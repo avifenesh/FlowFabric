@@ -1,0 +1,656 @@
+{
+  "topic": "AWS Step Functions - serverless workflow orchestration service",
+  "slug": "aws-step-functions",
+  "generated": "2026-04-09T00:00:00Z",
+  "depth": "deep",
+  "totalSources": 40,
+  "sources": [
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html",
+      "title": "What Is AWS Step Functions? - Developer Guide",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Core architecture: state machines, states, executions, tasks, activities",
+        "Standard vs Express workflow comparison",
+        "Three service integration patterns: Request-Response, Run a Job, Wait for Callback",
+        "220+ AWS service integrations"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-amazon-states-language.html",
+      "title": "Amazon States Language (ASL) Documentation",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "JSON-based structured language for state machine definitions",
+        "JSONata query language with {% %} syntax",
+        "State types: Task, Choice, Fail, Pass, Succeed, Wait, Parallel, Map",
+        "Variable assignment via Assign field",
+        ".asl.json file extension convention"
+      ]
+    },
+    {
+      "url": "https://aws.amazon.com/step-functions/",
+      "title": "AWS Step Functions Product Page",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 9,
+      "depth": 6,
+      "examples": 5,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Visual workflow development with drag-and-drop",
+        "220+ service integrations",
+        "Agentic AI workflow support",
+        "ETL automation, microservices orchestration use cases"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-standard-vs-express.html",
+      "title": "Standard vs Express Workflows Comparison",
+      "qualityScore": 96,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Standard: exactly-once, 1 year max, per-transition pricing",
+        "Express async: at-least-once; Express sync: at-most-once",
+        "Express: 100K/sec start rate, 5-minute max",
+        "Workflow type is immutable after creation",
+        "Synchronous Express console timeout at 60 seconds"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html",
+      "title": "Error Handling in Step Functions",
+      "qualityScore": 98,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Retry fields: ErrorEquals, IntervalSeconds, MaxAttempts, BackoffRate, MaxDelaySeconds, JitterStrategy",
+        "Catch fields: ErrorEquals, Next, ResultPath",
+        "Predefined errors: States.ALL, States.Timeout, States.TaskFailed, States.Runtime, States.DataLimitExceeded",
+        "Processing order: Retry first, then Catch",
+        "States.ALL cannot catch States.DataLimitExceeded or States.Runtime"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-supported-services.html",
+      "title": "Supported Service Integrations",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Over 200 AWS SDK integrations",
+        "Optimized integrations for Lambda, ECS, DynamoDB, SQS, SNS, Bedrock, Glue, etc.",
+        "Full pattern support (all 3) for Bedrock, ECS/Fargate, EKS, Step Functions",
+        "DynamoDB: Request-Response only"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-nested-workflows.html",
+      "title": "Nested Workflows",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Start child executions via StartExecution API",
+        "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID links parent-child",
+        "Retry StepFunctions.ExecutionLimitExceeded for throttling",
+        "Benefits: modularity, reusability, reduced complexity"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/use-dist-map-orchestrate-large-scale-parallel-workloads.html",
+      "title": "Distributed Map State",
+      "qualityScore": 97,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Up to 10,000 concurrent child executions",
+        "ItemReader for S3 (CSV, JSON), ItemBatcher for grouping, ResultWriter for S3 export",
+        "ToleratedFailurePercentage and ToleratedFailureCount",
+        "Child executions: EXPRESS (default) or STANDARD",
+        "MaxConcurrency and MaxConcurrencyPath for dynamic control"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html",
+      "title": "Service Integration Patterns",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 10,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Request-Response: immediate proceed after HTTP response",
+        ".sync: polls and waits for job completion",
+        ".waitForTaskToken: pauses until external callback with token",
+        "Resource ARN format: arn:aws:states:::service:action[.pattern]",
+        "Heartbeat configuration for callback patterns"
+      ]
+    },
+    {
+      "url": "https://aws.amazon.com/step-functions/pricing/",
+      "title": "Step Functions Pricing",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 5,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Standard: $0.000025 per state transition",
+        "Express: $1.00/million requests + $0.00001667/GB-second",
+        "Free tier: 4,000 transitions/month (never expires)",
+        "Memory formula: 50 MB + definition + execution data"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/workflow-studio.html",
+      "title": "Workflow Studio",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Three modes: Design (drag-and-drop), Code (ASL editor), Config",
+        "Auto-sync between Design and Code modes",
+        "Patterns tab for pre-built reusable blocks",
+        "VS Code integration for individual state testing",
+        "Infrastructure Composer integration for SAM/CloudFormation"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/cw-logs.html",
+      "title": "CloudWatch Logs Integration",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Four log levels: ALL, ERROR, FATAL, OFF",
+        "Express workflows require CloudWatch Logs for execution history",
+        "Logs delivered best-effort (not guaranteed complete)",
+        "Payloads > 248 KiB truncated in logs",
+        "Prefix log groups with /aws/vendedlogs/states/ to avoid policy limits"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_stepfunctions-readme.html",
+      "title": "AWS CDK Step Functions Module",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 8,
+      "keyInsights": [
+        "DefinitionBody.fromChainable() for programmatic definitions",
+        "State classes: Pass, Choice, Parallel, Map, DistributedMap, Wait, Succeed, Fail",
+        "Chain.start() and .next() for fluent chaining",
+        "JSONata support via *.jsonata() factory methods",
+        "addRetry(), addCatch() for error handling",
+        "JsonPath helper methods for intrinsic functions"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/sfn-best-practices.html",
+      "title": "Step Functions Best Practices",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Nest Express inside Standard for cost optimization",
+        "Use S3 for payloads > 256 KiB",
+        "Always set TimeoutSeconds on Task/Activity states",
+        "Handle Lambda transient errors with specific error codes",
+        "Maintain 100+ open polls per activity ARN",
+        "Use /aws/vendedlogs/ prefix for log groups"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-lambda.html",
+      "title": "Lambda Integration",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Three invocation modes: sync, async (InvocationType: Event), callback",
+        "Automatic JSON parsing of Lambda Payload",
+        "Direct function ARN vs states:::lambda:invoke resource",
+        "Heartbeat timeout starts after function completes (sync mode)"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-ddb.html",
+      "title": "DynamoDB Integration",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Optimized: GetItem, PutItem, UpdateItem, DeleteItem only",
+        "No Query or Scan via optimized integration (use AWS SDK)",
+        "DynamoDB attribute type descriptors required ({\"S\": \"value\"})",
+        "Exception prefix: 'DynamoDB' (uppercase) for optimized integration"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-bedrock.html",
+      "title": "Amazon Bedrock Integration",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "InvokeModel for inference, CreateModelCustomizationJob for fine-tuning",
+        "S3 Input/Output for large payloads exceeding 256 KiB",
+        "Supports foundation models, provisioned models, custom models",
+        "Prompt engineering via dynamic Body parameters"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-sqs.html",
+      "title": "SQS Integration",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 9,
+      "uniqueness": 6,
+      "keyInsights": [
+        "SendMessage with MessageAttributes support",
+        "Callback pattern embeds TaskToken in message body",
+        "JSONata expressions for dynamic values",
+        "PascalCase parameter convention"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-ecs.html",
+      "title": "ECS/Fargate Integration",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "RunTask action with .sync and .waitForTaskToken patterns",
+        "ContainerOverrides for command and environment variables",
+        "Task token passed via environment variable for callback",
+        "Non-empty Failures field triggers AmazonECS.Unknown error"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-sns.html",
+      "title": "SNS Integration",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 5,
+      "keyInsights": [
+        "Publish action with MessageAttributes",
+        "Callback pattern with task token",
+        "Dynamic value mapping with JSONata"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-eventbridge.html",
+      "title": "EventBridge Integration",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "PutEvents with automatic execution ARN tracking",
+        "Non-zero FailedEntryCount triggers EventBridge.FailedEntry error",
+        "Callback pattern support",
+        "Dynamic and static resource IAM policies"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-api-gateway.html",
+      "title": "API Gateway Integration",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Direct endpoint invocation without AWS SDK",
+        "Supports IAM, No Auth, Lambda Authorizers",
+        "REST and HTTP APIs (regional only)",
+        "Error format: ApiGateway.<HTTP Status Code>",
+        "Callback pattern via .waitForTaskToken"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/connect-glue.html",
+      "title": "AWS Glue Integration",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 8,
+      "depth": 6,
+      "examples": 7,
+      "uniqueness": 5,
+      "keyInsights": [
+        "StartJobRun with .sync pattern support",
+        "JobName extracted from request and added to response",
+        "Glue has no resource-based IAM control"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-activities.html",
+      "title": "Activities (External Workers)",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 8,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Polling model: GetActivityTask, SendTaskSuccess/Failure/Heartbeat",
+        "Can wait up to 1 year with heartbeats",
+        "Standard workflows only",
+        "Maintain 100+ open polls per activity ARN",
+        "Not versioned; create new activity for breaking changes"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-cd-aliasing-versioning.html",
+      "title": "Versioning and Aliases",
+      "qualityScore": 81,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Versions are immutable numbered snapshots",
+        "Aliases route traffic to up to 2 versions",
+        "Enables blue/green and canary deployments",
+        "Revisions are internal snapshots with UUID, no ARN"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/limits-overview.html",
+      "title": "Service Quotas and Limits",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 4,
+      "uniqueness": 9,
+      "keyInsights": [
+        "256 KiB payload limit (hard)",
+        "1 MB definition size (hard)",
+        "25,000 event history limit (Standard)",
+        "100,000 state machines per account",
+        "1,000,000 open executions per account",
+        "10,000 parallel Map children (hard)",
+        "Token bucket rate limiting for API calls"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-examine-map-run.html",
+      "title": "Monitoring Map Runs",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Map Run Details page shows status, ARN, configuration",
+        "Item statuses: Pending, Running, Succeeded, Failed, Aborted",
+        "Failed items inherit failure from child execution",
+        "90-day child execution retention",
+        "Recover dropdown for redrive or new execution"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/test-state-isolation.html",
+      "title": "TestState API",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Test individual states without deploying",
+        "Three inspection levels: INFO, DEBUG, TRACE",
+        "Mock service integrations for unit testing",
+        "Validate retry/catch behavior and data transformations",
+        "STRICT, PRESENT, NONE validation modes"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/redrive-executions.html",
+      "title": "Execution Redrives",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Restart from failure point, skip successful steps",
+        "Retry counts reset to 0 on redrive",
+        "14-day eligibility window",
+        "State-specific redrive behavior for each state type",
+        "Redriven transitions count as billable transitions"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/workflow-variables.html",
+      "title": "Workflow Variables",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Assign field for setting variables across steps",
+        "256 KiB per variable, 10 MiB per execution",
+        "Workflow-local scope; Parallel/Map create child scopes",
+        "Distributed Map cannot reference outer scope",
+        "Reserved $states variable for input, result, errorOutput, context"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/intrinsic-functions.html",
+      "title": "Intrinsic Functions Reference",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 10,
+      "uniqueness": 8,
+      "keyInsights": [
+        "18 intrinsic functions for array, string, math, encoding, hash, UUID operations",
+        "JSONPath only (not available with JSONata)",
+        "Up to 10 nested intrinsic functions per field",
+        "States.Format for string interpolation",
+        "States.UUID for unique identifier generation"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-transitions.html",
+      "title": "State Transitions",
+      "qualityScore": 79,
+      "authority": 10,
+      "recency": 8,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 5,
+      "keyInsights": [
+        "StartAt defines entry state, Next defines transitions",
+        "End: true marks terminal states",
+        "Choice state allows multiple transition rules",
+        "States can have multiple incoming transitions",
+        "Redrives count as state transitions for billing"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/cw-metrics.html",
+      "title": "CloudWatch Metrics Reference",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 5,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Execution metrics: Started, Succeeded, Failed, Aborted, TimedOut, Throttled",
+        "Express-specific: BilledDuration, BilledMemory",
+        "Service integration metrics separate from Lambda metrics",
+        "Map Run metrics: OpenMapRunCount, BacklogSize",
+        "Recommended: Sum for counts, Average for durations"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/concepts-xray-tracing.html",
+      "title": "X-Ray Tracing",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Enable via console or TracingConfiguration API",
+        "Default sampling: 1/sec + 5% additional",
+        "Service maps show dependencies and error rates",
+        "Not supported for Distributed Map child executions",
+        "traceHeader parameter for upstream service integration"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/sfn-local.html",
+      "title": "Step Functions Local",
+      "qualityScore": 78,
+      "authority": 10,
+      "recency": 7,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Docker-based local testing (unsupported, limited parity)",
+        "AWS recommends TestState API instead",
+        "Configurable endpoints for Lambda, DynamoDB, SQS, SNS",
+        "Integration with SAM CLI for local Lambda",
+        "Express workflow logs stored to local files"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/tutorial-creating-lambda-state-machine.html",
+      "title": "Tutorial: Create Lambda State Machine",
+      "qualityScore": 76,
+      "authority": 10,
+      "recency": 8,
+      "depth": 6,
+      "examples": 8,
+      "uniqueness": 4,
+      "keyInsights": [
+        "Step-by-step: create Lambda, create state machine, test execution",
+        "Lambda and state machine must be in same account and region",
+        "80-character name limit, ASCII only for CloudWatch compatibility"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/sample-bedrock-prompt-chaining.html",
+      "title": "Bedrock Prompt Chaining Sample",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 9,
+      "depth": 6,
+      "examples": 7,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Chain multiple prompts sequentially for higher quality output",
+        "Cohere Command LLM example",
+        "Deploy via CloudFormation template",
+        "Optimized Bedrock service integration"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html",
+      "title": "SAM AWS::Serverless::StateMachine",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "DefinitionUri or inline Definition property",
+        "DefinitionSubstitutions for runtime value injection",
+        "AutoPublishAlias for continuous deployments",
+        "Events property for schedule and event-driven triggers",
+        "Tracing and Logging configuration"
+      ]
+    },
+    {
+      "url": "https://docs.aws.amazon.com/step-functions/latest/dg/sample-project-transfer-data-sqs.html",
+      "title": "Sample: Transfer Data with Lambda, DynamoDB, SQS",
+      "qualityScore": 77,
+      "authority": 10,
+      "recency": 8,
+      "depth": 6,
+      "examples": 7,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Iterative DynamoDB read and SQS send pattern",
+        "CloudFormation-deployed demo workflow",
+        "Lambda populates initial data",
+        "For-loop iteration through table entries"
+      ]
+    }
+  ]
+}

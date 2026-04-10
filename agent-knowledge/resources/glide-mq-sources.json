@@ -1,0 +1,405 @@
+{
+  "topic": "avifenesh/glide-mq - message queue library built on Valkey GLIDE",
+  "slug": "glide-mq",
+  "generated": "2026-04-09T12:00:00Z",
+  "depth": "medium",
+  "totalSources": 22,
+  "sources": [
+    {
+      "url": "https://github.com/avifenesh/glide-mq",
+      "title": "glide-mq GitHub Repository",
+      "type": "repository",
+      "qualityScore": 98,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 10,
+      "keyInsights": [
+        "High-performance Node.js message queue with Rust NAPI core",
+        "1-RTT-per-job optimization via Valkey Functions (FCALL)",
+        "7 AI-native primitives for LLM orchestration",
+        "Apache 2.0 license, v0.15.1",
+        "Hash-tagged keys for zero-config clustering"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/README.md",
+      "title": "glide-mq README",
+      "type": "documentation",
+      "qualityScore": 96,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Complete feature matrix with categories",
+        "Performance benchmarks on AWS ElastiCache Valkey 8.2",
+        "35-38% throughput gain over BullMQ at c=10-15",
+        "Ecosystem packages: dashboard, framework integrations",
+        "When NOT to use glide-mq (Kafka-style streaming, browsers, exactly-once)"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/USAGE.md",
+      "title": "glide-mq Usage Guide",
+      "type": "documentation",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 10,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Queue class: add, addBulk (12.7x faster), getJob, getJobs, getJobCounts, getMetrics",
+        "Worker events: active, completed, failed, error, stalled, drained",
+        "Job options: delay, priority, attempts, backoff, timeout, ttl, lifo, ordering",
+        "LIFO uses separate Valkey LIST (RPUSH/RPOP)",
+        "Metrics recorded server-side inside Valkey Functions with zero extra RTTs"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/WORKFLOWS.md",
+      "title": "glide-mq Workflow Patterns",
+      "type": "documentation",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "FlowProducer creates atomic job trees (parents wait for children)",
+        "addDAG() supports arbitrary DAG topologies with deps arrays",
+        "chain() for sequential, group() for parallel, chord() for parallel+callback",
+        "Dynamic children via moveToWaitingChildren()",
+        "Cycle detection throws CycleError"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/ADVANCED.md",
+      "title": "glide-mq Advanced Features",
+      "type": "documentation",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Cron schedulers with timezone, fixed intervals, bounded runs",
+        "Dual-axis rate limiting: RPM + TPM with per-group sliding windows",
+        "Pluggable serializers and transparent gzip compression",
+        "Shared client option reduces connections from N+2 to 2",
+        "Job revocation via cooperative cancellation"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/ARCHITECTURE.md",
+      "title": "glide-mq Internal Architecture",
+      "type": "documentation",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 6,
+      "uniqueness": 10,
+      "keyInsights": [
+        "Key layout: glide:{queueName}:* with hash-tagged clustering",
+        "44 named Valkey Functions in glidemq library (vs 53 EVAL scripts in BullMQ)",
+        "Priority encoding: score = priority * 2^42 + timestamp_ms",
+        "Consumer group per queue, XAUTOCLAIM for stall recovery",
+        "Connection model: separate commandClient and blockingClient per worker"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/MIGRATION.md",
+      "title": "BullMQ to glide-mq Migration Guide",
+      "type": "documentation",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Connection format change: {host,port} to {addresses:[{host,port}]}",
+        "group.id replaced by ordering.key (free vs Pro license)",
+        "Many APIs identical: backoff, attemptsMade, updateData, limiter",
+        "Rust NAPI client replaces ioredis JavaScript client",
+        "1 persistent function library replaces 53 Lua scripts"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/OBSERVABILITY.md",
+      "title": "glide-mq Observability Guide",
+      "type": "documentation",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Auto OpenTelemetry spans with no code changes required",
+        "Per-minute metrics with 24-hour retention",
+        "AI usage telemetry: reportUsage, getFlowUsage, getUsageSummary",
+        "SSE surfaces for real-time event and stream monitoring",
+        "Telemetry can be disabled for max throughput"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/TESTING.md",
+      "title": "glide-mq Testing Guide",
+      "type": "documentation",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "TestQueue and TestWorker for in-memory testing without Valkey",
+        "Supports retries, batch mode, custom job IDs",
+        "searchJobs() for filtering by state and data fields",
+        "Works with Vitest/Jest",
+        "Mirrors production behavior including deduplication"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/BROADCAST.md",
+      "title": "glide-mq Broadcast/Pub-Sub Guide",
+      "type": "documentation",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Fan-out to all subscribers (vs point-to-point queue)",
+        "NATS-style subject filtering with * and > wildcards",
+        "BroadcastWorker with subscription names and subject arrays",
+        "startFrom controls replay ($ for new, 0-0 for history)",
+        "HTTP SSE exposure for external consumers"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/SERVERLESS.md",
+      "title": "glide-mq Serverless Deployment Guide",
+      "type": "documentation",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Producer class returns string IDs with minimal overhead",
+        "ServerlessPool manages connection reuse across warm Lambda invocations",
+        "HTTP proxy for Edge/Cloudflare Workers without NAPI",
+        "addBulk pipelines jobs in single round trip",
+        "All Queue.add() features available through Producer"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/STEP_JOBS.md",
+      "title": "glide-mq Step Jobs Guide",
+      "type": "documentation",
+      "qualityScore": 78,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "moveToDelayed(timestamp, nextStep) pauses and sets next step",
+        "State persists through step transitions in job.data.step",
+        "Eliminates need for separate queues in multi-step workflows",
+        "Combines with moveToWaitingChildren for orchestration",
+        "Drip campaign example demonstrates practical usage"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/WIRE_PROTOCOL.md",
+      "title": "glide-mq Cross-Language Wire Protocol",
+      "type": "specification",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 7,
+      "uniqueness": 10,
+      "keyInsights": [
+        "Non-Node languages use standard FCALL commands",
+        "glidemq_addJob takes 4 keys and 21 args",
+        "Job hash has 30+ fields including AI usage metrics",
+        "Compression format: gz: + base64(gzip(data)), 1MB max",
+        "Custom job ID validation: max 256 chars, no {}: characters"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/docs/DURABILITY.md",
+      "title": "glide-mq Durability Guarantees",
+      "type": "documentation",
+      "qualityScore": 79,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 7,
+      "keyInsights": [
+        "At-least-once delivery semantics",
+        "Stalled jobs recovered from PEL via XAUTOCLAIM",
+        "AOF appendfsync everysec recommended minimum",
+        "Async replication means primary failure can lose recent writes",
+        "Processors must be idempotent"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/src/functions/index.ts",
+      "title": "glide-mq Valkey Functions Source",
+      "type": "source-code",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 5,
+      "uniqueness": 9,
+      "keyInsights": [
+        "44 named functions in glidemq library (version 81)",
+        "Atomic completeAndFetchNext eliminates wasted HMGET calls",
+        "Token bucket with remainder accumulator for precision",
+        "Skip markers handle debounce deletion without sequence gaps",
+        "Separate stall detection for LIFO/priority list-sourced jobs"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/CHANGELOG.md",
+      "title": "glide-mq Changelog",
+      "type": "documentation",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 4,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Rapid release cadence: 0.8.0 to 0.15.1 in ~6 weeks",
+        "Breaking changes in 0.12.0 (group key type) and 0.14.0 (usage API)",
+        "v0.10.0 achieved 108% throughput gain at c=1",
+        "v0.13.0 introduced suspend/resume and vector search",
+        "v0.15.0 added HTTP proxy and Flow API"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh/glide-mq/blob/main/package.json",
+      "title": "glide-mq package.json",
+      "type": "metadata",
+      "qualityScore": 65,
+      "authority": 10,
+      "recency": 10,
+      "depth": 4,
+      "examples": 2,
+      "uniqueness": 5,
+      "keyInsights": [
+        "Version 0.15.1, Node.js >=20",
+        "Single runtime dependency: @glidemq/speedkey ^0.3.0",
+        "Exports: main, testing, proxy modules",
+        "Dev deps include BullMQ and ioredis for benchmarking",
+        "Build: TypeScript compilation, Vitest for testing"
+      ]
+    },
+    {
+      "url": "https://www.glidemq.dev",
+      "title": "glide-mq Documentation Site",
+      "type": "documentation-site",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Comprehensive doc site with guide, API reference, examples",
+        "Integration guides for Hono, Fastify, NestJS, Hapi",
+        "Migration guides from BullMQ and Bee-Queue",
+        "Example categories: basics, scheduling, workflows, AI pipelines",
+        "Requires Valkey 7.0+ (vector search needs valkey-bundle)"
+      ]
+    },
+    {
+      "url": "https://github.com/valkey-io/valkey-glide",
+      "title": "Valkey GLIDE - Official Client Library",
+      "type": "dependency",
+      "qualityScore": 82,
+      "authority": 9,
+      "recency": 9,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Rust-first client with language bindings (Java, Python, Node, Go)",
+        "Cluster-aware operations, AZ affinity routing",
+        "Backed by AWS and GCP",
+        "glide-mq uses the Node.js NAPI binding via @glidemq/speedkey",
+        "Eliminates JavaScript protocol parsing overhead"
+      ]
+    },
+    {
+      "url": "https://valkey.io/topics/streams-intro/",
+      "title": "Valkey Streams Introduction",
+      "type": "reference",
+      "qualityScore": 78,
+      "authority": 9,
+      "recency": 8,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Append-only log with O(1) random access",
+        "Consumer groups for server-side load balancing",
+        "PEL tracks unacknowledged messages per consumer",
+        "XAUTOCLAIM automates recovery from unresponsive consumers",
+        "Time-based IDs enable free range queries"
+      ]
+    },
+    {
+      "url": "https://valkey.io/topics/functions-intro/",
+      "title": "Valkey Functions Introduction",
+      "type": "reference",
+      "qualityScore": 76,
+      "authority": 9,
+      "recency": 8,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Persistent across restarts (stored in RDB/AOF)",
+        "Named functions vs SHA1 digests of EVAL",
+        "Functions can call other functions within same library",
+        "Atomic library replacement via FUNCTION LOAD REPLACE",
+        "Cluster deployment: load on all primaries"
+      ]
+    },
+    {
+      "url": "https://github.com/avifenesh",
+      "title": "Avi Fenesh - glide-mq Creator Profile",
+      "type": "author",
+      "qualityScore": 70,
+      "authority": 8,
+      "recency": 9,
+      "depth": 5,
+      "examples": 2,
+      "uniqueness": 8,
+      "keyInsights": [
+        "System Software Engineer at AWS ElastiCache",
+        "Member of AWS, Amazon Contributing, and Valkey-io organizations",
+        "Maintains both Valkey GLIDE client and glide-mq",
+        "Expertise in Rust, C, Node.js",
+        "Also develops agent-sh ecosystem (Agnix, AgentSys)"
+      ]
+    }
+  ]
+}

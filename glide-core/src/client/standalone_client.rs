@@ -1,0 +1,895 @@
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
+use super::get_valkey_connection_info;
+use super::reconnecting_connection::{ReconnectReason, ReconnectingConnection};
+use super::{ConnectionRequest, NodeAddress, TlsMode};
+use crate::client::types::ReadFrom as ClientReadFrom;
+use futures::{StreamExt, future, stream};
+use logger_core::log_debug;
+use logger_core::log_warn;
+use redis::aio::ConnectionLike;
+use redis::cluster_routing::{self, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd};
+use redis::{PushInfo, RedisError, RedisResult, RetryStrategy, Value};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use telemetrylib::Telemetry;
+use tokio::sync::mpsc;
+use tokio::task;
+
+#[derive(Debug)]
+enum ReadFrom {
+    Primary,
+    PreferReplica {
+        latest_read_replica_index: Arc<AtomicUsize>,
+    },
+    AZAffinity {
+        client_az: String,
+        last_read_replica_index: Arc<AtomicUsize>,
+    },
+    AZAffinityReplicasAndPrimary {
+        client_az: String,
+        last_read_replica_index: Arc<AtomicUsize>,
+    },
+}
+
+#[derive(Debug)]
+struct DropWrapper {
+    /// Connection to the primary node in the client.
+    primary_index: usize,
+    nodes: Vec<ReconnectingConnection>,
+    read_from: ReadFrom,
+    /// When true, write commands are blocked and INFO REPLICATION is skipped during connection.
+    read_only: bool,
+}
+
+impl Drop for DropWrapper {
+    fn drop(&mut self) {
+        for node in self.nodes.iter() {
+            node.mark_as_dropped();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StandaloneClient {
+    inner: Arc<DropWrapper>,
+}
+
+impl Drop for StandaloneClient {
+    fn drop(&mut self) {
+        // Client was dropped, reduce the number of clients
+        Telemetry::decr_total_clients(1);
+    }
+}
+
+pub enum StandaloneClientConnectionError {
+    NoAddressesProvided,
+    FailedConnection(Vec<(Option<String>, RedisError)>),
+    PrimaryConflictFound(String),
+}
+
+impl std::fmt::Debug for StandaloneClientConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StandaloneClientConnectionError::NoAddressesProvided => {
+                write!(f, "No addresses provided")
+            }
+            StandaloneClientConnectionError::FailedConnection(errs) => {
+                match errs.len() {
+                    0 => {
+                        writeln!(f, "Failed without explicit error")?;
+                    }
+                    1 => {
+                        let (ref address, ref error) = errs[0];
+                        match address {
+                            Some(address) => {
+                                writeln!(f, "Received error for address `{address}`: {error}")?
+                            }
+                            None => writeln!(f, "Received error: {error}")?,
+                        }
+                    }
+                    _ => {
+                        writeln!(f, "Received errors:")?;
+                        for (address, error) in errs {
+                            match address {
+                                Some(address) => writeln!(f, "{address}: {error}")?,
+                                None => writeln!(f, "{error}")?,
+                            }
+                        }
+                    }
+                };
+                Ok(())
+            }
+            StandaloneClientConnectionError::PrimaryConflictFound(found_primaries) => {
+                writeln!(
+                    f,
+                    "Primary conflict. More than one primary found in a Standalone setup: {found_primaries}"
+                )
+            }
+        }
+    }
+}
+
+impl StandaloneClient {
+    pub async fn create_client(
+        connection_request: ConnectionRequest,
+        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+        pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
+    ) -> Result<Self, StandaloneClientConnectionError> {
+        if connection_request.addresses.is_empty() {
+            return Err(StandaloneClientConnectionError::NoAddressesProvided);
+        }
+
+        // Validate read_only mode is not combined with AZAffinity strategies
+        if connection_request.read_only
+            && matches!(
+                connection_request.read_from,
+                Some(ClientReadFrom::AZAffinity(_))
+                    | Some(ClientReadFrom::AZAffinityReplicasAndPrimary(_))
+            )
+        {
+            return Err(StandaloneClientConnectionError::FailedConnection(vec![(
+                None,
+                RedisError::from((
+                    redis::ErrorKind::InvalidClientConfig,
+                    "read-only mode is not compatible with AZAffinity strategies",
+                )),
+            )]));
+        }
+
+        let valkey_connection_info =
+            get_valkey_connection_info(&connection_request, iam_token_manager).await;
+        let retry_strategy = match connection_request.connection_retry_strategy {
+            Some(strategy) => RetryStrategy::new(
+                strategy.exponent_base,
+                strategy.factor,
+                strategy.number_of_retries,
+                strategy.jitter_percent,
+            ),
+            None => RetryStrategy::default(),
+        };
+
+        let tls_mode = connection_request.tls_mode;
+        let node_count = connection_request.addresses.len();
+        let discover_az = matches!(
+            connection_request.read_from,
+            Some(ClientReadFrom::AZAffinity(_))
+                | Some(ClientReadFrom::AZAffinityReplicasAndPrimary(_))
+        );
+
+        let connection_timeout = connection_request.get_connection_timeout();
+
+        let tcp_nodelay = connection_request.tcp_nodelay;
+
+        let has_root_certs = !connection_request.root_certs.is_empty();
+        let has_client_cert = !connection_request.client_cert.is_empty();
+        let has_client_key = !connection_request.client_key.is_empty();
+        if has_client_cert != has_client_key {
+            return Err(StandaloneClientConnectionError::FailedConnection(vec![(
+                None,
+                RedisError::from((
+                    redis::ErrorKind::InvalidClientConfig,
+                    "client_cert and client_key must both be provided or both be empty",
+                )),
+            )]));
+        }
+
+        let tls_params = if has_root_certs || has_client_cert || has_client_key {
+            if tls_mode.unwrap_or(TlsMode::NoTls) == TlsMode::NoTls {
+                return Err(StandaloneClientConnectionError::FailedConnection(vec![(
+                    None,
+                    RedisError::from((
+                        redis::ErrorKind::InvalidClientConfig,
+                        "TLS certificates provided but TLS is disabled",
+                    )),
+                )]));
+            }
+
+            let root_cert = if has_root_certs {
+                let mut combined_certs = Vec::new();
+                for cert in &connection_request.root_certs {
+                    combined_certs.extend_from_slice(cert);
+                }
+                Some(combined_certs)
+            } else {
+                None
+            };
+
+            let client_tls = if has_client_cert && has_client_key {
+                Some(redis::ClientTlsConfig {
+                    client_cert: connection_request.client_cert.clone(),
+                    client_key: connection_request.client_key.clone(),
+                })
+            } else {
+                None
+            };
+
+            let tls_certificates = redis::TlsCertificates {
+                client_tls,
+                root_cert,
+            };
+            Some(
+                redis::retrieve_tls_certificates(tls_certificates).map_err(|err| {
+                    StandaloneClientConnectionError::FailedConnection(vec![(None, err)])
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let read_only = connection_request.read_only;
+        let addresses = connection_request.addresses.clone();
+        let read_from_option = connection_request.read_from.clone();
+
+        let iam_token_handle = iam_token_manager.map(|m| m.get_token_handle());
+
+        let mut stream = stream::iter(addresses.into_iter())
+            .map(move |address| {
+                let info = valkey_connection_info.clone();
+                let retry = retry_strategy;
+                let sender = push_sender.clone();
+                let tls = tls_mode.unwrap_or(TlsMode::NoTls);
+                let discover = discover_az;
+                let timeout = connection_timeout;
+                let params = tls_params.clone();
+                let nodelay = tcp_nodelay;
+                let sync = pubsub_synchronizer.clone();
+                let skip_replication = read_only;
+                let iam_handle = iam_token_handle.clone();
+                async move {
+                    get_connection_and_replication_info(
+                        &address,
+                        &retry,
+                        &info,
+                        tls,
+                        &sender,
+                        discover,
+                        timeout,
+                        params,
+                        nodelay,
+                        &sync,
+                        skip_replication,
+                        iam_handle,
+                    )
+                    .await
+                    .map_err(|err| (format!("{}:{}", address.host, address.port), err))
+                }
+            })
+            .buffer_unordered(node_count);
+
+        let mut nodes = Vec::with_capacity(node_count);
+        let mut addresses_and_errors = Vec::with_capacity(node_count);
+        let mut primary_index = if read_only { Some(0) } else { None };
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok((connection, replication_status)) => {
+                    nodes.push(connection);
+                    // Only check for primary in normal mode (when replication_status is Some)
+                    // and the node reports role:master
+                    let is_primary = replication_status
+                        .and_then(|status| redis::from_owned_redis_value::<String>(status).ok())
+                        .is_some_and(|val| val.contains("role:master"));
+
+                    if is_primary {
+                        if let Some(existing_primary) = primary_index {
+                            // More than one primary found
+                            return Err(StandaloneClientConnectionError::PrimaryConflictFound(
+                                format!(
+                                    "Primary nodes: {:?}, {:?}",
+                                    nodes.pop(),
+                                    nodes.get(existing_primary)
+                                ),
+                            ));
+                        }
+                        primary_index = Some(nodes.len().saturating_sub(1));
+                    }
+                }
+                Err((address, (connection, err))) => {
+                    nodes.push(connection);
+                    addresses_and_errors.push((Some(address), err));
+                }
+            }
+        }
+
+        // Validate we have required connections
+        let primary_index = if read_only {
+            // In read-only mode, we need at least one successful connection
+            if nodes.is_empty() && !addresses_and_errors.is_empty() {
+                return Err(StandaloneClientConnectionError::FailedConnection(
+                    addresses_and_errors,
+                ));
+            }
+            0 // primary_index won't be used for writes in read-only mode
+        } else {
+            // Normal mode requires a primary
+            match primary_index {
+                Some(idx) => idx,
+                None => {
+                    let mut errors = addresses_and_errors;
+                    if errors.is_empty() {
+                        errors.insert(
+                            0,
+                            (
+                                None,
+                                RedisError::from((
+                                    redis::ErrorKind::ClientError,
+                                    "No primary node found",
+                                )),
+                            ),
+                        )
+                    };
+                    return Err(StandaloneClientConnectionError::FailedConnection(errors));
+                }
+            }
+        };
+
+        if !addresses_and_errors.is_empty() {
+            log_warn(
+                "client creation",
+                format!(
+                    "Failed to connect to {addresses_and_errors:?}, will attempt to reconnect."
+                ),
+            );
+        }
+        let read_from = if read_only && read_from_option.is_none() {
+            // Default to PreferReplica when read_only=true and no ReadFrom specified
+            ReadFrom::PreferReplica {
+                latest_read_replica_index: Default::default(),
+            }
+        } else {
+            get_read_from(read_from_option)
+        };
+
+        #[cfg(feature = "standalone_heartbeat")]
+        for node in nodes.iter() {
+            Self::start_heartbeat(node.clone());
+        }
+
+        for node in nodes.iter() {
+            Self::start_periodic_connection_check(node.clone());
+        }
+
+        // Successfully created new client. Update the telemetry
+        Telemetry::incr_total_clients(1);
+
+        Ok(Self {
+            inner: Arc::new(DropWrapper {
+                primary_index,
+                nodes,
+                read_from,
+                read_only,
+            }),
+        })
+    }
+
+    fn get_primary_connection(&self) -> &ReconnectingConnection {
+        self.inner.nodes.get(self.inner.primary_index).unwrap()
+    }
+
+    fn round_robin_read_from_replica(
+        &self,
+        latest_read_replica_index: &Arc<AtomicUsize>,
+    ) -> &ReconnectingConnection {
+        let initial_index = latest_read_replica_index.load(Ordering::Relaxed);
+        let mut check_count = 0;
+        loop {
+            check_count += 1;
+
+            // Looped through all replicas, no connected replica was found.
+            if check_count > self.inner.nodes.len() {
+                return self.get_primary_connection();
+            }
+            let index = (initial_index + check_count) % self.inner.nodes.len();
+            if index == self.inner.primary_index {
+                continue;
+            }
+            let Some(connection) = self.inner.nodes.get(index) else {
+                continue;
+            };
+            if connection.is_connected() {
+                let _ = latest_read_replica_index.compare_exchange_weak(
+                    initial_index,
+                    index,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return connection;
+            }
+        }
+    }
+
+    async fn round_robin_read_from_replica_az_awareness(
+        &self,
+        latest_read_replica_index: &Arc<AtomicUsize>,
+        client_az: String,
+    ) -> &ReconnectingConnection {
+        let initial_index = latest_read_replica_index.load(Ordering::Relaxed);
+        let mut retries = 0usize;
+
+        loop {
+            retries = retries.saturating_add(1);
+            // Looped through all replicas; no connected replica found in the same AZ.
+            if retries > self.inner.nodes.len() {
+                // Attempt a fallback to any available replica in other AZs or primary.
+                return self.round_robin_read_from_replica(latest_read_replica_index);
+            }
+
+            // Calculate index based on initial index and check count.
+            let index = (initial_index + retries) % self.inner.nodes.len();
+            let replica = &self.inner.nodes[index];
+
+            // Attempt to get a connection and retrieve the replica's AZ.
+            if let Ok(connection) = replica.get_connection().await
+                && let Some(replica_az) = connection.get_az().as_deref()
+                && replica_az == client_az
+            {
+                // Update `latest_used_replica` with the index of this replica.
+                let _ = latest_read_replica_index.compare_exchange_weak(
+                    initial_index,
+                    index,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return replica;
+            }
+        }
+    }
+
+    async fn round_robin_read_from_replica_az_awareness_replicas_and_primary(
+        &self,
+        latest_read_replica_index: &Arc<AtomicUsize>,
+        client_az: String,
+    ) -> &ReconnectingConnection {
+        let initial_index = latest_read_replica_index.load(Ordering::Relaxed);
+        let mut retries = 0usize;
+
+        // Step 1: Try to find a replica in the same AZ
+        loop {
+            retries = retries.saturating_add(1);
+            // Looped through all replicas; no connected replica found in the same AZ.
+            if retries >= self.inner.nodes.len() {
+                break;
+            }
+
+            // Calculate index based on initial index and check count.
+            let index = (initial_index + retries) % self.inner.nodes.len();
+            let replica = &self.inner.nodes[index];
+
+            // Attempt to get a connection and retrieve the replica's AZ.
+            if let Ok(connection) = replica.get_connection().await
+                && let Some(replica_az) = connection.get_az().as_deref()
+                && replica_az == client_az
+            {
+                // Update `latest_used_replica` with the index of this replica.
+                let _ = latest_read_replica_index.compare_exchange_weak(
+                    initial_index,
+                    index,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return replica;
+            }
+        }
+
+        // Step 2: Check if primary is in the same AZ
+        let primary = self.get_primary_connection();
+        if let Ok(connection) = primary.get_connection().await
+            && let Some(primary_az) = connection.get_az().as_deref()
+            && primary_az == client_az
+        {
+            return primary;
+        }
+
+        // Step 3: Fall back to any available replica using round-robin
+        self.round_robin_read_from_replica(latest_read_replica_index)
+    }
+
+    async fn get_connection(&self, readonly: bool) -> &ReconnectingConnection {
+        if self.inner.nodes.len() == 1 || !readonly {
+            return self.get_primary_connection();
+        }
+
+        match &self.inner.read_from {
+            ReadFrom::Primary => self.get_primary_connection(),
+            ReadFrom::PreferReplica {
+                latest_read_replica_index,
+            } => self.round_robin_read_from_replica(latest_read_replica_index),
+            ReadFrom::AZAffinity {
+                client_az,
+                last_read_replica_index,
+            } => {
+                self.round_robin_read_from_replica_az_awareness(
+                    last_read_replica_index,
+                    client_az.to_string(),
+                )
+                .await
+            }
+            ReadFrom::AZAffinityReplicasAndPrimary {
+                client_az,
+                last_read_replica_index,
+            } => {
+                self.round_robin_read_from_replica_az_awareness_replicas_and_primary(
+                    last_read_replica_index,
+                    client_az.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn send_request(
+        cmd: &redis::Cmd,
+        reconnecting_connection: &ReconnectingConnection,
+    ) -> RedisResult<Value> {
+        let mut connection = reconnecting_connection.get_connection().await?;
+        let result = connection.send_packed_command(cmd).await;
+        match result {
+            Err(err) if err.is_unrecoverable_error() => {
+                log_warn("send request", format!("received disconnect error `{err}`"));
+                reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
+                Err(err)
+            }
+            _ => result,
+        }
+    }
+
+    pub(crate) async fn send_request_to_all_nodes(
+        &mut self,
+        cmd: &redis::Cmd,
+        response_policy: Option<ResponsePolicy>,
+    ) -> RedisResult<Value> {
+        let requests = self
+            .inner
+            .nodes
+            .iter()
+            .map(|node| Self::send_request(cmd, node));
+
+        // TODO - once Value::Error will be merged, these will need to be updated to handle this new value.
+        match response_policy {
+            Some(ResponsePolicy::AllSucceeded) => {
+                future::try_join_all(requests)
+                    .await
+                    .map(|mut results| results.pop().unwrap()) // unwrap is safe, since at least one function succeeded
+            }
+            Some(ResponsePolicy::OneSucceeded) => future::select_ok(requests.map(Box::pin))
+                .await
+                .map(|(result, _)| result),
+            Some(ResponsePolicy::FirstSucceededNonEmptyOrAllEmpty) => {
+                future::select_ok(requests.map(|request| {
+                    Box::pin(async move {
+                        let result = request.await?;
+                        match result {
+                            Value::Nil => {
+                                Err((redis::ErrorKind::ResponseError, "no value found").into())
+                            }
+                            _ => Ok(result),
+                        }
+                    })
+                }))
+                .await
+                .map(|(result, _)| result)
+            }
+            Some(ResponsePolicy::Aggregate(op)) => future::try_join_all(requests)
+                .await
+                .and_then(|results| cluster_routing::aggregate(results, op)),
+            Some(ResponsePolicy::AggregateArray(op)) => future::try_join_all(requests)
+                .await
+                .and_then(|results| cluster_routing::aggregate_array(results, op)),
+            Some(ResponsePolicy::AggregateLogical(op)) => future::try_join_all(requests)
+                .await
+                .and_then(|results| cluster_routing::logical_aggregate(results, op)),
+            Some(ResponsePolicy::CombineArrays) => future::try_join_all(requests)
+                .await
+                .and_then(cluster_routing::combine_array_results),
+            Some(ResponsePolicy::CombineMaps) => future::try_join_all(requests)
+                .await
+                .and_then(cluster_routing::combine_map_results),
+            Some(ResponsePolicy::Special) => {
+                // Await all futures and collect results
+                let results = future::try_join_all(requests).await?;
+                // Create key-value pairs where the key is the node address and the value is the corresponding result
+                let node_result_pairs = self
+                    .inner
+                    .nodes
+                    .iter()
+                    .zip(results)
+                    .map(|(node, result)| (Value::BulkString(node.node_address().into()), result))
+                    .collect();
+
+                Ok(Value::Map(node_result_pairs))
+            }
+
+            None => {
+                // This is our assumption - if there's no coherent way to aggregate the responses, we just collect them in an array, and pass it to the user.
+                // TODO - once Value::Error is merged, we can use join_all and report separate errors and also pass successes.
+                future::try_join_all(requests).await.map(Value::Array)
+            }
+        }
+    }
+
+    async fn send_request_to_single_node(
+        &mut self,
+        cmd: &redis::Cmd,
+        readonly: bool,
+    ) -> RedisResult<Value> {
+        let reconnecting_connection = self.get_connection(readonly).await;
+        Self::send_request(cmd, reconnecting_connection).await
+    }
+
+    pub async fn send_command(&mut self, cmd: &redis::Cmd) -> RedisResult<Value> {
+        let Some(cmd_bytes) = Routable::command(cmd) else {
+            return self.send_request_to_single_node(cmd, false).await;
+        };
+
+        // Block write commands in read-only mode
+        if self.inner.read_only && !is_readonly_cmd(cmd_bytes.as_slice()) {
+            return Err(RedisError::from((
+                redis::ErrorKind::ReadOnly,
+                "write commands are not allowed in read-only mode",
+            )));
+        }
+
+        if RoutingInfo::is_all_nodes(cmd_bytes.as_slice()) {
+            let response_policy = ResponsePolicy::for_command(cmd_bytes.as_slice());
+            return self.send_request_to_all_nodes(cmd, response_policy).await;
+        }
+        self.send_request_to_single_node(cmd, is_readonly_cmd(cmd_bytes.as_slice()))
+            .await
+    }
+
+    pub async fn send_pipeline(
+        &mut self,
+        pipeline: &redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisResult<Vec<Value>> {
+        let reconnecting_connection = self.get_primary_connection();
+        let mut connection = reconnecting_connection.get_connection().await?;
+        let result = connection
+            .send_packed_commands(pipeline, offset, count)
+            .await;
+        match result {
+            Err(err) if err.is_unrecoverable_error() => {
+                log_warn(
+                    "pipeline request",
+                    format!("received disconnect error `{err}`"),
+                );
+                reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
+                Err(err)
+            }
+            _ => result,
+        }
+    }
+
+    #[cfg(feature = "standalone_heartbeat")]
+    fn start_heartbeat(reconnecting_connection: ReconnectingConnection) {
+        task::spawn(async move {
+            loop {
+                tokio::time::sleep(super::HEARTBEAT_SLEEP_DURATION).await;
+                if reconnecting_connection.is_dropped() {
+                    log_debug(
+                        "StandaloneClient",
+                        "heartbeat stopped after connection was dropped",
+                    );
+                    // Client was dropped, heartbeat can stop.
+                    return;
+                }
+
+                let Some(mut connection) = reconnecting_connection.try_get_connection().await
+                else {
+                    log_debug(
+                        "StandaloneClient",
+                        "heartbeat stopped while connection is reconnecting",
+                    );
+                    // Client is reconnecting..
+                    continue;
+                };
+                log_debug("StandaloneClient", "performing heartbeat");
+                if connection
+                    .send_packed_command(&redis::cmd("PING"))
+                    .await
+                    .is_err_and(|err| err.is_connection_dropped() || err.is_connection_refusal())
+                {
+                    log_debug("StandaloneClient", "heartbeat triggered reconnect");
+                    reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
+                }
+            }
+        });
+    }
+
+    // Monitors passive connection status and reconnects if necessary.
+    // This function is cheaper alternative to start_heartbeat(),
+    // as it avoids sending PING commands to the server, checking only the connection state.
+    fn start_periodic_connection_check(reconnecting_connection: ReconnectingConnection) {
+        task::spawn(async move {
+            loop {
+                reconnecting_connection
+                    .wait_for_disconnect_with_timeout(&super::CONNECTION_CHECKS_INTERVAL)
+                    .await;
+                // check connection is valid
+                if reconnecting_connection.is_dropped() {
+                    log_debug(
+                        "StandaloneClient",
+                        "connection checker stopped after connection was dropped",
+                    );
+
+                    // Client was dropped, checker can stop.
+                    return;
+                }
+
+                let Some(connection) = reconnecting_connection.try_get_connection().await else {
+                    log_debug(
+                        "StandaloneClient",
+                        "connection checker is skipping a connections since its reconnecting",
+                    );
+                    // Client is reconnecting..
+                    continue;
+                };
+
+                if connection.is_closed() {
+                    log_debug(
+                        "StandaloneClient",
+                        "connection checker has triggered reconnect",
+                    );
+                    reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
+                }
+            }
+        });
+    }
+
+    /// Update the password used to authenticate with the servers.
+    /// If the password is `None`, the password will be removed.
+    pub async fn update_connection_password(
+        &self,
+        new_password: Option<String>,
+    ) -> RedisResult<Value> {
+        for node in self.inner.nodes.iter() {
+            node.update_connection_password(new_password.clone());
+        }
+
+        Ok(Value::Okay)
+    }
+
+    /// Update the database id used to establish connection with the servers.
+    pub async fn update_connection_database(&self, database_id: i64) -> RedisResult<Value> {
+        for node in self.inner.nodes.iter() {
+            node.update_connection_database(database_id);
+        }
+
+        Ok(Value::Okay)
+    }
+
+    /// Update the client_name used to create the connection.
+    pub async fn update_connection_client_name(
+        &self,
+        new_client_name: Option<String>,
+    ) -> RedisResult<Value> {
+        for node in self.inner.nodes.iter() {
+            node.update_connection_client_name(new_client_name.clone());
+        }
+
+        Ok(Value::Okay)
+    }
+
+    /// Update the username used to authenticate with the servers.
+    ///
+    /// This method updates the username for all connections and stores it for future reconnections.
+    /// Typically called after a successful AUTH command with a username parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_username` - The username to use for authentication (None to clear)
+    ///
+    pub async fn update_connection_username(
+        &self,
+        new_username: Option<String>,
+    ) -> RedisResult<Value> {
+        for node in self.inner.nodes.iter() {
+            node.update_connection_username(new_username.clone());
+        }
+
+        Ok(Value::Okay)
+    }
+
+    /// Update the protocol version used for connections.
+    ///
+    /// This method updates the protocol version for all connections and stores it for future reconnections.
+    /// Typically called after a successful HELLO command that changes the protocol version.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_protocol` - The protocol version to use (RESP2 or RESP3)
+    ///
+    pub async fn update_connection_protocol(
+        &self,
+        new_protocol: redis::ProtocolVersion,
+    ) -> RedisResult<Value> {
+        for node in self.inner.nodes.iter() {
+            node.update_connection_protocol(new_protocol);
+        }
+
+        Ok(Value::Okay)
+    }
+
+    /// Retrieve the username used to authenticate with the server.
+    pub fn get_username(&self) -> Option<String> {
+        // All nodes in the client should have the same username configured, thus any connection would work here.
+        self.get_primary_connection().get_username()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_connection_and_replication_info(
+    address: &NodeAddress,
+    retry_strategy: &RetryStrategy,
+    connection_info: &redis::RedisConnectionInfo,
+    tls_mode: TlsMode,
+    push_sender: &Option<mpsc::UnboundedSender<PushInfo>>,
+    discover_az: bool,
+    connection_timeout: Duration,
+    tls_params: Option<redis::TlsConnParams>,
+    tcp_nodelay: bool,
+    pubsub_synchronizer: &Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
+    skip_replication_check: bool,
+    iam_token_handle: Option<super::IAMTokenHandle>,
+) -> Result<(ReconnectingConnection, Option<Value>), (ReconnectingConnection, RedisError)> {
+    let reconnecting_connection = ReconnectingConnection::new(
+        address,
+        *retry_strategy,
+        connection_info.clone(),
+        tls_mode,
+        push_sender.clone(),
+        discover_az,
+        connection_timeout,
+        tls_params,
+        tcp_nodelay,
+        pubsub_synchronizer.clone(),
+        iam_token_handle,
+    )
+    .await?;
+
+    let mut multiplexed_connection = match reconnecting_connection.get_connection().await {
+        Ok(multiplexed_connection) => multiplexed_connection,
+        Err(err) => {
+            reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
+            return Err((reconnecting_connection, err));
+        }
+    };
+
+    // Skip INFO REPLICATION in read-only mode
+    if skip_replication_check {
+        return Ok((reconnecting_connection, None));
+    }
+
+    match multiplexed_connection
+        .send_packed_command(redis::cmd("INFO").arg("REPLICATION"))
+        .await
+    {
+        Ok(replication_status) => Ok((reconnecting_connection, Some(replication_status))),
+        Err(err) => Err((reconnecting_connection, err)),
+    }
+}
+
+fn get_read_from(read_from: Option<super::ReadFrom>) -> ReadFrom {
+    match read_from {
+        Some(super::ReadFrom::Primary) => ReadFrom::Primary,
+        Some(super::ReadFrom::PreferReplica) => ReadFrom::PreferReplica {
+            latest_read_replica_index: Default::default(),
+        },
+        Some(super::ReadFrom::AZAffinity(az)) => ReadFrom::AZAffinity {
+            client_az: az,
+            last_read_replica_index: Default::default(),
+        },
+        Some(super::ReadFrom::AZAffinityReplicasAndPrimary(az)) => {
+            ReadFrom::AZAffinityReplicasAndPrimary {
+                client_az: az,
+                last_read_replica_index: Default::default(),
+            }
+        }
+        None => ReadFrom::Primary,
+    }
+}

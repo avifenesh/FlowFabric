@@ -1,0 +1,889 @@
+{
+  "topic": "BullMQ Pro - Premium Redis/Valkey-Based Job Queue for Node.js",
+  "slug": "bullmq-pro",
+  "generated": "2026-04-09T12:00:00Z",
+  "depth": "deep",
+  "totalSources": 42,
+  "sources": [
+    {
+      "url": "https://docs.bullmq.io/",
+      "title": "BullMQ Documentation - Overview",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Exactly-once semantics with at-least-once delivery guarantee",
+        "Polling-free design minimizing CPU consumption",
+        "All operations atomic via Lua scripts and Redis pipelining",
+        "Horizontal scalability through parallel worker processing"
+      ]
+    },
+    {
+      "url": "https://bullmq.io/",
+      "title": "BullMQ Pro - Official Landing Page",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Pro features: Groups, Batches, Observables, Professional Support",
+        "Standard pricing: $1,395/year or $139/month per deployment",
+        "Enterprise and Embedded tiers with custom pricing",
+        "Compatible with Redis, Valkey, DragonflyDB, ElastiCache, Upstash"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/install",
+      "title": "BullMQ Pro - Installation Guide",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Private npm registry at npm.taskforce.sh",
+        "NPM_TASKFORCESH_TOKEN env variable for auth",
+        "Import QueuePro and WorkerPro from @taskforcesh/bullmq-pro",
+        "Docker .npmrc configuration for containerized builds"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups",
+      "title": "BullMQ Pro Groups - Feature Overview",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Round-robin processing across virtual queues",
+        "Zero Redis overhead for empty groups",
+        "Unlimited groups supported",
+        "Non-grouped jobs prioritized over grouped jobs"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/batches",
+      "title": "BullMQ Pro Batches - Feature Overview",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Process multiple jobs simultaneously with getBatch()",
+        "Configurable size, minSize, and timeout",
+        "Individual job failure via setAsFailed()",
+        "minSize/timeout not compatible with groups"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/observables",
+      "title": "BullMQ Pro Observables - Feature Overview",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 10,
+      "keyInsights": [
+        "Return RxJS Observables from worker processors",
+        "Multiple value emissions and cancellation support",
+        "State machine patterns with checkpoint/resume",
+        "Clean resource disposal on cancellation"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/flows",
+      "title": "BullMQ Flows - Parent-Child Dependencies",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 9,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "FlowProducer creates hierarchical job trees atomically",
+        "Parent waits in waiting-children state",
+        "Children can span different queues",
+        "getChildrenValues() aggregates child results"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/rate-limiting",
+      "title": "BullMQ Rate Limiting Guide",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Global rate limiting across all workers",
+        "Manual rate limiting for dynamic API responses",
+        "Rate-limited jobs stay in waiting state",
+        "Group rate limiting removed from OSS in v3, now Pro-only"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/workers",
+      "title": "BullMQ Workers Guide",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Async processor functions with optional AbortSignal",
+        "Progress tracking via job.progress()",
+        "Auto-run or manual control",
+        "CRITICAL: error handler required or processing stops"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/events",
+      "title": "BullMQ Events Guide",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Worker events are local, QueueEvents are global",
+        "QueueEvents use Redis Streams for reliable delivery",
+        "Auto-trim at ~10,000 events",
+        "Events: waiting, completed, failed, drained, progress"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/retrying-failing-jobs",
+      "title": "BullMQ Retry and Backoff Guide",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Fixed and exponential built-in backoff strategies",
+        "Jitter option (0-1) for random delay variation",
+        "Custom backoff strategies via worker settings",
+        "Return -1 from custom strategy to fail permanently"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/jobs/repeatable",
+      "title": "BullMQ Repeatable Jobs Guide",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 8,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Deprecated in v5.16 in favor of Job Schedulers",
+        "Cron expressions and fixed intervals",
+        "Custom repeat keys for updating schedules",
+        "Jobs don't accumulate if no workers are active"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/workers/sandboxed-processors",
+      "title": "BullMQ Sandboxed Processors Guide",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Isolate CPU-heavy work in separate processes",
+        "Prevents event loop blocking and job stalling",
+        "Worker threads supported since v3.13.0",
+        "Pass file path to Worker constructor"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/architecture",
+      "title": "BullMQ Architecture Guide",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Job lifecycle state machine with 7 states",
+        "Priority range 0 to 2^21",
+        "waiting-children state for flow dependencies",
+        "Unix convention: lower priority number = higher priority"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/connections",
+      "title": "BullMQ Connections Guide",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "maxRetriesPerRequest must be null for Workers",
+        "QueueEvents requires dedicated blocking connection",
+        "Never use ioredis keyPrefix",
+        "Redis maxmemory-policy must be noeviction"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/rate-limiting",
+      "title": "BullMQ Pro Group Rate Limiting",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Per-group rate limits with max and duration",
+        "Manual rateLimitGroup for API 429 responses",
+        "getGroupRateLimitTtl for status checking",
+        "Other groups continue while one is rate limited"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/concurrency",
+      "title": "BullMQ Pro Group Concurrency",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Global group concurrency enforced across all workers",
+        "Per-group max active jobs independent of worker concurrency",
+        "Group concurrency takes precedence within its scope",
+        "Default: no per-group concurrency limits"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/queues",
+      "title": "BullMQ Queues Guide",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 5,
+      "keyInsights": [
+        "Queue class is lightweight with few methods",
+        "Upsert on meta-key allows reconnection",
+        "No QueueScheduler needed since v2.0",
+        "add() stores jobs in Redis for eventual processing"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/jobs/prioritized",
+      "title": "BullMQ Prioritized Jobs Guide",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Priority 1 to 2,097,152; lower = higher priority",
+        "Unprioritized jobs processed first (highest priority)",
+        "O(log n) insertion complexity",
+        "changePriority() for runtime modification"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/local-group-concurrency",
+      "title": "BullMQ Pro Local Group Concurrency",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Per-group concurrency values stored in Redis",
+        "setGroupConcurrency and getGroupConcurrency methods",
+        "Must also set global group concurrency as default",
+        "Manual cleanup required for unused group settings"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/max-group-size",
+      "title": "BullMQ Pro Max Group Size",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Limit jobs per group with maxSize option",
+        "GroupMaxSizeExceededError thrown at capacity",
+        "Not compatible with addBulk",
+        "Useful for discarding overflow"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/going-to-production",
+      "title": "BullMQ Production Deployment Guide",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "AOF persistence with everysec sync",
+        "Exponential backoff for connection retries",
+        "Graceful shutdown with SIGINT/SIGTERM handlers",
+        "Encrypt sensitive data, configure job retention"
+      ]
+    },
+    {
+      "url": "https://github.com/taskforcesh/bullmq",
+      "title": "BullMQ GitHub Repository",
+      "qualityScore": 88,
+      "authority": 9,
+      "recency": 10,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 8,
+      "keyInsights": [
+        "8,700+ stars, 591 forks, 818 releases",
+        "TypeScript 53.6%, Elixir 32.1%, Python 6.3%, Lua 5.3%",
+        "Latest v5.73.3 (April 2026)",
+        "Notable users: Microsoft, NestJS, Langfuse, Novu"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/jobs/job-ids",
+      "title": "BullMQ Job IDs Guide",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Auto-incrementing IDs scoped per queue",
+        "Custom IDs enable deduplication",
+        "No colons allowed in custom IDs",
+        "Removed jobs lose dedup protection"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/jobs/deduplication",
+      "title": "BullMQ Job Deduplication Guide",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Three modes: Simple, Throttle, Debounce",
+        "keepLastIfActive for at-most-1-active semantics",
+        "Deduplicated event on QueueEvents",
+        "removeDeduplicationKey() for manual override"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/patterns/redis-cluster",
+      "title": "BullMQ Redis Cluster Pattern",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Use hash tags for key co-location",
+        "Prefix with {brackets} for cluster compatibility",
+        "Distinct prefixes for multiple queues",
+        "Prevents key distribution across nodes"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/telemetry",
+      "title": "BullMQ Telemetry Guide",
+      "qualityScore": 78,
+      "authority": 10,
+      "recency": 9,
+      "depth": 5,
+      "examples": 3,
+      "uniqueness": 7,
+      "keyInsights": [
+        "OpenTelemetry specification support",
+        "Job lifecycle visibility",
+        "Extensible interface for future backends",
+        "Useful for large distributed applications"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/changelog",
+      "title": "BullMQ Changelog",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 3,
+      "uniqueness": 7,
+      "keyInsights": [
+        "v5.73.3 latest (April 2026)",
+        "v5.72.0 added keepLastIfActive dedup",
+        "v5.71.0 added OTel gauge metrics",
+        "v5.0 changed marker architecture"
+      ]
+    },
+    {
+      "url": "https://blog.taskforce.sh/rate-limit-recipes-in-nodejs-using-bullmq/",
+      "title": "Rate Limit Recipes in Node.js Using BullMQ",
+      "qualityScore": 90,
+      "authority": 9,
+      "recency": 8,
+      "depth": 9,
+      "examples": 10,
+      "uniqueness": 9,
+      "keyInsights": [
+        "7 rate limiting strategies with code examples",
+        "Burst smoothing: convert max/duration to 1/interval",
+        "Dynamic rate limiting for HTTP 429 responses",
+        "Per-group rate limits for multi-tenant fairness"
+      ]
+    },
+    {
+      "url": "https://blog.taskforce.sh/bullmq-pro-edition/",
+      "title": "BullMQ Pro Edition Announcement",
+      "qualityScore": 83,
+      "authority": 9,
+      "recency": 6,
+      "depth": 7,
+      "examples": 4,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Pro motivation: fund advanced features development",
+        "Initial features: Observables, Groups, Group Rate Limiting",
+        "Roadmap: Batches, Topics",
+        "Open source commitment maintained"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/prioritized",
+      "title": "BullMQ Pro Prioritized Groups",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Per-group job prioritization",
+        "Priority 0-2,097,151 scale",
+        "getCountsPerPriorityForGroup method",
+        "Combined group.id and group.priority options"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/jobs/getters",
+      "title": "BullMQ Job Getters Guide",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 5,
+      "keyInsights": [
+        "getJobCounts() for multiple status counts",
+        "getJobs() with pagination support",
+        "9 job statuses queryable",
+        "TypeScript and Python support"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/nestjs",
+      "title": "BullMQ NestJS Integration Guide",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "@nestjs/bullmq module for queue management",
+        "BullModule.forRoot and registerQueue",
+        "@Processor decorator with WorkerHost",
+        "@OnWorkerEvent for lifecycle hooks"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/metrics",
+      "title": "BullMQ Metrics Guide",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "1-minute interval data collection",
+        "Completed and failed job counts",
+        "~120KB RAM for 2 weeks of data",
+        "getMetrics() with pagination"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/observables/cancelation",
+      "title": "BullMQ Pro Observable Cancellation",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "TTL-based automatic job cancellation",
+        "Global TTL or per-job-name TTL",
+        "Observable unsubscribe for cleanup",
+        "Configurable timeout thresholds"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/job-schedulers",
+      "title": "BullMQ Job Schedulers Guide",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "upsertJobScheduler replaces repeatable jobs",
+        "Upsert prevents duplicate schedulers",
+        "Job templates standardize configuration",
+        "Scheduler produces only when last job starts processing"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/queues/global-concurrency",
+      "title": "BullMQ Global Concurrency Guide",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Queue-wide concurrency limit across all workers",
+        "setGlobalConcurrency/getGlobalConcurrency/removeGlobalConcurrency",
+        "Worker concurrency cannot exceed global",
+        "Global constraint always respected"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/patterns/process-step-jobs",
+      "title": "BullMQ Process Step Jobs Pattern",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Multi-step state machine pattern",
+        "moveToDelayed with DelayedError",
+        "moveToWaitingChildren with WaitingChildrenError",
+        "maxStartedAttempts for step transition limits"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/parallelism-and-concurrency",
+      "title": "BullMQ Parallelism and Concurrency Guide",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "I/O-bound: concurrency 100-300",
+        "CPU-bound: low concurrency, more workers",
+        "Fine-tune via production workload observation",
+        "Multiple workers across machines for true parallelism"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/redis-tm-compatibility",
+      "title": "BullMQ Redis Compatibility Guide",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 9,
+      "depth": 6,
+      "examples": 3,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Redis 6.2+ fully supported",
+        "Valkey, DragonflyDB, ElastiCache, Upstash listed",
+        "Not all alternatives guaranteed compatible",
+        "Vendors regularly tested"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/redis-tm-compatibility/dragonfly",
+      "title": "BullMQ DragonflyDB Compatibility",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Use {queueName} for multi-core thread assignment",
+        "Split queues for parallelism",
+        "Priorities/rate limiting may not work across split queues",
+        "Official integration guide available"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/changelog",
+      "title": "BullMQ Pro Changelog",
+      "qualityScore": 81,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 3,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Pro v7.43.1 latest (April 2026)",
+        "Global rate limit support added",
+        "Job cancellation during processing",
+        "Deduplication replace option in single mode"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/support",
+      "title": "BullMQ Pro Support Details",
+      "qualityScore": 78,
+      "authority": 10,
+      "recency": 9,
+      "depth": 6,
+      "examples": 2,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Email support at support@taskforce.sh",
+        "1 business day response target",
+        "Resolution varies by complexity",
+        "Workarounds offered when full fix isn't immediate"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/jobs/stalled",
+      "title": "BullMQ Stalled Jobs Guide",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "30-second default lock timeout",
+        "maxStalledCount default is 1",
+        "Stalled jobs return to waiting or move to failed",
+        "Use sandboxed processors to prevent"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/pausing-groups",
+      "title": "BullMQ Pro Group Pausing",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 8,
+      "keyInsights": [
+        "pauseGroup/resumeGroup on QueuePro",
+        "Returns false if already paused/active",
+        "Can pause non-existent groups preemptively",
+        "Workers finish current group jobs before idling"
+      ]
+    },
+    {
+      "url": "https://blog.taskforce.sh/do-not-wait-for-your-jobs-to-complete/",
+      "title": "Do Not Wait for Your Jobs to Complete",
+      "qualityScore": 86,
+      "authority": 9,
+      "recency": 7,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "waitUntilFinished() antipattern in production",
+        "Return job ID immediately, poll for status",
+        "Queue secondary notification jobs for critical workflows",
+        "Decouple producers and consumers"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/queues/auto-removal-of-jobs",
+      "title": "BullMQ Auto-Removal of Jobs",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Boolean, count-based, and age-based retention",
+        "Lazy execution on next job completion/failure",
+        "KeepJobs object with age and count",
+        "Removed jobs lose deduplication protection"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/queues/removing-jobs",
+      "title": "BullMQ Queue Job Removal Methods",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 9,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 6,
+      "keyInsights": [
+        "drain(): remove waiting/delayed jobs",
+        "clean(): state + grace period based removal",
+        "obliterate(): destroy entire queue",
+        "Force obliterate bypasses active job locks"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/workers/graceful-shutdown",
+      "title": "BullMQ Graceful Shutdown Guide",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 6,
+      "keyInsights": [
+        "worker.close() waits for active jobs",
+        "No automatic timeout on close()",
+        "Unclosed workers create stalled jobs",
+        "Stalled jobs recovered after ~30 seconds"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/bullmq-pro/groups/getters",
+      "title": "BullMQ Pro Group Getters",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "getGroupsJobsCount for aggregate counts",
+        "getGroupActiveCount per group",
+        "getGroupJobs with pagination",
+        "Includes prioritized and non-prioritized jobs"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/patterns/named-processor",
+      "title": "BullMQ Named Processor Pattern",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 9,
+      "depth": 6,
+      "examples": 8,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Switch/case on job.name replaces old named processors",
+        "Explicit control over routing logic",
+        "Removed as built-in feature from Bull to BullMQ",
+        "Single worker handles multiple job types"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/patterns/throttle-jobs",
+      "title": "BullMQ Throttle Jobs Pattern",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Deduplication via identical jobId values",
+        "Only first job with given ID queued",
+        "Caution with removeOnComplete affecting dedup",
+        "Use case: profile update email throttling"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/migration-to-newer-versions",
+      "title": "BullMQ Migration Guide",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 4,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Upgrade incrementally: bugfix -> minor -> major",
+        "API-breaking vs data-structure-breaking changes",
+        "Pause/upgrade/unpause strategy for risky upgrades",
+        "New queues strategy for major migrations"
+      ]
+    },
+    {
+      "url": "https://docs.bullmq.io/guide/flows/get-flow-tree",
+      "title": "BullMQ Flow Tree Retrieval",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "getFlow() retrieves complete job hierarchy",
+        "depth and maxChildren for performance",
+        "Each node has job and children properties",
+        "Useful for monitoring complex workflows"
+      ]
+    },
+    {
+      "url": "https://dev.to/t/bullmq",
+      "title": "Dev.to BullMQ Community Articles",
+      "qualityScore": 72,
+      "authority": 5,
+      "recency": 9,
+      "depth": 6,
+      "examples": 7,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Ride-sharing dispatch with async workflows",
+        "Email sending with SES and queue processing",
+        "Stripe webhook race condition patterns",
+        "Decorator-based DI for job processors"
+      ]
+    }
+  ]
+}

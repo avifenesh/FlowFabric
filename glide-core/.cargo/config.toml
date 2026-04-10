@@ -1,0 +1,3 @@
+[env]
+GLIDE_NAME = "Glide" # This should be overwritten by each wrapper library.
+GLIDE_VERSION = "unknown"

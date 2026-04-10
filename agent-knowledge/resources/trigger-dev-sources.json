@@ -1,0 +1,665 @@
+{
+  "topic": "Trigger.dev - background job and workflow orchestration platform for TypeScript",
+  "slug": "trigger-dev",
+  "generated": "2026-04-09T00:00:00Z",
+  "depth": "deep",
+  "totalSources": 40,
+  "sources": [
+    {
+      "url": "https://trigger.dev/docs",
+      "title": "Trigger.dev Documentation - Main Index",
+      "qualityScore": 98,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Core documentation structure with tasks, triggering, runs, and API keys as foundational concepts",
+        "14+ practical example integrations including video processing, AI generation, and web scraping",
+        "Build extensions for Prisma, Python, Playwright, FFmpeg",
+        "Realtime API with React hooks for frontend integration"
+      ]
+    },
+    {
+      "url": "https://trigger.dev",
+      "title": "Trigger.dev Homepage - Platform Overview",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Four-tier pricing: Free ($0), Hobby ($10), Pro ($50), Enterprise (custom)",
+        "14,500+ GitHub stars, Apache 2.0 license",
+        "Elastic auto-scaling, multi-region workers, static IP availability",
+        "Integrates with Next.js, Vercel, AWS, Remix, Bun, Fastify, Express"
+      ]
+    },
+    {
+      "url": "https://github.com/triggerdotdev/trigger.dev",
+      "title": "Trigger.dev GitHub Repository",
+      "qualityScore": 96,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "TypeScript 98.4% of codebase, latest release v4.4.3 (March 2026)",
+        "7,065 commits, 615 releases, 1.1k forks",
+        "Self-hosting via Docker Compose or Kubernetes Helm charts",
+        "Checkpoint-resume system for durable execution"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/v3/tasks-overview",
+      "title": "Tasks Overview - Core Task Definition",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Tasks defined with task() function, require unique id and async run function",
+        "Return values must be JSON serializable",
+        "Lifecycle hooks: onStartAttempt, onWait, onResume, onSuccess, onComplete, onFailure, onCancel",
+        "Machine presets from micro (0.25 vCPU) to large-2x (8 vCPU, 16 GB)"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/v3/triggering",
+      "title": "Triggering Tasks - Execution Methods",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 7,
+      "keyInsights": [
+        "tasks.trigger(), batchTrigger(), triggerAndWait(), batchTriggerAndWait()",
+        "Type-safe triggering with generic type parameters",
+        "Trigger options: delay, ttl, idempotencyKey, debounce, queue, region, machine",
+        "Payloads up to 10MB, auto-offloaded to object storage above 512KB"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/v3/queue-concurrency",
+      "title": "Queue Concurrency - Flow Control",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Shared queues across tasks, per-tenant isolation with concurrencyKey",
+        "Waiting runs do NOT consume concurrency slots",
+        "SDK queue management: list, pause, resume, overrideConcurrencyLimit",
+        "Subtasks don't inherit parent queue - prevents deadlocks"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/errors-retrying",
+      "title": "Errors and Retrying - Resilience",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Global and task-level retry configuration with exponential backoff",
+        "retry.onThrow() for block-level retries, retry.fetch() for HTTP retries",
+        "AbortTaskRunError to prevent retries on known failures",
+        "catchError callback for conditional retry logic"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/wait",
+      "title": "Wait Functions Overview",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 8,
+      "keyInsights": [
+        "wait.for(), wait.until(), wait.forToken(), inputStream.wait()",
+        "Automatic checkpoint after ~5 seconds of waiting",
+        "Zero compute cost during waits",
+        "Parent tasks checkpoint when waiting for subtasks"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/realtime",
+      "title": "Realtime API Overview",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Run updates via Electric SQL (HTTP-based PostgreSQL sync, not WebSockets)",
+        "Streaming for continuous data like AI tokens",
+        "useRealtimeRun and useRealtimeStream React hooks",
+        "Subscribe by run ID, tags, batch, or trigger+subscribe combos"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/runs",
+      "title": "Runs - Task Execution Lifecycle",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 7,
+      "keyInsights": [
+        "11 run states from PENDING_VERSION to EXPIRED",
+        "runs.list(), retrieve(), cancel(), replay(), reschedule()",
+        "Idempotency keys prevent duplicate execution",
+        "TTL defines max queue wait time before auto-expire"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/open-source-self-hosting",
+      "title": "Self-Hosting Guide",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 9,
+      "depth": 9,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Minimum 4 CPU cores, 8 GB RAM, Debian OS",
+        "Docker Compose single-server or split-services deployment",
+        "No ARM support, Docker checkpoint experimental",
+        "Magic link auth with Resend/SMTP/AWS SES options"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/v3/tasks/scheduled",
+      "title": "Scheduled Tasks (Cron)",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Declarative cron via task config, imperative via schedules.create()",
+        "Timezone support with automatic DST adjustment",
+        "L notation for last day of month/week",
+        "externalId for per-user scheduling without redeployment"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/config/config-file",
+      "title": "trigger.config.ts Configuration Reference",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Runtimes: Node.js 21.7.3 (default), Node.js 22.16.0, Bun 1.3.3",
+        "Global lifecycle hooks: onStart, onSuccess, onFailure, init",
+        "Telemetry exporters for Axiom, Honeycomb via OTLP",
+        "Build extensions: Prisma, syncEnvVars, puppeteer, ffmpeg, python, aptGet"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/deploy-environment-variables",
+      "title": "Deployment and Environment Variables",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "CLI deploy and GitHub Actions deployment methods",
+        "syncEnvVars build extension for Infisical/Vercel sync",
+        "Auto-loads .env files in priority order during dev",
+        "Env vars fetched and injected before run begins"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/machines",
+      "title": "Machine Presets and Configuration",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "7 machine presets from micro to large-2x",
+        "Task-level, global default, and runtime override configuration",
+        "OOM detection with ResourceMonitor helper class",
+        "Auto-retry with larger machine on OOM failures"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/pricing",
+      "title": "Trigger.dev Pricing Page",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 5,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Per-second compute billing from $0.0000169/s (micro) to $0.0006800/s (large-2x)",
+        "Run invocation fee: $0.000025 per run ($0.25 per 10K)",
+        "Free tier: $5 credit, 20 concurrent runs, 10 schedules",
+        "Pro tier: $50/mo with $50 credit, 200+ concurrent runs, 30-day logs"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/cli-deploy",
+      "title": "CLI Deploy Command Reference",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Compiles, bundles, deploys, and registers tasks as new version",
+        "Supports prod, staging, and preview environments",
+        "dry-run, skip-promotion, skip-sync-env-vars options",
+        "Self-hosted: TRIGGER_ACCESS_TOKEN and TRIGGER_API_URL required in CI"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/wait-for-token",
+      "title": "Waitpoint Tokens - Human-in-the-Loop",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Create tokens with timeout, idempotency key, and tags",
+        "Token provides ID, callback URL, and publicAccessToken",
+        "Complete via SDK, HTTP callback, or webhook",
+        "Idempotency prevents redundant waits during retries"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/realtime/overview",
+      "title": "Realtime Architecture Deep Dive",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Electric SQL for run updates, dedicated transport for streaming",
+        "No polling or WebSockets required",
+        "Subscription patterns: run ID, tags, batch, trigger+subscribe",
+        "Both features can operate simultaneously"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/realtime/react-hooks",
+      "title": "React Hooks for Realtime",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Trigger hooks, run update hooks, streaming hooks, SWR hooks",
+        "Public Access Token authentication required",
+        "useRealtimeRun for status/metadata/tags updates",
+        "SWR hooks for one-time fetch with caching"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/realtime/streams",
+      "title": "Realtime Streams - Consuming Data",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Defined streams for type safety, direct streams by key, default streams",
+        "Timeout, startIndex for reconnection, AbortSignal support",
+        "SSE formatting for frontend via ReadableStream",
+        "Batch accumulation for database/queue optimization"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/guides/ai-agents",
+      "title": "AI Agent Building Guide",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Five patterns: prompt chaining, routing, parallelization, orchestrator, evaluator-optimizer",
+        "Human-in-the-loop with ReactFlow and waitpoint tokens",
+        "Claude, OpenAI, Vercel AI SDK, Mastra framework integrations",
+        "Seven example implementations including deep research agent"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/idempotency",
+      "title": "Idempotency Deep Dive",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Three scopes: run (default), attempt, global",
+        "TTL configuration from seconds to days (default 30 days)",
+        "Failed runs auto-clear keys; successful runs retain them",
+        "Payload-based deduplication via SHA-256 hashing pattern"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/tags",
+      "title": "Tags - Run Organization",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 6,
+      "keyInsights": [
+        "Up to 10 tags per run, 1-128 characters each",
+        "Add at trigger time or during execution via tags.add()",
+        "Tags don't propagate to child runs automatically",
+        "Filter in dashboard and via runs.list() SDK"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/management/overview",
+      "title": "Management API Overview",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 6,
+      "keyInsights": [
+        "REST API via @trigger.dev/sdk",
+        "Configure with secretKey for authentication",
+        "Runs, schedules, env vars, queues, waitpoints management",
+        "Auto-pagination for list endpoints"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/guides/frameworks/nextjs",
+      "title": "Next.js Integration Guide",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "App Router route handlers, Server Actions, Pages Router API routes",
+        "syncVercelEnvVars build extension for auto env sync",
+        "ISR path revalidation support",
+        "Concurrent dev with concurrently package"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/guides/introduction",
+      "title": "Guides Index - Frameworks and Integrations",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 5,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Framework guides: Bun, Next.js, Node.js, Remix, SvelteKit",
+        "Database: Prisma, Supabase, Sequin",
+        "Webhooks: Stripe, Hookdeck, custom",
+        "25+ copyable task templates, 18 example projects"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/how-it-works",
+      "title": "How Trigger.dev Works - Architecture",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 7,
+      "uniqueness": 10,
+      "keyInsights": [
+        "CRIU checkpoint captures memory, CPU registers, file descriptors",
+        "Checkpoint compresses and stores to disk, releases compute",
+        "Same esbuild build system in dev and production",
+        "Idempotency keys combined with checkpoint-resume for durable execution"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/versioning",
+      "title": "Atomic Versioning System",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Version format: YYYYMMDD.N",
+        "Running tasks locked to their start version",
+        "triggerAndWait children inherit parent version, trigger() uses latest",
+        "Replays use current code with same inputs for bug fix verification"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/limits",
+      "title": "System Limits Reference",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 5,
+      "uniqueness": 8,
+      "keyInsights": [
+        "API: 1,500 req/min across all tiers",
+        "Payload 3MB, output 10MB, offload above 512KB",
+        "Pro: 1M queued tasks, 1000+ schedules, 100+ concurrent runs",
+        "Max TTL 14 days, batch size 1,000"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/migrating-from-v3",
+      "title": "v3 to v4 Migration Guide",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 9,
+      "keyInsights": [
+        "v3 shutdown: April 1, 2026 (deploys stop), July 1, 2026 (full shutdown)",
+        "Import path change from @trigger.dev/sdk/v3 to @trigger.dev/sdk",
+        "Queue() function required instead of on-demand creation",
+        "triggerAndWait returns Result objects with .ok/.error/.unwrap()"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/vercel-integration",
+      "title": "Vercel Integration",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 7,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Automatic deployment on every Vercel push",
+        "Bidirectional env var sync (with sensitive var limitations)",
+        "Atomic deploys: gates Vercel until task build completes",
+        "Preview environment mapping support"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/github-actions",
+      "title": "GitHub Actions Deployment",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Production, staging, and preview branch workflows",
+        "TRIGGER_ACCESS_TOKEN secret required",
+        "Self-hosted: Docker Buildx + registry credentials needed",
+        "Version sync via package.json instead of @latest"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/logging",
+      "title": "Logging, Tracing, and Metrics",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 6,
+      "keyInsights": [
+        "console.log auto-captured in run logs",
+        "Structured logger with debug/log/info/warn/error levels",
+        "logger.trace() creates OpenTelemetry spans",
+        "All logs visible in dashboard run interface"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/context",
+      "title": "Context Object Reference",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Static context values fixed at run start",
+        "Includes task, attempt, run, queue, environment, git, org info",
+        "Machine specs: preset, CPU, memory, cost rate",
+        "Use usage functions for live cost tracking instead of ctx values"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/cli-dev",
+      "title": "CLI Dev Command - Local Development",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Each task runs in separate Node process",
+        "--analyze flag for debugging slow builds",
+        "Auto version check, hot reloading on file changes",
+        "Concurrent development with framework dev servers"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/guides/frameworks/bun",
+      "title": "Bun Runtime Integration",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 8,
+      "keyInsights": [
+        "Tasks run on Bun 1.3.3 in both dev and production",
+        "CLI still requires Node.js (Bun CLI not yet supported)",
+        "OpenTelemetry instrumentation limited due to missing register hooks",
+        "Init with --runtime bun flag"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/blog",
+      "title": "Trigger.dev Blog - Technical Insights",
+      "qualityScore": 82,
+      "authority": 9,
+      "recency": 10,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 9,
+      "keyInsights": [
+        "Replaced Node.js with Bun for 5x throughput (10,700 req/s vs 2,099 req/s)",
+        "TRQL query language for ClickHouse-backed analytics",
+        "Multi-tenant SQL access with tenant-safe compilation",
+        "Strategic evolution toward AI agents as core competency"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/run-tests",
+      "title": "Dashboard Test Runner",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 7,
+      "keyInsights": [
+        "Built-in test interface in dashboard",
+        "Configure payload, metadata, machine, queue, delay",
+        "Save reusable test templates",
+        "Reference and reuse previous test runs"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/run-usage",
+      "title": "Run Usage and Cost Tracking",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 8,
+      "keyInsights": [
+        "usage.getCurrent() for real-time cost/duration metrics",
+        "usage.measure() isolates resource consumption per code block",
+        "Waits and retry gaps not counted in compute cost",
+        "runs.retrieve() and runs.list() for retrospective cost analysis"
+      ]
+    },
+    {
+      "url": "https://trigger.dev/docs/llms.txt",
+      "title": "LLM Documentation Index - Complete URL Listing",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 10,
+      "depth": 5,
+      "examples": 3,
+      "uniqueness": 10,
+      "keyInsights": [
+        "150+ documentation pages across all categories",
+        "Full API endpoint documentation for REST management",
+        "30+ example projects covering AI, media, data processing",
+        "Migration guides from v3, Mergent, and n8n"
+      ]
+    }
+  ]
+}

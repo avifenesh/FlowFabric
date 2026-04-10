@@ -1,0 +1,843 @@
+{
+  "topic": "LangGraph - graph-based framework for building stateful AI agent workflows",
+  "slug": "langgraph",
+  "generated": "2026-04-09T00:00:00Z",
+  "depth": "deep",
+  "totalSources": 42,
+  "sourceBreakdown": {
+    "officialDocs": 28,
+    "blogPosts": 5,
+    "github": 3,
+    "tutorials": 3,
+    "packageRegistries": 2,
+    "courses": 1
+  },
+  "sources": [
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/overview",
+      "title": "LangGraph Overview - Official Documentation",
+      "qualityScore": 97,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "LangGraph is a low-level orchestration framework for stateful, long-running agents",
+        "Focus on orchestration rather than prompt engineering or architecture constraints",
+        "Trusted by Klarna, Uber, J.P. Morgan and 40+ companies",
+        "Four core capabilities: durable execution, human-in-the-loop, comprehensive memory, production deployment"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/quickstart",
+      "title": "LangGraph Quickstart Guide",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 10,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Two implementation approaches: Graph API and Functional API",
+        "Tools are defined with @tool decorator and bound via .bind_tools()",
+        "MessagesState tracks messages with Annotated types for append semantics",
+        "Conditional routing via should_continue function examining tool calls"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/graph-api",
+      "title": "LangGraph Graph API - Complete Reference",
+      "qualityScore": 98,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "State defined via TypedDict (fastest), Pydantic, or dataclass",
+        "Reducers control how state updates merge (default overwrites, Annotated for custom)",
+        "Send API enables map-reduce with dynamic fan-out",
+        "Command primitive combines state updates with control flow",
+        "Compilation validates structure and enables runtime configuration",
+        "Pregel execution model with super-steps and parallel node execution",
+        "Node caching via CachePolicy with TTL"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/functional-api",
+      "title": "LangGraph Functional API Reference",
+      "qualityScore": 92,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "@entrypoint decorator marks workflow start, accepts single positional argument",
+        "@task decorator wraps discrete work units with automatic checkpointing",
+        "Tasks return future-like objects resolved via .result()",
+        "Standard Python control flow (if/for) instead of graph structure",
+        "Inputs and outputs must be JSON-serializable"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/interrupts",
+      "title": "LangGraph Interrupts - Human-in-the-Loop Patterns",
+      "qualityScore": 96,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 9,
+      "type": "officialDocs",
+      "keyInsights": [
+        "interrupt() dynamically pauses execution anywhere in code",
+        "Resume with Command(resume=value) using same thread_id",
+        "Resuming restarts entire node from beginning",
+        "Never wrap interrupts in bare try/except",
+        "Maintain consistent interrupt ordering (index-based matching)",
+        "Patterns: approval, review/edit, tool call approval, validation loops, parallel interrupts"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/durable-execution",
+      "title": "LangGraph Durable Execution",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 9,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Three durability modes: exit, async, sync",
+        "Wrap side-effect operations in tasks to prevent re-execution",
+        "Implement idempotent operations with idempotency keys",
+        "Recovery by re-executing with same thread_id and null input"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/persistence",
+      "title": "LangGraph Persistence - Checkpointing and Memory Stores",
+      "qualityScore": 98,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 10,
+      "uniqueness": 9,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Checkpoints created at super-step boundaries",
+        "StateSnapshot contains values, next, config, metadata, tasks",
+        "Cross-thread memory via Store interface with semantic search",
+        "Multiple backends: InMemory, SQLite, Postgres, MongoDB, Redis, CosmosDB",
+        "AES encryption via EncryptedSerializer",
+        "Pending writes for fault tolerance on mid-step failures",
+        "Checkpoint namespaces for subgraph identification"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/streaming",
+      "title": "LangGraph Streaming Guide",
+      "qualityScore": 94,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Seven streaming modes: values, updates, messages, custom, checkpoints, tasks, debug",
+        "v2 format provides unified StreamPart structure",
+        "Token-level streaming via messages mode with metadata filtering",
+        "Custom mode for non-LangChain LLM integration via get_stream_writer()",
+        "Subgraph streaming with ns field for source identification"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/thinking-in-langgraph",
+      "title": "Thinking in LangGraph - Design Philosophy",
+      "qualityScore": 93,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 7,
+      "uniqueness": 10,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Five-step framework: map steps, classify operations, design state, implement nodes, wire edges",
+        "Store raw data in state, format on-demand in prompts",
+        "Error handling: transient (retry), LLM-recoverable (loop), user-fixable (interrupt), unexpected (bubble up)",
+        "Node granularity trade-offs: smaller = more resilient but more overhead",
+        "Command objects for explicit, traceable routing"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/choosing-apis",
+      "title": "Choosing Between Graph API and Functional API",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 6,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Graph API for visualization, complex state, team development",
+        "Functional API for minimal code changes, standard control flow, rapid prototyping",
+        "Both coexist within applications",
+        "Migrate from Functional to Graph when complexity warrants visualization"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/use-subgraphs",
+      "title": "LangGraph Subgraphs - Complete Guide",
+      "qualityScore": 95,
+      "authority": 10,
+      "recency": 10,
+      "depth": 10,
+      "examples": 9,
+      "uniqueness": 9,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Two patterns: invoke inside node (different state) vs. direct as node (shared state)",
+        "Three persistence modes: per-invocation, per-thread, stateless",
+        "Per-thread subgraphs don't support parallel tool calls",
+        "Checkpoint namespace hierarchy with pipe separator",
+        "Interface contracts enable separation of concerns"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/workflows-agents",
+      "title": "Workflows vs Agents in LangGraph",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Workflows have predetermined code paths; agents define their own processes",
+        "Workflow patterns: prompt chaining, parallelization, routing, orchestrator-worker, evaluator-optimizer",
+        "Agents operate in continuous feedback loops",
+        "Both leverage LangGraph persistence, streaming, debugging"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/pregel",
+      "title": "LangGraph Pregel Execution Model",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 6,
+      "uniqueness": 10,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Based on Google Pregel algorithm for parallel graph computation",
+        "Three phases: plan, execute, update",
+        "Actors (PregelNodes) subscribe to channels for inter-actor communication",
+        "Channel types: LastValue, Topic, BinaryOperatorAggregate",
+        "Channel updates invisible during execution step"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/application-structure",
+      "title": "LangGraph Application Structure",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 6,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Four required elements: langgraph.json, graph implementations, dependencies, env vars",
+        "Recommended layout: package dir with utils/, .env, requirements.txt, langgraph.json",
+        "langgraph.json specifies dependencies and graph references"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/add-memory",
+      "title": "Adding Memory to LangGraph Agents",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Short-term memory via checkpointer with thread_id",
+        "Long-term memory via Store with namespace tuples",
+        "Production backends: PostgresSaver, MongoDBSaver, RedisSaver",
+        "Memory management: trim, delete, summarize messages",
+        "Semantic search in memory stores with embeddings"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/agentic-rag",
+      "title": "Agentic RAG Patterns in LangGraph",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Conditional routing between retrieval and direct response",
+        "Document grading with structured output schemas",
+        "Multi-step: query -> retrieve -> grade -> rewrite/generate",
+        "Tool-based retrieval integrated with LLM decision-making"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/test",
+      "title": "Testing LangGraph Applications",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 6,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Access individual nodes via graph.nodes for unit testing",
+        "Partial execution testing with update_state and interrupt_after",
+        "Fresh checkpointer per test for isolation",
+        "Subgraph decomposition for focused testing"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/deploy",
+      "title": "LangGraph Deployment Guide",
+      "qualityScore": 78,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 5,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Three options: LangSmith Cloud, Control Plane, standalone",
+        "Cloud: one-click from GitHub, ~15min deployment",
+        "Traditional hosting not suited for stateful long-running workloads",
+        "Studio interface for testing deployed agents"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/use-time-travel",
+      "title": "LangGraph Time Travel - Replay and Fork",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 8,
+      "uniqueness": 9,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Replay re-executes nodes from checkpoint (not cached)",
+        "Fork creates new branch with modified state",
+        "Interrupts always re-trigger during time travel",
+        "as_node parameter controls state update attribution",
+        "Subgraph time travel requires checkpointer=True"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/local-server",
+      "title": "Running LangGraph as Local Server",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 8,
+      "uniqueness": 6,
+      "type": "officialDocs",
+      "keyInsights": [
+        "CLI requires Python 3.11+",
+        "langgraph dev starts API at port 2024 + Studio connection",
+        "Template-based project creation",
+        "In-memory mode for development; production requires persistent storage"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/studio",
+      "title": "LangGraph Studio",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Free visual interface for building, testing, debugging",
+        "Hot-reloading for instant code reflection",
+        "Re-run from any step for iterative testing",
+        "LANGSMITH_TRACING=false disables server data transmission"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/case-studies",
+      "title": "LangGraph Case Studies",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 9,
+      "depth": 6,
+      "examples": 5,
+      "uniqueness": 9,
+      "type": "officialDocs",
+      "keyInsights": [
+        "40+ companies across fintech, healthcare, dev tools, legal",
+        "Use cases: copilots, code gen, customer support, research, data extraction",
+        "Major adopters: Klarna, Uber, JP Morgan, Replit, Elastic, GitLab, LinkedIn"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/observability",
+      "title": "LangGraph Observability with LangSmith",
+      "qualityScore": 79,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 5,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Traces visualize execution from input to output",
+        "Selective tracing via tracing_context",
+        "Anonymizers mask sensitive patterns",
+        "Custom metadata and tags for filtering"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/ui",
+      "title": "LangGraph Agent Chat UI",
+      "qualityScore": 76,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 5,
+      "uniqueness": 6,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Next.js chat interface for any LangChain agent",
+        "Auto tool call rendering and interrupted thread support",
+        "Time-travel and state forking from UI",
+        "Self-hostable or hosted at agentchat.vercel.app"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/frontend/overview",
+      "title": "LangGraph Frontend Integration Overview",
+      "qualityScore": 82,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "useStream React hook for real-time graph execution",
+        "stream.values for completed outputs, stream.messages for tokens",
+        "Per-node status and streaming content visualization"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/frontend/graph-execution",
+      "title": "Graph Execution from Frontend Perspective",
+      "qualityScore": 81,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Map named nodes to UI components via stateKey",
+        "Priority: streaming content for live updates, committed state for done",
+        "Pipeline progress bars and collapsible node cards",
+        "Filter displayed nodes based on actual execution for conditional branches"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/use-graph-api",
+      "title": "How-To: Using the Graph API",
+      "qualityScore": 91,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 6,
+      "type": "officialDocs",
+      "keyInsights": [
+        "add_sequence() shorthand for linear chains",
+        "Nodes execute concurrently in same superstep for parallel branches",
+        "Overwrite type bypasses reducers",
+        "RetryPolicy for automatic error recovery",
+        "graph.get_graph().draw_mermaid_png() for visualization"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/use-functional-api",
+      "title": "How-To: Using the Functional API",
+      "qualityScore": 89,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 9,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Parallel task execution without blocking",
+        "entrypoint.final() decouples return from save",
+        "Composition with Graph API in same application",
+        "CachePolicy for task-level memoization"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/sql-agent",
+      "title": "SQL Agent Tutorial with LangGraph",
+      "qualityScore": 88,
+      "authority": 10,
+      "recency": 10,
+      "depth": 9,
+      "examples": 9,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "ReAct-style agent with dedicated nodes per SQL operation",
+        "Forced tool selection via tool_choice parameter",
+        "Conditional routing between validation and execution",
+        "Human-in-the-loop for query approval before execution"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/install",
+      "title": "LangGraph Installation Guide",
+      "qualityScore": 72,
+      "authority": 10,
+      "recency": 10,
+      "depth": 5,
+      "examples": 5,
+      "uniqueness": 3,
+      "type": "officialDocs",
+      "keyInsights": [
+        "pip install -U langgraph (or uv add langgraph)",
+        "Python 3.10+ required",
+        "LLM provider packages installed separately"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/python/langgraph/changelog-py",
+      "title": "LangGraph Python Changelog",
+      "qualityScore": 77,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 4,
+      "uniqueness": 8,
+      "type": "officialDocs",
+      "keyInsights": [
+        "v1.1 (Mar 2026): type-safe streaming/invoke v2, automatic Pydantic coercion",
+        "v1.0.0 (Oct 2025): major stable release milestone",
+        "v2 opt-in ensures backwards compatibility",
+        "GraphOutput object with .value and .interrupts"
+      ]
+    },
+    {
+      "url": "https://github.com/langchain-ai/langgraph",
+      "title": "LangGraph GitHub Repository",
+      "qualityScore": 90,
+      "authority": 10,
+      "recency": 10,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 7,
+      "type": "github",
+      "keyInsights": [
+        "99.4% Python codebase",
+        "MIT License",
+        "Integrates with LangChain, LangSmith ecosystem",
+        "Active development with frequent releases"
+      ]
+    },
+    {
+      "url": "https://github.com/langchain-ai/langgraphjs",
+      "title": "LangGraph.js GitHub Repository",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 7,
+      "uniqueness": 8,
+      "type": "github",
+      "keyInsights": [
+        "TypeScript/JavaScript SDK (97.9% TS)",
+        "Deno runtime support",
+        "Prebuilt agent templates: ReAct, memory, research, RAG",
+        "Zod-based schema validation"
+      ]
+    },
+    {
+      "url": "https://pypi.org/project/langgraph/",
+      "title": "LangGraph on PyPI",
+      "qualityScore": 75,
+      "authority": 9,
+      "recency": 10,
+      "depth": 5,
+      "examples": 3,
+      "uniqueness": 5,
+      "type": "packageRegistries",
+      "keyInsights": [
+        "Latest version 1.1.6 (April 2026)",
+        "Production/Stable status",
+        "Supports CPython and PyPy, versions 3.10-3.13",
+        "v1.0.0 released October 2025"
+      ]
+    },
+    {
+      "url": "https://reference.langchain.com/python/langgraph",
+      "title": "LangGraph API Reference",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 4,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Core classes: StateGraph, CompiledStateGraph, MessageGraph",
+        "Runtime, ExecutionInfo, ServerInfo for execution context",
+        "Custom exceptions: GraphRecursionError, InvalidUpdateError, GraphInterrupt",
+        "RetryPolicy and CachePolicy for resilience and performance"
+      ]
+    },
+    {
+      "url": "https://blog.langchain.com/langgraph-multi-agent-workflows",
+      "title": "Multi-Agent Workflows in LangGraph",
+      "qualityScore": 89,
+      "authority": 9,
+      "recency": 8,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 9,
+      "type": "blogPosts",
+      "keyInsights": [
+        "Three patterns: collaboration (shared scratchpad), supervisor, hierarchical teams",
+        "Agents as independent actors with own prompts and tools",
+        "Supervisor acts as agent with other agents as tools",
+        "Hierarchical nesting with LangGraph subgraphs"
+      ]
+    },
+    {
+      "url": "https://blog.langchain.com/reflection-agents/",
+      "title": "Reflection Agents - Self-Critique Patterns",
+      "qualityScore": 84,
+      "authority": 9,
+      "recency": 7,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 9,
+      "type": "blogPosts",
+      "keyInsights": [
+        "Reflection as prompting strategy for quality improvement",
+        "Basic reflection: generate + critique two-stage approach",
+        "Reflexion: grounded critiques with citations",
+        "LATS: selection, expansion, simulation, backpropagation cycle"
+      ]
+    },
+    {
+      "url": "https://blog.langchain.com/langgraph-cloud/",
+      "title": "LangGraph Cloud - Managed Agent Infrastructure",
+      "qualityScore": 82,
+      "authority": 9,
+      "recency": 7,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 8,
+      "type": "blogPosts",
+      "keyInsights": [
+        "Postgres checkpointer with horizontal scaling",
+        "Double-texting: reject, queue, interrupt, rollback strategies",
+        "Async background jobs with polling/webhook completion",
+        "One-click deployment from GitHub"
+      ]
+    },
+    {
+      "url": "https://blog.langchain.com/langgraph-v0-2/",
+      "title": "LangGraph v0.2 Release Announcement",
+      "qualityScore": 80,
+      "authority": 9,
+      "recency": 6,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 8,
+      "type": "blogPosts",
+      "keyInsights": [
+        "Dedicated checkpointer ecosystem introduced",
+        "Postgres pipeline mode for reduced roundtrips",
+        "Breaking changes: thread_ts renamed to checkpoint_id",
+        "LangGraph Cloud with fault-tolerant scalability"
+      ]
+    },
+    {
+      "url": "https://blog.langchain.com/what-is-an-agent/",
+      "title": "What Is an Agent? - LangChain's Definition",
+      "qualityScore": 81,
+      "authority": 9,
+      "recency": 7,
+      "depth": 7,
+      "examples": 5,
+      "uniqueness": 8,
+      "type": "blogPosts",
+      "keyInsights": [
+        "Agents defined as systems where LLM decides control flow",
+        "Agentic capabilities on a spectrum like vehicle autonomy levels",
+        "LangGraph for increasingly complex agentic systems",
+        "LangSmith for testing and observability"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/javascript/langgraph/overview",
+      "title": "LangGraph.js Overview",
+      "qualityScore": 83,
+      "authority": 10,
+      "recency": 10,
+      "depth": 6,
+      "examples": 7,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "npm install @langchain/langgraph @langchain/core",
+        "StateSchema with Zod for type-safe state definition",
+        "GraphNode utility type for node functions",
+        "Fully supported implementation, not a Python wrapper"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/javascript/langgraph/streaming",
+      "title": "LangGraph.js Streaming Guide",
+      "qualityScore": 86,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Six streaming modes including JS-specific tools mode",
+        "for await...of async iteration pattern",
+        "useStream React hook with toolProgress tracking",
+        "Async generator tools for intermediate data emission"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/javascript/langgraph/persistence",
+      "title": "LangGraph.js Persistence Guide",
+      "qualityScore": 85,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 7,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Five checkpointer packages: memory, SQLite, Postgres, MongoDB, Redis",
+        "Same BaseCheckpointSaver interface as Python",
+        "InMemoryStore with semantic search for cross-thread memory",
+        "Checkpointer config: true, false, or null (JS convention)"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/javascript/langgraph/graph-api",
+      "title": "LangGraph.js Graph API Reference",
+      "qualityScore": 87,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 7,
+      "type": "officialDocs",
+      "keyInsights": [
+        "StateSchema with Zod, ReducedValue, MessagesValue, UntrackedValue",
+        "GraphNode and ConditionalEdgeRouter utility types",
+        "Send objects for map-reduce patterns",
+        "Command for combined state updates and routing",
+        "InMemoryCache support with cachePolicy"
+      ]
+    },
+    {
+      "url": "https://docs.langchain.com/oss/javascript/langgraph/use-subgraphs",
+      "title": "LangGraph.js Subgraphs Guide",
+      "qualityScore": 84,
+      "authority": 10,
+      "recency": 10,
+      "depth": 8,
+      "examples": 8,
+      "uniqueness": 6,
+      "type": "officialDocs",
+      "keyInsights": [
+        "Zod-based state schemas for subgraphs",
+        "toolCallLimitMiddleware prevents parallel checkpoint conflicts",
+        "createAgent() and tool() for wrapping subagents",
+        "Same persistence patterns as Python"
+      ]
+    },
+    {
+      "url": "https://www.datacamp.com/tutorial/langgraph-tutorial",
+      "title": "DataCamp LangGraph Tutorial",
+      "qualityScore": 72,
+      "authority": 7,
+      "recency": 7,
+      "depth": 7,
+      "examples": 7,
+      "uniqueness": 5,
+      "type": "tutorials",
+      "keyInsights": [
+        "LangGraph as framework for defining, coordinating, executing multiple LLM agents",
+        "Structured orchestration of complex AI workflows",
+        "Practical implementation guidance for developers"
+      ]
+    },
+    {
+      "url": "https://academy.langchain.com/courses/intro-to-langgraph",
+      "title": "LangChain Academy - Introduction to LangGraph",
+      "qualityScore": 80,
+      "authority": 10,
+      "recency": 9,
+      "depth": 7,
+      "examples": 6,
+      "uniqueness": 7,
+      "type": "courses",
+      "keyInsights": [
+        "Free structured learning path for LangGraph",
+        "Foundation-level course covering Python SDK",
+        "Official curriculum from LangChain team"
+      ]
+    },
+    {
+      "url": "https://www.npmjs.com/package/@langchain/langgraph",
+      "title": "@langchain/langgraph on npm",
+      "qualityScore": 70,
+      "authority": 8,
+      "recency": 10,
+      "depth": 4,
+      "examples": 3,
+      "uniqueness": 4,
+      "type": "packageRegistries",
+      "keyInsights": [
+        "JavaScript/TypeScript package for LangGraph",
+        "Companion to @langchain/core",
+        "Active npm releases tracking Python SDK"
+      ]
+    }
+  ]
+}
