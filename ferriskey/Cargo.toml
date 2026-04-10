@@ -7,6 +7,7 @@ authors = ["FlowFabric Contributors"]
 
 [dependencies]
 # Allocator
+mimalloc = { version = "0.1", default-features = false, optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
 
 # Core
@@ -74,9 +75,11 @@ lz4 = { version = "1.28" }
 num_cpus = "1"
 
 [features]
+default = ["mimalloc-alloc"]
 standalone_heartbeat = []
 iam_tests = []
 mock-pubsub = []
+mimalloc-alloc = ["mimalloc"]
 jemalloc = ["tikv-jemallocator"]
 
 [dev-dependencies]
@@ -104,7 +107,7 @@ hdrhistogram = "7"
 libc = "0.2"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests", "jemalloc"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests", "jemalloc", "mimalloc-alloc"))'] }
 
 [lints.clippy]
 await_holding_lock = "deny"
