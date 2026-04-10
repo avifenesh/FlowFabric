@@ -48,7 +48,7 @@ use crate::cluster_slotmap::SlotMap;
 use crate::cluster_topology::{parse_and_count_slots, ParsedSlotsResult};
 use crate::cmd::{cmd, Cmd};
 use crate::connection::{
-    connect, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike, RedisConnectionInfo,
+    TlsMode, connect, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike, RedisConnectionInfo,
 };
 use crate::parser::parse_redis_value;
 use crate::types::{ErrorKind, HashMap, RedisError, RedisResult, RetryMethod, Value};
