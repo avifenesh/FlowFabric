@@ -734,11 +734,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
- "futures-core",
  "memchr",
- "pin-project-lite",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -1074,7 +1070,6 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "bytes",
- "combine",
  "crc16",
  "criterion",
  "ctor",

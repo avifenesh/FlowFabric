@@ -1924,7 +1924,7 @@ impl FromRedisValue for String {
     fn from_owned_redis_value(v: Value) -> RedisResult<String> {
         let v = get_owned_inner_value(v);
         match v {
-            Value::BulkString(bytes) => Ok(String::from_utf8(bytes.to_vec())?),
+            Value::BulkString(bytes) => Ok(String::from_utf8(bytes.to_vec().into())?),
             Value::Okay => Ok("OK".to_string()),
             Value::SimpleString(val) => Ok(val),
             Value::VerbatimString { format: _, text } => Ok(text),
@@ -1982,7 +1982,7 @@ macro_rules! from_vec_from_redis_value {
                     // Binary data is parsed into a single-element vector, except
                     // for the element type `u8`, which directly consumes the entire
                     // array of bytes.
-                    Value::BulkString(bytes) => FromRedisValue::from_owned_byte_vec(bytes.to_vec()).map($convert),
+                    Value::BulkString(bytes) => FromRedisValue::from_owned_byte_vec(bytes.to_vec().into()).map($convert),
                     Value::Array(items) => FromRedisValue::from_owned_redis_values(items).map($convert),
                     Value::Set(items) => FromRedisValue::from_owned_redis_values(items).map($convert),
                     Value::Map(items) => {

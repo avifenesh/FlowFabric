@@ -4148,7 +4148,7 @@ mod pipeline_routing_tests {
             ],
             vec![(
                 Some("node3".to_string()),
-                Value::BulkString(b"unchanged".to_vec()),
+                Value::BulkString(b"unchanged".to_vec().into()),
             )],
             vec![
                 (Some("node1".to_string()), Value::Int(5)),
@@ -4184,7 +4184,7 @@ mod pipeline_routing_tests {
             responses,
             vec![
                 Value::Int(10),
-                Value::BulkString(b"unchanged".to_vec()),
+                Value::BulkString(b"unchanged".to_vec().into()),
                 Value::Int(5)
             ],
             "{responses:?}"
@@ -4278,7 +4278,7 @@ mod pipeline_routing_tests {
             ],
             vec![(
                 Some("node3".to_string()),
-                Value::BulkString(b"unchanged".to_vec()),
+                Value::BulkString(b"unchanged".to_vec().into()),
             )],
         ];
         let mut response_policies = HashMap::new();
@@ -4304,7 +4304,7 @@ mod pipeline_routing_tests {
                     kind: ServerErrorKind::Moved,
                     detail: Some("An error was signalled by the server: 127.0.0.1".to_string()),
                 }),
-                Value::BulkString(b"unchanged".to_vec()),
+                Value::BulkString(b"unchanged".to_vec().into()),
             ]
         );
     }

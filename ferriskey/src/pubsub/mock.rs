@@ -872,7 +872,7 @@ impl MockPubSubBroker {
             };
             let values_array: Vec<Value> = values.into_iter().map(Value::BulkString).collect();
             redis_map.push((
-                Value::BulkString(key.as_bytes().to_vec()),
+                Value::BulkString(key.as_bytes().to_vec().into()),
                 Value::Array(values_array),
             ));
         }
@@ -1069,9 +1069,9 @@ impl MockPubSubBroker {
             let (desired, actual) = sync.get_subscription_state();
 
             let result = vec![
-                Value::BulkString(b"desired".to_vec()),
+                Value::BulkString(b"desired".to_vec().into()),
                 Self::convert_sub_map_to_value(desired),
-                Value::BulkString(b"actual".to_vec()),
+                Value::BulkString(b"actual".to_vec().into()),
                 Self::convert_sub_map_to_value(actual),
             ];
 
@@ -1079,9 +1079,9 @@ impl MockPubSubBroker {
         } else {
             let empty_map = HashMap::new();
             let result = vec![
-                Value::BulkString(b"desired".to_vec()),
+                Value::BulkString(b"desired".to_vec().into()),
                 Self::convert_sub_map_to_value(empty_map.clone()),
-                Value::BulkString(b"actual".to_vec()),
+                Value::BulkString(b"actual".to_vec().into()),
                 Self::convert_sub_map_to_value(empty_map),
             ];
             Value::Array(result)
@@ -1304,10 +1304,10 @@ fn create_push_info(
 
     let mut data = Vec::new();
     if let Some(pat) = pattern {
-        data.push(Value::BulkString(pat.as_bytes().to_vec()));
+        data.push(Value::BulkString(pat.as_bytes().to_vec().into()));
     }
-    data.push(Value::BulkString(channel.as_bytes().to_vec()));
-    data.push(Value::BulkString(message.to_vec()));
+    data.push(Value::BulkString(channel.as_bytes().to_vec().into()));
+    data.push(Value::BulkString(message.to_vec().into()));
 
     PushInfo { kind, data }
 }
