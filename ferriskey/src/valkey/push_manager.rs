@@ -93,7 +93,7 @@ impl PushManager {
 
         // Extract channel/pattern from push data
         let channel_or_pattern = match data.first() {
-            Some(Value::BulkString(bytes)) => bytes.clone(),
+            Some(Value::BulkString(bytes)) => bytes.to_vec(),
             _ => return,
         };
 

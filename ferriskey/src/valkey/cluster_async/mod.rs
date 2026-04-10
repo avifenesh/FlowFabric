@@ -2198,7 +2198,7 @@ where
                             "No address provided for response in Special or None response policy",
                         ))),
                     };
-                    pairs.push((Value::BulkString(key_bytes), value));
+                    pairs.push((Value::BulkString(bytes::Bytes::from(key_bytes)), value));
                 }
                 Ok(Value::Map(pairs))
             }

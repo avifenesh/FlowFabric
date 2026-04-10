@@ -293,7 +293,7 @@ pub(crate) fn convert_to_expected_type(
                 Value::BulkString(bytes) => {
                     let text = std::str::from_utf8(&bytes).unwrap();
                     let res = convert_lolwut_string(text);
-                    Ok(Value::BulkString(Vec::from(res)))
+                    Ok(Value::BulkString(bytes::Bytes::from(Vec::from(res))))
                 }
                 // RESP 3 response
                 Value::VerbatimString {
@@ -301,7 +301,7 @@ pub(crate) fn convert_to_expected_type(
                     ref text,
                 } => {
                     let res = convert_lolwut_string(text);
-                    Ok(Value::BulkString(Vec::from(res)))
+                    Ok(Value::BulkString(bytes::Bytes::from(Vec::from(res))))
                 }
                 _ => Err((
                     ErrorKind::TypeError,

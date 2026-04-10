@@ -267,7 +267,7 @@ pub fn combine_map_results(values: Vec<Value>) -> RedisResult<Value> {
                 while let Some(key) = iter.next() {
                     if let Value::BulkString(key_bytes) = key {
                         if let Some(Value::Int(value)) = iter.next() {
-                            *map.entry(key_bytes).or_insert(0) += value;
+                            *map.entry(key_bytes.to_vec()).or_insert(0) += value;
                         } else {
                             return Err((ErrorKind::TypeError, "expected integer value").into());
                         }
@@ -284,7 +284,7 @@ pub fn combine_map_results(values: Vec<Value>) -> RedisResult<Value> {
 
     let result_vec: Vec<(Value, Value)> = map
         .into_iter()
-        .map(|(k, v)| (Value::BulkString(k), Value::Int(v)))
+        .map(|(k, v)| (Value::BulkString(bytes::Bytes::from(k)), Value::Int(v)))
         .collect();
 
     Ok(Value::Map(result_vec))

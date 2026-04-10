@@ -797,13 +797,13 @@ pub fn decompress_single_value_response(
     match value {
         Value::BulkString(bytes) => {
             let decompressed = manager.try_decompress_value(&bytes);
-            Ok(Value::BulkString(decompressed))
+            Ok(Value::BulkString(bytes::Bytes::from(decompressed)))
         }
         Value::SimpleString(s) => {
             let decompressed = manager.try_decompress_value(s.as_bytes());
             match String::from_utf8(decompressed) {
                 Ok(decompressed_string) => Ok(Value::SimpleString(decompressed_string)),
-                Err(e) => Ok(Value::BulkString(e.into_bytes())),
+                Err(e) => Ok(Value::BulkString(bytes::Bytes::from(e.into_bytes()))),
             }
         }
         _ => Ok(value),

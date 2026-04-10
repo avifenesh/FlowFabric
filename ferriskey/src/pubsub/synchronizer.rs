@@ -579,9 +579,9 @@ impl GlidePubSubSynchronizer {
         let (desired, actual) = self.get_subscription_state();
 
         Value::Array(vec![
-            Value::BulkString(b"desired".to_vec()),
+            Value::BulkString(bytes::Bytes::from_static(b"desired")),
             Self::convert_sub_map_to_value(desired),
-            Value::BulkString(b"actual".to_vec()),
+            Value::BulkString(bytes::Bytes::from_static(b"actual")),
             Self::convert_sub_map_to_value(actual),
         ])
     }
@@ -595,9 +595,9 @@ impl GlidePubSubSynchronizer {
                     PubSubSubscriptionKind::Pattern => "Pattern",
                     PubSubSubscriptionKind::Sharded => "Sharded",
                 };
-                let values_array: Vec<Value> = values.into_iter().map(Value::BulkString).collect();
+                let values_array: Vec<Value> = values.into_iter().map(|v| Value::BulkString(bytes::Bytes::from(v))).collect();
                 (
-                    Value::BulkString(key.as_bytes().to_vec()),
+                    Value::BulkString(bytes::Bytes::from(key.as_bytes().to_vec())),
                     Value::Array(values_array),
                 )
             })
