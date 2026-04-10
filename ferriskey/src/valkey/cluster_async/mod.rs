@@ -3087,26 +3087,23 @@ where
                     )
             }
             InternalSingleNodeRouting::SpecificNode(route) => {
-                // Single lock acquisition for both connection lookup and notifier fetch.
-                let (conn_found, reconnect_notifier) = {
+                // Step 1: Attempt to get the connection directly using the route.
+                let conn_check = {
                     let conn_lock = core.conn_lock.read();
-                    let conn = conn_lock.connection_for_route(&route);
-                    let notifier = if conn.is_none() {
-                        conn_lock.notifier_for_route(&route).clone()
-                    } else {
-                        None
-                    };
-                    (conn, notifier)
+                    conn_lock
+                        .connection_for_route(&route)
+                        .map(ConnectionCheck::Found)
                 };
 
-                if let Some(conn) = conn_found {
-                    ConnectionCheck::Found(conn)
+                if let Some(conn_check) = conn_check {
+                    conn_check
                 } else {
-                    // No connection found for the route.
+                    // Step 2: Handle cases where no connection is found for the route.
                     // - For key-based commands, attempt redirection to a random node,
                     //   hopefully to be redirected afterwards by a MOVED error.
                     // - For non-key-based commands, avoid attempting redirection to a random node
-                    //   as it wouldn't result in MOVED hints and can lead to unwanted results.
+                    //   as it wouldn't result in MOVED hints and can lead to unwanted results
+                    //   (e.g., sending management command to a different node than the user asked for); instead, raise the error.
                     let mut conn_check = ConnectionCheck::RandomConnection;
 
                     let routable_cmd = cmd.and_then(|cmd| Routable::command(&*cmd));
@@ -3126,6 +3123,13 @@ where
                         Checking for reconnect tasks before redirecting to a random node."
                     );
 
+                    // Step 3: Obtain the reconnect notifier, ensuring the lock is released immediately after.
+                    let reconnect_notifier = {
+                        let conn_lock = core.conn_lock.read();
+                        conn_lock.notifier_for_route(&route).clone()
+                    };
+
+                    // Step 4: If a notifier exists, wait for it to signal completion.
                     if let Some(notifier) = reconnect_notifier {
                         debug!(
                             "SpecificNode: Waiting on reconnect notifier for route `{route:?}`."
@@ -3137,7 +3141,7 @@ where
                             "SpecificNode: Finished waiting on notifier for route `{route:?}`. Retrying connection lookup."
                         );
 
-                        // Retry after reconnect - needs fresh lock since we awaited.
+                        // Step 5: Retry the connection lookup after waiting for the reconnect task.
                         if let Some((conn, address)) =
                             core.conn_lock.read().connection_for_route(&route)
                         {
@@ -3401,19 +3405,12 @@ where
         retry: u32,
         retry_params: RetryParams,
     ) {
-        let is_primary = {
-            let lock = core.conn_lock.read();
-            let primary = lock.is_primary(&address);
-            if !primary {
-                // If the connection is a replica, remove the connection and retry.
-                // The connection will be established again on the next call to refresh slots once the replica is no longer in loading state.
-                lock.remove_node(&address);
-            }
-            primary
-        };
+        let is_primary = core.conn_lock.read().is_primary(&address);
 
         if !is_primary {
-            // Already removed above
+            // If the connection is a replica, remove the connection and retry.
+            // The connection will be established again on the next call to refresh slots once the replica is no longer in loading state.
+            core.conn_lock.read().remove_node(&address);
         } else {
             // If the connection is primary, just sleep and retry
             let sleep_duration = retry_params.wait_time_for_retry(retry);
