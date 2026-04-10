@@ -1091,6 +1091,7 @@ dependencies = [
  "iai-callgrind",
  "itoa",
  "lazy_static",
+ "libc",
  "logger_core",
  "lz4",
  "nanoid",

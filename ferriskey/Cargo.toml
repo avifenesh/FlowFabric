@@ -101,6 +101,7 @@ anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 serde_json = "1"
 hdrhistogram = "7"
+libc = "0.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests", "jemalloc"))'] }

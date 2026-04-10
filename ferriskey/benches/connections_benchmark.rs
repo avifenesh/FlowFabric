@@ -1,18 +1,21 @@
 // Ferriskey throughput + latency benchmark
 //
 // 80/20 GET/SET workload mix, fixed-duration runs, HdrHistogram percentiles.
+// Each permutation runs BENCH_RUNS times (default 3), reports median.
 //
 // Profiles (BENCH_PROFILE env var):
-//   quick  - 5s,  1s warmup, 1KB only,         c=1,100           (~1 min)
-//   short  - 30s, 3s warmup, 64B+1KB,          c=10,100          (~8 min)
-//   full   - 120s,5s warmup, 64B+1KB+64KB,     c=1,10,100,1000   (~48 min)
+//   quick  - 10s, 2s warmup, 1KB,        c=1,100         (3 runs ~6 min)
+//   short  - 120s,5s warmup, 100B+1KB,    c=10,100        (3 runs ~50 min)
+//   full   - 120s,5s warmup, 100B+1KB+16KB, c=1,10,100    (3 runs ~1h50m)
 //
-// Other env vars:
+// Env vars:
 //   VALKEY_HOST          cluster config endpoint (default: 127.0.0.1)
 //   VALKEY_PORT          cluster port (default: 6379)
 //   VALKEY_TLS           "true" to enable TLS (default: false)
 //   BENCH_DURATION       override seconds per permutation
 //   BENCH_WARMUP         override warmup seconds
+//   BENCH_RUNS           runs per permutation for median (default: 3)
+//   BENCH_CPUS           CPUs to pin tokio workers to (default: 4-15)
 
 use ferriskey::valkey::{
     ConnectionAddr, ConnectionInfo, RedisConnectionInfo, RedisResult, Value,
@@ -41,6 +44,7 @@ struct BenchConfig {
     duration: Duration,
     warmup: Duration,
     profile: String,
+    runs: usize,
     value_sizes: Vec<usize>,
     concurrencies: Vec<usize>,
 }
@@ -51,9 +55,9 @@ impl BenchConfig {
 
         let (default_duration, default_warmup, value_sizes, concurrencies) = match profile.as_str()
         {
-            "quick" => (5, 1, vec![100, 1024], vec![1, 100]),
-            "full" => (60, 5, vec![100, 1024, 16384], vec![1, 10, 100]),
-            _ => (60, 5, vec![100, 1024], vec![10, 100]), // "short" default
+            "quick" => (10, 2, vec![1024], vec![1, 100]),
+            "full" => (120, 5, vec![100, 1024, 16384], vec![1, 10, 100]),
+            _ => (120, 5, vec![100, 1024], vec![10, 100]), // "short" default
         };
 
         let duration = env::var("BENCH_DURATION")
@@ -64,6 +68,10 @@ impl BenchConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_warmup);
+        let runs = env::var("BENCH_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
 
         Self {
             host: env::var("VALKEY_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
@@ -75,6 +83,7 @@ impl BenchConfig {
             duration: Duration::from_secs(duration),
             warmup: Duration::from_secs(warmup),
             profile,
+            runs,
             value_sizes,
             concurrencies,
         }
@@ -88,7 +97,6 @@ impl BenchConfig {
 #[derive(Clone)]
 struct BenchResult {
     label: String,
-    connection_type: String,
     value_size: usize,
     concurrency: usize,
     duration_secs: f64,
@@ -103,23 +111,27 @@ struct BenchResult {
 }
 
 impl BenchResult {
-    fn print(&self) {
+    fn print_short(&self) {
         println!(
-            "\n[{}] 80/20 GET/SET  value={}  concurrency={}  duration={:.0}s",
-            self.connection_type,
-            format_size(self.value_size),
-            self.concurrency,
-            self.duration_secs,
+            "    {:>12}  p50={:.3}ms  p99={:.3}ms  max={:.3}ms",
+            format_tps(self.tps),
+            self.p50_us / 1000.0,
+            self.p99_us / 1000.0,
+            self.max_us / 1000.0,
         );
+    }
+
+    fn print_full(&self) {
+        let err_str = if self.total_errors > 0 {
+            format!("  ({} errors)", self.total_errors)
+        } else {
+            String::new()
+        };
         println!(
-            "  TPS:    {:<12}  (total: {}{})",
+            "  TPS:    {:<14}  total: {}{}",
             format_tps(self.tps),
             self.total_ops,
-            if self.total_errors > 0 {
-                format!(", {} errors", self.total_errors)
-            } else {
-                String::new()
-            },
+            err_str,
         );
         println!("  p50:    {:.3}ms", self.p50_us / 1000.0);
         println!("  p75:    {:.3}ms", self.p75_us / 1000.0);
@@ -131,7 +143,6 @@ impl BenchResult {
     fn to_json(&self) -> serde_json::Value {
         json!({
             "label": self.label,
-            "connection_type": self.connection_type,
             "value_size": self.value_size,
             "concurrency": self.concurrency,
             "duration_secs": self.duration_secs,
@@ -167,6 +178,12 @@ fn format_tps(tps: f64) -> String {
     }
 }
 
+/// Pick the result with the median TPS from a vec of runs.
+fn median_by_tps(mut runs: Vec<BenchResult>) -> BenchResult {
+    runs.sort_by(|a, b| a.tps.partial_cmp(&b.tps).unwrap());
+    runs.swap_remove(runs.len() / 2)
+}
+
 // ---------------------------------------------------------------------------
 // Connection helpers
 // ---------------------------------------------------------------------------
@@ -188,11 +205,51 @@ fn connection_info(host: &str, port: u16, tls: bool) -> ConnectionInfo {
 }
 
 fn create_runtime() -> Runtime {
+    // Pin to CPUs 4-15 by default (leave 0-3 for OS/network).
+    // Override with BENCH_CPUS=0-15 for all cores.
+    let cpu_str = env::var("BENCH_CPUS").unwrap_or_else(|_| "4-15".into());
+    let worker_threads = parse_cpu_count(&cpu_str);
+
+    // Set CPU affinity before building the runtime so workers inherit it.
+    if let Err(e) = set_cpu_affinity(&cpu_str) {
+        eprintln!("Warning: could not set CPU affinity: {e}");
+    }
+
     Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(num_cpus::get())
+        .worker_threads(worker_threads)
         .build()
         .unwrap()
+}
+
+fn parse_cpu_count(cpu_str: &str) -> usize {
+    // "4-15" -> 12, "0-7" -> 8, "0-15" -> 16
+    if let Some((start, end)) = cpu_str.split_once('-') {
+        if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
+            return e - s + 1;
+        }
+    }
+    num_cpus::get()
+}
+
+fn set_cpu_affinity(cpu_str: &str) -> Result<(), String> {
+    // Use libc sched_setaffinity to pin this process
+    if let Some((start, end)) = cpu_str.split_once('-') {
+        let start: usize = start.parse().map_err(|e| format!("{e}"))?;
+        let end: usize = end.parse().map_err(|e| format!("{e}"))?;
+
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for cpu in start..=end {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            if ret != 0 {
+                return Err(format!("sched_setaffinity returned {ret}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +362,6 @@ async fn run_workload<C: ConnectionLike + Clone + Send + 'static>(
 
     BenchResult {
         label: String::new(),
-        connection_type: String::new(),
         value_size,
         concurrency,
         duration_secs,
@@ -321,49 +377,6 @@ async fn run_workload<C: ConnectionLike + Clone + Send + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// Bench runner - runs one connection type through the matrix
-// ---------------------------------------------------------------------------
-
-fn run_matrix(
-    runtime: &Runtime,
-    conn_type: &str,
-    cfg: &BenchConfig,
-    conn: impl ConnectionLike + Clone + Send + 'static,
-) -> Vec<BenchResult> {
-    let mut results = Vec::new();
-
-    // Flush all nodes between runs to avoid stale key interference
-    {
-        let mut c = conn.clone();
-        runtime.block_on(async {
-            let _ = c.req_packed_command(&cmd("FLUSHALL")).await;
-        });
-    }
-
-    for &size in &cfg.value_sizes {
-        for &conc in &cfg.concurrencies {
-            print!(
-                "  {conn_type} value={} c={} ... ",
-                format_size(size),
-                conc
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-
-            let mut r =
-                runtime.block_on(run_workload(conn.clone(), conc, size, cfg.warmup, cfg.duration));
-            r.connection_type = conn_type.into();
-            r.label = format!("{conn_type}-{}-c{conc}", format_size(size));
-
-            println!("{}", format_tps(r.tps));
-            r.print();
-            results.push(r);
-        }
-    }
-
-    results
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -372,15 +385,17 @@ fn main() {
     let runtime = create_runtime();
 
     let permutations = cfg.value_sizes.len() * cfg.concurrencies.len();
+    let total_runs = permutations * cfg.runs;
     let est_mins =
-        (permutations as u64 * (cfg.duration.as_secs() + cfg.warmup.as_secs()) + 59) / 60;
+        (total_runs as u64 * (cfg.duration.as_secs() + cfg.warmup.as_secs()) + 59) / 60;
 
     println!("=== Ferriskey Benchmark [{}] ===", cfg.profile);
     println!(
-        "  {}s measure + {}s warmup | {} permutations | ~{} min",
+        "  {}s measure + {}s warmup | {} permutations x {} runs | ~{} min",
         cfg.duration.as_secs(),
         cfg.warmup.as_secs(),
         permutations,
+        cfg.runs,
         est_mins,
     );
     println!("  Workload: 80% GET / 20% SET");
@@ -404,19 +419,61 @@ fn main() {
         client.get_async_connection(None, None, None).await.unwrap()
     });
 
-    println!("--- cluster  {}:{} TLS={} ---", cfg.host, cfg.port, cfg.tls);
-    let results = run_matrix(&runtime, "cluster", &cfg, conn);
+    println!("--- cluster  {}:{} TLS={} ---\n", cfg.host, cfg.port, cfg.tls);
+
+    let mut medians: Vec<BenchResult> = Vec::new();
+
+    for &size in &cfg.value_sizes {
+        for &conc in &cfg.concurrencies {
+            let label = format!("cluster-{}-c{conc}", format_size(size));
+            println!("[{}]  {} runs of {}s:", label, cfg.runs, cfg.duration.as_secs());
+
+            let mut runs: Vec<BenchResult> = Vec::with_capacity(cfg.runs);
+
+            for run in 0..cfg.runs {
+                // Flush between runs
+                {
+                    let mut c = conn.clone();
+                    runtime.block_on(async {
+                        let _ = c.req_packed_command(&cmd("FLUSHALL")).await;
+                    });
+                }
+
+                print!("  run {}/{} ... ", run + 1, cfg.runs);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+
+                let mut r = runtime.block_on(run_workload(
+                    conn.clone(),
+                    conc,
+                    size,
+                    cfg.warmup,
+                    cfg.duration,
+                ));
+                r.label = label.clone();
+
+                println!("{}", format_tps(r.tps));
+                r.print_short();
+                runs.push(r);
+            }
+
+            let median = median_by_tps(runs);
+            println!("  MEDIAN:");
+            median.print_full();
+            println!();
+            medians.push(median);
+        }
+    }
 
     // Summary table
-    println!("\n\n=== Summary ===");
+    println!("\n=== Summary (median of {} runs) ===", cfg.runs);
     println!(
-        "{:<28} {:>14} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "{:<24} {:>14} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "Permutation", "TPS", "p50", "p75", "p90", "p99", "max"
     );
-    println!("{}", "-".repeat(102));
-    for r in &results {
+    println!("{}", "-".repeat(98));
+    for r in &medians {
         println!(
-            "{:<28} {:>14} {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms",
+            "{:<24} {:>14} {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms",
             r.label,
             format_tps(r.tps),
             r.p50_us / 1000.0,
@@ -436,12 +493,13 @@ fn main() {
         "config": {
             "duration_secs": cfg.duration.as_secs(),
             "warmup_secs": cfg.warmup.as_secs(),
+            "runs_per_permutation": cfg.runs,
             "workload": "80/20 GET/SET",
             "tls": cfg.tls,
             "value_sizes": cfg.value_sizes,
             "concurrencies": cfg.concurrencies,
         },
-        "results": results.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
+        "medians": medians.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
     });
 
     if let Ok(f) = std::fs::File::create(&json_path) {
