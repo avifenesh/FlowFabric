@@ -144,7 +144,7 @@ where
     {
         PipelineSink {
             sink_stream,
-            in_flight: VecDeque::new(),
+            in_flight: VecDeque::with_capacity(128),
             error: None,
             push_manager,
             disconnect_notifier,

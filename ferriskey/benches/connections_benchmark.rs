@@ -53,7 +53,7 @@ impl BenchConfig {
         {
             "quick" => (5, 1, vec![100, 1024], vec![1, 100]),
             "full" => (60, 5, vec![100, 1024, 16384], vec![1, 10, 100]),
-            _ => (30, 3, vec![100, 1024], vec![10, 100]), // "short" default
+            _ => (60, 5, vec![100, 1024], vec![10, 100]), // "short" default
         };
 
         let duration = env::var("BENCH_DURATION")
@@ -331,6 +331,14 @@ fn run_matrix(
     conn: impl ConnectionLike + Clone + Send + 'static,
 ) -> Vec<BenchResult> {
     let mut results = Vec::new();
+
+    // Flush all nodes between runs to avoid stale key interference
+    {
+        let mut c = conn.clone();
+        runtime.block_on(async {
+            let _ = c.req_packed_command(&cmd("FLUSHALL")).await;
+        });
+    }
 
     for &size in &cfg.value_sizes {
         for &conc in &cfg.concurrencies {

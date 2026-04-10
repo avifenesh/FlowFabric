@@ -6,6 +6,9 @@ license = "Apache-2.0"
 authors = ["FlowFabric Contributors"]
 
 [dependencies]
+# Allocator
+tikv-jemallocator = { version = "0.6", optional = true }
+
 # Core
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 bytes = "1"
@@ -74,6 +77,7 @@ num_cpus = "1"
 standalone_heartbeat = []
 iam_tests = []
 mock-pubsub = []
+jemalloc = ["tikv-jemallocator"]
 
 [dev-dependencies]
 rsevents = "0.3.1"
@@ -99,7 +103,7 @@ serde_json = "1"
 hdrhistogram = "7"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests", "jemalloc"))'] }
 
 [lints.clippy]
 await_holding_lock = "deny"
