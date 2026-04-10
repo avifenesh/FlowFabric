@@ -1,0 +1,110 @@
+# Error Handling Patterns in FlowFabric Glide-Core
+
+## Error Types Defined
+
+### 1. RequestErrorType (errors.rs)
+- Unspecified = 0
+- ExecAbort = 1
+- Timeout = 2
+- Disconnect = 3
+
+Maps RedisError → RequestErrorType via error_type() function
+Categorizes errors for external error handling
+
+### 2. ConnectionError (client/mod.rs)
+- Custom enum for connection-related failures
+- Implements Debug and Display traits
+- Wraps various failure modes
+
+### 3. StandaloneClientConnectionError (client/standalone_client.rs)
+- Standalone client-specific error variant
+- Implements Debug formatting
+
+### 4. CompressionError (compression.rs)
+- Error type for compression operations
+- Implements Display, Error traits
+- Associated CompressionResult<T> type alias
+
+### 5. GlideIAMError (iam/mod.rs)
+- AWS IAM authentication errors
+- Handles credential resolution failures
+- Token generation/refresh failures
+
+## Error Handling Patterns
+
+### Pattern 1: RedisError Wrapping
+- Primary pattern: Results use redis::RedisError
+- Type alias: `type RedisResult<T> = Result<T, RedisError>`
+- Used throughout: client/mod.rs, client/reconnecting_connection.rs
+
+### Pattern 2: Custom Error Enums
+- ConnectionError: client-specific failure modes
+- CompressionError: compression operation failures  
+- GlideIAMError: IAM authentication failures
+
+### Pattern 3: Error Message Formatting (errors.rs)
+- error_message() function enriches disconnect errors
+- Adds reconnection intent to user-facing messages
+- Example: "Received connection error `...`. Will attempt to reconnect"
+
+### Pattern 4: Error Conversion
+- From<RedisError> implementations (implicit conversions)
+- Error propagation via ? operator
+
+## Error Handling Locations
+
+### Client Initialization
+- file: client/mod.rs
+- get_or_initialize_client() → RedisResult<ClientWrapper>
+- Handles connection failures, auth failures
+
+### Connection Management  
+- file: client/reconnecting_connection.rs
+- get_connection() → Result<MultiplexedConnection, RedisError>
+- Handles reconnection logic
+
+### Command Execution
+- file: client/mod.rs
+- Timeout handling via get_request_timeout()
+- Database selection errors via extract_database_id_from_select()
+- AUTH command errors
+
+### Compression Operations
+- file: compression.rs
+- compress(), decompress() → CompressionResult<T>
+- Level validation errors
+
+### IAM Authentication
+- file: iam/mod.rs
+- Token refresh failures
+- Credential resolution errors
+
+## Inconsistencies and Patterns
+
+1. Mixed error handling strategies:
+   - Some places use RedisResult<T> (aliased Result<T, RedisError>)
+   - Some places use custom Result types (CompressionResult)
+   - Some places use generic Result<T, String>
+
+2. Error enrichment:
+   - Selective enrichment only for disconnect errors
+   - Other error types use raw RedisError
+
+3. Error context loss:
+   - String-based errors lose structured information
+   - Some functions return Result<..., String> which is less typed
+
+## Recommendations
+
+1. Establish consistent error handling:
+   - Consider custom Error enum for all FlowFabric-specific errors
+   - Use structured errors instead of String-based Results
+
+2. Improve error context:
+   - Add stack traces or error chains
+   - Consider `anyhow` or `thiserror` crate integration
+
+3. Error propagation:
+   - Ensure all error types implement Error trait
+   - Standardize From implementations
+

@@ -340,7 +340,7 @@ pub use crate::client::Client;
 pub use crate::client::GlideConnectionOptions;
 pub use crate::client::IAMTokenProvider;
 pub use crate::cmd::{cmd, fenced_cmd, pack_command, pipe, Arg, Cmd, Iter};
-pub use crate::connection::{
+pub use crate::connection::{\n    TlsMode,
     parse_redis_url, ConnectionAddr, ConnectionInfo, ConnectionLike,
     IntoConnectionInfo, PubSubChannelOrPattern, PubSubSubscriptionInfo,
     PubSubSubscriptionKind, RedisConnectionInfo,

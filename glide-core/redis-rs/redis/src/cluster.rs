@@ -52,7 +52,7 @@ use crate::connection::{
 };
 use crate::parser::parse_redis_value;
 use crate::types::{ErrorKind, HashMap, RedisError, RedisResult, RetryMethod, Value};
-pub use crate::TlsMode; // Pub for backwards compatibility
+ // Pub for backwards compatibility
 use crate::{
     cluster_client::ClusterParams,
     cluster_routing::{Redirect, Route, RoutingInfo},

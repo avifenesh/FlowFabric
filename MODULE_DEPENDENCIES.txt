@@ -1,0 +1,61 @@
+# FlowFabric Module Dependency Map
+
+## Module Graph (size in LOC)
+
+### Core Modules by Size:
+1. client/value_conversion.rs (3753 LOC) - Value serialization/deserialization
+2. client/mod.rs (2756 LOC) - Main client implementation  
+3. client/standalone_client.rs (895 LOC) - Standalone client variant
+4. pubsub/synchronizer.rs (1076 LOC) - PubSub synchronization logic
+5. iam/mod.rs (1008 LOC) - AWS IAM authentication
+6. pubsub/mock.rs (1313 LOC) - Mock PubSub for testing
+7. client/reconnecting_connection.rs (619 LOC) - Reconnection logic
+8. otel_db_semantics.rs (625 LOC) - OpenTelemetry instrumentation
+9. compression.rs (932 LOC) - Compression backend abstractions
+10. request_type.rs (446 LOC) - Redis command type definitions
+11. client/types.rs (137 LOC) - Connection config types
+12. scripts_container.rs (120 LOC) - Script storage
+13. cluster_scan_container.rs (52 LOC) - Cluster scan support
+14. pubsub/mod.rs (70 LOC) - PubSub module interface
+15. errors.rs (33 LOC) - Error type definitions
+
+## Module Dependencies (from lib.rs)
+
+Public Modules:
+- client (core client implementation)
+- otel_db_semantics (telemetry)
+- compression (compression backends)
+- errors (error handling)
+- scripts_container (script management)
+- cluster_scan_container (cluster scan)
+- iam (AWS IAM auth)
+- pubsub (publication/subscription)
+- request_type (Redis command types)
+
+## Dependency Flow Analysis
+
+### client/mod.rs imports from:
+- crate::cluster_scan_container
+- crate::compression
+- crate::scripts_container
+- crate::pubsub
+- crate::request_type
+- redis::aio, redis::cluster_async
+- redis::cluster_routing
+
+### compression.rs imports from:
+- (backend-specific)
+
+### iam/mod.rs imports from:
+- redis (error types)
+- tokio (async runtime)
+- aws-config, aws-sdk-sts (AWS credentials)
+
+### pubsub/* imports from:
+- redis::PubSubSubscriptionInfo
+- redis::PubSubSynchronizer trait
+- crate::client::ClientWrapper
+
+### client/value_conversion.rs imports from:
+- redis::Value (primary dependency)
+

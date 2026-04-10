@@ -40,7 +40,7 @@ use crate::{
         DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR,
     },
     cmd,
-    commands::cluster_scan::{cluster_scan, ClusterScanArgs, ScanStateRC},
+    crate::cluster_scan::{cluster_scan, ClusterScanArgs, ScanStateRC},
     types::ServerError,
     FromRedisValue, InfoDict, PipelineRetryStrategy,
 };
