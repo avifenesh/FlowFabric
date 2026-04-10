@@ -4023,32 +4023,29 @@ impl<C> ConnectionLike for ClusterConnection<C>
 where
     C: ConnectionLike + Send + Clone + Unpin + Sync + Connect + 'static,
 {
-    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+    async fn req_packed_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
         let routing = cluster_routing::RoutingInfo::for_routable(cmd).unwrap_or(
             cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
         );
-        self.route_command(cmd, routing).boxed()
+        self.route_command(cmd, routing).await
     }
 
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        pipeline: &'a crate::valkey::Pipeline,
+    async fn req_packed_commands(
+        &mut self,
+        pipeline: &crate::valkey::Pipeline,
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> RedisFuture<'a, Vec<Value>> {
-        async move {
-            let route = route_for_pipeline(pipeline)?;
-            self.route_pipeline(
-                pipeline,
-                offset,
-                count,
-                route.map(|r| Some(r).into()),
-                pipeline_retry_strategy,
-            )
-            .await
-        }
-        .boxed()
+    ) -> RedisResult<Vec<Value>> {
+        let route = route_for_pipeline(pipeline)?;
+        self.route_pipeline(
+            pipeline,
+            offset,
+            count,
+            route.map(|r| Some(r).into()),
+            pipeline_retry_strategy,
+        )
+        .await
     }
 
     fn get_db(&self) -> i64 {

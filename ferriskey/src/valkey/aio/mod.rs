@@ -3,7 +3,7 @@ use crate::valkey::cmd::{cmd, Cmd};
 use crate::valkey::connection::{get_resp3_hello_command_error, RedisConnectionInfo};
 use crate::valkey::pipeline::PipelineRetryStrategy;
 use crate::valkey::types::{
-    ErrorKind, FromRedisValue, InfoDict, ProtocolVersion, RedisError, RedisFuture, RedisResult,
+    ErrorKind, FromRedisValue, InfoDict, ProtocolVersion, RedisError, RedisResult,
     Value,
 };
 use ::tokio::io::{AsyncRead, AsyncWrite};
@@ -51,10 +51,13 @@ pub trait AsyncStream: AsyncRead + AsyncWrite {}
 impl<S> AsyncStream for S where S: AsyncRead + AsyncWrite {}
 
 /// An async abstraction over connections.
-pub trait ConnectionLike {
+pub trait ConnectionLike: Send {
     /// Sends an already encoded (packed) command into the TCP socket and
     /// reads the single response from it.
-    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value>;
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a Cmd,
+    ) -> impl Future<Output = RedisResult<Value>> + Send + 'a;
 
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement
@@ -70,7 +73,7 @@ pub trait ConnectionLike {
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> RedisFuture<'a, Vec<Value>>;
+    ) -> impl Future<Output = RedisResult<Vec<Value>>> + Send + 'a;
 
     /// Returns the database this connection is bound to.  Note that this
     /// information might be unreliable because it's initially cached and

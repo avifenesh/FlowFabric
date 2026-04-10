@@ -7,7 +7,7 @@ use crate::valkey::cmd::Cmd;
 use crate::valkey::parser::ValueCodec;
 use crate::valkey::pipeline::PipelineRetryStrategy;
 use crate::valkey::push_manager::PushManager;
-use crate::valkey::types::{RedisError, RedisFuture, RedisResult, Value};
+use crate::valkey::types::{RedisError, RedisResult, Value};
 use crate::valkey::{cmd, ConnectionInfo, ProtocolVersion, PushKind};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -474,7 +474,7 @@ where
         T::Error: Send,
         T::Error: ::std::fmt::Debug,
     {
-        const BUFFER_SIZE: usize = 1024;
+        const BUFFER_SIZE: usize = 50;
         let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
@@ -862,18 +862,18 @@ impl MultiplexedConnectionBuilder {
 }
 
 impl ConnectionLike for MultiplexedConnection {
-    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-        (async move { self.send_packed_command(cmd).await }).boxed()
+    async fn req_packed_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
+        self.send_packed_command(cmd).await
     }
 
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        cmd: &'a crate::valkey::Pipeline,
+    async fn req_packed_commands(
+        &mut self,
+        cmd: &crate::valkey::Pipeline,
         offset: usize,
         count: usize,
         _pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> RedisFuture<'a, Vec<Value>> {
-        (async move { self.send_packed_commands(cmd, offset, count).await }).boxed()
+    ) -> RedisResult<Vec<Value>> {
+        self.send_packed_commands(cmd, offset, count).await
     }
 
     fn get_db(&self) -> i64 {
