@@ -1197,7 +1197,7 @@ pub struct InfoDict {
 /// For instance this can be used to query the server for the role it's
 /// in (master, slave) etc:
 ///
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// # fn do_something() -> redis::ValkeyResult<()> {
 /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();

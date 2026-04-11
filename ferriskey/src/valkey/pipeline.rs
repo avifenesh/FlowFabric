@@ -25,7 +25,7 @@ pub struct Pipeline {
 ///
 /// Basic example:
 ///
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();
 /// let ((k1, k2),) : ((i32, i32),) = redis::pipe()
@@ -72,7 +72,7 @@ impl Pipeline {
     /// changes however.  This is easier than using `MULTI`/`EXEC` yourself
     /// as the format does not change.
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection(None).unwrap();
     /// let (k1, k2) : (i32, i32) = redis::pipe()

@@ -139,7 +139,7 @@ impl Clone for ClientTlsParams {
                 Pkcs1(key) => Pkcs1(key.secret_pkcs1_der().to_vec().into()),
                 Pkcs8(key) => Pkcs8(key.secret_pkcs8_der().to_vec().into()),
                 Sec1(key) => Sec1(key.secret_sec1_der().to_vec().into()),
-                _ => unreachable!(),
+                other => panic!("Unknown PrivateKeyDer variant: {other:?}"),
             },
         }
     }

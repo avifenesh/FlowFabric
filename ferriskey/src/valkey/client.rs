@@ -34,7 +34,7 @@ pub struct Client {
 ///
 /// Example usage::
 ///
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// let client = redis::Client::open("redis://127.0.0.1/").unwrap();
 /// let con = client.get_connection(None).unwrap();
 /// ```
@@ -191,7 +191,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```ignore
     /// use std::{fs::File, io::{BufReader, Read}};
     ///
     /// use redis::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};

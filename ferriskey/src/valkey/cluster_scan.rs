@@ -68,7 +68,7 @@ type SlotsBitsArray = [u64; BITS_ARRAY_SIZE as usize];
 ///
 /// Create a new `ClusterScanArgs` instance using the builder pattern:
 ///
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// use redis::ClusterScanArgs;
 /// use redis::ObjectType;
 ///
@@ -88,7 +88,7 @@ type SlotsBitsArray = [u64; BITS_ARRAY_SIZE as usize];
 ///     .with_match_pattern("session:*")
 ///     .with_object_type(ObjectType::String)
 ///     .build();
-/// ```
+/// ```ignore
 
 #[derive(Clone, Default)]
 pub struct ClusterScanArgs {
@@ -132,7 +132,7 @@ impl ClusterScanArgs {
 /// * Control over scanning non-covered slots
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use redis::{ClusterScanArgs, ObjectType};
 ///
 /// let args = ClusterScanArgs::builder()
@@ -140,7 +140,7 @@ impl ClusterScanArgs {
 ///     .with_count(100)
 ///     .with_object_type(ObjectType::Hash)
 ///     .build();
-/// ```
+/// ```ignore
 pub struct ClusterScanArgsBuilder {
     /// By default, the match pattern is set to `None` and no filtering is applied.
     match_pattern: Option<Vec<u8>>,

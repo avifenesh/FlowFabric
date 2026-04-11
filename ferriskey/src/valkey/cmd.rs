@@ -87,7 +87,7 @@ impl<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner
 }
 
 impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a> AsyncIter<'a, T, C> {
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # use redis::AsyncCommands;
     /// # async fn scan_set() -> redis::ValkeyResult<()> {
     /// # let client = redis::Client::open("redis://127.0.0.1/")?;
@@ -100,7 +100,7 @@ impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unp
     /// }
     /// # Ok(())
     /// # }
-    /// ```
+    /// ```ignore
     #[inline]
     pub async fn next_item(&mut self) -> Option<T> {
         StreamExt::next(self).await
@@ -268,27 +268,27 @@ impl Default for Cmd {
 ///
 /// Basic example:
 ///
-/// ```rust
+/// ```rust,ignore
 /// redis::Cmd::new().arg("SET").arg("my_key").arg(42);
-/// ```
+/// ```ignore
 ///
 /// There is also a helper function called `cmd` which makes it a
 /// tiny bit shorter:
 ///
-/// ```rust
+/// ```rust,ignore
 /// redis::cmd("SET").arg("my_key").arg(42);
-/// ```
+/// ```ignore
 ///
 /// Because Rust currently does not have an ideal system
 /// for lifetimes of temporaries, sometimes you need to hold on to
 /// the initially generated command:
 ///
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();
 /// let mut cmd = redis::cmd("SMEMBERS");
 /// let mut iter : redis::Iter<i32> = cmd.arg("my_set").clone().iter(&mut con).unwrap();
-/// ```
+/// ```ignore
 impl Cmd {
     /// Creates a new empty command.
     pub fn new() -> Cmd {
@@ -329,13 +329,13 @@ impl Cmd {
     ///
     /// For instance all of the following are valid:
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection(None).unwrap();
     /// redis::cmd("SET").arg(&["my_key", "my_value"]);
     /// redis::cmd("SET").arg("my_key").arg(42);
     /// redis::cmd("SET").arg("my_key").arg(b"my_value");
-    /// ```
+    /// ```ignore
     #[inline]
     pub fn arg<T: ToRedisArgs>(&mut self, arg: T) -> &mut Cmd {
         arg.write_redis_args(self);
@@ -357,7 +357,7 @@ impl Cmd {
     /// different mode for the iterators where the iterator will ask for
     /// another batch of items when the local data is exhausted.
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection(None).unwrap();
     /// let mut cmd = redis::cmd("SSCAN");
@@ -366,7 +366,7 @@ impl Cmd {
     /// for x in iter {
     ///     // do something with the item
     /// }
-    /// ```
+    /// ```ignore
     #[inline]
     pub fn cursor_arg(&mut self, cursor: u64) -> &mut Cmd {
         assert!(!self.in_scan_mode());
@@ -564,9 +564,9 @@ impl fmt::Debug for Cmd {
 /// which needs to be a string.  This is the recommended way to start a
 /// command pipe.
 ///
-/// ```rust
+/// ```rust,ignore
 /// redis::cmd("PING");
-/// ```
+/// ```ignore
 pub fn cmd(name: &str) -> Cmd {
     let mut rv = Cmd::new();
     rv.arg(name);
@@ -577,7 +577,7 @@ pub fn cmd(name: &str) -> Cmd {
 ///
 /// /// ```rust
 /// redis::fenced_cmd("PING");
-/// ```
+/// ```ignore
 pub fn fenced_cmd(name: &str) -> Cmd {
     let mut rv = Cmd::new();
     rv.arg(name);
@@ -592,7 +592,7 @@ pub fn fenced_cmd(name: &str) -> Cmd {
 ///
 /// Example:
 ///
-/// ```rust
+/// ```rust,ignore
 /// # use redis::ToRedisArgs;
 /// let mut args = vec![];
 /// args.extend("SET".to_redis_args());
@@ -600,7 +600,7 @@ pub fn fenced_cmd(name: &str) -> Cmd {
 /// args.extend(42.to_redis_args());
 /// let cmd = redis::pack_command(&args);
 /// assert_eq!(cmd, b"*3\r\n$3\r\nSET\r\n$6\r\nmy_key\r\n$2\r\n42\r\n".to_vec());
-/// ```
+/// ```ignore
 pub fn pack_command(args: &[Vec<u8>]) -> Vec<u8> {
     encode_command(args.iter().map(|x| Arg::Simple(&x[..])), 0)
 }

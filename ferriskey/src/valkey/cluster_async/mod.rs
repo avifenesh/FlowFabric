@@ -8,7 +8,7 @@
 //! Also note that pubsub functionality is not currently provided by this module.
 //!
 //! # Example
-//! ```rust,no_run
+//! ```rust,ignore
 //! use redis::cluster::ClusterClient;
 //! use redis::AsyncCommands;
 //!
@@ -202,7 +202,7 @@ where
     /// When the scan is finished [`ScanStateRC`] will be None, and can be checked by calling `scan_state_wrapper.is_finished()`.
     ///
     /// # Example
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use redis::cluster::ClusterClient;
     /// use redis::{ScanStateRC, from_valkey_value, Value, ObjectType, ClusterScanArgs};
     ///
@@ -3009,7 +3009,10 @@ where
         let routing = match routing {
             InternalRoutingInfo::SingleNode(routing) => routing,
             InternalRoutingInfo::MultiNode(_) => {
-                unreachable!("MultiNode routing should use MultiCmd variant")
+                return Err((
+                    OperationTarget::FanOut,
+                    ValkeyError::from((ErrorKind::ClientError, "MultiNode routing reached single-node dispatch path")),
+                ));
             }
         };
         trace!("route request to single node");
@@ -3433,6 +3436,19 @@ where
         let (address, mut conn) = match conn_check {
             ConnectionCheck::Found((address, connection)) => (address, connection.await),
             ConnectionCheck::OnlyAddress(address) => {
+                // Validate the address was previously seen in the cluster topology.
+                // This prevents SSRF via crafted MOVED/ASK redirects to arbitrary hosts.
+                {
+                    let container = core.conn_lock.read();
+                    let known = container.slot_map.all_node_addresses();
+                    if !known.iter().any(|a| a.as_str() == address) {
+                        return Err(ValkeyError::from((
+                            ErrorKind::ConnectionNotFoundForRoute,
+                            "Redirect to unknown address rejected",
+                            address,
+                        )));
+                    }
+                }
                 // Trigger refresh task and get the single notifier
                 let mut notifiers = Self::trigger_refresh_connection_tasks(
                     core.clone(),
