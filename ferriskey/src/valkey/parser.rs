@@ -63,48 +63,38 @@ pub fn get_push_kind(kind: String) -> PushKind {
     }
 }
 
-// ── Hand-written RESP parser ──────────────────────────────────────────
+// ── Two-pass RESP parser ──────────────────────────────────────────────
 //
-// Operates directly on BytesMut. Returns Ok(None) when the buffer
-// doesn't contain a complete message (partial read). Uses
-// BytesMut::split_to() for zero-copy BulkString extraction.
+// Pass 1 (scan): Read-only walk on &[u8] to check if a complete RESP
+//   message exists. Returns the total byte count consumed, or None if
+//   incomplete. No allocations, no mutations.
+//
+// Pass 2 (parse): Only called when scan confirms completeness. Operates
+//   on &mut BytesMut with split_to() for zero-copy BulkString extraction.
+//   Never returns None (the message is known to be complete).
+//
+// This avoids the O(n) BytesMut::clone() that the single-pass approach
+// required for rollback on incomplete messages.
 
-/// Find the position of \r\n in the buffer starting from `start`.
-/// Returns the byte offset of the '\r', or None if not found.
+// ── Pass 1: Scan ─────────────────────────────────────────────────────
+
+/// Find \r\n starting at `pos` in `buf`. Returns offset of '\r', or None.
 #[inline]
-fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
-    // memchr is typically faster for single-byte search, but \r\n is
-    // two bytes. The simple loop is fine — lines are short (typically < 20 bytes).
-    let slice = &buf[start..];
-    // Use memchr for the first byte, then verify the second
-    let mut pos = 0;
-    while pos < slice.len().saturating_sub(1) {
-        if slice[pos] == b'\r' && slice[pos + 1] == b'\n' {
-            return Some(start + pos);
+fn find_crlf(buf: &[u8], pos: usize) -> Option<usize> {
+    let slice = &buf[pos..];
+    let mut i = 0;
+    while i < slice.len().saturating_sub(1) {
+        if slice[i] == b'\r' && slice[i + 1] == b'\n' {
+            return Some(pos + i);
         }
-        pos += 1;
+        i += 1;
     }
     None
 }
 
-/// Read a line from buf (everything up to \r\n, not including the \r\n).
-/// Advances past the \r\n. Returns None if no complete line yet.
-#[inline]
-fn read_line(buf: &mut BytesMut) -> Option<BytesMut> {
-    if let Some(pos) = find_crlf(buf, 0) {
-        let line = buf.split_to(pos);
-        buf.advance(2); // skip \r\n
-        Some(line)
-    } else {
-        None
-    }
-}
-
-/// Parse an integer from a line (used for :, array lengths, bulk string lengths, etc.)
+/// Parse an integer from a byte slice (no allocations).
 #[inline]
 fn parse_integer(line: &[u8]) -> RedisResult<i64> {
-    // Fast path for common small positive numbers and simple negatives
-    // Avoid str::from_utf8 + parse for the hot path
     if line.is_empty() {
         return Err(RedisError::from((
             ErrorKind::ParseError,
@@ -124,7 +114,6 @@ fn parse_integer(line: &[u8]) -> RedisResult<i64> {
     let mut val: i64 = 0;
     for &b in digits {
         if b < b'0' || b > b'9' {
-            // Fall back to str parse for whitespace-trimmed values
             let s = std::str::from_utf8(line).map_err(|_| {
                 RedisError::from((
                     ErrorKind::ParseError,
@@ -140,9 +129,7 @@ fn parse_integer(line: &[u8]) -> RedisResult<i64> {
                 ))
             });
         }
-        val = val
-            .wrapping_mul(10)
-            .wrapping_add((b - b'0') as i64);
+        val = val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
     }
 
     if negative {
@@ -151,22 +138,14 @@ fn parse_integer(line: &[u8]) -> RedisResult<i64> {
     Ok(val)
 }
 
-/// Core recursive RESP parser on BytesMut.
-///
-/// Returns:
-/// - `Ok(Some(value))` when a complete value was parsed (buf is advanced)
-/// - `Ok(None)` when more data is needed (buf is NOT modified)
-/// - `Err(...)` on protocol errors
-fn parse_value(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
-    if buf.is_empty() {
+/// Scan a single RESP value starting at `pos` in `buf`.
+/// Returns the byte position AFTER the value if complete, or None if incomplete.
+/// Returns Err on protocol errors (bad type byte, exceeds recursion depth).
+fn scan_value(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+    if pos >= buf.len() {
         return Ok(None);
     }
 
-    // We need at least the type byte. Peek at it without consuming
-    // because we might need to rewind if the message is incomplete.
-    let type_byte = buf[0];
-
-    // For array types, enforce max recursion depth
     if depth > MAX_RECURSE_DEPTH {
         return Err(RedisError::from((
             ErrorKind::ParseError,
@@ -175,13 +154,145 @@ fn parse_value(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
         )));
     }
 
-    // Snapshot position so we can rewind on incomplete
-    let snapshot_len = buf.len();
+    let type_byte = buf[pos];
+    let after_type = pos + 1;
 
-    // Consume the type byte
+    match type_byte {
+        // Simple types: read until \r\n
+        b'+' | b'-' | b':' | b'_' | b',' | b'#' | b'(' => scan_line(buf, after_type),
+
+        // Bulk string: $<len>\r\n<data>\r\n
+        b'$' => scan_bulk(buf, after_type),
+
+        // Blob error / verbatim: same framing as bulk string
+        b'!' | b'=' => scan_bulk(buf, after_type),
+
+        // Array / Set / Push: *<count>\r\n<elements...>
+        b'*' | b'~' | b'>' => scan_aggregate(buf, after_type, depth),
+
+        // Map: %<count>\r\n<key><val>... (count = number of pairs)
+        b'%' => scan_map(buf, after_type, depth),
+
+        // Attribute: |<count>\r\n<key><val>...<data>
+        b'|' => scan_attribute(buf, after_type, depth),
+
+        _ => Err(RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            format!("Unexpected byte: {type_byte:#x}"),
+        ))),
+    }
+}
+
+/// Scan past a \r\n-terminated line. Returns position after the \r\n.
+#[inline]
+fn scan_line(buf: &[u8], pos: usize) -> RedisResult<Option<usize>> {
+    match find_crlf(buf, pos) {
+        Some(cr) => Ok(Some(cr + 2)),
+        None => Ok(None),
+    }
+}
+
+/// Scan a bulk string/blob: <len>\r\n<data>\r\n
+#[inline]
+fn scan_bulk(buf: &[u8], pos: usize) -> RedisResult<Option<usize>> {
+    let cr = match find_crlf(buf, pos) {
+        Some(cr) => cr,
+        None => return Ok(None),
+    };
+    let size = parse_integer(&buf[pos..cr])?;
+    if size < 0 {
+        // Null bulk string: just the length line
+        return Ok(Some(cr + 2));
+    }
+    let size = size as usize;
+    let data_start = cr + 2;
+    let end = data_start + size + 2; // data + \r\n
+    if buf.len() < end {
+        Ok(None)
+    } else {
+        Ok(Some(end))
+    }
+}
+
+/// Scan an aggregate type (array, set, push): <count>\r\n<elements...>
+fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+    let cr = match find_crlf(buf, pos) {
+        Some(cr) => cr,
+        None => return Ok(None),
+    };
+    let count = parse_integer(&buf[pos..cr])?;
+    if count < 0 {
+        return Ok(Some(cr + 2));
+    }
+    let count = count as usize;
+    let mut cursor = cr + 2;
+    for _ in 0..count {
+        match scan_value(buf, cursor, depth + 1)? {
+            Some(next) => cursor = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cursor))
+}
+
+/// Scan a map: <count>\r\n<key><val>... (count pairs = 2*count elements)
+fn scan_map(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+    let cr = match find_crlf(buf, pos) {
+        Some(cr) => cr,
+        None => return Ok(None),
+    };
+    let count = parse_integer(&buf[pos..cr])?;
+    let count = count as usize;
+    let mut cursor = cr + 2;
+    for _ in 0..count * 2 {
+        match scan_value(buf, cursor, depth + 1)? {
+            Some(next) => cursor = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cursor))
+}
+
+/// Scan an attribute: <count>\r\n<key><val>...<data> (count pairs + 1 data element)
+fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+    let cr = match find_crlf(buf, pos) {
+        Some(cr) => cr,
+        None => return Ok(None),
+    };
+    let count = parse_integer(&buf[pos..cr])?;
+    let count = count as usize;
+    let mut cursor = cr + 2;
+    // count key-value pairs + 1 data element = count*2 + 1
+    for _ in 0..count * 2 + 1 {
+        match scan_value(buf, cursor, depth + 1)? {
+            Some(next) => cursor = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cursor))
+}
+
+// ── Pass 2: Parse ────────────────────────────────────────────────────
+// Only called when scan confirms the buffer contains a complete message.
+// parse_value_unchecked never returns None — panics are bugs.
+
+/// Read a line from BytesMut, advancing past \r\n. Panics if incomplete
+/// (caller must have verified via scan).
+#[inline]
+fn read_line_unchecked(buf: &mut BytesMut) -> BytesMut {
+    let pos = find_crlf(buf, 0).expect("scan verified completeness");
+    let line = buf.split_to(pos);
+    buf.advance(2); // \r\n
+    line
+}
+
+/// Parse a complete RESP value from BytesMut. Never returns None.
+fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+    let type_byte = buf[0];
     buf.advance(1);
 
-    let result = match type_byte {
+    match type_byte {
         b'+' => parse_simple_string(buf),
         b'-' => parse_error(buf),
         b':' => parse_int_value(buf),
@@ -197,260 +308,155 @@ fn parse_value(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
         b'=' => parse_verbatim(buf),
         b'(' => parse_big_number(buf),
         b'>' => parse_push(buf, depth),
-        _ => {
-            // Restore the byte we consumed
-            // Can't un-advance BytesMut easily, so this is a hard error
-            return Err(RedisError::from((
-                ErrorKind::ParseError,
-                "parse error",
-                format!("Unexpected byte: {type_byte:#x}"),
-            )));
-        }
-    };
-
-    match result {
-        Ok(Some(val)) => Ok(Some(val)),
-        Ok(None) => {
-            // Incomplete — restore buffer to original state.
-            // We consumed some bytes, but `split_to` wasn't called on the
-            // real data (only advance on the type byte and possibly a line).
-            // The simplest correct approach: we took a snapshot_len and can
-            // calculate how many bytes were consumed, then un-consume them.
-            //
-            // BytesMut doesn't support un-advance, so we use a different
-            // strategy: the Decoder wrapper saves a checkpoint.
-            //
-            // For the inner parse functions, we use a "peek then commit" pattern:
-            // We work on the buffer directly and if we return None, the Decoder
-            // wrapper handles rollback by working on a clone.
-            //
-            // ACTUALLY: We need to fix this. The recursive nature means we can't
-            // easily rollback. The standard approach for Decoder is: the Decoder
-            // saves the original BytesMut, tries to parse, and on None, restores.
-            //
-            // Let's use the simpler approach of working on a &[u8] cursor for
-            // completeness checking, then doing the real parse with split_to
-            // only when we know we have enough data.
-            //
-            // For now, the `_checkpoint` strategy in ValueCodec handles this.
-            // But we need to not have advanced the real buffer...
-            //
-            // OK — revised design: parse functions check completeness on &[u8]
-            // first (via the Cursor approach), then split. But that loses zero-copy.
-            //
-            // BEST APPROACH: Work on the BytesMut directly, but the Decoder
-            // clones before calling parse_value. BytesMut clone is O(1) (it's
-            // refcounted internally). If parse returns None, we discard the clone.
-            // If it returns Some, we replace the original with the clone.
-            //
-            // This is exactly what tokio's LinesCodec and other decoders do.
-            // The clone cost is negligible — it's just bumping an Arc refcount.
-            //
-            // The ValueCodec::decode() method handles this pattern.
-            // Here we just return None and trust the caller saved a checkpoint.
-            let _consumed = snapshot_len - buf.len();
-            Ok(None)
-        }
-        Err(e) => Err(e),
+        _ => Err(RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            format!("Unexpected byte: {type_byte:#x}"),
+        ))),
     }
 }
 
-// ── Individual type parsers ───────────────────────────────────────────
-// Each returns Ok(Some(Value)) on success, Ok(None) on incomplete, Err on parse error.
+// ── Individual type parsers (pass 2, unchecked) ──────────────────────
 
 #[inline]
-fn parse_simple_string(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_simple_string(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let s = std::str::from_utf8(&line).map_err(|_| {
-        RedisError::from((ErrorKind::ParseError, "parse error", "Invalid UTF-8 in simple string".to_string()))
+        RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            "Invalid UTF-8 in simple string".to_string(),
+        ))
     })?;
     if s == "OK" {
-        Ok(Some(Value::Okay))
+        Ok(Value::Okay)
     } else {
-        Ok(Some(Value::SimpleString(s.to_string())))
+        Ok(Value::SimpleString(s.to_string()))
     }
 }
 
 #[inline]
-fn parse_error(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_error(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let s = std::str::from_utf8(&line).map_err(|_| {
-        RedisError::from((ErrorKind::ParseError, "parse error", "Invalid UTF-8 in error".to_string()))
+        RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            "Invalid UTF-8 in error".to_string(),
+        ))
     })?;
-    Ok(Some(Value::ServerError(err_parser(s))))
+    Ok(Value::ServerError(err_parser(s)))
 }
 
 #[inline]
-fn parse_int_value(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_int_value(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let val = parse_integer(&line)?;
-    Ok(Some(Value::Int(val)))
+    Ok(Value::Int(val))
 }
 
-/// Zero-copy bulk string: uses split_to + freeze to get Bytes without copying.
+/// Zero-copy bulk string: split_to + freeze. No memcpy.
 #[inline]
-fn parse_bulk_string(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_bulk_string(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let size = parse_integer(&line)?;
-
     if size < 0 {
-        return Ok(Some(Value::Nil));
+        return Ok(Value::Nil);
     }
-
     let size = size as usize;
-    // Need `size` bytes of data + 2 bytes for trailing \r\n
-    if buf.len() < size + 2 {
-        return Ok(None);
-    }
-
-    // Zero-copy: split_to gives us a new BytesMut owning the first `size` bytes,
-    // freeze() converts to Bytes (immutable, ref-counted). No memcpy.
     let data = buf.split_to(size).freeze();
-    buf.advance(2); // skip \r\n
-    Ok(Some(Value::BulkString(data)))
+    buf.advance(2); // \r\n
+    Ok(Value::BulkString(data))
 }
 
-fn parse_array(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_array(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let length = parse_integer(&line)?;
-
     if length < 0 {
-        return Ok(Some(Value::Nil));
+        return Ok(Value::Nil);
     }
-
     let length = length as usize;
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
-        match parse_value(buf, depth + 1)? {
-            Some(val) => items.push(val),
-            None => return Ok(None),
-        }
+        items.push(parse_value_unchecked(buf, depth + 1)?);
     }
-    Ok(Some(Value::Array(items)))
+    Ok(Value::Array(items))
 }
 
-fn parse_map(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_map(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let kv_length = parse_integer(&line)? as usize;
-
     let mut pairs = Vec::with_capacity(kv_length);
     for _ in 0..kv_length {
-        let key = match parse_value(buf, depth + 1)? {
-            Some(val) => val,
-            None => return Ok(None),
-        };
-        let val = match parse_value(buf, depth + 1)? {
-            Some(val) => val,
-            None => return Ok(None),
-        };
+        let key = parse_value_unchecked(buf, depth + 1)?;
+        let val = parse_value_unchecked(buf, depth + 1)?;
         pairs.push((key, val));
     }
-    Ok(Some(Value::Map(pairs)))
+    Ok(Value::Map(pairs))
 }
 
-fn parse_attribute(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_attribute(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let kv_length = parse_integer(&line)? as usize;
-
-    // Read kv_length key-value pairs + 1 data element
     let mut attributes = Vec::with_capacity(kv_length);
     for _ in 0..kv_length {
-        let key = match parse_value(buf, depth + 1)? {
-            Some(val) => val,
-            None => return Ok(None),
-        };
-        let val = match parse_value(buf, depth + 1)? {
-            Some(val) => val,
-            None => return Ok(None),
-        };
+        let key = parse_value_unchecked(buf, depth + 1)?;
+        let val = parse_value_unchecked(buf, depth + 1)?;
         attributes.push((key, val));
     }
-    let data = match parse_value(buf, depth + 1)? {
-        Some(val) => val,
-        None => return Ok(None),
-    };
-    Ok(Some(Value::Attribute {
+    let data = parse_value_unchecked(buf, depth + 1)?;
+    Ok(Value::Attribute {
         data: Box::new(data),
         attributes,
-    }))
+    })
 }
 
-fn parse_set(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_set(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let length = parse_integer(&line)?;
-
     if length < 0 {
-        return Ok(Some(Value::Nil));
+        return Ok(Value::Nil);
     }
-
     let length = length as usize;
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
-        match parse_value(buf, depth + 1)? {
-            Some(val) => items.push(val),
-            None => return Ok(None),
-        }
+        items.push(parse_value_unchecked(buf, depth + 1)?);
     }
-    Ok(Some(Value::Set(items)))
+    Ok(Value::Set(items))
 }
 
 #[inline]
-fn parse_null(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    // _\r\n
-    match read_line(buf) {
-        Some(_) => Ok(Some(Value::Nil)),
-        None => Ok(None),
-    }
+fn parse_null(buf: &mut BytesMut) -> RedisResult<Value> {
+    let _line = read_line_unchecked(buf);
+    Ok(Value::Nil)
 }
 
 #[inline]
-fn parse_double(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_double(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let s = std::str::from_utf8(&line).map_err(|_| {
-        RedisError::from((ErrorKind::ParseError, "parse error", "Invalid UTF-8 in double".to_string()))
+        RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            "Invalid UTF-8 in double".to_string(),
+        ))
     })?;
     let val = s.trim().parse::<f64>().map_err(|e| {
-        RedisError::from((ErrorKind::ParseError, "parse error", format!("Expected double: {e}")))
+        RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            format!("Expected double: {e}"),
+        ))
     })?;
-    Ok(Some(Value::Double(val)))
+    Ok(Value::Double(val))
 }
 
 #[inline]
-fn parse_boolean(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_boolean(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     match line.as_ref() {
-        b"t" => Ok(Some(Value::Boolean(true))),
-        b"f" => Ok(Some(Value::Boolean(false))),
+        b"t" => Ok(Value::Boolean(true)),
+        b"f" => Ok(Value::Boolean(false)),
         _ => Err(RedisError::from((
             ErrorKind::ParseError,
             "parse error",
@@ -459,70 +465,52 @@ fn parse_boolean(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
     }
 }
 
-/// Read a "blob" - length-prefixed binary string (used by blob errors, verbatim strings)
+/// Read a blob (length-prefixed string) for blob errors and verbatim strings.
 #[inline]
-fn read_blob(buf: &mut BytesMut) -> RedisResult<Option<String>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn read_blob_unchecked(buf: &mut BytesMut) -> RedisResult<String> {
+    let line = read_line_unchecked(buf);
     let size = parse_integer(&line)?;
-
     if size < 0 {
-        return Ok(Some(String::new()));
+        return Ok(String::new());
     }
-
     let size = size as usize;
-    if buf.len() < size + 2 {
-        return Ok(None);
-    }
-
     let data = &buf[..size];
     let s = String::from_utf8_lossy(data).to_string();
-    buf.advance(size + 2); // data + \r\n
-    Ok(Some(s))
+    buf.advance(size + 2);
+    Ok(s)
 }
 
 #[inline]
-fn parse_blob_error(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    match read_blob(buf)? {
-        Some(s) => Ok(Some(Value::ServerError(err_parser(&s)))),
-        None => Ok(None),
+fn parse_blob_error(buf: &mut BytesMut) -> RedisResult<Value> {
+    let s = read_blob_unchecked(buf)?;
+    Ok(Value::ServerError(err_parser(&s)))
+}
+
+#[inline]
+fn parse_verbatim(buf: &mut BytesMut) -> RedisResult<Value> {
+    let s = read_blob_unchecked(buf)?;
+    if let Some((format, text)) = s.split_once(':') {
+        let format = match format {
+            "txt" => VerbatimFormat::Text,
+            "mkd" => VerbatimFormat::Markdown,
+            x => VerbatimFormat::Unknown(x.to_string()),
+        };
+        Ok(Value::VerbatimString {
+            format,
+            text: text.to_string(),
+        })
+    } else {
+        Err(RedisError::from((
+            ErrorKind::ParseError,
+            "parse error",
+            "parse error when decoding verbatim string".to_string(),
+        )))
     }
 }
 
 #[inline]
-fn parse_verbatim(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    match read_blob(buf)? {
-        Some(s) => {
-            if let Some((format, text)) = s.split_once(':') {
-                let format = match format {
-                    "txt" => VerbatimFormat::Text,
-                    "mkd" => VerbatimFormat::Markdown,
-                    x => VerbatimFormat::Unknown(x.to_string()),
-                };
-                Ok(Some(Value::VerbatimString {
-                    format,
-                    text: text.to_string(),
-                }))
-            } else {
-                Err(RedisError::from((
-                    ErrorKind::ParseError,
-                    "parse error",
-                    "parse error when decoding verbatim string".to_string(),
-                )))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-#[inline]
-fn parse_big_number(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_big_number(buf: &mut BytesMut) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let val = BigInt::parse_bytes(&line, 10).ok_or_else(|| {
         RedisError::from((
             ErrorKind::ParseError,
@@ -530,30 +518,24 @@ fn parse_big_number(buf: &mut BytesMut) -> RedisResult<Option<Value>> {
             "Expected bigint, got garbage".to_string(),
         ))
     })?;
-    Ok(Some(Value::BigNumber(val)))
+    Ok(Value::BigNumber(val))
 }
 
-fn parse_push(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
-    let line = match read_line(buf) {
-        Some(l) => l,
-        None => return Ok(None),
-    };
+fn parse_push(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+    let line = read_line_unchecked(buf);
     let length = parse_integer(&line)?;
 
     if length <= 0 {
-        return Ok(Some(Value::Push {
+        return Ok(Value::Push {
             kind: PushKind::Other(String::new()),
             data: vec![],
-        }));
+        });
     }
 
     let length = length as usize;
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
-        match parse_value(buf, depth + 1)? {
-            Some(val) => items.push(val),
-            None => return Ok(None),
-        }
+        items.push(parse_value_unchecked(buf, depth + 1)?);
     }
 
     let mut it = items.into_iter();
@@ -566,15 +548,15 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> RedisResult<Option<Value>> {
                 "Invalid UTF-8 in push kind".to_string(),
             ))
         })?;
-        Ok(Some(Value::Push {
+        Ok(Value::Push {
             kind: get_push_kind(push_kind),
             data: it.collect(),
-        }))
+        })
     } else if let Value::SimpleString(kind) = first {
-        Ok(Some(Value::Push {
+        Ok(Value::Push {
             kind: get_push_kind(kind),
             data: it.collect(),
-        }))
+        })
     } else {
         Err(RedisError::from((
             ErrorKind::ParseError,
@@ -611,25 +593,17 @@ mod aio_support {
                 return Ok(None);
             }
 
-            // Clone is O(1) for BytesMut — just bumps the refcount.
-            // We parse on the clone; if complete, we replace src with the
-            // advanced clone. If incomplete, src is untouched.
-            let mut attempt = src.clone();
-            match parse_value(&mut attempt, 0) {
-                Ok(Some(val)) => {
-                    // Commit: advance src by the amount consumed
-                    let consumed = src.len() - attempt.len();
-                    *src = attempt;
-                    // Reserve some capacity if we're getting low,
-                    // to reduce syscalls on the next read
-                    let _ = consumed; // used above via split
+            // Pass 1: Scan on &[u8] — read-only, no allocations, no mutations.
+            // Returns the byte position after the complete message, or None.
+            match scan_value(src, 0, 0)? {
+                None => Ok(None), // Incomplete — src untouched
+                Some(_end) => {
+                    // Pass 2: Parse on &mut BytesMut — uses split_to() for
+                    // zero-copy BulkString. Never returns None since scan
+                    // confirmed completeness.
+                    let val = parse_value_unchecked(src, 0)?;
                     Ok(Some(Ok(val)))
                 }
-                Ok(None) => {
-                    // Incomplete — leave src untouched, ask for more data
-                    Ok(None)
-                }
-                Err(e) => Err(e),
             }
         }
 
@@ -642,10 +616,6 @@ mod aio_support {
     }
 
     /// Parses a redis value asynchronously from an AsyncRead source.
-    ///
-    /// This is a compatibility shim — the primary fast path is through
-    /// ValueCodec (Decoder) used with Framed. This function is only
-    /// re-exported for API compatibility.
     pub async fn parse_redis_value_async<R>(
         _decoder: &mut (),
         read: &mut R,
@@ -659,10 +629,14 @@ mod aio_support {
         loop {
             let n = read.read_buf(&mut buf).await?;
             if n == 0 {
-                return Err(RedisError::from(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                return Err(RedisError::from(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
             }
-            match parse_value(&mut buf, 0) {
-                Ok(Some(val)) => return Ok(val),
+            match scan_value(&buf, 0, 0) {
+                Ok(Some(_)) => {
+                    return parse_value_unchecked(&mut buf, 0);
+                }
                 Ok(None) => continue,
                 Err(e) => return Err(e),
             }
@@ -693,14 +667,16 @@ impl Parser {
         loop {
             let n = reader.read(&mut tmp)?;
             if n == 0 {
-                return Err(RedisError::from(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                return Err(RedisError::from(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
             }
             buf.extend_from_slice(&tmp[..n]);
 
-            // Try to parse after each read
-            let mut attempt = buf.clone();
-            match parse_value(&mut attempt, 0) {
-                Ok(Some(val)) => return Ok(val),
+            match scan_value(&buf, 0, 0) {
+                Ok(Some(_)) => {
+                    return parse_value_unchecked(&mut buf, 0);
+                }
                 Ok(None) => continue,
                 Err(e) => return Err(e),
             }
@@ -710,10 +686,18 @@ impl Parser {
 
 /// Parses bytes into a redis value.
 pub fn parse_redis_value(bytes: &[u8]) -> RedisResult<Value> {
-    let mut buf = BytesMut::from(bytes);
-    match parse_value(&mut buf, 0)? {
-        Some(val) => Ok(val),
-        None => Err(RedisError::from(io::Error::from(io::ErrorKind::UnexpectedEof))),
+    // For complete buffers we can skip scan — parse_value_unchecked will
+    // work if the data is complete, and we get an error/panic if not.
+    // But to match the old semantics (return error on incomplete), do
+    // the scan first.
+    match scan_value(bytes, 0, 0)? {
+        Some(_) => {
+            let mut buf = BytesMut::from(bytes);
+            parse_value_unchecked(&mut buf, 0)
+        }
+        None => Err(RedisError::from(io::Error::from(
+            io::ErrorKind::UnexpectedEof,
+        ))),
     }
 }
 
@@ -742,8 +726,9 @@ mod tests {
         use tokio_util::codec::Decoder;
         let mut codec = ValueCodec::default();
 
-        let mut bytes =
-            bytes::BytesMut::from(b"*3\r\n+OK\r\n-LOADING server is loading\r\n+OK\r\n".as_slice());
+        let mut bytes = bytes::BytesMut::from(
+            b"*3\r\n+OK\r\n-LOADING server is loading\r\n+OK\r\n".as_slice(),
+        );
         let result = codec.decode_eof(&mut bytes).unwrap().unwrap();
 
         assert_eq!(
@@ -791,7 +776,6 @@ mod tests {
         } else {
             panic!("expected double");
         }
-        // -nan is supported prior to redis 7.2
         let val = parse_redis_value(b",-nan\r\n").unwrap();
         if let Value::Double(val) = val {
             assert!(val.is_sign_negative());
@@ -799,7 +783,6 @@ mod tests {
         } else {
             panic!("expected double");
         }
-        //Allow doubles in scientific E notation
         let val = parse_redis_value(b",2.67923e+8\r\n").unwrap();
         assert_eq!(val, Value::Double(267923000.0));
         let val = parse_redis_value(b",2.67923E+8\r\n").unwrap();
@@ -855,7 +838,8 @@ mod tests {
 
     #[test]
     fn decode_resp3_big_number() {
-        let val = parse_redis_value(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
+        let val =
+            parse_redis_value(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
         assert_eq!(
             val,
             Value::BigNumber(
@@ -866,7 +850,8 @@ mod tests {
 
     #[test]
     fn decode_resp3_set() {
-        let val = parse_redis_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
+        let val =
+            parse_redis_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
         let v = val.as_sequence().unwrap();
         assert_eq!(Value::SimpleString("orange".to_string()), v[0]);
         assert_eq!(Value::SimpleString("apple".to_string()), v[1]);
@@ -877,8 +862,9 @@ mod tests {
 
     #[test]
     fn decode_resp3_push() {
-        let val = parse_redis_value(b">3\r\n+message\r\n+some_channel\r\n+this is the message\r\n")
-            .unwrap();
+        let val =
+            parse_redis_value(b">3\r\n+message\r\n+some_channel\r\n+this is the message\r\n")
+                .unwrap();
         if let Value::Push { ref kind, ref data } = val {
             assert_eq!(&PushKind::Message, kind);
             assert_eq!(Value::SimpleString("some_channel".to_string()), data[0]);
@@ -893,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_max_recursion_depth() {
-        let bytes = b"*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n";
+        let bytes = b"*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n";
         match parse_redis_value(bytes) {
             Ok(_) => panic!("Expected Err"),
             Err(e) => assert!(matches!(e.kind(), ErrorKind::ParseError)),
@@ -902,7 +888,6 @@ mod tests {
 
     #[test]
     fn test_bulk_string_zero_copy() {
-        // Verify that BulkString parsing produces correct Bytes
         let val = parse_redis_value(b"$5\r\nhello\r\n").unwrap();
         assert_eq!(val, Value::BulkString(bytes::Bytes::from_static(b"hello")));
     }
@@ -931,7 +916,6 @@ mod tests {
 
     #[test]
     fn test_incomplete_returns_error_for_parse_redis_value() {
-        // parse_redis_value on incomplete data should error (not hang)
         let result = parse_redis_value(b"$5\r\nhel");
         assert!(result.is_err());
     }
@@ -944,12 +928,31 @@ mod tests {
         // Incomplete bulk string — should return None, not error
         let mut bytes = bytes::BytesMut::from(&b"$5\r\nhel"[..]);
         assert_eq!(codec.decode(&mut bytes), Ok(None));
-        // Buffer should be untouched
+        // Buffer should be untouched (two-pass: scan says incomplete, no mutation)
         assert_eq!(&bytes[..], b"$5\r\nhel");
 
         // Now complete it
         bytes.extend_from_slice(b"lo\r\n");
         let result = codec.decode(&mut bytes).unwrap().unwrap();
-        assert_eq!(result, Ok(Value::BulkString(bytes::Bytes::from_static(b"hello"))));
+        assert_eq!(
+            result,
+            Ok(Value::BulkString(bytes::Bytes::from_static(b"hello")))
+        );
+    }
+
+    #[test]
+    fn test_scan_completeness() {
+        // Complete simple string
+        assert!(scan_value(b"+OK\r\n", 0, 0).unwrap().is_some());
+        // Incomplete simple string
+        assert!(scan_value(b"+OK", 0, 0).unwrap().is_none());
+        // Complete array
+        assert!(scan_value(b"*2\r\n+OK\r\n:1\r\n", 0, 0).unwrap().is_some());
+        // Incomplete array (missing second element)
+        assert!(scan_value(b"*2\r\n+OK\r\n", 0, 0).unwrap().is_none());
+        // Complete bulk string
+        assert!(scan_value(b"$3\r\nfoo\r\n", 0, 0).unwrap().is_some());
+        // Incomplete bulk string (data too short)
+        assert!(scan_value(b"$3\r\nfo", 0, 0).unwrap().is_none());
     }
 }
