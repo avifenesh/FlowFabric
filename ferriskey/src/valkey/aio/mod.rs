@@ -76,11 +76,20 @@ pub trait ConnectionLike: Send {
     ) -> impl Future<Output = ValkeyResult<Vec<Value>>> + Send + 'a;
 
     /// Sends pre-packed RESP bytes directly, skipping command serialization.
+    /// Only meaningful on per-node connections (MultiplexedConnection).
+    /// Default returns an error — cluster-level connections should use req_packed_command.
     fn send_packed_bytes<'a>(
         &'a mut self,
-        packed: bytes::Bytes,
-        is_fenced: bool,
-    ) -> impl Future<Output = ValkeyResult<Value>> + Send + 'a;
+        _packed: bytes::Bytes,
+        _is_fenced: bool,
+    ) -> impl Future<Output = ValkeyResult<Value>> + Send + 'a {
+        async {
+            Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "send_packed_bytes not supported — use req_packed_command",
+            )))
+        }
+    }
 
     /// Returns the database this connection is bound to.  Note that this
     /// information might be unreliable because it's initially cached and

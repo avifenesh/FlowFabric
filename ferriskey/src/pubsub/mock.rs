@@ -863,7 +863,7 @@ impl MockPubSubBroker {
     }
 
     pub fn convert_sub_map_to_value(map: PubSubSubscriptionInfo) -> Value {
-        let mut redis_map = Vec::new();
+        let mut valkey_map = Vec::new();
         for (kind, values) in map {
             let key = match kind {
                 PubSubSubscriptionKind::Exact => "Exact",
@@ -871,12 +871,12 @@ impl MockPubSubBroker {
                 PubSubSubscriptionKind::Sharded => "Sharded",
             };
             let values_array: Vec<Value> = values.into_iter().map(Value::BulkString).collect();
-            redis_map.push((
+            valkey_map.push((
                 Value::BulkString(key.as_bytes().to_vec().into()),
                 Value::Array(values_array),
             ));
         }
-        Value::Map(redis_map)
+        Value::Map(valkey_map)
     }
 
     fn handle_lazy_subscribe(

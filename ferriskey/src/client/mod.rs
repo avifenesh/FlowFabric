@@ -69,7 +69,7 @@ pub const DEFAULT_MAX_INFLIGHT_REQUESTS: u32 = 1000;
 /// and performance overhead.
 pub const CONNECTION_CHECKS_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Extract RequestType from a Redis command for decompression processing
+/// Extract RequestType from a Valkey command for decompression processing
 fn extract_request_type_from_cmd(cmd: &Cmd) -> Option<RequestType> {
     // Get the command name (first argument)
     let command_name = cmd.command()?;
@@ -354,7 +354,7 @@ fn get_timeout_from_cmd_arg(
         // `0` means we should set no timeout
         Ok(RequestTimeoutOption::NoTimeout)
     } else {
-        // We limit the maximum timeout due to restrictions imposed by Redis and the Duration crate
+        // We limit the maximum timeout due to restrictions imposed by Valkey and the Duration crate
         if timeout_secs > u32::MAX as f64 {
             Err(ValkeyError::from((
                 ErrorKind::ResponseError,
@@ -1693,7 +1693,7 @@ async fn create_cluster_client(
         .get_async_connection(push_sender, Some(pubsub_synchronizer), iam_token_provider)
         .await?;
 
-    // This validation ensures that sharded subscriptions are not applied to Redis engines older than version 7.0,
+    // This validation ensures that sharded subscriptions are not applied to Valkey engines older than version 7.0,
     // preventing scenarios where the client becomes inoperable or, worse, unaware that sharded pubsub messages are not being received.
     // The issue arises because `client.get_async_connection()` might succeed even if the engine does not support sharded pubsub.
     // For example, initial connections may exclude the target node for sharded subscriptions, allowing the creation to succeed,
@@ -1713,7 +1713,7 @@ async fn create_cluster_client(
             )
             .await?;
         let info_dict: InfoDict = FromValkeyValue::from_valkey_value(&info_res)?;
-        match info_dict.get::<String>("redis_version") {
+        match info_dict.get::<String>("valkey_version") {
             Some(version) => match (Versioning::new(version), Versioning::new("7.0")) {
                 (Some(server_ver), Some(min_ver)) => {
                     if server_ver < min_ver {
@@ -2352,7 +2352,7 @@ mod tests {
         // Test rejection of non-SELECT commands
         let client = create_test_client();
 
-        // Test common Redis commands
+        // Test common Valkey commands
         let mut cmd = Cmd::new();
         cmd.arg("GET").arg("key");
         assert!(!client.is_select_command(&cmd));

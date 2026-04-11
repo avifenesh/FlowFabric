@@ -129,7 +129,13 @@ fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
                 ))
             });
         }
-        val = val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
+        val = val.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as i64)).ok_or_else(|| {
+            ValkeyError::from((
+                ErrorKind::ParseError,
+                "parse error",
+                "Integer overflow in RESP integer".to_string(),
+            ))
+        })?;
     }
 
     if negative {
@@ -243,6 +249,9 @@ fn scan_map(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>>
         None => return Ok(None),
     };
     let count = parse_integer(&buf[pos..cr])?;
+    if count < 0 {
+        return Ok(Some(cr + 2));
+    }
     let count = count as usize;
     let mut cursor = cr + 2;
     for _ in 0..count * 2 {
@@ -261,6 +270,9 @@ fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<u
         None => return Ok(None),
     };
     let count = parse_integer(&buf[pos..cr])?;
+    if count < 0 {
+        return Ok(Some(cr + 2));
+    }
     let count = count as usize;
     let mut cursor = cr + 2;
     // count key-value pairs + 1 data element = count*2 + 1
@@ -385,7 +397,11 @@ fn parse_array(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
 
 fn parse_map(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
-    let kv_length = parse_integer(&line)? as usize;
+    let kv_length = parse_integer(&line)?;
+    if kv_length < 0 {
+        return Ok(Value::Nil);
+    }
+    let kv_length = kv_length as usize;
     let mut pairs = Vec::with_capacity(kv_length);
     for _ in 0..kv_length {
         let key = parse_value_unchecked(buf, depth + 1)?;
@@ -397,7 +413,11 @@ fn parse_map(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
 
 fn parse_attribute(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
-    let kv_length = parse_integer(&line)? as usize;
+    let kv_length = parse_integer(&line)?;
+    if kv_length < 0 {
+        return Ok(Value::Nil);
+    }
+    let kv_length = kv_length as usize;
     let mut attributes = Vec::with_capacity(kv_length);
     for _ in 0..kv_length {
         let key = parse_value_unchecked(buf, depth + 1)?;

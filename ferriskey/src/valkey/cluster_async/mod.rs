@@ -295,7 +295,7 @@ where
 
         let packed = cmd.get_packed_command();
         let is_fenced = cmd.is_fenced();
-        let result = conn.send_packed_bytes(packed.clone(), is_fenced).await;
+        let result = conn.send_packed_bytes(packed, is_fenced).await;
 
         match result {
             Ok(val) => Some(Ok(val)),
@@ -309,7 +309,8 @@ where
                     };
                     if let Some(conn_future) = conn_future {
                         let mut redirect_conn = conn_future.await;
-                        return Some(redirect_conn.send_packed_bytes(packed, is_fenced).await);
+                        let repacked = cmd.get_packed_command();
+                        return Some(redirect_conn.send_packed_bytes(repacked, is_fenced).await);
                     }
                 }
                 None // Can't resolve redirect — fall back to cluster task
@@ -326,7 +327,8 @@ where
                         let _ = redirect_conn
                             .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
                             .await;
-                        return Some(redirect_conn.send_packed_bytes(packed, is_fenced).await);
+                        let repacked = cmd.get_packed_command();
+                        return Some(redirect_conn.send_packed_bytes(repacked, is_fenced).await);
                     }
                 }
                 None
@@ -398,28 +400,26 @@ where
 
         for (addr, sub_pipeline, indices, conn_future) in grouped {
             let sub_count = sub_pipeline.len();
+            let node_idx = node_info.len();
             node_info.push((addr, indices));
 
             join_set.spawn(async move {
                 let mut conn = conn_future.await;
-                conn.req_packed_commands(&sub_pipeline, 0, sub_count, None).await
+                let result = conn.req_packed_commands(&sub_pipeline, 0, sub_count, None).await;
+                (node_idx, result)
             });
         }
 
         // Step 3: Collect results and reassemble in original command order.
-        let mut results_by_node: Vec<ValkeyResult<Vec<Value>>> = Vec::with_capacity(node_info.len());
-        while let Some(join_result) = join_set.join_next().await {
-            match join_result {
-                Ok(result) => results_by_node.push(result),
-                Err(_join_err) => return None, // Task panicked — fall back
-            }
-        }
-
-        // Reassemble: map sub-pipeline results back to original indices.
         let total_cmds = count;
         let mut final_results: Vec<Option<Value>> = vec![None; total_cmds];
 
-        for (node_idx, result) in results_by_node.into_iter().enumerate() {
+        while let Some(join_result) = join_set.join_next().await {
+            let (node_idx, result) = match join_result {
+                Ok(pair) => pair,
+                Err(_join_err) => return None, // Task panicked — fall back
+            };
+
             let values = match result {
                 Ok(values) => values,
                 Err(e) => {
@@ -4281,18 +4281,6 @@ where
         self.route_command(cmd, routing).await
     }
 
-    async fn send_packed_bytes(
-        &mut self,
-        _packed: bytes::Bytes,
-        _is_fenced: bool,
-    ) -> ValkeyResult<Value> {
-        // ClusterConnection uses req_packed_command for routing.
-        // send_packed_bytes without routing info is not meaningful at cluster level.
-        Err(ValkeyError::from((
-            crate::valkey::ErrorKind::ClientError,
-            "send_packed_bytes requires routing — use req_packed_command",
-        )))
-    }
 
     async fn req_packed_commands(
         &mut self,

@@ -718,14 +718,12 @@ fn main() {
 
     let info = connection_info(&cfg.host, cfg.port, cfg.tls);
     let conn: ClusterConnection = runtime.block_on(async {
-        let client = ClusterClientBuilder::new(vec![info])
-            .tls(if cfg.tls {
-                ferriskey::valkey::cluster::TlsMode::Insecure
-            } else {
-                ferriskey::valkey::cluster::TlsMode::Secure
-            })
-            .build()
-            .unwrap();
+        let mut builder = ClusterClientBuilder::new(vec![info]);
+        if cfg.tls {
+            builder = builder.tls(ferriskey::valkey::cluster::TlsMode::Insecure);
+        }
+        let client = builder.build()
+            .expect("Failed to build cluster client");
         client.get_async_connection(None, None, None).await.unwrap()
     });
 
