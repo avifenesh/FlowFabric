@@ -1058,8 +1058,8 @@ where
         let (index, inner_index) = indices;
 
         // Handle MOVED redirect by updating the topology
-        if matches!(retry_method, RetryMethod::MovedRedirect) {
-            if let Err(server_error) =
+        if matches!(retry_method, RetryMethod::MovedRedirect)
+            && let Err(server_error) =
                 pipeline_handle_moved_redirect(core.clone(), &redis_error).await
             {
                 // A failure occurred, so we will append the error and continue to the next entry
@@ -1073,7 +1073,6 @@ where
                 )?;
                 continue;
             }
-        }
 
         if let Some(redirect_info) = redis_error.redirect(false) {
             let routing = InternalSingleNodeRouting::Redirect {

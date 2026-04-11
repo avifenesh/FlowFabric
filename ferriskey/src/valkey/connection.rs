@@ -475,15 +475,14 @@ pub(crate) fn client_set_info_pipeline(lib_name: Option<&str>) -> Pipeline {
 
 /// Common logic for checking real cause of hello3 command error
 pub fn get_resp3_hello_command_error(err: ValkeyError) -> ValkeyError {
-    if let Some(detail) = err.detail() {
-        if detail.starts_with("unknown command `HELLO`") {
+    if let Some(detail) = err.detail()
+        && detail.starts_with("unknown command `HELLO`") {
             return (
                 ErrorKind::RESP3NotSupported,
                 "Redis Server doesn't support HELLO command therefore resp3 cannot be used",
             )
                 .into();
         }
-    }
     err
 }
 

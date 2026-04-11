@@ -1,4 +1,4 @@
-use std::io::{Error, ErrorKind as IOErrorKind};
+use std::io::Error;
 
 use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;
@@ -75,16 +75,14 @@ pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> ValkeyResult<
         // Parse certificates using rustls-pki-types v1.9.0+ API
         let certs = CertificateDer::pem_slice_iter(&client_cert);
         let client_cert_chain = certs.collect::<Result<Vec<_>, _>>().map_err(|e| {
-            Error::new(
-                IOErrorKind::Other,
+            Error::other(
                 format!("Failed to parse certificate: {}", e),
             )
         })?;
 
         // Parse private key using rustls-pki-types v1.9.0+ API
         let client_key = PrivateKeyDer::from_pem_slice(&client_key).map_err(|e| {
-            Error::new(
-                IOErrorKind::Other,
+            Error::other(
                 format!("Failed to parse private key: {}", e),
             )
         })?;
@@ -103,14 +101,13 @@ pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> ValkeyResult<
         let mut root_cert_store = RootCertStore::empty();
         for result in certs {
             let cert = result.map_err(|e| {
-                Error::new(
-                    IOErrorKind::Other,
+                Error::other(
                     format!("Failed to parse root certificate: {}", e),
                 )
             })?;
             if root_cert_store.add(cert.to_owned()).is_err() {
                 return Err(
-                    Error::new(IOErrorKind::Other, "Unable to parse TLS trust anchors").into(),
+                    Error::other("Unable to parse TLS trust anchors").into(),
                 );
             }
         }

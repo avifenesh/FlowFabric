@@ -116,6 +116,3 @@ mutex_atomic = "warn"
 name = "connections_benchmark"
 harness = false
 
-[[bench]]
-name = "memory_benchmark"
-harness = false

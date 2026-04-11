@@ -119,12 +119,11 @@ pin_project! {
             let push_manager = this.push_manager.load();
             let address = push_manager.get_address();
 
-            if let Some(address) = address {
-                if let Some(sync) = push_manager.get_synchronizer() {
+            if let Some(address) = address
+                && let Some(sync) = push_manager.get_synchronizer() {
                     let addresses = std::collections::HashSet::from([address.clone()]);
                     sync.remove_current_subscriptions_for_addresses(&addresses);
                 }
-            }
         }
     }
 }
@@ -189,14 +188,13 @@ where
             return;
         }
 
-        if let Ok(res) = &result {
-            if let Value::Push { kind, data: _data } = res {
+        if let Ok(res) = &result
+            && let Value::Push { kind, data: _data } = res {
                 self_.push_manager.load().try_send_raw(res);
                 if !kind.has_reply() {
                     return;
                 }
             }
-        }
 
         let mut entry = match self_.in_flight.pop_front() {
             Some(entry) => entry,
@@ -619,7 +617,7 @@ impl MultiplexedConnection {
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
     {
-        let codec = ValueCodec::default()
+        let codec = ValueCodec
             .framed(stream)
             .and_then(|msg| async move { msg });
         let (mut pipeline, driver) =
@@ -685,17 +683,15 @@ impl MultiplexedConnection {
                 cmd.is_fenced(),
             )
             .await;
-        if self.protocol != ProtocolVersion::RESP2 {
-            if let Err(e) = &result {
-                if e.is_connection_dropped() {
+        if self.protocol != ProtocolVersion::RESP2
+            && let Err(e) = &result
+                && e.is_connection_dropped() {
                     // Notify the PushManager that the connection was lost
                     self.push_manager.try_send_raw(&Value::Push {
                         kind: PushKind::Disconnection,
                         data: vec![],
                     });
                 }
-            }
-        }
         result
     }
 
@@ -719,17 +715,15 @@ impl MultiplexedConnection {
             )
             .await;
 
-        if self.protocol != ProtocolVersion::RESP2 {
-            if let Err(e) = &result {
-                if e.is_connection_dropped() {
+        if self.protocol != ProtocolVersion::RESP2
+            && let Err(e) = &result
+                && e.is_connection_dropped() {
                     // Notify the PushManager that the connection was lost
                     self.push_manager.try_send_raw(&Value::Push {
                         kind: PushKind::Disconnection,
                         data: vec![],
                     });
                 }
-            }
-        }
         let value = result?;
         match value {
             Value::Array(mut values) => {
@@ -875,16 +869,14 @@ impl ConnectionLike for MultiplexedConnection {
             .pipeline
             .send_single(packed, self.response_timeout, is_fenced)
             .await;
-        if self.protocol != ProtocolVersion::RESP2 {
-            if let Err(e) = &result {
-                if e.is_connection_dropped() {
+        if self.protocol != ProtocolVersion::RESP2
+            && let Err(e) = &result
+                && e.is_connection_dropped() {
                     self.push_manager.try_send_raw(&Value::Push {
                         kind: PushKind::Disconnection,
                         data: vec![],
                     });
                 }
-            }
-        }
         result
     }
 

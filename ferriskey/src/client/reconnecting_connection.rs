@@ -302,11 +302,11 @@ async fn create_connection(
 fn get_client(
     address: &NodeAddress,
     tls_mode: TlsMode,
-    redis_connection_info: crate::valkey::ValkeyConnectionInfo,
+    valkey_connection_info: crate::valkey::ValkeyConnectionInfo,
     tls_params: Option<crate::valkey::TlsConnParams>,
 ) -> crate::valkey::Client {
     let connection_info =
-        super::get_connection_info(address, tls_mode, redis_connection_info, tls_params);
+        super::get_connection_info(address, tls_mode, valkey_connection_info, tls_params);
     crate::valkey::Client::open(connection_info).unwrap() // can unwrap, because [open] fails only on trying to convert input to ConnectionInfo, and we pass ConnectionInfo.
 }
 
@@ -322,7 +322,7 @@ impl ReconnectingConnection {
     pub(super) async fn new(
         address: &NodeAddress,
         connection_retry_strategy: RetryStrategy,
-        redis_connection_info: ValkeyConnectionInfo,
+        valkey_connection_info: ValkeyConnectionInfo,
         tls_mode: TlsMode,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         discover_az: bool,
@@ -337,7 +337,7 @@ impl ReconnectingConnection {
             format!("Attempting connection to {address}"),
         );
 
-        let connection_info = get_client(address, tls_mode, redis_connection_info, tls_params);
+        let connection_info = get_client(address, tls_mode, valkey_connection_info, tls_params);
         let backend = ConnectionBackend {
             connection_info: RwLock::new(connection_info),
             connection_available_signal: ManualResetEvent::new(true),

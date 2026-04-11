@@ -37,7 +37,7 @@ async fn connect_tcp(addr: &SocketAddr, tcp_nodelay: bool) -> io::Result<TcpStre
         const DEFAULT_USER_TCP_TIMEOUT: Duration = Duration::from_secs(5);
         socket2.set_tcp_user_timeout(Some(DEFAULT_USER_TCP_TIMEOUT))?;
     }
-    Ok(TcpStreamTokio::from_std(socket2.into())?)
+    TcpStreamTokio::from_std(socket2.into())
 }
 
 pub(crate) enum Tokio {

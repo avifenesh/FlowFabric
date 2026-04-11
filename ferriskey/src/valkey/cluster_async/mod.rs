@@ -1047,7 +1047,6 @@ impl<C> RequestInfo<C> {
                     }
                     InternalRoutingInfo::MultiNode(_) => {
                         // Multi-node requests cannot be redirected — ignore the redirect.
-                        return;
                     }
                 },
                 CmdArg::Pipeline { route, .. } => {
@@ -1061,11 +1060,9 @@ impl<C> RequestInfo<C> {
                 }
                 // cluster_scan is sent as a normal command internally so we should not reach this point.
                 CmdArg::ClusterScan { .. } => {
-                    return;
                 }
                 // Operation requests are not routed — ignore redirects.
                 CmdArg::OperationRequest(_) => {
-                    return;
                 }
             }
         }
@@ -1786,15 +1783,14 @@ where
                             } else {
                                 (node_addr, false)
                             };
-                        if push_manager_needs_update {
-                            if let Ok(ref node) = result {
+                        if push_manager_needs_update
+                            && let Ok(ref node) = result {
                                 node.user_connection
                                     .conn
                                     .clone()
                                     .await
                                     .update_push_manager_node_address(node_address.clone());
                             }
-                        }
                         result.map(|node| (node_address, node))
                     }
                 })
@@ -1830,13 +1826,12 @@ where
     /// If IAM authentication is configured, refresh the token in `cluster_params` so that
     /// any subsequent connection attempts use a valid credential.
     async fn refresh_iam_token_in_cluster_params(inner: &Arc<InnerCore<C>>) {
-        if let Some(ref token_provider) = inner.glide_connection_options.iam_token_provider {
-            if let Some(valid_token) = token_provider.get_valid_token().await {
+        if let Some(ref token_provider) = inner.glide_connection_options.iam_token_provider
+            && let Some(valid_token) = token_provider.get_valid_token().await {
                 inner.set_cluster_param(|params| {
                     params.password = Some(valid_token);
                 });
             }
-        }
     }
 
     // Reconnect to the initial nodes provided by the user in the creation of the client,
@@ -2663,14 +2658,13 @@ where
         )
         .await;
 
-        if let Ok((_, found_topology_hash)) = topology_result {
-            if inner.conn_lock.read().get_current_topology_hash() != found_topology_hash {
+        if let Ok((_, found_topology_hash)) = topology_result
+            && inner.conn_lock.read().get_current_topology_hash() != found_topology_hash {
                 return true;
             }
-        }
 
-        if let Some(failed) = failed_connections {
-            if !failed.is_empty() {
+        if let Some(failed) = failed_connections
+            && !failed.is_empty() {
                 trace!("check_for_topology_diff: calling trigger_refresh_connection_tasks");
                 Self::trigger_refresh_connection_tasks(
                     inner,
@@ -2680,7 +2674,6 @@ where
                 )
                 .await;
             }
-        }
 
         false
     }
@@ -4288,11 +4281,10 @@ where
 
         // Fast path: single-node commands dispatch directly to the mux connection,
         // bypassing the cluster task and FuturesUnordered entirely.
-        if let cluster_routing::RoutingInfo::SingleNode(ref single) = routing {
-            if let Some(result) = self.try_direct_dispatch(cmd, single).await {
+        if let cluster_routing::RoutingInfo::SingleNode(ref single) = routing
+            && let Some(result) = self.try_direct_dispatch(cmd, single).await {
                 return result;
             }
-        }
 
         // Slow path: fan-out, MOVED/ASK retries, or route resolution failed.
         self.route_command(cmd, routing).await
@@ -4317,7 +4309,7 @@ where
             if let Some(conn_future) = conn_future {
                 let mut conn = conn_future.await;
                 let result = conn
-                    .req_packed_commands(pipeline, offset, count, pipeline_retry_strategy.clone())
+                    .req_packed_commands(pipeline, offset, count, pipeline_retry_strategy)
                     .await;
                 match &result {
                     Ok(_) => return result,
@@ -4330,11 +4322,10 @@ where
         }
 
         // Fast path: cross-slot non-atomic pipeline — split by node and send directly.
-        if !pipeline.is_atomic() && route.is_none() {
-            if let Some(result) = self.try_direct_pipeline_dispatch(pipeline, count).await {
+        if !pipeline.is_atomic() && route.is_none()
+            && let Some(result) = self.try_direct_pipeline_dispatch(pipeline, count).await {
                 return result;
             }
-        }
 
         // Slow path: MOVED/ASK retry, or direct dispatch failed
         self.route_pipeline(

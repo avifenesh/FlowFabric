@@ -452,8 +452,7 @@ where
             // Check if this replica’s availability zone matches the user’s availability zone.
             if let Some((address, connection_details)) =
                 self.connection_details_for_address(replica.as_str())
-            {
-                if self.az_for_address(&address) == Some(client_az.clone()) {
+                && self.az_for_address(&address) == Some(client_az.clone()) {
                     // Attempt to update `latest_used_replica` with the index of this replica.
                     let _ = slot_map_value.last_used_replica.compare_exchange_weak(
                         initial_index,
@@ -463,19 +462,15 @@ where
                     );
                     return Some((address, connection_details.conn));
                 }
-            }
         }
 
         // Step 2: Check if primary is in the same AZ
-        if check_primary {
-            if let Some((address, connection_details)) =
+        if check_primary
+            && let Some((address, connection_details)) =
                 self.connection_details_for_address(addrs.primary().as_str())
-            {
-                if self.az_for_address(&address) == Some(client_az) {
+                && self.az_for_address(&address) == Some(client_az) {
                     return Some((address, connection_details.conn));
                 }
-            }
-        }
 
         // Step 3: Fall back to any available replica using round-robin or primary if needed
         self.round_robin_read_from_replica(slot_map_value)

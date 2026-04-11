@@ -1924,7 +1924,7 @@ impl FromValkeyValue for String {
     fn from_owned_valkey_value(v: Value) -> ValkeyResult<String> {
         let v = get_owned_inner_value(v);
         match v {
-            Value::BulkString(bytes) => Ok(String::from_utf8(bytes.to_vec().into())?),
+            Value::BulkString(bytes) => Ok(String::from_utf8(bytes.to_vec())?),
             Value::Okay => Ok("OK".to_string()),
             Value::SimpleString(val) => Ok(val),
             Value::VerbatimString { format: _, text } => Ok(text),
@@ -2357,7 +2357,7 @@ impl FromValkeyValue for bytes::Bytes {
     fn from_owned_valkey_value(v: Value) -> ValkeyResult<Self> {
         let v = get_owned_inner_value(v);
         match v {
-            Value::BulkString(bytes_vec) => Ok(bytes_vec.into()),
+            Value::BulkString(bytes_vec) => Ok(bytes_vec),
             _ => invalid_type_error!(v, "Not a bulk string"),
         }
     }

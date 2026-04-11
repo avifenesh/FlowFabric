@@ -328,14 +328,13 @@ impl SlotMap {
     /// # Returns:
     /// - `bool`: Returns `true` if the merge was successful, otherwise `false`.
     fn try_merge_to_next_range(&mut self, slot: u16, new_addrs: Arc<ShardAddrs>) -> bool {
-        if let Some((_next_end, next_slot_value)) = self.slots.range_mut((slot + 1)..).next() {
-            if next_slot_value.start == slot + 1
+        if let Some((_next_end, next_slot_value)) = self.slots.range_mut((slot + 1)..).next()
+            && next_slot_value.start == slot + 1
                 && Self::shard_addrs_equal(&next_slot_value.addrs, &new_addrs)
             {
                 next_slot_value.start = slot;
                 return true;
             }
-        }
         false
     }
 
@@ -354,14 +353,13 @@ impl SlotMap {
         slot: u16,
         new_addrs: Arc<ShardAddrs>,
     ) -> ValkeyResult<bool> {
-        if let Some((prev_end, prev_slot_value)) = self.slots.range_mut(..slot).next_back() {
-            if *prev_end == slot - 1 && Self::shard_addrs_equal(&prev_slot_value.addrs, &new_addrs)
+        if let Some((prev_end, prev_slot_value)) = self.slots.range_mut(..slot).next_back()
+            && *prev_end == slot - 1 && Self::shard_addrs_equal(&prev_slot_value.addrs, &new_addrs)
             {
                 let prev_end = *prev_end;
                 self.update_end_range(prev_end, slot)?;
                 return Ok(true);
             }
-        }
         Ok(false)
     }
 

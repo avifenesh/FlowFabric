@@ -114,7 +114,7 @@ fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
 
     let mut val: i64 = 0;
     for &b in digits {
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             let s = std::str::from_utf8(line).map_err(|_| {
                 ValkeyError::from((
                     ErrorKind::ParseError,
