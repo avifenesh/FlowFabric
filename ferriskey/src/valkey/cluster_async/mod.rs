@@ -136,7 +136,13 @@ fn set_routed_node_on_span(span: &GlideSpan, address: &str) {
 /// underlying connections maintained for each node in the cluster, as well
 /// as common parameters for connecting to nodes and executing commands.
 #[derive(Clone)]
-pub struct ClusterConnection<C = MultiplexedConnection>(mpsc::Sender<Message<C>>);
+pub struct ClusterConnection<C = MultiplexedConnection> {
+    /// Channel to the cluster task — used for fan-out, MOVED/ASK retries, admin ops.
+    cluster_task: mpsc::Sender<Message<C>>,
+    /// Direct access to the connections container for fast single-node dispatch.
+    /// Bypasses the cluster task entirely for the happy path.
+    inner: Core<C>,
+}
 
 impl<C> ClusterConnection<C>
 where
@@ -158,6 +164,7 @@ where
         )
         .await
         .map(|inner| {
+            let core = inner.inner.clone();
             let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
             let stream = async move {
                 let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
@@ -166,7 +173,10 @@ where
                     .await;
             };
             tokio::spawn(stream);
-            ClusterConnection(tx)
+            ClusterConnection {
+                cluster_task: tx,
+                inner: core,
+            }
         })
     }
 
@@ -234,7 +244,7 @@ where
         cluster_scan_args: ClusterScanArgs,
     ) -> RedisResult<(ScanStateRC, Vec<Value>)> {
         let (sender, receiver) = oneshot::channel();
-        self.0
+        self.cluster_task
             .send(Message {
                 cmd: CmdArg::ClusterScan { cluster_scan_args },
                 sender,
@@ -260,6 +270,45 @@ where
             })
     }
 
+    /// Fast path: resolve route and send directly to the per-node mux connection.
+    /// Returns Some(result) on success or non-retryable error.
+    /// Returns None if the route couldn't be resolved (falls back to cluster task).
+    async fn try_direct_dispatch(
+        &self,
+        cmd: &Cmd,
+        routing: &SingleNodeRoutingInfo,
+    ) -> Option<RedisResult<Value>> {
+        // Resolve the route to a connection. Clone the connection (cheap — it's
+        // just an mpsc sender clone) so we can drop the read lock before async work.
+        let conn_future = {
+            let container = self.inner.conn_lock.read();
+            match routing {
+                SingleNodeRoutingInfo::SpecificNode(route) => {
+                    container.connection_for_route(route)?.1
+                }
+                // Random, ByAddress, Redirect, etc. — let cluster task handle
+                _ => return None,
+            }
+        };
+        // Read lock is now dropped. Resolve the connection future.
+        let mut conn = conn_future.await;
+
+        let packed = cmd.get_packed_command();
+        let result = conn.send_packed_bytes(packed, cmd.is_fenced()).await;
+
+        match &result {
+            Ok(_) => Some(result),
+            Err(e) => {
+                // MOVED/ASK: fall back to cluster task for retry with slot refresh
+                if e.kind() == ErrorKind::Moved || e.kind() == ErrorKind::Ask {
+                    None
+                } else {
+                    Some(result)
+                }
+            }
+        }
+    }
+
     /// Send a command to the given `routing`. If `routing` is [None], it will be computed from `cmd`.
     pub async fn route_command(
         &mut self,
@@ -280,7 +329,7 @@ where
                 routing: routing.into(),
             },
         };
-        self.0
+        self.cluster_task
             .send(Message {
                 cmd: cmd_arg,
                 sender,
@@ -322,7 +371,7 @@ where
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
     ) -> RedisResult<Vec<Value>> {
         let (sender, receiver) = oneshot::channel();
-        self.0
+        self.cluster_task
             .send(Message {
                 cmd: CmdArg::Pipeline {
                     pipeline: Arc::new(pipeline.clone()),
@@ -421,7 +470,7 @@ where
         operation_request: Operation,
     ) -> RedisResult<Value> {
         let (sender, receiver) = oneshot::channel();
-        self.0
+        self.cluster_task
             .send(Message {
                 cmd: CmdArg::OperationRequest(operation_request),
                 sender,
@@ -4081,6 +4130,16 @@ where
         let routing = cluster_routing::RoutingInfo::for_routable(cmd).unwrap_or(
             cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
         );
+
+        // Fast path: single-node commands dispatch directly to the mux connection,
+        // bypassing the cluster task and FuturesUnordered entirely.
+        if let cluster_routing::RoutingInfo::SingleNode(ref single) = routing {
+            if let Some(result) = self.try_direct_dispatch(cmd, single).await {
+                return result;
+            }
+        }
+
+        // Slow path: fan-out, MOVED/ASK retries, or route resolution failed.
         self.route_command(cmd, routing).await
     }
 
@@ -4089,10 +4148,11 @@ where
         _packed: bytes::Bytes,
         _is_fenced: bool,
     ) -> RedisResult<Value> {
-        // ClusterConnection routes via route_command which handles packing internally.
+        // ClusterConnection uses req_packed_command for routing.
+        // send_packed_bytes without routing info is not meaningful at cluster level.
         Err(RedisError::from((
             crate::valkey::ErrorKind::ClientError,
-            "send_packed_bytes not supported on ClusterConnection",
+            "send_packed_bytes requires routing — use req_packed_command",
         )))
     }
 
