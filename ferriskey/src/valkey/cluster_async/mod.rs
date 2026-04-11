@@ -309,6 +309,118 @@ where
         }
     }
 
+    /// Fast path for non-atomic cross-slot pipelines.
+    /// Groups commands by node, sends sub-pipelines in parallel directly to node connections.
+    /// Returns None if any sub-pipeline hits MOVED/ASK (falls back to cluster task).
+    async fn try_direct_pipeline_dispatch(
+        &self,
+        pipeline: &crate::valkey::Pipeline,
+        count: usize,
+    ) -> Option<RedisResult<Vec<Value>>> {
+        use tokio::task::JoinSet;
+
+        // Step 1: Group commands by node address.
+        // Hold conn_lock briefly, only for route resolution.
+        type ConnFut<C> = futures::future::Shared<futures_util::future::BoxFuture<'static, C>>;
+
+        let grouped: Vec<(String, crate::valkey::Pipeline, Vec<usize>, ConnFut<C>)> = {
+            let container = self.inner.conn_lock.read();
+            if container.is_empty() {
+                return None;
+            }
+
+            // Route each command to a node
+            let mut node_map: std::collections::HashMap<
+                String,
+                (crate::valkey::Pipeline, Vec<usize>, ConnFut<C>),
+            > = std::collections::HashMap::new();
+
+            for (idx, cmd) in pipeline.cmd_iter().enumerate() {
+                let route = match cluster_routing::RoutingInfo::for_routable(cmd.as_ref()) {
+                    Some(cluster_routing::RoutingInfo::SingleNode(
+                        SingleNodeRoutingInfo::SpecificNode(route),
+                    )) => route,
+                    _ => return None, // Can't resolve inline — fall back
+                };
+
+                let (addr, conn) = match container.connection_for_route(&route) {
+                    Some(pair) => pair,
+                    None => return None, // Node not found — fall back
+                };
+
+                let entry = node_map
+                    .entry(addr)
+                    .or_insert_with(|| (crate::valkey::Pipeline::new(), Vec::new(), conn));
+                entry.0.add_command_with_arc(cmd.clone());
+                entry.1.push(idx);
+            }
+
+            node_map
+                .into_iter()
+                .map(|(addr, (pipe, indices, conn))| (addr, pipe, indices, conn))
+                .collect()
+        };
+        // conn_lock dropped here.
+
+        if grouped.is_empty() {
+            return None;
+        }
+
+        // Step 2: Send sub-pipelines in parallel, directly to node mux connections.
+        let mut join_set = JoinSet::new();
+        let mut node_info: Vec<(String, Vec<usize>)> = Vec::with_capacity(grouped.len());
+
+        for (addr, sub_pipeline, indices, conn_future) in grouped {
+            let sub_count = sub_pipeline.len();
+            node_info.push((addr, indices));
+
+            join_set.spawn(async move {
+                let mut conn = conn_future.await;
+                conn.req_packed_commands(&sub_pipeline, 0, sub_count, None).await
+            });
+        }
+
+        // Step 3: Collect results and reassemble in original command order.
+        let mut results_by_node: Vec<RedisResult<Vec<Value>>> = Vec::with_capacity(node_info.len());
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok(result) => results_by_node.push(result),
+                Err(_join_err) => return None, // Task panicked — fall back
+            }
+        }
+
+        // Reassemble: map sub-pipeline results back to original indices.
+        let total_cmds = count;
+        let mut final_results: Vec<Option<Value>> = vec![None; total_cmds];
+
+        for (node_idx, result) in results_by_node.into_iter().enumerate() {
+            let values = match result {
+                Ok(values) => values,
+                Err(e) => {
+                    if e.kind() == ErrorKind::Moved || e.kind() == ErrorKind::Ask {
+                        return None; // Fall back to cluster task for retry
+                    }
+                    return Some(Err(e));
+                }
+            };
+
+            let (_, ref indices) = node_info[node_idx];
+            for (sub_idx, &original_idx) in indices.iter().enumerate() {
+                if original_idx < total_cmds && sub_idx < values.len() {
+                    final_results[original_idx] = Some(values[sub_idx].clone());
+                }
+            }
+        }
+
+        // Fill any missing slots with Nil
+        let assembled: Vec<Value> = final_results
+            .into_iter()
+            .map(|opt| opt.unwrap_or(Value::Nil))
+            .collect();
+
+        Some(Ok(assembled))
+    }
+
     /// Send a command to the given `routing`. If `routing` is [None], it will be computed from `cmd`.
     pub async fn route_command(
         &mut self,
@@ -4186,7 +4298,14 @@ where
             }
         }
 
-        // Slow path: cross-slot, MOVED/ASK, or route not found
+        // Fast path: cross-slot non-atomic pipeline — split by node and send directly.
+        if !pipeline.is_atomic() && route.is_none() {
+            if let Some(result) = self.try_direct_pipeline_dispatch(pipeline, count).await {
+                return result;
+            }
+        }
+
+        // Slow path: MOVED/ASK retry, or direct dispatch failed
         self.route_pipeline(
             pipeline,
             offset,
