@@ -100,12 +100,12 @@ pub trait ConnectionLike: Send {
     /// Returns the state of the connection
     fn is_closed(&self) -> bool;
 
-    /// Get the connection availibility zone
+    /// Get the connection availability zone
     fn get_az(&self) -> Option<String> {
         None
     }
 
-    /// Set the connection availibility zone
+    /// Set the connection availability zone
     fn set_az(&mut self, _az: Option<String>) {}
 
     /// Update the node address used for PubSub tracking.

@@ -264,9 +264,12 @@ where
                     format!("Cluster: Failed to receive SCAN command response from internal send task. {e:?}"),
                 )))
             })
-            .map(|response| match response {
-                Response::ClusterScanResult(new_scan_state_ref, key) => (new_scan_state_ref, key),
-                Response::Single(_) | Response::Multiple(_) => unreachable!(),
+            .and_then(|response| match response {
+                Response::ClusterScanResult(new_scan_state_ref, key) => Ok((new_scan_state_ref, key)),
+                Response::Single(_) | Response::Multiple(_) => Err(ValkeyError::from((
+                    ErrorKind::ResponseError,
+                    "Unexpected response variant for cluster scan",
+                ))),
             })
     }
 
@@ -302,6 +305,12 @@ where
             Err(ref e) if e.kind() == ErrorKind::Moved => {
                 // MOVED: try to send directly to the redirect target.
                 // The cluster task will eventually refresh the slot map.
+                //
+                // SAFETY (SSRF): connection_for_address only performs a lookup in the
+                // existing connection map — it never creates new connections. This means
+                // we will only redirect to nodes that are already known to the cluster
+                // topology, so an attacker-controlled MOVED response cannot cause us to
+                // connect to an arbitrary address.
                 if let Some((addr, _slot)) = e.redirect_node() {
                     let conn_future = {
                         let container = self.inner.conn_lock.read();
@@ -316,7 +325,13 @@ where
                 None // Can't resolve redirect — fall back to cluster task
             }
             Err(ref e) if e.kind() == ErrorKind::Ask => {
-                // ASK: send ASKING to the redirect node, then retry the command
+                // ASK: send ASKING to the redirect node, then retry the command.
+                //
+                // NOTE: The ASKING command and the retried command are sent as two
+                // separate requests, which means another command could be interleaved
+                // between them on the same connection. A proper fix requires pipelining
+                // both into a single write, but that needs pipeline-level support which
+                // is not yet available on the direct-dispatch path.
                 if let Some((addr, _slot)) = e.redirect_node() {
                     let conn_future = {
                         let container = self.inner.conn_lock.read();
@@ -489,9 +504,12 @@ where
                     ),
                 )))
             })
-            .map(|response| match response {
-                Response::Single(value) => value,
-                Response::ClusterScanResult(..) | Response::Multiple(_) => unreachable!(),
+            .and_then(|response| match response {
+                Response::Single(value) => Ok(value),
+                Response::ClusterScanResult(..) | Response::Multiple(_) => Err(ValkeyError::from((
+                    ErrorKind::ResponseError,
+                    "Unexpected response variant for single command",
+                ))),
             })
     }
 
@@ -534,9 +552,12 @@ where
                     err.to_string(),
                 )))
             })
-            .map(|response| match response {
-                Response::Multiple(values) => values,
-                Response::ClusterScanResult(..) | Response::Single(_) => unreachable!(),
+            .and_then(|response| match response {
+                Response::Multiple(values) => Ok(values),
+                Response::ClusterScanResult(..) | Response::Single(_) => Err(ValkeyError::from((
+                    ErrorKind::ResponseError,
+                    "Unexpected response variant for pipeline",
+                ))),
             })
     }
     /// Update the password used to authenticate with all cluster servers
@@ -624,9 +645,12 @@ where
                     err.to_string(),
                 )))
             })
-            .map(|response| match response {
-                Response::Single(values) => values,
-                Response::ClusterScanResult(..) | Response::Multiple(_) => unreachable!(),
+            .and_then(|response| match response {
+                Response::Single(values) => Ok(values),
+                Response::ClusterScanResult(..) | Response::Multiple(_) => Err(ValkeyError::from((
+                    ErrorKind::ResponseError,
+                    "Unexpected response variant for operation request",
+                ))),
             })
     }
 }
@@ -1022,7 +1046,8 @@ impl<C> RequestInfo<C> {
                         *routing = redirect;
                     }
                     InternalRoutingInfo::MultiNode(_) => {
-                        panic!("Cannot redirect multinode requests")
+                        // Multi-node requests cannot be redirected — ignore the redirect.
+                        return;
                     }
                 },
                 CmdArg::Pipeline { route, .. } => {
@@ -1034,13 +1059,13 @@ impl<C> RequestInfo<C> {
                     };
                     *route = Some(redirect);
                 }
-                // cluster_scan is sent as a normal command internally so we will not reach that point.
+                // cluster_scan is sent as a normal command internally so we should not reach this point.
                 CmdArg::ClusterScan { .. } => {
-                    unreachable!()
+                    return;
                 }
-                // Operation requests are not routed.
+                // Operation requests are not routed — ignore redirects.
                 CmdArg::OperationRequest(_) => {
-                    unreachable!()
+                    return;
                 }
             }
         }
@@ -1070,19 +1095,12 @@ impl<C> RequestInfo<C> {
                 }
             }
             CmdArg::Pipeline { route, .. } => {
-                if route.is_some() {
-                    let route = route.as_mut().unwrap();
+                if let Some(route) = route.as_mut() {
                     fix_route(route);
                 }
             }
-            // cluster_scan is sent as a normal command internally so we will not reach that point.
-            CmdArg::ClusterScan { .. } => {
-                unreachable!()
-            }
-            // Operation requests are not routed.
-            CmdArg::OperationRequest { .. } => {
-                unreachable!()
-            }
+            // These variants don't have routing to reset — no-op.
+            CmdArg::ClusterScan { .. } | CmdArg::OperationRequest { .. } => {}
         }
     }
 }
@@ -1410,7 +1428,7 @@ impl<C> Future for Request<C> {
                 }
                 return Next::Done.into();
             }
-            _ => panic!("Request future must be Some"),
+            _ => return Poll::Ready(Next::Done),
         };
 
         match ready!(future.poll(cx)) {
@@ -1578,14 +1596,11 @@ impl<C> Future for Request<C> {
 
 impl<C> Request<C> {
     fn respond(self: Pin<&mut Self>, msg: ValkeyResult<Response>) {
-        // If `send` errors the receiver has dropped and thus does not care about the message
-        let _ = self
-            .project()
-            .request
-            .take()
-            .expect("Result should only be sent once")
-            .sender
-            .send(msg);
+        // If `send` errors the receiver has dropped and thus does not care about the message.
+        // If the request was already taken (result sent once), this is a no-op.
+        if let Some(req) = self.project().request.take() {
+            let _ = req.sender.send(msg);
+        }
     }
 }
 
@@ -2145,18 +2160,20 @@ where
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
     ) -> ValkeyResult<Value> {
-        // Helper: extract a single Value from a Response::Single
+        // Helper: extract a single Value from a Response::Single.
+        // Only Response::Single is expected for multi-node commands.
         let extract_result = |response| match response {
-            Response::Single(value) => value,
-            Response::Multiple(_) | Response::ClusterScanResult(_, _) => unreachable!(
-                "aggregate_results only handles `Response::Single` for multi-node commands"
-            ),
+            Response::Single(value) => Ok(value),
+            Response::Multiple(_) | Response::ClusterScanResult(_, _) => Err(ValkeyError::from((
+                ErrorKind::ResponseError,
+                "Unexpected response variant in aggregate_results",
+            ))),
         };
 
         // Converts a Result<ValkeyResult<Response>, _> into ValkeyResult<Value>
         let convert_result = |res: Result<ValkeyResult<Response>, _>| {
             res.map_err(|_| ValkeyError::from((ErrorKind::ResponseError, "Internal failure: receiver was dropped before delivering a response"))) // this happens only if the result sender is dropped before usage.
-            .and_then(|res| res.map(extract_result))
+            .and_then(|res| res.and_then(extract_result))
         };
 
         // Helper: await a (addr, receiver) and return (addr, ValkeyResult<Value>)

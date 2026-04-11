@@ -132,7 +132,7 @@ impl<'a, T: FromValkeyValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unp
                     Poll::Ready(value)
                 }
             },
-            IterOrFuture::Empty => unreachable!(),
+            IterOrFuture::Empty => return Poll::Ready(None),
         }
     }
 }

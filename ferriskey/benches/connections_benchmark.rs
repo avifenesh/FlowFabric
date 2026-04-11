@@ -180,6 +180,7 @@ fn format_tps(tps: f64) -> String {
 
 /// Pick the result with the median TPS from a vec of runs.
 fn median_by_tps(mut runs: Vec<BenchResult>) -> BenchResult {
+    assert!(!runs.is_empty(), "BENCH_RUNS must be >= 1");
     runs.sort_by(|a, b| a.tps.partial_cmp(&b.tps).unwrap());
     runs.swap_remove(runs.len() / 2)
 }
@@ -298,19 +299,21 @@ async fn run_workload<C: ConnectionLike + Clone + Send + 'static>(
             let mut rng = FastRng::new(task_id as u64 ^ 0xdeadbeef);
             let key = format!("bench:{task_id}");
 
-            let _ = conn
-                .req_packed_command(&cmd("SET").arg(&key).arg(value.as_slice()))
-                .await;
+            // Pre-build GET and SET commands once to avoid allocation in the hot loop.
+            let mut get_cmd = cmd("GET");
+            get_cmd.arg(&key);
+            let mut set_cmd = cmd("SET");
+            set_cmd.arg(&key).arg(value.as_slice());
+
+            let _ = conn.req_packed_command(&set_cmd).await;
 
             // Warmup
             let warmup_deadline = Instant::now() + warmup;
             while Instant::now() < warmup_deadline {
                 if rng.is_get() {
-                    let _ = conn.req_packed_command(&cmd("GET").arg(&key)).await;
+                    let _ = conn.req_packed_command(&get_cmd).await;
                 } else {
-                    let _ = conn
-                        .req_packed_command(&cmd("SET").arg(&key).arg(value.as_slice()))
-                        .await;
+                    let _ = conn.req_packed_command(&set_cmd).await;
                 }
             }
 
@@ -322,10 +325,9 @@ async fn run_workload<C: ConnectionLike + Clone + Send + 'static>(
             loop {
                 let start = Instant::now();
                 let result: ValkeyResult<Value> = if rng.is_get() {
-                    conn.req_packed_command(&cmd("GET").arg(&key)).await
+                    conn.req_packed_command(&get_cmd).await
                 } else {
-                    conn.req_packed_command(&cmd("SET").arg(&key).arg(value.as_slice()))
-                        .await
+                    conn.req_packed_command(&set_cmd).await
                 };
                 let elapsed_us = start.elapsed().as_micros() as u64;
 
