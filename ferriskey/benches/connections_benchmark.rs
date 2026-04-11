@@ -18,7 +18,7 @@
 //   BENCH_CPUS           CPUs to pin tokio workers to (default: 4-15)
 
 use ferriskey::valkey::{
-    ConnectionAddr, ConnectionInfo, RedisConnectionInfo, RedisResult, Value,
+    ConnectionAddr, ConnectionInfo, Pipeline, RedisConnectionInfo, RedisResult, Value,
     aio::ConnectionLike,
     cluster::ClusterClientBuilder,
     cluster_async::ClusterConnection,
@@ -56,8 +56,8 @@ impl BenchConfig {
         let (default_duration, default_warmup, value_sizes, concurrencies) = match profile.as_str()
         {
             "quick" => (10, 2, vec![1024], vec![1, 100]),
-            "full" => (120, 5, vec![100, 1024, 16384], vec![1, 10, 100]),
-            _ => (120, 5, vec![100, 1024], vec![10, 100]), // "short" default
+            "full" => (60, 5, vec![100, 1024, 16384], vec![1, 10, 100]),
+            _ => (60, 5, vec![100, 1024], vec![10, 100]), // "short" default
         };
 
         let duration = env::var("BENCH_DURATION")
@@ -377,6 +377,207 @@ async fn run_workload<C: ConnectionLike + Clone + Send + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline workload: N GET commands in a single pipeline, same key (same slot)
+// ---------------------------------------------------------------------------
+
+async fn run_pipeline_workload<C: ConnectionLike + Clone + Send + 'static>(
+    conn: C,
+    concurrency: usize,
+    pipeline_size: usize,
+    warmup: Duration,
+    measure: Duration,
+) -> BenchResult {
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut tasks = JoinSet::new();
+
+    for task_id in 0..concurrency {
+        let mut conn = conn.clone();
+        let barrier = Arc::clone(&barrier);
+
+        tasks.spawn(async move {
+            barrier.wait().await;
+
+            let key = format!("bench:{task_id}");
+
+            // Seed key
+            let _ = conn
+                .req_packed_command(&cmd("SET").arg(&key).arg("val"))
+                .await;
+
+            // Build pipeline once — same key, same slot
+            let mut pipe = Pipeline::new();
+            for _ in 0..pipeline_size {
+                let mut c = cmd("GET");
+                c.arg(&key);
+                pipe.add_command(c);
+            }
+
+            // Warmup
+            let warmup_deadline = Instant::now() + warmup;
+            while Instant::now() < warmup_deadline {
+                let _: RedisResult<Vec<Value>> = pipe.query_async(&mut conn).await;
+            }
+
+            // Measure
+            let mut latencies: Vec<u64> = Vec::with_capacity(500_000);
+            let mut errors: u64 = 0;
+            let deadline = Instant::now() + measure;
+
+            loop {
+                let start = Instant::now();
+                let result: RedisResult<Vec<Value>> = pipe.query_async(&mut conn).await;
+                let elapsed_us = start.elapsed().as_micros() as u64;
+
+                if result.is_ok() {
+                    latencies.push(elapsed_us);
+                } else {
+                    errors += 1;
+                }
+
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+
+            (latencies, errors)
+        });
+    }
+
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let mut total_ops: u64 = 0;
+    let mut total_errors: u64 = 0;
+
+    while let Some(result) = tasks.join_next().await {
+        let (latencies, errors) = result.unwrap();
+        total_ops += latencies.len() as u64;
+        total_errors += errors;
+        for &lat in &latencies {
+            let _ = hist.record(lat);
+        }
+    }
+
+    let duration_secs = measure.as_secs_f64();
+    let tps = total_ops as f64 / duration_secs;
+
+    BenchResult {
+        label: String::new(),
+        value_size: 0,
+        concurrency,
+        duration_secs,
+        total_ops,
+        total_errors,
+        tps,
+        p50_us: hist.value_at_quantile(0.50) as f64,
+        p75_us: hist.value_at_quantile(0.75) as f64,
+        p90_us: hist.value_at_quantile(0.90) as f64,
+        p99_us: hist.value_at_quantile(0.99) as f64,
+        max_us: hist.max() as f64,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MGET workload: single MGET of N keys, same hash tag (same slot)
+// ---------------------------------------------------------------------------
+
+async fn run_mget_workload<C: ConnectionLike + Clone + Send + 'static>(
+    conn: C,
+    concurrency: usize,
+    num_keys: usize,
+    warmup: Duration,
+    measure: Duration,
+) -> BenchResult {
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut tasks = JoinSet::new();
+
+    for task_id in 0..concurrency {
+        let mut conn = conn.clone();
+        let barrier = Arc::clone(&barrier);
+
+        tasks.spawn(async move {
+            barrier.wait().await;
+
+            // All keys in same hash tag → same slot
+            let keys: Vec<String> = (0..num_keys)
+                .map(|i| format!("{{bench:{task_id}}}:k{i}"))
+                .collect();
+
+            // Seed keys
+            for k in &keys {
+                let _ = conn
+                    .req_packed_command(&cmd("SET").arg(k).arg("v"))
+                    .await;
+            }
+
+            // Build MGET command
+            let mut mget = cmd("MGET");
+            for k in &keys {
+                mget.arg(k.as_str());
+            }
+
+            // Warmup
+            let warmup_deadline = Instant::now() + warmup;
+            while Instant::now() < warmup_deadline {
+                let _ = conn.req_packed_command(&mget).await;
+            }
+
+            // Measure
+            let mut latencies: Vec<u64> = Vec::with_capacity(500_000);
+            let mut errors: u64 = 0;
+            let deadline = Instant::now() + measure;
+
+            loop {
+                let start = Instant::now();
+                let result = conn.req_packed_command(&mget).await;
+                let elapsed_us = start.elapsed().as_micros() as u64;
+
+                if result.is_ok() {
+                    latencies.push(elapsed_us);
+                } else {
+                    errors += 1;
+                }
+
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+
+            (latencies, errors)
+        });
+    }
+
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let mut total_ops: u64 = 0;
+    let mut total_errors: u64 = 0;
+
+    while let Some(result) = tasks.join_next().await {
+        let (latencies, errors) = result.unwrap();
+        total_ops += latencies.len() as u64;
+        total_errors += errors;
+        for &lat in &latencies {
+            let _ = hist.record(lat);
+        }
+    }
+
+    let duration_secs = measure.as_secs_f64();
+    let tps = total_ops as f64 / duration_secs;
+
+    BenchResult {
+        label: String::new(),
+        value_size: 0,
+        concurrency,
+        duration_secs,
+        total_ops,
+        total_errors,
+        tps,
+        p50_us: hist.value_at_quantile(0.50) as f64,
+        p75_us: hist.value_at_quantile(0.75) as f64,
+        p90_us: hist.value_at_quantile(0.90) as f64,
+        p99_us: hist.value_at_quantile(0.99) as f64,
+        max_us: hist.max() as f64,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -456,6 +657,68 @@ fn main() {
                 runs.push(r);
             }
 
+            let median = median_by_tps(runs);
+            println!("  MEDIAN:");
+            median.print_full();
+            println!();
+            medians.push(median);
+        }
+    }
+
+    // Pipeline benchmark (10-cmd pipeline, same slot) — only on short/full
+    if cfg.profile != "quick" {
+        for &conc in &cfg.concurrencies {
+            let label = format!("pipeline-10cmd-c{conc}");
+            println!("[{}]  {} runs of {}s:", label, cfg.runs, cfg.duration.as_secs());
+
+            let mut runs: Vec<BenchResult> = Vec::with_capacity(cfg.runs);
+            for run in 0..cfg.runs {
+                {
+                    let mut c = conn.clone();
+                    runtime.block_on(async { let _ = c.req_packed_command(&cmd("FLUSHALL")).await; });
+                }
+                print!("  run {}/{} ... ", run + 1, cfg.runs);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+
+                let mut r = runtime.block_on(run_pipeline_workload(
+                    conn.clone(), conc, 10, cfg.warmup, cfg.duration,
+                ));
+                r.label = label.clone();
+                println!("{}", format_tps(r.tps));
+                r.print_short();
+                runs.push(r);
+            }
+            let median = median_by_tps(runs);
+            println!("  MEDIAN:");
+            median.print_full();
+            println!();
+            medians.push(median);
+        }
+    }
+
+    // MGET benchmark (10 keys, same hash tag → same slot) — only on short/full
+    if cfg.profile != "quick" {
+        for &conc in &cfg.concurrencies {
+            let label = format!("mget-10keys-c{conc}");
+            println!("[{}]  {} runs of {}s:", label, cfg.runs, cfg.duration.as_secs());
+
+            let mut runs: Vec<BenchResult> = Vec::with_capacity(cfg.runs);
+            for run in 0..cfg.runs {
+                {
+                    let mut c = conn.clone();
+                    runtime.block_on(async { let _ = c.req_packed_command(&cmd("FLUSHALL")).await; });
+                }
+                print!("  run {}/{} ... ", run + 1, cfg.runs);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+
+                let mut r = runtime.block_on(run_mget_workload(
+                    conn.clone(), conc, 10, cfg.warmup, cfg.duration,
+                ));
+                r.label = label.clone();
+                println!("{}", format_tps(r.tps));
+                r.print_short();
+                runs.push(r);
+            }
             let median = median_by_tps(runs);
             println!("  MEDIAN:");
             median.print_full();
