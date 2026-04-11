@@ -49,7 +49,7 @@ pub async fn create_pubsub_synchronizer(
 
     #[cfg(not(feature = "mock-pubsub"))]
     {
-        let sync = synchronizer::GlidePubSubSynchronizer::new(
+        let sync = synchronizer::ValkeyPubSubSynchronizer::new(
             initial_subscriptions,
             is_cluster,
             reconciliation_interval,
@@ -61,8 +61,8 @@ pub async fn create_pubsub_synchronizer(
         // the real client later.
         if internal_client.upgrade().is_some() {
             sync.as_any()
-                .downcast_ref::<synchronizer::GlidePubSubSynchronizer>()
-                .expect("Expected GlidePubSubSynchronizer")
+                .downcast_ref::<synchronizer::ValkeyPubSubSynchronizer>()
+                .expect("Expected ValkeyPubSubSynchronizer")
                 .set_internal_client(internal_client);
         }
         sync

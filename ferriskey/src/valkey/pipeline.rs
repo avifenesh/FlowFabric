@@ -4,11 +4,11 @@ use telemetrylib::GlideSpan;
 
 use crate::valkey::cmd::{cmd, cmd_len, Cmd};
 use crate::valkey::types::{
-    from_owned_valkey_value, ErrorKind, FromValkeyValue, HashSet, ValkeyResult, ToRedisArgs, Value,
+    from_owned_valkey_value, ErrorKind, FromValkeyValue, HashSet, ValkeyResult, ToValkeyArgs, Value,
 };
 use std::sync::Arc;
 
-/// Represents a redis command pipeline.
+/// Represents a valkey command pipeline.
 #[derive(Clone, Debug)]
 pub struct Pipeline {
     commands: Vec<Arc<Cmd>>,
@@ -244,7 +244,7 @@ macro_rules! implement_pipeline_commands {
             ///
             /// Note that this function fails the task if executed on an empty pipeline.
             #[inline]
-            pub fn arg<T: ToRedisArgs>(&mut self, arg: T) -> &mut Self {
+            pub fn arg<T: ToValkeyArgs>(&mut self, arg: T) -> &mut Self {
                 {
                     let cmd = self.get_last_command();
                     cmd.arg(arg);

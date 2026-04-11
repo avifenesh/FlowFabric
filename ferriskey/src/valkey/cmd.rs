@@ -7,10 +7,10 @@ use std::pin::Pin;
 use std::{borrow::Borrow, fmt, io};
 
 use crate::valkey::pipeline::Pipeline;
-use crate::valkey::types::{from_owned_valkey_value, FromValkeyValue, ValkeyResult, ValkeyWrite, ToRedisArgs};
+use crate::valkey::types::{from_owned_valkey_value, FromValkeyValue, ValkeyResult, ValkeyWrite, ToValkeyArgs};
 use telemetrylib::GlideSpan;
 
-/// An argument to a redis command
+/// An argument to a valkey command
 #[derive(Clone)]
 pub enum Arg<D> {
     /// A normal argument
@@ -19,7 +19,7 @@ pub enum Arg<D> {
     Cursor,
 }
 
-/// Represents redis commands.
+/// Represents valkey commands.
 #[derive(Clone)]
 pub struct Cmd {
     data: Vec<u8>,
@@ -57,7 +57,7 @@ enum IterOrFuture<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
     Empty,
 }
 
-/// Represents a redis iterator that can be used with async connections.
+/// Represents a valkey iterator that can be used with async connections.
 pub struct AsyncIter<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
     inner: IterOrFuture<'a, T, C>,
 }
@@ -324,7 +324,7 @@ impl Cmd {
     }
 
     /// Appends an argument to the command.  The argument passed must
-    /// be a type that implements `ToRedisArgs`.  Most primitive types as
+    /// be a type that implements `ToValkeyArgs`.  Most primitive types as
     /// well as vectors of primitive types implement it.
     ///
     /// For instance all of the following are valid:
@@ -337,8 +337,8 @@ impl Cmd {
     /// redis::cmd("SET").arg("my_key").arg(b"my_value");
     /// ```ignore
     #[inline]
-    pub fn arg<T: ToRedisArgs>(&mut self, arg: T) -> &mut Cmd {
-        arg.write_redis_args(self);
+    pub fn arg<T: ToValkeyArgs>(&mut self, arg: T) -> &mut Cmd {
+        arg.write_valkey_args(self);
         self
     }
 
@@ -411,7 +411,7 @@ impl Cmd {
     }
 
     /// Sends the command as query to the async connection and converts the
-    /// result to the target redis value.
+    /// result to the target valkey value.
     #[inline]
     pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
     where
@@ -560,7 +560,7 @@ impl fmt::Debug for Cmd {
 
 /// Shortcut function to creating a command with a single argument.
 ///
-/// The first argument of a redis command is always the name of the command
+/// The first argument of a valkey command is always the name of the command
 /// which needs to be a string.  This is the recommended way to start a
 /// command pipe.
 ///
@@ -593,11 +593,11 @@ pub fn fenced_cmd(name: &str) -> Cmd {
 /// Example:
 ///
 /// ```rust,ignore
-/// # use redis::ToRedisArgs;
+/// # use redis::ToValkeyArgs;
 /// let mut args = vec![];
-/// args.extend("SET".to_redis_args());
-/// args.extend("my_key".to_redis_args());
-/// args.extend(42.to_redis_args());
+/// args.extend("SET".to_valkey_args());
+/// args.extend("my_key".to_valkey_args());
+/// args.extend(42.to_valkey_args());
 /// let cmd = redis::pack_command(&args);
 /// assert_eq!(cmd, b"*3\r\n$3\r\nSET\r\n$6\r\nmy_key\r\n$2\r\n42\r\n".to_vec());
 /// ```ignore

@@ -329,7 +329,7 @@ impl IntoConnectionInfo for url::Url {
             "unix" | "redis+unix" => url_to_unix_connection_info(self),
             _ => fail!((
                 ErrorKind::InvalidClientConfig,
-                "URL provided is not a redis URL"
+                "URL provided is not a valkey URL"
             )),
         }
     }

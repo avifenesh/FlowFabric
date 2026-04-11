@@ -39,7 +39,7 @@ pub struct Client {
 /// let con = client.get_connection(None).unwrap();
 /// ```
 impl Client {
-    /// Connects to a redis server and returns a client.  This does not
+    /// Connects to a valkey server and returns a client.  This does not
     /// actually open a connection yet but it does perform some basic
     /// checks on the URL that might make the operation fail.
     pub fn open<T: IntoConnectionInfo>(params: T) -> ValkeyResult<Client> {
@@ -54,7 +54,7 @@ impl Client {
     }
 }
 
-/// Glide-specific connection options
+/// Ferriskey-specific connection options
 #[derive(Clone, Default)]
 pub struct GlideConnectionOptions {
     /// Queue for RESP3 notifications

@@ -32,9 +32,9 @@ const TOKEN_GEN_INITIAL_BACKOFF_MS: u64 = 100;
 /// Safety cap so we never sleep unreasonably long between attempts
 const TOKEN_GEN_MAX_BACKOFF_MS: u64 = 3_000;
 
-/// Custom error type for IAM operations in Glide
+/// Custom error type for IAM operations
 #[derive(Debug, Error)]
-pub enum GlideIAMError {
+pub enum IAMError {
     /// Invalid refresh interval (must be 1 second to 12 hours)
     #[error(
         "IAM authentication error: Invalid refresh interval. Must be between 1 and {max}, got: {actual}"
@@ -69,18 +69,18 @@ pub enum ServiceType {
 /// Validate refresh interval (1 second to 12 hours, defaults to 5 minutes)
 fn validate_refresh_interval(
     refresh_interval_seconds: Option<u32>,
-) -> Result<Option<u32>, GlideIAMError> {
+) -> Result<Option<u32>, IAMError> {
     match refresh_interval_seconds {
         Some(0) => {
             // Reject 0 as an invalid interval
-            Err(GlideIAMError::InvalidRefreshInterval {
+            Err(IAMError::InvalidRefreshInterval {
                 max: MAX_REFRESH_INTERVAL_SECONDS,
                 actual: 0,
             })
         }
         Some(interval) => {
             if interval >= MAX_REFRESH_INTERVAL_SECONDS {
-                return Err(GlideIAMError::InvalidRefreshInterval {
+                return Err(IAMError::InvalidRefreshInterval {
                     max: MAX_REFRESH_INTERVAL_SECONDS,
                     actual: interval,
                 });
@@ -112,20 +112,20 @@ fn validate_refresh_interval(
 async fn get_signing_identity(
     region: &str,
     service_type: ServiceType,
-) -> Result<aws_credential_types::Credentials, GlideIAMError> {
+) -> Result<aws_credential_types::Credentials, IAMError> {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()))
         .load()
         .await;
 
     let provider = config.credentials_provider().ok_or_else(|| {
-        GlideIAMError::CredentialsError("No AWS credentials provider found".into())
+        IAMError::CredentialsError("No AWS credentials provider found".into())
     })?;
 
     let creds = provider
         .provide_credentials()
         .await
-        .map_err(|e| GlideIAMError::CredentialsError(e.to_string()))?;
+        .map_err(|e| IAMError::CredentialsError(e.to_string()))?;
 
     let service_name: &'static str = service_type.into();
     Ok(Credentials::new(
@@ -204,7 +204,7 @@ impl IAMTokenManager {
         region: String,
         service_type: ServiceType,
         refresh_interval_seconds: Option<u32>,
-    ) -> Result<Self, GlideIAMError> {
+    ) -> Result<Self, IAMError> {
         let validated_refresh_interval = validate_refresh_interval(refresh_interval_seconds)?;
 
         let state = IamTokenState {
@@ -314,7 +314,7 @@ impl IAMTokenManager {
     /// Returns token on success, last error on failure.
     pub(crate) async fn generate_token_with_backoff(
         state: &IamTokenState,
-    ) -> Result<String, GlideIAMError> {
+    ) -> Result<String, IAMError> {
         let mut attempt: u32 = 0;
         let mut backoff_ms = TOKEN_GEN_INITIAL_BACKOFF_MS;
 
@@ -417,7 +417,7 @@ impl IAMTokenManager {
     }
 
     /// Generate IAM authentication token using SigV4 signing (valid for 15 minutes)
-    async fn generate_token_static(state: &IamTokenState) -> Result<String, GlideIAMError> {
+    async fn generate_token_static(state: &IamTokenState) -> Result<String, IAMError> {
         let service_name: &'static str = state.service_type.into();
         let signing_time = SystemTime::now();
         let hostname = state.cluster_name.clone();
@@ -440,7 +440,7 @@ impl IAMTokenManager {
             .settings(signing_settings)
             .build()
             .map_err(|e| {
-                GlideIAMError::TokenGenerationError(format!("Failed to build signing params: {e}"))
+                IAMError::TokenGenerationError(format!("Failed to build signing params: {e}"))
             })?
             .into();
 
@@ -452,12 +452,12 @@ impl IAMTokenManager {
             SignableBody::Bytes(b""),
         )
         .map_err(|e| {
-            GlideIAMError::TokenGenerationError(format!("Failed to create signable request: {e}"))
+            IAMError::TokenGenerationError(format!("Failed to create signable request: {e}"))
         })?;
 
         // Sign the request (with presigning settings, this will generate query parameters)
         let (instructions, _sig) = sign(signable_request, &signing_params)
-            .map_err(|e| GlideIAMError::TokenGenerationError(format!("Failed to sign: {e}")))?
+            .map_err(|e| IAMError::TokenGenerationError(format!("Failed to sign: {e}")))?
             .into_parts();
 
         // Build a temporary HTTP request to apply the signing instructions
@@ -467,7 +467,7 @@ impl IAMTokenManager {
             .header("host", &hostname)
             .body(())
             .map_err(|e| {
-                GlideIAMError::TokenGenerationError(format!("Build HTTP request failed: {e}"))
+                IAMError::TokenGenerationError(format!("Build HTTP request failed: {e}"))
             })?;
 
         instructions.apply_to_request_http1x(&mut req);
@@ -889,7 +889,7 @@ mod tests {
 
             let error = result.unwrap_err();
             match error {
-                GlideIAMError::InvalidRefreshInterval { max, actual } => {
+                IAMError::InvalidRefreshInterval { max, actual } => {
                     assert_eq!(
                         max, MAX_REFRESH_INTERVAL_SECONDS,
                         "Max value should be 43200 seconds"

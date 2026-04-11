@@ -157,7 +157,7 @@ where
         loop {
             let item = match ready!(self.as_mut().project().sink_stream.poll_next(cx)) {
                 Some(result) => result,
-                // The redis response stream is not going to produce any more items so we `Err`
+                // The valkey response stream is not going to produce any more items so we `Err`
                 // to break out of the `forward` combinator and stop handling requests
                 None => {
                     // this is the right place to notify about the passive TCP disconnect

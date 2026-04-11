@@ -81,7 +81,7 @@ impl RetryParams {
     }
 }
 
-/// Configuration for rate limiting slot refresh operations in a Redis cluster.
+/// Configuration for rate limiting slot refresh operations in a valkey cluster.
 ///
 /// This struct defines the interval duration between consecutive slot refresh
 /// operations and an additional jitter to introduce randomness in the refresh intervals.
@@ -547,7 +547,7 @@ impl ClusterClientBuilder {
 
 }
 
-/// This is a Redis Cluster client.
+/// This is a valkey Cluster client.
 #[derive(Clone)]
 pub struct ClusterClient {
     initial_nodes: Vec<ConnectionInfo>,

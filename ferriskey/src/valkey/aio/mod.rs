@@ -222,7 +222,7 @@ where
             Ok(Value::Okay) => (),
             _ => fail!((
                 ErrorKind::ResponseError,
-                "Redis server refused to switch database"
+                "Valkey server refused to switch database"
             )),
         }
     }
@@ -237,7 +237,7 @@ where
             Ok(Value::Okay) => {}
             _ => fail!((
                 ErrorKind::ResponseError,
-                "Redis server refused to set client name"
+                "Valkey server refused to set client name"
             )),
         }
     }

@@ -37,14 +37,14 @@ struct SyncDiff {
     to_unsubscribe_by_address: HashMap<String, PubSubSubscriptionInfo>,
 }
 
-/// Glide PubSub Synchronizer
+/// Ferriskey PubSub Synchronizer
 ///
 /// Implements the observer pattern for managing PubSub subscriptions:
 /// - `desired_subscriptions`: What the user wants to be subscribed to (modified by API calls)
 /// - `current_subscriptions_by_address`: What we're actually subscribed to (updated by push notifications)
 ///
 /// A background reconciliation task continuously aligns current subscriptions with desired subscriptions.
-pub struct GlidePubSubSynchronizer {
+pub struct ValkeyPubSubSynchronizer {
     /// Weak reference to internal client wrapper (set once during init)
     internal_client: OnceCell<Weak<TokioRwLock<ClientWrapper>>>,
 
@@ -76,7 +76,7 @@ pub struct GlidePubSubSynchronizer {
     request_timeout: Duration,
 }
 
-impl GlidePubSubSynchronizer {
+impl ValkeyPubSubSynchronizer {
     pub fn new(
         initial_subscriptions: Option<PubSubSubscriptionInfo>,
         is_cluster: bool,
@@ -627,7 +627,7 @@ impl GlidePubSubSynchronizer {
     }
 }
 
-impl Drop for GlidePubSubSynchronizer {
+impl Drop for ValkeyPubSubSynchronizer {
     fn drop(&mut self) {
         if let Some(handle) = self.reconciliation_task_handle.lock().unwrap().take() {
             handle.abort();
@@ -636,7 +636,7 @@ impl Drop for GlidePubSubSynchronizer {
 }
 
 #[async_trait]
-impl PubSubSynchronizer for GlidePubSubSynchronizer {
+impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

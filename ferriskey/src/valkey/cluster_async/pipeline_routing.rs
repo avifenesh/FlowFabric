@@ -635,7 +635,7 @@ fn process_pipeline_responses(
                 RetryMethod::NoRetry,
             ),
 
-            // If we received a redis error, we will convert it to a ServerError and append it to the relevant indices
+            // If we received a valkey error, we will convert it to a ServerError and append it to the relevant indices
             Ok(Err(err)) => {
                 let retry_method = err.retry_method();
                 (err.into(), retry_method)
@@ -1054,13 +1054,13 @@ where
 {
     for (indices, address, mut error) in indices_addresses_and_error {
         // Convert the ServerError to a ValkeyError and try to extract redirect info.
-        let redis_error: ValkeyError = error.clone().into();
+        let valkey_error: ValkeyError = error.clone().into();
         let (index, inner_index) = indices;
 
         // Handle MOVED redirect by updating the topology
         if matches!(retry_method, RetryMethod::MovedRedirect)
             && let Err(server_error) =
-                pipeline_handle_moved_redirect(core.clone(), &redis_error).await
+                pipeline_handle_moved_redirect(core.clone(), &valkey_error).await
             {
                 // A failure occurred, so we will append the error and continue to the next entry
                 error.append_detail(&server_error);
@@ -1074,7 +1074,7 @@ where
                 continue;
             }
 
-        if let Some(redirect_info) = redis_error.redirect(false) {
+        if let Some(redirect_info) = valkey_error.redirect(false) {
             let routing = InternalSingleNodeRouting::Redirect {
                 redirect: redirect_info,
                 previous_routing: Box::new(InternalSingleNodeRouting::ByAddress(address.clone())),
@@ -1130,13 +1130,13 @@ where
 /// If updating the topology fails, the error is returned.
 async fn pipeline_handle_moved_redirect<C>(
     core: Core<C>,
-    redis_error: &ValkeyError,
+    valkey_error: &ValkeyError,
 ) -> Result<(), ServerError>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     let redirect_node =
-        RedirectNode::from_option_tuple(redis_error.redirect_node()).ok_or_else(|| {
+        RedirectNode::from_option_tuple(valkey_error.redirect_node()).ok_or_else(|| {
             ServerError::ExtensionError {
                 code: "ParsingError".to_string(),
                 detail: Some("Failed to parse MOVED error".to_string()),
@@ -1215,8 +1215,8 @@ where
                     true,
                 );
             }
-            Err(redis_error) => {
-                error.append_detail(&redis_error.into());
+            Err(valkey_error) => {
+                error.append_detail(&valkey_error.into());
                 add_pipeline_result(
                     pipeline_responses,
                     index,

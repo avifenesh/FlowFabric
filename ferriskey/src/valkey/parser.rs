@@ -659,7 +659,7 @@ mod aio_support {
         }
     }
 
-    /// Parses a redis value asynchronously from an AsyncRead source.
+    /// Parses a valkey value asynchronously from an AsyncRead source.
     pub async fn parse_valkey_value_async<R>(
         _decoder: &mut (),
         read: &mut R,
@@ -690,7 +690,7 @@ mod aio_support {
 
 pub use self::aio_support::*;
 
-/// The internal redis response parser.
+/// The internal valkey response parser.
 pub struct Parser;
 
 impl Default for Parser {
@@ -728,7 +728,7 @@ impl Parser {
     }
 }
 
-/// Parses bytes into a redis value.
+/// Parses bytes into a valkey value.
 pub fn parse_valkey_value(bytes: &[u8]) -> ValkeyResult<Value> {
     // For complete buffers we can skip scan — parse_value_unchecked will
     // work if the data is complete, and we get an error/panic if not.

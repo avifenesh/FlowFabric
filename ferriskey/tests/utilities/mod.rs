@@ -147,16 +147,16 @@ impl ValkeyServer {
     pub fn with_modules(server_type: ServerType, modules: &[Module]) -> ValkeyServer {
         let addr = match server_type {
             ServerType::Tcp { tls } => {
-                let redis_port = get_available_port();
+                let valkey_port = get_available_port();
                 if tls {
                     ferriskey::valkey::ConnectionAddr::TcpTls {
                         host: IP_ADDRESS_V4.to_string(),
-                        port: redis_port,
+                        port: valkey_port,
                         insecure: true,
                         tls_params: None,
                     }
                 } else {
-                    ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), redis_port)
+                    ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), valkey_port)
                 }
             }
             ServerType::Unix => {
@@ -169,16 +169,16 @@ impl ValkeyServer {
     }
 
     pub fn new_with_tls(use_tls: bool, tls_paths: Option<TlsFilePaths>) -> ValkeyServer {
-        let redis_port = get_available_port();
+        let valkey_port = get_available_port();
         let addr = if use_tls {
             ferriskey::valkey::ConnectionAddr::TcpTls {
                 host: IP_ADDRESS_V4.to_string(),
-                port: redis_port,
+                port: valkey_port,
                 insecure: true,
                 tls_params: None,
             }
         } else {
-            ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), redis_port)
+            ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), valkey_port)
         };
 
         ValkeyServer::new_with_addr_tls_modules_and_spawner(addr, tls_paths, &[], false, |cmd| {
@@ -214,8 +214,8 @@ impl ValkeyServer {
                 Module::Json => {
                     valkey_cmd
                         .arg("--loadmodule")
-                        .arg(env::var("REDIS_RS_REDIS_JSON_PATH").expect(
-                        "Unable to find path to RedisJSON at REDIS_RS_REDIS_JSON_PATH, is it set?",
+                        .arg(env::var("VALKEY_JSON_PATH").expect(
+                        "Unable to find path to RedisJSON at VALKEY_JSON_PATH, is it set?",
                     ));
                 }
             };
@@ -225,7 +225,7 @@ impl ValkeyServer {
             .stdout(process::Stdio::null())
             .stderr(process::Stdio::null());
         let tempdir = tempfile::Builder::new()
-            .prefix("redis")
+            .prefix("valkey")
             .tempdir()
             .expect("failed to create tempdir");
         match addr {
@@ -249,16 +249,16 @@ impl ValkeyServer {
                     _ => "no",
                 };
 
-                // prepare redis with TLS
+                // prepare valkey with TLS
                 valkey_cmd
                     .arg("--tls-port")
                     .arg(port.to_string())
                     .arg("--port")
                     .arg("0")
                     .arg("--tls-cert-file")
-                    .arg(&tls_paths.redis_crt)
+                    .arg(&tls_paths.valkey_crt)
                     .arg("--tls-key-file")
-                    .arg(&tls_paths.redis_key)
+                    .arg(&tls_paths.valkey_key)
                     .arg("--tls-ca-cert-file")
                     .arg(&tls_paths.ca_crt)
                     .arg("--tls-auth-clients") // Make it so client doesn't have to send cert
@@ -398,8 +398,8 @@ where
 
 #[derive(Clone)]
 pub struct TlsFilePaths {
-    redis_crt: PathBuf,
-    redis_key: PathBuf,
+    valkey_crt: PathBuf,
+    valkey_key: PathBuf,
     ca_crt: PathBuf,
 }
 
@@ -412,8 +412,8 @@ pub fn build_tls_file_paths(tempdir: &tempfile::TempDir) -> TlsFilePaths {
     let ca_crt = temp_dir_path.join("ca.crt");
     let ca_key = temp_dir_path.join("ca.key");
     let ca_serial = temp_dir_path.join("ca.txt");
-    let redis_crt = temp_dir_path.join("redis.crt");
-    let redis_key = temp_dir_path.join("redis.key");
+    let valkey_crt = temp_dir_path.join("redis.crt");
+    let valkey_key = temp_dir_path.join("redis.key");
     let ext_file = temp_dir_path.join("openssl.cnf");
 
     fn make_key<S: AsRef<std::ffi::OsStr>>(name: S, size: usize) {
@@ -433,8 +433,8 @@ pub fn build_tls_file_paths(tempdir: &tempfile::TempDir) -> TlsFilePaths {
     // Build CA Key
     make_key(&ca_key, 4096);
 
-    // Build redis key
-    make_key(&redis_key, 2048);
+    // Build valkey key
+    make_key(&valkey_key, 2048);
 
     // Build CA Cert
     process::Command::new("openssl")
@@ -448,7 +448,7 @@ pub fn build_tls_file_paths(tempdir: &tempfile::TempDir) -> TlsFilePaths {
         .arg("-days")
         .arg("3650")
         .arg("-subj")
-        .arg("/O=Redis Test/CN=Certificate Authority")
+        .arg("/O=Valkey Test/CN=Certificate Authority")
         .arg("-out")
         .arg(&ca_crt)
         .stdout(process::Stdio::null())
@@ -468,21 +468,21 @@ pub fn build_tls_file_paths(tempdir: &tempfile::TempDir) -> TlsFilePaths {
     )
     .expect("failed to create x509v3 extensions file");
 
-    // Read redis key
+    // Read valkey key
     let mut key_cmd = process::Command::new("openssl")
         .arg("req")
         .arg("-new")
         .arg("-sha256")
         .arg("-subj")
-        .arg("/O=Redis Test/CN=Generic-cert")
+        .arg("/O=Valkey Test/CN=Generic-cert")
         .arg("-key")
-        .arg(&redis_key)
+        .arg(&valkey_key)
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::null())
         .spawn()
         .expect("failed to spawn openssl");
 
-    // build redis cert
+    // build valkey cert
     process::Command::new("openssl")
         .arg("x509")
         .arg("-req")
@@ -499,20 +499,20 @@ pub fn build_tls_file_paths(tempdir: &tempfile::TempDir) -> TlsFilePaths {
         .arg("-extfile")
         .arg(&ext_file)
         .arg("-out")
-        .arg(&redis_crt)
+        .arg(&valkey_crt)
         .stdin(key_cmd.stdout.take().expect("should have stdout"))
         .stdout(process::Stdio::null())
         .stderr(process::Stdio::null())
         .spawn()
         .expect("failed to spawn openssl")
         .wait()
-        .expect("failed to create redis cert");
+        .expect("failed to create valkey cert");
 
-    key_cmd.wait().expect("failed to create redis key");
+    key_cmd.wait().expect("failed to create valkey key");
 
     TlsFilePaths {
-        redis_crt,
-        redis_key,
+        valkey_crt,
+        valkey_key,
         ca_crt,
     }
 }
@@ -521,11 +521,11 @@ impl TlsFilePaths {
     pub fn read_ca_cert_as_bytes(&self) -> Vec<u8> {
         fs::read(&self.ca_crt).expect("Failed to read CA certificate file")
     }
-    pub fn read_redis_cert_as_bytes(&self) -> Vec<u8> {
-        fs::read(&self.redis_crt).expect("Failed to read redis certificate file")
+    pub fn read_valkey_cert_as_bytes(&self) -> Vec<u8> {
+        fs::read(&self.valkey_crt).expect("Failed to read redis certificate file")
     }
-    pub fn read_redis_key_as_bytes(&self) -> Vec<u8> {
-        fs::read(&self.redis_key).expect("Failed to read redis private key file")
+    pub fn read_valkey_key_as_bytes(&self) -> Vec<u8> {
+        fs::read(&self.valkey_key).expect("Failed to read redis private key file")
     }
 }
 
@@ -802,7 +802,7 @@ fn init() {
     );
 }
 
-pub async fn kill_connection(client: &mut impl ferriskey::client::GlideClientForTests) {
+pub async fn kill_connection(client: &mut impl ferriskey::client::ValkeyClientForTests) {
     let mut client_kill_cmd = ferriskey::valkey::cmd("CLIENT");
     client_kill_cmd.arg("KILL").arg("SKIPME").arg("NO");
 
@@ -819,7 +819,7 @@ pub async fn kill_connection(client: &mut impl ferriskey::client::GlideClientFor
 }
 
 pub async fn kill_connection_for_route(
-    client: &mut impl ferriskey::client::GlideClientForTests,
+    client: &mut impl ferriskey::client::ValkeyClientForTests,
     route: RoutingInfo,
 ) {
     let mut client_kill_cmd = ferriskey::valkey::cmd("CLIENT");
@@ -838,7 +838,7 @@ pub enum BackingServer {
 
 /// Get the server version from a client connection
 pub async fn get_server_version(
-    client: &mut impl ferriskey::client::GlideClientForTests,
+    client: &mut impl ferriskey::client::ValkeyClientForTests,
 ) -> (u16, u16, u16) {
     let mut info_cmd = ferriskey::valkey::cmd("INFO");
     info_cmd.arg("SERVER");
@@ -899,7 +899,7 @@ fn parse_version_string(version_str: &str) -> (u16, u16, u16) {
 
 /// Check if the server version is greater than or equal to the specified version
 pub async fn version_greater_or_equal(
-    client: &mut impl ferriskey::client::GlideClientForTests,
+    client: &mut impl ferriskey::client::ValkeyClientForTests,
     version: &str,
 ) -> bool {
     let (major, minor, patch) = get_server_version(client).await;
@@ -918,7 +918,7 @@ pub fn extract_client_id(client_info: &str) -> Option<String> {
 }
 
 /// Assert that a client is connected by sending a PING command
-pub async fn assert_connected(client: &mut impl ferriskey::client::GlideClientForTests) {
+pub async fn assert_connected(client: &mut impl ferriskey::client::ValkeyClientForTests) {
     let mut ping_cmd = ferriskey::valkey::cmd("PING");
     let ping_result = client.send_command(&mut ping_cmd, None).await;
     assert_eq!(

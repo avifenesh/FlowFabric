@@ -760,7 +760,7 @@ where
                     )))
                 }
             }
-            Err(redis_error) => Err(redis_error),
+            Err(valkey_error) => Err(valkey_error),
         }
     }
 
@@ -4363,7 +4363,7 @@ where
     }
 }
 
-/// Implements the process of connecting to a Redis server
+/// Implements the process of connecting to a Valkey server
 /// and obtaining a connection handle.
 pub trait Connect: Sized {
     /// Connect to a node.

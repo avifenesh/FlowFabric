@@ -9,7 +9,7 @@ mod standalone_client_tests {
     use crate::constants::{IP_ADDRESS_V4, IP_ADDRESS_V6};
     use crate::utilities::mocks::{Mock, ServerMock};
     use ferriskey::{
-        client::{Client as GlideClient, ConnectionError, StandaloneClient},
+        client::{Client as FerrisKeyClient, ConnectionError, StandaloneClient},
         client::types::ReadFrom,
     };
     use ferriskey::valkey::{FromValkeyValue, Value};
@@ -597,9 +597,9 @@ mod standalone_client_tests {
                 lazy_client_connection_request_pb;
 
             // We need to use the generic Client::new for lazy loading behavior
-            let mut lazy_glide_client_enum = GlideClient::new(core_connection_request, None)
+            let mut lazy_ferriskey_client_enum = FerrisKeyClient::new(core_connection_request, None)
                 .await
-                .expect("Failed to create lazy GlideClient for dedicated server");
+                .expect("Failed to create lazy FerrisKeyClient for dedicated server");
 
             // 6. Assert that no new connection was made yet by the lazy client
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -615,14 +615,14 @@ mod standalone_client_tests {
                 "Lazy client (on dedicated server) should not connect before the first command. Before: {clients_before_lazy_init}, After: {clients_after_lazy_init}. protocol={protocol:?}"
             );
 
-            // 7. Send the first command using the lazy client (which is a GlideClient)
+            // 7. Send the first command using the lazy client (which is a FerrisKeyClient)
             logger_core::log_info(
                 "TestStandaloneLazy",
                 format!(
                     "Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated server)"
                 ),
             );
-            assert_connected(&mut lazy_glide_client_enum).await;
+            assert_connected(&mut lazy_ferriskey_client_enum).await;
 
             // 8. Assert that a new connection was made by the lazy client on the dedicated server
             let clients_after_first_command = get_connected_clients(monitoring_client).await; // Pass &mut StandaloneClient
@@ -856,8 +856,8 @@ mod standalone_client_tests {
             let tls_paths = build_tls_file_paths(&tempdir);
 
             let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
-            let client_cert_bytes = tls_paths.read_redis_cert_as_bytes();
-            let client_key_bytes = tls_paths.read_redis_key_as_bytes();
+            let client_cert_bytes = tls_paths.read_valkey_cert_as_bytes();
+            let client_key_bytes = tls_paths.read_valkey_key_as_bytes();
 
             let server = ValkeyServer::new_with_addr_tls_modules_and_spawner(
                 ferriskey::valkey::ConnectionAddr::TcpTls {

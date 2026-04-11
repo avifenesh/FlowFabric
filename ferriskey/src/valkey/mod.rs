@@ -44,7 +44,7 @@ pub use crate::valkey::types::{
     ValkeyError,
     ValkeyResult,
     ValkeyWrite,
-    ToRedisArgs,
+    ToValkeyArgs,
 
     // low level values
     Value,

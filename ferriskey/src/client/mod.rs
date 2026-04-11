@@ -87,20 +87,20 @@ fn extract_request_type_from_cmd(cmd: &Cmd) -> Option<RequestType> {
     }
 }
 
-/// A static Glide runtime instance
-static RUNTIME: OnceCell<GlideRt> = OnceCell::new();
+/// A static Ferriskey runtime instance
+static RUNTIME: OnceCell<FerrisKeyRt> = OnceCell::new();
 
-pub struct GlideRt {
+pub struct FerrisKeyRt {
     pub runtime: Handle,
     pub(crate) thread: Option<JoinHandle<()>>,
     shutdown_notifier: Arc<Notify>,
 }
 
 /// Initializes a single-threaded Tokio runtime in a dedicated thread (if not already initialized)
-/// and returns a static reference to the `GlideRt` wrapper, which holds the runtime handle and a shutdown notifier.
+/// and returns a static reference to the `FerrisKeyRt` wrapper, which holds the runtime handle and a shutdown notifier.
 /// The runtime remains active indefinitely until a shutdown is triggered via the notifier, allowing tasks to be spawned
 /// throughout the lifetime of the application.
-pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
+pub fn get_or_init_runtime() -> Result<&'static FerrisKeyRt, String> {
     RUNTIME.get_or_try_init(|| {
         let notify = Arc::new(Notify::new());
         let notify_thread = notify.clone();
@@ -108,7 +108,7 @@ pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
         let (tx, rx) = oneshot::channel();
 
         let thread_handle = thread::Builder::new()
-            .name("glide-runtime-thread".into())
+            .name("ferriskey-runtime-thread".into())
             .spawn(move || {
                 match Builder::new_current_thread().enable_all().build() {
                     Ok(runtime) => {
@@ -127,7 +127,7 @@ pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
             .blocking_recv()
             .map_err(|err| format!("Failed to receive runtime handle: {err:?}"))??;
 
-        Ok(GlideRt {
+        Ok(FerrisKeyRt {
             runtime: runtime_handle,
             thread: Some(thread_handle),
             shutdown_notifier: notify,
@@ -135,7 +135,7 @@ pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
     })
 }
 
-impl Drop for GlideRt {
+impl Drop for FerrisKeyRt {
     fn drop(&mut self) {
         if let Some(rt) = RUNTIME.get() {
             rt.shutdown_notifier.notify_one();
@@ -143,7 +143,7 @@ impl Drop for GlideRt {
 
         // Move the JoinHandle out of the Option and join it
         if let Some(handle) = self.thread.take() {
-            handle.join().expect("GlideRt thread panicked");
+            handle.join().expect("FerrisKeyRt thread panicked");
         }
     }
 }
@@ -220,7 +220,7 @@ use crate::valkey::{TlsCertificates, retrieve_tls_certificates};
 pub(super) fn get_connection_info(
     address: &NodeAddress,
     tls_mode: TlsMode,
-    redis_connection_info: crate::valkey::ValkeyConnectionInfo,
+    valkey_connection_info: crate::valkey::ValkeyConnectionInfo,
     tls_params: Option<crate::valkey::TlsConnParams>,
 ) -> crate::valkey::ConnectionInfo {
     let addr = if tls_mode != TlsMode::NoTls {
@@ -235,7 +235,7 @@ pub(super) fn get_connection_info(
     };
     crate::valkey::ConnectionInfo {
         addr,
-        valkey: redis_connection_info,
+        valkey: valkey_connection_info,
     }
 }
 
@@ -1682,7 +1682,7 @@ async fn create_cluster_client(
 
     builder = builder.tcp_nodelay(request.tcp_nodelay);
 
-    // Always use with Glide
+    // Always use with Ferriskey
     builder = builder.periodic_connections_checks(Some(CONNECTION_CHECKS_INTERVAL));
 
     let client = builder.build()?;
@@ -2100,7 +2100,7 @@ impl Client {
     }
 }
 
-pub trait GlideClientForTests {
+pub trait ValkeyClientForTests {
     fn send_command<'a>(
         &'a mut self,
         cmd: &'a mut Cmd,
@@ -2108,7 +2108,7 @@ pub trait GlideClientForTests {
     ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value>;
 }
 
-impl GlideClientForTests for Client {
+impl ValkeyClientForTests for Client {
     fn send_command<'a>(
         &'a mut self,
         cmd: &'a mut Cmd,
@@ -2118,7 +2118,7 @@ impl GlideClientForTests for Client {
     }
 }
 
-impl GlideClientForTests for StandaloneClient {
+impl ValkeyClientForTests for StandaloneClient {
     fn send_command<'a>(
         &'a mut self,
         cmd: &'a mut Cmd,
@@ -2129,7 +2129,7 @@ impl GlideClientForTests for StandaloneClient {
 }
 
 // This is used for pubsub tests
-impl GlideClientForTests for ClusterConnection {
+impl ValkeyClientForTests for ClusterConnection {
     fn send_command<'a>(
         &'a mut self,
         cmd: &'a mut crate::valkey::Cmd,

@@ -110,7 +110,7 @@ pub enum ErrorKind {
     Ask,
     /// Raised if a request needs to be retried.
     TryAgain,
-    /// Raised if a redis cluster is down.
+    /// Raised if a valkey cluster is down.
     ClusterDown,
     /// A request spans multiple slots
     CrossSlot,
@@ -286,8 +286,8 @@ map_error_kinds!(
 );
 
 impl From<ValkeyError> for ServerError {
-    fn from(redis_error: ValkeyError) -> Self {
-        match redis_error.repr {
+    fn from(valkey_error: ValkeyError) -> Self {
+        match valkey_error.repr {
             ErrorRepr::ExtensionError(code, detail) => ServerError::ExtensionError {
                 code,
                 detail: Some(detail),
@@ -349,7 +349,7 @@ impl From<ServerError> for ValkeyError {
     }
 }
 
-/// Internal low-level redis value enum.
+/// Internal low-level valkey value enum.
 #[derive(PartialEq, Clone)]
 pub enum Value {
     /// A nil response from the server.
@@ -705,7 +705,7 @@ impl fmt::Debug for Value {
     }
 }
 
-/// Represents a redis error.  For the most part you should be using
+/// Represents a valkey error.  For the most part you should be using
 /// the Error trait to interact with this rather than the actual
 /// struct.
 pub struct ValkeyError {
@@ -1264,12 +1264,12 @@ impl Deref for InfoDict {
     }
 }
 
-/// Abstraction trait for redis command abstractions.
+/// Abstraction trait for valkey command abstractions.
 pub trait ValkeyWrite {
-    /// Accepts a serialized redis command.
+    /// Accepts a serialized valkey command.
     fn write_arg(&mut self, arg: &[u8]);
 
-    /// Accepts a serialized redis command.
+    /// Accepts a serialized valkey command.
     fn write_arg_fmt(&mut self, arg: impl fmt::Display) {
         self.write_arg(arg.to_string().as_bytes())
     }
@@ -1288,15 +1288,15 @@ impl ValkeyWrite for Vec<Vec<u8>> {
 /// Used to convert a value into one or multiple redis argument
 /// strings.  Most values will produce exactly one item but in
 /// some cases it might make sense to produce more than one.
-pub trait ToRedisArgs: Sized {
+pub trait ToValkeyArgs: Sized {
     /// This converts the value into a vector of bytes.  Each item
     /// is a single argument.  Most items generate a vector of a
     /// single item.
     ///
     /// The exception to this rule currently are vectors of items.
-    fn to_redis_args(&self) -> Vec<Vec<u8>> {
+    fn to_valkey_args(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        self.write_redis_args(&mut out);
+        self.write_valkey_args(&mut out);
         out
     }
 
@@ -1304,12 +1304,12 @@ pub trait ToRedisArgs: Sized {
     /// is a single argument.  Most items generate a single item.
     ///
     /// The exception to this rule currently are vectors of items.
-    fn write_redis_args<W>(&self, out: &mut W)
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite;
 
     /// Returns an information about the contained value with regards
-    /// to it's numeric behavior in a redis context.  This is used in
+    /// to it's numeric behavior in a valkey context.  This is used in
     /// some high level concepts to switch between different implementations
     /// of redis functions (for instance `INCR` vs `INCRBYFLOAT`).
     fn describe_numeric_behavior(&self) -> NumericBehavior {
@@ -1344,7 +1344,7 @@ pub trait ToRedisArgs: Sized {
         Self: 'a,
     {
         for item in items {
-            item.write_redis_args(out);
+            item.write_valkey_args(out);
         }
     }
 
@@ -1354,10 +1354,10 @@ pub trait ToRedisArgs: Sized {
     }
 }
 
-macro_rules! itoa_based_to_redis_impl {
+macro_rules! itoa_based_to_valkey_impl {
     ($t:ty, $numeric:expr) => {
-        impl ToRedisArgs for $t {
-            fn write_redis_args<W>(&self, out: &mut W)
+        impl ToValkeyArgs for $t {
+            fn write_valkey_args<W>(&self, out: &mut W)
             where
                 W: ?Sized + ValkeyWrite,
             {
@@ -1373,10 +1373,10 @@ macro_rules! itoa_based_to_redis_impl {
     };
 }
 
-macro_rules! non_zero_itoa_based_to_redis_impl {
+macro_rules! non_zero_itoa_based_to_valkey_impl {
     ($t:ty, $numeric:expr) => {
-        impl ToRedisArgs for $t {
-            fn write_redis_args<W>(&self, out: &mut W)
+        impl ToValkeyArgs for $t {
+            fn write_valkey_args<W>(&self, out: &mut W)
             where
                 W: ?Sized + ValkeyWrite,
             {
@@ -1394,8 +1394,8 @@ macro_rules! non_zero_itoa_based_to_redis_impl {
 
 macro_rules! ryu_based_to_redis_impl {
     ($t:ty, $numeric:expr) => {
-        impl ToRedisArgs for $t {
-            fn write_redis_args<W>(&self, out: &mut W)
+        impl ToValkeyArgs for $t {
+            fn write_valkey_args<W>(&self, out: &mut W)
             where
                 W: ?Sized + ValkeyWrite,
             {
@@ -1411,8 +1411,8 @@ macro_rules! ryu_based_to_redis_impl {
     };
 }
 
-impl ToRedisArgs for u8 {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl ToValkeyArgs for u8 {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
@@ -1433,32 +1433,32 @@ impl ToRedisArgs for u8 {
     }
 }
 
-itoa_based_to_redis_impl!(i8, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(i16, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(u16, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(i32, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(u32, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(i64, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(u64, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(isize, NumericBehavior::NumberIsInteger);
-itoa_based_to_redis_impl!(usize, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(i8, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(i16, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(u16, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(i32, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(u32, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(i64, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(u64, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(isize, NumericBehavior::NumberIsInteger);
+itoa_based_to_valkey_impl!(usize, NumericBehavior::NumberIsInteger);
 
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU8, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI8, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU16, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI16, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU32, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI32, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroU64, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroI64, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroUsize, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_redis_impl!(core::num::NonZeroIsize, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU8, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI8, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU16, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI16, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU32, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI32, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU64, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI64, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroUsize, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroIsize, NumericBehavior::NumberIsInteger);
 
 ryu_based_to_redis_impl!(f32, NumericBehavior::NumberIsFloat);
 ryu_based_to_redis_impl!(f64, NumericBehavior::NumberIsFloat);
 
-impl ToRedisArgs for bool {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl ToValkeyArgs for bool {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
@@ -1466,8 +1466,8 @@ impl ToRedisArgs for bool {
     }
 }
 
-impl ToRedisArgs for String {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl ToValkeyArgs for String {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
@@ -1475,8 +1475,8 @@ impl ToRedisArgs for String {
     }
 }
 
-impl ToRedisArgs for &str {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl ToValkeyArgs for &str {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
@@ -1484,39 +1484,39 @@ impl ToRedisArgs for &str {
     }
 }
 
-impl<T: ToRedisArgs> ToRedisArgs for Vec<T> {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs> ToValkeyArgs for Vec<T> {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
-        ToRedisArgs::write_args_from_slice(self, out)
+        ToValkeyArgs::write_args_from_slice(self, out)
     }
 
     fn is_single_arg(&self) -> bool {
-        ToRedisArgs::is_single_vec_arg(&self[..])
+        ToValkeyArgs::is_single_vec_arg(&self[..])
     }
 }
 
-impl<T: ToRedisArgs> ToRedisArgs for &[T] {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs> ToValkeyArgs for &[T] {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
-        ToRedisArgs::write_args_from_slice(self, out)
+        ToValkeyArgs::write_args_from_slice(self, out)
     }
 
     fn is_single_arg(&self) -> bool {
-        ToRedisArgs::is_single_vec_arg(self)
+        ToValkeyArgs::is_single_vec_arg(self)
     }
 }
 
-impl<T: ToRedisArgs> ToRedisArgs for Option<T> {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs> ToValkeyArgs for Option<T> {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
         if let Some(ref x) = *self {
-            x.write_redis_args(out);
+            x.write_valkey_args(out);
         }
     }
 
@@ -1535,12 +1535,12 @@ impl<T: ToRedisArgs> ToRedisArgs for Option<T> {
     }
 }
 
-impl<T: ToRedisArgs> ToRedisArgs for &T {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs> ToValkeyArgs for &T {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
-        (*self).write_redis_args(out)
+        (*self).write_valkey_args(out)
     }
 
     fn is_single_arg(&self) -> bool {
@@ -1551,14 +1551,14 @@ impl<T: ToRedisArgs> ToRedisArgs for &T {
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default> ToRedisArgs
+impl<T: ToValkeyArgs + Hash + Eq, S: BuildHasher + Default> ToValkeyArgs
     for std::collections::HashSet<T, S>
 {
-    fn write_redis_args<W>(&self, out: &mut W)
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
-        ToRedisArgs::make_arg_iter_ref(self.iter(), out)
+        ToValkeyArgs::make_arg_iter_ref(self.iter(), out)
     }
 
     fn is_single_arg(&self) -> bool {
@@ -1569,12 +1569,12 @@ impl<T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default> ToRedisArgs
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToRedisArgs + Hash + Eq + Ord> ToRedisArgs for BTreeSet<T> {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs + Hash + Eq + Ord> ToValkeyArgs for BTreeSet<T> {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
-        ToRedisArgs::make_arg_iter_ref(self.iter(), out)
+        ToValkeyArgs::make_arg_iter_ref(self.iter(), out)
     }
 
     fn is_single_arg(&self) -> bool {
@@ -1586,8 +1586,8 @@ impl<T: ToRedisArgs + Hash + Eq + Ord> ToRedisArgs for BTreeSet<T> {
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs for BTreeMap<T, V> {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs + Hash + Eq + Ord, V: ToValkeyArgs> ToValkeyArgs for BTreeMap<T, V> {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
@@ -1595,8 +1595,8 @@ impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs for BTreeMap<
             // otherwise things like HMSET will simply NOT work
             assert!(key.is_single_arg() && value.is_single_arg());
 
-            key.write_redis_args(out);
-            value.write_redis_args(out);
+            key.write_valkey_args(out);
+            value.write_valkey_args(out);
         }
     }
 
@@ -1605,18 +1605,18 @@ impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs for BTreeMap<
     }
 }
 
-impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs
+impl<T: ToValkeyArgs + Hash + Eq + Ord, V: ToValkeyArgs> ToValkeyArgs
     for std::collections::HashMap<T, V>
 {
-    fn write_redis_args<W>(&self, out: &mut W)
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
         for (key, value) in self {
             assert!(key.is_single_arg() && value.is_single_arg());
 
-            key.write_redis_args(out);
-            value.write_redis_args(out);
+            key.write_valkey_args(out);
+            value.write_valkey_args(out);
         }
     }
 
@@ -1625,17 +1625,17 @@ impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs
     }
 }
 
-macro_rules! to_redis_args_for_tuple {
+macro_rules! to_valkey_args_for_tuple {
     () => ();
     ($($name:ident,)+) => (
         #[doc(hidden)]
-        impl<$($name: ToRedisArgs),*> ToRedisArgs for ($($name,)*) {
+        impl<$($name: ToValkeyArgs),*> ToValkeyArgs for ($($name,)*) {
             // we have local variables named T1 as dummies and those
             // variables are unused.
             #[allow(non_snake_case, unused_variables)]
-            fn write_redis_args<W>(&self, out: &mut W) where W: ?Sized + ValkeyWrite {
+            fn write_valkey_args<W>(&self, out: &mut W) where W: ?Sized + ValkeyWrite {
                 let ($(ref $name,)*) = *self;
-                $($name.write_redis_args(out);)*
+                $($name.write_valkey_args(out);)*
             }
 
             #[allow(non_snake_case, unused_variables)]
@@ -1645,29 +1645,29 @@ macro_rules! to_redis_args_for_tuple {
                 n == 1
             }
         }
-        to_redis_args_for_tuple_peel!($($name,)*);
+        to_valkey_args_for_tuple_peel!($($name,)*);
     )
 }
 
 /// This chips of the leading one and recurses for the rest.  So if the first
 /// iteration was T1, T2, T3 it will recurse to T2, T3.  It stops for tuples
 /// of size 1 (does not implement down to unit).
-macro_rules! to_redis_args_for_tuple_peel {
-    ($name:ident, $($other:ident,)*) => (to_redis_args_for_tuple!($($other,)*);)
+macro_rules! to_valkey_args_for_tuple_peel {
+    ($name:ident, $($other:ident,)*) => (to_valkey_args_for_tuple!($($other,)*);)
 }
 
-to_redis_args_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
+to_valkey_args_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
 
-impl<T: ToRedisArgs, const N: usize> ToRedisArgs for &[T; N] {
-    fn write_redis_args<W>(&self, out: &mut W)
+impl<T: ToValkeyArgs, const N: usize> ToValkeyArgs for &[T; N] {
+    fn write_valkey_args<W>(&self, out: &mut W)
     where
         W: ?Sized + ValkeyWrite,
     {
-        ToRedisArgs::write_args_from_slice(self.as_slice(), out)
+        ToValkeyArgs::write_args_from_slice(self.as_slice(), out)
     }
 
     fn is_single_arg(&self) -> bool {
-        ToRedisArgs::is_single_vec_arg(self.as_slice())
+        ToValkeyArgs::is_single_vec_arg(self.as_slice())
     }
 }
 
@@ -1707,8 +1707,8 @@ impl<T: FromValkeyValue, const N: usize> FromValkeyValue for [T; N] {
     }
 }
 
-/// This trait is used to convert a redis value into a more appropriate
-/// type.  While a redis `Value` can represent any response that comes
+/// This trait is used to convert a valkey value into a more appropriate
+/// type.  While a valkey `Value` can represent any response that comes
 /// back from the redis server, usually you want to map this into something
 /// that works better in rust.  For instance you might want to convert the
 /// return value into a `String` or an integer.
@@ -1719,12 +1719,12 @@ impl<T: FromValkeyValue, const N: usize> FromValkeyValue for [T; N] {
 /// In addition to what you can see from the docs, this is also implemented
 /// for tuples up to size 12 and for `Vec<u8>`.
 pub trait FromValkeyValue: Sized {
-    /// Given a redis `Value` this attempts to convert it into the given
+    /// Given a valkey `Value` this attempts to convert it into the given
     /// destination type.  If that fails because it's not compatible an
     /// appropriate error is generated.
     fn from_valkey_value(v: &Value) -> ValkeyResult<Self>;
 
-    /// Given a redis `Value` this attempts to convert it into the given
+    /// Given a valkey `Value` this attempts to convert it into the given
     /// destination type.  If that fails because it's not compatible an
     /// appropriate error is generated.
     fn from_owned_valkey_value(v: Value) -> ValkeyResult<Self> {

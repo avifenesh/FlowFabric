@@ -562,7 +562,7 @@ pub(crate) fn convert_to_expected_type(
         // First part of the response (`running_script`) is converted as `Map[str, any]`
         // Second part is converted as `Map[str, Map[str, int]]`
         ExpectedReturnType::FunctionStatsReturnType => match value {
-            // TODO reuse https://github.com/Bit-Quill/glide-for-redis/pull/331 and https://github.com/valkey-io/valkey-glide/pull/1489
+            // TODO reuse https://github.com/Bit-Quill/valkey-glide/pull/331 and https://github.com/valkey-io/valkey-glide/pull/1489
             Value::Map(map) => Ok(Value::Map(map)),
             Value::Array(mut array) if array.len() == 4 => {
                 let mut result: Vec<(Value, Value)> = Vec::with_capacity(2);

@@ -534,7 +534,7 @@ mod cluster_client_tests {
             );
 
             // 5. Create the client
-            let mut lazy_glide_client = Client::new(lazy_connection_request, None)
+            let mut lazy_ferriskey_client = Client::new(lazy_connection_request, None)
                 .await
                 .expect("Failed to create lazy client for Cluster A");
 
@@ -559,7 +559,7 @@ mod cluster_client_tests {
                     "Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated cluster A)"
                 ),
             );
-            let ping_response = lazy_glide_client
+            let ping_response = lazy_ferriskey_client
                 .send_command(&mut ferriskey::valkey::cmd("PING"), None)
                 .await;
             assert!(

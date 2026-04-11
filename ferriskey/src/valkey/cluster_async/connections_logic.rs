@@ -370,7 +370,7 @@ where
 }
 
 #[doc(hidden)]
-pub const MANAGEMENT_CONN_NAME: &str = "glide_management_connection";
+pub const MANAGEMENT_CONN_NAME: &str = "ferriskey_management_connection";
 
 async fn setup_management_connection<C>(conn: &mut C) -> ValkeyResult<()>
 where
