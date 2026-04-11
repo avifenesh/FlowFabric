@@ -14,7 +14,7 @@ pub use span_exporter_file::SpanExporterFile;
 pub struct Telemetry {
     /// Total number of connections opened to Valkey
     total_connections: usize,
-    /// Total number of GLIDE clients
+    /// Total number of FerrisKey clients
     total_clients: usize,
     /// Total number of values compressed
     total_values_compressed: usize,

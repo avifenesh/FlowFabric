@@ -8,7 +8,7 @@ use crate::valkey::types::{
 use bytes::{Buf, BytesMut};
 use logger_core::log_error;
 use num_bigint::BigInt;
-use telemetrylib::GlideOpenTelemetry;
+use telemetrylib::FerrisKeyOtel;
 
 const MAX_RECURSE_DEPTH: usize = 100;
 const MAX_BULK_STRING_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
@@ -21,7 +21,7 @@ fn err_parser(line: &str) -> ServerError {
         "LOADING" => ServerErrorKind::BusyLoadingError,
         "NOSCRIPT" => ServerErrorKind::NoScriptError,
         "MOVED" => {
-            if let Err(e) = GlideOpenTelemetry::record_moved_error() {
+            if let Err(e) = FerrisKeyOtel::record_moved_error() {
                 log_error(
                     "OpenTelemetry:moved_error",
                     format!("Failed to record moved error: {e}"),
@@ -547,7 +547,7 @@ fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
         Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
-            "parse error when decoding verbatim string".to_string(),
+            "Parse error when decoding verbatim string".to_string(),
         )))
     }
 }
@@ -605,7 +605,7 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
         Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
-            "parse error when decoding push".to_string(),
+            "Parse error when decoding push".to_string(),
         )))
     }
 }

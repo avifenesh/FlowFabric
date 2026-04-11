@@ -13,7 +13,7 @@ use ferriskey::{
 use once_cell::sync::Lazy;
 use rand::{Rng, distr::Alphanumeric};
 use ferriskey::valkey::{
-    ConnectionAddr, GlideConnectionOptions, ProtocolVersion, PushInfo, ValkeyConnectionInfo,
+    ConnectionAddr, FerrisKeyConnectionOptions, ProtocolVersion, PushInfo, ValkeyConnectionInfo,
     ValkeyResult, Value,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
 };
@@ -539,7 +539,7 @@ pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
     .unwrap();
     loop {
         match client
-            .get_multiplexed_async_connection(GlideConnectionOptions::default())
+            .get_multiplexed_async_connection(FerrisKeyConnectionOptions::default())
             .await
         {
             Err(err) => {
@@ -660,7 +660,7 @@ pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &ValkeyConnection
     .unwrap();
     let mut connection = retry(|| async {
         client
-            .get_multiplexed_async_connection(GlideConnectionOptions::default())
+            .get_multiplexed_async_connection(FerrisKeyConnectionOptions::default())
             .await
             .ok()
     })

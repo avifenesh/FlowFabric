@@ -1,6 +1,6 @@
 #![macro_use]
 
-use telemetrylib::GlideSpan;
+use telemetrylib::FerrisKeySpan;
 
 use crate::valkey::cmd::{cmd, cmd_len, Cmd};
 use crate::valkey::types::{
@@ -15,7 +15,7 @@ pub struct Pipeline {
     transaction_mode: bool,
     ignored_commands: HashSet<usize>,
     /// The OpenTelemtry span command, to measure the lifetime of the pipeline.
-    otel_command_span: Option<GlideSpan>,
+    otel_command_span: Option<FerrisKeySpan>,
 }
 
 /// A pipeline allows you to send multiple commands in one go to the
@@ -57,13 +57,13 @@ impl Pipeline {
     }
 
     /// Set the pipeline span
-    pub fn set_pipeline_span(&mut self, span: Option<GlideSpan>) {
+    pub fn set_pipeline_span(&mut self, span: Option<FerrisKeySpan>) {
         self.otel_command_span = span;
     }
 
     /// Return this command span
     #[inline]
-    pub fn span(&self) -> Option<GlideSpan> {
+    pub fn span(&self) -> Option<FerrisKeySpan> {
         self.otel_command_span.clone()
     }
 

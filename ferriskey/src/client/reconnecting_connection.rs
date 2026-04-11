@@ -6,7 +6,7 @@ use futures_intrusive::sync::ManualResetEvent;
 use logger_core::{log_debug, log_error, log_trace, log_warn};
 use crate::valkey::aio::{DisconnectNotifier, MultiplexedConnection};
 use crate::valkey::{
-    GlideConnectionOptions, PushInfo, ValkeyConnectionInfo, ValkeyError, ValkeyResult, RetryStrategy,
+    FerrisKeyConnectionOptions, PushInfo, ValkeyConnectionInfo, ValkeyError, ValkeyResult, RetryStrategy,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -139,7 +139,7 @@ struct InnerReconnectingConnection {
 #[derive(Clone)]
 pub(super) struct ReconnectingConnection {
     inner: Arc<InnerReconnectingConnection>,
-    connection_options: GlideConnectionOptions,
+    connection_options: FerrisKeyConnectionOptions,
 }
 
 impl fmt::Debug for ReconnectingConnection {
@@ -150,7 +150,7 @@ impl fmt::Debug for ReconnectingConnection {
 
 async fn get_multiplexed_connection(
     client: &crate::valkey::Client,
-    connection_options: &GlideConnectionOptions,
+    connection_options: &FerrisKeyConnectionOptions,
 ) -> ValkeyResult<MultiplexedConnection> {
     run_with_timeout(
         Some(
@@ -211,7 +211,7 @@ async fn create_connection(
         guard.clone()
     };
 
-    let connection_options = GlideConnectionOptions {
+    let connection_options = FerrisKeyConnectionOptions {
         push_sender,
         disconnect_notifier: Some::<Box<dyn DisconnectNotifier>>(Box::new(
             TokioDisconnectNotifier::new(),

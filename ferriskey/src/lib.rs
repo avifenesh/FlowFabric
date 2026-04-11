@@ -22,6 +22,6 @@ pub mod iam;
 pub mod pubsub;
 pub mod request_type;
 pub use telemetrylib::{
-    DEFAULT_FLUSH_SIGNAL_INTERVAL_MS, DEFAULT_TRACE_SAMPLE_PERCENTAGE, GlideOpenTelemetry,
-    GlideOpenTelemetryConfigBuilder, GlideOpenTelemetrySignalsExporter, GlideSpan, Telemetry,
+    DEFAULT_FLUSH_SIGNAL_INTERVAL_MS, DEFAULT_TRACE_SAMPLE_PERCENTAGE, FerrisKeyOtel,
+    FerrisKeyOtelConfigBuilder, OtelSignalsExporter, FerrisKeySpan, Telemetry,
 };

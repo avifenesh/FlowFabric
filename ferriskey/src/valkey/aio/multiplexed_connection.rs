@@ -2,7 +2,7 @@ use super::ConnectionLike;
 use super::runtime;
 use crate::valkey::aio::setup_connection;
 use crate::valkey::aio::DisconnectNotifier;
-use crate::valkey::client::GlideConnectionOptions;
+use crate::valkey::client::FerrisKeyConnectionOptions;
 use crate::valkey::cmd::Cmd;
 use crate::valkey::parser::ValueCodec;
 use crate::valkey::pipeline::PipelineRetryStrategy;
@@ -592,7 +592,7 @@ impl MultiplexedConnection {
     pub async fn new<C>(
         connection_info: &ConnectionInfo,
         stream: C,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
@@ -601,7 +601,7 @@ impl MultiplexedConnection {
             connection_info,
             stream,
             std::time::Duration::MAX,
-            glide_connection_options,
+            ferriskey_connection_options,
         )
         .await
     }
@@ -612,7 +612,7 @@ impl MultiplexedConnection {
         connection_info: &ConnectionInfo,
         stream: C,
         response_timeout: std::time::Duration,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
@@ -621,11 +621,11 @@ impl MultiplexedConnection {
             .framed(stream)
             .and_then(|msg| async move { msg });
         let (mut pipeline, driver) =
-            Pipeline::new(codec, glide_connection_options.disconnect_notifier);
+            Pipeline::new(codec, ferriskey_connection_options.disconnect_notifier);
         let driver = Box::pin(driver);
         let pm = PushManager::new(
-            glide_connection_options.push_sender,
-            glide_connection_options.pubsub_synchronizer,
+            ferriskey_connection_options.push_sender,
+            ferriskey_connection_options.pubsub_synchronizer,
             Some(connection_info.addr.to_string()),
         );
 
@@ -645,7 +645,7 @@ impl MultiplexedConnection {
             let auth = setup_connection(
                 &connection_info.valkey,
                 &mut con,
-                glide_connection_options.discover_az,
+                ferriskey_connection_options.discover_az,
             );
 
             futures_util::pin_mut!(auth);

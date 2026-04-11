@@ -684,8 +684,8 @@ async fn test_regression_subscription_last_sync_timestamp() {
 
     run_metric_export_test(
         "subscription_timestamp",
-        "glide.pubsub.subscription.last_sync_timestamp",
-        create_gauge_metrics("glide.pubsub.subscription.last_sync_timestamp", timestamp),
+        "ferriskey.pubsub.subscription.last_sync_timestamp",
+        create_gauge_metrics("ferriskey.pubsub.subscription.last_sync_timestamp", timestamp),
         |json| {
             let value = json["scope_metrics"][0]["metrics"][0]["data_points"][0]["value"]
                 .as_u64()

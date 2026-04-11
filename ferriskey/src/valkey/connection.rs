@@ -457,7 +457,7 @@ impl fmt::Debug for NoCertificateVerification {
 pub(crate) fn client_set_info_pipeline(lib_name: Option<&str>) -> Pipeline {
     let mut pipeline = crate::valkey::pipe();
     let lib_name_value = lib_name.unwrap_or("UnknownClient");
-    let final_lib_name = option_env!("GLIDE_NAME").unwrap_or(lib_name_value);
+    let final_lib_name = option_env!("FERRISKEY_NAME").unwrap_or(lib_name_value);
     pipeline
         .cmd("CLIENT")
         .arg("SETINFO")
@@ -498,7 +498,7 @@ mod tests {
         assert!(cmd_str.contains("CLIENT"));
         assert!(cmd_str.contains("SETINFO"));
         assert!(cmd_str.contains("LIB-NAME"));
-        assert!(cmd_str.contains("Glide") || cmd_str.contains("UnknownClient"));
+        assert!(cmd_str.contains("FerrisKey") || cmd_str.contains("UnknownClient"));
     }
 
     #[test]

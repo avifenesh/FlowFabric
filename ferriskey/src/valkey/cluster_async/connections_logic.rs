@@ -5,7 +5,7 @@ use super::{
 use crate::valkey::cluster_slotmap::ReadFromReplicaStrategy;
 use crate::valkey::{
     aio::{ConnectionLike, DisconnectNotifier},
-    client::GlideConnectionOptions,
+    client::FerrisKeyConnectionOptions,
     cluster::get_connection_info,
     cluster_client::ClusterParams,
     ErrorKind, ValkeyError, ValkeyResult,
@@ -55,7 +55,7 @@ pub(crate) async fn get_or_create_conn<C>(
     node: Option<AsyncClusterNode<C>>,
     params: &ClusterParams,
     conn_type: RefreshConnectionType,
-    glide_connection_options: GlideConnectionOptions,
+    ferriskey_connection_options: FerrisKeyConnectionOptions,
 ) -> ValkeyResult<AsyncClusterNode<C>>
 where
     C: ConnectionLike + Send + Clone + Sync + Connect + 'static,
@@ -71,7 +71,7 @@ where
                 None,
                 conn_type,
                 Some(node),
-                glide_connection_options,
+                ferriskey_connection_options,
             )
             .await
             .get_node(),
@@ -83,7 +83,7 @@ where
             None,
             conn_type,
             None,
-            glide_connection_options,
+            ferriskey_connection_options,
         )
         .await
         .get_node()
@@ -107,7 +107,7 @@ pub(crate) async fn connect_and_check_all_connections<C>(
     addr: &str,
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
-    glide_connection_options: GlideConnectionOptions,
+    ferriskey_connection_options: FerrisKeyConnectionOptions,
 ) -> ConnectAndCheckResult<C>
 where
     C: ConnectionLike + Connect + Send + Sync + 'static + Clone,
@@ -119,7 +119,7 @@ where
             params.clone(),
             socket_addr,
             false,
-            glide_connection_options.clone(),
+            ferriskey_connection_options.clone(),
         ),
         // Management connection
         create_connection(
@@ -127,7 +127,7 @@ where
             params.clone(),
             socket_addr,
             true,
-            glide_connection_options,
+            ferriskey_connection_options,
         ),
     )
     .await
@@ -187,7 +187,7 @@ where
         params.clone(),
         socket_addr,
         true,
-        GlideConnectionOptions {
+        FerrisKeyConnectionOptions {
             push_sender: None,
             disconnect_notifier,
             discover_az,
@@ -275,7 +275,7 @@ pub async fn connect_and_check<C>(
     socket_addr: Option<SocketAddr>,
     conn_type: RefreshConnectionType,
     node: Option<AsyncClusterNode<C>>,
-    glide_connection_options: GlideConnectionOptions,
+    ferriskey_connection_options: FerrisKeyConnectionOptions,
 ) -> ConnectAndCheckResult<C>
 where
     C: ConnectionLike + Connect + Send + Sync + 'static + Clone,
@@ -286,7 +286,7 @@ where
                 addr,
                 params.clone(),
                 socket_addr,
-                glide_connection_options,
+                ferriskey_connection_options,
             )
             .await
             {
@@ -305,7 +305,7 @@ where
                         params,
                         socket_addr,
                         node,
-                        glide_connection_options.disconnect_notifier,
+                        ferriskey_connection_options.disconnect_notifier,
                     )
                     .await
                 }
@@ -314,14 +314,14 @@ where
                         addr,
                         params,
                         socket_addr,
-                        glide_connection_options,
+                        ferriskey_connection_options,
                     )
                     .await
                 }
             }
         }
         RefreshConnectionType::AllConnections => {
-            connect_and_check_all_connections(addr, params, socket_addr, glide_connection_options)
+            connect_and_check_all_connections(addr, params, socket_addr, ferriskey_connection_options)
                 .await
         }
     }
@@ -331,7 +331,7 @@ async fn create_and_setup_user_connection<C>(
     node: &str,
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
-    glide_connection_options: GlideConnectionOptions,
+    ferriskey_connection_options: FerrisKeyConnectionOptions,
 ) -> ValkeyResult<ConnectionDetails<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
@@ -341,7 +341,7 @@ where
         params.clone(),
         socket_addr,
         false,
-        glide_connection_options,
+        ferriskey_connection_options,
     )
     .await?;
     setup_user_connection(&mut connection, params).await?;
@@ -388,7 +388,7 @@ async fn create_connection<C>(
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
     is_management: bool,
-    mut glide_connection_options: GlideConnectionOptions,
+    mut ferriskey_connection_options: FerrisKeyConnectionOptions,
 ) -> ValkeyResult<ConnectionDetails<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
@@ -399,15 +399,15 @@ where
     // management connection does not require notifications or disconnect notifications
     // or pubsub synchronizer (subscriptions only exist on user connections)
     if is_management {
-        glide_connection_options.disconnect_notifier = None;
-        glide_connection_options.pubsub_synchronizer = None;
+        ferriskey_connection_options.disconnect_notifier = None;
+        ferriskey_connection_options.pubsub_synchronizer = None;
     }
     C::connect(
         info,
         response_timeout,
         connection_timeout,
         socket_addr,
-        glide_connection_options,
+        ferriskey_connection_options,
     )
     .await
     .map(|conn| {

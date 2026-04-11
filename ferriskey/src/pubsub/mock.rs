@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
-use telemetrylib::GlideOpenTelemetry;
+use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{Notify, RwLock as TokioRwLock, mpsc};
 use tokio::time::sleep;
 
@@ -227,13 +227,13 @@ impl MockPubSubSynchronizer {
     pub(crate) fn check_and_record_sync_state(&self) {
         let is_synced = self.is_synchronized();
         if is_synced {
-            let _ = GlideOpenTelemetry::update_subscription_last_sync_timestamp();
+            let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
             log_debug(
                 "mock_pubsub",
                 format!("Client {} subscriptions in sync", self.client_id),
             );
         } else {
-            let _ = GlideOpenTelemetry::record_subscription_out_of_sync();
+            let _ = FerrisKeyOtel::record_subscription_out_of_sync();
             let (desired, actual) = self.get_subscription_state();
             log_debug(
                 "mock_pubsub",

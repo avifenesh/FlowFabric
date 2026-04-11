@@ -56,7 +56,7 @@ impl Client {
 
 /// Ferriskey-specific connection options
 #[derive(Clone, Default)]
-pub struct GlideConnectionOptions {
+pub struct FerrisKeyConnectionOptions {
     /// Queue for RESP3 notifications
     pub push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     /// Passive disconnect notifier
@@ -96,12 +96,12 @@ impl Client {
     /// Returns an async multiplexed connection from the client.
     pub async fn get_multiplexed_async_connection(
         &self,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<crate::valkey::aio::MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
-            glide_connection_options,
+            ferriskey_connection_options,
         )
         .await
     }
@@ -111,14 +111,14 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<crate::valkey::aio::MultiplexedConnection> {
         let result = crate::valkey::aio::runtime::timeout(
             connection_timeout,
             self.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
                 response_timeout,
                 None,
-                glide_connection_options,
+                ferriskey_connection_options,
             ),
         )
         .await;
@@ -135,12 +135,12 @@ impl Client {
     /// For Unix connections, returns (async connection, None)
     pub async fn get_multiplexed_async_connection_ip(
         &self,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)> {
         self.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
             Duration::MAX,
             None,
-            glide_connection_options,
+            ferriskey_connection_options,
         )
         .await
     }
@@ -149,7 +149,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)>
     where
         T: crate::valkey::aio::RedisRuntime,
@@ -161,7 +161,7 @@ impl Client {
         let (con, ip) = crate::valkey::aio::connect_simple::<T>(
             conn_info,
             socket_addr,
-            glide_connection_options.tcp_nodelay,
+            ferriskey_connection_options.tcp_nodelay,
         )
         .await?;
         let (connection, driver) =
@@ -169,7 +169,7 @@ impl Client {
                 conn_info,
                 con.boxed(),
                 response_timeout,
-                glide_connection_options,
+                ferriskey_connection_options,
             )
             .await?;
         T::spawn(driver);

@@ -27,25 +27,25 @@ const SPAN_READ_LOCK_ERR: &str = "Failed to acquire span read lock";
 const TRACE_SCOPE: &str = "valkey_glide";
 
 // Metric names
-const TIMEOUT_ERROR_METRIC: &str = "glide.timeout_errors";
-const RETRIES_METRIC: &str = "glide.retry_attempts";
-const MOVED_ERROR_METRIC: &str = "glide.moved_errors";
-const SUBSCRIPTION_OUT_OF_SYNC_METRIC: &str = "glide.subscription_out_of_sync_count";
-const SUBSCRIPTION_LAST_SYNC_TIMESTAMP_METRIC: &str = "glide.subscription_last_sync_timestamp";
+const TIMEOUT_ERROR_METRIC: &str = "ferriskey.timeout_errors";
+const RETRIES_METRIC: &str = "ferriskey.retry_attempts";
+const MOVED_ERROR_METRIC: &str = "ferriskey.moved_errors";
+const SUBSCRIPTION_OUT_OF_SYNC_METRIC: &str = "ferriskey.subscription_out_of_sync_count";
+const SUBSCRIPTION_LAST_SYNC_TIMESTAMP_METRIC: &str = "ferriskey.subscription_last_sync_timestamp";
 
-/// Custom error type for OpenTelemetry errors in Glide
+/// Custom error type for OpenTelemetry errors
 #[derive(Debug, Error)]
-pub enum GlideOTELError {
-    #[error("Glide OpenTelemetry trace error: {0}")]
+pub enum OtelError {
+    #[error("FerrisKey OpenTelemetry trace error: {0}")]
     TraceError(#[from] TraceError),
 
-    #[error("Glide OpenTelemetry metric error: {0}")]
+    #[error("FerrisKey OpenTelemetry metric error: {0}")]
     MetricError(#[from] MetricError),
 
-    #[error("Glide OpenTelemetry error: Failed to acquire read lock")]
+    #[error("FerrisKey OpenTelemetry error: Failed to acquire read lock")]
     ReadLockError,
 
-    #[error("Glide OpenTelemetry error: Failed to acquire write lock")]
+    #[error("FerrisKey OpenTelemetry error: Failed to acquire write lock")]
     WriteLockError,
 
     #[error("Other error: {0}")]
@@ -61,7 +61,7 @@ pub const DEFAULT_TRACE_SAMPLE_PERCENTAGE: u32 = 1;
 /// Default filename for the file exporter.
 pub const DEFAULT_SIGNAL_FILENAME: &str = "signals.json";
 
-pub enum GlideSpanStatus {
+pub enum FerrisKeySpanStatus {
     Ok,
     Error(String),
 }
@@ -70,7 +70,7 @@ pub enum GlideSpanStatus {
 /// Defines the method that exporter connects to the collector. It can be:
 /// gRPC or HTTP. The third type (i.e. "File") defines an exporter that does not connect to a collector
 /// instead, it writes the collected signals to files.
-pub enum GlideOpenTelemetrySignalsExporter {
+pub enum OtelSignalsExporter {
     /// Collector is listening on grpc
     Grpc(String),
     /// Collector is listening on http
@@ -115,23 +115,23 @@ fn protocol_from_env(signal: OtelSignal) -> Option<Protocol> {
     }
 }
 
-impl std::str::FromStr for GlideOpenTelemetrySignalsExporter {
+impl std::str::FromStr for OtelSignalsExporter {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         parse_endpoint(s)
     }
 }
 
-fn parse_endpoint(endpoint: &str) -> Result<GlideOpenTelemetrySignalsExporter, Error> {
+fn parse_endpoint(endpoint: &str) -> Result<OtelSignalsExporter, Error> {
     // Parse the URL using the `url` crate to validate it
     let url = Url::parse(endpoint)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, format!("Parse error. {endpoint}")))?;
 
     match url.scheme() {
-        "http" | "https" => Ok(GlideOpenTelemetrySignalsExporter::Http(
+        "http" | "https" => Ok(OtelSignalsExporter::Http(
             endpoint.to_string(),
         )), // HTTP/HTTPS endpoint
-        "grpc" => Ok(GlideOpenTelemetrySignalsExporter::Grpc(
+        "grpc" => Ok(OtelSignalsExporter::Grpc(
             endpoint.to_string(),
         )), // gRPC endpoint
         "file" => {
@@ -186,20 +186,20 @@ fn parse_endpoint(endpoint: &str) -> Result<GlideOpenTelemetrySignalsExporter, E
                 }
             }
 
-            Ok(GlideOpenTelemetrySignalsExporter::File(final_path))
+            Ok(OtelSignalsExporter::File(final_path))
         } // file endpoint
         _ => Err(Error::new(ErrorKind::InvalidInput, endpoint)),
     }
 }
 
 #[derive(Clone, Debug)]
-struct GlideSpanInner {
+struct FerrisKeySpanInner {
     span: Arc<RwLock<opentelemetry::global::BoxedSpan>>,
     #[cfg(test)]
     reference_count: Arc<AtomicUsize>,
 }
 
-impl GlideSpanInner {
+impl FerrisKeySpanInner {
     /// Create new span with no parent.
     pub fn new(name: &str) -> Self {
         let tracer = global::tracer(TRACE_SCOPE);
@@ -210,7 +210,7 @@ impl GlideSpanInner {
                 .start(&tracer),
         ));
 
-        GlideSpanInner {
+        FerrisKeySpanInner {
             span,
             #[cfg(test)]
             reference_count: Arc::new(AtomicUsize::new(1)),
@@ -218,7 +218,7 @@ impl GlideSpanInner {
     }
 
     /// Create new span as a child of `parent`, returning an error if the parent span lock is poisoned.
-    pub fn new_with_parent(name: &str, parent: &GlideSpanInner) -> Result<Self, TraceError> {
+    pub fn new_with_parent(name: &str, parent: &FerrisKeySpanInner) -> Result<Self, TraceError> {
         let parent_span_ctx = parent
             .span
             .read()
@@ -236,7 +236,7 @@ impl GlideSpanInner {
                 .with_kind(SpanKind::Client)
                 .start_with_context(&tracer, &parent_context),
         ));
-        Ok(GlideSpanInner {
+        Ok(FerrisKeySpanInner {
             span,
             #[cfg(test)]
             reference_count: Arc::new(AtomicUsize::new(1)),
@@ -283,7 +283,7 @@ impl GlideSpanInner {
                 .with_kind(SpanKind::Client)
                 .start_with_context(&tracer, &parent_context),
         ));
-        Ok(GlideSpanInner {
+        Ok(FerrisKeySpanInner {
             span,
             #[cfg(test)]
             reference_count: Arc::new(AtomicUsize::new(1)),
@@ -310,14 +310,14 @@ impl GlideSpanInner {
             );
     }
 
-    pub fn set_status(&self, status: GlideSpanStatus) {
+    pub fn set_status(&self, status: FerrisKeySpanStatus) {
         match status {
-            GlideSpanStatus::Ok => self
+            FerrisKeySpanStatus::Ok => self
                 .span
                 .write()
                 .expect(SPAN_WRITE_LOCK_ERR)
                 .set_status(opentelemetry::trace::Status::Ok),
-            GlideSpanStatus::Error(error_message) => {
+            FerrisKeySpanStatus::Error(error_message) => {
                 self.span.write().expect(SPAN_WRITE_LOCK_ERR).set_status(
                     opentelemetry::trace::Status::Error {
                         description: error_message.into(),
@@ -345,8 +345,8 @@ impl GlideSpanInner {
 
     /// Create new span, add it as a child to this span and return it.
     /// Returns an error if the child span creation fails.
-    pub fn add_span(&self, name: &str) -> Result<GlideSpanInner, TraceError> {
-        let child = GlideSpanInner::new_with_parent(name, self)?;
+    pub fn add_span(&self, name: &str) -> Result<FerrisKeySpanInner, TraceError> {
+        let child = FerrisKeySpanInner::new_with_parent(name, self)?;
         {
             let child_span = child
                 .span
@@ -392,7 +392,7 @@ impl GlideSpanInner {
 }
 
 #[cfg(test)]
-impl Drop for GlideSpanInner {
+impl Drop for FerrisKeySpanInner {
     fn drop(&mut self) {
         // Only print debug info if the reference count is non-zero
         let current_count = self.reference_count.load(Ordering::SeqCst);
@@ -405,14 +405,14 @@ impl Drop for GlideSpanInner {
 }
 
 #[derive(Clone, Debug)]
-pub struct GlideSpan {
-    inner: GlideSpanInner,
+pub struct FerrisKeySpan {
+    inner: FerrisKeySpanInner,
 }
 
-impl GlideSpan {
+impl FerrisKeySpan {
     pub fn new(name: &str) -> Self {
-        GlideSpan {
-            inner: GlideSpanInner::new(name),
+        FerrisKeySpan {
+            inner: FerrisKeySpanInner::new(name),
         }
     }
 
@@ -424,8 +424,8 @@ impl GlideSpan {
         trace_flags: u8,
         trace_state: Option<&str>,
     ) -> Result<Self, TraceError> {
-        Ok(GlideSpan {
-            inner: GlideSpanInner::new_with_remote_context(
+        Ok(FerrisKeySpan {
+            inner: FerrisKeySpanInner::new_with_remote_context(
                 name,
                 trace_id_hex,
                 span_id_hex,
@@ -445,7 +445,7 @@ impl GlideSpan {
         self.inner.add_event(name, Some(attributes))
     }
 
-    pub fn set_status(&self, status: GlideSpanStatus) {
+    pub fn set_status(&self, status: FerrisKeySpanStatus) {
         self.inner.set_status(status)
     }
 
@@ -460,12 +460,12 @@ impl GlideSpan {
     }
 
     /// Add child span to this span and return it
-    pub fn add_span(&self, name: &str) -> Result<GlideSpan, opentelemetry::trace::TraceError> {
+    pub fn add_span(&self, name: &str) -> Result<FerrisKeySpan, opentelemetry::trace::TraceError> {
         let inner_span = self.inner.add_span(name).map_err(|err| {
             TraceError::from(format!("Failed to create child span '{}': {}", name, err))
         })?;
 
-        Ok(GlideSpan { inner: inner_span })
+        Ok(FerrisKeySpan { inner: inner_span })
     }
 
     pub fn id(&self) -> String {
@@ -488,37 +488,37 @@ impl GlideSpan {
     }
 }
 
-/// OpenTelemetry configuration object. Use `GlideOpenTelemetryConfigBuilder` to construct it:
+/// OpenTelemetry configuration object. Use `FerrisKeyOtelConfigBuilder` to construct it:
 ///
 /// ```text
-/// let config = GlideOpenTelemetryConfigBuilder::default()
+/// let config = FerrisKeyOtelConfigBuilder::default()
 ///    .with_flush_interval(std::time::Duration::from_millis(100))
 ///    .build();
-/// GlideOpenTelemetry::initialise(config);
+/// FerrisKeyOtel::initialise(config);
 /// ```
 #[derive(Clone, Debug)]
-pub struct GlideOpenTelemetryConfig {
+pub struct FerrisKeyOtelConfig {
     /// Default delay interval between two consecutive exports.
     flush_interval_ms: Duration,
-    traces: Option<GlideOpenTelemetryTracesConfig>,
-    metrics: Option<GlideOpenTelemetryMetricsConfig>,
+    traces: Option<FerrisKeyOtelTracesConfig>,
+    metrics: Option<FerrisKeyOtelMetricsConfig>,
 }
 
 #[derive(Clone, Debug)]
-pub struct GlideOpenTelemetryTracesConfig {
+pub struct FerrisKeyOtelTracesConfig {
     /// Specifies how the exporter sends telemetry data to the collector, and holds the endpoint information.
-    trace_exporter: GlideOpenTelemetrySignalsExporter,
+    trace_exporter: OtelSignalsExporter,
     /// The percentage of requests to sample and create a span for, used to measure command duration.
     trace_sample_percentage: u32,
 }
 
 #[derive(Clone, Debug)]
-pub struct GlideOpenTelemetryMetricsConfig {
+pub struct FerrisKeyOtelMetricsConfig {
     /// Specifies how the exporter sends telemetry data to the collector, and holds the endpoint information.
-    metrics_exporter: GlideOpenTelemetrySignalsExporter,
+    metrics_exporter: OtelSignalsExporter,
 }
 
-/// Builder for configuring OpenTelemetry in GLIDE
+/// Builder for configuring OpenTelemetry in FerrisKey
 ///
 /// This struct allows you to configure how telemetry data (traces and metrics) is exported.
 /// - `flush_interval_ms`: Sets the interval between consecutive exports of telemetry data.
@@ -527,18 +527,18 @@ pub struct GlideOpenTelemetryMetricsConfig {
 ///
 /// If both `traces_config` and `metrics_config` are `None`, no telemetry data will be exported.
 #[derive(Clone, Debug)]
-pub struct GlideOpenTelemetryConfigBuilder {
+pub struct FerrisKeyOtelConfigBuilder {
     /// The interval between consecutive exports of telemetry data.
     flush_interval_ms: Duration,
     /// Optional configuration for exporting trace data. If `None`, trace data will not be exported.
-    traces_config: Option<GlideOpenTelemetryTracesConfig>,
+    traces_config: Option<FerrisKeyOtelTracesConfig>,
     /// Optional configuration for exporting metrics data. If `None`, metrics data will not be exported.
-    metrics_config: Option<GlideOpenTelemetryMetricsConfig>,
+    metrics_config: Option<FerrisKeyOtelMetricsConfig>,
 }
 
-impl Default for GlideOpenTelemetryConfigBuilder {
+impl Default for FerrisKeyOtelConfigBuilder {
     fn default() -> Self {
-        GlideOpenTelemetryConfigBuilder {
+        FerrisKeyOtelConfigBuilder {
             flush_interval_ms: Duration::from_millis(DEFAULT_FLUSH_SIGNAL_INTERVAL_MS as u64),
             traces_config: None,
             metrics_config: None,
@@ -546,7 +546,7 @@ impl Default for GlideOpenTelemetryConfigBuilder {
     }
 }
 
-impl GlideOpenTelemetryConfigBuilder {
+impl FerrisKeyOtelConfigBuilder {
     /// Configure the flush interval in milliseconds
     ///
     /// - `duration`: The duration between consecutive exports of telemetry data.
@@ -562,10 +562,10 @@ impl GlideOpenTelemetryConfigBuilder {
     ///   If `None`, the default value of `DEFAULT_TRACE_SAMPLE_PERCENTAGE` will be used.
     pub fn with_trace_exporter(
         mut self,
-        exporter: GlideOpenTelemetrySignalsExporter,
+        exporter: OtelSignalsExporter,
         sample_percentage: Option<u32>,
     ) -> Self {
-        self.traces_config = Some(GlideOpenTelemetryTracesConfig {
+        self.traces_config = Some(FerrisKeyOtelTracesConfig {
             trace_exporter: exporter,
             trace_sample_percentage: sample_percentage.unwrap_or(DEFAULT_TRACE_SAMPLE_PERCENTAGE),
         });
@@ -575,15 +575,15 @@ impl GlideOpenTelemetryConfigBuilder {
     /// Configure the metrics exporter
     ///
     /// - `exporter`: The exporter endpoint to use for metrics data.
-    pub fn with_metrics_exporter(mut self, exporter: GlideOpenTelemetrySignalsExporter) -> Self {
-        self.metrics_config = Some(GlideOpenTelemetryMetricsConfig {
+    pub fn with_metrics_exporter(mut self, exporter: OtelSignalsExporter) -> Self {
+        self.metrics_config = Some(FerrisKeyOtelMetricsConfig {
             metrics_exporter: exporter,
         });
         self
     }
 
-    pub fn build(self) -> GlideOpenTelemetryConfig {
-        GlideOpenTelemetryConfig {
+    pub fn build(self) -> FerrisKeyOtelConfig {
+        FerrisKeyOtelConfig {
             flush_interval_ms: self.flush_interval_ms,
             traces: self.traces_config,
             metrics: self.metrics_config,
@@ -601,7 +601,7 @@ fn build_span_exporter(
 }
 
 #[derive(Clone)]
-pub struct GlideOpenTelemetry {}
+pub struct FerrisKeyOtel {}
 
 static TIMEOUT_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock::new();
 static RETRIES_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock::new();
@@ -610,11 +610,11 @@ static SUBSCRIPTION_OUT_OF_SYNC_COUNTER: OnceLock<opentelemetry::metrics::Counte
     OnceLock::new();
 static SUBSCRIPTION_LAST_SYNC_GAUGE: OnceLock<opentelemetry::metrics::Gauge<u64>> = OnceLock::new();
 
-/// Singleton instance of GlideOpenTelemetry. Ensures that telemetry setup happens only once across the application.
-static OTEL: OnceCell<RwLock<GlideOpenTelemetry>> = OnceCell::new();
+/// Singleton instance of FerrisKeyOtel. Ensures that telemetry setup happens only once across the application.
+static OTEL: OnceCell<RwLock<FerrisKeyOtel>> = OnceCell::new();
 
 /// Our interface to OpenTelemetry
-impl GlideOpenTelemetry {
+impl FerrisKeyOtel {
     /// Validate if a span pointer is valid
     ///
     /// # Arguments
@@ -673,18 +673,18 @@ impl GlideOpenTelemetry {
         true
     }
 
-    /// Convert a span pointer to a GlideSpan with validation
+    /// Convert a span pointer to a FerrisKeySpan with validation
     ///
     /// # Arguments
     /// * `span_ptr` - The u64 span pointer to convert
     ///
     /// # Returns
-    /// * `Ok(GlideSpan)` - If the pointer is valid and conversion succeeds
+    /// * `Ok(FerrisKeySpan)` - If the pointer is valid and conversion succeeds
     /// * `Err(TraceError)` - If the pointer is invalid or conversion fails
     ///
     /// # Safety
     /// This function validates the pointer before attempting conversion, but still uses unsafe code
-    pub unsafe fn span_from_pointer(span_ptr: u64) -> Result<GlideSpan, TraceError> {
+    pub unsafe fn span_from_pointer(span_ptr: u64) -> Result<FerrisKeySpan, TraceError> {
         // First validate the pointer
         if !unsafe { Self::is_span_pointer_valid(span_ptr) } {
             return Err(TraceError::from(format!(
@@ -697,10 +697,10 @@ impl GlideOpenTelemetry {
         // This follows the same pattern as get_unsafe_span_from_ptr in FFI layer
         let span = unsafe {
             // Increment strong count to prevent premature deallocation
-            std::sync::Arc::increment_strong_count(span_ptr as *const GlideSpan);
+            std::sync::Arc::increment_strong_count(span_ptr as *const FerrisKeySpan);
 
             // Convert pointer back to Arc and clone the span
-            (*std::sync::Arc::from_raw(span_ptr as *const GlideSpan)).clone()
+            (*std::sync::Arc::from_raw(span_ptr as *const FerrisKeySpan)).clone()
         };
 
         Ok(span)
@@ -710,7 +710,7 @@ impl GlideOpenTelemetry {
     ///
     /// This method should be called once for the given **process**
     /// If OpenTelemetry is already initialized, this method will return Ok(()) without reinitializing
-    pub fn initialise(config: GlideOpenTelemetryConfig) -> Result<(), GlideOTELError> {
+    pub fn initialise(config: FerrisKeyOtelConfig) -> Result<(), OtelError> {
         OTEL.get_or_try_init(|| {
             Self::validate_config(config.clone())?;
 
@@ -729,7 +729,7 @@ impl GlideOpenTelemetry {
                 Self::init_metrics()?;
             }
 
-            Ok::<RwLock<GlideOpenTelemetry>, GlideOTELError>(RwLock::new(GlideOpenTelemetry {}))
+            Ok::<RwLock<FerrisKeyOtel>, OtelError>(RwLock::new(FerrisKeyOtel {}))
         })?;
 
         Ok(())
@@ -742,10 +742,10 @@ impl GlideOpenTelemetry {
     /// Returns an error if the configuration is invalid:
     /// - `flush_interval_ms` cannot be zero
     /// - `trace_sample_percentage` must be between 0 and 100
-    fn validate_config(config: GlideOpenTelemetryConfig) -> Result<(), GlideOTELError> {
+    fn validate_config(config: FerrisKeyOtelConfig) -> Result<(), OtelError> {
         // Validate flush_interval_ms
         if config.flush_interval_ms.is_zero() {
-            return Err(GlideOTELError::Other(
+            return Err(OtelError::Other(
                 "InvalidInput: flushIntervalMs cannot be zero".to_string(),
             ));
         }
@@ -754,7 +754,7 @@ impl GlideOpenTelemetry {
         if let Some(traces_config) = config.traces.as_ref()
             && traces_config.trace_sample_percentage > 100
         {
-            return Err(GlideOTELError::Other(
+            return Err(OtelError::Other(
                 "Trace sample percentage must be between 0 and 100".into(),
             ));
         }
@@ -764,21 +764,21 @@ impl GlideOpenTelemetry {
     /// Initialize the trace exporter based on the configuration
     fn initialise_trace_exporter(
         flush_interval_ms: Duration,
-        trace_exporter: &GlideOpenTelemetrySignalsExporter,
-    ) -> Result<(), GlideOTELError> {
+        trace_exporter: &OtelSignalsExporter,
+    ) -> Result<(), OtelError> {
         let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
             .with_scheduled_delay(flush_interval_ms)
             .build();
 
         let env_protocol = protocol_from_env(OtelSignal::Traces);
         let trace_exporter = match trace_exporter {
-            GlideOpenTelemetrySignalsExporter::File(p) => {
+            OtelSignalsExporter::File(p) => {
                 let exporter = crate::SpanExporterFile::new(p.clone()).map_err(|e| {
-                    GlideOTELError::Other(format!("Failed to create traces exporter: {}", e))
+                    OtelError::Other(format!("Failed to create traces exporter: {}", e))
                 })?;
                 build_span_exporter(batch_config, exporter)
             }
-            GlideOpenTelemetrySignalsExporter::Http(url) => {
+            OtelSignalsExporter::Http(url) => {
                 match env_protocol.unwrap_or(Protocol::HttpBinary) {
                     Protocol::Grpc => {
                         let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -798,7 +798,7 @@ impl GlideOpenTelemetry {
                     }
                 }
             }
-            GlideOpenTelemetrySignalsExporter::Grpc(url) => {
+            OtelSignalsExporter::Grpc(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::Grpc);
                 if protocol != Protocol::Grpc {
                     log_warn(
@@ -841,19 +841,19 @@ impl GlideOpenTelemetry {
     /// Initialize the metrics exporter based on the configuration
     fn initialise_metrics_exporter(
         flush_interval_ms: Duration,
-        metrics_exporter: &GlideOpenTelemetrySignalsExporter,
-    ) -> Result<(), GlideOTELError> {
+        metrics_exporter: &OtelSignalsExporter,
+    ) -> Result<(), OtelError> {
         let env_protocol = protocol_from_env(OtelSignal::Metrics);
         let metrics_exporter = match metrics_exporter {
-            GlideOpenTelemetrySignalsExporter::File(p) => {
+            OtelSignalsExporter::File(p) => {
                 let exporter = crate::FileMetricExporter::new(p.clone()).map_err(|e| {
-                    GlideOTELError::Other(format!("Failed to create metrics exporter: {}", e))
+                    OtelError::Other(format!("Failed to create metrics exporter: {}", e))
                 })?;
                 opentelemetry_sdk::metrics::PeriodicReader::builder(exporter, Tokio)
                     .with_interval(flush_interval_ms)
                     .build()
             }
-            GlideOpenTelemetrySignalsExporter::Http(url) => {
+            OtelSignalsExporter::Http(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::HttpBinary);
                 let exporter = match protocol {
                     Protocol::Grpc => MetricExporter::builder()
@@ -871,7 +871,7 @@ impl GlideOpenTelemetry {
                     .with_interval(flush_interval_ms)
                     .build()
             }
-            GlideOpenTelemetrySignalsExporter::Grpc(url) => {
+            OtelSignalsExporter::Grpc(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::Grpc);
                 if protocol != Protocol::Grpc {
                     log_warn(
@@ -908,7 +908,7 @@ impl GlideOpenTelemetry {
     }
 
     /// Initialize metrics counters
-    fn init_metrics() -> Result<(), GlideOTELError> {
+    fn init_metrics() -> Result<(), OtelError> {
         let meter = global::meter(TRACE_SCOPE);
 
         // Create timeout error counter
@@ -921,7 +921,7 @@ impl GlideOpenTelemetry {
                     .build(),
             )
             .map_err(|_| {
-                GlideOTELError::Other(
+                OtelError::Other(
                     "OpenTelemetry error: Failed to initialize timeout counter".to_owned(),
                 )
             })?;
@@ -936,7 +936,7 @@ impl GlideOpenTelemetry {
                     .build(),
             )
             .map_err(|_| {
-                GlideOTELError::Other(
+                OtelError::Other(
                     "OpenTelemetry error: Failed to initialize retries counter".to_owned(),
                 )
             })?;
@@ -951,7 +951,7 @@ impl GlideOpenTelemetry {
                     .build(),
             )
             .map_err(|_| {
-                GlideOTELError::Other(
+                OtelError::Other(
                     "OpenTelemetry error: Failed to initialize moved counter".to_owned(),
                 )
             })?;
@@ -965,7 +965,7 @@ impl GlideOpenTelemetry {
                     .build(),
             )
             .map_err(|_| {
-                GlideOTELError::Other(
+                OtelError::Other(
                     "OpenTelemetry error: Failed to initialize subscription out of sync counter"
                         .to_owned(),
                 )
@@ -981,7 +981,7 @@ impl GlideOpenTelemetry {
                     .build(),
             )
             .map_err(|_| {
-                GlideOTELError::Other(
+                OtelError::Other(
                     "OpenTelemetry error: Failed to initialize subscription last sync gauge".to_owned(),
                 )
             })?;
@@ -992,12 +992,12 @@ impl GlideOpenTelemetry {
     /// Record a timeout error
     ///
     /// If OpenTelemetry is not initialized, this method will do nothing.
-    pub fn record_timeout_error() -> Result<(), GlideOTELError> {
-        if GlideOpenTelemetry::is_initialized() {
+    pub fn record_timeout_error() -> Result<(), OtelError> {
+        if FerrisKeyOtel::is_initialized() {
             TIMEOUT_COUNTER
                 .get()
                 .ok_or_else(|| {
-                    GlideOTELError::Other(
+                    OtelError::Other(
                         "OpenTelemetry error: Timeout counter not initialized".to_owned(),
                     )
                 })?
@@ -1009,12 +1009,12 @@ impl GlideOpenTelemetry {
     /// Record a retry attempt
     ///
     /// If OpenTelemetry is not initialized, this method will do nothing.
-    pub fn record_retry_attempt() -> Result<(), GlideOTELError> {
-        if GlideOpenTelemetry::is_initialized() {
+    pub fn record_retry_attempt() -> Result<(), OtelError> {
+        if FerrisKeyOtel::is_initialized() {
             RETRIES_COUNTER
                 .get()
                 .ok_or_else(|| {
-                    GlideOTELError::Other(
+                    OtelError::Other(
                         "OpenTelemetry error: Retries counter not initialized".to_string(),
                     )
                 })?
@@ -1026,12 +1026,12 @@ impl GlideOpenTelemetry {
     /// Record a moved error
     ///
     /// If OpenTelemetry is not initialized, this method will do nothing.
-    pub fn record_moved_error() -> Result<(), GlideOTELError> {
-        if GlideOpenTelemetry::is_initialized() {
+    pub fn record_moved_error() -> Result<(), OtelError> {
+        if FerrisKeyOtel::is_initialized() {
             MOVED_COUNTER
                 .get()
                 .ok_or_else(|| {
-                    GlideOTELError::Other(
+                    OtelError::Other(
                         "OpenTelemetry error: Moved counter not initialized".to_string(),
                     )
                 })?
@@ -1043,13 +1043,13 @@ impl GlideOpenTelemetry {
     /// Record that subscriptions are out of sync
     ///
     /// If OpenTelemetry is not initialized, this method will do nothing.
-    pub fn record_subscription_out_of_sync() -> Result<(), GlideOTELError> {
+    pub fn record_subscription_out_of_sync() -> Result<(), OtelError> {
         Telemetry::incr_subscription_out_of_sync();
-        if GlideOpenTelemetry::is_initialized() {
+        if FerrisKeyOtel::is_initialized() {
             SUBSCRIPTION_OUT_OF_SYNC_COUNTER
                 .get()
                 .ok_or_else(|| {
-                    GlideOTELError::Other(
+                    OtelError::Other(
                         "OpenTelemetry error: Subscription out of sync counter not initialized"
                             .to_string(),
                     )
@@ -1064,19 +1064,19 @@ impl GlideOpenTelemetry {
     /// Records the current system time as a Unix timestamp in milliseconds.
     ///
     /// If OpenTelemetry is not initialized, this method will do nothing.
-    pub fn update_subscription_last_sync_timestamp() -> Result<(), GlideOTELError> {
+    pub fn update_subscription_last_sync_timestamp() -> Result<(), OtelError> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| GlideOTELError::Other(format!("Failed to get system time: {}", e)))?
+            .map_err(|e| OtelError::Other(format!("Failed to get system time: {}", e)))?
             .as_millis() as u64;
 
         Telemetry::update_subscription_last_sync_timestamp(timestamp);
 
-        if GlideOpenTelemetry::is_initialized() {
+        if FerrisKeyOtel::is_initialized() {
             SUBSCRIPTION_LAST_SYNC_GAUGE
                 .get()
                 .ok_or_else(|| {
-                    GlideOTELError::Other(
+                    OtelError::Other(
                         "OpenTelemetry error: Subscription last sync gauge not initialized"
                             .to_string(),
                     )
@@ -1087,13 +1087,13 @@ impl GlideOpenTelemetry {
     }
 
     /// Get the flush interval milliseconds
-    pub fn get_flush_interval_ms(config: GlideOpenTelemetryConfig) -> Duration {
+    pub fn get_flush_interval_ms(config: FerrisKeyOtelConfig) -> Duration {
         config.flush_interval_ms
     }
 
     /// Create new span
-    pub fn new_span(name: &str) -> GlideSpan {
-        GlideSpan::new(name)
+    pub fn new_span(name: &str) -> FerrisKeySpan {
+        FerrisKeySpan::new(name)
     }
 
     /// Trigger a shutdown procedure flushing all remaining traces
@@ -1139,18 +1139,18 @@ mod tests {
             .find(|m| m["name"] == metric_name)
     }
 
-    async fn init_otel() -> Result<(), GlideOTELError> {
-        let config = GlideOpenTelemetryConfigBuilder::default()
+    async fn init_otel() -> Result<(), OtelError> {
+        let config = FerrisKeyOtelConfigBuilder::default()
             .with_flush_interval(Duration::from_millis(2000))
             .with_trace_exporter(
-                GlideOpenTelemetrySignalsExporter::File(PathBuf::from(SPANS_JSON)),
+                OtelSignalsExporter::File(PathBuf::from(SPANS_JSON)),
                 Some(100),
             )
-            .with_metrics_exporter(GlideOpenTelemetrySignalsExporter::File(PathBuf::from(
+            .with_metrics_exporter(OtelSignalsExporter::File(PathBuf::from(
                 METRICS_JSON,
             )))
             .build();
-        if let Err(e) = GlideOpenTelemetry::initialise(config) {
+        if let Err(e) = FerrisKeyOtel::initialise(config) {
             panic!("Failed to initialize OpenTelemetry: {}", e);
         }
         Ok(())
@@ -1160,9 +1160,9 @@ mod tests {
         // Clear the file
         let _ = std::fs::remove_file(SPANS_JSON);
 
-        let span = GlideOpenTelemetry::new_span("Root_Span_1");
+        let span = FerrisKeyOtel::new_span("Root_Span_1");
         span.add_event("Event1");
-        span.set_status(GlideSpanStatus::Ok);
+        span.set_status(FerrisKeySpanStatus::Ok);
 
         let child1 = span.add_span("Network_Span").unwrap();
 
@@ -1174,10 +1174,10 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         span.end();
 
-        let span = GlideOpenTelemetry::new_span("Root_Span_2");
+        let span = FerrisKeyOtel::new_span("Root_Span_2");
         span.add_event("Event1");
         span.add_event("Event2");
-        span.set_status(GlideSpanStatus::Ok);
+        span.set_status(FerrisKeySpanStatus::Ok);
         drop(span); // writes the span
 
         sleep(Duration::from_millis(2100)).await;
@@ -1253,7 +1253,7 @@ mod tests {
         rt.block_on(async {
             let _ = std::fs::remove_file(SPANS_JSON);
             init_otel().await.unwrap();
-            let span = GlideOpenTelemetry::new_span("Root_Span_1");
+            let span = FerrisKeyOtel::new_span("Root_Span_1");
             span.add_reference();
             assert_eq!(span.get_reference_count(), 2);
             drop(span);
@@ -1266,10 +1266,10 @@ mod tests {
         rt.block_on(async {
             let _ = std::fs::remove_file(METRICS_JSON);
             init_otel().await.unwrap();
-            GlideOpenTelemetry::record_timeout_error().unwrap();
+            FerrisKeyOtel::record_timeout_error().unwrap();
             sleep(Duration::from_millis(2100)).await;
-            GlideOpenTelemetry::record_timeout_error().unwrap();
-            GlideOpenTelemetry::record_timeout_error().unwrap();
+            FerrisKeyOtel::record_timeout_error().unwrap();
+            FerrisKeyOtel::record_timeout_error().unwrap();
 
             // Add a sleep to wait for the metrics to be flushed
             sleep(Duration::from_millis(2100)).await;
@@ -1283,7 +1283,7 @@ mod tests {
             let metric_json: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
             assert_eq!(
                 metric_json["scope_metrics"][0]["metrics"][0]["name"],
-                "glide.timeout_errors"
+                "ferriskey.timeout_errors"
             );
             assert_eq!(
                 metric_json["scope_metrics"][0]["metrics"][0]["data_points"][0]["value"],
@@ -1304,10 +1304,10 @@ mod tests {
         rt.block_on(async {
             let _ = std::fs::remove_file(METRICS_JSON);
             init_otel().await.unwrap();
-            GlideOpenTelemetry::record_retry_attempt().unwrap();
+            FerrisKeyOtel::record_retry_attempt().unwrap();
             sleep(Duration::from_millis(2100)).await;
-            GlideOpenTelemetry::record_retry_attempt().unwrap();
-            GlideOpenTelemetry::record_retry_attempt().unwrap();
+            FerrisKeyOtel::record_retry_attempt().unwrap();
+            FerrisKeyOtel::record_retry_attempt().unwrap();
 
             // Add a sleep to wait for the metrics to be flushed
             sleep(Duration::from_millis(2100)).await;
@@ -1319,14 +1319,14 @@ mod tests {
                 .collect();
 
             let metric_json: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-            let retry_metric = find_metric_by_name(&metric_json, "glide.retry_attempts")
-                .expect("glide.retry_attempts metric not found");
+            let retry_metric = find_metric_by_name(&metric_json, "ferriskey.retry_attempts")
+                .expect("ferriskey.retry_attempts metric not found");
             assert_eq!(retry_metric["data_points"][0]["value"], 1);
 
             let metric_json: serde_json::Value =
                 serde_json::from_str(lines[lines.len() - 1]).unwrap();
-            let retry_metric = find_metric_by_name(&metric_json, "glide.retry_attempts")
-                .expect("glide.retry_attempts metric not found");
+            let retry_metric = find_metric_by_name(&metric_json, "ferriskey.retry_attempts")
+                .expect("ferriskey.retry_attempts metric not found");
             assert_eq!(retry_metric["data_points"][0]["value"], 3);
         });
     }
@@ -1337,10 +1337,10 @@ mod tests {
         rt.block_on(async {
             let _ = std::fs::remove_file(METRICS_JSON);
             init_otel().await.unwrap();
-            GlideOpenTelemetry::record_moved_error().unwrap();
+            FerrisKeyOtel::record_moved_error().unwrap();
             sleep(Duration::from_millis(2100)).await;
-            GlideOpenTelemetry::record_moved_error().unwrap();
-            GlideOpenTelemetry::record_moved_error().unwrap();
+            FerrisKeyOtel::record_moved_error().unwrap();
+            FerrisKeyOtel::record_moved_error().unwrap();
 
             // Add a sleep to wait for the metrics to be flushed
             sleep(Duration::from_millis(2100)).await;
@@ -1352,14 +1352,14 @@ mod tests {
                 .collect();
 
             let metric_json: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-            let moved_metric = find_metric_by_name(&metric_json, "glide.moved_errors")
-                .expect("glide.moved_errors metric not found");
+            let moved_metric = find_metric_by_name(&metric_json, "ferriskey.moved_errors")
+                .expect("ferriskey.moved_errors metric not found");
             assert_eq!(moved_metric["data_points"][0]["value"], 1);
 
             let metric_json: serde_json::Value =
                 serde_json::from_str(lines[lines.len() - 1]).unwrap();
-            let moved_metric = find_metric_by_name(&metric_json, "glide.moved_errors")
-                .expect("glide.moved_errors metric not found");
+            let moved_metric = find_metric_by_name(&metric_json, "ferriskey.moved_errors")
+                .expect("ferriskey.moved_errors metric not found");
             assert_eq!(moved_metric["data_points"][0]["value"], 3);
         });
     }
@@ -1372,9 +1372,9 @@ mod tests {
             let _ = std::fs::remove_file(SPANS_JSON);
 
             init_otel().await.unwrap();
-            let span = GlideOpenTelemetry::new_span("Root_Span_1");
+            let span = FerrisKeyOtel::new_span("Root_Span_1");
             span.add_event("Event1");
-            span.set_status(GlideSpanStatus::Ok);
+            span.set_status(FerrisKeySpanStatus::Ok);
 
             let child1 = span.add_span("Network_Span").unwrap();
 
@@ -1386,10 +1386,10 @@ mod tests {
             sleep(Duration::from_millis(100)).await;
             span.end();
 
-            let span = GlideOpenTelemetry::new_span("Root_Span_2");
+            let span = FerrisKeyOtel::new_span("Root_Span_2");
             span.add_event("Event1");
             span.add_event("Event2");
-            span.set_status(GlideSpanStatus::Error("simple error".to_string())); // Fixed typo in "simple"
+            span.set_status(FerrisKeySpanStatus::Error("simple error".to_string())); // Fixed typo in "simple"
             drop(span); // writes the span
 
             sleep(Duration::from_millis(2100)).await;
@@ -1464,25 +1464,25 @@ mod tests {
     #[test]
     fn test_span_pointer_validation() {
         // Test null pointer validation
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0) });
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0) });
 
         // Test misaligned pointer validation
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0x1001) }); // Not 8-byte aligned
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0x1002) }); // Not 8-byte aligned
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0x1007) }); // Not 8-byte aligned
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0x1001) }); // Not 8-byte aligned
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0x1002) }); // Not 8-byte aligned
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0x1007) }); // Not 8-byte aligned
 
         // Test address too low validation
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0x800) }); // Below MIN_VALID_ADDRESS
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0x100) }); // Way too low
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0x800) }); // Below MIN_VALID_ADDRESS
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0x100) }); // Way too low
 
         // Test address too high validation
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0x8000_0000_0000_0000) }); // Above MAX_VALID_ADDRESS
-        assert!(unsafe { !GlideOpenTelemetry::is_span_pointer_valid(0xFFFF_FFFF_FFFF_FFFF) }); // Maximum u64
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0x8000_0000_0000_0000) }); // Above MAX_VALID_ADDRESS
+        assert!(unsafe { !FerrisKeyOtel::is_span_pointer_valid(0xFFFF_FFFF_FFFF_FFFF) }); // Maximum u64
 
         // Test valid pointer ranges
-        assert!(unsafe { GlideOpenTelemetry::is_span_pointer_valid(0x1000) }); // Minimum valid
-        assert!(unsafe { GlideOpenTelemetry::is_span_pointer_valid(0x10000) }); // Reasonable heap address
-        assert!(unsafe { GlideOpenTelemetry::is_span_pointer_valid(0x7FFF_FFFF_FFFF_FFF8) }); // Near maximum valid
+        assert!(unsafe { FerrisKeyOtel::is_span_pointer_valid(0x1000) }); // Minimum valid
+        assert!(unsafe { FerrisKeyOtel::is_span_pointer_valid(0x10000) }); // Reasonable heap address
+        assert!(unsafe { FerrisKeyOtel::is_span_pointer_valid(0x7FFF_FFFF_FFFF_FFF8) }); // Near maximum valid
     }
 
     #[test]
@@ -1492,7 +1492,7 @@ mod tests {
             init_otel().await.unwrap();
 
             // Test with null pointer
-            let result = unsafe { GlideOpenTelemetry::span_from_pointer(0) };
+            let result = unsafe { FerrisKeyOtel::span_from_pointer(0) };
             assert!(result.is_err());
             assert!(
                 result
@@ -1502,7 +1502,7 @@ mod tests {
             );
 
             // Test with misaligned pointer
-            let result = unsafe { GlideOpenTelemetry::span_from_pointer(0x1001) };
+            let result = unsafe { FerrisKeyOtel::span_from_pointer(0x1001) };
             assert!(result.is_err());
             assert!(
                 result
@@ -1512,7 +1512,7 @@ mod tests {
             );
 
             // Test with address too low
-            let result = unsafe { GlideOpenTelemetry::span_from_pointer(0x800) };
+            let result = unsafe { FerrisKeyOtel::span_from_pointer(0x800) };
             assert!(result.is_err());
             assert!(
                 result
@@ -1534,11 +1534,11 @@ mod tests {
             init_otel().await.unwrap();
 
             // Create parent span
-            let parent_span = GlideOpenTelemetry::new_span("parent_span");
+            let parent_span = FerrisKeyOtel::new_span("parent_span");
 
             // Create child span using new_with_parent
             let child_span_result =
-                GlideSpanInner::new_with_parent("child_span", &parent_span.inner);
+                FerrisKeySpanInner::new_with_parent("child_span", &parent_span.inner);
             assert!(
                 child_span_result.is_ok(),
                 "Failed to create child span with parent"
@@ -1602,10 +1602,10 @@ mod tests {
             init_otel().await.unwrap();
 
             // Create a parent span
-            let parent_span = GlideOpenTelemetry::new_span("error_test_parent");
+            let parent_span = FerrisKeyOtel::new_span("error_test_parent");
 
             // Test creating child with empty name (should still work)
-            let child_result = GlideSpanInner::new_with_parent("", &parent_span.inner);
+            let child_result = FerrisKeySpanInner::new_with_parent("", &parent_span.inner);
             assert!(
                 child_result.is_ok(),
                 "Should be able to create child span with empty name"
@@ -1613,7 +1613,7 @@ mod tests {
 
             // Test creating child with very long name (should still work)
             let long_name = "a".repeat(1000);
-            let child_result = GlideSpanInner::new_with_parent(&long_name, &parent_span.inner);
+            let child_result = FerrisKeySpanInner::new_with_parent(&long_name, &parent_span.inner);
             assert!(
                 child_result.is_ok(),
                 "Should be able to create child span with long name"
@@ -1634,7 +1634,7 @@ mod tests {
             init_otel().await.unwrap();
 
             // Test null pointer error message
-            let result = unsafe { GlideOpenTelemetry::span_from_pointer(0) };
+            let result = unsafe { FerrisKeyOtel::span_from_pointer(0) };
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1647,7 +1647,7 @@ mod tests {
             );
 
             // Test misaligned pointer error message
-            let result = unsafe { GlideOpenTelemetry::span_from_pointer(0x1001) };
+            let result = unsafe { FerrisKeyOtel::span_from_pointer(0x1001) };
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1660,7 +1660,7 @@ mod tests {
             );
 
             // Test address too low error message
-            let result = unsafe { GlideOpenTelemetry::span_from_pointer(0x800) };
+            let result = unsafe { FerrisKeyOtel::span_from_pointer(0x800) };
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1676,7 +1676,7 @@ mod tests {
         rt.block_on(async {
             init_otel().await.unwrap();
 
-            let result = GlideSpanInner::new_with_remote_context(
+            let result = FerrisKeySpanInner::new_with_remote_context(
                 "remote_child",
                 "0af7651916cd43dd8448eb211c80319c", // valid 32-char hex trace ID
                 "b7ad6b7169203331",                 // valid 16-char hex span ID
@@ -1696,7 +1696,7 @@ mod tests {
         rt.block_on(async {
             init_otel().await.unwrap();
 
-            let result = GlideSpanInner::new_with_remote_context(
+            let result = FerrisKeySpanInner::new_with_remote_context(
                 "remote_child",
                 "not_valid_hex",
                 "b7ad6b7169203331",
@@ -1713,7 +1713,7 @@ mod tests {
         rt.block_on(async {
             init_otel().await.unwrap();
 
-            let result = GlideSpanInner::new_with_remote_context(
+            let result = FerrisKeySpanInner::new_with_remote_context(
                 "remote_child",
                 "0af7651916cd43dd8448eb211c80319c",
                 "zzzzzzzzzzzzzzzz", // 16 chars but not valid hex
@@ -1743,13 +1743,13 @@ mod tests {
             for &invalid_ptr in &invalid_pointers {
                 // Validation should return false
                 assert!(
-                    unsafe { !GlideOpenTelemetry::is_span_pointer_valid(invalid_ptr) },
+                    unsafe { !FerrisKeyOtel::is_span_pointer_valid(invalid_ptr) },
                     "Pointer 0x{:x} should be invalid",
                     invalid_ptr
                 );
 
                 // Safe conversion should return error
-                let result = unsafe { GlideOpenTelemetry::span_from_pointer(invalid_ptr) };
+                let result = unsafe { FerrisKeyOtel::span_from_pointer(invalid_ptr) };
                 assert!(
                     result.is_err(),
                     "Conversion of invalid pointer 0x{:x} should fail",

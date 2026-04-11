@@ -8,7 +8,7 @@ use std::{borrow::Borrow, fmt, io};
 
 use crate::valkey::pipeline::Pipeline;
 use crate::valkey::types::{from_owned_valkey_value, FromValkeyValue, ValkeyResult, ValkeyWrite, ToValkeyArgs};
-use telemetrylib::GlideSpan;
+use telemetrylib::FerrisKeySpan;
 
 /// An argument to a valkey command
 #[derive(Clone)]
@@ -29,7 +29,7 @@ pub struct Cmd {
     // If it's true command's response won't be read from socket. Useful for Pub/Sub.
     no_response: bool,
     /// The span associated with this command
-    span: Option<GlideSpan>,
+    span: Option<FerrisKeySpan>,
     //  A flag indicating whether this is a fenced command  (will have PING appended to ensure ordering)
     is_fenced: bool,
     /// Inflight slot tracker. When set, the slot is released when the last
@@ -347,7 +347,7 @@ impl Cmd {
     ///
     /// A span is used by an OpenTelemetry backend to track the lifetime of the command
     #[inline]
-    pub fn set_span(&mut self, span: Option<GlideSpan>) -> &mut Cmd {
+    pub fn set_span(&mut self, span: Option<FerrisKeySpan>) -> &mut Cmd {
         self.span = span;
         self
     }
@@ -516,7 +516,7 @@ impl Cmd {
 
     /// Return this command span
     #[inline]
-    pub fn span(&self) -> Option<GlideSpan> {
+    pub fn span(&self) -> Option<FerrisKeySpan> {
         self.span.clone()
     }
 

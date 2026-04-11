@@ -41,7 +41,7 @@ use crate::request_type::RequestType;
 use crate::valkey::InfoDict;
 use std::future::Future;
 use std::pin::Pin;
-use telemetrylib::GlideOpenTelemetry;
+use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use versions::Versioning;
 
@@ -277,7 +277,7 @@ async fn run_with_timeout<T>(
             Ok(result) => result,
             Err(_) => {
                 // Record timeout error metric if telemetry is initialized
-                if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
+                if let Err(e) = FerrisKeyOtel::record_timeout_error() {
                     log_error(
                         "OpenTelemetry:timeout_error",
                         format!("Failed to record timeout error: {e}"),
@@ -995,7 +995,7 @@ impl Client {
                             // was already moved into the event loop's PendingRequest,
                             // so its tracker clone keeps the inflight slot held until
                             // all sub-commands complete naturally.
-                            if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
+                            if let Err(e) = FerrisKeyOtel::record_timeout_error() {
                                 log_error(
                                     "OpenTelemetry:timeout_error",
                                     format!("Failed to record timeout error: {e}"),

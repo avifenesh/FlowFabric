@@ -5,7 +5,7 @@
 
 // public api
 pub use crate::valkey::client::Client;
-pub use crate::valkey::client::GlideConnectionOptions;
+pub use crate::valkey::client::FerrisKeyConnectionOptions;
 pub use crate::valkey::client::IAMTokenProvider;
 pub use crate::valkey::cmd::{cmd, fenced_cmd, pack_command, pipe, Arg, Cmd};
 pub use crate::valkey::connection::{

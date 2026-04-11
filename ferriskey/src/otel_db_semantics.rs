@@ -3,7 +3,7 @@
 use crate::client::Client;
 use crate::valkey::{Arg, Cmd};
 use std::borrow::Borrow;
-use telemetrylib::GlideSpan;
+use telemetrylib::FerrisKeySpan;
 
 /// Defines how command arguments are masked in `db.query.text` to prevent
 /// sensitive values from leaking into telemetry.
@@ -172,7 +172,7 @@ pub fn serialize_query_text(cmd: &Cmd) -> Option<String> {
 const DB_SYSTEM_NAME: &str = "redis";
 
 /// Sets connection-level OTel DB attributes on a span (no command-specific attributes).
-pub fn set_db_connection_attributes(span: &GlideSpan, client: &Client) {
+pub fn set_db_connection_attributes(span: &FerrisKeySpan, client: &Client) {
     span.set_attribute("db.system.name", DB_SYSTEM_NAME);
     span.set_attribute("server.address", client.server_address().to_string());
     span.set_attribute_i64("server.port", client.server_port() as i64);
@@ -180,7 +180,7 @@ pub fn set_db_connection_attributes(span: &GlideSpan, client: &Client) {
 }
 
 /// Sets OTel DB semantic convention attributes on a single command span.
-pub fn set_db_attributes(span: &GlideSpan, cmd: &Cmd, client: &Client) {
+pub fn set_db_attributes(span: &FerrisKeySpan, cmd: &Cmd, client: &Client) {
     set_db_connection_attributes(span, client);
 
     if let Some(Arg::Simple(name_bytes)) = cmd.args_iter().next() {
@@ -211,7 +211,7 @@ fn serialize_script_query_text(hash: &str, keys: &[&[u8]], args: &[&[u8]]) -> St
 
 /// Sets OTel DB semantic convention attributes on an EVALSHA (script) span.
 pub fn set_db_script_attributes(
-    span: &GlideSpan,
+    span: &FerrisKeySpan,
     hash: &str,
     keys: &[&[u8]],
     args: &[&[u8]],
@@ -228,7 +228,7 @@ pub fn set_db_script_attributes(
 /// Sets OTel DB semantic convention attributes on a batch (pipeline/transaction) span.
 /// `db.query.text` is a newline-joined serialization of all commands.
 /// `db.operation.name` is `PIPELINE <cmd>` if all commands are the same, otherwise `PIPELINE`.
-pub fn set_db_batch_attributes<T: Borrow<Cmd>>(span: &GlideSpan, cmds: &[T], client: &Client) {
+pub fn set_db_batch_attributes<T: Borrow<Cmd>>(span: &FerrisKeySpan, cmds: &[T], client: &Client) {
     set_db_connection_attributes(span, client);
 
     let mut query_texts: Vec<String> = Vec::with_capacity(cmds.len());

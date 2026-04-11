@@ -17,7 +17,7 @@ use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use telemetrylib::GlideOpenTelemetry;
+use telemetrylib::FerrisKeyOtel;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 
@@ -112,7 +112,7 @@ fn add_command_to_node_pipeline_map<C>(
 {
     if is_retrying {
         // Record retry attempt metric if telemetry is initialized
-        if let Err(e) = GlideOpenTelemetry::record_retry_attempt() {
+        if let Err(e) = FerrisKeyOtel::record_retry_attempt() {
             log_error(
                 "OpenTelemetry:retry_error",
                 format!("Failed to record retry attempt: {e}"),

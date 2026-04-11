@@ -31,7 +31,7 @@ pub mod testing {
     pub use super::connections_logic::*;
 }
 use crate::valkey::{
-    client::GlideConnectionOptions,
+    client::FerrisKeyConnectionOptions,
     cluster_routing::{Routable, RoutingInfo, ShardUpdateResult},
     cluster_slotmap::SlotMap,
     cluster_topology::{
@@ -70,7 +70,7 @@ use strum_macros::Display;
 use tokio::task::JoinHandle;
 
 use crate::valkey::aio::DisconnectNotifier;
-use telemetrylib::{GlideOpenTelemetry, GlideSpan, Telemetry};
+use telemetrylib::{FerrisKeyOtel, FerrisKeySpan, Telemetry};
 
 use crate::valkey::{
     aio::{get_socket_addrs, ConnectionLike, MultiplexedConnection},
@@ -125,7 +125,7 @@ fn parse_node_address(address: &str) -> Option<(&str, i64)> {
 
 /// Sets the routed node's address on the command span for OTel reporting.
 /// Called after cluster routing resolves the actual target node.
-fn set_routed_node_on_span(span: &GlideSpan, address: &str) {
+fn set_routed_node_on_span(span: &FerrisKeySpan, address: &str) {
     if let Some((host, port)) = parse_node_address(address) {
         span.set_attribute("server.address", host.to_string());
         span.set_attribute_i64("server.port", port);
@@ -700,7 +700,7 @@ pub(crate) struct InnerCore<C> {
     pending_requests_rx: std::sync::Mutex<mpsc::UnboundedReceiver<PendingRequest<C>>>,
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
-    glide_connection_options: GlideConnectionOptions,
+    ferriskey_connection_options: FerrisKeyConnectionOptions,
     /// Lock to ensure mutual exclusion between topology refresh operations and connection validation.
     ///
     /// This prevents validation from removing connections that were just created
@@ -917,7 +917,7 @@ enum CmdArg<C> {
     Cmd {
         packed: bytes::Bytes,
         is_fenced: bool,
-        span: Option<GlideSpan>,
+        span: Option<FerrisKeySpan>,
         routing: InternalRoutingInfo<C>,
     },
     /// Multi-node command: needs the full Cmd for fan-out splitting.
@@ -1251,11 +1251,11 @@ mod iam_token_refresh_tests {
         }
     }
 
-    /// Helper to build a minimal GlideConnectionOptions with an IAM provider.
+    /// Helper to build a minimal FerrisKeyConnectionOptions with an IAM provider.
     fn options_with_provider(
         provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
-    ) -> GlideConnectionOptions {
-        GlideConnectionOptions {
+    ) -> FerrisKeyConnectionOptions {
+        FerrisKeyConnectionOptions {
             push_sender: None,
             disconnect_notifier: None,
             discover_az: false,
@@ -1287,7 +1287,7 @@ mod iam_token_refresh_tests {
                 crate::valkey::cluster_client::SlotsRefreshRateLimit::default(),
             ),
             initial_nodes: Vec::new(),
-            glide_connection_options: options_with_provider(provider),
+            ferriskey_connection_options: options_with_provider(provider),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1474,7 +1474,7 @@ impl<C> Future for Request<C> {
                 }
                 request.retry = request.retry.saturating_add(1);
                 // Record retry attempts metric if telemetry is initialized
-                if let Err(e) = GlideOpenTelemetry::record_retry_attempt() {
+                if let Err(e) = FerrisKeyOtel::record_retry_attempt() {
                     log_error(
                         "OpenTelemetry:retry_error",
                         format!("Failed to record retry attempt: {e}"),
@@ -1632,7 +1632,7 @@ where
 
         let connection_retry_strategy = cluster_params.reconnect_retry_strategy.unwrap_or_default();
 
-        let glide_connection_options = GlideConnectionOptions {
+        let ferriskey_connection_options = FerrisKeyConnectionOptions {
             push_sender,
             disconnect_notifier,
             discover_az,
@@ -1646,7 +1646,7 @@ where
         let connections = Self::create_initial_connections(
             initial_nodes,
             &cluster_params,
-            glide_connection_options.clone(),
+            ferriskey_connection_options.clone(),
         )
         .await?;
 
@@ -1665,7 +1665,7 @@ where
             pending_requests_rx: std::sync::Mutex::new(pending_rx),
             slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
-            glide_connection_options,
+            ferriskey_connection_options,
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         });
         let mut connection = ClusterConnInner {
@@ -1751,7 +1751,7 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
         params: &ClusterParams,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<ConnectionMap<C>> {
         let initial_nodes: Vec<(String, Option<SocketAddr>)> =
             Self::try_to_expand_initial_nodes(initial_nodes).await;
@@ -1759,7 +1759,7 @@ where
             stream::iter(initial_nodes.iter().cloned())
                 .map(|(node_addr, socket_addr)| {
                     let params: ClusterParams = params.clone();
-                    let glide_connection_options = glide_connection_options.clone();
+                    let ferriskey_connection_options = ferriskey_connection_options.clone();
                     // set subscriptions to none, they will be applied upon the topology discovery
 
                     async move {
@@ -1769,7 +1769,7 @@ where
                             socket_addr,
                             RefreshConnectionType::AllConnections,
                             None,
-                            glide_connection_options,
+                            ferriskey_connection_options,
                         )
                         .await
                         .get_node();
@@ -1829,7 +1829,7 @@ where
     /// If IAM authentication is configured, refresh the token in `cluster_params` so that
     /// any subsequent connection attempts use a valid credential.
     async fn refresh_iam_token_in_cluster_params(inner: &Arc<InnerCore<C>>) {
-        if let Some(ref token_provider) = inner.glide_connection_options.iam_token_provider
+        if let Some(ref token_provider) = inner.ferriskey_connection_options.iam_token_provider
             && let Some(valid_token) = token_provider.get_valid_token().await {
                 inner.set_cluster_param(|params| {
                     params.password = Some(valid_token);
@@ -1848,7 +1848,7 @@ where
             let connection_map = match Self::create_initial_connections(
                 &inner.initial_nodes,
                 &cluster_params,
-                inner.glide_connection_options.clone(),
+                inner.ferriskey_connection_options.clone(),
             )
             .await
             {
@@ -2018,7 +2018,7 @@ where
 
                 // We run infinite retries to reconnect until it succeeds or it's aborted from outside.
                 let retry_strategy = inner_clone
-                    .glide_connection_options
+                    .ferriskey_connection_options
                     .connection_retry_strategy
                     .unwrap_or_default();
                 let infinite_backoff_iter = retry_strategy
@@ -2039,7 +2039,7 @@ where
                         node_option.clone(),
                         &cluster_params,
                         conn_type,
-                        inner_clone.glide_connection_options.clone(),
+                        inner_clone.ferriskey_connection_options.clone(),
                     )
                     .await;
 
@@ -2630,7 +2630,7 @@ where
     async fn connections_validation_task(inner: Arc<InnerCore<C>>, interval_duration: Duration) {
         loop {
             if let Some(disconnect_notifier) =
-                inner.glide_connection_options.disconnect_notifier.clone()
+                inner.ferriskey_connection_options.disconnect_notifier.clone()
             {
                 disconnect_notifier
                     .wait_for_disconnect_with_timeout(&interval_duration)
@@ -2720,14 +2720,14 @@ where
         // Ensure cluster_params has a fresh IAM token before creating connections
         Self::refresh_iam_token_in_cluster_params(&inner).await;
         let cluster_params = inner.get_cluster_param(|params| params.clone());
-        let glide_connection_options = &inner.glide_connection_options;
+        let ferriskey_connection_options = &inner.ferriskey_connection_options;
 
         // Find existing connections (by address or DNS resolution) or create new ones
         let connection_futures = nodes.into_iter().map(|addr| {
             let addr = addr.to_string();
             let inner = Arc::clone(&inner);
             let cluster_params = cluster_params.clone();
-            let glide_connection_options = glide_connection_options.clone();
+            let ferriskey_connection_options = ferriskey_connection_options.clone();
             let connection_timeout = cluster_params.connection_timeout;
 
             async move {
@@ -2779,7 +2779,7 @@ where
                         node,
                         &cluster_params,
                         RefreshConnectionType::AllConnections,
-                        glide_connection_options,
+                        ferriskey_connection_options,
                     )
                     .await
                 })
@@ -2819,7 +2819,7 @@ where
         // Notify the PubSub synchronizer about the new topology (using same lock)
         // Since handle_topology_refresh is sync, no other task can benefit from us
         // holding a read lock instead - hence, we continue with the write lock.
-        if let Some(sync) = &inner.glide_connection_options.pubsub_synchronizer {
+        if let Some(sync) = &inner.ferriskey_connection_options.pubsub_synchronizer {
             sync.handle_topology_refresh(&write_guard.slot_map);
         }
 
@@ -3005,7 +3005,7 @@ where
     async fn try_packed_request(
         packed: bytes::Bytes,
         is_fenced: bool,
-        span: Option<GlideSpan>,
+        span: Option<FerrisKeySpan>,
         routing: InternalRoutingInfo<C>,
         core: Core<C>,
     ) -> OperationResult {
@@ -4377,7 +4377,7 @@ pub trait Connect: Sized {
         response_timeout: Duration,
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a;
@@ -4389,7 +4389,7 @@ impl Connect for MultiplexedConnection {
         response_timeout: Duration,
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
-        glide_connection_options: GlideConnectionOptions,
+        ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyFuture<'a, (MultiplexedConnection, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a,
@@ -4403,7 +4403,7 @@ impl Connect for MultiplexedConnection {
                 client.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
                     response_timeout,
                     socket_addr,
-                    glide_connection_options,
+                    ferriskey_connection_options,
                 ),
             )
             .await?

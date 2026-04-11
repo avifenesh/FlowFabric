@@ -12,7 +12,7 @@ use crate::valkey::{
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
-use telemetrylib::GlideOpenTelemetry;
+use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{Notify, RwLock as TokioRwLock};
 
 const LOCK_ERR: &str = "Lock poisoned";
@@ -219,11 +219,11 @@ impl ValkeyPubSubSynchronizer {
         let state = self.compute_sync_diff();
 
         if state.is_synchronized {
-            let _ = GlideOpenTelemetry::update_subscription_last_sync_timestamp();
+            let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
             return;
         }
 
-        let _ = GlideOpenTelemetry::record_subscription_out_of_sync();
+        let _ = FerrisKeyOtel::record_subscription_out_of_sync();
     }
 
     async fn apply_pubsub(
