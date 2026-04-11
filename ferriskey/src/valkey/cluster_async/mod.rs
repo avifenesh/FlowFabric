@@ -339,9 +339,13 @@ where
                     };
                     if let Some(conn_future) = conn_future {
                         let mut redirect_conn = conn_future.await;
-                        let _ = redirect_conn
+                        if redirect_conn
                             .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return None; // ASKING failed — fall back to cluster task
+                        }
                         let repacked = cmd.get_packed_command();
                         return Some(redirect_conn.send_packed_bytes(repacked, is_fenced).await);
                     }
@@ -437,11 +441,10 @@ where
 
             let values = match result {
                 Ok(values) => values,
-                Err(e) => {
-                    if e.kind() == ErrorKind::Moved || e.kind() == ErrorKind::Ask {
-                        return None; // Fall back to cluster task for retry
-                    }
-                    return Some(Err(e));
+                Err(_) => {
+                    // Any sub-pipeline error (MOVED, ASK, connection drop) —
+                    // fall back to cluster task which handles retries and reconnection.
+                    return None;
                 }
             };
 
