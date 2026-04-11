@@ -75,6 +75,13 @@ pub trait ConnectionLike: Send {
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
     ) -> impl Future<Output = RedisResult<Vec<Value>>> + Send + 'a;
 
+    /// Sends pre-packed RESP bytes directly, skipping command serialization.
+    fn send_packed_bytes<'a>(
+        &'a mut self,
+        packed: bytes::Bytes,
+        is_fenced: bool,
+    ) -> impl Future<Output = RedisResult<Value>> + Send + 'a;
+
     /// Returns the database this connection is bound to.  Note that this
     /// information might be unreliable because it's initially cached and
     /// also might be incorrect if the connection like object is not

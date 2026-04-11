@@ -268,12 +268,21 @@ where
     ) -> RedisResult<Value> {
         trace!("route_command");
         let (sender, receiver) = oneshot::channel();
+        let cmd_arg = match &routing {
+            cluster_routing::RoutingInfo::MultiNode(_) => CmdArg::MultiCmd {
+                cmd: Arc::new(cmd.clone()),
+                routing: routing.into(),
+            },
+            _ => CmdArg::Cmd {
+                packed: cmd.get_packed_command(),
+                is_fenced: cmd.is_fenced(),
+                span: cmd.span(),
+                routing: routing.into(),
+            },
+        };
         self.0
             .send(Message {
-                cmd: CmdArg::Cmd {
-                    cmd: Arc::new(cmd.clone()),
-                    routing: routing.into(),
-                },
+                cmd: cmd_arg,
                 sender,
             })
             .await
@@ -689,7 +698,17 @@ impl<C> From<Option<SingleNodeRoutingInfo>> for InternalSingleNodeRouting<C> {
 
 #[derive(Clone)]
 enum CmdArg<C> {
+    /// Single-node command: carries pre-packed bytes instead of cloning the Cmd.
+    /// This is the hot path — GET, SET, etc. No heap allocation for the Cmd.
     Cmd {
+        packed: bytes::Bytes,
+        is_fenced: bool,
+        span: Option<GlideSpan>,
+        routing: InternalRoutingInfo<C>,
+    },
+    /// Multi-node command: needs the full Cmd for fan-out splitting.
+    /// Rare path — MGET across slots, DEL with keys in different slots, etc.
+    MultiCmd {
         cmd: Arc<Cmd>,
         routing: InternalRoutingInfo<C>,
     },
@@ -806,7 +825,7 @@ impl<C> RequestInfo<C> {
     fn set_redirect(&mut self, redirect: Option<Redirect>) {
         if let Some(redirect) = redirect {
             match &mut self.cmd {
-                CmdArg::Cmd { routing, .. } => match routing {
+                CmdArg::Cmd { routing, .. } | CmdArg::MultiCmd { routing, .. } => match routing {
                     InternalRoutingInfo::SingleNode(route) => {
                         let redirect = InternalSingleNodeRouting::Redirect {
                             redirect,
@@ -858,7 +877,7 @@ impl<C> RequestInfo<C> {
             }
         };
         match &mut self.cmd {
-            CmdArg::Cmd { routing, .. } => {
+            CmdArg::Cmd { routing, .. } | CmdArg::MultiCmd { routing, .. } => {
                 if let InternalRoutingInfo::SingleNode(route) = routing {
                     fix_route(route);
                 }
@@ -2709,7 +2728,7 @@ where
                                 retry: 0,
                                 sender,
                                 info: RequestInfo {
-                                    cmd: CmdArg::Cmd {
+                                    cmd: CmdArg::MultiCmd {
                                         cmd,
                                         routing: InternalSingleNodeRouting::Connection {
                                             address,
@@ -2782,6 +2801,36 @@ where
             .map_err(|err| (OperationTarget::FanOut, err))
     }
 
+    /// Hot path for single-node commands. Uses pre-packed bytes — no Cmd clone.
+    async fn try_packed_request(
+        packed: bytes::Bytes,
+        is_fenced: bool,
+        span: Option<GlideSpan>,
+        routing: InternalRoutingInfo<C>,
+        core: Core<C>,
+    ) -> OperationResult {
+        let routing = match routing {
+            InternalRoutingInfo::SingleNode(routing) => routing,
+            InternalRoutingInfo::MultiNode(_) => {
+                unreachable!("MultiNode routing should use MultiCmd variant")
+            }
+        };
+        trace!("route request to single node");
+
+        let (address, mut conn) = Self::get_connection(routing, core, None)
+            .await
+            .map_err(|err| (OperationTarget::NotFound, err))?;
+        if let Some(span) = span {
+            set_routed_node_on_span(&span, &address);
+        }
+
+        conn.send_packed_bytes(packed, is_fenced)
+            .await
+            .map(Response::Single)
+            .map_err(|err| (address.into(), err))
+    }
+
+    /// Multi-node and fan-out path. Keeps full Arc<Cmd> for command splitting.
     pub(crate) async fn try_cmd_request(
         cmd: Arc<Cmd>,
         routing: InternalRoutingInfo<C>,
@@ -2835,7 +2884,12 @@ where
 
     async fn try_request(info: RequestInfo<C>, core: Core<C>) -> OperationResult {
         match info.cmd {
-            CmdArg::Cmd { cmd, routing } => Self::try_cmd_request(cmd, routing, core).await,
+            CmdArg::Cmd { packed, is_fenced, span, routing } => {
+                Self::try_packed_request(packed, is_fenced, span, routing, core).await
+            }
+            CmdArg::MultiCmd { cmd, routing } => {
+                Self::try_cmd_request(cmd, routing, core).await
+            }
             CmdArg::Pipeline {
                 pipeline,
                 offset,
@@ -4028,6 +4082,18 @@ where
             cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
         );
         self.route_command(cmd, routing).await
+    }
+
+    async fn send_packed_bytes(
+        &mut self,
+        _packed: bytes::Bytes,
+        _is_fenced: bool,
+    ) -> RedisResult<Value> {
+        // ClusterConnection routes via route_command which handles packing internally.
+        Err(RedisError::from((
+            crate::valkey::ErrorKind::ClientError,
+            "send_packed_bytes not supported on ClusterConnection",
+        )))
     }
 
     async fn req_packed_commands(

@@ -866,6 +866,28 @@ impl ConnectionLike for MultiplexedConnection {
         self.send_packed_command(cmd).await
     }
 
+    async fn send_packed_bytes(
+        &mut self,
+        packed: bytes::Bytes,
+        is_fenced: bool,
+    ) -> RedisResult<Value> {
+        let result = self
+            .pipeline
+            .send_single(packed, self.response_timeout, is_fenced)
+            .await;
+        if self.protocol != ProtocolVersion::RESP2 {
+            if let Err(e) = &result {
+                if e.is_connection_dropped() {
+                    self.push_manager.try_send_raw(&Value::Push {
+                        kind: PushKind::Disconnection,
+                        data: vec![],
+                    });
+                }
+            }
+        }
+        result
+    }
+
     async fn req_packed_commands(
         &mut self,
         cmd: &crate::valkey::Pipeline,
