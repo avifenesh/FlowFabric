@@ -576,10 +576,10 @@ mod aio_support {
     #[derive(Default)]
     pub struct ValueCodec;
 
-    impl Encoder<Vec<u8>> for ValueCodec {
+    impl Encoder<bytes::Bytes> for ValueCodec {
         type Error = RedisError;
-        fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
-            dst.extend_from_slice(item.as_ref());
+        fn encode(&mut self, item: bytes::Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
+            dst.extend_from_slice(&item);
             Ok(())
         }
     }

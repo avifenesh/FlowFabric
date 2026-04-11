@@ -375,12 +375,12 @@ impl Cmd {
         self
     }
 
-    /// Returns the packed command as a byte vector.
+    /// Returns the packed command as Bytes.
     #[inline]
-    pub fn get_packed_command(&self) -> Vec<u8> {
+    pub fn get_packed_command(&self) -> bytes::Bytes {
         let mut cmd = Vec::new();
         self.write_packed_command(&mut cmd);
-        cmd
+        cmd.into()
     }
 
 

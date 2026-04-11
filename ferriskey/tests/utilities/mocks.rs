@@ -203,7 +203,7 @@ impl Mock for ServerMock {
     }
 
     fn add_response(&self, request: &Cmd, response: String) {
-        let expected_message = String::from_utf8(request.get_packed_command()).unwrap();
+        let expected_message = String::from_utf8(request.get_packed_command().to_vec()).unwrap();
         let _ = self.request_sender.send(MockedRequest {
             expected_message,
             response,

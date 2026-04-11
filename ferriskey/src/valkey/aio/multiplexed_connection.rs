@@ -570,7 +570,7 @@ where
 /// on the same underlying connection (tcp/unix socket).
 #[derive(Clone)]
 pub struct MultiplexedConnection {
-    pipeline: Pipeline<Vec<u8>>,
+    pipeline: Pipeline<bytes::Bytes>,
     db: i64,
     response_timeout: Duration,
     protocol: ProtocolVersion,
@@ -762,7 +762,7 @@ impl MultiplexedConnection {
     }
 
     /// Creates a new `MultiplexedConnectionBuilder` for constructing a `MultiplexedConnection`.
-    pub(crate) fn builder(pipeline: Pipeline<Vec<u8>>) -> MultiplexedConnectionBuilder {
+    pub(crate) fn builder(pipeline: Pipeline<bytes::Bytes>) -> MultiplexedConnectionBuilder {
         MultiplexedConnectionBuilder::new(pipeline)
     }
 
@@ -777,7 +777,7 @@ impl MultiplexedConnection {
 
 /// A builder for creating `MultiplexedConnection` instances.
 pub struct MultiplexedConnectionBuilder {
-    pipeline: Pipeline<Vec<u8>>,
+    pipeline: Pipeline<bytes::Bytes>,
     db: Option<i64>,
     response_timeout: Option<Duration>,
     push_manager: Option<PushManager>,
@@ -789,7 +789,7 @@ pub struct MultiplexedConnectionBuilder {
 
 impl MultiplexedConnectionBuilder {
     /// Creates a new builder with the required pipeline
-    pub(crate) fn new(pipeline: Pipeline<Vec<u8>>) -> Self {
+    pub(crate) fn new(pipeline: Pipeline<bytes::Bytes>) -> Self {
         Self {
             pipeline,
             db: None,

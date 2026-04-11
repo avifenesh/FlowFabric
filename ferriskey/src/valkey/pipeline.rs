@@ -92,8 +92,8 @@ impl Pipeline {
     }
 
     /// Returns the encoded pipeline commands.
-    pub fn get_packed_pipeline(&self) -> Vec<u8> {
-        encode_pipeline(&self.commands, self.transaction_mode)
+    pub fn get_packed_pipeline(&self) -> bytes::Bytes {
+        encode_pipeline(&self.commands, self.transaction_mode).into()
     }
 
 
