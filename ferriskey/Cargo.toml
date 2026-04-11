@@ -78,6 +78,7 @@ default = ["mimalloc-alloc"]
 standalone_heartbeat = []
 iam_tests = []
 mock-pubsub = []
+testing = []
 mimalloc-alloc = ["mimalloc"]
 jemalloc = ["tikv-jemallocator"]
 

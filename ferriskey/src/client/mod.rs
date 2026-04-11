@@ -1303,8 +1303,8 @@ impl Client {
 
     /// Reserve an inflight slot, returning a tracker whose Drop releases it.
     /// Returns `None` if no slots available.
-    pub fn reserve_inflight_request(&self) -> Option<crate::valkey::cluster_async::InflightRequestTracker> {
-        crate::valkey::cluster_async::InflightRequestTracker::try_new(
+    pub fn reserve_inflight_request(&self) -> Option<crate::valkey::InflightRequestTracker> {
+        crate::valkey::InflightRequestTracker::try_new(
             self.inflight_requests_allowed.clone(),
         )
     }

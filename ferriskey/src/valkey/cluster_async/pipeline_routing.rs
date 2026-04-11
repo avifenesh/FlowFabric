@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 
 use super::boxed_sleep;
-use super::testing::RefreshConnectionType;
+use super::connections_logic::RefreshConnectionType;
 use super::CmdArg;
 use super::PendingRequest;
 use super::PipelineRetryStrategy;

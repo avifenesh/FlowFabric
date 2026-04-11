@@ -50,7 +50,10 @@ pub use crate::valkey::types::{
     Value,
     PushKind,
     VerbatimFormat,
-    ProtocolVersion
+    ProtocolVersion,
+
+    // inflight tracking
+    InflightRequestTracker,
 };
 
 pub use crate::valkey::{

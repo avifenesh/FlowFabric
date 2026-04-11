@@ -26,13 +26,24 @@ mod connections_container;
 mod connections_logic;
 mod pipeline_routing;
 /// Exposed only for testing.
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
     pub use super::connections_container::ConnectionDetails;
     pub use super::connections_logic::*;
 }
 use crate::valkey::{
+    aio::{get_socket_addrs, ConnectionLike, DisconnectNotifier, MultiplexedConnection},
     client::FerrisKeyConnectionOptions,
-    cluster_routing::{Routable, RoutingInfo, ShardUpdateResult},
+    cluster::slot_cmd,
+    cluster_async::connections_logic::{
+        get_host_and_port_from_addr, get_or_create_conn, ConnectionFuture, RefreshConnectionType,
+    },
+    cluster_client::{ClusterParams, RetryParams},
+    cluster_routing::{
+        self, MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, Routable, RoutingInfo,
+        ShardUpdateResult, SingleNodeRoutingInfo,
+    },
+    cluster_scan::{cluster_scan, ClusterScanArgs, ScanStateRC},
     cluster_slotmap::SlotMap,
     cluster_topology::{
         calculate_topology, SlotRefreshState, TopologyHash,
@@ -40,80 +51,60 @@ use crate::valkey::{
         DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR,
     },
     cmd,
-    cluster_scan::{cluster_scan, ClusterScanArgs, ScanStateRC},
-    types::ServerError,
-    FromValkeyValue, InfoDict, PipelineRetryStrategy,
+    push_manager::PushInfo,
+    types::{ProtocolVersion, RetryMethod, ServerError},
+    Cmd, ConnectionInfo, ErrorKind, FromValkeyValue, InfoDict, IntoConnectionInfo,
+    PipelineRetryStrategy, ValkeyError, ValkeyFuture, ValkeyResult, Value,
 };
-use connections_container::{RefreshTaskNotifier, RefreshTaskState, RefreshTaskStatus};
-use dashmap::DashMap;
+use connections_container::{
+    ConnectionAndAddress, ConnectionType, ConnectionsMap, RefreshTaskNotifier, RefreshTaskState,
+    RefreshTaskStatus,
+};
+use connections_logic::connect_and_check;
 use pipeline_routing::{
     collect_and_send_pending_requests, map_pipeline_to_nodes, process_and_retry_pipeline_responses,
     route_for_pipeline, PipelineResponses, ResponsePoliciesMap,
 };
 
+use async_trait::async_trait;
+use dashmap::DashMap;
+use dispose::{Disposable, Dispose};
+use futures::{
+    future::{BoxFuture, Shared},
+    prelude::*,
+    ready,
+    stream::{FuturesUnordered, StreamExt},
+};
 use logger_core::log_error;
+use parking_lot::RwLock as ParkingLotRwLock;
+use pin_project_lite::pin_project;
 use rand::seq::IteratorRandom;
-
 use std::{
     collections::{HashMap, HashSet},
     fmt, io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{self, AtomicIsize, AtomicUsize, Ordering},
+        atomic::{self, AtomicUsize, Ordering},
         Arc,
     },
     task::{self, Poll},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use strum_macros::Display;
-use tokio::task::JoinHandle;
-
-use crate::valkey::aio::DisconnectNotifier;
 use telemetrylib::{FerrisKeyOtel, FerrisKeySpan, Telemetry};
-
-use crate::valkey::{
-    aio::{get_socket_addrs, ConnectionLike, MultiplexedConnection},
-    cluster::slot_cmd,
-    cluster_async::connections_logic::{
-        get_host_and_port_from_addr, get_or_create_conn, ConnectionFuture, RefreshConnectionType,
+use tokio::{
+    sync::{
+        mpsc,
+        oneshot::{self, Receiver},
+        Notify,
     },
-    cluster_client::{ClusterParams, RetryParams},
-    cluster_routing::{
-        self, MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, SingleNodeRoutingInfo,
-    },
-    push_manager::PushInfo,
-    types::ProtocolVersion,
-    Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, ValkeyError, ValkeyFuture, ValkeyResult,
-    Value,
+    task::JoinHandle,
+    time::timeout,
 };
-use futures::{
-    future::Shared,
-    stream::{FuturesUnordered, StreamExt},
-};
-use std::time::Duration;
-
-use async_trait::async_trait;
 use tokio_retry2::strategy::{jitter_range, ExponentialFactorBackoff};
 use tokio_retry2::{Retry, RetryError};
-
-use tokio::{sync::Notify, time::timeout};
-
-use dispose::{Disposable, Dispose};
-use futures::{future::BoxFuture, prelude::*, ready};
-use parking_lot::RwLock as ParkingLotRwLock;
-use pin_project_lite::pin_project;
-use tokio::sync::{
-    mpsc,
-    oneshot::{self, Receiver},
-};
 use tracing::{debug, info, trace, warn};
-
-use self::{
-    connections_container::{ConnectionAndAddress, ConnectionType, ConnectionsMap},
-    connections_logic::connect_and_check,
-};
-use crate::valkey::types::RetryMethod;
 
 /// Parses a `"host:port"` address string into its components.
 /// Returns `None` if the address has no `:` separator or the port is not a valid integer.
@@ -121,6 +112,67 @@ fn parse_node_address(address: &str) -> Option<(&str, i64)> {
     let (host, port_str) = address.rsplit_once(':')?;
     let port = port_str.parse::<i64>().ok()?;
     Some((host, port))
+}
+
+/// Attempts to forward a command to a MOVED or ASK redirect target using only
+/// already-known cluster connections (never creates new TCP connections).
+///
+/// Returns:
+/// - `Some(Ok(value))` — redirect succeeded and produced a result
+/// - `Some(Err(e))`   — redirect target was reached but the command failed
+/// - `None`           — redirect address is not in the connection map; caller
+///                      should fall back to the cluster task for a full retry
+///
+/// # SAFETY (SSRF)
+/// `connection_for_address` performs a map lookup only — it never opens new
+/// sockets. An attacker-controlled MOVED/ASK response therefore cannot redirect
+/// the client to an arbitrary host; it can only reach nodes already connected.
+///
+/// # Note on cluster task vs. direct dispatch
+/// The cluster task (Request::poll) and pipeline routing (pipeline_routing.rs)
+/// keep their own MOVED/ASK handling because they participate in full retry
+/// state machines with slot-map refresh, backoff, and response aggregation.
+/// This helper is **only for the direct-dispatch fast path** where we want a
+/// single opportunistic redirect without retry infrastructure.
+async fn try_redirect_to_known_node<C>(
+    conn_lock: &ParkingLotRwLock<ConnectionsContainer<C>>,
+    error: &ValkeyError,
+    packed: bytes::Bytes,
+    is_fenced: bool,
+) -> Option<ValkeyResult<Value>>
+where
+    C: ConnectionLike + Clone + Send + Sync + 'static,
+{
+    let is_ask = error.kind() == ErrorKind::Ask;
+    if !is_ask && error.kind() != ErrorKind::Moved {
+        return None;
+    }
+
+    let (addr, _slot) = error.redirect_node()?;
+
+    // Look up in the existing connection map only — never creates a new connection.
+    let conn_future = {
+        let container = conn_lock.read();
+        container.connection_for_address(addr).map(|(_, c)| c)
+    }?;
+
+    let mut conn = conn_future.await;
+
+    if is_ask {
+        // NOTE: ASKING and the retried command are two separate writes on the
+        // multiplexed connection, so another command could be interleaved between
+        // them. A correct fix requires pipelining both into one write; tracked as
+        // a known limitation of the direct-dispatch path.
+        if conn
+            .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
+            .await
+            .is_err()
+        {
+            return None; // ASKING failed — fall back to cluster task
+        }
+    }
+
+    Some(conn.send_packed_bytes(packed, is_fenced).await)
 }
 
 /// Sets the routed node's address on the command span for OTel reporting.
@@ -298,59 +350,16 @@ where
 
         let packed = cmd.get_packed_command();
         let is_fenced = cmd.is_fenced();
-        let result = conn.send_packed_bytes(packed, is_fenced).await;
+        // Clone packed cheaply (Bytes is Arc-backed) so it's available for redirect.
+        let result = conn.send_packed_bytes(packed.clone(), is_fenced).await;
 
         match result {
             Ok(val) => Some(Ok(val)),
-            Err(ref e) if e.kind() == ErrorKind::Moved => {
-                // MOVED: try to send directly to the redirect target.
-                // The cluster task will eventually refresh the slot map.
-                //
-                // SAFETY (SSRF): connection_for_address only performs a lookup in the
-                // existing connection map — it never creates new connections. This means
-                // we will only redirect to nodes that are already known to the cluster
-                // topology, so an attacker-controlled MOVED response cannot cause us to
-                // connect to an arbitrary address.
-                if let Some((addr, _slot)) = e.redirect_node() {
-                    let conn_future = {
-                        let container = self.inner.conn_lock.read();
-                        container.connection_for_address(addr).map(|(_, c)| c)
-                    };
-                    if let Some(conn_future) = conn_future {
-                        let mut redirect_conn = conn_future.await;
-                        let repacked = cmd.get_packed_command();
-                        return Some(redirect_conn.send_packed_bytes(repacked, is_fenced).await);
-                    }
-                }
-                None // Can't resolve redirect — fall back to cluster task
-            }
-            Err(ref e) if e.kind() == ErrorKind::Ask => {
-                // ASK: send ASKING to the redirect node, then retry the command.
-                //
-                // NOTE: The ASKING command and the retried command are sent as two
-                // separate requests, which means another command could be interleaved
-                // between them on the same connection. A proper fix requires pipelining
-                // both into a single write, but that needs pipeline-level support which
-                // is not yet available on the direct-dispatch path.
-                if let Some((addr, _slot)) = e.redirect_node() {
-                    let conn_future = {
-                        let container = self.inner.conn_lock.read();
-                        container.connection_for_address(addr).map(|(_, c)| c)
-                    };
-                    if let Some(conn_future) = conn_future {
-                        let mut redirect_conn = conn_future.await;
-                        if redirect_conn
-                            .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
-                            .await
-                            .is_err()
-                        {
-                            return None; // ASKING failed — fall back to cluster task
-                        }
-                        let repacked = cmd.get_packed_command();
-                        return Some(redirect_conn.send_packed_bytes(repacked, is_fenced).await);
-                    }
-                }
-                None
+            Err(ref e) if matches!(e.kind(), ErrorKind::Moved | ErrorKind::Ask) => {
+                // Delegate to shared redirect helper. The cluster task will also
+                // receive a slot-refresh trigger (MOVED) or handle retries (ASK)
+                // via its own state machine — this is a best-effort fast path only.
+                try_redirect_to_known_node(&self.inner.conn_lock, e, packed, is_fenced).await
             }
             Err(_) => Some(result),
         }
@@ -1124,91 +1133,9 @@ pin_project! {
     }
 }
 
-/// Arc-based inflight slot guard. Reserves one inflight slot on creation
-/// (decrements counter), releases it when the **last** clone is dropped
-/// (increments counter). Stored on `Cmd` so it flows naturally through
-/// the pipeline: Cmd → Message → PendingRequest → in_flight_requests.
-///
-/// For fan-out commands, `Arc<Cmd>` is cloned per shard — each clone
-/// shares the same tracker. The slot is released only when all
-/// sub-commands finish.
-struct InflightSlotGuard(Arc<AtomicIsize>);
-
-impl Drop for InflightSlotGuard {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-/// Cloneable handle to an inflight slot. Clone = Arc refcount bump.
-/// Last drop triggers `InflightSlotGuard::Drop` which releases the slot.
-#[derive(Clone)]
-pub struct InflightRequestTracker {
-    /// Held solely for its `Drop` impl which releases the inflight slot.
-    _guard: Arc<InflightSlotGuard>,
-}
-
-impl InflightRequestTracker {
-    /// Try to reserve one inflight slot atomically. Returns `None` if
-    /// no slots are available (counter <= 0).
-    pub fn try_new(counter: Arc<AtomicIsize>) -> Option<Self> {
-        loop {
-            let current = counter.load(Ordering::SeqCst);
-            if current <= 0 {
-                return None;
-            }
-            if counter
-                .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some(Self {
-                    _guard: Arc::new(InflightSlotGuard(counter)),
-                });
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod inflight_tracker_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::sync::Arc;
-
-    #[test]
-    fn tracker_reserves_and_releases_slot() {
-        let counter = Arc::new(AtomicIsize::new(5));
-        let tracker = InflightRequestTracker::try_new(counter.clone()).unwrap();
-        assert_eq!(counter.load(Ordering::Relaxed), 4); // reserved
-        drop(tracker);
-        assert_eq!(counter.load(Ordering::Relaxed), 5); // released
-    }
-
-    #[test]
-    fn try_new_returns_none_when_no_slots() {
-        let counter = Arc::new(AtomicIsize::new(0));
-        assert!(InflightRequestTracker::try_new(counter).is_none());
-    }
-
-    #[test]
-    fn cloned_tracker_releases_only_when_last_clone_drops() {
-        let counter = Arc::new(AtomicIsize::new(5));
-        let tracker = InflightRequestTracker::try_new(counter.clone()).unwrap();
-        assert_eq!(counter.load(Ordering::Relaxed), 4);
-
-        let clone1 = tracker.clone();
-        let clone2 = tracker.clone();
-
-        drop(clone1);
-        assert_eq!(counter.load(Ordering::Relaxed), 4); // still held
-
-        drop(tracker);
-        assert_eq!(counter.load(Ordering::Relaxed), 4); // still held
-
-        drop(clone2);
-        assert_eq!(counter.load(Ordering::Relaxed), 5); // last clone → released
-    }
-}
+// InflightSlotGuard and InflightRequestTracker live in crate::valkey::types
+// to avoid an upward dependency from cmd::Cmd into cluster_async.
+pub use crate::valkey::types::InflightRequestTracker;
 
 #[cfg(test)]
 mod iam_token_refresh_tests {

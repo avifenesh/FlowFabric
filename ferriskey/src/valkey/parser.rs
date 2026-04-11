@@ -13,6 +13,12 @@ use telemetrylib::FerrisKeyOtel;
 const MAX_RECURSE_DEPTH: usize = 100;
 const MAX_BULK_STRING_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 
+/// Shorthand for ParseError construction. Reduces 4-line error sites to 1 line.
+#[inline]
+fn parse_err(msg: impl Into<String>) -> ValkeyError {
+    ValkeyError::from((ErrorKind::ParseError, "parse error", msg.into()))
+}
+
 fn err_parser(line: &str) -> ServerError {
     let mut pieces = line.splitn(2, ' ');
     let kind = match pieces.next().unwrap() {
@@ -97,11 +103,7 @@ fn find_crlf(buf: &[u8], pos: usize) -> Option<usize> {
 #[inline]
 fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
     if line.is_empty() {
-        return Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Expected integer, got empty line".to_string(),
-        )));
+        return Err(parse_err("Expected integer, got empty line".to_string()));
     }
 
     let (negative, digits) = if line[0] == b'-' {
@@ -116,26 +118,14 @@ fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
     for &b in digits {
         if !b.is_ascii_digit() {
             let s = std::str::from_utf8(line).map_err(|_| {
-                ValkeyError::from((
-                    ErrorKind::ParseError,
-                    "parse error",
-                    "Expected integer, got garbage".to_string(),
-                ))
+                parse_err("Expected integer, got garbage".to_string())
             })?;
             return s.trim().parse::<i64>().map_err(|_| {
-                ValkeyError::from((
-                    ErrorKind::ParseError,
-                    "parse error",
-                    "Expected integer, got garbage".to_string(),
-                ))
+                parse_err("Expected integer, got garbage".to_string())
             });
         }
         val = val.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as i64)).ok_or_else(|| {
-            ValkeyError::from((
-                ErrorKind::ParseError,
-                "parse error",
-                "Integer overflow in RESP integer".to_string(),
-            ))
+            parse_err("Integer overflow in RESP integer".to_string())
         })?;
     }
 
@@ -154,11 +144,7 @@ fn scan_value(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize
     }
 
     if depth > MAX_RECURSE_DEPTH {
-        return Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Maximum recursion depth exceeded".to_string(),
-        )));
+        return Err(parse_err("Maximum recursion depth exceeded".to_string()));
     }
 
     let type_byte = buf[pos];
@@ -183,11 +169,7 @@ fn scan_value(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize
         // Attribute: |<count>\r\n<key><val>...<data>
         b'|' => scan_attribute(buf, after_type, depth),
 
-        _ => Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            format!("Unexpected byte: {type_byte:#x}"),
-        ))),
+        _ => Err(parse_err(format!("Unexpected byte: {type_byte:#x}"))),
     }
 }
 
@@ -214,12 +196,8 @@ fn scan_bulk(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
     }
     let size = size as usize;
     if size > MAX_BULK_STRING_BYTES {
-        return Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            format!(
-                "Bulk string length {size} exceeds maximum of {MAX_BULK_STRING_BYTES} bytes"
-            ),
+        return Err(parse_err(format!(
+            "Bulk string length {size} exceeds maximum of {MAX_BULK_STRING_BYTES} bytes"
         )));
     }
     let data_start = cr + 2;
@@ -304,11 +282,7 @@ fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<u
 #[inline]
 fn read_line_unchecked(buf: &mut BytesMut) -> ValkeyResult<BytesMut> {
     let pos = find_crlf(buf, 0).ok_or_else(|| {
-        ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Incomplete RESP line after scan".to_string(),
-        ))
+        parse_err("Incomplete RESP line after scan".to_string())
     })?;
     let line = buf.split_to(pos);
     buf.advance(2); // \r\n
@@ -336,11 +310,7 @@ fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value
         b'=' => parse_verbatim(buf),
         b'(' => parse_big_number(buf),
         b'>' => parse_push(buf, depth),
-        _ => Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            format!("Unexpected byte: {type_byte:#x}"),
-        ))),
+        _ => Err(parse_err(format!("Unexpected byte: {type_byte:#x}"))),
     }
 }
 
@@ -350,11 +320,7 @@ fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value
 fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
     let s = std::str::from_utf8(&line).map_err(|_| {
-        ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Invalid UTF-8 in simple string".to_string(),
-        ))
+        parse_err("Invalid UTF-8 in simple string".to_string())
     })?;
     if s == "OK" {
         Ok(Value::Okay)
@@ -367,11 +333,7 @@ fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
 fn parse_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
     let s = std::str::from_utf8(&line).map_err(|_| {
-        ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Invalid UTF-8 in error".to_string(),
-        ))
+        parse_err("Invalid UTF-8 in error".to_string())
     })?;
     Ok(Value::ServerError(err_parser(s)))
 }
@@ -471,19 +433,9 @@ fn parse_null(buf: &mut BytesMut) -> ValkeyResult<Value> {
 fn parse_double(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
     let s = std::str::from_utf8(&line).map_err(|_| {
-        ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Invalid UTF-8 in double".to_string(),
-        ))
+        parse_err("Invalid UTF-8 in double".to_string())
     })?;
-    let val = s.trim().parse::<f64>().map_err(|e| {
-        ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            format!("Expected double: {e}"),
-        ))
-    })?;
+    let val = s.trim().parse::<f64>().map_err(|e| parse_err(format!("Expected double: {e}")))?;
     Ok(Value::Double(val))
 }
 
@@ -493,11 +445,7 @@ fn parse_boolean(buf: &mut BytesMut) -> ValkeyResult<Value> {
     match line.as_ref() {
         b"t" => Ok(Value::Boolean(true)),
         b"f" => Ok(Value::Boolean(false)),
-        _ => Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Expected boolean, got garbage".to_string(),
-        ))),
+        _ => Err(parse_err("Expected boolean, got garbage".to_string())),
     }
 }
 
@@ -513,11 +461,7 @@ fn read_blob_unchecked(buf: &mut BytesMut) -> ValkeyResult<String> {
     let data = &buf[..size];
     let s = std::str::from_utf8(data)
         .map_err(|_| {
-            ValkeyError::from((
-                ErrorKind::ParseError,
-                "parse error",
-                "Invalid UTF-8 in blob string".to_string(),
-            ))
+            parse_err("Invalid UTF-8 in blob string".to_string())
         })?
         .to_string();
     buf.advance(size + 2);
@@ -544,11 +488,7 @@ fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
             text: text.to_string(),
         })
     } else {
-        Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Parse error when decoding verbatim string".to_string(),
-        )))
+        Err(parse_err("Parse error when decoding verbatim string".to_string()))
     }
 }
 
@@ -556,11 +496,7 @@ fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
 fn parse_big_number(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
     let val = BigInt::parse_bytes(&line, 10).ok_or_else(|| {
-        ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Expected bigint, got garbage".to_string(),
-        ))
+        parse_err("Expected bigint, got garbage".to_string())
     })?;
     Ok(Value::BigNumber(val))
 }
@@ -586,11 +522,7 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let first = it.next().unwrap_or(Value::Nil);
     if let Value::BulkString(kind) = first {
         let push_kind = String::from_utf8(kind.to_vec()).map_err(|_| {
-            ValkeyError::from((
-                ErrorKind::ParseError,
-                "parse error",
-                "Invalid UTF-8 in push kind".to_string(),
-            ))
+            parse_err("Invalid UTF-8 in push kind".to_string())
         })?;
         Ok(Value::Push {
             kind: get_push_kind(push_kind),
@@ -602,11 +534,7 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
             data: it.collect(),
         })
     } else {
-        Err(ValkeyError::from((
-            ErrorKind::ParseError,
-            "parse error",
-            "Parse error when decoding push".to_string(),
-        )))
+        Err(parse_err("Parse error when decoding push".to_string()))
     }
 }
 

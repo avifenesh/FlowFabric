@@ -8,6 +8,10 @@ use std::io;
 use std::num::ParseIntError;
 use std::str::{from_utf8, Utf8Error};
 use std::string::FromUtf8Error;
+use std::sync::{
+    Arc,
+    atomic::{AtomicIsize, Ordering},
+};
 
 use crate::valkey::cluster_routing::Redirect;
 use num_bigint::BigInt;
@@ -2385,4 +2389,92 @@ pub enum ProtocolVersion {
     /// <https://github.com/redis/redis-specifications/blob/master/protocol/RESP3.md>
     #[default]
     RESP3,
+}
+
+// ── Inflight slot tracking ────────────────────────────────────────────────────
+//
+// InflightRequestTracker is a cloneable handle to a reserved inflight slot.
+// It is held by `Cmd` and by the cluster pipeline; the slot is released
+// when the last clone is dropped. Defined here (rather than in cluster_async)
+// so that `cmd::Cmd` does not create an upward dependency into cluster_async.
+
+/// RAII guard that releases one inflight slot on drop.
+struct InflightSlotGuard(Arc<AtomicIsize>);
+
+impl Drop for InflightSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Cloneable handle to an inflight slot. Clone = Arc refcount bump.
+/// Last drop triggers `InflightSlotGuard::drop` which releases the slot.
+///
+/// Held by a [`crate::valkey::Cmd`] so that the slot is released when
+/// the last clone of that Cmd (or its `Arc<Cmd>`) is dropped — decoupling
+/// the user-facing timeout from internal pipeline cleanup.
+#[derive(Clone)]
+pub struct InflightRequestTracker {
+    /// Held solely for its `Drop` impl which releases the inflight slot.
+    _guard: Arc<InflightSlotGuard>,
+}
+
+impl InflightRequestTracker {
+    /// Try to reserve one inflight slot atomically. Returns `None` if
+    /// no slots are available (counter <= 0).
+    pub fn try_new(counter: Arc<AtomicIsize>) -> Option<Self> {
+        loop {
+            let current = counter.load(Ordering::SeqCst);
+            if current <= 0 {
+                return None;
+            }
+            if counter
+                .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(Self {
+                    _guard: Arc::new(InflightSlotGuard(counter)),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod inflight_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn tracker_reserves_and_releases_slot() {
+        let counter = Arc::new(AtomicIsize::new(5));
+        let tracker = InflightRequestTracker::try_new(counter.clone()).unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 4); // reserved
+        drop(tracker);
+        assert_eq!(counter.load(Ordering::Relaxed), 5); // released
+    }
+
+    #[test]
+    fn try_new_returns_none_when_no_slots() {
+        let counter = Arc::new(AtomicIsize::new(0));
+        assert!(InflightRequestTracker::try_new(counter).is_none());
+    }
+
+    #[test]
+    fn cloned_tracker_releases_only_when_last_clone_drops() {
+        let counter = Arc::new(AtomicIsize::new(5));
+        let tracker = InflightRequestTracker::try_new(counter.clone()).unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+
+        let clone1 = tracker.clone();
+        let clone2 = tracker.clone();
+
+        drop(clone1);
+        assert_eq!(counter.load(Ordering::Relaxed), 4); // still held
+
+        drop(tracker);
+        assert_eq!(counter.load(Ordering::Relaxed), 4); // still held
+
+        drop(clone2);
+        assert_eq!(counter.load(Ordering::Relaxed), 5); // last clone → released
+    }
 }
