@@ -294,18 +294,44 @@ where
         let mut conn = conn_future.await;
 
         let packed = cmd.get_packed_command();
-        let result = conn.send_packed_bytes(packed, cmd.is_fenced()).await;
+        let is_fenced = cmd.is_fenced();
+        let result = conn.send_packed_bytes(packed.clone(), is_fenced).await;
 
-        match &result {
-            Ok(_) => Some(result),
-            Err(e) => {
-                // MOVED/ASK: fall back to cluster task for retry with slot refresh
-                if e.kind() == ErrorKind::Moved || e.kind() == ErrorKind::Ask {
-                    None
-                } else {
-                    Some(result)
+        match result {
+            Ok(val) => Some(Ok(val)),
+            Err(ref e) if e.kind() == ErrorKind::Moved => {
+                // MOVED: try to send directly to the redirect target.
+                // The cluster task will eventually refresh the slot map.
+                if let Some((addr, _slot)) = e.redirect_node() {
+                    let conn_future = {
+                        let container = self.inner.conn_lock.read();
+                        container.connection_for_address(addr).map(|(_, c)| c)
+                    };
+                    if let Some(conn_future) = conn_future {
+                        let mut redirect_conn = conn_future.await;
+                        return Some(redirect_conn.send_packed_bytes(packed, is_fenced).await);
+                    }
                 }
+                None // Can't resolve redirect — fall back to cluster task
             }
+            Err(ref e) if e.kind() == ErrorKind::Ask => {
+                // ASK: send ASKING to the redirect node, then retry the command
+                if let Some((addr, _slot)) = e.redirect_node() {
+                    let conn_future = {
+                        let container = self.inner.conn_lock.read();
+                        container.connection_for_address(addr).map(|(_, c)| c)
+                    };
+                    if let Some(conn_future) = conn_future {
+                        let mut redirect_conn = conn_future.await;
+                        let _ = redirect_conn
+                            .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
+                            .await;
+                        return Some(redirect_conn.send_packed_bytes(packed, is_fenced).await);
+                    }
+                }
+                None
+            }
+            Err(_) => Some(result),
         }
     }
 
