@@ -4,7 +4,7 @@ use strum_macros::Display;
 use crate::valkey::cluster_topology::get_slot;
 use crate::valkey::cmd::{Arg, Cmd};
 use crate::valkey::types::Value;
-use crate::valkey::{ErrorKind, RedisError, RedisResult};
+use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult};
 use core::cmp::Ordering;
 use std::borrow::Cow;
 use std::cmp::min;
@@ -138,7 +138,7 @@ where
 }
 
 /// Aggreagte numeric responses.
-pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> RedisResult<Value> {
+pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> ValkeyResult<Value> {
     let initial_value = match op {
         AggregateOp::Min => i64::MAX,
         AggregateOp::Sum => 0,
@@ -147,7 +147,7 @@ pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> RedisResult<Value> {
         let int = match curr {
             Value::Int(int) => int,
             _ => {
-                return RedisResult::Err(
+                return ValkeyResult::Err(
                     (
                         ErrorKind::TypeError,
                         "expected array of integers as response",
@@ -166,7 +166,7 @@ pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> RedisResult<Value> {
 }
 
 /// Aggreagte numeric responses by a boolean operator.
-pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> RedisResult<Value> {
+pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> ValkeyResult<Value> {
     let initial_value = match op {
         LogicalAggregateOp::And => true,
     };
@@ -174,7 +174,7 @@ pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> RedisRes
         let values = match curr {
             Value::Array(values) => values,
             _ => {
-                return RedisResult::Err(
+                return ValkeyResult::Err(
                     (
                         ErrorKind::TypeError,
                         "expected array of integers as response",
@@ -214,7 +214,7 @@ pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> RedisRes
 }
 
 /// Aggregate array responses element-wise according to a numeric operator.
-pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> RedisResult<Value> {
+pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> ValkeyResult<Value> {
     let initial_value = match op {
         ArrayAggregateOp::Min => i64::MAX,
     };
@@ -222,7 +222,7 @@ pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> RedisResult<
         let values = match curr {
             Value::Array(values) => values,
             _ => {
-                return RedisResult::Err(
+                return ValkeyResult::Err(
                     (
                         ErrorKind::TypeError,
                         "expected array of integers as response",
@@ -256,7 +256,7 @@ pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> RedisResult<
     Ok(Value::Array(results.into_iter().map(Value::Int).collect()))
 }
 /// Aggregate array responses into a single map.
-pub fn combine_map_results(values: Vec<Value>) -> RedisResult<Value> {
+pub fn combine_map_results(values: Vec<Value>) -> ValkeyResult<Value> {
     let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
 
     for value in values {
@@ -291,7 +291,7 @@ pub fn combine_map_results(values: Vec<Value>) -> RedisResult<Value> {
 }
 
 /// Aggregate array responses into a single array.
-pub fn combine_array_results(values: Vec<Value>) -> RedisResult<Value> {
+pub fn combine_array_results(values: Vec<Value>) -> ValkeyResult<Value> {
     let mut results = Vec::new();
 
     for value in values {
@@ -336,11 +336,11 @@ type MultiSlotResIdxIter<'a> = std::iter::Map<
 fn calculate_multi_slot_result_indices<'a>(
     route_arg_indices: &'a [(Route, Vec<usize>)],
     args_pattern: &MultiSlotArgPattern,
-) -> RedisResult<MultiSlotResIdxIter<'a>> {
+) -> ValkeyResult<MultiSlotResIdxIter<'a>> {
     let check_indices_input = |step_count: usize| {
         for (_, indices) in route_arg_indices {
             if indices.len() % step_count != 0 {
-                return Err(RedisError::from((
+                return Err(ValkeyError::from((
                     ErrorKind::ClientError,
                     "Invalid indices input detected",
                     format!(
@@ -416,12 +416,12 @@ fn calculate_multi_slot_result_indices<'a>(
 ///
 /// # Returns
 ///
-/// Returns a `RedisResult<Value>` containing the final ordered array (`Value::Array`) of combined results.
+/// Returns a `ValkeyResult<Value>` containing the final ordered array (`Value::Array`) of combined results.
 pub(crate) fn combine_and_sort_array_results(
     values: Vec<Value>,
     route_arg_indices: &[(Route, Vec<usize>)],
     args_pattern: &MultiSlotArgPattern,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let result_indices = calculate_multi_slot_result_indices(route_arg_indices, args_pattern)?;
     let mut results = Vec::new();
     results.resize(
@@ -432,7 +432,7 @@ pub(crate) fn combine_and_sort_array_results(
         Value::Nil,
     );
     if values.len() != result_indices.len() {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::ClientError,
             "Mismatch in the number of multi-slot results compared to the expected result count.",
             format!(
@@ -1431,15 +1431,15 @@ impl ShardAddrs {
     /// * `replica_to_remove` - The address of the replica to be removed.
     ///
     /// # Returns
-    /// * `RedisResult<()>` - `Ok(())` if the replica was successfully removed, or an error if the
+    /// * `ValkeyResult<()>` - `Ok(())` if the replica was successfully removed, or an error if the
     ///   replica was not found.
-    pub(crate) fn remove_replica(&self, replica_to_remove: Arc<String>) -> RedisResult<()> {
+    pub(crate) fn remove_replica(&self, replica_to_remove: Arc<String>) -> ValkeyResult<()> {
         let mut replicas_lock = self.replicas.write().expect(WRITE_LK_ERR_SHARDADDRS);
         if let Some(index) = Self::replica_index(&replicas_lock, replica_to_remove.clone()) {
             replicas_lock.remove(index);
             Ok(())
         } else {
-            Err(RedisError::from((
+            Err(ValkeyError::from((
                 ErrorKind::ClientError,
                 "Couldn't remove replica",
                 format!("Replica {replica_to_remove:?} not found"),
@@ -1500,7 +1500,7 @@ mod tests_routing {
         ResponsePolicy, Route, RoutingInfo, ShardAddrs, SingleNodeRoutingInfo, SlotAddr,
     };
     use crate::valkey::cluster_routing::{is_readonly, is_readonly_cmd, Routable, ShardUpdateResult};
-    use crate::valkey::{cluster_topology::slot, cmd, parser::parse_redis_value, Value};
+    use crate::valkey::{cluster_topology::slot, cmd, parser::parse_valkey_value, Value};
     use core::panic;
     use std::sync::{Arc, RwLock};
 
@@ -1571,7 +1571,7 @@ mod tests_routing {
         test_cmds.push(test_cmd);
 
         for cmd in test_cmds {
-            let value = parse_redis_value(&cmd.get_packed_command()).unwrap();
+            let value = parse_valkey_value(&cmd.get_packed_command()).unwrap();
             assert_eq!(
                 RoutingInfo::for_routable(&value).unwrap(),
                 RoutingInfo::for_routable(&cmd).unwrap(),
@@ -1729,19 +1729,19 @@ mod tests_routing {
 
     #[test]
     fn test_slot_for_packed_cmd() {
-        assert!(matches!(RoutingInfo::for_routable(&parse_redis_value(&[
+        assert!(matches!(RoutingInfo::for_routable(&parse_valkey_value(&[
                 42, 50, 13, 10, 36, 54, 13, 10, 69, 88, 73, 83, 84, 83, 13, 10, 36, 49, 54, 13, 10,
                 244, 93, 23, 40, 126, 127, 253, 33, 89, 47, 185, 204, 171, 249, 96, 139, 13, 10
             ]).unwrap()), Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route(slot, SlotAddr::ReplicaOptional)))) if slot == 964));
 
-        assert!(matches!(RoutingInfo::for_routable(&parse_redis_value(&[
+        assert!(matches!(RoutingInfo::for_routable(&parse_valkey_value(&[
                 42, 54, 13, 10, 36, 51, 13, 10, 83, 69, 84, 13, 10, 36, 49, 54, 13, 10, 36, 241,
                 197, 111, 180, 254, 5, 175, 143, 146, 171, 39, 172, 23, 164, 145, 13, 10, 36, 52,
                 13, 10, 116, 114, 117, 101, 13, 10, 36, 50, 13, 10, 78, 88, 13, 10, 36, 50, 13, 10,
                 80, 88, 13, 10, 36, 55, 13, 10, 49, 56, 48, 48, 48, 48, 48, 13, 10
             ]).unwrap()), Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route(slot, SlotAddr::Master)))) if slot == 8352));
 
-        assert!(matches!(RoutingInfo::for_routable(&parse_redis_value(&[
+        assert!(matches!(RoutingInfo::for_routable(&parse_valkey_value(&[
                 42, 54, 13, 10, 36, 51, 13, 10, 83, 69, 84, 13, 10, 36, 49, 54, 13, 10, 169, 233,
                 247, 59, 50, 247, 100, 232, 123, 140, 2, 101, 125, 221, 66, 170, 13, 10, 36, 52,
                 13, 10, 116, 114, 117, 101, 13, 10, 36, 50, 13, 10, 78, 88, 13, 10, 36, 50, 13, 10,

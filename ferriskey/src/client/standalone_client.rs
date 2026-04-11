@@ -9,7 +9,7 @@ use logger_core::log_debug;
 use logger_core::log_warn;
 use crate::valkey::aio::ConnectionLike;
 use crate::valkey::cluster_routing::{self, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd};
-use crate::valkey::{PushInfo, RedisError, RedisResult, RetryStrategy, Value};
+use crate::valkey::{PushInfo, ValkeyError, ValkeyResult, RetryStrategy, Value};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -66,7 +66,7 @@ impl Drop for StandaloneClient {
 
 pub enum StandaloneClientConnectionError {
     NoAddressesProvided,
-    FailedConnection(Vec<(Option<String>, RedisError)>),
+    FailedConnection(Vec<(Option<String>, ValkeyError)>),
     PrimaryConflictFound(String),
 }
 
@@ -133,7 +133,7 @@ impl StandaloneClient {
         {
             return Err(StandaloneClientConnectionError::FailedConnection(vec![(
                 None,
-                RedisError::from((
+                ValkeyError::from((
                     crate::valkey::ErrorKind::InvalidClientConfig,
                     "read-only mode is not compatible with AZAffinity strategies",
                 )),
@@ -170,7 +170,7 @@ impl StandaloneClient {
         if has_client_cert != has_client_key {
             return Err(StandaloneClientConnectionError::FailedConnection(vec![(
                 None,
-                RedisError::from((
+                ValkeyError::from((
                     crate::valkey::ErrorKind::InvalidClientConfig,
                     "client_cert and client_key must both be provided or both be empty",
                 )),
@@ -181,7 +181,7 @@ impl StandaloneClient {
             if tls_mode.unwrap_or(TlsMode::NoTls) == TlsMode::NoTls {
                 return Err(StandaloneClientConnectionError::FailedConnection(vec![(
                     None,
-                    RedisError::from((
+                    ValkeyError::from((
                         crate::valkey::ErrorKind::InvalidClientConfig,
                         "TLS certificates provided but TLS is disabled",
                     )),
@@ -271,7 +271,7 @@ impl StandaloneClient {
                     // Only check for primary in normal mode (when replication_status is Some)
                     // and the node reports role:master
                     let is_primary = replication_status
-                        .and_then(|status| crate::valkey::from_owned_redis_value::<String>(status).ok())
+                        .and_then(|status| crate::valkey::from_owned_valkey_value::<String>(status).ok())
                         .is_some_and(|val| val.contains("role:master"));
 
                     if is_primary {
@@ -315,7 +315,7 @@ impl StandaloneClient {
                             0,
                             (
                                 None,
-                                RedisError::from((
+                                ValkeyError::from((
                                     crate::valkey::ErrorKind::ClientError,
                                     "No primary node found",
                                 )),
@@ -524,7 +524,7 @@ impl StandaloneClient {
     async fn send_request(
         cmd: &crate::valkey::Cmd,
         reconnecting_connection: &ReconnectingConnection,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let mut connection = reconnecting_connection.get_connection().await?;
         let result = connection.send_packed_command(cmd).await;
         match result {
@@ -541,7 +541,7 @@ impl StandaloneClient {
         &mut self,
         cmd: &crate::valkey::Cmd,
         response_policy: Option<ResponsePolicy>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let requests = self
             .inner
             .nodes
@@ -615,19 +615,19 @@ impl StandaloneClient {
         &mut self,
         cmd: &crate::valkey::Cmd,
         readonly: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let reconnecting_connection = self.get_connection(readonly).await;
         Self::send_request(cmd, reconnecting_connection).await
     }
 
-    pub async fn send_command(&mut self, cmd: &crate::valkey::Cmd) -> RedisResult<Value> {
+    pub async fn send_command(&mut self, cmd: &crate::valkey::Cmd) -> ValkeyResult<Value> {
         let Some(cmd_bytes) = Routable::command(cmd) else {
             return self.send_request_to_single_node(cmd, false).await;
         };
 
         // Block write commands in read-only mode
         if self.inner.read_only && !is_readonly_cmd(cmd_bytes.as_slice()) {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 crate::valkey::ErrorKind::ReadOnly,
                 "write commands are not allowed in read-only mode",
             )));
@@ -646,7 +646,7 @@ impl StandaloneClient {
         pipeline: &crate::valkey::Pipeline,
         offset: usize,
         count: usize,
-    ) -> RedisResult<Vec<Value>> {
+    ) -> ValkeyResult<Vec<Value>> {
         let reconnecting_connection = self.get_primary_connection();
         let mut connection = reconnecting_connection.get_connection().await?;
         let result = connection
@@ -746,7 +746,7 @@ impl StandaloneClient {
     pub async fn update_connection_password(
         &self,
         new_password: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         for node in self.inner.nodes.iter() {
             node.update_connection_password(new_password.clone());
         }
@@ -755,7 +755,7 @@ impl StandaloneClient {
     }
 
     /// Update the database id used to establish connection with the servers.
-    pub async fn update_connection_database(&self, database_id: i64) -> RedisResult<Value> {
+    pub async fn update_connection_database(&self, database_id: i64) -> ValkeyResult<Value> {
         for node in self.inner.nodes.iter() {
             node.update_connection_database(database_id);
         }
@@ -767,7 +767,7 @@ impl StandaloneClient {
     pub async fn update_connection_client_name(
         &self,
         new_client_name: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         for node in self.inner.nodes.iter() {
             node.update_connection_client_name(new_client_name.clone());
         }
@@ -787,7 +787,7 @@ impl StandaloneClient {
     pub async fn update_connection_username(
         &self,
         new_username: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         for node in self.inner.nodes.iter() {
             node.update_connection_username(new_username.clone());
         }
@@ -807,7 +807,7 @@ impl StandaloneClient {
     pub async fn update_connection_protocol(
         &self,
         new_protocol: crate::valkey::ProtocolVersion,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         for node in self.inner.nodes.iter() {
             node.update_connection_protocol(new_protocol);
         }
@@ -826,7 +826,7 @@ impl StandaloneClient {
 async fn get_connection_and_replication_info(
     address: &NodeAddress,
     retry_strategy: &RetryStrategy,
-    connection_info: &crate::valkey::RedisConnectionInfo,
+    connection_info: &crate::valkey::ValkeyConnectionInfo,
     tls_mode: TlsMode,
     push_sender: &Option<mpsc::UnboundedSender<PushInfo>>,
     discover_az: bool,
@@ -836,7 +836,7 @@ async fn get_connection_and_replication_info(
     pubsub_synchronizer: &Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     skip_replication_check: bool,
     iam_token_handle: Option<super::IAMTokenHandle>,
-) -> Result<(ReconnectingConnection, Option<Value>), (ReconnectingConnection, RedisError)> {
+) -> Result<(ReconnectingConnection, Option<Value>), (ReconnectingConnection, ValkeyError)> {
     let reconnecting_connection = ReconnectingConnection::new(
         address,
         *retry_strategy,

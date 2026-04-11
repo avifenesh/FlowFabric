@@ -7,7 +7,7 @@ use crate::valkey::cmd::Cmd;
 use crate::valkey::parser::ValueCodec;
 use crate::valkey::pipeline::PipelineRetryStrategy;
 use crate::valkey::push_manager::PushManager;
-use crate::valkey::types::{RedisError, RedisResult, Value};
+use crate::valkey::types::{ValkeyError, ValkeyResult, Value};
 use crate::valkey::{cmd, ConnectionInfo, ProtocolVersion, PushKind};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -36,7 +36,7 @@ use tokio_util::codec::Decoder;
 const DEFAULT_CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2000);
 
 // Senders which the result of a single request are sent through
-type PipelineOutput = oneshot::Sender<RedisResult<Value>>;
+type PipelineOutput = oneshot::Sender<ValkeyResult<Value>>;
 
 enum ResponseAggregate {
     SingleCommand,
@@ -44,7 +44,7 @@ enum ResponseAggregate {
         expected_response_count: usize, // = offset + count, pipelines offset is 0
         current_response_count: usize,
         buffer: Vec<Value>,
-        first_err: Option<RedisError>,
+        first_err: Option<ValkeyError>,
         is_transaction: bool,
     },
 }
@@ -68,7 +68,7 @@ struct InFlight {
     output: PipelineOutput,
     response_aggregate: ResponseAggregate,
     is_fenced: bool,
-    fenced_result: Option<RedisResult<Value>>,
+    fenced_result: Option<ValkeyResult<Value>>,
 }
 
 // A single message sent through the pipeline
@@ -106,7 +106,7 @@ pin_project! {
         #[pin]
         sink_stream: T,
         in_flight: VecDeque<InFlight>,
-        error: Option<RedisError>,
+        error: Option<ValkeyError>,
         push_manager: Arc<ArcSwap<PushManager>>,
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
         is_stream_closed: Arc<AtomicBool>,
@@ -131,7 +131,7 @@ pin_project! {
 
 impl<T> PipelineSink<T>
 where
-    T: Stream<Item = RedisResult<Value>> + 'static,
+    T: Stream<Item = ValkeyResult<Value>> + 'static,
 {
     fn new<SinkItem>(
         sink_stream: T,
@@ -140,7 +140,7 @@ where
         is_stream_closed: Arc<AtomicBool>,
     ) -> Self
     where
-        T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
+        T: Sink<SinkItem, Error = ValkeyError> + Stream<Item = ValkeyResult<Value>> + 'static,
     {
         PipelineSink {
             sink_stream,
@@ -174,13 +174,13 @@ where
         }
     }
 
-    fn send_result(self: Pin<&mut Self>, result: RedisResult<Value>) {
+    fn send_result(self: Pin<&mut Self>, result: ValkeyResult<Value>) {
         let self_ = self.project();
 
         // If response synchronization is lost, fail all requests
         if *self_.response_sync_lost {
             if let Some(entry) = self_.in_flight.pop_front() {
-                let err = RedisError::from((
+                let err = ValkeyError::from((
                     crate::valkey::ErrorKind::ProtocolDesync,
                     "Response synchronization lost - connection must be reestablished",
                 ));
@@ -272,7 +272,7 @@ where
     /// This function is only called for commands where `is_fenced` is true.
     fn handle_fenced_command(
         mut entry: InFlight,
-        result: RedisResult<Value>,
+        result: ValkeyResult<Value>,
         in_flight: &mut VecDeque<InFlight>,
         response_sync_lost: &mut bool,
     ) {
@@ -288,7 +288,7 @@ where
     /// Handles the first response of a fenced command.
     fn handle_fenced_first_response(
         mut entry: InFlight,
-        result: RedisResult<Value>,
+        result: ValkeyResult<Value>,
         in_flight: &mut VecDeque<InFlight>,
     ) {
         match result {
@@ -318,8 +318,8 @@ where
     /// Handles the second response of a fenced command (should be PONG).
     fn handle_fenced_second_response(
         entry: InFlight,
-        pong_result: RedisResult<Value>,
-        stored_result: RedisResult<Value>,
+        pong_result: ValkeyResult<Value>,
+        stored_result: ValkeyResult<Value>,
         response_sync_lost: &mut bool,
     ) {
         // Verify we got PONG
@@ -339,7 +339,7 @@ where
             );
 
             // Fail the current command
-            let err = RedisError::from((
+            let err = ValkeyError::from((
                 crate::valkey::ErrorKind::ProtocolDesync,
                 "Expected PONG for fenced command but received different response",
                 format!("Response synchronization lost. Got: {:?}", pong_result),
@@ -356,7 +356,7 @@ where
 
 impl<SinkItem, T> Sink<PipelineMessage<SinkItem>> for PipelineSink<T>
 where
-    T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
+    T: Sink<SinkItem, Error = ValkeyError> + Stream<Item = ValkeyResult<Value>> + 'static,
 {
     type Error = ();
 
@@ -399,7 +399,7 @@ where
         }
 
         if *self_.response_sync_lost {
-            let err = RedisError::from((
+            let err = ValkeyError::from((
                 crate::valkey::ErrorKind::ProtocolDesync,
                 "Response synchronization lost - connection must be reestablished",
             ));
@@ -468,7 +468,7 @@ where
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> (Self, impl Future<Output = ()>)
     where
-        T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
+        T: Sink<SinkItem, Error = ValkeyError> + Stream<Item = ValkeyResult<Value>> + 'static,
         T: Send + 'static,
         T::Item: Send,
         T::Error: Send,
@@ -505,7 +505,7 @@ where
         item: SinkItem,
         timeout: Duration,
         is_fenced: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         self.send_recv(item, None, timeout, true, is_fenced).await
     }
 
@@ -517,7 +517,7 @@ where
         timeout: Duration,
         is_atomic: bool,
         is_fenced: bool,
-    ) -> Result<Value, RedisError> {
+    ) -> Result<Value, ValkeyError> {
         let (sender, receiver) = oneshot::channel();
 
         self.sender
@@ -533,7 +533,7 @@ where
                 // If an error occurs here, it means the request never reached the server, as guaranteed
                 // by the 'send' function. Since the server did not receive the data, it is safe to retry
                 // the request.
-                RedisError::from((
+                ValkeyError::from((
                     crate::valkey::ErrorKind::FatalSendError,
                     "Failed to send the request to the server",
                     err.to_string(),
@@ -545,7 +545,7 @@ where
                 // The `sender` was dropped, likely indicating a failure in the stream.
                 // This error suggests that it's unclear whether the server received the request before the connection failed,
                 // making it unsafe to retry. For example, retrying an INCR request could result in double increments.
-                Err(RedisError::from((
+                Err(ValkeyError::from((
                     crate::valkey::ErrorKind::FatalReceiveError,
                     "Failed to receive a response due to a fatal error",
                     err.to_string(),
@@ -595,7 +595,7 @@ impl MultiplexedConnection {
         connection_info: &ConnectionInfo,
         stream: C,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<(Self, impl Future<Output = ()>)>
+    ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -615,7 +615,7 @@ impl MultiplexedConnection {
         stream: C,
         response_timeout: std::time::Duration,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<(Self, impl Future<Output = ()>)>
+    ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -634,18 +634,18 @@ impl MultiplexedConnection {
         pipeline.set_push_manager(pm.clone());
 
         let mut con = MultiplexedConnection::builder(pipeline)
-            .with_db(connection_info.redis.db)
+            .with_db(connection_info.valkey.db)
             .with_response_timeout(response_timeout)
             .with_push_manager(pm)
-            .with_protocol(connection_info.redis.protocol)
-            .with_password(connection_info.redis.password.clone())
+            .with_protocol(connection_info.valkey.protocol)
+            .with_password(connection_info.valkey.password.clone())
             .with_availability_zone(None)
             .build()
             .await?;
 
         let driver = {
             let auth = setup_connection(
-                &connection_info.redis,
+                &connection_info.valkey,
                 &mut con,
                 glide_connection_options.discover_az,
             );
@@ -658,7 +658,7 @@ impl MultiplexedConnection {
                     driver
                 }
                 futures_util::future::Either::Right(((), _)) => {
-                    return Err(RedisError::from((
+                    return Err(ValkeyError::from((
                         crate::valkey::ErrorKind::IoError,
                         "Multiplexed connection driver unexpectedly terminated",
                     )));
@@ -676,7 +676,7 @@ impl MultiplexedConnection {
 
     /// Sends an already encoded (packed) command into the TCP socket and
     /// reads the single response from it.
-    pub async fn send_packed_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
+    pub async fn send_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
         let result = self
             .pipeline
             .send_single(
@@ -707,7 +707,7 @@ impl MultiplexedConnection {
         cmd: &crate::valkey::Pipeline,
         offset: usize,
         count: usize,
-    ) -> RedisResult<Vec<Value>> {
+    ) -> ValkeyResult<Vec<Value>> {
         let result = self
             .pipeline
             .send_recv(
@@ -756,7 +756,7 @@ impl MultiplexedConnection {
     pub async fn update_connection_password(
         &mut self,
         password: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         self.password = password;
         Ok(Value::Okay)
     }
@@ -838,7 +838,7 @@ impl MultiplexedConnectionBuilder {
     }
 
     /// Builds and returns a new `MultiplexedConnection` instance using the configured settings.
-    pub async fn build(self) -> RedisResult<MultiplexedConnection> {
+    pub async fn build(self) -> ValkeyResult<MultiplexedConnection> {
         let db = self.db.unwrap_or_default();
         let response_timeout = self
             .response_timeout
@@ -862,7 +862,7 @@ impl MultiplexedConnectionBuilder {
 }
 
 impl ConnectionLike for MultiplexedConnection {
-    async fn req_packed_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
+    async fn req_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
         self.send_packed_command(cmd).await
     }
 
@@ -870,7 +870,7 @@ impl ConnectionLike for MultiplexedConnection {
         &mut self,
         packed: bytes::Bytes,
         is_fenced: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let result = self
             .pipeline
             .send_single(packed, self.response_timeout, is_fenced)
@@ -894,7 +894,7 @@ impl ConnectionLike for MultiplexedConnection {
         offset: usize,
         count: usize,
         _pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> RedisResult<Vec<Value>> {
+    ) -> ValkeyResult<Vec<Value>> {
         self.send_packed_commands(cmd, offset, count).await
     }
 
@@ -922,9 +922,9 @@ impl ConnectionLike for MultiplexedConnection {
 }
 impl MultiplexedConnection {
     /// Subscribes to a new channel.
-    pub async fn subscribe(&mut self, channel_name: String) -> RedisResult<()> {
+    pub async fn subscribe(&mut self, channel_name: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 crate::valkey::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
@@ -936,9 +936,9 @@ impl MultiplexedConnection {
     }
 
     /// Unsubscribes from channel.
-    pub async fn unsubscribe(&mut self, channel_name: String) -> RedisResult<()> {
+    pub async fn unsubscribe(&mut self, channel_name: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 crate::valkey::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
@@ -950,9 +950,9 @@ impl MultiplexedConnection {
     }
 
     /// Subscribes to a new channel with pattern.
-    pub async fn psubscribe(&mut self, channel_pattern: String) -> RedisResult<()> {
+    pub async fn psubscribe(&mut self, channel_pattern: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 crate::valkey::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
@@ -964,9 +964,9 @@ impl MultiplexedConnection {
     }
 
     /// Unsubscribes from channel pattern.
-    pub async fn punsubscribe(&mut self, channel_pattern: String) -> RedisResult<()> {
+    pub async fn punsubscribe(&mut self, channel_pattern: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 crate::valkey::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));

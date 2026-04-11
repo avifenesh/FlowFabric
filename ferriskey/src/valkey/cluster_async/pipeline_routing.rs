@@ -8,8 +8,8 @@ use crate::valkey::cluster_routing::{
 };
 use crate::valkey::types::{RetryMethod, ServerError};
 use crate::valkey::Pipeline;
-use crate::valkey::{cluster_routing, RedisResult, Value};
-use crate::valkey::{cluster_routing::Route, Cmd, ErrorKind, RedisError};
+use crate::valkey::{cluster_routing, ValkeyResult, Value};
+use crate::valkey::{cluster_routing::Route, Cmd, ErrorKind, ValkeyError};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
 use logger_core::log_error;
@@ -156,7 +156,7 @@ pub(crate) async fn map_pipeline_to_nodes<C>(
     pipeline: &crate::valkey::Pipeline,
     core: Core<C>,
     route: Option<InternalSingleNodeRouting<C>>,
-) -> Result<(NodePipelineMap<C>, ResponsePoliciesMap), (OperationTarget, RedisError)>
+) -> Result<(NodePipelineMap<C>, ResponsePoliciesMap), (OperationTarget, ValkeyError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -219,7 +219,7 @@ where
                                 };
                                 return Err((
                                     OperationTarget::NotFound,
-                                    RedisError::from((
+                                    ValkeyError::from((
                                         ErrorKind::AllConnectionsUnavailable,
                                         error_message,
                                     )),
@@ -275,7 +275,7 @@ async fn handle_pipeline_single_node_routing<C>(
     routing: InternalSingleNodeRouting<C>,
     core: Core<C>,
     index: usize,
-) -> Result<(), (OperationTarget, RedisError)>
+) -> Result<(), (OperationTarget, ValkeyError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -316,7 +316,7 @@ async fn handle_pipeline_multi_slot_routing<C>(
     cmd: Arc<Cmd>,
     index: usize,
     slots: Vec<(Route, Vec<usize>)>,
-) -> Result<(), (OperationTarget, RedisError)>
+) -> Result<(), (OperationTarget, ValkeyError)>
 where
     C: Clone,
 {
@@ -342,7 +342,7 @@ where
         } else {
             return Err((
                 OperationTarget::NotFound,
-                RedisError::from((
+                ValkeyError::from((
                     ErrorKind::ConnectionNotFoundForRoute,
                     "No available connections for route: ",
                     format!("Slot: {} Slot Address: {}", route.slot(), route.slot_addr()),
@@ -378,7 +378,7 @@ pub(crate) async fn collect_and_send_pending_requests<C>(
     retry: u32,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) -> (
-    Vec<Result<RedisResult<Response>, RecvError>>,
+    Vec<Result<ValkeyResult<Response>, RecvError>>,
     AddressAndIndices,
 )
 where
@@ -420,7 +420,7 @@ fn collect_pipeline_requests<C>(
     retry: u32,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) -> (
-    Vec<oneshot::Receiver<RedisResult<Response>>>,
+    Vec<oneshot::Receiver<ValkeyResult<Response>>>,
     Vec<PendingRequest<C>>,
     AddressAndIndices,
 )
@@ -480,7 +480,7 @@ fn add_pipeline_result(
     inner_index: Option<usize>,
     value: Value,
     address: String,
-) -> Result<(), (OperationTarget, RedisError)> {
+) -> Result<(), (OperationTarget, ValkeyError)> {
     if let Some(responses) = pipeline_responses.get_mut(index) {
         match inner_index {
             Some(inner_index) => {
@@ -511,7 +511,7 @@ fn add_pipeline_result(
                 } else {
                     return Err((
                         OperationTarget::FatalError,
-                        RedisError::from((
+                        ValkeyError::from((
                             ErrorKind::ClientError,
                             "Existing response is not a ServerError; cannot override.",
                         )),
@@ -523,7 +523,7 @@ fn add_pipeline_result(
     } else {
         Err((
             OperationTarget::FatalError,
-            RedisError::from((
+            ValkeyError::from((
                 ErrorKind::ClientError,
                 "Index not found in pipeline responses",
             )),
@@ -560,7 +560,7 @@ type RetryMap = HashMap<RetryMethod, Vec<RetryEntry>>;
 ///
 /// - `pipeline_responses`: A mutable collection that holds the responses corresponding to each command in the pipeline.
 /// - `responses`: A vector of results from sub-pipelines, where each item is a `Result` containing either a successful
-///   `RedisResult<Response>` or a `RecvError`.
+///   `ValkeyResult<Response>` or a `RecvError`.
 /// - `addresses_and_indices`: A collection of pairs where each pair associates a node address with the indices
 ///   of commands in the pipeline that were sent to that node.
 /// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.  
@@ -571,13 +571,13 @@ type RetryMap = HashMap<RetryMethod, Vec<RetryEntry>>;
 ///
 /// - **Ok**: A `RetryMap` mapping each retry method to the list of commands that failed and
 ///   should be retried.
-/// - **Err**: A tuple `(OperationTarget, RedisError)` if a node-level or reception error occurs while processing responses.
+/// - **Err**: A tuple `(OperationTarget, ValkeyError)` if a node-level or reception error occurs while processing responses.
 fn process_pipeline_responses(
     pipeline_responses: &mut PipelineResponses,
-    responses: Vec<Result<RedisResult<Response>, RecvError>>,
+    responses: Vec<Result<ValkeyResult<Response>, RecvError>>,
     addresses_and_indices: AddressAndIndices,
     pipeline_retry_strategy: PipelineRetryStrategy,
-) -> Result<RetryMap, (OperationTarget, RedisError)> {
+) -> Result<RetryMap, (OperationTarget, ValkeyError)> {
     let mut retry_map: RetryMap = HashMap::new();
     for ((address, command_indices), response_result) in
         addresses_and_indices.into_iter().zip(responses)
@@ -590,7 +590,7 @@ fn process_pipeline_responses(
                     // If the commands response is not marked to be ignored
                     if let Value::ServerError(error) = &value {
                         // Convert error and determine retry method
-                        let retry_method = RedisError::from(error.clone()).retry_method();
+                        let retry_method = ValkeyError::from(error.clone()).retry_method();
                         update_retry_map(
                             &mut retry_map,
                             retry_method,
@@ -755,13 +755,13 @@ fn update_retry_map(
 ///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).  
 ///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).  
 pub(crate) async fn process_and_retry_pipeline_responses<C>(
-    mut responses: Vec<Result<RedisResult<Response>, RecvError>>,
+    mut responses: Vec<Result<ValkeyResult<Response>, RecvError>>,
     mut addresses_and_indices: AddressAndIndices,
     pipeline: &crate::valkey::Pipeline,
     core: Core<C>,
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
-) -> Result<PipelineResponses, (OperationTarget, RedisError)>
+) -> Result<PipelineResponses, (OperationTarget, ValkeyError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -852,10 +852,10 @@ async fn handle_retry_map<C>(
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) -> Result<
     (
-        Vec<Result<RedisResult<Response>, RecvError>>,
+        Vec<Result<ValkeyResult<Response>, RecvError>>,
         AddressAndIndices,
     ),
-    (OperationTarget, RedisError),
+    (OperationTarget, ValkeyError),
 >
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
@@ -929,7 +929,7 @@ async fn handle_reconnect_logic<C>(
     should_retry: bool,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, RedisError)>
+) -> Result<(), (OperationTarget, ValkeyError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -989,7 +989,7 @@ async fn handle_retry_logic<C>(
     pipeline_responses: &mut PipelineResponses,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, RedisError)>
+) -> Result<(), (OperationTarget, ValkeyError)>
 where
     C: Clone + Sync + ConnectionLike + Send + Connect + 'static,
 {
@@ -1048,13 +1048,13 @@ async fn handle_redirect_logic<C>(
     pipeline_responses: &mut PipelineResponses,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, RedisError)>
+) -> Result<(), (OperationTarget, ValkeyError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     for (indices, address, mut error) in indices_addresses_and_error {
-        // Convert the ServerError to a RedisError and try to extract redirect info.
-        let redis_error: RedisError = error.clone().into();
+        // Convert the ServerError to a ValkeyError and try to extract redirect info.
+        let redis_error: ValkeyError = error.clone().into();
         let (index, inner_index) = indices;
 
         // Handle MOVED redirect by updating the topology
@@ -1131,7 +1131,7 @@ where
 /// If updating the topology fails, the error is returned.
 async fn pipeline_handle_moved_redirect<C>(
     core: Core<C>,
-    redis_error: &RedisError,
+    redis_error: &ValkeyError,
 ) -> Result<(), ServerError>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
@@ -1177,7 +1177,7 @@ async fn append_commands_to_retry<C>(
     indices_addresses_and_errors: Vec<((usize, Option<usize>), String, ServerError)>,
     pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, RedisError)>
+) -> Result<(), (OperationTarget, ValkeyError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -1288,7 +1288,7 @@ fn get_original_cmd(
 /// and returns the route for that specific node.
 /// If the pipeline contains no key-based commands, the function returns None.
 /// For non-atomic pipelines, the function will return None, regardless of the commands in it.
-pub(crate) fn route_for_pipeline(pipeline: &crate::valkey::Pipeline) -> RedisResult<Option<Route>> {
+pub(crate) fn route_for_pipeline(pipeline: &crate::valkey::Pipeline) -> ValkeyResult<Option<Route>> {
     fn route_for_command(cmd: &Cmd) -> Option<Route> {
         match cluster_routing::RoutingInfo::for_routable(cmd) {
             Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => None,

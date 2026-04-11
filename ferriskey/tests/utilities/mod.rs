@@ -13,8 +13,8 @@ use ferriskey::{
 use once_cell::sync::Lazy;
 use rand::{Rng, distr::Alphanumeric};
 use ferriskey::valkey::{
-    ConnectionAddr, GlideConnectionOptions, ProtocolVersion, PushInfo, RedisConnectionInfo,
-    RedisResult, Value,
+    ConnectionAddr, GlideConnectionOptions, ProtocolVersion, PushInfo, ValkeyConnectionInfo,
+    ValkeyResult, Value,
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
 };
 use socket2::{Domain, Socket, Type};
@@ -301,7 +301,7 @@ impl ValkeyServer {
     pub fn connection_info(&self) -> ferriskey::valkey::ConnectionInfo {
         ferriskey::valkey::ConnectionInfo {
             addr: self.get_client_addr(),
-            redis: Default::default(),
+            valkey: Default::default(),
         }
     }
 
@@ -534,7 +534,7 @@ pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
     let mut retries = 0;
     let client = ferriskey::valkey::Client::open(ferriskey::valkey::ConnectionInfo {
         addr: server_address.clone(),
-        redis: RedisConnectionInfo::default(),
+        valkey: ValkeyConnectionInfo::default(),
     })
     .unwrap();
     loop {
@@ -557,7 +557,7 @@ pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
                 while con.send_packed_command(&ferriskey::valkey::cmd("PING")).await.is_err() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                let _: RedisResult<()> = ferriskey::valkey::cmd("FLUSHDB").query_async(&mut con).await;
+                let _: ValkeyResult<()> = ferriskey::valkey::cmd("FLUSHDB").query_async(&mut con).await;
                 break;
             }
         }
@@ -600,7 +600,7 @@ pub fn generate_random_string(length: usize) -> String {
         .collect()
 }
 
-pub async fn send_get(client: &mut Client, key: &str) -> RedisResult<Value> {
+pub async fn send_get(client: &mut Client, key: &str) -> ValkeyResult<Value> {
     let mut get_command = ferriskey::valkey::Cmd::new();
     get_command.arg("GET").arg(key);
     client.send_command(&mut get_command, None).await
@@ -652,10 +652,10 @@ where
     panic!("Timed out: retry exceeded {:?}", timeout);
 }
 
-pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &RedisConnectionInfo) {
+pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &ValkeyConnectionInfo) {
     let client = ferriskey::valkey::Client::open(ferriskey::valkey::ConnectionInfo {
         addr: addr.clone(),
-        redis: RedisConnectionInfo::default(),
+        valkey: ValkeyConnectionInfo::default(),
     })
     .unwrap();
     let mut connection = retry(|| async {
@@ -735,7 +735,7 @@ pub fn create_connection_request(
 pub struct TestConfiguration {
     pub use_tls: bool,
     pub connection_retry_strategy: Option<ConnectionRetryStrategy>,
-    pub connection_info: Option<RedisConnectionInfo>,
+    pub connection_info: Option<ValkeyConnectionInfo>,
     pub cluster_mode: ClusterMode,
     pub request_timeout: Option<u32>,
     pub shared_server: bool,

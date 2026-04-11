@@ -6,7 +6,7 @@ use logger_core::{log_debug, log_error, log_warn};
 use once_cell::sync::OnceCell;
 use crate::valkey::{
     Cmd, ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
-    PubSubSynchronizer, RedisError, RedisResult, SlotMap, Value, cluster_routing::Routable,
+    PubSubSynchronizer, ValkeyError, ValkeyResult, SlotMap, Value, cluster_routing::Routable,
     cluster_routing::SingleNodeRoutingInfo,
 };
 use std::collections::{HashMap, HashSet};
@@ -230,19 +230,19 @@ impl GlidePubSubSynchronizer {
         &self,
         cmd: &mut Cmd,
         routing: Option<SingleNodeRoutingInfo>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let client_arc = self
             .internal_client
             .get()
             .ok_or_else(|| {
-                RedisError::from((
+                ValkeyError::from((
                     ErrorKind::ClientError,
                     "Internal client not set in synchronizer",
                 ))
             })?
             .upgrade()
             .ok_or_else(|| {
-                RedisError::from((ErrorKind::ClientError, "Internal client has been dropped"))
+                ValkeyError::from((ErrorKind::ClientError, "Internal client has been dropped"))
             })?;
 
         // Clone the client wrapper to release lock before await
@@ -255,9 +255,9 @@ impl GlidePubSubSynchronizer {
     }
 
     /// Parse an address string into SingleNodeRoutingInfo::ByAddress
-    fn parse_address_to_routing(address: &str) -> RedisResult<SingleNodeRoutingInfo> {
+    fn parse_address_to_routing(address: &str) -> ValkeyResult<SingleNodeRoutingInfo> {
         let (host, port_str) = address.rsplit_once(':').ok_or_else(|| {
-            RedisError::from((
+            ValkeyError::from((
                 ErrorKind::ClientError,
                 "Invalid address format",
                 address.to_string(),
@@ -266,7 +266,7 @@ impl GlidePubSubSynchronizer {
 
         let port = port_str
             .parse()
-            .map_err(|_| RedisError::from((ErrorKind::ClientError, "Invalid port")))?;
+            .map_err(|_| ValkeyError::from((ErrorKind::ClientError, "Invalid port")))?;
 
         Ok(SingleNodeRoutingInfo::ByAddress {
             host: host.to_string(),
@@ -308,7 +308,7 @@ impl GlidePubSubSynchronizer {
         *self.reconciliation_task_handle.lock().unwrap() = Some(handle);
     }
 
-    async fn reconcile(&self) -> RedisResult<()> {
+    async fn reconcile(&self) -> ValkeyResult<()> {
         // This are unsubscription stemming from slot migrations (we do them for load balancing reasons)
         // We need to process them first in order to get a correct view of our sync state during reconciliation
         self.process_pending_unsubscribes().await;
@@ -502,11 +502,11 @@ impl GlidePubSubSynchronizer {
         cmd: &Cmd,
         kind: PubSubSubscriptionKind,
         is_subscribe: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let channels = Self::extract_channels_from_cmd(cmd);
 
         if is_subscribe && channels.is_empty() {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::ClientError,
                 "No channels provided for subscription",
             )));
@@ -533,11 +533,11 @@ impl GlidePubSubSynchronizer {
         cmd: &Cmd,
         kind: PubSubSubscriptionKind,
         is_subscribe: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let (channels, timeout_ms) = Self::extract_channels_and_timeout(cmd);
 
         if is_subscribe && channels.is_empty() {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::ClientError,
                 "No channels provided for subscription",
             )));
@@ -615,9 +615,9 @@ impl GlidePubSubSynchronizer {
     }
 
     /// Run a synchronous operation with a timeout
-    async fn run_sync_with_timeout<T, F>(&self, f: F) -> RedisResult<T>
+    async fn run_sync_with_timeout<T, F>(&self, f: F) -> ValkeyResult<T>
     where
-        F: FnOnce() -> RedisResult<T> + Send,
+        F: FnOnce() -> ValkeyResult<T> + Send,
         T: Send,
     {
         match tokio::time::timeout(self.request_timeout, async move { f() }).await {
@@ -882,7 +882,7 @@ impl PubSubSynchronizer for GlidePubSubSynchronizer {
         self.reconciliation_notify.notify_one();
     }
 
-    async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<RedisResult<Value>> {
+    async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<ValkeyResult<Value>> {
         let command_name = cmd.command().unwrap_or_default();
         let command_str = std::str::from_utf8(&command_name).unwrap_or("");
 
@@ -990,7 +990,7 @@ impl PubSubSynchronizer for GlidePubSubSynchronizer {
         expected_channels: Option<HashSet<PubSubChannelOrPattern>>,
         expected_patterns: Option<HashSet<PubSubChannelOrPattern>>,
         expected_sharded: Option<HashSet<PubSubChannelOrPattern>>,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let deadline = if timeout_ms > 0 {
             Some(Instant::now() + Duration::from_millis(timeout_ms))
         } else {

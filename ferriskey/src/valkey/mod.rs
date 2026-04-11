@@ -12,9 +12,9 @@ pub use crate::valkey::connection::{
     TlsMode,
     parse_redis_url, ConnectionAddr, ConnectionInfo,
     IntoConnectionInfo, PubSubChannelOrPattern, PubSubSubscriptionInfo,
-    PubSubSubscriptionKind, RedisConnectionInfo,
+    PubSubSubscriptionKind, ValkeyConnectionInfo,
 };
-pub use crate::valkey::parser::{parse_redis_value, Parser};
+pub use crate::valkey::parser::{parse_valkey_value, Parser};
 pub use crate::valkey::pipeline::{Pipeline, PipelineRetryStrategy};
 pub use crate::valkey::pubsub_synchronizer::PubSubSynchronizer;
 pub use push_manager::{PushInfo, PushManager};
@@ -24,14 +24,14 @@ pub use retry_strategies::RetryStrategy;
 #[rustfmt::skip]
 pub use crate::valkey::types::{
     // utility functions
-    from_redis_value,
-    from_owned_redis_value,
+    from_valkey_value,
+    from_owned_valkey_value,
 
     // error kinds
     ErrorKind,
 
     // conversion traits
-    FromRedisValue,
+    FromValkeyValue,
 
     // utility types
     InfoDict,
@@ -41,9 +41,9 @@ pub use crate::valkey::types::{
     ExistenceCheck,
 
     // error and result types
-    RedisError,
-    RedisResult,
-    RedisWrite,
+    ValkeyError,
+    ValkeyResult,
+    ValkeyWrite,
     ToRedisArgs,
 
     // low level values
@@ -54,7 +54,7 @@ pub use crate::valkey::types::{
 };
 
 pub use crate::valkey::{
-    cmd::AsyncIter, parser::parse_redis_value_async, types::RedisFuture,
+    cmd::AsyncIter, parser::parse_valkey_value_async, types::ValkeyFuture,
 };
 
 mod macros;

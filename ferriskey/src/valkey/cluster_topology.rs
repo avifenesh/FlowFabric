@@ -4,7 +4,7 @@ use crate::valkey::cluster::get_connection_addr;
 use crate::valkey::cluster_client::SlotsRefreshRateLimit;
 use crate::valkey::cluster_routing::Slot;
 use crate::valkey::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap};
-use crate::valkey::{connection::TlsMode, ErrorKind, RedisError, RedisResult, Value};
+use crate::valkey::{connection::TlsMode, ErrorKind, ValkeyError, ValkeyResult, Value};
 use logger_core::log_warn;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
@@ -108,7 +108,7 @@ pub(crate) fn parse_and_count_slots(
     raw_slot_resp: &Value,
     tls: Option<TlsMode>,
     addr_of_answering_node: &str,
-) -> RedisResult<ParsedSlotsResult> {
+) -> ValkeyResult<ParsedSlotsResult> {
     // Parse response.
     let mut slots = Vec::with_capacity(2);
     let mut slots_count = 0;
@@ -280,7 +280,7 @@ pub(crate) fn parse_and_count_slots(
         }
     }
     if slots.is_empty() {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::ResponseError,
             "Error parsing slots: No healthy node found",
             format!("Raw slot map response: {raw_slot_resp:?}"),
@@ -306,7 +306,7 @@ pub(crate) fn calculate_topology<'a>(
     tls_mode: Option<TlsMode>,
     num_of_queried_nodes: usize,
     read_from_replica: ReadFromReplicaStrategy,
-) -> RedisResult<(SlotMap, TopologyHash)> {
+) -> ValkeyResult<(SlotMap, TopologyHash)> {
     let mut hash_view_map = HashMap::new();
     for (host, view) in topology_views {
         if let Ok(ParsedSlotsResult {
@@ -330,7 +330,7 @@ pub(crate) fn calculate_topology<'a>(
     let mut most_frequent_topology = match vec_iter.next() {
         Some(view) => view,
         None => {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::ResponseError,
                 "No topology views found",
             )));
@@ -382,7 +382,7 @@ pub(crate) fn calculate_topology<'a>(
         if curr_retry >= DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES || num_of_queried_nodes < 3 {
             return parse_and_built_result(most_frequent_topology);
         }
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::ResponseError,
             "Slot refresh error: Failed to obtain a majority in topology views",
         )));
@@ -394,7 +394,7 @@ pub(crate) fn calculate_topology<'a>(
     if agreement_rate >= MIN_AGREEMENT_RATE {
         parse_and_built_result(most_frequent_topology)
     } else {
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             ErrorKind::ResponseError,
             "Slot refresh error: The accuracy of the topology view is too low",
         )))

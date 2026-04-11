@@ -18,7 +18,7 @@
 //   BENCH_CPUS           CPUs to pin tokio workers to (default: 4-15)
 
 use ferriskey::valkey::{
-    ConnectionAddr, ConnectionInfo, Pipeline, RedisConnectionInfo, RedisResult, Value,
+    ConnectionAddr, ConnectionInfo, Pipeline, ValkeyConnectionInfo, ValkeyResult, Value,
     aio::ConnectionLike,
     cluster::ClusterClientBuilder,
     cluster_async::ClusterConnection,
@@ -200,7 +200,7 @@ fn connection_info(host: &str, port: u16, tls: bool) -> ConnectionInfo {
         } else {
             ConnectionAddr::Tcp(host.to_string(), port)
         },
-        redis: RedisConnectionInfo::default(),
+        valkey: ValkeyConnectionInfo::default(),
     }
 }
 
@@ -321,7 +321,7 @@ async fn run_workload<C: ConnectionLike + Clone + Send + 'static>(
 
             loop {
                 let start = Instant::now();
-                let result: RedisResult<Value> = if rng.is_get() {
+                let result: ValkeyResult<Value> = if rng.is_get() {
                     conn.req_packed_command(&cmd("GET").arg(&key)).await
                 } else {
                     conn.req_packed_command(&cmd("SET").arg(&key).arg(value.as_slice()))
@@ -415,7 +415,7 @@ async fn run_pipeline_workload<C: ConnectionLike + Clone + Send + 'static>(
             // Warmup
             let warmup_deadline = Instant::now() + warmup;
             while Instant::now() < warmup_deadline {
-                let _: RedisResult<Vec<Value>> = pipe.query_async(&mut conn).await;
+                let _: ValkeyResult<Vec<Value>> = pipe.query_async(&mut conn).await;
             }
 
             // Measure
@@ -425,7 +425,7 @@ async fn run_pipeline_workload<C: ConnectionLike + Clone + Send + 'static>(
 
             loop {
                 let start = Instant::now();
-                let result: RedisResult<Vec<Value>> = pipe.query_async(&mut conn).await;
+                let result: ValkeyResult<Vec<Value>> = pipe.query_async(&mut conn).await;
                 let elapsed_us = start.elapsed().as_micros() as u64;
 
                 if result.is_ok() {
@@ -625,7 +625,7 @@ async fn run_batch_cross_slot_workload<C: ConnectionLike + Clone + Send + 'stati
             let warmup_deadline = Instant::now() + warmup;
             while Instant::now() < warmup_deadline {
                 let pipe = build_pipe();
-                let _: RedisResult<Vec<Value>> = pipe.query_async(&mut conn).await;
+                let _: ValkeyResult<Vec<Value>> = pipe.query_async(&mut conn).await;
             }
 
             // Measure
@@ -636,7 +636,7 @@ async fn run_batch_cross_slot_workload<C: ConnectionLike + Clone + Send + 'stati
             loop {
                 let pipe = build_pipe();
                 let start = Instant::now();
-                let result: RedisResult<Vec<Value>> = pipe.query_async(&mut conn).await;
+                let result: ValkeyResult<Vec<Value>> = pipe.query_async(&mut conn).await;
                 let elapsed_us = start.elapsed().as_micros() as u64;
 
                 if result.is_ok() {

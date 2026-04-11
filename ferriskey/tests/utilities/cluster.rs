@@ -13,7 +13,7 @@ use ferriskey::pubsub::{PubSubSubscriptionInfo, PubSubSynchronizer, create_pubsu
 use once_cell::sync::Lazy;
 #[cfg(not(feature = "mock-pubsub"))]
 use ferriskey::valkey::PubSubSubscriptionKind;
-use ferriskey::valkey::{ConnectionAddr, RedisConnectionInfo};
+use ferriskey::valkey::{ConnectionAddr, ValkeyConnectionInfo};
 use ferriskey::valkey::{
     Value,
     cluster_async::ClusterConnection,
@@ -142,7 +142,7 @@ fn clean_shared_clusters() {
 impl ValkeyCluster {
     pub fn new(
         use_tls: bool,
-        conn_info: &Option<RedisConnectionInfo>,
+        conn_info: &Option<ValkeyConnectionInfo>,
         shards: Option<u16>,
         replicas: Option<u16>,
     ) -> ValkeyCluster {
@@ -159,7 +159,7 @@ impl ValkeyCluster {
 
     fn new_with_tls_paths(
         use_tls: bool,
-        conn_info: &Option<RedisConnectionInfo>,
+        conn_info: &Option<ValkeyConnectionInfo>,
         shards: Option<u16>,
         replicas: Option<u16>,
         tls_paths: Option<super::TlsFilePaths>,
@@ -319,7 +319,7 @@ pub struct ClusterTestBasics {
 
 async fn setup_acl_for_cluster(
     addresses: &[ConnectionAddr],
-    connection_info: &RedisConnectionInfo,
+    connection_info: &ValkeyConnectionInfo,
 ) {
     let ops: Vec<BoxFuture<()>> = addresses
         .iter()
@@ -473,7 +473,7 @@ impl PubSubTestSetup {
             .iter()
             .map(|addr| ferriskey::valkey::ConnectionInfo {
                 addr: addr.clone(),
-                redis: RedisConnectionInfo::default(),
+                valkey: ValkeyConnectionInfo::default(),
             })
             .collect();
 

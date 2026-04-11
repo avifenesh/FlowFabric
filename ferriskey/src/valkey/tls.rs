@@ -4,7 +4,7 @@ use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::valkey::{Client, ConnectionAddr, ConnectionInfo, ErrorKind, RedisError, RedisResult};
+use crate::valkey::{Client, ConnectionAddr, ConnectionInfo, ErrorKind, ValkeyError, ValkeyResult};
 
 /// Structure to hold mTLS client _certificate_ and _key_ binaries in PEM format
 ///
@@ -31,7 +31,7 @@ pub struct TlsCertificates {
 pub(crate) fn inner_build_with_tls(
     mut connection_info: ConnectionInfo,
     certificates: TlsCertificates,
-) -> RedisResult<Client> {
+) -> ValkeyResult<Client> {
     let tls_params = retrieve_tls_certificates(certificates)?;
 
     connection_info.addr = if let ConnectionAddr::TcpTls {
@@ -48,7 +48,7 @@ pub(crate) fn inner_build_with_tls(
             tls_params: Some(tls_params),
         }
     } else {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::InvalidClientConfig,
             "Constructing a TLS client requires a URL with the `rediss://` scheme",
         )));
@@ -61,7 +61,7 @@ pub(crate) fn inner_build_with_tls(
 ///
 /// Parses the provided TLS certificates and returns connection parameters
 /// that can be used to establish secure connections.
-pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> RedisResult<TlsConnParams> {
+pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> ValkeyResult<TlsConnParams> {
     let TlsCertificates {
         client_tls,
         root_cert,

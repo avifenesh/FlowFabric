@@ -21,7 +21,7 @@ mod cluster_client_tests {
     use ferriskey::client::types::ReadFrom;
     use ferriskey::valkey::{
         InfoDict, ProtocolVersion, PubSubSubscriptionInfo, PubSubSubscriptionKind,
-        RedisConnectionInfo, Value,
+        ValkeyConnectionInfo, Value,
         cluster_routing::{
             MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
         },
@@ -66,7 +66,7 @@ mod cluster_client_tests {
                 .send_command(&mut cmd, None)
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_redis_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::valkey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 0);
@@ -97,7 +97,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_redis_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::valkey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 0);
@@ -128,7 +128,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_redis_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::valkey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 3);
@@ -158,7 +158,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_redis_value::<String>(info).unwrap();
+            let info = ferriskey::valkey::from_owned_valkey_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 1);
             assert_eq!(replicas, 0);
@@ -192,7 +192,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_redis_value::<String>(info).unwrap();
+            let info = ferriskey::valkey::from_owned_valkey_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 0);
             assert_eq!(replicas, 1);
@@ -226,7 +226,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_redis_value::<String>(info).unwrap();
+            let info = ferriskey::valkey::from_owned_valkey_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 0);
             assert_eq!(replicas, 1);
@@ -259,7 +259,7 @@ mod cluster_client_tests {
                 .await
                 .unwrap();
 
-            let info_dict: InfoDict = ferriskey::valkey::from_owned_redis_value(info).unwrap();
+            let info_dict: InfoDict = ferriskey::valkey::from_owned_valkey_value(info).unwrap();
             match info_dict.get::<String>("redis_version") {
                 Some(version) => match (Versioning::new(version), Versioning::new("7.0")) {
                     (Some(server_ver), Some(min_ver)) => {
@@ -784,7 +784,7 @@ mod cluster_client_tests {
             // Create a new connection request with the restricted user's credentials
             let restricted_configuration = TestConfiguration {
                 cluster_mode: ClusterMode::Enabled,
-                connection_info: Some(RedisConnectionInfo {
+                connection_info: Some(ValkeyConnectionInfo {
                     username: Some(username.to_string()),
                     password: Some(password.to_string()),
                     ..Default::default()
@@ -859,12 +859,12 @@ mod cluster_client_tests {
                 .iter()
                 .map(|addr| ferriskey::valkey::ConnectionInfo {
                     addr: addr.clone(),
-                    redis: ferriskey::valkey::RedisConnectionInfo::default(),
+                    valkey: ferriskey::valkey::ValkeyConnectionInfo::default(),
                 })
                 .collect();
             initial_nodes.push(ferriskey::valkey::ConnectionInfo {
                 addr: ferriskey::valkey::ConnectionAddr::Tcp("127.0.0.1".to_string(), blackhole_port),
-                redis: ferriskey::valkey::RedisConnectionInfo::default(),
+                valkey: ferriskey::valkey::ValkeyConnectionInfo::default(),
             });
 
             let cluster_client = ferriskey::valkey::cluster::ClusterClientBuilder::new(initial_nodes)
@@ -879,7 +879,7 @@ mod cluster_client_tests {
                 .await
                 .expect("connect to cluster");
 
-            let ping: ferriskey::valkey::RedisResult<ferriskey::valkey::Value> = conn
+            let ping: ferriskey::valkey::ValkeyResult<ferriskey::valkey::Value> = conn
                 .route_command(
                     &ferriskey::valkey::cmd("PING"),
                     ferriskey::valkey::cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),

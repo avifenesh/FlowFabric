@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 
 use crate::valkey::types::{
-    ErrorKind, PushKind, RedisError, RedisResult, ServerError, ServerErrorKind, Value,
+    ErrorKind, PushKind, ValkeyError, ValkeyResult, ServerError, ServerErrorKind, Value,
     VerbatimFormat,
 };
 
@@ -94,9 +94,9 @@ fn find_crlf(buf: &[u8], pos: usize) -> Option<usize> {
 
 /// Parse an integer from a byte slice (no allocations).
 #[inline]
-fn parse_integer(line: &[u8]) -> RedisResult<i64> {
+fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
     if line.is_empty() {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Expected integer, got empty line".to_string(),
@@ -115,14 +115,14 @@ fn parse_integer(line: &[u8]) -> RedisResult<i64> {
     for &b in digits {
         if b < b'0' || b > b'9' {
             let s = std::str::from_utf8(line).map_err(|_| {
-                RedisError::from((
+                ValkeyError::from((
                     ErrorKind::ParseError,
                     "parse error",
                     "Expected integer, got garbage".to_string(),
                 ))
             })?;
             return s.trim().parse::<i64>().map_err(|_| {
-                RedisError::from((
+                ValkeyError::from((
                     ErrorKind::ParseError,
                     "parse error",
                     "Expected integer, got garbage".to_string(),
@@ -141,13 +141,13 @@ fn parse_integer(line: &[u8]) -> RedisResult<i64> {
 /// Scan a single RESP value starting at `pos` in `buf`.
 /// Returns the byte position AFTER the value if complete, or None if incomplete.
 /// Returns Err on protocol errors (bad type byte, exceeds recursion depth).
-fn scan_value(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+fn scan_value(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
     if pos >= buf.len() {
         return Ok(None);
     }
 
     if depth > MAX_RECURSE_DEPTH {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Maximum recursion depth exceeded".to_string(),
@@ -176,7 +176,7 @@ fn scan_value(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>
         // Attribute: |<count>\r\n<key><val>...<data>
         b'|' => scan_attribute(buf, after_type, depth),
 
-        _ => Err(RedisError::from((
+        _ => Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             format!("Unexpected byte: {type_byte:#x}"),
@@ -186,7 +186,7 @@ fn scan_value(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>
 
 /// Scan past a \r\n-terminated line. Returns position after the \r\n.
 #[inline]
-fn scan_line(buf: &[u8], pos: usize) -> RedisResult<Option<usize>> {
+fn scan_line(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
     match find_crlf(buf, pos) {
         Some(cr) => Ok(Some(cr + 2)),
         None => Ok(None),
@@ -195,7 +195,7 @@ fn scan_line(buf: &[u8], pos: usize) -> RedisResult<Option<usize>> {
 
 /// Scan a bulk string/blob: <len>\r\n<data>\r\n
 #[inline]
-fn scan_bulk(buf: &[u8], pos: usize) -> RedisResult<Option<usize>> {
+fn scan_bulk(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -216,7 +216,7 @@ fn scan_bulk(buf: &[u8], pos: usize) -> RedisResult<Option<usize>> {
 }
 
 /// Scan an aggregate type (array, set, push): <count>\r\n<elements...>
-fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -237,7 +237,7 @@ fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<us
 }
 
 /// Scan a map: <count>\r\n<key><val>... (count pairs = 2*count elements)
-fn scan_map(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+fn scan_map(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -255,7 +255,7 @@ fn scan_map(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> 
 }
 
 /// Scan an attribute: <count>\r\n<key><val>...<data> (count pairs + 1 data element)
-fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> RedisResult<Option<usize>> {
+fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -288,7 +288,7 @@ fn read_line_unchecked(buf: &mut BytesMut) -> BytesMut {
 }
 
 /// Parse a complete RESP value from BytesMut. Never returns None.
-fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let type_byte = buf[0];
     buf.advance(1);
 
@@ -308,7 +308,7 @@ fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> RedisResult<Value>
         b'=' => parse_verbatim(buf),
         b'(' => parse_big_number(buf),
         b'>' => parse_push(buf, depth),
-        _ => Err(RedisError::from((
+        _ => Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             format!("Unexpected byte: {type_byte:#x}"),
@@ -319,10 +319,10 @@ fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> RedisResult<Value>
 // ── Individual type parsers (pass 2, unchecked) ──────────────────────
 
 #[inline]
-fn parse_simple_string(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let s = std::str::from_utf8(&line).map_err(|_| {
-        RedisError::from((
+        ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Invalid UTF-8 in simple string".to_string(),
@@ -336,10 +336,10 @@ fn parse_simple_string(buf: &mut BytesMut) -> RedisResult<Value> {
 }
 
 #[inline]
-fn parse_error(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let s = std::str::from_utf8(&line).map_err(|_| {
-        RedisError::from((
+        ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Invalid UTF-8 in error".to_string(),
@@ -349,7 +349,7 @@ fn parse_error(buf: &mut BytesMut) -> RedisResult<Value> {
 }
 
 #[inline]
-fn parse_int_value(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_int_value(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let val = parse_integer(&line)?;
     Ok(Value::Int(val))
@@ -357,7 +357,7 @@ fn parse_int_value(buf: &mut BytesMut) -> RedisResult<Value> {
 
 /// Zero-copy bulk string: split_to + freeze. No memcpy.
 #[inline]
-fn parse_bulk_string(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_bulk_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let size = parse_integer(&line)?;
     if size < 0 {
@@ -369,7 +369,7 @@ fn parse_bulk_string(buf: &mut BytesMut) -> RedisResult<Value> {
     Ok(Value::BulkString(data))
 }
 
-fn parse_array(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+fn parse_array(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let length = parse_integer(&line)?;
     if length < 0 {
@@ -383,7 +383,7 @@ fn parse_array(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
     Ok(Value::Array(items))
 }
 
-fn parse_map(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+fn parse_map(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let kv_length = parse_integer(&line)? as usize;
     let mut pairs = Vec::with_capacity(kv_length);
@@ -395,7 +395,7 @@ fn parse_map(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
     Ok(Value::Map(pairs))
 }
 
-fn parse_attribute(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+fn parse_attribute(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let kv_length = parse_integer(&line)? as usize;
     let mut attributes = Vec::with_capacity(kv_length);
@@ -411,7 +411,7 @@ fn parse_attribute(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
     })
 }
 
-fn parse_set(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+fn parse_set(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let length = parse_integer(&line)?;
     if length < 0 {
@@ -426,23 +426,23 @@ fn parse_set(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
 }
 
 #[inline]
-fn parse_null(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_null(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let _line = read_line_unchecked(buf);
     Ok(Value::Nil)
 }
 
 #[inline]
-fn parse_double(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_double(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let s = std::str::from_utf8(&line).map_err(|_| {
-        RedisError::from((
+        ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Invalid UTF-8 in double".to_string(),
         ))
     })?;
     let val = s.trim().parse::<f64>().map_err(|e| {
-        RedisError::from((
+        ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             format!("Expected double: {e}"),
@@ -452,12 +452,12 @@ fn parse_double(buf: &mut BytesMut) -> RedisResult<Value> {
 }
 
 #[inline]
-fn parse_boolean(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_boolean(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     match line.as_ref() {
         b"t" => Ok(Value::Boolean(true)),
         b"f" => Ok(Value::Boolean(false)),
-        _ => Err(RedisError::from((
+        _ => Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Expected boolean, got garbage".to_string(),
@@ -467,7 +467,7 @@ fn parse_boolean(buf: &mut BytesMut) -> RedisResult<Value> {
 
 /// Read a blob (length-prefixed string) for blob errors and verbatim strings.
 #[inline]
-fn read_blob_unchecked(buf: &mut BytesMut) -> RedisResult<String> {
+fn read_blob_unchecked(buf: &mut BytesMut) -> ValkeyResult<String> {
     let line = read_line_unchecked(buf);
     let size = parse_integer(&line)?;
     if size < 0 {
@@ -481,13 +481,13 @@ fn read_blob_unchecked(buf: &mut BytesMut) -> RedisResult<String> {
 }
 
 #[inline]
-fn parse_blob_error(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_blob_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let s = read_blob_unchecked(buf)?;
     Ok(Value::ServerError(err_parser(&s)))
 }
 
 #[inline]
-fn parse_verbatim(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let s = read_blob_unchecked(buf)?;
     if let Some((format, text)) = s.split_once(':') {
         let format = match format {
@@ -500,7 +500,7 @@ fn parse_verbatim(buf: &mut BytesMut) -> RedisResult<Value> {
             text: text.to_string(),
         })
     } else {
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "parse error when decoding verbatim string".to_string(),
@@ -509,10 +509,10 @@ fn parse_verbatim(buf: &mut BytesMut) -> RedisResult<Value> {
 }
 
 #[inline]
-fn parse_big_number(buf: &mut BytesMut) -> RedisResult<Value> {
+fn parse_big_number(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let val = BigInt::parse_bytes(&line, 10).ok_or_else(|| {
-        RedisError::from((
+        ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "Expected bigint, got garbage".to_string(),
@@ -521,7 +521,7 @@ fn parse_big_number(buf: &mut BytesMut) -> RedisResult<Value> {
     Ok(Value::BigNumber(val))
 }
 
-fn parse_push(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
+fn parse_push(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf);
     let length = parse_integer(&line)?;
 
@@ -542,7 +542,7 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
     let first = it.next().unwrap_or(Value::Nil);
     if let Value::BulkString(kind) = first {
         let push_kind = String::from_utf8(kind.to_vec()).map_err(|_| {
-            RedisError::from((
+            ValkeyError::from((
                 ErrorKind::ParseError,
                 "parse error",
                 "Invalid UTF-8 in push kind".to_string(),
@@ -558,7 +558,7 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> RedisResult<Value> {
             data: it.collect(),
         })
     } else {
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             ErrorKind::ParseError,
             "parse error",
             "parse error when decoding push".to_string(),
@@ -577,7 +577,7 @@ mod aio_support {
     pub struct ValueCodec;
 
     impl Encoder<bytes::Bytes> for ValueCodec {
-        type Error = RedisError;
+        type Error = ValkeyError;
         fn encode(&mut self, item: bytes::Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
             dst.extend_from_slice(&item);
             Ok(())
@@ -585,8 +585,8 @@ mod aio_support {
     }
 
     impl Decoder for ValueCodec {
-        type Item = RedisResult<Value>;
-        type Error = RedisError;
+        type Item = ValkeyResult<Value>;
+        type Error = ValkeyError;
 
         fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
             if src.is_empty() {
@@ -616,10 +616,10 @@ mod aio_support {
     }
 
     /// Parses a redis value asynchronously from an AsyncRead source.
-    pub async fn parse_redis_value_async<R>(
+    pub async fn parse_valkey_value_async<R>(
         _decoder: &mut (),
         read: &mut R,
-    ) -> RedisResult<Value>
+    ) -> ValkeyResult<Value>
     where
         R: AsyncRead + std::marker::Unpin,
     {
@@ -629,7 +629,7 @@ mod aio_support {
         loop {
             let n = read.read_buf(&mut buf).await?;
             if n == 0 {
-                return Err(RedisError::from(io::Error::from(
+                return Err(ValkeyError::from(io::Error::from(
                     io::ErrorKind::UnexpectedEof,
                 )));
             }
@@ -661,13 +661,13 @@ impl Parser {
     }
 
     /// Parses synchronously into a single value from the reader.
-    pub fn parse_value<T: Read>(&mut self, mut reader: T) -> RedisResult<Value> {
+    pub fn parse_value<T: Read>(&mut self, mut reader: T) -> ValkeyResult<Value> {
         let mut buf = BytesMut::with_capacity(4096);
         let mut tmp = [0u8; 4096];
         loop {
             let n = reader.read(&mut tmp)?;
             if n == 0 {
-                return Err(RedisError::from(io::Error::from(
+                return Err(ValkeyError::from(io::Error::from(
                     io::ErrorKind::UnexpectedEof,
                 )));
             }
@@ -685,7 +685,7 @@ impl Parser {
 }
 
 /// Parses bytes into a redis value.
-pub fn parse_redis_value(bytes: &[u8]) -> RedisResult<Value> {
+pub fn parse_valkey_value(bytes: &[u8]) -> ValkeyResult<Value> {
     // For complete buffers we can skip scan — parse_value_unchecked will
     // work if the data is complete, and we get an error/panic if not.
     // But to match the old semantics (return error on incomplete), do
@@ -695,7 +695,7 @@ pub fn parse_redis_value(bytes: &[u8]) -> RedisResult<Value> {
             let mut buf = BytesMut::from(bytes);
             parse_value_unchecked(&mut buf, 0)
         }
-        None => Err(RedisError::from(io::Error::from(
+        None => Err(ValkeyError::from(io::Error::from(
             io::ErrorKind::UnexpectedEof,
         ))),
     }
@@ -715,7 +715,7 @@ mod tests {
         let mut bytes = bytes::BytesMut::from(&b"+GET 123\r\n"[..]);
         assert_eq!(
             codec.decode_eof(&mut bytes),
-            Ok(Some(Ok(parse_redis_value(b"+GET 123\r\n").unwrap())))
+            Ok(Some(Ok(parse_valkey_value(b"+GET 123\r\n").unwrap())))
         );
         assert_eq!(codec.decode_eof(&mut bytes), Ok(None));
         assert_eq!(codec.decode_eof(&mut bytes), Ok(None));
@@ -733,7 +733,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap().extract_error(),
-            Err(RedisError::from((
+            Err(ValkeyError::from((
                 ErrorKind::BusyLoadingError,
                 "An error was signalled by the server",
                 "server is loading".to_string()
@@ -749,58 +749,58 @@ mod tests {
     #[test]
     fn parse_nested_error_and_handle_more_inputs() {
         let bytes = b"*3\r\n+OK\r\n-LOADING server is loading\r\n+OK\r\n";
-        let result = parse_redis_value(bytes);
+        let result = parse_valkey_value(bytes);
 
         assert_eq!(
             result.unwrap().extract_error(),
-            Err(RedisError::from((
+            Err(ValkeyError::from((
                 ErrorKind::BusyLoadingError,
                 "An error was signalled by the server",
                 "server is loading".to_string()
             )))
         );
 
-        let result = parse_redis_value(b"+OK\r\n").unwrap();
+        let result = parse_valkey_value(b"+OK\r\n").unwrap();
 
         assert_eq!(result, Value::Okay);
     }
 
     #[test]
     fn decode_resp3_double() {
-        let val = parse_redis_value(b",1.23\r\n").unwrap();
+        let val = parse_valkey_value(b",1.23\r\n").unwrap();
         assert_eq!(val, Value::Double(1.23));
-        let val = parse_redis_value(b",nan\r\n").unwrap();
+        let val = parse_valkey_value(b",nan\r\n").unwrap();
         if let Value::Double(val) = val {
             assert!(val.is_sign_positive());
             assert!(val.is_nan());
         } else {
             panic!("expected double");
         }
-        let val = parse_redis_value(b",-nan\r\n").unwrap();
+        let val = parse_valkey_value(b",-nan\r\n").unwrap();
         if let Value::Double(val) = val {
             assert!(val.is_sign_negative());
             assert!(val.is_nan());
         } else {
             panic!("expected double");
         }
-        let val = parse_redis_value(b",2.67923e+8\r\n").unwrap();
+        let val = parse_valkey_value(b",2.67923e+8\r\n").unwrap();
         assert_eq!(val, Value::Double(267923000.0));
-        let val = parse_redis_value(b",2.67923E+8\r\n").unwrap();
+        let val = parse_valkey_value(b",2.67923E+8\r\n").unwrap();
         assert_eq!(val, Value::Double(267923000.0));
-        let val = parse_redis_value(b",-2.67923E+8\r\n").unwrap();
+        let val = parse_valkey_value(b",-2.67923E+8\r\n").unwrap();
         assert_eq!(val, Value::Double(-267923000.0));
-        let val = parse_redis_value(b",2.1E-2\r\n").unwrap();
+        let val = parse_valkey_value(b",2.1E-2\r\n").unwrap();
         assert_eq!(val, Value::Double(0.021));
 
-        let val = parse_redis_value(b",-inf\r\n").unwrap();
+        let val = parse_valkey_value(b",-inf\r\n").unwrap();
         assert_eq!(val, Value::Double(-f64::INFINITY));
-        let val = parse_redis_value(b",inf\r\n").unwrap();
+        let val = parse_valkey_value(b",inf\r\n").unwrap();
         assert_eq!(val, Value::Double(f64::INFINITY));
     }
 
     #[test]
     fn decode_resp3_map() {
-        let val = parse_redis_value(b"%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n").unwrap();
+        let val = parse_valkey_value(b"%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n").unwrap();
         let mut v = val.as_map_iter().unwrap();
         assert_eq!(
             (&Value::SimpleString("first".to_string()), &Value::Int(1)),
@@ -814,19 +814,19 @@ mod tests {
 
     #[test]
     fn decode_resp3_boolean() {
-        let val = parse_redis_value(b"#t\r\n").unwrap();
+        let val = parse_valkey_value(b"#t\r\n").unwrap();
         assert_eq!(val, Value::Boolean(true));
-        let val = parse_redis_value(b"#f\r\n").unwrap();
+        let val = parse_valkey_value(b"#f\r\n").unwrap();
         assert_eq!(val, Value::Boolean(false));
-        let val = parse_redis_value(b"#x\r\n");
+        let val = parse_valkey_value(b"#x\r\n");
         assert!(val.is_err());
-        let val = parse_redis_value(b"#\r\n");
+        let val = parse_valkey_value(b"#\r\n");
         assert!(val.is_err());
     }
 
     #[test]
     fn decode_resp3_blob_error() {
-        let val = parse_redis_value(b"!21\r\nSYNTAX invalid syntax\r\n");
+        let val = parse_valkey_value(b"!21\r\nSYNTAX invalid syntax\r\n");
         assert_eq!(
             val.unwrap().extract_error().err(),
             Some(make_extension_error(
@@ -839,7 +839,7 @@ mod tests {
     #[test]
     fn decode_resp3_big_number() {
         let val =
-            parse_redis_value(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
+            parse_valkey_value(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
         assert_eq!(
             val,
             Value::BigNumber(
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn decode_resp3_set() {
         let val =
-            parse_redis_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
+            parse_valkey_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
         let v = val.as_sequence().unwrap();
         assert_eq!(Value::SimpleString("orange".to_string()), v[0]);
         assert_eq!(Value::SimpleString("apple".to_string()), v[1]);
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn decode_resp3_push() {
         let val =
-            parse_redis_value(b">3\r\n+message\r\n+some_channel\r\n+this is the message\r\n")
+            parse_valkey_value(b">3\r\n+message\r\n+some_channel\r\n+this is the message\r\n")
                 .unwrap();
         if let Value::Push { ref kind, ref data } = val {
             assert_eq!(&PushKind::Message, kind);
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn test_max_recursion_depth() {
         let bytes = b"*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n";
-        match parse_redis_value(bytes) {
+        match parse_valkey_value(bytes) {
             Ok(_) => panic!("Expected Err"),
             Err(e) => assert!(matches!(e.kind(), ErrorKind::ParseError)),
         }
@@ -888,35 +888,35 @@ mod tests {
 
     #[test]
     fn test_bulk_string_zero_copy() {
-        let val = parse_redis_value(b"$5\r\nhello\r\n").unwrap();
+        let val = parse_valkey_value(b"$5\r\nhello\r\n").unwrap();
         assert_eq!(val, Value::BulkString(bytes::Bytes::from_static(b"hello")));
     }
 
     #[test]
     fn test_nil_bulk_string() {
-        let val = parse_redis_value(b"$-1\r\n").unwrap();
+        let val = parse_valkey_value(b"$-1\r\n").unwrap();
         assert_eq!(val, Value::Nil);
     }
 
     #[test]
     fn test_empty_bulk_string() {
-        let val = parse_redis_value(b"$0\r\n\r\n").unwrap();
+        let val = parse_valkey_value(b"$0\r\n\r\n").unwrap();
         assert_eq!(val, Value::BulkString(bytes::Bytes::new()));
     }
 
     #[test]
     fn test_simple_integer() {
-        let val = parse_redis_value(b":42\r\n").unwrap();
+        let val = parse_valkey_value(b":42\r\n").unwrap();
         assert_eq!(val, Value::Int(42));
-        let val = parse_redis_value(b":-100\r\n").unwrap();
+        let val = parse_valkey_value(b":-100\r\n").unwrap();
         assert_eq!(val, Value::Int(-100));
-        let val = parse_redis_value(b":0\r\n").unwrap();
+        let val = parse_valkey_value(b":0\r\n").unwrap();
         assert_eq!(val, Value::Int(0));
     }
 
     #[test]
-    fn test_incomplete_returns_error_for_parse_redis_value() {
-        let result = parse_redis_value(b"$5\r\nhel");
+    fn test_incomplete_returns_error_for_parse_valkey_value() {
+        let result = parse_valkey_value(b"$5\r\nhel");
         assert!(result.is_err());
     }
 

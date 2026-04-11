@@ -44,7 +44,7 @@ use crate::valkey::aio::ConnectionLike;
 use crate::valkey::cluster_async::{ClusterConnInner, Connect, InnerCore, RefreshPolicy};
 use crate::valkey::cluster_routing::SlotAddr;
 use crate::valkey::cluster_topology::SLOT_SIZE;
-use crate::valkey::{cmd, from_redis_value, ErrorKind, RedisError, RedisResult, Value};
+use crate::valkey::{cmd, from_valkey_value, ErrorKind, ValkeyError, ValkeyResult, Value};
 use std::sync::Arc;
 use strum_macros::{Display, EnumString};
 
@@ -394,7 +394,7 @@ impl ScanState {
     async fn initiate_scan<C>(
         core: &InnerCore<C>,
         allow_non_covered_slots: bool,
-    ) -> RedisResult<ScanState>
+    ) -> ValkeyResult<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
@@ -426,7 +426,7 @@ impl ScanState {
         core: Arc<InnerCore<C>>,
         allow_non_covered_slots: bool,
         new_scanned_slots_map: Option<SlotsBitsArray>,
-    ) -> RedisResult<ScanState>
+    ) -> ValkeyResult<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
@@ -467,7 +467,7 @@ impl ScanState {
         &mut self,
         core: Arc<InnerCore<C>>,
         allow_non_covered_slots: bool,
-    ) -> RedisResult<ScanState>
+    ) -> ValkeyResult<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
@@ -532,7 +532,7 @@ enum NextNodeResult {
 ///
 /// # Returns
 ///
-/// * `RedisResult<NextNodeResult>` - Returns the next node address to scan or indicates completion.
+/// * `ValkeyResult<NextNodeResult>` - Returns the next node address to scan or indicates completion.
 ///
 /// # Type Parameters
 ///
@@ -543,7 +543,7 @@ fn next_address_to_scan<C>(
     mut slot: u16,
     scanned_slots_map: &mut SlotsBitsArray,
     allow_non_covered_slots: bool,
-) -> RedisResult<NextNodeResult>
+) -> ValkeyResult<NextNodeResult>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -566,7 +566,7 @@ where
             slot = next_slot(scanned_slots_map).unwrap();
         } else {
             // Error if slots are not covered and scanning is not allowed
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                     ErrorKind::NotAllSlotsCovered,
                     "Could not find an address covering a slot, SCAN operation cannot continue \n 
                     If you want to continue scanning even if some slots are not covered, set allow_non_covered_slots to true \n 
@@ -609,9 +609,9 @@ fn next_slot(scanned_slots_map: &SlotsBitsArray) -> Option<u16> {
 ///
 /// # Returns
 ///
-/// * `RedisResult<(ScanStateRC, Vec<Value>)>` -
+/// * `ValkeyResult<(ScanStateRC, Vec<Value>)>` -
 ///   - On success: A tuple containing the updated scan state (`ScanStateRC`) and a vector of `Value`s representing the found keys.
-///   - On failure: A `RedisError` detailing the reason for the failure.
+///   - On failure: A `ValkeyError` detailing the reason for the failure.
 ///
 /// # Type Parameters
 ///
@@ -620,7 +620,7 @@ fn next_slot(scanned_slots_map: &SlotsBitsArray) -> Option<u16> {
 pub(crate) async fn cluster_scan<C>(
     core: Arc<InnerCore<C>>,
     cluster_scan_args: ClusterScanArgs,
-) -> RedisResult<(ScanStateRC, Vec<Value>)>
+) -> ValkeyResult<(ScanStateRC, Vec<Value>)>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -682,12 +682,12 @@ where
 ///
 /// # Returns
 ///
-/// A `RedisResult` containing the response from the `SCAN` command.
+/// A `ValkeyResult` containing the response from the `SCAN` command.
 async fn send_scan<C>(
     scan_state: &ScanState,
     cluster_scan_args: &ClusterScanArgs,
     core: Arc<InnerCore<C>>,
-) -> RedisResult<Value>
+) -> ValkeyResult<Value>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -709,7 +709,7 @@ where
         }
         conn.req_packed_command(&scan_command).await
     } else {
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             ErrorKind::ConnectionNotFoundForRoute,
             "Cluster scan failed. No connection available for address: ",
             format!("{}", scan_state.address_in_scan),
@@ -720,7 +720,7 @@ where
 /// Checks if the error is retryable during scanning.
 /// Retryable errors include network issues, cluster topology changes, and unavailable connections.
 /// Scan operations are not keyspace operations, so they are not affected by keyspace errors like `MOVED`.
-fn is_scanwise_retryable_error(err: &RedisError) -> bool {
+fn is_scanwise_retryable_error(err: &ValkeyError) -> bool {
     matches!(
         err.kind(),
         ErrorKind::IoError
@@ -741,7 +741,7 @@ async fn next_scan_state<C>(
     core: &Arc<InnerCore<C>>,
     scan_state: &ScanState,
     cluster_scan_args: &ClusterScanArgs,
-) -> RedisResult<Option<ScanState>>
+) -> ValkeyResult<Option<ScanState>>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -776,7 +776,7 @@ async fn try_scan<C>(
     scan_state: &ScanState,
     cluster_scan_args: &ClusterScanArgs,
     core: Arc<InnerCore<C>>,
-) -> RedisResult<((u64, Vec<Value>), ScanState)>
+) -> ValkeyResult<((u64, Vec<Value>), ScanState)>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -785,7 +785,7 @@ where
     loop {
         match send_scan(&new_scan_state, cluster_scan_args, core.clone()).await {
             Ok(scan_response) => {
-                let (new_cursor, new_keys) = from_redis_value::<(u64, Vec<Value>)>(&scan_response)?;
+                let (new_cursor, new_keys) = from_valkey_value::<(u64, Vec<Value>)>(&scan_response)?;
                 return Ok(((new_cursor, new_keys), new_scan_state));
             }
             Err(err) if is_scanwise_retryable_error(&err) => {

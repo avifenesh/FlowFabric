@@ -6,7 +6,7 @@ use crate::valkey::{
     connection::{ConnectionInfo, IntoConnectionInfo},
     push_manager::PushInfo,
     retry_strategies::RetryStrategy,
-    types::{ProtocolVersion, RedisResult},
+    types::{ProtocolVersion, ValkeyResult},
 };
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -42,7 +42,7 @@ impl Client {
     /// Connects to a redis server and returns a client.  This does not
     /// actually open a connection yet but it does perform some basic
     /// checks on the URL that might make the operation fail.
-    pub fn open<T: IntoConnectionInfo>(params: T) -> RedisResult<Client> {
+    pub fn open<T: IntoConnectionInfo>(params: T) -> ValkeyResult<Client> {
         Ok(Client {
             connection_info: params.into_connection_info()?,
         })
@@ -97,7 +97,7 @@ impl Client {
     pub async fn get_multiplexed_async_connection(
         &self,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<crate::valkey::aio::MultiplexedConnection> {
+    ) -> ValkeyResult<crate::valkey::aio::MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
@@ -112,7 +112,7 @@ impl Client {
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<crate::valkey::aio::MultiplexedConnection> {
+    ) -> ValkeyResult<crate::valkey::aio::MultiplexedConnection> {
         let result = crate::valkey::aio::runtime::timeout(
             connection_timeout,
             self.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
@@ -136,7 +136,7 @@ impl Client {
     pub async fn get_multiplexed_async_connection_ip(
         &self,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)> {
+    ) -> ValkeyResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)> {
         self.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
             Duration::MAX,
             None,
@@ -150,7 +150,7 @@ impl Client {
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)>
+    ) -> ValkeyResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)>
     where
         T: crate::valkey::aio::RedisRuntime,
     {
@@ -201,7 +201,7 @@ impl Client {
     ///     root_cert_file: &str,
     ///     cert_file: &str,
     ///     key_file: &str
-    /// ) -> redis::RedisResult<()> {
+    /// ) -> redis::ValkeyResult<()> {
     ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
     ///     let mut root_cert_vec = Vec::new();
     ///     BufReader::new(root_cert_file)
@@ -258,7 +258,7 @@ impl Client {
     pub fn build_with_tls<C: IntoConnectionInfo>(
         conn_info: C,
         tls_certs: TlsCertificates,
-    ) -> RedisResult<Client> {
+    ) -> ValkeyResult<Client> {
         let connection_info = conn_info.into_connection_info()?;
 
         inner_build_with_tls(connection_info, tls_certs)
@@ -266,7 +266,7 @@ impl Client {
 
     /// Updates the password in connection_info.
     pub fn update_password(&mut self, password: Option<String>) {
-        self.connection_info.redis.password = password;
+        self.connection_info.valkey.password = password;
     }
 
     /// Updates the database ID in connection_info.
@@ -280,12 +280,12 @@ impl Client {
     ///
     /// ```
     pub fn update_database(&mut self, database_id: i64) {
-        self.connection_info.redis.db = database_id;
+        self.connection_info.valkey.db = database_id;
     }
 
     /// Updates the client_name in connection_info.
     pub fn update_client_name(&mut self, client_name: Option<String>) {
-        self.connection_info.redis.client_name = client_name;
+        self.connection_info.valkey.client_name = client_name;
     }
 
     /// Updates the username in connection_info.
@@ -299,7 +299,7 @@ impl Client {
     /// * `username` - The username to use for authentication (None to clear)
     ///
     pub fn update_username(&mut self, username: Option<String>) {
-        self.connection_info.redis.username = username;
+        self.connection_info.valkey.username = username;
     }
 
     /// Updates the protocol version in connection_info.
@@ -313,7 +313,7 @@ impl Client {
     /// * `protocol` - The protocol version to use (RESP2 or RESP3)
     ///
     pub fn update_protocol(&mut self, protocol: ProtocolVersion) {
-        self.connection_info.redis.protocol = protocol;
+        self.connection_info.valkey.protocol = protocol;
     }
 }
 
@@ -332,12 +332,12 @@ mod test {
         let mut client = Client::open("redis://127.0.0.1/0").unwrap();
 
         // Verify initial database is 0
-        assert_eq!(client.connection_info.redis.db, 0);
+        assert_eq!(client.connection_info.valkey.db, 0);
 
         // Update to database 1
         client.update_database(1);
 
         // Verify database was updated
-        assert_eq!(client.connection_info.redis.db, 1);
+        assert_eq!(client.connection_info.valkey.db, 1);
     }
 }

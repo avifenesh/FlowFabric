@@ -31,7 +31,7 @@ pub(crate) mod shared_client_tests {
     use ferriskey::client::{Client, DEFAULT_RESPONSE_TIMEOUT};
     use ferriskey::valkey::cluster_routing::{SingleNodeRoutingInfo, SlotAddr};
     use ferriskey::valkey::{
-        FromRedisValue, InfoDict, Pipeline, PipelineRetryStrategy, RedisConnectionInfo, Value,
+        FromValkeyValue, InfoDict, Pipeline, PipelineRetryStrategy, ValkeyConnectionInfo, Value,
         cluster_routing::{MultipleNodeRoutingInfo, Route, RoutingInfo},
     };
     use rstest::rstest;
@@ -211,7 +211,7 @@ pub(crate) mod shared_client_tests {
 
             let values: Vec<_> = match values {
                 Value::Map(map) => map.into_iter().filter_map(|(_, value)| {
-                    let map = InfoDict::from_owned_redis_value(value).unwrap();
+                    let map = InfoDict::from_owned_valkey_value(value).unwrap();
                     map.get::<String>("cmdstat_get")?
                         .split_once(',')?
                         .0
@@ -245,7 +245,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     shared_server: true,
-                    connection_info: Some(RedisConnectionInfo {
+                    connection_info: Some(ValkeyConnectionInfo {
                         protocol: protocol_enum,
                         ..Default::default()
                     }),
@@ -258,7 +258,7 @@ pub(crate) mod shared_client_tests {
                 },
             )
             .await;
-            let hello: std::collections::HashMap<String, Value> = ferriskey::valkey::from_owned_redis_value(
+            let hello: std::collections::HashMap<String, Value> = ferriskey::valkey::from_owned_valkey_value(
                 test_basics
                     .client
                     .send_command(&mut ferriskey::valkey::cmd("HELLO"), None)
@@ -372,7 +372,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     use_tls: true,
-                    connection_info: Some(ferriskey::valkey::RedisConnectionInfo {
+                    connection_info: Some(ferriskey::valkey::ValkeyConnectionInfo {
                         password: Some("ReallySecurePassword".to_string()),
                         ..Default::default()
                     }),
@@ -394,7 +394,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     use_tls: true,
-                    connection_info: Some(ferriskey::valkey::RedisConnectionInfo {
+                    connection_info: Some(ferriskey::valkey::ValkeyConnectionInfo {
                         password: Some("ReallySecurePassword".to_string()),
                         username: Some("AuthorizedUsername".to_string()),
                         ..Default::default()
@@ -1575,11 +1575,11 @@ pub(crate) mod shared_client_tests {
                         .unwrap();
 
                     if use_cluster {
-                        ferriskey::valkey::from_owned_redis_value(variant_res).unwrap()
+                        ferriskey::valkey::from_owned_valkey_value(variant_res).unwrap()
                     } else {
                         [(
                             "DONT_CARE".to_string(),
-                            ferriskey::valkey::from_owned_redis_value(variant_res).unwrap(),
+                            ferriskey::valkey::from_owned_valkey_value(variant_res).unwrap(),
                         )]
                         .into()
                     }
@@ -1616,7 +1616,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     shared_server: true,
-                    connection_info: Some(RedisConnectionInfo {
+                    connection_info: Some(ValkeyConnectionInfo {
                         protocol: protocol_enum,
                         ..Default::default()
                     }),
@@ -1629,7 +1629,7 @@ pub(crate) mod shared_client_tests {
                 },
             )
             .await;
-            let hello: std::collections::HashMap<String, Value> = ferriskey::valkey::from_owned_redis_value(
+            let hello: std::collections::HashMap<String, Value> = ferriskey::valkey::from_owned_valkey_value(
                 test_basics
                     .client
                     .send_command(&mut ferriskey::valkey::cmd("HELLO"), None)
@@ -2830,7 +2830,7 @@ pub(crate) mod shared_client_tests {
                 TestConfiguration {
                     use_tls: true,
                     shared_server: false,
-                    connection_info: Some(ferriskey::valkey::RedisConnectionInfo {
+                    connection_info: Some(ferriskey::valkey::ValkeyConnectionInfo {
                         password: Some("ReallySecurePassword".to_string()),
                         ..Default::default()
                     }),
@@ -3002,7 +3002,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     shared_server: true,
-                    connection_info: Some(RedisConnectionInfo {
+                    connection_info: Some(ValkeyConnectionInfo {
                         protocol: ferriskey::valkey::ProtocolVersion::RESP2,
                         ..Default::default()
                     }),
@@ -3023,7 +3023,7 @@ pub(crate) mod shared_client_tests {
                 .unwrap();
 
             let initial_hello: std::collections::HashMap<String, Value> =
-                ferriskey::valkey::from_owned_redis_value(initial_hello_response).unwrap();
+                ferriskey::valkey::from_owned_valkey_value(initial_hello_response).unwrap();
             assert_eq!(initial_hello.get("proto").unwrap(), &Value::Int(2));
 
             // Use HELLO command to change to RESP3
@@ -3036,7 +3036,7 @@ pub(crate) mod shared_client_tests {
                 .unwrap();
 
             let hello_3_result: std::collections::HashMap<String, Value> =
-                ferriskey::valkey::from_owned_redis_value(hello_3_response).unwrap();
+                ferriskey::valkey::from_owned_valkey_value(hello_3_response).unwrap();
             assert_eq!(hello_3_result.get("proto").unwrap(), &Value::Int(3));
 
             // Kill the connection to simulate a network drop
@@ -3048,7 +3048,7 @@ pub(crate) mod shared_client_tests {
                     let mut client = test_basics.client.clone();
                     let mut cmd = hello_cmd.clone();
                     let response = client.send_command(&mut cmd, None).await.ok()?;
-                    ferriskey::valkey::from_owned_redis_value::<std::collections::HashMap<String, Value>>(
+                    ferriskey::valkey::from_owned_valkey_value::<std::collections::HashMap<String, Value>>(
                         response,
                     )
                     .ok()

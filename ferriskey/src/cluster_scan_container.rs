@@ -3,7 +3,7 @@
 use logger_core::log_debug;
 use nanoid::nanoid;
 use once_cell::sync::Lazy;
-use crate::valkey::{RedisResult, ScanStateRC};
+use crate::valkey::{ValkeyResult, ScanStateRC};
 use std::{collections::HashMap, sync::Mutex};
 
 // This is a container for storing the cursor of a cluster scan.
@@ -27,7 +27,7 @@ pub fn insert_cluster_scan_cursor(scan_state: ScanStateRC) -> String {
     id
 }
 
-pub fn get_cluster_scan_cursor(id: String) -> RedisResult<ScanStateRC> {
+pub fn get_cluster_scan_cursor(id: String) -> ValkeyResult<ScanStateRC> {
     let scan_state_rc = CONTAINER.lock().unwrap().get(&id).cloned();
     log_debug(
         "scan_state_cursor get",
@@ -35,7 +35,7 @@ pub fn get_cluster_scan_cursor(id: String) -> RedisResult<ScanStateRC> {
     );
     match scan_state_rc {
         Some(scan_state_rc) => Ok(scan_state_rc),
-        None => Err(crate::valkey::RedisError::from((
+        None => Err(crate::valkey::ValkeyError::from((
             crate::valkey::ErrorKind::ResponseError,
             "Invalid scan_state_cursor id",
             format!("The scan_state_cursor sent with id: `{id:?}` does not exist"),

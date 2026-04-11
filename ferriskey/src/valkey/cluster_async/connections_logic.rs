@@ -8,7 +8,7 @@ use crate::valkey::{
     client::GlideConnectionOptions,
     cluster::get_connection_info,
     cluster_client::ClusterParams,
-    ErrorKind, RedisError, RedisResult,
+    ErrorKind, ValkeyError, ValkeyResult,
 };
 use std::net::{Ipv6Addr, SocketAddr};
 
@@ -35,7 +35,7 @@ pub enum RefreshConnectionType {
 fn failed_management_connection<C>(
     addr: &str,
     user_conn: ConnectionDetails<ConnectionFuture<C>>,
-    err: RedisError,
+    err: ValkeyError,
 ) -> ConnectAndCheckResult<C>
 where
     C: ConnectionLike + Send + Clone + Sync + Connect + 'static,
@@ -56,7 +56,7 @@ pub(crate) async fn get_or_create_conn<C>(
     params: &ClusterParams,
     conn_type: RefreshConnectionType,
     glide_connection_options: GlideConnectionOptions,
-) -> RedisResult<AsyncClusterNode<C>>
+) -> ValkeyResult<AsyncClusterNode<C>>
 where
     C: ConnectionLike + Send + Clone + Sync + Connect + 'static,
 {
@@ -156,7 +156,7 @@ where
         }
         (Err(err_1), Err(err_2)) => {
             // Neither of the connections succeeded.
-            RedisError::from((
+            ValkeyError::from((
                 ErrorKind::IoError,
                 "Failed to refresh both connections",
                 format!("Node: {addr:?} received errors: `{err_1:?}`, `{err_2:?}`"),
@@ -223,14 +223,14 @@ pub enum ConnectAndCheckResult<C> {
     // Returns a node that failed to create a management connection, but has a working user connection.
     ManagementConnectionFailed {
         node: AsyncClusterNode<C>,
-        err: RedisError,
+        err: ValkeyError,
     },
     // Request failed completely, could not return a node with any working connection.
-    Failed(RedisError),
+    Failed(ValkeyError),
 }
 
 impl<C> ConnectAndCheckResult<C> {
-    pub fn get_node(self) -> RedisResult<AsyncClusterNode<C>> {
+    pub fn get_node(self) -> ValkeyResult<AsyncClusterNode<C>> {
         match self {
             ConnectAndCheckResult::Success(node) => Ok(node),
             ConnectAndCheckResult::ManagementConnectionFailed { node, .. } => Ok(node),
@@ -238,7 +238,7 @@ impl<C> ConnectAndCheckResult<C> {
         }
     }
 
-    pub fn get_error(self) -> Option<RedisError> {
+    pub fn get_error(self) -> Option<ValkeyError> {
         match self {
             ConnectAndCheckResult::Success(_) => None,
             ConnectAndCheckResult::ManagementConnectionFailed { err, .. } => Some(err),
@@ -247,8 +247,8 @@ impl<C> ConnectAndCheckResult<C> {
     }
 }
 
-impl<C> From<RedisError> for ConnectAndCheckResult<C> {
-    fn from(value: RedisError) -> Self {
+impl<C> From<ValkeyError> for ConnectAndCheckResult<C> {
+    fn from(value: ValkeyError) -> Self {
         ConnectAndCheckResult::Failed(value)
     }
 }
@@ -259,8 +259,8 @@ impl<C> From<AsyncClusterNode<C>> for ConnectAndCheckResult<C> {
     }
 }
 
-impl<C> From<RedisResult<AsyncClusterNode<C>>> for ConnectAndCheckResult<C> {
-    fn from(value: RedisResult<AsyncClusterNode<C>>) -> Self {
+impl<C> From<ValkeyResult<AsyncClusterNode<C>>> for ConnectAndCheckResult<C> {
+    fn from(value: ValkeyResult<AsyncClusterNode<C>>) -> Self {
         match value {
             Ok(value) => value.into(),
             Err(err) => err.into(),
@@ -332,7 +332,7 @@ async fn create_and_setup_user_connection<C>(
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
     glide_connection_options: GlideConnectionOptions,
-) -> RedisResult<ConnectionDetails<C>>
+) -> ValkeyResult<ConnectionDetails<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -351,7 +351,7 @@ where
 async fn setup_user_connection<C>(
     conn_details: &mut ConnectionDetails<C>,
     params: ClusterParams,
-) -> RedisResult<()>
+) -> ValkeyResult<()>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -372,7 +372,7 @@ where
 #[doc(hidden)]
 pub const MANAGEMENT_CONN_NAME: &str = "glide_management_connection";
 
-async fn setup_management_connection<C>(conn: &mut C) -> RedisResult<()>
+async fn setup_management_connection<C>(conn: &mut C) -> ValkeyResult<()>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -389,7 +389,7 @@ async fn create_connection<C>(
     socket_addr: Option<SocketAddr>,
     is_management: bool,
     mut glide_connection_options: GlideConnectionOptions,
-) -> RedisResult<ConnectionDetails<C>>
+) -> ValkeyResult<ConnectionDetails<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -476,7 +476,7 @@ where
     }
 }
 
-async fn check_connection<C>(conn: &mut C, timeout: std::time::Duration) -> RedisResult<()>
+async fn check_connection<C>(conn: &mut C, timeout: std::time::Duration) -> ValkeyResult<()>
 where
     C: ConnectionLike + Send + 'static,
 {

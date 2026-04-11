@@ -42,7 +42,7 @@ use crate::valkey::{
     cmd,
     cluster_scan::{cluster_scan, ClusterScanArgs, ScanStateRC},
     types::ServerError,
-    FromRedisValue, InfoDict, PipelineRetryStrategy,
+    FromValkeyValue, InfoDict, PipelineRetryStrategy,
 };
 use connections_container::{RefreshTaskNotifier, RefreshTaskState, RefreshTaskStatus};
 use dashmap::DashMap;
@@ -84,7 +84,7 @@ use crate::valkey::{
     },
     push_manager::PushInfo,
     types::ProtocolVersion,
-    Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisFuture, RedisResult,
+    Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, ValkeyError, ValkeyFuture, ValkeyResult,
     Value,
 };
 use futures::{
@@ -154,7 +154,7 @@ where
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
-    ) -> RedisResult<ClusterConnection<C>> {
+    ) -> ValkeyResult<ClusterConnection<C>> {
         ClusterConnInner::new(
             initial_nodes,
             cluster_params,
@@ -204,7 +204,7 @@ where
     /// # Example
     /// ```rust,no_run
     /// use redis::cluster::ClusterClient;
-    /// use redis::{ScanStateRC, from_redis_value, Value, ObjectType, ClusterScanArgs};
+    /// use redis::{ScanStateRC, from_valkey_value, Value, ObjectType, ClusterScanArgs};
     ///
     /// async fn scan_all_cluster() -> Vec<String> {
     ///     let nodes = vec!["redis://127.0.0.1/"];
@@ -219,7 +219,7 @@ where
     ///         scan_state_rc = next_cursor;
     ///         let mut scan_keys = scan_keys
     ///             .into_iter()
-    ///             .map(|v| from_redis_value(&v).unwrap())
+    ///             .map(|v| from_valkey_value(&v).unwrap())
     ///             .collect::<Vec<String>>(); // Change the type of `keys` to `Vec<String>`
     ///         keys.append(&mut scan_keys);
     ///         if scan_state_rc.is_finished() {
@@ -233,7 +233,7 @@ where
         &mut self,
         scan_state_rc: ScanStateRC,
         mut cluster_scan_args: ClusterScanArgs,
-    ) -> RedisResult<(ScanStateRC, Vec<Value>)> {
+    ) -> ValkeyResult<(ScanStateRC, Vec<Value>)> {
         cluster_scan_args.set_scan_state_cursor(scan_state_rc);
         self.route_cluster_scan(cluster_scan_args).await
     }
@@ -242,7 +242,7 @@ where
     async fn route_cluster_scan(
         &mut self,
         cluster_scan_args: ClusterScanArgs,
-    ) -> RedisResult<(ScanStateRC, Vec<Value>)> {
+    ) -> ValkeyResult<(ScanStateRC, Vec<Value>)> {
         let (sender, receiver) = oneshot::channel();
         self.cluster_task
             .send(Message {
@@ -251,7 +251,7 @@ where
             })
             .await
             .map_err(|e| {
-                RedisError::from(io::Error::new(
+                ValkeyError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Cluster: Error occurred while trying to send SCAN command to internal send task. {e:?}"),
                 ))
@@ -259,7 +259,7 @@ where
         receiver
             .await
             .unwrap_or_else(|e| {
-                Err(RedisError::from(io::Error::new(
+                Err(ValkeyError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Cluster: Failed to receive SCAN command response from internal send task. {e:?}"),
                 )))
@@ -277,7 +277,7 @@ where
         &self,
         cmd: &Cmd,
         routing: &SingleNodeRoutingInfo,
-    ) -> Option<RedisResult<Value>> {
+    ) -> Option<ValkeyResult<Value>> {
         // Resolve the route to a connection. Clone the connection (cheap — it's
         // just an mpsc sender clone) so we can drop the read lock before async work.
         let conn_future = {
@@ -342,7 +342,7 @@ where
         &self,
         pipeline: &crate::valkey::Pipeline,
         count: usize,
-    ) -> Option<RedisResult<Vec<Value>>> {
+    ) -> Option<ValkeyResult<Vec<Value>>> {
         use tokio::task::JoinSet;
 
         // Step 1: Group commands by node address.
@@ -407,7 +407,7 @@ where
         }
 
         // Step 3: Collect results and reassemble in original command order.
-        let mut results_by_node: Vec<RedisResult<Vec<Value>>> = Vec::with_capacity(node_info.len());
+        let mut results_by_node: Vec<ValkeyResult<Vec<Value>>> = Vec::with_capacity(node_info.len());
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok(result) => results_by_node.push(result),
@@ -452,7 +452,7 @@ where
         &mut self,
         cmd: &Cmd,
         routing: cluster_routing::RoutingInfo,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         trace!("route_command");
         let (sender, receiver) = oneshot::channel();
         let cmd_arg = match &routing {
@@ -474,7 +474,7 @@ where
             })
             .await
             .map_err(|e| {
-                RedisError::from(io::Error::new(
+                ValkeyError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Cluster: Error occurred while trying to send command to internal sender. {e:?}"),
                 ))
@@ -482,7 +482,7 @@ where
         receiver
             .await
             .unwrap_or_else(|e| {
-                Err(RedisError::from(io::Error::new(
+                Err(ValkeyError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!(
                         "Cluster: Failed to receive command response from internal sender. {e:?}"
@@ -507,7 +507,7 @@ where
         count: usize,
         route: Option<SingleNodeRoutingInfo>,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> RedisResult<Vec<Value>> {
+    ) -> ValkeyResult<Vec<Value>> {
         let (sender, receiver) = oneshot::channel();
         self.cluster_task
             .send(Message {
@@ -523,13 +523,13 @@ where
             })
             .await
             .map_err(|err| {
-                RedisError::from(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
+                ValkeyError::from(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
             })?;
 
         receiver
             .await
             .unwrap_or_else(|err| {
-                Err(RedisError::from(io::Error::new(
+                Err(ValkeyError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     err.to_string(),
                 )))
@@ -543,13 +543,13 @@ where
     pub async fn update_connection_password(
         &mut self,
         password: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         self.route_operation_request(Operation::UpdateConnectionPassword(password))
             .await
     }
 
     /// Update the database ID used for all cluster connections
-    pub async fn update_connection_database(&mut self, database_id: i64) -> RedisResult<Value> {
+    pub async fn update_connection_database(&mut self, database_id: i64) -> ValkeyResult<Value> {
         self.route_operation_request(Operation::UpdateConnectionDatabase(database_id))
             .await
     }
@@ -558,7 +558,7 @@ where
     pub async fn update_connection_client_name(
         &mut self,
         client_name: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         self.route_operation_request(Operation::UpdateConnectionClientName(client_name))
             .await
     }
@@ -575,7 +575,7 @@ where
     pub async fn update_connection_username(
         &mut self,
         username: Option<String>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         self.route_operation_request(Operation::UpdateConnectionUsername(username))
             .await
     }
@@ -592,13 +592,13 @@ where
     pub async fn update_connection_protocol(
         &mut self,
         protocol: ProtocolVersion,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         self.route_operation_request(Operation::UpdateConnectionProtocol(protocol))
             .await
     }
 
     /// Get the username used to authenticate with all cluster servers
-    pub async fn get_username(&mut self) -> RedisResult<Value> {
+    pub async fn get_username(&mut self) -> ValkeyResult<Value> {
         self.route_operation_request(Operation::GetUsername).await
     }
 
@@ -606,7 +606,7 @@ where
     async fn route_operation_request(
         &mut self,
         operation_request: Operation,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let (sender, receiver) = oneshot::channel();
         self.cluster_task
             .send(Message {
@@ -614,12 +614,12 @@ where
                 sender,
             })
             .await
-            .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
+            .map_err(|_| ValkeyError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
 
         receiver
             .await
             .unwrap_or_else(|err| {
-                Err(RedisError::from(io::Error::new(
+                Err(ValkeyError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     err.to_string(),
                 )))
@@ -703,13 +703,13 @@ where
     }
 
     // return epoch of node
-    pub(crate) async fn address_epoch(&self, node_address: &str) -> Result<u64, RedisError> {
+    pub(crate) async fn address_epoch(&self, node_address: &str) -> Result<u64, ValkeyError> {
         let command = cmd("CLUSTER").arg("INFO").to_owned();
         let node_conn = self
             .conn_lock
             .read()
             .connection_for_address(node_address)
-            .ok_or(RedisError::from((
+            .ok_or(ValkeyError::from((
                 ErrorKind::ResponseError,
                 "Failed to parse cluster info",
             )))?;
@@ -717,20 +717,20 @@ where
         let cluster_info = node_conn.1.await.req_packed_command(&command).await;
         match cluster_info {
             Ok(value) => {
-                let info_dict: Result<InfoDict, RedisError> =
-                    FromRedisValue::from_redis_value(&value);
+                let info_dict: Result<InfoDict, ValkeyError> =
+                    FromValkeyValue::from_valkey_value(&value);
                 if let Ok(info_dict) = info_dict {
                     let epoch = info_dict.get("cluster_my_epoch");
                     if let Some(epoch) = epoch {
                         Ok(epoch)
                     } else {
-                        Err(RedisError::from((
+                        Err(ValkeyError::from((
                             ErrorKind::ResponseError,
                             "Failed to get epoch from cluster info",
                         )))
                     }
                 } else {
-                    Err(RedisError::from((
+                    Err(ValkeyError::from((
                         ErrorKind::ResponseError,
                         "Failed to parse cluster info",
                     )))
@@ -765,7 +765,7 @@ pub(crate) struct ClusterConnInner<C> {
     state: ConnectionState,
     #[allow(clippy::complexity)]
     in_flight_requests: stream::FuturesUnordered<Pin<Box<Request<C>>>>,
-    refresh_error: Option<RedisError>,
+    refresh_error: Option<ValkeyError>,
     // Handler of the periodic check task.
     periodic_checks_handler: Option<JoinHandle<()>>,
     // Handler of fast connection validation task
@@ -947,7 +947,7 @@ pub(crate) enum OperationTarget {
     NotFound,
     FatalError,
 }
-type OperationResult = Result<Response, (OperationTarget, RedisError)>;
+type OperationResult = Result<Response, (OperationTarget, ValkeyError)>;
 
 impl From<String> for OperationTarget {
     fn from(address: String) -> Self {
@@ -976,11 +976,11 @@ impl RedirectNode {
 
 struct Message<C: Sized> {
     cmd: CmdArg<C>,
-    sender: oneshot::Sender<RedisResult<Response>>,
+    sender: oneshot::Sender<ValkeyResult<Response>>,
 }
 
 enum RecoverFuture {
-    RefreshingSlots(JoinHandle<RedisResult<()>>),
+    RefreshingSlots(JoinHandle<ValkeyResult<()>>),
     ReconnectToInitialNodes(JoinHandle<()>),
     Reconnect(JoinHandle<()>),
 }
@@ -1101,7 +1101,7 @@ pin_project! {
         },
         UpdateMoved {
             #[pin]
-            future: BoxFuture<'static, RedisResult<()>>,
+            future: BoxFuture<'static, ValkeyResult<()>>,
         },
     }
 }
@@ -1336,7 +1336,7 @@ mod iam_token_refresh_tests {
 
 struct PendingRequest<C> {
     retry: u32,
-    sender: oneshot::Sender<RedisResult<Response>>,
+    sender: oneshot::Sender<ValkeyResult<Response>>,
     info: RequestInfo<C>,
 }
 
@@ -1577,7 +1577,7 @@ impl<C> Future for Request<C> {
 }
 
 impl<C> Request<C> {
-    fn respond(self: Pin<&mut Self>, msg: RedisResult<Response>) {
+    fn respond(self: Pin<&mut Self>, msg: ValkeyResult<Response>) {
         // If `send` errors the receiver has dropped and thus does not care about the message
         let _ = self
             .project()
@@ -1605,7 +1605,7 @@ where
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
-    ) -> RedisResult<Disposable<Self>> {
+    ) -> ValkeyResult<Disposable<Self>> {
         let disconnect_notifier: Option<Box<dyn DisconnectNotifier>> =
             Some(Box::new(TokioDisconnectNotifier::new()));
 
@@ -1737,7 +1737,7 @@ where
         initial_nodes: &[ConnectionInfo],
         params: &ClusterParams,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisResult<ConnectionMap<C>> {
+    ) -> ValkeyResult<ConnectionMap<C>> {
         let initial_nodes: Vec<(String, Option<SocketAddr>)> =
             Self::try_to_expand_initial_nodes(initial_nodes).await;
         let connections =
@@ -1790,7 +1790,7 @@ where
                         None,
                     ),
                     |connections: (ConnectionMap<C>, Option<String>),
-                     addr_conn_res: RedisResult<_>| async move {
+                     addr_conn_res: ValkeyResult<_>| async move {
                         match addr_conn_res {
                             Ok((addr, node)) => {
                                 connections.0 .0.insert(addr, node);
@@ -1802,7 +1802,7 @@ where
                 )
                 .await;
         if connections.0 .0.is_empty() {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::IoError,
                 "Failed to create initial connections",
                 connections.1.unwrap_or("".to_string()),
@@ -2011,7 +2011,7 @@ where
                 let infinite_backoff_iter = retry_strategy
                     .get_infinite_backoff_dur_iterator();
 
-                let mut node_result = Err(RedisError::from((
+                let mut node_result = Err(ValkeyError::from((
                     ErrorKind::ClientError,
                     "No attempts performed",
                 )));
@@ -2109,7 +2109,7 @@ where
     fn spawn_refresh_slots_task(
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
-    ) -> JoinHandle<RedisResult<()>> {
+    ) -> JoinHandle<ValkeyResult<()>> {
         // Clone references for task
         let inner_clone = inner.clone();
         let policy_clone = policy.clone();
@@ -2132,19 +2132,19 @@ where
     ///
     /// # Arguments
     ///
-    /// * `receivers`: A list of `(node_address, oneshot::Receiver<RedisResult<Response>>)` pairs.
+    /// * `receivers`: A list of `(node_address, oneshot::Receiver<ValkeyResult<Response>>)` pairs.
     ///   Each receiver will yield exactly one `Response` (or error) from its node.
     /// * `routing` – The routing information of the command (e.g., multi‐slot, `AllNodes`, `AllPrimaries`).
     /// * `response_policy` – An `Option<ResponsePolicy>` that dictates how to aggregate the results from the different nodes.
     ///
     /// # Returns
     ///
-    /// A `RedisResult<Value>` representing the aggregated result.
+    /// A `ValkeyResult<Value>` representing the aggregated result.
     pub async fn aggregate_results(
-        receivers: Vec<(Option<String>, oneshot::Receiver<RedisResult<Response>>)>,
+        receivers: Vec<(Option<String>, oneshot::Receiver<ValkeyResult<Response>>)>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         // Helper: extract a single Value from a Response::Single
         let extract_result = |response| match response {
             Response::Single(value) => value,
@@ -2153,20 +2153,20 @@ where
             ),
         };
 
-        // Converts a Result<RedisResult<Response>, _> into RedisResult<Value>
-        let convert_result = |res: Result<RedisResult<Response>, _>| {
-            res.map_err(|_| RedisError::from((ErrorKind::ResponseError, "Internal failure: receiver was dropped before delivering a response"))) // this happens only if the result sender is dropped before usage.
+        // Converts a Result<ValkeyResult<Response>, _> into ValkeyResult<Value>
+        let convert_result = |res: Result<ValkeyResult<Response>, _>| {
+            res.map_err(|_| ValkeyError::from((ErrorKind::ResponseError, "Internal failure: receiver was dropped before delivering a response"))) // this happens only if the result sender is dropped before usage.
             .and_then(|res| res.map(extract_result))
         };
 
-        // Helper: await a (addr, receiver) and return (addr, RedisResult<Value>)
-        let get_receiver = |(_, receiver): (_, oneshot::Receiver<RedisResult<Response>>)| async {
+        // Helper: await a (addr, receiver) and return (addr, ValkeyResult<Value>)
+        let get_receiver = |(_, receiver): (_, oneshot::Receiver<ValkeyResult<Response>>)| async {
             convert_result(receiver.await)
         };
 
         // Sanity check: if there are no receivers at all, this is a client‐error
         if receivers.is_empty() {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::ClientError,
                 "Client internal error",
                 "Failed to aggregate results for multi-slot command. Maybe a malformed command?"
@@ -2232,7 +2232,7 @@ where
                             last_err = Some(err.into());
                         }
                         Ok(val) => return Ok(val),
-                        // If we received a RedisError, it means that this receiver returned a RecvError
+                        // If we received a ValkeyError, it means that this receiver returned a RecvError
                         Err(e) => last_err = Some(e),
                     }
                 }
@@ -2267,7 +2267,7 @@ where
                 let collected = future::try_join_all(receivers.into_iter().map(
                     |(addr, receiver)| async move {
                         let res = convert_result(receiver.await)?;
-                        Ok::<(Option<String>, Value), RedisError>((addr, res))
+                        Ok::<(Option<String>, Value), ValkeyError>((addr, res))
                     },
                 ))
                 .await?;
@@ -2294,12 +2294,12 @@ where
     ///
     /// # Returns
     ///
-    /// A `RedisResult<Value>` representing the aggregated result.
+    /// A `ValkeyResult<Value>` representing the aggregated result.
     fn aggregate_resolved_results(
         resolved: Vec<(Option<String>, Value)>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         // TODO: add support for returning partial results
         let should_check_errors = match response_policy {
             Some(ResponsePolicy::CombineArrays)
@@ -2335,7 +2335,7 @@ where
                 .next_back()
                 .map(|(_, val)| val)
                 .ok_or_else(|| {
-                    RedisError::from((
+                    ValkeyError::from((
                         ErrorKind::ResponseError,
                         "No responses to aggregate for AllSucceeded",
                     ))
@@ -2399,7 +2399,7 @@ where
                 for (addr_opt, value) in resolved {
                     let key_bytes = match addr_opt {
                         Some(addr) => addr.into_bytes(),
-                        None => return Err(RedisError::from((
+                        None => return Err(ValkeyError::from((
                             ErrorKind::ResponseError,
                             "No address provided for response in Special or None response policy",
                         ))),
@@ -2490,7 +2490,7 @@ where
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
         trigger: SlotRefreshTrigger,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let _guard = inner.topology_refresh_lock.lock().await;
         Self::refresh_slots_and_subscriptions_with_retries_inner(inner.clone(), policy, trigger)
             .await
@@ -2500,7 +2500,7 @@ where
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
         trigger: SlotRefreshTrigger,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let SlotRefreshState {
             in_progress,
             last_run,
@@ -2570,12 +2570,12 @@ where
     }
 
     /// Determines if the cluster topology has changed and refreshes slots and subscriptions if needed.
-    /// Returns `RedisResult` with `true` if changes were detected and slots were refreshed,
+    /// Returns `ValkeyResult` with `true` if changes were detected and slots were refreshed,
     /// or `false` if no changes were found. Raises an error if refreshing the topology fails.
     pub(crate) async fn check_topology_and_refresh_if_diff(
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
-    ) -> RedisResult<bool> {
+    ) -> ValkeyResult<bool> {
         let _guard = inner.topology_refresh_lock.lock().await;
 
         let topology_changed = Self::check_for_topology_diff(inner.clone()).await;
@@ -2672,7 +2672,7 @@ where
         inner: Arc<InnerCore<C>>,
         curr_retry: usize,
         trigger: SlotRefreshTrigger,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         // Update the slot refresh last run timestamp
         let now = SystemTime::now();
         let mut last_run_wlock = inner.slot_refresh_state.last_run.write().await;
@@ -2686,7 +2686,7 @@ where
         inner: Arc<InnerCore<C>>,
         curr_retry: usize,
         trigger: SlotRefreshTrigger,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let num_of_nodes = inner.conn_lock.read().len();
         const MAX_REQUESTED_NODES: usize = 10;
         let num_of_nodes_to_query = num_of_nodes.min(MAX_REQUESTED_NODES);
@@ -2832,12 +2832,12 @@ where
     /// * `new_primary` - The address of the node now responsible for the slot.
     ///
     /// # Returns
-    /// * `RedisResult<()>` indicating success or failure in updating slot mappings.
+    /// * `ValkeyResult<()>` indicating success or failure in updating slot mappings.
     async fn update_upon_moved_error(
         inner: Arc<InnerCore<C>>,
         slot: u16,
         new_primary: Arc<String>,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let curr_shard_addrs = inner.conn_lock.read().slot_map.shard_addrs_for_slot(slot);
         // let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
         // Check if the new primary is part of the current shard and update if required
@@ -2900,7 +2900,7 @@ where
                 Item = Option<(Arc<Cmd>, ConnectionAndAddress<ConnectionFuture<C>>)>,
             >,
         ) -> (
-            Vec<(Option<String>, Receiver<Result<Response, RedisError>>)>,
+            Vec<(Option<String>, Receiver<Result<Response, ValkeyError>>)>,
             Vec<Option<PendingRequest<C>>>,
         ) {
             iterator
@@ -3055,7 +3055,7 @@ where
         pipeline: Arc<crate::valkey::Pipeline>,
         offset: usize,
         count: usize,
-        conn: impl Future<Output = RedisResult<(String, C)>>,
+        conn: impl Future<Output = ValkeyResult<(String, C)>>,
     ) -> OperationResult {
         trace!("try_pipeline_request");
         let (address, mut conn) = conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
@@ -3299,7 +3299,7 @@ where
         routing: InternalSingleNodeRouting<C>,
         core: Core<C>,
         cmd: Option<Arc<Cmd>>,
-    ) -> RedisResult<(String, C)> {
+    ) -> ValkeyResult<(String, C)> {
         let mut asking = false;
 
         let conn_check = match routing {
@@ -3475,7 +3475,7 @@ where
                     match random_conn.and_then(|conn_iter| conn_iter.into_iter().next()) {
                         Some((address, future)) => (address, future),
                         None => {
-                            return Err(RedisError::from((
+                            return Err(ValkeyError::from((
                                 ErrorKind::AllConnectionsUnavailable,
                                 "No random connection found",
                             )));
@@ -3492,7 +3492,7 @@ where
         Ok((address, conn))
     }
 
-    fn poll_recover(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), RedisError>> {
+    fn poll_recover(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), ValkeyError>> {
         trace!("entered poll_recover");
 
         let recover_future = match &mut self.state {
@@ -3558,7 +3558,7 @@ where
                             );
 
                             // Report this critical error to clients
-                            let err = RedisError::from((
+                            let err = ValkeyError::from((
                                 ErrorKind::ClientError,
                                 "Slot refresh task panicked",
                                 format!("{join_err:?}"),
@@ -3984,12 +3984,12 @@ struct InitialNodeConnectionsResult<C> {
 async fn get_random_connections_from_initial_nodes<C>(
     inner: &Core<C>,
     num_of_nodes_to_query: usize,
-) -> RedisResult<InitialNodeConnectionsResult<C>>
+) -> ValkeyResult<InitialNodeConnectionsResult<C>>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     if inner.initial_nodes.is_empty() {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::InvalidClientConfig,
             "Cannot refresh topology from initial nodes: no initial nodes configured",
         )));
@@ -4148,7 +4148,7 @@ where
 /// Result of querying random cluster nodes for topology calculation.
 struct TopologyQueryResult {
     /// The calculated topology (slot map and hash), or an error if calculation failed
-    topology_result: RedisResult<(SlotMap, TopologyHash)>,
+    topology_result: ValkeyResult<(SlotMap, TopologyHash)>,
     /// Optionally addresses of connections that failed during the query and need refresh
     failed_connections: Option<HashSet<String>>,
 }
@@ -4200,7 +4200,7 @@ where
         (random_conns, HashSet::new())
     } else {
         return TopologyQueryResult {
-            topology_result: Err(RedisError::from((
+            topology_result: Err(ValkeyError::from((
                 ErrorKind::AllConnectionsUnavailable,
                 "No available connections to refresh slots from",
             ))),
@@ -4264,7 +4264,7 @@ impl<C> ConnectionLike for ClusterConnection<C>
 where
     C: ConnectionLike + Send + Clone + Unpin + Sync + Connect + 'static,
 {
-    async fn req_packed_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
+    async fn req_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
         let routing = cluster_routing::RoutingInfo::for_routable(cmd).unwrap_or(
             cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
         );
@@ -4285,10 +4285,10 @@ where
         &mut self,
         _packed: bytes::Bytes,
         _is_fenced: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         // ClusterConnection uses req_packed_command for routing.
         // send_packed_bytes without routing info is not meaningful at cluster level.
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             crate::valkey::ErrorKind::ClientError,
             "send_packed_bytes requires routing — use req_packed_command",
         )))
@@ -4300,7 +4300,7 @@ where
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> RedisResult<Vec<Value>> {
+    ) -> ValkeyResult<Vec<Value>> {
         let route = route_for_pipeline(pipeline)?;
 
         // Fast path: same-slot pipeline dispatched directly to the node's mux connection.
@@ -4363,7 +4363,7 @@ pub trait Connect: Sized {
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
+    ) -> ValkeyFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a;
 }
@@ -4375,7 +4375,7 @@ impl Connect for MultiplexedConnection {
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
         glide_connection_options: GlideConnectionOptions,
-    ) -> RedisFuture<'a, (MultiplexedConnection, Option<IpAddr>)>
+    ) -> ValkeyFuture<'a, (MultiplexedConnection, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a,
     {

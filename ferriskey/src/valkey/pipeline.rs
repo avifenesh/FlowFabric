@@ -4,7 +4,7 @@ use telemetrylib::GlideSpan;
 
 use crate::valkey::cmd::{cmd, cmd_len, Cmd};
 use crate::valkey::types::{
-    from_owned_redis_value, ErrorKind, FromRedisValue, HashSet, RedisResult, ToRedisArgs, Value,
+    from_owned_valkey_value, ErrorKind, FromValkeyValue, HashSet, ValkeyResult, ToRedisArgs, Value,
 };
 use std::sync::Arc;
 
@@ -97,7 +97,7 @@ impl Pipeline {
     }
 
 
-    async fn execute_pipelined_async<C>(&self, con: &mut C) -> RedisResult<Value>
+    async fn execute_pipelined_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
     where
         C: crate::valkey::aio::ConnectionLike,
     {
@@ -107,7 +107,7 @@ impl Pipeline {
         self.make_pipeline_results(value)
     }
 
-    async fn execute_transaction_async<C>(&self, con: &mut C) -> RedisResult<Value>
+    async fn execute_transaction_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
     where
         C: crate::valkey::aio::ConnectionLike,
     {
@@ -127,18 +127,18 @@ impl Pipeline {
 
     /// Executes the pipeline and fetches the return values.
     #[inline]
-    pub async fn query_async<C, T: FromRedisValue>(&self, con: &mut C) -> RedisResult<T>
+    pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
     where
         C: crate::valkey::aio::ConnectionLike,
     {
         let v = if self.commands.is_empty() {
-            return from_owned_redis_value(Value::Array(vec![]));
+            return from_owned_valkey_value(Value::Array(vec![]));
         } else if self.transaction_mode {
             self.execute_transaction_async(con).await?
         } else {
             self.execute_pipelined_async(con).await?
         };
-        from_owned_redis_value(v)
+        from_owned_valkey_value(v)
     }
 
     /// Returns whether the pipeline is in transaction mode (atomic).
@@ -271,7 +271,7 @@ macro_rules! implement_pipeline_commands {
                 Arc::get_mut(&mut self.commands[idx]).expect("Cannot modify the last command: multiple active references exist. Ensure the command is uniquely owned before mutating.")
             }
 
-            fn make_pipeline_results(&self, resp: Vec<Value>) -> RedisResult<Value> {
+            fn make_pipeline_results(&self, resp: Vec<Value>) -> ValkeyResult<Value> {
                 let mut rv = Vec::with_capacity(resp.len() - self.ignored_commands.len());
                 for (idx, result) in resp.into_iter().enumerate() {
                     if let Value::ServerError(e) = result {

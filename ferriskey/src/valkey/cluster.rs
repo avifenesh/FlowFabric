@@ -5,9 +5,9 @@
 
 pub use crate::valkey::cluster_client::{ClusterClient, ClusterClientBuilder};
 use crate::valkey::cmd::Cmd;
-use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, RedisConnectionInfo};
+use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo};
 use crate::valkey::tls::TlsConnParams;
-use crate::valkey::types::{ErrorKind, RedisResult};
+use crate::valkey::types::{ErrorKind, ValkeyResult};
 use std::str::FromStr;
 
 pub use crate::valkey::connection::TlsMode;
@@ -15,7 +15,7 @@ pub use crate::valkey::connection::TlsMode;
 pub(crate) fn get_connection_info(
     node: &str,
     cluster_params: crate::valkey::cluster_client::ClusterParams,
-) -> RedisResult<ConnectionInfo> {
+) -> ValkeyResult<ConnectionInfo> {
     let invalid_error = || (ErrorKind::InvalidClientConfig, "Invalid node string");
     let (host, port) = node
         .rsplit_once(':')
@@ -27,7 +27,7 @@ pub(crate) fn get_connection_info(
         .ok_or_else(invalid_error)?;
     Ok(ConnectionInfo {
         addr: get_connection_addr(host.to_string(), port, cluster_params.tls, cluster_params.tls_params),
-        redis: RedisConnectionInfo {
+        valkey: ValkeyConnectionInfo {
             password: cluster_params.password,
             username: cluster_params.username,
             client_name: cluster_params.client_name,

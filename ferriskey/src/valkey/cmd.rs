@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::{borrow::Borrow, fmt, io};
 
 use crate::valkey::pipeline::Pipeline;
-use crate::valkey::types::{from_owned_redis_value, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs};
+use crate::valkey::types::{from_owned_valkey_value, FromValkeyValue, ValkeyResult, ValkeyWrite, ToRedisArgs};
 use telemetrylib::GlideSpan;
 
 /// An argument to a redis command
@@ -44,25 +44,25 @@ const FENCE_COMMAND: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 use crate::valkey::aio::ConnectionLike as AsyncConnection;
 
 /// The inner future of AsyncIter
-struct AsyncIterInner<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + 'a> {
+struct AsyncIterInner<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
     batch: std::vec::IntoIter<T>,
     con: &'a mut C,
     cmd: Cmd,
 }
 
 /// Represents the state of AsyncIter
-enum IterOrFuture<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + 'a> {
+enum IterOrFuture<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
     Iter(AsyncIterInner<'a, T, C>),
     Future(BoxFuture<'a, (AsyncIterInner<'a, T, C>, Option<T>)>),
     Empty,
 }
 
 /// Represents a redis iterator that can be used with async connections.
-pub struct AsyncIter<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + 'a> {
+pub struct AsyncIter<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
     inner: IterOrFuture<'a, T, C>,
 }
 
-impl<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<'a, T, C> {
+impl<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<'a, T, C> {
     #[inline]
     pub async fn next_item(&mut self) -> Option<T> {
         loop {
@@ -78,7 +78,7 @@ impl<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<
             }
 
             let rv = self.con.req_packed_command(&self.cmd).await.ok()?;
-            let (cur, batch): (u64, Vec<T>) = from_owned_redis_value(rv).ok()?;
+            let (cur, batch): (u64, Vec<T>) = from_owned_valkey_value(rv).ok()?;
 
             self.cmd.cursor = Some(cur);
             self.batch = batch.into_iter();
@@ -86,10 +86,10 @@ impl<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<
     }
 }
 
-impl<'a, T: FromRedisValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a> AsyncIter<'a, T, C> {
+impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a> AsyncIter<'a, T, C> {
     /// ```rust,no_run
     /// # use redis::AsyncCommands;
-    /// # async fn scan_set() -> redis::RedisResult<()> {
+    /// # async fn scan_set() -> redis::ValkeyResult<()> {
     /// # let client = redis::Client::open("redis://127.0.0.1/")?;
     /// # let mut con = client.get_async_connection(None).await?;
     /// con.sadd::<_, _, ()>("my_set", 42i32).await?;
@@ -107,7 +107,7 @@ impl<'a, T: FromRedisValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpi
     }
 }
 
-impl<'a, T: FromRedisValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unpin + 'a> Stream for AsyncIter<'a, T, C> {
+impl<'a, T: FromValkeyValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unpin + 'a> Stream for AsyncIter<'a, T, C> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
@@ -243,7 +243,7 @@ where
     Ok(())
 }
 
-impl RedisWrite for Cmd {
+impl ValkeyWrite for Cmd {
     fn write_arg(&mut self, arg: &[u8]) {
         self.data.extend_from_slice(arg);
         self.args.push(Arg::Simple(self.data.len()));
@@ -413,12 +413,12 @@ impl Cmd {
     /// Sends the command as query to the async connection and converts the
     /// result to the target redis value.
     #[inline]
-    pub async fn query_async<C, T: FromRedisValue>(&self, con: &mut C) -> RedisResult<T>
+    pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
     where
         C: crate::valkey::aio::ConnectionLike,
     {
         let val = con.req_packed_command(self).await?;
-        from_owned_redis_value(val)
+        from_owned_valkey_value(val)
     }
 
     /// Returns an AsyncIter over the items of the
@@ -437,16 +437,16 @@ impl Cmd {
     /// format of `KEYS` (just a list) as well as `SSCAN` (which returns a
     /// tuple of cursor and list).
     #[inline]
-    pub async fn iter_async<'a, T: FromRedisValue + 'a, C: AsyncConnection + Send + Unpin + 'a>(
+    pub async fn iter_async<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + Unpin + 'a>(
         mut self,
         con: &'a mut C,
-    ) -> RedisResult<AsyncIter<'a, T, C>> {
+    ) -> ValkeyResult<AsyncIter<'a, T, C>> {
         let rv = con.req_packed_command(&self).await?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_owned_redis_value::<(u64, Vec<T>)>(rv)?
+            from_owned_valkey_value::<(u64, Vec<T>)>(rv)?
         } else {
-            (0, from_owned_redis_value(rv)?)
+            (0, from_owned_valkey_value(rv)?)
         };
         if cursor == 0 {
             self.cursor = None;

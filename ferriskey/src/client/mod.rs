@@ -18,8 +18,8 @@ use crate::valkey::cluster_routing::{
 };
 use crate::valkey::cluster_slotmap::ReadFromReplicaStrategy;
 use crate::valkey::{
-    ClusterScanArgs, Cmd, ErrorKind, FromRedisValue, PipelineRetryStrategy, PushInfo, RedisError,
-    RedisResult, RetryStrategy, ScanStateRC, Value,
+    ClusterScanArgs, Cmd, ErrorKind, FromValkeyValue, PipelineRetryStrategy, PushInfo, ValkeyError,
+    ValkeyResult, RetryStrategy, ScanStateRC, Value,
 };
 pub use standalone_client::StandaloneClient;
 use std::io;
@@ -166,7 +166,7 @@ pub(super) fn get_port(address: &NodeAddress) -> u16 {
 pub async fn get_valkey_connection_info(
     connection_request: &ConnectionRequest,
     iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
-) -> crate::valkey::RedisConnectionInfo {
+) -> crate::valkey::ValkeyConnectionInfo {
     let protocol = connection_request.protocol.unwrap_or_default();
     let db = connection_request.database_id;
     let client_name = connection_request.client_name.clone();
@@ -183,7 +183,7 @@ pub async fn get_valkey_connection_info(
                     info.password.clone().unwrap_or_default()
                 };
 
-                crate::valkey::RedisConnectionInfo {
+                crate::valkey::ValkeyConnectionInfo {
                     db,
                     username: info.username.clone(),
                     password: Some(token),
@@ -193,7 +193,7 @@ pub async fn get_valkey_connection_info(
                 }
             } else {
                 // Regular password-based authentication
-                crate::valkey::RedisConnectionInfo {
+                crate::valkey::ValkeyConnectionInfo {
                     db,
                     username: info.username.clone(),
                     password: info.password.clone(),
@@ -203,7 +203,7 @@ pub async fn get_valkey_connection_info(
                 }
             }
         }
-        None => crate::valkey::RedisConnectionInfo {
+        None => crate::valkey::ValkeyConnectionInfo {
             db,
             protocol,
             client_name,
@@ -220,7 +220,7 @@ use crate::valkey::{TlsCertificates, retrieve_tls_certificates};
 pub(super) fn get_connection_info(
     address: &NodeAddress,
     tls_mode: TlsMode,
-    redis_connection_info: crate::valkey::RedisConnectionInfo,
+    redis_connection_info: crate::valkey::ValkeyConnectionInfo,
     tls_params: Option<crate::valkey::TlsConnParams>,
 ) -> crate::valkey::ConnectionInfo {
     let addr = if tls_mode != TlsMode::NoTls {
@@ -235,7 +235,7 @@ pub(super) fn get_connection_info(
     };
     crate::valkey::ConnectionInfo {
         addr,
-        redis: redis_connection_info,
+        valkey: redis_connection_info,
     }
 }
 
@@ -270,8 +270,8 @@ pub struct Client {
 
 async fn run_with_timeout<T>(
     timeout: Option<Duration>,
-    future: impl futures::Future<Output = RedisResult<T>> + Send,
-) -> crate::valkey::RedisResult<T> {
+    future: impl futures::Future<Output = ValkeyResult<T>> + Send,
+) -> crate::valkey::ValkeyResult<T> {
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
@@ -312,9 +312,9 @@ enum RequestTimeoutOption {
 
 /// Helper function for parsing a timeout argument to f64.
 /// Attempts to parse the argument found at `timeout_idx` from bytes into an f64.
-fn parse_timeout_to_f64(cmd: &Cmd, timeout_idx: usize) -> RedisResult<f64> {
+fn parse_timeout_to_f64(cmd: &Cmd, timeout_idx: usize) -> ValkeyResult<f64> {
     let create_err = |err_msg| {
-        RedisError::from((
+        ValkeyError::from((
             ErrorKind::ResponseError,
             err_msg,
             format!(
@@ -341,11 +341,11 @@ fn get_timeout_from_cmd_arg(
     cmd: &Cmd,
     timeout_idx: usize,
     time_unit: TimeUnit,
-) -> RedisResult<RequestTimeoutOption> {
+) -> ValkeyResult<RequestTimeoutOption> {
     let timeout_secs = parse_timeout_to_f64(cmd, timeout_idx)? / ((time_unit as i32) as f64);
     if timeout_secs < 0.0 {
         // Timeout cannot be negative, return the client's configured request timeout
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             ErrorKind::ResponseError,
             "Timeout cannot be negative",
             format!("Received timeout = {timeout_secs:?}."),
@@ -356,7 +356,7 @@ fn get_timeout_from_cmd_arg(
     } else {
         // We limit the maximum timeout due to restrictions imposed by Redis and the Duration crate
         if timeout_secs > u32::MAX as f64 {
-            Err(RedisError::from((
+            Err(ValkeyError::from((
                 ErrorKind::ResponseError,
                 "Timeout is out of range, max timeout is 2^32 - 1 (u32::MAX)",
                 format!("Received timeout = {timeout_secs:?}."),
@@ -372,7 +372,7 @@ fn get_timeout_from_cmd_arg(
     }
 }
 
-fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> RedisResult<Option<Duration>> {
+fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> ValkeyResult<Option<Duration>> {
     let command = cmd.command().unwrap_or_default();
     let timeout = match command.as_slice() {
         b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BZPOPMAX" | b"BZPOPMIN" | b"BRPOPLPUSH" => {
@@ -415,12 +415,12 @@ impl Client {
     /// Extracts the database ID from a SELECT command.
     /// Parses the first argument of the SELECT command as an i64 database ID.
     /// Returns appropriate errors for invalid formats or missing arguments.
-    fn extract_database_id_from_select(&self, cmd: &Cmd) -> RedisResult<i64> {
+    fn extract_database_id_from_select(&self, cmd: &Cmd) -> ValkeyResult<i64> {
         // For both crate::valkey::cmd("SELECT").arg("5") and crate::valkey::Cmd::new().arg("SELECT").arg("5")
         // the database ID is at arg_idx(1)
         cmd.arg_idx(1)
             .ok_or_else(|| {
-                RedisError::from((
+                ValkeyError::from((
                     ErrorKind::ResponseError,
                     "SELECT command missing database argument",
                 ))
@@ -428,11 +428,11 @@ impl Client {
             .and_then(|db_bytes| {
                 std::str::from_utf8(db_bytes)
                     .map_err(|_| {
-                        RedisError::from((ErrorKind::ResponseError, "Invalid database ID format"))
+                        ValkeyError::from((ErrorKind::ResponseError, "Invalid database ID format"))
                     })
                     .and_then(|db_str| {
                         db_str.parse::<i64>().map_err(|_| {
-                            RedisError::from((
+                            ValkeyError::from((
                                 ErrorKind::ResponseError,
                                 "Database ID must be a valid integer",
                             ))
@@ -448,7 +448,7 @@ impl Client {
     /// into each request handler. If concurrent tasks issue SELECT, a cloned
     /// Client may report a stale `db_namespace` in OTel spans. This is an
     /// acceptable trade-off since concurrent SELECTs are rare in practice.
-    async fn handle_select_command(&mut self, cmd: &Cmd) -> RedisResult<()> {
+    async fn handle_select_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
         let database_id = self.extract_database_id_from_select(cmd)?;
 
         self.update_stored_database_id(database_id).await?;
@@ -460,7 +460,7 @@ impl Client {
     /// Updates the stored database ID for different client types.
     /// Handles standalone, cluster, and lazy clients appropriately.
     /// Ensures thread-safe updates using existing synchronization mechanisms.
-    async fn update_stored_database_id(&self, database_id: i64) -> RedisResult<()> {
+    async fn update_stored_database_id(&self, database_id: i64) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -501,7 +501,7 @@ impl Client {
 
     /// Handles CLIENT SETNAME command processing after successful execution.
     /// Updates connection name state for standalone, cluster, and lazy clients.
-    async fn handle_client_set_name_command(&mut self, cmd: &Cmd) -> RedisResult<()> {
+    async fn handle_client_set_name_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
         // Extract client name from the CLIENT SETNAME command
         let client_name = self.extract_client_name_from_client_set_name(cmd);
 
@@ -513,7 +513,7 @@ impl Client {
     /// Updates the stored client name for different client types.
     /// Handles standalone, cluster, and lazy clients appropriately.
     /// Ensures thread-safe updates using existing synchronization mechanisms.
-    async fn update_stored_client_name(&self, client_name: Option<String>) -> RedisResult<()> {
+    async fn update_stored_client_name(&self, client_name: Option<String>) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -566,7 +566,7 @@ impl Client {
 
     /// Handles AUTH command processing after successful execution.
     /// Updates username and password state for standalone, cluster, and lazy clients.
-    async fn handle_auth_command(&mut self, cmd: &Cmd) -> RedisResult<()> {
+    async fn handle_auth_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
         let (username, password) = self.extract_auth_info(cmd);
 
         // Update username if provided
@@ -583,7 +583,7 @@ impl Client {
     }
 
     /// Updates the stored username for different client types.
-    async fn update_stored_username(&self, username: Option<String>) -> RedisResult<()> {
+    async fn update_stored_username(&self, username: Option<String>) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -601,7 +601,7 @@ impl Client {
     }
 
     /// Updates the stored password for different client types.
-    async fn update_stored_password(&self, password: Option<String>) -> RedisResult<()> {
+    async fn update_stored_password(&self, password: Option<String>) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -690,7 +690,7 @@ impl Client {
 
     /// Handles HELLO command processing after successful execution.
     /// Updates protocol version and optionally auth info and client name.
-    async fn handle_hello_command(&mut self, cmd: &Cmd) -> RedisResult<()> {
+    async fn handle_hello_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
         let (protocol, username, password, client_name) = self.extract_hello_info(cmd);
 
         // Update protocol version if provided
@@ -717,7 +717,7 @@ impl Client {
     }
 
     /// Updates the stored protocol version for different client types.
-    async fn update_stored_protocol(&self, protocol: crate::valkey::ProtocolVersion) -> RedisResult<()> {
+    async fn update_stored_protocol(&self, protocol: crate::valkey::ProtocolVersion) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -734,7 +734,7 @@ impl Client {
         }
     }
 
-    async fn get_or_initialize_client(&self) -> RedisResult<ClientWrapper> {
+    async fn get_or_initialize_client(&self) -> ValkeyResult<ClientWrapper> {
         {
             let guard = self.internal_client.read().await;
             if !matches!(&*guard, ClientWrapper::Lazy(_)) {
@@ -783,7 +783,7 @@ impl Client {
                 )
                 .await
                 .map_err(|e| {
-                    RedisError::from((
+                    ValkeyError::from((
                         ErrorKind::IoError,
                         "Standalone connect failed",
                         format!("{e:?}"),
@@ -824,7 +824,7 @@ impl Client {
         routing: Option<RoutingInfo>,
         client: ClientWrapper,
         compression_manager: Option<Arc<CompressionManager>>,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let raw_value = match client {
             ClientWrapper::Standalone(mut client) => client.send_command(&cmd).await,
             ClientWrapper::Cluster { mut client } => {
@@ -902,7 +902,7 @@ impl Client {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::RedisFuture<'a, Value> {
+    ) -> crate::valkey::ValkeyFuture<'a, Value> {
         Box::pin(async move {
             // Check for IAM token changes and update the password without authentication if needed (pull model)
             if let Some(iam_manager) = &self.iam_token_manager
@@ -910,7 +910,7 @@ impl Client {
             {
                 let current_token = iam_manager.get_token().await;
                 if current_token.is_empty() {
-                    return Err(RedisError::from((
+                    return Err(ValkeyError::from((
                         ErrorKind::ClientError,
                         "IAM token not available",
                     )));
@@ -939,7 +939,7 @@ impl Client {
             let tracker = match self.reserve_inflight_request() {
                 Some(t) => t,
                 None => {
-                    return Err(RedisError::from((
+                    return Err(ValkeyError::from((
                         ErrorKind::ClientError,
                         "Reached maximum inflight requests",
                     )));
@@ -1027,7 +1027,7 @@ impl Client {
         &'a mut self,
         scan_state_cursor: &'a ScanStateRC,
         cluster_scan_args: ClusterScanArgs,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         // Clone arguments before the async block (ScanStateRC is Arc, clone is cheap)
         let scan_state_cursor_clone = scan_state_cursor.clone();
         let cluster_scan_args_clone = cluster_scan_args.clone(); // Assuming ClusterScanArgs is Clone
@@ -1061,7 +1061,7 @@ impl Client {
         command_count: usize,
         offset: usize,
         raise_on_error: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         assert_eq!(values.len(), 1);
         let value = values.pop();
         let values = match value {
@@ -1102,7 +1102,7 @@ impl Client {
         values: Vec<Value>,
         command_count: usize,
         raise_on_error: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let values = values
             .into_iter()
             .map(|value| {
@@ -1120,7 +1120,7 @@ impl Client {
             .map(|(value, expected_type)| convert_to_expected_type(value?, expected_type))
             .try_fold(
                 Vec::with_capacity(command_count),
-                |mut acc, result| -> RedisResult<_> {
+                |mut acc, result| -> ValkeyResult<_> {
                     acc.push(result?);
                     Ok(acc)
                 },
@@ -1137,7 +1137,7 @@ impl Client {
         routing: Option<RoutingInfo>,
         transaction_timeout: Option<u32>,
         raise_on_error: bool,
-    ) -> crate::valkey::RedisFuture<'a, Value> {
+    ) -> crate::valkey::ValkeyFuture<'a, Value> {
         Box::pin(async move {
             let client = self.get_or_initialize_client().await?;
 
@@ -1214,13 +1214,13 @@ impl Client {
         raise_on_error: bool,
         pipeline_timeout: Option<u32>,
         pipeline_retry_strategy: PipelineRetryStrategy,
-    ) -> crate::valkey::RedisFuture<'a, Value> {
+    ) -> crate::valkey::ValkeyFuture<'a, Value> {
         Box::pin(async move {
             let client = self.get_or_initialize_client().await?;
 
             let command_count = pipeline.cmd_iter().count();
             if pipeline.is_empty() {
-                return Err(RedisError::from((
+                return Err(ValkeyError::from((
                     ErrorKind::ResponseError,
                     "Received empty pipeline",
                 )));
@@ -1281,7 +1281,7 @@ impl Client {
         keys: &Vec<&[u8]>,
         args: &Vec<&[u8]>,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::RedisResult<Value> {
+    ) -> crate::valkey::ValkeyResult<Value> {
         let _ = self.get_or_initialize_client().await?;
 
         let mut eval = eval_cmd(hash, keys, args);
@@ -1325,7 +1325,7 @@ impl Client {
         &mut self,
         password: Option<String>,
         immediate_auth: bool,
-    ) -> RedisResult<Value> {
+    ) -> ValkeyResult<Value> {
         let timeout = self.request_timeout;
         // The password update operation is wrapped in a timeout to prevent it from blocking indefinitely.
         // If the operation times out, an error is returned.
@@ -1352,7 +1352,7 @@ impl Client {
                     result
                 }
             }
-            Err(_elapsed) => Err(RedisError::from((
+            Err(_elapsed) => Err(ValkeyError::from((
                 ErrorKind::IoError,
                 "Password update operation timed out, please check the connection",
             ))),
@@ -1360,11 +1360,11 @@ impl Client {
     }
 
     /// Send AUTH command using IAM token (preferred) or the provided password
-    async fn send_immediate_auth(&mut self, password: Option<String>) -> RedisResult<Value> {
+    async fn send_immediate_auth(&mut self, password: Option<String>) -> ValkeyResult<Value> {
         // Determine the password to use for authentication
         let pass = if let Some(ref password) = password {
             if password.is_empty() {
-                return Err(RedisError::from((
+                return Err(ValkeyError::from((
                     ErrorKind::UserOperationError,
                     "Empty password provided for authentication",
                 )));
@@ -1372,7 +1372,7 @@ impl Client {
             log_debug("send_immediate_auth", "Using password for authentication");
             password.to_string()
         } else {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::UserOperationError,
                 "No password provided for authentication",
             )));
@@ -1394,19 +1394,19 @@ impl Client {
     }
 
     /// Returns the username if one was configured during client creation. Otherwise, returns None.
-    pub async fn get_username(&mut self) -> RedisResult<Option<String>> {
+    pub async fn get_username(&mut self) -> ValkeyResult<Option<String>> {
         let client = self.get_or_initialize_client().await?;
 
         match client {
             ClientWrapper::Cluster { mut client } => match client.get_username().await {
                 Ok(Value::SimpleString(username)) => Ok(Some(username)),
                 Ok(Value::Nil) => Ok(None),
-                Ok(other) => Err(RedisError::from((
+                Ok(other) => Err(ValkeyError::from((
                     ErrorKind::ClientError,
                     "Unexpected type",
                     format!("Expected SimpleString or Nil, got: {other:?}"),
                 ))),
-                Err(e) => Err(RedisError::from((
+                Err(e) => Err(ValkeyError::from((
                     ErrorKind::ResponseError,
                     "Error getting username",
                     format!("Received error - {e:?}."),
@@ -1459,12 +1459,12 @@ impl Client {
     ///
     /// # Returns
     /// - `Ok(())` if the token was successfully refreshed and authentication succeeded
-    /// - `Err(RedisError)` if no IAM token manager is configured, token generation fails,
+    /// - `Err(ValkeyError)` if no IAM token manager is configured, token generation fails,
     ///   or authentication with the new token fails.
-    pub async fn refresh_iam_token(&mut self) -> RedisResult<()> {
+    pub async fn refresh_iam_token(&mut self) -> ValkeyResult<()> {
         // Check if IAM token manager is available
         let iam_manager = self.iam_token_manager.as_ref().ok_or_else(|| {
-            RedisError::from((
+            ValkeyError::from((
                 ErrorKind::ClientError,
                 "No IAM token manager configured - IAM token refresh requires IAM authentication to be enabled during client creation",
             ))
@@ -1483,7 +1483,7 @@ pub trait PubSubCommandApplier: Send + Sync {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<SingleNodeRoutingInfo>,
-    ) -> Pin<Box<dyn Future<Output = RedisResult<Value>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = ValkeyResult<Value>> + Send + 'a>>;
 }
 
 /// Implement the trait for ClientWrapper
@@ -1492,7 +1492,7 @@ impl PubSubCommandApplier for ClientWrapper {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<SingleNodeRoutingInfo>,
-    ) -> Pin<Box<dyn Future<Output = RedisResult<Value>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ValkeyResult<Value>> + Send + 'a>> {
         Box::pin(async move {
             match self {
                 ClientWrapper::Standalone(client) => {
@@ -1516,7 +1516,7 @@ impl PubSubCommandApplier for ClientWrapper {
                         .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
                     client.route_command(cmd, final_routing).await
                 }
-                ClientWrapper::Lazy(_) => Err(RedisError::from((
+                ClientWrapper::Lazy(_) => Err(ValkeyError::from((
                     ErrorKind::ClientError,
                     "Client not initialized",
                 ))),
@@ -1554,7 +1554,7 @@ async fn create_cluster_client(
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
     pubsub_synchronizer: Arc<dyn crate::pubsub::PubSubSynchronizer>,
-) -> RedisResult<crate::valkey::cluster_async::ClusterConnection> {
+) -> ValkeyResult<crate::valkey::cluster_async::ClusterConnection> {
     let tls_mode = request.tls_mode.unwrap_or_default();
 
     let valkey_connection_info = get_valkey_connection_info(&request, iam_token_manager).await;
@@ -1563,7 +1563,7 @@ async fn create_cluster_client(
     let has_client_cert = !request.client_cert.is_empty();
     let has_client_key = !request.client_key.is_empty();
     if has_client_cert != has_client_key {
-        return Err(RedisError::from((
+        return Err(ValkeyError::from((
             ErrorKind::InvalidClientConfig,
             "client_cert and client_key must both be provided or both be empty",
         )));
@@ -1571,7 +1571,7 @@ async fn create_cluster_client(
 
     let (tls_params, tls_certificates) = if has_root_certs || has_client_cert || has_client_key {
         if tls_mode == TlsMode::NoTls {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::InvalidClientConfig,
                 "TLS certificates provided but TLS is disabled",
             )));
@@ -1581,7 +1581,7 @@ async fn create_cluster_client(
             let mut combined_certs = Vec::new();
             for cert in &request.root_certs {
                 if cert.is_empty() {
-                    return Err(RedisError::from((
+                    return Err(ValkeyError::from((
                         ErrorKind::InvalidClientConfig,
                         "Root certificate cannot be empty byte string",
                     )));
@@ -1712,26 +1712,26 @@ async fn create_cluster_client(
                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
             )
             .await?;
-        let info_dict: InfoDict = FromRedisValue::from_redis_value(&info_res)?;
+        let info_dict: InfoDict = FromValkeyValue::from_valkey_value(&info_res)?;
         match info_dict.get::<String>("redis_version") {
             Some(version) => match (Versioning::new(version), Versioning::new("7.0")) {
                 (Some(server_ver), Some(min_ver)) => {
                     if server_ver < min_ver {
-                        return Err(RedisError::from((
+                        return Err(ValkeyError::from((
                             ErrorKind::InvalidClientConfig,
                             "Sharded subscriptions provided, but the engine version is < 7.0",
                         )));
                     }
                 }
                 _ => {
-                    return Err(RedisError::from((
+                    return Err(ValkeyError::from((
                         ErrorKind::ResponseError,
                         "Failed to parse engine version",
                     )));
                 }
             },
             _ => {
-                return Err(RedisError::from((
+                return Err(ValkeyError::from((
                     ErrorKind::ResponseError,
                     "Could not determine engine version from INFO result",
                 )));
@@ -1744,7 +1744,7 @@ async fn create_cluster_client(
 #[derive(thiserror::Error)]
 pub enum ConnectionError {
     Standalone(standalone_client::StandaloneClientConnectionError),
-    Cluster(crate::valkey::RedisError),
+    Cluster(crate::valkey::ValkeyError),
     Timeout,
     IoError(std::io::Error),
     Configuration(String),
@@ -2105,7 +2105,7 @@ pub trait GlideClientForTests {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::RedisFuture<'a, crate::valkey::Value>;
+    ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value>;
 }
 
 impl GlideClientForTests for Client {
@@ -2113,7 +2113,7 @@ impl GlideClientForTests for Client {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::RedisFuture<'a, crate::valkey::Value> {
+    ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value> {
         self.send_command(cmd, routing)
     }
 }
@@ -2123,7 +2123,7 @@ impl GlideClientForTests for StandaloneClient {
         &'a mut self,
         cmd: &'a mut Cmd,
         _routing: Option<RoutingInfo>,
-    ) -> crate::valkey::RedisFuture<'a, crate::valkey::Value> {
+    ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value> {
         self.send_command(cmd).boxed()
     }
 }
@@ -2134,7 +2134,7 @@ impl GlideClientForTests for ClusterConnection {
         &'a mut self,
         cmd: &'a mut crate::valkey::Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::RedisFuture<'a, Value> {
+    ) -> crate::valkey::ValkeyFuture<'a, Value> {
         let final_routing =
             routing.unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
 

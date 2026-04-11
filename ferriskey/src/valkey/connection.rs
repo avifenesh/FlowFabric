@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::valkey::pipeline::Pipeline;
-use crate::valkey::types::{ErrorKind, RedisError, RedisResult};
+use crate::valkey::types::{ErrorKind, ValkeyError, ValkeyResult};
 use crate::valkey::ProtocolVersion;
 
 use crate::valkey::tls::TlsConnParams;
@@ -110,7 +110,7 @@ pub struct ConnectionInfo {
     /// A connection address for where to connect to.
     pub addr: ConnectionAddr,
     /// A boxed connection address for where to connect to.
-    pub redis: RedisConnectionInfo,
+    pub valkey: ValkeyConnectionInfo,
 }
 
 /// Types of pubsub subscriptions
@@ -138,7 +138,7 @@ pub type PubSubSubscriptionInfo = HashMap<PubSubSubscriptionKind, HashSet<PubSub
 
 /// Redis specific/connection independent information used to establish a connection to redis.
 #[derive(Clone, Debug, Default)]
-pub struct RedisConnectionInfo {
+pub struct ValkeyConnectionInfo {
     /// The database number to use.  This is usually `0`.
     pub db: i64,
     /// Optionally a username that should be used for connection.
@@ -154,7 +154,7 @@ pub struct RedisConnectionInfo {
 }
 
 impl FromStr for ConnectionInfo {
-    type Err = RedisError;
+    type Err = ValkeyError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.into_connection_info()
@@ -164,17 +164,17 @@ impl FromStr for ConnectionInfo {
 /// Converts an object into a connection info struct.
 pub trait IntoConnectionInfo {
     /// Converts the object into a connection info object.
-    fn into_connection_info(self) -> RedisResult<ConnectionInfo>;
+    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo>;
 }
 
 impl IntoConnectionInfo for ConnectionInfo {
-    fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
+    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
         Ok(self)
     }
 }
 
 impl IntoConnectionInfo for &str {
-    fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
+    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
         match parse_redis_url(self) {
             Some(u) => u.into_connection_info(),
             None => fail!((ErrorKind::InvalidClientConfig, "Redis URL did not parse")),
@@ -186,16 +186,16 @@ impl<T> IntoConnectionInfo for (T, u16)
 where
     T: Into<String>,
 {
-    fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
+    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
         Ok(ConnectionInfo {
             addr: ConnectionAddr::Tcp(self.0.into(), self.1),
-            redis: RedisConnectionInfo::default(),
+            valkey: ValkeyConnectionInfo::default(),
         })
     }
 }
 
 impl IntoConnectionInfo for String {
-    fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
+    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
         match parse_redis_url(&self) {
             Some(u) => u.into_connection_info(),
             None => fail!((ErrorKind::InvalidClientConfig, "Redis URL did not parse")),
@@ -203,7 +203,7 @@ impl IntoConnectionInfo for String {
     }
 }
 
-fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
+fn url_to_tcp_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
     let host = match url.host() {
         Some(host) => match host {
             url::Host::Domain(path) => path.to_string(),
@@ -238,10 +238,10 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
     let query: HashMap<_, _> = url.query_pairs().collect();
     Ok(ConnectionInfo {
         addr,
-        redis: RedisConnectionInfo {
+        valkey: ValkeyConnectionInfo {
             db: match url.path().trim_matches('/') {
                 "" => 0,
-                path => path.parse::<i64>().map_err(|_| -> RedisError {
+                path => path.parse::<i64>().map_err(|_| -> ValkeyError {
                     (ErrorKind::InvalidClientConfig, "Invalid database number").into()
                 })?,
             },
@@ -283,15 +283,15 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
 }
 
 #[cfg(unix)]
-fn url_to_unix_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
+fn url_to_unix_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
     let query: HashMap<_, _> = url.query_pairs().collect();
     Ok(ConnectionInfo {
-        addr: ConnectionAddr::Unix(url.to_file_path().map_err(|_| -> RedisError {
+        addr: ConnectionAddr::Unix(url.to_file_path().map_err(|_| -> ValkeyError {
             (ErrorKind::InvalidClientConfig, "Missing path").into()
         })?),
-        redis: RedisConnectionInfo {
+        valkey: ValkeyConnectionInfo {
             db: match query.get("db") {
-                Some(db) => db.parse::<i64>().map_err(|_| -> RedisError {
+                Some(db) => db.parse::<i64>().map_err(|_| -> ValkeyError {
                     (ErrorKind::InvalidClientConfig, "Invalid database number").into()
                 })?,
                 None => 0,
@@ -315,7 +315,7 @@ fn url_to_unix_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
 }
 
 #[cfg(not(unix))]
-fn url_to_unix_connection_info(_: url::Url) -> RedisResult<ConnectionInfo> {
+fn url_to_unix_connection_info(_: url::Url) -> ValkeyResult<ConnectionInfo> {
     fail!((
         ErrorKind::InvalidClientConfig,
         "Unix sockets are not available on this platform."
@@ -323,7 +323,7 @@ fn url_to_unix_connection_info(_: url::Url) -> RedisResult<ConnectionInfo> {
 }
 
 impl IntoConnectionInfo for url::Url {
-    fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
+    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
         match self.scheme() {
             "redis" | "rediss" => url_to_tcp_connection_info(self),
             "unix" | "redis+unix" => url_to_unix_connection_info(self),
@@ -340,7 +340,7 @@ impl IntoConnectionInfo for url::Url {
 pub(crate) fn create_rustls_config(
     insecure: bool,
     tls_params: Option<TlsConnParams>,
-) -> RedisResult<rustls::ClientConfig> {
+) -> ValkeyResult<rustls::ClientConfig> {
     CRYPTO_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
@@ -405,8 +405,8 @@ pub(crate) fn create_rustls_config(
     Ok(config)
 }
 
-fn tls_config_error(context: &'static str, error: impl std::fmt::Display) -> RedisError {
-    RedisError::from((ErrorKind::InvalidClientConfig, context, error.to_string()))
+fn tls_config_error(context: &'static str, error: impl std::fmt::Display) -> ValkeyError {
+    ValkeyError::from((ErrorKind::InvalidClientConfig, context, error.to_string()))
 }
 
 struct NoCertificateVerification {
@@ -474,7 +474,7 @@ pub(crate) fn client_set_info_pipeline(lib_name: Option<&str>) -> Pipeline {
 }
 
 /// Common logic for checking real cause of hello3 command error
-pub fn get_resp3_hello_command_error(err: RedisError) -> RedisError {
+pub fn get_resp3_hello_command_error(err: ValkeyError) -> ValkeyError {
     if let Some(detail) = err.detail() {
         if detail.starts_with("unknown command `HELLO`") {
             return (
@@ -525,21 +525,21 @@ mod tests {
                 url::Url::parse("redis://127.0.0.1").unwrap(),
                 ConnectionInfo {
                     addr: ConnectionAddr::Tcp("127.0.0.1".to_string(), 6379),
-                    redis: Default::default(),
+                    valkey: Default::default(),
                 },
             ),
             (
                 url::Url::parse("redis://[::1]").unwrap(),
                 ConnectionInfo {
                     addr: ConnectionAddr::Tcp("::1".to_string(), 6379),
-                    redis: Default::default(),
+                    valkey: Default::default(),
                 },
             ),
         ];
         for (url, expected) in cases.into_iter() {
             let res = url_to_tcp_connection_info(url.clone()).unwrap();
             assert_eq!(res.addr, expected.addr, "addr of {url} is not expected");
-            assert_eq!(res.redis.db, expected.redis.db, "db of {url} is not expected");
+            assert_eq!(res.valkey.db, expected.valkey.db, "db of {url} is not expected");
         }
     }
 }

@@ -3,7 +3,7 @@ use crate::valkey::cluster_topology::{
     DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI, DEFAULT_SLOTS_REFRESH_WAIT_DURATION,
 };
 use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
-use crate::valkey::types::{ErrorKind, ProtocolVersion, RedisError, RedisResult};
+use crate::valkey::types::{ErrorKind, ProtocolVersion, ValkeyError, ValkeyResult};
 use crate::valkey::connection::TlsMode;
 use crate::valkey::{PushInfo, RetryStrategy};
 use rand::Rng;
@@ -142,7 +142,7 @@ pub struct ClusterParams {
 }
 
 impl ClusterParams {
-    fn from(value: BuilderParams) -> RedisResult<Self> {
+    fn from(value: BuilderParams) -> ValkeyResult<Self> {
         let tls_params = {
             let retrieved_tls_params = value.certs.clone().map(retrieve_tls_certificates);
 
@@ -201,7 +201,7 @@ impl ClusterParams {
 
 /// Used to configure and build a [`ClusterClient`].
 pub struct ClusterClientBuilder {
-    initial_nodes: RedisResult<Vec<ConnectionInfo>>,
+    initial_nodes: ValkeyResult<Vec<ConnectionInfo>>,
     builder_params: BuilderParams,
 }
 
@@ -233,13 +233,13 @@ impl ClusterClientBuilder {
     ///
     /// Upon failure to parse initial nodes or if the initial nodes have different passwords or
     /// usernames, an error is returned.
-    pub fn build(self) -> RedisResult<ClusterClient> {
+    pub fn build(self) -> ValkeyResult<ClusterClient> {
         let initial_nodes = self.initial_nodes?;
 
         let first_node = match initial_nodes.first() {
             Some(node) => node,
             None => {
-                return Err(RedisError::from((
+                return Err(ValkeyError::from((
                     ErrorKind::InvalidClientConfig,
                     "Initial nodes can't be empty.",
                 )))
@@ -250,7 +250,7 @@ impl ClusterClientBuilder {
         let password = if cluster_params.password.is_none() {
             cluster_params
                 .password
-                .clone_from(&first_node.redis.password);
+                .clone_from(&first_node.valkey.password);
             &cluster_params.password
         } else {
             &None
@@ -258,7 +258,7 @@ impl ClusterClientBuilder {
         let username = if cluster_params.username.is_none() {
             cluster_params
                 .username
-                .clone_from(&first_node.redis.username);
+                .clone_from(&first_node.valkey.username);
             &cluster_params.username
         } else {
             &None
@@ -281,34 +281,34 @@ impl ClusterClientBuilder {
         let mut nodes = Vec::with_capacity(initial_nodes.len());
         for mut node in initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
-                return Err(RedisError::from((ErrorKind::InvalidClientConfig,
+                return Err(ValkeyError::from((ErrorKind::InvalidClientConfig,
                                              "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")));
             }
 
-            if password.is_some() && node.redis.password != *password {
-                return Err(RedisError::from((
+            if password.is_some() && node.valkey.password != *password {
+                return Err(ValkeyError::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different password among initial nodes.",
                 )));
             }
 
-            if username.is_some() && node.redis.username != *username {
-                return Err(RedisError::from((
+            if username.is_some() && node.valkey.username != *username {
+                return Err(ValkeyError::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different username among initial nodes.",
                 )));
             }
 
-            if node.redis.client_name.is_some()
-                && node.redis.client_name != cluster_params.client_name
+            if node.valkey.client_name.is_some()
+                && node.valkey.client_name != cluster_params.client_name
             {
-                return Err(RedisError::from((
+                return Err(ValkeyError::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different client_name among initial nodes.",
                 )));
             }
 
-            node.redis.protocol = cluster_params.protocol;
+            node.valkey.protocol = cluster_params.protocol;
             nodes.push(node);
         }
 
@@ -566,7 +566,7 @@ impl ClusterClient {
     /// usernames, an error is returned.
     pub fn new<T: IntoConnectionInfo>(
         initial_nodes: impl IntoIterator<Item = T>,
-    ) -> RedisResult<ClusterClient> {
+    ) -> ValkeyResult<ClusterClient> {
         Self::builder(initial_nodes).build()
     }
 
@@ -590,7 +590,7 @@ impl ClusterClient {
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
-    ) -> RedisResult<cluster_async::ClusterConnection> {
+    ) -> ValkeyResult<cluster_async::ClusterConnection> {
         cluster_async::ClusterConnection::new(
             &self.initial_nodes,
             self.cluster_params.clone(),
@@ -604,7 +604,7 @@ impl ClusterClient {
     #[doc(hidden)]
     pub async fn get_async_generic_connection<C>(
         &self,
-    ) -> RedisResult<cluster_async::ClusterConnection<C>>
+    ) -> ValkeyResult<cluster_async::ClusterConnection<C>>
     where
         C: crate::valkey::aio::ConnectionLike
             + cluster_async::Connect

@@ -6,7 +6,7 @@ use futures_intrusive::sync::ManualResetEvent;
 use logger_core::{log_debug, log_error, log_trace, log_warn};
 use crate::valkey::aio::{DisconnectNotifier, MultiplexedConnection};
 use crate::valkey::{
-    GlideConnectionOptions, PushInfo, RedisConnectionInfo, RedisError, RedisResult, RetryStrategy,
+    GlideConnectionOptions, PushInfo, ValkeyConnectionInfo, ValkeyError, ValkeyResult, RetryStrategy,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -151,7 +151,7 @@ impl fmt::Debug for ReconnectingConnection {
 async fn get_multiplexed_connection(
     client: &crate::valkey::Client,
     connection_options: &GlideConnectionOptions,
-) -> RedisResult<MultiplexedConnection> {
+) -> ValkeyResult<MultiplexedConnection> {
     run_with_timeout(
         Some(
             connection_options
@@ -202,7 +202,7 @@ async fn create_connection(
     connection_timeout: Duration,
     tcp_nodelay: bool,
     pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
+) -> Result<ReconnectingConnection, (ReconnectingConnection, ValkeyError)> {
     let client = {
         let guard = connection_backend
             .connection_info
@@ -270,7 +270,7 @@ async fn create_connection(
             })
         }
         err => {
-            let err: RedisError = match err {
+            let err: ValkeyError = match err {
                 Ok(Err(e)) => e,
                 _ => std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
             };
@@ -302,7 +302,7 @@ async fn create_connection(
 fn get_client(
     address: &NodeAddress,
     tls_mode: TlsMode,
-    redis_connection_info: crate::valkey::RedisConnectionInfo,
+    redis_connection_info: crate::valkey::ValkeyConnectionInfo,
     tls_params: Option<crate::valkey::TlsConnParams>,
 ) -> crate::valkey::Client {
     let connection_info =
@@ -322,7 +322,7 @@ impl ReconnectingConnection {
     pub(super) async fn new(
         address: &NodeAddress,
         connection_retry_strategy: RetryStrategy,
-        redis_connection_info: RedisConnectionInfo,
+        redis_connection_info: ValkeyConnectionInfo,
         tls_mode: TlsMode,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         discover_az: bool,
@@ -331,7 +331,7 @@ impl ReconnectingConnection {
         tcp_nodelay: bool,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
         iam_token_handle: Option<IAMTokenHandle>,
-    ) -> Result<ReconnectingConnection, (ReconnectingConnection, RedisError)> {
+    ) -> Result<ReconnectingConnection, (ReconnectingConnection, ValkeyError)> {
         log_debug(
             "connection creation",
             format!("Attempting connection to {address}"),
@@ -391,7 +391,7 @@ impl ReconnectingConnection {
         }
     }
 
-    pub(super) async fn get_connection(&self) -> Result<MultiplexedConnection, RedisError> {
+    pub(super) async fn get_connection(&self) -> Result<MultiplexedConnection, ValkeyError> {
         loop {
             self.inner.backend.connection_available_signal.wait().await;
             if let Some(connection) = self.try_get_connection().await {
@@ -615,6 +615,6 @@ impl ReconnectingConnection {
     /// Returns the username if one was configured during client creation. Otherwise, returns None.
     pub(crate) fn get_username(&self) -> Option<String> {
         let client = self.inner.backend.get_backend_client();
-        client.get_connection_info().redis.username.clone()
+        client.get_connection_info().valkey.username.clone()
     }
 }

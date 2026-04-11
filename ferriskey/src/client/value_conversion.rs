@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::valkey::{
-    Cmd, ErrorKind, RedisResult, Value, cluster_routing::Routable, from_owned_redis_value,
+    Cmd, ErrorKind, ValkeyResult, Value, cluster_routing::Routable, from_owned_valkey_value,
 };
 
 #[derive(Clone, Copy)]
@@ -50,7 +50,7 @@ pub(crate) enum ExpectedReturnType<'a> {
 pub(crate) fn convert_to_expected_type(
     value: Value,
     expected: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let Some(expected) = expected else {
         return Ok(value);
     };
@@ -85,7 +85,7 @@ pub(crate) fn convert_to_expected_type(
                         let value_converted = convert_to_expected_type(inner_value, Some(ExpectedReturnType::Double)).unwrap();
                         Ok((key_str, value_converted))
                     })
-                    .collect::<RedisResult<_>>();
+                    .collect::<ValkeyResult<_>>();
 
                 result.map(Value::Map)
             }
@@ -112,11 +112,11 @@ pub(crate) fn convert_to_expected_type(
             )
                 .into()),
         },
-        ExpectedReturnType::Double => Ok(Value::Double(from_owned_redis_value::<f64>(value)?)),
-        ExpectedReturnType::Boolean => Ok(Value::Boolean(from_owned_redis_value::<bool>(value)?)),
+        ExpectedReturnType::Double => Ok(Value::Double(from_owned_valkey_value::<f64>(value)?)),
+        ExpectedReturnType::Boolean => Ok(Value::Boolean(from_owned_valkey_value::<bool>(value)?)),
         ExpectedReturnType::DoubleOrNull => match value {
             Value::Nil => Ok(value),
-            _ => Ok(Value::Double(from_owned_redis_value::<f64>(value)?)),
+            _ => Ok(Value::Double(from_owned_valkey_value::<f64>(value)?)),
         },
         ExpectedReturnType::ZRankReturnType => match value {
             Value::Nil => Ok(value),
@@ -143,18 +143,18 @@ pub(crate) fn convert_to_expected_type(
         },
         ExpectedReturnType::BulkString => match value {
             Value::BulkString(_) => Ok(value),
-            _ => Ok(Value::BulkString(from_owned_redis_value::<String>(value)?.into())),
+            _ => Ok(Value::BulkString(from_owned_valkey_value::<String>(value)?.into())),
         },
         ExpectedReturnType::SimpleString => Ok(Value::SimpleString(
-            from_owned_redis_value::<String>(value)?,
+            from_owned_valkey_value::<String>(value)?,
         )),
         ExpectedReturnType::JsonToggleReturnType => match value {
             Value::Array(array) => {
-                let converted_array: RedisResult<Vec<_>> = array
+                let converted_array: ValkeyResult<Vec<_>> = array
                     .into_iter()
                     .map(|item| match item {
                         Value::Nil => Ok(Value::Nil),
-                        _ => match from_owned_redis_value::<bool>(item.clone()) {
+                        _ => match from_owned_valkey_value::<bool>(item.clone()) {
                             Ok(boolean_value) => Ok(Value::Boolean(boolean_value)),
                             _ => Err((
                                 ErrorKind::TypeError,
@@ -245,7 +245,7 @@ pub(crate) fn convert_to_expected_type(
         ExpectedReturnType::ArrayOfArraysOfDoubleOrNull => match value {
             // This is used for GEOPOS command.
             Value::Array(array) => {
-                let converted_array: RedisResult<Vec<_>> = array
+                let converted_array: ValkeyResult<Vec<_>> = array
                     .clone()
                     .into_iter()
                     .map(|item| match item {
@@ -1221,7 +1221,7 @@ pub(crate) fn convert_to_expected_type(
                         value_type: &None,
                     }))?));
                     Ok(Value::Map(field_params))
-                }).collect::<RedisResult<Vec<Value>>>()?;
+                }).collect::<ValkeyResult<Vec<Value>>>()?;
                 let _ = std::mem::replace(fields_pair, (fields_key, Value::Array(fields)));
                 Ok(Value::Map(map))
             },
@@ -1292,7 +1292,7 @@ fn convert_map_entries(
     map: Vec<(Value, Value)>,
     key_type: Option<ExpectedReturnType>,
     value_type: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let result = map
         .into_iter()
         .map(|(key, inner_value)| {
@@ -1300,7 +1300,7 @@ fn convert_map_entries(
             let converted_value = convert_to_expected_type(inner_value, value_type)?;
             Ok((converted_key, converted_value))
         })
-        .collect::<RedisResult<_>>();
+        .collect::<ValkeyResult<_>>();
 
     result.map(Value::Map)
 }
@@ -1326,7 +1326,7 @@ fn convert_lolwut_string(data: &str) -> String {
 fn convert_array_elements(
     array: Vec<Value>,
     element_type: ExpectedReturnType,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let converted_array = array
         .iter()
         .map(|v| convert_to_expected_type(v.clone(), Some(element_type)).unwrap())
@@ -1360,7 +1360,7 @@ fn convert_array_elements(
 fn convert_array_of_flat_maps(
     array: Vec<Value>,
     value_expected_return_type: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let mut result: Vec<Value> = Vec::with_capacity(array.len());
     for entry in array {
         let Value::Array(entry_as_array) = entry else {
@@ -1387,7 +1387,7 @@ fn convert_inner_map_by_type(
     map: Vec<(Value, Value)>,
     key_type: Option<ExpectedReturnType>,
     value_type: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let result = map
         .into_iter()
         .map(|(key, inner_value)| {
@@ -1396,7 +1396,7 @@ fn convert_inner_map_by_type(
                 convert_to_expected_type(inner_value, value_type)?,
             ))
         })
-        .collect::<RedisResult<_>>();
+        .collect::<ValkeyResult<_>>();
 
     result.map(Value::Map)
 }
@@ -1413,7 +1413,7 @@ fn convert_array_to_map_by_type(
     array: Vec<Value>,
     key_type: Option<ExpectedReturnType>,
     value_type: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     let mut map = Vec::new();
     let mut iterator = array.into_iter();
     while let Some(key) = iterator.next() {
@@ -1475,7 +1475,7 @@ fn convert_array_to_map_by_type(
 fn convert_to_array_of_pairs(
     response: Value,
     value_expected_return_type: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     match response {
         Value::Nil => Ok(response),
         Value::Array(ref array) if array.is_empty() || matches!(array[0], Value::Array(_)) => {
@@ -1507,7 +1507,7 @@ fn convert_to_array_of_pairs(
 fn convert_flat_array_to_array_of_pairs(
     array: Vec<Value>,
     value_expected_return_type: Option<ExpectedReturnType>,
-) -> RedisResult<Value> {
+) -> ValkeyResult<Value> {
     if !array.len().is_multiple_of(2) {
         return Err((
             ErrorKind::TypeError,

@@ -1,9 +1,9 @@
 //! Adds async IO support to redis.
 use crate::valkey::cmd::{cmd, Cmd};
-use crate::valkey::connection::{get_resp3_hello_command_error, RedisConnectionInfo};
+use crate::valkey::connection::{get_resp3_hello_command_error, ValkeyConnectionInfo};
 use crate::valkey::pipeline::PipelineRetryStrategy;
 use crate::valkey::types::{
-    ErrorKind, FromRedisValue, InfoDict, ProtocolVersion, RedisError, RedisResult,
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, ValkeyError, ValkeyResult,
     Value,
 };
 use ::tokio::io::{AsyncRead, AsyncWrite};
@@ -24,7 +24,7 @@ pub mod tokio;
 #[async_trait]
 pub(crate) trait RedisRuntime: AsyncStream + Send + Sync + Sized + 'static {
     /// Performs a TCP connection
-    async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> RedisResult<Self>;
+    async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> ValkeyResult<Self>;
 
     // Performs a TCP TLS connection
     async fn connect_tcp_tls(
@@ -33,11 +33,11 @@ pub(crate) trait RedisRuntime: AsyncStream + Send + Sync + Sized + 'static {
         insecure: bool,
         tls_params: &Option<TlsConnParams>,
         tcp_nodelay: bool,
-    ) -> RedisResult<Self>;
+    ) -> ValkeyResult<Self>;
 
     /// Performs a UNIX connection
     #[cfg(unix)]
-    async fn connect_unix(path: &Path) -> RedisResult<Self>;
+    async fn connect_unix(path: &Path) -> ValkeyResult<Self>;
 
     fn spawn(f: impl Future<Output = ()> + Send + 'static);
 
@@ -57,7 +57,7 @@ pub trait ConnectionLike: Send {
     fn req_packed_command<'a>(
         &'a mut self,
         cmd: &'a Cmd,
-    ) -> impl Future<Output = RedisResult<Value>> + Send + 'a;
+    ) -> impl Future<Output = ValkeyResult<Value>> + Send + 'a;
 
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement
@@ -73,14 +73,14 @@ pub trait ConnectionLike: Send {
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> impl Future<Output = RedisResult<Vec<Value>>> + Send + 'a;
+    ) -> impl Future<Output = ValkeyResult<Vec<Value>>> + Send + 'a;
 
     /// Sends pre-packed RESP bytes directly, skipping command serialization.
     fn send_packed_bytes<'a>(
         &'a mut self,
         packed: bytes::Bytes,
         is_fenced: bool,
-    ) -> impl Future<Output = RedisResult<Value>> + Send + 'a;
+    ) -> impl Future<Output = ValkeyResult<Value>> + Send + 'a;
 
     /// Returns the database this connection is bound to.  Note that this
     /// information might be unreliable because it's initially cached and
@@ -126,7 +126,7 @@ impl Clone for Box<dyn DisconnectNotifier> {
 }
 
 // Helper function to extract and update availability zone from INFO command
-async fn update_az_from_info<C>(con: &mut C) -> RedisResult<()>
+async fn update_az_from_info<C>(con: &mut C) -> ValkeyResult<()>
 where
     C: ConnectionLike,
 {
@@ -134,7 +134,7 @@ where
 
     match info_res {
         Ok(value) => {
-            let info_dict: InfoDict = FromRedisValue::from_redis_value(&value)?;
+            let info_dict: InfoDict = FromValkeyValue::from_valkey_value(&value)?;
             if let Some(node_az) = info_dict.get::<String>("availability_zone") {
                 con.set_az(Some(node_az));
             }
@@ -142,7 +142,7 @@ where
         }
         Err(e) => {
             // Handle the error case for the INFO command
-            Err(RedisError::from((
+            Err(ValkeyError::from((
                 ErrorKind::ResponseError,
                 "Failed to execute INFO command. ",
                 format!("{e:?}"),
@@ -153,18 +153,18 @@ where
 
 // Initial setup for every connection.
 async fn setup_connection<C>(
-    connection_info: &RedisConnectionInfo,
+    connection_info: &ValkeyConnectionInfo,
     con: &mut C,
     // This parameter is set to 'true' if ReadFromReplica strategy is set to AZAffinity or AZAffinityReplicasAndPrimary.
     // An INFO command will be triggered in the connection's setup to update the 'availability_zone' property.
     discover_az: bool,
-) -> RedisResult<()>
+) -> ValkeyResult<()>
 where
     C: ConnectionLike,
 {
     if connection_info.protocol != ProtocolVersion::RESP2 {
         let hello_cmd = resp3_hello(connection_info);
-        let val: RedisResult<Value> = hello_cmd.query_async(con).await;
+        let val: ValkeyResult<Value> = hello_cmd.query_async(con).await;
         if let Err(err) = val {
             return Err(get_resp3_hello_command_error(err));
         }
@@ -239,7 +239,7 @@ where
 
     // result is ignored, as per the command's instructions.
     // https://redis.io/commands/client-setinfo/
-    let _: RedisResult<()> =
+    let _: ValkeyResult<()> =
         crate::valkey::connection::client_set_info_pipeline(connection_info.lib_name.as_deref())
             .query_async(con)
             .await;
@@ -256,12 +256,12 @@ use futures_util::future::select_ok;
 pub(crate) async fn get_socket_addrs(
     host: &str,
     port: u16,
-) -> RedisResult<impl Iterator<Item = SocketAddr> + Send + '_> {
+) -> ValkeyResult<impl Iterator<Item = SocketAddr> + Send + '_> {
     let socket_addrs = ::tokio::net::lookup_host((host, port)).await?;
     let mut socket_addrs = socket_addrs.peekable();
     match socket_addrs.peek() {
         Some(_) => Ok(socket_addrs),
-        None => Err(RedisError::from((
+        None => Err(ValkeyError::from((
             ErrorKind::InvalidClientConfig,
             "No address found for host",
         ))),
@@ -272,11 +272,11 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
     connection_info: &crate::valkey::connection::ConnectionInfo,
     _socket_addr: Option<SocketAddr>,
     tcp_nodelay: bool,
-) -> RedisResult<(T, Option<std::net::IpAddr>)> {
+) -> ValkeyResult<(T, Option<std::net::IpAddr>)> {
     Ok(match connection_info.addr {
         ConnectionAddr::Tcp(ref host, port) => {
             if let Some(socket_addr) = _socket_addr {
-                return Ok::<_, RedisError>((
+                return Ok::<_, ValkeyError>((
                     <T>::connect_tcp(socket_addr, tcp_nodelay).await?,
                     Some(socket_addr.ip()),
                 ));
@@ -284,7 +284,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             let socket_addrs = get_socket_addrs(host, port).await?;
             select_ok(socket_addrs.map(|socket_addr| {
                 Box::pin(async move {
-                    Ok::<_, RedisError>((
+                    Ok::<_, ValkeyError>((
                         <T>::connect_tcp(socket_addr, tcp_nodelay).await?,
                         Some(socket_addr.ip()),
                     ))
@@ -300,7 +300,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             ref tls_params,
         } => {
             if let Some(socket_addr) = _socket_addr {
-                return Ok::<_, RedisError>((
+                return Ok::<_, ValkeyError>((
                     <T>::connect_tcp_tls(host, socket_addr, insecure, tls_params, tcp_nodelay)
                         .await?,
                     Some(socket_addr.ip()),
@@ -309,7 +309,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             let socket_addrs = get_socket_addrs(host, port).await?;
             select_ok(socket_addrs.map(|socket_addr| {
                 Box::pin(async move {
-                    Ok::<_, RedisError>((
+                    Ok::<_, ValkeyError>((
                         <T>::connect_tcp_tls(host, socket_addr, insecure, tls_params, tcp_nodelay)
                             .await?,
                         Some(socket_addr.ip()),
@@ -323,7 +323,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
         ConnectionAddr::Unix(ref path) => (<T>::connect_unix(path).await?, None),
         #[cfg(not(unix))]
         ConnectionAddr::Unix(_) => {
-            return Err(RedisError::from((
+            return Err(ValkeyError::from((
                 ErrorKind::InvalidClientConfig,
                 "Cannot connect to unix sockets on this platform",
             )))
@@ -331,7 +331,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
     })
 }
 
-pub fn resp3_hello(connection_info: &RedisConnectionInfo) -> Cmd {
+pub fn resp3_hello(connection_info: &ValkeyConnectionInfo) -> Cmd {
     let mut hello_cmd = cmd("HELLO");
     hello_cmd.arg("3");
     if let Some(password) = &connection_info.password {

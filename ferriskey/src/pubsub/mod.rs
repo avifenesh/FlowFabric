@@ -4,7 +4,7 @@ use crate::client::ClientWrapper;
 use crate::valkey::PushInfo;
 pub use crate::valkey::{
     ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
-    PubSubSynchronizer, RedisError,
+    PubSubSynchronizer, ValkeyError,
 };
 use std::sync::{Arc, Weak};
 use std::time::Duration;

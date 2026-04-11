@@ -9,8 +9,8 @@ use dashmap::DashMap;
 
 use crate::valkey::cluster_routing::{Route, ShardAddrs, Slot, SlotAddr};
 use crate::valkey::ErrorKind;
-use crate::valkey::RedisError;
-use crate::valkey::RedisResult;
+use crate::valkey::ValkeyError;
+use crate::valkey::ValkeyResult;
 /// Maps node addresses to their IP address and shard information.
 pub(crate) type NodesMap = DashMap<Arc<String>, (Option<IpAddr>, Arc<ShardAddrs>)>;
 
@@ -285,7 +285,7 @@ impl SlotMap {
         slot: u16,
         node_addr: Arc<String>,
         ip_addr: Option<IpAddr>,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let shard_addrs = Arc::new(ShardAddrs::new_with_primary(node_addr.clone()));
         self.nodes_map
             .insert(node_addr, (ip_addr, shard_addrs.clone()));
@@ -305,12 +305,12 @@ impl SlotMap {
     /// # Parameters:
     /// - `curr_end`: The current end of the slot range that will be removed.
     /// - `new_end`: The new end of the slot range where the slot data will be reinserted.
-    fn update_end_range(&mut self, curr_end: u16, new_end: u16) -> RedisResult<()> {
+    fn update_end_range(&mut self, curr_end: u16, new_end: u16) -> ValkeyResult<()> {
         if let Some(curr_slot_val) = self.slots.remove(&curr_end) {
             self.slots.insert(new_end, curr_slot_val);
             return Ok(());
         }
-        Err(RedisError::from((
+        Err(ValkeyError::from((
             ErrorKind::ClientError,
             "Couldn't find slot range with end: {curr_end:?} in the slot map",
         )))
@@ -348,12 +348,12 @@ impl SlotMap {
     /// - `new_addrs`: The shard addresses to compare with the previous slot's shard addresses.
     ///
     /// # Returns:
-    /// - `RedisResult<bool>`: Returns `Ok(true)` if the merge was successful, otherwise `Ok(false)`.
+    /// - `ValkeyResult<bool>`: Returns `Ok(true)` if the merge was successful, otherwise `Ok(false)`.
     fn try_merge_to_prev_range(
         &mut self,
         slot: u16,
         new_addrs: Arc<ShardAddrs>,
-    ) -> RedisResult<bool> {
+    ) -> ValkeyResult<bool> {
         if let Some((prev_end, prev_slot_value)) = self.slots.range_mut(..slot).next_back() {
             if *prev_end == slot - 1 && Self::shard_addrs_equal(&prev_slot_value.addrs, &new_addrs)
             {
@@ -403,12 +403,12 @@ impl SlotMap {
     /// - `new_addrs`: The new shard addresses to associate with the slot.
     ///
     /// # Returns:
-    /// - `RedisResult<()>`: Indicates the success or failure of the operation.
+    /// - `ValkeyResult<()>`: Indicates the success or failure of the operation.
     pub(crate) fn update_slot_range(
         &mut self,
         slot: u16,
         new_addrs: Arc<ShardAddrs>,
-    ) -> RedisResult<()> {
+    ) -> ValkeyResult<()> {
         let curr_tree_node =
             self.slots
                 .range_mut(slot..)
