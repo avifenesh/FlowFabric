@@ -999,4 +999,53 @@ mod tests {
         // Incomplete bulk string (data too short)
         assert!(scan_value(b"$3\r\nfo", 0, 0).unwrap().is_none());
     }
+
+    #[test]
+    fn test_integer_overflow_rejected() {
+        // Overflow i64 — should error, not wrap silently
+        let result = parse_valkey_value(b":99999999999999999999\r\n");
+        assert!(result.is_err());
+        // Bulk string with overflowing length
+        let result = parse_valkey_value(b"$99999999999999999999\r\nhello\r\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bulk_string_size_cap() {
+        // Bulk string at exactly the cap should be fine (if data were present)
+        // But we test the scan rejection for oversized
+        let huge = format!("${}\r\n", MAX_BULK_STRING_BYTES + 1);
+        let result = parse_valkey_value(huge.as_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_negative_map_count() {
+        // Negative map count should return Nil, not panic
+        let val = parse_valkey_value(b"%-1\r\n").unwrap();
+        assert_eq!(val, Value::Nil);
+    }
+
+    #[test]
+    fn test_negative_attribute_count() {
+        // Negative attribute count should return Nil, not panic
+        // Attribute with -1 count: |<count>\r\n followed by a data element
+        // With negative count, we skip pairs and read the "data" element
+        // But our guard returns Nil before reaching data
+        let val = parse_valkey_value(b"|-1\r\n").unwrap();
+        assert_eq!(val, Value::Nil);
+    }
+
+    #[test]
+    fn test_empty_bulk_string_and_nil() {
+        // Empty bulk string ($0)
+        let val = parse_valkey_value(b"$0\r\n\r\n").unwrap();
+        assert_eq!(val, Value::BulkString(bytes::Bytes::new()));
+        // Nil bulk string ($-1)
+        let val = parse_valkey_value(b"$-1\r\n").unwrap();
+        assert_eq!(val, Value::Nil);
+        // Nil array (*-1)
+        let val = parse_valkey_value(b"*-1\r\n").unwrap();
+        assert_eq!(val, Value::Nil);
+    }
 }
