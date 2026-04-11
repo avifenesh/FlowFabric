@@ -4164,6 +4164,29 @@ where
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
     ) -> RedisResult<Vec<Value>> {
         let route = route_for_pipeline(pipeline)?;
+
+        // Fast path: same-slot pipeline dispatched directly to the node's mux connection.
+        if let Some(ref route) = route {
+            let conn_future = {
+                let container = self.inner.conn_lock.read();
+                container.connection_for_route(route).map(|(_, conn)| conn)
+            };
+            if let Some(conn_future) = conn_future {
+                let mut conn = conn_future.await;
+                let result = conn
+                    .req_packed_commands(pipeline, offset, count, pipeline_retry_strategy.clone())
+                    .await;
+                match &result {
+                    Ok(_) => return result,
+                    Err(e) if e.kind() == ErrorKind::Moved || e.kind() == ErrorKind::Ask => {
+                        // Fall through to cluster task for retry
+                    }
+                    Err(_) => return result,
+                }
+            }
+        }
+
+        // Slow path: cross-slot, MOVED/ASK, or route not found
         self.route_pipeline(
             pipeline,
             offset,
