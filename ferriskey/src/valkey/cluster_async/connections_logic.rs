@@ -217,6 +217,7 @@ where
 
 #[doc(hidden)]
 #[must_use]
+#[allow(dead_code)] // err field retained for future diagnostics
 pub enum ConnectAndCheckResult<C> {
     // Returns a node that was fully connected according to the request.
     Success(AsyncClusterNode<C>),
@@ -238,13 +239,6 @@ impl<C> ConnectAndCheckResult<C> {
         }
     }
 
-    pub fn get_error(self) -> Option<ValkeyError> {
-        match self {
-            ConnectAndCheckResult::Success(_) => None,
-            ConnectAndCheckResult::ManagementConnectionFailed { err, .. } => Some(err),
-            ConnectAndCheckResult::Failed(err) => Some(err),
-        }
-    }
 }
 
 impl<C> From<ValkeyError> for ConnectAndCheckResult<C> {

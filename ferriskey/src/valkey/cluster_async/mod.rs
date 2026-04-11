@@ -4708,3 +4708,422 @@ mod parse_node_address_tests {
         assert_eq!(parse_node_address(":6379"), Some(("", 6379)));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Direct-dispatch integration tests
+//
+// These tests exercise try_direct_dispatch and try_direct_pipeline_dispatch
+// in isolation by injecting a lightweight MockConn that records every bytes
+// payload it receives and returns pre-queued ValkeyResult<Value> responses.
+// No real TCP connections are used.
+//
+// Slot facts used throughout (CRC-16/CCITT of the key name):
+//   "foo"  → slot 12182  (well-known from routing unit tests)
+//   "baz"  → slot 4813
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod direct_dispatch_tests {
+    use super::*;
+    use connections_container::{ClusterNode, ConnectionDetails, ConnectionsMap};
+    use crate::valkey::{
+        cluster_client::ClusterParams,
+        cluster_routing::{Route, SingleNodeRoutingInfo, Slot, SlotAddr},
+        cluster_slotmap::{ReadFromReplicaStrategy, SlotMap},
+        pipeline::PipelineRetryStrategy,
+    };
+    use dashmap::DashMap;
+
+    use std::{
+        collections::VecDeque,
+        net::IpAddr,
+        sync::{Arc, Mutex},
+    };
+
+    // ── MockConn ────────────────────────────────────────────────────────────
+    // A zero-TCP fake connection. Stores pre-queued responses and records every
+    // raw bytes payload it receives (from send_packed_bytes / req_packed_command).
+
+    #[derive(Clone)]
+    struct MockConn {
+        responses: Arc<Mutex<VecDeque<ValkeyResult<Value>>>>,
+        /// Each entry is the raw bytes payload received by send_packed_bytes or
+        /// req_packed_command (packed command bytes).
+        received: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl MockConn {
+        fn new() -> Self {
+            MockConn {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                received: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn push_ok(&self, v: Value) {
+            self.responses.lock().unwrap().push_back(Ok(v));
+        }
+
+        fn push_err(&self, e: ValkeyError) {
+            self.responses.lock().unwrap().push_back(Err(e));
+        }
+
+        fn received_count(&self) -> usize {
+            self.received.lock().unwrap().len()
+        }
+
+        /// Returns a copy of the nth received payload, panicking if absent.
+        fn received_nth(&self, n: usize) -> Vec<u8> {
+            self.received.lock().unwrap()[n].clone()
+        }
+
+        fn pop_response(&self) -> ValkeyResult<Value> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(Value::Nil))
+        }
+    }
+
+    impl ConnectionLike for MockConn {
+        async fn req_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(cmd.get_packed_command().to_vec());
+            self.pop_response()
+        }
+
+        async fn req_packed_commands(
+            &mut self,
+            _pipeline: &crate::valkey::Pipeline,
+            _offset: usize,
+            _count: usize,
+            _retry: Option<PipelineRetryStrategy>,
+        ) -> ValkeyResult<Vec<Value>> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(b"<pipeline>".to_vec());
+            match self.pop_response() {
+                Ok(Value::Array(vals)) => Ok(vals),
+                Ok(v) => Ok(vec![v]),
+                Err(e) => Err(e),
+            }
+        }
+
+        async fn send_packed_bytes(
+            &mut self,
+            packed: bytes::Bytes,
+            _is_fenced: bool,
+        ) -> ValkeyResult<Value> {
+            self.received.lock().unwrap().push(packed.to_vec());
+            self.pop_response()
+        }
+
+        fn get_db(&self) -> i64 {
+            0
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    impl Connect for MockConn {
+        fn connect<'a, T>(
+            _info: T,
+            _response_timeout: Duration,
+            _connection_timeout: Duration,
+            _socket_addr: Option<SocketAddr>,
+            _opts: FerrisKeyConnectionOptions,
+        ) -> ValkeyFuture<'a, (Self, Option<IpAddr>)>
+        where
+            T: IntoConnectionInfo + Send + 'a,
+        {
+            async { Ok((MockConn::new(), None)) }.boxed()
+        }
+    }
+
+    // ── Builder helpers ─────────────────────────────────────────────────────
+
+    /// Wrap a MockConn in the ConnectionFuture type expected by ClusterNode.
+    fn into_future(conn: MockConn) -> ConnectionFuture<MockConn> {
+        async move { conn }.boxed().shared()
+    }
+
+    /// Build a ClusterConnection<MockConn> from a list of (addr, slot_start,
+    /// slot_end, conn) tuples.  Each entry becomes a primary node.
+    fn build_cluster(
+        nodes: Vec<(&str, u16, u16, MockConn)>,
+    ) -> ClusterConnection<MockConn> {
+        let slots: Vec<Slot> = nodes
+            .iter()
+            .map(|(addr, start, end, _)| Slot::new(*start, *end, addr.to_string(), vec![]))
+            .collect();
+
+        let slot_map = SlotMap::new(slots, HashMap::new(), ReadFromReplicaStrategy::AlwaysFromPrimary);
+
+        let dm: DashMap<String, ClusterNode<ConnectionFuture<MockConn>>> = DashMap::new();
+        for (addr, _, _, conn) in nodes {
+            let details = ConnectionDetails {
+                conn: into_future(conn),
+                ip: None,
+                az: None,
+            };
+            dm.insert(addr.to_string(), ClusterNode::new(details, None));
+        }
+
+        let container = connections_container::ConnectionsContainer::new(
+            slot_map,
+            ConnectionsMap(dm),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+            0,
+        );
+
+        let params = ClusterParams::default_for_test(None);
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(InnerCore {
+            conn_lock: ParkingLotRwLock::new(container),
+            cluster_params: ParkingLotRwLock::new(params),
+            pending_requests_tx: pending_tx,
+            pending_requests_rx: std::sync::Mutex::new(pending_rx),
+            slot_refresh_state: SlotRefreshState::new(
+                crate::valkey::cluster_client::SlotsRefreshRateLimit::default(),
+            ),
+            initial_nodes: vec![],
+            ferriskey_connection_options: FerrisKeyConnectionOptions {
+                push_sender: None,
+                disconnect_notifier: None,
+                discover_az: false,
+                connection_timeout: None,
+                connection_retry_strategy: None,
+                tcp_nodelay: false,
+                pubsub_synchronizer: None,
+                iam_token_provider: None,
+            },
+            topology_refresh_lock: tokio::sync::Mutex::new(()),
+        });
+
+        let (cluster_tx, _cluster_rx) = mpsc::channel(1);
+        ClusterConnection {
+            cluster_task: cluster_tx,
+            inner,
+        }
+    }
+
+    /// Create a MOVED error that redirect_node() will parse as (addr, slot).
+    fn moved_err(slot: u16, addr: &str) -> ValkeyError {
+        ValkeyError::from((ErrorKind::Moved, "key moved", format!("{slot} {addr}")))
+    }
+
+    /// Create an ASK error that redirect_node() will parse as (addr, slot).
+    fn ask_err(slot: u16, addr: &str) -> ValkeyError {
+        ValkeyError::from((ErrorKind::Ask, "key moved (ask)", format!("{slot} {addr}")))
+    }
+
+    // ── Test 1 ──────────────────────────────────────────────────────────────
+    // Happy-path routing: GET "foo" (slot 12182) goes directly to the node
+    // that owns the slot, without touching the other node.
+    #[tokio::test]
+    async fn test_try_direct_dispatch_routes_to_correct_node() {
+        let node_a = MockConn::new(); // owns slots 0–8191 (not slot 12182)
+        let node_b = MockConn::new(); // owns slots 8192–16383 (includes slot 12182)
+        node_b.push_ok(Value::BulkString(b"bar".to_vec().into()));
+
+        let conn = build_cluster(vec![
+            ("127.0.0.1:7001", 0, 8191, node_a.clone()),
+            ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
+        ]);
+
+        // GET "foo" → slot 12182 → node_b
+        let get_foo = cmd("GET").arg("foo").to_owned();
+        let routing = SingleNodeRoutingInfo::SpecificNode(Route::new(12182, SlotAddr::Master));
+        let result = conn.try_direct_dispatch(&get_foo, &routing).await;
+
+        assert!(result.is_some(), "expected Some from direct dispatch");
+        assert_eq!(result.unwrap(), Ok(Value::BulkString(b"bar".to_vec().into())));
+
+        // Command must have gone to node_b only.
+        assert_eq!(node_b.received_count(), 1, "node_b should have received 1 command");
+        assert_eq!(node_a.received_count(), 0, "node_a must not receive any command");
+    }
+
+    // ── Test 2 ──────────────────────────────────────────────────────────────
+    // MOVED to a known node: the first node returns MOVED pointing to the
+    // second node.  The command must be retried on the redirect target.
+    #[tokio::test]
+    async fn test_try_direct_dispatch_moved_to_known_node() {
+        let node_a = MockConn::new(); // initially owns "baz" (slot 4813)
+        let node_b = MockConn::new(); // will receive the redirected command
+
+        // node_a returns MOVED → node_b
+        node_a.push_err(moved_err(4813, "127.0.0.1:7002"));
+        // node_b returns success
+        node_b.push_ok(Value::BulkString(b"value".to_vec().into()));
+
+        let conn = build_cluster(vec![
+            ("127.0.0.1:7001", 0, 8191, node_a.clone()),
+            ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
+        ]);
+
+        let get_baz = cmd("GET").arg("baz").to_owned();
+        let routing = SingleNodeRoutingInfo::SpecificNode(Route::new(4813, SlotAddr::Master));
+        let result = conn.try_direct_dispatch(&get_baz, &routing).await;
+
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            Ok(Value::BulkString(b"value".to_vec().into()))
+        );
+        // node_a got the original command; node_b got the redirected retry.
+        assert_eq!(node_a.received_count(), 1, "node_a should receive the original command");
+        assert_eq!(node_b.received_count(), 1, "node_b should receive the redirected command");
+    }
+
+    // ── Test 3 ──────────────────────────────────────────────────────────────
+    // MOVED to an address that is NOT in the connection map.
+    // try_direct_dispatch must return None so the caller falls back to the
+    // cluster task.  No new connection must be established.
+    #[tokio::test]
+    async fn test_try_direct_dispatch_moved_to_unknown_address() {
+        let node_a = MockConn::new();
+        // Returns MOVED to a node that is not in our topology.
+        node_a.push_err(moved_err(4813, "10.0.0.99:7999"));
+
+        let conn = build_cluster(vec![
+            ("127.0.0.1:7001", 0, 16383, node_a.clone()),
+        ]);
+
+        let get_baz = cmd("GET").arg("baz").to_owned();
+        let routing = SingleNodeRoutingInfo::SpecificNode(Route::new(4813, SlotAddr::Master));
+        let result = conn.try_direct_dispatch(&get_baz, &routing).await;
+
+        // Must fall back: unknown redirect target → None.
+        assert!(
+            result.is_none(),
+            "expected None when redirect target is not in the topology"
+        );
+        // node_a still received the original (failed) attempt.
+        assert_eq!(node_a.received_count(), 1);
+    }
+
+    // ── Test 4 ──────────────────────────────────────────────────────────────
+    // ASK redirect: node_a returns ASK pointing to node_b.
+    // The redirect helper must send ASKING to node_b before the retried command.
+    // Because req_packed_command is used for ASKING and send_packed_bytes for
+    // the retry, node_b must record exactly 2 payloads in total.
+    #[tokio::test]
+    async fn test_try_direct_dispatch_ask_redirect() {
+        let node_a = MockConn::new();
+        let node_b = MockConn::new();
+
+        node_a.push_err(ask_err(4813, "127.0.0.1:7002"));
+        // node_b will receive ASKING (via req_packed_command → push Ok)
+        // and then the actual command (via send_packed_bytes → push Ok).
+        node_b.push_ok(Value::Okay); // response to ASKING
+        node_b.push_ok(Value::BulkString(b"ask-value".to_vec().into())); // response to actual command
+
+        let conn = build_cluster(vec![
+            ("127.0.0.1:7001", 0, 8191, node_a.clone()),
+            ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
+        ]);
+
+        let get_baz = cmd("GET").arg("baz").to_owned();
+        let routing = SingleNodeRoutingInfo::SpecificNode(Route::new(4813, SlotAddr::Master));
+        let result = conn.try_direct_dispatch(&get_baz, &routing).await;
+
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            Ok(Value::BulkString(b"ask-value".to_vec().into()))
+        );
+        // node_b must have received ASKING (1st call) + the retried command (2nd call).
+        assert_eq!(
+            node_b.received_count(),
+            2,
+            "node_b should receive ASKING then the retried command"
+        );
+        // The first payload sent to node_b must be the packed ASKING command.
+        let asking_bytes = cmd("ASKING").get_packed_command();
+        assert_eq!(
+            node_b.received_nth(0),
+            asking_bytes,
+            "first payload to node_b must be ASKING"
+        );
+    }
+
+    // ── Test 5 ──────────────────────────────────────────────────────────────
+    // Cross-slot pipeline ordering: a two-command pipeline targeting different
+    // nodes.  Results must be assembled in the original command order regardless
+    // of which sub-pipeline completes first.
+    //
+    //   cmd[0] = GET "foo"  → slot 12182 → node_b  returns "val_foo"
+    //   cmd[1] = GET "baz"  → slot 4813  → node_a  returns "val_baz"
+    //
+    // Final result must be ["val_foo", "val_baz"].
+    #[tokio::test]
+    async fn test_direct_pipeline_dispatch_ordering() {
+        let node_a = MockConn::new(); // owns slots 0–8191
+        let node_b = MockConn::new(); // owns slots 8192–16383
+
+        // Each node returns its sub-pipeline results as a Value::Array.
+        node_b.push_ok(Value::Array(vec![Value::BulkString(b"val_foo".to_vec().into())]));
+        node_a.push_ok(Value::Array(vec![Value::BulkString(b"val_baz".to_vec().into())]));
+
+        let conn = build_cluster(vec![
+            ("127.0.0.1:7001", 0, 8191, node_a.clone()),
+            ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
+        ]);
+
+        let mut pipeline = crate::valkey::Pipeline::new();
+        pipeline.cmd("GET").arg("foo"); // slot 12182 → node_b
+        pipeline.cmd("GET").arg("baz"); // slot 4813  → node_a
+
+        let result = conn.try_direct_pipeline_dispatch(&pipeline, 2).await;
+
+        assert!(result.is_some(), "expected Some from pipeline direct dispatch");
+        let values = result.unwrap().expect("pipeline should succeed");
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values[0],
+            Value::BulkString(b"val_foo".to_vec().into()),
+            "index 0 must be the result of GET foo"
+        );
+        assert_eq!(
+            values[1],
+            Value::BulkString(b"val_baz".to_vec().into()),
+            "index 1 must be the result of GET baz"
+        );
+    }
+
+    // ── Test 6 ──────────────────────────────────────────────────────────────
+    // Partial sub-pipeline failure: if any node returns an error the whole
+    // direct-dispatch path must return None so the cluster task handles retry.
+    #[tokio::test]
+    async fn test_direct_pipeline_dispatch_partial_failure_falls_back() {
+        let node_a = MockConn::new(); // will fail
+        let node_b = MockConn::new(); // will succeed
+
+        node_b.push_ok(Value::Array(vec![Value::BulkString(b"ok".to_vec().into())]));
+        node_a.push_err(ValkeyError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "simulated connection drop",
+        )));
+
+        let conn = build_cluster(vec![
+            ("127.0.0.1:7001", 0, 8191, node_a.clone()),
+            ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
+        ]);
+
+        let mut pipeline = crate::valkey::Pipeline::new();
+        pipeline.cmd("GET").arg("foo"); // slot 12182 → node_b (succeeds)
+        pipeline.cmd("GET").arg("baz"); // slot 4813  → node_a (fails)
+
+        let result = conn.try_direct_pipeline_dispatch(&pipeline, 2).await;
+
+        assert!(
+            result.is_none(),
+            "any sub-pipeline error must cause direct dispatch to return None"
+        );
+    }
+}
