@@ -1,1 +1,7 @@
 ferriskey/target/
+.cursor/
+ferriskey/bench-results-*.json
+ferriskey/benchmarks/
+ferriskey/flamegraph.svg
+*.perf.data
+perf.data
