@@ -99,8 +99,12 @@ pub(crate) mod shared_client_tests {
                 client: cluster_basics.client,
             }
         } else {
-            let test_basics = utilities::setup_test_basics_internal(&configuration).await;
-            let server = BackingServer::Standalone(test_basics.server);
+            // Use the lean server-only helper to avoid creating a StandaloneClient that gets
+            // immediately discarded. The discarded client's background tasks (heartbeat, checker)
+            // would keep running and interfere with the actual test client's pipeline requests.
+            let (server_inst, _) =
+                utilities::create_standalone_server(&configuration).await;
+            let server = BackingServer::Standalone(server_inst);
             let client = create_client(&server, configuration).await;
             TestBasics { server, client }
         }

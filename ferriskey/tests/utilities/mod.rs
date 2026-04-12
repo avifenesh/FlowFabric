@@ -757,6 +757,34 @@ pub struct TestConfiguration {
     pub lazy_connect: bool,
 }
 
+/// Creates only the server (and optionally ACL) without also creating a StandaloneClient.
+/// Use this when the caller needs the server address but will create their own client.
+pub(crate) async fn create_standalone_server(
+    configuration: &TestConfiguration,
+) -> (Option<ValkeyServer>, ConnectionAddr) {
+    let server = if !configuration.shared_server {
+        Some(ValkeyServer::new(ServerType::Tcp {
+            tls: configuration.use_tls,
+        }))
+    } else {
+        None
+    };
+    let connection_addr = if !configuration.shared_server {
+        server.as_ref().unwrap().get_client_addr()
+    } else {
+        get_shared_server_address(configuration.use_tls)
+    };
+
+    if let Some(valkey_connection_info) = &configuration.connection_info
+        && valkey_connection_info.password.is_some()
+    {
+        assert!(!configuration.shared_server);
+        setup_acl(&connection_addr, valkey_connection_info).await;
+    }
+
+    (server, connection_addr)
+}
+
 pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration) -> TestBasics {
     let server = if !configuration.shared_server {
         Some(ValkeyServer::new(ServerType::Tcp {

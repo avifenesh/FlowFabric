@@ -173,7 +173,13 @@ struct TokioDisconnectNotifier {
 #[async_trait]
 impl DisconnectNotifier for TokioDisconnectNotifier {
     fn notify_disconnect(&mut self) {
-        self.disconnect_notifier.notify_one();
+        // Use notify_waiters() instead of notify_one() to avoid storing a permit.
+        // notify_one() stores a permit when no listener is waiting, causing the
+        // connection checker to fire immediately on the NEXT connection if the
+        // PREVIOUS connection's setup triggered a disconnect (e.g. RESP3 negotiation).
+        // notify_waiters() only wakes current listeners — if nobody is listening,
+        // the notification is dropped cleanly.
+        self.disconnect_notifier.notify_waiters();
     }
 
     async fn wait_for_disconnect_with_timeout(&self, max_wait: &Duration) {
