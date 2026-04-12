@@ -128,7 +128,7 @@ fn parse_node_address(address: &str) -> Option<(&str, i64)> {
 /// - `Some(Ok(value))` — redirect succeeded and produced a result
 /// - `Some(Err(e))`   — redirect target was reached but the command failed
 /// - `None`           — redirect address is not in the connection map; caller
-///                      should fall back to the cluster task for a full retry
+///   should fall back to the cluster task for a full retry
 ///
 /// # SAFETY (SSRF)
 /// `connection_for_address` performs a map lookup only — it never opens new
@@ -181,6 +181,10 @@ where
 
     Some(conn.send_packed_bytes(packed, is_fenced).await)
 }
+
+type SharedConnFuture<C> = futures::future::Shared<futures_util::future::BoxFuture<'static, C>>;
+type DirectPipelineGroup<C> = (Arc<str>, crate::pipeline::Pipeline, Vec<usize>, SharedConnFuture<C>);
+type NodeResponseReceiver = (Option<Arc<str>>, oneshot::Receiver<ValkeyResult<Response>>);
 
 /// Sets the routed node's address on the command span for OTel reporting.
 /// Called after cluster routing resolves the actual target node.
@@ -384,9 +388,7 @@ where
 
         // Step 1: Group commands by node address.
         // Hold conn_lock briefly, only for route resolution.
-        type ConnFut<C> = futures::future::Shared<futures_util::future::BoxFuture<'static, C>>;
-
-        let grouped: Vec<(Arc<str>, crate::pipeline::Pipeline, Vec<usize>, ConnFut<C>)> = {
+        let grouped: Vec<DirectPipelineGroup<C>> = {
             let container = self.inner.conn_lock.read();
             if container.is_empty() {
                 return None;
@@ -395,7 +397,7 @@ where
             // Route each command to a node
             let mut node_map: std::collections::HashMap<
                 Arc<str>,
-                (crate::pipeline::Pipeline, Vec<usize>, ConnFut<C>),
+                (crate::pipeline::Pipeline, Vec<usize>, SharedConnFuture<C>),
             > = std::collections::HashMap::new();
 
             for (idx, cmd) in pipeline.cmd_iter().enumerate() {
@@ -2087,7 +2089,7 @@ where
     ///
     /// A `ValkeyResult<Value>` representing the aggregated result.
     pub async fn aggregate_results(
-        receivers: Vec<(Option<Arc<str>>, oneshot::Receiver<ValkeyResult<Response>>)>,
+        receivers: Vec<NodeResponseReceiver>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
     ) -> ValkeyResult<Value> {

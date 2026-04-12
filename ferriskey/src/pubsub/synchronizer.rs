@@ -93,10 +93,10 @@ impl ConfirmedState {
     fn remove_exact(&mut self, kind: PubSubSubscriptionKind, channel: &[u8], address: &str) {
         if kind == PubSubSubscriptionKind::Sharded {
             // Sharded: only remove from the specific address
-            if let Some(addr_subs) = self.by_address.get_mut(address) {
-                if let Some(channels) = addr_subs.get_mut(&kind) {
-                    channels.remove(channel);
-                }
+            if let Some(addr_subs) = self.by_address.get_mut(address)
+                && let Some(channels) = addr_subs.get_mut(&kind)
+            {
+                channels.remove(channel);
             }
         } else {
             // Exact/Pattern: remove from ALL addresses (server unsubscribe is authoritative)
@@ -820,11 +820,11 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                 confirmed.by_address.remove(addr);
             }
             for (addr, kind, channels) in &migrations {
-                if let Some(addr_subs) = confirmed.by_address.get_mut(addr) {
-                    if let Some(existing) = addr_subs.get_mut(kind) {
-                        for ch in channels {
-                            existing.remove(ch);
-                        }
+                if let Some(addr_subs) = confirmed.by_address.get_mut(addr)
+                    && let Some(existing) = addr_subs.get_mut(kind)
+                {
+                    for ch in channels {
+                        existing.remove(ch);
                     }
                 }
             }

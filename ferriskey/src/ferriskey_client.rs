@@ -17,13 +17,16 @@ pub use crate::value::ToValkeyArgs as ToArgs;
 pub type FerrisKeyError = ValkeyError;
 pub type Result<T> = std::result::Result<T, FerrisKeyError>;
 
+/// High-level Valkey/Redis client with convenience methods for common operations.
 #[derive(Clone)]
 pub struct Client(Arc<ClientInner>);
 
+/// Builder for constructing a [`Client`] with custom connection options.
 pub struct ClientBuilder {
     request: ConnectionRequest,
 }
 
+/// Builder for executing an arbitrary command through a [`Client`].
 pub struct CommandBuilder {
     client: Arc<ClientInner>,
     cmd: Cmd,
@@ -41,12 +44,14 @@ struct SharedConnectionOptions {
 }
 
 impl Client {
+    /// Connect to a standalone Valkey/Redis server by URL.
     pub async fn connect(url: &str) -> Result<Client> {
         let request = connection_request_from_url(url, false)?;
         let inner = ClientInner::new(request, None).await?;
         Ok(Self(Arc::new(inner)))
     }
 
+    /// Connect to a Valkey/Redis cluster using one or more seed node URLs.
     pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
         if urls.is_empty() {
             return Err(ValkeyError::from((
@@ -297,6 +302,12 @@ impl ClientBuilder {
 
         let inner = ClientInner::new(self.request, None).await?;
         Ok(Client(Arc::new(inner)))
+    }
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

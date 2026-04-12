@@ -95,13 +95,11 @@ fn add_command_to_node_pipeline_map<C>(
 ) where
     C: Clone,
 {
-    if is_retrying {
-        if let Err(e) = FerrisKeyOtel::record_retry_attempt() {
-            log_error(
-                "OpenTelemetry:retry_error",
-                format!("Failed to record retry attempt: {e}"),
-            );
-        }
+    if is_retrying && let Err(e) = FerrisKeyOtel::record_retry_attempt() {
+        log_error(
+            "OpenTelemetry:retry_error",
+            format!("Failed to record retry attempt: {e}"),
+        );
     }
     if add_asking {
         let asking_cmd = Arc::new(crate::cmd::cmd("ASKING"));
