@@ -1,6 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-use crate::valkey::{ScanStateRC, ValkeyResult};
+use crate::cluster::scan::ScanStateRC;
+use crate::value::ValkeyResult;
 use logger_core::log_debug;
 use nanoid::nanoid;
 use once_cell::sync::Lazy;
@@ -35,8 +36,8 @@ pub fn get_cluster_scan_cursor(id: String) -> ValkeyResult<ScanStateRC> {
     );
     match scan_state_rc {
         Some(scan_state_rc) => Ok(scan_state_rc),
-        None => Err(crate::valkey::ValkeyError::from((
-            crate::valkey::ErrorKind::ResponseError,
+        None => Err(crate::value::ValkeyError::from((
+            crate::value::ErrorKind::ResponseError,
             "Invalid scan_state_cursor id",
             format!("The scan_state_cursor sent with id: `{id:?}` does not exist"),
         ))),

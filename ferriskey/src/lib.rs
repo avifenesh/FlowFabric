@@ -22,9 +22,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[macro_use]
 mod macros;
 
-#[macro_use]
-pub mod valkey;
-
 pub mod cluster;
 pub mod connection;
 pub mod protocol;

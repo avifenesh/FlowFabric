@@ -4,7 +4,7 @@ use strum_macros::Display;
 use crate::cluster::topology::get_slot;
 use crate::cmd::{Arg, Cmd};
 use crate::value::Value;
-use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
 use core::cmp::Ordering;
 use std::borrow::Cow;
 use std::cmp::min;
@@ -1501,7 +1501,9 @@ mod tests_routing {
     };
     use crate::cluster::routing::{Routable, ShardUpdateResult, is_readonly, is_readonly_cmd};
     use crate::cluster::topology::slot;
-    use crate::valkey::{Value, cmd, parser::parse_valkey_value};
+    use crate::cmd::cmd;
+    use crate::protocol::parser::parse_valkey_value;
+    use crate::value::Value;
     use core::panic;
     use std::sync::{Arc, RwLock};
 
@@ -1768,7 +1770,7 @@ mod tests_routing {
             "expected={expected:?}\nrouting={routing:?}"
         );
 
-        let mut cmd = crate::valkey::cmd("MGET");
+        let mut cmd = crate::cmd::cmd("MGET");
         cmd.arg("foo").arg("bar").arg("baz").arg("{bar}vaz");
         let routing = RoutingInfo::for_routable(&cmd);
         let mut expected = std::collections::HashMap::new();

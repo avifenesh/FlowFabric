@@ -4,8 +4,9 @@ use crate::cluster::topology::{
 };
 use crate::connection::info::TlsMode;
 use crate::connection::info::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
+use crate::pubsub::push_manager::PushInfo;
+use crate::retry_strategies::RetryStrategy;
 use crate::value::{ErrorKind, ProtocolVersion, ValkeyError, ValkeyResult};
-use crate::valkey::{PushInfo, RetryStrategy};
 use rand::Rng;
 use std::ops::Add;
 use std::sync::Arc;
@@ -589,9 +590,7 @@ impl ClusterClient {
     pub async fn get_async_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        pubsub_synchronizer: Option<
-            Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>,
-        >,
+        pubsub_synchronizer: Option<Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>>,
     ) -> ValkeyResult<cluster::ClusterConnection> {
         cluster::ClusterConnection::new(

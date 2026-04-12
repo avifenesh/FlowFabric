@@ -43,8 +43,9 @@
 use crate::cluster::routing::SlotAddr;
 use crate::cluster::topology::SLOT_SIZE;
 use crate::cluster::{ClusterConnInner, Connect, InnerCore, RefreshPolicy};
+use crate::cmd::cmd;
 use crate::connection::ConnectionLike;
-use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult, Value, cmd, from_valkey_value};
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value, from_valkey_value};
 use std::sync::Arc;
 use strum_macros::{Display, EnumString};
 

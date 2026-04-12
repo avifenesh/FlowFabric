@@ -2414,7 +2414,7 @@ impl Drop for InflightSlotGuard {
 /// Cloneable handle to an inflight slot. Clone = Arc refcount bump.
 /// Last drop triggers `InflightSlotGuard::drop` which releases the slot.
 ///
-/// Held by a [`crate::valkey::Cmd`] so that the slot is released when
+/// Held by a [`crate::cmd::Cmd`] so that the slot is released when
 /// the last clone of that Cmd (or its `Arc<Cmd>`) is dropped — decoupling
 /// the user-facing timeout from internal pipeline cleanup.
 #[derive(Clone)]

@@ -74,10 +74,7 @@ num_cpus = "1"
 
 [features]
 default = []
-standalone_heartbeat = []
-iam_tests = []
-mock-pubsub = []
-testing = []
+test-util = []
 
 [dev-dependencies]
 rsevents = "0.3.1"

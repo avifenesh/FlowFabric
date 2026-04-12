@@ -39,21 +39,21 @@ pub(crate) mod shared_client_tests {
     use utilities::cluster::*;
     use utilities::*;
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     use ferriskey::client::types::{AuthenticationInfo, IamCredentials, ServiceType, TlsMode};
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     const ELASTICACHE_CLUSTER_IAM_ENDPOINT: &str = "elasticache-cluster-iam.endpoint"; // Replace with your cluster endpoint
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     const ELASTICACHE_STANDALONE_IAM_ENDPOINT: &str = "elasticache-standalone-iam.endpoint"; // Replace with your standalone endpoint
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     const MEMORYDB_CLUSTER_IAM_ENDPOINT: &str = "memorydb-cluster-iam.endpoint"; // Replace with your cluster endpoint
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     const TEST_STANDALONE_NAME: &str = "test-standalone";
 
     // Import IAM test constants from constants module
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     use constants::{IAM_TEST_CLUSTER_NAME, IAM_TEST_REGION_US_EAST_1, IAM_USERNAME};
 
     struct TestBasics {
@@ -106,7 +106,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     fn setup_mock_aws_credentials() {
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test_access_key");
@@ -115,7 +115,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     fn cleanup_mock_aws_credentials() {
         unsafe {
             std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -407,7 +407,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     fn remove_test_credentials() {
         // Clear any existing AWS credentials
         unsafe {
@@ -420,7 +420,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     /// Helper function to create connection request with IAM authentication
     fn create_iam_connection_request(
         addresses: &[ferriskey::ConnectionAddr],
@@ -458,7 +458,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -518,7 +518,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -578,7 +578,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -638,7 +638,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -738,7 +738,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -847,7 +847,7 @@ pub(crate) mod shared_client_tests {
      * - Sleep **> 900s and < refresh_interval_seconds** **before** killing the connection.
      *   The token will be expired and reconnect should fail.
      */
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -962,7 +962,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     fn test_iam_cluster_refresh_token_after_connection_kill_and_token_expired() {
@@ -1073,7 +1073,7 @@ pub(crate) mod shared_client_tests {
      * Install aws sdk for running the test.
      * Follow the steps inside the test to trigger a node failover, while keeping the token expired.
      */
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     fn test_iam_cluster_reconnection_after_node_kill() {
@@ -1179,7 +1179,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "iam_tests")]
+    #[cfg(feature = "test-util")]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]

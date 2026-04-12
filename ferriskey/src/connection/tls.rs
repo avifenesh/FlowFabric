@@ -4,8 +4,9 @@ use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::connection::factory::Client;
 use crate::connection::info::{ConnectionAddr, ConnectionInfo};
-use crate::valkey::{Client, ErrorKind, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
 
 /// Structure to hold mTLS client _certificate_ and _key_ binaries in PEM format
 ///

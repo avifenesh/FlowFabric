@@ -1,5 +1,5 @@
 use crate::connection::{AsyncStream, RedisRuntime};
-use crate::valkey::ValkeyResult;
+use crate::value::ValkeyResult;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 #[allow(unused_imports)] // fixes "Duration" unused when built with non-default feature set

@@ -1,8 +1,9 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::cluster::slotmap::SlotMap;
+use crate::cmd::Cmd;
 use crate::connection::info::{PubSubChannelOrPattern, PubSubSubscriptionKind};
-use crate::valkey::{Cmd, ValkeyResult, Value};
+use crate::value::{ValkeyResult, Value};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 

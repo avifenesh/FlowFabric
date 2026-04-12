@@ -1,14 +1,16 @@
+use crate::cmd::Cmd;
+use crate::cmd::cmd;
 use crate::connection::ConnectionLike;
 use crate::connection::DisconnectNotifier;
 use crate::connection::factory::FerrisKeyConnectionOptions;
+use crate::connection::info::ConnectionInfo;
 use crate::connection::runtime;
 use crate::connection::setup_connection;
-use crate::cmd::Cmd;
-use crate::protocol::parser::ValueCodec;
 use crate::pipeline::PipelineRetryStrategy;
+use crate::protocol::parser::ValueCodec;
 use crate::pubsub::push_manager::PushManager;
+use crate::value::{ProtocolVersion, PushKind};
 use crate::value::{ValkeyError, ValkeyResult, Value};
-use crate::valkey::{ConnectionInfo, ProtocolVersion, PushKind, cmd};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot},
@@ -180,7 +182,7 @@ where
         if *self_.response_sync_lost {
             if let Some(entry) = self_.in_flight.pop_front() {
                 let err = ValkeyError::from((
-                    crate::valkey::ErrorKind::ProtocolDesync,
+                    crate::value::ErrorKind::ProtocolDesync,
                     "Response synchronization lost - connection must be reestablished",
                 ));
                 entry.output.send(Err(err)).ok();
@@ -339,7 +341,7 @@ where
 
             // Fail the current command
             let err = ValkeyError::from((
-                crate::valkey::ErrorKind::ProtocolDesync,
+                crate::value::ErrorKind::ProtocolDesync,
                 "Expected PONG for fenced command but received different response",
                 format!("Response synchronization lost. Got: {:?}", pong_result),
             ));
@@ -399,7 +401,7 @@ where
 
         if *self_.response_sync_lost {
             let err = ValkeyError::from((
-                crate::valkey::ErrorKind::ProtocolDesync,
+                crate::value::ErrorKind::ProtocolDesync,
                 "Response synchronization lost - connection must be reestablished",
             ));
             let _ = output.send(Err(err));
@@ -534,7 +536,7 @@ where
                 // by the 'send' function. Since the server did not receive the data, it is safe to retry
                 // the request.
                 ValkeyError::from((
-                    crate::valkey::ErrorKind::FatalSendError,
+                    crate::value::ErrorKind::FatalSendError,
                     "Failed to send the request to the server",
                     err.to_string(),
                 ))
@@ -546,7 +548,7 @@ where
                 // This error suggests that it's unclear whether the server received the request before the connection failed,
                 // making it unsafe to retry. For example, retrying an INCR request could result in double increments.
                 Err(ValkeyError::from((
-                    crate::valkey::ErrorKind::FatalReceiveError,
+                    crate::value::ErrorKind::FatalReceiveError,
                     "Failed to receive a response due to a fatal error",
                     err.to_string(),
                 )))
@@ -657,7 +659,7 @@ impl MultiplexedConnection {
                 }
                 futures_util::future::Either::Right(((), _)) => {
                     return Err(ValkeyError::from((
-                        crate::valkey::ErrorKind::IoError,
+                        crate::value::ErrorKind::IoError,
                         "Multiplexed connection driver unexpectedly terminated",
                     )));
                 }
@@ -701,7 +703,7 @@ impl MultiplexedConnection {
     /// pipelining.
     pub async fn send_packed_commands(
         &mut self,
-        cmd: &crate::valkey::Pipeline,
+        cmd: &crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
     ) -> ValkeyResult<Vec<Value>> {
@@ -885,7 +887,7 @@ impl ConnectionLike for MultiplexedConnection {
 
     async fn req_packed_commands(
         &mut self,
-        cmd: &crate::valkey::Pipeline,
+        cmd: &crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
         _pipeline_retry_strategy: Option<PipelineRetryStrategy>,
@@ -920,7 +922,7 @@ impl MultiplexedConnection {
     pub async fn subscribe(&mut self, channel_name: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
             return Err(ValkeyError::from((
-                crate::valkey::ErrorKind::InvalidClientConfig,
+                crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
         }
@@ -934,7 +936,7 @@ impl MultiplexedConnection {
     pub async fn unsubscribe(&mut self, channel_name: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
             return Err(ValkeyError::from((
-                crate::valkey::ErrorKind::InvalidClientConfig,
+                crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
         }
@@ -948,7 +950,7 @@ impl MultiplexedConnection {
     pub async fn psubscribe(&mut self, channel_pattern: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
             return Err(ValkeyError::from((
-                crate::valkey::ErrorKind::InvalidClientConfig,
+                crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
         }
@@ -962,7 +964,7 @@ impl MultiplexedConnection {
     pub async fn punsubscribe(&mut self, channel_pattern: String) -> ValkeyResult<()> {
         if self.protocol == ProtocolVersion::RESP2 {
             return Err(ValkeyError::from((
-                crate::valkey::ErrorKind::InvalidClientConfig,
+                crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
         }

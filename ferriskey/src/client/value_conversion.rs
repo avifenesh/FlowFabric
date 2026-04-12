@@ -1,9 +1,8 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-use crate::valkey::{
-    Cmd, ErrorKind, ValkeyError, ValkeyResult, Value, cluster_routing::Routable,
-    from_owned_valkey_value,
-};
+use crate::cluster::routing::Routable;
+use crate::cmd::Cmd;
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value, from_owned_valkey_value};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ExpectedReturnType<'a> {
@@ -1723,7 +1722,7 @@ mod tests {
     #[test]
     fn xinfo_stream_expected_return_type() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("XINFO").arg("STREAM").arg("key")),
+            expected_type_for_cmd(crate::cmd::cmd("XINFO").arg("STREAM").arg("key")),
             Some(ExpectedReturnType::Map {
                 key_type: &Some(ExpectedReturnType::BulkString),
                 value_type: &None
@@ -1732,7 +1731,7 @@ mod tests {
 
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XINFO")
+                crate::cmd::cmd("XINFO")
                     .arg("STREAM")
                     .arg("key")
                     .arg("FULL")
@@ -1902,13 +1901,13 @@ mod tests {
     #[test]
     fn xinfo_groups_xinfo_consumers_expected_return_type() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("XINFO").arg("GROUPS").arg("key")),
+            expected_type_for_cmd(crate::cmd::cmd("XINFO").arg("GROUPS").arg("key")),
             Some(ExpectedReturnType::ArrayOfMaps(&None))
         ));
 
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XINFO")
+                crate::cmd::cmd("XINFO")
                     .arg("CONSUMERS")
                     .arg("key")
                     .arg("group")
@@ -1983,7 +1982,7 @@ mod tests {
 
     #[test]
     fn convert_function_list() {
-        let command = &mut crate::valkey::cmd("FUNCTION");
+        let command = &mut crate::cmd::cmd("FUNCTION");
         command.arg("LIST");
         let expected_type = expected_type_for_cmd(command);
 
@@ -2141,7 +2140,7 @@ mod tests {
     fn convert_lolwut() {
         let unconverted_string : String = "\x1b[0;97;107m \x1b[0m--\x1b[0;37;47m \x1b[0m--\x1b[0;90;100m \x1b[0m--\x1b[0;30;40m \x1b[0m".into();
         let expected: String = "\u{2591}--\u{2592}--\u{2593}-- ".into();
-        let mut cmd = crate::valkey::cmd("LOLWUT");
+        let mut cmd = crate::cmd::cmd("LOLWUT");
         let conversion_type = expected_type_for_cmd(cmd.arg("version").arg("42"));
 
         let converted_1 = convert_to_expected_type(
@@ -2155,7 +2154,7 @@ mod tests {
 
         let converted_2 = convert_to_expected_type(
             Value::VerbatimString {
-                format: crate::valkey::VerbatimFormat::Text,
+                format: crate::value::VerbatimFormat::Text,
                 text: unconverted_string.clone(),
             },
             conversion_type,
@@ -2203,7 +2202,7 @@ mod tests {
     fn convert_xclaim() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XCLAIM")
+                crate::cmd::cmd("XCLAIM")
                     .arg("key")
                     .arg("grou")
                     .arg("consumer")
@@ -2217,7 +2216,7 @@ mod tests {
         ));
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XCLAIM")
+                crate::cmd::cmd("XCLAIM")
                     .arg("key")
                     .arg("grou")
                     .arg("consumer")
@@ -2232,12 +2231,7 @@ mod tests {
     #[test]
     fn convert_xrange_xrevrange() {
         assert!(matches!(
-            expected_type_for_cmd(
-                crate::valkey::cmd("XRANGE")
-                    .arg("key")
-                    .arg("start")
-                    .arg("end")
-            ),
+            expected_type_for_cmd(crate::cmd::cmd("XRANGE").arg("key").arg("start").arg("end")),
             Some(ExpectedReturnType::Map {
                 key_type: &Some(ExpectedReturnType::BulkString),
                 value_type: &Some(ExpectedReturnType::ArrayOfPairs),
@@ -2245,7 +2239,7 @@ mod tests {
         ));
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XREVRANGE")
+                crate::cmd::cmd("XREVRANGE")
                     .arg("key")
                     .arg("end")
                     .arg("start")
@@ -2260,12 +2254,7 @@ mod tests {
     #[test]
     fn convert_xread() {
         assert!(matches!(
-            expected_type_for_cmd(
-                crate::valkey::cmd("XREAD")
-                    .arg("streams")
-                    .arg("key")
-                    .arg("id")
-            ),
+            expected_type_for_cmd(crate::cmd::cmd("XREAD").arg("streams").arg("key").arg("id")),
             Some(ExpectedReturnType::Map {
                 key_type: &Some(ExpectedReturnType::BulkString),
                 value_type: &Some(ExpectedReturnType::Map {
@@ -2280,7 +2269,7 @@ mod tests {
     fn convert_xreadgroup() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XREADGROUP")
+                crate::cmd::cmd("XREADGROUP")
                     .arg("GROUP")
                     .arg("group")
                     .arg("consumer")
@@ -2303,7 +2292,7 @@ mod tests {
         // Value conversion is not needed if the JUSTID arg was passed.
         assert!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XAUTOCLAIM")
+                crate::cmd::cmd("XAUTOCLAIM")
                     .arg("key")
                     .arg("group")
                     .arg("consumer")
@@ -2316,7 +2305,7 @@ mod tests {
 
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("XAUTOCLAIM")
+                crate::cmd::cmd("XAUTOCLAIM")
                     .arg("key")
                     .arg("group")
                     .arg("consumer")
@@ -2450,7 +2439,7 @@ mod tests {
 
     #[test]
     fn test_convert_empty_array_to_map_is_nil() {
-        let mut cmd = crate::valkey::cmd("XREAD");
+        let mut cmd = crate::cmd::cmd("XREAD");
         let expected_type = expected_type_for_cmd(cmd.arg("STREAMS").arg("key").arg("id"));
 
         // test convert nil is OK
@@ -2559,7 +2548,7 @@ mod tests {
         //    ...
         // #2) "key2"
         // ...
-        let mut cmd = crate::valkey::cmd("XREAD");
+        let mut cmd = crate::cmd::cmd("XREAD");
         let expected_type = expected_type_for_cmd(cmd.arg("STREAMS").arg("key").arg("id"));
         let converted_map =
             convert_to_expected_type(Value::Array(array_of_arrays), expected_type).unwrap();
@@ -2671,7 +2660,7 @@ mod tests {
         //    ...
         // #2) "key2"
         // ...
-        let mut cmd = crate::valkey::cmd("XREAD");
+        let mut cmd = crate::cmd::cmd("XREAD");
         let expected_type = expected_type_for_cmd(cmd.arg("STREAMS").arg("key").arg("id"));
         let converted_map =
             convert_to_expected_type(Value::Map(map_of_arrays), expected_type).unwrap();
@@ -2867,7 +2856,7 @@ mod tests {
             ),
         ]);
 
-        let cmd = crate::valkey::cmd("FUNCTION STATS");
+        let cmd = crate::cmd::cmd("FUNCTION STATS");
         let conversion_type = expected_type_for_cmd(&cmd);
         // resp2 -> resp3 conversion with non-empty `running_script` block
         assert_eq!(
@@ -2916,7 +2905,7 @@ mod tests {
     #[test]
     fn convert_smismember() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("SMISMEMBER").arg("key").arg("elem")),
+            expected_type_for_cmd(crate::cmd::cmd("SMISMEMBER").arg("key").arg("elem")),
             Some(ExpectedReturnType::ArrayOfBools)
         ));
 
@@ -2931,7 +2920,7 @@ mod tests {
     fn convert_to_array_of_pairs_return_type() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("HRANDFIELD")
+                crate::cmd::cmd("HRANDFIELD")
                     .arg("key")
                     .arg("1")
                     .arg("withvalues")
@@ -2939,10 +2928,8 @@ mod tests {
             Some(ExpectedReturnType::ArrayOfPairs)
         ));
 
-        assert!(
-            expected_type_for_cmd(crate::valkey::cmd("HRANDFIELD").arg("key").arg("1")).is_none()
-        );
-        assert!(expected_type_for_cmd(crate::valkey::cmd("HRANDFIELD").arg("key")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("HRANDFIELD").arg("key").arg("1")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("HRANDFIELD").arg("key")).is_none());
 
         let flat_array = Value::Array(vec![
             Value::BulkString(b"key1".to_vec().into()),
@@ -2992,7 +2979,7 @@ mod tests {
     fn convert_zmpop_response() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("BZMPOP")
+                crate::cmd::cmd("BZMPOP")
                     .arg(1)
                     .arg(1)
                     .arg("key")
@@ -3001,13 +2988,7 @@ mod tests {
             Some(ExpectedReturnType::ZMPopReturnType)
         ));
         assert!(matches!(
-            expected_type_for_cmd(
-                crate::valkey::cmd("ZMPOP")
-                    .arg(1)
-                    .arg(1)
-                    .arg("key")
-                    .arg("min")
-            ),
+            expected_type_for_cmd(crate::cmd::cmd("ZMPOP").arg(1).arg(1).arg("key").arg("min")),
             Some(ExpectedReturnType::ZMPopReturnType)
         ));
 
@@ -3040,7 +3021,7 @@ mod tests {
     fn convert_to_member_score_pairs_return_type() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZRANDMEMBER")
+                crate::cmd::cmd("ZRANDMEMBER")
                     .arg("key")
                     .arg("1")
                     .arg("withscores")
@@ -3049,9 +3030,9 @@ mod tests {
         ));
 
         assert!(
-            expected_type_for_cmd(crate::valkey::cmd("ZRANDMEMBER").arg("key").arg("1")).is_none()
+            expected_type_for_cmd(crate::cmd::cmd("ZRANDMEMBER").arg("key").arg("1")).is_none()
         );
-        assert!(expected_type_for_cmd(crate::valkey::cmd("ZRANDMEMBER").arg("key")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("ZRANDMEMBER").arg("key")).is_none());
 
         // convert_to_array_of_pairs_return_type already tests most functionality since the conversion for ArrayOfPairs
         // and ArrayOfMemberScorePairs is mostly the same. Here we also test that the scores are converted to double
@@ -3083,7 +3064,7 @@ mod tests {
     #[test]
     fn convert_to_array_of_string_and_array_return_type() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("LMPOP").arg("1").arg("key").arg("LEFT")),
+            expected_type_for_cmd(crate::cmd::cmd("LMPOP").arg("1").arg("key").arg("LEFT")),
             Some(ExpectedReturnType::ArrayOfStringAndArrays)
         ));
 
@@ -3106,7 +3087,7 @@ mod tests {
     fn convert_zadd_only_if_incr_is_included() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("zadd")
+                crate::cmd::cmd("zadd")
                     .arg("XT")
                     .arg("CH")
                     .arg("incr")
@@ -3118,7 +3099,7 @@ mod tests {
 
         assert!(
             expected_type_for_cmd(
-                crate::valkey::cmd("zadd")
+                crate::cmd::cmd("zadd")
                     .arg("XT")
                     .arg("CH")
                     .arg("0.6")
@@ -3132,7 +3113,7 @@ mod tests {
     fn convert_zrange_zdiff_only_if_withsocres_is_included() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("zrange")
+                crate::cmd::cmd("zrange")
                     .arg("0")
                     .arg("-1")
                     .arg("withscores")
@@ -3140,14 +3121,14 @@ mod tests {
             Some(ExpectedReturnType::MapOfStringToDouble)
         ));
 
-        assert!(expected_type_for_cmd(crate::valkey::cmd("ZRANGE").arg("0").arg("-1")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("ZRANGE").arg("0").arg("-1")).is_none());
 
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("ZDIFF").arg("1").arg("withscores")),
+            expected_type_for_cmd(crate::cmd::cmd("ZDIFF").arg("1").arg("withscores")),
             Some(ExpectedReturnType::MapOfStringToDouble)
         ));
 
-        assert!(expected_type_for_cmd(crate::valkey::cmd("ZDIFF").arg("1")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("ZDIFF").arg("1")).is_none());
     }
 
     #[test]
@@ -3155,7 +3136,7 @@ mod tests {
         // Test ZUNION without options
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3165,19 +3146,14 @@ mod tests {
         ));
 
         assert!(
-            expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
-                    .arg("2")
-                    .arg("set1")
-                    .arg("set2")
-            )
-            .is_none()
+            expected_type_for_cmd(crate::cmd::cmd("ZUNION").arg("2").arg("set1").arg("set2"))
+                .is_none()
         );
 
         // Test ZUNION with Weights
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3191,7 +3167,7 @@ mod tests {
 
         assert!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3205,7 +3181,7 @@ mod tests {
         // Test ZUNION with Aggregate
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3218,7 +3194,7 @@ mod tests {
 
         assert!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3231,7 +3207,7 @@ mod tests {
         // Test ZUNION with Weights and Aggregate
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3247,7 +3223,7 @@ mod tests {
 
         assert!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZUNION")
+                crate::cmd::cmd("ZUNION")
                     .arg("2")
                     .arg("set1")
                     .arg("set2")
@@ -3264,12 +3240,12 @@ mod tests {
     #[test]
     fn zpopmin_zpopmax_return_type() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("ZPOPMIN").arg("1")),
+            expected_type_for_cmd(crate::cmd::cmd("ZPOPMIN").arg("1")),
             Some(ExpectedReturnType::MapOfStringToDouble)
         ));
 
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("ZPOPMAX").arg("1")),
+            expected_type_for_cmd(crate::cmd::cmd("ZPOPMAX").arg("1")),
             Some(ExpectedReturnType::MapOfStringToDouble)
         ));
     }
@@ -3278,7 +3254,7 @@ mod tests {
     fn convert_bzpopmin_bzpopmax() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("BZPOPMIN")
+                crate::cmd::cmd("BZPOPMIN")
                     .arg("myzset1")
                     .arg("myzset2")
                     .arg("1")
@@ -3288,7 +3264,7 @@ mod tests {
 
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("BZPOPMAX")
+                crate::cmd::cmd("BZPOPMAX")
                     .arg("myzset1")
                     .arg("myzset2")
                     .arg("1")
@@ -3344,7 +3320,7 @@ mod tests {
     fn convert_zank_zrevrank_only_if_withsocres_is_included() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("zrank")
+                crate::cmd::cmd("zrank")
                     .arg("key")
                     .arg("member")
                     .arg("withscore")
@@ -3352,13 +3328,11 @@ mod tests {
             Some(ExpectedReturnType::ZRankReturnType)
         ));
 
-        assert!(
-            expected_type_for_cmd(crate::valkey::cmd("zrank").arg("key").arg("member")).is_none()
-        );
+        assert!(expected_type_for_cmd(crate::cmd::cmd("zrank").arg("key").arg("member")).is_none());
 
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("ZREVRANK")
+                crate::cmd::cmd("ZREVRANK")
                     .arg("key")
                     .arg("member")
                     .arg("withscore")
@@ -3367,15 +3341,14 @@ mod tests {
         ));
 
         assert!(
-            expected_type_for_cmd(crate::valkey::cmd("ZREVRANK").arg("key").arg("member"))
-                .is_none()
+            expected_type_for_cmd(crate::cmd::cmd("ZREVRANK").arg("key").arg("member")).is_none()
         );
     }
 
     #[test]
     fn convert_zmscore() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("ZMSCORE").arg("key").arg("member")),
+            expected_type_for_cmd(crate::cmd::cmd("ZMSCORE").arg("key").arg("member")),
             Some(ExpectedReturnType::ArrayOfDoubleOrNull)
         ));
 
@@ -3406,12 +3379,7 @@ mod tests {
     #[test]
     fn convert_smove_to_bool() {
         assert!(matches!(
-            expected_type_for_cmd(
-                crate::valkey::cmd("SMOVE")
-                    .arg("key1")
-                    .arg("key2")
-                    .arg("elem")
-            ),
+            expected_type_for_cmd(crate::cmd::cmd("SMOVE").arg("key1").arg("key2").arg("elem")),
             Some(ExpectedReturnType::Boolean)
         ));
     }
@@ -3419,7 +3387,7 @@ mod tests {
     #[test]
     fn convert_pfadd_to_bool() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("PFADD").arg("key1").arg("a").arg("b")),
+            expected_type_for_cmd(crate::cmd::cmd("PFADD").arg("key1").arg("a").arg("b")),
             Some(ExpectedReturnType::Boolean)
         ));
     }
@@ -3595,10 +3563,10 @@ mod tests {
     #[test]
     fn test_convert_spop_to_set_for_spop_count() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("SPOP").arg("key1").arg("3")),
+            expected_type_for_cmd(crate::cmd::cmd("SPOP").arg("key1").arg("3")),
             Some(ExpectedReturnType::Set)
         ));
-        assert!(expected_type_for_cmd(crate::valkey::cmd("SPOP").arg("key1")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("SPOP").arg("key1")).is_none());
     }
     #[test]
     fn test_convert_to_geo_search_return_type() {
@@ -3658,7 +3626,7 @@ mod tests {
     fn test_geosearch_return_type() {
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("GEOSEARCH")
+                crate::cmd::cmd("GEOSEARCH")
                     .arg("WITHDIST")
                     .arg("WITHHASH")
                     .arg("WITHCOORD")
@@ -3667,25 +3635,21 @@ mod tests {
         ));
 
         assert!(matches!(
-            expected_type_for_cmd(
-                crate::valkey::cmd("GEOSEARCH")
-                    .arg("WITHDIST")
-                    .arg("WITHHASH")
-            ),
+            expected_type_for_cmd(crate::cmd::cmd("GEOSEARCH").arg("WITHDIST").arg("WITHHASH")),
             Some(ExpectedReturnType::GeoSearchReturnType)
         ));
 
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("GEOSEARCH").arg("WITHDIST")),
+            expected_type_for_cmd(crate::cmd::cmd("GEOSEARCH").arg("WITHDIST")),
             Some(ExpectedReturnType::GeoSearchReturnType)
         ));
 
-        assert!(expected_type_for_cmd(crate::valkey::cmd("GEOSEARCH").arg("key")).is_none());
+        assert!(expected_type_for_cmd(crate::cmd::cmd("GEOSEARCH").arg("key")).is_none());
     }
     #[test]
     fn convert_lcs_idx() {
         assert!(matches!(
-            expected_type_for_cmd(crate::valkey::cmd("LCS").arg("key1").arg("key2").arg("IDX")),
+            expected_type_for_cmd(crate::cmd::cmd("LCS").arg("key1").arg("key2").arg("IDX")),
             Some(ExpectedReturnType::Map {
                 key_type: &Some(ExpectedReturnType::SimpleString),
                 value_type: &None,
@@ -3698,7 +3662,7 @@ mod tests {
         // expected_type_for_cmd: FT.SEARCH without WITHSORTKEYS → FTSearchReturnType
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("FT.SEARCH")
+                crate::cmd::cmd("FT.SEARCH")
                     .arg("idx")
                     .arg("*")
                     .arg("SORTBY")
@@ -3711,7 +3675,7 @@ mod tests {
         // expected_type_for_cmd: FT.SEARCH with WITHSORTKEYS → FTSearchWithSortKeysReturnType
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("FT.SEARCH")
+                crate::cmd::cmd("FT.SEARCH")
                     .arg("idx")
                     .arg("*")
                     .arg("SORTBY")
@@ -3725,7 +3689,7 @@ mod tests {
         // expected_type_for_cmd: FT.PROFILE SEARCH with WITHSORTKEYS
         assert!(matches!(
             expected_type_for_cmd(
-                crate::valkey::cmd("FT.PROFILE")
+                crate::cmd::cmd("FT.PROFILE")
                     .arg("idx")
                     .arg("SEARCH")
                     .arg("QUERY")

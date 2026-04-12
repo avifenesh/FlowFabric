@@ -2,11 +2,14 @@
 
 use crate::client::ClientWrapper;
 use crate::cluster::routing::Routable;
-use crate::valkey::{Cmd, ErrorKind, PushInfo, PushKind, ValkeyError, ValkeyResult, Value};
-use crate::valkey::{
-    PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind, PubSubSynchronizer,
-    SlotMap,
+use crate::cluster::slotmap::SlotMap;
+use crate::cmd::Cmd;
+use crate::connection::info::{
+    PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
 };
+use crate::pubsub::push_manager::PushInfo;
+use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
+use crate::value::{ErrorKind, PushKind, ValkeyError, ValkeyResult, Value};
 use async_trait::async_trait;
 use logger_core::{log_debug, log_warn};
 use once_cell::sync::Lazy;
@@ -76,7 +79,7 @@ impl MockPubSubSynchronizer {
 
     pub async fn create(
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        initial_subscriptions: Option<crate::valkey::PubSubSubscriptionInfo>,
+        initial_subscriptions: Option<PubSubSubscriptionInfo>,
         is_cluster: bool,
         reconciliation_interval: Option<Duration>,
     ) -> Arc<dyn PubSubSynchronizer> {
@@ -708,8 +711,8 @@ impl MockPubSubBroker {
             .args_iter()
             .skip(2) // Skip "PUBSUB" and "NUMSUB"
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::valkey::Arg::Cursor => None,
+                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                crate::cmd::Arg::Cursor => None,
             })
             .collect();
 
@@ -786,8 +789,8 @@ impl MockPubSubBroker {
             .args_iter()
             .skip(2) // Skip "PUBSUB" and "SHARDNUMSUB"
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::valkey::Arg::Cursor => None,
+                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                crate::cmd::Arg::Cursor => None,
             })
             .collect();
 
@@ -825,8 +828,8 @@ impl MockPubSubBroker {
         cmd.args_iter()
             .skip(1)
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::valkey::Arg::Cursor => None,
+                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                crate::cmd::Arg::Cursor => None,
             })
             .collect()
     }
@@ -839,10 +842,8 @@ impl MockPubSubBroker {
             .args_iter()
             .skip(1)
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => {
-                    Some(String::from_utf8_lossy(bytes).to_string())
-                }
-                crate::valkey::Arg::Cursor => None,
+                crate::cmd::Arg::Simple(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+                crate::cmd::Arg::Cursor => None,
             })
             .collect();
 

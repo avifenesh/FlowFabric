@@ -1,6 +1,6 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-use crate::valkey::ValkeyError;
+use crate::value::ValkeyError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestErrorType {
@@ -15,7 +15,7 @@ pub fn error_type(error: &ValkeyError) -> RequestErrorType {
         RequestErrorType::Timeout
     } else if error.is_unrecoverable_error() {
         RequestErrorType::Disconnect
-    } else if matches!(error.kind(), crate::valkey::ErrorKind::ExecAbortError) {
+    } else if matches!(error.kind(), crate::value::ErrorKind::ExecAbortError) {
         RequestErrorType::ExecAbort
     } else {
         RequestErrorType::Unspecified

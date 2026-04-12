@@ -1,37 +1,38 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::client::ClientWrapper;
-use crate::valkey::PushInfo;
-pub use crate::valkey::{
-    ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
-    PubSubSynchronizer, ValkeyError,
+pub use crate::connection::info::{
+    PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
 };
+use crate::pubsub::push_manager::PushInfo;
+pub use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
+pub use crate::value::{ErrorKind, ValkeyError};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 
-#[cfg(feature = "mock-pubsub")]
+#[cfg(feature = "test-util")]
 mod mock;
 
-#[cfg(feature = "mock-pubsub")]
+#[cfg(feature = "test-util")]
 pub use mock::MockPubSubBroker;
 
 pub(crate) mod push_manager;
 pub(crate) mod synchronizer_trait;
 
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 pub mod synchronizer;
 
 /// Factory function to create a synchronizer with internal client reference
 pub async fn create_pubsub_synchronizer(
     _push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    initial_subscriptions: Option<crate::valkey::PubSubSubscriptionInfo>,
+    initial_subscriptions: Option<crate::connection::info::PubSubSubscriptionInfo>,
     is_cluster: bool,
     internal_client: Weak<RwLock<ClientWrapper>>,
     reconciliation_interval: Option<Duration>,
     _request_timeout: Duration,
 ) -> Arc<dyn PubSubSynchronizer> {
-    #[cfg(feature = "mock-pubsub")]
+    #[cfg(feature = "test-util")]
     {
         let sync = mock::MockPubSubSynchronizer::create(
             _push_sender,
@@ -50,7 +51,7 @@ pub async fn create_pubsub_synchronizer(
         sync
     }
 
-    #[cfg(not(feature = "mock-pubsub"))]
+    #[cfg(not(feature = "test-util"))]
     {
         let sync = synchronizer::ValkeyPubSubSynchronizer::new(
             initial_subscriptions,

@@ -6,10 +6,8 @@ use crate::cluster::client::ClusterParams;
 use crate::cluster::compat::get_connection_info;
 use crate::cluster::slotmap::ReadFromReplicaStrategy;
 use crate::connection::factory::FerrisKeyConnectionOptions;
-use crate::valkey::{
-    ErrorKind, ValkeyError, ValkeyResult,
-    aio::{ConnectionLike, DisconnectNotifier},
-};
+use crate::connection::{ConnectionLike, DisconnectNotifier};
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
 use std::net::{Ipv6Addr, SocketAddr};
 
 use futures::prelude::*;
@@ -359,7 +357,7 @@ where
     check_connection(&mut conn_details.conn, connection_timeout).await?;
     if read_from_replicas {
         // If READONLY is sent to primary nodes, it will have no effect
-        crate::valkey::cmd("READONLY")
+        crate::cmd::cmd("READONLY")
             .query_async::<_, ()>(&mut conn_details.conn)
             .await?;
     }
@@ -374,7 +372,7 @@ async fn setup_management_connection<C>(conn: &mut C) -> ValkeyResult<()>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
-    crate::valkey::cmd("CLIENT")
+    crate::cmd::cmd("CLIENT")
         .arg(&["SETNAME", MANAGEMENT_CONN_NAME])
         .query_async::<_, ()>(conn)
         .await?;
@@ -480,7 +478,7 @@ where
 {
     tokio::time::timeout(
         timeout,
-        crate::valkey::cmd("PING").query_async::<_, String>(conn),
+        crate::cmd::cmd("PING").query_async::<_, String>(conn),
     )
     .await??;
     Ok(())

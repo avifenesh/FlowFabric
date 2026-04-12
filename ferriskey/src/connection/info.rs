@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::valkey::ProtocolVersion;
+use crate::value::ProtocolVersion;
 use crate::pipeline::Pipeline;
 use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
 
@@ -459,7 +459,7 @@ impl fmt::Debug for NoCertificateVerification {
 }
 
 pub(crate) fn client_set_info_pipeline(lib_name: Option<&str>) -> Pipeline {
-    let mut pipeline = crate::valkey::pipe();
+    let mut pipeline = crate::cmd::pipe();
     let lib_name_value = lib_name.unwrap_or("UnknownClient");
     let final_lib_name = option_env!("FERRISKEY_NAME").unwrap_or(lib_name_value);
     pipeline

@@ -7,11 +7,11 @@ use crate::cluster::routing::SlotAddr;
 use crate::cluster::routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, SingleNodeRoutingInfo, command_for_multi_slot_indices,
 };
-use crate::valkey::Pipeline;
+use crate::cmd::Cmd;
 use crate::connection::ConnectionLike;
+use crate::pipeline::Pipeline;
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
 use crate::value::{RetryMethod, ServerError};
-use crate::valkey::{Cmd, ErrorKind, ValkeyError};
-use crate::valkey::{ValkeyResult, Value};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
 use logger_core::log_error;
@@ -117,7 +117,7 @@ fn add_command_to_node_pipeline_map<C>(
 }
 
 pub(crate) async fn map_pipeline_to_nodes<C>(
-    pipeline: &crate::valkey::Pipeline,
+    pipeline: &crate::pipeline::Pipeline,
     core: Core<C>,
     route: Option<InternalSingleNodeRouting<C>>,
 ) -> Result<(NodePipelineMap<C>, ResponsePoliciesMap), (OperationTarget, ValkeyError)>
@@ -553,7 +553,7 @@ fn update_retry_map(
 pub(crate) async fn process_and_retry_pipeline_responses<C>(
     mut responses: Vec<Result<ValkeyResult<Response>, RecvError>>,
     mut addresses_and_indices: AddressAndIndices,
-    pipeline: &crate::valkey::Pipeline,
+    pipeline: &crate::pipeline::Pipeline,
     core: Core<C>,
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
@@ -602,7 +602,7 @@ where
 async fn handle_retry_map<C>(
     retry_map: RetryMap,
     core: Core<C>,
-    pipeline: &crate::valkey::Pipeline,
+    pipeline: &crate::pipeline::Pipeline,
     retry: u32,
     pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
@@ -861,7 +861,7 @@ where
 
 async fn append_commands_to_retry<C>(
     pipeline_map: &mut NodePipelineMap<C>,
-    pipeline: &crate::valkey::Pipeline,
+    pipeline: &crate::pipeline::Pipeline,
     core: Core<C>,
     entries: Vec<RetryEntry>,
     pipeline_responses: &mut PipelineResponses,
@@ -915,7 +915,7 @@ where
 }
 
 fn get_original_cmd(
-    pipeline: &crate::valkey::Pipeline,
+    pipeline: &crate::pipeline::Pipeline,
     index: usize,
     inner_index: Option<usize>,
     response_policies: Option<&ResponsePoliciesMap>,
@@ -946,7 +946,7 @@ fn get_original_cmd(
 }
 
 pub(crate) fn route_for_pipeline(
-    pipeline: &crate::valkey::Pipeline,
+    pipeline: &crate::pipeline::Pipeline,
 ) -> ValkeyResult<Option<Route>> {
     fn route_for_command(cmd: &Cmd) -> Option<Route> {
         match cluster_routing::RoutingInfo::for_routable(cmd) {

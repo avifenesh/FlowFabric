@@ -37,7 +37,7 @@ pub struct Cmd {
     /// Inflight slot tracker. When set, the slot is released when the last
     /// clone of this Cmd (or its Arc) is dropped. Used to decouple user-facing
     /// timeout from internal pipeline cleanup.
-    inflight_tracker: Option<crate::valkey::InflightRequestTracker>,
+    inflight_tracker: Option<crate::value::InflightRequestTracker>,
 }
 
 /// The PING command used to fence other commands for ordering guarantees
@@ -542,7 +542,7 @@ impl Cmd {
     /// Attach an inflight slot tracker. The slot is released when the last
     /// clone of this Cmd (or its `Arc<Cmd>`) is dropped.
     #[inline]
-    pub fn set_inflight_tracker(&mut self, tracker: crate::valkey::InflightRequestTracker) {
+    pub fn set_inflight_tracker(&mut self, tracker: crate::value::InflightRequestTracker) {
         self.inflight_tracker = Some(tracker);
     }
 }

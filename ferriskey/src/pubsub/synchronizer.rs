@@ -1,11 +1,14 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::client::{ClientWrapper, PubSubCommandApplier};
-use crate::valkey::{
-    Cmd, ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
-    PubSubSynchronizer, SlotMap, ValkeyError, ValkeyResult, Value, cluster_routing::Routable,
-    cluster_routing::SingleNodeRoutingInfo,
+use crate::cluster::routing::{Routable, SingleNodeRoutingInfo};
+use crate::cluster::slotmap::SlotMap;
+use crate::cmd::Cmd;
+use crate::connection::info::{
+    PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
 };
+use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
 use async_trait::async_trait;
 use logger_core::{log_debug, log_error, log_warn};
 use once_cell::sync::OnceCell;
@@ -409,7 +412,7 @@ impl ValkeyPubSubSynchronizer {
             (PubSubSubscriptionKind::Sharded, false) => "SUNSUBSCRIBE",
         };
 
-        let mut cmd = crate::valkey::cmd(cmd_name);
+        let mut cmd = crate::cmd::cmd(cmd_name);
         for channel in &channels {
             cmd.arg(channel.as_slice());
         }
@@ -463,8 +466,8 @@ impl ValkeyPubSubSynchronizer {
         cmd.args_iter()
             .skip(1)
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::valkey::Arg::Cursor => None,
+                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                crate::cmd::Arg::Cursor => None,
             })
             .collect()
     }
@@ -479,8 +482,8 @@ impl ValkeyPubSubSynchronizer {
             .args_iter()
             .skip(1) // Skip command name
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::valkey::Arg::Cursor => None,
+                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                crate::cmd::Arg::Cursor => None,
             })
             .collect();
 

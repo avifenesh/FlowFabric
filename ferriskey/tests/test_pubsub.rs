@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 // These tests require the real synchronizer implementation, not the mock
-#![cfg(not(feature = "mock-pubsub"))]
+#![cfg(not(feature = "test-util"))]
 
 mod constants;
 mod utilities;

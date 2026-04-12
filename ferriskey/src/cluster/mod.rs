@@ -32,7 +32,7 @@ pub(crate) mod scan;
 pub mod slotmap;
 pub mod topology;
 /// Exposed only for testing.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub mod testing {
     pub use super::connections::*;
     pub use super::container::ConnectionDetails;
@@ -53,13 +53,14 @@ use crate::cluster::topology::{
     DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR, SlotRefreshState, TopologyHash, calculate_topology,
 };
 use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
-use crate::valkey::{
-    Cmd, ConnectionInfo, ErrorKind, FromValkeyValue, InfoDict, IntoConnectionInfo,
-    PipelineRetryStrategy, ValkeyError, ValkeyFuture, ValkeyResult, Value,
-    aio::{ConnectionLike, DisconnectNotifier, MultiplexedConnection, get_socket_addrs},
-    cmd,
-    push_manager::PushInfo,
-    types::{ProtocolVersion, RetryMethod, ServerError},
+use crate::cmd::{Cmd, cmd};
+use crate::connection::{ConnectionLike, DisconnectNotifier, MultiplexedConnection, get_socket_addrs};
+use crate::connection::info::{ConnectionInfo, IntoConnectionInfo};
+use crate::pipeline::PipelineRetryStrategy;
+use crate::pubsub::push_manager::PushInfo;
+use crate::value::{
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, RetryMethod, ServerError,
+    ValkeyError, ValkeyFuture, ValkeyResult, Value,
 };
 use connections::connect_and_check;
 use container::{
@@ -376,7 +377,7 @@ where
     /// Returns None if any sub-pipeline hits MOVED/ASK (falls back to cluster task).
     async fn try_direct_pipeline_dispatch(
         &self,
-        pipeline: &crate::valkey::Pipeline,
+        pipeline: &crate::pipeline::Pipeline,
         count: usize,
     ) -> Option<ValkeyResult<Vec<Value>>> {
         use tokio::task::JoinSet;
@@ -385,7 +386,7 @@ where
         // Hold conn_lock briefly, only for route resolution.
         type ConnFut<C> = futures::future::Shared<futures_util::future::BoxFuture<'static, C>>;
 
-        let grouped: Vec<(Arc<str>, crate::valkey::Pipeline, Vec<usize>, ConnFut<C>)> = {
+        let grouped: Vec<(Arc<str>, crate::pipeline::Pipeline, Vec<usize>, ConnFut<C>)> = {
             let container = self.inner.conn_lock.read();
             if container.is_empty() {
                 return None;
@@ -394,7 +395,7 @@ where
             // Route each command to a node
             let mut node_map: std::collections::HashMap<
                 Arc<str>,
-                (crate::valkey::Pipeline, Vec<usize>, ConnFut<C>),
+                (crate::pipeline::Pipeline, Vec<usize>, ConnFut<C>),
             > = std::collections::HashMap::new();
 
             for (idx, cmd) in pipeline.cmd_iter().enumerate() {
@@ -412,7 +413,7 @@ where
 
                 let entry = node_map
                     .entry(addr)
-                    .or_insert_with(|| (crate::valkey::Pipeline::new(), Vec::new(), conn));
+                    .or_insert_with(|| (crate::pipeline::Pipeline::new(), Vec::new(), conn));
                 entry.0.add_command_with_arc(cmd.clone());
                 entry.1.push(idx);
             }
@@ -542,7 +543,7 @@ where
     ///     TODO: add wiki link.
     pub async fn route_pipeline<'a>(
         &'a mut self,
-        pipeline: &'a crate::valkey::Pipeline,
+        pipeline: &'a crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
         route: Option<SingleNodeRoutingInfo>,
@@ -947,7 +948,7 @@ enum CmdArg<C> {
         routing: InternalRoutingInfo<C>,
     },
     Pipeline {
-        pipeline: Arc<crate::valkey::Pipeline>,
+        pipeline: Arc<crate::pipeline::Pipeline>,
         offset: usize,
         count: usize,
         route: Option<InternalSingleNodeRouting<C>>,
@@ -1142,7 +1143,7 @@ pin_project! {
     }
 }
 
-// InflightSlotGuard and InflightRequestTracker live in crate::valkey::types
+// InflightSlotGuard and InflightRequestTracker live in crate::value
 // to avoid an upward dependency from cmd::Cmd into cluster_async.
 pub use crate::value::InflightRequestTracker;
 
@@ -1654,14 +1655,14 @@ where
                 Vec::with_capacity(initial_nodes.len()),
                 |mut acc, info| async {
                     let (host, port) = match &info.addr {
-                        crate::valkey::ConnectionAddr::Tcp(host, port) => (host, port),
-                        crate::valkey::ConnectionAddr::TcpTls {
+                        crate::connection::info::ConnectionAddr::Tcp(host, port) => (host, port),
+                        crate::connection::info::ConnectionAddr::TcpTls {
                             host,
                             port,
                             insecure: _,
                             tls_params: _,
                         } => (host, port),
-                        crate::valkey::ConnectionAddr::Unix(_) => {
+                        crate::connection::info::ConnectionAddr::Unix(_) => {
                             // We don't support multiple addresses for a Unix address. Store the initial node address and continue
                             acc.push((info.addr.to_string(), None));
                             return acc;
@@ -3033,7 +3034,7 @@ where
     }
 
     async fn try_pipeline_request(
-        pipeline: Arc<crate::valkey::Pipeline>,
+        pipeline: Arc<crate::pipeline::Pipeline>,
         offset: usize,
         count: usize,
         conn: impl Future<Output = ValkeyResult<(Arc<str>, C)>>,
@@ -3149,7 +3150,7 @@ where
     /// This function distributes the commands in the pipeline across the cluster nodes based on routing information, collects the responses,
     /// and aggregates them if necessary according to the specified response policies.
     async fn handle_non_atomic_pipeline_request(
-        pipeline: Arc<crate::valkey::Pipeline>,
+        pipeline: Arc<crate::pipeline::Pipeline>,
         core: Core<C>,
         retry: u32,
         pipeline_retry_strategy: PipelineRetryStrategy,
@@ -4300,7 +4301,7 @@ where
 
     async fn req_packed_commands(
         &mut self,
-        pipeline: &crate::valkey::Pipeline,
+        pipeline: &crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
@@ -4386,7 +4387,7 @@ impl Connect for MultiplexedConnection {
     {
         async move {
             let connection_info = info.into_connection_info()?;
-            let client = crate::valkey::Client::open(connection_info)?;
+            let client = crate::connection::factory::Client::open(connection_info)?;
 
             crate::connection::runtime::timeout(
                 connection_timeout,
@@ -4415,16 +4416,13 @@ mod pipeline_routing_tests {
     use crate::cluster::routing::{
         AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo, ResponsePolicy, Route, SlotAddr,
     };
-    use crate::valkey::{
-        Value,
-        aio::MultiplexedConnection,
-        cmd,
-        types::{ServerError, ServerErrorKind},
-    };
+    use crate::value::{Value, ServerError, ServerErrorKind};
+    use crate::connection::MultiplexedConnection;
+    use crate::cmd::cmd;
 
     #[test]
     fn test_first_route_is_found() {
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.atomic();
 
         pipeline
@@ -4667,7 +4665,7 @@ mod pipeline_routing_tests {
 
     #[test]
     fn test_return_none_if_no_route_is_found() {
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.atomic();
         pipeline
             .add_command(cmd("FLUSHALL")) // route to all masters
@@ -4678,7 +4676,7 @@ mod pipeline_routing_tests {
 
     #[test]
     fn test_prefer_primary_route_over_replica() {
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.atomic();
         pipeline
             .cmd("GET")
@@ -4700,7 +4698,7 @@ mod pipeline_routing_tests {
 
     #[test]
     fn test_raise_cross_slot_error_on_conflicting_slots() {
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.atomic();
         pipeline
             .add_command(cmd("FLUSHALL")) // route to all masters
@@ -4712,13 +4710,13 @@ mod pipeline_routing_tests {
 
         assert_eq!(
             route_for_pipeline(&pipeline).unwrap_err().kind(),
-            crate::valkey::ErrorKind::CrossSlot
+            crate::value::ErrorKind::CrossSlot
         );
     }
 
     #[test]
     fn unkeyed_commands_dont_affect_route() {
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.atomic();
         pipeline
             .cmd("SET")
@@ -4811,7 +4809,7 @@ mod direct_dispatch_tests {
         routing::{Route, SingleNodeRoutingInfo, Slot, SlotAddr},
         slotmap::{ReadFromReplicaStrategy, SlotMap},
     };
-    use crate::valkey::PipelineRetryStrategy;
+    use crate::pipeline::PipelineRetryStrategy;
     use container::{ClusterNode, ConnectionDetails, ConnectionsMap};
     use dashmap::DashMap;
 
@@ -4878,7 +4876,7 @@ mod direct_dispatch_tests {
 
         async fn req_packed_commands(
             &mut self,
-            _pipeline: &crate::valkey::Pipeline,
+            _pipeline: &crate::pipeline::Pipeline,
             _offset: usize,
             _count: usize,
             _retry: Option<PipelineRetryStrategy>,
@@ -5177,7 +5175,7 @@ mod direct_dispatch_tests {
             ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
         ]);
 
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.cmd("GET").arg("foo"); // slot 12182 → node_b
         pipeline.cmd("GET").arg("baz"); // slot 4813  → node_a
 
@@ -5220,7 +5218,7 @@ mod direct_dispatch_tests {
             ("127.0.0.1:7002", 8192, 16383, node_b.clone()),
         ]);
 
-        let mut pipeline = crate::valkey::Pipeline::new();
+        let mut pipeline = crate::pipeline::Pipeline::new();
         pipeline.cmd("GET").arg("foo"); // slot 12182 → node_b (succeeds)
         pipeline.cmd("GET").arg("baz"); // slot 4813  → node_a (fails)
 

@@ -72,7 +72,7 @@ pub trait ConnectionLike: Send {
     #[doc(hidden)]
     fn req_packed_commands<'a>(
         &'a mut self,
-        cmd: &'a crate::valkey::Pipeline,
+        cmd: &'a crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,

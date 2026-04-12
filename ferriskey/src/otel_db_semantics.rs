@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::client::Client;
-use crate::valkey::{Arg, Cmd};
+use crate::cmd::{Arg, Cmd};
 use std::borrow::Borrow;
 use telemetrylib::FerrisKeySpan;
 
@@ -268,7 +268,7 @@ mod tests {
     // serialize_query_text integration test.
 
     fn make_cmd(name: &str, args: &[&str]) -> Cmd {
-        let mut cmd = crate::valkey::cmd(name);
+        let mut cmd = crate::cmd::cmd(name);
         for arg in args {
             cmd.arg(*arg);
         }

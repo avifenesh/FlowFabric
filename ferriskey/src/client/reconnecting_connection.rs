@@ -1,11 +1,12 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{NodeAddress, TlsMode};
+use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
+use crate::connection::info::ValkeyConnectionInfo;
 use crate::connection::{DisconnectNotifier, MultiplexedConnection};
-use crate::valkey::{
-    FerrisKeyConnectionOptions, PushInfo, RetryStrategy, ValkeyConnectionInfo, ValkeyError,
-    ValkeyResult,
-};
+use crate::pubsub::push_manager::PushInfo;
+use crate::retry_strategies::RetryStrategy;
+use crate::value::{ValkeyError, ValkeyResult};
 use async_trait::async_trait;
 use futures_intrusive::sync::ManualResetEvent;
 use logger_core::{log_debug, log_error, log_trace, log_warn};
@@ -104,7 +105,7 @@ impl IAMTokenHandle {
 }
 
 #[async_trait::async_trait]
-impl crate::valkey::IAMTokenProvider for IAMTokenHandle {
+impl IAMTokenProvider for IAMTokenHandle {
     async fn get_valid_token(&self) -> Option<String> {
         self.get_valid_token_inner().await
     }
@@ -115,7 +116,7 @@ struct ConnectionBackend {
     /// This signal is reset when a connection disconnects, and set when a new `ConnectionState` has been set with a `Connected` state.
     connection_available_signal: ManualResetEvent,
     /// Information needed in order to create a new connection.
-    connection_info: RwLock<crate::valkey::Client>,
+    connection_info: RwLock<crate::connection::factory::Client>,
     /// Once this flag is set, the internal connection needs no longer try to reconnect to the server, because all the outer clients were dropped.
     client_dropped_flagged: AtomicBool,
     /// Optional handle to the IAM token cache for refreshing the password before reconnection.
@@ -150,7 +151,7 @@ impl fmt::Debug for ReconnectingConnection {
 }
 
 async fn get_multiplexed_connection(
-    client: &crate::valkey::Client,
+    client: &crate::connection::factory::Client,
     connection_options: &FerrisKeyConnectionOptions,
 ) -> ValkeyResult<MultiplexedConnection> {
     run_with_timeout(
@@ -234,9 +235,9 @@ async fn create_connection(
                 // Don't retry errors that won't resolve with retries
                 let is_permanent = matches!(
                     e.kind(),
-                    crate::valkey::ErrorKind::AuthenticationFailed
-                        | crate::valkey::ErrorKind::InvalidClientConfig
-                        | crate::valkey::ErrorKind::RESP3NotSupported
+                    crate::value::ErrorKind::AuthenticationFailed
+                        | crate::value::ErrorKind::InvalidClientConfig
+                        | crate::value::ErrorKind::RESP3NotSupported
                 ) || e.to_string().contains("NOAUTH")
                     || e.to_string().contains("WRONGPASS");
                 if is_permanent {
@@ -303,17 +304,18 @@ async fn create_connection(
 fn get_client(
     address: &NodeAddress,
     tls_mode: TlsMode,
-    valkey_connection_info: crate::valkey::ValkeyConnectionInfo,
-    tls_params: Option<crate::valkey::TlsConnParams>,
-) -> crate::valkey::Client {
+    valkey_connection_info: crate::connection::info::ValkeyConnectionInfo,
+    tls_params: Option<crate::connection::tls::TlsConnParams>,
+) -> crate::connection::factory::Client {
     let connection_info =
         super::get_connection_info(address, tls_mode, valkey_connection_info, tls_params);
-    crate::valkey::Client::open(connection_info).expect("Client::open from ConnectionInfo")
+    crate::connection::factory::Client::open(connection_info)
+        .expect("Client::open from ConnectionInfo")
 }
 
 impl ConnectionBackend {
     /// Returns a read-only reference to the client's connection information
-    fn get_backend_client(&self) -> RwLockReadGuard<'_, crate::valkey::Client> {
+    fn get_backend_client(&self) -> RwLockReadGuard<'_, crate::connection::factory::Client> {
         self.connection_info.read().expect(READ_LOCK_ERR)
     }
 }
@@ -328,7 +330,7 @@ impl ReconnectingConnection {
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         discover_az: bool,
         connection_timeout: Duration,
-        tls_params: Option<crate::valkey::TlsConnParams>,
+        tls_params: Option<crate::connection::tls::TlsConnParams>,
         tcp_nodelay: bool,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
         iam_token_handle: Option<IAMTokenHandle>,
@@ -490,7 +492,7 @@ impl ReconnectingConnection {
                 {
                     Ok(mut connection) => {
                         if connection
-                            .send_packed_command(&crate::valkey::cmd("PING"))
+                            .send_packed_command(&crate::cmd::cmd("PING"))
                             .await
                             .is_err()
                         {
@@ -603,7 +605,7 @@ impl ReconnectingConnection {
     /// # Arguments
     /// * `new_protocol` - The protocol version to store for future reconnections
     ///
-    pub(crate) fn update_connection_protocol(&self, new_protocol: crate::valkey::ProtocolVersion) {
+    pub(crate) fn update_connection_protocol(&self, new_protocol: crate::value::ProtocolVersion) {
         let mut client = self
             .inner
             .backend

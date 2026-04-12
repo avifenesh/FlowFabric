@@ -1,6 +1,6 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-use crate::valkey::{Cmd, cmd};
+use crate::cmd::{Cmd, cmd};
 
 #[derive(Debug, Clone, Copy)]
 pub enum RequestType {

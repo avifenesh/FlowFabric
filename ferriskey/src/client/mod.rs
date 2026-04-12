@@ -2,21 +2,32 @@
 
 pub mod types;
 
-use crate::cluster_scan_container::insert_cluster_scan_cursor;
-use crate::compression::CompressionBackendType;
-use crate::compression::lz4_backend::Lz4Backend;
-use crate::compression::zstd_backend::ZstdBackend;
-use crate::compression::{CompressionConfig, CompressionManager};
-use crate::scripts_container::get_script;
-use crate::connection::ConnectionLike;
 use crate::cluster::ClusterConnection;
 use crate::cluster::routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, Routable, RoutingInfo, SingleNodeRoutingInfo,
 };
+use crate::cluster::scan::{ClusterScanArgs, ScanStateRC};
 use crate::cluster::slotmap::ReadFromReplicaStrategy;
-use crate::valkey::{
-    ClusterScanArgs, Cmd, ErrorKind, FromValkeyValue, PipelineRetryStrategy, PushInfo,
-    RetryStrategy, ScanStateRC, ValkeyError, ValkeyResult, Value,
+use crate::cluster_scan_container::insert_cluster_scan_cursor;
+use crate::cmd::{Cmd, cmd};
+use crate::compression::CompressionBackendType;
+use crate::compression::lz4_backend::Lz4Backend;
+use crate::compression::zstd_backend::ZstdBackend;
+use crate::compression::{CompressionConfig, CompressionManager};
+use crate::connection::ConnectionLike;
+use crate::connection::info::{
+    ConnectionAddr, ConnectionInfo, PubSubSubscriptionKind, ValkeyConnectionInfo,
+};
+use crate::connection::tls::{
+    ClientTlsConfig, TlsCertificates, TlsConnParams, retrieve_tls_certificates,
+};
+use crate::pipeline::PipelineRetryStrategy;
+use crate::pubsub::push_manager::PushInfo;
+use crate::retry_strategies::RetryStrategy;
+use crate::scripts_container::get_script;
+use crate::value::{
+    ErrorKind, FromValkeyValue, InflightRequestTracker, ProtocolVersion, ValkeyError, ValkeyFuture,
+    ValkeyResult, Value,
 };
 use futures::FutureExt;
 use logger_core::{log_debug, log_error, log_info, log_warn};
@@ -38,7 +49,7 @@ mod standalone_client;
 mod value_conversion;
 use crate::pubsub::{PubSubSynchronizer, create_pubsub_synchronizer};
 use crate::request_type::RequestType;
-use crate::valkey::InfoDict;
+use crate::value::InfoDict;
 use std::future::Future;
 use std::pin::Pin;
 use telemetrylib::FerrisKeyOtel;
@@ -166,7 +177,7 @@ pub(super) fn get_port(address: &NodeAddress) -> u16 {
 pub async fn get_valkey_connection_info(
     connection_request: &ConnectionRequest,
     iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
-) -> crate::valkey::ValkeyConnectionInfo {
+) -> crate::connection::info::ValkeyConnectionInfo {
     let protocol = connection_request.protocol.unwrap_or_default();
     let db = connection_request.database_id;
     let client_name = connection_request.client_name.clone();
@@ -178,7 +189,7 @@ pub async fn get_valkey_connection_info(
             if let (Some(_), Some(manager)) = (&info.iam_config, iam_token_manager) {
                 let token = manager.get_token().await;
 
-                crate::valkey::ValkeyConnectionInfo {
+                crate::connection::info::ValkeyConnectionInfo {
                     db,
                     username: info.username.clone(),
                     password: Some(token),
@@ -188,7 +199,7 @@ pub async fn get_valkey_connection_info(
                 }
             } else {
                 // Regular password-based authentication
-                crate::valkey::ValkeyConnectionInfo {
+                crate::connection::info::ValkeyConnectionInfo {
                     db,
                     username: info.username.clone(),
                     password: info.password.clone(),
@@ -198,7 +209,7 @@ pub async fn get_valkey_connection_info(
                 }
             }
         }
-        None => crate::valkey::ValkeyConnectionInfo {
+        None => crate::connection::info::ValkeyConnectionInfo {
             db,
             protocol,
             client_name,
@@ -208,27 +219,25 @@ pub async fn get_valkey_connection_info(
     }
 }
 
-use crate::valkey::{TlsCertificates, retrieve_tls_certificates};
-
 // tls_params should be only set if tls_mode is SecureTls
 // this should be validated before calling this function
 pub(super) fn get_connection_info(
     address: &NodeAddress,
     tls_mode: TlsMode,
-    valkey_connection_info: crate::valkey::ValkeyConnectionInfo,
-    tls_params: Option<crate::valkey::TlsConnParams>,
-) -> crate::valkey::ConnectionInfo {
+    valkey_connection_info: ValkeyConnectionInfo,
+    tls_params: Option<TlsConnParams>,
+) -> ConnectionInfo {
     let addr = if tls_mode != TlsMode::NoTls {
-        crate::valkey::ConnectionAddr::TcpTls {
+        ConnectionAddr::TcpTls {
             host: address.host.to_string(),
             port: get_port(address),
             insecure: tls_mode == TlsMode::InsecureTls,
             tls_params,
         }
     } else {
-        crate::valkey::ConnectionAddr::Tcp(address.host.to_string(), get_port(address))
+        ConnectionAddr::Tcp(address.host.to_string(), get_port(address))
     };
-    crate::valkey::ConnectionInfo {
+    ConnectionInfo {
         addr,
         valkey: valkey_connection_info,
     }
@@ -266,7 +275,7 @@ pub struct Client {
 async fn run_with_timeout<T>(
     timeout: Option<Duration>,
     future: impl futures::Future<Output = ValkeyResult<T>> + Send,
-) -> crate::valkey::ValkeyResult<T> {
+) -> crate::value::ValkeyResult<T> {
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
@@ -411,7 +420,7 @@ impl Client {
     /// Parses the first argument of the SELECT command as an i64 database ID.
     /// Returns appropriate errors for invalid formats or missing arguments.
     fn extract_database_id_from_select(&self, cmd: &Cmd) -> ValkeyResult<i64> {
-        // For both crate::valkey::cmd("SELECT").arg("5") and crate::valkey::Cmd::new().arg("SELECT").arg("5")
+        // For both crate::cmd::cmd("SELECT").arg("5") and crate::cmd::Cmd::new().arg("SELECT").arg("5")
         // the database ID is at arg_idx(1)
         cmd.arg_idx(1)
             .ok_or_else(|| {
@@ -486,7 +495,7 @@ impl Client {
     /// Parses the client name argument from the CLIENT SETNAME command.
     /// Returns None if the argument is missing or invalid.
     fn extract_client_name_from_client_set_name(&self, cmd: &Cmd) -> Option<String> {
-        // For crate::valkey::cmd("CLIENT").arg("SETNAME").arg("name")
+        // For crate::cmd::cmd("CLIENT").arg("SETNAME").arg("name")
         // the client name is at arg_idx(2) (after "SETNAME")
         cmd.arg_idx(2).and_then(|name_bytes| {
             std::str::from_utf8(name_bytes)
@@ -635,7 +644,7 @@ impl Client {
         &self,
         cmd: &Cmd,
     ) -> (
-        Option<crate::valkey::ProtocolVersion>,
+        Option<crate::value::ProtocolVersion>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -643,8 +652,8 @@ impl Client {
         // Get protocol version (first argument)
         let protocol = cmd.arg_idx(1).and_then(|bytes| {
             std::str::from_utf8(bytes).ok().and_then(|s| match s {
-                "2" => Some(crate::valkey::ProtocolVersion::RESP2),
-                "3" => Some(crate::valkey::ProtocolVersion::RESP3),
+                "2" => Some(crate::value::ProtocolVersion::RESP2),
+                "3" => Some(crate::value::ProtocolVersion::RESP3),
                 _ => None,
             })
         });
@@ -718,7 +727,7 @@ impl Client {
     /// Updates the stored protocol version for different client types.
     async fn update_stored_protocol(
         &self,
-        protocol: crate::valkey::ProtocolVersion,
+        protocol: crate::value::ProtocolVersion,
     ) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
@@ -908,7 +917,7 @@ impl Client {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::ValkeyFuture<'a, Value> {
+    ) -> crate::value::ValkeyFuture<'a, Value> {
         Box::pin(async move {
             // Check for IAM token changes and update the password without authentication if needed (pull model)
             if let Some(iam_manager) = &self.iam_token_manager
@@ -1065,7 +1074,7 @@ impl Client {
     }
 
     fn get_transaction_values(
-        pipeline: &crate::valkey::Pipeline,
+        pipeline: &crate::pipeline::Pipeline,
         mut values: Vec<Value>,
         command_count: usize,
         offset: usize,
@@ -1113,7 +1122,7 @@ impl Client {
     }
 
     fn convert_pipeline_values_to_expected_types(
-        pipeline: &crate::valkey::Pipeline,
+        pipeline: &crate::pipeline::Pipeline,
         values: Vec<Value>,
         command_count: usize,
         raise_on_error: bool,
@@ -1148,11 +1157,11 @@ impl Client {
     /// Unlike a pipelines, transactions are atomic, and in cluster mode, the key-based commands must route to the same slot.
     pub fn send_transaction<'a>(
         &'a mut self,
-        pipeline: &'a crate::valkey::Pipeline,
+        pipeline: &'a crate::pipeline::Pipeline,
         routing: Option<RoutingInfo>,
         transaction_timeout: Option<u32>,
         raise_on_error: bool,
-    ) -> crate::valkey::ValkeyFuture<'a, Value> {
+    ) -> crate::value::ValkeyFuture<'a, Value> {
         Box::pin(async move {
             let client = self.get_or_initialize_client().await?;
 
@@ -1225,12 +1234,12 @@ impl Client {
     ///     TODO: add wiki link.
     pub fn send_pipeline<'a>(
         &'a mut self,
-        pipeline: &'a crate::valkey::Pipeline,
+        pipeline: &'a crate::pipeline::Pipeline,
         routing: Option<RoutingInfo>,
         raise_on_error: bool,
         pipeline_timeout: Option<u32>,
         pipeline_retry_strategy: PipelineRetryStrategy,
-    ) -> crate::valkey::ValkeyFuture<'a, Value> {
+    ) -> crate::value::ValkeyFuture<'a, Value> {
         Box::pin(async move {
             let client = self.get_or_initialize_client().await?;
 
@@ -1298,7 +1307,7 @@ impl Client {
         keys: &[&[u8]],
         args: &[&[u8]],
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::ValkeyResult<Value> {
+    ) -> crate::value::ValkeyResult<Value> {
         let _ = self.get_or_initialize_client().await?;
 
         let mut eval = eval_cmd(hash, keys, args);
@@ -1320,8 +1329,8 @@ impl Client {
 
     /// Reserve an inflight slot, returning a tracker whose Drop releases it.
     /// Returns `None` if no slots available.
-    pub fn reserve_inflight_request(&self) -> Option<crate::valkey::InflightRequestTracker> {
-        crate::valkey::InflightRequestTracker::try_new(self.inflight_requests_allowed.clone())
+    pub fn reserve_inflight_request(&self) -> Option<crate::value::InflightRequestTracker> {
+        crate::value::InflightRequestTracker::try_new(self.inflight_requests_allowed.clone())
     }
 
     /// Returns the current number of available inflight slots.
@@ -1403,7 +1412,7 @@ impl Client {
 
         let username = self.get_username().await.ok().flatten();
 
-        let mut cmd = crate::valkey::cmd("AUTH");
+        let mut cmd = crate::cmd::cmd("AUTH");
         if let Some(username) = username {
             cmd.arg(&username);
         }
@@ -1553,13 +1562,13 @@ impl PubSubCommandApplier for ClientWrapper {
 }
 
 fn load_cmd(code: &[u8]) -> Cmd {
-    let mut cmd = crate::valkey::cmd("SCRIPT");
+    let mut cmd = crate::cmd::cmd("SCRIPT");
     cmd.arg("LOAD").arg(code);
     cmd
 }
 
 fn eval_cmd(hash: &str, keys: &[&[u8]], args: &[&[u8]]) -> Cmd {
-    let mut cmd = crate::valkey::cmd("EVALSHA");
+    let mut cmd = crate::cmd::cmd("EVALSHA");
     cmd.arg(hash).arg(keys.len());
     for key in keys {
         cmd.arg(key);
@@ -1621,7 +1630,7 @@ async fn create_cluster_client(
         };
 
         let client_tls = if has_client_cert && has_client_key {
-            Some(crate::valkey::ClientTlsConfig {
+            Some(crate::connection::tls::ClientTlsConfig {
                 client_cert: request.client_cert.clone(),
                 client_key: request.client_key.clone(),
             })
@@ -1683,9 +1692,9 @@ async fn create_cluster_client(
     }
     if tls_mode != TlsMode::NoTls {
         let tls = if tls_mode == TlsMode::SecureTls {
-            crate::valkey::TlsMode::Secure
+            crate::connection::info::TlsMode::Secure
         } else {
-            crate::valkey::TlsMode::Insecure
+            crate::connection::info::TlsMode::Insecure
         };
         builder = builder.tls(tls);
         if let Some(certs) = tls_certificates {
@@ -1713,9 +1722,10 @@ async fn create_cluster_client(
     builder = builder.periodic_connections_checks(Some(CONNECTION_CHECKS_INTERVAL));
 
     let client = builder.build()?;
-    let iam_token_provider: Option<Arc<dyn crate::valkey::IAMTokenProvider>> = iam_token_manager
-        .map(|manager| {
-            Arc::new(manager.get_token_handle()) as Arc<dyn crate::valkey::IAMTokenProvider>
+    let iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>> =
+        iam_token_manager.map(|manager| {
+            Arc::new(manager.get_token_handle())
+                as Arc<dyn crate::connection::factory::IAMTokenProvider>
         });
 
     let mut con = client
@@ -1733,11 +1743,12 @@ async fn create_cluster_client(
     // Instead, we explicitly check the engine version here and fail the connection creation if it is incompatible with sharded subscriptions.
 
     if let Some(pubsub_subscriptions) = &request.pubsub_subscriptions
-        && pubsub_subscriptions.contains_key(&crate::valkey::PubSubSubscriptionKind::Sharded)
+        && pubsub_subscriptions
+            .contains_key(&crate::connection::info::PubSubSubscriptionKind::Sharded)
     {
         let info_res = con
             .route_command(
-                crate::valkey::cmd("INFO").arg("SERVER"),
+                crate::cmd::cmd("INFO").arg("SERVER"),
                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
             )
             .await?;
@@ -1773,7 +1784,7 @@ async fn create_cluster_client(
 #[derive(thiserror::Error)]
 pub enum ConnectionError {
     Standalone(standalone_client::StandaloneClientConnectionError),
-    Cluster(crate::valkey::ValkeyError),
+    Cluster(crate::value::ValkeyError),
     Timeout,
     IoError(std::io::Error),
     Configuration(String),
@@ -2136,7 +2147,7 @@ pub trait ValkeyClientForTests {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value>;
+    ) -> ValkeyFuture<'a, Value>;
 }
 
 impl ValkeyClientForTests for Client {
@@ -2144,7 +2155,7 @@ impl ValkeyClientForTests for Client {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value> {
+    ) -> ValkeyFuture<'a, Value> {
         self.send_command(cmd, routing)
     }
 }
@@ -2154,7 +2165,7 @@ impl ValkeyClientForTests for StandaloneClient {
         &'a mut self,
         cmd: &'a mut Cmd,
         _routing: Option<RoutingInfo>,
-    ) -> crate::valkey::ValkeyFuture<'a, crate::valkey::Value> {
+    ) -> ValkeyFuture<'a, Value> {
         self.send_command(cmd).boxed()
     }
 }
@@ -2163,9 +2174,9 @@ impl ValkeyClientForTests for StandaloneClient {
 impl ValkeyClientForTests for ClusterConnection {
     fn send_command<'a>(
         &'a mut self,
-        cmd: &'a mut crate::valkey::Cmd,
+        cmd: &'a mut crate::cmd::Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::valkey::ValkeyFuture<'a, Value> {
+    ) -> crate::value::ValkeyFuture<'a, Value> {
         let final_routing =
             routing.unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
 
@@ -2177,7 +2188,7 @@ impl ValkeyClientForTests for ClusterConnection {
 mod tests {
     use std::time::Duration;
 
-    use crate::valkey::Cmd;
+    use crate::cmd::Cmd;
 
     use crate::client::types::{ConnectionRequest, NodeAddress, OTelMetadata};
     use crate::client::{
@@ -2596,7 +2607,7 @@ mod tests {
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("3");
         let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
-        assert_eq!(protocol, Some(crate::valkey::ProtocolVersion::RESP3));
+        assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, None);
         assert_eq!(password, None);
         assert_eq!(client_name, None);
@@ -2605,7 +2616,7 @@ mod tests {
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("2");
         let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
-        assert_eq!(protocol, Some(crate::valkey::ProtocolVersion::RESP2));
+        assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP2));
         assert_eq!(username, None);
         assert_eq!(password, None);
         assert_eq!(client_name, None);
@@ -2618,7 +2629,7 @@ mod tests {
             .arg("myuser")
             .arg("mypass");
         let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
-        assert_eq!(protocol, Some(crate::valkey::ProtocolVersion::RESP3));
+        assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, Some("myuser".to_string()));
         assert_eq!(password, Some("mypass".to_string()));
         assert_eq!(client_name, None);
@@ -2627,7 +2638,7 @@ mod tests {
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("3").arg("SETNAME").arg("myclient");
         let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
-        assert_eq!(protocol, Some(crate::valkey::ProtocolVersion::RESP3));
+        assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, None);
         assert_eq!(password, None);
         assert_eq!(client_name, Some("myclient".to_string()));
@@ -2642,7 +2653,7 @@ mod tests {
             .arg("SETNAME")
             .arg("myclient");
         let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
-        assert_eq!(protocol, Some(crate::valkey::ProtocolVersion::RESP3));
+        assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, Some("myuser".to_string()));
         assert_eq!(password, Some("mypass".to_string()));
         assert_eq!(client_name, Some("myclient".to_string()));

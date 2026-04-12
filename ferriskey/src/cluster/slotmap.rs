@@ -8,9 +8,9 @@ use std::{
 use dashmap::DashMap;
 
 use crate::cluster::routing::{Route, ShardAddrs, Slot, SlotAddr};
-use crate::valkey::ErrorKind;
-use crate::valkey::ValkeyError;
-use crate::valkey::ValkeyResult;
+use crate::value::ErrorKind;
+use crate::value::ValkeyError;
+use crate::value::ValkeyResult;
 /// Maps node addresses to their IP address and shard information.
 pub(crate) type NodesMap = DashMap<Arc<String>, (Option<IpAddr>, Arc<ShardAddrs>)>;
 

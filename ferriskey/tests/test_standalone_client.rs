@@ -40,7 +40,6 @@ mod standalone_client_tests {
     #[rstest]
     #[serial_test::serial]
     #[timeout(LONG_STANDALONE_TEST_TIMEOUT)]
-    #[cfg(feature = "standalone_heartbeat")]
     fn test_detect_disconnect_and_reconnect_using_heartbeat(#[values(false, true)] use_tls: bool) {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         block_on_all(async move {

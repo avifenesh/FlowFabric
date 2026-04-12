@@ -1,14 +1,14 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{ClusterMode, TestConfiguration, create_connection_request};
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use ferriskey::PubSubSubscriptionKind;
 use ferriskey::client::Client;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use ferriskey::client::ClientWrapper;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use ferriskey::pubsub::synchronizer::ValkeyPubSubSynchronizer;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use ferriskey::pubsub::{PubSubSubscriptionInfo, PubSubSynchronizer, create_pubsub_synchronizer};
 use ferriskey::Value;
 use ferriskey::cluster::ClusterConnection;
@@ -18,17 +18,17 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, join_all};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::process::Command;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use std::sync::Weak;
 use std::time::Duration;
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 use tokio::sync::{RwLock as TokioRwLock, mpsc};
 use which::which;
 // Code copied from redis-rs
@@ -434,14 +434,14 @@ CLUSTER_NODES=127.0.0.1:39163,127.0.0.1:23178,127.0.0.1:25186,127.0.0.1:52500,12
 
 /// Holds all components needed for pubsub topology test setup.
 /// The `_client_holder` keeps the Arc alive so the weak reference in the synchronizer remains valid.
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 pub struct PubSubTestSetup {
     pub connection: ClusterConnection,
     pub synchronizer: Arc<dyn PubSubSynchronizer>,
     pub _client_holder: Arc<TokioRwLock<ClientWrapper>>,
 }
 
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 impl PubSubTestSetup {
     /// Creates a test setup with a ClusterConnection configured for fast slot refresh
     /// and a properly initialized synchronizer.
@@ -853,7 +853,7 @@ pub async fn wait_for_node_to_become_primary(
 }
 
 /// Wait for subscription state to match expected channels.
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 pub async fn wait_for_pubsub_state(
     synchronizer: &Arc<dyn PubSubSynchronizer>,
     kind: PubSubSubscriptionKind,
@@ -922,7 +922,7 @@ pub fn generate_test_subscriptions_different_slots(
 }
 
 /// Subscribe to multiple channels and wait for subscriptions to be established.
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 pub async fn subscribe_and_wait(
     synchronizer: &Arc<dyn PubSubSynchronizer>,
     channels: &[Vec<u8>],
@@ -937,7 +937,7 @@ pub async fn subscribe_and_wait(
 /// Find which address a channel is subscribed on.
 /// Returns None if channel is not found in current subscriptions.
 /// Panics if channel is found on multiple addresses (indicates a bug).
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 pub fn find_subscription_address(
     subs_by_address: &HashMap<String, PubSubSubscriptionInfo>,
     channel: &[u8],
@@ -965,7 +965,7 @@ pub fn find_subscription_address(
 
 /// Verify that subscriptions moved to different addresses after migration.
 /// Returns (changed_count, unchanged_count, not_found_count).
-#[cfg(not(feature = "mock-pubsub"))]
+#[cfg(not(feature = "test-util"))]
 pub fn verify_subscription_addresses_changed(
     subs_before: &HashMap<String, PubSubSubscriptionInfo>,
     subs_after: &HashMap<String, PubSubSubscriptionInfo>,

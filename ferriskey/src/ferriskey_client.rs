@@ -6,14 +6,13 @@ use crate::client::{
     AuthenticationInfo, Client as ClientInner, ConnectionError, ConnectionRequest, NodeAddress,
     TlsMode as ClientTlsMode,
 };
-use crate::valkey::{
-    Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, IntoConnectionInfo, ProtocolVersion,
-    ValkeyError, cmd, from_owned_valkey_value,
-};
+use crate::cmd::{Cmd, cmd};
+use crate::connection::info::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
+use crate::value::{ErrorKind, ProtocolVersion, ValkeyError, from_owned_valkey_value};
 
 pub use crate::client::ReadFrom;
-pub use crate::valkey::FromValkeyValue as FromValue;
-pub use crate::valkey::ToValkeyArgs as ToArgs;
+pub use crate::value::FromValkeyValue as FromValue;
+pub use crate::value::ToValkeyArgs as ToArgs;
 
 pub type FerrisKeyError = ValkeyError;
 pub type Result<T> = std::result::Result<T, FerrisKeyError>;
@@ -61,7 +60,7 @@ impl Client {
         let infos = urls
             .iter()
             .map(|url| (*url).into_connection_info())
-            .collect::<crate::valkey::ValkeyResult<Vec<_>>>()?;
+            .collect::<crate::value::ValkeyResult<Vec<_>>>()?;
 
         let mut iter = infos.into_iter();
         let first = iter.next().expect("checked non-empty cluster URLs");

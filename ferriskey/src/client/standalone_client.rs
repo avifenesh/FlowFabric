@@ -4,11 +4,13 @@ use super::get_valkey_connection_info;
 use super::reconnecting_connection::{ReconnectReason, ReconnectingConnection};
 use super::{ConnectionRequest, NodeAddress, TlsMode};
 use crate::client::types::ReadFrom as ClientReadFrom;
-use crate::connection::ConnectionLike;
 use crate::cluster::routing::{
     self as cluster_routing, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd,
 };
-use crate::valkey::{PushInfo, RetryStrategy, ValkeyError, ValkeyResult, Value};
+use crate::connection::ConnectionLike;
+use crate::pubsub::push_manager::PushInfo;
+use crate::retry_strategies::RetryStrategy;
+use crate::value::{ValkeyError, ValkeyResult, Value};
 use futures::{StreamExt, future, stream};
 use logger_core::log_debug;
 use logger_core::log_warn;
@@ -136,7 +138,7 @@ impl StandaloneClient {
             return Err(StandaloneClientConnectionError::FailedConnection(vec![(
                 None,
                 ValkeyError::from((
-                    crate::valkey::ErrorKind::InvalidClientConfig,
+                    crate::value::ErrorKind::InvalidClientConfig,
                     "read-only mode is not compatible with AZAffinity strategies",
                 )),
             )]));
@@ -173,7 +175,7 @@ impl StandaloneClient {
             return Err(StandaloneClientConnectionError::FailedConnection(vec![(
                 None,
                 ValkeyError::from((
-                    crate::valkey::ErrorKind::InvalidClientConfig,
+                    crate::value::ErrorKind::InvalidClientConfig,
                     "client_cert and client_key must both be provided or both be empty",
                 )),
             )]));
@@ -184,7 +186,7 @@ impl StandaloneClient {
                 return Err(StandaloneClientConnectionError::FailedConnection(vec![(
                     None,
                     ValkeyError::from((
-                        crate::valkey::ErrorKind::InvalidClientConfig,
+                        crate::value::ErrorKind::InvalidClientConfig,
                         "TLS certificates provided but TLS is disabled",
                     )),
                 )]));
@@ -201,7 +203,7 @@ impl StandaloneClient {
             };
 
             let client_tls = if has_client_cert && has_client_key {
-                Some(crate::valkey::ClientTlsConfig {
+                Some(crate::connection::tls::ClientTlsConfig {
                     client_cert: connection_request.client_cert.clone(),
                     client_key: connection_request.client_key.clone(),
                 })
@@ -209,14 +211,14 @@ impl StandaloneClient {
                 None
             };
 
-            let tls_certificates = crate::valkey::TlsCertificates {
+            let tls_certificates = crate::connection::tls::TlsCertificates {
                 client_tls,
                 root_cert,
             };
             Some(
-                crate::valkey::retrieve_tls_certificates(tls_certificates).map_err(|err| {
-                    StandaloneClientConnectionError::FailedConnection(vec![(None, err)])
-                })?,
+                crate::connection::tls::retrieve_tls_certificates(tls_certificates).map_err(
+                    |err| StandaloneClientConnectionError::FailedConnection(vec![(None, err)]),
+                )?,
             )
         } else {
             None
@@ -274,7 +276,7 @@ impl StandaloneClient {
                     // and the node reports role:master
                     let is_primary = replication_status
                         .and_then(|status| {
-                            crate::valkey::from_owned_valkey_value::<String>(status).ok()
+                            crate::value::from_owned_valkey_value::<String>(status).ok()
                         })
                         .is_some_and(|val| val.contains("role:master"));
 
@@ -325,7 +327,7 @@ impl StandaloneClient {
                             (
                                 None,
                                 ValkeyError::from((
-                                    crate::valkey::ErrorKind::ClientError,
+                                    crate::value::ErrorKind::ClientError,
                                     "No primary node found",
                                 )),
                             ),
@@ -356,7 +358,6 @@ impl StandaloneClient {
             get_read_from(read_from_option)
         };
 
-        #[cfg(feature = "standalone_heartbeat")]
         for node in nodes.iter() {
             Self::start_heartbeat(node.clone());
         }
@@ -537,7 +538,7 @@ impl StandaloneClient {
     }
 
     async fn send_request(
-        cmd: &crate::valkey::Cmd,
+        cmd: &crate::cmd::Cmd,
         reconnecting_connection: &ReconnectingConnection,
     ) -> ValkeyResult<Value> {
         let mut connection = reconnecting_connection.get_connection().await?;
@@ -554,7 +555,7 @@ impl StandaloneClient {
 
     pub(crate) async fn send_request_to_all_nodes(
         &mut self,
-        cmd: &crate::valkey::Cmd,
+        cmd: &crate::cmd::Cmd,
         response_policy: Option<ResponsePolicy>,
     ) -> ValkeyResult<Value> {
         let requests = self
@@ -579,7 +580,7 @@ impl StandaloneClient {
                         let result = request.await?;
                         match result {
                             Value::Nil => {
-                                Err((crate::valkey::ErrorKind::ResponseError, "no value found")
+                                Err((crate::value::ErrorKind::ResponseError, "no value found")
                                     .into())
                             }
                             _ => Ok(result),
@@ -629,14 +630,14 @@ impl StandaloneClient {
 
     async fn send_request_to_single_node(
         &mut self,
-        cmd: &crate::valkey::Cmd,
+        cmd: &crate::cmd::Cmd,
         readonly: bool,
     ) -> ValkeyResult<Value> {
         let reconnecting_connection = self.get_connection(readonly).await;
         Self::send_request(cmd, reconnecting_connection).await
     }
 
-    pub async fn send_command(&mut self, cmd: &crate::valkey::Cmd) -> ValkeyResult<Value> {
+    pub async fn send_command(&mut self, cmd: &crate::cmd::Cmd) -> ValkeyResult<Value> {
         let Some(cmd_bytes) = Routable::command(cmd) else {
             return self.send_request_to_single_node(cmd, false).await;
         };
@@ -644,7 +645,7 @@ impl StandaloneClient {
         // Block write commands in read-only mode
         if self.inner.read_only && !is_readonly_cmd(cmd_bytes.as_slice()) {
             return Err(ValkeyError::from((
-                crate::valkey::ErrorKind::ReadOnly,
+                crate::value::ErrorKind::ReadOnly,
                 "write commands are not allowed in read-only mode",
             )));
         }
@@ -659,7 +660,7 @@ impl StandaloneClient {
 
     pub async fn send_pipeline(
         &mut self,
-        pipeline: &crate::valkey::Pipeline,
+        pipeline: &crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
     ) -> ValkeyResult<Vec<Value>> {
@@ -681,7 +682,6 @@ impl StandaloneClient {
         }
     }
 
-    #[cfg(feature = "standalone_heartbeat")]
     fn start_heartbeat(reconnecting_connection: ReconnectingConnection) {
         task::spawn(async move {
             loop {
@@ -706,7 +706,7 @@ impl StandaloneClient {
                 };
                 log_debug("StandaloneClient", "performing heartbeat");
                 if connection
-                    .send_packed_command(&crate::valkey::cmd("PING"))
+                    .send_packed_command(&crate::cmd::cmd("PING"))
                     .await
                     .is_err_and(|err| err.is_connection_dropped() || err.is_connection_refusal())
                 {
@@ -822,7 +822,7 @@ impl StandaloneClient {
     ///
     pub async fn update_connection_protocol(
         &self,
-        new_protocol: crate::valkey::ProtocolVersion,
+        new_protocol: crate::value::ProtocolVersion,
     ) -> ValkeyResult<Value> {
         for node in self.inner.nodes.iter() {
             node.update_connection_protocol(new_protocol);
@@ -842,12 +842,12 @@ impl StandaloneClient {
 async fn get_connection_and_replication_info(
     address: &NodeAddress,
     retry_strategy: &RetryStrategy,
-    connection_info: &crate::valkey::ValkeyConnectionInfo,
+    connection_info: &crate::connection::info::ValkeyConnectionInfo,
     tls_mode: TlsMode,
     push_sender: &Option<mpsc::UnboundedSender<PushInfo>>,
     discover_az: bool,
     connection_timeout: Duration,
-    tls_params: Option<crate::valkey::TlsConnParams>,
+    tls_params: Option<crate::connection::tls::TlsConnParams>,
     tcp_nodelay: bool,
     pubsub_synchronizer: &Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     skip_replication_check: bool,
@@ -882,7 +882,7 @@ async fn get_connection_and_replication_info(
     }
 
     match multiplexed_connection
-        .send_packed_command(crate::valkey::cmd("INFO").arg("REPLICATION"))
+        .send_packed_command(crate::cmd::cmd("INFO").arg("REPLICATION"))
         .await
     {
         Ok(replication_status) => Ok((reconnecting_connection, Some(replication_status))),

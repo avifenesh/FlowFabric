@@ -772,11 +772,11 @@ fn compress_mset_command(
 }
 
 pub fn process_response_for_decompression(
-    value: crate::valkey::Value,
+    value: crate::value::Value,
     request_type: RequestType,
     compression_manager: Option<&CompressionManager>,
-) -> CompressionResult<crate::valkey::Value> {
-    use crate::valkey::Value;
+) -> CompressionResult<crate::value::Value> {
+    use crate::value::Value;
 
     let Some(manager) = compression_manager else {
         return Ok(value);
@@ -806,10 +806,10 @@ pub fn process_response_for_decompression(
 }
 
 pub fn decompress_single_value_response(
-    value: crate::valkey::Value,
+    value: crate::value::Value,
     manager: &CompressionManager,
-) -> CompressionResult<crate::valkey::Value> {
-    use crate::valkey::Value;
+) -> CompressionResult<crate::value::Value> {
+    use crate::value::Value;
 
     match value {
         Value::BulkString(bytes) => {
@@ -828,10 +828,10 @@ pub fn decompress_single_value_response(
 }
 
 pub fn decompress_mget_response(
-    value: crate::valkey::Value,
+    value: crate::value::Value,
     manager: &CompressionManager,
-) -> CompressionResult<crate::valkey::Value> {
-    use crate::valkey::Value;
+) -> CompressionResult<crate::value::Value> {
+    use crate::value::Value;
 
     match value {
         Value::Array(values) => {
