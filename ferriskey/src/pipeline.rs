@@ -47,7 +47,7 @@ impl Pipeline {
     }
 
     /// Creates an empty pipeline with pre-allocated capacity.
-    pub fn with_capacity(capacity: usize) -> Pipeline {
+    pub(crate) fn with_capacity(capacity: usize) -> Pipeline {
         Pipeline {
             commands: Vec::with_capacity(capacity),
             transaction_mode: false,
@@ -56,14 +56,9 @@ impl Pipeline {
         }
     }
 
-    /// Set the pipeline span
-    pub fn set_pipeline_span(&mut self, span: Option<FerrisKeySpan>) {
-        self.otel_command_span = span;
-    }
-
     /// Return this command span
     #[inline]
-    pub fn span(&self) -> Option<FerrisKeySpan> {
+    pub(crate) fn span(&self) -> Option<FerrisKeySpan> {
         self.otel_command_span.clone()
     }
 
@@ -86,13 +81,8 @@ impl Pipeline {
         self
     }
 
-    /// Returns a slice of the pipeline's commands.
-    pub fn commands(&self) -> &[Arc<Cmd>] {
-        &self.commands
-    }
-
     /// Returns the encoded pipeline commands.
-    pub fn get_packed_pipeline(&self) -> bytes::Bytes {
+    pub(crate) fn get_packed_pipeline(&self) -> bytes::Bytes {
         encode_pipeline(&self.commands, self.transaction_mode).into()
     }
 
@@ -144,17 +134,17 @@ impl Pipeline {
     ///
     /// When in transaction mode, all commands in the pipeline are executed
     /// as a single atomic operation.
-    pub fn is_atomic(&self) -> bool {
+    pub(crate) fn is_atomic(&self) -> bool {
         self.transaction_mode
     }
 
     /// Returns the number of commands in the pipeline.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.commands.len()
     }
 
     /// Returns `true` if the pipeline contains no commands.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
 

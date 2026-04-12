@@ -17,7 +17,9 @@ use telemetrylib::FerrisKeySpan;
 pub(crate) enum Arg<D> {
     /// A normal argument
     Simple(D),
-    /// A cursor argument created from `cursor_arg()`
+    /// A cursor position marker used in SCAN-family command argument lists.
+    /// Populated by cursor_arg(); kept for exhaustive match coverage in iterators.
+    #[allow(dead_code)]
     Cursor,
 }
 
@@ -28,8 +30,6 @@ pub struct Cmd {
     // Arg::Simple contains the offset that marks the end of the argument
     args: Vec<Arg<usize>>,
     cursor: Option<u64>,
-    // If it's true command's response won't be read from socket. Useful for Pub/Sub.
-    no_response: bool,
     /// The span associated with this command
     span: Option<FerrisKeySpan>,
     //  A flag indicating whether this is a fenced command  (will have PING appended to ensure ordering)
@@ -293,23 +293,9 @@ impl Cmd {
             data: vec![],
             args: vec![],
             cursor: None,
-            no_response: false,
             span: None,
             is_fenced: false,
             inflight_tracker: None,
-        }
-    }
-
-    /// Creates a new empty command, with at least the requested capacity.
-    pub fn with_capacity(arg_count: usize, size_of_data: usize) -> Cmd {
-        Cmd {
-            data: Vec::with_capacity(size_of_data),
-            args: Vec::with_capacity(arg_count),
-            cursor: None,
-            no_response: false,
-            span: None,
-            inflight_tracker: None,
-            is_fenced: false,
         }
     }
 
@@ -339,38 +325,6 @@ impl Cmd {
         self
     }
 
-    /// Associate a trackable span to the command. This allow tracking the lifetime
-    /// of the command.
-    ///
-    /// A span is used by an OpenTelemetry backend to track the lifetime of the command
-    #[inline]
-    pub fn set_span(&mut self, span: Option<FerrisKeySpan>) -> &mut Cmd {
-        self.span = span;
-        self
-    }
-
-    /// Works similar to `arg` but adds a cursor argument.  This is always
-    /// an integer and also flips the command implementation to support a
-    /// different mode for the iterators where the iterator will ask for
-    /// another batch of items when the local data is exhausted.
-    ///
-    /// ```rust,ignore
-    /// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
-    /// # let mut con = client.get_connection(None).unwrap();
-    /// let mut cmd = ferriskey::cmd("SSCAN");
-    /// let mut iter : ferriskey::Iter<isize> =
-    ///     cmd.arg("my_set").cursor_arg(0).clone().iter(&mut con).unwrap();
-    /// for x in iter {
-    ///     // do something with the item
-    /// }
-    /// ```ignore
-    #[inline]
-    pub fn cursor_arg(&mut self, cursor: u64) -> &mut Cmd {
-        assert!(!self.in_scan_mode());
-        self.cursor = Some(cursor);
-        self.args.push(Arg::Cursor);
-        self
-    }
 
     /// Returns the packed command as Bytes.
     #[inline]
@@ -399,13 +353,6 @@ impl Cmd {
         .unwrap()
     }
 
-    /// Like `get_packed_command` but replaces the cursor with the
-    /// Returns true if the command is in scan mode.
-    #[inline]
-    pub fn in_scan_mode(&self) -> bool {
-        self.cursor.is_some()
-    }
-
     /// Sends the command as query to the async connection and converts the
     /// result to the target valkey value.
     #[inline]
@@ -415,48 +362,6 @@ impl Cmd {
     {
         let val = con.req_packed_command(self).await?;
         from_owned_valkey_value(val)
-    }
-
-    /// Returns an AsyncIter over the items of the
-    /// bulk result or iterator.  A [futures::Stream](https://docs.rs/futures/0.3.3/futures/stream/trait.Stream.html)
-    /// is implemented on AsyncIter. In normal mode this is not in any way more
-    /// efficient than just querying into a `Vec<T>` as it's internally
-    /// implemented as buffering into a vector.  This however is useful when
-    /// `cursor_arg` was used in which case the stream will query for more
-    /// items until the server side cursor is exhausted.
-    ///
-    /// This is useful for commands such as `SSCAN`, `SCAN` and others in async contexts.
-    ///
-    /// One specialty of this function is that it will check if the response
-    /// looks like a cursor or not and always just looks at the payload.
-    /// This way you can use the function the same for responses in the
-    /// format of `KEYS` (just a list) as well as `SSCAN` (which returns a
-    /// tuple of cursor and list).
-    #[inline]
-    pub async fn iter_async<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + Unpin + 'a>(
-        mut self,
-        con: &'a mut C,
-    ) -> ValkeyResult<AsyncIter<'a, T, C>> {
-        let rv = con.req_packed_command(&self).await?;
-
-        let (cursor, batch) = if rv.looks_like_cursor() {
-            from_owned_valkey_value::<(u64, Vec<T>)>(rv)?
-        } else {
-            (0, from_owned_valkey_value(rv)?)
-        };
-        if cursor == 0 {
-            self.cursor = None;
-        } else {
-            self.cursor = Some(cursor);
-        }
-
-        Ok(AsyncIter {
-            inner: IterOrFuture::Iter(AsyncIterInner {
-                batch: batch.into_iter(),
-                con,
-                cmd: self,
-            }),
-        })
     }
 
     /// Returns an iterator over the arguments in this command (including the command name itself)
@@ -497,43 +402,30 @@ impl Cmd {
         Some(&self.data[start..end])
     }
 
-    /// Client won't read and wait for results. Currently only used for Pub/Sub commands in RESP3.
-    #[inline]
-    pub fn set_no_response(&mut self, nr: bool) -> &mut Cmd {
-        self.no_response = nr;
-        self
-    }
-
-    /// Check whether command's result will be waited for.
-    #[inline]
-    pub fn is_no_response(&self) -> bool {
-        self.no_response
-    }
-
     /// Return this command span
     #[inline]
-    pub fn span(&self) -> Option<FerrisKeySpan> {
+    pub(crate) fn span(&self) -> Option<FerrisKeySpan> {
         self.span.clone()
     }
 
     /// Mark this command as fenced. A PING command will be appended after it
     /// to ensure proper ordering of response processing.
     #[inline]
-    pub fn set_fenced(&mut self, fenced: bool) -> &mut Cmd {
+    pub(crate) fn set_fenced(&mut self, fenced: bool) -> &mut Cmd {
         self.is_fenced = fenced;
         self
     }
 
     /// Check whether this command is fenced.
     #[inline]
-    pub fn is_fenced(&self) -> bool {
+    pub(crate) fn is_fenced(&self) -> bool {
         self.is_fenced
     }
 
     /// Attach an inflight slot tracker. The slot is released when the last
     /// clone of this Cmd (or its `Arc<Cmd>`) is dropped.
     #[inline]
-    pub fn set_inflight_tracker(&mut self, tracker: crate::value::InflightRequestTracker) {
+    pub(crate) fn set_inflight_tracker(&mut self, tracker: crate::value::InflightRequestTracker) {
         self.inflight_tracker = Some(tracker);
     }
 }
