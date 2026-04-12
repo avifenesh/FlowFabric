@@ -77,7 +77,8 @@ impl PushManager {
             return;
         };
 
-        // Only process subscription-related pushes
+        // Only process subscription confirmation pushes (not message delivery).
+        // Message/PMessage/SMessage are data delivery — not state changes.
         let (subscription_type, is_subscribe) = match kind {
             PushKind::Subscribe => (PubSubSubscriptionKind::Exact, true),
             PushKind::Unsubscribe => (PubSubSubscriptionKind::Exact, false),
@@ -85,10 +86,7 @@ impl PushManager {
             PushKind::PUnsubscribe => (PubSubSubscriptionKind::Pattern, false),
             PushKind::SSubscribe => (PubSubSubscriptionKind::Sharded, true),
             PushKind::SUnsubscribe => (PubSubSubscriptionKind::Sharded, false),
-            PushKind::Message => (PubSubSubscriptionKind::Exact, true),
-            PushKind::PMessage => (PubSubSubscriptionKind::Pattern, true),
-            PushKind::SMessage => (PubSubSubscriptionKind::Sharded, true),
-            _ => return,
+            _ => return, // Message, PMessage, SMessage, etc. — not subscription state changes
         };
 
         // Extract channel/pattern from push data
