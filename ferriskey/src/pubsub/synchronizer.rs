@@ -179,6 +179,12 @@ impl EventDrivenSynchronizer {
         let _ = self.internal_client.set(client);
     }
 
+    /// Returns a snapshot of confirmed subscriptions keyed by node address.
+    /// Used by test utilities to inspect synchronizer state without polling.
+    pub fn get_current_subscriptions_by_address(&self) -> HashMap<String, PubSubSubscriptionInfo> {
+        self.confirmed.read().unwrap().by_address.clone()
+    }
+
     #[inline]
     fn kinds(&self) -> &'static [PubSubSubscriptionKind] {
         if self.is_cluster {

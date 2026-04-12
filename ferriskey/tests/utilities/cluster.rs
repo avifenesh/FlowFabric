@@ -7,7 +7,7 @@ use ferriskey::client::Client;
 #[cfg(not(feature = "test-util"))]
 use ferriskey::client::ClientWrapper;
 #[cfg(not(feature = "test-util"))]
-use ferriskey::pubsub::synchronizer::ValkeyPubSubSynchronizer;
+use ferriskey::pubsub::synchronizer::EventDrivenSynchronizer;
 #[cfg(not(feature = "test-util"))]
 use ferriskey::pubsub::{PubSubSubscriptionInfo, PubSubSynchronizer, create_pubsub_synchronizer};
 use ferriskey::Value;
@@ -495,8 +495,8 @@ impl PubSubTestSetup {
         // Now set the real client on the synchronizer
         synchronizer
             .as_any()
-            .downcast_ref::<ValkeyPubSubSynchronizer>()
-            .expect("Expected ValkeyPubSubSynchronizer")
+            .downcast_ref::<EventDrivenSynchronizer>()
+            .expect("Expected EventDrivenSynchronizer")
             .set_internal_client(Arc::downgrade(&client_arc));
 
         Self {
@@ -509,12 +509,12 @@ impl PubSubTestSetup {
     /// Get current subscriptions organized by address.
     /// Downcasts to concrete type to access internal state.
     pub fn get_subscriptions_by_address(&self) -> HashMap<String, PubSubSubscriptionInfo> {
-        use ferriskey::pubsub::synchronizer::ValkeyPubSubSynchronizer;
+        use ferriskey::pubsub::synchronizer::EventDrivenSynchronizer;
 
         self.synchronizer
             .as_any()
-            .downcast_ref::<ValkeyPubSubSynchronizer>()
-            .expect("Expected ValkeyPubSubSynchronizer")
+            .downcast_ref::<EventDrivenSynchronizer>()
+            .expect("Expected EventDrivenSynchronizer")
             .get_current_subscriptions_by_address()
     }
 
