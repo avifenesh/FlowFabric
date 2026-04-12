@@ -72,7 +72,7 @@ impl<C> NodePipelineContext<C> {
 }
 
 /// `NodeResponse` represents a response from a node along with its source node address.
-type NodeResponse = (Option<Arc<str>>, Value);
+type NodeResponse = (Option<Arc<str>>, ValkeyResult<Value>);
 /// `PipelineResponses` represents the responses for each pipeline command.
 pub(crate) type PipelineResponses = Vec<Vec<NodeResponse>>;
 
@@ -358,7 +358,7 @@ fn add_pipeline_result(
     pipeline_responses: &mut PipelineResponses,
     index: usize,
     inner_index: Option<usize>,
-    value: Value,
+    value: ValkeyResult<Value>,
     address: Arc<str>,
 ) -> Result<(), (OperationTarget, ValkeyError)> {
     if let Some(responses) = pipeline_responses.get_mut(index) {
@@ -369,10 +369,10 @@ fn add_pipeline_result(
                         inner_index + 1,
                         (
                             None,
-                            Value::ServerError(make_extension_error(
+                            Err(make_extension_error(
                                 "PipelineNoResponse".to_string(),
                                 Some("no response from node".to_string()),
-                            )),
+                            ).into()),
                         ),
                     );
                 }
@@ -381,7 +381,7 @@ fn add_pipeline_result(
             None => {
                 if responses.is_empty() {
                     responses.push((Some(address), value));
-                } else if let Value::ServerError(_) = responses[0].1 {
+                } else if responses[0].1.is_err() {
                     responses[0] = (Some(address), value);
                 } else {
                     return Err((
@@ -423,7 +423,7 @@ fn process_pipeline_responses(
             Ok(Ok(Response::Multiple(values))) => {
                 for ((index, inner_index, ignore), value) in command_indices.into_iter().zip(values)
                 {
-                    if let Value::ServerError(error) = &value {
+                    if let Value::ServerError(ref error) = value {
                         let retry_method = error.retry_method();
                         update_retry_map(
                             &mut retry_map,
@@ -439,7 +439,7 @@ fn process_pipeline_responses(
                             pipeline_responses,
                             index,
                             inner_index,
-                            value,
+                            Ok(value),
                             address.clone(),
                         )?;
                     }
@@ -493,7 +493,7 @@ fn process_pipeline_responses(
                     pipeline_responses,
                     index,
                     inner_index,
-                    Value::ServerError(server_error.clone().into()),
+                    Err(server_error.clone().into()),
                     address.clone(),
                 )?;
             }
@@ -777,7 +777,7 @@ where
                 pipeline_responses,
                 index,
                 inner_index,
-                Value::ServerError(error),
+                Err(error.into()),
                 address,
             )?;
             continue;
@@ -821,7 +821,7 @@ where
             pipeline_responses,
             index,
             inner_index,
-            Value::ServerError(error.into()),
+            Err(error.into()),
             address,
         )?;
     }
@@ -871,7 +871,7 @@ where
                     pipeline_responses,
                     index,
                     inner_index,
-                    Value::ServerError(error),
+                    Err(error.into()),
                     address.clone(),
                 )?;
                 continue;
@@ -897,7 +897,7 @@ where
                     pipeline_responses,
                     index,
                     inner_index,
-                    Value::ServerError(error),
+                    Err(error.into()),
                     address,
                 )?;
             }

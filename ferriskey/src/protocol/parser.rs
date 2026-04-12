@@ -335,7 +335,7 @@ fn parse_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
     let s =
         std::str::from_utf8(&line).map_err(|_| parse_err("Invalid UTF-8 in error".to_string()))?;
-    Ok(Value::ServerError(err_parser(s)))
+    Err(err_parser(s))
 }
 
 #[inline]
@@ -368,7 +368,12 @@ fn parse_array(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let length = length as usize;
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
-        items.push(parse_value_unchecked(buf, depth + 1)?);
+        // Error elements inside arrays (e.g. EXEC responses) become Value::ServerError.
+        // Top-level errors return Err directly — this distinction is intentional.
+        match parse_value_unchecked(buf, depth + 1) {
+            Ok(v) => items.push(v),
+            Err(e) => items.push(Value::ServerError(e)),
+        }
     }
     Ok(Value::Array(items))
 }
@@ -471,7 +476,7 @@ fn read_blob_unchecked(buf: &mut BytesMut) -> ValkeyResult<String> {
 #[inline]
 fn parse_blob_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let s = read_blob_unchecked(buf)?;
-    Ok(Value::ServerError(err_parser(&s)))
+    Err(err_parser(&s))
 }
 
 #[inline]
@@ -798,13 +803,11 @@ mod tests {
 
     #[test]
     fn decode_resp3_blob_error() {
+        // Blob errors (RESP3 !) are now returned as Err(ValkeyError) directly
         let val = parse_valkey_value(b"!21\r\nSYNTAX invalid syntax\r\n");
         assert_eq!(
-            val.unwrap().extract_error().err(),
-            Some(make_extension_error(
-                "SYNTAX".to_string(),
-                Some("invalid syntax".to_string())
-            ))
+            val.unwrap_err(),
+            make_extension_error("SYNTAX".to_string(), Some("invalid syntax".to_string()))
         )
     }
 

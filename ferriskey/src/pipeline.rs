@@ -263,9 +263,6 @@ macro_rules! implement_pipeline_commands {
             fn make_pipeline_results(&self, resp: Vec<Value>) -> ValkeyResult<Value> {
                 let mut rv = Vec::with_capacity(resp.len() - self.ignored_commands.len());
                 for (idx, result) in resp.into_iter().enumerate() {
-                    if let Value::ServerError(e) = result {
-                        return Err(e.into());
-                    }
                     if !self.ignored_commands.contains(&idx) {
                         rv.push(result);
                     }

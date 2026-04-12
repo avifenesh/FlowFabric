@@ -2145,7 +2145,7 @@ where
                             // Therefore, checking that val is a `ServerError` is sufficient—we do not need to check for nested errors within
                             // composite values.
                             if let Value::ServerError(err) = val {
-                                return Err(err.into());
+                                return Err(err);
                             }
                             Ok(val)
                         })
@@ -2184,7 +2184,7 @@ where
                         Ok(Value::Nil) => nil_counter += 1,
                         // If the value is a `ServerError` → the command failed for this node.
                         Ok(Value::ServerError(err)) => {
-                            last_err = Some(err.into());
+                            last_err = Some(err);
                         }
                         Ok(val) => return Ok(val),
                         // If we received a ValkeyError, it means that this receiver returned a RecvError
@@ -2274,7 +2274,7 @@ where
         if should_check_errors {
             for (_addr, val) in resolved.iter() {
                 if let Value::ServerError(err) = val {
-                    return Err(err.clone().into());
+                    return Err(err.clone());
                 }
             }
         }
@@ -2382,7 +2382,7 @@ where
                 for (_addr, val) in resolved {
                     match val {
                         Value::ServerError(err) => {
-                            last_err = Some(err.into());
+                            last_err = Some(err);
                         }
                         val => return Ok(val),
                     }
@@ -2421,7 +2421,7 @@ where
                     match val {
                         Value::Nil => nil_counter += 1,
                         Value::ServerError(err) => {
-                            last_err = Some(err.into());
+                            last_err = Some(err);
                         }
                         val => return Ok(val),
                     }
@@ -3255,8 +3255,14 @@ where
         for (index, mut responses) in pipeline_responses.into_iter().enumerate() {
             // If the first policy in the sorted vector matches the current command index, use it.
             if let Some(&(ref routing_info, response_policy)) = response_policies.get(&index) {
+                // Unwrap ValkeyResult<Value> → Value for aggregation
+                // (errors become Value::ServerError)
+                let resolved: Vec<(Option<Arc<str>>, Value)> = responses
+                    .into_iter()
+                    .map(|(addr, val)| (addr, val.unwrap_or_else(Value::ServerError)))
+                    .collect();
                 let aggregated_response = match Self::aggregate_resolved_results(
-                    responses,
+                    resolved,
                     routing_info,
                     response_policy,
                 ) {
@@ -3268,7 +3274,10 @@ where
             } else {
                 // If there's no policy for this index, use the first response if available.
                 if responses.len() == 1 {
-                    final_responses.push(responses.pop().unwrap().1);
+                    match responses.pop().unwrap().1 {
+                        Ok(val) => final_responses.push(val),
+                        Err(err) => final_responses.push(Value::ServerError(err)),
+                    }
                 } else {
                     final_responses.push(Value::ServerError(make_extension_error(
                         "PipelineResponseError".to_string(),
@@ -4439,17 +4448,17 @@ mod pipeline_routing_tests {
     fn test_numerical_response_aggregation_logic() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some(Arc::from("node1")), Value::Int(3)),
-                (Some(Arc::from("node2")), Value::Int(7)),
-                (Some(Arc::from("node3")), Value::Int(0)),
+                (Some(Arc::from("node1")), Ok(Value::Int(3))),
+                (Some(Arc::from("node2")), Ok(Value::Int(7))),
+                (Some(Arc::from("node3")), Ok(Value::Int(0))),
             ],
             vec![(
                 Some(Arc::from("node3")),
-                Value::BulkString(b"unchanged".to_vec().into()),
+                Ok(Value::BulkString(b"unchanged".to_vec().into())),
             )],
             vec![
-                (Some(Arc::from("node1")), Value::Int(5)),
-                (Some(Arc::from("node2")), Value::Int(11)),
+                (Some(Arc::from("node1")), Ok(Value::Int(5))),
+                (Some(Arc::from("node2")), Ok(Value::Int(11))),
             ],
         ];
         let response_policies = HashMap::from([
@@ -4492,23 +4501,23 @@ mod pipeline_routing_tests {
     fn test_combine_arrays_response_aggregation_logic() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some(Arc::from("node1")), Value::Array(vec![Value::Int(1)])),
-                (Some(Arc::from("node2")), Value::Array(vec![Value::Int(2)])),
+                (Some(Arc::from("node1")), Ok(Value::Array(vec![Value::Int(1)]))),
+                (Some(Arc::from("node2")), Ok(Value::Array(vec![Value::Int(2)]))),
             ],
             vec![
                 (
                     Some(Arc::from("node2")),
-                    Value::Array(vec![
+                    Ok(Value::Array(vec![
                         Value::BulkString("key1".into()),
                         Value::BulkString("key3".into()),
-                    ]),
+                    ])),
                 ),
                 (
                     Some(Arc::from("node1")),
-                    Value::Array(vec![
+                    Ok(Value::Array(vec![
                         Value::BulkString("key2".into()),
                         Value::BulkString("key4".into()),
-                    ]),
+                    ])),
                 ),
             ],
         ];
@@ -4563,16 +4572,16 @@ mod pipeline_routing_tests {
     fn test_aggregate_pipeline_multi_node_commands_with_error_response() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some(Arc::from("node1")), Value::Int(3)),
-                (Some(Arc::from("node2")), Value::Int(7)),
+                (Some(Arc::from("node1")), Ok(Value::Int(3))),
+                (Some(Arc::from("node2")), Ok(Value::Int(7))),
                 (
                     Some(Arc::from("node3")),
-                    Value::ServerError(ValkeyError::from((ErrorKind::Moved, "MOVED", "127.0.0.1".to_string()))),
+                    Err(ValkeyError::from((ErrorKind::Moved, "MOVED", "127.0.0.1".to_string()))),
                 ),
             ],
             vec![(
                 Some(Arc::from("node3")),
-                Value::BulkString(b"unchanged".to_vec().into()),
+                Ok(Value::BulkString(b"unchanged".to_vec().into())),
             )],
         ];
         let mut response_policies = HashMap::new();
@@ -4603,7 +4612,7 @@ mod pipeline_routing_tests {
     #[test]
     fn test_aggregate_pipeline_multi_node_commands_with_no_response_for_command() {
         let pipeline_responses: PipelineResponses =
-            vec![vec![(Some(Arc::from("node1")), Value::Int(1))], vec![]];
+            vec![vec![(Some(Arc::from("node1")), Ok(Value::Int(1)))], vec![]];
         let response_policies = HashMap::new();
 
         let responses = block_on(
@@ -4625,10 +4634,10 @@ mod pipeline_routing_tests {
     #[test]
     fn test_aggregate_pipeline_responses_with_multiple_responses_for_command() {
         let pipeline_responses: PipelineResponses = vec![
-            vec![(Some(Arc::from("node1")), Value::Int(1))],
+            vec![(Some(Arc::from("node1")), Ok(Value::Int(1)))],
             vec![
-                (Some(Arc::from("node2")), Value::Int(2)),
-                (Some(Arc::from("node3")), Value::Int(3)),
+                (Some(Arc::from("node2")), Ok(Value::Int(2))),
+                (Some(Arc::from("node3")), Ok(Value::Int(3))),
             ],
         ];
         let response_policies = HashMap::new();

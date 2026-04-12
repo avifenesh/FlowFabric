@@ -47,19 +47,18 @@ enum ResponseAggregate {
         current_response_count: usize,
         buffer: Vec<Value>,
         first_err: Option<ValkeyError>,
-        is_transaction: bool,
+
     },
 }
 
 impl ResponseAggregate {
-    fn new(pipeline_response_count: Option<usize>, is_transaction: bool) -> Self {
+    fn new(pipeline_response_count: Option<usize>, _is_transaction: bool) -> Self {
         match pipeline_response_count {
             Some(response_count) => ResponseAggregate::Pipeline {
                 expected_response_count: response_count,
                 current_response_count: 0,
                 buffer: Vec::new(),
                 first_err: None,
-                is_transaction,
             },
             None => ResponseAggregate::SingleCommand,
         }
@@ -222,18 +221,8 @@ where
                 current_response_count,
                 buffer,
                 first_err,
-                is_transaction,
             } => {
                 match result {
-                    Ok(Value::ServerError(err)) if *is_transaction => {
-                        // In transactions, `count` is always 1 because the final result is a single array (`offset + count = expected_response_count`).
-                        // If we receive a `ServerError` here, it means the error occurred between `MULTI` and `EXEC`.
-                        // After `EXEC`, the response is always a single array of results, so any error at this stage must have happened before `EXEC` was sent.
-                        // As a result, the entire transaction will be discarded (and can be retried).
-                        if first_err.is_none() {
-                            *first_err = Some(err.into());
-                        }
-                    }
                     Ok(item) => {
                         buffer.push(item);
                     }
