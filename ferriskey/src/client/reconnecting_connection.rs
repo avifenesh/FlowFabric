@@ -307,7 +307,7 @@ fn get_client(
 ) -> crate::valkey::Client {
     let connection_info =
         super::get_connection_info(address, tls_mode, valkey_connection_info, tls_params);
-    crate::valkey::Client::open(connection_info).unwrap() // can unwrap, because [open] fails only on trying to convert input to ConnectionInfo, and we pass ConnectionInfo.
+    crate::valkey::Client::open(connection_info).expect("Client::open from ConnectionInfo")
 }
 
 impl ConnectionBackend {
@@ -445,7 +445,7 @@ impl ReconnectingConnection {
             let retry_strategy = connection_clone
                 .connection_options
                 .connection_retry_strategy
-                .unwrap();
+                .expect("retry_strategy set by create_connection");
             let infinite_backoff_dur_iterator = retry_strategy
                 .get_infinite_backoff_dur_iterator();
             for sleep_duration in infinite_backoff_dur_iterator {
@@ -518,9 +518,9 @@ impl ReconnectingConnection {
     }
 
     pub fn is_connected(&self) -> bool {
-        !matches!(
+        matches!(
             *self.inner.state.lock().unwrap(),
-            ConnectionState::Reconnecting
+            ConnectionState::Connected(_)
         )
     }
 
@@ -532,6 +532,7 @@ impl ReconnectingConnection {
                 .await;
         } else {
             log_error("disconnect notifier", "BUG! Disconnect notifier is not set");
+            tokio::time::sleep(super::CONNECTION_CHECKS_INTERVAL).await;
         }
     }
 

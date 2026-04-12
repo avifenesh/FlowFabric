@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{Notify, RwLock as TokioRwLock};
 
-const LOCK_ERR: &str = "Lock poisoned";
 const DEFAULT_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Static slices for subscription kinds - no allocation
@@ -121,7 +120,7 @@ impl ValkeyPubSubSynchronizer {
         let current_by_addr = self
             .current_subscriptions_by_address
             .read()
-            .expect(LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
 
         let mut actual: PubSubSubscriptionInfo = self
             .subscription_kinds()
@@ -143,11 +142,11 @@ impl ValkeyPubSubSynchronizer {
 
     /// Compute synchronization diff - what needs to be subscribed/unsubscribed
     fn compute_sync_diff(&self) -> SyncDiff {
-        let desired = self.desired_subscriptions.read().expect(LOCK_ERR).clone();
+        let desired = self.desired_subscriptions.read().unwrap_or_else(|e| e.into_inner()).clone();
         let current_by_addr = self
             .current_subscriptions_by_address
             .read()
-            .expect(LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
 
         let mut actual: PubSubSubscriptionInfo = self
             .subscription_kinds()
@@ -305,7 +304,7 @@ impl ValkeyPubSubSynchronizer {
             }
         });
 
-        *self.reconciliation_task_handle.lock().unwrap() = Some(handle);
+        *self.reconciliation_task_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     async fn reconcile(&self) -> ValkeyResult<()> {
@@ -343,7 +342,7 @@ impl ValkeyPubSubSynchronizer {
 
     async fn process_pending_unsubscribes(&self) {
         let pending = {
-            let mut guard = self.pending_unsubscribes.write().expect(LOCK_ERR);
+            let mut guard = self.pending_unsubscribes.write().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *guard)
         };
 
@@ -610,7 +609,7 @@ impl ValkeyPubSubSynchronizer {
     pub fn get_current_subscriptions_by_address(&self) -> HashMap<String, PubSubSubscriptionInfo> {
         self.current_subscriptions_by_address
             .read()
-            .expect(LOCK_ERR)
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -629,7 +628,7 @@ impl ValkeyPubSubSynchronizer {
 
 impl Drop for ValkeyPubSubSynchronizer {
     fn drop(&mut self) {
-        if let Some(handle) = self.reconciliation_task_handle.lock().unwrap().take() {
+        if let Some(handle) = self.reconciliation_task_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
             handle.abort();
         }
     }
@@ -647,7 +646,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
     ) {
         {
-            let mut desired = self.desired_subscriptions.write().expect(LOCK_ERR);
+            let mut desired = self.desired_subscriptions.write().unwrap_or_else(|e| e.into_inner());
             desired
                 .entry(subscription_type)
                 .or_default()
@@ -663,7 +662,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
     ) {
         {
-            let mut desired = self.desired_subscriptions.write().expect(LOCK_ERR);
+            let mut desired = self.desired_subscriptions.write().unwrap_or_else(|e| e.into_inner());
             match channels {
                 Some(channels_to_remove) => {
                     if let Some(existing) = desired.get_mut(&subscription_type) {
@@ -690,7 +689,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         let mut current_by_addr = self
             .current_subscriptions_by_address
             .write()
-            .expect(LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         current_by_addr
             .entry(address)
             .or_default()
@@ -708,7 +707,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         let mut current_by_addr = self
             .current_subscriptions_by_address
             .write()
-            .expect(LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
 
         // For sharded subscriptions, only remove from the specific address.
         // Sharded subscriptions are slot-deterministic - an unsubscribe from Node A
@@ -756,7 +755,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         let mut current_by_addr = self
             .current_subscriptions_by_address
             .write()
-            .expect(LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
 
         for address in addresses {
             current_by_addr.remove(address);
@@ -777,8 +776,8 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
             let mut current_by_addr = self
                 .current_subscriptions_by_address
                 .write()
-                .expect(LOCK_ERR);
-            let mut pending = self.pending_unsubscribes.write().expect(LOCK_ERR);
+                .unwrap_or_else(|e| e.into_inner());
+            let mut pending = self.pending_unsubscribes.write().unwrap_or_else(|e| e.into_inner());
 
             // Helper to queue an unsubscribe
             let mut queue_unsubscribe =
@@ -873,7 +872,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
     }
 
     fn get_subscription_state(&self) -> (PubSubSubscriptionInfo, PubSubSubscriptionInfo) {
-        let desired = self.desired_subscriptions.read().expect(LOCK_ERR).clone();
+        let desired = self.desired_subscriptions.read().unwrap_or_else(|e| e.into_inner()).clone();
         let actual = self.compute_actual_subscriptions();
         (desired, actual)
     }

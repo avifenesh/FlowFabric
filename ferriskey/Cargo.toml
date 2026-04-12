@@ -6,9 +6,8 @@ license = "Apache-2.0"
 authors = ["FlowFabric Contributors"]
 
 [dependencies]
-# Allocator
-mimalloc = { version = "0.1", default-features = false, optional = true }
-tikv-jemallocator = { version = "0.6", optional = true }
+# Allocator — mimalloc on supported platforms, system allocator elsewhere
+mimalloc = { version = "0.1", default-features = false }
 
 # Core
 uuid = { version = "1", features = ["v4", "fast-rng"] }
@@ -74,13 +73,11 @@ lz4 = { version = "1.28" }
 num_cpus = "1"
 
 [features]
-default = ["mimalloc-alloc"]
+default = []
 standalone_heartbeat = []
 iam_tests = []
 mock-pubsub = []
 testing = []
-mimalloc-alloc = ["mimalloc"]
-jemalloc = ["tikv-jemallocator"]
 
 [dev-dependencies]
 rsevents = "0.3.1"
@@ -107,7 +104,7 @@ hdrhistogram = "7"
 libc = "0.2"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests", "jemalloc", "mimalloc-alloc"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_heartbeat)', 'cfg(feature, values("iam_tests"))'] }
 
 [lints.clippy]
 await_holding_lock = "deny"

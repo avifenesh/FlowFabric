@@ -435,14 +435,14 @@ pub(crate) fn convert_to_expected_type(
                         } else {
                             return Err((
                                 ErrorKind::TypeError,
-                                "Response couldn't be converted to GeoSeatch return type, Inner Array must contain at least one element",
+                                "Response couldn't be converted to GeoSearch return type, Inner Array must contain at least one element",
                             )
                                 .into());
                         }
                     } else {
                         return Err((
                             ErrorKind::TypeError,
-                            "Response couldn't be converted to GeoSeatch return type, Expected an array as an inner element",
+                            "Response couldn't be converted to GeoSearch return type, Expected an array as an inner element",
                         )
                             .into());
                     }
@@ -452,7 +452,7 @@ pub(crate) fn convert_to_expected_type(
 
             _ => Err((
                 ErrorKind::TypeError,
-                "Response couldn't be converted to GeoSeatch return type, Expected an array as the outer elemen.",
+                "Response couldn't be converted to GeoSearch return type, Expected an array as the outer element",
             )
                 .into()),
         },

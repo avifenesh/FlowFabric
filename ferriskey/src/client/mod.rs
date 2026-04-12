@@ -175,13 +175,8 @@ pub async fn get_valkey_connection_info(
     match &connection_request.authentication_info {
         Some(info) => {
             // If we have IAM configuration and a token manager, use the IAM token as password
-            if info.iam_config.is_some() && iam_token_manager.is_some() {
-                let token = if let Some(manager) = iam_token_manager {
-                    manager.get_token().await
-                } else {
-                    // Fallback to regular password if no token manager
-                    info.password.clone().unwrap_or_default()
-                };
+            if let (Some(_), Some(manager)) = (&info.iam_config, iam_token_manager) {
+                let token = manager.get_token().await;
 
                 crate::valkey::ValkeyConnectionInfo {
                     db,
@@ -407,7 +402,7 @@ impl Client {
     /// Checks if the given command is a SELECT command.
     /// Returns true if the command is "SELECT", false otherwise.
     /// Handles cases where command() returns None gracefully.
-    /// Note: The underlying redis-rs library normalizes commands to uppercase.
+    /// Note: The underlying ferriskey library normalizes commands to uppercase.
     fn is_select_command(&self, cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"SELECT")
     }
@@ -473,7 +468,7 @@ impl Client {
                 Ok(())
             }
             ClientWrapper::Lazy(_) => {
-                unreachable!("Lazy client should have been initialized")
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
             }
         }
     }
@@ -526,7 +521,7 @@ impl Client {
                 Ok(())
             }
             ClientWrapper::Lazy(_) => {
-                unreachable!("Lazy client should have been initialized")
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
             }
         }
     }
@@ -595,7 +590,7 @@ impl Client {
                 Ok(())
             }
             ClientWrapper::Lazy(_) => {
-                unreachable!("Lazy client should have been initialized")
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
             }
         }
     }
@@ -613,7 +608,7 @@ impl Client {
                 Ok(())
             }
             ClientWrapper::Lazy(_) => {
-                unreachable!("Lazy client should have been initialized")
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
             }
         }
     }
@@ -729,7 +724,7 @@ impl Client {
                 Ok(())
             }
             ClientWrapper::Lazy(_) => {
-                unreachable!("Lazy client should have been initialized")
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
             }
         }
     }
@@ -852,7 +847,9 @@ impl Client {
                 };
                 client.route_command(&cmd, final_routing).await
             }
-            ClientWrapper::Lazy(_) => unreachable!("Lazy client should have been initialized"),
+            ClientWrapper::Lazy(_) => {
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
+            }
         }?;
 
         // Post-process: decompress and convert to expected type.
@@ -1010,9 +1007,9 @@ impl Client {
         })
     }
 
-    // Cluster scan is not passed to redis-rs as a regular command, so we need to handle it separately.
-    // We send the command to a specific function in the redis-rs cluster client, which internally handles the
-    // the complication of a command scan, and generate the command base on the logic in the redis-rs library.
+    // Cluster scan is not passed to ferriskey as a regular command, so we need to handle it separately.
+    // We send the command to a specific function in the ferriskey cluster client, which internally handles the
+    // the complication of a command scan, and generate the command base on the logic in the ferriskey library.
     //
     // The function returns a tuple with the cursor and the keys found in the scan.
     // The cursor is not a regular cursor, but an ARC to a struct that contains the cursor and the data needed
@@ -1051,7 +1048,7 @@ impl Client {
                 Ok(Value::Array(vec![cluster_cursor_id, Value::Array(keys)]))
             }
             // Lazy case is now handled by the initial check
-            ClientWrapper::Lazy(_) => unreachable!("Lazy client should have been initialized"),
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized"))),
         }
     }
 
@@ -1062,7 +1059,13 @@ impl Client {
         offset: usize,
         raise_on_error: bool,
     ) -> ValkeyResult<Value> {
-        assert_eq!(values.len(), 1);
+        if values.len() != 1 {
+            return Err((
+                ErrorKind::ResponseError,
+                "Expected single transaction result",
+            )
+                .into());
+        }
         let value = values.pop();
         let values = match value {
             Some(Value::Array(values)) => values,
@@ -1185,7 +1188,7 @@ impl Client {
                             )
                         }
                         ClientWrapper::Lazy(_) => {
-                            unreachable!("Lazy client should have been initialized")
+                            Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
                         }
                     }
                 },
@@ -1259,7 +1262,7 @@ impl Client {
                             }
                         },
                         ClientWrapper::Lazy(_) => {
-                            unreachable!("Lazy client should have been initialized")
+                            Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
                         }
                     }?;
 
@@ -1278,8 +1281,8 @@ impl Client {
     pub async fn invoke_script<'a>(
         &'a mut self,
         hash: &'a str,
-        keys: &Vec<&[u8]>,
-        args: &Vec<&[u8]>,
+        keys: &[&[u8]],
+        args: &[&[u8]],
         routing: Option<RoutingInfo>,
     ) -> crate::valkey::ValkeyResult<Value> {
         let _ = self.get_or_initialize_client().await?;
@@ -1340,7 +1343,9 @@ impl Client {
                 ClientWrapper::Cluster { ref mut client } => {
                     client.update_connection_password(password.clone()).await
                 }
-                ClientWrapper::Lazy(_) => unreachable!("Lazy client should have been initialized"),
+                ClientWrapper::Lazy(_) => {
+                    Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
+                }
             }
         })
         .await
@@ -1413,7 +1418,9 @@ impl Client {
                 ))),
             },
             ClientWrapper::Standalone(client) => Ok(client.get_username()),
-            ClientWrapper::Lazy(_) => unreachable!("Lazy client should have been initialized"),
+            ClientWrapper::Lazy(_) => {
+                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
+            }
         }
     }
 
@@ -1471,7 +1478,13 @@ impl Client {
         })?;
 
         // Refresh the token using the IAM token manager
-        iam_manager.refresh_token().await;
+        iam_manager.refresh_token().await.map_err(|e| {
+            ValkeyError::from((
+                ErrorKind::ClientError,
+                "IAM token refresh failed",
+                e.to_string(),
+            ))
+        })?;
         Ok(())
     }
 }
@@ -1531,7 +1544,7 @@ fn load_cmd(code: &[u8]) -> Cmd {
     cmd
 }
 
-fn eval_cmd(hash: &str, keys: &Vec<&[u8]>, args: &Vec<&[u8]>) -> Cmd {
+fn eval_cmd(hash: &str, keys: &[&[u8]], args: &[&[u8]]) -> Cmd {
     let mut cmd = crate::valkey::cmd("EVALSHA");
     cmd.arg(hash).arg(keys.len());
     for key in keys {
@@ -1872,7 +1885,7 @@ fn sanitized_request_string(request: &ConnectionRequest) -> String {
         .unwrap_or_default();
 
     let inflight_requests_limit = format_optional_value(
-        "\nInflight requests limit: {}",
+        "Inflight requests limit",
         request.inflight_requests_limit,
     );
 
@@ -1923,7 +1936,7 @@ impl Client {
             .inflight_requests_limit
             .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
         let inflight_requests_allowed = Arc::new(AtomicIsize::new(
-            inflight_requests_limit.try_into().unwrap(),
+            inflight_requests_limit.try_into().expect("inflight limit exceeds isize::MAX"),
         ));
 
         // Create compression manager from configuration
@@ -1973,7 +1986,7 @@ impl Client {
             };
 
             // Create the Client first without IAM token manager
-            let inflight_limit: isize = inflight_requests_limit.try_into().unwrap();
+            let inflight_limit: isize = inflight_requests_limit.try_into().expect("inflight limit exceeds isize::MAX");
             let inflight_log_interval = (inflight_limit / 10).max(1);
             let client = Self {
                 internal_client: internal_client_arc.clone(),

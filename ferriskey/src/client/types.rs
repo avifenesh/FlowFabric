@@ -47,7 +47,7 @@ impl ConnectionRequest {
     }
 }
 
-/// Authentication information for connecting to Redis/Valkey servers
+/// Authentication information for connecting to Valkey servers
 ///
 /// Supports traditional username/password authentication and AWS IAM authentication.
 /// IAM authentication takes priority when both are configured.

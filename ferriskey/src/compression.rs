@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::request_type::RequestType;
+use logger_core::log_warn;
 use telemetrylib::Telemetry;
 
 /// Detailed compression error with context for debugging
@@ -283,6 +284,7 @@ pub enum CommandCompressionBehavior {
 }
 
 impl CommandCompressionBehavior {
+    #[allow(dead_code)]
     pub fn description(&self) -> &'static str {
         match self {
             CommandCompressionBehavior::CompressValues => {
@@ -367,7 +369,8 @@ impl CompressionManager {
                     Cow::Borrowed(value)
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                log_warn("compression", format!("Compression failed: {err:?}"));
                 Telemetry::incr_compression_skipped_count(1);
                 Cow::Borrowed(value)
             }
@@ -421,10 +424,22 @@ impl CompressionManager {
         self.config.enabled
     }
 
-    /// Attempts to decompress the value with graceful fallback to original data
+    /// Attempts to decompress the value with graceful fallback to original data.
+    ///
+    /// On decompression failure, logs a warning and returns the original raw bytes.
+    /// This is an intentional fallback: returning raw bytes prevents silent data
+    /// corruption (the caller receives bytes it can inspect) while avoiding a hard
+    /// error for a non-critical path.  Corruption would only occur if the bytes
+    /// happened to look like valid data of the expected type, which is detectable
+    /// by the caller.
     pub fn try_decompress_value(&self, value: &[u8]) -> Vec<u8> {
-        self.decompress_value(value)
-            .unwrap_or_else(|_| value.to_vec())
+        self.decompress_value(value).unwrap_or_else(|err| {
+            log_warn(
+                "compression",
+                format!("Decompression failed, returning raw bytes as fallback: {err:?}"),
+            );
+            value.to_vec()
+        })
     }
 }
 
@@ -567,8 +582,10 @@ pub mod lz4_backend {
             self.validate_compression_level(Some(compression_level))?;
 
             let original_size =
-                i32::try_from(data.len()).map_err(|_| CompressionError::InvalidConfiguration {
+                i32::try_from(data.len()).map_err(|_| CompressionError::CompressionFailed {
                     backend: self.backend_name().to_string(),
+                    level: None,
+                    data_size: data.len(),
                     reason: format!(
                         "Data too large for LZ4: {} bytes (max: {} bytes)",
                         data.len(),
@@ -879,7 +896,7 @@ pub fn create_header(backend_id: u8) -> [u8; HEADER_SIZE] {
 
 /// Creates a compression header with a specific version
 /// This is useful for testing or supporting multiple versions
-pub fn create_header_with_version(backend_id: u8, version: u8) -> [u8; HEADER_SIZE] {
+pub(crate) fn create_header_with_version(backend_id: u8, version: u8) -> [u8; HEADER_SIZE] {
     let mut header = [0u8; HEADER_SIZE];
     header[0..3].copy_from_slice(&MAGIC_PREFIX);
     header[HEADER_VERSION_INDEX] = version;

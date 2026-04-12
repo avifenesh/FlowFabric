@@ -1,12 +1,16 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-#[cfg(feature = "mimalloc-alloc")]
+// Use mimalloc as the global allocator on supported platforms.
+// mimalloc works on Linux, macOS, Windows, and FreeBSD.
+// Falls back to system allocator on unsupported targets.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "freebsd"
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(all(feature = "jemalloc", not(feature = "mimalloc-alloc")))]
-#[global_allocator]
-static GLOBAL_JE: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[macro_use]
 pub mod valkey;

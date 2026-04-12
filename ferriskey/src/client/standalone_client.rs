@@ -276,13 +276,17 @@ impl StandaloneClient {
 
                     if is_primary {
                         if let Some(existing_primary) = primary_index {
-                            // More than one primary found
+                            // More than one primary found — clean up before returning
+                            let msg = format!(
+                                "Primary nodes: {:?}, {:?}",
+                                nodes.last(),
+                                nodes.get(existing_primary)
+                            );
+                            for node in nodes.iter() {
+                                node.mark_as_dropped();
+                            }
                             return Err(StandaloneClientConnectionError::PrimaryConflictFound(
-                                format!(
-                                    "Primary nodes: {:?}, {:?}",
-                                    nodes.pop(),
-                                    nodes.get(existing_primary)
-                                ),
+                                msg,
                             ));
                         }
                         primary_index = Some(nodes.len().saturating_sub(1));
@@ -299,6 +303,9 @@ impl StandaloneClient {
         let primary_index = if read_only {
             // In read-only mode, we need at least one successful connection
             if nodes.is_empty() && !addresses_and_errors.is_empty() {
+                for node in nodes.iter() {
+                    node.mark_as_dropped();
+                }
                 return Err(StandaloneClientConnectionError::FailedConnection(
                     addresses_and_errors,
                 ));
@@ -322,6 +329,9 @@ impl StandaloneClient {
                             ),
                         )
                     };
+                    for node in nodes.iter() {
+                        node.mark_as_dropped();
+                    }
                     return Err(StandaloneClientConnectionError::FailedConnection(errors));
                 }
             }

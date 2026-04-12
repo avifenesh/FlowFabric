@@ -37,7 +37,7 @@ const TOKEN_GEN_MAX_BACKOFF_MS: u64 = 3_000;
 pub enum IAMError {
     /// Invalid refresh interval (must be 1 second to 12 hours)
     #[error(
-        "IAM authentication error: Invalid refresh interval. Must be between 1 and {max}, got: {actual}"
+        "IAM authentication error: Invalid refresh interval. Must be between 1 and {max} (inclusive), got: {actual}"
     )]
     InvalidRefreshInterval { max: u32, actual: u32 },
 
@@ -49,9 +49,7 @@ pub enum IAMError {
     #[error("IAM authentication error: Token generation failed: {0}")]
     TokenGenerationError(String),
 
-    /// No callback error
-    #[error("IAM authentication error: No token refresh callback set")]
-    NoCallbackError,
+
 }
 
 /// AWS service type for IAM authentication
@@ -79,7 +77,7 @@ fn validate_refresh_interval(
             })
         }
         Some(interval) => {
-            if interval >= MAX_REFRESH_INTERVAL_SECONDS {
+            if interval > MAX_REFRESH_INTERVAL_SECONDS {
                 return Err(IAMError::InvalidRefreshInterval {
                     max: MAX_REFRESH_INTERVAL_SECONDS,
                     actual: interval,
@@ -271,7 +269,7 @@ impl IAMTokenManager {
         loop {
             tokio::select! {
                 _ = interval_timer.tick() => {
-                    Self::handle_token_refresh(&iam_token_state, &cached_token, &token_created_at, &token_changed).await;
+                    let _ = Self::handle_token_refresh(&iam_token_state, &cached_token, &token_created_at, &token_changed).await;
                 }
                 _ = shutdown_notify.notified() => {
                     log_info("IAM token refresh task shutting down", "");
@@ -283,13 +281,13 @@ impl IAMTokenManager {
 
     /// Refresh cached token with backoff + jitter.
     /// On success: update token + set atomic flag.
-    /// On failure: log error, keep old token.
+    /// On failure: log error, keep old token, return error.
     async fn handle_token_refresh(
         iam_token_state: &IamTokenState,
         cached_token: &Arc<RwLock<String>>,
         token_created_at: &Arc<RwLock<tokio::time::Instant>>,
         token_changed: &Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), IAMError> {
         match Self::generate_token_with_backoff(iam_token_state).await {
             Ok(new_token) => {
                 Self::set_cached_token_static(cached_token, new_token.clone()).await;
@@ -298,6 +296,7 @@ impl IAMTokenManager {
                     *ts = tokio::time::Instant::now();
                 }
                 token_changed.store(true, Ordering::Release);
+                Ok(())
             }
             Err(err) => {
                 // Leave cached token unchanged; logs already emitted in backoff routine
@@ -305,6 +304,7 @@ impl IAMTokenManager {
                     "IAM token refresh failed",
                     format!("Could not refresh token after backoff: {}", err),
                 );
+                Err(err)
             }
         }
     }
@@ -344,15 +344,12 @@ impl IAMTokenManager {
 
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 
-                    // Exponential increase with cap
-                    // Add random jitter of ±20% to backoff_ms
+                    // Add random jitter of ±20% to backoff_ms, then double with cap
                     let jitter = (backoff_ms as f64 * 0.2) as u64;
                     let min = backoff_ms.saturating_sub(jitter);
                     let max = backoff_ms.saturating_add(jitter);
                     let mut rng = rand::rng();
                     backoff_ms = rng.random_range(min..=max);
-
-                    // Exponential increase with cap
                     backoff_ms = (backoff_ms.saturating_mul(2)).min(TOKEN_GEN_MAX_BACKOFF_MS);
                 }
             }
@@ -361,15 +358,15 @@ impl IAMTokenManager {
 
     /// Force refresh the token immediately
     ///
-    /// - Never returns errors; all failures are logged only
-    pub async fn refresh_token(&self) {
+    /// Returns an error if token generation fails after retries.
+    pub async fn refresh_token(&self) -> Result<(), IAMError> {
         Self::handle_token_refresh(
             &self.iam_token_state,
             &self.cached_token,
             &self.token_created_at,
             &self.token_changed,
         )
-        .await;
+        .await
     }
 
     /// Stop the background refresh task gracefully
@@ -665,7 +662,7 @@ mod tests {
         assert!(!manager.token_changed(), "Flag should be false after clear");
 
         // Manually refresh the token
-        manager.refresh_token().await;
+        manager.refresh_token().await.expect("refresh_token should succeed in test");
 
         // Verify that the flag was set
         assert!(
@@ -777,7 +774,7 @@ mod tests {
         // Wait at least 1 second to ensure timestamp difference in AWS SigV4 signing
         sleep(Duration::from_secs(1)).await;
 
-        manager.refresh_token().await;
+        manager.refresh_token().await.expect("refresh_token should succeed in test");
 
         let new_token = manager.get_token().await;
 
@@ -853,7 +850,7 @@ mod tests {
         let region = "us-east-1".to_string();
 
         // Test valid refresh intervals in seconds
-        let valid_intervals = [60, 900, 21600, 43199]; // 1 minute, 15 minutes, 6 hours, 12 hours - 1 sec
+        let valid_intervals = [60, 900, 21600, 43200]; // 1 minute, 15 minutes, 6 hours, 12 hours (max)
         for interval in valid_intervals {
             let result = IAMTokenManager::new(
                 cluster_name.clone(),
@@ -870,8 +867,8 @@ mod tests {
             );
         }
 
-        // Test invalid refresh intervals (greater than 43200 seconds / 12 hours)
-        let invalid_intervals = [0, 43200, 86400, 172800]; // 0, 12 hours, 24 hours, 48 hours
+        // Test invalid refresh intervals (0, or strictly greater than 43200 seconds / 12 hours)
+        let invalid_intervals = [0, 43201, 86400, 172800]; // 0, just over 12 hours, 24 hours, 48 hours
         for interval in invalid_intervals {
             let result = IAMTokenManager::new(
                 cluster_name.clone(),
