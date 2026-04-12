@@ -14,7 +14,7 @@ use telemetrylib::FerrisKeySpan;
 
 /// An argument to a valkey command
 #[derive(Clone)]
-pub enum Arg<D> {
+pub(crate) enum Arg<D> {
     /// A normal argument
     Simple(D),
     /// A cursor argument created from `cursor_arg()`
@@ -460,7 +460,7 @@ impl Cmd {
     }
 
     /// Returns an iterator over the arguments in this command (including the command name itself)
-    pub fn args_iter(&self) -> impl Clone + ExactSizeIterator<Item = Arg<&[u8]>> {
+    pub(crate) fn args_iter(&self) -> impl Clone + ExactSizeIterator<Item = Arg<&[u8]>> {
         let mut prev = 0;
         self.args.iter().map(move |arg| match *arg {
             Arg::Simple(i) => {

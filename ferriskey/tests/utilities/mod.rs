@@ -5,7 +5,7 @@ use crate::constants::{HOSTNAME_TLS, IP_ADDRESS_V4, IP_ADDRESS_V6};
 use ferriskey::cluster::routing::{MultipleNodeRoutingInfo, RoutingInfo};
 use ferriskey::connection::factory::FerrisKeyConnectionOptions;
 use ferriskey::{
-    ConnectionAddr, ConnectionInfo, ProtocolVersion, PushInfo, ValkeyConnectionInfo, ValkeyResult,
+    ConnectionAddr, ProtocolVersion, PushInfo, ValkeyConnectionInfo, ValkeyResult,
     Value,
 };
 use ferriskey::{

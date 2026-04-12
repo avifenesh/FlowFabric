@@ -32,7 +32,7 @@ pub mod value;
 
 // Flat re-exports — canonical paths for crate consumers.
 // These replace the old ferriskey::valkey::X paths.
-pub use cmd::{Arg, Cmd, cmd, pipe};
+pub use cmd::{Cmd, cmd, pipe};
 pub use connection::info::{
     ConnectionAddr, ConnectionInfo, IntoConnectionInfo, PubSubChannelOrPattern,
     PubSubSubscriptionInfo, PubSubSubscriptionKind, TlsMode, ValkeyConnectionInfo,
@@ -41,7 +41,7 @@ pub use pubsub::push_manager::PushInfo;
 pub use retry_strategies::RetryStrategy;
 pub use value::{
     ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, PushKind, ToValkeyArgs, ValkeyError,
-    ValkeyFuture, ValkeyResult, ValkeyWrite, Value, from_owned_valkey_value, from_valkey_value,
+    ValkeyResult, Value, from_owned_valkey_value, from_valkey_value,
 };
 
 pub mod client;

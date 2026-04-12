@@ -625,3 +625,21 @@ fn duration_to_millis(ttl: Duration) -> Result<u64> {
 fn duration_to_request_millis(timeout: Duration) -> u32 {
     u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verify the pipeline API compiles with correct types.
+    // Not meant to run — just type-checks the slot pattern.
+    fn _pipeline_type_check() {
+        let _: fn(&mut TypedPipeline, &str) -> PipeSlot<Option<String>> =
+            |p, k| p.get::<String>(k);
+        let _: fn(&mut TypedPipeline, &str, &str) -> PipeSlot<()> = |p, k, v| p.set(k, v);
+        let _: fn(&mut TypedPipeline, &str) -> PipeSlot<i64> = |p, k| p.del(k);
+        let _: fn(&mut TypedPipeline, &str) -> PipeSlot<i64> = |p, k| p.incr(k);
+        let _: fn(&mut TypedPipeline, &str) -> PipeSlot<bool> = |p, k| p.exists(k);
+        let _: fn(&mut TypedPipeline, &str, &str) -> PipeSlot<Option<String>> =
+            |p, k, f| p.hget::<String>(k, f);
+    }
+}

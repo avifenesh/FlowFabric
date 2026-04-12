@@ -1185,7 +1185,7 @@ pub fn make_extension_error(code: String, detail: Option<String>) -> ValkeyError
 pub type ValkeyResult<T> = Result<T, ValkeyError>;
 
 /// Library generic future type.
-pub type ValkeyFuture<'a, T> = futures_util::future::BoxFuture<'a, ValkeyResult<T>>;
+pub(crate) type ValkeyFuture<'a, T> = futures_util::future::BoxFuture<'a, ValkeyResult<T>>;
 
 /// An info dictionary type.
 #[derive(Debug, Clone)]
@@ -1269,6 +1269,7 @@ impl Deref for InfoDict {
 }
 
 /// Abstraction trait for valkey command abstractions.
+// Must stay pub: ToValkeyArgs (public) uses it in method signatures.
 pub trait ValkeyWrite {
     /// Accepts a serialized valkey command.
     fn write_arg(&mut self, arg: &[u8]);
