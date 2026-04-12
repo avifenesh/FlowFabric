@@ -63,15 +63,12 @@ pub struct StandaloneClient {
 
 impl Drop for StandaloneClient {
     fn drop(&mut self) {
-        // Client was dropped, reduce the number of clients
+        // Client was dropped, reduce the number of clients.
+        // NOTE: mark_as_dropped() is intentionally NOT called here.
+        // StandaloneClient is Clone (shares Arc<DropWrapper>), so this Drop fires
+        // on every clone drop, not just the final one. The DropWrapper::drop()
+        // handles mark_as_dropped() correctly when the LAST Arc reference is dropped.
         Telemetry::decr_total_clients(1);
-        // Mark all nodes as dropped so heartbeat and connection-checker tasks stop.
-        // Without this, background tasks holding ReconnectingConnection clones would
-        // continue running after the client is dropped, potentially triggering reconnects
-        // on a discarded client's connection and disrupting other live clients.
-        for node in self.inner.nodes.iter() {
-            node.mark_as_dropped();
-        }
     }
 }
 
