@@ -1,7 +1,7 @@
-use crate::valkey::connection::PubSubSubscriptionKind;
-use crate::valkey::{PubSubSynchronizer, PushKind, Value};
 #[cfg(test)]
 use crate::valkey::ValkeyResult;
+use crate::valkey::connection::PubSubSubscriptionKind;
+use crate::valkey::{PubSubSynchronizer, PushKind, Value};
 use arc_swap::ArcSwap;
 use std::collections::HashSet;
 use std::sync::Arc;

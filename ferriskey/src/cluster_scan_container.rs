@@ -1,9 +1,9 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+use crate::valkey::{ScanStateRC, ValkeyResult};
 use logger_core::log_debug;
 use nanoid::nanoid;
 use once_cell::sync::Lazy;
-use crate::valkey::{ValkeyResult, ScanStateRC};
 use std::{collections::HashMap, sync::Mutex};
 
 // This is a container for storing the cursor of a cluster scan.

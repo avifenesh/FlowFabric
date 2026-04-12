@@ -2,12 +2,12 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
     net::IpAddr,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 use dashmap::DashMap;
 
-use crate::valkey::cluster_routing::{Route, ShardAddrs, Slot, SlotAddr};
+use crate::cluster::routing::{Route, ShardAddrs, Slot, SlotAddr};
 use crate::valkey::ErrorKind;
 use crate::valkey::ValkeyError;
 use crate::valkey::ValkeyResult;
@@ -330,11 +330,11 @@ impl SlotMap {
     fn try_merge_to_next_range(&mut self, slot: u16, new_addrs: Arc<ShardAddrs>) -> bool {
         if let Some((_next_end, next_slot_value)) = self.slots.range_mut((slot + 1)..).next()
             && next_slot_value.start == slot + 1
-                && Self::shard_addrs_equal(&next_slot_value.addrs, &new_addrs)
-            {
-                next_slot_value.start = slot;
-                return true;
-            }
+            && Self::shard_addrs_equal(&next_slot_value.addrs, &new_addrs)
+        {
+            next_slot_value.start = slot;
+            return true;
+        }
         false
     }
 
@@ -354,12 +354,13 @@ impl SlotMap {
         new_addrs: Arc<ShardAddrs>,
     ) -> ValkeyResult<bool> {
         if let Some((prev_end, prev_slot_value)) = self.slots.range_mut(..slot).next_back()
-            && *prev_end == slot - 1 && Self::shard_addrs_equal(&prev_slot_value.addrs, &new_addrs)
-            {
-                let prev_end = *prev_end;
-                self.update_end_range(prev_end, slot)?;
-                return Ok(true);
-            }
+            && *prev_end == slot - 1
+            && Self::shard_addrs_equal(&prev_slot_value.addrs, &new_addrs)
+        {
+            let prev_end = *prev_end;
+            self.update_end_range(prev_end, slot)?;
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -566,9 +567,11 @@ mod tests_cluster_slotmap {
             ReadFromReplicaStrategy::AlwaysFromPrimary,
         );
 
-        assert!(slot_map
-            .slot_addr_for_route(&Route::new(0, SlotAddr::Master))
-            .is_none());
+        assert!(
+            slot_map
+                .slot_addr_for_route(&Route::new(0, SlotAddr::Master))
+                .is_none()
+        );
         assert_eq!(
             "node1:6379",
             *slot_map
@@ -587,9 +590,11 @@ mod tests_cluster_slotmap {
                 .slot_addr_for_route(&Route::new(1000, SlotAddr::Master))
                 .unwrap()
         );
-        assert!(slot_map
-            .slot_addr_for_route(&Route::new(1001, SlotAddr::Master))
-            .is_none());
+        assert!(
+            slot_map
+                .slot_addr_for_route(&Route::new(1001, SlotAddr::Master))
+                .is_none()
+        );
 
         assert_eq!(
             "node2:6379",
@@ -609,9 +614,11 @@ mod tests_cluster_slotmap {
                 .slot_addr_for_route(&Route::new(2000, SlotAddr::Master))
                 .unwrap()
         );
-        assert!(slot_map
-            .slot_addr_for_route(&Route::new(2001, SlotAddr::Master))
-            .is_none());
+        assert!(
+            slot_map
+                .slot_addr_for_route(&Route::new(2001, SlotAddr::Master))
+                .is_none()
+        );
     }
 
     fn get_slot_map(read_from_replica: ReadFromReplicaStrategy) -> SlotMap {
@@ -1383,9 +1390,11 @@ mod tests_cluster_slotmap {
         }
 
         // node_address_for_ip should return None for any IP
-        assert!(slot_map
-            .node_address_for_ip("10.0.0.1".parse().unwrap())
-            .is_none());
+        assert!(
+            slot_map
+                .node_address_for_ip("10.0.0.1".parse().unwrap())
+                .is_none()
+        );
     }
 
     #[test]

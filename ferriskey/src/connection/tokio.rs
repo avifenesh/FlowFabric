@@ -1,4 +1,6 @@
-use super::{AsyncStream, ValkeyResult, RedisRuntime, SocketAddr};
+use crate::connection::{AsyncStream, RedisRuntime};
+use crate::valkey::ValkeyResult;
+use std::net::SocketAddr;
 use async_trait::async_trait;
 #[allow(unused_imports)] // fixes "Duration" unused when built with non-default feature set
 use std::{
@@ -15,14 +17,14 @@ use tokio::{
     net::TcpStream as TcpStreamTokio,
 };
 
-use crate::valkey::connection::create_rustls_config;
+use crate::connection::info::create_rustls_config;
 use std::sync::Arc;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
-use crate::valkey::tls::TlsConnParams;
+use crate::connection::tls::TlsConnParams;
 
 #[cfg(unix)]
-use super::Path;
+use std::path::Path;
 
 #[inline(always)]
 async fn connect_tcp(addr: &SocketAddr, tcp_nodelay: bool) -> io::Result<TcpStreamTokio> {

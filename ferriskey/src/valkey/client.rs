@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::valkey::pubsub_synchronizer::PubSubSynchronizer;
-use crate::valkey::tls::{inner_build_with_tls, TlsCertificates};
+use crate::valkey::tls::{TlsCertificates, inner_build_with_tls};
 
 /// The client type.
 #[derive(Debug, Clone)]
@@ -158,8 +158,7 @@ impl Client {
         // This leaks ~200 bytes per connection. The proper fix requires changing
         // MultiplexedConnection::new_with_response_timeout to take owned ConnectionInfo
         // (tracked in DESIGN_DEBT.md item #5 — connection lifecycle simplification).
-        let conn_info: &'static ConnectionInfo =
-            Box::leak(Box::new(self.connection_info.clone()));
+        let conn_info: &'static ConnectionInfo = Box::leak(Box::new(self.connection_info.clone()));
         let (con, ip) = crate::valkey::aio::connect_simple::<T>(
             &conn_info,
             socket_addr,
@@ -177,7 +176,6 @@ impl Client {
         T::spawn(driver);
         Ok((connection, ip))
     }
-
 
     /// Constructs a new `Client` with parameters necessary to create a TLS connection.
     ///

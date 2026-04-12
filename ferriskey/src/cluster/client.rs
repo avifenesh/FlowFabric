@@ -1,10 +1,10 @@
-use crate::valkey::cluster_slotmap::ReadFromReplicaStrategy;
-use crate::valkey::cluster_topology::{
+use crate::cluster::slotmap::ReadFromReplicaStrategy;
+use crate::cluster::topology::{
     DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI, DEFAULT_SLOTS_REFRESH_WAIT_DURATION,
 };
+use crate::valkey::connection::TlsMode;
 use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
 use crate::valkey::types::{ErrorKind, ProtocolVersion, ValkeyError, ValkeyResult};
-use crate::valkey::connection::TlsMode;
 use crate::valkey::{PushInfo, RetryStrategy};
 use rand::Rng;
 use std::ops::Add;
@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use crate::valkey::tls::TlsConnParams;
 
-use crate::valkey::cluster_async;
+use crate::cluster;
 
-use crate::valkey::tls::{retrieve_tls_certificates, TlsCertificates};
+use crate::valkey::tls::{TlsCertificates, retrieve_tls_certificates};
 
 use tokio::sync::mpsc;
 
@@ -242,7 +242,7 @@ impl ClusterClientBuilder {
                 return Err(ValkeyError::from((
                     ErrorKind::InvalidClientConfig,
                     "Initial nodes can't be empty.",
-                )))
+                )));
             }
         };
 
@@ -281,8 +281,10 @@ impl ClusterClientBuilder {
         let mut nodes = Vec::with_capacity(initial_nodes.len());
         for mut node in initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
-                return Err(ValkeyError::from((ErrorKind::InvalidClientConfig,
-                                             "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")));
+                return Err(ValkeyError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.",
+                )));
             }
 
             if password.is_some() && node.valkey.password != *password {
@@ -544,7 +546,6 @@ impl ClusterClientBuilder {
         self.builder_params.database_id = database_id;
         self
     }
-
 }
 
 /// This is a valkey Cluster client.
@@ -584,14 +585,16 @@ impl ClusterClient {
     ///
     /// An error is returned if there is a failure while creating connections or slots.
     /// Creates new connections to Redis Cluster nodes and returns a
-    /// [`cluster_async::ClusterConnection`].
+    /// [`cluster::ClusterConnection`].
     pub async fn get_async_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        pubsub_synchronizer: Option<Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>>,
+        pubsub_synchronizer: Option<
+            Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>,
+        >,
         iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
-    ) -> ValkeyResult<cluster_async::ClusterConnection> {
-        cluster_async::ClusterConnection::new(
+    ) -> ValkeyResult<cluster::ClusterConnection> {
+        cluster::ClusterConnection::new(
             &self.initial_nodes,
             self.cluster_params.clone(),
             push_sender,
@@ -604,17 +607,17 @@ impl ClusterClient {
     #[doc(hidden)]
     pub async fn get_async_generic_connection<C>(
         &self,
-    ) -> ValkeyResult<cluster_async::ClusterConnection<C>>
+    ) -> ValkeyResult<cluster::ClusterConnection<C>>
     where
         C: crate::valkey::aio::ConnectionLike
-            + cluster_async::Connect
+            + cluster::Connect
             + Clone
             + Send
             + Sync
             + Unpin
             + 'static,
     {
-        cluster_async::ClusterConnection::new(
+        cluster::ClusterConnection::new(
             &self.initial_nodes,
             self.cluster_params.clone(),
             None,
@@ -623,12 +626,11 @@ impl ClusterClient {
         )
         .await
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::valkey::cluster_topology::{
+    use crate::cluster::topology::{
         DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI, DEFAULT_SLOTS_REFRESH_WAIT_DURATION,
     };
 

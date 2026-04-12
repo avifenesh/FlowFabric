@@ -1,16 +1,16 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::client::ClientWrapper;
-use async_trait::async_trait;
-use logger_core::{log_debug, log_warn};
-use once_cell::sync::Lazy;
-use once_cell::sync::OnceCell;
 use crate::valkey::cluster_routing::Routable;
 use crate::valkey::{Cmd, ErrorKind, PushInfo, PushKind, ValkeyError, ValkeyResult, Value};
 use crate::valkey::{
     PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind, PubSubSynchronizer,
     SlotMap,
 };
+use async_trait::async_trait;
+use logger_core::{log_debug, log_warn};
+use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -839,7 +839,9 @@ impl MockPubSubBroker {
             .args_iter()
             .skip(1)
             .filter_map(|arg| match arg {
-                crate::valkey::Arg::Simple(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+                crate::valkey::Arg::Simple(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).to_string())
+                }
                 crate::valkey::Arg::Cursor => None,
             })
             .collect();

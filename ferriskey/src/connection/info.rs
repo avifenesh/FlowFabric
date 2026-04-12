@@ -9,7 +9,7 @@ use crate::valkey::pipeline::Pipeline;
 use crate::valkey::types::{ErrorKind, ValkeyError, ValkeyResult};
 use crate::valkey::ProtocolVersion;
 
-use crate::valkey::tls::TlsConnParams;
+use crate::connection::tls::TlsConnParams;
 
 static CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -345,7 +345,7 @@ pub(crate) fn create_rustls_config(
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 
-    use crate::valkey::tls::ClientTlsParams;
+    use crate::connection::tls::ClientTlsParams;
     use rustls_platform_verifier::BuilderVerifierExt;
 
     let config = match tls_params {

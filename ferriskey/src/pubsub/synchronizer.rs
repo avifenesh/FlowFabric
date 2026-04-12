@@ -1,14 +1,14 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::client::{ClientWrapper, PubSubCommandApplier};
+use crate::valkey::{
+    Cmd, ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
+    PubSubSynchronizer, SlotMap, ValkeyError, ValkeyResult, Value, cluster_routing::Routable,
+    cluster_routing::SingleNodeRoutingInfo,
+};
 use async_trait::async_trait;
 use logger_core::{log_debug, log_error, log_warn};
 use once_cell::sync::OnceCell;
-use crate::valkey::{
-    Cmd, ErrorKind, PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
-    PubSubSynchronizer, ValkeyError, ValkeyResult, SlotMap, Value, cluster_routing::Routable,
-    cluster_routing::SingleNodeRoutingInfo,
-};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -142,7 +142,11 @@ impl ValkeyPubSubSynchronizer {
 
     /// Compute synchronization diff - what needs to be subscribed/unsubscribed
     fn compute_sync_diff(&self) -> SyncDiff {
-        let desired = self.desired_subscriptions.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let desired = self
+            .desired_subscriptions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let current_by_addr = self
             .current_subscriptions_by_address
             .read()
@@ -304,7 +308,10 @@ impl ValkeyPubSubSynchronizer {
             }
         });
 
-        *self.reconciliation_task_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        *self
+            .reconciliation_task_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     async fn reconcile(&self) -> ValkeyResult<()> {
@@ -342,7 +349,10 @@ impl ValkeyPubSubSynchronizer {
 
     async fn process_pending_unsubscribes(&self) {
         let pending = {
-            let mut guard = self.pending_unsubscribes.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .pending_unsubscribes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *guard)
         };
 
@@ -594,7 +604,10 @@ impl ValkeyPubSubSynchronizer {
                     PubSubSubscriptionKind::Pattern => "Pattern",
                     PubSubSubscriptionKind::Sharded => "Sharded",
                 };
-                let values_array: Vec<Value> = values.into_iter().map(|v| Value::BulkString(bytes::Bytes::from(v))).collect();
+                let values_array: Vec<Value> = values
+                    .into_iter()
+                    .map(|v| Value::BulkString(bytes::Bytes::from(v)))
+                    .collect();
                 (
                     Value::BulkString(bytes::Bytes::from(key.as_bytes().to_vec())),
                     Value::Array(values_array),
@@ -628,7 +641,12 @@ impl ValkeyPubSubSynchronizer {
 
 impl Drop for ValkeyPubSubSynchronizer {
     fn drop(&mut self) {
-        if let Some(handle) = self.reconciliation_task_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(handle) = self
+            .reconciliation_task_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             handle.abort();
         }
     }
@@ -646,7 +664,10 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
     ) {
         {
-            let mut desired = self.desired_subscriptions.write().unwrap_or_else(|e| e.into_inner());
+            let mut desired = self
+                .desired_subscriptions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             desired
                 .entry(subscription_type)
                 .or_default()
@@ -662,7 +683,10 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
     ) {
         {
-            let mut desired = self.desired_subscriptions.write().unwrap_or_else(|e| e.into_inner());
+            let mut desired = self
+                .desired_subscriptions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             match channels {
                 Some(channels_to_remove) => {
                     if let Some(existing) = desired.get_mut(&subscription_type) {
@@ -777,7 +801,10 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
                 .current_subscriptions_by_address
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut pending = self.pending_unsubscribes.write().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_unsubscribes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
 
             // Helper to queue an unsubscribe
             let mut queue_unsubscribe =
@@ -872,7 +899,11 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
     }
 
     fn get_subscription_state(&self) -> (PubSubSubscriptionInfo, PubSubSubscriptionInfo) {
-        let desired = self.desired_subscriptions.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let desired = self
+            .desired_subscriptions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let actual = self.compute_actual_subscriptions();
         (desired, actual)
     }

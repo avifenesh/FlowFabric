@@ -896,7 +896,7 @@ pub fn create_header(backend_id: u8) -> [u8; HEADER_SIZE] {
 
 /// Creates a compression header with a specific version
 /// This is useful for testing or supporting multiple versions
-pub(crate) fn create_header_with_version(backend_id: u8, version: u8) -> [u8; HEADER_SIZE] {
+pub fn create_header_with_version(backend_id: u8, version: u8) -> [u8; HEADER_SIZE] {
     let mut header = [0u8; HEADER_SIZE];
     header[0..3].copy_from_slice(&MAGIC_PREFIX);
     header[HEADER_VERSION_INDEX] = version;

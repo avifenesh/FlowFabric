@@ -133,5 +133,3 @@ pub struct ConnectionRetryStrategy {
     pub number_of_retries: u32,
     pub jitter_percent: Option<u32>,
 }
-
-

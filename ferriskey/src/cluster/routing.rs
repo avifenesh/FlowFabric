@@ -1,7 +1,7 @@
 use rand::Rng;
 use strum_macros::Display;
 
-use crate::valkey::cluster_topology::get_slot;
+use crate::cluster::topology::get_slot;
 use crate::valkey::cmd::{Arg, Cmd};
 use crate::valkey::types::Value;
 use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult};
@@ -446,7 +446,7 @@ pub(crate) fn combine_and_sort_array_results(
     for (key_indices, value) in result_indices.into_iter().zip(values) {
         match value {
             Value::Array(values) => {
-                assert_eq!(values.len(), key_indices.len());
+                debug_assert_eq!(values.len(), key_indices.len());
                 for (index, value) in key_indices.iter().zip(values) {
                     results[*index] = value;
                 }
@@ -1490,17 +1490,18 @@ impl Route {
 /// Choose a random slot from `0..SLOT_SIZE` (excluding)
 fn random_slot() -> u16 {
     let mut rng = rand::rng();
-    rng.random_range(0..crate::valkey::cluster_topology::SLOT_SIZE)
+    rng.random_range(0..crate::cluster::topology::SLOT_SIZE)
 }
 
 #[cfg(test)]
 mod tests_routing {
     use super::{
-        command_for_multi_slot_indices, AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo,
-        ResponsePolicy, Route, RoutingInfo, ShardAddrs, SingleNodeRoutingInfo, SlotAddr,
+        AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo, ResponsePolicy, Route,
+        RoutingInfo, ShardAddrs, SingleNodeRoutingInfo, SlotAddr, command_for_multi_slot_indices,
     };
-    use crate::valkey::cluster_routing::{is_readonly, is_readonly_cmd, Routable, ShardUpdateResult};
-    use crate::valkey::{cluster_topology::slot, cmd, parser::parse_valkey_value, Value};
+    use crate::cluster::routing::{Routable, ShardUpdateResult, is_readonly, is_readonly_cmd};
+    use crate::cluster::topology::slot;
+    use crate::valkey::{Value, cmd, parser::parse_valkey_value};
     use core::panic;
     use std::sync::{Arc, RwLock};
 
@@ -1790,7 +1791,7 @@ mod tests_routing {
         cmd.arg("foo") // key slot 12182
             .arg("bar") // value
             .arg("foo2") // key slot 1044
-            .arg("bar2")    // value
+            .arg("bar2") // value
             .arg("{foo}foo3") // key slot 12182
             .arg("bar3"); // value
         let routing = RoutingInfo::for_routable(&cmd);
@@ -1833,8 +1834,7 @@ mod tests_routing {
     #[test]
     fn test_multi_shard_key_with_two_arg_triples() {
         let mut cmd = cmd("JSON.MSET");
-        cmd
-            .arg("foo") // key slot 12182
+        cmd.arg("foo") // key slot 12182
             .arg("$.a") // path
             .arg("bar") // value
             .arg("foo2") // key slot 1044
@@ -1941,7 +1941,10 @@ mod tests_routing {
     fn test_combining_results_into_single_array_key_value_paires() {
         // For example `MSET foo bar foo2 bar2 {foo}foo3 bar3`
         let res1 = Value::Array(vec![Value::Okay]);
-        let res2 = Value::Array(vec![Value::BulkString("1".as_bytes().to_vec().into()), Value::Nil]);
+        let res2 = Value::Array(vec![
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::Nil,
+        ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
             &[
@@ -1965,7 +1968,10 @@ mod tests_routing {
     fn test_combining_results_into_single_array_keys_and_path() {
         // For example `JSON.MGET foo bar {foo}foo2 $.a`
         let res1 = Value::Array(vec![Value::Okay]);
-        let res2 = Value::Array(vec![Value::BulkString("1".as_bytes().to_vec().into()), Value::Nil]);
+        let res2 = Value::Array(vec![
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::Nil,
+        ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
             &[
@@ -1989,7 +1995,10 @@ mod tests_routing {
     fn test_combining_results_into_single_array_key_with_two_arg_triples() {
         // For example `JSON.MSET foo $.a bar foo2 $.f.a bar2 {foo}foo3 $.f bar3`
         let res1 = Value::Array(vec![Value::Okay]);
-        let res2 = Value::Array(vec![Value::BulkString("1".as_bytes().to_vec().into()), Value::Nil]);
+        let res2 = Value::Array(vec![
+            Value::BulkString("1".as_bytes().to_vec().into()),
+            Value::Nil,
+        ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
             &[

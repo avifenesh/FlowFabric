@@ -1,13 +1,14 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{NodeAddress, TlsMode};
+use crate::valkey::aio::{DisconnectNotifier, MultiplexedConnection};
+use crate::valkey::{
+    FerrisKeyConnectionOptions, PushInfo, RetryStrategy, ValkeyConnectionInfo, ValkeyError,
+    ValkeyResult,
+};
 use async_trait::async_trait;
 use futures_intrusive::sync::ManualResetEvent;
 use logger_core::{log_debug, log_error, log_trace, log_warn};
-use crate::valkey::aio::{DisconnectNotifier, MultiplexedConnection};
-use crate::valkey::{
-    FerrisKeyConnectionOptions, PushInfo, ValkeyConnectionInfo, ValkeyError, ValkeyResult, RetryStrategy,
-};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -446,8 +447,7 @@ impl ReconnectingConnection {
                 .connection_options
                 .connection_retry_strategy
                 .expect("retry_strategy set by create_connection");
-            let infinite_backoff_dur_iterator = retry_strategy
-                .get_infinite_backoff_dur_iterator();
+            let infinite_backoff_dur_iterator = retry_strategy.get_infinite_backoff_dur_iterator();
             for sleep_duration in infinite_backoff_dur_iterator {
                 if connection_clone.is_dropped() {
                     log_debug(

@@ -2,9 +2,9 @@
 
 use telemetrylib::FerrisKeySpan;
 
-use crate::valkey::cmd::{cmd, cmd_len, Cmd};
+use crate::valkey::cmd::{Cmd, cmd, cmd_len};
 use crate::valkey::types::{
-    from_owned_valkey_value, ErrorKind, FromValkeyValue, HashSet, ValkeyResult, ToValkeyArgs, Value,
+    ErrorKind, FromValkeyValue, HashSet, ToValkeyArgs, ValkeyResult, Value, from_owned_valkey_value,
 };
 use std::sync::Arc;
 
@@ -95,7 +95,6 @@ impl Pipeline {
     pub fn get_packed_pipeline(&self) -> bytes::Bytes {
         encode_pipeline(&self.commands, self.transaction_mode).into()
     }
-
 
     async fn execute_pipelined_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
     where

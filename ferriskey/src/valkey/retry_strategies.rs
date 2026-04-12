@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use std::time::Duration;
-use tokio_retry2::strategy::{jitter_range, ExponentialBackoff};
+use tokio_retry2::strategy::{ExponentialBackoff, jitter_range};
 use tracing::debug;
 
 /// This struct represents the exponential backoff parameters for reconnection attempts.

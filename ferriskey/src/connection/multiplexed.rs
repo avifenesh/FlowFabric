@@ -1,7 +1,7 @@
-use super::ConnectionLike;
-use super::runtime;
-use crate::valkey::aio::setup_connection;
-use crate::valkey::aio::DisconnectNotifier;
+use crate::connection::ConnectionLike;
+use crate::connection::runtime;
+use crate::connection::setup_connection;
+use crate::connection::DisconnectNotifier;
 use crate::valkey::client::FerrisKeyConnectionOptions;
 use crate::valkey::cmd::Cmd;
 use crate::valkey::parser::ValueCodec;

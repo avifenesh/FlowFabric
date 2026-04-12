@@ -4,12 +4,14 @@ use super::get_valkey_connection_info;
 use super::reconnecting_connection::{ReconnectReason, ReconnectingConnection};
 use super::{ConnectionRequest, NodeAddress, TlsMode};
 use crate::client::types::ReadFrom as ClientReadFrom;
+use crate::valkey::aio::ConnectionLike;
+use crate::valkey::cluster_routing::{
+    self, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd,
+};
+use crate::valkey::{PushInfo, RetryStrategy, ValkeyError, ValkeyResult, Value};
 use futures::{StreamExt, future, stream};
 use logger_core::log_debug;
 use logger_core::log_warn;
-use crate::valkey::aio::ConnectionLike;
-use crate::valkey::cluster_routing::{self, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd};
-use crate::valkey::{PushInfo, ValkeyError, ValkeyResult, RetryStrategy, Value};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -271,7 +273,9 @@ impl StandaloneClient {
                     // Only check for primary in normal mode (when replication_status is Some)
                     // and the node reports role:master
                     let is_primary = replication_status
-                        .and_then(|status| crate::valkey::from_owned_valkey_value::<String>(status).ok())
+                        .and_then(|status| {
+                            crate::valkey::from_owned_valkey_value::<String>(status).ok()
+                        })
                         .is_some_and(|val| val.contains("role:master"));
 
                     if is_primary {
@@ -285,9 +289,7 @@ impl StandaloneClient {
                             for node in nodes.iter() {
                                 node.mark_as_dropped();
                             }
-                            return Err(StandaloneClientConnectionError::PrimaryConflictFound(
-                                msg,
-                            ));
+                            return Err(StandaloneClientConnectionError::PrimaryConflictFound(msg));
                         }
                         primary_index = Some(nodes.len().saturating_sub(1));
                     }
@@ -577,7 +579,8 @@ impl StandaloneClient {
                         let result = request.await?;
                         match result {
                             Value::Nil => {
-                                Err((crate::valkey::ErrorKind::ResponseError, "no value found").into())
+                                Err((crate::valkey::ErrorKind::ResponseError, "no value found")
+                                    .into())
                             }
                             _ => Ok(result),
                         }

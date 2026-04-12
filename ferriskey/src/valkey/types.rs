@@ -6,7 +6,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::io;
 use std::num::ParseIntError;
-use std::str::{from_utf8, Utf8Error};
+use std::str::{Utf8Error, from_utf8};
 use std::string::FromUtf8Error;
 use std::sync::{
     Arc,
@@ -20,9 +20,7 @@ use std::ops::Deref;
 use strum_macros::Display;
 
 macro_rules! invalid_type_error {
-    ($v:expr, $det:expr) => {{
-        fail!(invalid_type_error_inner!($v, $det))
-    }};
+    ($v:expr, $det:expr) => {{ fail!(invalid_type_error_inner!($v, $det)) }};
 }
 
 macro_rules! invalid_type_error_inner {
@@ -955,7 +953,9 @@ impl ValkeyError {
             ErrorKind::FatalSendError => {
                 "failed to send the request to the server due to a fatal error - the request was not transmitted"
             }
-            ErrorKind::FatalReceiveError => "a fatal error occurred while attempting to receive a response from the server",
+            ErrorKind::FatalReceiveError => {
+                "a fatal error occurred while attempting to receive a response from the server"
+            }
             ErrorKind::ExtensionError => "extension error",
             ErrorKind::ClientError => "client error",
             ErrorKind::ReadOnly => "read-only",
@@ -1742,7 +1742,10 @@ pub trait FromValkeyValue: Sized {
     /// from another vector of values.  This primarily exists internally
     /// to customize the behavior for vectors of tuples.
     fn from_valkey_values(items: &[Value]) -> ValkeyResult<Vec<Self>> {
-        items.iter().map(FromValkeyValue::from_valkey_value).collect()
+        items
+            .iter()
+            .map(FromValkeyValue::from_valkey_value)
+            .collect()
     }
 
     /// The same as `from_valkey_values`, but takes a `Vec<Value>` instead
@@ -1763,7 +1766,8 @@ pub trait FromValkeyValue: Sized {
 
     /// Convert bytes to a single element vector.
     fn from_owned_byte_vec(_vec: Vec<u8>) -> ValkeyResult<Vec<Self>> {
-        Self::from_owned_valkey_value(Value::BulkString(bytes::Bytes::from(_vec))).map(|rv| vec![rv])
+        Self::from_owned_valkey_value(Value::BulkString(bytes::Bytes::from(_vec)))
+            .map(|rv| vec![rv])
     }
 }
 

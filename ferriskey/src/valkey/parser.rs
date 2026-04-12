@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 
 use crate::valkey::types::{
-    ErrorKind, PushKind, ValkeyError, ValkeyResult, ServerError, ServerErrorKind, Value,
+    ErrorKind, PushKind, ServerError, ServerErrorKind, ValkeyError, ValkeyResult, Value,
     VerbatimFormat,
 };
 
@@ -47,7 +47,7 @@ fn err_parser(line: &str) -> ServerError {
             return ServerError::ExtensionError {
                 code: code.to_string(),
                 detail: pieces.next().map(|str| str.to_string()),
-            }
+            };
         }
     };
     let detail = pieces.next().map(|str| str.to_string());
@@ -117,16 +117,17 @@ fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
     let mut val: i64 = 0;
     for &b in digits {
         if !b.is_ascii_digit() {
-            let s = std::str::from_utf8(line).map_err(|_| {
-                parse_err("Expected integer, got garbage".to_string())
-            })?;
-            return s.trim().parse::<i64>().map_err(|_| {
-                parse_err("Expected integer, got garbage".to_string())
-            });
+            let s = std::str::from_utf8(line)
+                .map_err(|_| parse_err("Expected integer, got garbage".to_string()))?;
+            return s
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| parse_err("Expected integer, got garbage".to_string()));
         }
-        val = val.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as i64)).ok_or_else(|| {
-            parse_err("Integer overflow in RESP integer".to_string())
-        })?;
+        val = val
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((b - b'0') as i64))
+            .ok_or_else(|| parse_err("Integer overflow in RESP integer".to_string()))?;
     }
 
     if negative {
@@ -281,9 +282,8 @@ fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<u
 /// Returns an error if the expected \r\n terminator is not found.
 #[inline]
 fn read_line_unchecked(buf: &mut BytesMut) -> ValkeyResult<BytesMut> {
-    let pos = find_crlf(buf, 0).ok_or_else(|| {
-        parse_err("Incomplete RESP line after scan".to_string())
-    })?;
+    let pos = find_crlf(buf, 0)
+        .ok_or_else(|| parse_err("Incomplete RESP line after scan".to_string()))?;
     let line = buf.split_to(pos);
     buf.advance(2); // \r\n
     Ok(line)
@@ -319,9 +319,8 @@ fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value
 #[inline]
 fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
-    let s = std::str::from_utf8(&line).map_err(|_| {
-        parse_err("Invalid UTF-8 in simple string".to_string())
-    })?;
+    let s = std::str::from_utf8(&line)
+        .map_err(|_| parse_err("Invalid UTF-8 in simple string".to_string()))?;
     if s == "OK" {
         Ok(Value::Okay)
     } else {
@@ -332,9 +331,8 @@ fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
 #[inline]
 fn parse_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
-    let s = std::str::from_utf8(&line).map_err(|_| {
-        parse_err("Invalid UTF-8 in error".to_string())
-    })?;
+    let s =
+        std::str::from_utf8(&line).map_err(|_| parse_err("Invalid UTF-8 in error".to_string()))?;
     Ok(Value::ServerError(err_parser(s)))
 }
 
@@ -432,10 +430,12 @@ fn parse_null(buf: &mut BytesMut) -> ValkeyResult<Value> {
 #[inline]
 fn parse_double(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
-    let s = std::str::from_utf8(&line).map_err(|_| {
-        parse_err("Invalid UTF-8 in double".to_string())
-    })?;
-    let val = s.trim().parse::<f64>().map_err(|e| parse_err(format!("Expected double: {e}")))?;
+    let s =
+        std::str::from_utf8(&line).map_err(|_| parse_err("Invalid UTF-8 in double".to_string()))?;
+    let val = s
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| parse_err(format!("Expected double: {e}")))?;
     Ok(Value::Double(val))
 }
 
@@ -460,9 +460,7 @@ fn read_blob_unchecked(buf: &mut BytesMut) -> ValkeyResult<String> {
     let size = size as usize;
     let data = &buf[..size];
     let s = std::str::from_utf8(data)
-        .map_err(|_| {
-            parse_err("Invalid UTF-8 in blob string".to_string())
-        })?
+        .map_err(|_| parse_err("Invalid UTF-8 in blob string".to_string()))?
         .to_string();
     buf.advance(size + 2);
     Ok(s)
@@ -488,16 +486,17 @@ fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
             text: text.to_string(),
         })
     } else {
-        Err(parse_err("Parse error when decoding verbatim string".to_string()))
+        Err(parse_err(
+            "Parse error when decoding verbatim string".to_string(),
+        ))
     }
 }
 
 #[inline]
 fn parse_big_number(buf: &mut BytesMut) -> ValkeyResult<Value> {
     let line = read_line_unchecked(buf)?;
-    let val = BigInt::parse_bytes(&line, 10).ok_or_else(|| {
-        parse_err("Expected bigint, got garbage".to_string())
-    })?;
+    let val = BigInt::parse_bytes(&line, 10)
+        .ok_or_else(|| parse_err("Expected bigint, got garbage".to_string()))?;
     Ok(Value::BigNumber(val))
 }
 
@@ -521,9 +520,8 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let mut it = items.into_iter();
     let first = it.next().unwrap_or(Value::Nil);
     if let Value::BulkString(kind) = first {
-        let push_kind = String::from_utf8(kind.to_vec()).map_err(|_| {
-            parse_err("Invalid UTF-8 in push kind".to_string())
-        })?;
+        let push_kind = String::from_utf8(kind.to_vec())
+            .map_err(|_| parse_err("Invalid UTF-8 in push kind".to_string()))?;
         Ok(Value::Push {
             kind: get_push_kind(push_kind),
             data: it.collect(),
@@ -588,10 +586,7 @@ mod aio_support {
     }
 
     /// Parses a valkey value asynchronously from an AsyncRead source.
-    pub async fn parse_valkey_value_async<R>(
-        _decoder: &mut (),
-        read: &mut R,
-    ) -> ValkeyResult<Value>
+    pub async fn parse_valkey_value_async<R>(_decoder: &mut (), read: &mut R) -> ValkeyResult<Value>
     where
         R: AsyncRead + std::marker::Unpin,
     {
@@ -698,9 +693,8 @@ mod tests {
         use tokio_util::codec::Decoder;
         let mut codec = ValueCodec::default();
 
-        let mut bytes = bytes::BytesMut::from(
-            b"*3\r\n+OK\r\n-LOADING server is loading\r\n+OK\r\n".as_slice(),
-        );
+        let mut bytes =
+            bytes::BytesMut::from(b"*3\r\n+OK\r\n-LOADING server is loading\r\n+OK\r\n".as_slice());
         let result = codec.decode_eof(&mut bytes).unwrap().unwrap();
 
         assert_eq!(
@@ -810,8 +804,7 @@ mod tests {
 
     #[test]
     fn decode_resp3_big_number() {
-        let val =
-            parse_valkey_value(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
+        let val = parse_valkey_value(b"(3492890328409238509324850943850943825024385\r\n").unwrap();
         assert_eq!(
             val,
             Value::BigNumber(
@@ -822,8 +815,7 @@ mod tests {
 
     #[test]
     fn decode_resp3_set() {
-        let val =
-            parse_valkey_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
+        let val = parse_valkey_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
         let v = val.as_sequence().unwrap();
         assert_eq!(Value::SimpleString("orange".to_string()), v[0]);
         assert_eq!(Value::SimpleString("apple".to_string()), v[1]);

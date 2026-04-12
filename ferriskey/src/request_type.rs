@@ -493,7 +493,6 @@ impl RequestType {
     }
 }
 
-
 fn get_two_word_command(first: &str, second: &str) -> Cmd {
     let mut cmd = cmd(first);
     cmd.arg(second);

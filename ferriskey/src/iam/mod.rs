@@ -48,8 +48,6 @@ pub enum IAMError {
     /// Token generation error
     #[error("IAM authentication error: Token generation failed: {0}")]
     TokenGenerationError(String),
-
-
 }
 
 /// AWS service type for IAM authentication
@@ -116,9 +114,9 @@ async fn get_signing_identity(
         .load()
         .await;
 
-    let provider = config.credentials_provider().ok_or_else(|| {
-        IAMError::CredentialsError("No AWS credentials provider found".into())
-    })?;
+    let provider = config
+        .credentials_provider()
+        .ok_or_else(|| IAMError::CredentialsError("No AWS credentials provider found".into()))?;
 
     let creds = provider
         .provide_credentials()
@@ -662,7 +660,10 @@ mod tests {
         assert!(!manager.token_changed(), "Flag should be false after clear");
 
         // Manually refresh the token
-        manager.refresh_token().await.expect("refresh_token should succeed in test");
+        manager
+            .refresh_token()
+            .await
+            .expect("refresh_token should succeed in test");
 
         // Verify that the flag was set
         assert!(
@@ -774,7 +775,10 @@ mod tests {
         // Wait at least 1 second to ensure timestamp difference in AWS SigV4 signing
         sleep(Duration::from_secs(1)).await;
 
-        manager.refresh_token().await.expect("refresh_token should succeed in test");
+        manager
+            .refresh_token()
+            .await
+            .expect("refresh_token should succeed in test");
 
         let new_token = manager.get_token().await;
 

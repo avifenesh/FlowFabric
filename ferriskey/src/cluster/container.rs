@@ -1,7 +1,7 @@
-use crate::valkey::cluster_async::ConnectionFuture;
-use crate::valkey::cluster_routing::{Route, ShardAddrs, SlotAddr};
-use crate::valkey::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap, SlotMapValue};
-use crate::valkey::cluster_topology::TopologyHash;
+use crate::cluster::connections::ConnectionFuture;
+use crate::cluster::routing::{Route, ShardAddrs, SlotAddr};
+use crate::cluster::slotmap::{ReadFromReplicaStrategy, SlotMap, SlotMapValue};
+use crate::cluster::topology::TopologyHash;
 use dashmap::DashMap;
 use futures::FutureExt;
 use rand::seq::IteratorRandom;
@@ -125,7 +125,7 @@ pub(crate) enum ConnectionType {
     PreferManagement,
 }
 
-pub(crate) struct ConnectionsMap<Connection>(pub(crate) DashMap<String, ClusterNode<Connection>>);
+pub(crate) struct ConnectionsMap<Connection>(pub(crate) DashMap<Arc<str>, ClusterNode<Connection>>);
 
 impl<Connection> std::fmt::Display for ConnectionsMap<Connection> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -271,7 +271,7 @@ impl Drop for RefreshTaskState {
 #[derive(Default)]
 pub(crate) struct RefreshConnectionStates {
     // Follow the refresh ops on the connections
-    pub(crate) refresh_address_in_progress: HashMap<String, RefreshTaskState>,
+    pub(crate) refresh_address_in_progress: HashMap<Arc<str>, RefreshTaskState>,
 }
 
 impl RefreshConnectionStates {
@@ -291,7 +291,7 @@ impl RefreshConnectionStates {
 }
 
 pub(crate) struct ConnectionsContainer<Connection> {
-    connection_map: DashMap<String, ClusterNode<Connection>>,
+    connection_map: DashMap<Arc<str>, ClusterNode<Connection>>,
     pub(crate) slot_map: SlotMap,
     read_from_replica_strategy: ReadFromReplicaStrategy,
     topology_hash: TopologyHash,
@@ -317,7 +317,7 @@ impl<Connection> Default for ConnectionsContainer<Connection> {
     }
 }
 
-pub(crate) type ConnectionAndAddress<Connection> = (String, Connection);
+pub(crate) type ConnectionAndAddress<Connection> = (Arc<str>, Connection);
 
 impl<Connection> ConnectionsContainer<Connection>
 where
@@ -375,8 +375,8 @@ where
     }
 
     /// Returns true if the address represents a known primary node.
-    pub(crate) fn is_primary(&self, address: &String) -> bool {
-        self.connection_for_address(address).is_some() && self.slot_map.is_primary(address)
+    pub(crate) fn is_primary(&self, address: &str) -> bool {
+        self.connection_for_address(address).is_some() && self.slot_map.is_primary(&address.to_string())
     }
 
     fn round_robin_read_from_replica(
@@ -537,9 +537,9 @@ where
 
     // Fetches the master address for a given route.
     // Returns `None` if no master address can be resolved.
-    pub(crate) fn address_for_route(&self, route: &Route) -> Option<String> {
+    pub(crate) fn address_for_route(&self, route: &Route) -> Option<Arc<str>> {
         let slot_map_value = self.slot_map.slot_value_for_route(route)?;
-        Some(slot_map_value.addrs.primary().clone().to_string())
+        Some(Arc::from(slot_map_value.addrs.primary().as_str()))
     }
 
     // Retrieves the notifier for a reconnect task associated with a given route.
@@ -660,15 +660,15 @@ where
 
     pub(crate) fn replace_or_add_connection_for_address(
         &self,
-        address: impl Into<String>,
+        address: impl Into<Arc<str>>,
         node: ClusterNode<Connection>,
-    ) -> String {
-        let address = address.into();
+    ) -> Arc<str> {
+        let address: Arc<str> = address.into();
 
         // Increase the total number of connections by the number of connections managed by `node`
         Telemetry::incr_total_connections(node.connections_count());
 
-        if let Some(old_conn) = self.connection_map.insert(String::clone(&address), node) {
+        if let Some(old_conn) = self.connection_map.insert(Arc::clone(&address), node) {
             // We are replacing a node. Reduce the counter by the number of connections managed by
             // the old connection
             Telemetry::decr_total_connections(old_conn.connections_count());
@@ -676,7 +676,7 @@ where
         address
     }
 
-    pub(crate) fn remove_node(&self, address: &String) -> Option<ClusterNode<Connection>> {
+    pub(crate) fn remove_node(&self, address: &str) -> Option<ClusterNode<Connection>> {
         if let Some((_key, old_conn)) = self.connection_map.remove(address) {
             Telemetry::decr_total_connections(old_conn.connections_count());
             Some(old_conn)
@@ -689,7 +689,7 @@ where
         self.connection_map.len()
     }
 
-    pub(crate) fn connection_map(&self) -> &DashMap<String, ClusterNode<Connection>> {
+    pub(crate) fn connection_map(&self) -> &DashMap<Arc<str>, ClusterNode<Connection>> {
         &self.connection_map
     }
 
@@ -707,7 +707,7 @@ where
 mod tests {
     use std::collections::HashSet;
 
-    use crate::valkey::cluster_routing::Slot;
+    use crate::cluster::routing::Slot;
 
     use super::*;
     impl<Connection> ClusterNode<Connection>
@@ -725,7 +725,7 @@ mod tests {
     }
     fn remove_nodes(container: &ConnectionsContainer<usize>, addresses: &[&str]) {
         for address in addresses {
-            container.remove_node(&(*address).into());
+            container.remove_node(address);
         }
     }
 
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn get_replica_connection_for_replica_route_if_some_but_not_all_replicas_were_removed() {
         let container = create_container();
-        container.remove_node(&"replica3-2".into());
+        container.remove_node("replica3-2");
 
         assert_eq!(
             31,
@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn get_connection_by_address_returns_none_if_connection_was_removed() {
         let container = create_container();
-        container.remove_node(&"primary1".into());
+        container.remove_node("primary1");
 
         assert!(container.connection_for_address("primary1").is_none());
     }
@@ -1430,7 +1430,7 @@ mod tests {
     #[test]
     fn get_all_user_connections_does_not_return_removed_connection() {
         let container = create_container();
-        container.remove_node(&"primary1".into());
+        container.remove_node("primary1");
 
         let mut connections: Vec<_> = container
             .all_node_connections()
@@ -1457,7 +1457,7 @@ mod tests {
     #[test]
     fn get_all_primaries_does_not_return_removed_connection() {
         let container = create_container();
-        container.remove_node(&"primary1".into());
+        container.remove_node("primary1");
 
         let mut connections: Vec<_> = container
             .all_primary_connections()
@@ -1474,7 +1474,7 @@ mod tests {
 
         assert_eq!(container.len(), 6);
 
-        container.remove_node(&"primary1".into());
+        container.remove_node("primary1");
         assert_eq!(container.len(), 5);
 
         container.replace_or_add_connection_for_address(
@@ -1491,7 +1491,7 @@ mod tests {
 
         assert_eq!(container.len(), 6);
 
-        container.remove_node(&"foobar".into());
+        container.remove_node("foobar");
         assert_eq!(container.len(), 6);
 
         container.replace_or_add_connection_for_address(
@@ -1505,10 +1505,10 @@ mod tests {
     fn remove_node_returns_connection_if_it_exists() {
         let container = create_container();
 
-        let connection = container.remove_node(&"primary1".into());
+        let connection = container.remove_node("primary1");
         assert_eq!(connection, Some(ClusterNode::new_only_with_user_conn(1)));
 
-        let non_connection = container.remove_node(&"foobar".into());
+        let non_connection = container.remove_node("foobar");
         assert_eq!(non_connection, None);
     }
 
@@ -1517,17 +1517,17 @@ mod tests {
         let container = create_container();
 
         assert!(!container.is_empty());
-        container.remove_node(&"primary1".into());
+        container.remove_node("primary1");
         assert!(!container.is_empty());
-        container.remove_node(&"primary2".into());
-        container.remove_node(&"primary3".into());
-        assert!(!container.is_empty());
-
-        container.remove_node(&"replica2-1".into());
-        container.remove_node(&"replica3-1".into());
+        container.remove_node("primary2");
+        container.remove_node("primary3");
         assert!(!container.is_empty());
 
-        container.remove_node(&"replica3-2".into());
+        container.remove_node("replica2-1");
+        container.remove_node("replica3-1");
+        assert!(!container.is_empty());
+
+        container.remove_node("replica3-2");
         assert!(container.is_empty());
     }
 
@@ -1535,23 +1535,23 @@ mod tests {
     fn is_primary_returns_true_for_known_primary() {
         let container = create_container();
 
-        assert!(container.is_primary(&"primary1".into()));
+        assert!(container.is_primary("primary1"));
     }
 
     #[test]
     fn is_primary_returns_false_for_known_replica() {
         let container = create_container();
 
-        assert!(!container.is_primary(&"replica2-1".into()));
+        assert!(!container.is_primary("replica2-1"));
     }
 
     #[test]
     fn is_primary_returns_false_for_removed_node() {
         let container = create_container();
-        let address = "primary1".into();
-        container.remove_node(&address);
+        let address = "primary1";
+        container.remove_node(address);
 
-        assert!(!container.is_primary(&address));
+        assert!(!container.is_primary(address));
     }
 
     #[test]
@@ -1562,12 +1562,12 @@ mod tests {
             .map(|conn| conn.0)
             .collect();
 
-        let new_node = "new_primary1".to_string();
+        let new_node: Arc<str> = Arc::from("new_primary1");
         // Check that `new_node` not exists in the current
         assert!(container.connection_for_address(&new_node).is_none());
         // Create new connection map
         let new_connection_map = DashMap::new();
-        new_connection_map.insert(new_node.clone(), create_cluster_node(1, false, None));
+        new_connection_map.insert(Arc::clone(&new_node), create_cluster_node(1, false, None));
 
         // Extend the current connection map
         container.extend_connection_map(ConnectionsMap(new_connection_map));

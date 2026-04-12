@@ -22,46 +22,52 @@
 //! }
 //! ```
 
-mod connections_container;
-mod connections_logic;
-mod pipeline_routing;
+pub mod container;
+pub mod connections;
+pub(crate) mod pipeline;
+pub mod slotmap;
+pub mod routing;
+pub mod topology;
+pub(crate) mod client;
+pub mod compat;
+pub(crate) mod scan;
 /// Exposed only for testing.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    pub use super::connections_container::ConnectionDetails;
-    pub use super::connections_logic::*;
+    pub use super::container::ConnectionDetails;
+    pub use super::connections::*;
 }
 use crate::valkey::{
     aio::{get_socket_addrs, ConnectionLike, DisconnectNotifier, MultiplexedConnection},
     client::FerrisKeyConnectionOptions,
-    cluster::slot_cmd,
-    cluster_async::connections_logic::{
-        get_host_and_port_from_addr, get_or_create_conn, ConnectionFuture, RefreshConnectionType,
-    },
-    cluster_client::{ClusterParams, RetryParams},
-    cluster_routing::{
-        self, MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, Routable, RoutingInfo,
-        ShardUpdateResult, SingleNodeRoutingInfo,
-    },
-    cluster_scan::{cluster_scan, ClusterScanArgs, ScanStateRC},
-    cluster_slotmap::SlotMap,
-    cluster_topology::{
-        calculate_topology, SlotRefreshState, TopologyHash,
-        DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES, DEFAULT_REFRESH_SLOTS_RETRY_BASE_DURATION_MILLIS,
-        DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR,
-    },
     cmd,
     push_manager::PushInfo,
     types::{ProtocolVersion, RetryMethod, ServerError},
     Cmd, ConnectionInfo, ErrorKind, FromValkeyValue, InfoDict, IntoConnectionInfo,
     PipelineRetryStrategy, ValkeyError, ValkeyFuture, ValkeyResult, Value,
 };
-use connections_container::{
+use crate::cluster::compat::slot_cmd;
+use crate::cluster::connections::{
+    get_host_and_port_from_addr, get_or_create_conn, ConnectionFuture, RefreshConnectionType,
+};
+use crate::cluster::client::{ClusterParams, RetryParams};
+use crate::cluster::routing::{
+    self as cluster_routing, MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, Routable,
+    RoutingInfo, ShardUpdateResult, SingleNodeRoutingInfo,
+};
+use crate::cluster::scan::{cluster_scan, ClusterScanArgs, ScanStateRC};
+use crate::cluster::slotmap::SlotMap;
+use crate::cluster::topology::{
+    calculate_topology, SlotRefreshState, TopologyHash,
+    DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES, DEFAULT_REFRESH_SLOTS_RETRY_BASE_DURATION_MILLIS,
+    DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR,
+};
+use container::{
     ConnectionAndAddress, ConnectionType, ConnectionsMap, RefreshTaskNotifier, RefreshTaskState,
     RefreshTaskStatus,
 };
-use connections_logic::connect_and_check;
-use pipeline_routing::{
+use connections::connect_and_check;
+use pipeline::{
     collect_and_send_pending_requests, map_pipeline_to_nodes, process_and_retry_pipeline_responses,
     route_for_pipeline, PipelineResponses, ResponsePoliciesMap,
 };
@@ -379,7 +385,7 @@ where
         // Hold conn_lock briefly, only for route resolution.
         type ConnFut<C> = futures::future::Shared<futures_util::future::BoxFuture<'static, C>>;
 
-        let grouped: Vec<(String, crate::valkey::Pipeline, Vec<usize>, ConnFut<C>)> = {
+        let grouped: Vec<(Arc<str>, crate::valkey::Pipeline, Vec<usize>, ConnFut<C>)> = {
             let container = self.inner.conn_lock.read();
             if container.is_empty() {
                 return None;
@@ -387,7 +393,7 @@ where
 
             // Route each command to a node
             let mut node_map: std::collections::HashMap<
-                String,
+                Arc<str>,
                 (crate::valkey::Pipeline, Vec<usize>, ConnFut<C>),
             > = std::collections::HashMap::new();
 
@@ -424,7 +430,7 @@ where
 
         // Step 2: Send sub-pipelines in parallel, directly to node mux connections.
         let mut join_set = JoinSet::new();
-        let mut node_info: Vec<(String, Vec<usize>)> = Vec::with_capacity(grouped.len());
+        let mut node_info: Vec<(Arc<str>, Vec<usize>)> = Vec::with_capacity(grouped.len());
 
         for (addr, sub_pipeline, indices, conn_future) in grouped {
             let sub_count = sub_pipeline.len();
@@ -698,9 +704,9 @@ impl TokioDisconnectNotifier {
     }
 }
 
-type ConnectionMap<C> = connections_container::ConnectionsMap<ConnectionFuture<C>>;
+type ConnectionMap<C> = container::ConnectionsMap<ConnectionFuture<C>>;
 type ConnectionsContainer<C> =
-    self::connections_container::ConnectionsContainer<ConnectionFuture<C>>;
+    self::container::ConnectionsContainer<ConnectionFuture<C>>;
 
 pub(crate) struct InnerCore<C> {
     pub(crate) conn_lock: ParkingLotRwLock<ConnectionsContainer<C>>,
@@ -884,7 +890,7 @@ pub(crate) enum InternalSingleNodeRouting<C> {
     SpecificNode(Route),
     ByAddress(String),
     Connection {
-        address: String,
+        address: Arc<str>,
         conn: ConnectionFuture<C>,
     },
     Redirect {
@@ -1199,8 +1205,8 @@ mod iam_token_refresh_tests {
         initial_password: Option<String>,
         provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
     ) -> Arc<InnerCore<crate::valkey::aio::MultiplexedConnection>> {
-        use crate::valkey::cluster_client::ClusterParams;
-        use connections_container::ConnectionsContainer;
+        use crate::cluster::client::ClusterParams;
+        use container::ConnectionsContainer;
 
         let params = ClusterParams::default_for_test(initial_password);
 
@@ -1211,7 +1217,7 @@ mod iam_token_refresh_tests {
             pending_requests_tx,
             pending_requests_rx: std::sync::Mutex::new(pending_requests_rx),
             slot_refresh_state: SlotRefreshState::new(
-                crate::valkey::cluster_client::SlotsRefreshRateLimit::default(),
+                crate::cluster::client::SlotsRefreshRateLimit::default(),
             ),
             initial_nodes: Vec::new(),
             ferriskey_connection_options: options_with_provider(provider),
@@ -1532,7 +1538,7 @@ impl<C> Request<C> {
 }
 
 enum ConnectionCheck<C> {
-    Found((String, ConnectionFuture<C>)),
+    Found((Arc<str>, ConnectionFuture<C>)),
     OnlyAddress(String),
     RandomConnection,
 }
@@ -1553,8 +1559,8 @@ where
 
         let discover_az = matches!(
             cluster_params.read_from_replicas,
-            crate::valkey::cluster_slotmap::ReadFromReplicaStrategy::AZAffinity(_)
-                | crate::valkey::cluster_slotmap::ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_)
+            crate::cluster::slotmap::ReadFromReplicaStrategy::AZAffinity(_)
+                | crate::cluster::slotmap::ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_)
         );
 
         let connection_retry_strategy = cluster_params.reconnect_retry_strategy.unwrap_or_default();
@@ -1734,7 +1740,7 @@ where
                      addr_conn_res: ValkeyResult<_>| async move {
                         match addr_conn_res {
                             Ok((addr, node)) => {
-                                connections.0 .0.insert(addr, node);
+                                connections.0 .0.insert(Arc::from(&*addr), node);
                                 (connections.0, None)
                             }
                             Err(e) => (connections.0, Some(e.to_string())),
@@ -1829,7 +1835,7 @@ where
             connections_container
                 .all_node_connections()
                 .for_each(|(addr, con)| {
-                    if all_nodes_with_slots.contains(&addr) {
+                    if all_nodes_with_slots.iter().any(|a| a.as_str() == &*addr) {
                         all_valid_conns.insert(addr.clone(), con.clone());
                     } else {
                         nodes_to_delete.push(addr.clone());
@@ -1857,7 +1863,7 @@ where
             all_nodes_with_slots
                 .iter()
                 .filter(|addr| !all_valid_conns.contains_key(addr.as_str()))
-                .map(|addr| addr.to_string()),
+                .map(|addr| Arc::from(addr.as_str())),
         );
 
         if !addrs_to_refresh.is_empty() {
@@ -1876,7 +1882,7 @@ where
     // Awaiting on the notifier guaranties at least one reconnect attempt on each address.
     async fn refresh_and_update_connections(
         inner: Arc<InnerCore<C>>,
-        addresses: HashSet<String>,
+        addresses: HashSet<Arc<str>>,
         conn_type: RefreshConnectionType,
         check_existing_conn: bool,
     ) {
@@ -1904,7 +1910,7 @@ where
     // Returns a vector of notifiers for the refresh tasks (new or existing) corresponding to the supplied addresses.
     async fn trigger_refresh_connection_tasks(
         inner: Arc<InnerCore<C>>,
-        addresses: HashSet<String>,
+        addresses: HashSet<Arc<str>>,
         conn_type: RefreshConnectionType,
         check_existing_conn: bool,
     ) -> Vec<Arc<Notify>> {
@@ -1918,7 +1924,7 @@ where
                 .read()
                 .refresh_conn_state
                 .refresh_address_in_progress
-                .get(&address)
+                .get(&*address)
             {
                 if let RefreshTaskStatus::Reconnecting(ref notifier) = existing_task.status {
                     // Store the notifier
@@ -1981,7 +1987,7 @@ where
                                     .write()
                                     .refresh_conn_state
                                     .refresh_address_in_progress
-                                    .get_mut(&address_clone_for_task)
+                                    .get_mut(&*address_clone_for_task)
                                 {
                                     conn_state.status.flip_status_to_too_long();
                                 }
@@ -2006,7 +2012,7 @@ where
                         inner_clone
                             .conn_lock
                             .read()
-                            .replace_or_add_connection_for_address(&address_clone_for_task, node);
+                            .replace_or_add_connection_for_address(&*address_clone_for_task, node);
                     }
                     Err(err) => {
                         warn!(
@@ -2021,7 +2027,7 @@ where
                     .write()
                     .refresh_conn_state
                     .refresh_address_in_progress
-                    .remove(&address_clone_for_task);
+                    .remove(&*address_clone_for_task);
 
                 debug!(
                     "Refreshing connection task to {:?} is done",
@@ -2040,7 +2046,7 @@ where
                 .write()
                 .refresh_conn_state
                 .refresh_address_in_progress
-                .insert(address.clone(), refresh_task_state);
+                .insert(address, refresh_task_state);
         }
         debug!("trigger_refresh_connection_tasks: Done");
         notifiers
@@ -2081,7 +2087,7 @@ where
     ///
     /// A `ValkeyResult<Value>` representing the aggregated result.
     pub async fn aggregate_results(
-        receivers: Vec<(Option<String>, oneshot::Receiver<ValkeyResult<Response>>)>,
+        receivers: Vec<(Option<Arc<str>>, oneshot::Receiver<ValkeyResult<Response>>)>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
     ) -> ValkeyResult<Value> {
@@ -2209,7 +2215,7 @@ where
                 let collected = future::try_join_all(receivers.into_iter().map(
                     |(addr, receiver)| async move {
                         let res = convert_result(receiver.await)?;
-                        Ok::<(Option<String>, Value), ValkeyError>((addr, res))
+                        Ok::<(Option<Arc<str>>, Value), ValkeyError>((addr, res))
                     },
                 ))
                 .await?;
@@ -2238,7 +2244,7 @@ where
     ///
     /// A `ValkeyResult<Value>` representing the aggregated result.
     fn aggregate_resolved_results(
-        resolved: Vec<(Option<String>, Value)>,
+        resolved: Vec<(Option<Arc<str>>, Value)>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
     ) -> ValkeyResult<Value> {
@@ -2288,7 +2294,7 @@ where
             // ——————————————————————————————————————————
             Some(ResponsePolicy::Aggregate(op)) => {
                 let all_vals: Vec<Value> = resolved.into_iter().map(|(_addr, val)| val).collect();
-                crate::valkey::cluster_routing::aggregate(all_vals, op)
+                crate::cluster::routing::aggregate(all_vals, op)
             }
 
             // ——————————————————————————————————————————
@@ -2296,7 +2302,7 @@ where
             // ——————————————————————————————————————————
             Some(ResponsePolicy::AggregateArray(op)) => {
                 let all_vals: Vec<Value> = resolved.into_iter().map(|(_addr, val)| val).collect();
-                crate::valkey::cluster_routing::aggregate_array(all_vals, op)
+                crate::cluster::routing::aggregate_array(all_vals, op)
             }
 
             // ——————————————————————————————————————————
@@ -2304,7 +2310,7 @@ where
             // ——————————————————————————————————————————
             Some(ResponsePolicy::AggregateLogical(op)) => {
                 let all_vals: Vec<Value> = resolved.into_iter().map(|(_addr, val)| val).collect();
-                crate::valkey::cluster_routing::logical_aggregate(all_vals, op)
+                crate::cluster::routing::logical_aggregate(all_vals, op)
             }
 
             // ——————————————————————————————————————————
@@ -2315,13 +2321,13 @@ where
                 let all_vals: Vec<Value> = resolved.into_iter().map(|(_addr, val)| val).collect();
                 match routing {
                     MultipleNodeRoutingInfo::MultiSlot((keys_vec, args_pattern)) => {
-                        crate::valkey::cluster_routing::combine_and_sort_array_results(
+                        crate::cluster::routing::combine_and_sort_array_results(
                             all_vals,
                             keys_vec,
                             args_pattern,
                         )
                     }
-                    _ => crate::valkey::cluster_routing::combine_array_results(all_vals),
+                    _ => crate::cluster::routing::combine_array_results(all_vals),
                 }
             }
 
@@ -2330,7 +2336,7 @@ where
             // ——————————————————————————————————————————
             Some(ResponsePolicy::CombineMaps) => {
                 let all_vals: Vec<Value> = resolved.into_iter().map(|(_addr, val)| val).collect();
-                crate::valkey::cluster_routing::combine_map_results(all_vals)
+                crate::cluster::routing::combine_map_results(all_vals)
             }
 
             // ——————————————————————————————————————————
@@ -2340,7 +2346,7 @@ where
                 let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(total);
                 for (addr_opt, value) in resolved {
                     let key_bytes = match addr_opt {
-                        Some(addr) => addr.into_bytes(),
+                        Some(addr) => addr.as_bytes().to_vec(),
                         None => return Err(ValkeyError::from((
                             ErrorKind::ResponseError,
                             "No address provided for response in Special or None response policy",
@@ -2598,7 +2604,7 @@ where
                 trace!("check_for_topology_diff: calling trigger_refresh_connection_tasks");
                 Self::trigger_refresh_connection_tasks(
                     inner,
-                    failed,
+                    failed.into_iter().map(|s| Arc::<str>::from(s.as_str())).collect(),
                     RefreshConnectionType::OnlyManagementConnection,
                     true,
                 )
@@ -2724,7 +2730,7 @@ where
         let new_connections = ConnectionsMap(DashMap::with_capacity(nodes_len));
         for (addr, result) in results {
             if let Ok(node) = result {
-                new_connections.0.insert(addr, node);
+                new_connections.0.insert(Arc::from(&*addr), node);
             }
         }
 
@@ -2840,7 +2846,7 @@ where
                 Item = Option<(Arc<Cmd>, ConnectionAndAddress<ConnectionFuture<C>>)>,
             >,
         ) -> (
-            Vec<(Option<String>, Receiver<Result<Response, ValkeyError>>)>,
+            Vec<(Option<Arc<str>>, Receiver<Result<Response, ValkeyError>>)>,
             Vec<Option<PendingRequest<C>>>,
         ) {
             iterator
@@ -2908,7 +2914,7 @@ where
                             .connection_for_route(route)
                             .map(|tuple| {
                                 let new_cmd =
-                                    crate::valkey::cluster_routing::command_for_multi_slot_indices(
+                                    crate::cluster::routing::command_for_multi_slot_indices(
                                         cmd.as_ref(),
                                         indices.iter(),
                                     );
@@ -2957,7 +2963,7 @@ where
         conn.send_packed_bytes(packed, is_fenced)
             .await
             .map(Response::Single)
-            .map_err(|err| (address.into(), err))
+            .map_err(|err| (OperationTarget::Node { address: address.to_string() }, err))
     }
 
     /// Multi-node and fan-out path. Keeps full Arc<Cmd> for command splitting.
@@ -2991,14 +2997,14 @@ where
         conn.req_packed_command(&cmd)
             .await
             .map(Response::Single)
-            .map_err(|err| (address.into(), err))
+            .map_err(|err| (OperationTarget::Node { address: address.to_string() }, err))
     }
 
     async fn try_pipeline_request(
         pipeline: Arc<crate::valkey::Pipeline>,
         offset: usize,
         count: usize,
-        conn: impl Future<Output = ValkeyResult<(String, C)>>,
+        conn: impl Future<Output = ValkeyResult<(Arc<str>, C)>>,
     ) -> OperationResult {
         trace!("try_pipeline_request");
         let (address, mut conn) = conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
@@ -3009,7 +3015,7 @@ where
         conn.req_packed_commands(&pipeline, offset, count, None)
             .await
             .map(Response::Multiple)
-            .map_err(|err| (OperationTarget::Node { address }, err))
+            .map_err(|err| (OperationTarget::Node { address: address.to_string() }, err))
     }
 
     async fn try_request(info: RequestInfo<C>, core: Core<C>) -> OperationResult {
@@ -3242,7 +3248,7 @@ where
         routing: InternalSingleNodeRouting<C>,
         core: Core<C>,
         cmd: Option<Arc<Cmd>>,
-    ) -> ValkeyResult<(String, C)> {
+    ) -> ValkeyResult<(Arc<str>, C)> {
         let mut asking = false;
 
         let conn_check = match routing {
@@ -3382,7 +3388,7 @@ where
                 // Trigger refresh task and get the single notifier
                 let mut notifiers = Self::trigger_refresh_connection_tasks(
                     core.clone(),
-                    HashSet::from([address.clone()]),
+                    HashSet::from([Arc::<str>::from(address.as_str())]),
                     RefreshConnectionType::AllConnections,
                     false,
                 )
@@ -3723,7 +3729,7 @@ where
                 }
                 Next::Reconnect { request, target } => {
                     poll_flush_action = poll_flush_action
-                        .change_state(PollFlushAction::Reconnect(HashSet::from_iter([target])));
+                        .change_state(PollFlushAction::Reconnect(HashSet::from_iter([Arc::<str>::from(target.as_str())])));
                     if let Some(request) = request {
                         let _ = self.inner.pending_requests_tx.send(request);
                     }
@@ -3775,7 +3781,7 @@ where
 enum PollFlushAction {
     None,
     RebuildSlots,
-    Reconnect(HashSet<String>),
+    Reconnect(HashSet<Arc<str>>),
     ReconnectFromInitialConnections,
 }
 
@@ -3871,7 +3877,7 @@ where
                     let handle = tokio::spawn(async move {
                         ClusterConnInner::trigger_refresh_connection_tasks(
                             inner,
-                            addresses,
+                            addresses.into_iter().map(|s| Arc::<str>::from(&*s)).collect(),
                             RefreshConnectionType::OnlyUserConnection,
                             true,
                         )
@@ -3907,7 +3913,7 @@ where
 struct InitialNodeConnectionsResult<C> {
     /// Successfully found connections with their addresses
     #[allow(clippy::type_complexity)]
-    connections: Vec<(String, Shared<Pin<Box<dyn Future<Output = C> + Send>>>)>,
+    connections: Vec<(Arc<str>, Shared<Pin<Box<dyn Future<Output = C> + Send>>>)>,
     /// Addresses that need connection refresh (exists in slot map but not in connection map)
     addresses_needing_refresh: HashSet<String>,
 }
@@ -3983,7 +3989,7 @@ where
             connection_timeout,
             ClusterConnInner::refresh_and_update_connections(
                 inner.clone(),
-                addresses_needing_refresh.clone(),
+                addresses_needing_refresh.iter().map(|s| Arc::<str>::from(s.as_str())).collect(),
                 RefreshConnectionType::AllConnections,
                 true,
             ),
@@ -4013,7 +4019,7 @@ where
 #[allow(clippy::type_complexity)]
 enum ConnectionLookupResult<C> {
     /// Connection found - returns the node address as stored in the connection map and the connection future
-    Found((String, Shared<Pin<Box<dyn Future<Output = C> + Send>>>)),
+    Found((Arc<str>, Shared<Pin<Box<dyn Future<Output = C> + Send>>>)),
     /// Connection not found - needs refresh for the given address
     NeedsConnectionRefresh(String),
 }
@@ -4177,7 +4183,7 @@ where
         topology_join_results
             .iter()
             .filter_map(|(address, res)| match res {
-                Err(err) if err.is_unrecoverable_error() => Some(address.clone()),
+                Err(err) if err.is_unrecoverable_error() => Some(address.to_string()),
                 _ => None,
             }),
     );
@@ -4342,17 +4348,18 @@ impl Connect for MultiplexedConnection {
 #[cfg(test)]
 mod pipeline_routing_tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use futures::executor::block_on;
 
-    use super::pipeline_routing::route_for_pipeline;
+    use super::pipeline::route_for_pipeline;
+    use super::ClusterConnInner;
+    use super::pipeline::PipelineResponses;
+    use crate::cluster::routing::{
+        AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo, ResponsePolicy, Route, SlotAddr,
+    };
     use crate::valkey::{
         aio::MultiplexedConnection,
-        cluster_async::{pipeline_routing::PipelineResponses, ClusterConnInner},
-        cluster_routing::{
-            AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo, ResponsePolicy, Route,
-            SlotAddr,
-        },
         cmd,
         types::{ServerError, ServerErrorKind},
         Value,
@@ -4378,17 +4385,17 @@ mod pipeline_routing_tests {
     fn test_numerical_response_aggregation_logic() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some("node1".to_string()), Value::Int(3)),
-                (Some("node2".to_string()), Value::Int(7)),
-                (Some("node3".to_string()), Value::Int(0)),
+                (Some(Arc::from("node1")), Value::Int(3)),
+                (Some(Arc::from("node2")), Value::Int(7)),
+                (Some(Arc::from("node3")), Value::Int(0)),
             ],
             vec![(
-                Some("node3".to_string()),
+                Some(Arc::from("node3")),
                 Value::BulkString(b"unchanged".to_vec().into()),
             )],
             vec![
-                (Some("node1".to_string()), Value::Int(5)),
-                (Some("node2".to_string()), Value::Int(11)),
+                (Some(Arc::from("node1")), Value::Int(5)),
+                (Some(Arc::from("node2")), Value::Int(11)),
             ],
         ];
         let response_policies = HashMap::from([
@@ -4431,19 +4438,19 @@ mod pipeline_routing_tests {
     fn test_combine_arrays_response_aggregation_logic() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some("node1".to_string()), Value::Array(vec![Value::Int(1)])),
-                (Some("node2".to_string()), Value::Array(vec![Value::Int(2)])),
+                (Some(Arc::from("node1")), Value::Array(vec![Value::Int(1)])),
+                (Some(Arc::from("node2")), Value::Array(vec![Value::Int(2)])),
             ],
             vec![
                 (
-                    Some("node2".to_string()),
+                    Some(Arc::from("node2")),
                     Value::Array(vec![
                         Value::BulkString("key1".into()),
                         Value::BulkString("key3".into()),
                     ]),
                 ),
                 (
-                    Some("node1".to_string()),
+                    Some(Arc::from("node1")),
                     Value::Array(vec![
                         Value::BulkString("key2".into()),
                         Value::BulkString("key4".into()),
@@ -4502,10 +4509,10 @@ mod pipeline_routing_tests {
     fn test_aggregate_pipeline_multi_node_commands_with_error_response() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some("node1".to_string()), Value::Int(3)),
-                (Some("node2".to_string()), Value::Int(7)),
+                (Some(Arc::from("node1")), Value::Int(3)),
+                (Some(Arc::from("node2")), Value::Int(7)),
                 (
-                    Some("node3".to_string()),
+                    Some(Arc::from("node3")),
                     Value::ServerError(ServerError::KnownError {
                         kind: ServerErrorKind::Moved,
                         detail: Some("127.0.0.1".to_string()),
@@ -4513,7 +4520,7 @@ mod pipeline_routing_tests {
                 ),
             ],
             vec![(
-                Some("node3".to_string()),
+                Some(Arc::from("node3")),
                 Value::BulkString(b"unchanged".to_vec().into()),
             )],
         ];
@@ -4548,7 +4555,7 @@ mod pipeline_routing_tests {
     #[test]
     fn test_aggregate_pipeline_multi_node_commands_with_no_response_for_command() {
         let pipeline_responses: PipelineResponses =
-            vec![vec![(Some("node1".to_string()), Value::Int(1))], vec![]];
+            vec![vec![(Some(Arc::from("node1")), Value::Int(1))], vec![]];
         let response_policies = HashMap::new();
 
         let responses = block_on(
@@ -4573,10 +4580,10 @@ mod pipeline_routing_tests {
     #[test]
     fn test_aggregate_pipeline_responses_with_multiple_responses_for_command() {
         let pipeline_responses: PipelineResponses = vec![
-            vec![(Some("node1".to_string()), Value::Int(1))],
+            vec![(Some(Arc::from("node1")), Value::Int(1))],
             vec![
-                (Some("node2".to_string()), Value::Int(2)),
-                (Some("node3".to_string()), Value::Int(3)),
+                (Some(Arc::from("node2")), Value::Int(2)),
+                (Some(Arc::from("node3")), Value::Int(3)),
             ],
         ];
         let response_policies = HashMap::new();
@@ -4724,13 +4731,13 @@ mod parse_node_address_tests {
 #[cfg(test)]
 mod direct_dispatch_tests {
     use super::*;
-    use connections_container::{ClusterNode, ConnectionDetails, ConnectionsMap};
-    use crate::valkey::{
-        cluster_client::ClusterParams,
-        cluster_routing::{Route, SingleNodeRoutingInfo, Slot, SlotAddr},
-        cluster_slotmap::{ReadFromReplicaStrategy, SlotMap},
-        pipeline::PipelineRetryStrategy,
+    use container::{ClusterNode, ConnectionDetails, ConnectionsMap};
+    use crate::cluster::{
+        client::ClusterParams,
+        routing::{Route, SingleNodeRoutingInfo, Slot, SlotAddr},
+        slotmap::{ReadFromReplicaStrategy, SlotMap},
     };
+    use crate::valkey::PipelineRetryStrategy;
     use dashmap::DashMap;
 
     use std::{
@@ -4863,17 +4870,17 @@ mod direct_dispatch_tests {
 
         let slot_map = SlotMap::new(slots, HashMap::new(), ReadFromReplicaStrategy::AlwaysFromPrimary);
 
-        let dm: DashMap<String, ClusterNode<ConnectionFuture<MockConn>>> = DashMap::new();
+        let dm: DashMap<Arc<str>, ClusterNode<ConnectionFuture<MockConn>>> = DashMap::new();
         for (addr, _, _, conn) in nodes {
             let details = ConnectionDetails {
                 conn: into_future(conn),
                 ip: None,
                 az: None,
             };
-            dm.insert(addr.to_string(), ClusterNode::new(details, None));
+            dm.insert(Arc::from(addr), ClusterNode::new(details, None));
         }
 
-        let container = connections_container::ConnectionsContainer::new(
+        let container = container::ConnectionsContainer::new(
             slot_map,
             ConnectionsMap(dm),
             ReadFromReplicaStrategy::AlwaysFromPrimary,
@@ -4888,7 +4895,7 @@ mod direct_dispatch_tests {
             pending_requests_tx: pending_tx,
             pending_requests_rx: std::sync::Mutex::new(pending_rx),
             slot_refresh_state: SlotRefreshState::new(
-                crate::valkey::cluster_client::SlotsRefreshRateLimit::default(),
+                crate::cluster::client::SlotsRefreshRateLimit::default(),
             ),
             initial_nodes: vec![],
             ferriskey_connection_options: FerrisKeyConnectionOptions {

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::valkey::tls::TlsConnParams;
+use crate::connection::tls::TlsConnParams;
 
 /// Enables the tokio compatibility
 pub mod tokio;
@@ -249,17 +249,19 @@ where
     // result is ignored, as per the command's instructions.
     // https://redis.io/commands/client-setinfo/
     let _: ValkeyResult<()> =
-        crate::valkey::connection::client_set_info_pipeline(connection_info.lib_name.as_deref())
+        crate::connection::info::client_set_info_pipeline(connection_info.lib_name.as_deref())
             .query_async(con)
             .await;
     Ok(())
 }
 
-mod multiplexed_connection;
-pub use multiplexed_connection::*;
+mod multiplexed;
+pub use multiplexed::*;
 pub(crate) mod runtime;
+pub(crate) mod info;
+pub(crate) mod tls;
 
-use crate::valkey::connection::ConnectionAddr;
+use crate::connection::info::ConnectionAddr;
 use futures_util::future::select_ok;
 
 pub(crate) async fn get_socket_addrs(
@@ -278,7 +280,7 @@ pub(crate) async fn get_socket_addrs(
 }
 
 pub(crate) async fn connect_simple<T: RedisRuntime>(
-    connection_info: &crate::valkey::connection::ConnectionInfo,
+    connection_info: &crate::connection::info::ConnectionInfo,
     _socket_addr: Option<SocketAddr>,
     tcp_nodelay: bool,
 ) -> ValkeyResult<(T, Option<std::net::IpAddr>)> {

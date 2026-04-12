@@ -1,14 +1,14 @@
 use super::{
-    connections_container::{ClusterNode, ConnectionDetails},
     Connect,
+    container::{ClusterNode, ConnectionDetails},
 };
-use crate::valkey::cluster_slotmap::ReadFromReplicaStrategy;
+use crate::cluster::client::ClusterParams;
+use crate::cluster::compat::get_connection_info;
+use crate::cluster::slotmap::ReadFromReplicaStrategy;
 use crate::valkey::{
+    ErrorKind, ValkeyError, ValkeyResult,
     aio::{ConnectionLike, DisconnectNotifier},
     client::FerrisKeyConnectionOptions,
-    cluster::get_connection_info,
-    cluster_client::ClusterParams,
-    ErrorKind, ValkeyError, ValkeyResult,
 };
 use std::net::{Ipv6Addr, SocketAddr};
 
@@ -178,8 +178,8 @@ where
 {
     let discover_az = matches!(
         params.read_from_replicas,
-        crate::valkey::cluster_slotmap::ReadFromReplicaStrategy::AZAffinity(_)
-            | crate::valkey::cluster_slotmap::ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_)
+        crate::cluster::slotmap::ReadFromReplicaStrategy::AZAffinity(_)
+            | crate::cluster::slotmap::ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_)
     );
 
     match create_connection::<C>(
@@ -238,7 +238,6 @@ impl<C> ConnectAndCheckResult<C> {
             ConnectAndCheckResult::Failed(err) => Err(err),
         }
     }
-
 }
 
 impl<C> From<ValkeyError> for ConnectAndCheckResult<C> {
@@ -315,8 +314,13 @@ where
             }
         }
         RefreshConnectionType::AllConnections => {
-            connect_and_check_all_connections(addr, params, socket_addr, ferriskey_connection_options)
-                .await
+            connect_and_check_all_connections(
+                addr,
+                params,
+                socket_addr,
+                ferriskey_connection_options,
+            )
+            .await
         }
     }
 }
@@ -474,7 +478,11 @@ async fn check_connection<C>(conn: &mut C, timeout: std::time::Duration) -> Valk
 where
     C: ConnectionLike + Send + 'static,
 {
-    tokio::time::timeout(timeout, crate::valkey::cmd("PING").query_async::<_, String>(conn)).await??;
+    tokio::time::timeout(
+        timeout,
+        crate::valkey::cmd("PING").query_async::<_, String>(conn),
+    )
+    .await??;
     Ok(())
 }
 

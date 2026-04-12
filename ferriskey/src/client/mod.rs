@@ -8,9 +8,6 @@ use crate::compression::lz4_backend::Lz4Backend;
 use crate::compression::zstd_backend::ZstdBackend;
 use crate::compression::{CompressionConfig, CompressionManager};
 use crate::scripts_container::get_script;
-use futures::FutureExt;
-use logger_core::{log_debug, log_error, log_info, log_warn};
-use once_cell::sync::OnceCell;
 use crate::valkey::aio::ConnectionLike;
 use crate::valkey::cluster_async::ClusterConnection;
 use crate::valkey::cluster_routing::{
@@ -18,9 +15,12 @@ use crate::valkey::cluster_routing::{
 };
 use crate::valkey::cluster_slotmap::ReadFromReplicaStrategy;
 use crate::valkey::{
-    ClusterScanArgs, Cmd, ErrorKind, FromValkeyValue, PipelineRetryStrategy, PushInfo, ValkeyError,
-    ValkeyResult, RetryStrategy, ScanStateRC, Value,
+    ClusterScanArgs, Cmd, ErrorKind, FromValkeyValue, PipelineRetryStrategy, PushInfo,
+    RetryStrategy, ScanStateRC, ValkeyError, ValkeyResult, Value,
 };
+use futures::FutureExt;
+use logger_core::{log_debug, log_error, log_info, log_warn};
+use once_cell::sync::OnceCell;
 pub use standalone_client::StandaloneClient;
 use std::io;
 use std::sync::Arc;
@@ -467,9 +467,10 @@ impl Client {
                 client.update_connection_database(database_id).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -520,9 +521,10 @@ impl Client {
                 client.update_connection_client_name(client_name).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -589,9 +591,10 @@ impl Client {
                 client.update_connection_username(username).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -607,9 +610,10 @@ impl Client {
                 client.update_connection_password(password).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -712,7 +716,10 @@ impl Client {
     }
 
     /// Updates the stored protocol version for different client types.
-    async fn update_stored_protocol(&self, protocol: crate::valkey::ProtocolVersion) -> ValkeyResult<()> {
+    async fn update_stored_protocol(
+        &self,
+        protocol: crate::valkey::ProtocolVersion,
+    ) -> ValkeyResult<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -723,9 +730,10 @@ impl Client {
                 client.update_connection_protocol(protocol).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -847,9 +855,10 @@ impl Client {
                 };
                 client.route_command(&cmd, final_routing).await
             }
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }?;
 
         // Post-process: decompress and convert to expected type.
@@ -1048,7 +1057,10 @@ impl Client {
                 Ok(Value::Array(vec![cluster_cursor_id, Value::Array(keys)]))
             }
             // Lazy case is now handled by the initial check
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized"))),
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -1187,9 +1199,10 @@ impl Client {
                                 raise_on_error,
                             )
                         }
-                        ClientWrapper::Lazy(_) => {
-                            Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-                        }
+                        ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                            ErrorKind::ClientError,
+                            "Client not yet initialized",
+                        ))),
                     }
                 },
             )
@@ -1261,9 +1274,10 @@ impl Client {
                                     .await
                             }
                         },
-                        ClientWrapper::Lazy(_) => {
-                            Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-                        }
+                        ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                            ErrorKind::ClientError,
+                            "Client not yet initialized",
+                        ))),
                     }?;
 
                     Client::convert_pipeline_values_to_expected_types(
@@ -1307,9 +1321,7 @@ impl Client {
     /// Reserve an inflight slot, returning a tracker whose Drop releases it.
     /// Returns `None` if no slots available.
     pub fn reserve_inflight_request(&self) -> Option<crate::valkey::InflightRequestTracker> {
-        crate::valkey::InflightRequestTracker::try_new(
-            self.inflight_requests_allowed.clone(),
-        )
+        crate::valkey::InflightRequestTracker::try_new(self.inflight_requests_allowed.clone())
     }
 
     /// Returns the current number of available inflight slots.
@@ -1343,9 +1355,10 @@ impl Client {
                 ClientWrapper::Cluster { ref mut client } => {
                     client.update_connection_password(password.clone()).await
                 }
-                ClientWrapper::Lazy(_) => {
-                    Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-                }
+                ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                    ErrorKind::ClientError,
+                    "Client not yet initialized",
+                ))),
             }
         })
         .await
@@ -1418,9 +1431,10 @@ impl Client {
                 ))),
             },
             ClientWrapper::Standalone(client) => Ok(client.get_username()),
-            ClientWrapper::Lazy(_) => {
-                Err(ValkeyError::from((ErrorKind::ClientError, "Client not yet initialized")))
-            }
+            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "Client not yet initialized",
+            ))),
         }
     }
 
@@ -1700,7 +1714,9 @@ async fn create_cluster_client(
 
     let client = builder.build()?;
     let iam_token_provider: Option<Arc<dyn crate::valkey::IAMTokenProvider>> = iam_token_manager
-        .map(|manager| Arc::new(manager.get_token_handle()) as Arc<dyn crate::valkey::IAMTokenProvider>);
+        .map(|manager| {
+            Arc::new(manager.get_token_handle()) as Arc<dyn crate::valkey::IAMTokenProvider>
+        });
 
     let mut con = client
         .get_async_connection(push_sender, Some(pubsub_synchronizer), iam_token_provider)
@@ -1884,10 +1900,8 @@ fn sanitized_request_string(request: &ConnectionRequest) -> String {
         .map(|pubsub_subscriptions| format!("\nPubsub subscriptions: {pubsub_subscriptions:?}"))
         .unwrap_or_default();
 
-    let inflight_requests_limit = format_optional_value(
-        "Inflight requests limit",
-        request.inflight_requests_limit,
-    );
+    let inflight_requests_limit =
+        format_optional_value("Inflight requests limit", request.inflight_requests_limit);
 
     format!(
         "\nAddresses: {addresses}{tls_mode}{cluster_mode}{request_timeout}{connection_timeout}{rfr_strategy}{connection_retry_strategy}{database_id}{protocol}{client_name}{periodic_checks}{pubsub_subscriptions}{inflight_requests_limit}",
@@ -1936,7 +1950,9 @@ impl Client {
             .inflight_requests_limit
             .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
         let inflight_requests_allowed = Arc::new(AtomicIsize::new(
-            inflight_requests_limit.try_into().expect("inflight limit exceeds isize::MAX"),
+            inflight_requests_limit
+                .try_into()
+                .expect("inflight limit exceeds isize::MAX"),
         ));
 
         // Create compression manager from configuration
@@ -1986,7 +2002,9 @@ impl Client {
             };
 
             // Create the Client first without IAM token manager
-            let inflight_limit: isize = inflight_requests_limit.try_into().expect("inflight limit exceeds isize::MAX");
+            let inflight_limit: isize = inflight_requests_limit
+                .try_into()
+                .expect("inflight limit exceeds isize::MAX");
             let inflight_log_interval = (inflight_limit / 10).max(1);
             let client = Self {
                 internal_client: internal_client_arc.clone(),

@@ -3,7 +3,7 @@
 //! The primary entry point is [`ClusterClientBuilder`] which configures
 //! cluster connections used by the async cluster module.
 
-pub use crate::valkey::cluster_client::{ClusterClient, ClusterClientBuilder};
+pub use crate::cluster::client::{ClusterClient, ClusterClientBuilder};
 use crate::valkey::cmd::Cmd;
 use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo};
 use crate::valkey::tls::TlsConnParams;
@@ -14,7 +14,7 @@ pub use crate::valkey::connection::TlsMode;
 
 pub(crate) fn get_connection_info(
     node: &str,
-    cluster_params: crate::valkey::cluster_client::ClusterParams,
+    cluster_params: crate::cluster::client::ClusterParams,
 ) -> ValkeyResult<ConnectionInfo> {
     let invalid_error = || (ErrorKind::InvalidClientConfig, "Invalid node string");
     let (host, port) = node
@@ -26,7 +26,12 @@ pub(crate) fn get_connection_info(
         })
         .ok_or_else(invalid_error)?;
     Ok(ConnectionInfo {
-        addr: get_connection_addr(host.to_string(), port, cluster_params.tls, cluster_params.tls_params),
+        addr: get_connection_addr(
+            host.to_string(),
+            port,
+            cluster_params.tls,
+            cluster_params.tls_params,
+        ),
         valkey: ValkeyConnectionInfo {
             password: cluster_params.password,
             username: cluster_params.username,
@@ -45,8 +50,18 @@ pub(crate) fn get_connection_addr(
     tls_params: Option<TlsConnParams>,
 ) -> ConnectionAddr {
     match tls {
-        Some(TlsMode::Secure) => ConnectionAddr::TcpTls { host, port, insecure: false, tls_params },
-        Some(TlsMode::Insecure) => ConnectionAddr::TcpTls { host, port, insecure: true, tls_params },
+        Some(TlsMode::Secure) => ConnectionAddr::TcpTls {
+            host,
+            port,
+            insecure: false,
+            tls_params,
+        },
+        Some(TlsMode::Insecure) => ConnectionAddr::TcpTls {
+            host,
+            port,
+            insecure: true,
+            tls_params,
+        },
         _ => ConnectionAddr::Tcp(host, port),
     }
 }

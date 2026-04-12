@@ -1,16 +1,16 @@
 //! This module provides the functionality to refresh and calculate the cluster topology for Redis Cluster.
 
-use crate::valkey::cluster::get_connection_addr;
-use crate::valkey::cluster_client::SlotsRefreshRateLimit;
-use crate::valkey::cluster_routing::Slot;
-use crate::valkey::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap};
-use crate::valkey::{connection::TlsMode, ErrorKind, ValkeyError, ValkeyResult, Value};
+use crate::cluster::client::SlotsRefreshRateLimit;
+use crate::cluster::compat::get_connection_addr;
+use crate::cluster::routing::Slot;
+use crate::cluster::slotmap::{ReadFromReplicaStrategy, SlotMap};
+use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult, Value, connection::TlsMode};
 use logger_core::log_warn;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -294,10 +294,24 @@ pub(crate) fn parse_and_count_slots(
     })
 }
 
+/// Deterministic FNV-1a hasher — produces the same hash across process restarts
+/// and Rust versions, unlike `DefaultHasher` which offers no stability guarantees.
 fn calculate_hash<T: Hash>(t: &T) -> u64 {
-    let mut s = DefaultHasher::new();
-    t.hash(&mut s);
-    s.finish()
+    struct FnvHasher(u64);
+    impl Hasher for FnvHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for &byte in bytes {
+                self.0 ^= byte as u64;
+                self.0 = self.0.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    let mut hasher = FnvHasher(0xcbf29ce484222325); // FNV offset basis
+    t.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(crate) fn calculate_topology<'a>(
@@ -404,7 +418,7 @@ pub(crate) fn calculate_topology<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::valkey::cluster_routing::ShardAddrs;
+    use crate::cluster::routing::ShardAddrs;
 
     #[test]
     fn test_get_hashtag() {
@@ -1121,8 +1135,8 @@ mod tests {
     }
 
     #[test]
-    fn test_topology_calculator_2_nodes_queried_no_majority_no_full_coverage_prefer_fuller_coverage(
-    ) {
+    fn test_topology_calculator_2_nodes_queried_no_majority_no_full_coverage_prefer_fuller_coverage()
+     {
         //  2 nodes queried: No majority, no full slot coverage, should return error
         let queried_nodes = 2;
         let topology_results = [

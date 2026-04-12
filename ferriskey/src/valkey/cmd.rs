@@ -1,13 +1,15 @@
 use futures_util::{
+    Stream, StreamExt,
     future::BoxFuture,
     task::{Context, Poll},
-    Stream, StreamExt,
 };
 use std::pin::Pin;
 use std::{borrow::Borrow, fmt, io};
 
 use crate::valkey::pipeline::Pipeline;
-use crate::valkey::types::{from_owned_valkey_value, FromValkeyValue, ValkeyResult, ValkeyWrite, ToValkeyArgs};
+use crate::valkey::types::{
+    FromValkeyValue, ToValkeyArgs, ValkeyResult, ValkeyWrite, from_owned_valkey_value,
+};
 use telemetrylib::FerrisKeySpan;
 
 /// An argument to a valkey command
@@ -86,7 +88,9 @@ impl<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner
     }
 }
 
-impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a> AsyncIter<'a, T, C> {
+impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a>
+    AsyncIter<'a, T, C>
+{
     /// ```rust,ignore
     /// # use redis::AsyncCommands;
     /// # async fn scan_set() -> redis::ValkeyResult<()> {
@@ -107,7 +111,9 @@ impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unp
     }
 }
 
-impl<'a, T: FromValkeyValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unpin + 'a> Stream for AsyncIter<'a, T, C> {
+impl<'a, T: FromValkeyValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unpin + 'a> Stream
+    for AsyncIter<'a, T, C>
+{
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
@@ -382,7 +388,6 @@ impl Cmd {
         self.write_packed_command(&mut cmd);
         cmd.into()
     }
-
 
     pub(crate) fn write_packed_command(&self, cmd: &mut Vec<u8>) {
         write_command_to_vec(

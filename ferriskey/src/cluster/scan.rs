@@ -40,11 +40,11 @@
 //! - Network connectivity issues
 //! - Invalid routing scenarios
 
+use crate::cluster::routing::SlotAddr;
+use crate::cluster::topology::SLOT_SIZE;
+use crate::cluster::{ClusterConnInner, Connect, InnerCore, RefreshPolicy};
 use crate::valkey::aio::ConnectionLike;
-use crate::valkey::cluster_async::{ClusterConnInner, Connect, InnerCore, RefreshPolicy};
-use crate::valkey::cluster_routing::SlotAddr;
-use crate::valkey::cluster_topology::SLOT_SIZE;
-use crate::valkey::{cmd, from_valkey_value, ErrorKind, ValkeyError, ValkeyResult, Value};
+use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult, Value, cmd, from_valkey_value};
 use std::sync::Arc;
 use strum_macros::{Display, EnumString};
 
@@ -785,7 +785,8 @@ where
     loop {
         match send_scan(&new_scan_state, cluster_scan_args, core.clone()).await {
             Ok(scan_response) => {
-                let (new_cursor, new_keys) = from_valkey_value::<(u64, Vec<Value>)>(&scan_response)?;
+                let (new_cursor, new_keys) =
+                    from_valkey_value::<(u64, Vec<Value>)>(&scan_response)?;
                 return Ok(((new_cursor, new_keys), new_scan_state));
             }
             Err(err) if is_scanwise_retryable_error(&err) => {
