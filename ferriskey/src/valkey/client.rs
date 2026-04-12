@@ -154,19 +154,21 @@ impl Client {
     where
         T: crate::valkey::aio::RedisRuntime,
     {
-        // Clone to give the spawned driver task its own 'static reference.
-        // The driver future captures connection_info for push-manager metadata.
-        let conn_info = Box::new(self.connection_info.clone());
-        let conn_info: &'static ConnectionInfo = Box::leak(conn_info);
+        // KNOWN ISSUE: Box::leak creates a 'static reference that is never freed.
+        // This leaks ~200 bytes per connection. The proper fix requires changing
+        // MultiplexedConnection::new_with_response_timeout to take owned ConnectionInfo
+        // (tracked in DESIGN_DEBT.md item #5 — connection lifecycle simplification).
+        let conn_info: &'static ConnectionInfo =
+            Box::leak(Box::new(self.connection_info.clone()));
         let (con, ip) = crate::valkey::aio::connect_simple::<T>(
-            conn_info,
+            &conn_info,
             socket_addr,
             ferriskey_connection_options.tcp_nodelay,
         )
         .await?;
         let (connection, driver) =
             crate::valkey::aio::MultiplexedConnection::new_with_response_timeout(
-                conn_info,
+                &conn_info,
                 con.boxed(),
                 response_timeout,
                 ferriskey_connection_options,
