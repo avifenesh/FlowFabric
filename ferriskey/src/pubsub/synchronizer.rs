@@ -42,18 +42,6 @@ const STANDALONE_KINDS: &[PubSubSubscriptionKind] = &[
 enum SyncEvent {
     /// User changed desired subscriptions — reconcile immediately
     DesiredChanged,
-    /// Server confirmed a subscription (from push notification)
-    Confirmed {
-        kind: PubSubSubscriptionKind,
-        channel: Vec<u8>,
-        address: String,
-    },
-    /// Server confirmed an unsubscription (from push notification)
-    Unconfirmed {
-        kind: PubSubSubscriptionKind,
-        channel: Vec<u8>,
-        address: String,
-    },
     /// Topology changed — pre-computed migrations to unsubscribe + reconcile
     TopologyChanged {
         migrations: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>,
@@ -248,20 +236,6 @@ impl EventDrivenSynchronizer {
                             log_error("pubsub_sync", format!("Reconcile failed: {e:?}"));
                         }
                     }
-                    SyncEvent::Confirmed {
-                        kind,
-                        channel,
-                        address,
-                    } => {
-                        sync.on_confirmed(kind, channel, address);
-                    }
-                    SyncEvent::Unconfirmed {
-                        kind,
-                        channel,
-                        address,
-                    } => {
-                        sync.on_unconfirmed(kind, channel, address);
-                    }
                     SyncEvent::TopologyChanged { migrations, gone_subs } => {
                         // Drain and keep only the latest TopologyChanged
                         let mut latest_mig = migrations;
@@ -286,6 +260,30 @@ impl EventDrivenSynchronizer {
 
                 sync.check_sync_and_notify();
                 sync.reconcile_complete_notify.notify_waiters();
+
+                // If not synced after processing, schedule a retry after a short delay.
+                // This handles transient failures (e.g. failover in progress).
+                {
+                    let desired = sync.desired.read().unwrap_or_else(|e| e.into_inner());
+                    let actual = sync.confirmed.read().unwrap_or_else(|e| e.into_inner()).aggregate();
+                    let is_synced = sync.kinds().iter().all(|kind| {
+                        let d = desired.get(kind);
+                        let a = actual.get(kind);
+                        match (d, a) {
+                            (Some(d_set), Some(a_set)) => d_set == a_set,
+                            (None, None) => true,
+                            (Some(d_set), None) => d_set.is_empty(),
+                            (None, Some(a_set)) => a_set.is_empty(),
+                        }
+                    });
+                    if !is_synced {
+                        let tx = sync.events_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            let _ = tx.send(SyncEvent::DesiredChanged);
+                        });
+                    }
+                }
             }
         });
 
@@ -362,26 +360,6 @@ impl EventDrivenSynchronizer {
         }
 
         Ok(())
-    }
-
-    fn on_confirmed(
-        &self,
-        kind: PubSubSubscriptionKind,
-        channel: Vec<u8>,
-        address: String,
-    ) {
-        let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
-        confirmed.add(kind, channel, address);
-    }
-
-    fn on_unconfirmed(
-        &self,
-        kind: PubSubSubscriptionKind,
-        channel: Vec<u8>,
-        address: String,
-    ) {
-        let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
-        confirmed.remove_exact(kind, &channel, &address);
     }
 
     /// Handle pre-computed topology migrations. Confirmed state is already
@@ -715,13 +693,14 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         subscription_type: PubSubSubscriptionKind,
         address: String,
     ) {
+        // Update confirmed state synchronously — handle_topology_refresh reads
+        // confirmed directly under the RwLock, so we can't defer this to the event loop.
+        let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
         for channel in channels {
-            self.send_event(SyncEvent::Confirmed {
-                kind: subscription_type,
-                channel,
-                address: address.clone(),
-            });
+            confirmed.add(subscription_type, channel, address.clone());
         }
+        drop(confirmed);
+        self.check_sync_and_notify();
     }
 
     fn remove_current_subscriptions(
@@ -730,13 +709,16 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         subscription_type: PubSubSubscriptionKind,
         address: String,
     ) {
-        for channel in channels {
-            self.send_event(SyncEvent::Unconfirmed {
-                kind: subscription_type,
-                channel,
-                address: address.clone(),
-            });
+        // Update confirmed state synchronously — same reason as add_current_subscriptions.
+        let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
+        for channel in &channels {
+            confirmed.remove_exact(subscription_type, channel, &address);
         }
+        drop(confirmed);
+        // Trigger reconciliation — the server may have unsubscribed us (e.g. slot migration
+        // sends SUnsubscribe) while we still want the channel. Reconcile will re-subscribe
+        // on the new slot owner.
+        self.send_event(SyncEvent::DesiredChanged);
     }
 
     fn get_subscription_state(
@@ -778,8 +760,10 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         // Compute migrations synchronously (trait method is sync)
         let migrations: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>;
         let gone_subs: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>;
+        let confirmed_keys: Vec<String>;
         {
             let confirmed = self.confirmed.read().unwrap_or_else(|e| e.into_inner());
+            confirmed_keys = confirmed.by_address.keys().cloned().collect();
             let mut mig = Vec::new();
             let mut gone = Vec::new();
 
@@ -814,6 +798,14 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
             migrations = mig;
             gone_subs = gone;
         }
+
+        log_debug(
+            "pubsub_sync",
+            format!(
+                "handle_topology_refresh: confirmed_addrs={:?}, new_addrs count={}, migrations={}, gone={}",
+                confirmed_keys, new_addresses.len(), migrations.len(), gone_subs.len()
+            ),
+        );
 
         if migrations.is_empty() && gone_subs.is_empty() {
             return;

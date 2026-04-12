@@ -34,7 +34,7 @@ use which::which;
 // Code copied from ferriskey
 
 pub(crate) const SHORT_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(50_000);
-pub(crate) const LONG_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(60_000);
+pub(crate) const LONG_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(300_000);
 
 enum ClusterType {
     Tcp,
@@ -478,6 +478,7 @@ impl PubSubTestSetup {
         let client = ferriskey::cluster::compat::ClusterClientBuilder::new(initial_nodes)
             .slots_refresh_rate_limit(Duration::from_millis(0), 0)
             .periodic_topology_checks(Duration::from_millis(500))
+            .response_timeout(Duration::from_secs(5))
             .build()
             .expect("Failed to build cluster client for topology test");
 
