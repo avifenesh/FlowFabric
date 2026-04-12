@@ -24,15 +24,11 @@ use crate::scripts_container::get_script;
 use crate::value::{ErrorKind, FromValkeyValue, ValkeyError, ValkeyFuture, ValkeyResult, Value};
 use futures::FutureExt;
 use logger_core::{log_debug, log_error, log_info, log_warn};
-use once_cell::sync::OnceCell;
 pub use standalone_client::StandaloneClient;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::thread;
-use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::runtime::{Builder, Handle};
 pub use types::*;
 
 use self::value_conversion::{convert_to_expected_type, expected_type_for_cmd, get_value_type};
@@ -46,7 +42,7 @@ use crate::value::InfoDict;
 use std::future::Future;
 use std::pin::Pin;
 use telemetrylib::FerrisKeyOtel;
-use tokio::sync::{Notify, RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc};
 use versions::Versioning;
 
 pub const HEARTBEAT_SLEEP_DURATION: Duration = Duration::from_secs(1);
@@ -65,7 +61,7 @@ pub(crate) const FINISHED_SCAN_CURSOR: &str = "finished";
 ///   (50,000 requests/second) × (1 millisecond / 1000 milliseconds) = 50 requests
 ///
 /// The value of 1000 provides a buffer for bursts while still allowing full utilization of the maximum request rate.
-pub const DEFAULT_MAX_INFLIGHT_REQUESTS: u32 = 1000;
+pub(crate) const DEFAULT_MAX_INFLIGHT_REQUESTS: u32 = 1000;
 
 /// The connection check interval is currently not exposed to the user via ConnectionRequest,
 /// as improper configuration could negatively impact performance or pub/sub resiliency.
@@ -88,67 +84,6 @@ fn extract_request_type_from_cmd(cmd: &Cmd) -> Option<RequestType> {
         "GETDEL" => Some(RequestType::GetDel),
         "GETSET" => Some(RequestType::GetSet),
         _ => None, // Unknown command or write command, no decompression needed
-    }
-}
-
-/// A static Ferriskey runtime instance
-static RUNTIME: OnceCell<FerrisKeyRt> = OnceCell::new();
-
-pub struct FerrisKeyRt {
-    pub runtime: Handle,
-    pub(crate) thread: Option<JoinHandle<()>>,
-    shutdown_notifier: Arc<Notify>,
-}
-
-/// Initializes a single-threaded Tokio runtime in a dedicated thread (if not already initialized)
-/// and returns a static reference to the `FerrisKeyRt` wrapper, which holds the runtime handle and a shutdown notifier.
-/// The runtime remains active indefinitely until a shutdown is triggered via the notifier, allowing tasks to be spawned
-/// throughout the lifetime of the application.
-pub fn get_or_init_runtime() -> Result<&'static FerrisKeyRt, String> {
-    RUNTIME.get_or_try_init(|| {
-        let notify = Arc::new(Notify::new());
-        let notify_thread = notify.clone();
-
-        let (tx, rx) = oneshot::channel();
-
-        let thread_handle = thread::Builder::new()
-            .name("ferriskey-runtime-thread".into())
-            .spawn(move || {
-                match Builder::new_current_thread().enable_all().build() {
-                    Ok(runtime) => {
-                        let _ = tx.send(Ok(runtime.handle().clone()));
-                        // Keep runtime alive until shutdown is signaled
-                        runtime.block_on(notify_thread.notified());
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Err(format!("Failed to create runtime: {err}")));
-                    }
-                }
-            })
-            .map_err(|_| "Failed to spawn runtime thread".to_string())?;
-
-        let runtime_handle = rx
-            .blocking_recv()
-            .map_err(|err| format!("Failed to receive runtime handle: {err:?}"))??;
-
-        Ok(FerrisKeyRt {
-            runtime: runtime_handle,
-            thread: Some(thread_handle),
-            shutdown_notifier: notify,
-        })
-    })
-}
-
-impl Drop for FerrisKeyRt {
-    fn drop(&mut self) {
-        if let Some(rt) = RUNTIME.get() {
-            rt.shutdown_notifier.notify_one();
-        }
-
-        // Move the JoinHandle out of the Option and join it
-        if let Some(handle) = self.thread.take() {
-            handle.join().expect("FerrisKeyRt thread panicked");
-        }
     }
 }
 
@@ -1224,7 +1159,6 @@ impl Client {
     ///     which could affect operations that rely on strict execution sequence.
     ///   - If `retry_connection_error` is `true`, sub-pipeline requests will be retried on connection errors.
     ///     ⚠️ **Caution**: Retrying after a connection error may result in duplicate executions, since the server might have already received and processed the request before the error occurred.
-    ///     TODO: add wiki link.
     pub fn send_pipeline<'a>(
         &'a mut self,
         pipeline: &'a crate::pipeline::Pipeline,
@@ -2066,21 +2000,12 @@ impl Client {
         .map_err(|_| ValkeyError::from(std::io::Error::from(std::io::ErrorKind::TimedOut)))?
     }
 
-    /// Get the compression manager if compression is enabled
-    ///
-    /// # Returns
-    /// * `Some(Arc<CompressionManager>)` - If compression is enabled and configured
-    /// * `None` - If compression is disabled or not configured
-    pub fn compression_manager(&self) -> Option<Arc<CompressionManager>> {
-        self.compression_manager.clone()
-    }
-
     /// Check if compression is enabled for this client
     ///
     /// # Returns
     /// * `true` if compression is enabled and configured
     /// * `false` if compression is disabled or not configured
-    pub fn is_compression_enabled(&self) -> bool {
+    pub(crate) fn is_compression_enabled(&self) -> bool {
         self.compression_manager
             .as_ref()
             .map(|manager| manager.is_enabled())
@@ -2368,10 +2293,10 @@ mod tests {
 
     #[test]
     fn test_is_select_command_case_normalization() {
-        // Test that redis-rs normalizes commands to uppercase
+        // Test that ferriskey normalizes commands to uppercase
         let client = create_test_client();
 
-        // Test lowercase select (redis-rs normalizes to uppercase, so this works too)
+        // Test lowercase select (ferriskey normalizes to uppercase, so this works too)
         let mut cmd = Cmd::new();
         cmd.arg("select").arg("1");
         assert!(client.is_select_command(&cmd));

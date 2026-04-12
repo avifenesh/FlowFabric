@@ -60,6 +60,28 @@ pub use ferriskey_client::{
     Client, ClientBuilder, CommandBuilder, FerrisKeyError, FromValue, PipeCmdBuilder, PipeSlot,
     ReadFrom, ToArgs, TypedPipeline,
 };
+
+/// Connect to a standalone Valkey server.
+///
+/// ```no_run
+/// # async fn example() -> ferriskey::Result<()> {
+/// let client = ferriskey::connect("valkey://localhost:6379").await?;
+/// # Ok(()) }
+/// ```
+pub async fn connect(url: &str) -> Result<Client> {
+    Client::connect(url).await
+}
+
+/// Connect to a Valkey cluster.
+///
+/// ```no_run
+/// # async fn example() -> ferriskey::Result<()> {
+/// let client = ferriskey::connect_cluster(&["valkey://node1:6379", "valkey://node2:6379"]).await?;
+/// # Ok(()) }
+/// ```
+pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
+    Client::connect_cluster(urls).await
+}
 pub mod cluster_scan_container;
 pub mod iam;
 pub mod pubsub;

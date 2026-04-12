@@ -203,6 +203,12 @@ impl Client {
         }
     }
 
+    pub fn transaction(&self) -> TypedPipeline {
+        let mut pipe = self.pipeline();
+        pipe.atomic();
+        pipe
+    }
+
     async fn execute<T: FromValue>(&self, mut cmd: Cmd) -> Result<T> {
         let mut inner = (*self.0).clone();
         let value = inner.send_command(&mut cmd, None).await?;
@@ -340,6 +346,12 @@ pub struct PipeSlot<T> {
 }
 
 impl TypedPipeline {
+    /// Enable atomic (MULTI/EXEC) mode for this pipeline.
+    pub fn atomic(&mut self) -> &mut Self {
+        self.inner.atomic();
+        self
+    }
+
     fn push_cmd(&mut self, c: Cmd) -> usize {
         self.inner.add_command(c);
         let idx = self.next_index;
@@ -445,18 +457,24 @@ impl TypedPipeline {
 
     /// Execute all queued commands. After this returns, [`PipeSlot::value()`]
     /// can be called on any slot returned by prior pipeline methods.
+    ///
+    /// Automatically uses MULTI/EXEC when [`atomic()`](TypedPipeline::atomic)
+    /// was called (or when created via [`Client::transaction()`]).
     pub async fn execute(&mut self) -> Result<()> {
         let mut inner = (*self.client).clone();
-        let value = inner
-            .send_pipeline(
-                &self.inner,
-                None,
-                true,
-                None,
-                crate::pipeline::PipelineRetryStrategy::default(),
-            )
-            .await?;
-        // send_pipeline returns Value::Array(results) — extract the inner vec
+        let value = if self.inner.is_atomic() {
+            inner.send_transaction(&self.inner, None, None, true).await?
+        } else {
+            inner
+                .send_pipeline(
+                    &self.inner,
+                    None,
+                    true,
+                    None,
+                    crate::pipeline::PipelineRetryStrategy::default(),
+                )
+                .await?
+        };
         let vals = match value {
             crate::value::Value::Array(v) => v,
             other => vec![other],
