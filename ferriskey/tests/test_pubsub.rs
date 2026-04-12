@@ -675,3 +675,217 @@ fn test_all_subscription_types_survive_failover() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Standalone PubSub tests
+// ---------------------------------------------------------------------------
+// Requires VALKEY_STANDALONE_HOST env var pointing to a standalone node.
+// Run: VALKEY_STANDALONE_HOST=host VALKEY_TLS=true cargo test --test test_pubsub standalone_pubsub
+
+#[cfg(test)]
+mod standalone_pubsub_tests {
+    use ferriskey::client::types::{ConnectionRetryStrategy, NodeAddress};
+    use ferriskey::client::Client;
+    use ferriskey::value::Value;
+    use ferriskey::{ConnectionAddr, PushInfo};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    const STANDALONE_TIMEOUT: Duration = Duration::from_secs(30);
+    const SYNC_TIMEOUT_MS: u64 = 5000;
+
+    fn standalone_addr() -> Option<ConnectionAddr> {
+        let host = std::env::var("VALKEY_STANDALONE_HOST").ok()?;
+        let port: u16 = std::env::var("VALKEY_STANDALONE_PORT")
+            .unwrap_or_else(|_| "6379".into())
+            .parse()
+            .unwrap_or(6379);
+        let tls = std::env::var("VALKEY_TLS").unwrap_or_default() == "true";
+
+        if tls {
+            Some(ConnectionAddr::TcpTls {
+                host,
+                port,
+                insecure: true,
+                tls_params: None,
+            })
+        } else {
+            Some(ConnectionAddr::Tcp(host, port))
+        }
+    }
+
+    fn standalone_request(
+        addr: &ConnectionAddr,
+    ) -> ferriskey::client::types::ConnectionRequest {
+        let node = match addr {
+            ConnectionAddr::Tcp(h, p) => NodeAddress {
+                host: h.clone(),
+                port: *p,
+            },
+            ConnectionAddr::TcpTls { host, port, .. } => NodeAddress {
+                host: host.clone(),
+                port: *port,
+            },
+            _ => panic!("Unix not supported"),
+        };
+
+        let tls_mode = match addr {
+            ConnectionAddr::TcpTls { .. } => {
+                Some(ferriskey::client::types::TlsMode::InsecureTls)
+            }
+            _ => None,
+        };
+
+        ferriskey::client::types::ConnectionRequest {
+            addresses: vec![node],
+            cluster_mode_enabled: false,
+            tls_mode,
+            connection_retry_strategy: Some(ConnectionRetryStrategy {
+                number_of_retries: 3,
+                factor: 100,
+                exponent_base: 2,
+                jitter_percent: Some(20),
+            }),
+            connection_timeout: Some(5000),
+            request_timeout: Some(10000),
+            ..Default::default()
+        }
+    }
+
+    async fn create_standalone_client() -> Option<(Client, mpsc::UnboundedReceiver<PushInfo>)> {
+        let addr = standalone_addr()?;
+        let request = standalone_request(&addr);
+        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let client = Client::new(request, Some(push_tx)).await.ok()?;
+        Some((client, push_rx))
+    }
+
+    macro_rules! require_standalone {
+        () => {
+            match create_standalone_client().await {
+                Some(c) => c,
+                None => {
+                    eprintln!("Skipping: VALKEY_STANDALONE_HOST not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_standalone_exact_subscribe_and_publish() {
+        let (mut client, mut push_rx) = require_standalone!();
+
+        let channels = vec!["standalone:ch1", "standalone:ch2", "standalone:ch3"];
+        for ch in &channels {
+            let mut cmd = ferriskey::cmd("SUBSCRIBE_BLOCKING");
+            cmd.arg(*ch).arg(SYNC_TIMEOUT_MS);
+            client.send_command(&mut cmd, None).await.unwrap();
+        }
+
+        // Publish a message to ch2
+        let mut pub_cmd = ferriskey::cmd("PUBLISH");
+        pub_cmd.arg("standalone:ch2").arg("hello-standalone");
+        client.send_command(&mut pub_cmd, None).await.unwrap();
+
+        // Wait for the push message
+        let msg = tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+            .await
+            .expect("Timed out waiting for push message")
+            .expect("Push channel closed");
+
+        assert_eq!(msg.kind, ferriskey::PushKind::Message);
+
+        // Unsubscribe all
+        for ch in &channels {
+            let mut cmd = ferriskey::cmd("UNSUBSCRIBE_BLOCKING");
+            cmd.arg(*ch).arg(SYNC_TIMEOUT_MS);
+            client.send_command(&mut cmd, None).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_standalone_pattern_subscribe_and_publish() {
+        let (mut client, mut push_rx) = require_standalone!();
+
+        let mut sub_cmd = ferriskey::cmd("PSUBSCRIBE_BLOCKING");
+        sub_cmd.arg("standalone:events:*").arg(SYNC_TIMEOUT_MS);
+        client.send_command(&mut sub_cmd, None).await.unwrap();
+
+        let mut pub_cmd = ferriskey::cmd("PUBLISH");
+        pub_cmd
+            .arg("standalone:events:order123")
+            .arg("order-created");
+        client.send_command(&mut pub_cmd, None).await.unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+            .await
+            .expect("Timed out waiting for push message")
+            .expect("Push channel closed");
+
+        assert_eq!(msg.kind, ferriskey::PushKind::PMessage);
+
+        let mut unsub_cmd = ferriskey::cmd("PUNSUBSCRIBE_BLOCKING");
+        unsub_cmd.arg("standalone:events:*").arg(SYNC_TIMEOUT_MS);
+        client.send_command(&mut unsub_cmd, None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_standalone_rapid_subscribe_unsubscribe() {
+        let (mut client, _push_rx) = require_standalone!();
+
+        // 10 concurrent subscribe-then-unsubscribe cycles
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let mut client_clone = client.clone();
+            handles.push(tokio::spawn(async move {
+                let channel = format!("standalone:rapid:{i}");
+
+                let mut sub = ferriskey::cmd("SUBSCRIBE_BLOCKING");
+                sub.arg(channel.as_str()).arg(SYNC_TIMEOUT_MS);
+                let _ = client_clone.send_command(&mut sub, None).await;
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let mut unsub = ferriskey::cmd("UNSUBSCRIBE_BLOCKING");
+                unsub.arg(channel.as_str()).arg(SYNC_TIMEOUT_MS);
+                let _ = client_clone.send_command(&mut unsub, None).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify zero subscriptions remain
+        let mut get_subs = ferriskey::cmd("GET_SUBSCRIPTIONS");
+        let result = client.send_command(&mut get_subs, None).await.unwrap();
+
+        if let Value::Array(items) = &result {
+            // actual map is items[3]
+            if let Value::Map(actual_map) = &items[3] {
+                for (_, channels_val) in actual_map {
+                    if let Value::Array(channels) = channels_val {
+                        assert!(
+                            channels.is_empty(),
+                            "Expected zero actual subscriptions after rapid unsub, got {:?}",
+                            channels
+                        );
+                    }
+                }
+            }
+            // desired map is items[1]
+            if let Value::Map(desired_map) = &items[1] {
+                for (_, channels_val) in desired_map {
+                    if let Value::Array(channels) = channels_val {
+                        assert!(
+                            channels.is_empty(),
+                            "Expected zero desired subscriptions after rapid unsub, got {:?}",
+                            channels
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
