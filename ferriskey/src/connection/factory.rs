@@ -1,20 +1,20 @@
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::valkey::aio::DisconnectNotifier;
+use tokio::sync::mpsc;
 
+use crate::connection::runtime;
+use crate::connection::{DisconnectNotifier, MultiplexedConnection, RedisRuntime, connect_simple};
+use crate::valkey::tls::{TlsCertificates, inner_build_with_tls};
 use crate::valkey::{
+    PubSubSynchronizer,
     connection::{ConnectionInfo, IntoConnectionInfo},
     push_manager::PushInfo,
     retry_strategies::RetryStrategy,
     types::{ProtocolVersion, ValkeyResult},
 };
-use std::net::IpAddr;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-
-use crate::valkey::pubsub_synchronizer::PubSubSynchronizer;
-use crate::valkey::tls::{TlsCertificates, inner_build_with_tls};
 
 /// The client type.
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ impl Client {
     pub async fn get_multiplexed_async_connection(
         &self,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<crate::valkey::aio::MultiplexedConnection> {
+    ) -> ValkeyResult<MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
@@ -112,10 +112,10 @@ impl Client {
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<crate::valkey::aio::MultiplexedConnection> {
-        let result = crate::valkey::aio::runtime::timeout(
+    ) -> ValkeyResult<MultiplexedConnection> {
+        let result = runtime::timeout(
             connection_timeout,
-            self.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
+            self.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
                 response_timeout,
                 None,
                 ferriskey_connection_options,
@@ -136,8 +136,8 @@ impl Client {
     pub async fn get_multiplexed_async_connection_ip(
         &self,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)> {
-        self.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
+    ) -> ValkeyResult<(MultiplexedConnection, Option<IpAddr>)> {
+        self.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
             Duration::MAX,
             None,
             ferriskey_connection_options,
@@ -150,29 +150,28 @@ impl Client {
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<(crate::valkey::aio::MultiplexedConnection, Option<IpAddr>)>
+    ) -> ValkeyResult<(MultiplexedConnection, Option<IpAddr>)>
     where
-        T: crate::valkey::aio::RedisRuntime,
+        T: RedisRuntime,
     {
         // KNOWN ISSUE: Box::leak creates a 'static reference that is never freed.
         // This leaks ~200 bytes per connection. The proper fix requires changing
         // MultiplexedConnection::new_with_response_timeout to take owned ConnectionInfo
         // (tracked in DESIGN_DEBT.md item #5 — connection lifecycle simplification).
         let conn_info: &'static ConnectionInfo = Box::leak(Box::new(self.connection_info.clone()));
-        let (con, ip) = crate::valkey::aio::connect_simple::<T>(
+        let (con, ip) = connect_simple::<T>(
             &conn_info,
             socket_addr,
             ferriskey_connection_options.tcp_nodelay,
         )
         .await?;
-        let (connection, driver) =
-            crate::valkey::aio::MultiplexedConnection::new_with_response_timeout(
-                &conn_info,
-                con.boxed(),
-                response_timeout,
-                ferriskey_connection_options,
-            )
-            .await?;
+        let (connection, driver) = MultiplexedConnection::new_with_response_timeout(
+            &conn_info,
+            con.boxed(),
+            response_timeout,
+            ferriskey_connection_options,
+        )
+        .await?;
         T::spawn(driver);
         Ok((connection, ip))
     }

@@ -1,14 +1,14 @@
 use crate::connection::ConnectionLike;
+use crate::connection::DisconnectNotifier;
+use crate::connection::factory::FerrisKeyConnectionOptions;
 use crate::connection::runtime;
 use crate::connection::setup_connection;
-use crate::connection::DisconnectNotifier;
-use crate::valkey::client::FerrisKeyConnectionOptions;
 use crate::valkey::cmd::Cmd;
 use crate::valkey::parser::ValueCodec;
 use crate::valkey::pipeline::PipelineRetryStrategy;
 use crate::valkey::push_manager::PushManager;
 use crate::valkey::types::{ValkeyError, ValkeyResult, Value};
-use crate::valkey::{cmd, ConnectionInfo, ProtocolVersion, PushKind};
+use crate::valkey::{ConnectionInfo, ProtocolVersion, PushKind, cmd};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot},
@@ -26,8 +26,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{self, Poll};
 use std::time::Duration;
 use tokio_util::codec::Decoder;
@@ -189,12 +189,13 @@ where
         }
 
         if let Ok(res) = &result
-            && let Value::Push { kind, data: _data } = res {
-                self_.push_manager.load().try_send_raw(res);
-                if !kind.has_reply() {
-                    return;
-                }
+            && let Value::Push { kind, data: _data } = res
+        {
+            self_.push_manager.load().try_send_raw(res);
+            if !kind.has_reply() {
+                return;
             }
+        }
 
         let mut entry = match self_.in_flight.pop_front() {
             Some(entry) => entry,
@@ -430,14 +431,15 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
-        ready!(self
-            .as_mut()
-            .project()
-            .sink_stream
-            .poll_flush(cx)
-            .map_err(|err| {
-                self.as_mut().send_result(Err(err));
-            }))?;
+        ready!(
+            self.as_mut()
+                .project()
+                .sink_stream
+                .poll_flush(cx)
+                .map_err(|err| {
+                    self.as_mut().send_result(Err(err));
+                })
+        )?;
         self.poll_read(cx)
     }
 
@@ -617,9 +619,7 @@ impl MultiplexedConnection {
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
     {
-        let codec = ValueCodec
-            .framed(stream)
-            .and_then(|msg| async move { msg });
+        let codec = ValueCodec.framed(stream).and_then(|msg| async move { msg });
         let (mut pipeline, driver) =
             Pipeline::new(codec, ferriskey_connection_options.disconnect_notifier);
         let driver = Box::pin(driver);
@@ -685,13 +685,14 @@ impl MultiplexedConnection {
             .await;
         if self.protocol != ProtocolVersion::RESP2
             && let Err(e) = &result
-                && e.is_connection_dropped() {
-                    // Notify the PushManager that the connection was lost
-                    self.push_manager.try_send_raw(&Value::Push {
-                        kind: PushKind::Disconnection,
-                        data: vec![],
-                    });
-                }
+            && e.is_connection_dropped()
+        {
+            // Notify the PushManager that the connection was lost
+            self.push_manager.try_send_raw(&Value::Push {
+                kind: PushKind::Disconnection,
+                data: vec![],
+            });
+        }
         result
     }
 
@@ -717,13 +718,14 @@ impl MultiplexedConnection {
 
         if self.protocol != ProtocolVersion::RESP2
             && let Err(e) = &result
-                && e.is_connection_dropped() {
-                    // Notify the PushManager that the connection was lost
-                    self.push_manager.try_send_raw(&Value::Push {
-                        kind: PushKind::Disconnection,
-                        data: vec![],
-                    });
-                }
+            && e.is_connection_dropped()
+        {
+            // Notify the PushManager that the connection was lost
+            self.push_manager.try_send_raw(&Value::Push {
+                kind: PushKind::Disconnection,
+                data: vec![],
+            });
+        }
         let value = result?;
         match value {
             Value::Array(mut values) => {
@@ -871,12 +873,13 @@ impl ConnectionLike for MultiplexedConnection {
             .await;
         if self.protocol != ProtocolVersion::RESP2
             && let Err(e) = &result
-                && e.is_connection_dropped() {
-                    self.push_manager.try_send_raw(&Value::Push {
-                        kind: PushKind::Disconnection,
-                        data: vec![],
-                    });
-                }
+            && e.is_connection_dropped()
+        {
+            self.push_manager.try_send_raw(&Value::Push {
+                kind: PushKind::Disconnection,
+                data: vec![],
+            });
+        }
         result
     }
 

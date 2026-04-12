@@ -427,54 +427,124 @@ fn process_pipeline_responses(
                 {
                     if let Value::ServerError(error) = &value {
                         let retry_method = ValkeyError::from(error.clone()).retry_method();
-                        update_retry_map(&mut retry_map, retry_method, (index, inner_index), address.clone(), error.clone(), pipeline_retry_strategy);
+                        update_retry_map(
+                            &mut retry_map,
+                            retry_method,
+                            (index, inner_index),
+                            address.clone(),
+                            error.clone(),
+                            pipeline_retry_strategy,
+                        );
                     }
                     if !ignore {
-                        add_pipeline_result(pipeline_responses, index, inner_index, value, address.clone())?;
+                        add_pipeline_result(
+                            pipeline_responses,
+                            index,
+                            inner_index,
+                            value,
+                            address.clone(),
+                        )?;
                     }
                 }
                 continue;
             }
             Ok(Ok(Response::Single(_))) => (
-                ServerError::ExtensionError { code: "SingleResponseError".to_string(), detail: Some("Received a single response for a pipeline with multiple commands.".to_string()) },
+                ServerError::ExtensionError {
+                    code: "SingleResponseError".to_string(),
+                    detail: Some(
+                        "Received a single response for a pipeline with multiple commands."
+                            .to_string(),
+                    ),
+                },
                 RetryMethod::NoRetry,
             ),
             Ok(Ok(Response::ClusterScanResult(_, _))) => (
-                ServerError::ExtensionError { code: "ClusterScanError".to_string(), detail: Some("Received a cluster scan result inside a pipeline.".to_string()) },
+                ServerError::ExtensionError {
+                    code: "ClusterScanError".to_string(),
+                    detail: Some("Received a cluster scan result inside a pipeline.".to_string()),
+                },
                 RetryMethod::NoRetry,
             ),
-            Ok(Err(err)) => { let retry_method = err.retry_method(); (err.into(), retry_method) }
+            Ok(Err(err)) => {
+                let retry_method = err.retry_method();
+                (err.into(), retry_method)
+            }
             Err(err) => (
-                ServerError::ExtensionError { code: "BrokenPipe".to_string(), detail: Some(format!("Cluster: Failed to receive command response from internal sender. {err:?}")) },
-                if pipeline_retry_strategy.retry_connection_error { RetryMethod::ReconnectAndRetry } else { RetryMethod::Reconnect },
+                ServerError::ExtensionError {
+                    code: "BrokenPipe".to_string(),
+                    detail: Some(format!(
+                        "Cluster: Failed to receive command response from internal sender. {err:?}"
+                    )),
+                },
+                if pipeline_retry_strategy.retry_connection_error {
+                    RetryMethod::ReconnectAndRetry
+                } else {
+                    RetryMethod::Reconnect
+                },
             ),
         };
 
         for (index, inner_index, ignore) in command_indices {
-            update_retry_map(&mut retry_map, retry_method, (index, inner_index), address.clone(), server_error.clone(), pipeline_retry_strategy);
+            update_retry_map(
+                &mut retry_map,
+                retry_method,
+                (index, inner_index),
+                address.clone(),
+                server_error.clone(),
+                pipeline_retry_strategy,
+            );
             if !ignore {
-                add_pipeline_result(pipeline_responses, index, inner_index, Value::ServerError(server_error.clone()), address.clone())?;
+                add_pipeline_result(
+                    pipeline_responses,
+                    index,
+                    inner_index,
+                    Value::ServerError(server_error.clone()),
+                    address.clone(),
+                )?;
             }
         }
     }
     Ok(retry_map)
 }
 
-fn update_retry_map(retry_map: &mut RetryMap, retry_method: RetryMethod, indices: (usize, Option<usize>), address: Arc<str>, error: ServerError, pipeline_retry_strategy: PipelineRetryStrategy) {
+fn update_retry_map(
+    retry_map: &mut RetryMap,
+    retry_method: RetryMethod,
+    indices: (usize, Option<usize>),
+    address: Arc<str>,
+    error: ServerError,
+    pipeline_retry_strategy: PipelineRetryStrategy,
+) {
     let (index, inner_index) = indices;
     match retry_method {
         RetryMethod::NoRetry => {}
         RetryMethod::Reconnect | RetryMethod::ReconnectAndRetry => {
-            let effective = if pipeline_retry_strategy.retry_connection_error { RetryMethod::ReconnectAndRetry } else { retry_method };
-            retry_map.entry(effective).or_default().push(((index, inner_index), address, error));
+            let effective = if pipeline_retry_strategy.retry_connection_error {
+                RetryMethod::ReconnectAndRetry
+            } else {
+                retry_method
+            };
+            retry_map
+                .entry(effective)
+                .or_default()
+                .push(((index, inner_index), address, error));
         }
         RetryMethod::AskRedirect | RetryMethod::MovedRedirect => {
-            retry_map.entry(retry_method).or_default().push(((index, inner_index), address, error));
+            retry_map
+                .entry(retry_method)
+                .or_default()
+                .push(((index, inner_index), address, error));
         }
         RetryMethod::RefreshSlotsAndRetry => {}
-        RetryMethod::RetryImmediately | RetryMethod::WaitAndRetry | RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
+        RetryMethod::RetryImmediately
+        | RetryMethod::WaitAndRetry
+        | RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
             if pipeline_retry_strategy.retry_server_error {
-                retry_map.entry(retry_method).or_default().push(((index, inner_index), address, error));
+                retry_map.entry(retry_method).or_default().push((
+                    (index, inner_index),
+                    address,
+                    error,
+                ));
             }
         }
     }
@@ -488,18 +558,39 @@ pub(crate) async fn process_and_retry_pipeline_responses<C>(
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) -> Result<PipelineResponses, (OperationTarget, ValkeyError)>
-where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     let retry_params = core.get_cluster_param(|params| params.retry_params.clone());
     let mut retry = 0;
     let mut pipeline_responses: PipelineResponses = vec![Vec::new(); pipeline.len()];
     loop {
-        match process_pipeline_responses(&mut pipeline_responses, responses, addresses_and_indices, pipeline_retry_strategy) {
+        match process_pipeline_responses(
+            &mut pipeline_responses,
+            responses,
+            addresses_and_indices,
+            pipeline_retry_strategy,
+        ) {
             Ok(retry_map) => {
-                if retry_map.is_empty() || retry >= retry_params.number_of_retries { return Ok(pipeline_responses); }
+                if retry_map.is_empty() || retry >= retry_params.number_of_retries {
+                    return Ok(pipeline_responses);
+                }
                 retry = retry.saturating_add(1);
-                match handle_retry_map(retry_map, core.clone(), pipeline, retry, &mut pipeline_responses, response_policies, pipeline_retry_strategy).await {
-                    Ok((r, a)) => { responses = r; addresses_and_indices = a; }
+                match handle_retry_map(
+                    retry_map,
+                    core.clone(),
+                    pipeline,
+                    retry,
+                    &mut pipeline_responses,
+                    response_policies,
+                    pipeline_retry_strategy,
+                )
+                .await
+                {
+                    Ok((r, a)) => {
+                        responses = r;
+                        addresses_and_indices = a;
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -509,24 +600,65 @@ where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 }
 
 async fn handle_retry_map<C>(
-    retry_map: RetryMap, core: Core<C>, pipeline: &crate::valkey::Pipeline, retry: u32,
-    pipeline_responses: &mut PipelineResponses, response_policies: &mut ResponsePoliciesMap,
+    retry_map: RetryMap,
+    core: Core<C>,
+    pipeline: &crate::valkey::Pipeline,
+    retry: u32,
+    pipeline_responses: &mut PipelineResponses,
+    response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
-) -> Result<(Vec<Result<ValkeyResult<Response>, RecvError>>, AddressAndIndices), (OperationTarget, ValkeyError)>
-where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+) -> Result<
+    (
+        Vec<Result<ValkeyResult<Response>, RecvError>>,
+        AddressAndIndices,
+    ),
+    (OperationTarget, ValkeyError),
+>
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     let mut pipeline_map = NodePipelineMap::new();
     for (retry_method, entries) in retry_map {
         match retry_method {
             RetryMethod::NoRetry | RetryMethod::RefreshSlotsAndRetry => {}
             RetryMethod::Reconnect | RetryMethod::ReconnectAndRetry => {
-                handle_reconnect_logic(entries, core.clone(), pipeline, pipeline_responses, matches!(retry_method, RetryMethod::ReconnectAndRetry), &mut pipeline_map, response_policies).await?;
+                handle_reconnect_logic(
+                    entries,
+                    core.clone(),
+                    pipeline,
+                    pipeline_responses,
+                    matches!(retry_method, RetryMethod::ReconnectAndRetry),
+                    &mut pipeline_map,
+                    response_policies,
+                )
+                .await?;
             }
-            RetryMethod::RetryImmediately | RetryMethod::WaitAndRetry | RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
-                handle_retry_logic(retry_method, retry, core.clone(), entries, pipeline, pipeline_responses, &mut pipeline_map, response_policies).await?;
+            RetryMethod::RetryImmediately
+            | RetryMethod::WaitAndRetry
+            | RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
+                handle_retry_logic(
+                    retry_method,
+                    retry,
+                    core.clone(),
+                    entries,
+                    pipeline,
+                    pipeline_responses,
+                    &mut pipeline_map,
+                    response_policies,
+                )
+                .await?;
             }
             RetryMethod::MovedRedirect | RetryMethod::AskRedirect => {
-                handle_redirect_logic(retry_method, core.clone(), pipeline, entries, pipeline_responses, &mut pipeline_map, response_policies).await?;
+                handle_redirect_logic(
+                    retry_method,
+                    core.clone(),
+                    pipeline,
+                    entries,
+                    pipeline_responses,
+                    &mut pipeline_map,
+                    response_policies,
+                )
+                .await?;
             }
         }
     }
@@ -534,72 +666,151 @@ where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 }
 
 async fn handle_reconnect_logic<C>(
-    entries: Vec<RetryEntry>, core: Core<C>, pipeline: &Pipeline,
-    pipeline_responses: &mut PipelineResponses, should_retry: bool,
-    pipeline_map: &mut NodePipelineMap<C>, response_policies: &mut ResponsePoliciesMap,
+    entries: Vec<RetryEntry>,
+    core: Core<C>,
+    pipeline: &Pipeline,
+    pipeline_responses: &mut PipelineResponses,
+    should_retry: bool,
+    pipeline_map: &mut NodePipelineMap<C>,
+    response_policies: &mut ResponsePoliciesMap,
 ) -> Result<(), (OperationTarget, ValkeyError)>
-where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     let addresses: HashSet<Arc<str>> = entries.iter().map(|(_, a, _)| a.clone()).collect();
     if should_retry {
-        ClusterConnInner::refresh_and_update_connections(core.clone(), addresses, RefreshConnectionType::OnlyUserConnection, true).await;
-        append_commands_to_retry(pipeline_map, pipeline, core.clone(), entries, pipeline_responses, response_policies).await?;
+        ClusterConnInner::refresh_and_update_connections(
+            core.clone(),
+            addresses,
+            RefreshConnectionType::OnlyUserConnection,
+            true,
+        )
+        .await;
+        append_commands_to_retry(
+            pipeline_map,
+            pipeline,
+            core.clone(),
+            entries,
+            pipeline_responses,
+            response_policies,
+        )
+        .await?;
     } else {
-        ClusterConnInner::trigger_refresh_connection_tasks(core.clone(), addresses.clone(), RefreshConnectionType::OnlyUserConnection, true).await;
+        ClusterConnInner::trigger_refresh_connection_tasks(
+            core.clone(),
+            addresses.clone(),
+            RefreshConnectionType::OnlyUserConnection,
+            true,
+        )
+        .await;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_retry_logic<C>(
-    retry_method: RetryMethod, retry: u32, core: Core<C>,
-    entries: Vec<RetryEntry>, pipeline: &Pipeline,
-    pipeline_responses: &mut PipelineResponses, pipeline_map: &mut NodePipelineMap<C>,
+    retry_method: RetryMethod,
+    retry: u32,
+    core: Core<C>,
+    entries: Vec<RetryEntry>,
+    pipeline: &Pipeline,
+    pipeline_responses: &mut PipelineResponses,
+    pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
 ) -> Result<(), (OperationTarget, ValkeyError)>
-where C: Clone + Sync + ConnectionLike + Send + Connect + 'static,
+where
+    C: Clone + Sync + ConnectionLike + Send + Connect + 'static,
 {
     let retry_params = core.get_cluster_param(|params| params.retry_params.clone());
     if matches!(retry_method, RetryMethod::WaitAndRetry) {
         boxed_sleep(retry_params.wait_time_for_retry(retry)).await;
-    } else if matches!(retry_method, RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica) {
-        let futures = entries.iter().fold(HashSet::new(), |mut set, (_, a, _)| { set.insert(a.to_string()); set })
-            .into_iter().map(|address| ClusterConnInner::handle_loading_error(core.clone(), address, retry, retry_params.clone()));
+    } else if matches!(
+        retry_method,
+        RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica
+    ) {
+        let futures = entries
+            .iter()
+            .fold(HashSet::new(), |mut set, (_, a, _)| {
+                set.insert(a.to_string());
+                set
+            })
+            .into_iter()
+            .map(|address| {
+                ClusterConnInner::handle_loading_error(
+                    core.clone(),
+                    address,
+                    retry,
+                    retry_params.clone(),
+                )
+            });
         futures::future::join_all(futures).await;
     }
-    append_commands_to_retry(pipeline_map, pipeline, core, entries, pipeline_responses, response_policies).await?;
+    append_commands_to_retry(
+        pipeline_map,
+        pipeline,
+        core,
+        entries,
+        pipeline_responses,
+        response_policies,
+    )
+    .await?;
     Ok(())
 }
 
 async fn handle_redirect_logic<C>(
-    retry_method: RetryMethod, core: Core<C>, pipeline: &Pipeline,
-    entries: Vec<RetryEntry>, pipeline_responses: &mut PipelineResponses,
-    pipeline_map: &mut NodePipelineMap<C>, response_policies: &mut ResponsePoliciesMap,
+    retry_method: RetryMethod,
+    core: Core<C>,
+    pipeline: &Pipeline,
+    entries: Vec<RetryEntry>,
+    pipeline_responses: &mut PipelineResponses,
+    pipeline_map: &mut NodePipelineMap<C>,
+    response_policies: &mut ResponsePoliciesMap,
 ) -> Result<(), (OperationTarget, ValkeyError)>
-where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     for (indices, address, mut error) in entries {
         let valkey_error: ValkeyError = error.clone().into();
         let (index, inner_index) = indices;
 
         if matches!(retry_method, RetryMethod::MovedRedirect)
-            && let Err(server_error) = pipeline_handle_moved_redirect(core.clone(), &valkey_error).await
+            && let Err(server_error) =
+                pipeline_handle_moved_redirect(core.clone(), &valkey_error).await
         {
             error.append_detail(&server_error);
-            add_pipeline_result(pipeline_responses, index, inner_index, Value::ServerError(error), address)?;
+            add_pipeline_result(
+                pipeline_responses,
+                index,
+                inner_index,
+                Value::ServerError(error),
+                address,
+            )?;
             continue;
         }
 
         if let Some(redirect_info) = valkey_error.redirect(false) {
             let routing = InternalSingleNodeRouting::Redirect {
                 redirect: redirect_info,
-                previous_routing: Box::new(InternalSingleNodeRouting::ByAddress(address.to_string())),
+                previous_routing: Box::new(InternalSingleNodeRouting::ByAddress(
+                    address.to_string(),
+                )),
             };
             match get_original_cmd(pipeline, index, inner_index, Some(response_policies)) {
                 Ok(cmd) => {
-                    match ClusterConnInner::get_connection(routing, core.clone(), Some(cmd.clone())).await {
+                    match ClusterConnInner::get_connection(routing, core.clone(), Some(cmd.clone()))
+                        .await
+                    {
                         Ok((addr, conn)) => {
-                            add_command_to_node_pipeline_map(pipeline_map, addr, conn, cmd, index, inner_index, matches!(retry_method, RetryMethod::AskRedirect), true);
+                            add_command_to_node_pipeline_map(
+                                pipeline_map,
+                                addr,
+                                conn,
+                                cmd,
+                                index,
+                                inner_index,
+                                matches!(retry_method, RetryMethod::AskRedirect),
+                                true,
+                            );
                             continue;
                         }
                         Err(err) => error.append_detail(&err.into()),
@@ -608,47 +819,95 @@ where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
                 Err(cmd_err) => error.append_detail(&cmd_err),
             }
         } else {
-            error.append_detail(&ServerError::ExtensionError { code: "RedirectError".to_string(), detail: Some("Failed to find redirect info".to_string()) });
+            error.append_detail(&ServerError::ExtensionError {
+                code: "RedirectError".to_string(),
+                detail: Some("Failed to find redirect info".to_string()),
+            });
         }
 
-        add_pipeline_result(pipeline_responses, index, inner_index, Value::ServerError(error), address)?;
+        add_pipeline_result(
+            pipeline_responses,
+            index,
+            inner_index,
+            Value::ServerError(error),
+            address,
+        )?;
     }
     Ok(())
 }
 
-async fn pipeline_handle_moved_redirect<C>(core: Core<C>, valkey_error: &ValkeyError) -> Result<(), ServerError>
-where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+async fn pipeline_handle_moved_redirect<C>(
+    core: Core<C>,
+    valkey_error: &ValkeyError,
+) -> Result<(), ServerError>
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
-    let redirect_node = RedirectNode::from_option_tuple(valkey_error.redirect_node()).ok_or_else(|| {
-        ServerError::ExtensionError { code: "ParsingError".to_string(), detail: Some("Failed to parse MOVED error".to_string()) }
-    })?;
-    ClusterConnInner::update_upon_moved_error(core.clone(), redirect_node.slot, redirect_node.address.into()).await.map_err(Into::into)
+    let redirect_node =
+        RedirectNode::from_option_tuple(valkey_error.redirect_node()).ok_or_else(|| {
+            ServerError::ExtensionError {
+                code: "ParsingError".to_string(),
+                detail: Some("Failed to parse MOVED error".to_string()),
+            }
+        })?;
+    ClusterConnInner::update_upon_moved_error(
+        core.clone(),
+        redirect_node.slot,
+        redirect_node.address.into(),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 async fn append_commands_to_retry<C>(
-    pipeline_map: &mut NodePipelineMap<C>, pipeline: &crate::valkey::Pipeline, core: Core<C>,
-    entries: Vec<RetryEntry>, pipeline_responses: &mut PipelineResponses,
+    pipeline_map: &mut NodePipelineMap<C>,
+    pipeline: &crate::valkey::Pipeline,
+    core: Core<C>,
+    entries: Vec<RetryEntry>,
+    pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
 ) -> Result<(), (OperationTarget, ValkeyError)>
-where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     for ((index, inner_index), address, mut error) in entries {
         let cmd = match get_original_cmd(pipeline, index, inner_index, Some(response_policies)) {
             Ok(cmd) => cmd,
             Err(server_error) => {
                 error.append_detail(&server_error);
-                add_pipeline_result(pipeline_responses, index, inner_index, Value::ServerError(error), address.clone())?;
+                add_pipeline_result(
+                    pipeline_responses,
+                    index,
+                    inner_index,
+                    Value::ServerError(error),
+                    address.clone(),
+                )?;
                 continue;
             }
         };
         let routing = InternalSingleNodeRouting::ByAddress(address.to_string());
         match ClusterConnInner::get_connection(routing, core.clone(), None).await {
             Ok((addr, conn)) => {
-                add_command_to_node_pipeline_map(pipeline_map, addr, conn, cmd, index, inner_index, false, true);
+                add_command_to_node_pipeline_map(
+                    pipeline_map,
+                    addr,
+                    conn,
+                    cmd,
+                    index,
+                    inner_index,
+                    false,
+                    true,
+                );
             }
             Err(valkey_error) => {
                 error.append_detail(&valkey_error.into());
-                add_pipeline_result(pipeline_responses, index, inner_index, Value::ServerError(error), address)?;
+                add_pipeline_result(
+                    pipeline_responses,
+                    index,
+                    inner_index,
+                    Value::ServerError(error),
+                    address,
+                )?;
             }
         }
     }
@@ -656,19 +915,25 @@ where C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 }
 
 fn get_original_cmd(
-    pipeline: &crate::valkey::Pipeline, index: usize, inner_index: Option<usize>,
+    pipeline: &crate::valkey::Pipeline,
+    index: usize,
+    inner_index: Option<usize>,
     response_policies: Option<&ResponsePoliciesMap>,
 ) -> Result<Arc<Cmd>, ServerError> {
-    let cmd = pipeline.get_command(index).ok_or_else(|| ServerError::ExtensionError {
-        code: "IndexNotFoundInPipelineResponses".to_string(),
-        detail: Some(format!("Index {index} was not found in pipeline")),
-    })?;
+    let cmd = pipeline
+        .get_command(index)
+        .ok_or_else(|| ServerError::ExtensionError {
+            code: "IndexNotFoundInPipelineResponses".to_string(),
+            detail: Some(format!("Index {index} was not found in pipeline")),
+        })?;
     if inner_index.is_some() {
         let routing_info = response_policies.and_then(|map| map.get(&index).map(|t| t.0.clone()));
         if let Some(MultipleNodeRoutingInfo::MultiSlot((slots, _))) = routing_info {
             let inner_index = inner_index.ok_or_else(|| ServerError::ExtensionError {
                 code: "IndexNotFoundInPipelineResponses".to_string(),
-                detail: Some(format!("Inner index is required for a multi-slot command: {cmd:?}")),
+                detail: Some(format!(
+                    "Inner index is required for a multi-slot command: {cmd:?}"
+                )),
             })?;
             let indices = slots.get(inner_index).ok_or_else(|| ServerError::ExtensionError {
                 code: "IndexNotFoundInPipelineResponses".to_string(),
@@ -680,33 +945,44 @@ fn get_original_cmd(
     Ok(cmd)
 }
 
-pub(crate) fn route_for_pipeline(pipeline: &crate::valkey::Pipeline) -> ValkeyResult<Option<Route>> {
+pub(crate) fn route_for_pipeline(
+    pipeline: &crate::valkey::Pipeline,
+) -> ValkeyResult<Option<Route>> {
     fn route_for_command(cmd: &Cmd) -> Option<Route> {
         match cluster_routing::RoutingInfo::for_routable(cmd) {
             Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => None,
-            Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(route))) => Some(route),
-            Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::RandomPrimary)) => Some(Route::new_random_primary()),
+            Some(cluster_routing::RoutingInfo::SingleNode(
+                SingleNodeRoutingInfo::SpecificNode(route),
+            )) => Some(route),
+            Some(cluster_routing::RoutingInfo::SingleNode(
+                SingleNodeRoutingInfo::RandomPrimary,
+            )) => Some(Route::new_random_primary()),
             Some(cluster_routing::RoutingInfo::MultiNode(_)) => None,
-            Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress { .. })) => None,
+            Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                ..
+            })) => None,
             None => None,
         }
     }
     if pipeline.is_atomic() {
-        pipeline.cmd_iter().map(|cmd| route_for_command(cmd.as_ref())).try_fold(None, |chosen_route, next_cmd_route| {
-            match (chosen_route, next_cmd_route) {
-                (None, _) => Ok(next_cmd_route),
-                (_, None) => Ok(chosen_route),
-                (Some(chosen_route), Some(next_cmd_route)) => {
-                    if chosen_route.slot() != next_cmd_route.slot() {
-                        Err((ErrorKind::CrossSlot, "Received crossed slots in pipeline").into())
-                    } else if chosen_route.slot_addr() == SlotAddr::ReplicaOptional {
-                        Ok(Some(next_cmd_route))
-                    } else {
-                        Ok(Some(chosen_route))
+        pipeline
+            .cmd_iter()
+            .map(|cmd| route_for_command(cmd.as_ref()))
+            .try_fold(None, |chosen_route, next_cmd_route| {
+                match (chosen_route, next_cmd_route) {
+                    (None, _) => Ok(next_cmd_route),
+                    (_, None) => Ok(chosen_route),
+                    (Some(chosen_route), Some(next_cmd_route)) => {
+                        if chosen_route.slot() != next_cmd_route.slot() {
+                            Err((ErrorKind::CrossSlot, "Received crossed slots in pipeline").into())
+                        } else if chosen_route.slot_addr() == SlotAddr::ReplicaOptional {
+                            Ok(Some(next_cmd_route))
+                        } else {
+                            Ok(Some(chosen_route))
+                        }
                     }
                 }
-            }
-        })
+            })
     } else {
         Ok(None)
     }

@@ -5,10 +5,10 @@ use super::{
 use crate::cluster::client::ClusterParams;
 use crate::cluster::compat::get_connection_info;
 use crate::cluster::slotmap::ReadFromReplicaStrategy;
+use crate::connection::factory::FerrisKeyConnectionOptions;
 use crate::valkey::{
     ErrorKind, ValkeyError, ValkeyResult,
     aio::{ConnectionLike, DisconnectNotifier},
-    client::FerrisKeyConnectionOptions,
 };
 use std::net::{Ipv6Addr, SocketAddr};
 

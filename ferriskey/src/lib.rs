@@ -20,10 +20,18 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[macro_use]
+mod macros;
+
+#[macro_use]
 pub mod valkey;
 
 pub mod cluster;
 pub mod connection;
+pub mod protocol;
+pub(crate) mod cmd;
+pub(crate) mod pipeline;
+pub(crate) mod retry_strategies;
+pub(crate) mod value;
 
 pub mod client;
 pub mod compression;

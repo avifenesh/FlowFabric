@@ -22,54 +22,53 @@
 //! }
 //! ```
 
-pub mod container;
-pub mod connections;
-pub(crate) mod pipeline;
-pub mod slotmap;
-pub mod routing;
-pub mod topology;
 pub(crate) mod client;
 pub mod compat;
+pub mod connections;
+pub mod container;
+pub(crate) mod pipeline;
+pub mod routing;
 pub(crate) mod scan;
+pub mod slotmap;
+pub mod topology;
 /// Exposed only for testing.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    pub use super::container::ConnectionDetails;
     pub use super::connections::*;
+    pub use super::container::ConnectionDetails;
 }
+use crate::cluster::client::{ClusterParams, RetryParams};
+use crate::cluster::compat::slot_cmd;
+use crate::cluster::connections::{
+    ConnectionFuture, RefreshConnectionType, get_host_and_port_from_addr, get_or_create_conn,
+};
+use crate::cluster::routing::{
+    self as cluster_routing, MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Routable, Route,
+    RoutingInfo, ShardUpdateResult, SingleNodeRoutingInfo,
+};
+use crate::cluster::scan::{ClusterScanArgs, ScanStateRC, cluster_scan};
+use crate::cluster::slotmap::SlotMap;
+use crate::cluster::topology::{
+    DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES, DEFAULT_REFRESH_SLOTS_RETRY_BASE_DURATION_MILLIS,
+    DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR, SlotRefreshState, TopologyHash, calculate_topology,
+};
+use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
 use crate::valkey::{
-    aio::{get_socket_addrs, ConnectionLike, DisconnectNotifier, MultiplexedConnection},
-    client::FerrisKeyConnectionOptions,
+    Cmd, ConnectionInfo, ErrorKind, FromValkeyValue, InfoDict, IntoConnectionInfo,
+    PipelineRetryStrategy, ValkeyError, ValkeyFuture, ValkeyResult, Value,
+    aio::{ConnectionLike, DisconnectNotifier, MultiplexedConnection, get_socket_addrs},
     cmd,
     push_manager::PushInfo,
     types::{ProtocolVersion, RetryMethod, ServerError},
-    Cmd, ConnectionInfo, ErrorKind, FromValkeyValue, InfoDict, IntoConnectionInfo,
-    PipelineRetryStrategy, ValkeyError, ValkeyFuture, ValkeyResult, Value,
 };
-use crate::cluster::compat::slot_cmd;
-use crate::cluster::connections::{
-    get_host_and_port_from_addr, get_or_create_conn, ConnectionFuture, RefreshConnectionType,
-};
-use crate::cluster::client::{ClusterParams, RetryParams};
-use crate::cluster::routing::{
-    self as cluster_routing, MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, Routable,
-    RoutingInfo, ShardUpdateResult, SingleNodeRoutingInfo,
-};
-use crate::cluster::scan::{cluster_scan, ClusterScanArgs, ScanStateRC};
-use crate::cluster::slotmap::SlotMap;
-use crate::cluster::topology::{
-    calculate_topology, SlotRefreshState, TopologyHash,
-    DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES, DEFAULT_REFRESH_SLOTS_RETRY_BASE_DURATION_MILLIS,
-    DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR,
-};
+use connections::connect_and_check;
 use container::{
     ConnectionAndAddress, ConnectionType, ConnectionsMap, RefreshTaskNotifier, RefreshTaskState,
     RefreshTaskStatus,
 };
-use connections::connect_and_check;
 use pipeline::{
-    collect_and_send_pending_requests, map_pipeline_to_nodes, process_and_retry_pipeline_responses,
-    route_for_pipeline, PipelineResponses, ResponsePoliciesMap,
+    PipelineResponses, ResponsePoliciesMap, collect_and_send_pending_requests,
+    map_pipeline_to_nodes, process_and_retry_pipeline_responses, route_for_pipeline,
 };
 
 use async_trait::async_trait;
@@ -91,8 +90,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{self, AtomicUsize, Ordering},
         Arc,
+        atomic::{self, AtomicUsize, Ordering},
     },
     task::{self, Poll},
     time::{Duration, SystemTime},
@@ -101,14 +100,13 @@ use strum_macros::Display;
 use telemetrylib::{FerrisKeyOtel, FerrisKeySpan, Telemetry};
 use tokio::{
     sync::{
-        mpsc,
+        Notify, mpsc,
         oneshot::{self, Receiver},
-        Notify,
     },
     task::JoinHandle,
     time::timeout,
 };
-use tokio_retry2::strategy::{jitter_range, ExponentialFactorBackoff};
+use tokio_retry2::strategy::{ExponentialFactorBackoff, jitter_range};
 use tokio_retry2::{Retry, RetryError};
 use tracing::{debug, info, trace, warn};
 
@@ -210,8 +208,10 @@ where
         initial_nodes: &[ConnectionInfo],
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        pubsub_synchronizer: Option<Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>>,
-        iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
+        pubsub_synchronizer: Option<
+            Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>,
+        >,
+        iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> ValkeyResult<ClusterConnection<C>> {
         ClusterConnInner::new(
             initial_nodes,
@@ -439,7 +439,9 @@ where
 
             join_set.spawn(async move {
                 let mut conn = conn_future.await;
-                let result = conn.req_packed_commands(&sub_pipeline, 0, sub_count, None).await;
+                let result = conn
+                    .req_packed_commands(&sub_pipeline, 0, sub_count, None)
+                    .await;
                 (node_idx, result)
             });
         }
@@ -524,10 +526,12 @@ where
             })
             .and_then(|response| match response {
                 Response::Single(value) => Ok(value),
-                Response::ClusterScanResult(..) | Response::Multiple(_) => Err(ValkeyError::from((
-                    ErrorKind::ResponseError,
-                    "Unexpected response variant for single command",
-                ))),
+                Response::ClusterScanResult(..) | Response::Multiple(_) => {
+                    Err(ValkeyError::from((
+                        ErrorKind::ResponseError,
+                        "Unexpected response variant for single command",
+                    )))
+                }
             })
     }
 
@@ -665,10 +669,12 @@ where
             })
             .and_then(|response| match response {
                 Response::Single(values) => Ok(values),
-                Response::ClusterScanResult(..) | Response::Multiple(_) => Err(ValkeyError::from((
-                    ErrorKind::ResponseError,
-                    "Unexpected response variant for operation request",
-                ))),
+                Response::ClusterScanResult(..) | Response::Multiple(_) => {
+                    Err(ValkeyError::from((
+                        ErrorKind::ResponseError,
+                        "Unexpected response variant for operation request",
+                    )))
+                }
             })
     }
 }
@@ -705,8 +711,7 @@ impl TokioDisconnectNotifier {
 }
 
 type ConnectionMap<C> = container::ConnectionsMap<ConnectionFuture<C>>;
-type ConnectionsContainer<C> =
-    self::container::ConnectionsContainer<ConnectionFuture<C>>;
+type ConnectionsContainer<C> = self::container::ConnectionsContainer<ConnectionFuture<C>>;
 
 pub(crate) struct InnerCore<C> {
     pub(crate) conn_lock: ParkingLotRwLock<ConnectionsContainer<C>>,
@@ -1077,11 +1082,9 @@ impl<C> RequestInfo<C> {
                     *route = Some(redirect);
                 }
                 // cluster_scan is sent as a normal command internally so we should not reach this point.
-                CmdArg::ClusterScan { .. } => {
-                }
+                CmdArg::ClusterScan { .. } => {}
                 // Operation requests are not routed — ignore redirects.
-                CmdArg::OperationRequest(_) => {
-                }
+                CmdArg::OperationRequest(_) => {}
             }
         }
     }
@@ -1172,21 +1175,17 @@ mod iam_token_refresh_tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::valkey::client::IAMTokenProvider for MockTokenProvider {
+    impl IAMTokenProvider for MockTokenProvider {
         async fn get_valid_token(&self) -> Option<String> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let token = self.token.lock().unwrap().clone();
-            if token.is_empty() {
-                None
-            } else {
-                Some(token)
-            }
+            if token.is_empty() { None } else { Some(token) }
         }
     }
 
     /// Helper to build a minimal FerrisKeyConnectionOptions with an IAM provider.
     fn options_with_provider(
-        provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
+        provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> FerrisKeyConnectionOptions {
         FerrisKeyConnectionOptions {
             push_sender: None,
@@ -1203,7 +1202,7 @@ mod iam_token_refresh_tests {
     /// Helper to build a minimal InnerCore with the given password and IAM provider.
     fn build_inner(
         initial_password: Option<String>,
-        provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
+        provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> Arc<InnerCore<crate::valkey::aio::MultiplexedConnection>> {
         use crate::cluster::client::ClusterParams;
         use container::ConnectionsContainer;
@@ -1225,7 +1224,9 @@ mod iam_token_refresh_tests {
         })
     }
 
-    fn read_password(inner: &Arc<InnerCore<crate::valkey::aio::MultiplexedConnection>>) -> Option<String> {
+    fn read_password(
+        inner: &Arc<InnerCore<crate::valkey::aio::MultiplexedConnection>>,
+    ) -> Option<String> {
         inner.cluster_params.read().password.clone()
     }
 
@@ -1551,8 +1552,10 @@ where
         initial_nodes: &[ConnectionInfo],
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        pubsub_synchronizer: Option<Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>>,
-        iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
+        pubsub_synchronizer: Option<
+            Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>,
+        >,
+        iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> ValkeyResult<Disposable<Self>> {
         let disconnect_notifier: Option<Box<dyn DisconnectNotifier>> =
             Some(Box::new(TokioDisconnectNotifier::new()));
@@ -1688,67 +1691,65 @@ where
     ) -> ValkeyResult<ConnectionMap<C>> {
         let initial_nodes: Vec<(String, Option<SocketAddr>)> =
             Self::try_to_expand_initial_nodes(initial_nodes).await;
-        let connections =
-            stream::iter(initial_nodes.iter().cloned())
-                .map(|(node_addr, socket_addr)| {
-                    let params: ClusterParams = params.clone();
-                    let ferriskey_connection_options = ferriskey_connection_options.clone();
-                    // set subscriptions to none, they will be applied upon the topology discovery
+        let connections = stream::iter(initial_nodes.iter().cloned())
+            .map(|(node_addr, socket_addr)| {
+                let params: ClusterParams = params.clone();
+                let ferriskey_connection_options = ferriskey_connection_options.clone();
+                // set subscriptions to none, they will be applied upon the topology discovery
 
-                    async move {
-                        let result = connect_and_check::<C>(
-                            &node_addr,
-                            params,
-                            socket_addr,
-                            RefreshConnectionType::AllConnections,
-                            None,
-                            ferriskey_connection_options,
-                        )
-                        .await
-                        .get_node();
-                        // The PushManager is initialized with connection_info.addr
-                        // (the original hostname, e.g. "localhost:6379"), but the
-                        // ConnectionsMap key uses the resolved IP from socket_addr
-                        // (e.g. "127.0.0.1:6379"). When these differ, align them so
-                        // PubSub synchronization can match subscriptions to nodes.
-                        let (node_address, push_manager_needs_update) =
-                            if let Some(socket_addr) = socket_addr {
-                                let resolved = socket_addr.to_string();
-                                let differs = resolved != node_addr;
-                                (resolved, differs)
-                            } else {
-                                (node_addr, false)
-                            };
-                        if push_manager_needs_update
-                            && let Ok(ref node) = result {
-                                node.user_connection
-                                    .conn
-                                    .clone()
-                                    .await
-                                    .update_push_manager_node_address(node_address.clone());
-                            }
-                        result.map(|node| (node_address, node))
-                    }
-                })
-                .buffer_unordered(initial_nodes.len())
-                .fold(
-                    (
-                        ConnectionsMap(DashMap::with_capacity(initial_nodes.len())),
+                async move {
+                    let result = connect_and_check::<C>(
+                        &node_addr,
+                        params,
+                        socket_addr,
+                        RefreshConnectionType::AllConnections,
                         None,
-                    ),
-                    |connections: (ConnectionMap<C>, Option<String>),
-                     addr_conn_res: ValkeyResult<_>| async move {
-                        match addr_conn_res {
-                            Ok((addr, node)) => {
-                                connections.0 .0.insert(Arc::from(&*addr), node);
-                                (connections.0, None)
-                            }
-                            Err(e) => (connections.0, Some(e.to_string())),
+                        ferriskey_connection_options,
+                    )
+                    .await
+                    .get_node();
+                    // The PushManager is initialized with connection_info.addr
+                    // (the original hostname, e.g. "localhost:6379"), but the
+                    // ConnectionsMap key uses the resolved IP from socket_addr
+                    // (e.g. "127.0.0.1:6379"). When these differ, align them so
+                    // PubSub synchronization can match subscriptions to nodes.
+                    let (node_address, push_manager_needs_update) =
+                        if let Some(socket_addr) = socket_addr {
+                            let resolved = socket_addr.to_string();
+                            let differs = resolved != node_addr;
+                            (resolved, differs)
+                        } else {
+                            (node_addr, false)
+                        };
+                    if push_manager_needs_update && let Ok(ref node) = result {
+                        node.user_connection
+                            .conn
+                            .clone()
+                            .await
+                            .update_push_manager_node_address(node_address.clone());
+                    }
+                    result.map(|node| (node_address, node))
+                }
+            })
+            .buffer_unordered(initial_nodes.len())
+            .fold(
+                (
+                    ConnectionsMap(DashMap::with_capacity(initial_nodes.len())),
+                    None,
+                ),
+                |connections: (ConnectionMap<C>, Option<String>),
+                 addr_conn_res: ValkeyResult<_>| async move {
+                    match addr_conn_res {
+                        Ok((addr, node)) => {
+                            connections.0.0.insert(Arc::from(&*addr), node);
+                            (connections.0, None)
                         }
-                    },
-                )
-                .await;
-        if connections.0 .0.is_empty() {
+                        Err(e) => (connections.0, Some(e.to_string())),
+                    }
+                },
+            )
+            .await;
+        if connections.0.0.is_empty() {
             return Err(ValkeyError::from((
                 ErrorKind::IoError,
                 "Failed to create initial connections",
@@ -1763,11 +1764,12 @@ where
     /// any subsequent connection attempts use a valid credential.
     async fn refresh_iam_token_in_cluster_params(inner: &Arc<InnerCore<C>>) {
         if let Some(ref token_provider) = inner.ferriskey_connection_options.iam_token_provider
-            && let Some(valid_token) = token_provider.get_valid_token().await {
-                inner.set_cluster_param(|params| {
-                    params.password = Some(valid_token);
-                });
-            }
+            && let Some(valid_token) = token_provider.get_valid_token().await
+        {
+            inner.set_cluster_param(|params| {
+                params.password = Some(valid_token);
+            });
+        }
     }
 
     // Reconnect to the initial nodes provided by the user in the creation of the client,
@@ -1954,8 +1956,7 @@ where
                     .ferriskey_connection_options
                     .connection_retry_strategy
                     .unwrap_or_default();
-                let infinite_backoff_iter = retry_strategy
-                    .get_infinite_backoff_dur_iterator();
+                let infinite_backoff_iter = retry_strategy.get_infinite_backoff_dur_iterator();
 
                 let mut node_result = Err(ValkeyError::from((
                     ErrorKind::ClientError,
@@ -2103,7 +2104,12 @@ where
 
         // Converts a Result<ValkeyResult<Response>, _> into ValkeyResult<Value>
         let convert_result = |res: Result<ValkeyResult<Response>, _>| {
-            res.map_err(|_| ValkeyError::from((ErrorKind::ResponseError, "Internal failure: receiver was dropped before delivering a response"))) // this happens only if the result sender is dropped before usage.
+            res.map_err(|_| {
+                ValkeyError::from((
+                    ErrorKind::ResponseError,
+                    "Internal failure: receiver was dropped before delivering a response",
+                ))
+            }) // this happens only if the result sender is dropped before usage.
             .and_then(|res| res.and_then(extract_result))
         };
 
@@ -2347,10 +2353,12 @@ where
                 for (addr_opt, value) in resolved {
                     let key_bytes = match addr_opt {
                         Some(addr) => addr.as_bytes().to_vec(),
-                        None => return Err(ValkeyError::from((
-                            ErrorKind::ResponseError,
-                            "No address provided for response in Special or None response policy",
-                        ))),
+                        None => {
+                            return Err(ValkeyError::from((
+                                ErrorKind::ResponseError,
+                                "No address provided for response in Special or None response policy",
+                            )));
+                        }
                     };
                     pairs.push((Value::BulkString(bytes::Bytes::from(key_bytes)), value));
                 }
@@ -2562,8 +2570,10 @@ where
 
     async fn connections_validation_task(inner: Arc<InnerCore<C>>, interval_duration: Duration) {
         loop {
-            if let Some(disconnect_notifier) =
-                inner.ferriskey_connection_options.disconnect_notifier.clone()
+            if let Some(disconnect_notifier) = inner
+                .ferriskey_connection_options
+                .disconnect_notifier
+                .clone()
             {
                 disconnect_notifier
                     .wait_for_disconnect_with_timeout(&interval_duration)
@@ -2595,21 +2605,26 @@ where
         .await;
 
         if let Ok((_, found_topology_hash)) = topology_result
-            && inner.conn_lock.read().get_current_topology_hash() != found_topology_hash {
-                return true;
-            }
+            && inner.conn_lock.read().get_current_topology_hash() != found_topology_hash
+        {
+            return true;
+        }
 
         if let Some(failed) = failed_connections
-            && !failed.is_empty() {
-                trace!("check_for_topology_diff: calling trigger_refresh_connection_tasks");
-                Self::trigger_refresh_connection_tasks(
-                    inner,
-                    failed.into_iter().map(|s| Arc::<str>::from(s.as_str())).collect(),
-                    RefreshConnectionType::OnlyManagementConnection,
-                    true,
-                )
-                .await;
-            }
+            && !failed.is_empty()
+        {
+            trace!("check_for_topology_diff: calling trigger_refresh_connection_tasks");
+            Self::trigger_refresh_connection_tasks(
+                inner,
+                failed
+                    .into_iter()
+                    .map(|s| Arc::<str>::from(s.as_str()))
+                    .collect(),
+                RefreshConnectionType::OnlyManagementConnection,
+                true,
+            )
+            .await;
+        }
 
         false
     }
@@ -2947,7 +2962,10 @@ where
             InternalRoutingInfo::MultiNode(_) => {
                 return Err((
                     OperationTarget::FanOut,
-                    ValkeyError::from((ErrorKind::ClientError, "MultiNode routing reached single-node dispatch path")),
+                    ValkeyError::from((
+                        ErrorKind::ClientError,
+                        "MultiNode routing reached single-node dispatch path",
+                    )),
                 ));
             }
         };
@@ -2963,7 +2981,14 @@ where
         conn.send_packed_bytes(packed, is_fenced)
             .await
             .map(Response::Single)
-            .map_err(|err| (OperationTarget::Node { address: address.to_string() }, err))
+            .map_err(|err| {
+                (
+                    OperationTarget::Node {
+                        address: address.to_string(),
+                    },
+                    err,
+                )
+            })
     }
 
     /// Multi-node and fan-out path. Keeps full Arc<Cmd> for command splitting.
@@ -2997,7 +3022,14 @@ where
         conn.req_packed_command(&cmd)
             .await
             .map(Response::Single)
-            .map_err(|err| (OperationTarget::Node { address: address.to_string() }, err))
+            .map_err(|err| {
+                (
+                    OperationTarget::Node {
+                        address: address.to_string(),
+                    },
+                    err,
+                )
+            })
     }
 
     async fn try_pipeline_request(
@@ -3015,17 +3047,25 @@ where
         conn.req_packed_commands(&pipeline, offset, count, None)
             .await
             .map(Response::Multiple)
-            .map_err(|err| (OperationTarget::Node { address: address.to_string() }, err))
+            .map_err(|err| {
+                (
+                    OperationTarget::Node {
+                        address: address.to_string(),
+                    },
+                    err,
+                )
+            })
     }
 
     async fn try_request(info: RequestInfo<C>, core: Core<C>) -> OperationResult {
         match info.cmd {
-            CmdArg::Cmd { packed, is_fenced, span, routing } => {
-                Self::try_packed_request(packed, is_fenced, span, routing, core).await
-            }
-            CmdArg::MultiCmd { cmd, routing } => {
-                Self::try_cmd_request(cmd, routing, core).await
-            }
+            CmdArg::Cmd {
+                packed,
+                is_fenced,
+                span,
+                routing,
+            } => Self::try_packed_request(packed, is_fenced, span, routing, core).await,
+            CmdArg::MultiCmd { cmd, routing } => Self::try_cmd_request(cmd, routing, core).await,
             CmdArg::Pipeline {
                 pipeline,
                 offset,
@@ -3449,7 +3489,9 @@ where
         };
 
         if asking {
-            let _ = conn.req_packed_command(&crate::valkey::cmd::cmd("ASKING")).await;
+            let _ = conn
+                .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
+                .await;
         }
         Ok((address, conn))
     }
@@ -3506,7 +3548,10 @@ where
                             return Poll::Ready(Ok(()));
                         } else {
                             // Task panicked - try reconnecting to initial nodes as a recovery strategy
-                            warn!("Slot refresh task panicked: {:?} - attempting recovery by reconnecting to initial nodes", join_err);
+                            warn!(
+                                "Slot refresh task panicked: {:?} - attempting recovery by reconnecting to initial nodes",
+                                join_err
+                            );
 
                             // TODO - consider a gracefully closing of the client
                             // Since a panic indicates a bug in the refresh logic,
@@ -3548,7 +3593,10 @@ where
                         if join_err.is_cancelled() {
                             trace!("Reconnect to initial nodes task was aborted");
                         } else {
-                            warn!("Reconnect to initial nodes task panicked: {:?} - marking recovery as complete", join_err);
+                            warn!(
+                                "Reconnect to initial nodes task panicked: {:?} - marking recovery as complete",
+                                join_err
+                            );
                         }
                         self.state = ConnectionState::PollComplete;
                     }
@@ -3728,8 +3776,9 @@ where
                     }
                 }
                 Next::Reconnect { request, target } => {
-                    poll_flush_action = poll_flush_action
-                        .change_state(PollFlushAction::Reconnect(HashSet::from_iter([Arc::<str>::from(target.as_str())])));
+                    poll_flush_action = poll_flush_action.change_state(PollFlushAction::Reconnect(
+                        HashSet::from_iter([Arc::<str>::from(target.as_str())]),
+                    ));
                     if let Some(request) = request {
                         let _ = self.inner.pending_requests_tx.send(request);
                     }
@@ -3877,7 +3926,10 @@ where
                     let handle = tokio::spawn(async move {
                         ClusterConnInner::trigger_refresh_connection_tasks(
                             inner,
-                            addresses.into_iter().map(|s| Arc::<str>::from(&*s)).collect(),
+                            addresses
+                                .into_iter()
+                                .map(|s| Arc::<str>::from(&*s))
+                                .collect(),
                             RefreshConnectionType::OnlyUserConnection,
                             true,
                         )
@@ -3989,7 +4041,10 @@ where
             connection_timeout,
             ClusterConnInner::refresh_and_update_connections(
                 inner.clone(),
-                addresses_needing_refresh.iter().map(|s| Arc::<str>::from(s.as_str())).collect(),
+                addresses_needing_refresh
+                    .iter()
+                    .map(|s| Arc::<str>::from(s.as_str()))
+                    .collect(),
                 RefreshConnectionType::AllConnections,
                 true,
             ),
@@ -4234,14 +4289,14 @@ where
         // Fast path: single-node commands dispatch directly to the mux connection,
         // bypassing the cluster task and FuturesUnordered entirely.
         if let cluster_routing::RoutingInfo::SingleNode(ref single) = routing
-            && let Some(result) = self.try_direct_dispatch(cmd, single).await {
-                return result;
-            }
+            && let Some(result) = self.try_direct_dispatch(cmd, single).await
+        {
+            return result;
+        }
 
         // Slow path: fan-out, MOVED/ASK retries, or route resolution failed.
         self.route_command(cmd, routing).await
     }
-
 
     async fn req_packed_commands(
         &mut self,
@@ -4274,10 +4329,12 @@ where
         }
 
         // Fast path: cross-slot non-atomic pipeline — split by node and send directly.
-        if !pipeline.is_atomic() && route.is_none()
-            && let Some(result) = self.try_direct_pipeline_dispatch(pipeline, count).await {
-                return result;
-            }
+        if !pipeline.is_atomic()
+            && route.is_none()
+            && let Some(result) = self.try_direct_pipeline_dispatch(pipeline, count).await
+        {
+            return result;
+        }
 
         // Slow path: MOVED/ASK retry, or direct dispatch failed
         self.route_pipeline(
@@ -4352,17 +4409,17 @@ mod pipeline_routing_tests {
 
     use futures::executor::block_on;
 
-    use super::pipeline::route_for_pipeline;
     use super::ClusterConnInner;
     use super::pipeline::PipelineResponses;
+    use super::pipeline::route_for_pipeline;
     use crate::cluster::routing::{
         AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo, ResponsePolicy, Route, SlotAddr,
     };
     use crate::valkey::{
+        Value,
         aio::MultiplexedConnection,
         cmd,
         types::{ServerError, ServerErrorKind},
-        Value,
     };
 
     #[test]
@@ -4372,7 +4429,8 @@ mod pipeline_routing_tests {
 
         pipeline
             .add_command(cmd("FLUSHALL")) // route to all masters
-            .cmd("GET").arg("foo") // route to slot 12182
+            .cmd("GET")
+            .arg("foo") // route to slot 12182
             .add_command(cmd("EVAL")); // route randomly
 
         assert_eq!(
@@ -4623,11 +4681,16 @@ mod pipeline_routing_tests {
         let mut pipeline = crate::valkey::Pipeline::new();
         pipeline.atomic();
         pipeline
-            .cmd("GET").arg("foo") // route to replica of slot 12182
+            .cmd("GET")
+            .arg("foo") // route to replica of slot 12182
             .add_command(cmd("FLUSHALL")) // route to all masters
-            .add_command(cmd("EVAL"))// route randomly
-            .cmd("CONFIG").arg("GET").arg("timeout") // unkeyed command
-            .cmd("SET").arg("foo").arg("bar"); // route to primary of slot 12182
+            .add_command(cmd("EVAL")) // route randomly
+            .cmd("CONFIG")
+            .arg("GET")
+            .arg("timeout") // unkeyed command
+            .cmd("SET")
+            .arg("foo")
+            .arg("bar"); // route to primary of slot 12182
 
         assert_eq!(
             route_for_pipeline(&pipeline),
@@ -4641,8 +4704,11 @@ mod pipeline_routing_tests {
         pipeline.atomic();
         pipeline
             .add_command(cmd("FLUSHALL")) // route to all masters
-            .cmd("SET").arg("baz").arg("bar") // route to slot 4813
-            .cmd("GET").arg("foo"); // route to slot 12182
+            .cmd("SET")
+            .arg("baz")
+            .arg("bar") // route to slot 4813
+            .cmd("GET")
+            .arg("foo"); // route to slot 12182
 
         assert_eq!(
             route_for_pipeline(&pipeline).unwrap_err().kind(),
@@ -4655,11 +4721,20 @@ mod pipeline_routing_tests {
         let mut pipeline = crate::valkey::Pipeline::new();
         pipeline.atomic();
         pipeline
-            .cmd("SET").arg("{foo}bar").arg("baz") // route to primary of slot 12182
-            .cmd("CONFIG").arg("GET").arg("timeout") // unkeyed command
-            .cmd("SET").arg("foo").arg("bar") // route to primary of slot 12182
-            .cmd("DEBUG").arg("PAUSE").arg("100") // unkeyed command
-            .cmd("ECHO").arg("hello world"); // unkeyed command
+            .cmd("SET")
+            .arg("{foo}bar")
+            .arg("baz") // route to primary of slot 12182
+            .cmd("CONFIG")
+            .arg("GET")
+            .arg("timeout") // unkeyed command
+            .cmd("SET")
+            .arg("foo")
+            .arg("bar") // route to primary of slot 12182
+            .cmd("DEBUG")
+            .arg("PAUSE")
+            .arg("100") // unkeyed command
+            .cmd("ECHO")
+            .arg("hello world"); // unkeyed command
 
         assert_eq!(
             route_for_pipeline(&pipeline),
@@ -4731,13 +4806,13 @@ mod parse_node_address_tests {
 #[cfg(test)]
 mod direct_dispatch_tests {
     use super::*;
-    use container::{ClusterNode, ConnectionDetails, ConnectionsMap};
     use crate::cluster::{
         client::ClusterParams,
         routing::{Route, SingleNodeRoutingInfo, Slot, SlotAddr},
         slotmap::{ReadFromReplicaStrategy, SlotMap},
     };
     use crate::valkey::PipelineRetryStrategy;
+    use container::{ClusterNode, ConnectionDetails, ConnectionsMap};
     use dashmap::DashMap;
 
     use std::{
@@ -4808,10 +4883,7 @@ mod direct_dispatch_tests {
             _count: usize,
             _retry: Option<PipelineRetryStrategy>,
         ) -> ValkeyResult<Vec<Value>> {
-            self.received
-                .lock()
-                .unwrap()
-                .push(b"<pipeline>".to_vec());
+            self.received.lock().unwrap().push(b"<pipeline>".to_vec());
             match self.pop_response() {
                 Ok(Value::Array(vals)) => Ok(vals),
                 Ok(v) => Ok(vec![v]),
@@ -4860,15 +4932,17 @@ mod direct_dispatch_tests {
 
     /// Build a ClusterConnection<MockConn> from a list of (addr, slot_start,
     /// slot_end, conn) tuples.  Each entry becomes a primary node.
-    fn build_cluster(
-        nodes: Vec<(&str, u16, u16, MockConn)>,
-    ) -> ClusterConnection<MockConn> {
+    fn build_cluster(nodes: Vec<(&str, u16, u16, MockConn)>) -> ClusterConnection<MockConn> {
         let slots: Vec<Slot> = nodes
             .iter()
             .map(|(addr, start, end, _)| Slot::new(*start, *end, addr.to_string(), vec![]))
             .collect();
 
-        let slot_map = SlotMap::new(slots, HashMap::new(), ReadFromReplicaStrategy::AlwaysFromPrimary);
+        let slot_map = SlotMap::new(
+            slots,
+            HashMap::new(),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
 
         let dm: DashMap<Arc<str>, ClusterNode<ConnectionFuture<MockConn>>> = DashMap::new();
         for (addr, _, _, conn) in nodes {
@@ -4948,11 +5022,22 @@ mod direct_dispatch_tests {
         let result = conn.try_direct_dispatch(&get_foo, &routing).await;
 
         assert!(result.is_some(), "expected Some from direct dispatch");
-        assert_eq!(result.unwrap(), Ok(Value::BulkString(b"bar".to_vec().into())));
+        assert_eq!(
+            result.unwrap(),
+            Ok(Value::BulkString(b"bar".to_vec().into()))
+        );
 
         // Command must have gone to node_b only.
-        assert_eq!(node_b.received_count(), 1, "node_b should have received 1 command");
-        assert_eq!(node_a.received_count(), 0, "node_a must not receive any command");
+        assert_eq!(
+            node_b.received_count(),
+            1,
+            "node_b should have received 1 command"
+        );
+        assert_eq!(
+            node_a.received_count(),
+            0,
+            "node_a must not receive any command"
+        );
     }
 
     // ── Test 2 ──────────────────────────────────────────────────────────────
@@ -4983,8 +5068,16 @@ mod direct_dispatch_tests {
             Ok(Value::BulkString(b"value".to_vec().into()))
         );
         // node_a got the original command; node_b got the redirected retry.
-        assert_eq!(node_a.received_count(), 1, "node_a should receive the original command");
-        assert_eq!(node_b.received_count(), 1, "node_b should receive the redirected command");
+        assert_eq!(
+            node_a.received_count(),
+            1,
+            "node_a should receive the original command"
+        );
+        assert_eq!(
+            node_b.received_count(),
+            1,
+            "node_b should receive the redirected command"
+        );
     }
 
     // ── Test 3 ──────────────────────────────────────────────────────────────
@@ -4997,9 +5090,7 @@ mod direct_dispatch_tests {
         // Returns MOVED to a node that is not in our topology.
         node_a.push_err(moved_err(4813, "10.0.0.99:7999"));
 
-        let conn = build_cluster(vec![
-            ("127.0.0.1:7001", 0, 16383, node_a.clone()),
-        ]);
+        let conn = build_cluster(vec![("127.0.0.1:7001", 0, 16383, node_a.clone())]);
 
         let get_baz = cmd("GET").arg("baz").to_owned();
         let routing = SingleNodeRoutingInfo::SpecificNode(Route::new(4813, SlotAddr::Master));
@@ -5074,8 +5165,12 @@ mod direct_dispatch_tests {
         let node_b = MockConn::new(); // owns slots 8192–16383
 
         // Each node returns its sub-pipeline results as a Value::Array.
-        node_b.push_ok(Value::Array(vec![Value::BulkString(b"val_foo".to_vec().into())]));
-        node_a.push_ok(Value::Array(vec![Value::BulkString(b"val_baz".to_vec().into())]));
+        node_b.push_ok(Value::Array(vec![Value::BulkString(
+            b"val_foo".to_vec().into(),
+        )]));
+        node_a.push_ok(Value::Array(vec![Value::BulkString(
+            b"val_baz".to_vec().into(),
+        )]));
 
         let conn = build_cluster(vec![
             ("127.0.0.1:7001", 0, 8191, node_a.clone()),
@@ -5088,7 +5183,10 @@ mod direct_dispatch_tests {
 
         let result = conn.try_direct_pipeline_dispatch(&pipeline, 2).await;
 
-        assert!(result.is_some(), "expected Some from pipeline direct dispatch");
+        assert!(
+            result.is_some(),
+            "expected Some from pipeline direct dispatch"
+        );
         let values = result.unwrap().expect("pipeline should succeed");
         assert_eq!(values.len(), 2);
         assert_eq!(

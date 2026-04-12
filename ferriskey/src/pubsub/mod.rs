@@ -16,6 +16,9 @@ mod mock;
 #[cfg(feature = "mock-pubsub")]
 pub use mock::MockPubSubBroker;
 
+pub(crate) mod push_manager;
+pub(crate) mod synchronizer_trait;
+
 #[cfg(not(feature = "mock-pubsub"))]
 pub mod synchronizer;
 

@@ -4,9 +4,13 @@
 #![allow(missing_docs)]
 
 // public api
-pub use crate::valkey::client::Client;
-pub use crate::valkey::client::FerrisKeyConnectionOptions;
-pub use crate::valkey::client::IAMTokenProvider;
+pub use crate::connection::factory::{
+    Client, Client as ValkeyClient, FerrisKeyConnectionOptions, IAMTokenProvider,
+};
+pub use crate::pubsub::push_manager::{PushInfo, PushManager};
+pub use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
+pub(crate) use crate::retry_strategies;
+pub use crate::retry_strategies::RetryStrategy;
 pub use crate::valkey::cmd::{Arg, Cmd, cmd, fenced_cmd, pack_command, pipe};
 pub use crate::valkey::connection::{
     ConnectionAddr, ConnectionInfo, IntoConnectionInfo, PubSubChannelOrPattern,
@@ -14,9 +18,6 @@ pub use crate::valkey::connection::{
 };
 pub use crate::valkey::parser::{Parser, parse_valkey_value};
 pub use crate::valkey::pipeline::{Pipeline, PipelineRetryStrategy};
-pub use crate::valkey::pubsub_synchronizer::PubSubSynchronizer;
-pub use push_manager::{PushInfo, PushManager};
-pub use retry_strategies::RetryStrategy;
 
 // preserve grouping and order
 #[rustfmt::skip]
@@ -56,8 +57,7 @@ pub use crate::valkey::types::{
 
 pub use crate::valkey::{cmd::AsyncIter, parser::parse_valkey_value_async, types::ValkeyFuture};
 
-mod macros;
-pub(crate) mod pipeline;
+pub(crate) use crate::pipeline;
 
 pub use crate::connection as aio;
 
@@ -80,11 +80,10 @@ pub use crate::connection::tls::{
     ClientTlsConfig, TlsCertificates, TlsConnParams, retrieve_tls_certificates,
 };
 
-pub(crate) mod client;
-pub(crate) mod cmd;
+pub(crate) use crate::cmd;
+pub(crate) use crate::connection::factory as client;
 pub(crate) use crate::connection::info as connection;
-pub(crate) mod parser;
-pub(crate) mod pubsub_synchronizer;
-pub(crate) mod push_manager;
-pub(crate) mod retry_strategies;
-pub(crate) mod types;
+pub(crate) use crate::protocol::parser;
+pub(crate) use crate::pubsub::synchronizer_trait as pubsub_synchronizer;
+pub(crate) use crate::pubsub::push_manager;
+pub(crate) use crate::value as types;

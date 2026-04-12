@@ -5,9 +5,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::valkey::ProtocolVersion;
 use crate::valkey::pipeline::Pipeline;
 use crate::valkey::types::{ErrorKind, ValkeyError, ValkeyResult};
-use crate::valkey::ProtocolVersion;
 
 use crate::connection::tls::TlsConnParams;
 
@@ -359,7 +359,10 @@ pub(crate) fn create_rustls_config(
                 }) => config
                     .with_client_auth_cert(client_cert, client_key)
                     .map_err(|err| {
-                        tls_config_error("Failed to configure client cert auth with custom root store", err)
+                        tls_config_error(
+                            "Failed to configure client cert auth with custom root store",
+                            err,
+                        )
                     })?,
                 None => config.with_no_client_auth(),
             }
@@ -377,16 +380,17 @@ pub(crate) fn create_rustls_config(
                 }) => config
                     .with_client_auth_cert(client_cert, client_key)
                     .map_err(|err| {
-                        tls_config_error("Failed to configure client cert auth with platform verifier", err)
+                        tls_config_error(
+                            "Failed to configure client cert auth with platform verifier",
+                            err,
+                        )
                     })?,
                 None => config.with_no_client_auth(),
             }
         }
         None => rustls::ClientConfig::builder()
             .with_platform_verifier()
-            .map_err(|err| {
-                tls_config_error("Failed to configure default TLS settings", err)
-            })?
+            .map_err(|err| tls_config_error("Failed to configure default TLS settings", err))?
             .with_no_client_auth(),
     };
 
@@ -476,13 +480,14 @@ pub(crate) fn client_set_info_pipeline(lib_name: Option<&str>) -> Pipeline {
 /// Common logic for checking real cause of hello3 command error
 pub fn get_resp3_hello_command_error(err: ValkeyError) -> ValkeyError {
     if let Some(detail) = err.detail()
-        && detail.starts_with("unknown command `HELLO`") {
-            return (
-                ErrorKind::RESP3NotSupported,
-                "Redis Server doesn't support HELLO command therefore resp3 cannot be used",
-            )
-                .into();
-        }
+        && detail.starts_with("unknown command `HELLO`")
+    {
+        return (
+            ErrorKind::RESP3NotSupported,
+            "Redis Server doesn't support HELLO command therefore resp3 cannot be used",
+        )
+            .into();
+    }
     err
 }
 
@@ -513,7 +518,11 @@ mod tests {
         ];
         for (url, expected) in cases.into_iter() {
             let res = parse_redis_url(url);
-            assert_eq!(res.is_some(), expected, "Parsed result of `{url}` is not expected");
+            assert_eq!(
+                res.is_some(),
+                expected,
+                "Parsed result of `{url}` is not expected"
+            );
         }
     }
 
@@ -538,7 +547,10 @@ mod tests {
         for (url, expected) in cases.into_iter() {
             let res = url_to_tcp_connection_info(url.clone()).unwrap();
             assert_eq!(res.addr, expected.addr, "addr of {url} is not expected");
-            assert_eq!(res.valkey.db, expected.valkey.db, "db of {url} is not expected");
+            assert_eq!(
+                res.valkey.db, expected.valkey.db,
+                "db of {url} is not expected"
+            );
         }
     }
 }

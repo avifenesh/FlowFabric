@@ -7,8 +7,8 @@ use futures::FutureExt;
 use rand::seq::IteratorRandom;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use telemetrylib::Telemetry;
 
 use tracing::debug;
@@ -376,7 +376,8 @@ where
 
     /// Returns true if the address represents a known primary node.
     pub(crate) fn is_primary(&self, address: &str) -> bool {
-        self.connection_for_address(address).is_some() && self.slot_map.is_primary(&address.to_string())
+        self.connection_for_address(address).is_some()
+            && self.slot_map.is_primary(&address.to_string())
     }
 
     fn round_robin_read_from_replica(
@@ -452,25 +453,27 @@ where
             // Check if this replica’s availability zone matches the user’s availability zone.
             if let Some((address, connection_details)) =
                 self.connection_details_for_address(replica.as_str())
-                && self.az_for_address(&address) == Some(client_az.clone()) {
-                    // Attempt to update `latest_used_replica` with the index of this replica.
-                    let _ = slot_map_value.last_used_replica.compare_exchange_weak(
-                        initial_index,
-                        index,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                    return Some((address, connection_details.conn));
-                }
+                && self.az_for_address(&address) == Some(client_az.clone())
+            {
+                // Attempt to update `latest_used_replica` with the index of this replica.
+                let _ = slot_map_value.last_used_replica.compare_exchange_weak(
+                    initial_index,
+                    index,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return Some((address, connection_details.conn));
+            }
         }
 
         // Step 2: Check if primary is in the same AZ
         if check_primary
             && let Some((address, connection_details)) =
                 self.connection_details_for_address(addrs.primary().as_str())
-                && self.az_for_address(&address) == Some(client_az) {
-                    return Some((address, connection_details.conn));
-                }
+            && self.az_for_address(&address) == Some(client_az)
+        {
+            return Some((address, connection_details.conn));
+        }
 
         // Step 3: Fall back to any available replica using round-robin or primary if needed
         self.round_robin_read_from_replica(slot_map_value)
@@ -899,9 +902,11 @@ mod tests {
     fn get_connection_for_primary_route() {
         let container = create_container();
 
-        assert!(container
-            .connection_for_route(&Route::new(0, SlotAddr::Master))
-            .is_none());
+        assert!(
+            container
+                .connection_for_route(&Route::new(0, SlotAddr::Master))
+                .is_none()
+        );
 
         assert_eq!(
             1,
@@ -919,9 +924,11 @@ mod tests {
                 .1
         );
 
-        assert!(container
-            .connection_for_route(&Route::new(1001, SlotAddr::Master))
-            .is_none());
+        assert!(
+            container
+                .connection_for_route(&Route::new(1001, SlotAddr::Master))
+                .is_none()
+        );
 
         assert_eq!(
             2,
@@ -952,9 +959,11 @@ mod tests {
     fn get_connection_for_replica_route() {
         let container = create_container();
 
-        assert!(container
-            .connection_for_route(&Route::new(1001, SlotAddr::ReplicaOptional))
-            .is_none());
+        assert!(
+            container
+                .connection_for_route(&Route::new(1001, SlotAddr::ReplicaOptional))
+                .is_none()
+        );
 
         assert_eq!(
             21,
@@ -982,9 +991,11 @@ mod tests {
     fn get_primary_connection_for_replica_route_if_no_replicas_were_added() {
         let container = create_container();
 
-        assert!(container
-            .connection_for_route(&Route::new(0, SlotAddr::ReplicaOptional))
-            .is_none());
+        assert!(
+            container
+                .connection_for_route(&Route::new(0, SlotAddr::ReplicaOptional))
+                .is_none()
+        );
 
         assert_eq!(
             1,
@@ -1018,8 +1029,8 @@ mod tests {
     }
 
     #[test]
-    fn get_replica_connection_for_replica_route_if_replica_is_required_even_if_strategy_is_always_from_primary(
-    ) {
+    fn get_replica_connection_for_replica_route_if_replica_is_required_even_if_strategy_is_always_from_primary()
+     {
         let container =
             create_container_with_strategy(ReadFromReplicaStrategy::AlwaysFromPrimary, false);
 
@@ -1067,9 +1078,11 @@ mod tests {
         );
 
         // slot number is not exits
-        assert!(container
-            .connection_for_route(&Route::new(1001, SlotAddr::ReplicaOptional))
-            .is_none());
+        assert!(
+            container
+                .connection_for_route(&Route::new(1001, SlotAddr::ReplicaOptional))
+                .is_none()
+        );
         // Get the replica that holds the slot 1002
         assert_eq!(
             21,
@@ -1196,9 +1209,11 @@ mod tests {
             .az = Some("use-1c".to_string());
 
         // Slot number does not exist (slot 1001 wasn't assigned to any primary)
-        assert!(container
-            .connection_for_route(&Route::new(1001, SlotAddr::ReplicaOptional))
-            .is_none());
+        assert!(
+            container
+                .connection_for_route(&Route::new(1001, SlotAddr::ReplicaOptional))
+                .is_none()
+        );
 
         // Test getting replica in client's AZ for slot 2001
         assert!(one_of(
@@ -1338,9 +1353,11 @@ mod tests {
             .collect();
 
         assert_eq!(random_connections.len(), 3);
-        assert!(random_connections
-            .iter()
-            .all(|connection| [1, 2, 3, 21, 31, 32].contains(connection)));
+        assert!(
+            random_connections
+                .iter()
+                .all(|connection| [1, 2, 3, 21, 31, 32].contains(connection))
+        );
     }
 
     #[test]
@@ -1348,9 +1365,11 @@ mod tests {
         let container = create_container();
         remove_all_connections(&container);
 
-        assert!(container
-            .random_connections(1, ConnectionType::User)
-            .is_none());
+        assert!(
+            container
+                .random_connections(1, ConnectionType::User)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1485,8 +1504,8 @@ mod tests {
     }
 
     #[test]
-    fn len_is_not_adjusted_on_removals_of_nonexisting_connections_or_additions_of_existing_connections(
-    ) {
+    fn len_is_not_adjusted_on_removals_of_nonexisting_connections_or_additions_of_existing_connections()
+     {
         let container = create_container();
 
         assert_eq!(container.len(), 6);

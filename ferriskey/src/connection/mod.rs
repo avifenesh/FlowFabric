@@ -1,10 +1,13 @@
 //! Adds async IO support to redis.
-use crate::valkey::cmd::{cmd, Cmd};
-use crate::valkey::connection::{get_resp3_hello_command_error, ValkeyConnectionInfo};
+pub mod factory;
+
+pub use factory::{Client, FerrisKeyConnectionOptions, IAMTokenProvider};
+
+use crate::valkey::cmd::{Cmd, cmd};
+use crate::valkey::connection::{ValkeyConnectionInfo, get_resp3_hello_command_error};
 use crate::valkey::pipeline::PipelineRetryStrategy;
 use crate::valkey::types::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, ValkeyError, ValkeyResult,
-    Value,
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, ValkeyError, ValkeyResult, Value,
 };
 use ::tokio::io::{AsyncRead, AsyncWrite};
 use async_trait::async_trait;
@@ -257,8 +260,8 @@ where
 
 mod multiplexed;
 pub use multiplexed::*;
-pub(crate) mod runtime;
 pub(crate) mod info;
+pub(crate) mod runtime;
 pub(crate) mod tls;
 
 use crate::connection::info::ConnectionAddr;
@@ -337,7 +340,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             return Err(ValkeyError::from((
                 ErrorKind::InvalidClientConfig,
                 "Cannot connect to unix sockets on this platform",
-            )))
+            )));
         }
     })
 }

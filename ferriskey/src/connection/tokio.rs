@@ -1,7 +1,7 @@
 use crate::connection::{AsyncStream, RedisRuntime};
 use crate::valkey::ValkeyResult;
-use std::net::SocketAddr;
 use async_trait::async_trait;
+use std::net::SocketAddr;
 #[allow(unused_imports)] // fixes "Duration" unused when built with non-default feature set
 use std::{
     future::Future,
@@ -19,7 +19,7 @@ use tokio::{
 
 use crate::connection::info::create_rustls_config;
 use std::sync::Arc;
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::connection::tls::TlsConnParams;
 
