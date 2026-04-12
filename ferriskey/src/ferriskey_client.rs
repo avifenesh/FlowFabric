@@ -85,24 +85,28 @@ impl Client {
         Ok(Self(Arc::new(inner)))
     }
 
+    /// Get the value of a key, returning `None` if the key does not exist.
     pub async fn get<T: FromValue>(&self, key: impl ToArgs) -> Result<Option<T>> {
         let mut cmd = cmd("GET");
         cmd.arg(key);
         self.execute(cmd).await
     }
 
+    /// Increment the integer value of a key by one, returning the new value.
     pub async fn incr(&self, key: impl ToArgs) -> Result<i64> {
         let mut cmd = cmd("INCR");
         cmd.arg(key);
         self.execute(cmd).await
     }
 
+    /// Set a key to a value.
     pub async fn set(&self, key: impl ToArgs, value: impl ToArgs) -> Result<()> {
         let mut cmd = cmd("SET");
         cmd.arg(key).arg(value);
         self.execute(cmd).await
     }
 
+    /// Set a key to a value and return the old value.
     pub async fn get_set<T: FromValue>(
         &self,
         key: impl ToArgs,
@@ -113,24 +117,28 @@ impl Client {
         self.execute(cmd).await
     }
 
+    /// Set a key to a value with an expiration time.
     pub async fn set_ex(&self, key: impl ToArgs, value: impl ToArgs, ttl: Duration) -> Result<()> {
         let mut cmd = cmd("PSETEX");
         cmd.arg(key).arg(duration_to_millis(ttl)?).arg(value);
         self.execute(cmd).await
     }
 
+    /// Delete one or more keys, returning the number of keys removed.
     pub async fn del(&self, keys: &[impl ToArgs]) -> Result<i64> {
         let mut cmd = cmd("DEL");
         cmd.arg(keys);
         self.execute(cmd).await
     }
 
+    /// Set a timeout on a key, returning `true` if the key exists.
     pub async fn expire(&self, key: impl ToArgs, ttl: Duration) -> Result<bool> {
         let mut cmd = cmd("PEXPIRE");
         cmd.arg(key).arg(duration_to_millis(ttl)?);
         self.execute(cmd).await
     }
 
+    /// Check if a key exists.
     pub async fn exists(&self, key: impl ToArgs) -> Result<bool> {
         let mut cmd = cmd("EXISTS");
         cmd.arg(key);
@@ -138,6 +146,7 @@ impl Client {
         Ok(exists != 0)
     }
 
+    /// Set a hash field to a value, returning the number of new fields added.
     pub async fn hset(
         &self,
         key: impl ToArgs,
@@ -149,6 +158,7 @@ impl Client {
         self.execute(cmd).await
     }
 
+    /// Get the value of a hash field, returning `None` if the field does not exist.
     pub async fn hget<T: FromValue>(
         &self,
         key: impl ToArgs,
@@ -159,18 +169,21 @@ impl Client {
         self.execute(cmd).await
     }
 
+    /// Get all fields and values of a hash.
     pub async fn hgetall(&self, key: impl ToArgs) -> Result<HashMap<String, String>> {
         let mut cmd = cmd("HGETALL");
         cmd.arg(key);
         self.execute(cmd).await
     }
 
+    /// Prepend one or more elements to a list, returning the new length.
     pub async fn lpush(&self, key: impl ToArgs, elements: &[impl ToArgs]) -> Result<i64> {
         let mut cmd = cmd("LPUSH");
         cmd.arg(key).arg(elements);
         self.execute(cmd).await
     }
 
+    /// Remove and return the last element of a list.
     pub async fn rpop(&self, key: impl ToArgs, count: Option<usize>) -> Result<Option<String>> {
         match count {
             None => {
@@ -192,6 +205,7 @@ impl Client {
         }
     }
 
+    /// Start building an arbitrary command by name.
     pub fn cmd(&self, name: &str) -> CommandBuilder {
         CommandBuilder {
             client: self.0.clone(),
@@ -199,6 +213,7 @@ impl Client {
         }
     }
 
+    /// Create a new typed pipeline for batching multiple commands.
     pub fn pipeline(&self) -> TypedPipeline {
         TypedPipeline {
             inner: crate::pipeline::Pipeline::new(),
@@ -208,6 +223,7 @@ impl Client {
         }
     }
 
+    /// Create a new atomic pipeline (MULTI/EXEC transaction).
     pub fn transaction(&self) -> TypedPipeline {
         let mut pipe = self.pipeline();
         pipe.atomic();
@@ -222,12 +238,14 @@ impl Client {
 }
 
 impl ClientBuilder {
+    /// Create a new builder with default options.
     pub fn new() -> Self {
         Self {
             request: ConnectionRequest::default(),
         }
     }
 
+    /// Add a server address (host and port).
     pub fn host(mut self, host: &str, port: u16) -> Self {
         self.request.addresses.push(NodeAddress {
             host: host.to_string(),
@@ -236,62 +254,74 @@ impl ClientBuilder {
         self
     }
 
+    /// Add a server by URL, extracting host, port, TLS, and auth settings.
     pub fn url(mut self, url: &str) -> Result<Self> {
         let info = url.into_connection_info()?;
         apply_connection_info(&mut self.request, info)?;
         Ok(self)
     }
 
+    /// Enable cluster mode.
     pub fn cluster(mut self) -> Self {
         self.request.cluster_mode_enabled = true;
         self
     }
 
+    /// Enable TLS with certificate verification.
     pub fn tls(mut self) -> Self {
         self.request.tls_mode = Some(ClientTlsMode::SecureTls);
         self
     }
 
+    /// Enable TLS without certificate verification.
     pub fn tls_insecure(mut self) -> Self {
         self.request.tls_mode = Some(ClientTlsMode::InsecureTls);
         self
     }
 
+    /// Set the authentication password.
     pub fn password(mut self, pw: impl Into<String>) -> Self {
         authentication_info_mut(&mut self.request).password = Some(pw.into());
         self
     }
 
+    /// Set the authentication username (ACL).
     pub fn username(mut self, username: impl Into<String>) -> Self {
         authentication_info_mut(&mut self.request).username = Some(username.into());
         self
     }
 
+    /// Select the database number.
     pub fn database(mut self, db: i64) -> Self {
         self.request.database_id = db;
         self
     }
 
+    /// Set the read-from strategy (primary, replica, etc.).
     pub fn read_from(mut self, strategy: ReadFrom) -> Self {
         self.request.read_from = Some(strategy);
         self
     }
 
+    /// Set the connection timeout.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.request.connection_timeout = Some(duration_to_request_millis(timeout));
         self
     }
 
+    /// Set the per-request timeout.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request.request_timeout = Some(duration_to_request_millis(timeout));
         self
     }
 
+    /// Set the maximum number of in-flight requests.
     pub fn max_inflight(mut self, max_inflight: u32) -> Self {
         self.request.inflight_requests_limit = Some(max_inflight);
         self
     }
 
+    /// Build and connect the client.
     pub async fn build(self) -> Result<Client> {
         if self.request.addresses.is_empty() {
             return Err(ValkeyError::from((

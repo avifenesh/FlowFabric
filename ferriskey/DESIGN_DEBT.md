@@ -33,14 +33,15 @@ FerrisKey is the library. The `valkey` prefix adds nothing.
 | `ValkeyResult<T>` | Verbose | `Result<T>` (type alias in crate root) |
 | `ValkeyError` | Verbose | `Error` |
 
-**Status (2026-04-12): Partial.**
+**Status (2026-04-12): Mostly done.**
 - `FromValue`, `ToArgs`, `Error`, and `Result<T>` aliases exist at the crate root
 - `connect()` / `connect_cluster()` free functions exist at the crate root
-- remaining leak cleanup:
-  - `ValkeyWrite` should become `pub(crate)`
-  - `ValkeyFuture` should become `pub(crate)`
-  - `Arg` appears to be legacy/internal
-  - `ConnectionRequest` should eventually stop being a public user-facing type
+- `ValkeyFuture` — now `pub(crate)`, removed from lib.rs re-exports
+- `Arg` — now `pub(crate)`, removed from lib.rs re-exports
+- `ValkeyWrite` — removed from lib.rs re-exports (stays `pub` in value.rs: required by public `ToValkeyArgs` trait)
+- 19 internal-only methods in cmd.rs (11) and pipeline.rs (8) tightened to `pub(crate)`
+- `ConnectionRequest` — still public, tracked in #11
+- Remaining: type renames (`ValkeyError`→`Error`, `FromValkeyValue`→`FromValue`, etc.) deferred to avoid churn
 
 ## 3. Missing convenience API
 
@@ -82,6 +83,12 @@ address-level tracking, pending unsubscribes queue, OnceCell+Weak client referen
 
 **Why not simpler:** Confirmation-based correctness matters (fire-and-forget isn't safe).
 Sharded PubSub is slot-routed. Failover blast radius must be minimal.
+
+**Status (2026-04-12): DONE.**
+- `EventDrivenSynchronizer` in `src/pubsub/synchronizer.rs` (~1043 lines)
+- Event-driven model replaces polling-based synchronizer
+- Topology change handling via `handle_topology_changed()`
+- Confirmation tracking via push message callbacks
 
 ## 5. Connection lifecycle — Too many types
 
@@ -171,14 +178,14 @@ Remaining:
 
 | # | Status | Impact | Effort | When |
 |---|---|---|---|---|
-| 4 | Open | High (correctness / resiliency) | Large | Top remaining functional rewrite |
-| 2 | Partial | High (public API cleanup) | Small | Next small win: make `ValkeyWrite` / `ValkeyFuture` `pub(crate)` |
 | 6 | Open | Medium (correctness / design) | Large | Depends on deferred `ServerError` collapse |
-| 5 | ✓ DONE | Medium (ownership / lifecycle) | Large | `Box::leak` eliminated in `connection/factory.rs` |
 | 9 | Partial | Medium (clarity) | Large | `ServerError` / `ServerErrorKind` deferred |
 | 11 | Open | Medium (API hygiene) | Medium | Hide `ConnectionRequest` after tests/bindings migrate |
+| 2 | Mostly done | High (public API cleanup) | Small | Type renames deferred; visibility tightening complete |
 | 7 | Open | Low (perf) | Medium | Cmd double-allocation — after profiling |
 | 1 | ✓ DONE | Medium (structure) | Large | Module migration complete |
 | 3 | ✓ DONE | High (user-facing) | Medium | High-level API + typed pipeline complete |
+| 4 | ✓ DONE | High (correctness / resiliency) | Large | EventDrivenSynchronizer replaces polling |
+| 5 | ✓ DONE | Medium (ownership / lifecycle) | Large | `Box::leak` eliminated in `connection/factory.rs` |
 | 8 | ✓ DONE | Low (perf) | Small | Arc<str> node addresses |
 | 10 | ✓ DONE | Low (DX) | Small | Feature flags consolidated |
