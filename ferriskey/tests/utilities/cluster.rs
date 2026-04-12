@@ -31,7 +31,7 @@ use std::time::Duration;
 #[cfg(not(feature = "test-util"))]
 use tokio::sync::{RwLock as TokioRwLock, mpsc};
 use which::which;
-// Code copied from redis-rs
+// Code copied from ferriskey
 
 pub(crate) const SHORT_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(50_000);
 pub(crate) const LONG_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(60_000);

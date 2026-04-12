@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use std::{collections::HashMap, sync::Mutex};
 
 // This is a container for storing the cursor of a cluster scan.
-// The cursor for a cluster scan is a ref to the actual ScanState struct in redis-rs.
+// The cursor for a cluster scan is a ref to the actual ScanState struct in ferriskey.
 // In order to avoid dropping it when it is passed between layers of the application,
 // we store it in this container and only pass the id of the cursor.
 // The cursor is stored in the container and can be retrieved using the id.

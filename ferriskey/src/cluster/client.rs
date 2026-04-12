@@ -476,7 +476,7 @@ impl ClusterClientBuilder {
     ///
     /// If not set, the slots refresh rate limit configurations will be set with the default values:
     /// ```ignore
-    /// use redis::cluster_topology::{DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI, DEFAULT_SLOTS_REFRESH_WAIT_DURATION};
+    /// use ferriskey::cluster::topology::{DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI, DEFAULT_SLOTS_REFRESH_WAIT_DURATION};
     /// ```ignore
     ///
     /// - `interval_duration`: `DEFAULT_SLOTS_REFRESH_WAIT_DURATION`

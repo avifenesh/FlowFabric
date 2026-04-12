@@ -92,13 +92,13 @@ impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unp
     AsyncIter<'a, T, C>
 {
     /// ```rust,ignore
-    /// # use redis::AsyncCommands;
-    /// # async fn scan_set() -> redis::ValkeyResult<()> {
-    /// # let client = redis::Client::open("redis://127.0.0.1/")?;
+    /// # use ferriskey::AsyncCommands;
+    /// # async fn scan_set() -> ferriskey::ValkeyResult<()> {
+    /// # let client = ferriskey::Client::open("redis://127.0.0.1/")?;
     /// # let mut con = client.get_async_connection(None).await?;
     /// con.sadd::<_, _, ()>("my_set", 42i32).await?;
     /// con.sadd::<_, _, ()>("my_set", 43i32).await?;
-    /// let mut iter: redis::AsyncIter<i32> = con.sscan("my_set").await?;
+    /// let mut iter: ferriskey::AsyncIter<i32> = con.sscan("my_set").await?;
     /// while let Some(element) = iter.next_item().await {
     ///     assert!(element == 42 || element == 43);
     /// }
@@ -266,14 +266,14 @@ impl Default for Cmd {
 /// Basic example:
 ///
 /// ```rust,ignore
-/// redis::Cmd::new().arg("SET").arg("my_key").arg(42);
+/// ferriskey::Cmd::new().arg("SET").arg("my_key").arg(42);
 /// ```ignore
 ///
 /// There is also a helper function called `cmd` which makes it a
 /// tiny bit shorter:
 ///
 /// ```rust,ignore
-/// redis::cmd("SET").arg("my_key").arg(42);
+/// ferriskey::cmd("SET").arg("my_key").arg(42);
 /// ```ignore
 ///
 /// Because Rust currently does not have an ideal system
@@ -281,10 +281,10 @@ impl Default for Cmd {
 /// the initially generated command:
 ///
 /// ```rust,no_run,ignore
-/// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+/// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();
-/// let mut cmd = redis::cmd("SMEMBERS");
-/// let mut iter : redis::Iter<i32> = cmd.arg("my_set").clone().iter(&mut con).unwrap();
+/// let mut cmd = ferriskey::cmd("SMEMBERS");
+/// let mut iter : ferriskey::Iter<i32> = cmd.arg("my_set").clone().iter(&mut con).unwrap();
 /// ```ignore
 impl Cmd {
     /// Creates a new empty command.
@@ -327,11 +327,11 @@ impl Cmd {
     /// For instance all of the following are valid:
     ///
     /// ```rust,ignore
-    /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    /// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection(None).unwrap();
-    /// redis::cmd("SET").arg(&["my_key", "my_value"]);
-    /// redis::cmd("SET").arg("my_key").arg(42);
-    /// redis::cmd("SET").arg("my_key").arg(b"my_value");
+    /// ferriskey::cmd("SET").arg(&["my_key", "my_value"]);
+    /// ferriskey::cmd("SET").arg("my_key").arg(42);
+    /// ferriskey::cmd("SET").arg("my_key").arg(b"my_value");
     /// ```ignore
     #[inline]
     pub fn arg<T: ToValkeyArgs>(&mut self, arg: T) -> &mut Cmd {
@@ -355,10 +355,10 @@ impl Cmd {
     /// another batch of items when the local data is exhausted.
     ///
     /// ```rust,ignore
-    /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    /// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection(None).unwrap();
-    /// let mut cmd = redis::cmd("SSCAN");
-    /// let mut iter : redis::Iter<isize> =
+    /// let mut cmd = ferriskey::cmd("SSCAN");
+    /// let mut iter : ferriskey::Iter<isize> =
     ///     cmd.arg("my_set").cursor_arg(0).clone().iter(&mut con).unwrap();
     /// for x in iter {
     ///     // do something with the item
@@ -561,7 +561,7 @@ impl fmt::Debug for Cmd {
 /// command pipe.
 ///
 /// ```rust,ignore
-/// redis::cmd("PING");
+/// ferriskey::cmd("PING");
 /// ```ignore
 pub fn cmd(name: &str) -> Cmd {
     let mut rv = Cmd::new();

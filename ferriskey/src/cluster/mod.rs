@@ -9,8 +9,8 @@
 //!
 //! # Example
 //! ```rust,ignore
-//! use redis::cluster::ClusterClient;
-//! use redis::AsyncCommands;
+//! use ferriskey::cluster::ClusterClient;
+//! use ferriskey::AsyncCommands;
 //!
 //! async fn fetch_an_integer() -> String {
 //!     let nodes = vec!["redis://127.0.0.1/"];
@@ -262,8 +262,8 @@ where
     ///
     /// # Example
     /// ```rust,ignore
-    /// use redis::cluster::ClusterClient;
-    /// use redis::{ScanStateRC, from_valkey_value, Value, ObjectType, ClusterScanArgs};
+    /// use ferriskey::cluster::ClusterClient;
+    /// use ferriskey::{ScanStateRC, from_valkey_value, Value, ObjectType, ClusterScanArgs};
     ///
     /// async fn scan_all_cluster() -> Vec<String> {
     ///     let nodes = vec!["redis://127.0.0.1/"];

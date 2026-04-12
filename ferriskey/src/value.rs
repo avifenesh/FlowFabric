@@ -1202,10 +1202,10 @@ pub struct InfoDict {
 /// in (master, slave) etc:
 ///
 /// ```rust,no_run,ignore
-/// # fn do_something() -> redis::ValkeyResult<()> {
-/// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+/// # fn do_something() -> ferriskey::ValkeyResult<()> {
+/// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();
-/// let info : redis::InfoDict = redis::cmd("INFO").query(&mut con)?;
+/// let info : ferriskey::InfoDict = ferriskey::cmd("INFO").query(&mut con)?;
 /// let role : Option<String> = info.get("role");
 /// # Ok(()) }
 /// ```

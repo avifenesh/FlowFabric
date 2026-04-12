@@ -26,9 +26,9 @@ pub struct Pipeline {
 /// Basic example:
 ///
 /// ```rust,no_run,ignore
-/// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+/// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();
-/// let ((k1, k2),) : ((i32, i32),) = redis::pipe()
+/// let ((k1, k2),) : ((i32, i32),) = ferriskey::pipe()
 ///     .cmd("SET").arg("key_1").arg(42).ignore()
 ///     .cmd("SET").arg("key_2").arg(43).ignore()
 ///     .cmd("MGET").arg(&["key_1", "key_2"]).query(&mut con).unwrap();
@@ -73,9 +73,9 @@ impl Pipeline {
     /// as the format does not change.
     ///
     /// ```rust,ignore
-    /// # let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    /// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
     /// # let mut con = client.get_connection(None).unwrap();
-    /// let (k1, k2) : (i32, i32) = redis::pipe()
+    /// let (k1, k2) : (i32, i32) = ferriskey::pipe()
     ///     .atomic()
     ///     .cmd("GET").arg("key_1")
     ///     .cmd("GET").arg("key_2").query(&mut con).unwrap();

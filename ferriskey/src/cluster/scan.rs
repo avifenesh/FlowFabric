@@ -70,8 +70,8 @@ type SlotsBitsArray = [u64; BITS_ARRAY_SIZE as usize];
 /// Create a new `ClusterScanArgs` instance using the builder pattern:
 ///
 /// ```rust,no_run,ignore
-/// use redis::ClusterScanArgs;
-/// use redis::ObjectType;
+/// use ferriskey::ClusterScanArgs;
+/// use ferriskey::ObjectType;
 ///
 /// // Create basic scan args with defaults
 /// let basic_scan = ClusterScanArgs::builder().build();
@@ -134,7 +134,7 @@ impl ClusterScanArgs {
 ///
 /// # Example
 /// ```ignore
-/// use redis::{ClusterScanArgs, ObjectType};
+/// use ferriskey::{ClusterScanArgs, ObjectType};
 ///
 /// let args = ClusterScanArgs::builder()
 ///     .with_match_pattern(b"user:*")

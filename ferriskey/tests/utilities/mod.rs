@@ -32,7 +32,7 @@ pub mod mocks;
 pub(crate) const SHORT_STANDALONE_TEST_TIMEOUT: Duration = Duration::from_millis(20_000);
 pub(crate) const LONG_STANDALONE_TEST_TIMEOUT: Duration = Duration::from_millis(40_000);
 
-// Code copied from redis-rs
+// Code copied from ferriskey
 
 #[derive(PartialEq, Eq)]
 pub enum ServerType {
@@ -159,7 +159,7 @@ impl ValkeyServer {
             }
             ServerType::Unix => {
                 let (a, b) = rand::random::<(u64, u64)>();
-                let path = format!("/tmp/redis-rs-test-{a}-{b}.sock");
+                let path = format!("/tmp/ferriskey-test-{a}-{b}.sock");
                 ferriskey::ConnectionAddr::Unix(PathBuf::from(&path))
             }
         };

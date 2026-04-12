@@ -33,7 +33,7 @@ pub struct Client {
 /// Example usage::
 ///
 /// ```rust,no_run,ignore
-/// let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+/// let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
 /// let con = client.get_connection(None).unwrap();
 /// ```
 impl Client {
@@ -187,14 +187,14 @@ impl Client {
     /// ```ignore
     /// use std::{fs::File, io::{BufReader, Read}};
     ///
-    /// use redis::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
+    /// use ferriskey::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
     ///
     /// async fn do_redis_code(
     ///     url: &str,
     ///     root_cert_file: &str,
     ///     cert_file: &str,
     ///     key_file: &str
-    /// ) -> redis::ValkeyResult<()> {
+    /// ) -> ferriskey::ValkeyResult<()> {
     ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
     ///     let mut root_cert_vec = Vec::new();
     ///     BufReader::new(root_cert_file)
@@ -233,12 +233,12 @@ impl Client {
     ///
     ///     con.set::<_, _, ()>("key1", b"foo").await?;
     ///
-    ///     redis::cmd("SET")
+    ///     ferriskey::cmd("SET")
     ///         .arg(&["key2", "bar"])
     ///         .query_async::<_, ()>(&mut con)
     ///         .await?;
     ///
-    ///     let result = redis::cmd("MGET")
+    ///     let result = ferriskey::cmd("MGET")
     ///         .arg(&["key1", "key2"])
     ///         .query_async(&mut con)
     ///         .await;
