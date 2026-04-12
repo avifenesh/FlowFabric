@@ -10,8 +10,10 @@ FerrisKey is the library. The `valkey` prefix adds nothing.
 **Current:** `ferriskey::valkey::aio::ConnectionLike`, `ferriskey::valkey::cmd`
 **Target:** `ferriskey::aio::ConnectionLike`, `ferriskey::cmd`
 
-**Plan:** Flatten `src/valkey/` into `src/`. Move `valkey/mod.rs` exports to `lib.rs`.
-This is a large but mechanical refactor (every `use crate::valkey::` becomes `use crate::`).
+**Status (2026-04-12): DONE.**
+- `src/valkey/` is gone
+- modules live under `src/cluster`, `src/connection`, `src/protocol`, `src/cmd`, `src/pipeline`, `src/value`
+- old `crate::valkey::...` paths have been cleaned from the main source tree
 
 ## 2. Public API naming — Exposes internals
 
@@ -31,6 +33,15 @@ This is a large but mechanical refactor (every `use crate::valkey::` becomes `us
 | `ValkeyResult<T>` | Verbose | `Result<T>` (type alias in crate root) |
 | `ValkeyError` | Verbose | `Error` |
 
+**Status (2026-04-12): Partial.**
+- `FromValue`, `ToArgs`, `Error`, and `Result<T>` aliases exist at the crate root
+- `connect()` / `connect_cluster()` free functions exist at the crate root
+- remaining leak cleanup:
+  - `ValkeyWrite` should become `pub(crate)`
+  - `ValkeyFuture` should become `pub(crate)`
+  - `Arg` appears to be legacy/internal
+  - `ConnectionRequest` should eventually stop being a public user-facing type
+
 ## 3. Missing convenience API
 
 Users have to write:
@@ -49,6 +60,13 @@ conn.execute(cmd("GET").arg("key")).await?
 - `Client` trait with `get()`, `set()`, `del()`, `lpush()`, `rpop()`, etc.
 - `connect("valkey://host:port")` factory function
 - `Pipeline::new().get("k1").set("k2", "v2").execute(&mut conn).await?`
+
+**Status (2026-04-12): DONE for initial surface.**
+- high-level `Client` wrapper exists
+- `ClientBuilder` exists
+- convenience methods exist for the initial key/hash/list surface
+- typed pipeline exists
+- crate-root `connect()` / `connect_cluster()` exist
 
 ## 4. PubSub — Polling-based synchronizer
 
@@ -81,6 +99,10 @@ Config → Connection (standalone) or ClusterClient (cluster)
 
 Both implement `Client` trait. Connection details are internal.
 
+**Status (2026-04-12): Partial.**
+- low-level client factory moved to `src/connection/factory.rs`
+- the main remaining concrete debt is the `Box::leak` ownership hack in `connection/factory.rs`
+
 ## 6. Value type — Server errors mixed with data
 
 `Value` enum has `ServerError(ServerError)` as a variant alongside `Int`, `BulkString`, etc.
@@ -109,13 +131,16 @@ At 250K ops/sec, that's 250K String allocations for addresses.
 
 **Target:** Use `Arc<str>` for node addresses. Clone is refcount bump, not heap allocation.
 
+**Status (2026-04-12): DONE.**
+- `Arc<str>` migration completed
+
 ## 9. Error types — Two parallel hierarchies
 
 **Status (2026-04-12): Partially done.**
-- ~~`IAMError`~~ — From<IAMError> for ValkeyError added; IAMError being eliminated
-- ~~`StandaloneClientConnectionError`~~ — deleted (47 lines); create_client returns ValkeyError
-- ~~`ConnectionError`~~ — being deleted (~40 lines); Client::new returns ValkeyError
-- `ServerError` / `ServerErrorKind` — **deferred**. 16 direct construction sites (9 in cluster/pipeline alone). Performance-critical redirect logic. Needs benchmarking when touched. Can collapse to `ValkeyError(ErrorKind::Moved/Ask, ...)` but large effort.
+- ~~`IAMError`~~ — eliminated
+- ~~`StandaloneClientConnectionError`~~ — eliminated
+- ~~`ConnectionError`~~ — eliminated
+- `ServerError` / `ServerErrorKind` — **deferred**. 16 direct construction sites remain (9 in cluster/pipeline). Redirect logic already prefers `ErrorKind::{Moved, Ask}`. Large effort because `ServerError` is still embedded in `Value::ServerError(...)` and the parser/pipeline hot path.
 
 Remaining:
 - `ValkeyError` (value.rs) — the main error type
@@ -130,19 +155,29 @@ Remaining:
 - Merged into: `default=[]`, `test-util=[]`
 - Heartbeat always-on; test infrastructure behind `test-util`
 
+## 11. ConnectionRequest exposure — low-level config leaked as public surface
+
+`ConnectionRequest` is still re-exported at the crate root. It is useful today for tests, internal wrappers, and FFI/language-binding layers, but it is not part of the intended end-user API in `API_DESIGN.md`.
+
+**Target:**
+- user-facing code should prefer `ClientBuilder`, `connect()`, and `connect_cluster()`
+- `ConnectionRequest` should eventually become `pub(crate)` or move behind a clearly internal/bindings-only module
+- tests and binding adapters should migrate first before visibility is tightened
+
 ---
 
 ## Priority
 
 | # | Status | Impact | Effort | When |
 |---|---|---|---|---|
-| 1 | ✓ DONE | Medium (structure) | Large | Module migration complete |
-| 2 | Open | High (user-facing) | Medium | Next: rename public types |
-| 3 | ✓ DONE (partial) | High (user-facing) | Medium | Client + convenience methods + pipeline |
-| 4 | Open | Medium (correctness) | Medium | PubSub rewrite — dedicated session |
-| 5 | Open | Medium (simplicity) | Large | Box::leak in connection/factory.rs — after lifecycle work |
-| 6 | Open | Medium (correctness) | Large | Value::ServerError variant — with ServerError collapse |
+| 4 | Open | High (correctness / resiliency) | Large | Top remaining functional rewrite |
+| 2 | Partial | High (public API cleanup) | Small | Next small win: make `ValkeyWrite` / `ValkeyFuture` `pub(crate)` |
+| 6 | Open | Medium (correctness / design) | Large | Depends on deferred `ServerError` collapse |
+| 5 | Partial | Medium (ownership / lifecycle) | Large | Remove `Box::leak` from `connection/factory.rs` |
+| 9 | Partial | Medium (clarity) | Large | `ServerError` / `ServerErrorKind` deferred |
+| 11 | Open | Medium (API hygiene) | Medium | Hide `ConnectionRequest` after tests/bindings migrate |
 | 7 | Open | Low (perf) | Medium | Cmd double-allocation — after profiling |
+| 1 | ✓ DONE | Medium (structure) | Large | Module migration complete |
+| 3 | ✓ DONE | High (user-facing) | Medium | High-level API + typed pipeline complete |
 | 8 | ✓ DONE | Low (perf) | Small | Arc<str> node addresses |
-| 9 | Partial | Low (clarity) | Mixed | IAMError+Standalone+Connection done; ServerError deferred |
 | 10 | ✓ DONE | Low (DX) | Small | Feature flags consolidated |
