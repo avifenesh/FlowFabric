@@ -342,11 +342,13 @@ impl Default for ClientBuilder {
 }
 
 impl CommandBuilder {
+    /// Append an argument to the command.
     pub fn arg(mut self, arg: impl ToArgs) -> Self {
         self.cmd.arg(arg);
         self
     }
 
+    /// Execute the command and return the typed result.
     pub async fn execute<T: FromValue>(self) -> Result<T> {
         let mut inner = (*self.client).clone();
         let mut cmd = self.cmd;
@@ -408,6 +410,7 @@ impl TypedPipeline {
         }
     }
 
+    /// Queue a GET command, returning a slot for the result.
     pub fn get<T: FromValue>(&mut self, key: impl ToArgs) -> PipeSlot<Option<T>> {
         let mut c = cmd("GET");
         c.arg(key);
@@ -415,6 +418,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue a SET command.
     pub fn set(&mut self, key: impl ToArgs, value: impl ToArgs) -> PipeSlot<()> {
         let mut c = cmd("SET");
         c.arg(key).arg(value);
@@ -422,6 +426,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue a DEL command, returning the number of keys removed.
     pub fn del(&mut self, key: impl ToArgs) -> PipeSlot<i64> {
         let mut c = cmd("DEL");
         c.arg(key);
@@ -429,6 +434,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue an INCR command, returning the new value.
     pub fn incr(&mut self, key: impl ToArgs) -> PipeSlot<i64> {
         let mut c = cmd("INCR");
         c.arg(key);
@@ -436,6 +442,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue an HSET command, returning the number of new fields added.
     pub fn hset(
         &mut self,
         key: impl ToArgs,
@@ -448,6 +455,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue an HGET command, returning the field value or `None`.
     pub fn hget<T: FromValue>(
         &mut self,
         key: impl ToArgs,
@@ -459,6 +467,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue an LPUSH command, returning the new list length.
     pub fn lpush(&mut self, key: impl ToArgs, elements: &[impl ToArgs]) -> PipeSlot<i64> {
         let mut c = cmd("LPUSH");
         c.arg(key).arg(elements);
@@ -466,6 +475,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue an RPOP command, returning the removed element or `None`.
     pub fn rpop(&mut self, key: impl ToArgs) -> PipeSlot<Option<String>> {
         let mut c = cmd("RPOP");
         c.arg(key);
@@ -473,6 +483,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue a PEXPIRE command, returning `true` if the timeout was set.
     pub fn expire(&mut self, key: impl ToArgs, ttl: Duration) -> PipeSlot<bool> {
         let mut c = cmd("PEXPIRE");
         c.arg(key).arg(ttl.as_millis() as u64);
@@ -480,6 +491,7 @@ impl TypedPipeline {
         self.slot(idx)
     }
 
+    /// Queue an EXISTS command.
     pub fn exists(&mut self, key: impl ToArgs) -> PipeSlot<bool> {
         let mut c = cmd("EXISTS");
         c.arg(key);
@@ -533,11 +545,13 @@ pub struct PipeCmdBuilder<'a, T> {
 }
 
 impl<'a, T: FromValue> PipeCmdBuilder<'a, T> {
+    /// Append an argument to the command.
     pub fn arg(mut self, arg: impl ToArgs) -> Self {
         self.cmd.arg(arg);
         self
     }
 
+    /// Finalize the command and return a typed slot for its result.
     pub fn finish(self) -> PipeSlot<T> {
         let idx = self.pipeline.push_cmd(self.cmd);
         self.pipeline.slot(idx)
