@@ -188,15 +188,6 @@ pub(crate) fn cmd_len(cmd: &impl Borrow<Cmd>) -> usize {
     args_len(cmd_ref.args_iter(), cmd_ref.cursor.unwrap_or(0))
 }
 
-fn encode_command<'a, I>(args: I, cursor: u64) -> Vec<u8>
-where
-    I: IntoIterator<Item = Arg<&'a [u8]>> + Clone + ExactSizeIterator,
-{
-    let mut cmd = Vec::new();
-    write_command_to_vec(&mut cmd, args, cursor, false);
-    cmd
-}
-
 fn write_command_to_vec<'a, I>(cmd: &mut Vec<u8>, args: I, cursor: u64, is_fenced: bool)
 where
     I: IntoIterator<Item = Arg<&'a [u8]>> + Clone + ExactSizeIterator,
@@ -576,38 +567,6 @@ pub fn cmd(name: &str) -> Cmd {
     let mut rv = Cmd::new();
     rv.arg(name);
     rv
-}
-
-/// Shortcut function to creating a fenced command with a single argument.
-///
-/// /// ```rust
-/// redis::fenced_cmd("PING");
-/// ```ignore
-pub fn fenced_cmd(name: &str) -> Cmd {
-    let mut rv = Cmd::new();
-    rv.arg(name);
-    rv.is_fenced = true;
-    rv
-}
-
-/// Packs a bunch of commands into a request.  This is generally a quite
-/// useless function as this functionality is nicely wrapped through the
-/// `Cmd` object, but in some cases it can be useful.  The return value
-/// of this can then be send to the low level `ConnectionLike` methods.
-///
-/// Example:
-///
-/// ```rust,ignore
-/// # use redis::ToValkeyArgs;
-/// let mut args = vec![];
-/// args.extend("SET".to_valkey_args());
-/// args.extend("my_key".to_valkey_args());
-/// args.extend(42.to_valkey_args());
-/// let cmd = redis::pack_command(&args);
-/// assert_eq!(cmd, b"*3\r\n$3\r\nSET\r\n$6\r\nmy_key\r\n$2\r\n42\r\n".to_vec());
-/// ```ignore
-pub fn pack_command(args: &[Vec<u8>]) -> Vec<u8> {
-    encode_command(args.iter().map(|x| Arg::Simple(&x[..])), 0)
 }
 
 /// Shortcut for creating a new pipeline.

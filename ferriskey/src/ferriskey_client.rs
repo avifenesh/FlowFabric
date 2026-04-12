@@ -308,6 +308,202 @@ impl CommandBuilder {
     }
 }
 
+/// A typed pipeline that returns [`PipeSlot`] handles for each command.
+///
+/// After calling [`execute()`](TypedPipeline::execute), each slot can be
+/// resolved to its typed value via [`PipeSlot::value()`].
+///
+/// ```rust,ignore
+/// let mut pipe = client.pipeline();
+/// let name  = pipe.get::<String>("user:1:name");
+/// let score = pipe.get::<f64>("user:1:score");
+/// let _     = pipe.set("user:1:name", "alice");
+/// pipe.execute().await?;
+/// let name: Option<String> = name.value()?;
+/// ```
+pub struct TypedPipeline {
+    inner: crate::pipeline::Pipeline,
+    client: Arc<ClientInner>,
+    results: Arc<std::sync::OnceLock<Vec<crate::value::Value>>>,
+    next_index: usize,
+}
+
+/// A handle to a single result within a [`TypedPipeline`].
+///
+/// Created by pipeline methods like [`TypedPipeline::get()`] and
+/// [`TypedPipeline::set()`]. Call [`.value()`](PipeSlot::value) after
+/// `pipeline.execute()` to extract the typed result.
+pub struct PipeSlot<T> {
+    index: usize,
+    results: Arc<std::sync::OnceLock<Vec<crate::value::Value>>>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl TypedPipeline {
+    fn push_cmd(&mut self, c: Cmd) -> usize {
+        self.inner.add_command(c);
+        let idx = self.next_index;
+        self.next_index += 1;
+        idx
+    }
+
+    fn slot<T: FromValue>(&self, index: usize) -> PipeSlot<T> {
+        PipeSlot {
+            index,
+            results: self.results.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn get<T: FromValue>(&mut self, key: impl ToArgs) -> PipeSlot<Option<T>> {
+        let mut c = cmd("GET");
+        c.arg(key);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn set(&mut self, key: impl ToArgs, value: impl ToArgs) -> PipeSlot<()> {
+        let mut c = cmd("SET");
+        c.arg(key).arg(value);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn del(&mut self, key: impl ToArgs) -> PipeSlot<i64> {
+        let mut c = cmd("DEL");
+        c.arg(key);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn incr(&mut self, key: impl ToArgs) -> PipeSlot<i64> {
+        let mut c = cmd("INCR");
+        c.arg(key);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn hset(
+        &mut self,
+        key: impl ToArgs,
+        field: impl ToArgs,
+        value: impl ToArgs,
+    ) -> PipeSlot<i64> {
+        let mut c = cmd("HSET");
+        c.arg(key).arg(field).arg(value);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn hget<T: FromValue>(
+        &mut self,
+        key: impl ToArgs,
+        field: impl ToArgs,
+    ) -> PipeSlot<Option<T>> {
+        let mut c = cmd("HGET");
+        c.arg(key).arg(field);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn lpush(&mut self, key: impl ToArgs, elements: &[impl ToArgs]) -> PipeSlot<i64> {
+        let mut c = cmd("LPUSH");
+        c.arg(key).arg(elements);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn rpop(&mut self, key: impl ToArgs) -> PipeSlot<Option<String>> {
+        let mut c = cmd("RPOP");
+        c.arg(key);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn expire(&mut self, key: impl ToArgs, ttl: Duration) -> PipeSlot<bool> {
+        let mut c = cmd("PEXPIRE");
+        c.arg(key).arg(ttl.as_millis() as u64);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    pub fn exists(&mut self, key: impl ToArgs) -> PipeSlot<bool> {
+        let mut c = cmd("EXISTS");
+        c.arg(key);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    /// Add an arbitrary command to the pipeline, returning a typed slot.
+    pub fn cmd<T: FromValue>(&mut self, name: &str) -> PipeCmdBuilder<'_, T> {
+        PipeCmdBuilder {
+            pipeline: self,
+            cmd: cmd(name),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Execute all queued commands. After this returns, [`PipeSlot::value()`]
+    /// can be called on any slot returned by prior pipeline methods.
+    pub async fn execute(&mut self) -> Result<()> {
+        let mut inner = (*self.client).clone();
+        let value = inner
+            .send_pipeline(
+                &self.inner,
+                None,
+                true,
+                None,
+                crate::pipeline::PipelineRetryStrategy::default(),
+            )
+            .await?;
+        // send_pipeline returns Value::Array(results) — extract the inner vec
+        let vals = match value {
+            crate::value::Value::Array(v) => v,
+            other => vec![other],
+        };
+        let _ = self.results.set(vals);
+        Ok(())
+    }
+}
+
+/// Builder for adding an arbitrary command to a [`TypedPipeline`].
+pub struct PipeCmdBuilder<'a, T> {
+    pipeline: &'a mut TypedPipeline,
+    cmd: Cmd,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: FromValue> PipeCmdBuilder<'a, T> {
+    pub fn arg(mut self, arg: impl ToArgs) -> Self {
+        self.cmd.arg(arg);
+        self
+    }
+
+    pub fn finish(self) -> PipeSlot<T> {
+        let idx = self.pipeline.push_cmd(self.cmd);
+        self.pipeline.slot(idx)
+    }
+}
+
+impl<T: FromValue> PipeSlot<T> {
+    /// Extract the typed value from the pipeline results.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before [`TypedPipeline::execute()`].
+    pub fn value(self) -> Result<T> {
+        let vals = self
+            .results
+            .get()
+            .expect("PipeSlot::value() called before pipeline.execute()");
+        let val = vals
+            .get(self.index)
+            .cloned()
+            .unwrap_or(crate::value::Value::Nil);
+        from_owned_valkey_value(val)
+    }
+}
+
 fn connection_request_from_url(url: &str, cluster_mode_enabled: bool) -> Result<ConnectionRequest> {
     let info = url.into_connection_info()?;
     connection_request_from_info(info, cluster_mode_enabled)

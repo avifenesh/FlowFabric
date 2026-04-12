@@ -50,11 +50,11 @@ use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use versions::Versioning;
 
 pub const HEARTBEAT_SLEEP_DURATION: Duration = Duration::from_secs(1);
-pub const DEFAULT_RETRIES: u32 = 3;
+pub(crate) const DEFAULT_RETRIES: u32 = 3;
 /// Note: If you change the default value, make sure to change the documentation in *all* wrappers.
 pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
-pub const DEFAULT_PERIODIC_TOPOLOGY_CHECKS_INTERVAL: Duration = Duration::from_secs(60);
-pub const FINISHED_SCAN_CURSOR: &str = "finished";
+pub(crate) const DEFAULT_PERIODIC_TOPOLOGY_CHECKS_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const FINISHED_SCAN_CURSOR: &str = "finished";
 
 /// The value of 1000 for the maximum number of inflight requests is determined based on Little's Law in queuing theory:
 ///
@@ -1774,8 +1774,6 @@ async fn create_cluster_client(
     Ok(con)
 }
 
-
-
 fn format_optional_value<T>(name: &'static str, value: Option<T>) -> String
 where
     T: std::fmt::Display,
@@ -2023,8 +2021,7 @@ impl Client {
                     iam_token_manager.as_ref(),
                     pubsub_synchronizer.clone(),
                 )
-                .await
-                ?;
+                .await?;
                 ClientWrapper::Cluster { client }
             } else {
                 ClientWrapper::Standalone(
@@ -2034,8 +2031,7 @@ impl Client {
                         iam_token_manager.as_ref(),
                         Some(pubsub_synchronizer.clone()),
                     )
-                    .await
-                    ?,
+                    .await?,
                 )
             };
 

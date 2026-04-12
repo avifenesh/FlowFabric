@@ -52,15 +52,17 @@ use crate::cluster::topology::{
     DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES, DEFAULT_REFRESH_SLOTS_RETRY_BASE_DURATION_MILLIS,
     DEFAULT_REFRESH_SLOTS_RETRY_BASE_FACTOR, SlotRefreshState, TopologyHash, calculate_topology,
 };
-use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
 use crate::cmd::{Cmd, cmd};
-use crate::connection::{ConnectionLike, DisconnectNotifier, MultiplexedConnection, get_socket_addrs};
+use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
 use crate::connection::info::{ConnectionInfo, IntoConnectionInfo};
+use crate::connection::{
+    ConnectionLike, DisconnectNotifier, MultiplexedConnection, get_socket_addrs,
+};
 use crate::pipeline::PipelineRetryStrategy;
 use crate::pubsub::push_manager::PushInfo;
 use crate::value::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, RetryMethod, ServerError,
-    ValkeyError, ValkeyFuture, ValkeyResult, Value,
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, RetryMethod, ServerError, ValkeyError,
+    ValkeyFuture, ValkeyResult, Value,
 };
 use connections::connect_and_check;
 use container::{
@@ -209,9 +211,7 @@ where
         initial_nodes: &[ConnectionInfo],
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        pubsub_synchronizer: Option<
-            Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>,
-        >,
+        pubsub_synchronizer: Option<Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> ValkeyResult<ClusterConnection<C>> {
         ClusterConnInner::new(
@@ -1553,9 +1553,7 @@ where
         initial_nodes: &[ConnectionInfo],
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        pubsub_synchronizer: Option<
-            Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>,
-        >,
+        pubsub_synchronizer: Option<Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> ValkeyResult<Disposable<Self>> {
         let disconnect_notifier: Option<Box<dyn DisconnectNotifier>> =
@@ -3490,9 +3488,7 @@ where
         };
 
         if asking {
-            let _ = conn
-                .req_packed_command(&crate::cmd::cmd("ASKING"))
-                .await;
+            let _ = conn.req_packed_command(&crate::cmd::cmd("ASKING")).await;
         }
         Ok((address, conn))
     }
@@ -4416,9 +4412,9 @@ mod pipeline_routing_tests {
     use crate::cluster::routing::{
         AggregateOp, MultiSlotArgPattern, MultipleNodeRoutingInfo, ResponsePolicy, Route, SlotAddr,
     };
-    use crate::value::{Value, ServerError, ServerErrorKind};
-    use crate::connection::MultiplexedConnection;
     use crate::cmd::cmd;
+    use crate::connection::MultiplexedConnection;
+    use crate::value::{ServerError, ServerErrorKind, Value};
 
     #[test]
     fn test_first_route_is_found() {

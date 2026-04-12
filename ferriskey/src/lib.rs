@@ -23,27 +23,26 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod macros;
 
 pub mod cluster;
-pub mod connection;
-pub mod protocol;
 pub mod cmd;
+pub mod connection;
 pub mod pipeline;
+pub mod protocol;
 pub(crate) mod retry_strategies;
 pub mod value;
 
 // Flat re-exports — canonical paths for crate consumers.
 // These replace the old ferriskey::valkey::X paths.
 pub use cmd::{Arg, Cmd, cmd, pipe};
-pub use value::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, PushKind, ToValkeyArgs, Value,
-    ValkeyError, ValkeyFuture, ValkeyResult, ValkeyWrite,
-    from_valkey_value, from_owned_valkey_value,
-};
 pub use connection::info::{
     ConnectionAddr, ConnectionInfo, IntoConnectionInfo, PubSubChannelOrPattern,
     PubSubSubscriptionInfo, PubSubSubscriptionKind, TlsMode, ValkeyConnectionInfo,
 };
 pub use pubsub::push_manager::PushInfo;
 pub use retry_strategies::RetryStrategy;
+pub use value::{
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, PushKind, ToValkeyArgs, ValkeyError,
+    ValkeyFuture, ValkeyResult, ValkeyWrite, Value, from_owned_valkey_value, from_valkey_value,
+};
 
 pub mod client;
 pub mod compression;
@@ -54,9 +53,12 @@ pub mod scripts_container;
 pub use client::ConnectionRequest;
 
 // High-level public API — the entry point for library users.
+pub type Error = ValkeyError;
+pub type Result<T> = FerrisKeyResult<T>;
 pub use ferriskey_client::Result as FerrisKeyResult;
 pub use ferriskey_client::{
-    Client, ClientBuilder, CommandBuilder, FerrisKeyError, FromValue, ReadFrom, ToArgs,
+    Client, ClientBuilder, CommandBuilder, FerrisKeyError, FromValue, PipeCmdBuilder, PipeSlot,
+    ReadFrom, ToArgs, TypedPipeline,
 };
 pub mod cluster_scan_container;
 pub mod iam;

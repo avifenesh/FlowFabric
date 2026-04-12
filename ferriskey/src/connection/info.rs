@@ -5,8 +5,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::value::ProtocolVersion;
 use crate::pipeline::Pipeline;
+use crate::value::ProtocolVersion;
 use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
 
 use crate::connection::tls::TlsConnParams;
