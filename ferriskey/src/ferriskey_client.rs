@@ -91,8 +91,24 @@ impl Client {
         self.execute(cmd).await
     }
 
+    pub async fn incr(&self, key: impl ToArgs) -> Result<i64> {
+        let mut cmd = cmd("INCR");
+        cmd.arg(key);
+        self.execute(cmd).await
+    }
+
     pub async fn set(&self, key: impl ToArgs, value: impl ToArgs) -> Result<()> {
         let mut cmd = cmd("SET");
+        cmd.arg(key).arg(value);
+        self.execute(cmd).await
+    }
+
+    pub async fn get_set<T: FromValue>(
+        &self,
+        key: impl ToArgs,
+        value: impl ToArgs,
+    ) -> Result<Option<T>> {
+        let mut cmd = cmd("GETSET");
         cmd.arg(key).arg(value);
         self.execute(cmd).await
     }
@@ -113,6 +129,13 @@ impl Client {
         let mut cmd = cmd("PEXPIRE");
         cmd.arg(key).arg(duration_to_millis(ttl)?);
         self.execute(cmd).await
+    }
+
+    pub async fn exists(&self, key: impl ToArgs) -> Result<bool> {
+        let mut cmd = cmd("EXISTS");
+        cmd.arg(key);
+        let exists: i64 = self.execute(cmd).await?;
+        Ok(exists != 0)
     }
 
     pub async fn hset(
