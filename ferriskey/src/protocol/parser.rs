@@ -578,8 +578,14 @@ mod aio_support {
                     // Pass 2: Parse on &mut BytesMut — uses split_to() for
                     // zero-copy BulkString. Never returns None since scan
                     // confirmed completeness.
-                    let val = parse_value_unchecked(src, 0)?;
-                    Ok(Some(Ok(val)))
+                    //
+                    // IMPORTANT: Server error responses (-ERR, -WRONGTYPE, etc.)
+                    // are returned as Ok(Err(e)) NOT Err(e). If we return Err(e)
+                    // from Decoder::decode(), tokio-util's Framed sets has_errored=true
+                    // and returns None (fake EOF) on the next poll, closing the stream.
+                    // Server errors are application-level, not codec-level failures.
+                    let val = parse_value_unchecked(src, 0);
+                    Ok(Some(val))
                 }
             }
         }
