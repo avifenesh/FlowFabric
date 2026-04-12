@@ -47,18 +47,23 @@ enum ResponseAggregate {
         current_response_count: usize,
         buffer: Vec<Value>,
         first_err: Option<ValkeyError>,
-
+        /// Whether this pipeline is a MULTI/EXEC transaction.
+        /// In transaction mode, any server error (e.g. EXECABORT) fails the whole pipeline.
+        /// In non-transaction mode, per-command errors are stored in the buffer as
+        /// Value::ServerError to allow callers to inspect individual command results.
+        is_transaction: bool,
     },
 }
 
 impl ResponseAggregate {
-    fn new(pipeline_response_count: Option<usize>, _is_transaction: bool) -> Self {
+    fn new(pipeline_response_count: Option<usize>, is_transaction: bool) -> Self {
         match pipeline_response_count {
             Some(response_count) => ResponseAggregate::Pipeline {
                 expected_response_count: response_count,
                 current_response_count: 0,
                 buffer: Vec::new(),
                 first_err: None,
+                is_transaction,
             },
             None => ResponseAggregate::SingleCommand,
         }
@@ -221,15 +226,23 @@ where
                 current_response_count,
                 buffer,
                 first_err,
+                is_transaction,
             } => {
                 match result {
                     Ok(item) => {
                         buffer.push(item);
                     }
-                    Err(err) => {
+                    Err(err) if *is_transaction => {
+                        // Transaction errors (e.g. EXECABORT between MULTI/EXEC) fail the whole transaction.
                         if first_err.is_none() {
                             *first_err = Some(err);
                         }
+                    }
+                    Err(err) => {
+                        // Per-command errors in non-transaction pipelines are stored in the buffer
+                        // as Value::ServerError so callers can inspect individual command results.
+                        // This preserves the semantics of raise_on_error=false in send_pipeline.
+                        buffer.push(Value::ServerError(err));
                     }
                 }
 

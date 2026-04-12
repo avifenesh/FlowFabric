@@ -28,7 +28,8 @@ Results files: bench-results-full-1775976379.json (run1), bench-full-run{2,3,4}.
 - **#3 Convenience API**: `ferriskey::Client` with `get/set/del/incr/expire/exists/hset/hget/hgetall/lpush/rpop/get_set/set_ex`. Typed `Pipeline` with `PipeSlot<T>`. `Client::transaction()` for MULTI/EXEC.
 - **#4 PubSub rewrite**: DONE. `EventDrivenSynchronizer` replaces `ValkeyPubSubSynchronizer`. Event-driven via mpsc channel (no 3s polling). Single `ConfirmedState`, no `pending_unsubscribes` queue. Old code backed up as `synchronizer_v1.rs`. Standalone + rapid subscribe/unsubscribe test gaps CLOSED (3 new tests in `tests/test_pubsub.rs::standalone_pubsub_tests`).
 - **#8 Arc\<str\> for addresses**: DONE. `DashMap<Arc<str>, ClusterNode>` in container.rs. Connection lookups are refcount bump.
-- **#9 Error consolidation**: FULLY COMPLETE. `ConnectionError`, `StandaloneClientConnectionError`, `IAMError` collapsed into `ValkeyError`. `ServerError`/`ServerErrorKind` deleted — `Value::ServerError` now wraps `ValkeyError` directly. Single error hierarchy.
+- **#6 Value::ServerError**: PARTIAL. Top-level errors: parser returns `Err(ValkeyError)` directly. Cluster pipeline `NodeResponse = ValkeyResult<Value>`. `Value::ServerError` variant stays — still needed for array element errors (EXEC/RESP3). Full removal deferred: requires `Value::Array` → `Vec<ValkeyResult<Value>>` + `FromValkeyValue` changes.
+- **#9 Error consolidation**: FULLY COMPLETE. All 4 error types eliminated (`IAMError`, `StandaloneClientConnectionError`, `ConnectionError`, `ServerError`/`ServerErrorKind`). Single `ValkeyError` hierarchy.
 - **DefaultHasher non-determinism**: DONE. FNV-1a deterministic hasher in topology.rs.
 - **assert_eq! in hot path**: DONE. Converted to `debug_assert_eq!` in routing.rs.
 - **Box::leak fix**: DONE. `new_with_response_timeout` takes owned `ConnectionInfo`.
@@ -39,7 +40,7 @@ Flat re-exports from `ferriskey::` root: `Cmd`, `cmd`, `Value`, `ErrorKind`, `Va
 Feature flags: default=[], test-util=[mock-pubsub].
 
 ## Next
-1. **DESIGN_DEBT #6 — Value::ServerError removal**: Parser returns `Err(ValkeyError)` instead of `Ok(Value::ServerError(e))`. Now unblocked (#9 complete). Requires changing parser + pipeline result arrays from `Vec<Value>` to `Vec<Result<Value, ValkeyError>>`. 25 consumer sites across 6 files.
+1. **DESIGN_DEBT #6 full removal** (deferred): Remove `Value::ServerError` variant entirely. Requires `Value::Array` → `Vec<ValkeyResult<Value>>` + `FromValkeyValue` changes. Large scope.
 2. **DESIGN_DEBT #7 — Cmd double-allocation**: `Cmd` stores args in `data: Vec<u8>` + `args: Vec<Arg<usize>>`, then `get_packed_command()` re-serializes into RESP. Build directly in RESP format.
 3. **DESIGN_DEBT #2 — Public API naming**: Rename `ValkeyError`→`Error`, `FromValkeyValue`→`FromValue`, `ToValkeyArgs`→`ToArgs` at crate root. Type aliases already exist.
 
