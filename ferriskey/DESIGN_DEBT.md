@@ -115,12 +115,21 @@ Both implement `Client` trait. Connection details are internal.
 
 `Value` enum still has `ServerError(ValkeyError)` as a variant alongside `Int`, `BulkString`, etc.
 This means every `Value` consumer must check for errors, even in successful responses.
-The parser wraps errors inside `Ok(Value::ServerError(...))` instead of `Err(...)`.
+Top-level parser errors no longer come back as `Value::ServerError(...)`, but nested array elements still can.
 
-**Current:** `Ok(Value::ServerError(e))` — successful parse of an error response
-**Problem:** Callers must call `.extract_error()` to get the actual error
-**Target:** Parser returns `Err(ValkeyError::Server(e))` for error responses.
-`Value` only contains data variants.
+**Status (2026-04-12): Partial.**
+- Parser now returns `Err(ValkeyError)` for top-level error responses (`parse_error`, `parse_blob_error`)
+- `cluster/pipeline.rs` `NodeResponse` changed to `ValkeyResult<Value>` — per-command errors are `Err`
+- `is_transaction` field removed from the multiplexed accumulator (dead code)
+
+Remaining for full completion:
+- `Value::ServerError` stays — still needed for error elements inside RESP arrays
+  (`EXEC` responses, RESP3 inline errors in arrays use `parse_array`, which catches `Err` and stores `ServerError`)
+- Full removal requires changing `Value::Array(Vec<Value>)` to `Vec<ValkeyResult<Value>>`
+- That cascades into `FromValkeyValue` implementations for tuples, `Pipeline::query_async` semantics, and the public API
+- Dedicated session required
+
+**Long-term target:** parser and response model return errors directly without embedding them inside `Value`.
 
 ## 7. Command building — Double allocation
 
@@ -176,7 +185,7 @@ At 250K ops/sec, that's 250K String allocations for addresses.
 
 | # | Status | Impact | Effort | When |
 |---|---|---|---|---|
-| 6 | Open | Medium (correctness / design) | Large | Now unblocked: remove `Value::ServerError(...)` and return parser errors directly |
+| 6 | Partial | Medium (correctness / design) | Large | Dedicated session: remove nested `Value::ServerError(...)` from array semantics |
 | 11 | Open | Medium (API hygiene) | Medium | Hide `ConnectionRequest` after tests/bindings migrate |
 | 2 | Mostly done | High (public API cleanup) | Small | Type renames deferred; visibility tightening complete |
 | 7 | Open | Low (perf) | Medium | Cmd double-allocation — after profiling |
