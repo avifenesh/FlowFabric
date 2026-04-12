@@ -113,7 +113,7 @@ Both implement `Client` trait. Connection details are internal.
 
 ## 6. Value type — Server errors mixed with data
 
-`Value` enum has `ServerError(ServerError)` as a variant alongside `Int`, `BulkString`, etc.
+`Value` enum still has `ServerError(ValkeyError)` as a variant alongside `Int`, `BulkString`, etc.
 This means every `Value` consumer must check for errors, even in successful responses.
 The parser wraps errors inside `Ok(Value::ServerError(...))` instead of `Err(...)`.
 
@@ -144,17 +144,15 @@ At 250K ops/sec, that's 250K String allocations for addresses.
 
 ## 9. Error types — Two parallel hierarchies
 
-**Status (2026-04-12): Partially done.**
+**Status (2026-04-12): DONE.**
 - ~~`IAMError`~~ — eliminated
 - ~~`StandaloneClientConnectionError`~~ — eliminated
 - ~~`ConnectionError`~~ — eliminated
-- `ServerError` / `ServerErrorKind` — **deferred**. 16 direct construction sites remain (9 in cluster/pipeline). Redirect logic already prefers `ErrorKind::{Moved, Ask}`. Large effort because `ServerError` is still embedded in `Value::ServerError(...)` and the parser/pipeline hot path.
-
-Remaining:
-- `ValkeyError` (value.rs) — the main error type
-- `ServerError` / `ServerErrorKind` — server-specific errors (MOVED/ASK, inline error responses). Deferred: large effort, hot path.
+- ~~`ServerError` / `ServerErrorKind`~~ — eliminated
 
 **Target:** Single error enum with variants. Use `thiserror` derive consistently.
+
+**Result:** `ValkeyError` is now the single error carrier in the core library. Legacy parallel helper error types have been removed.
 
 ## 10. Feature flags — Inconsistent gating
 
@@ -178,8 +176,7 @@ Remaining:
 
 | # | Status | Impact | Effort | When |
 |---|---|---|---|---|
-| 6 | Open | Medium (correctness / design) | Large | Depends on deferred `ServerError` collapse |
-| 9 | Partial | Medium (clarity) | Large | `ServerError` / `ServerErrorKind` deferred |
+| 6 | Open | Medium (correctness / design) | Large | Now unblocked: remove `Value::ServerError(...)` and return parser errors directly |
 | 11 | Open | Medium (API hygiene) | Medium | Hide `ConnectionRequest` after tests/bindings migrate |
 | 2 | Mostly done | High (public API cleanup) | Small | Type renames deferred; visibility tightening complete |
 | 7 | Open | Low (perf) | Medium | Cmd double-allocation — after profiling |
@@ -187,5 +184,6 @@ Remaining:
 | 3 | ✓ DONE | High (user-facing) | Medium | High-level API + typed pipeline complete |
 | 4 | ✓ DONE | High (correctness / resiliency) | Large | EventDrivenSynchronizer replaces polling |
 | 5 | ✓ DONE | Medium (ownership / lifecycle) | Large | `Box::leak` eliminated in `connection/factory.rs` |
+| 9 | ✓ DONE | Medium (clarity) | Large | Legacy parallel error types removed; `ValkeyError` unified |
 | 8 | ✓ DONE | Low (perf) | Small | Arc<str> node addresses |
 | 10 | ✓ DONE | Low (DX) | Small | Feature flags consolidated |

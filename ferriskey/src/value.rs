@@ -774,6 +774,12 @@ impl ValkeyError {
     }
 
     /// Returns the raw error code if available.
+    /// Returns the error code string (e.g. "MOVED", "ERR", "WRONGTYPE").
+    /// Equivalent to the old ServerError::err_code() — returns empty string if no code.
+    pub fn err_code(&self) -> &str {
+        self.code().unwrap_or("")
+    }
+
     pub fn code(&self) -> Option<&str> {
         match self.kind() {
             ErrorKind::ResponseError => Some("ERR"),
