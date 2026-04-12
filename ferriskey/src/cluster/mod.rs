@@ -168,7 +168,7 @@ where
         // them. A correct fix requires pipelining both into one write; tracked as
         // a known limitation of the direct-dispatch path.
         if conn
-            .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
+            .req_packed_command(&crate::cmd::cmd("ASKING"))
             .await
             .is_err()
         {
@@ -209,7 +209,7 @@ where
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<
-            Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>,
+            Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>,
         >,
         iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> ValkeyResult<ClusterConnection<C>> {
@@ -1144,7 +1144,7 @@ pin_project! {
 
 // InflightSlotGuard and InflightRequestTracker live in crate::valkey::types
 // to avoid an upward dependency from cmd::Cmd into cluster_async.
-pub use crate::valkey::types::InflightRequestTracker;
+pub use crate::value::InflightRequestTracker;
 
 #[cfg(test)]
 mod iam_token_refresh_tests {
@@ -1203,7 +1203,7 @@ mod iam_token_refresh_tests {
     fn build_inner(
         initial_password: Option<String>,
         provider: Option<Arc<dyn IAMTokenProvider>>,
-    ) -> Arc<InnerCore<crate::valkey::aio::MultiplexedConnection>> {
+    ) -> Arc<InnerCore<crate::connection::MultiplexedConnection>> {
         use crate::cluster::client::ClusterParams;
         use container::ConnectionsContainer;
 
@@ -1225,7 +1225,7 @@ mod iam_token_refresh_tests {
     }
 
     fn read_password(
-        inner: &Arc<InnerCore<crate::valkey::aio::MultiplexedConnection>>,
+        inner: &Arc<InnerCore<crate::connection::MultiplexedConnection>>,
     ) -> Option<String> {
         inner.cluster_params.read().password.clone()
     }
@@ -1553,7 +1553,7 @@ where
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<
-            Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>,
+            Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>,
         >,
         iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
     ) -> ValkeyResult<Disposable<Self>> {
@@ -3490,7 +3490,7 @@ where
 
         if asking {
             let _ = conn
-                .req_packed_command(&crate::valkey::cmd::cmd("ASKING"))
+                .req_packed_command(&crate::cmd::cmd("ASKING"))
                 .await;
         }
         Ok((address, conn))
@@ -4388,9 +4388,9 @@ impl Connect for MultiplexedConnection {
             let connection_info = info.into_connection_info()?;
             let client = crate::valkey::Client::open(connection_info)?;
 
-            crate::valkey::aio::runtime::timeout(
+            crate::connection::runtime::timeout(
                 connection_timeout,
-                client.get_multiplexed_async_connection_inner::<crate::valkey::aio::tokio::Tokio>(
+                client.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
                     response_timeout,
                     socket_addr,
                     ferriskey_connection_options,

@@ -28,10 +28,25 @@ pub mod valkey;
 pub mod cluster;
 pub mod connection;
 pub mod protocol;
-pub(crate) mod cmd;
-pub(crate) mod pipeline;
+pub mod cmd;
+pub mod pipeline;
 pub(crate) mod retry_strategies;
-pub(crate) mod value;
+pub mod value;
+
+// Flat re-exports — canonical paths for crate consumers.
+// These replace the old ferriskey::valkey::X paths.
+pub use cmd::{Arg, Cmd, cmd, pipe};
+pub use value::{
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, PushKind, ToValkeyArgs, Value,
+    ValkeyError, ValkeyFuture, ValkeyResult, ValkeyWrite,
+    from_valkey_value, from_owned_valkey_value,
+};
+pub use connection::info::{
+    ConnectionAddr, ConnectionInfo, IntoConnectionInfo, PubSubChannelOrPattern,
+    PubSubSubscriptionInfo, PubSubSubscriptionKind, TlsMode, ValkeyConnectionInfo,
+};
+pub use pubsub::push_manager::PushInfo;
+pub use retry_strategies::RetryStrategy;
 
 pub mod client;
 pub mod compression;

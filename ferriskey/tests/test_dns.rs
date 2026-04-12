@@ -29,10 +29,10 @@ mod dns_tests {
     // ==================== Helper Methods ======================
 
     /// Returns the port from the given connection address.
-    fn extract_port(addr: &ferriskey::valkey::ConnectionAddr) -> u16 {
+    fn extract_port(addr: &ferriskey::ConnectionAddr) -> u16 {
         match addr {
-            ferriskey::valkey::ConnectionAddr::Tcp(_, p) => *p,
-            ferriskey::valkey::ConnectionAddr::TcpTls { port, .. } => *port,
+            ferriskey::ConnectionAddr::Tcp(_, p) => *p,
+            ferriskey::ConnectionAddr::TcpTls { port, .. } => *port,
             _ => panic!("Unexpected address type"),
         }
     }
@@ -41,7 +41,7 @@ mod dns_tests {
     async fn build_cluster_client(hostname: &str) -> Option<(Client, ValkeyCluster)> {
         let cluster = ValkeyCluster::new(false, &None, None, None);
         let port = extract_port(&cluster.get_server_addresses()[0]);
-        let addr = ferriskey::valkey::ConnectionAddr::Tcp(hostname.to_string(), port);
+        let addr = ferriskey::ConnectionAddr::Tcp(hostname.to_string(), port);
 
         let connection_request = create_connection_request(
             &[addr],
@@ -64,7 +64,7 @@ mod dns_tests {
         let cluster = ValkeyCluster::new_with_tls(3, 0, Some(TLS_PATHS.clone()));
 
         let port = extract_port(&cluster.get_server_addresses()[0]);
-        let addr = ferriskey::valkey::ConnectionAddr::TcpTls {
+        let addr = ferriskey::ConnectionAddr::TcpTls {
             host: hostname.to_string(),
             port,
             insecure: false,
@@ -94,7 +94,7 @@ mod dns_tests {
     async fn build_standalone_client(hostname: &str) -> Option<(StandaloneClient, ValkeyServer)> {
         let server = ValkeyServer::new(ServerType::Tcp { tls: false });
         let port = extract_port(&server.get_client_addr());
-        let addr = ferriskey::valkey::ConnectionAddr::Tcp(hostname.to_string(), port);
+        let addr = ferriskey::ConnectionAddr::Tcp(hostname.to_string(), port);
 
         let connection_request = create_connection_request(
             &[addr],
@@ -119,7 +119,7 @@ mod dns_tests {
         let server = ValkeyServer::new_with_tls(true, Some(TLS_PATHS.clone()));
 
         let port = extract_port(&server.get_client_addr());
-        let addr = ferriskey::valkey::ConnectionAddr::TcpTls {
+        let addr = ferriskey::ConnectionAddr::TcpTls {
             host: hostname.to_string(),
             port,
             insecure: false,

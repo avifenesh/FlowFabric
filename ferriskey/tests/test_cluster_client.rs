@@ -19,12 +19,12 @@ mod cluster_client_tests {
     };
     use ferriskey::client::Client;
     use ferriskey::client::types::ReadFrom;
-    use ferriskey::valkey::{
+    use ferriskey::{
         InfoDict, ProtocolVersion, PubSubSubscriptionInfo, PubSubSubscriptionKind,
         ValkeyConnectionInfo, Value,
-        cluster_routing::{
-            MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
-        },
+    };
+    use ferriskey::cluster::routing::{
+        MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
     };
     use rstest::rstest;
     use versions::Versioning;
@@ -59,14 +59,14 @@ mod cluster_client_tests {
             })
             .await;
 
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("REPLICATION");
             let info = test_basics
                 .client
                 .send_command(&mut cmd, None)
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 0);
@@ -84,7 +84,7 @@ mod cluster_client_tests {
             })
             .await;
 
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("REPLICATION");
             let info = test_basics
                 .client
@@ -97,7 +97,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 0);
@@ -115,7 +115,7 @@ mod cluster_client_tests {
             })
             .await;
 
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("REPLICATION");
             let info = test_basics
                 .client
@@ -128,7 +128,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 3);
@@ -146,7 +146,7 @@ mod cluster_client_tests {
             })
             .await;
 
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("REPLICATION");
             let info = test_basics
                 .client
@@ -158,7 +158,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_valkey_value::<String>(info).unwrap();
+            let info = ferriskey::from_owned_valkey_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 1);
             assert_eq!(replicas, 0);
@@ -177,7 +177,7 @@ mod cluster_client_tests {
             })
             .await;
 
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("REPLICATION");
             let info = test_basics
                 .client
@@ -192,7 +192,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_valkey_value::<String>(info).unwrap();
+            let info = ferriskey::from_owned_valkey_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 0);
             assert_eq!(replicas, 1);
@@ -211,7 +211,7 @@ mod cluster_client_tests {
             })
             .await;
 
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("REPLICATION");
             let info = test_basics
                 .client
@@ -226,7 +226,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::valkey::from_owned_valkey_value::<String>(info).unwrap();
+            let info = ferriskey::from_owned_valkey_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 0);
             assert_eq!(replicas, 1);
@@ -249,7 +249,7 @@ mod cluster_client_tests {
             .await;
 
             // get engine version
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             let info = test_basics
                 .client
                 .send_command(
@@ -259,7 +259,7 @@ mod cluster_client_tests {
                 .await
                 .unwrap();
 
-            let info_dict: InfoDict = ferriskey::valkey::from_owned_valkey_value(info).unwrap();
+            let info_dict: InfoDict = ferriskey::from_owned_valkey_value(info).unwrap();
             match info_dict.get::<String>("redis_version") {
                 Some(version) => match (Versioning::new(version), Versioning::new("7.0")) {
                     (Some(server_ver), Some(min_ver)) => {
@@ -311,7 +311,7 @@ mod cluster_client_tests {
 
     // Helper function to get client count on shared cluster primaries using AllMasters routing
     async fn get_total_clients_on_shared_cluster_primaries(client: &mut Client) -> usize {
-        let mut cmd = ferriskey::valkey::Cmd::new();
+        let mut cmd = ferriskey::Cmd::new();
         cmd.arg("CLIENT").arg("LIST");
 
         let routing_info = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
@@ -383,7 +383,7 @@ mod cluster_client_tests {
     ///    - Succeeds with a new client ID (indicating reconnection) and verifies still on db=4
     /// This ensures that database selection persists across reconnections.
     fn test_set_database_id_after_reconnection() {
-        let mut client_info_cmd = ferriskey::valkey::cmd("CLIENT");
+        let mut client_info_cmd = ferriskey::cmd("CLIENT");
         client_info_cmd.arg("INFO");
         block_on_all(async {
             // First create a basic client to check server version
@@ -412,8 +412,8 @@ mod cluster_client_tests {
                 .await
                 .unwrap();
             let client_info_str = match client_info {
-                ferriskey::valkey::Value::BulkString(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                ferriskey::valkey::Value::VerbatimString { text, .. } => text,
+                ferriskey::Value::BulkString(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                ferriskey::Value::VerbatimString { text, .. } => text,
                 _ => panic!("Unexpected CLIENT INFO response type: {:?}", client_info),
             };
             assert!(client_info_str.contains("db=4"));
@@ -434,7 +434,7 @@ mod cluster_client_tests {
                     assert!(
                         err.is_connection_dropped()
                             || err.is_timeout()
-                            || err.kind() == ferriskey::valkey::ErrorKind::AllConnectionsUnavailable,
+                            || err.kind() == ferriskey::ErrorKind::AllConnectionsUnavailable,
                         "Expected connection dropped, timeout, or unavailable error, got: {err:?}",
                     );
                     let client_info = retry(|| async {
@@ -442,10 +442,10 @@ mod cluster_client_tests {
                         let mut cmd = client_info_cmd.clone();
                         let response = client.send_command(&mut cmd, None).await.ok()?;
                         match response {
-                            ferriskey::valkey::Value::BulkString(bytes) => {
+                            ferriskey::Value::BulkString(bytes) => {
                                 Some(String::from_utf8_lossy(&bytes).to_string())
                             }
-                            ferriskey::valkey::Value::VerbatimString { text, .. } => Some(text),
+                            ferriskey::Value::VerbatimString { text, .. } => Some(text),
                             _ => None,
                         }
                     })
@@ -455,10 +455,10 @@ mod cluster_client_tests {
                 Ok(response) => {
                     // Command succeeded, extract new client ID and compare
                     let new_client_info = match response {
-                        ferriskey::valkey::Value::BulkString(bytes) => {
+                        ferriskey::Value::BulkString(bytes) => {
                             String::from_utf8_lossy(&bytes).to_string()
                         }
-                        ferriskey::valkey::Value::VerbatimString { text, .. } => text,
+                        ferriskey::Value::VerbatimString { text, .. } => text,
                         _ => panic!("Unexpected CLIENT INFO response type: {:?}", response),
                     };
                     let new_client_id = extract_client_id(&new_client_info)
@@ -508,7 +508,7 @@ mod cluster_client_tests {
                 .cluster
                 .as_ref()
                 .expect("Dedicated cluster (Cluster A) should have been created")
-                .get_server_addresses(); // This returns Vec<ferriskey::valkey::ConnectionAddr>
+                .get_server_addresses(); // This returns Vec<ferriskey::ConnectionAddr>
 
             // 3. Get initial client count on Cluster A.
             let clients_before_lazy_init =
@@ -560,7 +560,7 @@ mod cluster_client_tests {
                 ),
             );
             let ping_response = lazy_ferriskey_client
-                .send_command(&mut ferriskey::valkey::cmd("PING"), None)
+                .send_command(&mut ferriskey::cmd("PING"), None)
                 .await;
             assert!(
                 ping_response.is_ok(),
@@ -570,7 +570,7 @@ mod cluster_client_tests {
             );
             assert_eq!(
                 ping_response.unwrap(),
-                ferriskey::valkey::Value::SimpleString("PONG".to_string())
+                ferriskey::Value::SimpleString("PONG".to_string())
             );
 
             // 8. Assert that new connections were made on Cluster A by the lazy client.
@@ -679,7 +679,7 @@ mod cluster_client_tests {
 
             let default_address = cluster.get_server_addresses()[0].clone();
             let ip_addr = match default_address {
-                ferriskey::valkey::ConnectionAddr::TcpTls { port, .. } => ferriskey::valkey::ConnectionAddr::TcpTls {
+                ferriskey::ConnectionAddr::TcpTls { port, .. } => ferriskey::ConnectionAddr::TcpTls {
                     host: host.to_string(),
                     port,
                     insecure: false,
@@ -722,8 +722,8 @@ mod cluster_client_tests {
 
             let default_address = cluster.get_server_addresses()[0].clone();
             let ip_addr = match default_address {
-                ferriskey::valkey::ConnectionAddr::Tcp(_, port) => {
-                    ferriskey::valkey::ConnectionAddr::Tcp(host.to_string(), port)
+                ferriskey::ConnectionAddr::Tcp(_, port) => {
+                    ferriskey::ConnectionAddr::Tcp(host.to_string(), port)
                 }
                 _ => panic!("Expected TCP address"),
             };
@@ -764,7 +764,7 @@ mod cluster_client_tests {
             let username = "restricted_user";
             let password = "test_password_456";
 
-            let mut cmd = ferriskey::valkey::cmd("ACL");
+            let mut cmd = ferriskey::cmd("ACL");
             cmd.arg("SETUSER")
                 .arg(username)
                 .arg("on")
@@ -855,34 +855,34 @@ mod cluster_client_tests {
             let pids = cluster.all_server_pids();
 
             // Add blackhole as a seed node to trigger blocking reconnect behavior
-            let mut initial_nodes: Vec<ferriskey::valkey::ConnectionInfo> = cluster_addresses
+            let mut initial_nodes: Vec<ferriskey::ConnectionInfo> = cluster_addresses
                 .iter()
-                .map(|addr| ferriskey::valkey::ConnectionInfo {
+                .map(|addr| ferriskey::ConnectionInfo {
                     addr: addr.clone(),
-                    valkey: ferriskey::valkey::ValkeyConnectionInfo::default(),
+                    valkey: ferriskey::ValkeyConnectionInfo::default(),
                 })
                 .collect();
-            initial_nodes.push(ferriskey::valkey::ConnectionInfo {
-                addr: ferriskey::valkey::ConnectionAddr::Tcp("127.0.0.1".to_string(), blackhole_port),
-                valkey: ferriskey::valkey::ValkeyConnectionInfo::default(),
+            initial_nodes.push(ferriskey::ConnectionInfo {
+                addr: ferriskey::ConnectionAddr::Tcp("127.0.0.1".to_string(), blackhole_port),
+                valkey: ferriskey::ValkeyConnectionInfo::default(),
             });
 
-            let cluster_client = ferriskey::valkey::cluster::ClusterClientBuilder::new(initial_nodes)
+            let cluster_client = ferriskey::cluster::compat::ClusterClientBuilder::new(initial_nodes)
                 .periodic_connections_checks(Some(Duration::from_millis(100)))
                 .connection_timeout(Duration::from_millis(CONNECTION_TIMEOUT_MS))
                 .slots_refresh_rate_limit(Duration::from_millis(0), 0)
                 .build()
                 .expect("build cluster client");
 
-            let mut conn: ferriskey::valkey::cluster_async::ClusterConnection = cluster_client
+            let mut conn: ferriskey::cluster::ClusterConnection = cluster_client
                 .get_async_connection(None, None, None)
                 .await
                 .expect("connect to cluster");
 
-            let ping: ferriskey::valkey::ValkeyResult<ferriskey::valkey::Value> = conn
+            let ping: ferriskey::ValkeyResult<ferriskey::Value> = conn
                 .route_command(
-                    &ferriskey::valkey::cmd("PING"),
-                    ferriskey::valkey::cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
+                    &ferriskey::cmd("PING"),
+                    ferriskey::cluster::routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
                 )
                 .await;
             assert!(ping.is_ok(), "PING before kill failed: {:?}", ping);
@@ -900,7 +900,7 @@ mod cluster_client_tests {
 
             // Measure how many commands complete (success or error) in the window
             let mut completed: u32 = 0;
-            let mut cmd = ferriskey::valkey::cmd("GET");
+            let mut cmd = ferriskey::cmd("GET");
             cmd.arg("{test}key");
             let window_start = std::time::Instant::now();
 
@@ -909,7 +909,7 @@ mod cluster_client_tests {
                     Duration::from_millis(CONNECTION_TIMEOUT_MS + 500),
                     conn.route_command(
                         &cmd,
-                        ferriskey::valkey::cluster_routing::RoutingInfo::SingleNode(
+                        ferriskey::cluster::routing::RoutingInfo::SingleNode(
                             SingleNodeRoutingInfo::SpecificNode(Route::new(0, SlotAddr::Master)),
                         ),
                     ),

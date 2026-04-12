@@ -4,9 +4,9 @@ use super::get_valkey_connection_info;
 use super::reconnecting_connection::{ReconnectReason, ReconnectingConnection};
 use super::{ConnectionRequest, NodeAddress, TlsMode};
 use crate::client::types::ReadFrom as ClientReadFrom;
-use crate::valkey::aio::ConnectionLike;
-use crate::valkey::cluster_routing::{
-    self, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd,
+use crate::connection::ConnectionLike;
+use crate::cluster::routing::{
+    self as cluster_routing, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd,
 };
 use crate::valkey::{PushInfo, RetryStrategy, ValkeyError, ValkeyResult, Value};
 use futures::{StreamExt, future, stream};

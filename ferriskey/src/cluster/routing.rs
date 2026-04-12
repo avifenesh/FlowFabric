@@ -2,8 +2,8 @@ use rand::Rng;
 use strum_macros::Display;
 
 use crate::cluster::topology::get_slot;
-use crate::valkey::cmd::{Arg, Cmd};
-use crate::valkey::types::Value;
+use crate::cmd::{Arg, Cmd};
+use crate::value::Value;
 use crate::valkey::{ErrorKind, ValkeyError, ValkeyResult};
 use core::cmp::Ordering;
 use std::borrow::Cow;

@@ -6,8 +6,8 @@ use futures_util::{
 use std::pin::Pin;
 use std::{borrow::Borrow, fmt, io};
 
-use crate::valkey::pipeline::Pipeline;
-use crate::valkey::types::{
+use crate::pipeline::Pipeline;
+use crate::value::{
     FromValkeyValue, ToValkeyArgs, ValkeyResult, ValkeyWrite, from_owned_valkey_value,
 };
 use telemetrylib::FerrisKeySpan;
@@ -43,7 +43,7 @@ pub struct Cmd {
 /// The PING command used to fence other commands for ordering guarantees
 const FENCE_COMMAND: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 
-use crate::valkey::aio::ConnectionLike as AsyncConnection;
+use crate::connection::ConnectionLike as AsyncConnection;
 
 /// The inner future of AsyncIter
 struct AsyncIterInner<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
@@ -420,7 +420,7 @@ impl Cmd {
     #[inline]
     pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
     where
-        C: crate::valkey::aio::ConnectionLike,
+        C: crate::connection::ConnectionLike,
     {
         let val = con.req_packed_command(self).await?;
         from_owned_valkey_value(val)

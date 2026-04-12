@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{NodeAddress, TlsMode};
-use crate::valkey::aio::{DisconnectNotifier, MultiplexedConnection};
+use crate::connection::{DisconnectNotifier, MultiplexedConnection};
 use crate::valkey::{
     FerrisKeyConnectionOptions, PushInfo, RetryStrategy, ValkeyConnectionInfo, ValkeyError,
     ValkeyResult,

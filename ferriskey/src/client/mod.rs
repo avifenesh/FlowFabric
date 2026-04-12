@@ -8,12 +8,12 @@ use crate::compression::lz4_backend::Lz4Backend;
 use crate::compression::zstd_backend::ZstdBackend;
 use crate::compression::{CompressionConfig, CompressionManager};
 use crate::scripts_container::get_script;
-use crate::valkey::aio::ConnectionLike;
-use crate::valkey::cluster_async::ClusterConnection;
-use crate::valkey::cluster_routing::{
+use crate::connection::ConnectionLike;
+use crate::cluster::ClusterConnection;
+use crate::cluster::routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, Routable, RoutingInfo, SingleNodeRoutingInfo,
 };
-use crate::valkey::cluster_slotmap::ReadFromReplicaStrategy;
+use crate::cluster::slotmap::ReadFromReplicaStrategy;
 use crate::valkey::{
     ClusterScanArgs, Cmd, ErrorKind, FromValkeyValue, PipelineRetryStrategy, PushInfo,
     RetryStrategy, ScanStateRC, ValkeyError, ValkeyResult, Value,
@@ -837,7 +837,7 @@ impl Client {
                 {
                     let cmd_name = cmd.command().unwrap_or_default();
                     let cmd_name = String::from_utf8_lossy(&cmd_name);
-                    if crate::valkey::cluster_routing::is_readonly_cmd(cmd_name.as_bytes()) {
+                    if crate::cluster::routing::is_readonly_cmd(cmd_name.as_bytes()) {
                         RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
                     } else {
                         log_warn(
@@ -1581,7 +1581,7 @@ async fn create_cluster_client(
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
     pubsub_synchronizer: Arc<dyn crate::pubsub::PubSubSynchronizer>,
-) -> ValkeyResult<crate::valkey::cluster_async::ClusterConnection> {
+) -> ValkeyResult<crate::cluster::ClusterConnection> {
     let tls_mode = request.tls_mode.unwrap_or_default();
 
     let valkey_connection_info = get_valkey_connection_info(&request, iam_token_manager).await;
@@ -1658,7 +1658,7 @@ async fn create_cluster_client(
         })
         .collect();
 
-    let mut builder = crate::valkey::cluster::ClusterClientBuilder::new(initial_nodes)
+    let mut builder = crate::cluster::compat::ClusterClientBuilder::new(initial_nodes)
         .connection_timeout(connection_timeout)
         .retries(DEFAULT_RETRIES);
     let read_from_strategy = request.read_from.unwrap_or_default();

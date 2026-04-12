@@ -7,12 +7,13 @@
 //! Requires: VALKEY_HOST and VALKEY_PORT env vars pointing to a cluster.
 //! Skip with: cargo test --test test_integration_real_workload -- --ignored
 
-use ferriskey::valkey::{
-    aio::ConnectionLike,
-    cluster::ClusterClientBuilder,
-    cluster_async::ClusterConnection,
-    cmd, ConnectionAddr, ConnectionInfo, Pipeline, ValkeyConnectionInfo, Value,
+use ferriskey::{
+    cmd, ConnectionAddr, ConnectionInfo, Value, ValkeyConnectionInfo,
 };
+use ferriskey::connection::ConnectionLike;
+use ferriskey::cluster::compat::ClusterClientBuilder;
+use ferriskey::cluster::ClusterConnection;
+use ferriskey::pipeline::Pipeline;
 
 fn connection_info() -> Option<ConnectionInfo> {
     let host = std::env::var("VALKEY_HOST").ok()?;
@@ -37,7 +38,7 @@ async fn get_conn() -> Option<ClusterConnection> {
     let info = connection_info()?;
     let mut builder = ClusterClientBuilder::new(vec![info]);
     if std::env::var("VALKEY_TLS").unwrap_or_default() == "true" {
-        builder = builder.tls(ferriskey::valkey::cluster::TlsMode::Insecure);
+        builder = builder.tls(ferriskey::cluster::compat::TlsMode::Insecure);
     }
     let client = builder.build().ok()?;
     client.get_async_connection(None, None, None).await.ok()

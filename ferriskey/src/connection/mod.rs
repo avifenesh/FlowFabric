@@ -3,10 +3,10 @@ pub mod factory;
 
 pub use factory::{Client, FerrisKeyConnectionOptions, IAMTokenProvider};
 
-use crate::valkey::cmd::{Cmd, cmd};
-use crate::valkey::connection::{ValkeyConnectionInfo, get_resp3_hello_command_error};
-use crate::valkey::pipeline::PipelineRetryStrategy;
-use crate::valkey::types::{
+use crate::cmd::{Cmd, cmd};
+use crate::connection::info::{ValkeyConnectionInfo, get_resp3_hello_command_error};
+use crate::pipeline::PipelineRetryStrategy;
+use crate::value::{
     ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, ValkeyError, ValkeyResult, Value,
 };
 use ::tokio::io::{AsyncRead, AsyncWrite};

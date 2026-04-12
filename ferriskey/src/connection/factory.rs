@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::runtime;
 use crate::connection::{DisconnectNotifier, MultiplexedConnection, RedisRuntime, connect_simple};
-use crate::valkey::tls::{TlsCertificates, inner_build_with_tls};
+use crate::connection::tls::{TlsCertificates, inner_build_with_tls};
 use crate::valkey::{
     PubSubSynchronizer,
     connection::{ConnectionInfo, IntoConnectionInfo},

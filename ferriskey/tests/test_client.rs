@@ -24,25 +24,23 @@ macro_rules! async_assert_eq {
 #[cfg(test)]
 pub(crate) mod shared_client_tests {
     use ferriskey::Telemetry;
-    use ferriskey::valkey::{cluster_topology::get_slot, cmd};
+    use ferriskey::cluster::routing::{
+        MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
+    };
+    use ferriskey::cluster::topology::get_slot;
+    use ferriskey::pipeline::{Pipeline, PipelineRetryStrategy};
+    use ferriskey::{FromValkeyValue, InfoDict, ValkeyConnectionInfo, Value, cmd};
     use std::collections::HashMap;
 
     use super::*;
     use ferriskey::client::{Client, DEFAULT_RESPONSE_TIMEOUT};
-    use ferriskey::valkey::cluster_routing::{SingleNodeRoutingInfo, SlotAddr};
-    use ferriskey::valkey::{
-        FromValkeyValue, InfoDict, Pipeline, PipelineRetryStrategy, ValkeyConnectionInfo, Value,
-        cluster_routing::{MultipleNodeRoutingInfo, Route, RoutingInfo},
-    };
     use rstest::rstest;
     use utilities::BackingServer;
     use utilities::cluster::*;
     use utilities::*;
 
     #[cfg(feature = "iam_tests")]
-    use ferriskey::client::types::{
-        AuthenticationInfo, IamCredentials, ServiceType, TlsMode,
-    };
+    use ferriskey::client::types::{AuthenticationInfo, IamCredentials, ServiceType, TlsMode};
 
     #[cfg(feature = "iam_tests")]
     const ELASTICACHE_CLUSTER_IAM_ENDPOINT: &str = "elasticache-cluster-iam.endpoint"; // Replace with your cluster endpoint
@@ -166,7 +164,7 @@ pub(crate) mod shared_client_tests {
             .await;
 
             // reset stats on all connections
-            let mut cmd = ferriskey::valkey::cmd("CONFIG");
+            let mut cmd = ferriskey::cmd("CONFIG");
             cmd.arg("RESETSTAT");
             let _ = test_basics
                 .client
@@ -182,7 +180,7 @@ pub(crate) mod shared_client_tests {
 
             // Send a keyed transaction
             let key = generate_random_string(6);
-            let mut pipe = ferriskey::valkey::pipe();
+            let mut pipe = ferriskey::pipe();
             pipe.cmd("GET").arg(key);
             pipe.atomic();
 
@@ -195,7 +193,7 @@ pub(crate) mod shared_client_tests {
             }
 
             // Gather info from each server
-            let mut cmd = ferriskey::valkey::cmd("INFO");
+            let mut cmd = ferriskey::cmd("INFO");
             cmd.arg("commandstats");
             let values = test_basics
                 .client
@@ -236,8 +234,8 @@ pub(crate) mod shared_client_tests {
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
     fn test_resp_support(#[values(false, true)] use_cluster: bool, #[values(2, 3)] protocol: i64) {
         let protocol_enum = match protocol {
-            2 => ferriskey::valkey::ProtocolVersion::RESP2,
-            3 => ferriskey::valkey::ProtocolVersion::RESP3,
+            2 => ferriskey::ProtocolVersion::RESP2,
+            3 => ferriskey::ProtocolVersion::RESP3,
             _ => panic!(),
         };
         block_on_all(async {
@@ -250,32 +248,33 @@ pub(crate) mod shared_client_tests {
                         ..Default::default()
                     }),
                     protocol: match protocol {
-                        2 => ferriskey::valkey::ProtocolVersion::RESP2,
-                        3 => ferriskey::valkey::ProtocolVersion::RESP3,
+                        2 => ferriskey::ProtocolVersion::RESP2,
+                        3 => ferriskey::ProtocolVersion::RESP3,
                         _ => panic!(),
                     },
                     ..Default::default()
                 },
             )
             .await;
-            let hello: std::collections::HashMap<String, Value> = ferriskey::valkey::from_owned_valkey_value(
-                test_basics
-                    .client
-                    .send_command(&mut ferriskey::valkey::cmd("HELLO"), None)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
+            let hello: std::collections::HashMap<String, Value> =
+                ferriskey::from_owned_valkey_value(
+                    test_basics
+                        .client
+                        .send_command(&mut ferriskey::cmd("HELLO"), None)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
             assert_eq!(hello.get("proto").unwrap(), &Value::Int(protocol));
 
-            let mut cmd = ferriskey::valkey::cmd("HSET");
+            let mut cmd = ferriskey::cmd("HSET");
             cmd.arg("hash").arg("foo").arg("baz");
             test_basics
                 .client
                 .send_command(&mut cmd, None)
                 .await
                 .unwrap();
-            let mut cmd = ferriskey::valkey::cmd("HSET");
+            let mut cmd = ferriskey::cmd("HSET");
             cmd.arg("hash").arg("bar").arg("foobar");
             test_basics
                 .client
@@ -283,7 +282,7 @@ pub(crate) mod shared_client_tests {
                 .await
                 .unwrap();
 
-            let mut cmd = ferriskey::valkey::cmd("HGETALL");
+            let mut cmd = ferriskey::cmd("HGETALL");
             cmd.arg("hash");
             let result = test_basics
                 .client
@@ -358,7 +357,7 @@ pub(crate) mod shared_client_tests {
                 .unwrap_err();
             assert!(
                 get_result.is_connection_dropped()
-                    || get_result.kind() == ferriskey::valkey::ErrorKind::ConnectionNotFoundForRoute
+                    || get_result.kind() == ferriskey::ErrorKind::ConnectionNotFoundForRoute
             );
         });
     }
@@ -372,7 +371,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     use_tls: true,
-                    connection_info: Some(ferriskey::valkey::ValkeyConnectionInfo {
+                    connection_info: Some(ferriskey::ValkeyConnectionInfo {
                         password: Some("ReallySecurePassword".to_string()),
                         ..Default::default()
                     }),
@@ -394,7 +393,7 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     use_tls: true,
-                    connection_info: Some(ferriskey::valkey::ValkeyConnectionInfo {
+                    connection_info: Some(ferriskey::ValkeyConnectionInfo {
                         password: Some("ReallySecurePassword".to_string()),
                         username: Some("AuthorizedUsername".to_string()),
                         ..Default::default()
@@ -424,7 +423,7 @@ pub(crate) mod shared_client_tests {
     #[cfg(feature = "iam_tests")]
     /// Helper function to create connection request with IAM authentication
     fn create_iam_connection_request(
-        addresses: &[ferriskey::valkey::ConnectionAddr],
+        addresses: &[ferriskey::ConnectionAddr],
         cluster_name: &str,
         username: &str,
         region: &str,
@@ -473,7 +472,7 @@ pub(crate) mod shared_client_tests {
             let endpoint: &'static str = ELASTICACHE_CLUSTER_IAM_ENDPOINT; // Replace with your cluster endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request
             let connection_request = create_iam_connection_request(
@@ -533,7 +532,7 @@ pub(crate) mod shared_client_tests {
             let endpoint = ELASTICACHE_STANDALONE_IAM_ENDPOINT; // Replace with your standalone endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request
             let connection_request = create_iam_connection_request(
@@ -593,7 +592,7 @@ pub(crate) mod shared_client_tests {
             let endpoint = MEMORYDB_CLUSTER_IAM_ENDPOINT; // Replace with your cluster endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request
             let connection_request = create_iam_connection_request(
@@ -653,7 +652,7 @@ pub(crate) mod shared_client_tests {
             let endpoint = ELASTICACHE_CLUSTER_IAM_ENDPOINT; // Replace with your cluster endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request with lazy connection enabled
             let mut connection_request = create_iam_connection_request(
@@ -678,7 +677,7 @@ pub(crate) mod shared_client_tests {
                     // The connection should be established on the first command
 
                     // Send the first command - this should trigger the connection establishment
-                    let result = client.send_command(&mut ferriskey::valkey::cmd("PING"), None).await;
+                    let result = client.send_command(&mut ferriskey::cmd("PING"), None).await;
 
                     match result {
                         Ok(value) => {
@@ -688,15 +687,19 @@ pub(crate) mod shared_client_tests {
                             // Send another command to verify the connection is established and working
                             let key = generate_random_string(6);
                             let set_result = client
-                                .send_command(ferriskey::valkey::cmd("SET").arg(&key).arg("test_value"), None)
+                                .send_command(
+                                    ferriskey::cmd("SET").arg(&key).arg("test_value"),
+                                    None,
+                                )
                                 .await;
                             assert!(
                                 set_result.is_ok(),
                                 "SET command should succeed: {set_result:?}"
                             );
 
-                            let get_result =
-                                client.send_command(ferriskey::valkey::cmd("GET").arg(&key), None).await;
+                            let get_result = client
+                                .send_command(ferriskey::cmd("GET").arg(&key), None)
+                                .await;
                             assert_eq!(
                                 get_result.unwrap(),
                                 Value::BulkString("test_value".as_bytes().to_vec().into())
@@ -749,7 +752,7 @@ pub(crate) mod shared_client_tests {
             let endpoint = ELASTICACHE_STANDALONE_IAM_ENDPOINT; // Replace with your standalone endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request with lazy connection enabled
             let mut connection_request = create_iam_connection_request(
@@ -774,7 +777,7 @@ pub(crate) mod shared_client_tests {
                     // The connection should be established on the first command
 
                     // Send the first command - this should trigger the connection establishment
-                    let result = client.send_command(&mut ferriskey::valkey::cmd("PING"), None).await;
+                    let result = client.send_command(&mut ferriskey::cmd("PING"), None).await;
 
                     match result {
                         Ok(value) => {
@@ -784,15 +787,19 @@ pub(crate) mod shared_client_tests {
                             // Send another command to verify the connection is established and working
                             let key = generate_random_string(6);
                             let set_result = client
-                                .send_command(ferriskey::valkey::cmd("SET").arg(&key).arg("test_value"), None)
+                                .send_command(
+                                    ferriskey::cmd("SET").arg(&key).arg("test_value"),
+                                    None,
+                                )
                                 .await;
                             assert!(
                                 set_result.is_ok(),
                                 "SET command should succeed: {set_result:?}"
                             );
 
-                            let get_result =
-                                client.send_command(ferriskey::valkey::cmd("GET").arg(&key), None).await;
+                            let get_result = client
+                                .send_command(ferriskey::cmd("GET").arg(&key), None)
+                                .await;
                             assert_eq!(
                                 get_result.unwrap(),
                                 Value::BulkString("test_value".as_bytes().to_vec().into())
@@ -969,7 +976,7 @@ pub(crate) mod shared_client_tests {
             let endpoint = ELASTICACHE_CLUSTER_IAM_ENDPOINT; // Replace with your cluster endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request
             let connection_request = create_iam_connection_request(
@@ -996,7 +1003,7 @@ pub(crate) mod shared_client_tests {
                     let test_value = generate_random_string(10);
 
                     let set_result = client
-                        .send_command(ferriskey::valkey::cmd("SET").arg(&test_key).arg(&test_value), None)
+                        .send_command(ferriskey::cmd("SET").arg(&test_key).arg(&test_value), None)
                         .await;
                     assert!(
                         set_result.is_ok(),
@@ -1005,7 +1012,7 @@ pub(crate) mod shared_client_tests {
 
                     // Verify the value was set correctly
                     let get_result = client
-                        .send_command(ferriskey::valkey::cmd("GET").arg(&test_key), None)
+                        .send_command(ferriskey::cmd("GET").arg(&test_key), None)
                         .await;
                     assert_eq!(
                         get_result.unwrap(),
@@ -1027,7 +1034,7 @@ pub(crate) mod shared_client_tests {
 
                     // Verify that we can still retrieve the previously set value after reconnection
                     let get_after_reconnect = client
-                        .send_command(ferriskey::valkey::cmd("GET").arg(&test_key), None)
+                        .send_command(ferriskey::cmd("GET").arg(&test_key), None)
                         .await;
                     assert_eq!(
                         get_after_reconnect.unwrap(),
@@ -1079,7 +1086,7 @@ pub(crate) mod shared_client_tests {
             let endpoint = ELASTICACHE_CLUSTER_IAM_ENDPOINT; // Replace with your cluster endpoint
 
             // Use the provided endpoint and port
-            let address = ferriskey::valkey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
+            let address = ferriskey::ConnectionAddr::Tcp(endpoint.to_string(), 6379);
 
             // Create IAM connection request
             let connection_request = create_iam_connection_request(
@@ -1267,7 +1274,7 @@ pub(crate) mod shared_client_tests {
                     assert_connected(&mut client).await;
 
                     // Get initial client info
-                    let mut client_info_cmd = ferriskey::valkey::Cmd::new();
+                    let mut client_info_cmd = ferriskey::Cmd::new();
                     client_info_cmd.arg("CLIENT").arg("INFO");
                     let initial_client_info_response = client
                         .send_command(&mut client_info_cmd, None)
@@ -1290,7 +1297,7 @@ pub(crate) mod shared_client_tests {
                     let test_key = generate_random_string(10);
                     let test_value = "iam_test_value";
                     let set_result = client
-                        .send_command(ferriskey::valkey::cmd("SET").arg(&test_key).arg(test_value), None)
+                        .send_command(ferriskey::cmd("SET").arg(&test_key).arg(test_value), None)
                         .await;
                     assert!(
                         set_result.is_ok(),
@@ -1311,7 +1318,8 @@ pub(crate) mod shared_client_tests {
                             assert!(
                                 err.is_connection_dropped()
                                     || err.is_timeout()
-                                    || err.kind() == ferriskey::valkey::ErrorKind::AllConnectionsUnavailable,
+                                    || err.kind()
+                                        == ferriskey::ErrorKind::AllConnectionsUnavailable,
                                 "Expected connection dropped, timeout, or unavailable error, got: {err:?}",
                             );
                             // Retry and verify we can still connect with IAM auth after reconnection
@@ -1362,7 +1370,7 @@ pub(crate) mod shared_client_tests {
 
                     // Verify we can still retrieve the previously set value after reconnection
                     let get_result = client
-                        .send_command(ferriskey::valkey::cmd("GET").arg(&test_key), None)
+                        .send_command(ferriskey::cmd("GET").arg(&test_key), None)
                         .await;
                     assert!(
                         get_result.is_ok(),
@@ -1398,7 +1406,7 @@ pub(crate) mod shared_client_tests {
                 },
             )
             .await;
-            let mut cmd = ferriskey::valkey::Cmd::new();
+            let mut cmd = ferriskey::Cmd::new();
             // Create a long running command to ensure we get into timeout
             cmd.arg("EVAL")
                 .arg(
@@ -1437,7 +1445,7 @@ pub(crate) mod shared_client_tests {
             )
             .await;
 
-            let mut cmd = ferriskey::valkey::Cmd::new();
+            let mut cmd = ferriskey::Cmd::new();
             cmd.arg("BLPOP").arg(generate_random_string(10)).arg(0.3); // server should return null after 300 millisecond
             let result = test_basics.client.send_command(&mut cmd, None).await;
             assert!(result.is_ok());
@@ -1462,12 +1470,12 @@ pub(crate) mod shared_client_tests {
                 },
             )
             .await;
-            let mut cmd = ferriskey::valkey::Cmd::new();
+            let mut cmd = ferriskey::Cmd::new();
             cmd.arg("BLPOP").arg(generate_random_string(10)).arg(-1);
             let result = test_basics.client.send_command(&mut cmd, None).await;
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert_eq!(err.kind(), ferriskey::valkey::ErrorKind::ResponseError);
+            assert_eq!(err.kind(), ferriskey::ErrorKind::ResponseError);
             assert!(err.to_string().contains("negative"));
         });
     }
@@ -1488,7 +1496,7 @@ pub(crate) mod shared_client_tests {
             let mut test_basics = setup_test_basics(use_cluster, config).await;
             let key = generate_random_string(10);
             let future = async move {
-                let mut cmd = ferriskey::valkey::Cmd::new();
+                let mut cmd = ferriskey::Cmd::new();
                 cmd.arg("BLPOP").arg(key).arg(0); // `0` should block indefinitely
                 test_basics.client.send_command(&mut cmd, None).await
             };
@@ -1515,7 +1523,7 @@ pub(crate) mod shared_client_tests {
             .await;
 
             // BLPOP doesn't block in transactions, so we'll pause the client instead.
-            let mut cmd = ferriskey::valkey::cmd("CLIENT");
+            let mut cmd = ferriskey::cmd("CLIENT");
             cmd.arg("PAUSE").arg(100);
             let _ = test_basics
                 .client
@@ -1528,7 +1536,7 @@ pub(crate) mod shared_client_tests {
                 )
                 .await;
 
-            let mut pipeline = ferriskey::valkey::pipe();
+            let mut pipeline = ferriskey::pipe();
             pipeline.atomic();
             pipeline.cmd("GET").arg("foo");
             let result = test_basics
@@ -1546,7 +1554,7 @@ pub(crate) mod shared_client_tests {
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
     fn test_client_name_after_reconnection(#[values(false, true)] use_cluster: bool) {
         const CLIENT_NAME: &str = "TEST_CLIENT_NAME";
-        let mut client_info_cmd = ferriskey::valkey::Cmd::new();
+        let mut client_info_cmd = ferriskey::Cmd::new();
         client_info_cmd.arg("CLIENT").arg("INFO");
         block_on_all(async move {
             let test_basics = setup_test_basics(
@@ -1575,11 +1583,11 @@ pub(crate) mod shared_client_tests {
                         .unwrap();
 
                     if use_cluster {
-                        ferriskey::valkey::from_owned_valkey_value(variant_res).unwrap()
+                        ferriskey::from_owned_valkey_value(variant_res).unwrap()
                     } else {
                         [(
                             "DONT_CARE".to_string(),
-                            ferriskey::valkey::from_owned_valkey_value(variant_res).unwrap(),
+                            ferriskey::from_owned_valkey_value(variant_res).unwrap(),
                         )]
                         .into()
                     }
@@ -1607,8 +1615,8 @@ pub(crate) mod shared_client_tests {
         #[values(2, 3)] protocol: i64,
     ) {
         let protocol_enum = match protocol {
-            2 => ferriskey::valkey::ProtocolVersion::RESP2,
-            3 => ferriskey::valkey::ProtocolVersion::RESP3,
+            2 => ferriskey::ProtocolVersion::RESP2,
+            3 => ferriskey::ProtocolVersion::RESP3,
             _ => panic!(),
         };
         block_on_all(async {
@@ -1621,22 +1629,23 @@ pub(crate) mod shared_client_tests {
                         ..Default::default()
                     }),
                     protocol: match protocol {
-                        2 => ferriskey::valkey::ProtocolVersion::RESP2,
-                        3 => ferriskey::valkey::ProtocolVersion::RESP3,
+                        2 => ferriskey::ProtocolVersion::RESP2,
+                        3 => ferriskey::ProtocolVersion::RESP3,
                         _ => panic!(),
                     },
                     ..Default::default()
                 },
             )
             .await;
-            let hello: std::collections::HashMap<String, Value> = ferriskey::valkey::from_owned_valkey_value(
-                test_basics
-                    .client
-                    .send_command(&mut ferriskey::valkey::cmd("HELLO"), None)
-                    .await
-                    .expect("HELLO failed"),
-            )
-            .unwrap();
+            let hello: std::collections::HashMap<String, Value> =
+                ferriskey::from_owned_valkey_value(
+                    test_basics
+                        .client
+                        .send_command(&mut ferriskey::cmd("HELLO"), None)
+                        .await
+                        .expect("HELLO failed"),
+                )
+                .unwrap();
             assert_eq!(hello.get("proto").unwrap(), &Value::Int(protocol));
 
             let (key, field, value, field2, value2) = (
@@ -1693,7 +1702,7 @@ pub(crate) mod shared_client_tests {
         #[values(false, true)] use_cluster: bool,
         #[values(false, true)] raise_error: bool,
     ) {
-        use ferriskey::valkey::ErrorKind;
+        use ferriskey::ErrorKind;
 
         block_on_all(async move {
             let mut test_basics = setup_test_basics(
@@ -1713,7 +1722,16 @@ pub(crate) mod shared_client_tests {
             );
 
             let mut pipeline = Pipeline::new();
-            pipeline.cmd("SET").arg(&key).arg(&value).cmd("GET").arg(&key).cmd("LLEN").arg(&key).cmd("GET").arg(&key2);
+            pipeline
+                .cmd("SET")
+                .arg(&key)
+                .arg(&value)
+                .cmd("GET")
+                .arg(&key)
+                .cmd("LLEN")
+                .arg(&key)
+                .cmd("GET")
+                .arg(&key2);
 
             let res = test_basics
                 .client
@@ -1737,7 +1755,10 @@ pub(crate) mod shared_client_tests {
                     };
                     assert_eq!(
                         &res[..2],
-                        &[Value::Okay, Value::BulkString(value.as_bytes().to_vec().into()),],
+                        &[
+                            Value::Okay,
+                            Value::BulkString(value.as_bytes().to_vec().into()),
+                        ],
                         "Pipeline result: {res:?}"
                     );
 
@@ -1844,10 +1865,16 @@ pub(crate) mod shared_client_tests {
 
             let mut pipeline = Pipeline::new();
             pipeline
-                .cmd("SET").arg(&key).arg("value1")
-                .cmd("GET").arg(&key)
-                .cmd("BLPOP").arg(&key2).arg(2.0)
-                .cmd("GET").arg(&key2);
+                .cmd("SET")
+                .arg(&key)
+                .arg("value1")
+                .cmd("GET")
+                .arg(&key)
+                .cmd("BLPOP")
+                .arg(&key2)
+                .arg(2.0)
+                .cmd("GET")
+                .arg(&key2);
 
             // Pipeline containing BLPOP with 2s block exceeds the 1s request_timeout,
             // so it should time out.
@@ -1894,10 +1921,16 @@ pub(crate) mod shared_client_tests {
 
             let mut pipeline = Pipeline::new();
             pipeline
-                .cmd("SET").arg(&key).arg("value1")
-                .cmd("GET").arg(&key)
-                .cmd("BLPOP").arg(&key2).arg(2.0)
-                .cmd("GET").arg(&key2);
+                .cmd("SET")
+                .arg(&key)
+                .arg("value1")
+                .cmd("GET")
+                .arg(&key)
+                .cmd("BLPOP")
+                .arg(&key2)
+                .arg(2.0)
+                .cmd("GET")
+                .arg(&key2);
 
             let res = test_basics
                 .client
@@ -1945,9 +1978,14 @@ pub(crate) mod shared_client_tests {
             // Generate random keys.
             let key = generate_random_string(10);
 
-            let mut transaction = ferriskey::valkey::pipe();
+            let mut transaction = ferriskey::pipe();
             transaction.atomic();
-            transaction.cmd("BLPOP").arg(&key).arg(2.0).cmd("GET").arg(&key);
+            transaction
+                .cmd("BLPOP")
+                .arg(&key)
+                .arg(2.0)
+                .cmd("GET")
+                .arg(&key);
 
             let res = test_basics
                 .client
@@ -1982,10 +2020,16 @@ pub(crate) mod shared_client_tests {
 
             let mut pipeline = Pipeline::new();
             pipeline
-                .cmd("SET").arg(&key).arg(&value)
-                .cmd("GET").arg(&key)
-                .cmd("SET").arg(&key2).arg(&value2)
-                .cmd("GET").arg(&key2);
+                .cmd("SET")
+                .arg(&key)
+                .arg(&value)
+                .cmd("GET")
+                .arg(&key)
+                .cmd("SET")
+                .arg(&key2)
+                .arg(&value2)
+                .cmd("GET")
+                .arg(&key2);
 
             // kill the connection for `key2`
             kill_connection_for_route(
@@ -2143,10 +2187,16 @@ pub(crate) mod shared_client_tests {
 
             let mut pipeline = Pipeline::new();
             pipeline
-                .cmd("SET").arg(&key).arg("value1")
-                .cmd("GET").arg(&key)
-                .cmd("SET").arg(&key2).arg("value2")
-                .cmd("GET").arg(&key2);
+                .cmd("SET")
+                .arg(&key)
+                .arg("value1")
+                .cmd("GET")
+                .arg(&key)
+                .cmd("SET")
+                .arg(&key2)
+                .arg("value2")
+                .cmd("GET")
+                .arg(&key2);
 
             // Kill all connections.
             kill_connection(&mut test_basics.client).await;
@@ -2331,7 +2381,10 @@ pub(crate) mod shared_client_tests {
 
             let mut pipeline = Pipeline::new();
             pipeline.add_command(cmd("PING"));
-            pipeline.cmd("SET").arg(generate_random_string(10)).arg("value");
+            pipeline
+                .cmd("SET")
+                .arg(generate_random_string(10))
+                .arg("value");
             pipeline.add_command(cmd("FLUSHALL"));
             pipeline.add_command(cmd("DBSIZE")); // AllPrimary cmd + SUM aggregation
 
@@ -2506,10 +2559,10 @@ pub(crate) mod shared_client_tests {
             let cluster = cluster::setup_default_cluster().await;
             println!("Creating 1st cluster client...");
             let mut c1 = cluster::setup_default_client(&cluster).await;
-            let result = c1.send_command(&mut ferriskey::valkey::cmd("MSET"), None).await;
+            let result = c1.send_command(&mut ferriskey::cmd("MSET"), None).await;
             assert!(result.is_err());
             let e = result.unwrap_err();
-            assert!(e.kind().clone().eq(&ferriskey::valkey::ErrorKind::ResponseError));
+            assert!(e.kind().clone().eq(&ferriskey::ErrorKind::ResponseError));
             assert!(e.to_string().contains("wrong number of arguments"));
         });
     }
@@ -2523,14 +2576,14 @@ pub(crate) mod shared_client_tests {
                 use_cluster,
                 TestConfiguration {
                     shared_server: true,
-                    protocol: ferriskey::valkey::ProtocolVersion::RESP2,
+                    protocol: ferriskey::ProtocolVersion::RESP2,
                     ..Default::default()
                 },
             )
             .await;
 
             let key = generate_random_string(10);
-            let mut pipeline = ferriskey::valkey::pipe();
+            let mut pipeline = ferriskey::pipe();
             pipeline.atomic();
             pipeline.cmd("HSET").arg(&key).arg("bar").arg("vaz");
             pipeline.cmd("HGETALL").arg(&key);
@@ -2597,10 +2650,10 @@ pub(crate) mod shared_client_tests {
                 }
             }
 
-            let mut client_info_cmd = ferriskey::valkey::Cmd::new();
+            let mut client_info_cmd = ferriskey::Cmd::new();
             client_info_cmd.arg("CLIENT").arg("INFO");
 
-            let mut select_cmd = ferriskey::valkey::Cmd::new();
+            let mut select_cmd = ferriskey::Cmd::new();
             select_cmd.arg("SELECT").arg("5");
 
             // Verify initial connection is to database 0
@@ -2665,7 +2718,7 @@ pub(crate) mod shared_client_tests {
                     assert!(
                         err.is_connection_dropped()
                             || err.is_timeout()
-                            || err.kind() == ferriskey::valkey::ErrorKind::AllConnectionsUnavailable,
+                            || err.kind() == ferriskey::ErrorKind::AllConnectionsUnavailable,
                         "Expected connection dropped, timeout, or unavailable error, got: {err:?}",
                     );
                     // Retry and verify we're still on database 5 after reconnection
@@ -2733,10 +2786,10 @@ pub(crate) mod shared_client_tests {
             )
             .await;
 
-            let mut client_info_cmd = ferriskey::valkey::Cmd::new();
+            let mut client_info_cmd = ferriskey::Cmd::new();
             client_info_cmd.arg("CLIENT").arg("INFO");
 
-            let mut client_setname_cmd = ferriskey::valkey::Cmd::new();
+            let mut client_setname_cmd = ferriskey::Cmd::new();
             client_setname_cmd
                 .arg("Client")
                 .arg("SETNAME")
@@ -2830,7 +2883,7 @@ pub(crate) mod shared_client_tests {
                 TestConfiguration {
                     use_tls: true,
                     shared_server: false,
-                    connection_info: Some(ferriskey::valkey::ValkeyConnectionInfo {
+                    connection_info: Some(ferriskey::ValkeyConnectionInfo {
                         password: Some("ReallySecurePassword".to_string()),
                         ..Default::default()
                     }),
@@ -2839,7 +2892,7 @@ pub(crate) mod shared_client_tests {
             )
             .await;
 
-            let mut client_info_cmd = ferriskey::valkey::Cmd::new();
+            let mut client_info_cmd = ferriskey::Cmd::new();
             client_info_cmd.arg("CLIENT").arg("INFO");
 
             // Verify initial connection (should be default user)
@@ -2864,7 +2917,7 @@ pub(crate) mod shared_client_tests {
                 .expect("Failed to extract initial client ID");
 
             // Create a new user using ACL SETUSER (automatically routes to all nodes)
-            let mut acl_setuser_cmd = ferriskey::valkey::Cmd::new();
+            let mut acl_setuser_cmd = ferriskey::Cmd::new();
             acl_setuser_cmd
                 .arg("ACL")
                 .arg("SETUSER")
@@ -2884,7 +2937,7 @@ pub(crate) mod shared_client_tests {
             assert_eq!(acl_result, Value::Okay);
 
             // Execute AUTH command to authenticate as testuser (automatically routes to all nodes)
-            let mut auth_cmd = ferriskey::valkey::Cmd::new();
+            let mut auth_cmd = ferriskey::Cmd::new();
             auth_cmd.arg("AUTH").arg("testuser").arg("testpassword");
 
             let auth_result = test_basics
@@ -2930,7 +2983,7 @@ pub(crate) mod shared_client_tests {
                     assert!(
                         err.is_connection_dropped()
                             || err.is_timeout()
-                            || err.kind() == ferriskey::valkey::ErrorKind::AllConnectionsUnavailable,
+                            || err.kind() == ferriskey::ErrorKind::AllConnectionsUnavailable,
                         "Expected connection dropped, timeout, or unavailable error, got: {err:?}",
                     );
                     // Retry and verify we're still authenticated with same username after reconnection
@@ -2975,7 +3028,7 @@ pub(crate) mod shared_client_tests {
             }
 
             // Cleanup: delete the test user (automatically routes to all nodes)
-            let mut acl_deluser_cmd = ferriskey::valkey::Cmd::new();
+            let mut acl_deluser_cmd = ferriskey::Cmd::new();
             acl_deluser_cmd.arg("ACL").arg("DELUSER").arg("testuser");
             let _ = test_basics
                 .client
@@ -3003,16 +3056,16 @@ pub(crate) mod shared_client_tests {
                 TestConfiguration {
                     shared_server: true,
                     connection_info: Some(ValkeyConnectionInfo {
-                        protocol: ferriskey::valkey::ProtocolVersion::RESP2,
+                        protocol: ferriskey::ProtocolVersion::RESP2,
                         ..Default::default()
                     }),
-                    protocol: ferriskey::valkey::ProtocolVersion::RESP2,
+                    protocol: ferriskey::ProtocolVersion::RESP2,
                     ..Default::default()
                 },
             )
             .await;
 
-            let mut hello_cmd = ferriskey::valkey::Cmd::new();
+            let mut hello_cmd = ferriskey::Cmd::new();
             hello_cmd.arg("HELLO");
 
             // Verify initial connection is using RESP2
@@ -3023,11 +3076,11 @@ pub(crate) mod shared_client_tests {
                 .unwrap();
 
             let initial_hello: std::collections::HashMap<String, Value> =
-                ferriskey::valkey::from_owned_valkey_value(initial_hello_response).unwrap();
+                ferriskey::from_owned_valkey_value(initial_hello_response).unwrap();
             assert_eq!(initial_hello.get("proto").unwrap(), &Value::Int(2));
 
             // Use HELLO command to change to RESP3
-            let mut hello_3_cmd = ferriskey::valkey::Cmd::new();
+            let mut hello_3_cmd = ferriskey::Cmd::new();
             hello_3_cmd.arg("HELLO").arg("3");
             let hello_3_response = test_basics
                 .client
@@ -3036,7 +3089,7 @@ pub(crate) mod shared_client_tests {
                 .unwrap();
 
             let hello_3_result: std::collections::HashMap<String, Value> =
-                ferriskey::valkey::from_owned_valkey_value(hello_3_response).unwrap();
+                ferriskey::from_owned_valkey_value(hello_3_response).unwrap();
             assert_eq!(hello_3_result.get("proto").unwrap(), &Value::Int(3));
 
             // Kill the connection to simulate a network drop
@@ -3048,7 +3101,7 @@ pub(crate) mod shared_client_tests {
                     let mut client = test_basics.client.clone();
                     let mut cmd = hello_cmd.clone();
                     let response = client.send_command(&mut cmd, None).await.ok()?;
-                    ferriskey::valkey::from_owned_valkey_value::<std::collections::HashMap<String, Value>>(
+                    ferriskey::from_owned_valkey_value::<std::collections::HashMap<String, Value>>(
                         response,
                     )
                     .ok()

@@ -6,7 +6,7 @@
 mod constants;
 mod utilities;
 
-use ferriskey::valkey::PubSubSubscriptionKind;
+use ferriskey::PubSubSubscriptionKind;
 use rstest::rstest;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -308,7 +308,7 @@ fn test_all_subscription_types_survive_same_slot_migration() {
         let pattern = b"{mixed-test}pattern-*".to_vec();
         let sharded_channel = b"{mixed-test}sharded-channel".to_vec();
 
-        let slot = ferriskey::valkey::cluster_topology::get_slot(&exact_channel);
+        let slot = ferriskey::cluster::topology::get_slot(&exact_channel);
 
         let exact_sub = subscribe_and_wait(
             &setup.synchronizer,
@@ -440,9 +440,9 @@ fn test_all_subscription_types_survive_different_slot_migrations() {
         let pattern = b"{pattern-diff-8000}*".to_vec();
         let sharded_channel = b"{sharded-diff-15000}channel".to_vec();
 
-        let exact_slot = ferriskey::valkey::cluster_topology::get_slot(&exact_channel);
-        let pattern_slot = ferriskey::valkey::cluster_topology::get_slot(&pattern);
-        let sharded_slot = ferriskey::valkey::cluster_topology::get_slot(&sharded_channel);
+        let exact_slot = ferriskey::cluster::topology::get_slot(&exact_channel);
+        let pattern_slot = ferriskey::cluster::topology::get_slot(&pattern);
+        let sharded_slot = ferriskey::cluster::topology::get_slot(&sharded_channel);
 
         subscribe_and_wait(
             &setup.synchronizer,
@@ -556,7 +556,7 @@ fn test_all_subscription_types_survive_failover() {
         let pattern = b"{failover-all}-pattern-*".to_vec();
         let sharded_channel = b"{failover-all}-sharded".to_vec();
 
-        let slot = ferriskey::valkey::cluster_topology::get_slot(&exact_channel);
+        let slot = ferriskey::cluster::topology::get_slot(&exact_channel);
 
         let primary = topology
             .find_slot_owner(slot)

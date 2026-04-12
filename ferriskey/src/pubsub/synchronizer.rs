@@ -443,7 +443,7 @@ impl ValkeyPubSubSynchronizer {
         // Group channels by slot
         let channels_by_slot: HashMap<u16, HashSet<_>> =
             channels.into_iter().fold(HashMap::new(), |mut acc, chan| {
-                let slot = crate::valkey::cluster_topology::get_slot(&chan);
+                let slot = crate::cluster::topology::get_slot(&chan);
                 acc.entry(slot).or_default().insert(chan);
                 acc
             });
@@ -856,7 +856,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
                     let mut migrated_channels: HashSet<PubSubChannelOrPattern> = HashSet::new();
 
                     channels.retain(|channel| {
-                        let slot = crate::valkey::cluster_topology::get_slot(channel);
+                        let slot = crate::cluster::topology::get_slot(channel);
 
                         match new_slot_map.shard_addrs_for_slot(slot) {
                             Some(shard_addrs) => {

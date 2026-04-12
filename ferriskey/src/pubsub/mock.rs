@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::client::ClientWrapper;
-use crate::valkey::cluster_routing::Routable;
+use crate::cluster::routing::Routable;
 use crate::valkey::{Cmd, ErrorKind, PushInfo, PushKind, ValkeyError, ValkeyResult, Value};
 use crate::valkey::{
     PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind, PubSubSynchronizer,

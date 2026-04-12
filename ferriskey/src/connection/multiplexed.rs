@@ -3,11 +3,11 @@ use crate::connection::DisconnectNotifier;
 use crate::connection::factory::FerrisKeyConnectionOptions;
 use crate::connection::runtime;
 use crate::connection::setup_connection;
-use crate::valkey::cmd::Cmd;
-use crate::valkey::parser::ValueCodec;
-use crate::valkey::pipeline::PipelineRetryStrategy;
-use crate::valkey::push_manager::PushManager;
-use crate::valkey::types::{ValkeyError, ValkeyResult, Value};
+use crate::cmd::Cmd;
+use crate::protocol::parser::ValueCodec;
+use crate::pipeline::PipelineRetryStrategy;
+use crate::pubsub::push_manager::PushManager;
+use crate::value::{ValkeyError, ValkeyResult, Value};
 use crate::valkey::{ConnectionInfo, ProtocolVersion, PushKind, cmd};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},

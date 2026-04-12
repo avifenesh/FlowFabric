@@ -2,25 +2,26 @@
 
 #![allow(dead_code)]
 use crate::constants::{HOSTNAME_TLS, IP_ADDRESS_V4, IP_ADDRESS_V6};
-use futures::Future;
+use ferriskey::cluster::routing::{MultipleNodeRoutingInfo, RoutingInfo};
+use ferriskey::connection::factory::FerrisKeyConnectionOptions;
 use ferriskey::{
-    client::{Client, StandaloneClient},
-    client::types::{
-        AuthenticationInfo, ConnectionRequest, ConnectionRetryStrategy,
-        NodeAddress, ReadFrom, TlsMode,
-    },
+    ConnectionAddr, ConnectionInfo, ProtocolVersion, PushInfo, ValkeyConnectionInfo, ValkeyResult,
+    Value,
 };
+use ferriskey::{
+    client::types::{
+        AuthenticationInfo, ConnectionRequest, ConnectionRetryStrategy, NodeAddress, ReadFrom,
+        TlsMode,
+    },
+    client::{Client, StandaloneClient},
+};
+use futures::Future;
 use once_cell::sync::Lazy;
 use rand::{Rng, distr::Alphanumeric};
-use ferriskey::valkey::{
-    ConnectionAddr, FerrisKeyConnectionOptions, ProtocolVersion, PushInfo, ValkeyConnectionInfo,
-    ValkeyResult, Value,
-    cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
-};
 use socket2::{Domain, Socket, Type};
 use std::{
-    env, fs, io, net::SocketAddr, net::TcpListener, path::PathBuf, process,
-    sync::Mutex, time::Duration,
+    env, fs, io, net::SocketAddr, net::TcpListener, path::PathBuf, process, sync::Mutex,
+    time::Duration,
 };
 use tokio::sync::mpsc;
 use versions::Versioning;
@@ -85,7 +86,7 @@ fn clean_shared_clusters() {
 pub struct ValkeyServer {
     pub process: process::Child,
     tempdir: Option<tempfile::TempDir>,
-    addr: ferriskey::valkey::ConnectionAddr,
+    addr: ferriskey::ConnectionAddr,
 }
 
 pub enum Module {
@@ -99,8 +100,7 @@ pub fn get_available_port() -> u16 {
 
         let addr4 = format!("{}:{}", IP_ADDRESS_V4, port)
             .parse::<SocketAddr>()
-            .unwrap()
-            ;
+            .unwrap();
 
         let sock4 = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         if sock4.bind(&socket2::SockAddr::from(addr4)).is_err() {
@@ -109,8 +109,7 @@ pub fn get_available_port() -> u16 {
 
         let addr6 = format!("[{}]:{}", IP_ADDRESS_V6, port)
             .parse::<SocketAddr>()
-            .unwrap()
-            ;
+            .unwrap();
 
         let sock6 = Socket::new(Domain::IPV6, Type::STREAM, None).unwrap();
         sock6.set_only_v6(true).unwrap();
@@ -128,8 +127,7 @@ pub fn get_listener_on_available_port() -> TcpListener {
     let port = get_available_port();
     let addr = &format!("{}:{}", IP_ADDRESS_V4, port)
         .parse::<SocketAddr>()
-        .unwrap()
-        ;
+        .unwrap();
 
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.set_reuse_address(true).unwrap();
@@ -149,20 +147,20 @@ impl ValkeyServer {
             ServerType::Tcp { tls } => {
                 let valkey_port = get_available_port();
                 if tls {
-                    ferriskey::valkey::ConnectionAddr::TcpTls {
+                    ferriskey::ConnectionAddr::TcpTls {
                         host: IP_ADDRESS_V4.to_string(),
                         port: valkey_port,
                         insecure: true,
                         tls_params: None,
                     }
                 } else {
-                    ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), valkey_port)
+                    ferriskey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), valkey_port)
                 }
             }
             ServerType::Unix => {
                 let (a, b) = rand::random::<(u64, u64)>();
                 let path = format!("/tmp/redis-rs-test-{a}-{b}.sock");
-                ferriskey::valkey::ConnectionAddr::Unix(PathBuf::from(&path))
+                ferriskey::ConnectionAddr::Unix(PathBuf::from(&path))
             }
         };
         ValkeyServer::new_with_addr_and_modules(addr, modules)
@@ -171,14 +169,14 @@ impl ValkeyServer {
     pub fn new_with_tls(use_tls: bool, tls_paths: Option<TlsFilePaths>) -> ValkeyServer {
         let valkey_port = get_available_port();
         let addr = if use_tls {
-            ferriskey::valkey::ConnectionAddr::TcpTls {
+            ferriskey::ConnectionAddr::TcpTls {
                 host: IP_ADDRESS_V4.to_string(),
                 port: valkey_port,
                 insecure: true,
                 tls_params: None,
             }
         } else {
-            ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), valkey_port)
+            ferriskey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), valkey_port)
         };
 
         ValkeyServer::new_with_addr_tls_modules_and_spawner(addr, tls_paths, &[], false, |cmd| {
@@ -188,7 +186,7 @@ impl ValkeyServer {
     }
 
     pub fn new_with_addr_and_modules(
-        addr: ferriskey::valkey::ConnectionAddr,
+        addr: ferriskey::ConnectionAddr,
         modules: &[Module],
     ) -> ValkeyServer {
         ValkeyServer::new_with_addr_tls_modules_and_spawner(addr, None, modules, false, |cmd| {
@@ -200,14 +198,18 @@ impl ValkeyServer {
     pub fn new_with_addr_tls_modules_and_spawner<
         F: FnOnce(&mut process::Command) -> process::Child,
     >(
-        addr: ferriskey::valkey::ConnectionAddr,
+        addr: ferriskey::ConnectionAddr,
         tls_paths: Option<TlsFilePaths>,
         modules: &[Module],
         tls_auth_clients: bool,
         spawner: F,
     ) -> ValkeyServer {
         let mut valkey_cmd = process::Command::new("valkey-server");
-        valkey_cmd.arg("--save").arg("").arg("--appendonly").arg("no");
+        valkey_cmd
+            .arg("--save")
+            .arg("")
+            .arg("--appendonly")
+            .arg("no");
 
         for module in modules {
             match module {
@@ -215,8 +217,8 @@ impl ValkeyServer {
                     valkey_cmd
                         .arg("--loadmodule")
                         .arg(env::var("VALKEY_JSON_PATH").expect(
-                        "Unable to find path to RedisJSON at VALKEY_JSON_PATH, is it set?",
-                    ));
+                            "Unable to find path to RedisJSON at VALKEY_JSON_PATH, is it set?",
+                        ));
                 }
             };
         }
@@ -229,7 +231,7 @@ impl ValkeyServer {
             .tempdir()
             .expect("failed to create tempdir");
         match addr {
-            ferriskey::valkey::ConnectionAddr::Tcp(ref bind, server_port) => {
+            ferriskey::ConnectionAddr::Tcp(ref bind, server_port) => {
                 valkey_cmd
                     .arg("--port")
                     .arg(server_port.to_string())
@@ -242,7 +244,7 @@ impl ValkeyServer {
                     addr,
                 }
             }
-            ferriskey::valkey::ConnectionAddr::TcpTls { ref host, port, .. } => {
+            ferriskey::ConnectionAddr::TcpTls { ref host, port, .. } => {
                 let tls_paths = tls_paths.unwrap_or_else(|| build_tls_file_paths(&tempdir));
                 let tls_auth_clients_arg_value = match tls_auth_clients {
                     true => "yes",
@@ -266,7 +268,7 @@ impl ValkeyServer {
                     .arg("--bind")
                     .arg(host);
 
-                let addr = ferriskey::valkey::ConnectionAddr::TcpTls {
+                let addr = ferriskey::ConnectionAddr::TcpTls {
                     host: host.clone(),
                     port,
                     insecure: true,
@@ -279,7 +281,7 @@ impl ValkeyServer {
                     addr,
                 }
             }
-            ferriskey::valkey::ConnectionAddr::Unix(ref path) => {
+            ferriskey::ConnectionAddr::Unix(ref path) => {
                 valkey_cmd
                     .arg("--port")
                     .arg("0")
@@ -294,12 +296,12 @@ impl ValkeyServer {
         }
     }
 
-    pub fn get_client_addr(&self) -> ferriskey::valkey::ConnectionAddr {
+    pub fn get_client_addr(&self) -> ferriskey::ConnectionAddr {
         self.addr.clone()
     }
 
-    pub fn connection_info(&self) -> ferriskey::valkey::ConnectionInfo {
-        ferriskey::valkey::ConnectionInfo {
+    pub fn connection_info(&self) -> ferriskey::ConnectionInfo {
+        ferriskey::ConnectionInfo {
             addr: self.get_client_addr(),
             valkey: Default::default(),
         }
@@ -308,7 +310,7 @@ impl ValkeyServer {
     pub fn stop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
-        if let ferriskey::valkey::ConnectionAddr::Unix(ref path) = self.get_client_addr() {
+        if let ferriskey::ConnectionAddr::Unix(ref path) = self.get_client_addr() {
             fs::remove_file(path).ok();
         }
     }
@@ -532,7 +534,7 @@ impl TlsFilePaths {
 pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
     let millisecond = Duration::from_millis(1);
     let mut retries = 0;
-    let client = ferriskey::valkey::Client::open(ferriskey::valkey::ConnectionInfo {
+    let client = ferriskey::connection::factory::Client::open(ferriskey::ConnectionInfo {
         addr: server_address.clone(),
         valkey: ValkeyConnectionInfo::default(),
     })
@@ -554,10 +556,16 @@ pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
                 }
             }
             Ok(mut con) => {
-                while con.send_packed_command(&ferriskey::valkey::cmd("PING")).await.is_err() {
+                while con
+                    .send_packed_command(&ferriskey::cmd("PING"))
+                    .await
+                    .is_err()
+                {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                let _: ValkeyResult<()> = ferriskey::valkey::cmd("FLUSHDB").query_async(&mut con).await;
+                let _: ValkeyResult<()> = ferriskey::cmd("FLUSHDB")
+                    .query_async(&mut con)
+                    .await;
                 break;
             }
         }
@@ -601,7 +609,7 @@ pub fn generate_random_string(length: usize) -> String {
 }
 
 pub async fn send_get(client: &mut Client, key: &str) -> ValkeyResult<Value> {
-    let mut get_command = ferriskey::valkey::Cmd::new();
+    let mut get_command = ferriskey::Cmd::new();
     get_command.arg("GET").arg(key);
     client.send_command(&mut get_command, None).await
 }
@@ -610,10 +618,10 @@ pub async fn send_set_and_get(mut client: Client, key: String) {
     const VALUE_LENGTH: usize = 10;
     let value = generate_random_string(VALUE_LENGTH);
 
-    let mut set_command = ferriskey::valkey::Cmd::new();
+    let mut set_command = ferriskey::Cmd::new();
     set_command.arg("SET").arg(key.as_str()).arg(value.clone());
     let set_result = client.send_command(&mut set_command, None).await.unwrap();
-    let mut get_command = ferriskey::valkey::Cmd::new();
+    let mut get_command = ferriskey::Cmd::new();
     get_command.arg("GET").arg(key);
     let get_result = client.send_command(&mut get_command, None).await.unwrap();
 
@@ -653,7 +661,7 @@ where
 }
 
 pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &ValkeyConnectionInfo) {
-    let client = ferriskey::valkey::Client::open(ferriskey::valkey::ConnectionInfo {
+    let client = ferriskey::connection::factory::Client::open(ferriskey::ConnectionInfo {
         addr: addr.clone(),
         valkey: ValkeyConnectionInfo::default(),
     })
@@ -671,7 +679,7 @@ pub async fn setup_acl(addr: &ConnectionAddr, connection_info: &ValkeyConnection
         .username
         .clone()
         .unwrap_or_else(|| "default".to_string());
-    let mut cmd = ferriskey::valkey::cmd("ACL");
+    let mut cmd = ferriskey::cmd("ACL");
     cmd.arg("SETUSER")
         .arg(username)
         .arg("on")
@@ -716,12 +724,14 @@ pub fn create_connection_request(
         cluster_mode_enabled: ClusterMode::Enabled == configuration.cluster_mode,
         request_timeout: configuration.request_timeout,
         read_from: configuration.read_from.clone(),
-        connection_retry_strategy: configuration.connection_retry_strategy.or(Some(ConnectionRetryStrategy {
-            number_of_retries: 5,
-            factor: 100,
-            exponent_base: 2,
-            jitter_percent: Some(20),
-        })),
+        connection_retry_strategy: configuration.connection_retry_strategy.or(Some(
+            ConnectionRetryStrategy {
+                number_of_retries: 5,
+                factor: 100,
+                exponent_base: 2,
+                jitter_percent: Some(20),
+            },
+        )),
         authentication_info: auth,
         client_name: configuration.client_name.clone(),
         protocol: Some(configuration.protocol),
@@ -771,10 +781,9 @@ pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration
     connection_request.cluster_mode_enabled = false;
     connection_request.protocol = Some(configuration.protocol);
     let (push_sender, push_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let client =
-        StandaloneClient::create_client(connection_request, Some(push_sender), None, None)
-            .await
-            .unwrap();
+    let client = StandaloneClient::create_client(connection_request, Some(push_sender), None, None)
+        .await
+        .unwrap();
 
     TestBasics {
         server,
@@ -803,7 +812,7 @@ fn init() {
 }
 
 pub async fn kill_connection(client: &mut impl ferriskey::client::ValkeyClientForTests) {
-    let mut client_kill_cmd = ferriskey::valkey::cmd("CLIENT");
+    let mut client_kill_cmd = ferriskey::cmd("CLIENT");
     client_kill_cmd.arg("KILL").arg("SKIPME").arg("NO");
 
     let _ = client
@@ -811,7 +820,7 @@ pub async fn kill_connection(client: &mut impl ferriskey::client::ValkeyClientFo
             &mut client_kill_cmd,
             Some(RoutingInfo::MultiNode((
                 MultipleNodeRoutingInfo::AllNodes,
-                Some(ferriskey::valkey::cluster_routing::ResponsePolicy::AllSucceeded),
+                Some(ferriskey::cluster::routing::ResponsePolicy::AllSucceeded),
             ))),
         )
         .await
@@ -822,7 +831,7 @@ pub async fn kill_connection_for_route(
     client: &mut impl ferriskey::client::ValkeyClientForTests,
     route: RoutingInfo,
 ) {
-    let mut client_kill_cmd = ferriskey::valkey::cmd("CLIENT");
+    let mut client_kill_cmd = ferriskey::cmd("CLIENT");
     client_kill_cmd.arg("KILL").arg("SKIPME").arg("NO");
 
     let _ = client
@@ -840,7 +849,7 @@ pub enum BackingServer {
 pub async fn get_server_version(
     client: &mut impl ferriskey::client::ValkeyClientForTests,
 ) -> (u16, u16, u16) {
-    let mut info_cmd = ferriskey::valkey::cmd("INFO");
+    let mut info_cmd = ferriskey::cmd("INFO");
     info_cmd.arg("SERVER");
 
     let info_result = client.send_command(&mut info_cmd, None).await.unwrap();
@@ -919,7 +928,7 @@ pub fn extract_client_id(client_info: &str) -> Option<String> {
 
 /// Assert that a client is connected by sending a PING command
 pub async fn assert_connected(client: &mut impl ferriskey::client::ValkeyClientForTests) {
-    let mut ping_cmd = ferriskey::valkey::cmd("PING");
+    let mut ping_cmd = ferriskey::cmd("PING");
     let ping_result = client.send_command(&mut ping_cmd, None).await;
     assert_eq!(
         ping_result.unwrap(),

@@ -17,13 +17,13 @@
 //   BENCH_RUNS           runs per permutation for median (default: 3)
 //   BENCH_CPUS           CPUs to pin tokio workers to (default: 4-15)
 
-use ferriskey::valkey::{
-    ConnectionAddr, ConnectionInfo, Pipeline, ValkeyConnectionInfo, ValkeyResult, Value,
-    aio::ConnectionLike,
-    cluster::ClusterClientBuilder,
-    cluster_async::ClusterConnection,
-    cmd,
+use ferriskey::{
+    cmd, ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo, ValkeyResult, Value,
 };
+use ferriskey::connection::ConnectionLike;
+use ferriskey::cluster::compat::ClusterClientBuilder;
+use ferriskey::cluster::ClusterConnection;
+use ferriskey::pipeline::Pipeline;
 use hdrhistogram::Histogram;
 use serde_json::json;
 use std::env;
@@ -722,7 +722,7 @@ fn main() {
     let conn: ClusterConnection = runtime.block_on(async {
         let mut builder = ClusterClientBuilder::new(vec![info]);
         if cfg.tls {
-            builder = builder.tls(ferriskey::valkey::cluster::TlsMode::Insecure);
+            builder = builder.tls(ferriskey::cluster::compat::TlsMode::Insecure);
         }
         let client = builder.build()
             .expect("Failed to build cluster client");

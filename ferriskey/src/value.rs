@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicIsize, Ordering},
 };
 
-use crate::valkey::cluster_routing::Redirect;
+use crate::cluster::routing::Redirect;
 use num_bigint::BigInt;
 pub(crate) use std::collections::{HashMap, HashSet};
 use std::ops::Deref;

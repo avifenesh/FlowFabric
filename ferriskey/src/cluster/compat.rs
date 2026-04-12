@@ -4,13 +4,13 @@
 //! cluster connections used by the async cluster module.
 
 pub use crate::cluster::client::{ClusterClient, ClusterClientBuilder};
-use crate::valkey::cmd::Cmd;
-use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo};
-use crate::valkey::tls::TlsConnParams;
-use crate::valkey::types::{ErrorKind, ValkeyResult};
+use crate::cmd::Cmd;
+use crate::connection::info::{ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo};
+use crate::connection::tls::TlsConnParams;
+use crate::value::{ErrorKind, ValkeyResult};
 use std::str::FromStr;
 
-pub use crate::valkey::connection::TlsMode;
+pub use crate::connection::info::TlsMode;
 
 pub(crate) fn get_connection_info(
     node: &str,

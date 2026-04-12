@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::valkey::ProtocolVersion;
-use crate::valkey::pipeline::Pipeline;
-use crate::valkey::types::{ErrorKind, ValkeyError, ValkeyResult};
+use crate::pipeline::Pipeline;
+use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
 
 use crate::connection::tls::TlsConnParams;
 

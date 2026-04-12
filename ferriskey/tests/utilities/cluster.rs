@@ -1,8 +1,8 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{ClusterMode, TestConfiguration, create_connection_request};
-use futures::FutureExt;
-use futures::future::{BoxFuture, join_all};
+#[cfg(not(feature = "mock-pubsub"))]
+use ferriskey::PubSubSubscriptionKind;
 use ferriskey::client::Client;
 #[cfg(not(feature = "mock-pubsub"))]
 use ferriskey::client::ClientWrapper;
@@ -10,15 +10,13 @@ use ferriskey::client::ClientWrapper;
 use ferriskey::pubsub::synchronizer::ValkeyPubSubSynchronizer;
 #[cfg(not(feature = "mock-pubsub"))]
 use ferriskey::pubsub::{PubSubSubscriptionInfo, PubSubSynchronizer, create_pubsub_synchronizer};
+use ferriskey::Value;
+use ferriskey::cluster::ClusterConnection;
+use ferriskey::cluster::routing::{RoutingInfo, SingleNodeRoutingInfo};
+use ferriskey::{ConnectionAddr, ValkeyConnectionInfo};
+use futures::FutureExt;
+use futures::future::{BoxFuture, join_all};
 use once_cell::sync::Lazy;
-#[cfg(not(feature = "mock-pubsub"))]
-use ferriskey::valkey::PubSubSubscriptionKind;
-use ferriskey::valkey::{ConnectionAddr, ValkeyConnectionInfo};
-use ferriskey::valkey::{
-    Value,
-    cluster_async::ClusterConnection,
-    cluster_routing::{RoutingInfo, SingleNodeRoutingInfo},
-};
 use serde::Deserialize;
 #[cfg(not(feature = "mock-pubsub"))]
 use std::collections::HashMap;
@@ -52,16 +50,16 @@ struct ValkeyServerInfo {
 }
 
 impl ClusterType {
-    fn build_addr(use_tls: bool, host: &str, port: u16) -> ferriskey::valkey::ConnectionAddr {
+    fn build_addr(use_tls: bool, host: &str, port: u16) -> ferriskey::ConnectionAddr {
         if use_tls {
-            ferriskey::valkey::ConnectionAddr::TcpTls {
+            ferriskey::ConnectionAddr::TcpTls {
                 host: host.to_string(),
                 port,
                 insecure: true,
                 tls_params: None,
             }
         } else {
-            ferriskey::valkey::ConnectionAddr::Tcp(host.to_string(), port)
+            ferriskey::ConnectionAddr::Tcp(host.to_string(), port)
         }
     }
 }
@@ -469,15 +467,15 @@ impl PubSubTestSetup {
         )
         .await;
 
-        let initial_nodes: Vec<ferriskey::valkey::ConnectionInfo> = addresses
+        let initial_nodes: Vec<ferriskey::ConnectionInfo> = addresses
             .iter()
-            .map(|addr| ferriskey::valkey::ConnectionInfo {
+            .map(|addr| ferriskey::ConnectionInfo {
                 addr: addr.clone(),
                 valkey: ValkeyConnectionInfo::default(),
             })
             .collect();
 
-        let client = ferriskey::valkey::cluster::ClusterClientBuilder::new(initial_nodes)
+        let client = ferriskey::cluster::compat::ClusterClientBuilder::new(initial_nodes)
             .slots_refresh_rate_limit(Duration::from_millis(0), 0)
             .periodic_topology_checks(Duration::from_millis(500))
             .build()
@@ -564,7 +562,7 @@ impl ClusterTopology {
     pub async fn from_connection(connection: &mut ClusterConnection) -> Self {
         let nodes_output = connection
             .route_command(
-                ferriskey::valkey::cmd("CLUSTER").arg("NODES"),
+                ferriskey::cmd("CLUSTER").arg("NODES"),
                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
             )
             .await
@@ -682,7 +680,7 @@ pub async fn migrate_slot(
     all_node_addresses: &[(String, u16)],
 ) {
     for (host, port) in all_node_addresses {
-        let mut cmd = ferriskey::valkey::cmd("CLUSTER");
+        let mut cmd = ferriskey::cmd("CLUSTER");
         cmd.arg("SETSLOT").arg(slot).arg("NODE").arg(to_node_id);
 
         let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
@@ -800,7 +798,7 @@ pub async fn trigger_failover(
     connection: &mut ClusterConnection,
     replica: &ClusterNodeInfo,
 ) -> bool {
-    let cmd = ferriskey::valkey::cmd("CLUSTER").arg("FAILOVER").to_owned();
+    let cmd = ferriskey::cmd("CLUSTER").arg("FAILOVER").to_owned();
 
     let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
         host: replica.host.clone(),
@@ -901,7 +899,7 @@ pub fn generate_test_subscriptions_different_slots(
             format!("{{{}-{}}}-channel", prefix, i)
         };
         let bytes = name.into_bytes();
-        let slot = ferriskey::valkey::cluster_topology::get_slot(&bytes);
+        let slot = ferriskey::cluster::topology::get_slot(&bytes);
 
         if !used_slots.contains(&slot) {
             used_slots.insert(slot);

@@ -2,20 +2,20 @@ use crate::cluster::slotmap::ReadFromReplicaStrategy;
 use crate::cluster::topology::{
     DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI, DEFAULT_SLOTS_REFRESH_WAIT_DURATION,
 };
-use crate::valkey::connection::TlsMode;
-use crate::valkey::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
-use crate::valkey::types::{ErrorKind, ProtocolVersion, ValkeyError, ValkeyResult};
+use crate::connection::info::TlsMode;
+use crate::connection::info::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
+use crate::value::{ErrorKind, ProtocolVersion, ValkeyError, ValkeyResult};
 use crate::valkey::{PushInfo, RetryStrategy};
 use rand::Rng;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::valkey::tls::TlsConnParams;
+use crate::connection::tls::TlsConnParams;
 
 use crate::cluster;
 
-use crate::valkey::tls::{TlsCertificates, retrieve_tls_certificates};
+use crate::connection::tls::{TlsCertificates, retrieve_tls_certificates};
 
 use tokio::sync::mpsc;
 
@@ -590,9 +590,9 @@ impl ClusterClient {
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<
-            Arc<dyn crate::valkey::pubsub_synchronizer::PubSubSynchronizer>,
+            Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>,
         >,
-        iam_token_provider: Option<Arc<dyn crate::valkey::client::IAMTokenProvider>>,
+        iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>>,
     ) -> ValkeyResult<cluster::ClusterConnection> {
         cluster::ClusterConnection::new(
             &self.initial_nodes,
@@ -609,7 +609,7 @@ impl ClusterClient {
         &self,
     ) -> ValkeyResult<cluster::ClusterConnection<C>>
     where
-        C: crate::valkey::aio::ConnectionLike
+        C: crate::connection::ConnectionLike
             + cluster::Connect
             + Clone
             + Send

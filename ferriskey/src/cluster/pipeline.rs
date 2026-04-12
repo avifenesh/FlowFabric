@@ -8,8 +8,8 @@ use crate::cluster::routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, SingleNodeRoutingInfo, command_for_multi_slot_indices,
 };
 use crate::valkey::Pipeline;
-use crate::valkey::aio::ConnectionLike;
-use crate::valkey::types::{RetryMethod, ServerError};
+use crate::connection::ConnectionLike;
+use crate::value::{RetryMethod, ServerError};
 use crate::valkey::{Cmd, ErrorKind, ValkeyError};
 use crate::valkey::{ValkeyResult, Value};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
@@ -104,7 +104,7 @@ fn add_command_to_node_pipeline_map<C>(
         }
     }
     if add_asking {
-        let asking_cmd = Arc::new(crate::valkey::cmd::cmd("ASKING"));
+        let asking_cmd = Arc::new(crate::cmd::cmd("ASKING"));
         pipeline_map
             .entry(address.clone())
             .or_insert_with(|| NodePipelineContext::new(connection.clone()))

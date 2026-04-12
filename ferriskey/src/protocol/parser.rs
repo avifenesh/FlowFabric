@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use crate::valkey::types::{
+use crate::value::{
     ErrorKind, PushKind, ServerError, ServerErrorKind, ValkeyError, ValkeyResult, Value,
     VerbatimFormat,
 };
@@ -670,7 +670,7 @@ pub fn parse_valkey_value(bytes: &[u8]) -> ValkeyResult<Value> {
 
 #[cfg(test)]
 mod tests {
-    use crate::valkey::types::make_extension_error;
+    use crate::value::make_extension_error;
 
     use super::*;
 

@@ -1,6 +1,6 @@
 use std::{io, time::Duration};
 
-use crate::valkey::types::ValkeyError;
+use crate::value::ValkeyError;
 use futures_util::Future;
 
 pub(crate) async fn timeout<F: Future>(

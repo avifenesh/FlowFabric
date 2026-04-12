@@ -11,17 +11,17 @@ pub use crate::pubsub::push_manager::{PushInfo, PushManager};
 pub use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 pub(crate) use crate::retry_strategies;
 pub use crate::retry_strategies::RetryStrategy;
-pub use crate::valkey::cmd::{Arg, Cmd, cmd, fenced_cmd, pack_command, pipe};
-pub use crate::valkey::connection::{
+pub use crate::cmd::{Arg, Cmd, cmd, fenced_cmd, pack_command, pipe};
+pub use crate::connection::info::{
     ConnectionAddr, ConnectionInfo, IntoConnectionInfo, PubSubChannelOrPattern,
     PubSubSubscriptionInfo, PubSubSubscriptionKind, TlsMode, ValkeyConnectionInfo, parse_redis_url,
 };
-pub use crate::valkey::parser::{Parser, parse_valkey_value};
-pub use crate::valkey::pipeline::{Pipeline, PipelineRetryStrategy};
+pub use crate::protocol::parser::{Parser, parse_valkey_value};
+pub use crate::pipeline::{Pipeline, PipelineRetryStrategy};
 
 // preserve grouping and order
 #[rustfmt::skip]
-pub use crate::valkey::types::{
+pub use crate::value::{
     // utility functions
     from_valkey_value,
     from_owned_valkey_value,
@@ -55,7 +55,9 @@ pub use crate::valkey::types::{
     InflightRequestTracker,
 };
 
-pub use crate::valkey::{cmd::AsyncIter, parser::parse_valkey_value_async, types::ValkeyFuture};
+pub use crate::cmd::AsyncIter;
+pub use crate::protocol::parser::parse_valkey_value_async;
+pub use crate::value::ValkeyFuture;
 
 pub(crate) use crate::pipeline;
 
@@ -80,7 +82,6 @@ pub use crate::connection::tls::{
     ClientTlsConfig, TlsCertificates, TlsConnParams, retrieve_tls_certificates,
 };
 
-pub(crate) use crate::cmd;
 pub(crate) use crate::connection::factory as client;
 pub(crate) use crate::connection::info as connection;
 pub(crate) use crate::protocol::parser;

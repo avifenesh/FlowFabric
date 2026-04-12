@@ -2,8 +2,8 @@
 
 use telemetrylib::FerrisKeySpan;
 
-use crate::valkey::cmd::{Cmd, cmd, cmd_len};
-use crate::valkey::types::{
+use crate::cmd::{Cmd, cmd, cmd_len};
+use crate::value::{
     ErrorKind, FromValkeyValue, HashSet, ToValkeyArgs, ValkeyResult, Value, from_owned_valkey_value,
 };
 use std::sync::Arc;
@@ -98,7 +98,7 @@ impl Pipeline {
 
     async fn execute_pipelined_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
     where
-        C: crate::valkey::aio::ConnectionLike,
+        C: crate::connection::ConnectionLike,
     {
         let value = con
             .req_packed_commands(self, 0, self.commands.len(), None)
@@ -108,7 +108,7 @@ impl Pipeline {
 
     async fn execute_transaction_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
     where
-        C: crate::valkey::aio::ConnectionLike,
+        C: crate::connection::ConnectionLike,
     {
         let mut resp = con
             .req_packed_commands(self, self.commands.len() + 1, 1, None)
@@ -128,7 +128,7 @@ impl Pipeline {
     #[inline]
     pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
     where
-        C: crate::valkey::aio::ConnectionLike,
+        C: crate::connection::ConnectionLike,
     {
         let v = if self.commands.is_empty() {
             return from_owned_valkey_value(Value::Array(vec![]));

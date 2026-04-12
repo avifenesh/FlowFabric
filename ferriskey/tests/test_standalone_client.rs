@@ -12,13 +12,13 @@ mod standalone_client_tests {
         client::{Client as FerrisKeyClient, ConnectionError, StandaloneClient},
         client::types::ReadFrom,
     };
-    use ferriskey::valkey::{FromValkeyValue, Value};
+    use ferriskey::{FromValkeyValue, Value};
     use rstest::rstest;
     use std::collections::HashMap;
     use utilities::*;
 
     async fn get_connected_clients(client: &mut StandaloneClient) -> usize {
-        let mut cmd = ferriskey::valkey::Cmd::new();
+        let mut cmd = ferriskey::Cmd::new();
         cmd.arg("CLIENT").arg("LIST");
         let result: Value = client.send_command(&cmd).await.expect("CLIENT LIST failed");
         match result {
@@ -64,7 +64,7 @@ mod standalone_client_tests {
             )
             .await;
 
-            let mut get_command = ferriskey::valkey::Cmd::new();
+            let mut get_command = ferriskey::Cmd::new();
             get_command
                 .arg("GET")
                 .arg("test_detect_disconnect_and_reconnect_using_heartbeat");
@@ -89,11 +89,11 @@ mod standalone_client_tests {
 
             let mut monitoring_client = setup_test_basics_internal(&shared_config).await;
 
-            let mut info_clients_cmd = ferriskey::valkey::Cmd::new();
+            let mut info_clients_cmd = ferriskey::Cmd::new();
             info_clients_cmd.arg("INFO").arg("CLIENTS");
 
             // validate 2 connected clients
-            let info_clients: String = ferriskey::valkey::from_owned_valkey_value(
+            let info_clients: String = ferriskey::from_owned_valkey_value(
                 monitoring_client
                     .client
                     .send_command(&info_clients_cmd)
@@ -110,7 +110,7 @@ mod standalone_client_tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             // validate 2 connected clients
-            let info_clients: String = ferriskey::valkey::from_owned_valkey_value(
+            let info_clients: String = ferriskey::from_owned_valkey_value(
                 monitoring_client
                     .client
                     .send_command(&info_clients_cmd)
@@ -125,7 +125,7 @@ mod standalone_client_tests {
         });
     }
 
-    fn get_mock_addresses(mocks: &[ServerMock]) -> Vec<ferriskey::valkey::ConnectionAddr> {
+    fn get_mock_addresses(mocks: &[ServerMock]) -> Vec<ferriskey::ConnectionAddr> {
         mocks.iter().flat_map(|mock| mock.get_addresses()).collect()
     }
 
@@ -240,7 +240,7 @@ mod standalone_client_tests {
         let mut servers = create_primary_mock_with_replicas(
             config.number_of_initial_replicas - config.number_of_missing_replicas,
         );
-        let mut cmd = ferriskey::valkey::cmd("GET");
+        let mut cmd = ferriskey::cmd("GET");
         cmd.arg("foo");
 
         for server in servers.iter() {
@@ -251,7 +251,7 @@ mod standalone_client_tests {
 
         let mut addresses = get_mock_addresses(&servers);
         for i in 4 - config.number_of_missing_replicas..4 {
-            addresses.push(ferriskey::valkey::ConnectionAddr::Tcp(
+            addresses.push(ferriskey::ConnectionAddr::Tcp(
                 "192.0.2.1".to_string(), // Use non-routable IP for fast connection failure
                 6379 + i as u16,
             ));
@@ -432,7 +432,7 @@ mod standalone_client_tests {
     #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
     fn test_send_acl_request_to_all_nodes() {
         let mocks = create_primary_mock_with_replicas(2);
-        let mut cmd = ferriskey::valkey::cmd("ACL");
+        let mut cmd = ferriskey::cmd("ACL");
         cmd.arg("SETUSER").arg("foo");
 
         for mock in mocks.iter() {
@@ -441,7 +441,7 @@ mod standalone_client_tests {
             }
         }
 
-        let addresses: Vec<ferriskey::valkey::ConnectionAddr> =
+        let addresses: Vec<ferriskey::ConnectionAddr> =
             mocks.iter().flat_map(|mock| mock.get_addresses()).collect();
 
         let connection_request =
@@ -475,7 +475,7 @@ mod standalone_client_tests {
     ///    - Succeeds with a new client ID (indicating reconnection) and verifies still on db=4
     /// This ensures that database selection persists across reconnections.
     fn test_set_database_id_after_reconnection() {
-        let mut client_info_cmd = ferriskey::valkey::Cmd::new();
+        let mut client_info_cmd = ferriskey::Cmd::new();
         client_info_cmd.arg("CLIENT").arg("INFO");
         block_on_all(async move {
             let test_basics = setup_test_basics_internal(&TestConfiguration {
@@ -505,7 +505,7 @@ mod standalone_client_tests {
                     assert!(
                         err.is_connection_dropped()
                             || err.is_timeout()
-                            || err.kind() == ferriskey::valkey::ErrorKind::AllConnectionsUnavailable,
+                            || err.kind() == ferriskey::ErrorKind::AllConnectionsUnavailable,
                         "Expected connection dropped, timeout, or unavailable error, got: {err:?}",
                     );
                     let client_info = retry(|| async {
@@ -538,7 +538,7 @@ mod standalone_client_tests {
     #[serial_test::serial]
     #[timeout(LONG_STANDALONE_TEST_TIMEOUT)]
     fn test_lazy_connection_establishes_on_first_command(
-        #[values(ferriskey::valkey::ProtocolVersion::RESP2, ferriskey::valkey::ProtocolVersion::RESP3)] protocol: ferriskey::valkey::ProtocolVersion,
+        #[values(ferriskey::ProtocolVersion::RESP2, ferriskey::ProtocolVersion::RESP3)] protocol: ferriskey::ProtocolVersion,
     ) {
         block_on_all(async move {
             const USE_TLS: bool = false;
@@ -732,7 +732,7 @@ mod standalone_client_tests {
     #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
     fn test_tls_connection_fails_with_invalid_cert_bytes() {
         block_on_all(async move {
-            let server_addr = ferriskey::valkey::ConnectionAddr::TcpTls {
+            let server_addr = ferriskey::ConnectionAddr::TcpTls {
                 host: IP_ADDRESS_V4.to_string(),
                 port: get_available_port(),
                 insecure: false,
@@ -772,7 +772,7 @@ mod standalone_client_tests {
     fn test_tls_connection_fails_with_custom_certs_and_no_tls() {
         block_on_all(async move {
             let server_addr =
-                ferriskey::valkey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), get_available_port());
+                ferriskey::ConnectionAddr::Tcp(IP_ADDRESS_V4.to_string(), get_available_port());
 
             let mut connection_request = create_connection_request(
                 &[server_addr],
@@ -860,7 +860,7 @@ mod standalone_client_tests {
             let client_key_bytes = tls_paths.read_valkey_key_as_bytes();
 
             let server = ValkeyServer::new_with_addr_tls_modules_and_spawner(
-                ferriskey::valkey::ConnectionAddr::TcpTls {
+                ferriskey::ConnectionAddr::TcpTls {
                     host: "127.0.0.1".to_string(),
                     port: get_available_port(),
                     insecure: false,
@@ -911,7 +911,7 @@ mod standalone_client_tests {
             let tls_paths = build_tls_file_paths(&tempdir);
             let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
 
-            let ip_addr = ferriskey::valkey::ConnectionAddr::TcpTls {
+            let ip_addr = ferriskey::ConnectionAddr::TcpTls {
                 host: host.to_string(),
                 port: get_available_port(),
                 insecure: false,
@@ -956,7 +956,7 @@ mod standalone_client_tests {
         #[values(IP_ADDRESS_V4, IP_ADDRESS_V6)] host: &str,
     ) {
         block_on_all(async move {
-            let ip_addr = ferriskey::valkey::ConnectionAddr::Tcp(host.to_string(), get_available_port());
+            let ip_addr = ferriskey::ConnectionAddr::Tcp(host.to_string(), get_available_port());
 
             let _server = ValkeyServer::new_with_addr_and_modules(ip_addr.clone(), &[]);
 
@@ -1038,7 +1038,7 @@ mod standalone_client_tests {
         let servers = create_primary_mock_with_replicas(0);
         let mock = &servers[0];
 
-        let mut get_cmd = ferriskey::valkey::cmd("GET");
+        let mut get_cmd = ferriskey::cmd("GET");
         get_cmd.arg("foo");
         mock.add_response(&get_cmd, "$3\r\nbar\r\n".to_string());
 
@@ -1054,7 +1054,7 @@ mod standalone_client_tests {
                     .unwrap();
 
             // Write command should be blocked before reaching the server
-            let mut set_cmd = ferriskey::valkey::cmd("SET");
+            let mut set_cmd = ferriskey::cmd("SET");
             set_cmd.arg("foo").arg("bar");
             let result = client.send_command(&set_cmd).await;
             assert!(result.is_err(), "Write command should be blocked");
@@ -1076,7 +1076,7 @@ mod standalone_client_tests {
         let servers = create_primary_mock_with_replicas(0);
         let mock = &servers[0];
 
-        let mut get_cmd = ferriskey::valkey::cmd("GET");
+        let mut get_cmd = ferriskey::cmd("GET");
         get_cmd.arg("foo");
         mock.add_response(&get_cmd, "$3\r\nbar\r\n".to_string());
 
@@ -1259,12 +1259,12 @@ mod standalone_client_tests {
         let replica_mock = &servers[1];
 
         // Add SET command response to primary
-        let mut set_cmd = ferriskey::valkey::cmd("SET");
+        let mut set_cmd = ferriskey::cmd("SET");
         set_cmd.arg("test_key").arg("test_value");
         primary_mock.add_response(&set_cmd, "+OK\r\n".to_string());
 
         // Add GET command response to replica (simulating replicated data)
-        let mut get_cmd = ferriskey::valkey::cmd("GET");
+        let mut get_cmd = ferriskey::cmd("GET");
         get_cmd.arg("test_key");
         replica_mock.add_response(&get_cmd, "$10\r\ntest_value\r\n".to_string());
 

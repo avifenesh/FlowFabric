@@ -1,7 +1,7 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+use ferriskey::{Cmd, ConnectionAddr, Value};
 use futures_intrusive::sync::ManualResetEvent;
-use ferriskey::valkey::{Cmd, ConnectionAddr, Value};
 use std::collections::HashMap;
 use std::io;
 use std::io::Read;
