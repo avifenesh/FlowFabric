@@ -1,8 +1,7 @@
 use std::io::{self, Read};
 
 use crate::value::{
-    ErrorKind, PushKind, ServerError, ServerErrorKind, ValkeyError, ValkeyResult, Value,
-    VerbatimFormat,
+    ErrorKind, PushKind, ValkeyError, ValkeyResult, Value, VerbatimFormat, make_extension_error,
 };
 
 use bytes::{Buf, BytesMut};
@@ -19,13 +18,13 @@ fn parse_err(msg: impl Into<String>) -> ValkeyError {
     ValkeyError::from((ErrorKind::ParseError, "parse error", msg.into()))
 }
 
-fn err_parser(line: &str) -> ServerError {
+fn err_parser(line: &str) -> ValkeyError {
     let mut pieces = line.splitn(2, ' ');
     let kind = match pieces.next().unwrap() {
-        "ERR" => ServerErrorKind::ResponseError,
-        "EXECABORT" => ServerErrorKind::ExecAbortError,
-        "LOADING" => ServerErrorKind::BusyLoadingError,
-        "NOSCRIPT" => ServerErrorKind::NoScriptError,
+        "ERR" => ErrorKind::ResponseError,
+        "EXECABORT" => ErrorKind::ExecAbortError,
+        "LOADING" => ErrorKind::BusyLoadingError,
+        "NOSCRIPT" => ErrorKind::NoScriptError,
         "MOVED" => {
             if let Err(e) = FerrisKeyOtel::record_moved_error() {
                 log_error(
@@ -33,25 +32,28 @@ fn err_parser(line: &str) -> ServerError {
                     format!("Failed to record moved error: {e}"),
                 );
             }
-            ServerErrorKind::Moved
+            ErrorKind::Moved
         }
-        "ASK" => ServerErrorKind::Ask,
-        "TRYAGAIN" => ServerErrorKind::TryAgain,
-        "CLUSTERDOWN" => ServerErrorKind::ClusterDown,
-        "CROSSSLOT" => ServerErrorKind::CrossSlot,
-        "MASTERDOWN" => ServerErrorKind::MasterDown,
-        "READONLY" => ServerErrorKind::ReadOnly,
-        "NOTBUSY" => ServerErrorKind::NotBusy,
-        "NOPERM" => ServerErrorKind::PermissionDenied,
+        "ASK" => ErrorKind::Ask,
+        "TRYAGAIN" => ErrorKind::TryAgain,
+        "CLUSTERDOWN" => ErrorKind::ClusterDown,
+        "CROSSSLOT" => ErrorKind::CrossSlot,
+        "MASTERDOWN" => ErrorKind::MasterDown,
+        "READONLY" => ErrorKind::ReadOnly,
+        "NOTBUSY" => ErrorKind::NotBusy,
+        "NOPERM" => ErrorKind::PermissionDenied,
         code => {
-            return ServerError::ExtensionError {
-                code: code.to_string(),
-                detail: pieces.next().map(|str| str.to_string()),
-            };
+            return make_extension_error(
+                code.to_string(),
+                pieces.next().map(|str| str.to_string()),
+            );
         }
     };
     let detail = pieces.next().map(|str| str.to_string());
-    ServerError::KnownError { kind, detail }
+    match detail {
+        Some(d) => ValkeyError::from((kind, "server error", d)),
+        None => ValkeyError::from((kind, "server error")),
+    }
 }
 
 pub fn get_push_kind(kind: String) -> PushKind {

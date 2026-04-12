@@ -26,7 +26,7 @@ Results files: bench-results-full-1775976379.json (run1), bench-full-run{2,3,4}.
 ### Completed DESIGN_DEBT items
 - **#1 Module structure**: `src/valkey/` flattened and deleted. `valkey/mod.rs` was the last file, now gone.
 - **#3 Convenience API**: `ferriskey::Client` with `get/set/del/incr/expire/exists/hset/hget/hgetall/lpush/rpop/get_set/set_ex`. Typed `Pipeline` with `PipeSlot<T>`. `Client::transaction()` for MULTI/EXEC.
-- **#4 PubSub rewrite**: DONE. `EventDrivenSynchronizer` replaces `ValkeyPubSubSynchronizer`. Event-driven via mpsc channel (no 3s polling). Single `ConfirmedState`, no `pending_unsubscribes` queue. Old code backed up as `synchronizer_v1.rs`.
+- **#4 PubSub rewrite**: DONE. `EventDrivenSynchronizer` replaces `ValkeyPubSubSynchronizer`. Event-driven via mpsc channel (no 3s polling). Single `ConfirmedState`, no `pending_unsubscribes` queue. Old code backed up as `synchronizer_v1.rs`. Standalone + rapid subscribe/unsubscribe test gaps CLOSED (3 new tests in `tests/test_pubsub.rs::standalone_pubsub_tests`).
 - **#8 Arc\<str\> for addresses**: DONE. `DashMap<Arc<str>, ClusterNode>` in container.rs. Connection lookups are refcount bump.
 - **#9 Error consolidation**: Audit complete. `ConnectionError` collapsed to `ValkeyError` (Worker-2). Remaining: `IAMError`, `ServerError`, `StandaloneClientConnectionError`.
 - **DefaultHasher non-determinism**: DONE. FNV-1a deterministic hasher in topology.rs.
@@ -46,6 +46,8 @@ Feature flags: default=[], test-util=[mock-pubsub].
 
 ## Context
 - ElastiCache cluster: `clustercfg.glide-perf-test-cache-2026.nra7gl.use1.cache.amazonaws.com:6379` TLS, 3 shards, same VPC.
+- ElastiCache standalone: `master.ferriskey-standalone-test.nra7gl.use1.cache.amazonaws.com:6379` TLS, SG sg-0c74e2e41027e3285 + inbound rule for sg-0171012222e7a6f61.
+- Standalone PubSub tests: `VALKEY_STANDALONE_HOST=master.ferriskey-standalone-test.nra7gl.use1.cache.amazonaws.com VALKEY_TLS=true cargo test --test test_pubsub standalone_pubsub`
 - Bench command: `VALKEY_HOST=... VALKEY_PORT=6379 VALKEY_TLS=true BENCH_PROFILE=short BENCH_RUNS=3 BENCH_CPUS=4-15 cargo bench --bench connections_benchmark`
 - User is AWS employee (account 507286591552, role dev-x-oncall).
 - User has 3 tmux workers (`team-msg worker-{1,2,3} manager "task"`). Use them aggressively.

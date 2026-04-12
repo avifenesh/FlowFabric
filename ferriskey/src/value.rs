@@ -166,191 +166,6 @@ pub enum ErrorKind {
     ProtocolDesync,
 }
 
-#[derive(PartialEq, Debug, Clone, Display, Copy)]
-pub enum ServerErrorKind {
-    ResponseError,
-    ExecAbortError,
-    BusyLoadingError,
-    NoScriptError,
-    Moved,
-    Ask,
-    TryAgain,
-    ClusterDown,
-    CrossSlot,
-    MasterDown,
-    ReadOnly,
-    NotBusy,
-    PermissionDenied,
-}
-
-#[derive(PartialEq, Debug, Clone, Display)]
-pub enum ServerError {
-    ExtensionError {
-        code: String,
-        detail: Option<String>,
-    },
-    KnownError {
-        kind: ServerErrorKind,
-        detail: Option<String>,
-    },
-}
-
-impl ServerError {
-    pub fn err_code(&self) -> &str {
-        match self {
-            ServerError::ExtensionError { code, .. } => code,
-            ServerError::KnownError { kind, .. } => match kind {
-                ServerErrorKind::ResponseError => "ERR",
-                ServerErrorKind::ExecAbortError => "EXECABORT",
-                ServerErrorKind::BusyLoadingError => "LOADING",
-                ServerErrorKind::NoScriptError => "NOSCRIPT",
-                ServerErrorKind::Moved => "MOVED",
-                ServerErrorKind::Ask => "ASK",
-                ServerErrorKind::TryAgain => "TRYAGAIN",
-                ServerErrorKind::ClusterDown => "CLUSTERDOWN",
-                ServerErrorKind::CrossSlot => "CROSSSLOT",
-                ServerErrorKind::MasterDown => "MASTERDOWN",
-                ServerErrorKind::ReadOnly => "READONLY",
-                ServerErrorKind::NotBusy => "NOTBUSY",
-                ServerErrorKind::PermissionDenied => "NOPERM",
-            },
-        }
-    }
-
-    pub fn details(&self) -> Option<&str> {
-        match self {
-            ServerError::ExtensionError { detail, .. } => detail.as_ref().map(|str| str.as_str()),
-            ServerError::KnownError { detail, .. } => detail.as_ref().map(|str| str.as_str()),
-        }
-    }
-
-    /// Returns the error kind of the error.
-    pub fn kind(&self) -> ErrorKind {
-        match self {
-            ServerError::ExtensionError { .. } => ErrorKind::ExtensionError,
-            ServerError::KnownError { kind, .. } => (*kind).into(),
-        }
-    }
-
-    /// Appends the string representation of `other` to the existing `detail`.
-    /// If no detail exists, it simply sets it to `other`’s string.
-    pub(crate) fn append_detail(&mut self, other: &ServerError) {
-        // Convert the other error to a string representation.
-        match self {
-            ServerError::ExtensionError { detail, .. } | ServerError::KnownError { detail, .. } => {
-                if let Some(existing) = detail {
-                    // Append with a separator.
-                    existing.push_str(format!("; {other}").as_str());
-                } else {
-                    *detail = Some(other.to_string());
-                }
-            }
-        };
-    }
-}
-
-macro_rules! map_error_kinds {
-    ($($variant:ident),*) => {
-        impl From<ServerErrorKind> for ErrorKind {
-            fn from(kind: ServerErrorKind) -> Self {
-                match kind {
-                    $(ServerErrorKind::$variant => ErrorKind::$variant,)*
-                }
-            }
-        }
-
-        impl From<ErrorKind> for Option<ServerErrorKind> {
-            fn from(kind: ErrorKind) -> Self {
-                match kind {
-                    $(ErrorKind::$variant => Some(ServerErrorKind::$variant),)*
-                    _ => None,
-                }
-            }
-        }
-    };
-}
-
-// Define mappings using the macro
-map_error_kinds!(
-    ResponseError,
-    ExecAbortError,
-    BusyLoadingError,
-    NoScriptError,
-    Moved,
-    Ask,
-    TryAgain,
-    ClusterDown,
-    CrossSlot,
-    MasterDown,
-    ReadOnly,
-    NotBusy,
-    PermissionDenied
-);
-
-impl From<ValkeyError> for ServerError {
-    fn from(valkey_error: ValkeyError) -> Self {
-        match valkey_error.repr {
-            ErrorRepr::ExtensionError(code, detail) => ServerError::ExtensionError {
-                code,
-                detail: Some(detail),
-            },
-            ErrorRepr::WithDescription(kind, desc) => {
-                if let Some(mapped) = kind.into() {
-                    ServerError::KnownError {
-                        kind: mapped,
-                        detail: Some(desc.to_string()),
-                    }
-                } else {
-                    ServerError::ExtensionError {
-                        code: kind.to_string(),
-                        detail: Some(desc.to_string()), // do we need the word description (check all places)
-                    }
-                }
-            }
-            ErrorRepr::WithDescriptionAndDetail(kind, desc, detail) => {
-                if let Some(mapped) = kind.into() {
-                    ServerError::KnownError {
-                        kind: mapped,
-                        detail: Some(format!("{desc} {detail}")),
-                    }
-                } else {
-                    ServerError::ExtensionError {
-                        code: kind.to_string(),
-                        detail: Some(format!("{desc} {detail}")),
-                    }
-                }
-            }
-            ErrorRepr::IoError(io_err) => ServerError::ExtensionError {
-                code: "IoError".into(),
-                detail: Some(io_err.to_string()),
-            },
-        }
-    }
-}
-
-impl From<tokio::time::error::Elapsed> for ValkeyError {
-    fn from(_: tokio::time::error::Elapsed) -> Self {
-        ValkeyError::from((ErrorKind::IoError, "Operation timed out"))
-    }
-}
-
-impl From<ServerError> for ValkeyError {
-    fn from(value: ServerError) -> Self {
-        // TODO - Consider changing ValkeyError to explicitly represent whether an error came from the server or not. Today it is only implied.
-        match value {
-            ServerError::ExtensionError { code, detail } => make_extension_error(code, detail),
-            ServerError::KnownError { kind, detail } => {
-                let desc = "An error was signalled by the server:";
-                let kind: ErrorKind = kind.into();
-                match detail {
-                    Some(detail) => ValkeyError::from((kind, desc, detail)),
-                    None => ValkeyError::from((kind, desc)),
-                }
-            }
-        }
-    }
-}
-
 /// Internal low-level valkey value enum.
 #[derive(PartialEq, Clone)]
 pub enum Value {
@@ -402,7 +217,13 @@ pub enum Value {
         data: Vec<Value>,
     },
     /// Error from the server.
-    ServerError(ServerError),
+    ServerError(ValkeyError),
+}
+
+impl From<ValkeyError> for Value {
+    fn from(e: ValkeyError) -> Self {
+        Value::ServerError(e)
+    }
 }
 
 /// `VerbatimString`'s format types defined by spec
@@ -722,6 +543,24 @@ enum ErrorRepr {
     IoError(io::Error),
 }
 
+impl Clone for ValkeyError {
+    fn clone(&self) -> Self {
+        ValkeyError {
+            repr: match &self.repr {
+                ErrorRepr::WithDescription(k, s) => ErrorRepr::WithDescription(*k, s),
+                ErrorRepr::WithDescriptionAndDetail(k, s, d) => {
+                    ErrorRepr::WithDescriptionAndDetail(*k, s, d.clone())
+                }
+                ErrorRepr::ExtensionError(c, d) => {
+                    ErrorRepr::ExtensionError(c.clone(), d.clone())
+                }
+                // io::Error is not Clone; recreate from its kind (loses OS error detail)
+                ErrorRepr::IoError(e) => ErrorRepr::IoError(io::Error::from(e.kind())),
+            },
+        }
+    }
+}
+
 impl PartialEq for ValkeyError {
     fn eq(&self, other: &ValkeyError) -> bool {
         match (&self.repr, &other.repr) {
@@ -735,6 +574,12 @@ impl PartialEq for ValkeyError {
             (ErrorRepr::ExtensionError(a, _), ErrorRepr::ExtensionError(b, _)) => *a == *b,
             _ => false,
         }
+    }
+}
+
+impl From<tokio::time::error::Elapsed> for ValkeyError {
+    fn from(_: tokio::time::error::Elapsed) -> ValkeyError {
+        ValkeyError::from(io::Error::from(io::ErrorKind::TimedOut))
     }
 }
 
@@ -890,6 +735,25 @@ pub(crate) enum RetryMethod {
 
 /// Indicates a general failure in the library.
 impl ValkeyError {
+    /// Appends additional detail to the error message.
+    /// Used when accumulating pipeline errors from multiple sources.
+    pub(crate) fn append_detail(&mut self, extra: &str) {
+        self.repr = match std::mem::replace(&mut self.repr, ErrorRepr::WithDescription(ErrorKind::ClientError, "")) {
+            ErrorRepr::WithDescription(k, s) => {
+                ErrorRepr::WithDescriptionAndDetail(k, s, extra.to_string())
+            }
+            ErrorRepr::WithDescriptionAndDetail(k, s, existing) => {
+                ErrorRepr::WithDescriptionAndDetail(k, s, format!("{existing}; {extra}"))
+            }
+            ErrorRepr::ExtensionError(code, existing) => {
+                ErrorRepr::ExtensionError(code, format!("{existing}; {extra}"))
+            }
+            ErrorRepr::IoError(_) => {
+                ErrorRepr::WithDescriptionAndDetail(ErrorKind::IoError, "IO error", extra.to_string())
+            }
+        };
+    }
+
     /// Returns the kind of the error.
     pub fn kind(&self) -> ErrorKind {
         match self.repr {

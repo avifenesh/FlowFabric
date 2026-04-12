@@ -11,7 +11,7 @@ use crate::cmd::Cmd;
 use crate::connection::ConnectionLike;
 use crate::pipeline::Pipeline;
 use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
-use crate::value::{RetryMethod, ServerError};
+use crate::value::{RetryMethod, make_extension_error};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
 use logger_core::log_error;
@@ -369,10 +369,10 @@ fn add_pipeline_result(
                         inner_index + 1,
                         (
                             None,
-                            Value::ServerError(ServerError::ExtensionError {
-                                code: "PipelineNoResponse".to_string(),
-                                detail: (Some("no response from node".to_string())),
-                            }),
+                            Value::ServerError(make_extension_error(
+                                "PipelineNoResponse".to_string(),
+                                Some("no response from node".to_string()),
+                            )),
                         ),
                     );
                 }
@@ -406,7 +406,7 @@ fn add_pipeline_result(
     }
 }
 
-type RetryEntry = ((usize, Option<usize>), Arc<str>, ServerError);
+type RetryEntry = ((usize, Option<usize>), Arc<str>, ValkeyError);
 type RetryMap = HashMap<RetryMethod, Vec<RetryEntry>>;
 
 fn process_pipeline_responses(
@@ -424,7 +424,7 @@ fn process_pipeline_responses(
                 for ((index, inner_index, ignore), value) in command_indices.into_iter().zip(values)
                 {
                     if let Value::ServerError(error) = &value {
-                        let retry_method = ValkeyError::from(error.clone()).retry_method();
+                        let retry_method = error.retry_method();
                         update_retry_map(
                             &mut retry_map,
                             retry_method,
@@ -447,33 +447,30 @@ fn process_pipeline_responses(
                 continue;
             }
             Ok(Ok(Response::Single(_))) => (
-                ServerError::ExtensionError {
-                    code: "SingleResponseError".to_string(),
-                    detail: Some(
-                        "Received a single response for a pipeline with multiple commands."
-                            .to_string(),
-                    ),
-                },
+                make_extension_error(
+                    "SingleResponseError".to_string(),
+                    Some("Received a single response for a pipeline with multiple commands.".to_string()),
+                ),
                 RetryMethod::NoRetry,
             ),
             Ok(Ok(Response::ClusterScanResult(_, _))) => (
-                ServerError::ExtensionError {
-                    code: "ClusterScanError".to_string(),
-                    detail: Some("Received a cluster scan result inside a pipeline.".to_string()),
-                },
+                make_extension_error(
+                    "ClusterScanError".to_string(),
+                    Some("Received a cluster scan result inside a pipeline.".to_string()),
+                ),
                 RetryMethod::NoRetry,
             ),
             Ok(Err(err)) => {
                 let retry_method = err.retry_method();
-                (err.into(), retry_method)
+                (err, retry_method)
             }
             Err(err) => (
-                ServerError::ExtensionError {
-                    code: "BrokenPipe".to_string(),
-                    detail: Some(format!(
+                make_extension_error(
+                    "BrokenPipe".to_string(),
+                    Some(format!(
                         "Cluster: Failed to receive command response from internal sender. {err:?}"
                     )),
-                },
+                ),
                 if pipeline_retry_strategy.retry_connection_error {
                     RetryMethod::ReconnectAndRetry
                 } else {
@@ -496,7 +493,7 @@ fn process_pipeline_responses(
                     pipeline_responses,
                     index,
                     inner_index,
-                    Value::ServerError(server_error.clone()),
+                    Value::ServerError(server_error.clone().into()),
                     address.clone(),
                 )?;
             }
@@ -510,7 +507,7 @@ fn update_retry_map(
     retry_method: RetryMethod,
     indices: (usize, Option<usize>),
     address: Arc<str>,
-    error: ServerError,
+    error: ValkeyError,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) {
     let (index, inner_index) = indices;
@@ -775,7 +772,7 @@ where
             && let Err(server_error) =
                 pipeline_handle_moved_redirect(core.clone(), &valkey_error).await
         {
-            error.append_detail(&server_error);
+            error.append_detail(&server_error.to_string());
             add_pipeline_result(
                 pipeline_responses,
                 index,
@@ -811,23 +808,20 @@ where
                             );
                             continue;
                         }
-                        Err(err) => error.append_detail(&err.into()),
+                        Err(err) => error.append_detail(&err.to_string()),
                     }
                 }
-                Err(cmd_err) => error.append_detail(&cmd_err),
+                Err(cmd_err) => error.append_detail(&cmd_err.to_string()),
             }
         } else {
-            error.append_detail(&ServerError::ExtensionError {
-                code: "RedirectError".to_string(),
-                detail: Some("Failed to find redirect info".to_string()),
-            });
+            error.append_detail("RedirectError: Failed to find redirect info");
         }
 
         add_pipeline_result(
             pipeline_responses,
             index,
             inner_index,
-            Value::ServerError(error),
+            Value::ServerError(error.into()),
             address,
         )?;
     }
@@ -837,16 +831,16 @@ where
 async fn pipeline_handle_moved_redirect<C>(
     core: Core<C>,
     valkey_error: &ValkeyError,
-) -> Result<(), ServerError>
+) -> Result<(), ValkeyError>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     let redirect_node =
         RedirectNode::from_option_tuple(valkey_error.redirect_node()).ok_or_else(|| {
-            ServerError::ExtensionError {
-                code: "ParsingError".to_string(),
-                detail: Some("Failed to parse MOVED error".to_string()),
-            }
+            make_extension_error(
+                "ParsingError".to_string(),
+                Some("Failed to parse MOVED error".to_string()),
+            )
         })?;
     ClusterConnInner::update_upon_moved_error(
         core.clone(),
@@ -872,7 +866,7 @@ where
         let cmd = match get_original_cmd(pipeline, index, inner_index, Some(response_policies)) {
             Ok(cmd) => cmd,
             Err(server_error) => {
-                error.append_detail(&server_error);
+                error.append_detail(&server_error.to_string());
                 add_pipeline_result(
                     pipeline_responses,
                     index,
@@ -898,7 +892,7 @@ where
                 );
             }
             Err(valkey_error) => {
-                error.append_detail(&valkey_error.into());
+                error.append_detail(&valkey_error.to_string());
                 add_pipeline_result(
                     pipeline_responses,
                     index,
@@ -917,26 +911,24 @@ fn get_original_cmd(
     index: usize,
     inner_index: Option<usize>,
     response_policies: Option<&ResponsePoliciesMap>,
-) -> Result<Arc<Cmd>, ServerError> {
+) -> Result<Arc<Cmd>, ValkeyError> {
     let cmd = pipeline
         .get_command(index)
-        .ok_or_else(|| ServerError::ExtensionError {
-            code: "IndexNotFoundInPipelineResponses".to_string(),
-            detail: Some(format!("Index {index} was not found in pipeline")),
-        })?;
+        .ok_or_else(|| make_extension_error(
+            "IndexNotFoundInPipelineResponses".to_string(),
+            Some(format!("Index {index} was not found in pipeline")),
+        ))?;
     if inner_index.is_some() {
         let routing_info = response_policies.and_then(|map| map.get(&index).map(|t| t.0.clone()));
         if let Some(MultipleNodeRoutingInfo::MultiSlot((slots, _))) = routing_info {
-            let inner_index = inner_index.ok_or_else(|| ServerError::ExtensionError {
-                code: "IndexNotFoundInPipelineResponses".to_string(),
-                detail: Some(format!(
-                    "Inner index is required for a multi-slot command: {cmd:?}"
-                )),
-            })?;
-            let indices = slots.get(inner_index).ok_or_else(|| ServerError::ExtensionError {
-                code: "IndexNotFoundInPipelineResponses".to_string(),
-                detail: Some(format!("Inner index {inner_index} for multi-slot command {cmd:?} was not found in command slots {slots:?}")),
-            })?;
+            let inner_index = inner_index.ok_or_else(|| make_extension_error(
+                "IndexNotFoundInPipelineResponses".to_string(),
+                Some(format!("Inner index is required for a multi-slot command: {cmd:?}")),
+            ))?;
+            let indices = slots.get(inner_index).ok_or_else(|| make_extension_error(
+                "IndexNotFoundInPipelineResponses".to_string(),
+                Some(format!("Inner index {inner_index} for multi-slot command {cmd:?} was not found in command slots {slots:?}")),
+            ))?;
             return Ok(command_for_multi_slot_indices(cmd.as_ref(), indices.1.iter()).into());
         }
     }

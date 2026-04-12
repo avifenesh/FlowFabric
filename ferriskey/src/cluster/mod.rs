@@ -61,8 +61,8 @@ use crate::connection::{
 use crate::pipeline::PipelineRetryStrategy;
 use crate::pubsub::push_manager::PushInfo;
 use crate::value::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, RetryMethod, ServerError, ValkeyError,
-    ValkeyFuture, ValkeyResult, Value,
+    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, RetryMethod, ValkeyError,
+    ValkeyFuture, ValkeyResult, Value, make_extension_error,
 };
 use connections::connect_and_check;
 use container::{
@@ -3270,14 +3270,14 @@ where
                 if responses.len() == 1 {
                     final_responses.push(responses.pop().unwrap().1);
                 } else {
-                    final_responses.push(Value::ServerError(ServerError::ExtensionError {
-                        code: "PipelineResponseError".to_string(),
-                        detail: Some(format!(
+                    final_responses.push(Value::ServerError(make_extension_error(
+                        "PipelineResponseError".to_string(),
+                        Some(format!(
                             "Expected exactly one response for command {}, got {}",
                             index,
                             responses.len(),
                         )),
-                    }));
+                    )));
                 }
             }
         }
@@ -4416,7 +4416,7 @@ mod pipeline_routing_tests {
     };
     use crate::cmd::cmd;
     use crate::connection::MultiplexedConnection;
-    use crate::value::{ServerError, ServerErrorKind, Value};
+    use crate::value::{ErrorKind, ValkeyError, Value, make_extension_error};
 
     #[test]
     fn test_first_route_is_found() {
@@ -4567,10 +4567,7 @@ mod pipeline_routing_tests {
                 (Some(Arc::from("node2")), Value::Int(7)),
                 (
                     Some(Arc::from("node3")),
-                    Value::ServerError(ServerError::KnownError {
-                        kind: ServerErrorKind::Moved,
-                        detail: Some("127.0.0.1".to_string()),
-                    }),
+                    Value::ServerError(ValkeyError::from((ErrorKind::Moved, "MOVED", "127.0.0.1".to_string()))),
                 ),
             ],
             vec![(
@@ -4597,10 +4594,7 @@ mod pipeline_routing_tests {
         assert_eq!(
             responses,
             vec![
-                Value::ServerError(ServerError::KnownError {
-                    kind: ServerErrorKind::Moved,
-                    detail: Some("An error was signalled by the server: 127.0.0.1".to_string()),
-                }),
+                Value::ServerError(ValkeyError::from((ErrorKind::Moved, "MOVED", "An error was signalled by the server: 127.0.0.1".to_string()))),
                 Value::BulkString(b"unchanged".to_vec().into()),
             ]
         );
@@ -4623,10 +4617,7 @@ mod pipeline_routing_tests {
             responses,
             vec![
                 Value::Int(1),
-                Value::ServerError(ServerError::ExtensionError {
-                    code: "PipelineResponseError".to_string(),
-                    detail: Some("Expected exactly one response for command 1, got 0".to_string())
-                })
+                Value::ServerError(make_extension_error("PipelineResponseError".to_string(), Some("Expected exactly one response for command 1, got 0".to_string())))
             ]
         );
     }
@@ -4653,10 +4644,7 @@ mod pipeline_routing_tests {
             responses,
             vec![
                 Value::Int(1),
-                Value::ServerError(ServerError::ExtensionError {
-                    code: "PipelineResponseError".to_string(),
-                    detail: Some("Expected exactly one response for command 1, got 2".to_string())
-                })
+                Value::ServerError(make_extension_error("PipelineResponseError".to_string(), Some("Expected exactly one response for command 1, got 2".to_string())))
             ]
         );
     }
