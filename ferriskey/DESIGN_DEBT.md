@@ -99,9 +99,10 @@ Config → Connection (standalone) or ClusterClient (cluster)
 
 Both implement `Client` trait. Connection details are internal.
 
-**Status (2026-04-12): Partial.**
-- low-level client factory moved to `src/connection/factory.rs`
-- the main remaining concrete debt is the `Box::leak` ownership hack in `connection/factory.rs`
+**Status (2026-04-12): DONE.**
+- low-level client factory lives in `src/connection/factory.rs`
+- `Box::leak` eliminated
+- `MultiplexedConnection::new_with_response_timeout` now takes owned `ConnectionInfo`
 
 ## 6. Value type — Server errors mixed with data
 
@@ -173,7 +174,7 @@ Remaining:
 | 4 | Open | High (correctness / resiliency) | Large | Top remaining functional rewrite |
 | 2 | Partial | High (public API cleanup) | Small | Next small win: make `ValkeyWrite` / `ValkeyFuture` `pub(crate)` |
 | 6 | Open | Medium (correctness / design) | Large | Depends on deferred `ServerError` collapse |
-| 5 | Partial | Medium (ownership / lifecycle) | Large | Remove `Box::leak` from `connection/factory.rs` |
+| 5 | ✓ DONE | Medium (ownership / lifecycle) | Large | `Box::leak` eliminated in `connection/factory.rs` |
 | 9 | Partial | Medium (clarity) | Large | `ServerError` / `ServerErrorKind` deferred |
 | 11 | Open | Medium (API hygiene) | Medium | Hide `ConnectionRequest` after tests/bindings migrate |
 | 7 | Open | Low (perf) | Medium | Cmd double-allocation — after profiling |
