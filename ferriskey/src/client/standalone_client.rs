@@ -367,7 +367,10 @@ impl StandaloneClient {
     }
 
     fn get_primary_connection(&self) -> &ReconnectingConnection {
-        self.inner.nodes.get(self.inner.primary_index).unwrap()
+        self.inner
+            .nodes
+            .get(self.inner.primary_index)
+            .expect("Primary index out of bounds — client in invalid state")
     }
 
     fn round_robin_read_from_replica(

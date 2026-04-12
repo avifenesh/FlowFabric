@@ -1,7 +1,8 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use crate::valkey::{
-    Cmd, ErrorKind, ValkeyResult, Value, cluster_routing::Routable, from_owned_valkey_value,
+    Cmd, ErrorKind, ValkeyError, ValkeyResult, Value, cluster_routing::Routable,
+    from_owned_valkey_value,
 };
 
 #[derive(Clone, Copy)]
@@ -81,8 +82,8 @@ pub(crate) fn convert_to_expected_type(
                 let result = map
                     .into_iter()
                     .map(|(key, inner_value)| {
-                        let key_str = convert_to_expected_type(key, Some(ExpectedReturnType::BulkString)).unwrap();
-                        let value_converted = convert_to_expected_type(inner_value, Some(ExpectedReturnType::Double)).unwrap();
+                        let key_str = convert_to_expected_type(key, Some(ExpectedReturnType::BulkString))?;
+                        let value_converted = convert_to_expected_type(inner_value, Some(ExpectedReturnType::Double))?;
                         Ok((key_str, value_converted))
                     })
                     .collect::<ValkeyResult<_>>();
@@ -291,7 +292,9 @@ pub(crate) fn convert_to_expected_type(
             match value {
                 // RESP 2 response
                 Value::BulkString(bytes) => {
-                    let text = std::str::from_utf8(&bytes).unwrap();
+                    let text = std::str::from_utf8(&bytes).map_err(|_| {
+                        ValkeyError::from((ErrorKind::TypeError, "Invalid UTF-8 in LOLWUT response"))
+                    })?;
                     let res = convert_lolwut_string(text);
                     Ok(Value::BulkString(bytes::Bytes::from(Vec::from(res))))
                 }
@@ -1327,11 +1330,11 @@ fn convert_array_elements(
     array: Vec<Value>,
     element_type: ExpectedReturnType,
 ) -> ValkeyResult<Value> {
-    let converted_array = array
-        .iter()
-        .map(|v| convert_to_expected_type(v.clone(), Some(element_type)).unwrap())
+    let converted_array: ValkeyResult<Vec<Value>> = array
+        .into_iter()
+        .map(|v| convert_to_expected_type(v, Some(element_type)))
         .collect();
-    Ok(Value::Array(converted_array))
+    Ok(Value::Array(converted_array?))
 }
 
 /// Converts an array of flat maps into an array of maps.
