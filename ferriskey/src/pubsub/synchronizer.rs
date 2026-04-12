@@ -1,106 +1,177 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+//! Event-driven PubSub synchronizer.
+//!
+//! Replaces the polling-based synchronizer with an event-driven model:
+//! - Single source of truth: `desired` subscriptions
+//! - `confirmed` state derived from server push messages
+//! - All reconciliation is event-triggered, no polling interval
+
 use crate::client::{ClientWrapper, PubSubCommandApplier};
 use crate::cluster::routing::{Routable, SingleNodeRoutingInfo};
 use crate::cluster::slotmap::SlotMap;
-use crate::cmd::Cmd;
+use crate::cmd::{self, Cmd};
 use crate::connection::info::{
     PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
 };
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
 use async_trait::async_trait;
-use logger_core::{log_debug, log_error, log_warn};
+use logger_core::{log_debug, log_error};
 use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use telemetrylib::FerrisKeyOtel;
-use tokio::sync::{Notify, RwLock as TokioRwLock};
+use tokio::sync::{mpsc, Notify, RwLock as TokioRwLock};
 
-const DEFAULT_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Static slices for subscription kinds - no allocation
-const CLUSTER_SUBSCRIPTION_KINDS: &[PubSubSubscriptionKind] = &[
+/// Subscription kinds for cluster mode
+const CLUSTER_KINDS: &[PubSubSubscriptionKind] = &[
     PubSubSubscriptionKind::Exact,
     PubSubSubscriptionKind::Pattern,
     PubSubSubscriptionKind::Sharded,
 ];
 
-const STANDALONE_SUBSCRIPTION_KINDS: &[PubSubSubscriptionKind] = &[
+/// Subscription kinds for standalone mode
+const STANDALONE_KINDS: &[PubSubSubscriptionKind] = &[
     PubSubSubscriptionKind::Exact,
     PubSubSubscriptionKind::Pattern,
 ];
 
-/// Result of checking synchronization state - avoids recomputation
-struct SyncDiff {
-    is_synchronized: bool,
-    to_subscribe: PubSubSubscriptionInfo,
-    to_unsubscribe_by_address: HashMap<String, PubSubSubscriptionInfo>,
+/// Events that drive synchronizer state changes.
+enum SyncEvent {
+    /// User changed desired subscriptions — reconcile immediately
+    DesiredChanged,
+    /// Server confirmed a subscription (from push notification)
+    Confirmed {
+        kind: PubSubSubscriptionKind,
+        channel: Vec<u8>,
+        address: String,
+    },
+    /// Server confirmed an unsubscription (from push notification)
+    Unconfirmed {
+        kind: PubSubSubscriptionKind,
+        channel: Vec<u8>,
+        address: String,
+    },
+    /// Topology changed — pre-computed migrations to unsubscribe + reconcile
+    TopologyChanged {
+        migrations: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>,
+        gone_subs: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>,
+    },
+    /// Node(s) disconnected — clear confirmations and reconcile
+    NodeDisconnected { addresses: HashSet<String> },
 }
 
-/// Ferriskey PubSub Synchronizer
-///
-/// Implements the observer pattern for managing PubSub subscriptions:
-/// - `desired_subscriptions`: What the user wants to be subscribed to (modified by API calls)
-/// - `current_subscriptions_by_address`: What we're actually subscribed to (updated by push notifications)
-///
-/// A background reconciliation task continuously aligns current subscriptions with desired subscriptions.
-pub struct ValkeyPubSubSynchronizer {
-    /// Weak reference to internal client wrapper (set once during init)
-    internal_client: OnceCell<Weak<TokioRwLock<ClientWrapper>>>,
+/// Confirmed subscriptions tracked per node address.
+#[derive(Default)]
+struct ConfirmedState {
+    by_address: HashMap<String, PubSubSubscriptionInfo>,
+}
 
-    /// Whether this is a cluster client
+impl ConfirmedState {
+    /// Aggregate all confirmed subscriptions across addresses into a flat map.
+    fn aggregate(&self) -> PubSubSubscriptionInfo {
+        let mut result = PubSubSubscriptionInfo::new();
+        for subs in self.by_address.values() {
+            for (kind, channels) in subs {
+                result.entry(*kind).or_default().extend(channels.clone());
+            }
+        }
+        result
+    }
+
+    fn add(&mut self, kind: PubSubSubscriptionKind, channel: Vec<u8>, address: String) {
+        self.by_address
+            .entry(address)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .insert(channel);
+    }
+
+    fn remove_exact(&mut self, kind: PubSubSubscriptionKind, channel: &[u8], address: &str) {
+        if kind == PubSubSubscriptionKind::Sharded {
+            // Sharded: only remove from the specific address
+            if let Some(addr_subs) = self.by_address.get_mut(address) {
+                if let Some(channels) = addr_subs.get_mut(&kind) {
+                    channels.remove(channel);
+                }
+            }
+        } else {
+            // Exact/Pattern: remove from ALL addresses (server unsubscribe is authoritative)
+            for addr_subs in self.by_address.values_mut() {
+                if let Some(channels) = addr_subs.get_mut(&kind) {
+                    channels.remove(channel);
+                }
+            }
+        }
+        self.gc();
+    }
+
+    fn clear_addresses(&mut self, addresses: &HashSet<String>) {
+        for addr in addresses {
+            self.by_address.remove(addr);
+        }
+    }
+
+    /// Remove empty entries
+    fn gc(&mut self) {
+        self.by_address.retain(|_, subs| {
+            subs.retain(|_, channels| !channels.is_empty());
+            !subs.is_empty()
+        });
+    }
+}
+
+/// Event-driven PubSub synchronizer.
+pub struct EventDrivenSynchronizer {
+    internal_client: OnceCell<Weak<TokioRwLock<ClientWrapper>>>,
     is_cluster: bool,
 
-    /// What the user wants to be subscribed to (modified by API calls)
-    desired_subscriptions: RwLock<PubSubSubscriptionInfo>,
+    /// Single source of truth: what the user wants
+    desired: RwLock<PubSubSubscriptionInfo>,
 
-    /// What we're actually subscribed to, tracked by address for topology handling
-    current_subscriptions_by_address: RwLock<HashMap<String, PubSubSubscriptionInfo>>,
+    /// Confirmed by server push messages
+    confirmed: RwLock<ConfirmedState>,
 
-    /// Notifier to trigger reconciliation task
-    reconciliation_notify: Notify,
+    /// Event channel
+    events_tx: mpsc::UnboundedSender<SyncEvent>,
 
-    /// Notifier for when reconciliation completes a cycle
-    reconciliation_complete_notify: Notify,
+    /// Background task handle
+    task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 
-    /// Handle to the reconciliation task
-    reconciliation_task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Notified when confirmed == desired (for wait_for_sync)
+    sync_notify: Notify,
 
-    /// Pending unsubscribes due to topology change that need to be sent to specific addresses
-    pending_unsubscribes: RwLock<HashMap<String, PubSubSubscriptionInfo>>,
+    /// Notified after each reconciliation cycle completes
+    reconcile_complete_notify: Notify,
 
-    /// Configurable reconciliation interval
-    reconciliation_interval: Duration,
-
-    /// Request timeout for non-blocking operations
     request_timeout: Duration,
 }
 
-impl ValkeyPubSubSynchronizer {
+impl EventDrivenSynchronizer {
     pub fn new(
         initial_subscriptions: Option<PubSubSubscriptionInfo>,
         is_cluster: bool,
-        reconciliation_interval: Option<Duration>,
+        _reconciliation_interval: Option<Duration>,
         request_timeout: Duration,
     ) -> Arc<Self> {
-        let interval = reconciliation_interval.unwrap_or(DEFAULT_RECONCILIATION_INTERVAL);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
 
         let sync = Arc::new(Self {
             internal_client: OnceCell::new(),
             is_cluster,
-            desired_subscriptions: RwLock::new(initial_subscriptions.unwrap_or_default()),
-            current_subscriptions_by_address: RwLock::new(HashMap::new()),
-            reconciliation_notify: Notify::new(),
-            reconciliation_complete_notify: Notify::new(),
-            reconciliation_task_handle: Mutex::new(None),
-            pending_unsubscribes: RwLock::new(HashMap::new()),
-            reconciliation_interval: interval,
+            desired: RwLock::new(initial_subscriptions.unwrap_or_default()),
+            confirmed: RwLock::new(ConfirmedState::default()),
+            events_tx,
+            task_handle: Mutex::new(None),
+            sync_notify: Notify::new(),
+            reconcile_complete_notify: Notify::new(),
             request_timeout,
         });
 
-        sync.start_reconciliation_task();
+        sync.start_event_loop(events_rx);
         sync
     }
 
@@ -108,128 +179,314 @@ impl ValkeyPubSubSynchronizer {
         let _ = self.internal_client.set(client);
     }
 
-    /// Returns slice of applicable subscription kinds - zero allocation
     #[inline]
-    fn subscription_kinds(&self) -> &'static [PubSubSubscriptionKind] {
+    fn kinds(&self) -> &'static [PubSubSubscriptionKind] {
         if self.is_cluster {
-            CLUSTER_SUBSCRIPTION_KINDS
+            CLUSTER_KINDS
         } else {
-            STANDALONE_SUBSCRIPTION_KINDS
+            STANDALONE_KINDS
         }
     }
 
-    // get the actual subscriptions not by address
-    fn compute_actual_subscriptions(&self) -> PubSubSubscriptionInfo {
-        let current_by_addr = self
-            .current_subscriptions_by_address
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+    fn send_event(&self, event: SyncEvent) {
+        let _ = self.events_tx.send(event);
+    }
 
-        let mut actual: PubSubSubscriptionInfo = self
-            .subscription_kinds()
-            .iter()
-            .map(|k| (*k, HashSet::new()))
-            .collect();
+    /// Check if confirmed state matches desired and notify waiters if so.
+    fn check_sync_and_notify(&self) {
+        let desired = self.desired.read().unwrap_or_else(|e| e.into_inner());
+        let confirmed = self.confirmed.read().unwrap_or_else(|e| e.into_inner());
+        let actual = confirmed.aggregate();
 
-        for subs in current_by_addr.values() {
-            for (kind, channels) in subs.iter() {
-                actual
-                    .get_mut(kind)
-                    .unwrap()
-                    .extend(channels.iter().cloned());
+        let is_synced = self.kinds().iter().all(|kind| {
+            let d = desired.get(kind).map(|s| s.len()).unwrap_or(0);
+            let a = actual.get(kind).map(|s| s.len()).unwrap_or(0);
+            if d != a {
+                return false;
             }
-        }
+            match (desired.get(kind), actual.get(kind)) {
+                (Some(d_set), Some(a_set)) => d_set == a_set,
+                (None, None) => true,
+                (Some(d_set), None) => d_set.is_empty(),
+                (None, Some(a_set)) => a_set.is_empty(),
+            }
+        });
 
-        actual
+        if is_synced {
+            let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
+            self.sync_notify.notify_waiters();
+        } else {
+            let _ = FerrisKeyOtel::record_subscription_out_of_sync();
+        }
     }
 
-    /// Compute synchronization diff - what needs to be subscribed/unsubscribed
-    fn compute_sync_diff(&self) -> SyncDiff {
+    fn start_event_loop(self: &Arc<Self>, mut events_rx: mpsc::UnboundedReceiver<SyncEvent>) {
+        let sync_weak = Arc::downgrade(self);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let event = events_rx.recv().await;
+                let Some(sync) = sync_weak.upgrade() else {
+                    break; // synchronizer dropped
+                };
+
+                let Some(event) = event else {
+                    break; // channel closed
+                };
+
+                match event {
+                    SyncEvent::DesiredChanged => {
+                        // Drain any additional DesiredChanged events (coalesce)
+                        while let Ok(SyncEvent::DesiredChanged) = events_rx.try_recv() {}
+                        if let Err(e) = sync.reconcile().await {
+                            log_error("pubsub_sync", format!("Reconcile failed: {e:?}"));
+                        }
+                    }
+                    SyncEvent::Confirmed {
+                        kind,
+                        channel,
+                        address,
+                    } => {
+                        sync.on_confirmed(kind, channel, address);
+                    }
+                    SyncEvent::Unconfirmed {
+                        kind,
+                        channel,
+                        address,
+                    } => {
+                        sync.on_unconfirmed(kind, channel, address);
+                    }
+                    SyncEvent::TopologyChanged { migrations, gone_subs } => {
+                        // Drain and keep only the latest TopologyChanged
+                        let mut latest_mig = migrations;
+                        let mut latest_gone = gone_subs;
+                        while let Ok(evt) = events_rx.try_recv() {
+                            match evt {
+                                SyncEvent::TopologyChanged { migrations, gone_subs } => {
+                                    latest_mig = migrations;
+                                    latest_gone = gone_subs;
+                                }
+                                other => {
+                                    let _ = sync.events_tx.send(other);
+                                }
+                            }
+                        }
+                        sync.on_topology_changed(latest_mig, latest_gone).await;
+                    }
+                    SyncEvent::NodeDisconnected { addresses } => {
+                        sync.on_node_disconnected(&addresses).await;
+                    }
+                }
+
+                sync.check_sync_and_notify();
+                sync.reconcile_complete_notify.notify_waiters();
+            }
+        });
+
+        *self
+            .task_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Compute diff between desired and confirmed, send subscribe/unsubscribe commands.
+    async fn reconcile(&self) -> ValkeyResult<()> {
         let desired = self
-            .desired_subscriptions
+            .desired
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let current_by_addr = self
-            .current_subscriptions_by_address
+        let actual = self
+            .confirmed
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .aggregate();
 
-        let mut actual: PubSubSubscriptionInfo = self
-            .subscription_kinds()
-            .iter()
-            .map(|k| (*k, HashSet::new()))
-            .collect();
+        // Subscribe: in desired but not confirmed
+        for kind in self.kinds() {
+            let desired_channels = desired.get(kind);
+            let actual_channels = actual.get(kind);
 
-        let mut to_unsubscribe_by_address: HashMap<String, PubSubSubscriptionInfo> = HashMap::new();
+            let to_sub: HashSet<_> = desired_channels
+                .iter()
+                .flat_map(|d| d.iter())
+                .filter(|ch| actual_channels.as_ref().is_none_or(|a| !a.contains(*ch)))
+                .cloned()
+                .collect();
 
-        // Pass 1: O(current_subscriptions)
-        // Iterate over current subscriptions and add to to_unsub each subscription not in desired
-        for (addr, subs) in current_by_addr.iter() {
-            for (kind, channels) in subs.iter() {
-                actual
-                    .get_mut(kind)
-                    .unwrap()
-                    .extend(channels.iter().cloned());
-
-                let desired_for_kind = desired.get(kind);
-
-                let to_unsub: HashSet<_> = channels
-                    .iter()
-                    .filter(|ch| desired_for_kind.is_none_or(|d| !d.contains(*ch)))
-                    .cloned()
-                    .collect();
-
-                if !to_unsub.is_empty() {
-                    to_unsubscribe_by_address
-                        .entry(addr.clone())
-                        .or_default()
-                        .entry(*kind)
-                        .or_default()
-                        .extend(to_unsub);
-                }
+            if !to_sub.is_empty() {
+                self.send_subscription_cmd(to_sub, *kind, true, None)
+                    .await;
             }
         }
 
-        let mut to_subscribe = PubSubSubscriptionInfo::new();
-
-        // Pass 2: O(desired_subscriptions)
-        // Iterate over desired subscriptions and add to to_sub each subscription not in actual
-        for kind in self.subscription_kinds() {
-            if let Some(desired_channels) = desired.get(kind) {
-                let actual_channels = actual.get(kind);
-
-                let to_sub: HashSet<_> = desired_channels
-                    .iter()
-                    .filter(|ch| actual_channels.is_none_or(|a| !a.contains(*ch)))
-                    .cloned()
-                    .collect();
-
-                if !to_sub.is_empty() {
-                    to_subscribe.insert(*kind, to_sub);
+        // Unsubscribe: in confirmed but not desired (grouped by address)
+        // Collect under lock, then send commands outside lock
+        let unsub_work: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)> = {
+            let confirmed = self
+                .confirmed
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut work = Vec::new();
+            for (addr, addr_subs) in &confirmed.by_address {
+                for (kind, channels) in addr_subs {
+                    let desired_for_kind = desired.get(kind);
+                    let to_unsub: HashSet<_> = channels
+                        .iter()
+                        .filter(|ch| desired_for_kind.is_none_or(|d| !d.contains(*ch)))
+                        .cloned()
+                        .collect();
+                    if !to_unsub.is_empty() {
+                        work.push((addr.clone(), *kind, to_unsub));
+                    }
                 }
+            }
+            work
+        };
+
+        for (addr, kind, to_unsub) in unsub_work {
+            let routing = parse_address_routing(&addr).ok();
+            if kind == PubSubSubscriptionKind::Sharded {
+                self.send_sharded_unsubscribe_by_slot(to_unsub, routing)
+                    .await;
+            } else {
+                self.send_subscription_cmd(to_unsub, kind, false, routing)
+                    .await;
             }
         }
 
-        let is_synchronized = to_subscribe.is_empty() && to_unsubscribe_by_address.is_empty();
-
-        SyncDiff {
-            is_synchronized,
-            to_subscribe,
-            to_unsubscribe_by_address,
-        }
+        Ok(())
     }
 
-    /// Check sync state and update metrics - single computation
-    fn check_and_record_sync_state(&self) {
-        let state = self.compute_sync_diff();
+    fn on_confirmed(
+        &self,
+        kind: PubSubSubscriptionKind,
+        channel: Vec<u8>,
+        address: String,
+    ) {
+        let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
+        confirmed.add(kind, channel, address);
+    }
 
-        if state.is_synchronized {
-            let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
+    fn on_unconfirmed(
+        &self,
+        kind: PubSubSubscriptionKind,
+        channel: Vec<u8>,
+        address: String,
+    ) {
+        let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
+        confirmed.remove_exact(kind, &channel, &address);
+    }
+
+    /// Handle pre-computed topology migrations. Confirmed state is already
+    /// updated synchronously in `handle_topology_refresh()` — this method
+    /// just sends the unsubscribe commands and reconciles.
+    async fn on_topology_changed(
+        &self,
+        migrations: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>,
+        gone_subs: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>,
+    ) {
+        if migrations.is_empty() && gone_subs.is_empty() {
             return;
         }
 
-        let _ = FerrisKeyOtel::record_subscription_out_of_sync();
+        // Step 1: Unsubscribe from old owners FIRST
+        for (addr, kind, channels) in migrations.iter().chain(gone_subs.iter()) {
+            let routing = parse_address_routing(addr).ok();
+            if *kind == PubSubSubscriptionKind::Sharded {
+                self.send_sharded_unsubscribe_by_slot(channels.clone(), routing)
+                    .await;
+            } else {
+                self.send_subscription_cmd(channels.clone(), *kind, false, routing)
+                    .await;
+            }
+        }
+
+        // Step 2: Resubscribe to new owners via reconcile
+        if let Err(e) = self.reconcile().await {
+            log_error("pubsub_sync", format!("Post-topology reconcile failed: {e:?}"));
+        }
+    }
+
+    async fn on_node_disconnected(&self, addresses: &HashSet<String>) {
+        if addresses.is_empty() {
+            return;
+        }
+        log_debug(
+            "pubsub_sync",
+            format!("Clearing confirmations for disconnected: {addresses:?}"),
+        );
+        {
+            let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
+            confirmed.clear_addresses(addresses);
+        }
+        if let Err(e) = self.reconcile().await {
+            log_error("pubsub_sync", format!("Post-disconnect reconcile failed: {e:?}"));
+        }
+    }
+
+    async fn send_subscription_cmd(
+        &self,
+        channels: HashSet<PubSubChannelOrPattern>,
+        kind: PubSubSubscriptionKind,
+        is_subscribe: bool,
+        routing: Option<SingleNodeRoutingInfo>,
+    ) {
+        if channels.is_empty() {
+            return;
+        }
+
+        let cmd_name = match (kind, is_subscribe) {
+            (PubSubSubscriptionKind::Exact, true) => "SUBSCRIBE",
+            (PubSubSubscriptionKind::Exact, false) => "UNSUBSCRIBE",
+            (PubSubSubscriptionKind::Pattern, true) => "PSUBSCRIBE",
+            (PubSubSubscriptionKind::Pattern, false) => "PUNSUBSCRIBE",
+            (PubSubSubscriptionKind::Sharded, true) => "SSUBSCRIBE",
+            (PubSubSubscriptionKind::Sharded, false) => "SUNSUBSCRIBE",
+        };
+
+        let mut command = cmd::cmd(cmd_name);
+        for channel in &channels {
+            command.arg(channel.as_slice());
+        }
+        if kind == PubSubSubscriptionKind::Sharded && !is_subscribe {
+            command.set_fenced(true);
+        }
+
+        match self.apply_pubsub(&mut command, routing).await {
+            Ok(_) => {}
+            Err(e) => {
+                let action = if is_subscribe { "subscribe" } else { "unsubscribe" };
+                log_error(
+                    "pubsub_sync",
+                    format!("Failed to {action} {kind:?}: {e:?}"),
+                );
+            }
+        }
+    }
+
+    async fn send_sharded_unsubscribe_by_slot(
+        &self,
+        channels: HashSet<PubSubChannelOrPattern>,
+        routing: Option<SingleNodeRoutingInfo>,
+    ) {
+        // Group by slot so each SUNSUBSCRIBE goes to the right node
+        let by_slot: HashMap<u16, HashSet<_>> =
+            channels.into_iter().fold(HashMap::new(), |mut acc, ch| {
+                let slot = crate::cluster::topology::get_slot(&ch);
+                acc.entry(slot).or_default().insert(ch);
+                acc
+            });
+
+        for (_, slot_channels) in by_slot {
+            self.send_subscription_cmd(
+                slot_channels,
+                PubSubSubscriptionKind::Sharded,
+                false,
+                routing.clone(),
+            )
+            .await;
+        }
     }
 
     async fn apply_pubsub(
@@ -251,7 +508,6 @@ impl ValkeyPubSubSynchronizer {
                 ValkeyError::from((ErrorKind::ClientError, "Internal client has been dropped"))
             })?;
 
-        // Clone the client wrapper to release lock before await
         let mut client_wrapper = {
             let guard = client_arc.read().await;
             guard.clone()
@@ -260,245 +516,37 @@ impl ValkeyPubSubSynchronizer {
         client_wrapper.apply_pubsub_command(cmd, routing).await
     }
 
-    /// Parse an address string into SingleNodeRoutingInfo::ByAddress
-    fn parse_address_to_routing(address: &str) -> ValkeyResult<SingleNodeRoutingInfo> {
-        let (host, port_str) = address.rsplit_once(':').ok_or_else(|| {
-            ValkeyError::from((
-                ErrorKind::ClientError,
-                "Invalid address format",
-                address.to_string(),
-            ))
-        })?;
+    // --- Command interception helpers ---
 
-        let port = port_str
-            .parse()
-            .map_err(|_| ValkeyError::from((ErrorKind::ClientError, "Invalid port")))?;
-
-        Ok(SingleNodeRoutingInfo::ByAddress {
-            host: host.to_string(),
-            port,
-        })
-    }
-
-    fn start_reconciliation_task(self: &Arc<Self>) {
-        // Create a Weak pointer for the spawned task. This is necessary because:
-        // 1. tokio::spawn requires 'static lifetime - we can't use a borrowed reference
-        // 2. Using Arc::clone would prevent the synchronizer from ever being dropped (memory leak)
-        // 3. Weak doesn't increment the strong count, so when all external strong refs are dropped,
-        //    the synchronizer is dropped and weak.upgrade() returns None, signaling the task to exit
-        let sync_weak = Arc::downgrade(self);
-        let interval = self.reconciliation_interval;
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let Some(sync) = sync_weak.upgrade() else {
-                    break;
-                };
-                tokio::select! {
-                    _ = sync.reconciliation_notify.notified() => {},
-                    _ = tokio::time::sleep(interval) => {},
-                }
-
-                if let Err(e) = sync.reconcile().await {
-                    log_error(
-                        "pubsub_synchronizer",
-                        format!("Reconciliation failed: {:?}", e),
-                    );
-                }
-
-                sync.check_and_record_sync_state();
-                sync.reconciliation_complete_notify.notify_waiters();
-            }
-        });
-
-        *self
-            .reconciliation_task_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
-    }
-
-    async fn reconcile(&self) -> ValkeyResult<()> {
-        // This are unsubscription stemming from slot migrations (we do them for load balancing reasons)
-        // We need to process them first in order to get a correct view of our sync state during reconciliation
-        self.process_pending_unsubscribes().await;
-
-        let diff = self.compute_sync_diff();
-
-        if diff.is_synchronized {
-            return Ok(());
-        }
-
-        for (kind, channels) in diff.to_subscribe {
-            self.execute_subscription_change(channels, kind, true, None)
-                .await;
-        }
-
-        for (addr, subs_by_kind) in diff.to_unsubscribe_by_address {
-            let routing = Self::parse_address_to_routing(&addr).ok();
-
-            for (kind, channels) in subs_by_kind {
-                if kind == PubSubSubscriptionKind::Sharded {
-                    self.execute_sharded_unsubscribe_by_slot(channels, routing.clone())
-                        .await;
-                } else {
-                    self.execute_subscription_change(channels, kind, false, routing.clone())
-                        .await;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn process_pending_unsubscribes(&self) {
-        let pending = {
-            let mut guard = self
-                .pending_unsubscribes
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *guard)
-        };
-
-        if pending.is_empty() {
-            return;
-        }
-
-        for (address, subs_by_kind) in pending {
-            let routing = match Self::parse_address_to_routing(&address) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    log_warn(
-                        "pubsub_synchronizer",
-                        format!("Failed to parse address '{}': {:?}", address, e),
-                    );
-                    continue;
-                }
-            };
-
-            for (kind, channels) in subs_by_kind {
-                if channels.is_empty() {
-                    continue;
-                }
-
-                if kind == PubSubSubscriptionKind::Sharded {
-                    self.execute_sharded_unsubscribe_by_slot(channels, routing.clone())
-                        .await;
-                } else {
-                    self.execute_subscription_change(channels, kind, false, routing.clone())
-                        .await;
-                }
-            }
-        }
-    }
-
-    /// Execute a subscription change (subscribe or unsubscribe)
-    async fn execute_subscription_change(
-        &self,
-        channels: HashSet<PubSubChannelOrPattern>,
-        kind: PubSubSubscriptionKind,
-        is_subscribe: bool,
-        routing: Option<SingleNodeRoutingInfo>,
-    ) {
-        if channels.is_empty() {
-            return;
-        }
-
-        let cmd_name = match (kind, is_subscribe) {
-            (PubSubSubscriptionKind::Exact, true) => "SUBSCRIBE",
-            (PubSubSubscriptionKind::Exact, false) => "UNSUBSCRIBE",
-            (PubSubSubscriptionKind::Pattern, true) => "PSUBSCRIBE",
-            (PubSubSubscriptionKind::Pattern, false) => "PUNSUBSCRIBE",
-            (PubSubSubscriptionKind::Sharded, true) => "SSUBSCRIBE",
-            (PubSubSubscriptionKind::Sharded, false) => "SUNSUBSCRIBE",
-        };
-
-        let mut cmd = crate::cmd::cmd(cmd_name);
-        for channel in &channels {
-            cmd.arg(channel.as_slice());
-        }
-
-        if kind == PubSubSubscriptionKind::Sharded && !is_subscribe {
-            cmd.set_fenced(true);
-        }
-
-        let action = if is_subscribe {
-            "subscribe"
-        } else {
-            "unsubscribe"
-        };
-        match self.apply_pubsub(&mut cmd, routing).await {
-            Ok(_) => {}
-            Err(e) => {
-                log_error(
-                    "pubsub_synchronizer",
-                    format!("Failed to {} {:?} channels: {:?}", action, kind, e),
-                );
-            }
-        }
-    }
-
-    /// Execute sharded unsubscribe, grouping by slot
-    async fn execute_sharded_unsubscribe_by_slot(
-        &self,
-        channels: HashSet<PubSubChannelOrPattern>,
-        routing: Option<SingleNodeRoutingInfo>,
-    ) {
-        // Group channels by slot
-        let channels_by_slot: HashMap<u16, HashSet<_>> =
-            channels.into_iter().fold(HashMap::new(), |mut acc, chan| {
-                let slot = crate::cluster::topology::get_slot(&chan);
-                acc.entry(slot).or_default().insert(chan);
-                acc
-            });
-
-        for (_, slot_channels) in channels_by_slot {
-            self.execute_subscription_change(
-                slot_channels,
-                PubSubSubscriptionKind::Sharded,
-                false,
-                routing.clone(),
-            )
-            .await;
-        }
-    }
-
-    fn extract_channels_from_cmd(cmd: &Cmd) -> Vec<PubSubChannelOrPattern> {
+    fn extract_channels(cmd: &Cmd) -> Vec<PubSubChannelOrPattern> {
         cmd.args_iter()
             .skip(1)
             .filter_map(|arg| match arg {
-                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::cmd::Arg::Cursor => None,
+                cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                cmd::Arg::Cursor => None,
             })
             .collect()
     }
 
-    /// Extract channels and timeout from a blocking subscription command.
-    ///
-    /// For blocking operations, the format is: COMMAND channel1 channel2 ... timeout_ms
-    /// The last argument is always the timeout in milliseconds.
-    /// A timeout of 0 means block indefinitely until the operation completes.
     fn extract_channels_and_timeout(cmd: &Cmd) -> (Vec<PubSubChannelOrPattern>, u64) {
         let args: Vec<_> = cmd
             .args_iter()
-            .skip(1) // Skip command name
+            .skip(1)
             .filter_map(|arg| match arg {
-                crate::cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
-                crate::cmd::Arg::Cursor => None,
+                cmd::Arg::Simple(bytes) => Some(bytes.to_vec()),
+                cmd::Arg::Cursor => None,
             })
             .collect();
 
-        // Must have at least the timeout argument
         if args.is_empty() {
             return (Vec::new(), 0);
         }
 
-        // Last argument is always the timeout for blocking operations
         let timeout_ms = args
             .last()
             .and_then(|arg| String::from_utf8_lossy(arg).parse::<u64>().ok())
             .unwrap_or(0);
 
-        // All arguments except the last are channels
         let channels = if args.len() > 1 {
             args[..args.len() - 1].to_vec()
         } else {
@@ -508,14 +556,13 @@ impl ValkeyPubSubSynchronizer {
         (channels, timeout_ms)
     }
 
-    /// Handle lazy subscription change (subscribe or unsubscribe)
-    fn handle_lazy_subscription(
+    fn handle_lazy(
         &self,
         cmd: &Cmd,
         kind: PubSubSubscriptionKind,
         is_subscribe: bool,
     ) -> ValkeyResult<Value> {
-        let channels = Self::extract_channels_from_cmd(cmd);
+        let channels = Self::extract_channels(cmd);
 
         if is_subscribe && channels.is_empty() {
             return Err(ValkeyError::from((
@@ -539,8 +586,7 @@ impl ValkeyPubSubSynchronizer {
         Ok(Value::Nil)
     }
 
-    /// Handle blocking subscription change (subscribe or unsubscribe)
-    async fn handle_blocking_subscription(
+    async fn handle_blocking(
         &self,
         cmd: &Cmd,
         kind: PubSubSubscriptionKind,
@@ -568,69 +614,30 @@ impl ValkeyPubSubSynchronizer {
             self.remove_desired_subscriptions(to_remove, kind);
         }
 
-        // Build expected args based on subscription kind
         let (expected_channels, expected_patterns, expected_sharded) = match kind {
             PubSubSubscriptionKind::Exact => (Some(channels_set), None, None),
             PubSubSubscriptionKind::Pattern => (None, Some(channels_set), None),
             PubSubSubscriptionKind::Sharded => (None, None, Some(channels_set)),
         };
 
-        self.wait_for_sync(
-            timeout_ms,
-            expected_channels,
-            expected_patterns,
-            expected_sharded,
-        )
-        .await?;
+        self.wait_for_sync(timeout_ms, expected_channels, expected_patterns, expected_sharded)
+            .await?;
 
         Ok(Value::Nil)
     }
 
-    /// Convert subscription state to Value for GET_SUBSCRIPTIONS response
-    fn get_subscriptions_as_value(&self) -> Value {
+    fn get_subscriptions_value(&self) -> Value {
         let (desired, actual) = self.get_subscription_state();
 
         Value::Array(vec![
             Value::BulkString(bytes::Bytes::from_static(b"desired")),
-            Self::convert_sub_map_to_value(desired),
+            sub_map_to_value(desired),
             Value::BulkString(bytes::Bytes::from_static(b"actual")),
-            Self::convert_sub_map_to_value(actual),
+            sub_map_to_value(actual),
         ])
     }
 
-    fn convert_sub_map_to_value(map: PubSubSubscriptionInfo) -> Value {
-        let subscriptions_map: Vec<_> = map
-            .into_iter()
-            .map(|(kind, values)| {
-                let key = match kind {
-                    PubSubSubscriptionKind::Exact => "Exact",
-                    PubSubSubscriptionKind::Pattern => "Pattern",
-                    PubSubSubscriptionKind::Sharded => "Sharded",
-                };
-                let values_array: Vec<Value> = values
-                    .into_iter()
-                    .map(|v| Value::BulkString(bytes::Bytes::from(v)))
-                    .collect();
-                (
-                    Value::BulkString(bytes::Bytes::from(key.as_bytes().to_vec())),
-                    Value::Array(values_array),
-                )
-            })
-            .collect();
-        Value::Map(subscriptions_map)
-    }
-
-    /// Get current subscriptions organized by address.
-    /// Used for testing to verify subscriptions moved to different addresses after slot migration.
-    pub fn get_current_subscriptions_by_address(&self) -> HashMap<String, PubSubSubscriptionInfo> {
-        self.current_subscriptions_by_address
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// Run a synchronous operation with a timeout
-    async fn run_sync_with_timeout<T, F>(&self, f: F) -> ValkeyResult<T>
+    async fn run_with_timeout<T, F>(&self, f: F) -> ValkeyResult<T>
     where
         F: FnOnce() -> ValkeyResult<T> + Send,
         T: Send,
@@ -642,10 +649,10 @@ impl ValkeyPubSubSynchronizer {
     }
 }
 
-impl Drop for ValkeyPubSubSynchronizer {
+impl Drop for EventDrivenSynchronizer {
     fn drop(&mut self) {
         if let Some(handle) = self
-            .reconciliation_task_handle
+            .task_handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -656,7 +663,7 @@ impl Drop for ValkeyPubSubSynchronizer {
 }
 
 #[async_trait]
-impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
+impl PubSubSynchronizer for EventDrivenSynchronizer {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -667,17 +674,10 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
     ) {
         {
-            let mut desired = self
-                .desired_subscriptions
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            desired
-                .entry(subscription_type)
-                .or_default()
-                .extend(channels);
+            let mut desired = self.desired.write().unwrap_or_else(|e| e.into_inner());
+            desired.entry(subscription_type).or_default().extend(channels);
         }
-
-        self.trigger_reconciliation();
+        self.send_event(SyncEvent::DesiredChanged);
     }
 
     fn remove_desired_subscriptions(
@@ -686,15 +686,12 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
     ) {
         {
-            let mut desired = self
-                .desired_subscriptions
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut desired = self.desired.write().unwrap_or_else(|e| e.into_inner());
             match channels {
-                Some(channels_to_remove) => {
+                Some(to_remove) => {
                     if let Some(existing) = desired.get_mut(&subscription_type) {
-                        for channel in channels_to_remove {
-                            existing.remove(&channel);
+                        for ch in to_remove {
+                            existing.remove(&ch);
                         }
                     }
                 }
@@ -703,8 +700,7 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
                 }
             }
         }
-
-        self.trigger_reconciliation();
+        self.send_event(SyncEvent::DesiredChanged);
     }
 
     fn add_current_subscriptions(
@@ -713,16 +709,13 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
         address: String,
     ) {
-        let mut current_by_addr = self
-            .current_subscriptions_by_address
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        current_by_addr
-            .entry(address)
-            .or_default()
-            .entry(subscription_type)
-            .or_default()
-            .extend(channels);
+        for channel in channels {
+            self.send_event(SyncEvent::Confirmed {
+                kind: subscription_type,
+                channel,
+                address: address.clone(),
+            });
+        }
     }
 
     fn remove_current_subscriptions(
@@ -731,188 +724,118 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         subscription_type: PubSubSubscriptionKind,
         address: String,
     ) {
-        let mut current_by_addr = self
-            .current_subscriptions_by_address
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-
-        // For sharded subscriptions, only remove from the specific address.
-        // Sharded subscriptions are slot-deterministic - an unsubscribe from Node A
-        // doesn't invalidate a valid subscription on Node B (the new slot owner).
-        if subscription_type == PubSubSubscriptionKind::Sharded {
-            if let Some(addr_subs) = current_by_addr.get_mut(&address)
-                && let Some(existing) = addr_subs.get_mut(&subscription_type)
-            {
-                for channel in &channels {
-                    existing.remove(channel);
-                }
-            }
-        } else {
-            // For regular subscriptions (Exact/Pattern), remove from ALL addresses.
-            // These are not slot-bound, and the server's unsubscribe is authoritative.
-            for (_, addr_subs) in current_by_addr.iter_mut() {
-                if let Some(existing) = addr_subs.get_mut(&subscription_type) {
-                    for channel in &channels {
-                        existing.remove(channel);
-                    }
-                }
-            }
+        for channel in channels {
+            self.send_event(SyncEvent::Unconfirmed {
+                kind: subscription_type,
+                channel,
+                address: address.clone(),
+            });
         }
+    }
 
-        // Clean up empty entries
-        current_by_addr.retain(|_, addr_subs| {
-            addr_subs.retain(|_, channels| !channels.is_empty());
-            !addr_subs.is_empty()
-        });
+    fn get_subscription_state(
+        &self,
+    ) -> (PubSubSubscriptionInfo, PubSubSubscriptionInfo) {
+        let desired = self
+            .desired
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let actual = self
+            .confirmed
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .aggregate();
+        (desired, actual)
+    }
+
+    fn trigger_reconciliation(&self) {
+        self.send_event(SyncEvent::DesiredChanged);
     }
 
     fn remove_current_subscriptions_for_addresses(&self, addresses: &HashSet<String>) {
-        if addresses.is_empty() {
-            return;
+        if !addresses.is_empty() {
+            self.send_event(SyncEvent::NodeDisconnected {
+                addresses: addresses.clone(),
+            });
         }
-
-        log_debug(
-            "pubsub_synchronizer",
-            format!(
-                "Clearing subscriptions for disconnected addresses: {:?}",
-                addresses
-            ),
-        );
-
-        let mut current_by_addr = self
-            .current_subscriptions_by_address
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-
-        for address in addresses {
-            current_by_addr.remove(address);
-        }
-        self.trigger_reconciliation();
     }
 
     fn handle_topology_refresh(&self, new_slot_map: &SlotMap) {
+        // SlotMap doesn't implement Clone — extract the data we need
         let new_addresses: HashSet<String> = new_slot_map
             .all_node_addresses()
             .iter()
             .map(|arc| arc.to_string())
             .collect();
 
-        let mut modified = false;
-
+        // Compute migrations synchronously (trait method is sync)
+        let migrations: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>;
+        let gone_subs: Vec<(String, PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>)>;
         {
-            let mut current_by_addr = self
-                .current_subscriptions_by_address
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut pending = self
-                .pending_unsubscribes
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let confirmed = self.confirmed.read().unwrap_or_else(|e| e.into_inner());
+            let mut mig = Vec::new();
+            let mut gone = Vec::new();
 
-            // Helper to queue an unsubscribe
-            let mut queue_unsubscribe =
-                |addr: &str,
-                 kind: PubSubSubscriptionKind,
-                 channels: HashSet<PubSubChannelOrPattern>| {
-                    if channels.is_empty() {
-                        return;
-                    }
-                    log_debug(
-                        "pubsub_synchronizer",
-                        format!(
-                            "Slot migration detected, queueing unsubscribe for {} {:?} channels from {}",
-                            channels.len(),
-                            kind,
-                            addr
-                        ),
-                    );
-                    pending
-                        .entry(addr.to_string())
-                        .or_default()
-                        .entry(kind)
-                        .or_default()
-                        .extend(channels);
-                };
-
-            // Collect addresses to remove entirely (node no longer exists)
-            let addresses_to_remove: Vec<String> = current_by_addr
-                .keys()
-                .filter(|addr| !new_addresses.contains(*addr))
-                .cloned()
-                .collect();
-
-            // Queue unsubscribes for removed addresses
-            for addr in &addresses_to_remove {
-                if let Some(addr_subs) = current_by_addr.remove(addr) {
+            for (addr, addr_subs) in &confirmed.by_address {
+                if !new_addresses.contains(addr) {
                     for (kind, channels) in addr_subs {
                         if !channels.is_empty() {
-                            queue_unsubscribe(addr, kind, channels);
-                            modified = true;
+                            gone.push((addr.clone(), *kind, channels.clone()));
                         }
                     }
+                    continue;
                 }
-            }
 
-            // Check for slot migrations on remaining addresses
-            for (addr, addr_subs) in current_by_addr.iter_mut() {
-                for (kind, channels) in addr_subs.iter_mut() {
-                    let mut migrated_channels: HashSet<PubSubChannelOrPattern> = HashSet::new();
-
-                    channels.retain(|channel| {
+                for (kind, channels) in addr_subs {
+                    let mut migrated = HashSet::new();
+                    for channel in channels {
                         let slot = crate::cluster::topology::get_slot(channel);
-
-                        match new_slot_map.shard_addrs_for_slot(slot) {
-                            Some(shard_addrs) => {
-                                let new_primary = shard_addrs.primary();
-                                if new_primary.as_str() != addr {
-                                    // Slot migrated to a different node
-                                    migrated_channels.insert(channel.clone());
-                                    modified = true;
-                                    false
-                                } else {
-                                    true
-                                }
+                        if let Some(shard_addrs) = new_slot_map.shard_addrs_for_slot(slot) {
+                            if shard_addrs.primary().as_str() != addr {
+                                migrated.insert(channel.clone());
                             }
-                            None => {
-                                // Slot has no owner - queue unsubscribe
-                                migrated_channels.insert(channel.clone());
-                                modified = true;
-                                false
-                            }
+                        } else {
+                            migrated.insert(channel.clone());
                         }
-                    });
-
-                    // Queue unsubscribes for migrated channels from this address
-                    if !migrated_channels.is_empty() {
-                        queue_unsubscribe(addr, *kind, migrated_channels);
+                    }
+                    if !migrated.is_empty() {
+                        mig.push((addr.clone(), *kind, migrated));
                     }
                 }
-
-                // Clean up empty entries
-                addr_subs.retain(|_, channels| !channels.is_empty());
             }
 
-            // Clean up addresses with no subscriptions
-            current_by_addr.retain(|_, addr_subs| !addr_subs.is_empty());
+            migrations = mig;
+            gone_subs = gone;
         }
 
-        if modified {
-            self.trigger_reconciliation();
+        if migrations.is_empty() && gone_subs.is_empty() {
+            return;
         }
-    }
 
-    fn get_subscription_state(&self) -> (PubSubSubscriptionInfo, PubSubSubscriptionInfo) {
-        let desired = self
-            .desired_subscriptions
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let actual = self.compute_actual_subscriptions();
-        (desired, actual)
-    }
+        // Update confirmed state synchronously
+        {
+            let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
+            for (addr, _, _) in &gone_subs {
+                confirmed.by_address.remove(addr);
+            }
+            for (addr, kind, channels) in &migrations {
+                if let Some(addr_subs) = confirmed.by_address.get_mut(addr) {
+                    if let Some(existing) = addr_subs.get_mut(kind) {
+                        for ch in channels {
+                            existing.remove(ch);
+                        }
+                    }
+                }
+            }
+            confirmed.gc();
+        }
 
-    fn trigger_reconciliation(&self) {
-        self.reconciliation_notify.notify_one();
+        // Send event with pre-computed data for async unsubscribe + reconcile
+        self.send_event(SyncEvent::TopologyChanged {
+            migrations,
+            gone_subs,
+        });
     }
 
     async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<ValkeyResult<Value>> {
@@ -920,99 +843,69 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         let command_str = std::str::from_utf8(&command_name).unwrap_or("");
 
         match command_str {
-            // Non-blocking subscribe commands
             "SUBSCRIBE" => {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_sync_with_timeout(|| {
-                        self.handle_lazy_subscription(&cmd, PubSubSubscriptionKind::Exact, true)
-                    })
-                    .await,
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Exact, true))
+                        .await,
                 )
             }
             "PSUBSCRIBE" => {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_sync_with_timeout(|| {
-                        self.handle_lazy_subscription(&cmd, PubSubSubscriptionKind::Pattern, true)
-                    })
-                    .await,
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Pattern, true))
+                        .await,
                 )
             }
             "SSUBSCRIBE" => {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_sync_with_timeout(|| {
-                        self.handle_lazy_subscription(&cmd, PubSubSubscriptionKind::Sharded, true)
-                    })
-                    .await,
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Sharded, true))
+                        .await,
                 )
             }
-
-            // Non-blocking unsubscribe commands
             "UNSUBSCRIBE" => {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_sync_with_timeout(|| {
-                        self.handle_lazy_subscription(&cmd, PubSubSubscriptionKind::Exact, false)
-                    })
-                    .await,
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Exact, false))
+                        .await,
                 )
             }
             "PUNSUBSCRIBE" => {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_sync_with_timeout(|| {
-                        self.handle_lazy_subscription(&cmd, PubSubSubscriptionKind::Pattern, false)
-                    })
-                    .await,
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Pattern, false))
+                        .await,
                 )
             }
             "SUNSUBSCRIBE" => {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_sync_with_timeout(|| {
-                        self.handle_lazy_subscription(&cmd, PubSubSubscriptionKind::Sharded, false)
-                    })
-                    .await,
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Sharded, false))
+                        .await,
                 )
             }
-
-            // Blocking subscribe commands
             "SUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking_subscription(cmd, PubSubSubscriptionKind::Exact, true)
-                    .await,
+                self.handle_blocking(cmd, PubSubSubscriptionKind::Exact, true).await,
             ),
             "PSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking_subscription(cmd, PubSubSubscriptionKind::Pattern, true)
-                    .await,
+                self.handle_blocking(cmd, PubSubSubscriptionKind::Pattern, true).await,
             ),
             "SSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking_subscription(cmd, PubSubSubscriptionKind::Sharded, true)
-                    .await,
+                self.handle_blocking(cmd, PubSubSubscriptionKind::Sharded, true).await,
             ),
-
-            // Blocking unsubscribe commands
             "UNSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking_subscription(cmd, PubSubSubscriptionKind::Exact, false)
-                    .await,
+                self.handle_blocking(cmd, PubSubSubscriptionKind::Exact, false).await,
             ),
             "PUNSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking_subscription(cmd, PubSubSubscriptionKind::Pattern, false)
-                    .await,
+                self.handle_blocking(cmd, PubSubSubscriptionKind::Pattern, false).await,
             ),
             "SUNSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking_subscription(cmd, PubSubSubscriptionKind::Sharded, false)
-                    .await,
+                self.handle_blocking(cmd, PubSubSubscriptionKind::Sharded, false).await,
             ),
-
-            // Get subscriptions
             "GET_SUBSCRIPTIONS" => Some(
-                self.run_sync_with_timeout(|| Ok(self.get_subscriptions_as_value()))
-                    .await,
+                self.run_with_timeout(|| Ok(self.get_subscriptions_value())).await,
             ),
-
-            // Not a pubsub command we handle
             _ => None,
         }
     }
@@ -1031,59 +924,62 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
         };
 
         loop {
-            let notified = self.reconciliation_complete_notify.notified();
+            let notified = self.reconcile_complete_notify.notified();
 
             let condition_met = {
-                // If no specific expectations, just check overall synchronization
                 if expected_channels.is_none()
                     && expected_patterns.is_none()
                     && expected_sharded.is_none()
                 {
-                    self.compute_sync_diff().is_synchronized
+                    // Check overall sync
+                    let desired = self.desired.read().unwrap_or_else(|e| e.into_inner());
+                    let actual = self
+                        .confirmed
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .aggregate();
+
+                    self.kinds().iter().all(|kind| {
+                        let d = desired.get(kind);
+                        let a = actual.get(kind);
+                        match (d, a) {
+                            (Some(d_set), Some(a_set)) => d_set == a_set,
+                            (None, None) => true,
+                            (Some(d_set), None) => d_set.is_empty(),
+                            (None, Some(a_set)) => a_set.is_empty(),
+                        }
+                    })
                 } else {
-                    // Check that specified channels are synced (desired == actual for those channels)
                     let (desired, actual) = self.get_subscription_state();
 
-                    let is_synced_for_channels = |channels: &Option<
-                        HashSet<PubSubChannelOrPattern>,
-                    >,
-                                                  kind: PubSubSubscriptionKind|
+                    let check = |channels: &Option<HashSet<PubSubChannelOrPattern>>,
+                                 kind: PubSubSubscriptionKind|
                      -> bool {
                         channels.as_ref().is_none_or(|chs| {
-                            let desired_set = desired.get(&kind);
-                            let actual_set = actual.get(&kind);
-
+                            let d = desired.get(&kind);
+                            let a = actual.get(&kind);
                             if chs.is_empty() {
-                                // When expecting empty set (unsubscribe-all), verify both
-                                // desired and actual are empty for this subscription type
-                                let desired_empty = desired_set.is_none_or(|d| d.is_empty());
-                                let actual_empty = actual_set.is_none_or(|a| a.is_empty());
-                                desired_empty && actual_empty
+                                let d_empty = d.is_none_or(|s| s.is_empty());
+                                let a_empty = a.is_none_or(|s| s.is_empty());
+                                d_empty && a_empty
                             } else {
-                                // Check each specified channel has matching state in desired and actual
                                 chs.iter().all(|ch| {
-                                    let in_desired = desired_set.is_some_and(|d| d.contains(ch));
-                                    let in_actual = actual_set.is_some_and(|a| a.contains(ch));
-                                    in_desired == in_actual
+                                    let in_d = d.is_some_and(|s| s.contains(ch));
+                                    let in_a = a.is_some_and(|s| s.contains(ch));
+                                    in_d == in_a
                                 })
                             }
                         })
                     };
 
-                    is_synced_for_channels(&expected_channels, PubSubSubscriptionKind::Exact)
-                        && is_synced_for_channels(
-                            &expected_patterns,
-                            PubSubSubscriptionKind::Pattern,
-                        )
-                        && is_synced_for_channels(
-                            &expected_sharded,
-                            PubSubSubscriptionKind::Sharded,
-                        )
+                    check(&expected_channels, PubSubSubscriptionKind::Exact)
+                        && check(&expected_patterns, PubSubSubscriptionKind::Pattern)
+                        && check(&expected_sharded, PubSubSubscriptionKind::Sharded)
                 }
             };
 
             if condition_met {
-                self.check_and_record_sync_state();
+                self.check_sync_and_notify();
                 return Ok(());
             }
 
@@ -1094,7 +990,6 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
                 if remaining.is_zero() {
                     return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
                 }
-
                 tokio::select! {
                     _ = notified => {}
                     _ = tokio::time::sleep(remaining) => {
@@ -1106,4 +1001,43 @@ impl PubSubSynchronizer for ValkeyPubSubSynchronizer {
             }
         }
     }
+}
+
+fn parse_address_routing(address: &str) -> ValkeyResult<SingleNodeRoutingInfo> {
+    let (host, port_str) = address.rsplit_once(':').ok_or_else(|| {
+        ValkeyError::from((
+            ErrorKind::ClientError,
+            "Invalid address format",
+            address.to_string(),
+        ))
+    })?;
+    let port = port_str
+        .parse()
+        .map_err(|_| ValkeyError::from((ErrorKind::ClientError, "Invalid port")))?;
+    Ok(SingleNodeRoutingInfo::ByAddress {
+        host: host.to_string(),
+        port,
+    })
+}
+
+fn sub_map_to_value(map: PubSubSubscriptionInfo) -> Value {
+    let entries: Vec<_> = map
+        .into_iter()
+        .map(|(kind, values)| {
+            let key = match kind {
+                PubSubSubscriptionKind::Exact => "Exact",
+                PubSubSubscriptionKind::Pattern => "Pattern",
+                PubSubSubscriptionKind::Sharded => "Sharded",
+            };
+            let values_array: Vec<Value> = values
+                .into_iter()
+                .map(|v| Value::BulkString(bytes::Bytes::from(v)))
+                .collect();
+            (
+                Value::BulkString(bytes::Bytes::from(key.as_bytes().to_vec())),
+                Value::Array(values_array),
+            )
+        })
+        .collect();
+    Value::Map(entries)
 }

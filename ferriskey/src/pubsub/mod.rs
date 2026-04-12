@@ -53,20 +53,16 @@ pub async fn create_pubsub_synchronizer(
 
     #[cfg(not(feature = "test-util"))]
     {
-        let sync = synchronizer::ValkeyPubSubSynchronizer::new(
+        let sync = synchronizer::EventDrivenSynchronizer::new(
             initial_subscriptions,
             is_cluster,
             reconciliation_interval,
             _request_timeout,
         );
-        // Only set if the weak pointer can be upgraded (is not empty)
-        // This is because OnceCell::set only works once - if we set an empty Weak::new(),
-        // tests that create the synchronizer before the client won't be able to set
-        // the real client later.
         if internal_client.upgrade().is_some() {
             sync.as_any()
-                .downcast_ref::<synchronizer::ValkeyPubSubSynchronizer>()
-                .expect("Expected ValkeyPubSubSynchronizer")
+                .downcast_ref::<synchronizer::EventDrivenSynchronizer>()
+                .expect("Expected EventDrivenSynchronizer")
                 .set_internal_client(internal_client);
         }
         sync
