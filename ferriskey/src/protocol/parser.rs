@@ -586,6 +586,7 @@ mod aio_support {
     }
 
     /// Parses a valkey value asynchronously from an AsyncRead source.
+    #[allow(dead_code)]
     pub async fn parse_valkey_value_async<R>(_decoder: &mut (), read: &mut R) -> ValkeyResult<Value>
     where
         R: AsyncRead + std::marker::Unpin,
@@ -614,6 +615,7 @@ mod aio_support {
 pub use self::aio_support::*;
 
 /// The internal valkey response parser.
+#[allow(dead_code)]
 pub struct Parser;
 
 impl Default for Parser {
@@ -622,6 +624,7 @@ impl Default for Parser {
     }
 }
 
+#[allow(dead_code)]
 impl Parser {
     pub fn new() -> Parser {
         Parser
@@ -651,7 +654,8 @@ impl Parser {
     }
 }
 
-/// Parses bytes into a valkey value.
+/// Parses bytes into a valkey value. Used in tests.
+#[allow(dead_code)]
 pub fn parse_valkey_value(bytes: &[u8]) -> ValkeyResult<Value> {
     // For complete buffers we can skip scan — parse_value_unchecked will
     // work if the data is complete, and we get an error/panic if not.

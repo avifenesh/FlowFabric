@@ -9,7 +9,7 @@ mod standalone_client_tests {
     use crate::constants::{IP_ADDRESS_V4, IP_ADDRESS_V6};
     use crate::utilities::mocks::{Mock, ServerMock};
     use ferriskey::{
-        client::{Client as FerrisKeyClient, ConnectionError, StandaloneClient},
+        client::{Client as FerrisKeyClient, StandaloneClient},
         client::types::ReadFrom,
     };
     use ferriskey::{FromValkeyValue, Value};
@@ -408,16 +408,13 @@ mod standalone_client_tests {
             create_connection_request(addresses.as_slice(), &Default::default());
         block_on_all(async {
             let client_res =
-                StandaloneClient::create_client(connection_request, None, None, None)
-                    .await
-                    .map_err(ConnectionError::Standalone);
+                StandaloneClient::create_client(connection_request, None, None, None).await;
             assert!(client_res.is_err());
             let error = client_res.unwrap_err();
-            assert!(matches!(error, ConnectionError::Standalone(_),));
             let primary_1_addr = addresses.first().unwrap().to_string();
             let primary_2_addr = addresses.get(1).unwrap().to_string();
             let replica_addr = addresses.get(2).unwrap().to_string();
-            let err_msg = error.to_string().to_ascii_lowercase();
+            let err_msg = format!("{error:?}").to_ascii_lowercase();
             assert!(
                 err_msg.contains("conflict")
                     && err_msg.contains(&primary_1_addr)

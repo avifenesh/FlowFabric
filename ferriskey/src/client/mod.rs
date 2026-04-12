@@ -9,26 +9,19 @@ use crate::cluster::routing::{
 use crate::cluster::scan::{ClusterScanArgs, ScanStateRC};
 use crate::cluster::slotmap::ReadFromReplicaStrategy;
 use crate::cluster_scan_container::insert_cluster_scan_cursor;
-use crate::cmd::{Cmd, cmd};
+use crate::cmd::Cmd;
 use crate::compression::CompressionBackendType;
 use crate::compression::lz4_backend::Lz4Backend;
 use crate::compression::zstd_backend::ZstdBackend;
 use crate::compression::{CompressionConfig, CompressionManager};
 use crate::connection::ConnectionLike;
-use crate::connection::info::{
-    ConnectionAddr, ConnectionInfo, PubSubSubscriptionKind, ValkeyConnectionInfo,
-};
-use crate::connection::tls::{
-    ClientTlsConfig, TlsCertificates, TlsConnParams, retrieve_tls_certificates,
-};
+use crate::connection::info::{ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo};
+use crate::connection::tls::{TlsCertificates, TlsConnParams, retrieve_tls_certificates};
 use crate::pipeline::PipelineRetryStrategy;
 use crate::pubsub::push_manager::PushInfo;
 use crate::retry_strategies::RetryStrategy;
 use crate::scripts_container::get_script;
-use crate::value::{
-    ErrorKind, FromValkeyValue, InflightRequestTracker, ProtocolVersion, ValkeyError, ValkeyFuture,
-    ValkeyResult, Value,
-};
+use crate::value::{ErrorKind, FromValkeyValue, ValkeyError, ValkeyFuture, ValkeyResult, Value};
 use futures::FutureExt;
 use logger_core::{log_debug, log_error, log_info, log_warn};
 use once_cell::sync::OnceCell;
@@ -1783,8 +1776,7 @@ async fn create_cluster_client(
 
 #[derive(thiserror::Error)]
 pub enum ConnectionError {
-    Standalone(standalone_client::StandaloneClientConnectionError),
-    Cluster(crate::value::ValkeyError),
+    Valkey(crate::value::ValkeyError),
     Timeout,
     IoError(std::io::Error),
     Configuration(String),
@@ -1793,8 +1785,7 @@ pub enum ConnectionError {
 impl std::fmt::Debug for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Standalone(arg0) => f.debug_tuple("Standalone").field(arg0).finish(),
-            Self::Cluster(arg0) => f.debug_tuple("Cluster").field(arg0).finish(),
+            Self::Valkey(arg0) => f.debug_tuple("Valkey").field(arg0).finish(),
             Self::IoError(arg0) => f.debug_tuple("IoError").field(arg0).finish(),
             Self::Timeout => write!(f, "Timeout"),
             Self::Configuration(arg0) => f.debug_tuple("Configuration").field(arg0).finish(),
@@ -1805,8 +1796,7 @@ impl std::fmt::Debug for ConnectionError {
 impl std::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectionError::Standalone(err) => write!(f, "{err:?}"),
-            ConnectionError::Cluster(err) => write!(f, "{err}"),
+            ConnectionError::Valkey(err) => write!(f, "{err}"),
             ConnectionError::IoError(err) => write!(f, "{err}"),
             ConnectionError::Timeout => f.write_str("connection attempt timed out"),
             ConnectionError::Configuration(msg) => write!(f, "configuration error: {msg}"),
@@ -2058,7 +2048,7 @@ impl Client {
                     pubsub_synchronizer.clone(),
                 )
                 .await
-                .map_err(ConnectionError::Cluster)?;
+                .map_err(ConnectionError::Valkey)?;
                 ClientWrapper::Cluster { client }
             } else {
                 ClientWrapper::Standalone(
@@ -2069,7 +2059,7 @@ impl Client {
                         Some(pubsub_synchronizer.clone()),
                     )
                     .await
-                    .map_err(ConnectionError::Standalone)?,
+                    .map_err(ConnectionError::Valkey)?,
                 )
             };
 

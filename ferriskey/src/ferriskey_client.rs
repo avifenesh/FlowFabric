@@ -398,18 +398,13 @@ fn apply_connection_info(request: &mut ConnectionRequest, info: ConnectionInfo) 
 
 fn connection_error_to_ferriskey_error(error: ConnectionError) -> FerrisKeyError {
     match error {
-        ConnectionError::Cluster(error) => error,
+        ConnectionError::Valkey(error) => error,
         ConnectionError::Timeout => std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
         ConnectionError::IoError(error) => error.into(),
         ConnectionError::Configuration(message) => ValkeyError::from((
             ErrorKind::InvalidClientConfig,
             "Connection configuration error",
             message,
-        )),
-        ConnectionError::Standalone(error) => ValkeyError::from((
-            ErrorKind::ClientError,
-            "Standalone connection failed",
-            format!("{:?}", error),
         )),
     }
 }

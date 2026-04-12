@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
 use strum_macros::IntoStaticStr;
-use thiserror::Error;
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
+
+use crate::value::{ErrorKind, ValkeyError};
 
 /// Maximum refresh interval in seconds (12 hours)
 const MAX_REFRESH_INTERVAL_SECONDS: u32 = 12 * 60 * 60; // 43200 seconds
@@ -33,21 +34,38 @@ const TOKEN_GEN_INITIAL_BACKOFF_MS: u64 = 100;
 const TOKEN_GEN_MAX_BACKOFF_MS: u64 = 3_000;
 
 /// Custom error type for IAM operations
-#[derive(Debug, Error)]
-pub enum IAMError {
+#[derive(Debug)]
+enum IAMError {
     /// Invalid refresh interval (must be 1 second to 12 hours)
-    #[error(
-        "IAM authentication error: Invalid refresh interval. Must be between 1 and {max} (inclusive), got: {actual}"
-    )]
     InvalidRefreshInterval { max: u32, actual: u32 },
 
     /// AWS credentials resolution error
-    #[error("IAM authentication error: Failed to get AWS credentials: {0}")]
     CredentialsError(String),
 
     /// Token generation error
-    #[error("IAM authentication error: Token generation failed: {0}")]
     TokenGenerationError(String),
+}
+
+impl From<IAMError> for ValkeyError {
+    fn from(value: IAMError) -> Self {
+        match value {
+            IAMError::InvalidRefreshInterval { max, actual } => ValkeyError::from((
+                ErrorKind::InvalidClientConfig,
+                "IAM authentication error: Invalid refresh interval",
+                format!("Must be between 1 and {max} (inclusive), got: {actual}"),
+            )),
+            IAMError::CredentialsError(message) => ValkeyError::from((
+                ErrorKind::AuthenticationFailed,
+                "IAM authentication error: Failed to get AWS credentials",
+                message,
+            )),
+            IAMError::TokenGenerationError(message) => ValkeyError::from((
+                ErrorKind::AuthenticationFailed,
+                "IAM authentication error: Token generation failed",
+                message,
+            )),
+        }
+    }
 }
 
 /// AWS service type for IAM authentication
@@ -65,21 +83,23 @@ pub enum ServiceType {
 /// Validate refresh interval (1 second to 12 hours, defaults to 5 minutes)
 fn validate_refresh_interval(
     refresh_interval_seconds: Option<u32>,
-) -> Result<Option<u32>, IAMError> {
+) -> Result<Option<u32>, ValkeyError> {
     match refresh_interval_seconds {
         Some(0) => {
             // Reject 0 as an invalid interval
             Err(IAMError::InvalidRefreshInterval {
                 max: MAX_REFRESH_INTERVAL_SECONDS,
                 actual: 0,
-            })
+            }
+            .into())
         }
         Some(interval) => {
             if interval > MAX_REFRESH_INTERVAL_SECONDS {
                 return Err(IAMError::InvalidRefreshInterval {
                     max: MAX_REFRESH_INTERVAL_SECONDS,
                     actual: interval,
-                });
+                }
+                .into());
             }
 
             // Log warning if interval is above 15 minutes
@@ -108,7 +128,7 @@ fn validate_refresh_interval(
 async fn get_signing_identity(
     region: &str,
     service_type: ServiceType,
-) -> Result<aws_credential_types::Credentials, IAMError> {
+) -> Result<aws_credential_types::Credentials, ValkeyError> {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()))
         .load()
@@ -200,7 +220,7 @@ impl IAMTokenManager {
         region: String,
         service_type: ServiceType,
         refresh_interval_seconds: Option<u32>,
-    ) -> Result<Self, IAMError> {
+    ) -> Result<Self, ValkeyError> {
         let validated_refresh_interval = validate_refresh_interval(refresh_interval_seconds)?;
 
         let state = IamTokenState {
@@ -285,7 +305,7 @@ impl IAMTokenManager {
         cached_token: &Arc<RwLock<String>>,
         token_created_at: &Arc<RwLock<tokio::time::Instant>>,
         token_changed: &Arc<AtomicBool>,
-    ) -> Result<(), IAMError> {
+    ) -> Result<(), ValkeyError> {
         match Self::generate_token_with_backoff(iam_token_state).await {
             Ok(new_token) => {
                 Self::set_cached_token_static(cached_token, new_token.clone()).await;
@@ -312,7 +332,7 @@ impl IAMTokenManager {
     /// Returns token on success, last error on failure.
     pub(crate) async fn generate_token_with_backoff(
         state: &IamTokenState,
-    ) -> Result<String, IAMError> {
+    ) -> Result<String, ValkeyError> {
         let mut attempt: u32 = 0;
         let mut backoff_ms = TOKEN_GEN_INITIAL_BACKOFF_MS;
 
@@ -357,7 +377,7 @@ impl IAMTokenManager {
     /// Force refresh the token immediately
     ///
     /// Returns an error if token generation fails after retries.
-    pub async fn refresh_token(&self) -> Result<(), IAMError> {
+    pub async fn refresh_token(&self) -> Result<(), ValkeyError> {
         Self::handle_token_refresh(
             &self.iam_token_state,
             &self.cached_token,
@@ -412,7 +432,7 @@ impl IAMTokenManager {
     }
 
     /// Generate IAM authentication token using SigV4 signing (valid for 15 minutes)
-    async fn generate_token_static(state: &IamTokenState) -> Result<String, IAMError> {
+    async fn generate_token_static(state: &IamTokenState) -> Result<String, ValkeyError> {
         let service_name: &'static str = state.service_type.into();
         let signing_time = SystemTime::now();
         let hostname = state.cluster_name.clone();
@@ -889,16 +909,16 @@ mod tests {
             );
 
             let error = result.unwrap_err();
-            match error {
-                IAMError::InvalidRefreshInterval { max, actual } => {
-                    assert_eq!(
-                        max, MAX_REFRESH_INTERVAL_SECONDS,
-                        "Max value should be 43200 seconds"
-                    );
-                    assert_eq!(actual, interval, "Actual value should match input interval");
-                }
-                _ => panic!("Expected InvalidRefreshInterval error, got: {error:?}"),
-            }
+            assert_eq!(error.kind(), ErrorKind::InvalidClientConfig);
+            let detail = error.detail().unwrap_or_default();
+            assert!(
+                detail.contains(&format!("{interval}")),
+                "Expected interval value in error detail, got: {detail}"
+            );
+            assert!(
+                detail.contains(&format!("{MAX_REFRESH_INTERVAL_SECONDS}")),
+                "Expected max interval value in error detail, got: {detail}"
+            );
         }
     }
 

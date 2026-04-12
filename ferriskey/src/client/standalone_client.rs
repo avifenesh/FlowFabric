@@ -68,52 +68,22 @@ impl Drop for StandaloneClient {
     }
 }
 
-pub enum StandaloneClientConnectionError {
-    NoAddressesProvided,
-    FailedConnection(Vec<(Option<String>, ValkeyError)>),
-    PrimaryConflictFound(String),
-}
-
-impl std::fmt::Debug for StandaloneClientConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StandaloneClientConnectionError::NoAddressesProvided => {
-                write!(f, "No addresses provided")
-            }
-            StandaloneClientConnectionError::FailedConnection(errs) => {
-                match errs.len() {
-                    0 => {
-                        writeln!(f, "Failed without explicit error")?;
-                    }
-                    1 => {
-                        let (ref address, ref error) = errs[0];
-                        match address {
-                            Some(address) => {
-                                writeln!(f, "Received error for address `{address}`: {error}")?
-                            }
-                            None => writeln!(f, "Received error: {error}")?,
-                        }
-                    }
-                    _ => {
-                        writeln!(f, "Received errors:")?;
-                        for (address, error) in errs {
-                            match address {
-                                Some(address) => writeln!(f, "{address}: {error}")?,
-                                None => writeln!(f, "{error}")?,
-                            }
-                        }
-                    }
-                };
-                Ok(())
-            }
-            StandaloneClientConnectionError::PrimaryConflictFound(found_primaries) => {
-                writeln!(
-                    f,
-                    "Primary conflict. More than one primary found in a Standalone setup: {found_primaries}"
-                )
-            }
-        }
+fn format_connection_errors(errors: Vec<(Option<String>, ValkeyError)>) -> ValkeyError {
+    if errors.len() == 1 {
+        return errors.into_iter().next().unwrap().1;
     }
+    let detail: Vec<String> = errors
+        .iter()
+        .map(|(addr, err)| match addr {
+            Some(a) => format!("{a}: {err}"),
+            None => format!("{err}"),
+        })
+        .collect();
+    ValkeyError::from((
+        crate::value::ErrorKind::ClientError,
+        "Connection failed",
+        detail.join("; "),
+    ))
 }
 
 impl StandaloneClient {
@@ -122,9 +92,12 @@ impl StandaloneClient {
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-    ) -> Result<Self, StandaloneClientConnectionError> {
+    ) -> Result<Self, ValkeyError> {
         if connection_request.addresses.is_empty() {
-            return Err(StandaloneClientConnectionError::NoAddressesProvided);
+            return Err(ValkeyError::from((
+                crate::value::ErrorKind::InvalidClientConfig,
+                "No addresses provided",
+            )));
         }
 
         // Validate read_only mode is not combined with AZAffinity strategies
@@ -135,13 +108,10 @@ impl StandaloneClient {
                     | Some(ClientReadFrom::AZAffinityReplicasAndPrimary(_))
             )
         {
-            return Err(StandaloneClientConnectionError::FailedConnection(vec![(
-                None,
-                ValkeyError::from((
-                    crate::value::ErrorKind::InvalidClientConfig,
-                    "read-only mode is not compatible with AZAffinity strategies",
-                )),
-            )]));
+            return Err(ValkeyError::from((
+                crate::value::ErrorKind::InvalidClientConfig,
+                "read-only mode is not compatible with AZAffinity strategies",
+            )));
         }
 
         let valkey_connection_info =
@@ -172,24 +142,18 @@ impl StandaloneClient {
         let has_client_cert = !connection_request.client_cert.is_empty();
         let has_client_key = !connection_request.client_key.is_empty();
         if has_client_cert != has_client_key {
-            return Err(StandaloneClientConnectionError::FailedConnection(vec![(
-                None,
-                ValkeyError::from((
-                    crate::value::ErrorKind::InvalidClientConfig,
-                    "client_cert and client_key must both be provided or both be empty",
-                )),
-            )]));
+            return Err(ValkeyError::from((
+                crate::value::ErrorKind::InvalidClientConfig,
+                "client_cert and client_key must both be provided or both be empty",
+            )));
         }
 
         let tls_params = if has_root_certs || has_client_cert || has_client_key {
             if tls_mode.unwrap_or(TlsMode::NoTls) == TlsMode::NoTls {
-                return Err(StandaloneClientConnectionError::FailedConnection(vec![(
-                    None,
-                    ValkeyError::from((
-                        crate::value::ErrorKind::InvalidClientConfig,
-                        "TLS certificates provided but TLS is disabled",
-                    )),
-                )]));
+                return Err(ValkeyError::from((
+                    crate::value::ErrorKind::InvalidClientConfig,
+                    "TLS certificates provided but TLS is disabled",
+                )));
             }
 
             let root_cert = if has_root_certs {
@@ -215,11 +179,9 @@ impl StandaloneClient {
                 client_tls,
                 root_cert,
             };
-            Some(
-                crate::connection::tls::retrieve_tls_certificates(tls_certificates).map_err(
-                    |err| StandaloneClientConnectionError::FailedConnection(vec![(None, err)]),
-                )?,
-            )
+            Some(crate::connection::tls::retrieve_tls_certificates(
+                tls_certificates,
+            )?)
         } else {
             None
         };
@@ -291,7 +253,11 @@ impl StandaloneClient {
                             for node in nodes.iter() {
                                 node.mark_as_dropped();
                             }
-                            return Err(StandaloneClientConnectionError::PrimaryConflictFound(msg));
+                            return Err(ValkeyError::from((
+                                crate::value::ErrorKind::ClientError,
+                                "Primary conflict in standalone setup",
+                                msg,
+                            )));
                         }
                         primary_index = Some(nodes.len().saturating_sub(1));
                     }
@@ -310,9 +276,7 @@ impl StandaloneClient {
                 for node in nodes.iter() {
                     node.mark_as_dropped();
                 }
-                return Err(StandaloneClientConnectionError::FailedConnection(
-                    addresses_and_errors,
-                ));
+                return Err(format_connection_errors(addresses_and_errors));
             }
             0 // primary_index won't be used for writes in read-only mode
         } else {
@@ -320,23 +284,16 @@ impl StandaloneClient {
             match primary_index {
                 Some(idx) => idx,
                 None => {
-                    let mut errors = addresses_and_errors;
-                    if errors.is_empty() {
-                        errors.insert(
-                            0,
-                            (
-                                None,
-                                ValkeyError::from((
-                                    crate::value::ErrorKind::ClientError,
-                                    "No primary node found",
-                                )),
-                            ),
-                        )
-                    };
                     for node in nodes.iter() {
                         node.mark_as_dropped();
                     }
-                    return Err(StandaloneClientConnectionError::FailedConnection(errors));
+                    if addresses_and_errors.is_empty() {
+                        return Err(ValkeyError::from((
+                            crate::value::ErrorKind::ClientError,
+                            "No primary node found",
+                        )));
+                    }
+                    return Err(format_connection_errors(addresses_and_errors));
                 }
             }
         };
