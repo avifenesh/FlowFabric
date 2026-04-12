@@ -594,7 +594,7 @@ impl MultiplexedConnection {
     /// Constructs a new `MultiplexedConnection` out of a `AsyncRead + AsyncWrite` object
     /// and a `ConnectionInfo`
     pub async fn new<C>(
-        connection_info: &ConnectionInfo,
+        connection_info: ConnectionInfo,
         stream: C,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
@@ -613,7 +613,7 @@ impl MultiplexedConnection {
     /// Constructs a new `MultiplexedConnection` out of a `AsyncRead + AsyncWrite` object
     /// and a `ConnectionInfo`. The new object will wait on operations for the given `response_timeout`.
     pub async fn new_with_response_timeout<C>(
-        connection_info: &ConnectionInfo,
+        connection_info: ConnectionInfo,
         stream: C,
         response_timeout: std::time::Duration,
         ferriskey_connection_options: FerrisKeyConnectionOptions,

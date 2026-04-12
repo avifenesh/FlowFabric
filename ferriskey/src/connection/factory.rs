@@ -152,11 +152,7 @@ impl Client {
     where
         T: RedisRuntime,
     {
-        // KNOWN ISSUE: Box::leak creates a 'static reference that is never freed.
-        // This leaks ~200 bytes per connection. The proper fix requires changing
-        // MultiplexedConnection::new_with_response_timeout to take owned ConnectionInfo
-        // (tracked in DESIGN_DEBT.md item #5 — connection lifecycle simplification).
-        let conn_info: &'static ConnectionInfo = Box::leak(Box::new(self.connection_info.clone()));
+        let conn_info = self.connection_info.clone();
         let (con, ip) = connect_simple::<T>(
             &conn_info,
             socket_addr,
@@ -164,7 +160,7 @@ impl Client {
         )
         .await?;
         let (connection, driver) = MultiplexedConnection::new_with_response_timeout(
-            &conn_info,
+            conn_info,
             con.boxed(),
             response_timeout,
             ferriskey_connection_options,
