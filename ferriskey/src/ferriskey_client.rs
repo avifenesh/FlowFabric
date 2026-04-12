@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::{
-    AuthenticationInfo, Client as ClientInner, ConnectionError, ConnectionRequest, NodeAddress,
+    AuthenticationInfo, Client as ClientInner, ConnectionRequest, NodeAddress,
     TlsMode as ClientTlsMode,
 };
 use crate::cmd::{Cmd, cmd};
@@ -43,9 +43,7 @@ struct SharedConnectionOptions {
 impl Client {
     pub async fn connect(url: &str) -> Result<Client> {
         let request = connection_request_from_url(url, false)?;
-        let inner = ClientInner::new(request, None)
-            .await
-            .map_err(connection_error_to_ferriskey_error)?;
+        let inner = ClientInner::new(request, None).await?;
         Ok(Self(Arc::new(inner)))
     }
 
@@ -78,9 +76,7 @@ impl Client {
             request.addresses.push(node_address_from_addr(info.addr)?);
         }
 
-        let inner = ClientInner::new(request, None)
-            .await
-            .map_err(connection_error_to_ferriskey_error)?;
+        let inner = ClientInner::new(request, None).await?;
         Ok(Self(Arc::new(inner)))
     }
 
@@ -198,6 +194,15 @@ impl Client {
         }
     }
 
+    pub fn pipeline(&self) -> TypedPipeline {
+        TypedPipeline {
+            inner: crate::pipeline::Pipeline::new(),
+            client: self.0.clone(),
+            results: Arc::new(std::sync::OnceLock::new()),
+            next_index: 0,
+        }
+    }
+
     async fn execute<T: FromValue>(&self, mut cmd: Cmd) -> Result<T> {
         let mut inner = (*self.0).clone();
         let value = inner.send_command(&mut cmd, None).await?;
@@ -284,9 +289,7 @@ impl ClientBuilder {
             )));
         }
 
-        let inner = ClientInner::new(self.request, None)
-            .await
-            .map_err(connection_error_to_ferriskey_error)?;
+        let inner = ClientInner::new(self.request, None).await?;
         Ok(Client(Arc::new(inner)))
     }
 }
@@ -394,19 +397,6 @@ fn apply_connection_info(request: &mut ConnectionRequest, info: ConnectionInfo) 
     request.client_name = valkey.client_name;
     request.lib_name = valkey.lib_name;
     Ok(())
-}
-
-fn connection_error_to_ferriskey_error(error: ConnectionError) -> FerrisKeyError {
-    match error {
-        ConnectionError::Valkey(error) => error,
-        ConnectionError::Timeout => std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
-        ConnectionError::IoError(error) => error.into(),
-        ConnectionError::Configuration(message) => ValkeyError::from((
-            ErrorKind::InvalidClientConfig,
-            "Connection configuration error",
-            message,
-        )),
-    }
 }
 
 fn duration_to_millis(ttl: Duration) -> Result<u64> {

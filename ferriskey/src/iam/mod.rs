@@ -33,41 +33,6 @@ const TOKEN_GEN_INITIAL_BACKOFF_MS: u64 = 100;
 /// Safety cap so we never sleep unreasonably long between attempts
 const TOKEN_GEN_MAX_BACKOFF_MS: u64 = 3_000;
 
-/// Custom error type for IAM operations
-#[derive(Debug)]
-enum IAMError {
-    /// Invalid refresh interval (must be 1 second to 12 hours)
-    InvalidRefreshInterval { max: u32, actual: u32 },
-
-    /// AWS credentials resolution error
-    CredentialsError(String),
-
-    /// Token generation error
-    TokenGenerationError(String),
-}
-
-impl From<IAMError> for ValkeyError {
-    fn from(value: IAMError) -> Self {
-        match value {
-            IAMError::InvalidRefreshInterval { max, actual } => ValkeyError::from((
-                ErrorKind::InvalidClientConfig,
-                "IAM authentication error: Invalid refresh interval",
-                format!("Must be between 1 and {max} (inclusive), got: {actual}"),
-            )),
-            IAMError::CredentialsError(message) => ValkeyError::from((
-                ErrorKind::AuthenticationFailed,
-                "IAM authentication error: Failed to get AWS credentials",
-                message,
-            )),
-            IAMError::TokenGenerationError(message) => ValkeyError::from((
-                ErrorKind::AuthenticationFailed,
-                "IAM authentication error: Token generation failed",
-                message,
-            )),
-        }
-    }
-}
-
 /// AWS service type for IAM authentication
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoStaticStr)]
 pub enum ServiceType {
@@ -87,19 +52,19 @@ fn validate_refresh_interval(
     match refresh_interval_seconds {
         Some(0) => {
             // Reject 0 as an invalid interval
-            Err(IAMError::InvalidRefreshInterval {
-                max: MAX_REFRESH_INTERVAL_SECONDS,
-                actual: 0,
-            }
-            .into())
+            Err(ValkeyError::from((
+                ErrorKind::ClientError,
+                "IAM refresh interval validation failed",
+                format!("actual=0 exceeds max={MAX_REFRESH_INTERVAL_SECONDS}"),
+            )))
         }
         Some(interval) => {
             if interval > MAX_REFRESH_INTERVAL_SECONDS {
-                return Err(IAMError::InvalidRefreshInterval {
-                    max: MAX_REFRESH_INTERVAL_SECONDS,
-                    actual: interval,
-                }
-                .into());
+                return Err(ValkeyError::from((
+                    ErrorKind::ClientError,
+                    "IAM refresh interval validation failed",
+                    format!("actual={interval} exceeds max={MAX_REFRESH_INTERVAL_SECONDS}"),
+                )));
             }
 
             // Log warning if interval is above 15 minutes
@@ -134,14 +99,21 @@ async fn get_signing_identity(
         .load()
         .await;
 
-    let provider = config
-        .credentials_provider()
-        .ok_or_else(|| IAMError::CredentialsError("No AWS credentials provider found".into()))?;
+    let provider = config.credentials_provider().ok_or_else(|| {
+        ValkeyError::from((
+            ErrorKind::ClientError,
+            "IAM credentials error",
+            "No AWS credentials provider found".to_string(),
+        ))
+    })?;
 
-    let creds = provider
-        .provide_credentials()
-        .await
-        .map_err(|e| IAMError::CredentialsError(e.to_string()))?;
+    let creds = provider.provide_credentials().await.map_err(|e| {
+        ValkeyError::from((
+            ErrorKind::ClientError,
+            "IAM credentials error",
+            e.to_string(),
+        ))
+    })?;
 
     let service_name: &'static str = service_type.into();
     Ok(Credentials::new(
@@ -455,7 +427,11 @@ impl IAMTokenManager {
             .settings(signing_settings)
             .build()
             .map_err(|e| {
-                IAMError::TokenGenerationError(format!("Failed to build signing params: {e}"))
+                ValkeyError::from((
+                    ErrorKind::ClientError,
+                    "IAM token generation failed",
+                    format!("Failed to build signing params: {e}"),
+                ))
             })?
             .into();
 
@@ -467,12 +443,22 @@ impl IAMTokenManager {
             SignableBody::Bytes(b""),
         )
         .map_err(|e| {
-            IAMError::TokenGenerationError(format!("Failed to create signable request: {e}"))
+            ValkeyError::from((
+                ErrorKind::ClientError,
+                "IAM token generation failed",
+                format!("Failed to create signable request: {e}"),
+            ))
         })?;
 
         // Sign the request (with presigning settings, this will generate query parameters)
         let (instructions, _sig) = sign(signable_request, &signing_params)
-            .map_err(|e| IAMError::TokenGenerationError(format!("Failed to sign: {e}")))?
+            .map_err(|e| {
+                ValkeyError::from((
+                    ErrorKind::ClientError,
+                    "IAM token generation failed",
+                    format!("Failed to sign: {e}"),
+                ))
+            })?
             .into_parts();
 
         // Build a temporary HTTP request to apply the signing instructions
@@ -482,7 +468,11 @@ impl IAMTokenManager {
             .header("host", &hostname)
             .body(())
             .map_err(|e| {
-                IAMError::TokenGenerationError(format!("Build HTTP request failed: {e}"))
+                ValkeyError::from((
+                    ErrorKind::ClientError,
+                    "IAM token generation failed",
+                    format!("Build HTTP request failed: {e}"),
+                ))
             })?;
 
         instructions.apply_to_request_http1x(&mut req);
@@ -909,7 +899,7 @@ mod tests {
             );
 
             let error = result.unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidClientConfig);
+            assert_eq!(error.kind(), ErrorKind::ClientError);
             let detail = error.detail().unwrap_or_default();
             assert!(
                 detail.contains(&format!("{interval}")),

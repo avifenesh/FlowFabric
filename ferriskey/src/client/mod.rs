@@ -1774,35 +1774,7 @@ async fn create_cluster_client(
     Ok(con)
 }
 
-#[derive(thiserror::Error)]
-pub enum ConnectionError {
-    Valkey(crate::value::ValkeyError),
-    Timeout,
-    IoError(std::io::Error),
-    Configuration(String),
-}
 
-impl std::fmt::Debug for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Valkey(arg0) => f.debug_tuple("Valkey").field(arg0).finish(),
-            Self::IoError(arg0) => f.debug_tuple("IoError").field(arg0).finish(),
-            Self::Timeout => write!(f, "Timeout"),
-            Self::Configuration(arg0) => f.debug_tuple("Configuration").field(arg0).finish(),
-        }
-    }
-}
-
-impl std::fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionError::Valkey(err) => write!(f, "{err}"),
-            ConnectionError::IoError(err) => write!(f, "{err}"),
-            ConnectionError::Timeout => f.write_str("connection attempt timed out"),
-            ConnectionError::Configuration(msg) => write!(f, "configuration error: {msg}"),
-        }
-    }
-}
 
 fn format_optional_value<T>(name: &'static str, value: Option<T>) -> String
 where
@@ -1913,7 +1885,7 @@ fn sanitized_request_string(request: &ConnectionRequest) -> String {
 /// Returns None if compression is disabled or not configured
 fn create_compression_manager(
     compression_config: Option<CompressionConfig>,
-) -> Result<Option<Arc<CompressionManager>>, ConnectionError> {
+) -> Result<Option<Arc<CompressionManager>>, ValkeyError> {
     let Some(config) = compression_config else {
         return Ok(None);
     };
@@ -1928,7 +1900,11 @@ fn create_compression_manager(
     };
 
     let manager = CompressionManager::new(backend, config).map_err(|e| {
-        ConnectionError::Configuration(format!("Failed to create compression manager: {}", e))
+        ValkeyError::from((
+            ErrorKind::InvalidClientConfig,
+            "Failed to create compression manager",
+            e.to_string(),
+        ))
     })?;
 
     Ok(Some(Arc::new(manager)))
@@ -1938,7 +1914,7 @@ impl Client {
     pub async fn new(
         request: ConnectionRequest,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    ) -> Result<Self, ConnectionError> {
+    ) -> Result<Self, ValkeyError> {
         // Add buffer to connection_timeout to allow inner connection logic to fully execute before the outer timeout triggers
         let client_creation_timeout = request.get_connection_timeout() + Duration::from_millis(500);
 
@@ -2048,7 +2024,7 @@ impl Client {
                     pubsub_synchronizer.clone(),
                 )
                 .await
-                .map_err(ConnectionError::Valkey)?;
+                ?;
                 ClientWrapper::Cluster { client }
             } else {
                 ClientWrapper::Standalone(
@@ -2059,7 +2035,7 @@ impl Client {
                         Some(pubsub_synchronizer.clone()),
                     )
                     .await
-                    .map_err(ConnectionError::Valkey)?,
+                    ?,
                 )
             };
 
@@ -2091,7 +2067,7 @@ impl Client {
             Ok(client)
         })
         .await
-        .map_err(|_| ConnectionError::Timeout)?
+        .map_err(|_| ValkeyError::from(std::io::Error::from(std::io::ErrorKind::TimedOut)))?
     }
 
     /// Get the compression manager if compression is enabled

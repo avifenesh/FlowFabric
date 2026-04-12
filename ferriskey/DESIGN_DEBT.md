@@ -111,40 +111,38 @@ At 250K ops/sec, that's 250K String allocations for addresses.
 
 ## 9. Error types — Two parallel hierarchies
 
-- `ValkeyError` (types.rs) — the main error type
-- `ServerError` / `ServerErrorKind` — server-specific errors, wrapped in ValkeyError
-- `IAMError` (iam/mod.rs) — separate error type
-- `StandaloneClientConnectionError` — another separate type
-- `ConnectionError` — yet another
+**Status (2026-04-12): Partially done.**
+- ~~`IAMError`~~ — From<IAMError> for ValkeyError added; IAMError being eliminated
+- ~~`StandaloneClientConnectionError`~~ — deleted (47 lines); create_client returns ValkeyError
+- ~~`ConnectionError`~~ — being deleted (~40 lines); Client::new returns ValkeyError
+- `ServerError` / `ServerErrorKind` — **deferred**. 16 direct construction sites (9 in cluster/pipeline alone). Performance-critical redirect logic. Needs benchmarking when touched. Can collapse to `ValkeyError(ErrorKind::Moved/Ask, ...)` but large effort.
+
+Remaining:
+- `ValkeyError` (value.rs) — the main error type
+- `ServerError` / `ServerErrorKind` — server-specific errors (MOVED/ASK, inline error responses). Deferred: large effort, hot path.
 
 **Target:** Single error enum with variants. Use `thiserror` derive consistently.
 
 ## 10. Feature flags — Inconsistent gating
 
-- `mock-pubsub` — gates test infrastructure
-- `testing` — gates cluster test exports
-- `standalone_heartbeat` — gates heartbeat logic
-- `iam_tests` — gates IAM test code
-
-Some use `#[cfg(feature = "...")]`, some use `#[cfg(test)]`, some use both.
-No consistency in what's a feature vs what's a test-only gate.
-
-**Target:** Two gates only: `#[cfg(test)]` for test code, `#[cfg(feature = "test-util")]`
-for test infrastructure that external integration tests need.
+**Status (2026-04-12): DONE.**
+- Removed `testing`, `standalone_heartbeat`, `iam_tests`, `mock-pubsub` features
+- Merged into: `default=[]`, `test-util=[]`
+- Heartbeat always-on; test infrastructure behind `test-util`
 
 ---
 
 ## Priority
 
-| # | Impact | Effort | When |
-|---|---|---|---|
-| 3 | High (user-facing) | Medium | Next: convenience API |
-| 2 | High (user-facing) | Medium | Next: rename public types |
-| 1 | Medium (structure) | Large | After API stabilizes |
-| 4 | Medium (correctness) | Medium | Dedicated session |
-| 6 | Medium (correctness) | Large | Breaking change |
-| 5 | Medium (simplicity) | Large | After API stabilizes |
-| 7 | Low (perf) | Medium | After profiling confirms need |
-| 8 | Low (perf) | Small | Quick win |
-| 9 | Low (clarity) | Medium | With API redesign |
-| 10 | Low (DX) | Small | Quick win |
+| # | Status | Impact | Effort | When |
+|---|---|---|---|---|
+| 1 | ✓ DONE | Medium (structure) | Large | Module migration complete |
+| 2 | Open | High (user-facing) | Medium | Next: rename public types |
+| 3 | ✓ DONE (partial) | High (user-facing) | Medium | Client + convenience methods + pipeline |
+| 4 | Open | Medium (correctness) | Medium | PubSub rewrite — dedicated session |
+| 5 | Open | Medium (simplicity) | Large | Box::leak in connection/factory.rs — after lifecycle work |
+| 6 | Open | Medium (correctness) | Large | Value::ServerError variant — with ServerError collapse |
+| 7 | Open | Low (perf) | Medium | Cmd double-allocation — after profiling |
+| 8 | ✓ DONE | Low (perf) | Small | Arc<str> node addresses |
+| 9 | Partial | Low (clarity) | Mixed | IAMError+Standalone+Connection done; ServerError deferred |
+| 10 | ✓ DONE | Low (DX) | Small | Feature flags consolidated |
