@@ -136,6 +136,11 @@ pub struct EventDrivenSynchronizer {
     reconcile_complete_notify: Notify,
 
     request_timeout: Duration,
+
+    /// Set when remove_current_subscriptions fires (server-initiated unsubscribe).
+    /// handle_topology_refresh uses this to fire DesiredChanged exactly ONCE per incident
+    /// and then clears it — prevents infinite MOVED→refresh→DesiredChanged loops.
+    pending_resubscribe: std::sync::atomic::AtomicBool,
 }
 
 impl EventDrivenSynchronizer {
@@ -157,6 +162,7 @@ impl EventDrivenSynchronizer {
             sync_notify: Notify::new(),
             reconcile_complete_notify: Notify::new(),
             request_timeout,
+            pending_resubscribe: std::sync::atomic::AtomicBool::new(false),
         });
 
         sync.start_event_loop(events_rx);
@@ -609,6 +615,7 @@ impl EventDrivenSynchronizer {
             Err(_) => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
         }
     }
+
 }
 
 impl Drop for EventDrivenSynchronizer {
@@ -671,8 +678,6 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         subscription_type: PubSubSubscriptionKind,
         address: String,
     ) {
-        // Update confirmed state synchronously — handle_topology_refresh reads
-        // confirmed directly under the RwLock, so we can't defer this to the event loop.
         let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
         for channel in channels {
             confirmed.add(subscription_type, channel, address.clone());
@@ -687,22 +692,15 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         subscription_type: PubSubSubscriptionKind,
         address: String,
     ) {
-        // Update confirmed state synchronously — same reason as add_current_subscriptions.
         let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
         for channel in &channels {
             confirmed.remove_exact(subscription_type, channel, &address);
         }
         drop(confirmed);
+        // Signal that a server-initiated unsubscribe occurred. handle_topology_refresh will
+        // fire DesiredChanged exactly once when it next runs with an updated slot map.
+        self.pending_resubscribe.store(true, std::sync::atomic::Ordering::Relaxed);
         self.check_sync_and_notify();
-        // Fire DesiredChanged AFTER a short delay so the periodic topology check (500ms) has
-        // time to run first and update the slot map. This ensures reconcile uses correct routing
-        // when the SUnsubscribe was caused by a slot migration or failover. Without the delay,
-        // immediate reconcile would route to the old owner → MOVED → slot refresh loop.
-        let tx = self.events_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            let _ = tx.send(SyncEvent::DesiredChanged);
-        });
     }
 
     fn get_subscription_state(
@@ -792,6 +790,14 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         );
 
         if migrations.is_empty() && gone_subs.is_empty() {
+            // If a server-initiated SUnsubscribe previously cleared confirmed state
+            // (pending_resubscribe=true), fire DesiredChanged exactly ONCE so reconcile
+            // runs with the freshly-updated slot map. The flag is cleared atomically to
+            // ensure only one DesiredChanged fires per SUnsubscribe incident — preventing
+            // the MOVED→refresh→DesiredChanged→reconcile→MOVED infinite loop.
+            if self.pending_resubscribe.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.send_event(SyncEvent::DesiredChanged);
+            }
             return;
         }
 

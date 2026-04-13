@@ -489,7 +489,7 @@ impl PubSubTestSetup {
             // Minimum 200ms between slot refreshes prevents rapid MOVED→refresh→MOVED loops
             // when the cluster is settling after failover. With async conn_lock, there is no
             // natural throttle from blocking, so we need explicit rate limiting.
-            .slots_refresh_rate_limit(Duration::from_millis(200), 0)
+            .slots_refresh_rate_limit(Duration::from_millis(1000), 0)
             .periodic_topology_checks(Duration::from_millis(500))
             // Finite response timeout prevents indefinite waits when nodes are temporarily
             // unresponsive during failover/migration. Safe now that conn_lock uses
