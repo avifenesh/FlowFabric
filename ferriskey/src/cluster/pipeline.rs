@@ -159,7 +159,7 @@ where
                     match multi_node_routing {
                         MultipleNodeRoutingInfo::AllNodes | MultipleNodeRoutingInfo::AllMasters => {
                             let connections: Vec<_> = {
-                                let lock = core.conn_lock.read();
+                                let lock = core.conn_lock.read().await;
                                 if matches!(multi_node_routing, MultipleNodeRoutingInfo::AllNodes) {
                                     lock.all_node_connections().collect()
                                 } else {
@@ -255,7 +255,7 @@ where
 {
     for (inner_index, (route, indices)) in slots.iter().enumerate() {
         let conn = {
-            let lock = core.conn_lock.read();
+            let lock = core.conn_lock.read().await;
             lock.connection_for_route(route)
         };
         if let Some((address, conn)) = conn {

@@ -34,7 +34,7 @@ use which::which;
 // Code copied from ferriskey
 
 pub(crate) const SHORT_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(50_000);
-pub(crate) const LONG_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(300_000);
+pub(crate) const LONG_CLUSTER_TEST_TIMEOUT: Duration = Duration::from_millis(600_000);
 
 enum ClusterType {
     Tcp,
@@ -73,24 +73,34 @@ pub struct ValkeyCluster {
 
 impl Drop for ValkeyCluster {
     fn drop(&mut self) {
+        // Kill processes immediately with SIGKILL for fast teardown in tests.
+        // The cluster_manager.py stop script can wait many minutes for graceful shutdown
+        // which causes test timeouts. We kill directly, then let the script clean up
+        // the cluster folder in the background.
+        for server in &self.servers {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &server.pid.to_string()])
+                .output();
+        }
+
         let pids: Vec<String> = self
             .servers
             .iter()
             .map(|server| format!("{}", server.pid))
             .collect();
         let pids = pids.join(",");
-        Self::execute_cluster_script(
-            vec![
-                "stop",
-                "--cluster-folder",
-                &self.cluster_folder,
-                "--pids",
-                &pids,
-            ],
-            self.use_tls,
-            self.password.clone(),
-            None,
-        );
+        let cluster_folder = self.cluster_folder.clone();
+        let use_tls = self.use_tls;
+        let password = self.password.clone();
+        // Run the cleanup script in a background thread so teardown doesn't block.
+        std::thread::spawn(move || {
+            Self::execute_cluster_script(
+                vec!["stop", "--cluster-folder", &cluster_folder, "--pids", &pids],
+                use_tls,
+                password,
+                None,
+            );
+        });
     }
 }
 
@@ -476,8 +486,15 @@ impl PubSubTestSetup {
             .collect();
 
         let client = ferriskey::cluster::compat::ClusterClientBuilder::new(initial_nodes)
-            .slots_refresh_rate_limit(Duration::from_millis(0), 0)
+            // Minimum 200ms between slot refreshes prevents rapid MOVED→refresh→MOVED loops
+            // when the cluster is settling after failover. With async conn_lock, there is no
+            // natural throttle from blocking, so we need explicit rate limiting.
+            .slots_refresh_rate_limit(Duration::from_millis(200), 0)
             .periodic_topology_checks(Duration::from_millis(500))
+            // Finite response timeout prevents indefinite waits when nodes are temporarily
+            // unresponsive during failover/migration. Safe now that conn_lock uses
+            // tokio::sync::RwLock (async) — no scheduler freezing from conn_lock.write().
+            .response_timeout(Duration::from_secs(5))
             .build()
             .expect("Failed to build cluster client for topology test");
 

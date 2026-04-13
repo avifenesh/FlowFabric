@@ -401,8 +401,13 @@ impl ScanState {
     {
         let mut new_scanned_slots_map: SlotsBitsArray = [0; BITS_ARRAY_SIZE as usize];
         let new_cursor = 0;
-        let address =
-            next_address_to_scan(core, 0, &mut new_scanned_slots_map, allow_non_covered_slots)?;
+        let address = next_address_to_scan(
+            core,
+            0,
+            &mut new_scanned_slots_map,
+            allow_non_covered_slots,
+        )
+        .await?;
 
         match address {
             NextNodeResult::AllSlotsCompleted => Ok(ScanState::create_finished_state()),
@@ -442,7 +447,9 @@ impl ScanState {
             next_slot,
             &mut scanned_slots_map,
             allow_non_covered_slots,
-        ) {
+        )
+        .await
+        {
             Ok(NextNodeResult::Address(new_address)) => {
                 let new_epoch = core.address_epoch(&new_address).await.unwrap_or(0);
                 Ok(ScanState::new(
@@ -539,7 +546,7 @@ enum NextNodeResult {
 ///
 /// * `C`: The connection type that must implement `ConnectionLike`, `Connect`, `Clone`, `Send`, `Sync`, and `'static`.
 ///
-fn next_address_to_scan<C>(
+async fn next_address_to_scan<C>(
     core: &InnerCore<C>,
     mut slot: u16,
     scanned_slots_map: &mut SlotsBitsArray,
@@ -556,6 +563,7 @@ where
         if let Some(addr) = core
             .conn_lock
             .read()
+            .await
             .slot_map
             .node_address_for_slot(slot, SlotAddr::ReplicaRequired)
         {
@@ -753,7 +761,9 @@ where
         next_slot,
         &mut scanned_slots_map,
         cluster_scan_args.allow_non_covered_slots,
-    ) {
+    )
+    .await
+    {
         Ok(NextNodeResult::Address(new_address)) => {
             let new_epoch = core.address_epoch(&new_address).await.unwrap_or(0);
             Ok(Some(ScanState::new(

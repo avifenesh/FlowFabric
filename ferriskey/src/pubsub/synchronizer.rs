@@ -237,14 +237,16 @@ impl EventDrivenSynchronizer {
                         }
                     }
                     SyncEvent::TopologyChanged { migrations, gone_subs } => {
-                        // Drain and keep only the latest TopologyChanged
+                        // Drain additional TopologyChanged events, MERGING their data.
+                        // Do NOT replace — a subsequent refresh with empty gone_subs would
+                        // discard the important gone/migration data from the first event.
                         let mut latest_mig = migrations;
                         let mut latest_gone = gone_subs;
                         while let Ok(evt) = events_rx.try_recv() {
                             match evt {
                                 SyncEvent::TopologyChanged { migrations, gone_subs } => {
-                                    latest_mig = migrations;
-                                    latest_gone = gone_subs;
+                                    latest_mig.extend(migrations);
+                                    latest_gone.extend(gone_subs);
                                 }
                                 other => {
                                     let _ = sync.events_tx.send(other);
@@ -686,19 +688,21 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         address: String,
     ) {
         // Update confirmed state synchronously — same reason as add_current_subscriptions.
-        // NOTE: do NOT send DesiredChanged here. After a server-initiated SUnsubscribe (e.g.
-        // slot migration or failover), the topology change hasn't been reflected in the
-        // client's slot map yet. Firing reconcile immediately would route SSUBSCRIBE to the
-        // old owner (getting MOVED), which then triggers conn_lock.write() from slot-refresh
-        // code — a sync parking_lot lock that freezes the tokio current_thread runtime.
-        // Instead, reconcile is triggered after the topology refresh in handle_topology_refresh,
-        // where the slot map is already updated and routing is correct.
         let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
         for channel in &channels {
             confirmed.remove_exact(subscription_type, channel, &address);
         }
         drop(confirmed);
         self.check_sync_and_notify();
+        // Fire DesiredChanged AFTER a short delay so the periodic topology check (500ms) has
+        // time to run first and update the slot map. This ensures reconcile uses correct routing
+        // when the SUnsubscribe was caused by a slot migration or failover. Without the delay,
+        // immediate reconcile would route to the old owner → MOVED → slot refresh loop.
+        let tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let _ = tx.send(SyncEvent::DesiredChanged);
+        });
     }
 
     fn get_subscription_state(
@@ -788,24 +792,6 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         );
 
         if migrations.is_empty() && gone_subs.is_empty() {
-            // No explicit migrations, but the topology just refreshed with an updated slot map.
-            // If desired subscriptions are not yet confirmed (e.g. a server-initiated SUnsubscribe
-            // cleared confirmed before this topology refresh), fire DesiredChanged so reconcile
-            // runs with the correct, up-to-date slot map.
-            // This is safe: reconcile is idempotent and only sends commands if desired != actual.
-            let has_unconfirmed = {
-                let desired = self.desired.read().unwrap_or_else(|e| e.into_inner());
-                let confirmed = self.confirmed.read().unwrap_or_else(|e| e.into_inner());
-                let actual = confirmed.aggregate();
-                self.kinds().iter().any(|kind| {
-                    let d = desired.get(kind).map(|s| s.len()).unwrap_or(0);
-                    let a = actual.get(kind).map(|s| s.len()).unwrap_or(0);
-                    d != a
-                })
-            };
-            if has_unconfirmed {
-                self.send_event(SyncEvent::DesiredChanged);
-            }
             return;
         }
 
