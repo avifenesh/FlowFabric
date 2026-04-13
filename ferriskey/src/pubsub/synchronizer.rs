@@ -137,10 +137,10 @@ pub struct EventDrivenSynchronizer {
 
     request_timeout: Duration,
 
-    /// Set when remove_current_subscriptions fires (server-initiated unsubscribe).
-    /// handle_topology_refresh uses this to fire DesiredChanged exactly ONCE per incident
-    /// and then clears it — prevents infinite MOVED→refresh→DesiredChanged loops.
-    pending_resubscribe: std::sync::atomic::AtomicBool,
+    /// Tracks whether on_topology_changed is currently executing.
+    /// Prevents backoff tasks from spawning for our own UNSUBSCRIBE command responses,
+    /// which would create compounding retry loops.
+    in_topology_change: std::sync::atomic::AtomicBool,
 }
 
 impl EventDrivenSynchronizer {
@@ -162,7 +162,7 @@ impl EventDrivenSynchronizer {
             sync_notify: Notify::new(),
             reconcile_complete_notify: Notify::new(),
             request_timeout,
-            pending_resubscribe: std::sync::atomic::AtomicBool::new(false),
+            in_topology_change: std::sync::atomic::AtomicBool::new(false),
         });
 
         sync.start_event_loop(events_rx);
@@ -358,6 +358,10 @@ impl EventDrivenSynchronizer {
             return;
         }
 
+        // Suppress backoff-task spawning during this handler so UNSUBSCRIBE echo responses
+        // don't spawn additional retry loops on top of the ones already running.
+        self.in_topology_change.store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Step 1: Unsubscribe from old owners FIRST
         for (addr, kind, channels) in migrations.iter().chain(gone_subs.iter()) {
             let routing = parse_address_routing(addr).ok();
@@ -374,6 +378,8 @@ impl EventDrivenSynchronizer {
         if let Err(e) = self.reconcile().await {
             log_error("pubsub_sync", format!("Post-topology reconcile failed: {e:?}"));
         }
+
+        self.in_topology_change.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn on_node_disconnected(&self, addresses: &HashSet<String>) {
@@ -697,10 +703,40 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
             confirmed.remove_exact(subscription_type, channel, &address);
         }
         drop(confirmed);
-        // Signal that a server-initiated unsubscribe occurred. handle_topology_refresh will
-        // fire DesiredChanged exactly once when it next runs with an updated slot map.
-        self.pending_resubscribe.store(true, std::sync::atomic::Ordering::Relaxed);
         self.check_sync_and_notify();
+        // Trigger reconcile with exponential backoff + jitter.
+        // When a server-initiated SUnsubscribe clears our subscription, we need to
+        // resubscribe on the new slot owner. We retry with backoff so that:
+        // - First attempt is fast (200ms) → quick resubscription after slot migration
+        // - Subsequent attempts back off (400ms, 800ms, 1600ms, 2000ms max) → if the
+        //   cluster is settling after failover, we naturally reduce retry frequency
+        //   instead of hammering at 5 retries/second.
+        let tx = self.events_tx.clone();
+        let desired = self.desired.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // Only schedule retries if we actually want this subscription type
+        let still_desired = desired.get(&subscription_type)
+            .is_some_and(|channels_set| channels.iter().any(|ch| channels_set.contains(ch)));
+        // Don't spawn a backoff task if we're inside on_topology_changed — those UNSUBSCRIBE
+        // responses are our own commands and should not trigger additional retry loops.
+        let in_change = self.in_topology_change.load(std::sync::atomic::Ordering::Relaxed);
+        if still_desired && !in_change {
+            tokio::spawn(async move {
+                let mut delay_ms = 200u64;
+                const MAX_DELAY_MS: u64 = 2000;
+                const MAX_ATTEMPTS: u32 = 8;
+                for _ in 0..MAX_ATTEMPTS {
+                    // Jitter: 80%-120% of base delay
+                    let jitter_range = delay_ms / 5; // 20% jitter
+                    let jitter = if jitter_range > 0 {
+                        (rand::random::<u64>() % (2 * jitter_range)).saturating_sub(jitter_range)
+                    } else { 0 };
+                    let actual_delay = Duration::from_millis(delay_ms.saturating_add(jitter));
+                    tokio::time::sleep(actual_delay).await;
+                    let _ = tx.send(SyncEvent::DesiredChanged);
+                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                }
+            });
+        }
     }
 
     fn get_subscription_state(
@@ -790,14 +826,6 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         );
 
         if migrations.is_empty() && gone_subs.is_empty() {
-            // If a server-initiated SUnsubscribe previously cleared confirmed state
-            // (pending_resubscribe=true), fire DesiredChanged exactly ONCE so reconcile
-            // runs with the freshly-updated slot map. The flag is cleared atomically to
-            // ensure only one DesiredChanged fires per SUnsubscribe incident — preventing
-            // the MOVED→refresh→DesiredChanged→reconcile→MOVED infinite loop.
-            if self.pending_resubscribe.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                self.send_event(SyncEvent::DesiredChanged);
-            }
             return;
         }
 

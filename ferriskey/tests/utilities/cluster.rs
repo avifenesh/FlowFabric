@@ -486,10 +486,9 @@ impl PubSubTestSetup {
             .collect();
 
         let client = ferriskey::cluster::compat::ClusterClientBuilder::new(initial_nodes)
-            // Minimum 200ms between slot refreshes prevents rapid MOVED→refresh→MOVED loops
-            // when the cluster is settling after failover. With async conn_lock, there is no
-            // natural throttle from blocking, so we need explicit rate limiting.
-            .slots_refresh_rate_limit(Duration::from_millis(1000), 0)
+            // No fixed rate limit — the exponential backoff in remove_current_subscriptions
+            // provides natural throttling for retry scenarios.
+            .slots_refresh_rate_limit(Duration::from_millis(0), 0)
             .periodic_topology_checks(Duration::from_millis(500))
             // Finite response timeout prevents indefinite waits when nodes are temporarily
             // unresponsive during failover/migration. Safe now that conn_lock uses
