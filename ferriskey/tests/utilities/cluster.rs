@@ -478,7 +478,6 @@ impl PubSubTestSetup {
         let client = ferriskey::cluster::compat::ClusterClientBuilder::new(initial_nodes)
             .slots_refresh_rate_limit(Duration::from_millis(0), 0)
             .periodic_topology_checks(Duration::from_millis(500))
-            .response_timeout(Duration::from_secs(5))
             .build()
             .expect("Failed to build cluster client for topology test");
 
@@ -837,15 +836,23 @@ pub async fn wait_for_node_to_become_primary(
     timeout: Duration,
 ) -> bool {
     let start = std::time::Instant::now();
+    // Per-query timeout: if a node is temporarily unresponsive during failover,
+    // skip that iteration rather than blocking indefinitely (Duration::MAX).
+    let per_query_timeout = Duration::from_secs(3);
 
     while start.elapsed() < timeout {
-        let topology = ClusterTopology::from_connection(connection).await;
+        let query_result =
+            tokio::time::timeout(per_query_timeout, ClusterTopology::from_connection(connection))
+                .await;
 
-        if let Some(node) = topology.nodes.iter().find(|n| n.node_id == node_id)
-            && node.is_primary
-        {
-            return true;
+        if let Ok(topology) = query_result {
+            if let Some(node) = topology.nodes.iter().find(|n| n.node_id == node_id)
+                && node.is_primary
+            {
+                return true;
+            }
         }
+        // On timeout or wrong state, wait briefly and retry
 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
