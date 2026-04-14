@@ -889,9 +889,11 @@ Streams are attempt-scoped. Each attempt may have its own ordered output stream.
 
 ## Open Questions
 
-1. **Attempt record TTL:** Should attempt records have their own TTL independent of the execution, or should they always share the execution's retention policy? (Leaning toward shared — simpler to reason about.)
-2. **Compaction threshold:** At what attempt count should the engine begin compacting old attempt records into summaries? This is a product/operational decision, not a correctness concern.
-3. **Fallback vs. retry boundary:** When a fallback tier also fails and the policy says "retry same fallback tier," should that be `attempt_type = retry` or `attempt_type = fallback`? (Leaning toward `retry` — the fallback index does not change, so it is a retry within the same fallback position.)
+1. **Compaction threshold:** At what attempt count should the engine begin compacting old attempt records into summaries? This is a product/operational decision, not a correctness concern.
+
+**Resolved:** Attempt record TTL = inherited from parent execution. Confirmed by RFC-010 §9.3 retention defaults.
+
+**Resolved:** Fallback within same tier = `attempt_type = retry`. The fallback_index does not change, so it is a retry within the same fallback position.
 
 ## References
 

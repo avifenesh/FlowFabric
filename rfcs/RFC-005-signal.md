@@ -730,8 +730,9 @@ Signal records follow the execution's retention policy. When an execution is pur
 
 ## Open Questions
 
-1. **Buffered signal replay order:** When suspension commits and buffered signals are replayed, should they be evaluated in `created_at` order or `accepted_at` order? (Leaning toward `accepted_at` — engine acceptance order is authoritative.)
-2. **Escalate timeout — mutate or replace?** When `timeout_behavior = escalate` fires, should the engine mutate the current suspension in place (change reason_code + resume condition) or close it and create a new operator-review suspension episode? RFC-004 open question 2 asks the same — should align.
+1. **Escalate timeout — mutate or replace?** When `timeout_behavior = escalate` fires, should the engine mutate the current suspension in place (change reason_code + resume condition) or close it and create a new operator-review suspension episode? RFC-004 open question 2 asks the same — should align.
+
+**Resolved:** Buffered signal replay order = Valkey Stream insertion order (`accepted_at`). RFC-004's buffered signal evaluation code uses `XRANGE` which returns entries in insertion order. Engine acceptance order is authoritative.
 
 ---
 

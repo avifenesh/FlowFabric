@@ -716,8 +716,9 @@ A background scanner processes `ff:idx:{b:M}:budget_resets`:
 
 ## Open Questions
 
-1. **Budget overshoot tolerance for cross-partition budgets:** Cross-partition budget checks are not atomic with the attempt-level usage update. How much overshoot is acceptable? One concurrent request seems fine for v1 — the budget is rechecked at the next enforcement point.
-2. **Quota scope hierarchy:** Should quota policies cascade (tenant policy overrides lane policy) or stack (both apply, most restrictive wins)? Leaning toward stack for v1 — same semantics as budget.
+1. **Quota scope hierarchy:** Should quota policies cascade (tenant policy overrides lane policy) or stack (both apply, most restrictive wins)? Leaning toward stack for v1 — same semantics as budget.
+
+**Resolved:** Budget overshoot tolerance — one concurrent request overshoot is accepted for cross-partition budgets. Confirmed by RFC-010 §3.3 (cross-partition operation catalog) and §6.5 (budget reconciler). Budget is rechecked at every enforcement point.
 
 **Resolved:** Concurrency counter consistency — the concurrency reconciler described in §4.5 handles drift from Valkey crashes. It periodically counts actual active leases and corrects the counter.
 

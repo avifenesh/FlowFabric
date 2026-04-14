@@ -860,9 +860,10 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 ## Open Questions
 
 1. ~~**Scheduler instance coordination:**~~ **Resolved.** The `issue_claim_grant.lua` script atomically ZREMs the execution from the eligible set (step 5) before writing the grant. If two schedulers race on the same candidate, only one wins the ZREM — the second finds the execution absent from the set and returns `execution_not_in_eligible_set`. No leader election required for v1. At very high scale, partition-affine scheduling (each scheduler owns a subset of partitions) can reduce wasted work. See RFC-010 §4.6.
-2. **Fairness window duration:** What is the right default fairness evaluation window? Short windows (1-5s) react quickly but are noisy. Long windows (30-60s) are stable but slow to rebalance. Leaning toward 10s default.
-3. ~~Request/reply implementation~~ — Resolved in §8.5: XREAD BLOCK on lease_history stream. No pub/sub needed.
-4. **Flow-aware priority boosting:** Should the scheduler inherit or boost priority from the parent flow or coordinator execution? This would require cross-partition reads to the flow's `{fp:N}` partition. V1 ignores flow priority (§5.4). When should this be introduced — when DAG critical-path scheduling becomes a product requirement?
+2. ~~Request/reply implementation~~ — Resolved in §8.5: XREAD BLOCK on lease_history stream. No pub/sub needed.
+3. **Flow-aware priority boosting:** Should the scheduler inherit or boost priority from the parent flow or coordinator execution? This would require cross-partition reads to the flow's `{fp:N}` partition. V1 ignores flow priority (§5.4). When should this be introduced — when DAG critical-path scheduling becomes a product requirement?
+
+**Resolved:** Fairness window duration = 10 seconds default, configurable per deployment. Short enough to rebalance within seconds, long enough to avoid noisy oscillation.
 
 ---
 

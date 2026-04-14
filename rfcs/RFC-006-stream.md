@@ -665,8 +665,9 @@ Mitigations:
 
 ## Open Questions
 
-1. **Eager vs. lazy stream creation:** V1 uses lazy creation (on first append). Should there be a lane-level or execution-level flag to switch to eager creation for pre-subscription scenarios?
-2. **Merged view pagination:** Should the merged cursor be opaque (server chooses encoding) or structured (client can construct `(attempt_index, sequence)` tuples)? Opaque is simpler; structured enables more flexible client-side navigation.
+1. **Merged view pagination:** Should the merged cursor be opaque (server chooses encoding) or structured (client can construct `(attempt_index, sequence)` tuples)? Opaque is simpler; structured enables more flexible client-side navigation.
+
+**Resolved:** Eager vs. lazy stream creation — both modes supported. Default is lazy (on first append). Eager creation is opt-in via `stream_policy.eager_create = true` on the execution or lane config. Eager mode creates the stream key and metadata hash at attempt start, before any frames are appended. This allows clients to start `XREAD BLOCK` immediately without polling for stream existence — critical for real-time token streaming UX.
 
 ---
 

@@ -2269,7 +2269,23 @@ The Valkey backend must support in v1:
 
 **Cross-execution event feed:** V1 does not provide a lane-level or system-level event stream for observers and dashboards. Per-execution observability is available: attempt streams (XREAD BLOCK for live output, RFC-006), lease history streams (lifecycle events, RFC-003). Lane-level dashboards rely on periodic count aggregation (§6.13). A cross-execution event stream (one XADD per state transition, consumable by dashboards and webhooks) is a designed-for extension that would address UC-55 (execution event feed) more fully.
 
-**Unified per-execution audit trail:** V1 audit trail is reconstructable from four sources: lease history (ownership events with `reason` field — completed, failed, suspended), attempt records (per-attempt timing and outcome), signal records (delivery and resume effects), and suspension records (episodes and close reasons). A unified per-execution event stream (one XADD per lifecycle transition: created, claimed, completed, failed, cancelled, suspended, resumed, replayed, operator_override) is a designed-for extension that would consolidate audit into one queryable timeline.
+**Per-execution lifecycle event stream (RECOMMENDED v1 extension, not blocking):**
+
+Recommended key: `ff:exec:{p:N}:<execution_id>:events` (Valkey Stream). One XADD per lifecycle transition:
+
+| Event | Trigger | Fields |
+|---|---|---|
+| `created` | `create_execution` | execution_id, lane_id, kind, creator |
+| `claimed` | `claim_execution` / `claim_resumed` | worker_id, attempt_index, lease_epoch |
+| `suspended` | `suspend_execution` | suspension_id, waitpoint_key, reason_code |
+| `resumed` | `deliver_signal` / `resume_execution` | trigger, resume_delay_ms |
+| `completed` | `complete_execution` | attempt_index |
+| `failed` | `fail_execution` (terminal) | failure_reason, failure_category |
+| `cancelled` | `cancel_execution` | reason, source |
+| `reclaimed` | `reclaim_execution` | old_worker, new_worker, new_epoch |
+| `replayed` | `replay_execution` | replay_reason, requested_by, new_attempt_index |
+
+Consolidates audit trail (currently across lease history + attempt records + signal records + suspension records) into one queryable timeline. Simplifies `enqueue_and_wait` (subscribe here instead of lease_history). Enables real-time dashboards (XREAD BLOCK). Addresses UC-55. Implementation: one XADD (~100 bytes) per transition, trimmed by MAXLEN, shares `{p:N}`. If deferred: four-source reconstruction works; operators use `get_execution_state` + `list_attempts`.
 
 ### 9.3 Retention and Cleanup Strategy
 
@@ -2327,22 +2343,37 @@ The following are **not** goals for the v1 Valkey backend:
 
 Single coherent reference for SDK authors implementing a FlowFabric worker.
 
-### 10.1 Minimum Viable Worker Loop
+### 10.1 Communication Model
+
+The scheduler is a separate stateless process (§8.3). Workers request work via the scheduler's claim API. The scheduler performs fairness, capability matching, quota, and budget checks, then issues a `claim_grant` on the execution's `{p:N}` partition. The worker then calls `acquire_lease` (`claim_execution` or `claim_resumed_execution`) directly on Valkey. Two hops per claim: worker → scheduler (request), worker → Valkey (acquire).
+
+### 10.2 Recommended Timing Defaults
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Lease TTL | 30s | Long enough for slow operations; short enough for prompt reclaim. |
+| Lease renewal interval | 10s (TTL / 3) | Renew at 1/3 of TTL gives 2 missed renewals before expiry. |
+| Heartbeat interval | 15s | Keeps worker registration alive. TTL = 60s (4× heartbeat). |
+| Claim backoff on empty | 100ms–1s | Exponential backoff when no eligible execution found. |
+
+### 10.3 Minimum Viable Worker Loop
 
 ```
 STARTUP:
   register_worker(worker_id, instance_id, capabilities)     [RFC-009]
-  start heartbeat_worker(instance_id) every 10-30s          [RFC-009]
+  start heartbeat_worker(instance_id) every 15s             [RFC-009]
 
 CLAIM:
   1. claim_request(caps, lanes) → scheduler issues grant    [RFC-009]
   2. IF attempt_state == attempt_interrupted:
        claim_resumed_execution → same attempt, new lease    [RFC-001]
+       read continuation: get_suspension(exec_id) to get
+         continuation_metadata_pointer from closed record
      ELSE:
        claim_execution → new attempt + lease                [RFC-001]
 
 PROCESS (loop while working):
-  3. renew_lease(exec_id, lease_id, epoch) every ttl/3      [RFC-003]
+  3. renew_lease(exec_id, lease_id, epoch) every 10s        [RFC-003]
   4. append_frame(exec_id, att_idx, lease_id, epoch, frame) [RFC-006]
   5. report_usage(exec_id, att_idx, epoch, delta)           [RFC-008]
 
@@ -2355,12 +2386,15 @@ SUSPEND (external waits):
   7b. call external system with waitpoint_key
   7c. suspend_execution → releases lease, exits loop        [RFC-004]
       on resume: re-claim via step 2 (claim_resumed)
+      worker reads continuation_metadata_pointer to resume
 
 SHUTDOWN:
   deregister_worker(instance_id) — leases expire naturally  [RFC-009]
 ```
 
-### 10.2 Error Handling
+**Continuation on resume:** When `claim_resumed_execution` returns, the worker must read the closed suspension record via `get_suspension(exec_id)` (RFC-004) to retrieve the `continuation_metadata_pointer`. This pointer references worker-owned durable state (e.g., last completed step, checkpoint data, tool call context) that the worker needs to resume processing from where it left off. The engine does not own the continuation state — it stores only the pointer.
+
+### 10.4 Error Handling
 
 | Error | Action |
 |-------|--------|
@@ -2370,7 +2404,7 @@ SHUTDOWN:
 | `execution_not_active` | On retry: check enriched return. Epoch match + success = my call won. |
 | `budget_exceeded` | Per policy: fail/suspend/warn. |
 
-### 10.3 SDK Requirements
+### 10.5 SDK Requirements
 
 - Cluster-aware Valkey client: slot discovery, redirects, EVALSHA.
 - Independent heartbeat thread: must run even if processing blocks.
