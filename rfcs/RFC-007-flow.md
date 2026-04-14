@@ -329,9 +329,11 @@ Flow-level cancellation is policy-controlled.
 - allow active members to finish
 - move unclaimed runnable members to:
   - `eligibility_state = blocked_by_operator`
-  - `blocking_reason = paused_by_policy`
-- remove those unclaimed runnable members from eligible/runnable indexes
-- when active members drain to zero, cancel the still-unclaimed blocked members
+  - `blocking_reason = paused_by_flow_cancel`
+  - `blocking_detail = "flow <flow_id> cancellation: let_active_finish"`
+- remove those unclaimed runnable members from eligible/runnable/blocked indexes, ZADD to `blocked:operator`
+- **`paused_by_flow_cancel` is distinct from `paused_by_policy`** (lane pause). The unblock scanner (RFC-010 §6.15) MUST skip executions with `paused_by_flow_cancel` — only `cancel_flow` clears this blocking reason. This prevents a race where the unblock scanner unblocks flow-cancelled executions because the lane happens to be open.
+- when active members drain to zero, cancel the still-unclaimed blocked members (transition to `terminal(cancelled)`)
 - mark the flow cancelled once active work drains
 
 #### `coordinator_decides`
@@ -363,11 +365,22 @@ The passive flow container does not suspend or wait during cancellation. It issu
 #### `completed`
 
 - completion policy is satisfied
-- aggregate outcome is successful
+- aggregate outcome is successful (all terminal members are `success` or `skipped`)
 
 #### `failed`
 
-- failure policy declares overall failure
+- completion policy is satisfied (all members terminal) BUT at least one member is `failed`, `cancelled`, or `expired` (not just `skipped`)
+- OR: failure policy explicitly declares overall failure (e.g., `fail_fast` on first critical failure)
+
+**Explicit derivation rules by failure_policy + completion_policy:**
+
+| failure_policy | completion_policy | Flow outcome when all members terminal |
+|---|---|---|
+| `isolate_failures` | `all_terminal` | If all members are `success` or `skipped` → `completed`. If any member is `failed`/`cancelled`/`expired` → `failed`. |
+| `isolate_failures` | `root_and_no_unresolved` | Follows the root execution's `terminal_outcome`: root `success` → `completed`, root `failed` → `failed`, root `cancelled` → `cancelled`. Non-root failures don't override the root. |
+| `fail_fast` | any | `failed` immediately on first critical member failure. Remaining members cancelled per cancellation policy. |
+| `collect_all` | `all_terminal` | Same as `isolate_failures` + `all_terminal` (aggregate after all finish). |
+| `coordinator_declares` | `coordinator_declares` | Coordinator execution sets the outcome explicitly. |
 
 #### `cancelled`
 
@@ -378,7 +391,7 @@ The passive flow container does not suspend or wait during cancellation. It issu
 | Operation | Class | Semantics |
 | --- | --- | --- |
 | `create_flow(flow_spec)` | A | Creates the flow core record and initial structural metadata. |
-| `add_execution_to_flow(flow_id, execution_id, member_spec)` | A | **Two-phase cross-partition operation.** Phase 1 on `{p:N}` (execution partition): atomically check `flow_id` is empty on exec core — if non-empty, return `execution_already_in_flow`. Set `flow_id` on exec core. This is the ownership claim, serialized on the execution's partition. Phase 2 on `{fp:N}` (flow partition): SADD to membership set, increment `graph_revision`, apply flow defaults. If phase 2 fails, retry (idempotent — membership SADD is idempotent). If budget `deny_child` check on `{b:M}` fails, reject before phase 1. |
+| `add_execution_to_flow(flow_id, execution_id, member_spec)` | A | **Two-phase cross-partition operation.** Phase 1 on `{p:N}` (execution partition): atomically check `flow_id` on exec core. If `flow_id` is set to a *different* flow → return `execution_already_in_flow`. If `flow_id` is already set to *this* flow → idempotent, skip the SET and proceed to Phase 2 (supports `create_child_execution` which pre-sets `flow_id`). If empty → SET `flow_id`. This is the ownership claim, serialized on the execution's partition. Phase 2 on `{fp:N}` (flow partition): SADD to membership set, increment `graph_revision`, apply flow defaults. If phase 2 fails, retry (idempotent — membership SADD is idempotent). If budget `deny_child` check on `{b:M}` fails, reject before phase 1. |
 | `add_dependency(flow_id, upstream_execution_id, downstream_execution_id, edge_spec)` | A | Validates topology and creates a dependency edge; also updates child-local dependency gating. |
 | `resolve_dependency(flow_id, edge_id, upstream_outcome)` | A | Applies one upstream outcome to one edge and updates downstream eligibility or impossibility atomically on the child partition. |
 | `get_flow(flow_id)` | C | Returns the flow core record. |
@@ -393,7 +406,7 @@ The passive flow container does not suspend or wait during cancellation. It issu
 | --- | --- |
 | `flow_not_found` | The flow does not exist. |
 | `execution_not_in_flow` | The referenced execution is not a member of the flow. |
-| `execution_already_in_flow` | Tried to add an execution that already belongs to a flow. |
+| `execution_already_in_flow` | Tried to add an execution that already belongs to a *different* flow. Adding to the *same* flow is idempotent (Phase 1 skips SET, proceeds to Phase 2). |
 | `duplicate_flow_membership_entry` | Membership already exists for this flow and execution. |
 | `invalid_dependency` | Edge endpoints or dependency kind are invalid. |
 | `dependency_already_exists` | The same edge already exists. |
@@ -665,26 +678,29 @@ redis.call("HINCRBY", KEYS.deps_meta, "impossible_required_count", 1)
 
 local core = redis.call("HGETALL", KEYS.exec_core)
 if core.terminal_outcome == "none" then
-  -- Preserve attempt_state for executions that had a running attempt.
-  -- none only if never claimed (attempt_state is 'none' or unset).
-  -- If attempt existed (attempt_interrupted from move_to_waiting_children,
-  -- or pending_first_attempt from creation), set attempt_terminal.
+  -- Determine skip_attempt_state based on whether a real attempt hash exists.
+  -- Only running_attempt and attempt_interrupted have actual attempt hashes
+  -- (the attempt was started or paused). pending_first/retry/replay_attempt
+  -- means the attempt was set on exec_core but claim_execution hasn't created
+  -- the attempt hash yet — writing to it would create a phantom corrupt record.
   local skip_attempt_state = core.attempt_state
-  if is_set(skip_attempt_state) and skip_attempt_state ~= "none" then
+  if skip_attempt_state == "running_attempt" or skip_attempt_state == "attempt_interrupted" then
+    -- Real attempt hash exists — end it and close stream
     skip_attempt_state = "attempt_terminal"
 
-    -- End the existing attempt: mark as ended_cancelled due to impossible dependency
     redis.call("HSET", KEYS.attempt_hash,
       "attempt_state", "ended_cancelled",
       "ended_at", ARGV.now_ms,
       "failure_reason", "dependency_impossible")
 
-    -- Close attempt stream if it exists
     if redis.call("EXISTS", KEYS.stream_meta) == 1 then
       redis.call("HSET", KEYS.stream_meta,
         "closed_at", ARGV.now_ms,
         "closed_reason", "dependency_impossible")
     end
+  elseif is_set(skip_attempt_state) and skip_attempt_state ~= "none" then
+    -- pending_first/retry/replay_attempt: no attempt hash exists. Clear to none.
+    skip_attempt_state = "none"
   end
 
   redis.call("HSET", KEYS.exec_core,
@@ -793,9 +809,10 @@ Designed for later but not required in v1:
 Only genuinely unresolved questions remain here.
 
 1. Should `aggregate_threshold` completion be a first-class v1 policy or remain designed-for until a concrete product requires it?
-2. Should the flow summary projector be best-effort polling, event-driven, or hybrid by default?
 3. How much edge-level data-passing metadata should be standardized versus left as opaque references?
 4. Replay of a completed upstream execution does not automatically un-resolve already-satisfied dependency edges in v1. If replay semantics need to reopen downstream eligibility, that will require an explicit graph-reconciliation model in a later RFC.
+
+**Resolved:** Q2 — Flow summary projector mode. Resolved by RFC-010 §6.7: event-driven with periodic fallback (10-30s catchup). Event-driven for promptness; periodic for consistency.
 
 ## References
 

@@ -85,8 +85,8 @@ The `ResetPolicy`:
 |---|---|---|---|
 | `on_hard_limit` | `EnforcementAction` enum | Yes | What happens when a hard limit is breached. |
 | `on_soft_limit` | `EnforcementAction` enum | No | What happens when a soft limit is breached. Default: `warn`. |
-| `enforcement_mode` | `EnforcementMode` enum | Yes | `strict` (reject/act immediately), `advisory` (log only, no blocking). |
-| `escalation_target` | `String` | No | Operator or system to notify on breach (e.g., PagerDuty route, operator group). |
+| `enforcement_mode` | `EnforcementMode` enum | Yes | `strict` (reject/act immediately), `advisory` (log only, no blocking). **Consumed by the engine's enforcement dispatch layer (outside Lua), not by the Lua script.** `report_usage_and_check.lua` always returns breach status; the enforcement dispatcher reads `enforcement_mode` to decide whether to call `fail_execution` (strict) or just log (advisory). |
+| `escalation_target` | `String` | No | Operator or system to notify on breach (e.g., PagerDuty route, operator group). **Consumed by the notification layer** — v1 logs a warning with the target identifier, future versions may integrate with PagerDuty/Slack/webhooks. |
 
 #### 1.2 Budget Dimensions
 
@@ -486,7 +486,7 @@ ff:quota_attach:{q:K}:{scope_type}:{scope_id}  →  SET
 
 #### 4.4 Atomic Usage Report + Breach Check (Lua Script)
 
-`report_usage_and_check.lua` — atomically increments usage and checks limits:
+`report_usage_and_check.lua` — **check-before-increment**: reads current usage, checks limits, only HINRBYs if under limit. Since this runs as a Lua script on one `{b:M}` partition, the read-check-write sequence is **atomic** — concurrent calls are serialized by Valkey. This eliminates budget overshoot entirely (previously, HINCRBY-before-check allowed N concurrent workers to overshoot by N×delta).
 
 ```lua
 -- KEYS (on budget partition {b:M}):
@@ -504,22 +504,38 @@ local now_ms = ARGV[2 * dim_count + 2]
 local breached_hard = nil
 local breached_soft = nil
 
+-- Phase 1: CHECK all dimensions BEFORE any increment.
+-- If any hard limit would be breached, reject the entire report.
 for i = 1, dim_count do
   local dim = ARGV[1 + i]
   local delta = tonumber(ARGV[1 + dim_count + i])
+  local current = tonumber(redis.call("HGET", KEYS[1], dim) or "0")
+  local new_total = current + delta
 
-  -- Atomic increment
-  local new_val = redis.call("HINCRBY", KEYS[1], dim, delta)
-
-  -- Check hard limit
+  -- Check hard limit (reject entire report if ANY dimension breaches)
   local hard_limit = redis.call("HGET", KEYS[2], "hard:" .. dim)
-  if hard_limit and tonumber(hard_limit) > 0 and new_val > tonumber(hard_limit) then
+  if hard_limit and tonumber(hard_limit) > 0 and new_total > tonumber(hard_limit) then
     if not breached_hard then
       breached_hard = dim
+      -- Record breach metadata but DO NOT increment
+      redis.call("HINCRBY", KEYS[3], "breach_count", 1)
+      redis.call("HSET", KEYS[3],
+        "last_breach_at", now_ms,
+        "last_breach_dim", dim,
+        "last_updated_at", now_ms)
+      local action = redis.call("HGET", KEYS[3], "on_hard_limit")
+      return { "HARD_BREACH", dim, action, tostring(current), tostring(hard_limit) }
     end
   end
+end
 
-  -- Check soft limit
+-- Phase 2: No hard breach detected — safe to increment all dimensions.
+for i = 1, dim_count do
+  local dim = ARGV[1 + i]
+  local delta = tonumber(ARGV[1 + dim_count + i])
+  local new_val = redis.call("HINCRBY", KEYS[1], dim, delta)
+
+  -- Check soft limit (advisory — increment still happens)
   local soft_limit = redis.call("HGET", KEYS[2], "soft:" .. dim)
   if soft_limit and tonumber(soft_limit) > 0 and new_val > tonumber(soft_limit) then
     if not breached_soft then
@@ -531,15 +547,6 @@ end
 -- Update metadata
 redis.call("HSET", KEYS[3], "last_updated_at", now_ms)
 
-if breached_hard then
-  redis.call("HINCRBY", KEYS[3], "breach_count", 1)
-  redis.call("HSET", KEYS[3],
-    "last_breach_at", now_ms,
-    "last_breach_dim", breached_hard)
-  local action = redis.call("HGET", KEYS[3], "on_hard_limit")
-  return { "HARD_BREACH", breached_hard, action }
-end
-
 if breached_soft then
   redis.call("HINCRBY", KEYS[3], "soft_breach_count", 1)
   local action = redis.call("HGET", KEYS[3], "on_soft_limit")
@@ -549,7 +556,9 @@ end
 return { "OK" }
 ```
 
-**Important:** For execution-scoped budgets colocated on `{p:N}`, this script can run within the same partition as the attempt usage update. For cross-partition budgets (flow, lane, tenant), the caller makes a separate Lua call to the budget's `{b:M}` partition. The attempt-level usage update (RFC-002) and the budget update are NOT in one atomic script for cross-partition budgets — the budget increment is best-effort-consistent. Overshoot by one concurrent request is accepted; the budget is checked again at the next enforcement point.
+**Zero-overshoot guarantee:** Because this is a Lua script, the read-check-write sequence is atomic on the `{b:M}` partition. Concurrent `report_usage` calls are serialized by Valkey. If two workers race and one would push the budget over the limit, the first to execute wins (increments), the second finds the budget already at or above the limit and gets HARD_BREACH (no increment). Budget usage never exceeds the hard limit by more than one Lua-script-width of concurrency — which is zero, because Lua scripts block the shard.
+
+**Important:** For execution-scoped budgets colocated on `{p:N}`, this script can run within the same partition as the attempt usage update. For cross-partition budgets (flow, lane, tenant), the caller makes a separate Lua call to the budget's `{b:M}` partition. The attempt-level usage update (RFC-002) and the budget update are NOT in one atomic script for cross-partition budgets. However, the budget counter itself is now strictly accurate — the only inconsistency is that attempt-level usage may record tokens that the budget rejected. The budget reconciler (§6.5) handles this safely because it corrects upward only.
 
 #### 4.5 Atomic Admission Check (Lua Script)
 
@@ -750,7 +759,7 @@ The high-priority execution was starved because low-priority work consumed the b
 
 ## Open Questions
 
-1. **Quota scope hierarchy:** Should quota policies cascade (tenant policy overrides lane policy) or stack (both apply, most restrictive wins)? Leaning toward stack for v1 — same semantics as budget.
+**Resolved:** Q1 — Quota scope hierarchy. Stack semantics for v1 — both apply, most restrictive breach triggers. Same semantics as budget attachment hierarchy (RFC-008 §1.5). Cascade overrides deferred to post-v1.
 
 **Resolved:** Budget overshoot tolerance — one concurrent request overshoot is accepted for cross-partition budgets. Confirmed by RFC-010 §3.3 (cross-partition operation catalog) and §6.5 (budget reconciler). Budget is rechecked at every enforcement point.
 

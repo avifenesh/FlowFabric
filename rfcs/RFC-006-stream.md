@@ -482,6 +482,7 @@ The metadata hash is created atomically with the first frame append. It is separ
 --   [11] execution_id (for lazy metadata creation)
 --   [12] durability_mode (for lazy metadata creation)
 --   [13] max_payload_bytes (64KB default)
+--   [14] attempt_id (for lazy metadata creation)
 
 local now = redis.call("TIME")
 local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
@@ -516,7 +517,9 @@ end
 -- Lazy-create stream metadata if needed
 if redis.call("EXISTS", KEYS[3]) == 0 then
   redis.call("HSET", KEYS[3],
+    "stream_id", ARGV[11] .. ":" .. ARGV[1],
     "execution_id", ARGV[11],
+    "attempt_id", ARGV[14],
     "attempt_index", ARGV[1],
     "created_at", now_ms,
     "closed_at", "",

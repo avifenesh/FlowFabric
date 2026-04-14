@@ -770,7 +770,7 @@ Signal records follow the execution's retention policy. When an execution is pur
 
 ## Open Questions
 
-1. **Escalate timeout — mutate or replace?** When `timeout_behavior = escalate` fires, should the engine mutate the current suspension in place (change reason_code + resume condition) or close it and create a new operator-review suspension episode? RFC-004 open question 2 asks the same — should align.
+**Resolved:** Q1 — Escalate timeout behavior. Aligned with RFC-004 Q2: mutate in place. `escalate` changes the suspension's `reason_code` to `waiting_for_operator_review` and replaces the resume condition with an operator-only condition. The waitpoint stays open; the condition is replaced. No new suspension episode created.
 
 **Resolved:** Buffered signal replay order = Valkey Stream insertion order (`accepted_at`). RFC-004's buffered signal evaluation code uses `XRANGE` which returns entries in insertion order. Engine acceptance order is authoritative.
 

@@ -262,6 +262,7 @@ Answers: *what is the most specific explanation for lack of forward progress?* T
 | `waiting_for_locality_match` | No worker in required region/locality. |
 | `paused_by_operator` | Operator placed a hold. |
 | `paused_by_policy` | Policy rule (e.g. lane pause) prevents progress. |
+| `paused_by_flow_cancel` | Flow cancellation with `let_active_finish` policy blocked this unclaimed member. Only `cancel_flow` clears this — the unblock scanner must skip it. |
 
 ##### Dimension E — Terminal Outcome
 
@@ -431,7 +432,7 @@ attempt_state     = pending_retry_attempt
 public_state      = delayed
 ```
 
-##### Waiting on children (DAG/flow)
+##### Waiting on children (DAG/flow, never claimed)
 
 ```
 lifecycle_phase   = runnable
@@ -439,7 +440,7 @@ ownership_state   = unowned
 eligibility_state = blocked_by_dependencies
 blocking_reason   = waiting_for_children
 terminal_outcome  = none
-attempt_state     = none
+attempt_state     = pending_first_attempt
 ─────────────────────────────────────────
 public_state      = waiting_children
 ```
@@ -635,7 +636,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | `create_execution` | `lane_id`, `execution_kind`, `input_payload`, `policy?`, `idempotency_key?`, `tags?` | Creates execution in `submitted` phase. Engine resolves to `runnable` (possibly `delayed`). If `idempotency_key` matches existing execution within dedup window, returns existing. **Idempotency is TTL-bounded:** the dedup key (`ff:idem:<namespace>:<key>`) has `TTL = min(dedup_window, retention_window)`. After TTL expires, a retry with the same key creates a new execution. V1 default `dedup_window`: 24h. Idempotency is namespace-scoped — different tenants may safely reuse the same key. Callers requiring permanent dedup must enforce it externally before submission. |
 | `create_delayed_execution` | Same + `delay_until` | Creates execution in `runnable` with `eligibility_state = not_eligible_until_time`. |
 | `create_scheduled_execution` | Same + `schedule_spec` | Creates with schedule metadata. Engine handles recurring promotion. |
-| `create_child_execution` | `parent_execution_id`, `flow_id`, same as above | Creates with `parent_execution_id` and `flow_id` set. **Starts with `eligibility_state = blocked_by_dependencies`**, `blocking_reason = waiting_for_children`, `blocking_detail = "waiting for dependency edges to be applied"` — NOT added to eligible set. Added to `blocked:dependencies` set instead. This closes the race window between execution creation and `apply_dependency_to_child`. If the child has no dependencies, `apply_dependency_to_child` is never called and the child stays blocked — the caller must explicitly unblock it or use `create_execution` (without flow context) for dependency-free children. |
+| `create_child_execution` | `parent_execution_id`, `flow_id`, same as above | Creates with `parent_execution_id` and `flow_id` set. **Starts with `eligibility_state = blocked_by_dependencies`**, `blocking_reason = waiting_for_children`, `blocking_detail = "waiting for dependency edges to be applied"`, `attempt_state = pending_first_attempt` — NOT added to eligible set. Added to `blocked:dependencies` set instead. This closes the race window between execution creation and `apply_dependency_to_child`. If the child has no dependencies, the caller must call `promote_blocked_to_eligible` (RFC-010 #35) after flow setup to avoid reconciler delay. Alternatively, use `create_execution` (without flow context) which starts eligible. |
 
 #### 4.2 Claim / Ownership Operations (Class A — atomic)
 
@@ -713,6 +714,7 @@ Every non-progressing, non-terminal execution exposes a blocking reason. This an
 │  waiting_for_locality_match  │  blocked_by_route            │
 │  paused_by_operator          │  blocked_by_operator         │
 │  paused_by_policy            │  blocked_by_lane_state       │
+│  paused_by_flow_cancel       │  blocked_by_operator         │
 └─────────────────────────────────────────────────────────────┘
 ```
 

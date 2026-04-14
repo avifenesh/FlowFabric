@@ -301,12 +301,14 @@ Worker                Scheduler                {q:K}              {b:M}         
 - Selects the highest-priority, capability-matched candidate.
 
 **Step 3 — Budget check per-candidate (`{b:M}`)**
-- For the selected candidate: read `budget_ids` from the execution's core hash (cached from prior partition scan or read inline). For each attached budget: read `ff:budget:{b:M}:<budget_id>:usage` and `:limits`.
+- For the selected candidate: read `budget_ids` from the execution's core hash (cached from prior partition scan or read inline). For each attached budget: check the **per-cycle budget cache** first. If not cached, read `ff:budget:{b:M}:<budget_id>:usage` and `:limits`, cache the result keyed by `budget_id`.
 - Advisory read — no mutation. Usage is not pre-charged.
 - If any attached budget's hard limit is already breached:
   - Run `block_execution_for_admission.lua` on the candidate's `{p:N}` partition. This atomically sets `eligibility_state = blocked_by_budget`, `blocking_reason = waiting_for_budget`, ZREMs from eligible, ZADDs to `blocked:budget`.
   - **Go back to step 2** with the next candidate. If no more candidates: return empty response to worker.
 - If all budgets have headroom: proceed.
+
+**Budget cache per scheduling cycle:** The scheduler caches budget breach status per `budget_id` during a single claim cycle. The first candidate sharing budget B triggers a cross-partition read to `{b:M}`; all subsequent candidates sharing B reuse the cached result. Cache invalidated at cycle end. This prevents O(N) reads to the same `{b:M}` hash when N candidates share a breached budget. Same caching pattern as the unblock scanner (§6.15).
 
 **Step 4 — Issue claim-grant (`{p:N}`)**
 - Lua: `issue_claim_grant.lua` on the execution's partition.
@@ -474,8 +476,10 @@ Flow summary counters (members_active, members_completed, aggregate_tokens, etc.
 **Partitions touched:** (optional `{b:M}` budget check) → `{p:N}` (execution) → `{fp:N}` (flow)
 
 1. **Budget check on `{b:M}`** (if flow has `deny_child` budget): read budget usage. If exhausted, reject.
-2. **Phase 1 — ownership claim on `{p:N}`**: Lua script atomically checks `flow_id` field on exec core. If non-empty → `execution_already_in_flow`. If empty → SET `flow_id = <flow_id>`. This is the serialization point that prevents two flows from claiming the same execution.
+2. **Phase 1 — ownership claim on `{p:N}`**: Lua script atomically checks `flow_id` field on exec core. If set to a *different* flow → `execution_already_in_flow`. If set to *this* flow → idempotent, skip SET and proceed (supports `create_child_execution` which pre-sets `flow_id`). If empty → SET `flow_id = <flow_id>`. This is the serialization point that prevents two flows from claiming the same execution.
 3. **Phase 2 — membership on `{fp:N}`**: SADD to flow membership set. Increment `graph_revision`. Apply flow policy defaults. Idempotent — if this step fails and is retried, SADD on an existing member is a no-op.
+
+**After Phase 2 + edge staging:** For any root member with zero dependencies, the control plane calls `promote_blocked_to_eligible` (#35) immediately. This avoids the 10-60s reconciler delay for the first execution in the flow to become claimable.
 
 **Failure modes and convergence:**
 
@@ -516,10 +520,12 @@ Operator / Engine       {fp:N} (flow)            {p:N} (member execs)
 |---|---|---|
 | `cancel_all` | All members. | Cancel active executions (bypasses lease unconditionally — `cancel_flow` is implicitly operator-privileged). |
 | `cancel_unscheduled_only` | Members not yet active (`runnable`, `delayed`, `suspended`). | Active members allowed to finish. |
-| `let_active_finish` | Block unclaimed runnable members (`blocked_by_operator`). | Active members finish. When all drain, cancel blocked. |
+| `let_active_finish` | Block unclaimed runnable members (`blocked_by_operator` + `paused_by_flow_cancel`). | Active members finish. `cancel_flow` is sole authority for clearing `paused_by_flow_cancel` → `terminal(cancelled)`. |
 | `coordinator_decides` | Coordinator execution determines scope. | Per-branch decision. |
 
 **Per-member cancellation:** Each `cancel_execution` runs on the member's `{p:N}` partition. The operation is idempotent — cancelling an already-terminal execution is a no-op.
+
+**`let_active_finish` uses `paused_by_flow_cancel`** (not `paused_by_policy`) to prevent the unblock scanner (§6.15) from erroneously unblocking flow-cancelled executions when the lane is open.
 
 **Failure modes and convergence:**
 
@@ -613,6 +619,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 32 | `change_priority` | RFC-001 | Update priority field + re-score in current scheduling sorted set. Validate runnable + eligible. ZREM old score, ZADD new composite score. | A | 2 | exec_core, eligible_zset |
 | 33 | `update_progress` | RFC-001 | Update progress_pct + progress_message. Validate lease (lease_id + epoch). | B | 1 | exec_core |
 | 34 | `report_usage_on_attempt` | RFC-001/008 | **Idempotent** via monotonic `usage_report_seq`. ARGV includes `usage_report_seq` (caller-supplied, monotonically increasing per attempt). Script checks `attempt_usage.last_usage_report_seq`: if `ARGV.seq <= last_seq` → return `ok_already_applied` (no-op). Otherwise: HINCRBY attempt usage counters + exec core usage totals, HSET `last_usage_report_seq = ARGV.seq`. Validate lease. Route to `{b:M}` budget check after return. Budget `report_usage_and_check` on `{b:M}` must also include the seq — if `ok_already_applied`, skip the budget call entirely. | B | 2 | exec_core, attempt_usage |
+| 35 | `promote_blocked_to_eligible` | RFC-007 | Promote zero-dep flow member from blocked:dependencies to eligible. Validate runnable + blocked_by_dependencies + unsatisfied_required_count=0 + deps:unresolved empty. Set eligible_now + waiting_for_worker + blocking_detail="". **Preserve attempt_state** (same logic as resolve_dependency satisfaction path). ZREM blocked:deps, ZADD eligible with composite priority score. Called by control plane immediately after flow setup for root members with zero dependencies. | A | 5 | exec_core, blocked_deps_zset, eligible_zset, deps_meta, deps_unresolved |
 | — | `skip_execution` | RFC-001 | *Implemented inline in `resolve_dependency` (#23) impossible path. Not a standalone script.* | — | — | — |
 | — | `release_lease` | RFC-001 | *Implemented inline in complete/fail/suspend/delay/move_to_waiting_children scripts. Not standalone.* | — | — | — |
 | — | `recover_abandoned_execution` | RFC-001 | *Same as `reclaim_execution` (#9). See RFC-003.* | — | — | — |
@@ -628,7 +635,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 
 | # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{b:M}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
-| 30 | `report_usage_and_check` | RFC-008 | Atomically HINCRBY usage per dimension, check hard/soft limits, return breach status | A | 3 | budget_usage, budget_limits, budget_def |
+| 30 | `report_usage_and_check` | RFC-008 | **Check-before-increment.** Read current usage, check hard limits. If any dimension would breach: return HARD_BREACH without incrementing (zero overshoot). If safe: HINCRBY all dimensions, check soft limits. Atomic Lua serialization on `{b:M}` guarantees no concurrent overshoot. | A | 3 | budget_usage, budget_limits, budget_def |
 | 31 | `reset_budget` | RFC-008 | Zero all usage counters, record reset event, compute next_reset_at, re-score in reset index | A | 3 | budget_usage, budget_def, budget_resets_zset |
 
 ### 4.4 Quota Partition Scripts (`{q:K}`)
@@ -1968,7 +1975,9 @@ Cache invalidated at cycle end. Staleness within one cycle (5-10s) is acceptable
 | Budget | `waiting_for_budget` | Any other |
 | Quota | `waiting_for_quota` | Any other |
 | Route | `waiting_for_capable_worker` or `waiting_for_locality_match` | Any other |
-| Lane (`blocked:operator`) | `paused_by_policy` | `paused_by_operator` |
+| Lane (`blocked:operator`) | `paused_by_policy` | `paused_by_operator`, `paused_by_flow_cancel` |
+
+**`paused_by_flow_cancel` MUST be skipped.** This blocking reason is set by `cancel_flow` with `let_active_finish` policy (RFC-007). Only `cancel_flow` clears it — when active members drain to zero, it cancels the blocked members. The unblock scanner must NOT unblock these executions, even if the lane is open. Without this check, the scanner creates a race: it unblocks flow-cancelled executions (lane is open → unblock), allowing them to be claimed and run, violating the cancellation intent.
 
 | Property | Value |
 |---|---|
@@ -2631,7 +2640,7 @@ Valkey Cluster uses **asynchronous replication**. The primary acknowledges write
 
 Counters and gauges the engine process exports (Prometheus/OpenTelemetry). Computed by engine, not stored in Valkey.
 
-**Throughput (per lane):**
+**Throughput (per namespace+lane):**
 
 | Metric | Type |
 |---|---|
@@ -2640,9 +2649,12 @@ Counters and gauges the engine process exports (Prometheus/OpenTelemetry). Compu
 | `ff_executions_completed_total` | Counter |
 | `ff_executions_failed_total` | Counter |
 | `ff_executions_cancelled_total` | Counter |
+| `ff_executions_expired_total` | Counter (timeout/deadline) |
+| `ff_executions_skipped_total` | Counter (DAG dep failure) |
 | `ff_executions_suspended_total` | Counter |
 | `ff_executions_resumed_total` | Counter |
-| `ff_executions_reclaimed_total` | Counter (worker health indicator) |
+| `ff_executions_reclaimed_total` | Counter (worker health) |
+| `ff_executions_replayed_total` | Counter (operator action) |
 
 **Queue depth (per lane, from §6.13):**
 
@@ -2653,6 +2665,9 @@ Counters and gauges the engine process exports (Prometheus/OpenTelemetry). Compu
 | `ff_queue_active` | Gauge |
 | `ff_queue_suspended` | Gauge |
 | `ff_queue_blocked_budget` | Gauge |
+| `ff_queue_blocked_quota` | Gauge |
+| `ff_queue_blocked_route` | Gauge |
+| `ff_queue_blocked_operator` | Gauge |
 | `ff_queue_blocked_dependencies` | Gauge |
 
 **Latency:**
@@ -2664,15 +2679,28 @@ Counters and gauges the engine process exports (Prometheus/OpenTelemetry). Compu
 | `ff_signal_delivery_latency_ms` | Histogram |
 | `ff_scheduler_cycle_ms` | Histogram |
 | `ff_scanner_cycle_ms` | Histogram (per scanner) |
+| `ff_scanner_items_processed_total` | Counter (per scanner) |
 
 **Resources:**
 
 | Metric | Type |
 |---|---|
 | `ff_budget_usage_ratio` | Gauge (per budget) |
-| `ff_budget_breach_total` | Counter |
+| `ff_budget_hard_breach_total` | Counter (per budget+dimension) |
+| `ff_budget_soft_breach_total` | Counter (per budget+dimension) |
 | `ff_worker_active_count` | Gauge |
 | `ff_worker_claim_count` | Gauge (per worker) |
+
+**Safety and dedup:**
+
+| Metric | Type |
+|---|---|
+| `ff_signal_limit_exceeded_total` | Counter (per namespace) |
+| `ff_signal_dedup_total` | Counter (per namespace) |
+| `ff_usage_report_dedup_total` | Counter (network retry indicator) |
+| `ff_quota_admission_dedup_total` | Counter |
+| `ff_suspension_already_satisfied_total` | Counter (signal-before-suspend race) |
+| `ff_reconciler_corrections_total` | Counter (per reconciler+correction_type) |
 
 ---
 
@@ -2889,7 +2917,12 @@ CLAIM:
 PROCESS (loop while working):
   3. renew_lease(exec_id, lease_id, epoch) every 10s        [RFC-003]
   4. append_frame(exec_id, att_idx, lease_id, epoch, frame) [RFC-006]
-  5. report_usage(exec_id, att_idx, epoch, delta)           [RFC-008]
+  5. report_usage(exec_id, att_idx, epoch, delta, seq)      [RFC-008]
+     SDK internally: (a) HINCRBY on {p:N} via report_usage_on_attempt
+                     (b) check-before-increment on {b:M} per budget
+     Returns: {ok, breach: null} or {ok, breach: {dim, current, limit}}
+     On HARD_BREACH: SDK auto-calls fail_execution(budget_exceeded)
+     Worker MUST stop processing after breach (see §10.4)
 
 DONE:
   6a. complete_execution(exec_id, lease_id, epoch, att_id)  [RFC-001]
@@ -3029,19 +3062,21 @@ Every error code returned by worker-facing scripts, classified by SDK action.
 
 Build incrementally. Each phase adds a testable capability. ~14 Lua scripts cover all core execution paths.
 
-| Phase | Capability | Scripts | RFCs |
-|---|---|---|---|
-| **1. Hello world** | create → claim → complete | `create_execution`, `issue_claim_grant`, `claim_execution`, `complete_execution` (4 scripts) | RFC-001, RFC-002, RFC-003, RFC-009 |
-| **2. Failure + retry** | fail → retry with backoff → reclaim | `fail_execution` (1 script, handles retry decision + new attempt) | RFC-001, RFC-002 |
-| **3. Suspend + signal + resume** | suspend → signal delivery → resume → re-claim | `suspend_execution`, `deliver_signal`, `claim_resumed_execution` (3 scripts) | RFC-004, RFC-005 |
-| **4. Streaming** | append frames, tail stream, close on terminal | `append_frame` (1 script; close is inline in complete/fail) | RFC-006 |
-| **5. Budget + quota** | usage reporting, breach detection, admission checks | `report_usage_and_check`, `check_admission_and_record` (2 scripts) | RFC-008 |
-| **6. Flow coordination** | dependency edges, resolution, skip propagation | `stage_dependency_edge`, `apply_dependency_to_child`, `resolve_dependency` (3 scripts) | RFC-007 |
-| **Total** | All core paths | **~14 scripts** | |
+| Phase | Capability | Scripts | Scanners | RFCs |
+|---|---|---|---|---|
+| **1. Hello world** | create → claim → renew → complete, cancel, lease expiry | `create_execution`, `issue_claim_grant`, `claim_execution`, `complete_execution`, `renew_lease`, `mark_lease_expired_if_due`, `cancel_execution` (7 scripts) | Lease expiry scanner, delayed promoter | RFC-001, RFC-002, RFC-003, RFC-009 |
+| **2. Failure + retry + reclaim** | fail → retry decision (sets pending state, no attempt creation) → backoff → reclaim after crash | `fail_execution`, `issue_reclaim_grant`, `reclaim_execution`, `expire_execution`, `promote_delayed` (5 scripts) | Execution/attempt timeout scanner | RFC-001, RFC-002, RFC-003 |
+| **3. Suspend + signal + resume** | suspend → signal delivery → resume → re-claim | `suspend_execution`, `deliver_signal`, `claim_resumed_execution`, `create_pending_waitpoint` (4 scripts) | Suspension timeout scanner, pending waitpoint expiry scanner | RFC-004, RFC-005 |
+| **4. Streaming** | append frames, tail stream, close on terminal | `append_frame` (1 script; close is inline in complete/fail) | Stream retention trimmer | RFC-006 |
+| **5. Budget + quota** | usage reporting, breach detection, admission checks | `report_usage_on_attempt`, `report_usage_and_check`, `check_admission_and_record`, `block_execution_for_admission`, `unblock_execution` (5 scripts) | Budget reset scanner, budget reconciler, quota concurrency reconciler, eligibility re-evaluation scanner | RFC-008, RFC-009 |
+| **6. Flow coordination** | dependency edges, resolution, skip propagation, replay | `stage_dependency_edge`, `apply_dependency_to_child`, `resolve_dependency`, `replay_execution` (4 scripts) | Dependency resolution reconciler, flow summary projector | RFC-007 |
+| **Total** | All core paths | **~26 scripts** | 12 scanners | |
 
-**Phase 1 is the minimum viable execution engine.** It proves the partition model, claim-grant mechanism, lease fencing, and state vector management. Each subsequent phase adds one primitive and its associated scanner(s).
+**Phase 1 is the minimum viable execution engine.** It proves the partition model, claim-grant mechanism, lease fencing, state vector management, and basic operator control (cancel). `renew_lease` is essential even for "Hello World" — without it, every execution expires after 30s. `cancel_execution` is needed for operator control of stuck executions. The delayed promoter is included because `create_delayed_execution` is a Phase 1 submission mode.
 
-Background scanners should be added alongside their phase: lease expiry scanner with phase 1, delayed promoter with phase 2, suspension timeout scanner with phase 3, stream retention trimmer with phase 4, budget reset scanner with phase 5, dependency reconciler with phase 6.
+**Phase 2 notes:** `fail_execution` sets `pending_retry_attempt` + lineage fields on exec core. It does NOT create the attempt — `claim_execution` (Phase 1) reads these fields on the next claim and creates the attempt with the correct type. This works because Phase 1's `claim_execution` uses `or ""` defaults for the pending fields (§4.8m forward compatibility). `reclaim_execution` is essential for crash recovery. `expire_execution` handles both per-attempt timeouts (slow-but-alive workers) and total execution deadlines, across all lifecycle phases (active, runnable, suspended).
+
+Background scanners should be added alongside their phase as listed above. The generalized index reconciler and worker claim count reconciler should be added in Phase 1 or 2 as safety nets.
 
 ---
 

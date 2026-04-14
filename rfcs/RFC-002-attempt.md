@@ -56,7 +56,7 @@ An attempt record contains the following fields, grouped by purpose.
 | `attempt_state` | `AttemptState` enum | Yes | Current lifecycle state of this attempt (see Lifecycle section). |
 | `failure_reason` | `String` | No | Structured failure reason if `ended_failure`. |
 | `failure_category` | `String` | No | Machine-readable failure category (e.g., `timeout`, `worker_error`, `provider_error`, `budget_exceeded`). |
-| `terminalized_by_override` | `bool` | No | `true` if an operator or privileged action forced the outcome. |
+| `terminalized_by_override` | `bool` | No | `true` if an operator or privileged action forced the outcome. Set by `cancel_execution` when `source = operator_override`, and by `expire_execution` (engine-forced timeout). Enables audit queries: "which attempts were terminated by the system vs the worker?" |
 
 #### Ownership / Placement
 
@@ -304,13 +304,13 @@ Replay is an explicit operator or system action that re-executes work even after
 4. The previously terminal attempt is *not* modified — its state remains `ended_success`, `ended_failure`, etc. The new attempt is what carries replay forward.
 
 **Replay metadata on execution:**
-The execution record (RFC-001) should track:
+The execution record (RFC-001) tracks:
 
 | Field | Type | Description |
 |---|---|---|
 | `replay_count` | `u32` | Number of times this execution has been replayed. Derivable from attempt history but cached for fast access. |
-| `last_replay_reason` | `String` | Most recent replay reason. |
-| `last_replay_requested_by` | `String` | Actor who requested the most recent replay. |
+
+Replay reason and requester are carried as transient fields (`pending_replay_reason`, `pending_replay_requested_by`) on exec core during the claim window (set by `replay_execution`, consumed and cleared by `claim_execution` which copies them to the new attempt's `replay_reason` and `replay_requested_by` fields). Persistent `last_replay_*` fields are not needed on exec core — query the latest replay attempt (filter `attempt_type = replay` in the attempts ZSET) for the most recent replay reason and requester.
 
 **Replay guards:**
 - Replay is only valid on terminal executions. Attempting to replay an active or suspended execution is an error.

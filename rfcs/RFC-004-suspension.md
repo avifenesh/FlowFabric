@@ -1052,11 +1052,13 @@ Designed for later but not required in v1:
 
 ## Open Questions
 
-Only unresolved questions remain here.
+No unresolved questions remain.
 
-1. Should the engine store raw `waitpoint_key` values, or only a keyed hash, once the externally returned opaque token has been generated?
-2. Should `escalate` mutate the current suspension in place or always close it and create a new operator-review suspension episode?
-3. Should continuation metadata be stored entirely outside the engine with only a pointer, or should the engine own a small standardized checkpoint envelope?
+**Resolved:** Q1 — Waitpoint key storage. Store raw `waitpoint_key` values. The raw token is needed for operator inspection ("what key was given to the external system?") and for re-issuance if the external system loses it. Storing only a keyed hash would prevent reconstruction. The MAC provides integrity; the raw value provides debuggability. Current design is correct.
+
+**Resolved:** Q2 — Escalate timeout behavior. Deferred and aligned with RFC-005 Q1. When implemented, `escalate` will mutate the current suspension in place (change `reason_code` to `waiting_for_operator_review`, replace resume condition with operator-only). Mutate-in-place avoids the complexity of closing + creating a new suspension episode atomically. The waitpoint remains open; the condition is replaced.
+
+**Resolved:** Q3 — Continuation metadata ownership. Pointer only — the engine stores `continuation_metadata_pointer` as an opaque string reference to worker-owned durable state. The engine does not own or parse the continuation data. This cleanly separates engine durability (suspension correctness) from runtime semantics (what the worker needs to resume). A standardized checkpoint envelope is a v2 extension if cross-runtime portability is needed.
 
 ## References
 
