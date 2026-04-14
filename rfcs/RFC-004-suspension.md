@@ -696,6 +696,59 @@ end
 -- Record waitpoint_id in mandatory history set (required for cleanup cascade)
 redis.call("SADD", KEYS.waitpoint_history, waitpoint_id)
 
+-- OOM-SAFE WRITE ORDERING (per RFC-010 §4.8b):
+-- exec_core HSET is the "point of no return" — write it FIRST.
+-- If OOM kills after exec_core but before creating sub-objects,
+-- execution is suspended (correct lifecycle) with missing suspension/
+-- waitpoint records. The suspension timeout scanner and generalized
+-- index reconciler can detect and initiate recovery (expire or re-enable).
+-- Reverse order would leave sub-objects (suspension, waitpoint) existing
+-- while exec_core still says 'active' — an unrecoverable zombie state
+-- because no scanner looks for orphaned suspension records on active executions.
+
+-- Step 1: Transition exec_core (FIRST — point of no return, all 7 dims)
+redis.call("HSET", KEYS.core,
+  "lifecycle_phase", "suspended",
+  "ownership_state", "unowned",
+  "eligibility_state", "not_applicable",
+  "blocking_reason", map_reason_to_blocking(ARGV.reason_code),
+  "blocking_detail", "suspended: waitpoint " .. waitpoint_id .. " awaiting " .. ARGV.reason_code,
+  "terminal_outcome", "none",
+  "attempt_state", "attempt_interrupted",
+  "public_state", "suspended",
+  "current_lease_id", "",
+  "current_worker_id", "",
+  "current_worker_instance_id", "",
+  "lease_expires_at", "",
+  "lease_last_renewed_at", "",
+  "current_suspension_id", ARGV.suspension_id,
+  "current_waitpoint_id", waitpoint_id,
+  "last_transition_at", now_ms, "last_mutation_at", now_ms
+)
+
+-- Step 2: Pause the attempt: started -> suspended (RFC-002 suspend_attempt)
+redis.call("HSET", KEYS.current_attempt,
+  "attempt_state", "suspended",
+  "suspended_at", now_ms,
+  "suspension_id", ARGV.suspension_id)
+
+-- Step 3: Release lease + update indexes (exec_core already correct)
+redis.call("DEL", KEYS.current_lease)
+redis.call("ZREM", KEYS.lease_expiry, ARGV.execution_id)
+redis.call("SREM", KEYS.worker_leases, ARGV.execution_id)
+redis.call("ZREM", KEYS.active_index, ARGV.execution_id)
+redis.call("ZREM", KEYS.attempt_timeout_zset, ARGV.execution_id)  -- clear per-attempt timeout (§6.16)
+redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",
+  "event", "released",
+  "lease_id", ARGV.lease_id,
+  "lease_epoch", ARGV.lease_epoch,
+  "attempt_index", ARGV.attempt_index,
+  "attempt_id", core.current_attempt_id,
+  "reason", "suspend",
+  "ts", now_ms
+)
+
+-- Step 4: Create suspension record (safe to lose on OOM — stale but not zombie)
 redis.call("HSET", KEYS.suspension_current,
   "suspension_id", ARGV.suspension_id,
   "execution_id", ARGV.execution_id,
@@ -716,49 +769,7 @@ redis.call("HSET", KEYS.suspension_current,
   "close_reason", ""
 )
 
--- Pause the attempt: started -> suspended (RFC-002 suspend_attempt)
-redis.call("HSET", KEYS.current_attempt,
-  "attempt_state", "suspended",
-  "suspended_at", now_ms,
-  "suspension_id", ARGV.suspension_id)
-
--- Release lease
-redis.call("DEL", KEYS.current_lease)
-redis.call("ZREM", KEYS.lease_expiry, ARGV.execution_id)
-redis.call("SREM", KEYS.worker_leases, ARGV.execution_id)
-redis.call("ZREM", KEYS.active_index, ARGV.execution_id)
-redis.call("ZREM", KEYS.attempt_timeout_zset, ARGV.execution_id)  -- clear per-attempt timeout (§6.16)
-redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",
-  "event", "released",
-  "lease_id", ARGV.lease_id,
-  "lease_epoch", ARGV.lease_epoch,
-  "attempt_index", ARGV.attempt_index,
-  "attempt_id", core.current_attempt_id,
-  "reason", "suspend",
-  "ts", now_ms
-)
-
--- Set ALL 7 state vector dimensions explicitly
-redis.call("HSET", KEYS.core,
-  "lifecycle_phase", "suspended",
-  "ownership_state", "unowned",
-  "eligibility_state", "not_applicable",
-  "blocking_reason", map_reason_to_blocking(ARGV.reason_code),
-  "blocking_detail", "suspended: waitpoint " .. waitpoint_id .. " awaiting " .. ARGV.reason_code,
-  "terminal_outcome", "none",
-  "attempt_state", "attempt_interrupted",
-  "public_state", "suspended",
-  "current_lease_id", "",
-  "current_worker_id", "",
-  "current_worker_instance_id", "",
-  "lease_expires_at", "",
-  "lease_last_renewed_at", "",
-  "current_suspension_id", ARGV.suspension_id,
-  "current_waitpoint_id", waitpoint_id,
-  "last_transition_at", now_ms, "last_mutation_at", now_ms
-)
-
--- Add to per-lane suspended index
+-- Step 5: Add to per-lane suspended index + suspension timeout
 redis.call("ZADD", KEYS.suspended_index,
   ARGV.timeout_at ~= "" and ARGV.timeout_at or 9999999999999,
   ARGV.execution_id)
@@ -808,14 +819,6 @@ if not trigger_satisfies_resume_condition(suspension, waitpoint, ARGV.trigger_js
   return err("resume_condition_not_met")
 end
 
-redis.call("HSET", KEYS.waitpoint,
-  "state", "satisfied",
-  "satisfied_at", now_ms
-)
-redis.call("HSET", KEYS.suspension_current,
-  "satisfied_at", now_ms
-)
-
 local eligibility_state = "eligible_now"
 local blocking_reason = "waiting_for_worker"
 local blocking_detail = ""
@@ -828,20 +831,14 @@ if resume_delay_ms > 0 then
   public_state = "delayed"
 end
 
-redis.call("HSET", KEYS.waitpoint,
-  "state", "closed",
-  "closed_at", now_ms,
-  "close_reason", "resumed"
-)
-redis.call("HSET", KEYS.suspension_current,
-  "closed_at", now_ms,
-  "close_reason", "resumed"
-)
-redis.call("ZREM", KEYS.suspension_timeout, ARGV.execution_id)
-redis.call("ZREM", KEYS.suspended_index, ARGV.execution_id)
+-- OOM-SAFE WRITE ORDERING (per RFC-010 §4.8b):
+-- exec_core HSET is the "point of no return" — write it FIRST.
+-- If OOM kills after exec_core but before closing sub-objects,
+-- execution is runnable (correct) with stale suspension/waitpoint
+-- records (generalized index reconciler catches this).
+-- Reverse order would leave execution suspended with closed sub-objects — zombie.
 
--- Set ALL 7 state vector dimensions explicitly
--- attempt_state stays attempt_interrupted until a worker re-claims (then → running_attempt)
+-- Step 1: Transition exec_core (FIRST — point of no return)
 redis.call("HSET", KEYS.core,
   "lifecycle_phase", "runnable",
   "ownership_state", "unowned",
@@ -856,11 +853,32 @@ redis.call("HSET", KEYS.core,
   "last_transition_at", now_ms, "last_mutation_at", now_ms
 )
 
+-- Step 2: Update scheduling indexes (exec_core already correct)
+redis.call("ZREM", KEYS.suspended_index, ARGV.execution_id)
 if eligibility_state == "eligible_now" then
   redis.call("ZADD", KEYS.eligible_index, now_ms, ARGV.execution_id)
 else
   redis.call("ZADD", KEYS.delayed_index, now_ms + resume_delay_ms, ARGV.execution_id)
 end
+
+-- Step 3: Close sub-objects (safe to lose on OOM — stale but not zombie)
+redis.call("HSET", KEYS.waitpoint,
+  "state", "satisfied",
+  "satisfied_at", now_ms
+)
+redis.call("HSET", KEYS.suspension_current,
+  "satisfied_at", now_ms
+)
+redis.call("HSET", KEYS.waitpoint,
+  "state", "closed",
+  "closed_at", now_ms,
+  "close_reason", "resumed"
+)
+redis.call("HSET", KEYS.suspension_current,
+  "closed_at", now_ms,
+  "close_reason", "resumed"
+)
+redis.call("ZREM", KEYS.suspension_timeout, ARGV.execution_id)
 
 return ok()
 ```
@@ -899,41 +917,15 @@ if suspension.suspension_id == nil or suspension.suspension_id == "" then
   return err("execution_not_suspended")
 end
 
--- Close waitpoint
-redis.call("HSET", KEYS.waitpoint,
-  "state", "closed",
-  "closed_at", now_ms,
-  "close_reason", "cancelled")
-redis.call("HSET", KEYS.wp_condition,
-  "closed", "1",
-  "closed_at", now_ms,
-  "closed_reason", "cancelled")
+-- OOM-SAFE WRITE ORDERING (per RFC-010 §4.8b):
+-- exec_core HSET is the "point of no return" — write it FIRST.
+-- If OOM kills after exec_core but before closing sub-objects,
+-- execution is terminal:cancelled (correct) with stale suspension/waitpoint
+-- records. The generalized index reconciler adds to terminal set.
+-- Reverse order would leave sub-objects closed while exec_core still
+-- says 'suspended' — reconciler would try to keep it suspended.
 
--- Close suspension
-redis.call("HSET", KEYS.suspension_current,
-  "closed_at", now_ms,
-  "close_reason", "cancelled")
-
--- Terminate attempt: suspended → ended_cancelled
-redis.call("HSET", KEYS.attempt_record,
-  "attempt_state", "ended_cancelled",
-  "ended_at", now_ms,
-  "failure_reason", ARGV.reason,
-  "suspended_at", "",
-  "suspension_id", "")
-
--- Close attempt stream if it exists
-if redis.call("EXISTS", KEYS.stream_meta) == 1 then
-  redis.call("HSET", KEYS.stream_meta,
-    "closed_at", now_ms,
-    "closed_reason", "attempt_cancelled")
-end
-
--- Remove from suspension indexes
-redis.call("ZREM", KEYS.suspension_timeout, ARGV.execution_id)
-redis.call("ZREM", KEYS.suspended_index, ARGV.execution_id)
-
--- Set ALL 7 state vector dimensions — terminal cancelled
+-- Step 1: Transition exec_core (FIRST — point of no return, all 7 dims)
 redis.call("HSET", KEYS.core,
   "lifecycle_phase", "terminal",
   "ownership_state", "unowned",
@@ -949,6 +941,38 @@ redis.call("HSET", KEYS.core,
   "last_mutation_at", now_ms,
   "current_suspension_id", "",
   "current_waitpoint_id", "")
+
+-- Step 2: Terminate attempt: suspended → ended_cancelled
+redis.call("HSET", KEYS.attempt_record,
+  "attempt_state", "ended_cancelled",
+  "ended_at", now_ms,
+  "failure_reason", ARGV.reason,
+  "suspended_at", "",
+  "suspension_id", "")
+
+-- Step 3: Close attempt stream if it exists
+if redis.call("EXISTS", KEYS.stream_meta) == 1 then
+  redis.call("HSET", KEYS.stream_meta,
+    "closed_at", now_ms,
+    "closed_reason", "attempt_cancelled")
+end
+
+-- Step 4: Close sub-objects (safe to lose on OOM — stale but not zombie)
+redis.call("HSET", KEYS.waitpoint,
+  "state", "closed",
+  "closed_at", now_ms,
+  "close_reason", "cancelled")
+redis.call("HSET", KEYS.wp_condition,
+  "closed", "1",
+  "closed_at", now_ms,
+  "closed_reason", "cancelled")
+redis.call("HSET", KEYS.suspension_current,
+  "closed_at", now_ms,
+  "close_reason", "cancelled")
+
+-- Step 5: Remove from suspension indexes
+redis.call("ZREM", KEYS.suspension_timeout, ARGV.execution_id)
+redis.call("ZREM", KEYS.suspended_index, ARGV.execution_id)
 
 -- Add to terminal set for retention scanning
 redis.call("ZADD", KEYS.terminal_index, now_ms, ARGV.execution_id)

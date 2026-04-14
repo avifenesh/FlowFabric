@@ -561,29 +561,17 @@ for i = 0, total - 1 do
       end
 
       if resume then
-        -- 7a. Close waitpoint condition
-        redis.call("HSET", KEYS[2],
-          "closed", "1", "closed_at", now_ms,
-          "closed_reason", "satisfied")
         effect = "resume_condition_satisfied"
 
-        -- 7b. Close waitpoint record
-        redis.call("HSET", KEYS[8],
-          "state", "closed",
-          "satisfied_at", now_ms,
-          "closed_at", now_ms,
-          "close_reason", "resumed")
+        -- OOM-SAFE WRITE ORDERING (per §4.8b defensive write ordering):
+        -- exec_core HSET is the "point of no return" — write it FIRST.
+        -- If OOM kills the script after exec_core but before closing
+        -- sub-objects, the execution is runnable (correct) with stale
+        -- suspension/waitpoint records (reconciler catches this).
+        -- If we closed sub-objects first and OOM hit before exec_core,
+        -- the execution stays suspended with closed sub-objects — zombie.
 
-        -- 7c. Close suspension record
-        redis.call("HSET", KEYS[9],
-          "satisfied_at", now_ms,
-          "closed_at", now_ms,
-          "close_reason", "resumed")
-
-        -- 7d. Remove from suspension timeout index
-        redis.call("ZREM", KEYS[13], ARGV.execution_id)
-
-        -- 7e. Transition execution: suspended → runnable
+        -- 7a. Transition execution: suspended → runnable (WRITE FIRST)
         -- Resume continues the SAME attempt (no new attempt created)
         if lp == "suspended" then
           local resume_delay = tonumber(ARGV.resume_delay_ms)
@@ -617,7 +605,7 @@ for i = 0, total - 1 do
             "current_waitpoint_id", "",
             "last_transition_at", now_ms, "last_mutation_at", now_ms)
 
-          -- 7f. Update scheduling indexes
+          -- 7b. Update scheduling indexes
           local priority = tonumber(core.priority or "0")
           local created_at = tonumber(core.created_at or "0")
           redis.call("ZREM", KEYS[11], ARGV.execution_id)
@@ -630,6 +618,27 @@ for i = 0, total - 1 do
               ARGV.execution_id)
           end
         end
+
+        -- 7c. Close waitpoint condition (after exec_core is safe)
+        redis.call("HSET", KEYS[2],
+          "closed", "1", "closed_at", now_ms,
+          "closed_reason", "satisfied")
+
+        -- 7d. Close waitpoint record
+        redis.call("HSET", KEYS[8],
+          "state", "closed",
+          "satisfied_at", now_ms,
+          "closed_at", now_ms,
+          "close_reason", "resumed")
+
+        -- 7e. Close suspension record
+        redis.call("HSET", KEYS[9],
+          "satisfied_at", now_ms,
+          "closed_at", now_ms,
+          "close_reason", "resumed")
+
+        -- 7f. Remove from suspension timeout index
+        redis.call("ZREM", KEYS[13], ARGV.execution_id)
       end
       break
     end

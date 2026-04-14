@@ -402,6 +402,7 @@ The passive flow container does not suspend or wait during cancellation. It issu
 | `flow_policy_violation` | Requested mutation conflicts with flow failure/completion/cancellation policy. |
 | `dynamic_expansion_disabled` | Runtime addition attempted while dynamic expansion is disabled. |
 | `dependency_resolution_mismatch` | Tried to resolve an edge against an upstream outcome that does not match its current state or source. |
+| `self_referencing_edge` | Upstream and downstream are the same execution. Self-loops cause permanent deadlock. |
 
 ## Valkey Data Model
 
@@ -527,6 +528,7 @@ This keeps structural truth and runtime truth consistent without pretending a si
 
 Responsibilities:
 
+- **reject self-referencing edges** (`upstream_execution_id == downstream_execution_id`)
 - verify both executions are members of the flow
 - verify topology kind allows the edge
 - run cycle check in DAG mode
@@ -534,9 +536,10 @@ Responsibilities:
 - increment `graph_revision`
 - create `grant:<mutation_id>` with child target info
 
-Cycle check note:
+Self-loop and cycle check note:
 
-- **The Lua script validates `graph_revision` only. It does NOT independently verify acyclicity.** Cycle detection is the control plane's responsibility.
+- **Self-loops (A→A) are rejected by the Lua script directly, not by DFS.** The script checks `upstream_execution_id == downstream_execution_id` before any other validation and returns `self_referencing_edge`. This is necessary because the DFS-based cycle detection traverses *existing* edges — when no edges exist yet, a self-loop has no path to detect. The explicit check prevents permanent deadlock (execution blocked on its own completion).
+- **The Lua script validates `graph_revision` only for multi-node cycles. It does NOT independently verify acyclicity.** Cycle detection for A→B→...→A is the control plane's responsibility.
 - The control plane reads the flow's adjacency snapshot (all `out:<node>` sets), runs DFS reachability from the proposed downstream node. If the proposed upstream is reachable, the edge would create a cycle → reject before calling the Lua script.
 - The Lua script checks `expected_graph_revision == current_graph_revision`. If stale (another edge was added between snapshot read and script call), it returns `stale_graph_revision`. The control plane re-reads the adjacency, re-runs cycle detection, and retries.
 - This optimistic concurrency + retry loop correctly prevents cycles even under concurrent edge additions.

@@ -271,7 +271,7 @@ Every operation that spans more than one partition family. For each: the partiti
 #### 3.1 Three-Partition Claim Flow
 
 **Operation:** Worker claims an eligible execution.
-**Partitions touched:** `{q:K}` → `{b:M}` → `{p:N}` (→ `{p:N}` again for `acquire_lease`)
+**Partitions touched:** `{q:K}` → `{b:M}` (per-candidate) → `{p:N}` (→ `{p:N}` again for `acquire_lease`)
 
 ```
 Worker                Scheduler                {q:K}              {b:M}             {p:N}
@@ -279,7 +279,8 @@ Worker                Scheduler                {q:K}              {b:M}         
   ├─claim_request──────►│                       │                  │                 │
   │                      ├─check_admission─────►│                  │                 │
   │                      │◄──────admitted────────│                  │                 │
-  │                      ├─check_budget────────────────────────►│                 │
+  │                      │ SELECT CANDIDATE      │                  │                 │
+  │                      ├─check_budget (per-candidate)────────►│                 │
   │                      │◄──────────────────────────budget_ok──│                 │
   │                      ├─issue_claim_grant──────────────────────────────────────►│
   │                      │◄──────────────────────────────────────────grant_issued──│
@@ -290,25 +291,32 @@ Worker                Scheduler                {q:K}              {b:M}         
 
 **Step 1 — Quota admission check (`{q:K}`)**
 - Lua: `check_admission_and_record.lua` on the quota partition.
-- Sliding-window rate check + concurrency cap check.
+- Scope-level fast pre-check: sliding-window rate check + concurrency cap check.
 - If admitted: ZADD to window, INCR concurrency counter. Proceed.
 - If denied: return `rate_limit_exceeded` or `concurrency_limit_exceeded`. Stop.
 
-**Step 2 — Budget check (`{b:M}`)**
-- Lua: read `ff:budget:{b:M}:<budget_id>:usage` and `ff:budget:{b:M}:<budget_id>:limits`.
-- Advisory read — no mutation. Usage is not pre-charged.
-- If any attached budget's hard limit is already breached: return `budget_admission_denied`. Stop.
-- If OK: proceed.
+**Step 2 — Select candidate**
+- Scheduler reads eligible sorted sets across partitions for the selected lane(s).
+- Applies fairness policy (cross-lane weighted round-robin, cross-tenant fair share).
+- Selects the highest-priority, capability-matched candidate.
 
-**Step 3 — Issue claim-grant (`{p:N}`)**
+**Step 3 — Budget check per-candidate (`{b:M}`)**
+- For the selected candidate: read `budget_ids` from the execution's core hash (cached from prior partition scan or read inline). For each attached budget: read `ff:budget:{b:M}:<budget_id>:usage` and `:limits`.
+- Advisory read — no mutation. Usage is not pre-charged.
+- If any attached budget's hard limit is already breached:
+  - Run `block_execution_for_admission.lua` on the candidate's `{p:N}` partition. This atomically sets `eligibility_state = blocked_by_budget`, `blocking_reason = waiting_for_budget`, ZREMs from eligible, ZADDs to `blocked:budget`.
+  - **Go back to step 2** with the next candidate. If no more candidates: return empty response to worker.
+- If all budgets have headroom: proceed.
+
+**Step 4 — Issue claim-grant (`{p:N}`)**
 - Lua: `issue_claim_grant.lua` on the execution's partition.
 - Validates execution is still `runnable` + `eligible_now` + `unowned`.
 - Writes `ff:exec:{p:N}:<execution_id>:claim_grant` with TTL.
 - ZREM from eligible sorted set (prevents double-grant).
 - If execution already claimed/cancelled: return error. Stop.
 
-**Step 4 — Acquire lease (`{p:N}`)**
-- Lua: `acquire_lease.lua` on the same partition as step 3.
+**Step 5 — Acquire lease (`{p:N}`)**
+- Lua: `acquire_lease.lua` on the same partition as step 4.
 - Validates and consumes the claim grant.
 - Creates lease, creates attempt, transitions execution to `active`.
 - Updates all partition-local indexes atomically.
@@ -319,14 +327,15 @@ Worker                Scheduler                {q:K}              {b:M}         
 | Failure Point | Effect | Convergence |
 |---|---|---|
 | Step 1 rejected (quota) | No side effects. Worker retries or backs off. | Immediate — no cleanup needed. |
-| Step 2 rejected (budget) | Step 1 already admitted (INCR'd concurrency). | **Stale INCR.** Concurrency reconciler corrects drift periodically. Acceptable: one extra count until reconciliation. |
-| Step 3 fails (execution gone) | Step 1 INCR'd, step 2 passed. | Same as above for step 1. No grant written — no orphan. |
-| Step 3 succeeds, step 4 never runs (worker crash) | Grant key exists with TTL. Execution removed from eligible set. | Grant TTL expires (5s). **Grant expiry reconciler** (RFC-009 §12.8) detects execution is `runnable` + `eligible_now` but not in eligible set, re-adds it. |
-| Step 3 succeeds, step 4 fails (execution state changed between 3 and 4) | Grant exists but execution no longer claimable. | Grant TTL expires. Reconciler checks execution state — since it's no longer `runnable`, no re-add needed. Grant key auto-deletes. |
-| **Quota partition `{q:K}` unreachable** (network partition, shard down) | Scheduler cannot check admission. | **FAIL-OPEN.** Proceed without quota check. Quota is admission pacing, not a correctness boundary. Over-admission is bounded by the claim-grant serialization on `{p:N}`. Reconcile quota counters when `{q:K}` recovers. |
-| **Budget partition `{b:M}` unreachable** — hard-limit budget | Scheduler cannot check budget. | **FAIL-CLOSED.** Do not issue claim grant. Budget hard limits are a correctness boundary (spending caps). Execution remains eligible but unclaimed until `{b:M}` recovers. |
-| **Budget partition `{b:M}` unreachable** — advisory/soft budget | Scheduler cannot check budget. | **FAIL-OPEN.** Proceed without budget check. Advisory budgets are monitoring tools, not hard enforcement. Log warning. |
-| **Execution partition `{p:N}` unreachable** | Cannot access execution state at all. | **FAIL.** Claim is impossible — the execution, lease, and attempt all live on `{p:N}`. Scheduler skips this execution until the partition recovers. |
+| Step 3 rejected (budget) — candidate blocked | Step 1 INCR'd. Candidate moved to `blocked:budget`. Scheduler tries next candidate. | **Stale INCR** if no candidate succeeds. Concurrency reconciler corrects. Blocked candidate unblocked by §6.15 when budget frees. |
+| Step 3 denied for ALL candidates | Step 1 INCR'd. All candidates blocked. Worker gets empty response. | Same INCR drift. All candidates recoverable via unblock scanner. |
+| Step 4 fails (execution gone) | Step 1 INCR'd, step 3 passed. | Same INCR drift. No grant written — no orphan. |
+| Step 4 succeeds, step 5 never runs (worker crash) | Grant key exists with TTL. Execution removed from eligible set. | Grant TTL expires (5s). **Grant expiry reconciler** (RFC-009 §12.8) detects execution is `runnable` + `eligible_now` but not in eligible set, re-adds it. |
+| Step 4 succeeds, step 5 fails (state changed between 4 and 5) | Grant exists but execution no longer claimable. | Grant TTL expires. Reconciler checks — no longer `runnable`, no re-add needed. |
+| **Quota partition `{q:K}` unreachable** | Scheduler cannot check admission. | **FAIL-OPEN.** Proceed without quota check. Over-admission bounded by claim-grant serialization on `{p:N}`. Reconcile when `{q:K}` recovers. |
+| **Budget partition `{b:M}` unreachable** — hard-limit budget | Scheduler cannot check budget for selected candidate. | **FAIL-CLOSED.** Do not issue claim grant. Execution remains eligible but unclaimed until `{b:M}` recovers. |
+| **Budget partition `{b:M}` unreachable** — advisory/soft budget | Scheduler cannot check budget for selected candidate. | **FAIL-OPEN.** Proceed without budget check. Log warning. |
+| **Execution partition `{p:N}` unreachable** | Cannot access execution state at all. | **FAIL.** Claim impossible — skip until partition recovers. |
 
 #### 3.2 Flow Dependency Resolution
 
@@ -574,7 +583,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 10 | `create_and_start_attempt` | RFC-002 | *See #1 (`claim_execution`). Same logical operation described from attempt perspective.* | A | — | *See #1* |
 | 11 | `end_attempt_and_decide` | RFC-002 | *See #3/#4. Same logical operation described from attempt perspective. Includes stream close.* | A | — | *See #3/#4* |
 | 12 | `interrupt_and_reclaim` | RFC-002 | *See #9 (`reclaim_execution`). Same logical operation described from attempt perspective. Includes stream close.* | A | — | *See #9* |
-| 12a | `cancel_execution` | RFC-001 | Cancel from any non-terminal state. Active: validate lease or operator override, end attempt, close stream, clear lease. Runnable: ZREM from eligible/delayed/blocked. Suspended: close waitpoint+suspension. All paths: set terminal_outcome=cancelled. **ZADD terminal_zset is UNCONDITIONAL** — even if execution is not in any sorted set (handles grant-cancel race where grant ZREM'd from eligible but claim never completed). | A | 12 | exec_core, attempt_hash, stream_meta, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, suspension_timeout_zset, terminal_zset, source_state_zset (eligible or delayed or blocked or suspended or active_index) |
+| 12a | `cancel_execution` | RFC-001 | Cancel from any non-terminal state. **Exec_core HSET (terminal:cancelled) is FIRST mutation** (§4.8b Rule 2). Active: validate lease or operator override, end attempt, close stream, clear lease. Runnable: defensive ZREM from ALL scheduling sets. Suspended: close waitpoint+suspension (after exec_core). All paths: ZREM from attempt_timeout + execution_deadline. **ZADD terminal_zset is UNCONDITIONAL.** Uses defensive ZREM from ALL scheduling sorted sets (not a single source_state_zset) to avoid TOCTOU race where execution moves between sets between caller's state read and Lua execution. | A | 21 | exec_core, attempt_hash, stream_meta, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, wp_condition, suspension_timeout_zset, terminal_zset, attempt_timeout_zset, execution_deadline_zset, eligible_zset, delayed_zset, blocked_deps_zset, blocked_budget_zset, blocked_quota_zset, blocked_route_zset, blocked_operator_zset |
 | 12b | `replay_execution` | RFC-001 | Validate terminal, set `pending_replay_attempt` + lineage on exec core (does NOT create attempt — `claim_execution` creates it with type=replay), transition terminal→runnable. **If `terminal_outcome = skipped` AND `flow_id` set:** reset dep edges (impossible→unsatisfied), recompute `deps:meta` counts, set `blocked_by_dependencies` instead of `eligible_now`, ZADD blocked:deps (engine dispatches cross-partition `resolve_dependency` post-script). **Otherwise:** ZADD eligible. Both paths: ZREM terminal. | A | 8 | exec_core, terminal_zset, eligible_zset, blocked_deps_zset, lease_history, deps_meta, deps_unresolved, dep_edge_hashes (variable) |
 | 13 | `suspend_execution` | RFC-004 | Validate lease (incl. expiry + revocation checks matching complete_or_fail template), release ownership, create suspension + waitpoint (or activate pending), initialize wp_condition hash, ZADD suspended_zset, ZREM attempt_timeout, update execution state, update indexes | A | 16 | exec_core, attempt_record, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, waitpoint_signals, suspension_timeout_zset, pending_wp_expiry_zset, active_index, suspended_zset, waitpoint_history, wp_condition, attempt_timeout_zset |
 | 14 | `resume_execution` | RFC-004 | Validate suspension + waitpoint satisfied, close suspension + waitpoint, ZREM suspended_zset, transition suspended→runnable, update indexes | A | 8 | exec_core, suspension_current, waitpoint_hash, waitpoint_signals, suspension_timeout_zset, eligible_zset, delayed_zset, suspended_zset |
@@ -599,7 +608,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 31 | `move_to_waiting_children` | RFC-001 | Worker blocks on child dependencies. Validate lease, release ownership, set blocked_by_dependencies + waiting_for_children, all 7 dims. ZREM from active + lease_expiry + attempt_timeout. ZADD blocked:dependencies. | A | 7 | exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases, active_index, blocked_deps_zset |
 | 32 | `change_priority` | RFC-001 | Update priority field + re-score in current scheduling sorted set. Validate runnable + eligible. ZREM old score, ZADD new composite score. | A | 2 | exec_core, eligible_zset |
 | 33 | `update_progress` | RFC-001 | Update progress_pct + progress_message. Validate lease (lease_id + epoch). | B | 1 | exec_core |
-| 34 | `report_usage_on_attempt` | RFC-001/008 | HINCRBY attempt usage counters + exec core usage totals. Validate lease. Route to {b:M} budget check after return. | B | 2 | exec_core, attempt_usage |
+| 34 | `report_usage_on_attempt` | RFC-001/008 | **Idempotent** via monotonic `usage_report_seq`. ARGV includes `usage_report_seq` (caller-supplied, monotonically increasing per attempt). Script checks `attempt_usage.last_usage_report_seq`: if `ARGV.seq <= last_seq` → return `ok_already_applied` (no-op). Otherwise: HINCRBY attempt usage counters + exec core usage totals, HSET `last_usage_report_seq = ARGV.seq`. Validate lease. Route to `{b:M}` budget check after return. Budget `report_usage_and_check` on `{b:M}` must also include the seq — if `ok_already_applied`, skip the budget call entirely. | B | 2 | exec_core, attempt_usage |
 | — | `skip_execution` | RFC-001 | *Implemented inline in `resolve_dependency` (#23) impossible path. Not a standalone script.* | — | — | — |
 | — | `release_lease` | RFC-001 | *Implemented inline in complete/fail/suspend/delay/move_to_waiting_children scripts. Not standalone.* | — | — | — |
 | — | `recover_abandoned_execution` | RFC-001 | *Same as `reclaim_execution` (#9). See RFC-003.* | — | — | — |
@@ -622,7 +631,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 
 | # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{q:K}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
-| 32 | `check_admission_and_record` | RFC-008 | Sliding-window ZREMRANGEBYSCORE + ZCARD rate check, INCR concurrency check, ZADD + INCR on admit | A | 3 | window_zset, concurrency_counter, quota_def |
+| 32 | `check_admission_and_record` | RFC-008 | **Idempotent.** Checks admitted guard key (`ff:quota:{q:K}:<policy_id>:admitted:<execution_id>`) — if exists, return `ALREADY_ADMITTED`. Otherwise: sliding-window ZREMRANGEBYSCORE + ZCARD rate check, INCR concurrency check, ZADD (member=execution_id alone, not execution_id:timestamp) + SET NX guard + INCR on admit. Guard TTL = window size. | A | 4 | window_zset, concurrency_counter, quota_def, admitted_guard_key |
 
 ### 4.5 Script Overlap Notes
 
@@ -690,7 +699,11 @@ Valkey Lua scripts execute each `redis.call()` independently. If a script aborts
 
 Example: if `HSET exec_core lifecycle_phase=terminal` succeeds but the subsequent `ZADD terminal_zset` fails (OOM), the execution is terminal but not indexed. The generalized index reconciler (§6.17) catches this, but implementers must understand the risk.
 
-**Defensive write ordering:** Where possible, perform index writes (ZADD, ZREM, SADD) BEFORE state mutations (HSET exec_core). If an index write OOMs, the state hasn't changed — the execution remains in its previous consistent state. This isn't always possible (some HSET fields are needed before index writes), but the principle is: delay the "point of no return" state mutation as late as possible in the script.
+**Defensive write ordering — two rules that apply in different contexts:**
+
+**Rule 1 — Index writes before state for simple transitions:** Where possible, perform index writes (ZADD, ZREM, SADD) BEFORE state mutations (HSET exec_core). If an index write OOMs, the state hasn't changed — the execution remains in its previous consistent state. This applies to transitions like complete, fail, and claim where the index update and state update are on the same partition and the only sub-objects are indexes.
+
+**Rule 2 — exec_core FIRST for transitions that create/close sub-objects:** Scripts that transition exec_core AND create or close sub-objects (suspension records, waitpoint records, attempt records) MUST write exec_core state FIRST, before creating or closing sub-objects. This ensures partial writes leave exec_core in the target lifecycle state, which reconcilers can detect and resolve. The reverse (sub-objects mutated but exec_core still in old state) creates zombie states that no scanner checks for. Applies to: `suspend_execution` (exec_core=suspended BEFORE suspension_current creation), `resume_execution` (exec_core=runnable BEFORE closing suspension/waitpoint), `cancel_suspension` (exec_core=terminal BEFORE closing sub-objects).
 
 #### (b2) All exec_core mutations MUST go through Lua scripts
 
@@ -718,13 +731,30 @@ All pseudocode uses named ARGV references (`ARGV.lease_id`, `ARGV.execution_id`)
 
 The composite score `-(priority * 1_000_000_000_000) + created_at_ms` is stored as a Valkey sorted set score (IEEE 754 double, 53-bit mantissa). With `created_at_ms` around 1.7 × 10^12 (current epoch ms), the score magnitude is `priority * 10^12 + 1.7 * 10^12`. IEEE 754 doubles lose integer precision above 2^53 = 9.0 × 10^15. Safe priority range: `|priority| <= ~9000` before FIFO tiebreaking becomes unreliable. V1 recommended range `[-1000, 1000]` is safe with wide margin.
 
-#### (e) Dependency resolution trigger: engine dispatches after complete
+#### (e) Dependency resolution trigger: engine dispatches after ANY terminal transition
 
-`complete_execution` does NOT call `resolve_dependency` inline — they may be on different partitions. Instead, `complete_execution` returns a flag or event indicating the execution has a `flow_id`. The engine layer (outside Lua) then:
+Terminal-transition Lua scripts do NOT call `resolve_dependency` inline — they may be on different partitions. Instead, every terminal-transition script returns a flag or event indicating the execution has a `flow_id`. The engine layer (outside Lua) then:
 1. Reads outgoing edges from `{fp:N}` flow partition.
-2. For each downstream child, calls `resolve_dependency.lua` on the child's `{p:N}` partition.
+2. **Re-reads the parent execution's `terminal_outcome` from `{p:N}` immediately before each `resolve_dependency` call.** If the parent is no longer terminal (e.g., operator replayed it between the terminal event and this dispatch), SKIP the dispatch for that edge. This prevents stale edge resolution — a replayed parent should not satisfy downstream dependencies using its old terminal outcome.
+3. For each downstream child where the parent is still terminal, calls `resolve_dependency.lua` on the child's `{p:N}` partition with the parent's current `terminal_outcome`.
 
-This cross-partition dispatch is documented in §3.2 (Flow Dependency Resolution). If the engine crashes between `complete_execution` returning and the dependency resolution dispatch, the dependency resolution reconciler (§6) catches the gap.
+**This dispatch applies to ALL terminal transitions, not just completion:**
+
+| Terminal Script | Upstream Outcome | Downstream Effect |
+|---|---|---|
+| `complete_execution` | `success` | Edge satisfied → may promote to eligible |
+| `fail_execution` (terminal path) | `failed` | Edge impossible → downstream skipped |
+| `cancel_execution` | `cancelled` | Edge impossible → downstream skipped |
+| `expire_execution` | `expired` | Edge impossible → downstream skipped |
+| `resolve_dependency` (skip path) | `skipped` | Edge impossible → downstream of the skipped node also skipped (cascade) |
+
+Without dispatch on non-completion terminals, skip cascade propagation through a chain of depth N takes N × reconciler_interval (10-30s each), producing 30-90s+ delays for a 3-4 node chain. With dispatch, propagation is immediate (milliseconds per hop).
+
+**Consistency window:** Between the terminal script returning and the engine re-reading in step 2, the parent may be replayed. Step 2's re-read closes this window. Without it, a stale dispatch satisfies a child's dependency using an outcome that no longer exists — the child runs with the old result while the parent re-executes.
+
+**replay_execution interaction:** `replay_execution` already resets `impossible → unsatisfied` edges for skipped children (round 21 fix). A future enhancement should also reset `satisfied → unsatisfied` edges for children that haven't yet been claimed, enabling full re-evaluation of the dependency graph on parent replay. For v1, the step 2 re-read guard is sufficient — it prevents new stale resolutions. Already-satisfied edges from prior completions remain (documented in RFC-007 Open Questions §4).
+
+This cross-partition dispatch is documented in §3.2 (Flow Dependency Resolution). If the engine crashes between any terminal script returning and the dependency resolution dispatch, the dependency resolution reconciler (§6.14) catches the gap. The reconciler is a **safety net**, not the primary propagation mechanism.
 
 #### (f) Flow completion policy MUST read authoritative member states
 
@@ -954,25 +984,42 @@ Worker          Scheduler           {q:K}         {b:M}         {p:N}
   │───────────────►│                  │             │              │
   │                │                  │             │              │
   │                │ 1. QUOTA CHECK   │             │              │
+  │                │ (scope-level,    │             │              │
+  │                │  fast pre-check) │             │              │
   │                │ check_admission_ │             │              │
   │                │ and_record.lua   │             │              │
   │                │─────────────────►│             │              │
   │                │ (ADMITTED/DENIED)│             │              │
   │                │◄─────────────────│             │              │
   │                │                  │             │              │
-  │                │ 2. BUDGET CHECK  │             │              │
+  │                │ 2. SELECT        │             │              │
+  │                │ CANDIDATE        │             │              │
+  │                │ (fairness,       │             │              │
+  │                │  priority,       │             │              │
+  │                │  capability      │             │              │
+  │                │  match)          │             │              │
+  │                │                  │             │              │
+  │                │ 3. BUDGET CHECK  │             │              │
+  │                │ PER-CANDIDATE    │             │              │
   │                │ (advisory read   │             │              │
-  │                │  of usage vs     │             │              │
-  │                │  limits — no     │             │              │
+  │                │  of attached     │             │              │
+  │                │  budgets — no    │             │              │
   │                │  mutation)       │             │              │
   │                │────────────────────────────────►│              │
   │                │                  │  (OK/BREACH)│              │
   │                │◄───────────────────────────────│              │
   │                │                  │             │              │
-  │                │ 3. SELECT CANDIDATE            │              │
-  │                │ (fairness, priority,           │              │
-  │                │  capability match)             │              │
+  │                │ [IF BUDGET DENIED]:            │              │
+  │                │ 3a. block_execution_for_       │              │
+  │                │     admission on THIS          │              │
+  │                │     candidate's {p:N}          │              │
+  │                │──────────────────────────────────────────────►│
+  │                │◄─────────────────────────────────────────────│
+  │                │ 3b. GOTO step 2 (next          │              │
+  │                │     candidate). If no more     │              │
+  │                │     candidates: return empty.  │              │
   │                │                  │             │              │
+  │                │ [IF BUDGET OK]:  │             │              │
   │                │ 4. ISSUE GRANT   │             │              │
   │                │ issue_claim_     │             │              │
   │                │ grant.lua        │             │              │
@@ -1003,10 +1050,13 @@ Worker          Scheduler           {q:K}         {b:M}         {p:N}
   │ (lease_id, epoch,                 │             │              │
   │  attempt_id, exec data)           │             │              │
 
-  Lua scripts: check_admission_and_record → budget read (advisory) →
-               issue_claim_grant → claim_execution
-  Partitions: {q:K} → {b:M} (read) → {p:N} → {p:N}
-              (4 sequential calls, 3 potentially different shards)
+  Lua scripts: check_admission_and_record → [select candidate] →
+               budget read (per-candidate) → issue_claim_grant →
+               claim_execution
+  Partitions: {q:K} → [scheduler] → {b:M} (read) → {p:N} → {p:N}
+              (4 sequential Lua calls, 3 potentially different shards)
+  Budget denial loop: steps 2-3a may repeat for multiple candidates
+  until one passes or no candidates remain.
 ```
 
 ### 5c. Complete Execution (lease validate → attempt end → stream close → indexes)
@@ -1705,6 +1755,16 @@ FlowFabric requires several background processes to maintain system correctness,
 
 This prevents ghost members from accumulating in flow membership sets after their executions are purged.
 
+**The projector IS the flow completion evaluator.** The projector reads **authoritative** member execution states via cross-partition HMGET calls to each member's `{p:N}` partition — not from the summary hash. After aggregating counts from these authoritative reads, it:
+1. Writes updated counts to `ff:flow:{fp:N}:<flow_id>:summary`.
+2. Evaluates the flow's `completion_policy` (from `ff:flow:{fp:N}:<flow_id>:core`) against the aggregated counts.
+3. If the completion policy is satisfied: HSET `public_flow_state` on both the summary hash AND the flow core hash (`ff:flow:{fp:N}:<flow_id>:core`).
+4. Similarly evaluates `failure_policy` and `cancellation_propagation` state.
+
+No separate process evaluates flow completion. The projector is the **sole authority** for `public_flow_state` transitions. This is consistent with §4.8(f) — the projector already reads authoritative states, so it can evaluate policies directly without a second pass.
+
+**Latency implication:** Flow completion detection latency = projector cycle time (event-driven: sub-second on state change events; periodic fallback: 10-30s). For time-sensitive flows, ensure the event-driven path fires on every member terminal transition.
+
 ### 6.8 Stream Retention Trimmer
 
 **Source:** RFC-006 (Stream Model)
@@ -1942,15 +2002,62 @@ One unified scanner handles all 4 block types per partition per lane.
 --       suspended_zset, terminal_zset, lease_expiry_zset,
 --       blocked_deps, blocked_budget, blocked_quota,
 --       blocked_route, blocked_operator, suspension_timeout,
---       deps_meta, deps_unresolved
--- ARGV: execution_id, now_ms
+--       deps_meta, deps_unresolved,
+--       attempt_timeout_zset, execution_deadline_zset,
+--       attempts_zset, suspension_current
+-- ARGV: execution_id, now_ms, partition_number
 
 local core = redis.call("HMGET", KEYS[1],
   "lifecycle_phase", "ownership_state", "eligibility_state",
   "priority", "created_at", "completed_at",
-  "lease_expires_at", "delay_until")
+  "lease_expires_at", "delay_until",
+  "current_suspension_id")
 
 local lp, os, es = core[1], core[2], core[3]
+local suspension_id = core[9]
+
+-- Suspension state consistency check (defense-in-depth for OOM partial writes)
+-- KEYS[19] = ff:exec:{p:N}:<eid>:suspension:current
+if lp == "suspended" then
+  -- Check: exec says suspended, but does the suspension record exist?
+  local susp_exists = redis.call("EXISTS", KEYS[19])
+  if susp_exists == 0 then
+    -- Zombie: exec_core says suspended but no suspension record.
+    -- OOM during suspend_execution before exec_core HSET, then
+    -- the reverse happened: exec_core was written but suspension wasn't.
+    -- Or suspension was closed but exec_core not updated.
+    -- Fix: transition to runnable + eligible_now.
+    redis.call("HSET", KEYS[1],
+      "lifecycle_phase", "runnable",
+      "ownership_state", "unowned",
+      "eligibility_state", "eligible_now",
+      "blocking_reason", "waiting_for_worker",
+      "blocking_detail", "",
+      "terminal_outcome", "none",
+      "attempt_state", "attempt_interrupted",
+      "public_state", "waiting",
+      "current_suspension_id", "",
+      "current_waitpoint_id", "",
+      "last_transition_at", ARGV[2], "last_mutation_at", ARGV[2])
+    lp = "runnable"; es = "eligible_now"  -- continue with corrected state
+    -- Log warning: reconciler fixed suspended-without-suspension zombie
+  end
+elseif lp ~= "suspended" and suspension_id ~= nil and suspension_id ~= false and suspension_id ~= "" then
+  -- Check: exec NOT suspended, but has a current_suspension_id referencing an open suspension
+  local closed_at = redis.call("HGET", KEYS[19], "closed_at")
+  if closed_at == nil or closed_at == false or closed_at == "" then
+    -- Zombie: suspension record is open but exec_core is not suspended.
+    -- OOM during resume/cancel/deliver_signal: suspension was not closed
+    -- before exec_core was updated. Close the orphaned suspension.
+    redis.call("HSET", KEYS[19],
+      "closed_at", ARGV[2],
+      "close_reason", "reconciler_cleanup")
+    redis.call("HSET", KEYS[1],
+      "current_suspension_id", "",
+      "current_waitpoint_id", "")
+    -- Log warning: reconciler closed orphaned suspension record
+  end
+end
 if lp == nil then return ok("purged") end
 
 local eid = ARGV[1]
@@ -2009,15 +2116,51 @@ redis.call("ZADD", correct_key, score, eid)
 for _, idx in ipairs(all_sched) do
   if idx ~= correct_key then redis.call("ZREM", idx, eid) end
 end
+
+-- Clean orphan entries from auxiliary indexes not in all_sched.
+-- These indexes are only valid in specific lifecycle phases:
+--   lease_expiry (KEYS[7]):        only when active
+--   suspension_timeout (KEYS[13]): only when suspended
+--   attempt_timeout (KEYS[16]):    only when active (running attempt)
+--   execution_deadline (KEYS[17]): valid when active or runnable (total deadline)
+if lp ~= "active" then
+  redis.call("ZREM", KEYS[7], eid)   -- lease_expiry orphan
+  redis.call("ZREM", KEYS[16], eid)  -- attempt_timeout orphan
+end
+if lp ~= "suspended" then
+  redis.call("ZREM", KEYS[13], eid)  -- suspension_timeout orphan
+end
+-- execution_deadline: clean only for terminal/suspended (runnable may have valid deadline)
+if lp == "terminal" or lp == "suspended" then
+  redis.call("ZREM", KEYS[17], eid)  -- execution_deadline orphan
+end
+
+-- Orphaned attempt cleanup: KEYS[18] = attempts_zset
+local total_ct = tonumber(redis.call("HGET", KEYS[1], "total_attempt_count") or "0")
+if total_ct > 0 then
+  local latest = redis.call("ZREVRANGE", KEYS[18], 0, 0, "WITHSCORES")
+  if #latest >= 2 then
+    local latest_idx = tonumber(latest[1])
+    if latest_idx and latest_idx >= total_ct then
+      -- Orphan: attempt at index >= total_attempt_count. A script created
+      -- the attempt but OOM'd before incrementing the counter on exec_core.
+      for oi = total_ct, latest_idx do
+        redis.call("ZREM", KEYS[18], tostring(oi))
+        -- DEL orphaned attempt hash + usage + policy (partition-local)
+      end
+    end
+  end
+end
+
 return ok("reconciled")
 ```
 
 | Property | Value |
 |---|---|
-| **Per-item action** | Atomic Lua: HMGET state, ZADD correct, ZREM all others. No state mutations — only index repairs. |
+| **Per-item action** | Atomic Lua: HMGET state, ZADD correct, ZREM all other scheduling indexes, clean orphan auxiliary indexes, check attempts ZSET for orphans at index >= `total_attempt_count` and ZREM + DEL if found. |
 | **Failure mode** | Safe to crash. Desync persists until next scan. |
 | **Idempotency** | ZADD on existing member is no-op. ZREM on non-member is no-op. |
-| **Batch size** | 100-200 SCAN iterations. Each Lua: ~13 keys, 1 HMGET + 1 ZADD + ~10 ZREM. |
+| **Batch size** | 100-200 SCAN iterations. Each Lua: ~17 keys, 1 HMGET + 1 ZADD + ~10 ZREM (scheduling) + ~4 ZREM (auxiliary). |
 | **Discovery strategy** | Iterate `ff:idx:{p:N}:all_executions` to get execution IDs in the partition. For partitions with ≤10K members: use `SMEMBERS` (single response). For partitions with >10K members: use `SSCAN` with COUNT 200 to avoid large single-response payloads (~7 MB at 195K members). For each execution_id: read lane_id from exec_core, construct per-lane index keys, call `reconcile_execution_index.lua`. Process in batches of 100-200 per cycle. |
 
 **When this fires:** Under normal operation, finds nothing (ZADDs match, ZREMs find nothing). Exists for:
@@ -2612,6 +2755,29 @@ The following are **not** goals for the v1 Valkey backend:
 - **Zero-downtime schema migration:** V1 key schemas are designed for forward compatibility (new fields can be added to hashes without migration), but structural changes (e.g., changing partition count) require a planned migration.
 - **Built-in observability backend:** FlowFabric exposes metrics and events for external observability (Prometheus, Grafana, OpenTelemetry), but does not include a built-in dashboard or time-series store.
 - **Namespace-based access control:** V1 does not enforce namespace/tenant isolation at the engine level. The `namespace` field on execution, flow, and budget objects is metadata used for fairness (RFC-009 §5.3), listing (namespace index), and idempotency scoping — **not a security boundary**. Any caller who knows an `execution_id` can read, signal, or inspect that execution regardless of namespace. Multi-tenant isolation must be enforced at the API gateway or control plane layer. Engine-level namespace enforcement is a designed-for extension.
+
+  **API gateway namespace validation requirements:** The following table lists every operation that involves multiple entities and the namespace check the API gateway MUST perform before invoking the engine. Lua scripts assume namespace correctness for performance — they do NOT validate namespace.
+
+  | Operation | Entities Involved | Required Namespace Check |
+  |-----------|-------------------|--------------------------|
+  | `create_execution` | caller + namespace | Caller authorized for target namespace. |
+  | `attach_budget` | budget + scope entity | Budget's scope includes the target entity's namespace. For scope_type=tenant: scope_id must equal target namespace. For scope_type=execution: verify execution.namespace matches budget owner namespace. |
+  | `add_execution_to_flow` | execution + flow | `execution.namespace == flow.namespace`. Cross-namespace flow membership is forbidden. |
+  | `deliver_signal` / `send_signal` | caller + target execution | Caller authorized for `execution.namespace`. Waitpoint key MAC prevents guessing, but the gateway must still verify namespace authorization after decoding. |
+  | `report_usage` | execution + attached budgets | Verified at `attach_budget` time — no re-check needed per-report. |
+  | `claim_execution` | worker + execution | Worker authorized for `execution.namespace` (typically via lane authorization). |
+  | `create_child_execution` | parent + child | Child inherits `parent.namespace`. Gateway must reject attempts to set a different namespace on the child. |
+  | `cancel_execution` | caller + execution | Caller authorized for `execution.namespace`. |
+  | `replay_execution` | caller + execution | Caller authorized for `execution.namespace`. |
+  | `suspend_execution` | worker + execution | Validated implicitly by lease ownership (worker already authorized at claim time). |
+  | `attach_quota_policy` | quota policy + scope entity | Quota scope includes target namespace. |
+  | `cancel_flow` | caller + flow | Caller authorized for `flow.namespace`. |
+
+  **Cross-namespace threat scenarios** (what happens if the gateway fails to validate):
+  - **Budget hijack:** Attacker attaches Budget-X (namespace-A, $50K limit) to executions in namespace-B. Namespace-B's usage charges against namespace-A's budget, draining their allowance.
+  - **Flow contamination:** Attacker adds namespace-B execution to namespace-A flow. The flow summary counts the foreign execution, skewing aggregate metrics. Dependency resolution could block or skip namespace-A executions based on namespace-B outcomes.
+  - **Signal injection:** Attacker crafts a signal targeting namespace-B's waitpoint with a malicious payload. The resumed execution processes the attacker's data as if it were a legitimate callback.
+  - **Claim theft:** Attacker's worker claims executions from namespace-B, gaining access to input payloads and the ability to produce results.
 - **Trusted network assumption:** The Valkey backend assumes a trusted network between workers, schedulers, reconcilers, and Valkey. All callers are trusted to provide correct parameters (worker_id, lease_id, lease_epoch, usage deltas). The Lua scripts validate data consistency (lease fencing, state vector constraints) but do NOT authenticate callers. Untrusted callers must be mediated by an authenticated API gateway that validates identity, authorization, and input before invoking Lua scripts. Engine-level per-operation authentication (signed tokens, per-worker ACLs) is a post-v1 extension.
 - **Separate dead-letter queue:** FlowFabric does not have a DLQ. Terminal failed executions are stored in the per-lane terminal sorted set (`ff:idx:{p:N}:lane:<lane_id>:terminal`) alongside completed/cancelled/expired/skipped executions. Operators find failed executions via `list_executions(lane_id, public_state=failed)`. The `failure_category` field on the attempt record (RFC-002) distinguishes failure causes (`timeout`, `worker_error`, `provider_error`, `budget_exceeded`). Failed executions are replayable via `replay_execution` (RFC-001 §4.4). This design matches UC-07 (dead-letter handling): "move terminal failures into a durable failed state for inspection or replay."
 
@@ -2686,7 +2852,8 @@ SHUTDOWN:
 | `claim_grant_expired` | Retry from step 1. |
 | `stale_lease` / `lease_expired` / `lease_revoked` | Stop. Do NOT complete/fail. Reclaimed. |
 | `execution_not_active` | On retry: check enriched return. Epoch match + success = my call won. |
-| `budget_exceeded` | Per policy: fail/suspend/warn. |
+| `budget_exceeded` | **Immediate stop.** Worker MUST cease resource consumption (stop LLM calls, stop appending frames). Call `fail_execution` with `failure_category = "budget_exceeded"`. Do NOT call `complete_execution`. Enforcement is cooperative — worker must act on it. |
+| `budget_soft_exceeded` | Log warning. Worker MAY continue — soft limits are advisory in v1. |
 
 ### 10.5 SDK Requirements
 
@@ -2695,6 +2862,17 @@ SHUTDOWN:
 - Independent lease renewal thread: must fire during slow LLM calls.
 - Partition awareness: track `partition_id` per execution for `{p:N}` keys.
 - Parse structured returns per §4.9: `{1, "OK", ...}` or `{0, "ERROR", ...}`.
+- **Monotonic `usage_report_seq`:** SDK maintains a per-attempt counter (starts at 1, increments on each `report_usage` call). Passed as ARGV to `report_usage_on_attempt`. Enables idempotent retries — if the call succeeds but the ACK is lost, the retry with the same seq is a no-op.
+
+### 10.6 Idempotency
+
+**Submission idempotency:** The SDK SHOULD auto-generate an `idempotency_key` for every `create_execution` call if the caller does not provide one. Recommended format: `<client_id>:<monotonic_counter>` or UUID. Without an idempotency key, a retry after a lost ACK creates a **duplicate execution** — two distinct executions with different `execution_id`s processing the same input. The engine's `SET NX` dedup guard (RFC-001 §4.1) only fires if an `idempotency_key` is provided.
+
+**Usage reporting idempotency:** Each `report_usage` call includes a monotonic `usage_report_seq` (see §10.5). The Lua script checks `attempt_usage.last_usage_report_seq` and skips duplicate increments. This prevents double-counting tokens and cost on network retries.
+
+**Signal idempotency:** External systems sending signals SHOULD include an `idempotency_key` (RFC-005 §7.2). The engine's `SET NX` guard deduplicates within the `signal_dedup_window` (default 24h).
+
+**Claim idempotency:** `claim_execution` consumes (DELs) the claim grant key atomically. A retry finds the grant missing → `invalid_claim_grant`. The worker must request a new grant from the scheduler. This is safe — the first call either succeeded (worker has a lease) or the grant expired (reconciler re-adds to eligible).
 
 ---
 

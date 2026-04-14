@@ -667,7 +667,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | Operation | Parameters | Semantics |
 |-----------|-----------|-----------|
 | `update_progress` | `execution_id`, `lease_id`, `pct?`, `message?` | Updates progress snapshot. |
-| `report_usage` | `execution_id`, `lease_id`, `usage_delta` | Increments token/cost counters. Triggers budget check. |
+| `report_usage` | `execution_id`, `lease_id`, `usage_delta`, `usage_report_seq` | **Idempotent.** Caller provides a monotonically increasing `usage_report_seq` per attempt (starts at 1). Script checks `attempt_usage.last_usage_report_seq`: if `seq <= last` → `ok_already_applied` (no-op, prevents double-counting on retry). Otherwise: HINCRBY attempt + exec core counters, HSET `last_usage_report_seq`. Triggers budget check on `{b:M}` only if HINCRBY occurred. |
 | `record_result` | `execution_id`, `lease_id`, `result_payload` | Sets final result (normally part of `complete_execution`). |
 
 #### 4.6 Inspection Operations (Class C — derived/best-effort)

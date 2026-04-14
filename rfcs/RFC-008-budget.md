@@ -560,6 +560,7 @@ return { "OK" }
 --   [1] window_zset (for the specific rate dimension)
 --   [2] concurrency_counter
 --   [3] quota_def_hash
+--   [4] admitted_guard_key (ff:quota:{q:K}:<policy_id>:admitted:<execution_id>)
 -- ARGV:
 --   [1] now_ms
 --   [2] window_seconds
@@ -573,10 +574,17 @@ local window_ms = tonumber(ARGV[2]) * 1000
 local rate_limit = tonumber(ARGV[3])
 local concurrency_cap = tonumber(ARGV[4])
 
+-- Idempotency guard: if this execution was already admitted in this window,
+-- return immediately. Prevents double-counting on retry (lost ACK scenario).
+if redis.call("EXISTS", KEYS[4]) == 1 then
+  return { "ALREADY_ADMITTED" }
+end
+
 -- Sliding window: remove expired entries
 redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", now_ms - window_ms)
 
--- Check rate
+-- Check rate — member is execution_id ALONE (not execution_id:timestamp).
+-- ZADD on existing member updates score (no-op for count), making retries safe.
 local current_count = redis.call("ZCARD", KEYS[1])
 if rate_limit > 0 and current_count >= rate_limit then
   -- Find oldest entry to compute when window opens
@@ -597,9 +605,14 @@ if concurrency_cap > 0 then
   end
 end
 
--- Admit: record in window and increment concurrency
-redis.call("ZADD", KEYS[1], now_ms, ARGV[5] .. ":" .. now_ms)
+-- Admit: record in window (execution_id as member — idempotent on retry)
+redis.call("ZADD", KEYS[1], now_ms, ARGV[5])
+-- Set admitted guard key with TTL = window size (prevents double-INCR on retry)
+redis.call("SET", KEYS[4], "1", "PX", window_ms, "NX")
 if concurrency_cap > 0 then
+  -- Only INCR if this is the first admission (SET NX succeeded → key was new)
+  -- NX flag on SET above returns nil if key existed, but we already returned
+  -- ALREADY_ADMITTED above. If we reach here, the guard was just created.
   redis.call("INCR", KEYS[2])
 end
 
@@ -711,6 +724,27 @@ A background scanner processes `ff:idx:{b:M}:budget_resets`:
 - Cost injection from routing/fallback policy (v1 relies on worker-reported cost).
 - Fixed-window rate limiting (v1 uses sliding window).
 - Cross-partition budget enforcement with stronger consistency guarantees.
+- Priority-aware budget reservation (see Known Limitations below).
+
+### Known Limitations
+
+**Shared budgets have no priority awareness.** When executions of different priorities share a budget (flow-scoped, lane-scoped, or tenant-scoped), the budget system has no concept of priority. Budget is consumed in execution order (first to report usage claims the headroom), not priority order. This creates a **budget-mediated priority inversion**:
+
+1. High-priority execution is created and claimed (highest priority, budget has headroom).
+2. High-priority execution suspends (e.g., waiting for human approval).
+3. While suspended, many low-priority executions are claimed and consume the shared budget.
+4. High-priority execution resumes, is re-claimed by a worker.
+5. Worker reports usage → budget breached → enforcement action (fail) punishes the high-priority execution.
+
+The high-priority execution was starved because low-priority work consumed the budget during its suspension. No mechanism exists to reserve budget headroom for high-priority work, preempt low-priority consumers, or order enforcement by priority.
+
+**V1 mitigations (operator-controlled):**
+
+- **(a) Separate budgets per priority tier:** Attach distinct budgets to high-priority and low-priority lanes or execution groups. Each tier has its own limit.
+- **(b) Soft limits on shared budgets, hard limits on per-execution budgets:** Use shared budgets for monitoring only (`on_hard_limit = warn`). Apply hard limits at the execution level where priority inversion cannot occur.
+- **(c) Per-execution budget guards:** Attach a small per-execution budget as a guardrail. The shared budget provides visibility; the per-execution budget provides protection.
+
+**Designed-for extension:** Priority-aware budget reservation — the scheduler reserves a configurable fraction of shared budget headroom for executions above a priority threshold. Below the threshold, the budget appears exhausted even if headroom exists. This requires the scheduler to read priority + budget state together, which is a cross-partition operation. Deferred to post-v1.
 
 ---
 

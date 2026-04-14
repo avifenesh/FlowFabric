@@ -51,13 +51,14 @@ The scheduling layer sits between execution state and lease acquisition. It does
 
 **Key separation:** The scheduler computes *what* to claim. The Lua script ensures *atomicity*. This avoids cross-slot reads inside atomic scripts while keeping the final claim decision safe.
 
-**Three-partition routing:** A single claim decision may touch three different Valkey Cluster shards via three sequential Lua calls:
+**Three-partition routing:** A single claim decision may touch three different Valkey Cluster shards via sequential Lua calls:
 
-1. **Quota check** on `{q:K}` partition (RFC-008) — sliding-window rate check + concurrency check
-2. **Budget check** on `{b:M}` partition (RFC-008) — remaining allowance check against all attached budgets
-3. **Claim-grant issuance** on `{p:N}` partition (this RFC) — validates execution eligibility, writes grant, removes from eligible set
+1. **Quota check** on `{q:K}` partition (RFC-008) — scope-level sliding-window rate check + concurrency check (fast pre-check)
+2. **Candidate selection** (scheduler-local) — fairness, priority, capability match
+3. **Budget check** on `{b:M}` partition (RFC-008) — per-candidate remaining allowance check against all attached budgets. If denied: block candidate via `block_execution_for_admission` on `{p:N}`, return to step 2 with next candidate.
+4. **Claim-grant issuance** on `{p:N}` partition (this RFC) — validates execution eligibility, writes grant, removes from eligible set
 
-If step 1 or 2 rejects, the scheduler does not proceed to step 3. The `acquire_lease` Lua script (RFC-003) subsequently runs on the same `{p:N}` partition as step 3, consuming the grant. Budget and quota are NOT re-validated inside the atomic claim Lua — they were checked by the scheduler before the grant was issued.
+If step 1 rejects, the scheduler stops (scope-level denial). If step 3 denies the candidate, the scheduler blocks that candidate and tries the next (per-candidate budget check). The `acquire_lease` Lua script (RFC-003) subsequently runs on the same `{p:N}` partition as step 4, consuming the grant. Budget and quota are NOT re-validated inside the atomic claim Lua — they were checked by the scheduler before the grant was issued.
 
 ### 2. Scheduling Inputs
 
@@ -85,9 +86,11 @@ The claim-grant is the bridge between the scheduling layer (multi-key reads, cro
 #### 3.1 How It Works
 
 1. **Worker requests work:** Sends `claim_request(worker_id, capabilities, preferred_lanes?, batch_size?)` to the scheduling layer.
-2. **Scheduler evaluates:** Reads eligible executions from partition-local sorted sets, checks capability match, applies fairness policy, checks budget/quota admission.
-3. **Scheduler issues grant:** Writes a short-lived `claim_grant` key to the target partition with the worker's identity, capabilities hash, and a grant expiry.
-4. **Worker (or scheduler) calls `acquire_lease`:** The atomic Lua script (RFC-003) validates the grant, creates the lease + attempt, and transitions execution to `active`. If the grant expired or another worker already claimed, the script rejects.
+2. **Quota pre-check (scope-level):** Scheduler checks quota/rate-limit admission on `{q:K}`. If denied, return rejection to worker. This is a scope-level fast pre-check — it does not select a specific execution.
+3. **Select candidate:** Scheduler reads eligible executions from partition-local sorted sets, checks capability match, applies fairness policy (cross-lane weighted round-robin, cross-tenant fair share), and selects the highest-priority candidate.
+4. **Budget check (per-candidate):** Scheduler reads attached budget usage on `{b:M}` for the selected candidate. If any hard-limit budget is exhausted: block this candidate via `block_execution_for_admission` on `{p:N}`, then go back to step 3 with the next candidate. If no more candidates, return empty response to worker.
+5. **Scheduler issues grant:** Writes a short-lived `claim_grant` key to the target partition with the worker's identity, capabilities hash, and a grant expiry.
+6. **Worker (or scheduler) calls `acquire_lease`:** The atomic Lua script (RFC-003) validates the grant, creates the lease + attempt, and transitions execution to `active`. If the grant expired or another worker already claimed, the script rejects.
 
 #### 3.2 Claim Grant Object
 
