@@ -692,10 +692,6 @@ where
         self.connection_map.len()
     }
 
-    pub(crate) fn connection_map(&self) -> &DashMap<Arc<str>, ClusterNode<Connection>> {
-        &self.connection_map
-    }
-
     pub(crate) fn get_current_topology_hash(&self) -> TopologyHash {
         self.topology_hash
     }

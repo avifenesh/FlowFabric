@@ -37,6 +37,13 @@ const STANDALONE_KINDS: &[PubSubSubscriptionKind] = &[
     PubSubSubscriptionKind::Pattern,
 ];
 
+/// Initial backoff delay before first resubscription attempt (ms).
+const RESUBSCRIBE_INITIAL_BACKOFF_MS: u64 = 200;
+/// Maximum backoff delay between resubscription attempts (ms).
+const RESUBSCRIBE_MAX_BACKOFF_MS: u64 = 2000;
+/// Maximum number of resubscription backoff attempts.
+const RESUBSCRIBE_MAX_ATTEMPTS: u32 = 8;
+
 /// Events that drive synchronizer state changes.
 enum SyncEvent {
     /// User changed desired subscriptions — reconcile immediately
@@ -145,6 +152,33 @@ pub struct EventDrivenSynchronizer {
     /// Only one backoff task runs at a time — additional remove_current_subscriptions
     /// calls while a backoff is active are covered by the running task's reconciles.
     backoff_active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Drop guard that resets the backoff_active flag when the backoff task completes.
+struct BackoffGuard(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for BackoffGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Map a PubSub command name to (subscription kind, is_subscribe, is_blocking).
+fn command_info(cmd_str: &str) -> Option<(PubSubSubscriptionKind, bool, bool)> {
+    match cmd_str {
+        "SUBSCRIBE" => Some((PubSubSubscriptionKind::Exact, true, false)),
+        "UNSUBSCRIBE" => Some((PubSubSubscriptionKind::Exact, false, false)),
+        "PSUBSCRIBE" => Some((PubSubSubscriptionKind::Pattern, true, false)),
+        "PUNSUBSCRIBE" => Some((PubSubSubscriptionKind::Pattern, false, false)),
+        "SSUBSCRIBE" => Some((PubSubSubscriptionKind::Sharded, true, false)),
+        "SUNSUBSCRIBE" => Some((PubSubSubscriptionKind::Sharded, false, false)),
+        "SUBSCRIBE_BLOCKING" => Some((PubSubSubscriptionKind::Exact, true, true)),
+        "UNSUBSCRIBE_BLOCKING" => Some((PubSubSubscriptionKind::Exact, false, true)),
+        "PSUBSCRIBE_BLOCKING" => Some((PubSubSubscriptionKind::Pattern, true, true)),
+        "PUNSUBSCRIBE_BLOCKING" => Some((PubSubSubscriptionKind::Pattern, false, true)),
+        "SSUBSCRIBE_BLOCKING" => Some((PubSubSubscriptionKind::Sharded, true, true)),
+        "SUNSUBSCRIBE_BLOCKING" => Some((PubSubSubscriptionKind::Sharded, false, true)),
+        _ => None,
+    }
 }
 
 impl EventDrivenSynchronizer {
@@ -649,6 +683,53 @@ impl EventDrivenSynchronizer {
         }
     }
 
+    /// Spawn a background task that triggers reconciliation with exponential
+    /// backoff + jitter. Called when a server-initiated unsubscribe clears a
+    /// subscription we still want — the backoff gives the cluster time to settle
+    /// while still resubscribing promptly.
+    fn schedule_resubscription_backoff(
+        &self,
+        channels: &HashSet<PubSubChannelOrPattern>,
+        subscription_type: PubSubSubscriptionKind,
+    ) {
+        let desired = self.desired.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // Only schedule retries if we actually want this subscription type
+        let still_desired = desired.get(&subscription_type)
+            .is_some_and(|channels_set| channels.iter().any(|ch| channels_set.contains(ch)));
+        // Don't spawn a backoff task if we're inside on_topology_changed — those UNSUBSCRIBE
+        // responses are our own commands and should not trigger additional retry loops.
+        let in_change = self.in_topology_change.load(std::sync::atomic::Ordering::Acquire);
+        // Only spawn one backoff task at a time. If 100 channels migrate simultaneously,
+        // the single running backoff task's reconcile attempts cover all of them.
+        if still_desired && !in_change
+            && !self.backoff_active.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let tx = self.events_tx.clone();
+            let backoff_flag = self.backoff_active.clone();
+            tokio::spawn(async move {
+                let _guard = BackoffGuard(backoff_flag);
+
+                let mut delay_ms = RESUBSCRIBE_INITIAL_BACKOFF_MS;
+                for _ in 0..RESUBSCRIBE_MAX_ATTEMPTS {
+                    // Jitter: symmetric -20% to +20% of base delay
+                    let jitter_range = delay_ms / 5;
+                    let jitter_offset = if jitter_range > 0 {
+                        rand::random::<u64>() % (2 * jitter_range + 1)
+                    } else { 0 };
+                    // jitter_offset is in [0, 2*jitter_range], subtract jitter_range for [-20%, +20%]
+                    let actual_delay = if jitter_offset >= jitter_range {
+                        Duration::from_millis(delay_ms + (jitter_offset - jitter_range))
+                    } else {
+                        Duration::from_millis(delay_ms - (jitter_range - jitter_offset))
+                    };
+                    tokio::time::sleep(actual_delay).await;
+                    let _ = tx.send(SyncEvent::DesiredChanged);
+                    delay_ms = (delay_ms * 2).min(RESUBSCRIBE_MAX_BACKOFF_MS);
+                }
+                // _guard dropped here, resetting backoff_active
+            });
+        }
+    }
 }
 
 impl Drop for EventDrivenSynchronizer {
@@ -731,59 +812,7 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         }
         drop(confirmed);
         self.check_sync_and_notify();
-        // Trigger reconcile with exponential backoff + jitter.
-        // When a server-initiated SUnsubscribe clears our subscription, we need to
-        // resubscribe on the new slot owner. We retry with backoff so that:
-        // - First attempt is fast (200ms) → quick resubscription after slot migration
-        // - Subsequent attempts back off (400ms, 800ms, 1600ms, 2000ms max) → if the
-        //   cluster is settling after failover, we naturally reduce retry frequency
-        //   instead of hammering at 5 retries/second.
-        let tx = self.events_tx.clone();
-        let desired = self.desired.read().unwrap_or_else(|e| e.into_inner()).clone();
-        // Only schedule retries if we actually want this subscription type
-        let still_desired = desired.get(&subscription_type)
-            .is_some_and(|channels_set| channels.iter().any(|ch| channels_set.contains(ch)));
-        // Don't spawn a backoff task if we're inside on_topology_changed — those UNSUBSCRIBE
-        // responses are our own commands and should not trigger additional retry loops.
-        let in_change = self.in_topology_change.load(std::sync::atomic::Ordering::Acquire);
-        // Only spawn one backoff task at a time. If 100 channels migrate simultaneously,
-        // the single running backoff task's reconcile attempts cover all of them.
-        if still_desired && !in_change
-            && !self.backoff_active.swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            let backoff_flag = self.backoff_active.clone();
-            tokio::spawn(async move {
-                // Drop guard ensures the flag is reset even if the task panics or is cancelled.
-                struct BackoffGuard(Arc<std::sync::atomic::AtomicBool>);
-                impl Drop for BackoffGuard {
-                    fn drop(&mut self) {
-                        self.0.store(false, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                let _guard = BackoffGuard(backoff_flag);
-
-                let mut delay_ms = 200u64;
-                const MAX_DELAY_MS: u64 = 2000;
-                const MAX_ATTEMPTS: u32 = 8;
-                for _ in 0..MAX_ATTEMPTS {
-                    // Jitter: symmetric -20% to +20% of base delay
-                    let jitter_range = delay_ms / 5; // 20% jitter
-                    let jitter_offset = if jitter_range > 0 {
-                        rand::random::<u64>() % (2 * jitter_range + 1)
-                    } else { 0 };
-                    // jitter_offset is in [0, 2*jitter_range], subtract jitter_range for [-20%, +20%]
-                    let actual_delay = if jitter_offset >= jitter_range {
-                        Duration::from_millis(delay_ms + (jitter_offset - jitter_range))
-                    } else {
-                        Duration::from_millis(delay_ms - (jitter_range - jitter_offset))
-                    };
-                    tokio::time::sleep(actual_delay).await;
-                    let _ = tx.send(SyncEvent::DesiredChanged);
-                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
-                }
-                // _guard dropped here, resetting backoff_active
-            });
-        }
+        self.schedule_resubscription_backoff(&channels, subscription_type);
     }
 
     fn get_subscription_state(
@@ -924,72 +953,25 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         let command_name = cmd.command().unwrap_or_default();
         let command_str = std::str::from_utf8(&command_name).unwrap_or("");
 
-        match command_str {
-            "SUBSCRIBE" => {
+        if let Some((kind, is_subscribe, is_blocking)) = command_info(command_str) {
+            return if is_blocking {
+                Some(self.handle_blocking(cmd, kind, is_subscribe).await)
+            } else {
                 let cmd = cmd.clone();
                 Some(
-                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Exact, true))
+                    self.run_with_timeout(|| self.handle_lazy(&cmd, kind, is_subscribe))
                         .await,
                 )
-            }
-            "PSUBSCRIBE" => {
-                let cmd = cmd.clone();
-                Some(
-                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Pattern, true))
-                        .await,
-                )
-            }
-            "SSUBSCRIBE" => {
-                let cmd = cmd.clone();
-                Some(
-                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Sharded, true))
-                        .await,
-                )
-            }
-            "UNSUBSCRIBE" => {
-                let cmd = cmd.clone();
-                Some(
-                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Exact, false))
-                        .await,
-                )
-            }
-            "PUNSUBSCRIBE" => {
-                let cmd = cmd.clone();
-                Some(
-                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Pattern, false))
-                        .await,
-                )
-            }
-            "SUNSUBSCRIBE" => {
-                let cmd = cmd.clone();
-                Some(
-                    self.run_with_timeout(|| self.handle_lazy(&cmd, PubSubSubscriptionKind::Sharded, false))
-                        .await,
-                )
-            }
-            "SUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking(cmd, PubSubSubscriptionKind::Exact, true).await,
-            ),
-            "PSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking(cmd, PubSubSubscriptionKind::Pattern, true).await,
-            ),
-            "SSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking(cmd, PubSubSubscriptionKind::Sharded, true).await,
-            ),
-            "UNSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking(cmd, PubSubSubscriptionKind::Exact, false).await,
-            ),
-            "PUNSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking(cmd, PubSubSubscriptionKind::Pattern, false).await,
-            ),
-            "SUNSUBSCRIBE_BLOCKING" => Some(
-                self.handle_blocking(cmd, PubSubSubscriptionKind::Sharded, false).await,
-            ),
-            "GET_SUBSCRIPTIONS" => Some(
-                self.run_with_timeout(|| Ok(self.get_subscriptions_value())).await,
-            ),
-            _ => None,
+            };
         }
+
+        if command_str == "GET_SUBSCRIPTIONS" {
+            return Some(
+                self.run_with_timeout(|| Ok(self.get_subscriptions_value())).await,
+            );
+        }
+
+        None
     }
 
     async fn wait_for_sync(

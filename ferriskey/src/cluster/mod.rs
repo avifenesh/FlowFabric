@@ -821,14 +821,8 @@ pub(crate) struct ClusterConnInner<C> {
 
 impl<C> Dispose for ClusterConnInner<C> {
     fn dispose(self) {
-        if let Some(conn_lock) = self.inner.conn_lock.try_read() {
-            // Each node may contain user and *maybe* a management connection
-            let mut count = 0usize;
-            for node in conn_lock.connection_map() {
-                count = node.connections_count();
-            }
-            Telemetry::decr_total_connections(count);
-        }
+        // Connection count telemetry is handled by ConnectionsContainer::drop(),
+        // so we only need to clean up task handles here.
 
         if let Some(handle) = self.periodic_checks_handler {
             handle.abort()
@@ -3465,7 +3459,16 @@ where
             InternalSingleNodeRouting::ByAddress(address) => {
                 let conn_option = core.conn_lock.read().connection_for_address(&address);
                 if let Some((address, conn)) = conn_option {
-                    return Ok((address, conn.await, false));
+                    let resolved = conn.await;
+                    if resolved.is_closed() {
+                        return Err((
+                            ErrorKind::ConnectionNotFoundForRoute,
+                            "Connection is closed",
+                            address.to_string(),
+                        )
+                            .into());
+                    }
+                    return Ok((address, resolved, false));
                 } else {
                     return Err((
                         ErrorKind::ConnectionNotFoundForRoute,
@@ -3555,6 +3558,15 @@ where
                 (random_address, random_conn_future.await)
             }
         };
+
+        if conn.is_closed() {
+            return Err((
+                ErrorKind::ConnectionNotFoundForRoute,
+                "Connection is closed",
+                address.to_string(),
+            )
+                .into());
+        }
 
         Ok((address, conn, asking))
     }
