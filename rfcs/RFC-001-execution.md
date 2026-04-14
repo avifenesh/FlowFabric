@@ -248,6 +248,7 @@ Answers: *what is the most specific explanation for lack of forward progress?* T
 | `waiting_for_worker` | Eligible but no worker has claimed yet. |
 | `waiting_for_retry_backoff` | Delayed for retry backoff. |
 | `waiting_for_resume_delay` | Delayed after suspension resume (resume_delay_ms). |
+| `waiting_for_delay` | Worker-initiated explicit delay (via `delay_execution`). |
 | `waiting_for_signal` | Suspended, waiting for a generic signal. |
 | `waiting_for_approval` | Suspended, waiting for human approval. |
 | `waiting_for_callback` | Suspended, waiting for external callback. |
@@ -627,7 +628,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | `create_execution` | `lane_id`, `execution_kind`, `input_payload`, `policy?`, `idempotency_key?`, `tags?` | Creates execution in `submitted` phase. Engine resolves to `runnable` (possibly `delayed`). If `idempotency_key` matches existing execution within dedup window, returns existing. **Idempotency is TTL-bounded:** the dedup key (`ff:idem:<namespace>:<key>`) has `TTL = min(dedup_window, retention_window)`. After TTL expires, a retry with the same key creates a new execution. V1 default `dedup_window`: 24h. Idempotency is namespace-scoped — different tenants may safely reuse the same key. Callers requiring permanent dedup must enforce it externally before submission. |
 | `create_delayed_execution` | Same + `delay_until` | Creates execution in `runnable` with `eligibility_state = not_eligible_until_time`. |
 | `create_scheduled_execution` | Same + `schedule_spec` | Creates with schedule metadata. Engine handles recurring promotion. |
-| `create_child_execution` | `parent_execution_id`, `flow_id`, same as above | Creates with `parent_execution_id` and `flow_id` set. **Starts with `eligibility_state = blocked_by_dependencies`** and `blocking_reason = waiting_for_children` — NOT added to eligible set. Added to `blocked:dependencies` set instead. This closes the race window between execution creation and `apply_dependency_to_child`. If the child has no dependencies, `apply_dependency_to_child` is never called and the child stays blocked — the caller must explicitly unblock it or use `create_execution` (without flow context) for dependency-free children. |
+| `create_child_execution` | `parent_execution_id`, `flow_id`, same as above | Creates with `parent_execution_id` and `flow_id` set. **Starts with `eligibility_state = blocked_by_dependencies`**, `blocking_reason = waiting_for_children`, `blocking_detail = "waiting for dependency edges to be applied"` — NOT added to eligible set. Added to `blocked:dependencies` set instead. This closes the race window between execution creation and `apply_dependency_to_child`. If the child has no dependencies, `apply_dependency_to_child` is never called and the child stays blocked — the caller must explicitly unblock it or use `create_execution` (without flow context) for dependency-free children. |
 
 #### 4.2 Claim / Ownership Operations (Class A — atomic)
 
@@ -645,7 +646,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | `complete_execution` | `execution_id`, `lease_id`, `lease_epoch`, `result_payload?` | Requires valid lease. Sets `terminal_outcome = success`. Clears lease. |
 | `fail_execution` | `execution_id`, `lease_id`, `lease_epoch`, `failure_reason` | Requires valid lease. If retries remain: transitions to `runnable` + `not_eligible_until_time` (backoff). If exhausted: sets `terminal_outcome = failed`. |
 | `cancel_execution` | `execution_id`, `reason`, `operator?` | May bypass lease if operator-privileged. Sets `terminal_outcome = cancelled`. |
-| `expire_execution` | `execution_id` | Engine-initiated on deadline/TTL. Sets `terminal_outcome = expired`. |
+| `expire_execution` | `execution_id` | Engine-initiated on per-attempt timeout or total execution deadline. Handles three lifecycle phases: **active** (close attempt + stream, release lease), **runnable** (ZREM from current scheduling index), **suspended** (close waitpoint + suspension, terminate attempt). All paths set `terminal_outcome = expired`. See RFC-010 §6.16 for scanner details. |
 | `skip_execution` | `execution_id`, `reason` | Engine-initiated when required dependency failed. Sets `terminal_outcome = skipped`. |
 | `delay_execution` | `execution_id`, `lease_id`, `lease_epoch`, `delay_until` | From active: releases lease, moves to `runnable` + `not_eligible_until_time`. |
 | `move_to_waiting_children` | `execution_id`, `lease_id`, `lease_epoch` | Releases lease. Sets `eligibility_state = blocked_by_dependencies`, `blocking_reason = waiting_for_children`. |
@@ -658,7 +659,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | Operation | Parameters | Semantics |
 |-----------|-----------|-----------|
 | `retry_execution` | `execution_id` | Engine-initiated after `fail_execution` when retry policy allows. Creates new attempt (RFC-002). Moves to `runnable`. |
-| `replay_execution` | `execution_id`, `replay_reason`, `requested_by` | Operator or system action. Execution must be `terminal`. Enforces `replay_count < max_replay_count` from execution policy (default: 10). If limit reached, returns `max_replays_exhausted`. Otherwise: creates new attempt. Resets to `runnable`. Increments `replay_count`. Records `replay_reason`. |
+| `replay_execution` | `execution_id`, `replay_reason`, `requested_by` | Operator or system action. Execution must be `terminal`. Enforces `replay_count < max_replay_count` from execution policy (default: 10). If limit reached, returns `max_replays_exhausted`. Otherwise: sets `attempt_state = pending_replay_attempt` and stores lineage on exec core (`pending_replay_reason`, `pending_replay_requested_by`, `pending_previous_attempt_index`). Does NOT create the attempt record — `claim_execution` creates it with `attempt_type = replay`. Increments `replay_count`. **Dependency reset for skipped flow members:** If `terminal_outcome = skipped` AND `flow_id` is set (execution is a flow member that was skipped due to upstream failure), the script resets dependency edge state within `{p:N}`: for each `dep:<edge_id>` hash with `state = impossible`, set `state = unsatisfied`, SADD `edge_id` back to `deps:unresolved`, reset `deps:meta` (`impossible_required_count = 0`, recompute `unsatisfied_required_count`). Sets `eligibility_state = blocked_by_dependencies`, `blocking_reason = waiting_for_children`, `public_state = waiting_children` — NOT `eligible_now`. After the script returns, the engine dispatches cross-partition `resolve_dependency` calls for each reset edge (reads upstream execution terminal state, satisfies or re-skips the edge). The dependency resolution reconciler (§6.14) is a safety net. For non-skipped terminals (success, failed, cancelled, expired), replay sets `eligible_now` as normal — no dep reset needed. |
 | `change_priority` | `execution_id`, `new_priority` | Updates priority. Re-scores in scheduling. |
 
 #### 4.5 Output / Accounting Operations (Class B — durable append)
@@ -693,6 +694,7 @@ Every non-progressing, non-terminal execution exposes a blocking reason. This an
 │  waiting_for_worker          │  eligible_now                │
 │  waiting_for_retry_backoff   │  not_eligible_until_time     │
 │  waiting_for_resume_delay    │  not_eligible_until_time     │
+│  waiting_for_delay           │  not_eligible_until_time     │
 │  waiting_for_signal          │  not_applicable (suspended)  │
 │  waiting_for_approval        │  not_applicable (suspended)  │
 │  waiting_for_callback        │  not_applicable (suspended)  │
@@ -997,7 +999,7 @@ All state transitions use Lua scripts for atomicity. Every key in a single Lua s
 
 ##### Lua script: claim_execution (new attempt)
 
-Creates a new attempt and lease for a fresh or retried execution. Does NOT apply to resumed-after-suspension executions (see `claim_resumed_execution` below).
+Creates a new attempt and lease for a fresh, retried, or replayed execution. The attempt type is derived from the execution's `attempt_state` on the exec core — `fail_execution` and `replay_execution` set the state but do NOT create attempt records (preventing double-creation). Does NOT apply to resumed-after-suspension executions (see `claim_resumed_execution` below).
 
 ```lua
 -- KEYS: exec_core, claim_grant, eligible_zset, lease_expiry_zset,
@@ -1045,23 +1047,45 @@ local expires_at = now_ms + tonumber(ARGV.lease_ttl_ms)
 local renewal_deadline = now_ms + tonumber(ARGV.renew_before_ms)
 local next_att_idx = tonumber(core.total_attempt_count or "0")
 
--- 4. Create attempt record (RFC-002)
+-- 4. Derive attempt type from exec core attempt_state.
+--    fail_execution sets pending_retry_attempt + stores lineage on exec core.
+--    replay_execution sets pending_replay_attempt + stores lineage on exec core.
+--    create_execution sets pending_first_attempt (initial).
+local attempt_type = "initial"
+local lineage_fields = {}
+if core.attempt_state == "pending_retry_attempt" then
+  attempt_type = "retry"
+  lineage_fields = {
+    "retry_reason", core.pending_retry_reason or "",
+    "previous_attempt_index", core.pending_previous_attempt_index or ""
+  }
+elseif core.attempt_state == "pending_replay_attempt" then
+  attempt_type = "replay"
+  lineage_fields = {
+    "replay_reason", core.pending_replay_reason or "",
+    "replay_requested_by", core.pending_replay_requested_by or "",
+    "replayed_from_attempt_index", core.pending_previous_attempt_index or ""
+  }
+end
+
+-- 5. Create attempt record (RFC-002)
 redis.call("HSET", KEYS[6],
   "attempt_id", ARGV.attempt_id,
   "execution_id", ARGV.execution_id,
   "attempt_index", next_att_idx,
-  "attempt_type", "initial",
+  "attempt_type", attempt_type,
   "attempt_state", "started",
   "created_at", now_ms,
   "started_at", now_ms,
   "lease_id", ARGV.lease_id,
   "lease_epoch", next_epoch,
   "worker_id", ARGV.worker_id,
-  "worker_instance_id", ARGV.worker_instance_id)
+  "worker_instance_id", ARGV.worker_instance_id,
+  unpack(lineage_fields))
 redis.call("ZADD", KEYS[9], now_ms, next_att_idx)
 redis.call("HSET", KEYS[8], unpack_policy(ARGV.attempt_policy_json))
 
--- 5. Create lease record (RFC-003)
+-- 6. Create lease record (RFC-003)
 redis.call("DEL", KEYS[10])
 redis.call("HSET", KEYS[10],
   "lease_id", ARGV.lease_id,
@@ -1075,12 +1099,14 @@ redis.call("HSET", KEYS[10],
   "last_renewed_at", now_ms,
   "renewal_deadline", renewal_deadline)
 
--- 6. Update execution core — ALL 7 state vector dimensions
+-- 7. Update execution core — ALL 7 state vector dimensions
+--    Clear pending lineage fields (consumed by attempt creation above).
 redis.call("HSET", KEYS[1],
   "lifecycle_phase", "active",
   "ownership_state", "leased",
   "eligibility_state", "not_applicable",
   "blocking_reason", "none",
+  "blocking_detail", "",
   "terminal_outcome", "none",
   "attempt_state", "running_attempt",
   "public_state", "active",
@@ -1097,15 +1123,19 @@ redis.call("HSET", KEYS[1],
   "lease_last_renewed_at", now_ms,
   "lease_renewal_deadline", renewal_deadline,
   "started_at", core.started_at or now_ms,
+  "pending_retry_reason", "",
+  "pending_replay_reason", "",
+  "pending_replay_requested_by", "",
+  "pending_previous_attempt_index", "",
   "last_transition_at", now_ms, "last_mutation_at", now_ms)
 
--- 7. Update indexes
+-- 8. Update indexes
 redis.call("ZREM", KEYS[3], ARGV.execution_id)       -- remove from eligible
 redis.call("ZADD", KEYS[4], expires_at, ARGV.execution_id) -- add to lease_expiry
 redis.call("SADD", KEYS[5], ARGV.execution_id)       -- add to worker leases
 redis.call("ZADD", KEYS[12], expires_at, ARGV.execution_id) -- add to per-lane active
 
--- 7a. Timeout indexes (§6.16)
+-- 8a. Timeout indexes (§6.16)
 if ARGV.attempt_timeout_ms ~= "" and ARGV.attempt_timeout_ms ~= "0" then
   redis.call("ZADD", KEYS[13], now_ms + tonumber(ARGV.attempt_timeout_ms), ARGV.execution_id)
 end
@@ -1113,7 +1143,7 @@ if ARGV.execution_deadline_at ~= "" and ARGV.execution_deadline_at ~= "0" then
   redis.call("ZADD", KEYS[14], tonumber(ARGV.execution_deadline_at), ARGV.execution_id)
 end
 
--- 8. Lease history event (includes attempt_index)
+-- 9. Lease history event (includes attempt_index)
 redis.call("XADD", KEYS[11], "*",
   "event", "acquired", "lease_id", ARGV.lease_id,
   "lease_epoch", next_epoch, "attempt_id", ARGV.attempt_id,
@@ -1198,6 +1228,7 @@ redis.call("HSET", KEYS[1],
   "ownership_state", "leased",
   "eligibility_state", "not_applicable",
   "blocking_reason", "none",
+  "blocking_detail", "",
   "terminal_outcome", "none",
   "attempt_state", "running_attempt",
   "public_state", "active",
@@ -1282,6 +1313,7 @@ redis.call("HSET", KEYS[1],
   "ownership_state", "unowned",
   "eligibility_state", "not_applicable",
   "blocking_reason", "none",
+  "blocking_detail", "",
   "terminal_outcome", "success",
   "attempt_state", "attempt_terminal",
   "public_state", "completed",
@@ -1315,11 +1347,9 @@ return ok()
 ```lua
 -- KEYS: exec_core, attempt_hash, lease_expiry_zset, worker_leases,
 --       terminal_zset, delayed_zset, lease_current, lease_history,
---       new_attempt_hash, new_attempt_usage, new_attempt_policy, attempts_zset,
 --       active_index, stream_meta, attempt_timeout_zset, execution_deadline_zset
 -- ARGV: execution_id, lease_id, lease_epoch, attempt_id, failure_reason,
---       failure_category, max_retries, backoff_ms, new_attempt_id,
---       new_attempt_policy_json
+--       failure_category, max_retries, backoff_ms
 
 local now = redis.call("TIME")
 local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
@@ -1345,8 +1375,8 @@ redis.call("HSET", KEYS[2],
   "failure_category", ARGV.failure_category)
 
 -- Close attempt stream if exists (RFC-006)
-if redis.call("EXISTS", KEYS[14]) == 1 then
-  redis.call("HSET", KEYS[14], "closed_at", now_ms, "closed_reason", "attempt_failure")
+if redis.call("EXISTS", KEYS[10]) == 1 then
+  redis.call("HSET", KEYS[10], "closed_at", now_ms, "closed_reason", "attempt_failure")
 end
 
 local retry_ct = tonumber(core.retry_count or "0")
@@ -1354,21 +1384,12 @@ local att_ct = tonumber(core.total_attempt_count or "0")
 local can_retry = retry_ct < tonumber(ARGV.max_retries)
 
 if can_retry then
-  -- Create new retry attempt (RFC-002) — lineage on new attempt only
-  local next_att_idx = att_ct
-  redis.call("HSET", KEYS[9],
-    "attempt_id", ARGV.new_attempt_id,
-    "execution_id", ARGV.execution_id,
-    "attempt_index", next_att_idx,
-    "attempt_type", "retry",
-    "attempt_state", "created",
-    "created_at", now_ms,
-    "retry_reason", ARGV.failure_reason,
-    "previous_attempt_index", tonumber(core.current_attempt_index))
-  redis.call("ZADD", KEYS[12], now_ms, next_att_idx)
-  redis.call("HSET", KEYS[11], unpack_policy(ARGV.new_attempt_policy_json))
+  -- DO NOT create attempt record here. claim_execution creates the attempt
+  -- with the correct type (retry) when a worker claims the execution.
+  -- This prevents double attempt creation (fail creates one, claim creates another).
 
   -- Transition execution to delayed (backoff)
+  -- Store retry lineage on exec core so claim_execution can copy to the attempt.
   local delay_until = now_ms + tonumber(ARGV.backoff_ms)
   -- ALL 7 state vector dimensions
   redis.call("HSET", KEYS[1],
@@ -1376,14 +1397,17 @@ if can_retry then
     "ownership_state", "unowned",
     "eligibility_state", "not_eligible_until_time",
     "blocking_reason", "waiting_for_retry_backoff",
+    "blocking_detail", "retry backoff until " .. delay_until .. " (attempt " .. (retry_ct + 1) .. " of " .. ARGV.max_retries .. ")",
     "terminal_outcome", "none",
     "attempt_state", "pending_retry_attempt",
     "public_state", "delayed",
-    "current_attempt_index", next_att_idx,
-    "total_attempt_count", att_ct + 1,
+    "current_attempt_index", tonumber(core.current_attempt_index),
+    "total_attempt_count", att_ct,
     "retry_count", retry_ct + 1,
     "delay_until", delay_until,
-    "current_attempt_id", ARGV.new_attempt_id,
+    "pending_retry_reason", ARGV.failure_reason,
+    "pending_previous_attempt_index", tonumber(core.current_attempt_index),
+    "current_attempt_id", "",
     "current_lease_id", "", "current_lease_epoch", core.current_lease_epoch,
     "current_worker_id", "", "current_worker_instance_id", "",
     "lease_expires_at", "", "lease_last_renewed_at", "",
@@ -1393,9 +1417,9 @@ if can_retry then
   redis.call("ZREM", KEYS[3], ARGV.execution_id)     -- remove from lease_expiry
   redis.call("SREM", KEYS[4], ARGV.execution_id)     -- remove from worker leases
   redis.call("ZADD", KEYS[6], delay_until, ARGV.execution_id) -- add to delayed
-  redis.call("ZREM", KEYS[13], ARGV.execution_id)   -- remove from per-lane active
-  redis.call("ZREM", KEYS[15], ARGV.execution_id)   -- remove old attempt_timeout (§6.16)
-  -- Note: new attempt timeout ZADD happens on next claim, not here (attempt is in delayed/created state)
+  redis.call("ZREM", KEYS[9], ARGV.execution_id)    -- remove from per-lane active
+  redis.call("ZREM", KEYS[11], ARGV.execution_id)   -- remove old attempt_timeout (§6.16)
+  -- Note: new attempt timeout ZADD happens on next claim, not here
 
   redis.call("DEL", KEYS[7])
   redis.call("XADD", KEYS[8], "*",
@@ -1403,7 +1427,7 @@ if can_retry then
     "attempt_index", core.current_attempt_index,
     "reason", "failed_retry_scheduled", "ts", now_ms)
 
-  return ok("retry_scheduled", ARGV.new_attempt_id, next_att_idx, delay_until)
+  return ok("retry_scheduled", delay_until)
 else
   -- Terminal failure — no more retries
   -- ALL 7 state vector dimensions
@@ -1412,6 +1436,7 @@ else
     "ownership_state", "unowned",
     "eligibility_state", "not_applicable",
     "blocking_reason", "none",
+    "blocking_detail", "",
     "terminal_outcome", "failed",
     "attempt_state", "attempt_terminal",
     "public_state", "failed",
@@ -1426,9 +1451,9 @@ else
   redis.call("ZREM", KEYS[3], ARGV.execution_id)
   redis.call("SREM", KEYS[4], ARGV.execution_id)
   redis.call("ZADD", KEYS[5], now_ms, ARGV.execution_id)
-  redis.call("ZREM", KEYS[13], ARGV.execution_id)   -- remove from per-lane active
-  redis.call("ZREM", KEYS[15], ARGV.execution_id)   -- remove from attempt_timeout (§6.16)
-  redis.call("ZREM", KEYS[16], ARGV.execution_id)   -- remove from execution_deadline (§6.16)
+  redis.call("ZREM", KEYS[9], ARGV.execution_id)    -- remove from per-lane active
+  redis.call("ZREM", KEYS[11], ARGV.execution_id)   -- remove from attempt_timeout (§6.16)
+  redis.call("ZREM", KEYS[12], ARGV.execution_id)   -- remove from execution_deadline (§6.16)
 
   redis.call("DEL", KEYS[7])
   redis.call("XADD", KEYS[8], "*",
@@ -1438,6 +1463,74 @@ else
 
   return ok("terminal_failed")
 end
+```
+
+##### Lua script: move_to_waiting_children
+
+Worker blocks its active execution on child dependencies. Releases the lease and transitions execution to `runnable` + `blocked_by_dependencies`. The same attempt continues — it is not ended, only paused (like suspension). When all child dependencies resolve, the execution becomes eligible and is re-claimed via `claim_resumed_execution` (same attempt continues).
+
+```lua
+-- KEYS: exec_core, attempt_hash, lease_current, lease_history,
+--       lease_expiry_zset, worker_leases, active_index,
+--       blocked_deps_zset, attempt_timeout_zset
+-- ARGV: execution_id, lease_id, lease_epoch, attempt_id
+
+local now = redis.call("TIME")
+local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
+local core = redis.call("HGETALL", KEYS[1])
+
+-- Validate lease (long canonical field names)
+if core.lifecycle_phase ~= "active" then
+  return err("execution_not_active",
+    core.terminal_outcome or "", core.current_lease_epoch or "")
+end
+if core.ownership_state == "lease_revoked" then return err("lease_revoked") end
+if tonumber(core.lease_expires_at) <= now_ms then return err("lease_expired") end
+if core.current_lease_id ~= ARGV.lease_id then return err("stale_lease") end
+if core.current_lease_epoch ~= ARGV.lease_epoch then return err("stale_lease") end
+if core.current_attempt_id ~= ARGV.attempt_id then return err("stale_lease") end
+
+-- Pause the attempt: started → suspended (paused for children, not ended)
+redis.call("HSET", KEYS[2],
+  "attempt_state", "suspended",
+  "suspended_at", now_ms,
+  "suspension_id", "waiting_children")
+
+-- Release lease
+redis.call("DEL", KEYS[3])
+redis.call("ZREM", KEYS[5], ARGV.execution_id)       -- remove from lease_expiry
+redis.call("SREM", KEYS[6], ARGV.execution_id)       -- remove from worker leases
+redis.call("ZREM", KEYS[7], ARGV.execution_id)       -- remove from per-lane active
+redis.call("ZREM", KEYS[9], ARGV.execution_id)       -- remove from attempt_timeout (§6.16)
+
+-- Lease history event
+redis.call("XADD", KEYS[4], "*",
+  "event", "released", "lease_id", ARGV.lease_id,
+  "lease_epoch", ARGV.lease_epoch,
+  "attempt_index", core.current_attempt_index,
+  "attempt_id", ARGV.attempt_id,
+  "reason", "waiting_children", "ts", now_ms)
+
+-- Update execution core — ALL 7 state vector dimensions
+redis.call("HSET", KEYS[1],
+  "lifecycle_phase", "runnable",
+  "ownership_state", "unowned",
+  "eligibility_state", "blocked_by_dependencies",
+  "blocking_reason", "waiting_for_children",
+  "blocking_detail", "waiting for child executions to complete",
+  "terminal_outcome", "none",
+  "attempt_state", "attempt_interrupted",
+  "public_state", "waiting_children",
+  "current_lease_id", "", "current_lease_epoch", core.current_lease_epoch,
+  "current_worker_id", "", "current_worker_instance_id", "",
+  "lease_expires_at", "", "lease_last_renewed_at", "",
+  "lease_renewal_deadline", "",
+  "last_transition_at", now_ms, "last_mutation_at", now_ms)
+
+-- Add to blocked:dependencies set
+redis.call("ZADD", KEYS[8], tonumber(core.created_at or "0"), ARGV.execution_id)
+
+return ok()
 ```
 
 #### 9.5 Key Expiry and Retention

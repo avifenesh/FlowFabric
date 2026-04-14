@@ -184,6 +184,7 @@ on claim_request(worker):
     select lane with highest deficit (most underserved)
     serve one execution from that lane
     reduce that lane's deficit by 1.0 / lane.scheduling_weight
+    clamp: lane.deficit = max(lane.deficit, -(2.0 * lane.scheduling_weight))
 ```
 
 #### 5.3 Cross-Tenant Fairness
@@ -200,7 +201,9 @@ When multiple tenants (namespaces) share a lane, the scheduler applies a **tenan
 
 Within a lane, if the next candidate by priority belongs to a tenant that has consumed more than its fair share in the current window, the scheduler may skip it in favor of an underserved tenant's execution (subject to priority floor — a high-priority execution is never skipped below a configurable threshold).
 
-**Deficit cap:** Accumulated deficit per tenant and per lane is capped at `2 × weight`. This prevents runaway rebalancing after extended budget exhaustion or capacity outage. Without a cap, a tenant blocked by budget for hours would accumulate massive deficit that monopolizes claims for an extended period once the budget frees.
+**Deficit cap (symmetric):** Deficit per tenant and per lane is clamped to the range `[-(2 × weight), +(2 × weight)]`:
+- **Positive cap** (`+2 × weight`): Prevents runaway rebalancing after extended budget exhaustion or capacity outage. Without this cap, a tenant blocked by budget for hours would accumulate massive deficit that monopolizes claims for an extended period once the budget frees.
+- **Negative cap** (`-(2 × weight)`): Prevents unbounded recovery time after a burst. Without this cap, a lane that served 50K executions during a burst accumulates deficit of -50K. After the burst ends, the lane would need 50K scheduling cycles before it receives fair treatment again — even if its backlog is long cleared. The negative cap bounds recovery to at most `4 × weight` cycles (from `-2w` to `+2w`).
 
 #### 5.4 V1 Fairness Ignores Flow/Coordinator Priority
 
@@ -510,6 +513,25 @@ When the scheduler cannot issue a claim-grant, it must provide an **explainable 
 
 When the blocking condition clears (budget increased, quota window resets, worker registers, lane unpaused), a corresponding **unblock scanner** must detect the condition change and move executions back from the blocked set to the eligible set. This is analogous to the delayed→eligible promoter but triggered by resource availability changes rather than time.
 
+**Batch-block short-circuit for repeated rejections:** When the scheduler iterates an eligible set and encounters N consecutive capability mismatches (default: 10), it MUST stop scanning and batch-block the rejected candidates instead of continuing through the entire set. Without this, a lane with 50K unmatchable executions causes a hot loop where the scheduler repeatedly scans and rejects without making progress.
+
+Implementation:
+1. Scanner maintains a consecutive-rejection counter per lane per cycle.
+2. When the counter reaches the batch-block threshold (default: 10), the scheduler stops scanning this lane for this cycle.
+3. It issues a single batch `block_execution_for_admission` Lua call per partition that blocks up to 100 executions from the eligible set head. The Lua script iterates `ZRANGE eligible 0 99`, checks each execution's routing requirements against the rejection reason, and ZREMs + ZADDs in bulk.
+4. A separate batch variant of `block_execution_for_admission` (script 29a-batch) is required for this:
+
+```lua
+-- KEYS: eligible_zset, target_blocked_zset, exec_core_1..exec_core_N
+-- ARGV: block_eligibility_state, block_blocking_reason, block_blocking_detail,
+--       block_public_state, now_ms, execution_id_1..execution_id_N
+-- Processes up to N executions in one Lua call (all on same {p:N}).
+-- For each: validate still eligible_now + runnable, HSET 7 dims, ZREM eligible, ZADD blocked.
+-- Returns count of actually blocked executions.
+```
+
+5. The scheduler resumes scanning other lanes normally. The blocked executions will be unblocked by the eligibility re-evaluation scanner (§6.15 in RFC-010) when capable workers register.
+
 ---
 
 ### 12. Valkey Data Model
@@ -735,9 +757,9 @@ When the scheduler denies a claim due to a structural block (budget, quota, rout
 ```lua
 -- KEYS: exec_core, eligible_zset, target_blocked_zset
 -- ARGV: execution_id, block_eligibility_state, block_blocking_reason,
---       block_public_state, now_ms
+--       block_blocking_detail, block_public_state, now_ms
 -- NOTE: Parameterized by block reason. Scheduler passes the specific
---       eligibility_state/blocking_reason/public_state for the denial type.
+--       eligibility_state/blocking_reason/blocking_detail/public_state for the denial type.
 
 local now_ms = tonumber(ARGV.now_ms)
 local core = redis.call("HGETALL", KEYS[1])
@@ -753,6 +775,7 @@ redis.call("HSET", KEYS[1],
   "ownership_state", "unowned",
   "eligibility_state", ARGV.block_eligibility_state,
   "blocking_reason", ARGV.block_blocking_reason,
+  "blocking_detail", ARGV.block_blocking_detail,
   "terminal_outcome", "none",
   "attempt_state", core.attempt_state,  -- unchanged
   "public_state", ARGV.block_public_state,
@@ -766,10 +789,10 @@ return ok("blocked")
 ```
 
 **Caller invocation examples:**
-- Budget denial: `block_eligibility_state = "blocked_by_budget"`, `block_blocking_reason = "waiting_for_budget"`, `block_public_state = "rate_limited"`, `target_blocked_zset = ff:idx:{p:N}:lane:<lane>:blocked:budget`
-- Quota denial: `"blocked_by_quota"`, `"waiting_for_quota"`, `"rate_limited"`, `blocked:quota`
-- Route denial: `"blocked_by_route"`, `"waiting_for_capable_worker"`, `"waiting"`, `blocked:route`
-- Lane denial: `"blocked_by_lane_state"`, `"paused_by_policy"`, `"waiting"`, `blocked:operator`
+- Budget denial: `block_eligibility_state = "blocked_by_budget"`, `block_blocking_reason = "waiting_for_budget"`, `block_blocking_detail = "budget budget-abc123: total_cost 48M/50M (96%)"`, `block_public_state = "rate_limited"`, `target_blocked_zset = ff:idx:{p:N}:lane:<lane>:blocked:budget`
+- Quota denial: `"blocked_by_quota"`, `"waiting_for_quota"`, `"quota quota-xyz: tokens_per_minute 95K/100K, resets in 8s"`, `"rate_limited"`, `blocked:quota`
+- Route denial: `"blocked_by_route"`, `"waiting_for_capable_worker"`, `"requires gpu=true, no registered worker has it"`, `"waiting"`, `blocked:route`
+- Lane denial: `"blocked_by_lane_state"`, `"paused_by_policy"`, `"lane inference-fast is in draining state"`, `"waiting"`, `blocked:operator`
 
 #### 12.10 Grant Expiry Reconciler
 

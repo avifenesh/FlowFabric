@@ -585,6 +585,7 @@ Keys:
 - lane suspended index
 - waitpoint history set
 - waitpoint condition hash
+- attempt timeout zset
 
 Pseudocode:
 
@@ -598,7 +599,19 @@ assert_execution_exists(core)
 if core.lifecycle_phase ~= "active" then
   return err("execution_not_active")
 end
+-- Full lease validation matching complete_or_fail template (RFC-003):
+-- expiry check, revocation check, identity check, attempt binding check
+if core.ownership_state == "lease_revoked" or is_set(core.lease_revoked_at) then
+  return err("lease_revoked")
+end
+if tonumber(core.lease_expires_at) <= now_ms then
+  mark_expired(core, now_ms)
+  return err("lease_expired")
+end
 if tostring(core.current_attempt_index) ~= ARGV.attempt_index then
+  return err("invalid_lease_for_suspend")
+end
+if core.current_attempt_id ~= ARGV.attempt_id then
   return err("invalid_lease_for_suspend")
 end
 if core.current_lease_id ~= ARGV.lease_id or tostring(core.current_lease_epoch) ~= ARGV.lease_epoch then
@@ -714,6 +727,7 @@ redis.call("DEL", KEYS.current_lease)
 redis.call("ZREM", KEYS.lease_expiry, ARGV.execution_id)
 redis.call("SREM", KEYS.worker_leases, ARGV.execution_id)
 redis.call("ZREM", KEYS.active_index, ARGV.execution_id)
+redis.call("ZREM", KEYS.attempt_timeout_zset, ARGV.execution_id)  -- clear per-attempt timeout (§6.16)
 redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",
   "event", "released",
   "lease_id", ARGV.lease_id,
@@ -730,6 +744,7 @@ redis.call("HSET", KEYS.core,
   "ownership_state", "unowned",
   "eligibility_state", "not_applicable",
   "blocking_reason", map_reason_to_blocking(ARGV.reason_code),
+  "blocking_detail", "suspended: waitpoint " .. waitpoint_id .. " awaiting " .. ARGV.reason_code,
   "terminal_outcome", "none",
   "attempt_state", "attempt_interrupted",
   "public_state", "suspended",
@@ -739,7 +754,8 @@ redis.call("HSET", KEYS.core,
   "lease_expires_at", "",
   "lease_last_renewed_at", "",
   "current_suspension_id", ARGV.suspension_id,
-  "current_waitpoint_id", waitpoint_id
+  "current_waitpoint_id", waitpoint_id,
+  "last_transition_at", now_ms, "last_mutation_at", now_ms
 )
 
 -- Add to per-lane suspended index
@@ -802,11 +818,13 @@ redis.call("HSET", KEYS.suspension_current,
 
 local eligibility_state = "eligible_now"
 local blocking_reason = "waiting_for_worker"
+local blocking_detail = ""
 local public_state = "waiting"
 local resume_delay_ms = resolve_resume_delay_ms(suspension.resume_policy_json)
 if resume_delay_ms > 0 then
   eligibility_state = "not_eligible_until_time"
   blocking_reason = "waiting_for_resume_delay"
+  blocking_detail = "resume delay " .. resume_delay_ms .. "ms"
   public_state = "delayed"
 end
 
@@ -829,11 +847,13 @@ redis.call("HSET", KEYS.core,
   "ownership_state", "unowned",
   "eligibility_state", eligibility_state,
   "blocking_reason", blocking_reason,
+  "blocking_detail", blocking_detail,
   "terminal_outcome", "none",
   "attempt_state", "attempt_interrupted",
   "public_state", public_state,
   "current_suspension_id", "",
-  "current_waitpoint_id", ""
+  "current_waitpoint_id", "",
+  "last_transition_at", now_ms, "last_mutation_at", now_ms
 )
 
 if eligibility_state == "eligible_now" then
@@ -919,6 +939,7 @@ redis.call("HSET", KEYS.core,
   "ownership_state", "unowned",
   "eligibility_state", "not_applicable",
   "blocking_reason", "none",
+  "blocking_detail", "",
   "terminal_outcome", "cancelled",
   "attempt_state", "attempt_terminal",
   "public_state", "cancelled",

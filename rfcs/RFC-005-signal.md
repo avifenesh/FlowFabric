@@ -178,7 +178,7 @@ When a signal is delivered, the engine records the **actual effect** for auditab
 |--------|-------------|
 | `no_op` | Signal was accepted and recorded but had no state effect. Waitpoint conditions not yet satisfied. |
 | `no_op_waitpoint_never_activated` | Signal was buffered for a pending waitpoint that was never activated. |
-| `buffered_for_pending_waitpoint` | Signal accepted against a pending (not yet committed) waitpoint. Will be evaluated on suspension commit. |
+| `buffered_for_pending_waitpoint` | Signal accepted against a pending (not yet committed) waitpoint. Will be evaluated on suspension commit. **Tentative** — if suspension never commits, the signal is discarded (see §12.3). Response includes `requires_confirmation = true`. |
 | `appended_to_waitpoint` | Signal recorded against an open waitpoint. Resume conditions not yet fully satisfied. |
 | `resume_condition_satisfied` | Signal satisfied the waitpoint's resume condition. Execution becomes eligible for `waiting` → claimable. |
 | `duplicate_ignored` | Idempotency key matched a previously accepted signal. No new record created. |
@@ -587,14 +587,16 @@ for i = 0, total - 1 do
         -- Resume continues the SAME attempt (no new attempt created)
         if lp == "suspended" then
           local resume_delay = tonumber(ARGV.resume_delay_ms)
-          local es, br, ps, as_val
+          local es, br, bd, ps, as_val
           if resume_delay > 0 then
             es = "not_eligible_until_time"
             br = "waiting_for_resume_delay"
+            bd = "resume delay " .. resume_delay .. "ms after signal " .. ARGV.signal_name
             ps = "delayed"
           else
             es = "eligible_now"
             br = "waiting_for_worker"
+            bd = ""
             ps = "waiting"
           end
           -- attempt_state = attempt_interrupted (paused, awaiting re-claim)
@@ -607,6 +609,7 @@ for i = 0, total - 1 do
             "ownership_state", "unowned",
             "eligibility_state", es,
             "blocking_reason", br,
+            "blocking_detail", bd,
             "terminal_outcome", "none",
             "attempt_state", as_val,
             "public_state", ps,
@@ -656,6 +659,15 @@ A simpler variant used when the waitpoint exists but suspension is not yet commi
 -- - On suspension commit, a separate script replays buffered signals
 --   through the full evaluation path
 ```
+
+**Important: `buffered_for_pending_waitpoint` is a tentative acknowledgment.** The signal is durably recorded against the pending waitpoint, but the waitpoint may never be activated (worker crashes before calling `suspend_execution`). In that case, the pending waitpoint expiry scanner (RFC-004 §Pending waitpoint expiry scanner) closes the waitpoint with `close_reason = never_committed` and the signal's `observed_effect` is updated to `no_op_waitpoint_never_activated`. The signal data is then cleaned up.
+
+**Caller responsibility:** External systems that receive `observed_effect = buffered_for_pending_waitpoint` in the response MUST implement at-least-once delivery with a confirmation timeout. Specifically:
+1. After receiving `buffered_for_pending_waitpoint`, start a confirmation timer (recommended: 2× the expected suspension commit time, e.g., 30-60 seconds).
+2. If the execution does not transition to `suspended` or `runnable` within the timer, re-send the signal.
+3. On re-send, use the same `idempotency_key` — if the waitpoint was activated and the original signal was already evaluated, the re-send is deduplicated harmlessly.
+
+The SDK's `send_signal` response should include a `requires_confirmation` flag set to `true` when `observed_effect = buffered_for_pending_waitpoint`, signaling the caller that the delivery is tentative and may require retry. This flag is `false` for all other effects.
 
 #### 12.4 Waitpoint Closure on Timeout Script
 

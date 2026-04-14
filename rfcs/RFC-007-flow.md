@@ -582,7 +582,9 @@ if core.lifecycle_phase == "runnable" and core.terminal_outcome == "none" then
   redis.call("HSET", KEYS[1],
     "eligibility_state", "blocked_by_dependencies",
     "blocking_reason", "waiting_for_children",
-    "public_state", "waiting_children"
+    "blocking_detail", unresolved .. " dep(s) unresolved incl " .. ARGV.edge_id,
+    "public_state", "waiting_children",
+    "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
   )
   -- Move from eligible → blocked:dependencies (ZREM is no-op if not in eligible)
   redis.call("ZREM", KEYS[5], core.execution_id)
@@ -624,12 +626,21 @@ if ARGV.upstream_outcome == "success" then
      and core.ownership_state == "unowned"
      and core.terminal_outcome == "none"
      and core.eligibility_state == "blocked_by_dependencies" then
+    -- Preserve attempt_state for resumed-from-blocked executions.
+    -- pending_first_attempt only if never claimed (attempt_state is 'none').
+    -- If attempt_interrupted (from move_to_waiting_children), keep it
+    -- so claim dispatch routes to claim_resumed_execution (same attempt continues).
+    local new_attempt_state = core.attempt_state
+    if not is_set(new_attempt_state) or new_attempt_state == "none" then
+      new_attempt_state = "pending_first_attempt"
+    end
     redis.call("HSET", KEYS[1],
       "eligibility_state", "eligible_now",
       "blocking_reason", "waiting_for_worker",
-      "attempt_state", "pending_first_attempt",
+      "blocking_detail", "",
+      "attempt_state", new_attempt_state,
       "public_state", "waiting",
-      "last_tx", ARGV.now_ms, "last_mut", ARGV.now_ms
+      "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
     )
     -- Move from blocked:dependencies → eligible
     redis.call("ZREM", KEYS[7], core.execution_id)
@@ -655,11 +666,12 @@ if core.terminal_outcome == "none" then
     "ownership_state", "unowned",
     "eligibility_state", "not_applicable",
     "blocking_reason", "none",
+    "blocking_detail", "",
     "terminal_outcome", "skipped",
     "attempt_state", "none",
     "public_state", "skipped",
-    "completed", ARGV.now_ms,
-    "last_tx", ARGV.now_ms, "last_mut", ARGV.now_ms
+    "completed_at", ARGV.now_ms,
+    "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
   )
   -- Move from blocked:dependencies → terminal
   redis.call("ZREM", KEYS[7], core.execution_id)
