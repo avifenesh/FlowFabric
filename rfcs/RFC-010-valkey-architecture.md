@@ -445,7 +445,23 @@ Flow summary counters (members_active, members_completed, aggregate_tokens, etc.
 
 **Staleness impact:** A `list_executions` query using the namespace index may briefly miss a just-created execution or include a just-deleted one. Queries that require authoritative data should use partition-local indexes.
 
-#### 3.8 Flow Cancellation Propagation
+#### 3.8 Add Execution to Flow (Two-Phase Ownership Claim)
+
+**Operation:** Add an execution to a flow's membership. Enforces single-flow invariant (F2) cross-partition.
+**Partitions touched:** (optional `{b:M}` budget check) → `{p:N}` (execution) → `{fp:N}` (flow)
+
+1. **Budget check on `{b:M}`** (if flow has `deny_child` budget): read budget usage. If exhausted, reject.
+2. **Phase 1 — ownership claim on `{p:N}`**: Lua script atomically checks `flow_id` field on exec core. If non-empty → `execution_already_in_flow`. If empty → SET `flow_id = <flow_id>`. This is the serialization point that prevents two flows from claiming the same execution.
+3. **Phase 2 — membership on `{fp:N}`**: SADD to flow membership set. Increment `graph_revision`. Apply flow policy defaults. Idempotent — if this step fails and is retried, SADD on an existing member is a no-op.
+
+**Failure modes and convergence:**
+
+| Failure Point | Effect | Convergence |
+|---|---|---|
+| Phase 1 succeeds, phase 2 fails | Execution has `flow_id` set but is not in the flow's membership set. | Retry phase 2. SADD is idempotent. Flow summary projector will eventually detect the member when it reads exec core. |
+| Two concurrent adds to different flows | Both reach phase 1 on the same `{p:N}` — serialized. First wins, second gets `execution_already_in_flow`. | Immediate — {p:N} serialization prevents the race. |
+
+#### 3.9 Flow Cancellation Propagation
 
 **Operation:** Flow is cancelled — propagate to member executions.
 **Partitions touched:** `{fp:N}` (flow members) → `{p:N}` (each member execution)
@@ -639,7 +655,15 @@ local core = hgetall_to_table(redis.call("HGETALL", KEYS[1]))
 
 Alternatively, use `HMGET` to fetch only the specific fields needed — more efficient for large hashes. The execution core has 50+ fields but most scripts check 5-10.
 
-#### (b) All exec_core mutations MUST go through Lua scripts
+#### (b) Lua scripts are NOT transactional — partial writes persist on abort
+
+Valkey Lua scripts execute each `redis.call()` independently. If a script aborts mid-execution (OOM, bug, or `redis.call()` error propagation), **all writes that already executed within the script persist**. There is no rollback.
+
+Example: if `HSET exec_core lifecycle_phase=terminal` succeeds but the subsequent `ZADD terminal_zset` fails (OOM), the execution is terminal but not indexed. The generalized index reconciler (§6.17) catches this, but implementers must understand the risk.
+
+**Defensive write ordering:** Where possible, perform index writes (ZADD, ZREM, SADD) BEFORE state mutations (HSET exec_core). If an index write OOMs, the state hasn't changed — the execution remains in its previous consistent state. This isn't always possible (some HSET fields are needed before index writes), but the principle is: delay the "point of no return" state mutation as late as possible in the script.
+
+#### (b2) All exec_core mutations MUST go through Lua scripts
 
 No raw `HSET` calls from application code. Every state transition is an atomic Lua script that validates preconditions, updates the state vector, and maintains indexes in one call. A raw `HSET` that skips validation can violate invariants (e.g., setting `lifecycle_phase = active` without creating a lease).
 
@@ -673,6 +697,17 @@ The `renew_lease` script's XADD to lease_history is a performance-sensitive hot 
 The execution core field `lease_last_renewed_at` already provides the latest renewal timestamp without stream overhead. The important lease history events — `acquired`, `released`, `expired`, `revoked`, `reclaimed` — are far less frequent and MUST always be recorded.
 
 **V1 default:** Renewal history events OFF. The `renew_lease` script skips the XADD for `"event", "renewed"`. Enable per-lane when detailed ownership audit trails are needed for debugging.
+
+#### (h) Worker current_claim_count — async INCR/DECR pattern
+
+The `current_claim_count` field on `ff:worker:<worker_instance_id>` (global key) tracks how many active leases a worker holds. The capability matcher reads this for `max_concurrent_claims` enforcement. But lease acquisition on `{p:N}` cannot atomically update a global key.
+
+**Maintenance pattern** (same as quota concurrency counter, §6.6):
+- After `claim_execution` / `claim_resumed_execution` succeeds on `{p:N}`: caller issues async `HINCRBY ff:worker:<wid> current_claim_count 1`.
+- After lease release (complete/fail/suspend/revoke/reclaim) on `{p:N}`: caller issues async `HINCRBY ff:worker:<wid> current_claim_count -1`.
+- **Worker claim count reconciler** (§6.18): periodically sums `SCARD ff:idx:{p:N}:worker:<wid>:leases` across all execution partitions. If the sum diverges from `current_claim_count`, resets the count.
+
+Without this pattern, `current_claim_count` stays at 0 and `max_concurrent_claims` is never enforced.
 
 ### 4.9 Lua Script Return Convention
 
@@ -1701,6 +1736,61 @@ One unified scanner handles all 4 block types per partition per lane.
 
 **Index cleanup:** When an execution completes normally (complete_execution, fail_execution), the script must ZREM from both `attempt_timeout` and `execution_deadline` indexes. When a new attempt starts after retry, the old entry is removed and a new one added with the new `started_at + timeout_ms`.
 
+### 6.17 Generalized Index Reconciler
+
+**Source:** All RFCs. Safety net for OOM partial writes, crashes, and any state/index desync.
+
+**Purpose:** Detects inconsistencies between execution core state and partition-local index membership. Catches the case where a Lua script aborted mid-execution (e.g., OOM) — prior writes within the script persisted but later index writes did not, leaving the execution in a valid state but absent from the correct index.
+
+| Property | Value |
+|---|---|
+| **Trigger** | Periodic timer |
+| **Frequency** | Every 30-60 seconds per partition |
+| **Partition scope** | Per `{p:N}` execution partition |
+| **Operation** | SCAN execution core hashes within the partition. For each execution, verify it is in the correct index for its current state. Fix any desync. |
+
+**Reconciliation rules:**
+
+| Execution State | Expected Index | If Missing |
+|---|---|---|
+| `lifecycle=terminal` | `ff:idx:{p:N}:lane:<lane>:terminal` | ZADD to terminal_zset (prevents ghost terminals that never get purged). |
+| `lifecycle=active, ownership=leased` | `ff:idx:{p:N}:lease_expiry` | Run `mark_lease_expired_if_due` — treat as crashed worker. If lease is actually still valid, the script is a no-op. |
+| `lifecycle=runnable, eligibility=eligible_now` | `ff:idx:{p:N}:lane:<lane>:eligible` | ZADD to eligible_zset with correct priority score (overlaps with claim-grant reconciler §6.4 but catches additional cases). |
+| `lifecycle=runnable, eligibility=not_eligible_until_time` | `ff:idx:{p:N}:lane:<lane>:delayed` | ZADD to delayed_zset. |
+| `lifecycle=suspended` | `ff:idx:{p:N}:lane:<lane>:suspended` | ZADD to suspended_zset. If timeout_at is set: ZADD to suspension_timeout_zset. |
+| `lifecycle=runnable, eligibility=blocked_by_*` | `ff:idx:{p:N}:lane:<lane>:blocked:<reason>` | ZADD to appropriate blocked set. |
+
+| Property | Value |
+|---|---|
+| **Per-item action** | ZADD/SADD to the correct index if missing. No state mutations — only index repairs. |
+| **Failure mode** | Safe to crash. Desync persists until next scan. |
+| **Idempotency** | ZADD on existing member with same score is a no-op. |
+| **Batch size** | 100-200 SCAN iterations per cycle. Lightweight — ZADD is O(log N). |
+| **SCAN strategy** | Use `SCAN 0 MATCH ff:exec:{p:N}:*:core COUNT 200` to iterate execution core hashes within the partition. Extract execution_id from key name. Read lifecycle_phase + eligibility_state + lane_id. Check index membership via ZSCORE/SISMEMBER. |
+
+**When this fires:** Under normal operation, this reconciler finds nothing. It exists for:
+- OOM partial writes (Lua script aborted after state mutation but before index write)
+- Engine crash during a multi-step operation (e.g., between state transition and index update)
+- Any bug that causes state/index desync
+- Operator peace of mind ("are all my executions indexed correctly?")
+
+### 6.18 Worker Claim Count Reconciler
+
+**Source:** RFC-009 (Scheduling, Fairness, and Admission), RFC-010 §4.8(h)
+
+**Purpose:** Corrects the `current_claim_count` field on worker registration hashes. This count is maintained via async INCR/DECR (same pattern as quota concurrency, §6.6) and may drift due to lost INCR/DECR calls, worker crashes, or Valkey restarts.
+
+| Property | Value |
+|---|---|
+| **Trigger** | Periodic timer |
+| **Frequency** | Every 10-30 seconds per worker |
+| **Partition scope** | Cross-partition (reads from all `{p:N}` partitions for one worker) |
+| **Operation** | For each active worker: sum `SCARD ff:idx:{p:N}:worker:<wid>:leases` across all execution partitions. Compare against `current_claim_count` on `ff:worker:<wid>`. If diverged, `HSET ff:worker:<wid> current_claim_count <actual>`. |
+| **Per-item action** | `HSET` on the global worker hash. |
+| **Failure mode** | Safe to crash. Stale count means capacity check may over-reject (safe direction) or under-reject (one extra claim). |
+| **Idempotency** | Overwrites with authoritative count. Running twice is safe. |
+| **Batch size** | 1 worker per cycle. Each worker requires `num_partitions` SCARD calls (parallelizable). |
+
 ---
 
 ## 7. Memory and Capacity Estimates
@@ -1856,6 +1946,15 @@ FlowFabric v1 is **Valkey-native**. The Valkey cluster is the single durable sto
 **Shard count rationale:** Each shard handles ~16,384 / shard_count hash slots. More shards = more parallelism for Lua scripts (which block one shard at a time). At 100K+ active executions, Lua script latency on overloaded shards becomes the bottleneck.
 
 **Replication:** At least 1 replica per shard for production. Replicas provide read scaling for inspection APIs (Class C operations) and failover durability.
+
+**MAXMEMORY configuration (MANDATORY):**
+
+| Setting | Required Value | Rationale |
+|---|---|---|
+| `maxmemory-policy` | `noeviction` | FlowFabric keys are durable state. Eviction would silently delete execution records, lease histories, or index entries, causing data loss and invariant violations. |
+| Memory monitoring | Alert at 80% capacity | Provides operational headroom for traffic spikes and batch operations. |
+| Hard alert | Alert at 90% capacity | Immediate operator action required: increase memory, reduce retention, or scale out. |
+| Operational ceiling | Never exceed 90% | Above 90%, write-heavy Lua scripts risk OOM. Valkey Lua scripts are NOT transactional — a mid-script OOM aborts the script but prior writes within the script persist, leaving indexes inconsistent with execution state. The generalized index reconciler (§6.17) catches this, but prevention is better than repair. |
 
 ### 8.2 Partition Count Recommendations
 

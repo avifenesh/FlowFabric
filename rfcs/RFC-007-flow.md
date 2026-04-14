@@ -291,6 +291,7 @@ Derived outcome notes:
 
 - `skipped` nodes count as terminal
 - a flow must not remain semantically open forever just because some descendants became impossible to run
+- **empty flow (zero members, no root):** derives `public_flow_state = open`. `all_terminal` requires `node_count > 0` to fire — guard against vacuous completion. `root_and_no_unresolved` and `coordinator_declares` cannot fire without a root/coordinator execution. An empty flow can be cancelled (transitions to `cancelled`) or deleted. Implementers must enforce the `node_count > 0` guard.
 
 ### Dynamic Child Spawning
 
@@ -304,6 +305,7 @@ Validation rules:
 4. DAG mode must reject cycles
 5. policy inheritance from flow to execution remains explicit and auditable
 6. if the flow has an attached budget with `on_hard_limit = deny_child`, exhausted allowance rejects the spawn before membership is committed
+7. every child execution requires a `lane_id`. If not explicitly provided, the child inherits the parent execution's `lane_id` or the flow's `default_routing_hints` lane. Every execution in FlowFabric must belong to a lane — there is no lane-less execution.
 
 ### Cancellation Propagation
 
@@ -374,7 +376,7 @@ The passive flow container does not suspend or wait during cancellation. It issu
 | Operation | Class | Semantics |
 | --- | --- | --- |
 | `create_flow(flow_spec)` | A | Creates the flow core record and initial structural metadata. |
-| `add_execution_to_flow(flow_id, execution_id, member_spec)` | A | Adds explicit membership, increments `graph_revision` (membership is a structural mutation that can invalidate concurrent cycle check snapshots), and applies any flow defaults that are inherited by the execution. If the flow has an attached budget whose hard-limit action is `deny_child` and the remaining allowance is exhausted, the add/spawn is rejected. |
+| `add_execution_to_flow(flow_id, execution_id, member_spec)` | A | **Two-phase cross-partition operation.** Phase 1 on `{p:N}` (execution partition): atomically check `flow_id` is empty on exec core — if non-empty, return `execution_already_in_flow`. Set `flow_id` on exec core. This is the ownership claim, serialized on the execution's partition. Phase 2 on `{fp:N}` (flow partition): SADD to membership set, increment `graph_revision`, apply flow defaults. If phase 2 fails, retry (idempotent — membership SADD is idempotent). If budget `deny_child` check on `{b:M}` fails, reject before phase 1. |
 | `add_dependency(flow_id, upstream_execution_id, downstream_execution_id, edge_spec)` | A | Validates topology and creates a dependency edge; also updates child-local dependency gating. |
 | `resolve_dependency(flow_id, edge_id, upstream_outcome)` | A | Applies one upstream outcome to one edge and updates downstream eligibility or impossibility atomically on the child partition. |
 | `get_flow(flow_id)` | C | Returns the flow core record. |

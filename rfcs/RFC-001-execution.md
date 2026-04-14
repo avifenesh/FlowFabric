@@ -1224,7 +1224,12 @@ local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
 local core = redis.call("HGETALL", KEYS[1])
 
 -- Validate lease (long canonical field names)
-if core.lifecycle_phase ~= "active" then return err("execution_not_active") end
+-- Enriched error per §4.9: return terminal_outcome + lease_epoch so client
+-- can distinguish "my completion already won" from "someone else terminated"
+if core.lifecycle_phase ~= "active" then
+  return err("execution_not_active",
+    core.terminal_outcome or "", core.current_lease_epoch or "")
+end
 if core.ownership_state == "lease_revoked" then return err("lease_revoked") end
 if tonumber(core.lease_expires_at) <= now_ms then return err("lease_expired") end
 if core.current_lease_id ~= ARGV.lease_id then return err("stale_lease") end
@@ -1293,7 +1298,11 @@ local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
 local core = redis.call("HGETALL", KEYS[1])
 
 -- Validate lease (long canonical field names)
-if core.lifecycle_phase ~= "active" then return err("execution_not_active") end
+-- Enriched error per §4.9: see complete_execution for rationale
+if core.lifecycle_phase ~= "active" then
+  return err("execution_not_active",
+    core.terminal_outcome or "", core.current_lease_epoch or "")
+end
 if core.ownership_state == "lease_revoked" then return err("lease_revoked") end
 if tonumber(core.lease_expires_at) <= now_ms then return err("lease_expired") end
 if core.current_lease_id ~= ARGV.lease_id then return err("stale_lease") end
@@ -1415,7 +1424,7 @@ Terminal execution records are retained according to lane retention policy. The 
 | `stale_lease` | Lease ID or epoch does not match current. Worker lost ownership. |
 | `lease_expired` | Lease TTL passed. |
 | `lease_not_held` | Operation requires lease but execution is unowned. |
-| `execution_not_active` | Operation requires `active` but execution is in another phase. |
+| `execution_not_active` | Operation requires `active` but execution is in another phase. Returns enriched context: `{0, "execution_not_active", terminal_outcome, lease_epoch}`. Client compares its lease_epoch with returned epoch — match + `terminal_outcome=success` means "my completion already won"; mismatch or different outcome means "someone else terminated it." |
 | `execution_not_terminal` | Replay requires `terminal` but execution is not. |
 | `execution_already_terminal` | Complete/fail on already-terminal execution. |
 | `budget_exceeded` | Budget check failed during claim or usage report. |
