@@ -12,8 +12,6 @@ use crate::pubsub::push_manager::PushInfo;
 use crate::retry_strategies::RetryStrategy;
 use crate::value::{Error, Result, Value};
 use futures::{StreamExt, future, stream};
-use logger_core::log_debug;
-use logger_core::log_warn;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -303,12 +301,7 @@ impl StandaloneClient {
         };
 
         if !addresses_and_errors.is_empty() {
-            log_warn(
-                "client creation",
-                format!(
-                    "Failed to connect to {addresses_and_errors:?}, will attempt to reconnect."
-                ),
-            );
+            tracing::warn!("client creation - Failed to connect to {addresses_and_errors:?}, will attempt to reconnect.");
         }
         let read_from = if read_only && read_from_option.is_none() {
             // Default to PreferReplica when read_only=true and no ReadFrom specified
@@ -506,7 +499,7 @@ impl StandaloneClient {
         let result = connection.send_packed_command(cmd).await;
         match result {
             Err(err) if err.is_unrecoverable_error() => {
-                log_warn("send request", format!("received disconnect error `{err}`"));
+                tracing::warn!("send request - received disconnect error `{err}`");
                 reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
                 Err(err)
             }
@@ -630,10 +623,7 @@ impl StandaloneClient {
             .await;
         match result {
             Err(err) if err.is_unrecoverable_error() => {
-                log_warn(
-                    "pipeline request",
-                    format!("received disconnect error `{err}`"),
-                );
+                tracing::warn!("pipeline request - received disconnect error `{err}`");
                 reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
                 Err(err)
             }
@@ -646,30 +636,24 @@ impl StandaloneClient {
             loop {
                 tokio::time::sleep(super::HEARTBEAT_SLEEP_DURATION).await;
                 if reconnecting_connection.is_dropped() {
-                    log_debug(
-                        "StandaloneClient",
-                        "heartbeat stopped after connection was dropped",
-                    );
+                    tracing::debug!("StandaloneClient - heartbeat stopped after connection was dropped");
                     // Client was dropped, heartbeat can stop.
                     return;
                 }
 
                 let Some(mut connection) = reconnecting_connection.try_get_connection().await
                 else {
-                    log_debug(
-                        "StandaloneClient",
-                        "heartbeat stopped while connection is reconnecting",
-                    );
+                    tracing::debug!("StandaloneClient - heartbeat stopped while connection is reconnecting");
                     // Client is reconnecting..
                     continue;
                 };
-                log_debug("StandaloneClient", "performing heartbeat");
+                tracing::debug!("StandaloneClient - performing heartbeat");
                 if connection
                     .send_packed_command(&crate::cmd::cmd("PING"))
                     .await
                     .is_err_and(|err| err.is_connection_dropped() || err.is_connection_refusal())
                 {
-                    log_debug("StandaloneClient", "heartbeat triggered reconnect");
+                    tracing::debug!("StandaloneClient - heartbeat triggered reconnect");
                     reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
                 }
             }
@@ -687,29 +671,20 @@ impl StandaloneClient {
                     .await;
                 // check connection is valid
                 if reconnecting_connection.is_dropped() {
-                    log_debug(
-                        "StandaloneClient",
-                        "connection checker stopped after connection was dropped",
-                    );
+                    tracing::debug!("StandaloneClient - connection checker stopped after connection was dropped");
 
                     // Client was dropped, checker can stop.
                     return;
                 }
 
                 let Some(connection) = reconnecting_connection.try_get_connection().await else {
-                    log_debug(
-                        "StandaloneClient",
-                        "connection checker is skipping a connections since its reconnecting",
-                    );
+                    tracing::debug!("StandaloneClient - connection checker is skipping a connections since its reconnecting");
                     // Client is reconnecting..
                     continue;
                 };
 
                 if connection.is_closed() {
-                    log_debug(
-                        "StandaloneClient",
-                        "connection checker has triggered reconnect",
-                    );
+                    tracing::debug!("StandaloneClient - connection checker has triggered reconnect");
                     reconnecting_connection.reconnect(ReconnectReason::ConnectionDropped);
                 }
             }

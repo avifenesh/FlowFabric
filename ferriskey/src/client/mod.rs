@@ -24,7 +24,6 @@ use crate::scripts_container::get_script;
 use crate::value::{ErrorKind, Error, FromValue, Result, Value};
 use futures_util::future::BoxFuture;
 use futures::FutureExt;
-use logger_core::{log_debug, log_error, log_info, log_warn};
 pub use standalone_client::StandaloneClient;
 use std::io;
 use std::sync::Arc;
@@ -211,10 +210,7 @@ async fn run_with_timeout<T>(
             Err(_) => {
                 // Record timeout error metric if telemetry is initialized
                 if let Err(e) = FerrisKeyOtel::record_timeout_error() {
-                    log_error(
-                        "OpenTelemetry:timeout_error",
-                        format!("Failed to record timeout error: {e}"),
-                    );
+                    tracing::error!("OpenTelemetry:timeout_error - Failed to record timeout error: {e}");
                 }
                 Err(io::Error::from(io::ErrorKind::TimedOut).into())
             }
@@ -746,10 +742,7 @@ impl Client {
             .wait_for_sync(0, None, None, None)
             .await
         {
-            log_warn(
-                "Client::new",
-                format!("Failed to establish initial subscriptions within timeout: {e:?}"),
-            );
+            tracing::warn!("Client::new - Failed to establish initial subscriptions within timeout: {e:?}");
         }
 
         // Re-acquire for the return
@@ -778,12 +771,7 @@ impl Client {
                     if crate::cluster::routing::is_readonly_cmd(cmd_name.as_bytes()) {
                         RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
                     } else {
-                        log_warn(
-                            "send_command",
-                            format!(
-                                "User provided 'Random' routing which is not suitable for the writeable command '{cmd_name}'. Changing it to 'RandomPrimary'"
-                            ),
-                        );
+                        tracing::warn!("send_command - User provided 'Random' routing which is not suitable for the writeable command '{cmd_name}'. Changing it to 'RandomPrimary'");
                         RoutingInfo::SingleNode(SingleNodeRoutingInfo::RandomPrimary)
                     }
                 } else {
@@ -810,10 +798,7 @@ impl Client {
                 ) {
                     Ok(decompressed_value) => decompressed_value,
                     Err(e) => {
-                        log_warn(
-                            "send_command_decompression",
-                            format!("Failed to decompress response: {}", e),
-                        );
+                        tracing::warn!("send_command_decompression - Failed to decompress response: {e}");
                         raw_value
                     }
                 }
@@ -860,10 +845,7 @@ impl Client {
                     )));
                 }
                 iam_manager.clear_token_changed();
-                log_debug(
-                    "update_connection_password",
-                    "Updating connection password with IAM token",
-                );
+                tracing::debug!("update_connection_password - Updating connection password with IAM token");
                 self.update_connection_password(Some(current_token), false)
                     .await?;
             }
@@ -900,13 +882,8 @@ impl Client {
                 let prev = LAST_BUCKET.load(Ordering::Relaxed);
                 if bucket != prev {
                     LAST_BUCKET.store(bucket, Ordering::Relaxed);
-                    log_debug(
-                        "inflight",
-                        format!(
-                            "Inflight: {used}/{} slots used",
-                            self.inflight_requests_limit
-                        ),
-                    );
+                    let limit = self.inflight_requests_limit;
+                    tracing::debug!("inflight - Inflight: {used}/{limit} slots used");
                 }
             }
 
@@ -940,10 +917,7 @@ impl Client {
                             // so its tracker clone keeps the inflight slot held until
                             // all sub-commands complete naturally.
                             if let Err(e) = FerrisKeyOtel::record_timeout_error() {
-                                log_error(
-                                    "OpenTelemetry:timeout_error",
-                                    format!("Failed to record timeout error: {e}"),
-                                );
+                                tracing::error!("OpenTelemetry:timeout_error - Failed to record timeout error: {e}");
                             }
                             Err(io::Error::from(io::ErrorKind::TimedOut).into())
                         }
@@ -1326,7 +1300,7 @@ impl Client {
                     "Empty password provided for authentication",
                 )));
             }
-            log_debug("send_immediate_auth", "Using password for authentication");
+            tracing::debug!("send_immediate_auth - Using password for authentication");
             password.to_string()
         } else {
             return Err(Error::from((
@@ -1399,12 +1373,12 @@ impl Client {
                         Some(std::sync::Arc::new(token_manager))
                     }
                     Err(e) => {
-                        log_error("IAM", format!("Failed to create IAM token manager: {e}"));
+                        tracing::error!("IAM - Failed to create IAM token manager: {e}");
                         None
                     }
                 }
             } else {
-                log_error("IAM", "IAM authentication requires a username");
+                tracing::error!("IAM - IAM authentication requires a username");
                 None
             }
         } else {
@@ -1853,10 +1827,7 @@ impl Client {
         // Add buffer to connection_timeout to allow inner connection logic to fully execute before the outer timeout triggers
         let client_creation_timeout = request.get_connection_timeout() + Duration::from_millis(500);
 
-        log_info(
-            "Connection configuration",
-            sanitized_request_string(&request),
-        );
+        tracing::info!("Connection configuration - {}", sanitized_request_string(&request));
         let request_timeout = to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT);
         let inflight_requests_limit = request
             .inflight_requests_limit
@@ -1981,13 +1952,7 @@ impl Client {
             if !is_lazy {
                 pubsub_synchronizer.trigger_reconciliation();
                 if let Err(e) = pubsub_synchronizer.wait_for_sync(0, None, None, None).await {
-                    log_error(
-                        "Client::new",
-                        format!(
-                            "Failed to establish initial subscriptions within timeout: {:?}",
-                            e
-                        ),
-                    );
+                    tracing::error!("Client::new - Failed to establish initial subscriptions within timeout: {e:?}");
                 }
             }
 

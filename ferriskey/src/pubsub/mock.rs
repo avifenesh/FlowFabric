@@ -11,7 +11,6 @@ use crate::pubsub::push_manager::PushInfo;
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 use crate::value::{ErrorKind, PushKind, Error, Result, Value};
 use async_trait::async_trait;
-use logger_core::{log_debug, log_warn};
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
@@ -176,7 +175,7 @@ impl MockPubSubSynchronizer {
                 }
 
                 let Some(sync) = sync_weak.upgrade() else {
-                    log_debug("reconciliation_task", "Synchronizer dropped, exiting task");
+                    tracing::debug!("reconciliation_task - Synchronizer dropped, exiting task");
                     break;
                 };
 
@@ -186,10 +185,10 @@ impl MockPubSubSynchronizer {
                 }
 
                 if let Err(e) = sync.reconcile_internal() {
-                    log_warn(
-                        "reconciliation_task",
-                        format!("Reconciliation failed for client {}: {}", sync.client_id, e),
-                    );
+                    {
+                        let client_id = &sync.client_id;
+                        tracing::warn!("reconciliation_task - Reconciliation failed for client {client_id}: {e}");
+                    }
                 }
                 sync.check_and_record_sync_state();
                 complete_notify.notify_waiters();
@@ -231,20 +230,17 @@ impl MockPubSubSynchronizer {
         let is_synced = self.is_synchronized();
         if is_synced {
             let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
-            log_debug(
-                "mock_pubsub",
-                format!("Client {} subscriptions in sync", self.client_id),
-            );
+            {
+                let client_id = &self.client_id;
+                tracing::debug!("mock_pubsub - Client {client_id} subscriptions in sync");
+            }
         } else {
             let _ = FerrisKeyOtel::record_subscription_out_of_sync();
             let (desired, actual) = self.get_subscription_state();
-            log_debug(
-                "mock_pubsub",
-                format!(
-                    "Client {} subscriptions out of sync - desired: {:?}, actual: {:?}",
-                    self.client_id, desired, actual
-                ),
-            );
+            {
+                let client_id = &self.client_id;
+                tracing::debug!("mock_pubsub - Client {client_id} subscriptions out of sync - desired: {desired:?}, actual: {actual:?}");
+            }
         }
     }
 }
@@ -1109,10 +1105,7 @@ impl MockPubSubBroker {
                 if actual_sharded.contains(&channel_bytes) {
                     let push_info = create_push_info(channel, message, None, sharded);
                     if let Err(e) = client_data.push_sender.send(push_info) {
-                        log_warn(
-                            "mock_pubsub",
-                            format!("Failed to send to client {client_id}: {e}"),
-                        );
+                        tracing::warn!("mock_pubsub - Failed to send to client {client_id}: {e}");
                     } else {
                         recipient_count += 1;
                     }
@@ -1131,10 +1124,7 @@ impl MockPubSubBroker {
                 if actual_channels.contains(&channel_bytes) {
                     let push_info = create_push_info(channel, message, None, false);
                     if let Err(e) = client_data.push_sender.send(push_info) {
-                        log_warn(
-                            "mock_pubsub",
-                            format!("Failed to send to client {client_id} (exact): {e}"),
-                        );
+                        tracing::warn!("mock_pubsub - Failed to send to client {client_id} (exact): {e}");
                     } else {
                         recipient_count += 1;
                     }
@@ -1145,10 +1135,7 @@ impl MockPubSubBroker {
                     if glob_match(&pat, channel) {
                         let push_info = create_push_info(channel, message, Some(&pat), false);
                         if let Err(e) = client_data.push_sender.send(push_info) {
-                            log_warn(
-                                "mock_pubsub",
-                                format!("Failed to send to client {client_id}: {e}"),
-                            );
+                            tracing::warn!("mock_pubsub - Failed to send to client {client_id}: {e}");
                         } else {
                             recipient_count += 1;
                         }
@@ -1240,20 +1227,12 @@ impl MockPubSubBroker {
             for (client_id, client) in clients.iter_mut() {
                 if client.username.as_ref() == Some(&username) {
                     client.synchronizer.set_can_subscribe(can_subscribe);
-                    log_debug(
-                        "mock_pubsub",
-                        format!(
-                            "Updated client {client_id} can_subscribe to {can_subscribe} due to ACL change for user {username}"
-                        ),
-                    );
+                    tracing::debug!("mock_pubsub - Updated client {client_id} can_subscribe to {can_subscribe} due to ACL change for user {username}");
                 }
             }
         }
 
-        log_debug(
-            "mock_pubsub",
-            format!("ACL command for username {username}, set can_subscribe to {can_subscribe}"),
-        );
+        tracing::debug!("mock_pubsub - ACL command for username {username}, set can_subscribe to {can_subscribe}");
     }
 
     pub async fn unregister_client(&self, client_id: &str) {

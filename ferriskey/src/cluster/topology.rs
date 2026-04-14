@@ -6,7 +6,6 @@ use crate::cluster::routing::Slot;
 use crate::cluster::slotmap::{ReadFromReplicaStrategy, SlotMap};
 use crate::connection::info::TlsMode;
 use crate::value::{ErrorKind, Error, Result, Value};
-use logger_core::log_warn;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
@@ -214,10 +213,7 @@ pub(crate) fn parse_and_count_slots(
                                 // Array format: ["ip", "127.0.0.1", "hostname", "example.com", ...]
                                 Ok(Value::Array(metadata)) => {
                                     if metadata.len() % 2 != 0 {
-                                        log_warn(
-                                                "cluster_topology",
-                                                "Node metadata array has odd length, some entries may be skipped"
-                                            );
+                                        tracing::warn!("cluster_topology - Node metadata array has odd length, some entries may be skipped");
                                     }
                                     for chunk in metadata.chunks_exact(2) {
                                         if let (Ok(Value::BulkString(key)), Ok(Value::BulkString(value))) =
@@ -238,10 +234,7 @@ pub(crate) fn parse_and_count_slots(
                                     }
                                 }
                                 other => {
-                                    log_warn(
-                                        "cluster_topology",
-                                        format!("Unexpected node metadata format: {:?}", other)
-                                    );
+                                    tracing::warn!("cluster_topology - Unexpected node metadata format: {:?}", other);
                                 }
                             }
                         }

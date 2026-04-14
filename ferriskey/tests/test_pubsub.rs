@@ -18,7 +18,6 @@ use utilities::cluster::{
     verify_subscription_addresses_changed, wait_for_node_to_become_primary, wait_for_pubsub_state,
 };
 
-const LOG_PREFIX: &str = "test_pubsub";
 
 /// Delay between slot migrations to avoid overwhelming the cluster.
 const MIGRATION_DELAY: Duration = Duration::from_millis(0);
@@ -92,12 +91,9 @@ fn test_sharded_subscriptions_survive_slot_migrations(#[case] num_channels: usiz
             PubSubSubscriptionKind::Sharded,
         );
 
-        logger_core::log_debug(
-            LOG_PREFIX,
-            format!(
-                "Subscription address changes: {} changed, {} unchanged, {} not found",
-                changed, unchanged, not_found
-            ),
+        tracing::debug!(
+            "test_pubsub - Subscription address changes: {} changed, {} unchanged, {} not found",
+            changed, unchanged, not_found
         );
 
         assert_eq!(
@@ -180,12 +176,9 @@ fn test_exact_subscriptions_survive_slot_migrations(#[case] num_channels: usize)
             PubSubSubscriptionKind::Exact,
         );
 
-        logger_core::log_info(
-            LOG_PREFIX,
-            format!(
-                "Subscription address changes: {} changed, {} unchanged, {} not found",
-                changed, unchanged, not_found
-            ),
+        tracing::info!(
+            "test_pubsub - Subscription address changes: {} changed, {} unchanged, {} not found",
+            changed, unchanged, not_found
         );
 
         assert_eq!(
@@ -268,12 +261,9 @@ fn test_pattern_subscriptions_survive_slot_migrations(#[case] num_patterns: usiz
             PubSubSubscriptionKind::Pattern,
         );
 
-        logger_core::log_info(
-            LOG_PREFIX,
-            format!(
-                "Subscription address changes: {} changed, {} unchanged, {} not found",
-                changed, unchanged, not_found
-            ),
+        tracing::info!(
+            "test_pubsub - Subscription address changes: {} changed, {} unchanged, {} not found",
+            changed, unchanged, not_found
         );
 
         assert_eq!(
@@ -569,12 +559,9 @@ fn test_all_subscription_types_survive_failover() {
         );
         let replica = replicas[0];
 
-        logger_core::log_info(
-            LOG_PREFIX,
-            format!(
-                "Channels hash to slot {}. Primary {}:{} with replica {}:{}",
-                slot, primary.host, primary.port, replica.host, replica.port
-            ),
+        tracing::info!(
+            "test_pubsub - Channels hash to slot {}. Primary {}:{} with replica {}:{}",
+            slot, primary.host, primary.port, replica.host, replica.port
         );
 
         subscribe_and_wait(
@@ -671,9 +658,8 @@ fn test_all_subscription_types_survive_failover() {
         // if the old primary temporarily disappears from topology, they get
         // resubscribed on a new node. The key invariant is not_found == 0.
 
-        logger_core::log_info(
-            LOG_PREFIX,
-            "Test completed: all subscription types survived failover",
+        tracing::info!(
+            "test_pubsub - Test completed: all subscription types survived failover"
         );
     });
 }

@@ -1,7 +1,6 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use bytes::BytesMut;
-use logger_core::{log_info, log_warn};
 use once_cell::sync::Lazy;
 use sha1_smol::Sha1;
 use std::cell::Cell;
@@ -26,10 +25,7 @@ pub fn add_script(script: &[u8]) -> String {
     let mut hash = Sha1::new();
     hash.update(script);
     let hash = hash.digest().to_string();
-    log_info(
-        "script lifetime",
-        format!("Added script with hash: `{hash}`"),
-    );
+    tracing::info!("script lifetime - Added script with hash: `{hash}`");
 
     let mut container = CONTAINER.lock().expect(LOCK_ERR);
     let entry = container
@@ -40,10 +36,7 @@ pub fn add_script(script: &[u8]) -> String {
         });
     let new_count = entry.ref_count.get() + 1;
     entry.ref_count.set(new_count);
-    log_info(
-        "script_lifetime",
-        format!("Added script with hash: `{hash}`, ref_count = {new_count}"),
-    );
+    tracing::info!("script_lifetime - Added script with hash: `{hash}`, ref_count = {new_count}");
     hash
 }
 
@@ -63,21 +56,12 @@ pub fn remove_script(hash: &str) {
 
         if new_count == 0 {
             container.remove(hash);
-            log_info(
-                "script_lifetime",
-                format!("Removed script with hash `{hash}` (ref_count reached 0)."),
-            );
+            tracing::info!("script_lifetime - Removed script with hash `{hash}` (ref_count reached 0).");
         } else {
-            log_info(
-                "script_lifetime",
-                format!("Decremented ref_count for script `{hash}`: new ref_count = {new_count}."),
-            );
+            tracing::info!("script_lifetime - Decremented ref_count for script `{hash}`: new ref_count = {new_count}.");
         }
     } else {
-        log_warn(
-            "script_lifetime",
-            format!("Attempted to remove non-existent script with hash `{hash}`."),
-        );
+        tracing::warn!("script_lifetime - Attempted to remove non-existent script with hash `{hash}`.");
     }
 }
 

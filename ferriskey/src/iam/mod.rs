@@ -4,7 +4,6 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
-use logger_core::{log_debug, log_error, log_info, log_warn};
 use rand::Rng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,17 +68,12 @@ fn validate_refresh_interval(
 
             // Log warning if interval is above 15 minutes
             if interval >= WARNING_REFRESH_INTERVAL_SECONDS {
-                log_warn(
-                    "IAM token refresh interval warning",
-                    format!(
-                        "Refresh interval of {} seconds ({}min) exceeds recommended maximum of {} seconds ({}min). \
-                        This may increase the risk of token expiration. \
-                        Consider using a shorter interval for better reliability.",
-                        interval,
-                        interval / 60,
-                        WARNING_REFRESH_INTERVAL_SECONDS,
-                        WARNING_REFRESH_INTERVAL_SECONDS / 60
-                    ),
+                let interval_min = interval / 60;
+                let warning_min = WARNING_REFRESH_INTERVAL_SECONDS / 60;
+                tracing::warn!(
+                    "IAM token refresh interval warning - Refresh interval of {interval} seconds ({interval_min}min) exceeds recommended maximum of {WARNING_REFRESH_INTERVAL_SECONDS} seconds ({warning_min}min). \
+                    This may increase the risk of token expiration. \
+                    Consider using a shorter interval for better reliability."
                 );
             }
 
@@ -262,7 +256,7 @@ impl IAMTokenManager {
                     let _ = Self::handle_token_refresh(&iam_token_state, &cached_token, &token_created_at, &token_changed).await;
                 }
                 _ = shutdown_notify.notified() => {
-                    log_info("IAM token refresh task shutting down", "");
+                    tracing::info!("IAM token refresh task shutting down");
                     break;
                 }
             }
@@ -290,10 +284,7 @@ impl IAMTokenManager {
             }
             Err(err) => {
                 // Leave cached token unchanged; logs already emitted in backoff routine
-                log_error(
-                    "IAM token refresh failed",
-                    format!("Could not refresh token after backoff: {}", err),
-                );
+                tracing::error!("IAM token refresh failed - Could not refresh token after backoff: {err}");
                 Err(err)
             }
         }
@@ -317,13 +308,7 @@ impl IAMTokenManager {
                     attempt += 1;
 
                     if attempt >= TOKEN_GEN_MAX_ATTEMPTS {
-                        log_error(
-                            "IAM token generation failed",
-                            format!(
-                                "Exhausted {} attempts with exponential backoff. error: {}",
-                                TOKEN_GEN_MAX_ATTEMPTS, e
-                            ),
-                        );
+                        tracing::error!("IAM token generation failed - Exhausted {TOKEN_GEN_MAX_ATTEMPTS} attempts with exponential backoff. error: {e}");
                         return Err(e);
                     }
 
@@ -337,10 +322,7 @@ impl IAMTokenManager {
                         rng.random_range(min..=max)
                     };
 
-                    log_warn(
-                        "IAM token generation failed",
-                        format!(" {}. Retrying in {}ms", e, sleep_ms),
-                    );
+                    tracing::warn!("IAM token generation failed - {e}. Retrying in {sleep_ms}ms");
 
                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
 
@@ -484,7 +466,7 @@ impl IAMTokenManager {
 
         // Extract the token from the signed request URI
         let token = strip_scheme(req.uri().to_string());
-        log_debug("Generated new IAM token", "");
+        tracing::debug!("Generated new IAM token");
         Ok(token)
     }
 }
@@ -534,7 +516,7 @@ mod tests {
     fn initialize_test_environment() {
         INIT.call_once(|| {
             let _ = std::fs::remove_file(IAM_TOKENS_JSON);
-            log_info("Test setup", "Cleaned up old IAM token log file");
+            tracing::info!("Test setup - Cleaned up old IAM token log file");
         });
     }
 
@@ -643,10 +625,7 @@ mod tests {
         // Stop the refresh task
         manager.stop_refresh_task().await;
 
-        log_info(
-            "Test completed successfully!",
-            "Atomic flag working as expected",
-        );
+        tracing::info!("Test completed successfully! - Atomic flag working as expected");
     }
 
     #[tokio::test]
@@ -686,7 +665,7 @@ mod tests {
             "Flag should be true after manual refresh"
         );
 
-        log_info("Manual refresh test completed successfully!", "");
+        tracing::info!("Manual refresh test completed successfully!");
     }
 
     #[tokio::test]

@@ -264,19 +264,15 @@ mod standalone_client_tests {
                 StandaloneClient::create_client(connection_request, None, None, None)
                     .await
                     .unwrap();
-            logger_core::log_info(
-                "Test",
-                format!(
-                    "Closing {} servers after connection established",
-                    config.number_of_replicas_dropped_after_connection
-                ),
+            tracing::info!(
+                "Test - Closing {} servers after connection established",
+                config.number_of_replicas_dropped_after_connection
             );
             for server in servers.drain(1..config.number_of_replicas_dropped_after_connection + 1) {
                 server.close().await;
             }
-            logger_core::log_info(
-                "Test",
-                format!("sending {} messages", config.number_of_requests_sent),
+            tracing::info!(
+                "Test - sending {} messages", config.number_of_requests_sent
             );
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -569,11 +565,8 @@ mod standalone_client_tests {
 
             // 3. Get initial client count on the DEDICATED server.
             let clients_before_lazy_init = get_connected_clients(monitoring_client).await;
-            logger_core::log_info(
-                "TestStandaloneLazy",
-                format!(
-                    "Clients before lazy client init (protocol={protocol:?} on dedicated server): {clients_before_lazy_init}"
-                ),
+            tracing::info!(
+                "TestStandaloneLazy - Clients before lazy client init (protocol={protocol:?} on dedicated server): {clients_before_lazy_init}"
             );
 
             // 4. Configuration for the lazy client, targeting the SAME dedicated server.
@@ -600,11 +593,8 @@ mod standalone_client_tests {
             // 6. Assert that no new connection was made yet by the lazy client
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let clients_after_lazy_init = get_connected_clients(monitoring_client).await; // Pass &mut StandaloneClient
-            logger_core::log_info(
-                "TestStandaloneLazy",
-                format!(
-                    "Clients after lazy client init (protocol={protocol:?} on dedicated server): {clients_after_lazy_init}"
-                ),
+            tracing::info!(
+                "TestStandaloneLazy - Clients after lazy client init (protocol={protocol:?} on dedicated server): {clients_after_lazy_init}"
             );
             assert_eq!(
                 clients_after_lazy_init, clients_before_lazy_init,
@@ -612,21 +602,15 @@ mod standalone_client_tests {
             );
 
             // 7. Send the first command using the lazy client (which is a FerrisKeyClient)
-            logger_core::log_info(
-                "TestStandaloneLazy",
-                format!(
-                    "Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated server)"
-                ),
+            tracing::info!(
+                "TestStandaloneLazy - Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated server)"
             );
             assert_connected(&mut lazy_ferriskey_client_enum).await;
 
             // 8. Assert that a new connection was made by the lazy client on the dedicated server
             let clients_after_first_command = get_connected_clients(monitoring_client).await; // Pass &mut StandaloneClient
-            logger_core::log_info(
-                "TestStandaloneLazy",
-                format!(
-                    "Clients after first command (protocol={protocol:?} on dedicated server): {clients_after_first_command}"
-                ),
+            tracing::info!(
+                "TestStandaloneLazy - Clients after first command (protocol={protocol:?} on dedicated server): {clients_after_first_command}"
             );
             assert_eq!(
                 clients_after_first_command,

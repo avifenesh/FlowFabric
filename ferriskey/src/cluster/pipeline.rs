@@ -14,7 +14,6 @@ use crate::value::{ErrorKind, Error, Result, Value};
 use crate::value::{RetryMethod, make_extension_error};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
-use logger_core::log_error;
 use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -96,10 +95,7 @@ fn add_command_to_node_pipeline_map<C>(
     C: Clone,
 {
     if is_retrying && let Err(e) = FerrisKeyOtel::record_retry_attempt() {
-        log_error(
-            "OpenTelemetry:retry_error",
-            format!("Failed to record retry attempt: {e}"),
-        );
+        tracing::error!("OpenTelemetry:retry_error - Failed to record retry attempt: {e}");
     }
     if add_asking {
         let asking_cmd = Arc::new(crate::cmd::cmd("ASKING"));

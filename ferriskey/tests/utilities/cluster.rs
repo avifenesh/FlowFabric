@@ -546,9 +546,8 @@ impl PubSubTestSetup {
 macro_rules! skip_if_version_below {
     ($setup:expr, $version:expr) => {
         if !$setup.version_gte($version).await {
-            logger_core::log_info(
-                "test_pubsub",
-                format!("Skipping test: requires server version >= {}", $version),
+            tracing::info!(
+                "test_pubsub - Skipping test: requires server version >= {}", $version
             );
             return;
         }
@@ -706,18 +705,14 @@ pub async fn migrate_slot(
 
         match connection.route_command(&cmd, routing).await {
             Ok(_) => {
-                logger_core::log_debug(
-                    "migrate_slot",
-                    format!(
-                        "CLUSTER SETSLOT {} NODE {} on {}:{} succeeded",
-                        slot, to_node_id, host, port
-                    ),
+                tracing::debug!(
+                    "migrate_slot - CLUSTER SETSLOT {} NODE {} on {}:{} succeeded",
+                    slot, to_node_id, host, port
                 );
             }
             Err(e) => {
-                logger_core::log_warn(
-                    "migrate_slot",
-                    format!("CLUSTER SETSLOT on {}:{} failed: {:?}", host, port, e),
+                tracing::warn!(
+                    "migrate_slot - CLUSTER SETSLOT on {}:{} failed: {:?}", host, port, e
                 );
             }
         }
@@ -732,30 +727,23 @@ pub async fn migrate_channel_to_different_node(
     slot: u16,
 ) -> Option<String> {
     let Some(owner) = topology.find_slot_owner(slot) else {
-        logger_core::log_warn(
-            "migrate_channel",
-            format!("No owner found for slot {}", slot),
+        tracing::warn!(
+            "migrate_channel - No owner found for slot {}", slot
         );
         return None;
     };
 
     let Some(target) = topology.find_different_primary(&owner.node_id) else {
-        logger_core::log_warn(
-            "migrate_channel",
-            format!(
-                "No different primary found for slot {} (owner: {})",
-                slot, owner.node_id
-            ),
+        tracing::warn!(
+            "migrate_channel - No different primary found for slot {} (owner: {})",
+            slot, owner.node_id
         );
         return None;
     };
 
-    logger_core::log_info(
-        "migrate_channel",
-        format!(
-            "Migrating slot {} from {} to {}",
-            slot, owner.node_id, target.node_id
-        ),
+    tracing::info!(
+        "migrate_channel - Migrating slot {} from {} to {}",
+        slot, owner.node_id, target.node_id
     );
 
     migrate_slot(
@@ -783,19 +771,15 @@ pub async fn migrate_channels_to_different_nodes(
         match migrate_channel_to_different_node(connection, topology, *slot).await {
             Some(_) => {
                 migrated_count += 1;
-                logger_core::log_debug(
-                    "migrate_channels",
-                    format!(
-                        "Successfully migrated slot {} for channel {:?}",
-                        slot,
-                        String::from_utf8_lossy(channel)
-                    ),
+                tracing::debug!(
+                    "migrate_channels - Successfully migrated slot {} for channel {:?}",
+                    slot,
+                    String::from_utf8_lossy(channel)
                 );
             }
             None => {
-                logger_core::log_debug(
-                    "migrate_channels",
-                    format!("Skipped migration for slot {}", slot),
+                tracing::debug!(
+                    "migrate_channels - Skipped migration for slot {}", slot
                 );
             }
         }
@@ -823,22 +807,16 @@ pub async fn trigger_failover(
 
     match connection.route_command(&cmd, routing).await {
         Ok(_) => {
-            logger_core::log_info(
-                "trigger_failover",
-                format!(
-                    "CLUSTER FAILOVER initiated on {}:{}",
-                    replica.host, replica.port
-                ),
+            tracing::info!(
+                "trigger_failover - CLUSTER FAILOVER initiated on {}:{}",
+                replica.host, replica.port
             );
             true
         }
         Err(e) => {
-            logger_core::log_warn(
-                "trigger_failover",
-                format!(
-                    "CLUSTER FAILOVER on {}:{} failed: {:?}",
-                    replica.host, replica.port, e
-                ),
+            tracing::warn!(
+                "trigger_failover - CLUSTER FAILOVER on {}:{} failed: {:?}",
+                replica.host, replica.port, e
             );
             false
         }

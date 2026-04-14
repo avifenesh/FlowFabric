@@ -5,7 +5,6 @@ use crate::value::{
 };
 
 use bytes::{Buf, BytesMut};
-use logger_core::log_error;
 use num_bigint::BigInt;
 use telemetrylib::FerrisKeyOtel;
 
@@ -27,10 +26,7 @@ fn err_parser(line: &str) -> Error {
         "NOSCRIPT" => ErrorKind::NoScriptError,
         "MOVED" => {
             if let Err(e) = FerrisKeyOtel::record_moved_error() {
-                log_error(
-                    "OpenTelemetry:moved_error",
-                    format!("Failed to record moved error: {e}"),
-                );
+                tracing::error!("OpenTelemetry:moved_error - Failed to record moved error: {e}");
             }
             ErrorKind::Moved
         }

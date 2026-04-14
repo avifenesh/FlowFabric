@@ -50,7 +50,6 @@ socket2 = { version = "0.6", features = ["all"] }
 
 # Telemetry
 telemetrylib = { path = "./telemetry" }
-logger_core = { path = "../logger_core" }
 tracing = "0.1"
 
 # AWS IAM

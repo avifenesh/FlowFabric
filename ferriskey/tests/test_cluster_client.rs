@@ -317,9 +317,8 @@ mod cluster_client_tests {
         let routing_info = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
         let mut total_clients = 0;
 
-        logger_core::log_info(
-            "TestClusterLazyHelper",
-            "Querying CLIENT LIST on all shared cluster primaries via AllMasters routing.",
+        tracing::info!(
+            "TestClusterLazyHelper - Querying CLIENT LIST on all shared cluster primaries via AllMasters routing."
         );
 
         match client.send_command(&mut cmd, Some(routing_info)).await {
@@ -336,11 +335,8 @@ mod cluster_client_tests {
                             total_clients += text.lines().count();
                         }
                         _ => {
-                            logger_core::log_warn(
-                                "TestClusterLazyHelper",
-                                format!(
-                                    "CLIENT LIST from a primary (AllMasters) returned unexpected inner type for a node's result: {node_result_value:?}"
-                                ),
+                            tracing::warn!(
+                                "TestClusterLazyHelper - CLIENT LIST from a primary (AllMasters) returned unexpected inner type for a node's result: {node_result_value:?}"
                             );
                         }
                     }
@@ -348,24 +344,19 @@ mod cluster_client_tests {
             }
             Ok(other_type) => {
                 // Logging if returned type is not a map as we expect
-                logger_core::log_warn(
-                    "TestClusterLazyHelper",
-                    format!(
-                        "CLIENT LIST with AllMasters routing returned an unexpected type (expected Map): {other_type:?}"
-                    ),
+                tracing::warn!(
+                    "TestClusterLazyHelper - CLIENT LIST with AllMasters routing returned an unexpected type (expected Map): {other_type:?}"
                 );
             }
             Err(e) => {
-                logger_core::log_warn(
-                    "TestClusterLazyHelper",
-                    format!("CLIENT LIST with AllMasters routing failed: {e:?}"),
+                tracing::warn!(
+                    "TestClusterLazyHelper - CLIENT LIST with AllMasters routing failed: {e:?}"
                 );
             }
         }
 
-        logger_core::log_info(
-            "TestClusterLazyHelper",
-            format!("Total clients found on shared primaries (AllMasters): {total_clients}"),
+        tracing::info!(
+            "TestClusterLazyHelper - Total clients found on shared primaries (AllMasters): {total_clients}"
         );
         total_clients
     }
@@ -513,11 +504,8 @@ mod cluster_client_tests {
             // 3. Get initial client count on Cluster A.
             let clients_before_lazy_init =
                 get_total_clients_on_shared_cluster_primaries(&mut monitoring_client).await;
-            logger_core::log_info(
-                "TestClusterLazy",
-                format!(
-                    "Clients before lazy client init (protocol={protocol:?} on dedicated cluster A): {clients_before_lazy_init}"
-                ),
+            tracing::info!(
+                "TestClusterLazy - Clients before lazy client init (protocol={protocol:?} on dedicated cluster A): {clients_before_lazy_init}"
             );
 
             // 4. Manually create the ConnectionRequest for the lazy client,
@@ -541,11 +529,8 @@ mod cluster_client_tests {
             // 6. Assert that no new connections were made yet by the lazy client on Cluster A.
             let clients_after_lazy_init =
                 get_total_clients_on_shared_cluster_primaries(&mut monitoring_client).await;
-            logger_core::log_info(
-                "TestClusterLazy",
-                format!(
-                    "Clients after lazy client init (protocol={protocol:?} on dedicated cluster A): {clients_after_lazy_init}"
-                ),
+            tracing::info!(
+                "TestClusterLazy - Clients after lazy client init (protocol={protocol:?} on dedicated cluster A): {clients_after_lazy_init}"
             );
             assert_eq!(
                 clients_after_lazy_init, clients_before_lazy_init,
@@ -553,11 +538,8 @@ mod cluster_client_tests {
             );
 
             // 7. Send the first command using the lazy client to Cluster A.
-            logger_core::log_info(
-                "TestClusterLazy",
-                format!(
-                    "Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated cluster A)"
-                ),
+            tracing::info!(
+                "TestClusterLazy - Sending first command to lazy client (PING) (protocol={protocol:?} on dedicated cluster A)"
             );
             let ping_response = lazy_ferriskey_client
                 .send_command(&mut ferriskey::cmd("PING"), None)
@@ -576,11 +558,8 @@ mod cluster_client_tests {
             // 8. Assert that new connections were made on Cluster A by the lazy client.
             let clients_after_first_command =
                 get_total_clients_on_shared_cluster_primaries(&mut monitoring_client).await;
-            logger_core::log_info(
-                "TestClusterLazy",
-                format!(
-                    "Clients after first command (protocol={protocol:?} on dedicated cluster A): {clients_after_first_command}"
-                ),
+            tracing::info!(
+                "TestClusterLazy - Clients after first command (protocol={protocol:?} on dedicated cluster A): {clients_after_first_command}"
             );
             assert!(
                 clients_after_first_command > clients_before_lazy_init,

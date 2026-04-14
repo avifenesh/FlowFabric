@@ -60,13 +60,10 @@ fn read_from_socket(
 
 /// Escape and print a RESP message
 fn log_resp_message(msg: &str) {
-    logger_core::log_info(
-        "Test",
-        format!(
-            "{:?} {}",
-            std::thread::current().id(),
-            msg.replace('\r', "\\r").replace('\n', "\\n")
-        ),
+    tracing::info!(
+        "Test - {:?} {}",
+        std::thread::current().id(),
+        msg.replace('\r', "\\r").replace('\n', "\\n")
     );
 }
 
@@ -157,7 +154,7 @@ impl ServerMock {
         let closing_completed_signal_clone = closing_completed_signal.clone();
         let address_clone = address.clone();
         std::thread::spawn(move || {
-            logger_core::log_info("Test", format!("ServerMock started on: {address_clone}"));
+            tracing::info!("Test - ServerMock started on: {address_clone}");
             let mut socket: StdTcpStream = listener.accept().unwrap().0;
             let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(10)));
 
@@ -175,9 +172,8 @@ impl ServerMock {
             // Now notify exit completed
             closing_completed_signal_clone.set();
 
-            logger_core::log_info(
-                "Test",
-                format!("{:?} ServerMock exited", std::thread::current().id()),
+            tracing::info!(
+                "Test - {:?} ServerMock exited", std::thread::current().id()
             );
         });
 

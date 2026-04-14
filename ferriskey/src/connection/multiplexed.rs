@@ -22,7 +22,6 @@ use futures_util::{
     sink::Sink,
     stream::{self, Stream, StreamExt, TryStreamExt as _},
 };
-use logger_core::log_error;
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::fmt;
@@ -334,11 +333,7 @@ where
             // Set the flag - all future commands will fail
             *response_sync_lost = true;
 
-            log_error(
-                "Fenced command",
-                "CRITICAL: Expected PONG for fenced command but got unexpected response.
-                Response synchronization lost. All commands will fail until reconnection.",
-            );
+            tracing::error!("Fenced command - CRITICAL: Expected PONG for fenced command but got unexpected response. Response synchronization lost. All commands will fail until reconnection.");
 
             // Fail the current command
             let err = Error::from((

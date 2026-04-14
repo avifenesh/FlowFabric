@@ -17,7 +17,6 @@ use crate::connection::info::{
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 use crate::value::{ErrorKind, Error, Result, Value};
 use async_trait::async_trait;
-use logger_core::{log_debug, log_error};
 use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -247,7 +246,7 @@ impl EventDrivenSynchronizer {
                         }
                         for evt in deferred { let _ = sync.events_tx.send(evt); }
                         if let Err(e) = sync.reconcile().await {
-                            log_error("pubsub_sync", format!("Reconcile failed: {e:?}"));
+                            tracing::error!("pubsub_sync - Reconcile failed: {e:?}");
                         }
                     }
                     SyncEvent::TopologyChanged { migrations, gone_subs } => {
@@ -388,7 +387,7 @@ impl EventDrivenSynchronizer {
 
         // Step 2: Resubscribe to new owners via reconcile
         if let Err(e) = self.reconcile().await {
-            log_error("pubsub_sync", format!("Post-topology reconcile failed: {e:?}"));
+            tracing::error!("pubsub_sync - Post-topology reconcile failed: {e:?}");
         }
 
         // No explicit retry needed — periodic topology refreshes call handle_topology_refresh,
@@ -399,16 +398,13 @@ impl EventDrivenSynchronizer {
         if addresses.is_empty() {
             return;
         }
-        log_debug(
-            "pubsub_sync",
-            format!("Clearing confirmations for disconnected: {addresses:?}"),
-        );
+        tracing::debug!("pubsub_sync - Clearing confirmations for disconnected: {addresses:?}");
         {
             let mut confirmed = self.confirmed.write().unwrap_or_else(|e| e.into_inner());
             confirmed.clear_addresses(addresses);
         }
         if let Err(e) = self.reconcile().await {
-            log_error("pubsub_sync", format!("Post-disconnect reconcile failed: {e:?}"));
+            tracing::error!("pubsub_sync - Post-disconnect reconcile failed: {e:?}");
         }
     }
 
@@ -444,10 +440,7 @@ impl EventDrivenSynchronizer {
             Ok(_) => {}
             Err(e) => {
                 let action = if is_subscribe { "subscribe" } else { "unsubscribe" };
-                log_error(
-                    "pubsub_sync",
-                    format!("Failed to {action} {kind:?}: {e:?}"),
-                );
+                tracing::error!("pubsub_sync - Failed to {action} {kind:?}: {e:?}");
             }
         }
     }
@@ -856,13 +849,12 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
             gone_subs = gone;
         }
 
-        log_debug(
-            "pubsub_sync",
-            format!(
-                "handle_topology_refresh: confirmed_addrs={:?}, new_addrs count={}, migrations={}, gone={}",
-                confirmed_keys, new_addresses.len(), migrations.len(), gone_subs.len()
-            ),
-        );
+        {
+            let new_addrs_count = new_addresses.len();
+            let migrations_count = migrations.len();
+            let gone_count = gone_subs.len();
+            tracing::debug!("pubsub_sync - handle_topology_refresh: confirmed_addrs={confirmed_keys:?}, new_addrs count={new_addrs_count}, migrations={migrations_count}, gone={gone_count}");
+        }
 
         // Even if no migrations/gone, check if desired != confirmed and nudge reconcile.
         // This makes every topology refresh a self-healing opportunity: if a prior

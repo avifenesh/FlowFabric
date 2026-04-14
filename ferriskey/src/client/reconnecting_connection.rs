@@ -9,7 +9,6 @@ use crate::retry_strategies::RetryStrategy;
 use crate::value::{Error, Result};
 use async_trait::async_trait;
 use futures_intrusive::sync::ManualResetEvent;
-use logger_core::{log_debug, log_error, log_trace, log_warn};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -68,10 +67,7 @@ impl IAMTokenHandle {
         };
 
         if is_expired {
-            logger_core::log_info(
-                "IAM reconnect",
-                "Token expired, generating a fresh token before reconnection",
-            );
+            tracing::info!("IAM reconnect - Token expired, generating a fresh token before reconnection");
             match crate::iam::IAMTokenManager::generate_token_with_backoff(&self.iam_token_state)
                 .await
             {
@@ -87,10 +83,7 @@ impl IAMTokenHandle {
                     return Some(new_token);
                 }
                 Err(err) => {
-                    logger_core::log_error(
-                        "IAM reconnect",
-                        format!("Failed to generate fresh IAM token, using cached token: {err}"),
-                    );
+                    tracing::error!("IAM reconnect - Failed to generate fresh IAM token, using cached token: {err}");
                     // Fall through to return the cached (possibly expired) token
                 }
             }
@@ -256,16 +249,11 @@ async fn create_connection(
 
     match result {
         Ok(Ok(connection)) => {
-            log_debug(
-                "connection creation",
-                format!(
-                    "Connection to {} created",
-                    connection_backend
-                        .get_backend_client()
-                        .get_connection_info()
-                        .addr
-                ),
-            );
+            {
+                let client = connection_backend.get_backend_client();
+                let addr = &client.get_connection_info().addr;
+                tracing::debug!("connection creation - Connection to {addr} created");
+            }
             Telemetry::incr_total_connections(1);
             Ok(ReconnectingConnection {
                 inner: Arc::new(InnerReconnectingConnection {
@@ -280,16 +268,11 @@ async fn create_connection(
                 Ok(Err(e)) => e,
                 _ => std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
             };
-            log_warn(
-                "connection creation",
-                format!(
-                    "Failed connecting to {}, due to {err}",
-                    connection_backend
-                        .get_backend_client()
-                        .get_connection_info()
-                        .addr
-                ),
-            );
+            {
+                let client = connection_backend.get_backend_client();
+                let addr = &client.get_connection_info().addr;
+                tracing::warn!("connection creation - Failed connecting to {addr}, due to {err}");
+            }
             let connection = ReconnectingConnection {
                 inner: Arc::new(InnerReconnectingConnection {
                     state: Mutex::new(ConnectionState::InitializedDisconnected),
@@ -339,10 +322,7 @@ impl ReconnectingConnection {
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
         iam_token_handle: Option<IAMTokenHandle>,
     ) -> std::result::Result<ReconnectingConnection, (ReconnectingConnection, Error)> {
-        log_debug(
-            "connection creation",
-            format!("Attempting connection to {address}"),
-        );
+        tracing::debug!("connection creation - Attempting connection to {address}");
 
         let connection_info = get_client(address, tls_mode, valkey_connection_info, tls_params);
         let backend = ConnectionBackend {
@@ -414,14 +394,14 @@ impl ReconnectingConnection {
         {
             let mut guard = self.inner.state.lock().unwrap();
             if matches!(*guard, ConnectionState::Reconnecting) {
-                log_trace("reconnect", "already started");
+                tracing::trace!("reconnect - already started");
                 // exit early - if reconnection already started or failed, there's nothing else to do.
                 return;
             }
             self.inner.backend.connection_available_signal.reset();
             *guard = ConnectionState::Reconnecting;
         };
-        log_debug("reconnect", "starting");
+        tracing::debug!("reconnect - starting");
 
         let connection_clone = self.clone();
 
@@ -456,10 +436,7 @@ impl ReconnectingConnection {
             let infinite_backoff_dur_iterator = retry_strategy.get_infinite_backoff_dur_iterator();
             for sleep_duration in infinite_backoff_dur_iterator {
                 if connection_clone.is_dropped() {
-                    log_debug(
-                        "ReconnectingConnection",
-                        "reconnect stopped after client was dropped",
-                    );
+                    tracing::debug!("ReconnectingConnection - reconnect stopped after client was dropped");
                     // Client was dropped, reconnection attempts can stop
                     return;
                 }
@@ -477,10 +454,7 @@ impl ReconnectingConnection {
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
                     client.update_password(Some(valid_token));
-                    log_debug(
-                        "reconnect",
-                        "Updated connection password with valid IAM token before reconnection attempt",
-                    );
+                    tracing::debug!("reconnect - Updated connection password with valid IAM token before reconnection attempt");
                 }
 
                 let client = if let Some(ref c) = static_client {
@@ -505,7 +479,7 @@ impl ReconnectingConnection {
                         }
                         {
                             let mut guard = connection_clone.inner.state.lock().unwrap();
-                            log_debug("reconnect", "completed successfully");
+                            tracing::debug!("reconnect - completed successfully");
                             connection_clone
                                 .inner
                                 .backend
@@ -537,7 +511,7 @@ impl ReconnectingConnection {
                 .wait_for_disconnect_with_timeout(max_wait)
                 .await;
         } else {
-            log_error("disconnect notifier", "BUG! Disconnect notifier is not set");
+            tracing::error!("disconnect notifier - BUG! Disconnect notifier is not set");
             tokio::time::sleep(super::CONNECTION_CHECKS_INTERVAL).await;
         }
     }

@@ -83,7 +83,6 @@ use futures::{
     ready,
     stream::{FuturesUnordered, StreamExt},
 };
-use logger_core::log_error;
 use parking_lot::RwLock as ParkingLotRwLock;
 use pin_project_lite::pin_project;
 use rand::seq::IteratorRandom;
@@ -1412,10 +1411,7 @@ impl<C> Future for Request<C> {
                 request.retry = request.retry.saturating_add(1);
                 // Record retry attempts metric if telemetry is initialized
                 if let Err(e) = FerrisKeyOtel::record_retry_attempt() {
-                    log_error(
-                        "OpenTelemetry:retry_error",
-                        format!("Failed to record retry attempt: {e}"),
-                    );
+                    tracing::error!("OpenTelemetry:retry_error - Failed to record retry attempt: {e}");
                 }
 
                 if err.kind() == ErrorKind::AllConnectionsUnavailable {

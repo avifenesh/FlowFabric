@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::request_type::RequestType;
-use logger_core::log_warn;
 use telemetrylib::Telemetry;
 
 /// Detailed compression error with context for debugging
@@ -355,7 +354,7 @@ impl CompressionManager {
                 }
             }
             Err(err) => {
-                log_warn("compression", format!("Compression failed: {err:?}"));
+                tracing::warn!("compression - Compression failed: {err:?}");
                 Telemetry::incr_compression_skipped_count(1);
                 Cow::Borrowed(value)
             }
@@ -419,10 +418,7 @@ impl CompressionManager {
     /// by the caller.
     pub fn try_decompress_value(&self, value: &[u8]) -> Vec<u8> {
         self.decompress_value(value).unwrap_or_else(|err| {
-            log_warn(
-                "compression",
-                format!("Decompression failed, returning raw bytes as fallback: {err:?}"),
-            );
+            tracing::warn!("compression - Decompression failed, returning raw bytes as fallback: {err:?}");
             value.to_vec()
         })
     }

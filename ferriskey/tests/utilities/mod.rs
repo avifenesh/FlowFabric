@@ -849,7 +849,10 @@ pub async fn setup_test_basics(use_tls: bool) -> TestBasics {
 #[cfg(test)]
 #[ctor::ctor]
 fn init() {
-    logger_core::init(Some(logger_core::Level::Debug), None);
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
 
     // This needs to be done before any TLS connections are made
     let _ = rustls::crypto::CryptoProvider::install_default(

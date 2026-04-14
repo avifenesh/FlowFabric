@@ -5,3 +5,4 @@ ferriskey/benchmarks/
 ferriskey/flamegraph.svg
 *.perf.data
 perf.data
+.remember/

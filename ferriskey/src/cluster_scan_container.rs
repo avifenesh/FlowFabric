@@ -2,7 +2,6 @@
 
 use crate::cluster::scan::ScanStateRC;
 use crate::value::Result;
-use logger_core::log_debug;
 use nanoid::nanoid;
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, sync::Mutex};
@@ -21,19 +20,13 @@ static CONTAINER: Lazy<Mutex<HashMap<String, ScanStateRC>>> =
 pub fn insert_cluster_scan_cursor(scan_state: ScanStateRC) -> String {
     let id = nanoid!();
     CONTAINER.lock().unwrap().insert(id.clone(), scan_state);
-    log_debug(
-        "scan_state_cursor insert",
-        format!("Inserted to container scan_state_cursor with id: `{id:?}`"),
-    );
+    tracing::debug!("scan_state_cursor insert - Inserted to container scan_state_cursor with id: `{id:?}`");
     id
 }
 
 pub fn get_cluster_scan_cursor(id: String) -> Result<ScanStateRC> {
     let scan_state_rc = CONTAINER.lock().unwrap().get(&id).cloned();
-    log_debug(
-        "scan_state_cursor get",
-        format!("Retrieved from container scan_state_cursor with id: `{id:?}`"),
-    );
+    tracing::debug!("scan_state_cursor get - Retrieved from container scan_state_cursor with id: `{id:?}`");
     match scan_state_rc {
         Some(scan_state_rc) => Ok(scan_state_rc),
         None => Err(crate::value::Error::from((
@@ -45,9 +38,6 @@ pub fn get_cluster_scan_cursor(id: String) -> Result<ScanStateRC> {
 }
 
 pub fn remove_scan_state_cursor(id: String) {
-    log_debug(
-        "scan_state_cursor remove",
-        format!("Removed from container scan_state_cursor with id: `{id:?}`"),
-    );
+    tracing::debug!("scan_state_cursor remove - Removed from container scan_state_cursor with id: `{id:?}`");
     CONTAINER.lock().unwrap().remove(&id);
 }

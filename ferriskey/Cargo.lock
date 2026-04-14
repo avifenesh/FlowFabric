@@ -1087,7 +1087,6 @@ dependencies = [
  "itoa",
  "lazy_static",
  "libc",
- "logger_core",
  "lz4",
  "mimalloc",
  "nanoid",
@@ -1128,16 +1127,6 @@ dependencies = [
  "versions",
  "which",
  "zstd",
-]
-
-[[package]]
-name = "file-rotate"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a3ed82142801f5b1363f7d463963d114db80f467e860b1cd82228eaebc627a0"
-dependencies = [
- "chrono",
- "flate2",
 ]
 
 [[package]]
@@ -1960,17 +1949,6 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
-
-[[package]]
-name = "logger_core"
-version = "0.1.0"
-dependencies = [
- "file-rotate",
- "once_cell",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "lz4"
@@ -3144,7 +3122,6 @@ dependencies = [
  "chrono",
  "futures-util",
  "lazy_static",
- "logger_core",
  "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -3153,6 +3130,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -3225,7 +3203,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
- "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -3475,18 +3452,6 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-appender"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
-dependencies = [
- "crossbeam-channel",
- "thiserror 2.0.18",
- "time",
- "tracing-subscriber",
 ]
 
 [[package]]

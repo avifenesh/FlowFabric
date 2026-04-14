@@ -1,5 +1,4 @@
 use crate::Telemetry;
-use logger_core::log_warn;
 use once_cell::sync::OnceCell;
 use opentelemetry::global::ObjectSafeSpan;
 use opentelemetry::trace::{
@@ -630,20 +629,14 @@ impl FerrisKeyOtel {
     pub unsafe fn is_span_pointer_valid(span_ptr: u64) -> bool {
         // Check for null pointer
         if span_ptr == 0 {
-            logger_core::log_warn("OpenTelemetry", "Invalid span pointer - null pointer (0)");
+            tracing::warn!("OpenTelemetry - Invalid span pointer - null pointer (0)");
             return false;
         }
 
         // Check for obviously invalid pointer values
         // Pointers should be aligned to at least 8 bytes on 64-bit systems
         if !span_ptr.is_multiple_of(8) {
-            logger_core::log_warn(
-                "OpenTelemetry",
-                format!(
-                    "Invalid span pointer - misaligned pointer: 0x{:x}",
-                    span_ptr
-                ),
-            );
+            tracing::warn!("OpenTelemetry - Invalid span pointer - misaligned pointer: 0x{span_ptr:x}");
             return false;
         }
 
@@ -651,10 +644,7 @@ impl FerrisKeyOtel {
         // Valid heap addresses are typically much higher than this
         const MIN_VALID_ADDRESS: u64 = 0x1000; // 4KB, below this is likely invalid
         if span_ptr < MIN_VALID_ADDRESS {
-            logger_core::log_warn(
-                "OpenTelemetry",
-                format!("Invalid span pointer - address too low: 0x{:x}", span_ptr),
-            );
+            tracing::warn!("OpenTelemetry - Invalid span pointer - address too low: 0x{span_ptr:x}");
             return false;
         }
 
@@ -663,10 +653,7 @@ impl FerrisKeyOtel {
         // On most 64-bit systems, user space is limited to the lower half of the address space
         const MAX_VALID_ADDRESS: u64 = 0x7FFF_FFFF_FFFF_FFF8; // Max user space on most 64-bit systems
         if span_ptr > MAX_VALID_ADDRESS {
-            logger_core::log_warn(
-                "OpenTelemetry",
-                format!("Invalid span pointer - address too high: 0x{:x}", span_ptr),
-            );
+            tracing::warn!("OpenTelemetry - Invalid span pointer - address too high: 0x{span_ptr:x}");
             return false;
         }
 
@@ -801,12 +788,7 @@ impl FerrisKeyOtel {
             OtelSignalsExporter::Grpc(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::Grpc);
                 if protocol != Protocol::Grpc {
-                    log_warn(
-                        "opentelemetry",
-                        format!(
-                            "Inconsistent configuration: The endpoint URL '{url}' suggests gRPC, but the protocol is set to '{protocol:?}' via environment variables. The environment variable setting will be used."
-                        ),
-                    );
+                    tracing::warn!("opentelemetry - Inconsistent configuration: The endpoint URL '{url}' suggests gRPC, but the protocol is set to '{protocol:?}' via environment variables. The environment variable setting will be used.");
                 }
                 match protocol {
                     Protocol::Grpc => {
@@ -874,12 +856,7 @@ impl FerrisKeyOtel {
             OtelSignalsExporter::Grpc(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::Grpc);
                 if protocol != Protocol::Grpc {
-                    log_warn(
-                        "opentelemetry",
-                        format!(
-                            "Inconsistent configuration: The endpoint URL '{url}' suggests gRPC, but the protocol is set to '{protocol:?}' via environment variables. The environment variable setting will be used."
-                        ),
-                    );
+                    tracing::warn!("opentelemetry - Inconsistent configuration: The endpoint URL '{url}' suggests gRPC, but the protocol is set to '{protocol:?}' via environment variables. The environment variable setting will be used.");
                 }
                 let exporter = match protocol {
                     Protocol::Grpc => MetricExporter::builder()
