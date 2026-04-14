@@ -9,7 +9,7 @@
 
 ## Summary
 
-This RFC defines three **separate user-facing resource-control policy families**: budget (consumable allowance), quota (admission caps per window), and rate-limit (pacing and throughput shaping). They may share enforcement machinery internally but remain distinct in the public model because they govern different resources, trigger different breach behaviors, and require different configuration surfaces. This RFC covers the budget object, extensible dimensions, attachment model, usage reporting, enforcement timing and actions, the quota/rate-limit policy object, concurrency caps, and the Valkey data model with atomic usage-increment + breach-check Lua scripts.
+This RFC defines three **separate user-facing resource-control policy families**: budget (consumable allowance), quota (admission caps per window), and rate-limit (pacing and throughput shaping). They may share enforcement machinery internally but remain distinct in the public model because they govern different resources, trigger different breach behaviors, and require different configuration surfaces. This RFC covers the budget object, extensible dimensions, attachment model, usage reporting, enforcement timing and actions, the quota/rate-limit policy object, concurrency caps, and the Valkey data model with atomic usage-increment + breach-check Valkey Functions.
 
 ## Motivation
 
@@ -85,7 +85,7 @@ The `ResetPolicy`:
 |---|---|---|---|
 | `on_hard_limit` | `EnforcementAction` enum | Yes | What happens when a hard limit is breached. |
 | `on_soft_limit` | `EnforcementAction` enum | No | What happens when a soft limit is breached. Default: `warn`. |
-| `enforcement_mode` | `EnforcementMode` enum | Yes | `strict` (reject/act immediately), `advisory` (log only, no blocking). **Consumed by the engine's enforcement dispatch layer (outside Lua), not by the Lua script.** `report_usage_and_check.lua` always returns breach status; the enforcement dispatcher reads `enforcement_mode` to decide whether to call `fail_execution` (strict) or just log (advisory). |
+| `enforcement_mode` | `EnforcementMode` enum | Yes | `strict` (reject/act immediately), `advisory` (log only, no blocking). **Consumed by the engine's enforcement dispatch layer, not by the function itself.** `ff_report_usage_and_check` always returns breach status; the enforcement dispatcher reads `enforcement_mode` to decide whether to call `fail_execution` (strict) or just log (advisory). |
 | `escalation_target` | `String` | No | Operator or system to notify on breach (e.g., PagerDuty route, operator group). **Consumed by the notification layer** — v1 logs a warning with the target identifier, future versions may integrate with PagerDuty/Slack/webhooks. |
 
 #### 1.2 Budget Dimensions
@@ -125,7 +125,7 @@ Every budget has an explicit `scope_type` and `scope_id`. There are no implicit 
 
 If the engine claims to enforce a budget (enforcement_mode = strict), the usage increment and limit check must be atomic enough to avoid obvious overshoot races. A worker must not report 10K tokens and then have a second worker report another 10K before the first breach check runs.
 
-**Rationale:** Non-atomic check-then-increment allows two concurrent workers to each pass a 50% budget check and collectively exceed 100%. The Lua script must HINCRBY + compare in one atomic operation.
+**Rationale:** Non-atomic check-then-increment allows two concurrent workers to each pass a 50% budget check and collectively exceed 100%. The function must HINCRBY + compare in one atomic operation.
 
 ##### Invariant B3 — Breach policy is explicit
 
@@ -198,12 +198,12 @@ Usage is reported through explicit increment operations. The engine does NOT inf
 | Counter | Location | Updated How | Authoritative For |
 |---|---|---|---|
 | Attempt usage | `ff:attempt:{p:N}:{eid}:{idx}:usage` | HINCRBY in Lua on `{p:N}` — ALL dimensions including custom | Per-attempt attribution (which run consumed what). |
-| Execution usage | `ff:exec:{p:N}:{eid}:core` (total_input_tokens, etc.) | HINCRBY in same Lua script on `{p:N}` — **built-in dimensions only** | Execution-level inspection (fast read, no scan of attempt hashes). |
+| Execution usage | `ff:exec:{p:N}:{eid}:core` (total_input_tokens, etc.) | HINCRBY in same function on `{p:N}` — **built-in dimensions only** | Execution-level inspection (fast read, no scan of attempt hashes). |
 | Budget usage | `ff:budget:{b:M}:{bid}:usage` | HINCRBY in separate Lua on `{b:M}` — ALL dimensions including custom | Budget enforcement (breach checks). |
 
-**Built-in dimensions for exec core HINCRBY** (hardcoded in the Lua script): `total_input_tokens`, `total_output_tokens`, `total_thinking_tokens`, `total_cost_micros`, `total_latency_ms`. Custom dimensions (e.g., `custom:effort_units`) are tracked on the attempt usage hash and budget usage hash but NOT on the execution core hash. This prevents unbounded custom fields from polluting the core hash.
+**Built-in dimensions for exec core HINCRBY** (hardcoded in the `ff_report_usage_on_attempt` function): `total_input_tokens`, `total_output_tokens`, `total_thinking_tokens`, `total_cost_micros`, `total_latency_ms`. Custom dimensions (e.g., `custom:effort_units`) are tracked on the attempt usage hash and budget usage hash but NOT on the execution core hash. This prevents unbounded custom fields from polluting the core hash.
 
-Attempt and execution counters are updated atomically in one Lua script (same `{p:N}` partition). Budget counters are updated in a separate call to `{b:M}`. At any point in time, attempt and execution counters agree with each other for built-in dimensions, but budget counters may lag by one concurrent `report_usage` call. This is the documented cross-partition consistency model from RFC-010 §3.3.
+Attempt and execution counters are updated atomically in one function call (same `{p:N}` partition). Budget counters are updated in a separate `FCALL` to `{b:M}`. At any point in time, attempt and execution counters agree with each other for built-in dimensions, but budget counters may lag by one concurrent `report_usage` call. This is the documented cross-partition consistency model from RFC-010 §3.3.
 
 #### 1.7 Enforcement Timing
 
@@ -220,7 +220,7 @@ Budget checks happen at several distinct points in the execution lifecycle:
 **Enforcement strictness depends on scope colocation:**
 
 For **execution-scoped** budgets (colocated on the same `{p:N}` partition as the execution):
-- All enforcement points are **strict** (Class A atomic). The budget usage hash shares the partition with the execution core, so HINCRBY + limit check + execution state update can run in one Lua script.
+- All enforcement points are **strict** (Class A atomic). The budget usage hash shares the partition with the execution core, so HINCRBY + limit check + execution state update can run in one function call.
 
 For **cross-partition** budgets (flow-scoped on `{b:M}`, lane-scoped, tenant-scoped):
 - Enforcement is **best-effort-consistent**, not atomic with claim or spawn. The caller increments the budget on the budget's `{b:M}` partition in a separate Lua call. Between the budget check and the execution state transition, another concurrent request may also pass. Overshoot by one concurrent request is accepted.
@@ -328,7 +328,7 @@ Budget and quota blocks map to RFC-001's `blocking_reason` enum. Fine-grained ca
 | `waiting_for_quota` | Token rate limit hit. | `"quota quota-xyz: tokens_per_minute 95K/100K, resets in 8s"` | `rate_limited` |
 | `waiting_for_quota` | Concurrency cap reached. | `"quota quota-xyz: active_concurrency 50/50"` | `rate_limited` |
 
-**V1 soft limits:** `on_soft_limit` defaults to `warn`. The Lua script returns `SOFT_BREACH` to the caller, which logs a warning and emits a metric. No execution state change occurs — the execution continues running. No `blocking_reason` is set. Graduated soft-limit enforcement (block, suspend, reroute on soft breach) is deferred to post-v1.
+**V1 soft limits:** `on_soft_limit` defaults to `warn`. The `ff_report_usage_and_check` function returns `SOFT_BREACH` to the caller, which logs a warning and emits a metric. No execution state change occurs — the execution continues running. No `blocking_reason` is set. Graduated soft-limit enforcement (block, suspend, reroute on soft breach) is deferred to post-v1.
 
 When budget enforcement action is `suspend` (post-v1), the execution transitions to `suspended` with `blocking_reason = paused_by_budget` (an existing RFC-001 blocking_reason value used when lifecycle_phase = suspended).
 
@@ -378,7 +378,7 @@ Budget and quota keys use `{p:N}` partition tags where possible. However, budget
 Budget partition: {b:M} where M = crc16(budget_id) % partition_count
 ```
 
-For execution-scoped budgets that share a partition with the execution, the budget key uses the execution's `{p:N}` tag for colocated atomic scripts.
+For execution-scoped budgets that share a partition with the execution, the budget key uses the execution's `{p:N}` tag for colocated atomic function calls.
 
 #### 4.2 Budget Key Schema
 
@@ -476,7 +476,7 @@ ff:quota:{q:K}:{quota_policy_id}:concurrency  →  STRING
   value: current active count
 ```
 
-Incremented on lease acquire, decremented on lease release/expire. Must be decremented in the same Lua scripts that handle lease release (RFC-003).
+Incremented on lease acquire, decremented on lease release/expire. Must be decremented by the caller after the lease-release function returns (async cross-partition DECR, see RFC-003).
 
 **Quota attachment index:**
 ```
@@ -484,9 +484,9 @@ ff:quota_attach:{q:K}:{scope_type}:{scope_id}  →  SET
   member: quota_policy_id
 ```
 
-#### 4.4 Atomic Usage Report + Breach Check (Lua Script)
+#### 4.4 Atomic Usage Report + Breach Check (Valkey Function)
 
-`report_usage_and_check.lua` — **check-before-increment**: reads current usage, checks limits, only HINRBYs if under limit. Since this runs as a Lua script on one `{b:M}` partition, the read-check-write sequence is **atomic** — concurrent calls are serialized by Valkey. This eliminates budget overshoot entirely (previously, HINCRBY-before-check allowed N concurrent workers to overshoot by N×delta).
+`ff_report_usage_and_check` — registered in the `flowfabric` library. **Check-before-increment**: reads current usage, checks limits, only HINRBYs if under limit. Since this runs as a Valkey Function on one `{b:M}` partition, the read-check-write sequence is **atomic** — concurrent calls are serialized by Valkey. This eliminates budget overshoot entirely. Invoked via `FCALL ff_report_usage_and_check <numkeys> <keys...> <args...>`. Returns domain-specific status (`HARD_BREACH`, `SOFT_BREACH`, `OK`) — see RFC-010 §4.9 for mapping to API error names.
 
 ```lua
 -- KEYS (on budget partition {b:M}):
@@ -556,13 +556,13 @@ end
 return { "OK" }
 ```
 
-**Zero-overshoot guarantee:** Because this is a Lua script, the read-check-write sequence is atomic on the `{b:M}` partition. Concurrent `report_usage` calls are serialized by Valkey. If two workers race and one would push the budget over the limit, the first to execute wins (increments), the second finds the budget already at or above the limit and gets HARD_BREACH (no increment). Budget usage never exceeds the hard limit by more than one Lua-script-width of concurrency — which is zero, because Lua scripts block the shard.
+**Zero-overshoot guarantee:** Because this is a Valkey Function, the read-check-write sequence is atomic on the `{b:M}` partition. Concurrent `report_usage` calls are serialized by Valkey. If two workers race and one would push the budget over the limit, the first to execute wins (increments), the second finds the budget already at or above the limit and gets HARD_BREACH (no increment). Budget usage never exceeds the hard limit — Valkey Functions block the shard during execution.
 
-**Important:** For execution-scoped budgets colocated on `{p:N}`, this script can run within the same partition as the attempt usage update. For cross-partition budgets (flow, lane, tenant), the caller makes a separate Lua call to the budget's `{b:M}` partition. The attempt-level usage update (RFC-002) and the budget update are NOT in one atomic script for cross-partition budgets. However, the budget counter itself is now strictly accurate — the only inconsistency is that attempt-level usage may record tokens that the budget rejected. The budget reconciler (§6.5) handles this safely because it corrects upward only.
+**Important:** For execution-scoped budgets colocated on `{p:N}`, this function can run within the same partition as the attempt usage update. For cross-partition budgets (flow, lane, tenant), the caller makes a separate `FCALL` to the budget's `{b:M}` partition. The attempt-level usage update (RFC-002) and the budget update are NOT in one atomic script for cross-partition budgets. However, the budget counter itself is now strictly accurate — the only inconsistency is that attempt-level usage may record tokens that the budget rejected. The budget reconciler (§6.5) handles this safely because it corrects upward only.
 
-#### 4.5 Atomic Admission Check (Lua Script)
+#### 4.5 Atomic Admission Check (Valkey Function)
 
-`check_admission_and_record.lua` — sliding-window rate check + concurrency check:
+`ff_check_admission_and_record` — registered in the `flowfabric` library. Sliding-window rate check + concurrency check. Invoked via `FCALL ff_check_admission_and_record <numkeys> <keys...> <args...>`. Returns `ADMITTED`, `RATE_EXCEEDED`, or `CONCURRENCY_EXCEEDED`.
 
 ```lua
 -- KEYS (on quota partition {q:K}):
@@ -628,7 +628,7 @@ end
 return { "ADMITTED" }
 ```
 
-**Concurrency decrement:** When a lease is released (RFC-003 complete/fail/suspend/expire), the concurrency counter must be decremented. This decrement is **asynchronous and cross-partition** — the lease-release Lua script (on `{p:N}`) cannot atomically DECR a counter on `{q:K}`. Instead, the control plane issues a separate DECR to the quota partition after the lease-release script completes.
+**Concurrency decrement:** When a lease is released (RFC-003 complete/fail/suspend/expire), the concurrency counter must be decremented. This decrement is **asynchronous and cross-partition** — the lease-release function (on `{p:N}`) cannot atomically DECR a counter on `{q:K}`. Instead, the control plane issues a separate DECR to the quota partition after the lease-release script completes.
 
 Because the decrement is async, the counter may temporarily overcount (showing more active executions than actually exist). A **concurrency reconciler** runs periodically to correct drift: it counts actual active leases for the scope and resets the counter if it diverges. This is the same pattern as RFC-009's grant expiry reconciler — a safety net for cross-partition eventual consistency.
 

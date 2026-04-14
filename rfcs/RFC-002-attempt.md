@@ -522,7 +522,7 @@ Transitions an attempt from `started` to `suspended` when the execution intentio
 - Records `suspended_at` timestamp on the attempt hash.
 - Records `suspension_id` on the attempt hash for correlation.
 - Does NOT set `ended_at` (the attempt is not terminal).
-- **Atomicity class: A** (must be atomic with execution state transition, lease release, and suspension record creation in RFC-004's `suspend_execution` Lua script).
+- **Atomicity class: A** (must be atomic with execution state transition, lease release, and suspension record creation in RFC-004's `ff_suspend_execution` function).
 
 **Errors:**
 - `attempt_not_found`
@@ -643,7 +643,7 @@ Returns the latest attempt for an execution.
 
 #### Key Schema
 
-All attempt keys use the same `{p:N}` partition hash tag as RFC-003's execution and lease keys. This ensures all keys for one execution — core record, lease, and attempt records — colocate on the same Valkey Cluster shard, enabling atomic Lua scripts across all of them.
+All attempt keys use the same `{p:N}` partition hash tag as RFC-003's execution and lease keys. This ensures all keys for one execution — core record, lease, and attempt records — colocate on the same Valkey Cluster shard, enabling atomic operations via Valkey Functions (`FCALL`) across all of them.
 
 The partition tag `p:N` is assigned to each execution at creation time and is stable for the execution's lifetime. `N` is derived from the execution_id (e.g., `crc16(execution_id) % partition_count`).
 
@@ -733,12 +733,12 @@ ff:exec:{p:N}:{execution_id}:core  →  HASH
 
 This denormalization on the execution core hash avoids a sorted-set lookup for the most common query pattern ("what is the current attempt?").
 
-#### Atomic Operations (Lua Scripts)
+#### Atomic Operations (Valkey Functions)
 
-All Lua scripts operate on keys sharing the `{p:N}` hash tag, ensuring single-shard atomicity in Valkey Cluster.
+All operations below are registered as Valkey Functions within the `flowfabric` library (see RFC-010 §4.8). They operate on keys sharing the `{p:N}` hash tag, ensuring single-shard atomicity in Valkey Cluster. Invoked via `FCALL <function_name> <numkeys> <keys...> <args...>`.
 
-**create_and_start_attempt (claim path):**
-For the common case where claim + attempt creation + lease acquisition happen together:
+**ff_claim_execution (claim path):**
+For the common case where claim + attempt creation + lease acquisition happen together. Registered as `ff_claim_execution` in the `flowfabric` library.
 
 ```
 -- KEYS (all share {p:N} hash tag):
@@ -765,7 +765,8 @@ For the common case where claim + attempt creation + lease acquisition happen to
 -- Returns: attempt_id, attempt_index, lease_epoch, lease_expires_at
 ```
 
-**end_attempt_and_decide (completion/failure path):**
+**ff_complete_execution / ff_fail_execution (completion/failure path):**
+Registered as `ff_complete_execution` and `ff_fail_execution` in the `flowfabric` library. See RFC-001 for full pseudocode.
 ```
 -- KEYS (all share {p:N} hash tag):
 --   exec_core, attempt_hash, attempt_usage, lease_current, lease_history,
@@ -787,7 +788,8 @@ For the common case where claim + attempt creation + lease acquisition happen to
 -- Returns: attempt_id, retry_needed, next_delay_ms
 ```
 
-**interrupt_and_reclaim:**
+**ff_reclaim_execution (interrupt and reclaim):**
+Registered as `ff_reclaim_execution` in the `flowfabric` library. See RFC-003 for full pseudocode.
 ```
 -- KEYS (all share {p:N} hash tag):
 --   exec_core, old_attempt_hash, new_attempt_hash, attempts_zset,
@@ -855,9 +857,9 @@ The execution object (RFC-001) is the parent of all attempts. Key interactions:
 The lease (RFC-003) binds to the current active attempt. The primary binding key is `attempt_index` (monotonic, used in Valkey keys); `attempt_id` is recorded for audit correlation only. Key interactions:
 
 - `lease_id` and `lease_epoch` are recorded on the attempt when it transitions to `started`.
-- Lease acquisition is atomic with attempt start (Lua script `create_and_start_attempt`).
-- Lease release is atomic with attempt end (Lua script `end_attempt_and_decide`).
-- Lease expiry triggers attempt interruption + reclaim (Lua script `interrupt_and_reclaim`).
+- Lease acquisition is atomic with attempt start (`ff_claim_execution` function).
+- Lease release is atomic with attempt end (`ff_complete_execution` / `ff_fail_execution` functions).
+- Lease expiry triggers attempt interruption + reclaim (`ff_reclaim_execution` function).
 - `lease_epoch` is monotonic per execution. Reclaim always increments it, ensuring stale-owner rejection.
 - Lease renewal does NOT create a new attempt — it extends the current attempt's lease.
 
@@ -879,7 +881,7 @@ Streams are attempt-scoped. Each attempt may have its own ordered output stream.
 - Per-attempt usage attribution (tokens, cost, latency).
 - AttemptPolicySnapshot with route, provider/model, fallback index, timeout, and pricing.
 - Valkey data model: attempt hash, sorted set index, usage hash, policy hash.
-- Atomic Lua scripts for create+start, end+decide, interrupt+reclaim.
+- Atomic Valkey Functions for create+start, end+decide, interrupt+reclaim (registered in `flowfabric` library).
 - `get_attempt`, `list_attempts`, `get_current_attempt` APIs.
 - Execution-level denormalized attempt summary fields.
 

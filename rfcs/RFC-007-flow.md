@@ -433,7 +433,7 @@ Why:
 - flow structure is keyed by `flow_id`
 - execution claimability is keyed by `execution_id`
 - arbitrary flow members may live on different execution partitions
-- a single Lua script cannot atomically mutate arbitrary flow and execution partitions at once in Valkey Cluster
+- a single Lua function call cannot atomically mutate arbitrary flow and execution partitions at once in Valkey Cluster
 
 Therefore:
 
@@ -524,6 +524,10 @@ Adjacency sets:
 
 These are authoritative for topology inspection and cycle validation.
 
+### Valkey Functions
+
+All flow-related Lua functions are registered in the `flowfabric` library (single `#!lua name=flowfabric` library shared with all other FlowFabric functions). Invoked via `FCALL ff_<operation> <numkeys> <KEYS...> <ARGS...>`. Shared helpers (`is_set`, `err`, `ok`, `hgetall_to_table`) are library-local functions available to all registered functions. See RFC-010 §4.8 for implementation conventions.
+
 ### Add dependency: structural validation + child gating
 
 External API semantics:
@@ -537,9 +541,9 @@ Implementation strategy:
 3. consume the grant on the child execution partition to update dependency gating
 4. finalize the edge as active
 
-This keeps structural truth and runtime truth consistent without pretending a single cross-slot Lua script can do impossible work.
+This keeps structural truth and runtime truth consistent without pretending a single cross-slot Lua function can do impossible work.
 
-#### `stage_dependency_edge.lua` on flow partition
+#### `ff_stage_dependency_edge` on flow partition
 
 Responsibilities:
 
@@ -553,13 +557,13 @@ Responsibilities:
 
 Self-loop and cycle check note:
 
-- **Self-loops (A→A) are rejected by the Lua script directly, not by DFS.** The script checks `upstream_execution_id == downstream_execution_id` before any other validation and returns `self_referencing_edge`. This is necessary because the DFS-based cycle detection traverses *existing* edges — when no edges exist yet, a self-loop has no path to detect. The explicit check prevents permanent deadlock (execution blocked on its own completion).
-- **The Lua script validates `graph_revision` only for multi-node cycles. It does NOT independently verify acyclicity.** Cycle detection for A→B→...→A is the control plane's responsibility.
-- The control plane reads the flow's adjacency snapshot (all `out:<node>` sets), runs DFS reachability from the proposed downstream node. If the proposed upstream is reachable, the edge would create a cycle → reject before calling the Lua script.
-- The Lua script checks `expected_graph_revision == current_graph_revision`. If stale (another edge was added between snapshot read and script call), it returns `stale_graph_revision`. The control plane re-reads the adjacency, re-runs cycle detection, and retries.
+- **Self-loops (A→A) are rejected by the function directly, not by DFS.** The function checks `upstream_execution_id == downstream_execution_id` before any other validation and returns `self_referencing_edge`. This is necessary because the DFS-based cycle detection traverses *existing* edges — when no edges exist yet, a self-loop has no path to detect. The explicit check prevents permanent deadlock (execution blocked on its own completion).
+- **The function validates `graph_revision` only for multi-node cycles. It does NOT independently verify acyclicity.** Cycle detection for A→B→...→A is the control plane's responsibility.
+- The control plane reads the flow's adjacency snapshot (all `out:<node>` sets), runs DFS reachability from the proposed downstream node. If the proposed upstream is reachable, the edge would create a cycle → reject before calling the function.
+- The function checks `expected_graph_revision == current_graph_revision`. If stale (another edge was added between snapshot read and function call), it returns `stale_graph_revision`. The control plane re-reads the adjacency, re-runs cycle detection, and retries.
 - This optimistic concurrency + retry loop correctly prevents cycles even under concurrent edge additions.
 
-#### `apply_dependency_to_child.lua` on child execution partition
+#### `ff_apply_dependency_to_child` on child execution partition
 
 Pseudocode:
 
@@ -616,7 +620,7 @@ return ok(unresolved)
 
 When an upstream execution reaches a relevant terminal outcome, the engine uses the flow partition’s outgoing adjacency to drive child-local updates.
 
-#### `resolve_dependency.lua` on child execution partition
+#### `ff_resolve_dependency` on child execution partition
 
 Pseudocode:
 
@@ -729,7 +733,7 @@ return ok("impossible")
 
 The claim path must not reach across the flow partition. It checks child-local dependency state instead.
 
-#### `evaluate_flow_eligibility.lua`
+#### `ff_evaluate_flow_eligibility`
 
 Pseudocode:
 

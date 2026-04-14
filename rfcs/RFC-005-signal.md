@@ -310,7 +310,7 @@ Signal delivery is tightly coupled with the suspension/waitpoint model defined i
 | `send_signal` | `target_execution_id`, `signal_name`, `signal_category`, `payload?`, `payload_encoding?`, `source_type`, `source_identity`, `correlation_id?`, `idempotency_key?`, `target_waitpoint_key?` | Delivers a signal to an execution. If `target_waitpoint_key` is provided, the control plane decodes the self-routing opaque token (RFC-004) to extract partition + waitpoint_id — no lookup required. If no key, resolves to the single open waitpoint (rejects if ambiguous). Atomically: records signal, evaluates resume condition, optionally transitions execution state. Returns `signal_id` + `observed_effect`. |
 | `send_signal_to_waitpoint` | `target_waitpoint_id`, `signal_name`, `signal_category`, `payload?`, `payload_encoding?`, `source_type`, `source_identity`, `correlation_id?`, `idempotency_key?` | Delivers a signal directly to a waitpoint by internal ID. The caller must know the execution_id (derived from the waitpoint record or passed alongside). Same atomic semantics as `send_signal`. |
 
-Both operations are **Class A** because signal acceptance, resume condition evaluation, and potential execution state transition must be atomic. A signal that is recorded but whose resume effect is lost is a correctness bug.
+Both operations are **Class A** because signal acceptance, resume condition evaluation, and potential execution state transition must be atomic within a single Valkey Function call. A signal that is recorded but whose resume effect is lost is a correctness bug.
 
 #### 10.2 Inspection Operations (Class C — derived/best-effort)
 
@@ -439,9 +439,11 @@ This hash tracks which matchers have been satisfied and by which signal. Schema 
 
 #### 12.2 Atomic Signal Delivery Script
 
-`deliver_signal.lua`
+`ff_deliver_signal` (Valkey Function in `flowfabric` library)
 
-This script atomically: validates target, checks idempotency, records signal, evaluates resume condition, and on satisfaction: closes waitpoint + suspension records, transitions execution state, clears suspension fields on execution core, and respects resume_delay_ms.
+Invocation: `FCALL ff_deliver_signal 13 KEYS... ARGS...`. Uses shared helpers: `hgetall_to_table`, `ok`, `err`, `ok_duplicate`, `is_set`.
+
+This function atomically: validates target, checks idempotency, records signal, evaluates resume condition, and on satisfaction: closes waitpoint + suspension records, transitions execution state, clears suspension fields on execution core, and respects resume_delay_ms.
 
 **Critical design note:** Resume after suspension continues the **same attempt** — it does NOT create a new attempt. The `attempt_state` returns to `running_attempt` when a worker re-claims the resumed execution. Here, on signal-triggered resume, we set `attempt_state = attempt_interrupted` (paused, awaiting re-claim).
 
@@ -667,7 +669,7 @@ return ok(ARGV.signal_id, effect)
 
 #### 12.3 Pending Waitpoint Buffer Script
 
-`buffer_signal_for_pending_waitpoint.lua`
+`ff_buffer_signal_for_pending_waitpoint` (Valkey Function)
 
 A simpler variant used when the waitpoint exists but suspension is not yet committed:
 
@@ -690,7 +692,7 @@ The SDK's `send_signal` response should include a `requires_confirmation` flag s
 
 #### 12.4 Waitpoint Closure on Timeout Script
 
-`timeout_waitpoint.lua`
+`ff_timeout_waitpoint` (Valkey Function)
 
 Engine-initiated when suspension timeout fires:
 

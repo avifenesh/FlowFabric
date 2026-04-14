@@ -1007,15 +1007,17 @@ These do not share the `{p:N}` hash tag and cannot participate in the atomic Lua
 
 #### 9.4 Atomicity Model
 
-All state transitions use Lua scripts for atomicity. Every key in a single Lua script shares the `{p:N}` hash tag, ensuring colocation on one Valkey Cluster shard.
+All state transitions use **Valkey Functions** (registered in the `flowfabric` library) for atomicity. Every key in a single function invocation shares the `{p:N}` hash tag, ensuring colocation on one Valkey Cluster shard. Functions are invoked via `FCALL ff_<operation> <numkeys> KEYS... ARGS...`.
 
 **KEYS/ARGV naming convention:** All Lua pseudocode in this RFC uses named references (`KEYS.exec_core`, `ARGV.lease_id`) per RFC-010 §4.8(c2). In Valkey Lua, KEYS and ARGV are positional arrays. The `-- KEYS:` comment at the top of each script defines the mapping from names to positions. Where older pseudocode uses `KEYS[N]` notation, the KEYS comment provides the authoritative name-to-position mapping. Implementers should use the named form in implementation code (via a helper that maps names to positions).
 
-**Capability, budget, and quota validation happen in the claim-grant pre-step** (scheduler/admission layer), NOT inside the atomic Lua. The Lua script only validates and consumes the claim grant.
+**Capability, budget, and quota validation happen in the claim-grant pre-step** (scheduler/admission layer), NOT inside the atomic function. The function only validates and consumes the claim grant.
 
-##### Lua script: claim_execution (new attempt)
+##### Function: ff_claim_execution (new attempt)
 
-Creates a new attempt and lease for a fresh, retried, or replayed execution. The attempt type is derived from the execution's `attempt_state` on the exec core — `fail_execution` and `replay_execution` set the state but do NOT create attempt records (preventing double-creation). Does NOT apply to resumed-after-suspension executions (see `claim_resumed_execution` below).
+Registered in the `flowfabric` library. Invocation: `FCALL ff_claim_execution 14 KEYS... ARGS...`. Uses shared helpers: `hgetall_to_table`, `ok`, `err`, `is_set`, `unpack_policy`.
+
+Creates a new attempt and lease for a fresh, retried, or replayed execution. The attempt type is derived from the execution's `attempt_state` on the exec core — `ff_fail_execution` and `ff_replay_execution` set the state but do NOT create attempt records (preventing double-creation). Does NOT apply to resumed-after-suspension executions (see `ff_claim_resumed_execution` below).
 
 ```lua
 -- KEYS: exec_core, claim_grant, eligible_zset, lease_expiry_zset,
@@ -1169,7 +1171,7 @@ redis.call("XADD", KEYS[11], "*",
 return ok(ARGV.lease_id, next_epoch, expires_at, ARGV.attempt_id, next_att_idx)
 ```
 
-##### Lua script: claim_resumed_execution (same attempt continues)
+##### Function: ff_claim_resumed_execution (same attempt continues)
 
 Used after a suspended execution is resumed (signal satisfied the waitpoint, execution returned to `runnable`). Does NOT create a new attempt — continues the existing one. Issues a new lease with incremented `lease_epoch`, binding it to the existing `attempt_index`.
 
@@ -1284,7 +1286,7 @@ redis.call("XADD", KEYS[8], "*",
 return ok(ARGV.lease_id, next_epoch, expires_at, existing_attempt_id, existing_att_idx)
 ```
 
-##### Lua script: complete_execution
+##### Function: ff_complete_execution
 
 ```lua
 -- KEYS: exec_core, attempt_hash, lease_expiry_zset, worker_leases,
@@ -1358,7 +1360,7 @@ redis.call("XADD", KEYS.lease_history, "*",
 return ok()
 ```
 
-##### Lua script: fail_execution (with retry decision)
+##### Function: ff_fail_execution (with retry decision)
 
 ```lua
 -- KEYS: exec_core, attempt_hash, lease_expiry_zset, worker_leases,
@@ -1481,7 +1483,7 @@ else
 end
 ```
 
-##### Lua script: move_to_waiting_children
+##### Function: ff_move_to_waiting_children
 
 Worker blocks its active execution on child dependencies. Releases the lease and transitions execution to `runnable` + `blocked_by_dependencies`. The same attempt continues — it is not ended, only paused (like suspension). When all child dependencies resolve, the execution becomes eligible and is re-claimed via `claim_resumed_execution` (same attempt continues).
 
@@ -1549,7 +1551,7 @@ redis.call("ZADD", KEYS[8], tonumber(core.created_at or "0"), ARGV.execution_id)
 return ok()
 ```
 
-##### Lua script: delay_execution
+##### Function: ff_delay_execution
 
 Worker explicitly delays its own active execution. Releases the lease and transitions to `runnable` + `not_eligible_until_time`. The same attempt continues (paused, not ended) — when the delay expires, the promoter moves to eligible and the execution is re-claimed via `claim_resumed_execution`.
 
@@ -1619,7 +1621,7 @@ redis.call("XADD", KEYS[4], "*",
 return ok()
 ```
 
-##### Lua script: replay_execution
+##### Function: ff_replay_execution
 
 Operator-initiated replay of a terminal execution. Validates terminal state, enforces replay limits, sets pending replay lineage on exec core (does NOT create the attempt — `claim_execution` creates it with `attempt_type = replay`). For skipped flow members, resets dependency edge state so the dependency graph is re-evaluated.
 
@@ -1805,7 +1807,7 @@ Terminal execution records are retained according to lane retention policy. The 
 - All submission, claim, runtime mutation, retry/replay, and inspection operations
 - Valkey hash-based execution storage
 - Sorted-set-based scheduling (eligible, delayed, active, terminal, blocked, suspended)
-- Lua-script atomic state transitions
+- Valkey Function atomic state transitions (FCALL)
 - Idempotency via `SET NX` with TTL
 - Three visibility levels
 - Usage/accounting fields (token, cost, latency)

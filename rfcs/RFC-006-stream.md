@@ -83,7 +83,7 @@ A frame is one unit of output appended to a stream. Frames are immutable once ap
 
 Frame types are an open enum — new types may be added without breaking existing consumers. Consumers must ignore unknown frame types gracefully.
 
-**Maximum frame payload size:** 64KB (65,536 bytes) per frame in v1. This is generous for tokens, structured events, and log entries. Large artifacts (images, documents, model weights) must use `artifact_reference` frames with a pointer to external storage, not inline payloads. The limit is enforced in the `append_frame` Lua script.
+**Maximum frame payload size:** 64KB (65,536 bytes) per frame in v1. This is generous for tokens, structured events, and log entries. Large artifacts (images, documents, model weights) must use `artifact_reference` frames with a pointer to external storage, not inline payloads. The limit is enforced in the `ff_append_frame` function.
 
 **Known v1 limitation — no frame-level idempotency:** `XADD` uses auto-generated entry IDs (`*`). If the client connection drops after a successful XADD but before the client receives the entry ID, a retry produces a duplicate frame. For token streaming, this means consumers may see duplicate tokens. This is not data loss but data duplication. Consumers should be resilient to occasional duplicates. Future mitigation: client-side sequence tracking where the client assigns a monotonic frame sequence number and the `append_frame` script rejects frames with sequence <= last seen.
 
@@ -166,7 +166,7 @@ The stream metadata is not modified during suspension. The gap in frame timestam
 
 #### Close
 
-The stream closes automatically when the parent attempt reaches a terminal state (`ended_success`, `ended_failure`, `ended_cancelled`, `interrupted_reclaimed`). Closing sets `closed_at` and `closed_reason` on the stream metadata atomically with the attempt state transition (within RFC-002's `end_attempt_and_decide` or `interrupt_and_reclaim` Lua scripts). After close, no new frames may be appended (except by privileged system context for annotations).
+The stream closes automatically when the parent attempt reaches a terminal state (`ended_success`, `ended_failure`, `ended_cancelled`, `interrupted_reclaimed`). Closing sets `closed_at` and `closed_reason` on the stream metadata atomically with the attempt state transition (within RFC-002's `ff_complete_execution` / `ff_fail_execution` or `ff_reclaim_execution` functions). After close, no new frames may be appended (except by privileged system context for annotations).
 
 Consumers tailing a closed stream receive the remaining unread frames and then see the stream end.
 
@@ -197,7 +197,7 @@ The execution API exposes a merged stream view that aggregates frames across all
 | `all_attempts` | Include frames from all attempts, in attempt order. Default. |
 | `latest_attempt_only` | Include frames only from the current/latest attempt. Useful for simple "watch this execution" UX where prior failed attempts are noise. |
 
-**Implementation:** The merged view is computed client-side or by a server-side Lua script that iterates attempt streams in order. It is a convenience surface, not stored separately.
+**Implementation:** The merged view is computed client-side or by a server-side function that iterates attempt streams in order. It is a convenience surface, not stored separately.
 
 ### Durability Modes
 
@@ -241,7 +241,7 @@ Privileged appends do not require a lease but do require system-level authorizat
 
 #### Post-close append
 
-After the stream is closed (attempt terminal), no further appends are allowed — even from privileged context. The only exception is a narrow window for the engine to append a final `usage_update` or `warning` frame as part of the atomic attempt-end transition. This is handled within the `end_attempt_and_decide` Lua script (RFC-002), not as a separate append.
+After the stream is closed (attempt terminal), no further appends are allowed — even from privileged context. The only exception is a narrow window for the engine to append a final `usage_update` or `warning` frame as part of the atomic attempt-end transition. This is handled within the `ff_complete_execution` / `ff_fail_execution` functions (RFC-002), not as a separate append.
 
 ### Relationship to Engine Events
 
@@ -392,7 +392,7 @@ Closes a stream, marking it as no longer appendable.
 
 **Semantics:**
 - Sets `closed_at` and `closed_reason` on stream metadata.
-- Called automatically by the engine when the attempt reaches a terminal state (within the `end_attempt_and_decide` or `interrupt_and_reclaim` Lua scripts from RFC-002).
+- Called automatically by the engine when the attempt reaches a terminal state (within the `ff_complete_execution` / `ff_fail_execution` or `ff_reclaim_execution` functions from RFC-002).
 - Not normally called by workers directly.
 - **Atomicity class: A** (atomic with attempt state transition).
 
@@ -459,9 +459,9 @@ ff:stream:{p:N}:{execution_id}:{attempt_index}:meta  →  HASH
 
 The metadata hash is created atomically with the first frame append. It is separate from the Valkey Stream itself because Valkey Streams do not support arbitrary metadata fields.
 
-#### Append Operation (Lua Script)
+#### Append Operation (Valkey Function)
 
-`append_frame.lua` — validates lease and appends atomically:
+`ff_append_frame` — registered in the `flowfabric` library. Validates lease and appends atomically. Invoked via `FCALL ff_append_frame <numkeys> <keys...> <args...>`.
 
 ```lua
 -- KEYS (all share {p:N} hash tag):
@@ -561,7 +561,7 @@ return entry_id
 
 #### Close Operation
 
-Stream close is part of the attempt-end Lua scripts (RFC-002 `end_attempt_and_decide` and `interrupt_and_reclaim`). Within those scripts, after setting the attempt to a terminal state:
+Stream close is inline within the attempt-end functions (`ff_complete_execution`, `ff_fail_execution`, `ff_reclaim_execution`). Within those functions, after setting the attempt to a terminal state:
 
 ```lua
 -- Close stream metadata
@@ -624,7 +624,7 @@ Mitigations:
 
 - Streams are attempt-scoped. The primary key includes `attempt_index`.
 - Stream creation is lazy on first append during an active attempt.
-- Stream close is atomic with attempt termination (within RFC-002 Lua scripts).
+- Stream close is atomic with attempt termination (within RFC-002 functions).
 - The attempt record may cache `has_stream: bool` for fast inspection.
 
 ### RFC-003 — Lease
@@ -650,7 +650,7 @@ Mitigations:
 - Stream close atomic with attempt termination.
 - MAXLEN-based retention per stream.
 - `durable_full` as default durability mode.
-- Append Lua script with lease validation.
+- `ff_append_frame` function with lease validation.
 - Privileged system/operator append path with source marker.
 - Separation from engine lifecycle events.
 

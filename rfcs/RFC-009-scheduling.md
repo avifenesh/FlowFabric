@@ -49,7 +49,7 @@ The scheduling layer sits between execution state and lease acquisition. It does
                     └─────────────────────┘
 ```
 
-**Key separation:** The scheduler computes *what* to claim. The Lua script ensures *atomicity*. This avoids cross-slot reads inside atomic scripts while keeping the final claim decision safe.
+**Key separation:** The scheduler computes *what* to claim. The Valkey Function ensures *atomicity*. This avoids cross-slot reads inside atomic functions while keeping the final claim decision safe.
 
 **Three-partition routing:** A single claim decision may touch three different Valkey Cluster shards via sequential Lua calls:
 
@@ -90,7 +90,7 @@ The claim-grant is the bridge between the scheduling layer (multi-key reads, cro
 3. **Select candidate:** Scheduler reads eligible executions from partition-local sorted sets, checks capability match, applies fairness policy (cross-lane weighted round-robin, cross-tenant fair share), and selects the highest-priority candidate.
 4. **Budget check (per-candidate):** Scheduler reads attached budget usage on `{b:M}` for the selected candidate. If any hard-limit budget is exhausted: block this candidate via `block_execution_for_admission` on `{p:N}`, then go back to step 3 with the next candidate. If no more candidates, return empty response to worker.
 5. **Scheduler issues grant:** Writes a short-lived `claim_grant` key to the target partition with the worker's identity, capabilities hash, and a grant expiry.
-6. **Worker (or scheduler) calls `acquire_lease`:** The atomic Lua script (RFC-003) validates the grant, creates the lease + attempt, and transitions execution to `active`. If the grant expired or another worker already claimed, the script rejects.
+6. **Worker (or scheduler) calls `acquire_lease`:** The atomic Valkey Function `ff_claim_execution` (RFC-001/003) validates the grant, creates the lease + attempt, and transitions execution to `active`. If the grant expired or another worker already claimed, the function rejects.
 
 #### 3.2 Claim Grant Object
 
@@ -656,7 +656,7 @@ Updated periodically by a background aggregator that scans partition-local sorte
 
 #### 12.7 Scheduling Lua Script: Issue Claim-Grant
 
-`issue_claim_grant.lua`
+`ff_issue_claim_grant` (Valkey Function)
 
 This script runs within a single partition. The scheduling layer calls it after selecting a candidate execution.
 
@@ -708,7 +708,7 @@ return ok(expires_at)
 
 #### 12.8 Reclaim Grant Script
 
-`issue_reclaim_grant.lua`
+`ff_issue_reclaim_grant` (Valkey Function)
 
 Used by the reclaim path when a lease-expired or lease-revoked execution needs to be claimed by a new worker. Unlike `issue_claim_grant` which requires the execution to be in the eligible sorted set, this script validates reclaimable ownership state directly on the execution core.
 
@@ -755,7 +755,7 @@ return ok(expires_at)
 
 #### 12.9 Block Execution for Admission Script
 
-`block_execution_for_admission.lua`
+`ff_block_execution_for_admission` (Valkey Function)
 
 When the scheduler denies a claim due to a structural block (budget, quota, route, or lane state), it must atomically move the execution from the eligible set to the appropriate blocked set and update the state vector. Without this, the execution stays in the eligible set appearing as "waiting for worker" when the real cause is budget/quota/route.
 
@@ -867,7 +867,7 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 - All lane control operations (pause, resume, drain, disable, enable)
 - Explainable admission rejections mapped to RFC-001 blocking reasons
 - Partition-local eligible sorted sets with priority scoring
-- Claim-grant Lua script with double-grant prevention
+- Claim-grant Valkey Function with double-grant prevention
 - Grant expiry reconciler
 - Worker capability index for fast lookup
 - Lane counts (cached, periodically aggregated)
@@ -887,7 +887,7 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 
 ## Open Questions
 
-1. ~~**Scheduler instance coordination:**~~ **Resolved.** The `issue_claim_grant.lua` script atomically ZREMs the execution from the eligible set (step 5) before writing the grant. If two schedulers race on the same candidate, only one wins the ZREM — the second finds the execution absent from the set and returns `execution_not_in_eligible_set`. No leader election required for v1. At very high scale, partition-affine scheduling (each scheduler owns a subset of partitions) can reduce wasted work. See RFC-010 §4.6.
+1. ~~**Scheduler instance coordination:**~~ **Resolved.** The `ff_issue_claim_grant` (Valkey Function) script atomically ZREMs the execution from the eligible set (step 5) before writing the grant. If two schedulers race on the same candidate, only one wins the ZREM — the second finds the execution absent from the set and returns `execution_not_in_eligible_set`. No leader election required for v1. At very high scale, partition-affine scheduling (each scheduler owns a subset of partitions) can reduce wasted work. See RFC-010 §4.6.
 2. ~~Request/reply implementation~~ — Resolved in §8.5: XREAD BLOCK on lease_history stream. No pub/sub needed.
 3. **Flow-aware priority boosting:** Should the scheduler inherit or boost priority from the parent flow or coordinator execution? This would require cross-partition reads to the flow's `{fp:N}` partition. V1 ignores flow priority (§5.4). When should this be introduced — when DAG critical-path scheduling becomes a product requirement?
 

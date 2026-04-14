@@ -454,7 +454,7 @@ Correctness does not depend on the worker index being globally perfect. It is an
 
 ### Key naming and partitioning
 
-This RFC assumes Valkey Cluster compatibility. Atomic Lua in cluster mode requires all keys in a script to hash to the same slot. Therefore, FlowFabric must not use pure `{execution_id}` hash tags for lease operations if it also needs local indexes such as expiry sets.
+This RFC assumes Valkey Cluster compatibility. Atomic Lua functions in cluster mode require all keys in a single function call to hash to the same slot. Therefore, FlowFabric must not use pure `{execution_id}` hash tags for lease operations if it also needs local indexes such as expiry sets.
 
 Instead, each execution is assigned a stable partition tag:
 
@@ -578,11 +578,11 @@ Each entry should include:
 - `ts`
 - `reason` if applicable
 
-### Atomic claim script
+### Atomic claim function
 
-`acquire_lease.lua`
+`ff_acquire_lease` — registered in the `flowfabric` library via `redis.register_function()`. Shared helpers (`is_set`, `err`, `ok`, `mark_expired`, `hgetall_to_table`) are library-local functions available to all registered functions.
 
-Keys:
+KEYS:
 
 - execution core
 - current lease hash
@@ -689,9 +689,9 @@ redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen,
 return ok(lease_id, next_epoch, expires_at)
 ```
 
-### Atomic renew script
+### Atomic renew function
 
-`renew_lease.lua`
+`ff_renew_lease`
 
 Pseudocode:
 
@@ -770,11 +770,9 @@ redis.call("ZADD", KEYS.lease_expiry, new_expires_at, ARGV.execution_id)
 return ok(new_expires_at)
 ```
 
-### Atomic complete / fail script
+### Atomic complete / fail function
 
-`complete_or_fail.lua`
-
-This script is the template for any active-state mutation that clears ownership.
+`ff_complete_or_fail` — template for any active-state mutation that clears ownership. Concrete implementations: `ff_complete_execution`, `ff_fail_execution`.
 
 Pseudocode:
 
@@ -853,9 +851,9 @@ The same validation block is reused for:
 
 **Post-script caller obligation:** After this script returns, the caller must issue an async DECR to the quota concurrency counter on the `{q:K}` partition (RFC-008 §4.5). This is a cross-partition operation and cannot be included in this atomic script.
 
-### Revoke and reclaim scripts
+### Revoke and reclaim functions
 
-`revoke_lease.lua`:
+`ff_revoke_lease`:
 
 - validate the target lease if an expected `lease_id` is supplied
 - set `ownership_state = lease_revoked`
@@ -866,7 +864,7 @@ The same validation block is reused for:
 
 **Post-script caller obligation:** After this script returns, the caller must issue an async DECR to the quota concurrency counter on the `{q:K}` partition (RFC-008 §4.5).
 
-`reclaim_execution.lua`:
+`ff_reclaim_execution`:
 
 - validate `ownership_state in {lease_expired_reclaimable, lease_revoked}`
 - **check `lease_reclaim_count < max_reclaim_count`** (default: 100, from execution policy). If limit reached: do NOT create a new attempt. Instead: set `lifecycle_phase = terminal`, `terminal_outcome = failed`, `failure_reason = max_reclaims_exceeded`, `attempt_state = attempt_terminal`. ZADD terminal, ZREM lease_expiry. Return `ok("max_reclaims_exceeded")`. This prevents unbounded attempt creation from flapping workers.

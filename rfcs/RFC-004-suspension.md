@@ -564,9 +564,9 @@ Because `waitpoint_key` must route to the correct partition without a cross-slot
 
 No global `waitpoint_key -> waitpoint_id` key is required for correctness.
 
-### Atomic suspend script
+### Atomic suspend function
 
-`suspend_execution.lua`
+`ff_suspend_execution` — registered in the `flowfabric` library via `redis.register_function()`. Shared helpers (`is_set`, `err`, `ok`, `mark_expired`, `hgetall_to_table`, `map_reason_to_blocking`, `initialize_condition`, `evaluate_signal_against_condition`, `is_condition_satisfied`, `write_condition_hash`, `extract_field`) are library-local functions available to all registered functions.
 
 Keys:
 
@@ -781,9 +781,9 @@ end
 return ok(ARGV.suspension_id, waitpoint_id, waitpoint_key)
 ```
 
-### Atomic resume script
+### Atomic resume function
 
-`resume_execution.lua`
+`ff_resume_execution`
 
 This script is called after a matching signal or explicit operator resume trigger has already been durably accepted.
 
@@ -883,9 +883,9 @@ redis.call("ZREM", KEYS.suspension_timeout, ARGV.execution_id)
 return ok()
 ```
 
-### Atomic cancel-suspension script
+### Atomic cancel-suspension function
 
-`cancel_suspension.lua`
+`ff_cancel_suspension`
 
 Cancels a suspended execution. Closes the waitpoint and suspension, terminates the attempt, closes the stream, and transitions the execution to terminal cancelled.
 
@@ -982,7 +982,7 @@ return ok()
 
 ### Pending waitpoint creation
 
-`create_pending_waitpoint.lua`
+`ff_create_pending_waitpoint`
 
 Rules:
 
@@ -1002,7 +1002,7 @@ Background scanner pattern:
 
 1. `ZRANGEBYSCORE ff:idx:{p:N}:suspension_timeout -inf now LIMIT 0 batch_size`
 2. for each execution:
-   - run `expire_suspension.lua`
+   - run `FCALL ff_expire_suspension`
    - revalidate that the execution is still suspended and the timeout is still due
    - apply the configured timeout behavior atomically
 

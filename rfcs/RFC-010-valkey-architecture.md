@@ -578,15 +578,45 @@ Every periodic background process required by the architecture, consolidated in 
 
 ---
 
-## Part 2 — Lua Script Inventory and Operation Flows
+## Part 2 — Function Inventory and Operation Flows
 
-## 4. Lua Script Inventory
+## 4. Function Inventory
 
-Every Lua script defined across RFC-001 through RFC-009. All scripts within a single invocation touch only keys sharing one hash tag (`{p:N}`, `{b:M}`, `{q:K}`, or `{fp:N}`).
+All FlowFabric operations are deployed as a **single Valkey Function library** (`flowfabric`). Functions are loaded via `FUNCTION LOAD REPLACE` on engine startup and persist across Valkey restarts. Invocation uses `FCALL ff_<operation> <numkeys> KEYS... ARGS...` (not EVALSHA). Every function within a single invocation touches only keys sharing one hash tag (`{p:N}`, `{b:M}`, `{q:K}`, or `{fp:N}`).
 
-### 4.1 Execution Partition Scripts (`{p:N}`)
+**Library structure:**
+```lua
+#!lua name=flowfabric
 
-| # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{p:N}`) |
+-- Shared helpers (available to all functions in the library)
+local function ok(...)  return {1, "OK", ...} end
+local function err(...) return {0, ...} end
+local function ok_already_satisfied(...) return {1, "ALREADY_SATISFIED", ...} end
+local function ok_duplicate(...) return {1, "DUPLICATE", ...} end
+local function is_set(v) return v ~= nil and v ~= false and v ~= "" end
+local function hgetall_to_table(flat)
+  local t = {}
+  for i = 1, #flat, 2 do t[flat[i]] = flat[i + 1] end
+  return t
+end
+-- mark_expired, initialize_condition, evaluate_signal_against_condition,
+-- is_condition_satisfied, write_condition_hash, map_reason_to_blocking,
+-- unpack_policy — all defined once, shared by all functions.
+
+-- Version function (Phase 0)
+redis.register_function('ff_version', function(keys, args)
+  return {1, "OK", "1.0.0"}
+end)
+
+-- Operation functions (Phases 1-6)
+redis.register_function('ff_create_execution', function(keys, args) ... end)
+redis.register_function('ff_claim_execution', function(keys, args) ... end)
+-- ... (all functions registered in the library)
+```
+
+### 4.1 Execution Partition Functions (`{p:N}`)
+
+| # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{p:N}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
 | 0 | `create_execution` | RFC-001 | Create execution core hash + payload + policy + tags, set initial state vector (all 7 dims), ZADD to eligible or delayed or blocked set, SET NX idempotency key, SADD all_executions (§1.1). If timeout_policy.deadline_at set: ZADD execution_deadline index. | A | 8 | exec_core, payload, policy, tags, eligible_or_delayed_zset, idem_key, execution_deadline_zset, all_executions |
 | 1 | `claim_execution` | RFC-001 | Consume claim-grant, create new attempt + lease, transition runnable→active. Derives attempt_type from exec core `attempt_state` (pending_first→initial, pending_retry→retry, pending_replay→replay). Copies pending lineage fields from exec core to attempt, then clears them. ZADD attempt_timeout index (score=now+timeout_ms). | A | 14 | exec_core, claim_grant, eligible_zset, lease_expiry_zset, worker_leases, attempt_hash, attempt_usage, attempt_policy, attempts_zset, lease_current, lease_history, active_index, attempt_timeout_zset, execution_deadline_zset |
@@ -634,26 +664,26 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | — | `recover_abandoned_execution` | RFC-001 | *Same as `reclaim_execution` (#9). See RFC-003.* | — | — | — |
 | — | `record_result` | RFC-001 | *Inline in `complete_execution` (#3) — SET on result key. Standalone use for partial results: direct SET with lease validation (Class B, 2 keys).* | — | — | — |
 
-### 4.2 Flow Partition Scripts (`{fp:N}`)
+### 4.2 Flow Partition Functions (`{fp:N}`)
 
-| # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{fp:N}`) |
+| # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{fp:N}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
 | 29 | `stage_dependency_edge` | RFC-007 | Validate membership + topology, check `expected_graph_revision` matches current (reject with `stale_graph_revision` on mismatch), create edge record, increment graph_revision, create mutation grant. ARGV must include `expected_graph_revision`. | A | 6 | flow_core, members_set, edge_hash, out_adj_set, in_adj_set, grant_hash |
 
-### 4.3 Budget Partition Scripts (`{b:M}`)
+### 4.3 Budget Partition Functions (`{b:M}`)
 
-| # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{b:M}`) |
+| # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{b:M}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
 | 30 | `report_usage_and_check` | RFC-008 | **Check-before-increment.** Read current usage, check hard limits. If any dimension would breach: return HARD_BREACH without incrementing (zero overshoot). If safe: HINCRBY all dimensions, check soft limits. Atomic Lua serialization on `{b:M}` guarantees no concurrent overshoot. | A | 3 | budget_usage, budget_limits, budget_def |
 | 31 | `reset_budget` | RFC-008 | Zero all usage counters, record reset event, compute next_reset_at, re-score in reset index | A | 3 | budget_usage, budget_def, budget_resets_zset |
 
-### 4.4 Quota Partition Scripts (`{q:K}`)
+### 4.4 Quota Partition Functions (`{q:K}`)
 
-| # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{q:K}`) |
+| # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{q:K}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
 | 32 | `check_admission_and_record` | RFC-008 | **Idempotent.** Checks admitted guard key (`ff:quota:{q:K}:<policy_id>:admitted:<execution_id>`) — if exists, return `ALREADY_ADMITTED`. Otherwise: sliding-window ZREMRANGEBYSCORE + ZCARD rate check, INCR concurrency check, ZADD (member=execution_id alone, not execution_id:timestamp) + SET NX guard + INCR on admit. Guard TTL = window size. | A | 4 | window_zset, concurrency_counter, quota_def, admitted_guard_key |
 
-### 4.5 Script Overlap Notes
+### 4.5 Function Overlap Notes
 
 **Overlap group A:** Scripts 1/5/10 (`claim_execution` / `acquire_lease` / `create_and_start_attempt`) are the same operation from RFC-001/003/002 perspectives. Implement as ONE script. RFC-001 #1 is canonical. #5 and #10 are listed as cross-references only.
 
@@ -681,22 +711,80 @@ The scheduler must dispatch to the correct claim script based on execution state
 
 ### 4.7 Summary
 
-| Partition | Script Count | Notes |
-|-----------|-------------|-------|
-| `{p:N}` execution | 30 | All claim/lease/attempt/suspension/signal/stream/promotion/cancel/replay operations. |
+| Partition | Function Count | Notes |
+|-----------|---------------|-------|
+| `{p:N}` execution | 30 | All claim/lease/attempt/suspension/signal/stream/promotion/cancel/replay functions. |
 | `{fp:N}` flow | 1 | Topology validation + edge staging. |
 | `{b:M}` budget | 2 | Usage increment + breach check, reset. |
 | `{q:K}` quota | 1 | Admission check + record. |
 | **Total listed** | **34** | Including cross-reference entries for overlap groups. |
-| **Unique for implementation** | **~25** | After deduplicating overlap groups A (claim: -2), B (complete/fail: -2), C (reclaim: -1), D (timeout: -1), inline close_stream (-1), plus cancel+replay added (+2). |
+| **Unique `redis.register_function` calls** | **~26** | After deduplicating overlap groups A-D + `ff_version`. All registered in one `flowfabric` library. |
 
-### 4.8 Implementation Notes for Lua Scripts
+### 4.8 Implementation Notes for Valkey Functions
 
-These notes apply to ALL Lua scripts across all RFCs. Mandatory reading before implementation.
+These notes apply to ALL functions in the `flowfabric` library across all RFCs. Mandatory reading before implementation.
 
-#### (a) HGETALL returns a flat array — use a conversion helper
+#### (pre) Valkey Functions deployment model
 
-Valkey `HGETALL` returns a flat array `{key1, val1, key2, val2, ...}`, NOT a Lua table with named fields. All RFC Lua pseudocode uses `core.lifecycle_phase` syntax which assumes a dict-style table. Every script must begin with a conversion:
+All FlowFabric Lua logic is deployed as a **single Valkey Function library** (`#!lua name=flowfabric`). This replaces the EVALSHA/SCRIPT LOAD pattern.
+
+**Key differences from EVALSHA:**
+- **No SHA caching.** Functions are registered by name, not by script hash.
+- **No NOSCRIPT retry.** Functions persist across Valkey restarts and replicate to replicas automatically.
+- **Shared helpers.** Library-local Lua functions (`is_set`, `err`, `ok`, `hgetall_to_table`, `mark_expired`, `initialize_condition`, `map_reason_to_blocking`, etc.) are defined once at the top of the library and available to all registered functions. This eliminates duplication and ensures consistent behavior.
+- **Invocation:** `FCALL ff_<operation> <numkeys> KEYS... ARGS...` (not `EVALSHA <sha> <numkeys> ...`).
+- **Loading:** `FUNCTION LOAD REPLACE <library_source>` on each Valkey primary at engine startup. In Valkey Cluster: route to all primaries. The library auto-replicates to replicas.
+- **Version check:** `FCALL ff_version 0` → returns `{1, "OK", "<version>"}`. If version mismatch or ERR (function not found): `FUNCTION LOAD REPLACE`.
+
+#### Library-Local Helpers
+
+These are `local function` definitions in the library preamble, shared by all registered functions. They are NOT independently FCALL-able — they are internal implementation helpers.
+
+**Return wrappers:**
+
+| Helper | Signature | Used By |
+|---|---|---|
+| `ok(...)` | `return {1, "OK", ...}` | All functions |
+| `err(...)` | `return {0, ...}` | All functions |
+| `ok_already_satisfied(...)` | `return {1, "ALREADY_SATISFIED", ...}` | `ff_suspend_execution` |
+| `ok_duplicate(sig_id)` | `return {1, "DUPLICATE", sig_id}` | `ff_deliver_signal` |
+
+**Data access:**
+
+| Helper | Purpose | Used By |
+|---|---|---|
+| `hgetall_to_table(flat)` | Converts HGETALL flat array to dict table | All functions reading hashes |
+| `is_set(v)` | `v ~= nil and v ~= false and v ~= ""` — safe nil/empty check | All functions checking optional fields |
+
+**Lease validation (most widely shared — prevents copy-paste drift):**
+
+| Helper | Purpose | Used By |
+|---|---|---|
+| `validate_lease(core, argv, now_ms)` | Checks lifecycle=active, ownership not revoked, lease not expired, lease_id + epoch + attempt_id match. Returns error tuple or nil. | 7+ functions: complete, fail, suspend, delay, move_to_waiting_children, append_frame, report_usage |
+| `mark_expired(keys, core, now_ms, maxlen)` | Sets `ownership_state = lease_expired_reclaimable`, `lease_expired_at`, XADD lease_history. Idempotent. | renew_lease, complete_or_fail (on expiry detection) |
+
+**Suspension/signal condition evaluation (shared module):**
+
+| Helper | Purpose | Used By |
+|---|---|---|
+| `map_reason_to_blocking(reason_code)` | Suspension reason → RFC-001 blocking_reason lookup table | `ff_suspend_execution` |
+| `initialize_condition(json)` | Parse resume_condition_json → matcher table | `ff_suspend_execution`, `ff_deliver_signal` |
+| `write_condition_hash(key, cond, now_ms)` | HSET condition state fields | `ff_suspend_execution`, `ff_deliver_signal` |
+| `evaluate_signal_against_condition(cond, name, id)` | Match signal to matchers | `ff_suspend_execution` (buffered), `ff_deliver_signal` |
+| `is_condition_satisfied(cond)` | Check mode (any/all/count) | `ff_suspend_execution`, `ff_deliver_signal` |
+| `extract_field(fields, name)` | Valkey Stream entry array → named field | `ff_suspend_execution` (buffered signals) |
+
+**Policy:**
+
+| Helper | Purpose | Used By |
+|---|---|---|
+| `unpack_policy(json)` | `cjson.decode` → flat key-value pairs for HSET | `ff_claim_execution` (attempt policy) |
+
+**Note:** Budget/quota functions (`ff_report_usage_and_check`, `ff_check_admission_and_record`) use domain-specific return formats (`HARD_BREACH`, `ADMITTED`, etc.), not `ok()`/`err()`. They are engine-internal and do not share the worker-facing return convention (§4.9).
+
+#### (a) HGETALL returns a flat array — use `hgetall_to_table`
+
+Valkey `HGETALL` returns a flat array `{key1, val1, key2, val2, ...}`, NOT a Lua table with named fields. All RFC Lua pseudocode uses `core.lifecycle_phase` syntax which assumes a dict-style table. The shared `hgetall_to_table` helper handles this conversion:
 
 ```lua
 local function hgetall_to_table(flat)
@@ -713,7 +801,7 @@ local core = hgetall_to_table(redis.call("HGETALL", KEYS[1]))
 
 Alternatively, use `HMGET` to fetch only the specific fields needed — more efficient for large hashes. The execution core has 50+ fields but most scripts check 5-10.
 
-#### (b) Lua scripts are NOT transactional — partial writes persist on abort
+#### (b) Valkey Functions are NOT transactional — partial writes persist on abort
 
 Valkey Lua scripts execute each `redis.call()` independently. If a script aborts mid-execution (OOM, bug, or `redis.call()` error propagation), **all writes that already executed within the script persist**. There is no rollback.
 
@@ -725,7 +813,7 @@ Example: if `HSET exec_core lifecycle_phase=terminal` succeeds but the subsequen
 
 **Rule 2 — exec_core FIRST for transitions that create/close sub-objects:** Scripts that transition exec_core AND create or close sub-objects (suspension records, waitpoint records, attempt records) MUST write exec_core state FIRST, before creating or closing sub-objects. This ensures partial writes leave exec_core in the target lifecycle state, which reconcilers can detect and resolve. The reverse (sub-objects mutated but exec_core still in old state) creates zombie states that no scanner checks for. Applies to: `suspend_execution` (exec_core=suspended BEFORE suspension_current creation), `resume_execution` (exec_core=runnable BEFORE closing suspension/waitpoint), `cancel_suspension` (exec_core=terminal BEFORE closing sub-objects).
 
-#### (b2) All exec_core mutations MUST go through Lua scripts
+#### (b2) All exec_core mutations MUST go through Valkey Functions
 
 No raw `HSET` calls from application code. Every state transition is an atomic Lua script that validates preconditions, updates the state vector, and maintains indexes in one call. A raw `HSET` that skips validation can violate invariants (e.g., setting `lifecycle_phase = active` without creating a lease).
 
@@ -886,13 +974,13 @@ All Lua pseudocode calls these helpers. Implementers must provide them.
 
 All field reads in Lua must use the `or` default pattern: `core.field or "default"`. This allows new fields to be added to exec_core (or any hash) in v2+ without migrating existing records. Valkey hashes are schema-less — HGET on a nonexistent field returns nil. Existing v1 records missing the new field simply get the default value. No migration, no backfill, no downtime.
 
-#### (n) Script consolidation — v2 shared modules
+#### (n) Shared helpers eliminate consolidation concern
 
-V1 uses separate Lua scripts for each operation for clarity and auditability. Several scripts share a common "validate lease → release ownership → clear indexes → transition state" preamble (delay_execution, move_to_waiting_children, suspend_execution, complete_execution, fail_execution, expire_execution). V2 may extract shared helper modules (via Valkey FUNCTION LOAD or inline inclusion) for the lease-release preamble. This reduces maintenance burden without sacrificing the validate-then-mutate correctness pattern.
+The Valkey Functions library model (§4.8 pre) solves the v1 consolidation problem natively. The `validate_lease` shared helper (see Library-Local Helpers above) is defined once and used by all functions that need lease validation (complete, fail, suspend, delay, move_to_waiting_children, append_frame, report_usage). No copy-paste of the lease validation preamble. Similarly, `mark_expired`, condition evaluation helpers, and return wrappers are defined once. This is the primary benefit of the single-library model over separate EVALSHA scripts.
 
-### 4.9 Lua Script Return Convention
+### 4.9 Return Convention
 
-All Lua scripts use `err()` and `ok()` in pseudocode. Concrete return format:
+All functions use the shared `err()` and `ok()` helpers defined in the library preamble. Concrete return format:
 
 **Success:** `return {1, "OK", ...values}`
 **Failure:** `return {0, "ERROR_NAME", ...context}`
@@ -932,7 +1020,7 @@ Some scripts return a sub-status at element [3] for multiple success outcomes:
 | `return ok_duplicate(signal_id)` | `return {1, "DUPLICATE", signal_id}` |
 | `return ok_already_satisfied(sid, wpid, wpkey)` | `return {1, "ALREADY_SATISFIED", sid, wpid, wpkey}` |
 
-**Helper (prepend to every script):**
+**Shared helpers (defined once in library preamble, available to all functions):**
 
 ```lua
 local function ok(...)  return {1, "OK", ...} end
@@ -2599,7 +2687,7 @@ FlowFabric workers and control-plane processes connect to Valkey via the **ferri
 **Connection requirements:**
 - Cluster-aware: automatic slot discovery, redirect handling, topology refresh.
 - Pipeline support: batch commands for efficiency.
-- Lua script support: EVALSHA with automatic script loading.
+- Valkey Functions support: FCALL invocation. On startup: `FUNCTION LOAD REPLACE` the flowfabric library to all primaries; `FCALL ff_version 0` to verify.
 - TLS support: required for production (ElastiCache, cloud Valkey).
 
 **Connection pool sizing:**
@@ -3017,7 +3105,7 @@ GRACEFUL SHUTDOWN:
 
 ### 10.5 SDK Requirements
 
-- Cluster-aware Valkey client: slot discovery, redirects, EVALSHA.
+- Cluster-aware Valkey client: slot discovery, redirects, FCALL support.
 - Independent heartbeat thread: must run even if processing blocks.
 - Independent lease renewal thread: must fire during slow LLM calls.
 - Partition awareness: track `partition_id` per execution for `{p:N}` keys.
@@ -3115,10 +3203,11 @@ Every error code returned by worker-facing scripts, classified by SDK action.
 
 ## 11. Recommended Implementation Order
 
-Build incrementally. Each phase adds a testable capability. ~14 Lua scripts cover all core execution paths.
+Build incrementally. Each phase adds a testable capability. All functions are registered in the `flowfabric` library via `FUNCTION LOAD REPLACE`.
 
-| Phase | Capability | Scripts | Scanners | RFCs |
+| Phase | Capability | Functions | Scanners | RFCs |
 |---|---|---|---|---|
+| **0. Library bootstrap** | `FUNCTION LOAD REPLACE` with shared helpers + `ff_version` | `ff_version` (1 function) + all shared helpers (§4.8 Library-Local Helpers) | — | RFC-010 |
 | **1. Hello world** | create → claim → renew → complete, cancel, lease expiry | `create_execution`, `issue_claim_grant`, `claim_execution`, `complete_execution`, `renew_lease`, `mark_lease_expired_if_due`, `cancel_execution` (7 scripts) | Lease expiry scanner, delayed promoter | RFC-001, RFC-002, RFC-003, RFC-009 |
 | **2. Failure + retry + reclaim** | fail → retry decision (sets pending state, no attempt creation) → backoff → reclaim after crash | `fail_execution`, `issue_reclaim_grant`, `reclaim_execution`, `expire_execution`, `promote_delayed` (5 scripts) | Execution/attempt timeout scanner | RFC-001, RFC-002, RFC-003 |
 | **3. Suspend + signal + resume** | suspend → signal delivery → resume → re-claim | `suspend_execution`, `deliver_signal`, `claim_resumed_execution`, `create_pending_waitpoint` (4 scripts) | Suspension timeout scanner, pending waitpoint expiry scanner | RFC-004, RFC-005 |
