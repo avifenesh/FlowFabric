@@ -11,6 +11,7 @@
 //! TODO: This file is ~3 900 lines. Consider splitting into sub-modules:
 //!   - `expected_types.rs`  — `ExpectedReturnType` + `expected_type_for_cmd`
 //!   - `conversion.rs`      — `convert_to_expected_type` and all its helpers
+//!
 //!   Re-export from this module so downstream callers are unaffected.
 
 use crate::cluster::routing::Routable;

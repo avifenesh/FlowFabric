@@ -46,9 +46,12 @@ pub use value::{
 
 pub mod client;
 pub mod compression;
+#[allow(dead_code)]
 pub(crate) mod errors;
 pub(crate) mod ferriskey_client;
+#[allow(dead_code)]
 pub(crate) mod otel_db_semantics;
+#[allow(dead_code)]
 pub(crate) mod scripts_container;
 
 // High-level public API — the entry point for library users.
@@ -77,8 +80,9 @@ pub async fn connect(url: &str) -> Result<Client> {
 pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
     Client::connect_cluster(urls).await
 }
-pub mod cluster_scan_container;
-pub mod iam;
+#[allow(dead_code)]
+pub(crate) mod cluster_scan_container;
+pub(crate) mod iam;
 pub mod pubsub;
 pub mod request_type;
 pub use telemetrylib::Telemetry;

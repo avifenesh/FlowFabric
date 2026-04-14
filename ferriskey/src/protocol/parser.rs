@@ -413,6 +413,10 @@ fn parse_attribute(buf: &mut BytesMut, depth: usize) -> Result<Value> {
         return Ok(Value::Nil);
     }
     let kv_length = kv_length as usize;
+    if kv_length > MAX_COLLECTION_LENGTH {
+        return Err((ErrorKind::ParseError, "Attribute length exceeds maximum",
+            format!("got {kv_length}, max is {MAX_COLLECTION_LENGTH}")).into());
+    }
     let mut attributes = Vec::with_capacity(kv_length);
     for _ in 0..kv_length {
         let key = parse_value_unchecked(buf, depth + 1)?;
@@ -433,6 +437,10 @@ fn parse_set(buf: &mut BytesMut, depth: usize) -> Result<Value> {
         return Ok(Value::Nil);
     }
     let length = length as usize;
+    if length > MAX_COLLECTION_LENGTH {
+        return Err((ErrorKind::ParseError, "Set length exceeds maximum",
+            format!("got {length}, max is {MAX_COLLECTION_LENGTH}")).into());
+    }
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
         items.push(parse_value_unchecked(buf, depth + 1)?);
@@ -531,6 +539,10 @@ fn parse_push(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     }
 
     let length = length as usize;
+    if length > MAX_COLLECTION_LENGTH {
+        return Err((ErrorKind::ParseError, "Push length exceeds maximum",
+            format!("got {length}, max is {MAX_COLLECTION_LENGTH}")).into());
+    }
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
         items.push(parse_value_unchecked(buf, depth + 1)?);

@@ -753,6 +753,15 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         {
             let backoff_flag = self.backoff_active.clone();
             tokio::spawn(async move {
+                // Drop guard ensures the flag is reset even if the task panics or is cancelled.
+                struct BackoffGuard(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for BackoffGuard {
+                    fn drop(&mut self) {
+                        self.0.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                let _guard = BackoffGuard(backoff_flag);
+
                 let mut delay_ms = 200u64;
                 const MAX_DELAY_MS: u64 = 2000;
                 const MAX_ATTEMPTS: u32 = 8;
@@ -772,7 +781,7 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                     let _ = tx.send(SyncEvent::DesiredChanged);
                     delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
                 }
-                backoff_flag.store(false, std::sync::atomic::Ordering::Release);
+                // _guard dropped here, resetting backoff_active
             });
         }
     }

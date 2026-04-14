@@ -368,7 +368,7 @@ fn add_pipeline_result(
                             Err(make_extension_error(
                                 "PipelineNoResponse".to_string(),
                                 Some("no response from node".to_string()),
-                            ).into()),
+                            )),
                         ),
                     );
                 }
@@ -478,7 +478,7 @@ fn process_pipeline_responses(
                     pipeline_responses,
                     index,
                     inner_index,
-                    Err(server_error.clone().into()),
+                    Err(server_error.clone()),
                     address.clone(),
                 )?;
             }
@@ -750,7 +750,7 @@ where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     for (indices, address, mut error) in entries {
-        let valkey_error: Error = error.clone().into();
+        let valkey_error: Error = error.clone();
         let (index, inner_index) = indices;
 
         if matches!(retry_method, RetryMethod::MovedRedirect)
@@ -762,7 +762,7 @@ where
                 pipeline_responses,
                 index,
                 inner_index,
-                Err(error.into()),
+                Err(error),
                 address,
             )?;
             continue;
@@ -806,7 +806,7 @@ where
             pipeline_responses,
             index,
             inner_index,
-            Err(error.into()),
+            Err(error),
             address,
         )?;
     }
@@ -832,9 +832,7 @@ where
         redirect_node.slot,
         redirect_node.address.into(),
     )
-    .await
-    .map_err(Into::into)
-}
+    .await}
 
 async fn append_commands_to_retry<C>(
     pipeline_map: &mut NodePipelineMap<C>,
@@ -856,7 +854,7 @@ where
                     pipeline_responses,
                     index,
                     inner_index,
-                    Err(error.into()),
+                    Err(error),
                     address.clone(),
                 )?;
                 continue;
@@ -882,7 +880,7 @@ where
                     pipeline_responses,
                     index,
                     inner_index,
-                    Err(error.into()),
+                    Err(error),
                     address,
                 )?;
             }

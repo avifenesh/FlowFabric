@@ -3243,19 +3243,17 @@ where
                     )
                 };
                 final_responses.push(aggregated_response);
+            } else if responses.len() == 1 {
+                final_responses.push(responses.pop().unwrap().1);
             } else {
-                if responses.len() == 1 {
-                    final_responses.push(responses.pop().unwrap().1);
-                } else {
-                    final_responses.push(Err(crate::value::make_extension_error(
-                        "PipelineResponseError".to_string(),
-                        Some(format!(
-                            "Expected exactly one response for command {}, got {}",
-                            index,
-                            responses.len(),
-                        )),
-                    )));
-                }
+                final_responses.push(Err(crate::value::make_extension_error(
+                    "PipelineResponseError".to_string(),
+                    Some(format!(
+                        "Expected exactly one response for command {}, got {}",
+                        index,
+                        responses.len(),
+                    )),
+                )));
             }
         }
 
@@ -3467,6 +3465,17 @@ where
         };
 
         if asking {
+            // TODO(atomicity): ASKING and the subsequent command are sent as two
+            // separate writes on `conn`.  The cluster task is single-threaded, so
+            // *its own* requests cannot interleave, but `conn` is a shared
+            // multiplexed connection — concurrent direct-dispatch requests or
+            // pipeline fan-outs running on other Tokio tasks may write to the same
+            // connection between the ASKING response and the real command write.
+            // The correct fix is to pack ASKING + command into a single pipeline
+            // write (similar to how the pipeline fan-out path prepends ASKING in
+            // `collect_and_send_pending_requests`), or to use a per-connection
+            // write lock that spans both writes.  This requires a deeper
+            // architectural change and is deferred for now.
             let _ = conn.req_packed_command(&crate::cmd::cmd("ASKING")).await;
         }
         Ok((address, conn))
