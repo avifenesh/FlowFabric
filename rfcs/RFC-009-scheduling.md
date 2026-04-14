@@ -434,6 +434,8 @@ All modes create standard execution objects (RFC-001). The mode only affects the
 
 **Limitation:** The caller must know the execution's partition to construct the stream key. The `create_execution` response includes `partition_id`, which the caller uses to derive the `{p:N}` prefix.
 
+**Replay caveat:** On receiving a completion event (`reason = completed` or `reason = failed_terminal`), the caller MUST immediately stop tailing `lease_history` and read the result. Subsequent events in the stream (e.g., `replayed`, `acquired` from a replay or reclaim) belong to a new lifecycle and must not be consumed by the original `enqueue_and_wait` caller. A naive implementation that continues XREAD after seeing completion would observe confusing state transitions (completed → replayed → acquired). The correct pattern: filter for the first completion event, return the result, close the XREAD.
+
 ---
 
 ### 9. Lane State Model

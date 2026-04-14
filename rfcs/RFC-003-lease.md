@@ -869,6 +869,7 @@ The same validation block is reused for:
 `reclaim_execution.lua`:
 
 - validate `ownership_state in {lease_expired_reclaimable, lease_revoked}`
+- **check `lease_reclaim_count < max_reclaim_count`** (default: 100, from execution policy). If limit reached: do NOT create a new attempt. Instead: set `lifecycle_phase = terminal`, `terminal_outcome = failed`, `failure_reason = max_reclaims_exceeded`, `attempt_state = attempt_terminal`. ZADD terminal, ZREM lease_expiry. Return `ok("max_reclaims_exceeded")`. This prevents unbounded attempt creation from flapping workers.
 - verify the caller's claim grant
 - load `current_attempt_index` from the execution core and derive `next_attempt_index = current_attempt_index + 1`
 - write the previous attempt terminal detail needed for reclaim history

@@ -535,6 +535,10 @@ Operator / Engine       {fp:N} (flow)            {p:N} (member execs)
 
 Every periodic background process required by the architecture, consolidated in one place.
 
+**Scanner timing model:** Frequencies listed are **wall-clock intervals per partition**, but partitions are scanned via **pipelined batches**, not sequentially. A scanner with "1s per partition" and 256 partitions does NOT take 256s. Implementation: pipeline `ZRANGEBYSCORE` across all partitions in batches (pipeline depth ~32-64). With 256 partitions and pipeline depth 32: ~8 batches × network RTT (~1ms) = ~8ms total scan time for empty results. Processing found items adds Lua script execution time per item. **Total cycle time for all P partitions = ceil(P / pipeline_depth) × (RTT + per_item_processing).** For 256 partitions with empty results: < 50ms. The frequency defines the **sleep interval between cycles**, not per-partition sequential delay.
+
+**Short timeout note:** For deployments with per-attempt timeouts < 5s, the execution/attempt timeout scanner frequency SHOULD be reduced to 0.5s to limit overshoot to ~10%. The default 1-2s frequency causes up to 40% overshoot on 5s timeouts (7s actual vs 5s configured). Alternatively, implement inline timeout checking in `renew_lease` (compare `now_ms` against attempt_timeout score on each renewal).
+
 | Scanner | Target Key | Frequency | Action | RFC |
 |---|---|---|---|---|
 | **Delayed → Eligible promotion** | `ff:idx:{p:N}:lane:<lane_id>:delayed` | 0.5–1s per partition | `ZRANGEBYSCORE -inf <now>`. Verify execution state, set `eligible_now`, ZADD eligible set with priority score. | 001, 009 |
@@ -570,7 +574,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 
 | # | Script Name | RFC | Purpose | Class | Key Count | KEYS (all `{p:N}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
-| 0 | `create_execution` | RFC-001 | Create execution core hash + payload + policy + tags, set initial state vector (all 7 dims), ZADD to eligible or delayed or blocked set, SET NX idempotency key. If timeout_policy.deadline_at set: ZADD execution_deadline index. | A | 7 | exec_core, payload, policy, tags, eligible_or_delayed_zset, idem_key, execution_deadline_zset |
+| 0 | `create_execution` | RFC-001 | Create execution core hash + payload + policy + tags, set initial state vector (all 7 dims), ZADD to eligible or delayed or blocked set, SET NX idempotency key, SADD all_executions (§1.1). If timeout_policy.deadline_at set: ZADD execution_deadline index. | A | 8 | exec_core, payload, policy, tags, eligible_or_delayed_zset, idem_key, execution_deadline_zset, all_executions |
 | 1 | `claim_execution` | RFC-001 | Consume claim-grant, create new attempt + lease, transition runnable→active. Derives attempt_type from exec core `attempt_state` (pending_first→initial, pending_retry→retry, pending_replay→replay). Copies pending lineage fields from exec core to attempt, then clears them. ZADD attempt_timeout index (score=now+timeout_ms). | A | 14 | exec_core, claim_grant, eligible_zset, lease_expiry_zset, worker_leases, attempt_hash, attempt_usage, attempt_policy, attempts_zset, lease_current, lease_history, active_index, attempt_timeout_zset, execution_deadline_zset |
 | 2 | `claim_resumed_execution` | RFC-001 | Consume claim-grant, resume existing attempt (interrupted→started), new lease, transition runnable→active. ZADD attempt_timeout (score=now+remaining_timeout). | A | 11 | exec_core, claim_grant, eligible_zset, lease_expiry_zset, worker_leases, existing_attempt_hash, lease_current, lease_history, active_index, attempt_timeout_zset, execution_deadline_zset |
 | 3 | `complete_execution` | RFC-001 | Validate lease, end attempt, close stream, transition active→terminal(success). ZREM from attempt_timeout + execution_deadline. | A | 12 | exec_core, attempt_hash, lease_expiry_zset, worker_leases, terminal_zset, lease_current, lease_history, active_index, stream_meta, result_key, attempt_timeout_zset, execution_deadline_zset |
@@ -579,23 +583,23 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 6 | `renew_lease` | RFC-003 | Validate lease identity + epoch + expiry, extend expires_at, update lease_expiry index | A | 4 | exec_core, lease_current, lease_history, lease_expiry_zset |
 | 7 | `complete_or_fail` | RFC-003 | *See #3/#4. Generic template described from lease perspective.* | A | — | *See #3/#4* |
 | 8 | `revoke_lease` | RFC-003 | Validate target lease, set ownership_state=lease_revoked, record revocation, update indexes | A | 5 | exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases |
-| 9 | `reclaim_execution` | RFC-003 | Validate expired/revoked ownership, consume claim-grant, create new attempt + lease, increment epoch | A | 15 | exec_core, old_attempt, new_attempt, attempts_zset, new_policy, new_usage, old_lease, new_lease, lease_history, lease_expiry_zset, old_worker_leases, new_worker_leases, claim_grant, old_stream_meta, active_index |
+| 9 | `reclaim_execution` | RFC-003 | Validate expired/revoked ownership. **Check `lease_reclaim_count < max_reclaim_count`** (default 100) — if exceeded, transition to terminal(failed, max_reclaims_exceeded) instead of creating new attempt. Otherwise: consume claim-grant, create new attempt + lease, increment epoch. | A | 16 | exec_core, old_attempt, new_attempt, attempts_zset, new_policy, new_usage, old_lease, new_lease, lease_history, lease_expiry_zset, old_worker_leases, new_worker_leases, claim_grant, old_stream_meta, active_index |
 | 10 | `create_and_start_attempt` | RFC-002 | *See #1 (`claim_execution`). Same logical operation described from attempt perspective.* | A | — | *See #1* |
 | 11 | `end_attempt_and_decide` | RFC-002 | *See #3/#4. Same logical operation described from attempt perspective. Includes stream close.* | A | — | *See #3/#4* |
 | 12 | `interrupt_and_reclaim` | RFC-002 | *See #9 (`reclaim_execution`). Same logical operation described from attempt perspective. Includes stream close.* | A | — | *See #9* |
 | 12a | `cancel_execution` | RFC-001 | Cancel from any non-terminal state. **Exec_core HSET (terminal:cancelled) is FIRST mutation** (§4.8b Rule 2). Active: validate lease or operator override, end attempt, close stream, clear lease. Runnable: defensive ZREM from ALL scheduling sets. Suspended: close waitpoint+suspension (after exec_core). All paths: ZREM from attempt_timeout + execution_deadline. **ZADD terminal_zset is UNCONDITIONAL.** Uses defensive ZREM from ALL scheduling sorted sets (not a single source_state_zset) to avoid TOCTOU race where execution moves between sets between caller's state read and Lua execution. | A | 21 | exec_core, attempt_hash, stream_meta, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, wp_condition, suspension_timeout_zset, terminal_zset, attempt_timeout_zset, execution_deadline_zset, eligible_zset, delayed_zset, blocked_deps_zset, blocked_budget_zset, blocked_quota_zset, blocked_route_zset, blocked_operator_zset |
-| 12b | `replay_execution` | RFC-001 | Validate terminal, set `pending_replay_attempt` + lineage on exec core (does NOT create attempt — `claim_execution` creates it with type=replay), transition terminal→runnable. **If `terminal_outcome = skipped` AND `flow_id` set:** reset dep edges (impossible→unsatisfied), recompute `deps:meta` counts, set `blocked_by_dependencies` instead of `eligible_now`, ZADD blocked:deps (engine dispatches cross-partition `resolve_dependency` post-script). **Otherwise:** ZADD eligible. Both paths: ZREM terminal. | A | 8 | exec_core, terminal_zset, eligible_zset, blocked_deps_zset, lease_history, deps_meta, deps_unresolved, dep_edge_hashes (variable) |
+| 12b | `replay_execution` | RFC-001 | Validate terminal, set `pending_replay_attempt` + lineage on exec core (does NOT create attempt — `claim_execution` creates it with type=replay), transition terminal→runnable. **If `terminal_outcome = skipped` AND `flow_id` set:** reset dep edges (impossible→unsatisfied), recompute `deps:meta` counts, set `blocked_by_dependencies` instead of `eligible_now`, ZADD blocked:deps (engine dispatches cross-partition `resolve_dependency` post-script). **Otherwise:** ZADD eligible. Both paths: ZREM terminal. | A | 4+N | exec_core, terminal_zset, eligible_zset, lease_history (base 4). **If skipped flow member:** +blocked_deps_zset, +deps_meta, +deps_unresolved, +N×dep_edge_hash (N = number of dep edges to reset, from 0 to edge_count). Non-flow or non-skipped replays use only the base 4 keys. |
 | 13 | `suspend_execution` | RFC-004 | Validate lease (incl. expiry + revocation checks matching complete_or_fail template), release ownership, create suspension + waitpoint (or activate pending), initialize wp_condition hash, ZADD suspended_zset, ZREM attempt_timeout, update execution state, update indexes | A | 16 | exec_core, attempt_record, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, waitpoint_signals, suspension_timeout_zset, pending_wp_expiry_zset, active_index, suspended_zset, waitpoint_history, wp_condition, attempt_timeout_zset |
 | 14 | `resume_execution` | RFC-004 | Validate suspension + waitpoint satisfied, close suspension + waitpoint, ZREM suspended_zset, transition suspended→runnable, update indexes | A | 8 | exec_core, suspension_current, waitpoint_hash, waitpoint_signals, suspension_timeout_zset, eligible_zset, delayed_zset, suspended_zset |
 | 15 | `create_pending_waitpoint` | RFC-004 | Validate active lease, create pending waitpoint with short expiry, add to pending_wp_expiry index | A | 3 | exec_core, waitpoint_hash, pending_wp_expiry_zset |
-| 16 | `expire_suspension` | RFC-004 | Validate suspension still active + timeout due, apply timeout_behavior (fail/cancel/expire/auto_resume/escalate), close suspension + waitpoint | A | 7 | exec_core, suspension_current, waitpoint_hash, suspension_timeout_zset, terminal_zset or eligible_zset, lease_history |
-| 17 | `deliver_signal` | RFC-005 | Validate target, check idempotency, record signal, evaluate resume condition, optionally close waitpoint + suspension + transition suspended→runnable | A | 13 | exec_core, wp_condition, wp_signals_stream, exec_signals_zset, signal_hash, signal_payload, idem_key, waitpoint_hash, suspension_current, eligible_zset, suspended_zset, delayed_zset, suspension_timeout_zset |
+| 16 | `expire_suspension` | RFC-004 | Validate suspension still active + timeout due, apply timeout_behavior. **Terminal paths (fail/cancel/expire):** exec_core FIRST (§4.8b Rule 2), end attempt, close stream, close waitpoint + wp_condition + suspension, ZREM suspended + suspension_timeout, ZADD terminal. **auto_resume:** close waitpoint + wp_condition + suspension, transition to runnable, ZREM suspended + suspension_timeout, ZADD eligible or delayed. **escalate:** mutate suspension reason_code. Overlap group D with #19. | A | 12 | exec_core, suspension_current, waitpoint_hash, wp_condition, attempt_hash, stream_meta, suspension_timeout_zset, suspended_zset, terminal_zset, eligible_zset, delayed_zset, lease_history |
+| 17 | `deliver_signal` | RFC-005 | Validate target, **check signal count limit** (ZCARD exec_signals_zset vs max_signals_per_execution, default 10K — reject with `signal_limit_exceeded` if over), check idempotency, record signal, evaluate resume condition, optionally close waitpoint + suspension + transition suspended→runnable | A | 13 | exec_core, wp_condition, wp_signals_stream, exec_signals_zset, signal_hash, signal_payload, idem_key, waitpoint_hash, suspension_current, eligible_zset, suspended_zset, delayed_zset, suspension_timeout_zset |
 | 18 | `buffer_signal_for_pending_waitpoint` | RFC-005 | Accept signal for pending waitpoint without evaluating resume conditions | A | 7 | exec_core, wp_condition, wp_signals_stream, exec_signals_zset, signal_hash, signal_payload, idem_key |
-| 19 | `timeout_waitpoint` | RFC-005 | Generate synthetic timeout signal, apply timeout_behavior, close waitpoint + suspension, transition execution state | A | 8 | exec_core, wp_condition, wp_signals_stream, signal_hash, waitpoint_hash, suspension_current, suspension_timeout_zset, target_state_zset |
+| 19 | `timeout_waitpoint` | RFC-005 | Generate synthetic timeout signal, apply timeout_behavior, close waitpoint + suspension, transition execution state. **Overlap group D with #16 (same script).** | A | 12 | *See #16 (`expire_suspension`). Same operation — implement as ONE script.* |
 | 20 | `append_frame` | RFC-006 | Validate lease (lease_id + epoch + expiry), lazy-create stream metadata, XADD frame, XTRIM retention | B | 3 | exec_core, stream_key, stream_meta |
 | 21 | `close_stream` | RFC-006 | Set closed_at + closed_reason on stream metadata (called within end_attempt scripts) | A | 1 | stream_meta |
 | 22 | `apply_dependency_to_child` | RFC-007 | Create dep record, increment unsatisfied count. If runnable: set blocked_by_dependencies, ZREM eligible, ZADD blocked:dependencies | A | 6 | exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, blocked_deps_zset |
-| 23 | `resolve_dependency` | RFC-007 | Satisfy or skip. Satisfaction: ZREM blocked:deps, set eligible_now, ZADD eligible. Skip: ZREM blocked:deps, set terminal=skipped, ZADD terminal | A | 7 | exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, terminal_zset, blocked_deps_zset |
+| 23 | `resolve_dependency` | RFC-007 | Satisfy or skip. Satisfaction: ZREM blocked:deps, set eligible_now, ZADD eligible. Skip: end attempt (if exists) + close stream, ZREM blocked:deps, set terminal=skipped, ZADD terminal | A | 9 | exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, terminal_zset, blocked_deps_zset, attempt_hash, stream_meta |
 | 24 | `evaluate_flow_eligibility` | RFC-007 | Read-only check of execution + dependency state, return eligibility status | C | 2 | exec_core, deps_meta |
 | 25 | `issue_claim_grant` | RFC-009 | Validate execution eligible, check no existing grant, write grant with TTL, remove from eligible set | A | 3 | exec_core, claim_grant_key, eligible_zset |
 | 26 | `issue_reclaim_grant` | RFC-009 | Validate ownership_state in {expired_reclaimable, revoked}, write grant with TTL. No ZREM (exec not in eligible set) | A | 2 | exec_core, claim_grant_key |
@@ -603,7 +607,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 28 | `mark_lease_expired_if_due` | RFC-003 | Re-validate lease expiry on exec core, set ownership_state=lease_expired_reclaimable if confirmed. No-op if renewed/reclaimed | A | 4 | exec_core, lease_current, lease_expiry_zset, lease_history |
 | 29a | `block_execution_for_admission` | RFC-009 | Parameterized block: set eligibility/blocking/public for budget/quota/route/lane denial, ZREM eligible, ZADD target blocked set. All 7 dims. | A | 3 | exec_core, eligible_zset, target_blocked_zset |
 | 29b | `unblock_execution` | RFC-010 | Re-evaluate blocked execution, set eligible_now + waiting_for_worker + blocking_detail="" (clear per §4.8k), ZREM blocked set, ZADD eligible with composite priority score. All 7 dims. | A | 3 | exec_core, source_blocked_zset, eligible_zset |
-| 29c | `expire_execution` | RFC-001 | Engine-initiated on attempt timeout or execution deadline. Handles **three lifecycle phases**: (1) `active`: validate running, close attempt + stream, release lease, ZREM from lease_expiry + worker_leases + active_index. (2) `runnable`: ZREM from current index (eligible/delayed/blocked). No lease to release, no attempt to close. (3) `suspended`: close suspension + waitpoint, terminate attempt, ZREM from suspended + suspension_timeout. All paths: set terminal_outcome=expired, all 7 dims, blocking_detail='', ZREM from attempt_timeout + execution_deadline, ZADD terminal. | A | 14 | exec_core, attempt_hash, lease_expiry_zset, worker_leases, terminal_zset, lease_current, lease_history, active_index, stream_meta, attempt_timeout_zset, execution_deadline_zset, suspended_zset, suspension_current, waitpoint_hash |
+| 29c | `expire_execution` | RFC-001 | Engine-initiated on attempt timeout or execution deadline. Handles **three lifecycle phases**: (1) `active`: exec_core FIRST (§4.8b Rule 2), close attempt + stream, release lease, ZREM from lease_expiry + worker_leases + active_index. (2) `runnable`: exec_core FIRST, defensive ZREM from ALL scheduling sets. (3) `suspended`: exec_core FIRST, close suspension + waitpoint + wp_condition, terminate attempt, close stream, ZREM from suspended + suspension_timeout. All paths: set terminal_outcome=expired, all 7 dims, blocking_detail='', ZREM from attempt_timeout + execution_deadline, ZADD terminal. Uses defensive ZREM from all scheduling sets (matching cancel_execution pattern). | A | 23 | exec_core, attempt_hash, lease_expiry_zset, worker_leases, terminal_zset, lease_current, lease_history, active_index, stream_meta, attempt_timeout_zset, execution_deadline_zset, suspended_zset, suspension_current, waitpoint_hash, wp_condition, suspension_timeout_zset, eligible_zset, delayed_zset, blocked_deps_zset, blocked_budget_zset, blocked_quota_zset, blocked_route_zset, blocked_operator_zset |
 | 30 | `delay_execution` | RFC-001 | Worker delays its own active execution. Validate lease, release ownership. All 7 dims: lifecycle=runnable, ownership=unowned, eligibility=not_eligible_until_time, blocking_reason=waiting_for_delay, blocking_detail='delayed until \<delay_until\>', terminal=none, attempt_state=attempt_interrupted, public_state=delayed. Pause attempt (started→suspended). ZREM from active + lease_expiry + attempt_timeout. ZADD delayed (score=delay_until). Release lease + XADD lease_history. | A | 9 | exec_core, attempt_hash, lease_current, lease_history, lease_expiry_zset, worker_leases, active_index, delayed_zset, attempt_timeout_zset |
 | 31 | `move_to_waiting_children` | RFC-001 | Worker blocks on child dependencies. Validate lease, release ownership, set blocked_by_dependencies + waiting_for_children, all 7 dims. ZREM from active + lease_expiry + attempt_timeout. ZADD blocked:dependencies. | A | 7 | exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases, active_index, blocked_deps_zset |
 | 32 | `change_priority` | RFC-001 | Update priority field + re-score in current scheduling sorted set. Validate runnable + eligible. ZREM old score, ZADD new composite score. | A | 2 | exec_core, eligible_zset |
@@ -723,9 +727,9 @@ end
 
 The check `field ~= ""` is WRONG for fields that may not exist — `nil ~= ""` and `false ~= ""` are both `true`, which incorrectly treats a never-set field as having a value. This matters for optional fields like `lease_revoked_at`, `lease_expired_at`, `cancellation_reason`, etc.
 
-#### (c2) ARGV ordering is positional
+#### (c2) KEYS and ARGV naming convention
 
-All pseudocode uses named ARGV references (`ARGV.lease_id`, `ARGV.execution_id`) for clarity. In implementation, ARGV is a positional array (`ARGV[1]`, `ARGV[2]`, ...). Map named references to positional indices during implementation. The ordering is implementation-defined.
+All pseudocode uses **named KEYS** (`KEYS.exec_core`, `KEYS.eligible_zset`) and **named ARGV** (`ARGV.lease_id`, `ARGV.execution_id`) for readability. In Valkey Lua, both are positional arrays (`KEYS[1]`, `ARGV[1]`). The mapping from named references to positional indices is defined by the KEYS/ARGV comment at the top of each script. Implementers must map names to positions during implementation. The ordering is implementation-defined — the comment at the top of each script is the authoritative mapping.
 
 #### (d) Priority score is IEEE 754 double — safe up to ~priority 9000
 
@@ -877,36 +881,65 @@ All Lua scripts use `err()` and `ok()` in pseudocode. Concrete return format:
 **Success:** `return {1, "OK", ...values}`
 **Failure:** `return {0, "ERROR_NAME", ...context}`
 
-Client SDK parses element 1: `1` = success, `0` = failure.
+Client SDK parses element [1]: `1` = success, `0` = failure.
 
-**Do NOT use `redis.error_reply()` for Class A scripts** — it prevents returning structured context. Class B scripts (e.g., `append_frame`) MAY use `redis.error_reply()` for simplicity per RFC-006 convention.
+**Do NOT use `redis.error_reply()` for Class A scripts** — it prevents returning structured context. Class B scripts MAY use `redis.error_reply()` for errors. **Exception:** `append_frame` returns the raw XADD entry ID string on success (e.g., `"1713100800150-0"`) — the sole exception to the `{1,"OK",...}` convention. The SDK handles this non-table return as a special case.
+
+#### Success Variants (element [2])
+
+Element [2] of success returns distinguishes success types. SDK MUST branch on element [2]:
+
+| Element [2] | Meaning | Scripts |
+|---|---|---|
+| `"OK"` | Normal success. Values at element [3]+. | All (default) |
+| `"ALREADY_SATISFIED"` | Suspension skipped — buffered signals satisfied condition. Lease still held. | `suspend_execution` |
+| `"DUPLICATE"` | Signal deduplicated. Element [3] = existing signal_id. | `deliver_signal` |
+| `"ALREADY_APPLIED"` | Idempotent no-op — usage seq already processed. | `report_usage_on_attempt` |
+
+#### Sub-Status Strings (element [3] within OK)
+
+Some scripts return a sub-status at element [3] for multiple success outcomes:
+
+| Script | Element [3] | SDK Action |
+|---|---|---|
+| `fail_execution` | `"retry_scheduled"` / `"terminal_failed"` | Distinguish retry vs permanent failure |
+| `resolve_dependency` | `"satisfied"` / `"impossible"` / `"already_resolved"` | Edge resolution outcome |
+| `block_execution_for_admission` | `"blocked"` / `"not_runnable"` / `"already_blocked"` / `"terminal"` | Block outcome |
 
 | Pseudocode | Concrete Return |
 |---|---|
 | `return err("stale_lease")` | `return {0, "stale_lease"}` |
-| `return err("budget_exceeded")` | `return {0, "budget_exceeded", dimension, usage, limit}` |
-| `return err("rate_limit_exceeded")` | `return {0, "rate_limit_exceeded", retry_after_ms}` |
+| `return err("execution_not_active", outcome, epoch)` | `return {0, "execution_not_active", outcome, epoch}` |
 | `return ok()` | `return {1, "OK"}` |
 | `return ok(lease_id, epoch, expires_at)` | `return {1, "OK", lease_id, epoch, expires_at}` |
-| `return ok("retry_scheduled", id, idx, delay)` | `return {1, "OK", "retry_scheduled", id, idx, delay}` |
+| `return ok("retry_scheduled", delay)` | `return {1, "OK", "retry_scheduled", delay}` |
 | `return ok_duplicate(signal_id)` | `return {1, "DUPLICATE", signal_id}` |
+| `return ok_already_satisfied(sid, wpid, wpkey)` | `return {1, "ALREADY_SATISFIED", sid, wpid, wpkey}` |
 
 **Helper (prepend to every script):**
 
 ```lua
 local function ok(...)  return {1, "OK", ...} end
 local function err(...) return {0, ...} end
+local function ok_already_satisfied(...) return {1, "ALREADY_SATISFIED", ...} end
+local function ok_duplicate(...) return {1, "DUPLICATE", ...} end
 ```
 
-**RFC-008 Lua return → API error name mapping:** RFC-008 budget/quota Lua scripts use uppercase status names internally. The API layer maps these to the error names in RFC-008's error model:
+#### Engine-Internal Script Returns (RFC-008)
 
-| Lua Return | API Error Name |
+RFC-008 budget/quota scripts use **domain-specific return formats** called by the scheduler/engine, not the worker SDK. The scheduler translates returns to engine actions:
+
+| Lua Return | Scheduler Action |
 |---|---|
-| `HARD_BREACH` | `budget_exceeded` |
-| `SOFT_BREACH` | `budget_soft_exceeded` |
-| `RATE_EXCEEDED` | `rate_limit_exceeded` |
-| `CONCURRENCY_EXCEEDED` | `concurrency_limit_exceeded` |
-| `OK` / `ADMITTED` | success |
+| `{"OK"}` | Continue (budget accepted). |
+| `{"HARD_BREACH", dim, action}` | Apply enforcement on `{p:N}`. |
+| `{"SOFT_BREACH", dim, action}` | Log warning, emit metric. |
+| `{"ADMITTED"}` | Proceed to claim-grant. |
+| `{"ALREADY_ADMITTED"}` | Proceed (idempotent). |
+| `{"RATE_EXCEEDED", retry_ms}` | Block execution or return empty. |
+| `{"CONCURRENCY_EXCEEDED"}` | Return empty to worker. |
+
+Workers never see these. SDK parses only `{1,...}/{0,...}` from worker-facing scripts.
 
 ### 4.10 Usage Counter Consistency Model
 
@@ -1921,6 +1954,13 @@ One unified scanner handles all 4 block types per partition per lane.
 | `blocked:route` | Check worker registrations for capable + active workers with capacity. | Yes (global worker keys) |
 | `blocked:operator` (lane-paused) | Read exec core `blocking_reason`. **Only if `paused_by_policy`** (lane block) — skip `paused_by_operator` (explicit hold). Then check lane config; unblock if `state = intake_open`. | Yes (global lane config) |
 
+**Cross-partition state caching (MANDATORY):** Per scan cycle, the unblock scanner MUST cache cross-partition state to avoid redundant reads. Without caching, 50K budget-blocked executions sharing the same budget trigger 50K HMGET calls to the same `{b:M}` hash per cycle. Cache per cycle:
+- **Budget:** `Map<budget_id, has_headroom>` — first execution triggers read, rest reuse.
+- **Quota:** `Map<quota_policy_id, can_admit>` — same pattern.
+- **Workers:** `Map<capability_hash, capable_exists>` — read registrations once.
+- **Lanes:** `Map<lane_id, state>` — read config once.
+Cache invalidated at cycle end. Staleness within one cycle (5-10s) is acceptable.
+
 **Critical: `blocking_reason` field check.** The `blocked:operator` set contains both lane-paused (`paused_by_policy`) and explicit operator-held (`paused_by_operator`) executions. The scanner must read each execution's `blocking_reason` before unblocking. Each block type has an expected reason:
 
 | Scanner | Expected `blocking_reason` | Skip if |
@@ -2316,6 +2356,23 @@ An execution is in exactly one scheduling index at a time (eligible OR delayed O
 | Agent loop (5 steps, each with suspend/resume) | 1 | 1000 frames | 5 episodes | 10 signals | **~175 KB** |
 | Heavily retried with fallback (5 attempts) | 5 | 300 frames × 5 | 0 | 0 | **~240 KB** |
 
+#### Worst-Case Per-Execution Memory (Pathological but Bounded)
+
+| Component | Pathological Scenario | Memory |
+|---|---|---|
+| Core + sub-keys | Fixed | ~12 KB |
+| 100 reclaim attempts (max_reclaim_count=100) | Flapping worker, 50 min at 30s TTL | ~130 KB |
+| 10K signals at cap (max_signals_per_execution) | Webhook retry storm | ~4 MB |
+| Active stream (MAXLEN 10K × 150B) | Long streaming | ~1.5 MB |
+| 50 suspensions (waitpoints + conditions) | Multi-step agent | ~42 KB |
+| Lease history (MAXLEN 100) | Capped | ~10 KB |
+| **Realistic worst case** | 100 reclaims (no streaming) + 10K signals | **~4.2 MB** (~90× avg) |
+| **Extreme worst case** | 100 reclaims each with full streams in retention | **~150 MB** |
+
+Extreme case requires each reclaim to produce 10K stream frames AND all 100 streams within 24h retention. Mitigation: reduce `retention_maxlen` or `retention_ttl_ms` for high-reclaim lanes.
+
+**Growth caps (after round 23 fixes):** Lease history: MAXLEN 100. Streams: MAXLEN 10K/stream. Signals: 10K/execution. Attempts: ~max_reclaim(100)+max_retries+max_replay(10). Waitpoints SET: unbounded but grows only 1 per suspension episode.
+
 ### 7.3 Scale Projections
 
 Assumes a mix: 60% simple (7.4 KB), 30% streaming (85 KB), 10% agent/complex (175 KB).
@@ -2689,6 +2746,19 @@ The Valkey backend must support in v1:
 
 **Cross-execution event feed:** V1 does not provide a lane-level or system-level event stream for observers and dashboards. Per-execution observability is available: attempt streams (XREAD BLOCK for live output, RFC-006), lease history streams (lifecycle events, RFC-003). Lane-level dashboards rely on periodic count aggregation (§6.13). A cross-execution event stream (one XADD per state transition, consumable by dashboards and webhooks) is a designed-for extension that would address UC-55 (execution event feed) more fully.
 
+**V1 event model — fragmented sources:** Until the unified event stream is implemented, execution lifecycle events are distributed across 4 sources. Operators building dashboards or audit tools must understand this fragmentation:
+
+| Source | Key Pattern | Contains | Access Pattern |
+|---|---|---|---|
+| **Lease history** | `ff:exec:{p:N}:<eid>:lease:history` | Ownership transitions: acquired, released, expired, revoked, reclaimed. Each with lease_id, epoch, attempt_index, worker_id, reason. | XREAD BLOCK for tailing, XRANGE for replay. |
+| **Waitpoint signal stream** | `ff:wp:{p:N}:<wp_id>:signals` | Signal delivery: signal_id, name, category, source, matched flag. | XRANGE. Requires knowing the waitpoint_id (from suspension record). |
+| **Suspension record** | `ff:exec:{p:N}:<eid>:suspension:current` | Current suspension state: reason_code, waitpoint_key, timeout_at, satisfied_at, closed_at, close_reason. | HGETALL. Only shows current/last episode. |
+| **Execution core** | `ff:exec:{p:N}:<eid>:core` | Authoritative state vector (all 7 dimensions), timestamps, accounting. | HMGET for specific fields. |
+
+**Simplified dashboard approach:** For operators who want a single-source view without tailing 4 streams, poll `exec_core` for `public_state` at 1-5 second intervals. This gives: waiting → active → suspended → active → completed. The polling misses intermediate events (which signal triggered resume, which worker claimed) but provides a usable timeline. For detailed audit, read all 4 sources.
+
+**Gap between lease_released(suspend) and lease_acquired(resume):** Lease history shows "released/suspend" then a gap until "acquired/resume_after_suspension". During this gap: signal delivery, resume condition evaluation, and the suspended→runnable transition are NOT visible in lease_history. They are visible in the waitpoint signal stream and the execution core state.
+
 **Per-execution lifecycle event stream (RECOMMENDED v1 extension, not blocking):**
 
 Recommended key: `ff:exec:{p:N}:<execution_id>:events` (Valkey Stream). One XADD per lifecycle transition:
@@ -2852,8 +2922,10 @@ SHUTDOWN:
 | `claim_grant_expired` | Retry from step 1. |
 | `stale_lease` / `lease_expired` / `lease_revoked` | Stop. Do NOT complete/fail. Reclaimed. |
 | `execution_not_active` | On retry: check enriched return. Epoch match + success = my call won. |
-| `budget_exceeded` | **Immediate stop.** Worker MUST cease resource consumption (stop LLM calls, stop appending frames). Call `fail_execution` with `failure_category = "budget_exceeded"`. Do NOT call `complete_execution`. Enforcement is cooperative — worker must act on it. |
+| `budget_exceeded` | **Immediate stop.** Worker MUST cease resource consumption (stop LLM calls, stop appending frames). Call `fail_execution` with `failure_category = "budget_exceeded"`. Do NOT call `complete_execution`. Enforcement is cooperative: both worker and engine may call `fail_execution` — the second caller receives `execution_not_active` or `execution_already_terminal`, which is expected and harmless. If `fail_execution` returns `execution_not_active` with `terminal_outcome = failed` and matching `lease_epoch`: the engine applied enforcement first. Treat as successful enforcement and stop work. |
 | `budget_soft_exceeded` | Log warning. Worker MAY continue — soft limits are advisory in v1. |
+| `signal_limit_exceeded` | Signal cap reached (default 10K per execution). Stop sending signals. Use idempotency keys to reduce unique signal count. |
+| `max_reclaims_exceeded` | Execution terminated by engine due to excessive reclaims (flapping worker). Investigate worker stability. |
 
 ### 10.5 SDK Requirements
 
@@ -2873,6 +2945,83 @@ SHUTDOWN:
 **Signal idempotency:** External systems sending signals SHOULD include an `idempotency_key` (RFC-005 §7.2). The engine's `SET NX` guard deduplicates within the `signal_dedup_window` (default 24h).
 
 **Claim idempotency:** `claim_execution` consumes (DELs) the claim grant key atomically. A retry finds the grant missing → `invalid_claim_grant`. The worker must request a new grant from the scheduler. This is safe — the first call either succeeded (worker has a lease) or the grant expired (reconciler re-adds to eligible).
+
+### 10.7 Error Classification
+
+Every error code returned by worker-facing scripts, classified by SDK action.
+
+**TERMINAL** — Stop work. Do NOT retry. **RETRYABLE** — Retry after backoff. **COOPERATIVE** — Take specific action then stop. **INFORMATIONAL** — No-op, log and continue.
+
+| Error Code | Class | SDK Action |
+|---|---|---|
+| `stale_lease` | TERMINAL | Stop. Lease superseded by reclaim. Do NOT complete/fail. |
+| `lease_expired` | TERMINAL | Stop. Lease TTL elapsed. Reclaim scanner handles. |
+| `lease_revoked` | TERMINAL | Stop. Operator revoked. |
+| `execution_not_active` | TERMINAL | Stop. Check enriched return: epoch match + `success` = your completion won. |
+| `active_attempt_exists` | TERMINAL | Bug. Log error. |
+| `use_claim_resumed_execution` | RETRYABLE | Re-dispatch to `claim_resumed_execution`. |
+| `not_a_resumed_execution` | RETRYABLE | Re-dispatch to `claim_execution`. |
+| `execution_not_leaseable` | RETRYABLE | State changed since grant. Request new grant. |
+| `lease_conflict` | RETRYABLE | Another worker holds lease. Request different execution. |
+| `invalid_claim_grant` | RETRYABLE | Grant missing/mismatched. Request new grant. |
+| `claim_grant_expired` | RETRYABLE | Grant TTL elapsed. Request new grant. |
+| `no_eligible_execution` | RETRYABLE | Backoff 100ms-1s, retry. |
+| `budget_exceeded` | COOPERATIVE | **Immediate stop.** Call `fail_execution(failure_category="budget_exceeded")`. |
+| `budget_soft_exceeded` | INFORMATIONAL | Log warning. Continue. |
+| `execution_not_suspended` | INFORMATIONAL | Already resumed/cancelled. No-op. |
+| `already_suspended` | INFORMATIONAL | Open suspension exists. No-op. |
+| `waitpoint_closed` | INFORMATIONAL | Signal too late. Return to caller. |
+| `waitpoint_not_found` | RETRYABLE | Waitpoint may not exist yet. Retry with backoff. |
+| `target_not_signalable` | TERMINAL | Execution not suspended, no pending waitpoint. |
+| `waitpoint_pending_use_buffer_script` | RETRYABLE | Route to `buffer_signal_for_pending_waitpoint`. |
+| `duplicate_signal` | INFORMATIONAL | Dedup. Return existing signal_id. |
+| `payload_too_large` | TERMINAL | Payload > 64KB. Reduce or use reference. |
+| `signal_limit_exceeded` | TERMINAL | Max signals reached. Likely webhook storm. |
+| `invalid_waitpoint_key` | TERMINAL | MAC failed. Token invalid or expired. |
+| `execution_not_terminal` | TERMINAL | Cannot replay non-terminal. |
+| `max_replays_exhausted` | TERMINAL | Replay limit reached. Operator increases. |
+| `stream_closed` | TERMINAL | Attempt terminal. No appends. |
+| `stale_owner_cannot_append` | TERMINAL | Lease mismatch on stream append. |
+| `retention_limit_exceeded` | TERMINAL | Frame > 64KB. Reduce size. |
+| `invalid_lease_for_suspend` | TERMINAL | Lease/attempt binding mismatch. |
+| `resume_condition_not_met` | TERMINAL | Conditions not satisfied, no override. |
+| `execution_not_eligible` | INFORMATIONAL | State changed. Scheduler skips. |
+| `execution_not_in_eligible_set` | INFORMATIONAL | Another scheduler got it. Skip. |
+| `grant_already_exists` | INFORMATIONAL | Grant already issued. Skip. |
+| `execution_not_reclaimable` | INFORMATIONAL | Already reclaimed/cancelled. Skip. |
+| `invalid_dependency` | TERMINAL | Edge doesn't exist. Data issue. |
+| `stale_graph_revision` | RETRYABLE | Re-read adjacency, retry. |
+| `execution_already_in_flow` | TERMINAL | Already in another flow. |
+| `cycle_detected` | TERMINAL | Edge would create cycle. Reject. |
+| `ok_already_applied` | INFORMATIONAL | Usage seq already processed. No-op. |
+| **RFC-002 Attempt** | | |
+| `attempt_not_found` | TERMINAL | Attempt index doesn't exist. |
+| `active_attempt_exists` | BUG | Should never reach — invariant violation. Log + alert. |
+| `attempt_not_in_created_state` | BUG | Attempt not created. Internal sequencing error. |
+| `attempt_not_started` | TERMINAL | Attempt not running. Cannot end/report. |
+| `attempt_already_terminal` | INFORMATIONAL | Already ended. No-op. |
+| `execution_not_found` | TERMINAL | Execution doesn't exist. |
+| `execution_not_eligible_for_attempt` | TERMINAL | Wrong state for new attempt. |
+| `replay_not_allowed` | TERMINAL | Not terminal or limit reached. |
+| `max_retries_exhausted` | TERMINAL | Retry limit reached. |
+| **RFC-006 Stream** | | |
+| `stream_not_found` | EXPECTED | No frames appended yet. Normal for new attempts. |
+| `stream_already_closed` | INFORMATIONAL | Already closed. No-op. |
+| `invalid_frame_type` | SOFT_ERROR | Unrecognized type. Log warning, may accept if open enum. |
+| `invalid_offset` | RETRYABLE | Invalid Stream ID. Fix offset and retry. |
+| `unauthorized` | TERMINAL | System/operator auth failed. |
+| **RFC-008 Budget/Quota** | | |
+| `budget_not_found` | TERMINAL | Budget doesn't exist. |
+| `invalid_budget_scope` | TERMINAL | Malformed scope. |
+| `budget_attach_conflict` | TERMINAL | Budget already attached or conflicts. |
+| `budget_override_not_allowed` | TERMINAL | No operator privileges. |
+| `quota_policy_not_found` | TERMINAL | Quota doesn't exist. |
+| `rate_limit_exceeded` | RETRYABLE | Window full. Backoff `retry_after_ms`. |
+| `concurrency_limit_exceeded` | RETRYABLE | Cap hit. Backoff and retry. |
+| `quota_attach_conflict` | TERMINAL | Policy already attached. |
+| `invalid_quota_spec` | TERMINAL | Malformed policy definition. |
+
+**Classification key:** TERMINAL (give up), RETRYABLE (backoff+retry), COOPERATIVE (worker must act), INFORMATIONAL (no-op, log), ADVISORY (log warning only), BUG (should never happen — alert), EXPECTED (normal empty state), SOFT_ERROR (log warning, may continue).
 
 ---
 

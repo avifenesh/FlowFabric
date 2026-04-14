@@ -553,15 +553,15 @@ Pseudocode:
 -- ARGV: flow_id, edge_id, upstream_execution_id, graph_revision,
 --       dependency_kind, data_passing_ref, now_ms
 
-local core = redis.call("HGETALL", KEYS[1])
+local core = redis.call("HGETALL", KEYS.exec_core)
 assert_execution_exists(core)
 assert_flow_membership(core, ARGV.flow_id)
 
-if redis.call("EXISTS", KEYS[4]) == 1 then
+if redis.call("EXISTS", KEYS.dep_hash) == 1 then
   return ok("already_applied")
 end
 
-redis.call("HSET", KEYS[4],
+redis.call("HSET", KEYS.dep_hash,
   "edge_id", ARGV.edge_id,
   "flow_id", ARGV.flow_id,
   "upstream_execution_id", ARGV.upstream_execution_id,
@@ -572,9 +572,9 @@ redis.call("HSET", KEYS[4],
   "last_resolved_at", ""
 )
 
-redis.call("SADD", KEYS[3], ARGV.edge_id)
-local unresolved = redis.call("HINCRBY", KEYS[2], "unsatisfied_required_count", 1)
-redis.call("HSET", KEYS[2],
+redis.call("SADD", KEYS.unresolved_set, ARGV.edge_id)
+local unresolved = redis.call("HINCRBY", KEYS.deps_meta, "unsatisfied_required_count", 1)
+redis.call("HSET", KEYS.deps_meta,
   "flow_id", ARGV.flow_id,
   "last_flow_graph_revision", ARGV.graph_revision,
   "last_dependency_update_at", ARGV.now_ms
@@ -582,7 +582,7 @@ redis.call("HSET", KEYS[2],
 
 -- Partial update: only eligibility/blocking change. Other state vector dimensions unchanged.
 if core.lifecycle_phase == "runnable" and core.terminal_outcome == "none" then
-  redis.call("HSET", KEYS[1],
+  redis.call("HSET", KEYS.exec_core,
     "eligibility_state", "blocked_by_dependencies",
     "blocking_reason", "waiting_for_children",
     "blocking_detail", unresolved .. " dep(s) unresolved incl " .. ARGV.edge_id,
@@ -590,8 +590,8 @@ if core.lifecycle_phase == "runnable" and core.terminal_outcome == "none" then
     "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
   )
   -- Move from eligible → blocked:dependencies (ZREM is no-op if not in eligible)
-  redis.call("ZREM", KEYS[5], core.execution_id)
-  redis.call("ZADD", KEYS[6], tonumber(core.created_at or "0"), core.execution_id)
+  redis.call("ZREM", KEYS.eligible_zset, core.execution_id)
+  redis.call("ZADD", KEYS.blocked_deps_zset, tonumber(core.created_at or "0"), core.execution_id)
 end
 
 return ok(unresolved)
@@ -606,10 +606,11 @@ When an upstream execution reaches a relevant terminal outcome, the engine uses 
 Pseudocode:
 
 ```lua
--- KEYS: exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, terminal_zset, blocked_deps_zset
+-- KEYS: exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, terminal_zset, blocked_deps_zset,
+--       attempt_hash, stream_meta
 -- ARGV: edge_id, upstream_outcome, now_ms
 
-local dep = redis.call("HGETALL", KEYS[4])
+local dep = redis.call("HGETALL", KEYS.dep_hash)
 if not dep.edge_id then
   return err("invalid_dependency")
 end
@@ -619,11 +620,11 @@ if dep.state == "satisfied" or dep.state == "impossible" then
 end
 
 if ARGV.upstream_outcome == "success" then
-  redis.call("HSET", KEYS[4], "state", "satisfied", "last_resolved_at", ARGV.now_ms)
-  redis.call("SREM", KEYS[3], ARGV.edge_id)
-  local remaining = redis.call("HINCRBY", KEYS[2], "unsatisfied_required_count", -1)
+  redis.call("HSET", KEYS.dep_hash, "state", "satisfied", "last_resolved_at", ARGV.now_ms)
+  redis.call("SREM", KEYS.unresolved_set, ARGV.edge_id)
+  local remaining = redis.call("HINCRBY", KEYS.deps_meta, "unsatisfied_required_count", -1)
 
-  local core = redis.call("HGETALL", KEYS[1])
+  local core = redis.call("HGETALL", KEYS.exec_core)
   if remaining == 0
      and core.lifecycle_phase == "runnable"
      and core.ownership_state == "unowned"
@@ -637,7 +638,7 @@ if ARGV.upstream_outcome == "success" then
     if not is_set(new_attempt_state) or new_attempt_state == "none" then
       new_attempt_state = "pending_first_attempt"
     end
-    redis.call("HSET", KEYS[1],
+    redis.call("HSET", KEYS.exec_core,
       "eligibility_state", "eligible_now",
       "blocking_reason", "waiting_for_worker",
       "blocking_detail", "",
@@ -646,39 +647,61 @@ if ARGV.upstream_outcome == "success" then
       "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
     )
     -- Move from blocked:dependencies → eligible
-    redis.call("ZREM", KEYS[7], core.execution_id)
+    redis.call("ZREM", KEYS.blocked_deps_zset, core.execution_id)
     local priority = tonumber(core.priority or "0")
     local created_at_ms = tonumber(core.created_at or "0")
     local score = 0 - (priority * 1000000000000) + created_at_ms
-    redis.call("ZADD", KEYS[5], score, core.execution_id)
+    redis.call("ZADD", KEYS.eligible_zset, score, core.execution_id)
   end
 
   return ok("satisfied")
 end
 
 -- success_only default: failed/cancelled/expired/skipped upstream makes this edge impossible
-redis.call("HSET", KEYS[4], "state", "impossible", "last_resolved_at", ARGV.now_ms)
-redis.call("SREM", KEYS[3], ARGV.edge_id)
-redis.call("HINCRBY", KEYS[2], "unsatisfied_required_count", -1)
-redis.call("HINCRBY", KEYS[2], "impossible_required_count", 1)
+redis.call("HSET", KEYS.dep_hash, "state", "impossible", "last_resolved_at", ARGV.now_ms)
+redis.call("SREM", KEYS.unresolved_set, ARGV.edge_id)
+redis.call("HINCRBY", KEYS.deps_meta, "unsatisfied_required_count", -1)
+redis.call("HINCRBY", KEYS.deps_meta, "impossible_required_count", 1)
 
-local core = redis.call("HGETALL", KEYS[1])
+local core = redis.call("HGETALL", KEYS.exec_core)
 if core.terminal_outcome == "none" then
-  redis.call("HSET", KEYS[1],
+  -- Preserve attempt_state for executions that had a running attempt.
+  -- none only if never claimed (attempt_state is 'none' or unset).
+  -- If attempt existed (attempt_interrupted from move_to_waiting_children,
+  -- or pending_first_attempt from creation), set attempt_terminal.
+  local skip_attempt_state = core.attempt_state
+  if is_set(skip_attempt_state) and skip_attempt_state ~= "none" then
+    skip_attempt_state = "attempt_terminal"
+
+    -- End the existing attempt: mark as ended_cancelled due to impossible dependency
+    redis.call("HSET", KEYS.attempt_hash,
+      "attempt_state", "ended_cancelled",
+      "ended_at", ARGV.now_ms,
+      "failure_reason", "dependency_impossible")
+
+    -- Close attempt stream if it exists
+    if redis.call("EXISTS", KEYS.stream_meta) == 1 then
+      redis.call("HSET", KEYS.stream_meta,
+        "closed_at", ARGV.now_ms,
+        "closed_reason", "dependency_impossible")
+    end
+  end
+
+  redis.call("HSET", KEYS.exec_core,
     "lifecycle_phase", "terminal",
     "ownership_state", "unowned",
     "eligibility_state", "not_applicable",
     "blocking_reason", "none",
     "blocking_detail", "",
     "terminal_outcome", "skipped",
-    "attempt_state", "none",
+    "attempt_state", skip_attempt_state,
     "public_state", "skipped",
     "completed_at", ARGV.now_ms,
     "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
   )
   -- Move from blocked:dependencies → terminal
-  redis.call("ZREM", KEYS[7], core.execution_id)
-  redis.call("ZADD", KEYS[6], ARGV.now_ms, core.execution_id)
+  redis.call("ZREM", KEYS.blocked_deps_zset, core.execution_id)
+  redis.call("ZADD", KEYS.terminal_zset, ARGV.now_ms, core.execution_id)
 end
 
 return ok("impossible")
@@ -694,8 +717,8 @@ Pseudocode:
 
 ```lua
 -- KEYS: exec_core, deps_meta
-local core = redis.call("HGETALL", KEYS[1])
-local deps = redis.call("HGETALL", KEYS[2])
+local core = redis.call("HGETALL", KEYS.exec_core)
+local deps = redis.call("HGETALL", KEYS.deps_meta)
 
 if core.lifecycle_phase ~= "runnable" then
   return ok("not_runnable")

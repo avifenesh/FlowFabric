@@ -690,14 +690,17 @@ ff:attempt:{p:N}:{execution_id}:{attempt_index}  →  HASH
 **Attempt usage (hash per attempt, separate key for hot-path increments):**
 ```
 ff:attempt:{p:N}:{execution_id}:{attempt_index}:usage  →  HASH
-  input_tokens        → 1500
-  output_tokens       → 350
-  thinking_tokens     → 0
-  total_tokens        → 1850
-  cost_microdollars   → 2775
-  latency_ms          → 1050
-  ttft_ms             → 120
+  input_tokens            → 1500
+  output_tokens           → 350
+  thinking_tokens         → 0
+  total_tokens            → 1850
+  cost_microdollars       → 2775
+  latency_ms              → 1050
+  ttft_ms                 → 120
+  last_usage_report_seq   → 7
 ```
+
+`last_usage_report_seq` (u64): Monotonically increasing sequence number for idempotent `report_usage` calls. Each `report_usage` call includes a `usage_report_seq` in ARGV. The script checks: if `ARGV.seq <= last_usage_report_seq` → return `ok_already_applied` (no-op, prevents double-counting on retry). Otherwise: HINCRBY counters, HSET `last_usage_report_seq = ARGV.seq`. Starts at 0; the first report uses seq=1.
 
 Separating usage into its own hash avoids contention between usage increment operations (frequent, Class B) and state transitions (less frequent, Class A).
 

@@ -338,6 +338,7 @@ Both operations are **Class A** because signal acceptance, resume condition eval
 | `signal_rejected_by_policy` | Lane or execution policy forbids signals of this category or from this source. |
 | `invalid_waitpoint_key` | `target_waitpoint_key` could not be decoded (invalid MAC, corrupted token, or expired nonce). |
 | `payload_too_large` | Signal payload exceeds the 64KB v1 limit. Use reference-based delivery for large payloads. |
+| `signal_limit_exceeded` | Per-execution signal count has reached `max_signals_per_execution` (default: 10,000). Protects against unbounded memory growth from webhook retry storms. The caller should stop retrying or use idempotency keys to avoid creating new signal records. |
 
 ---
 
@@ -486,6 +487,15 @@ if not wp_cond.condition_type then
 end
 if wp_cond.closed == "1" then
   return err("waitpoint_closed")
+end
+
+-- 2b. Signal count limit (prevents unbounded ZSET growth from webhook retry storms)
+local max_signals = tonumber(ARGV.max_signals_per_execution or "10000")
+if max_signals > 0 then
+  local current_count = redis.call("ZCARD", KEYS[4])
+  if current_count >= max_signals then
+    return err("signal_limit_exceeded")
+  end
 end
 
 -- 3. Check idempotency
