@@ -536,6 +536,11 @@ Every periodic background process required by the architecture, consolidated in 
 | **Terminal retention** | `ff:idx:{p:N}:lane:<lane_id>:terminal` | Minutes–hours | `ZRANGEBYSCORE -inf <retention_cutoff>`. Purge execution + all sub-keys (cascade delete). | 001, 002, 005, 006 |
 | **Worker heartbeat expiry** | `ff:worker:<worker_instance_id>` | Handled by TTL | Valkey auto-expires worker registration keys when heartbeat TTL lapses. Scheduler skips expired workers. | 009 |
 | **Dependency resolution reconciler** | `ff:idx:{p:N}:lane:<lane_id>:blocked:dependencies` | 10–30s per partition | For each blocked execution: read upstream terminal states (cross-partition). If upstream is terminal, run `resolve_dependency.lua`. Safety net for engine crash between parent complete and child resolve dispatch. | 007, 010 |
+| **Lane count aggregator** | `ff:lane:<lane_id>:counts` | 5–15s per lane | ZCARD across all `{p:N}` partitions for each per-lane sorted set. Write aggregate counts. | 009, 010 |
+| **Eligibility re-evaluation (unblock) scanner** | `ff:idx:{p:N}:lane:<lane>:blocked:*` | 5–10s per partition | Re-evaluate block condition. If cleared (budget increased, quota reset, worker registered, lane unpaused), move execution back to eligible set. | 008, 009, 010 |
+| **Execution/attempt timeout scanner** | `ff:idx:{p:N}:attempt_timeout`, `:execution_deadline` | 1–2s per partition | `ZRANGEBYSCORE -inf <now>`. Expire active executions that exceeded per-attempt timeout or total deadline. Distinct from lease expiry. | 001, 010 |
+| **Generalized index reconciler** | `ff:idx:{p:N}:all_executions` | 30–60s per partition | SSCAN execution IDs. Verify correct index membership for current state. ZADD if missing. Safety net for OOM partial writes. | 010 |
+| **Worker claim count reconciler** | `ff:worker:<wid>` + `ff:idx:{p:N}:worker:<wid>:leases` | 10–30s per worker | Sum SCARD of worker lease sets across partitions. Reset `current_claim_count` if drifted. | 009, 010 |
 
 ---
 
@@ -1790,7 +1795,9 @@ This prevents ghost members from accumulating in flow membership sets after thei
 | **Idempotency** | `resolve_dependency` checks edge state before acting. Satisfied or impossible edges are skipped. |
 | **Batch size** | 20-50 per cycle. Each item may require 1-3 cross-partition reads (upstream execution states). |
 
-**When this reconciler fires:** Normally, dependency resolution is dispatched by the engine within milliseconds of parent completion. The reconciler is a safety net for: engine crash between parent complete and child resolve dispatch, network partition between engine and Valkey during dispatch, or failure reading outgoing edges from the flow partition.
+**Zero-dep promotion check:** Additionally, for each execution in the blocked set: if `unsatisfied_required_count == 0` AND `deps:unresolved` is empty (SCARD == 0) AND `eligibility_state == blocked_by_dependencies` → promote to `eligible_now`. Atomic Lua: HSET eligibility=eligible_now + blocking_reason=waiting_for_worker + public_state=waiting + blocking_detail="". ZREM from blocked:dependencies. ZADD to eligible with composite priority score. This catches: (a) engine crash before dependencies were applied (child created blocked but deps never staged), (b) dependency-free flow children not explicitly promoted by the caller, (c) any scenario where all deps resolved but the promotion HSET/ZADD was lost (OOM).
+
+**When this reconciler fires:** Normally, dependency resolution is dispatched by the engine within milliseconds of parent completion. The reconciler is a safety net for: engine crash between parent complete and child resolve dispatch, network partition between engine and Valkey during dispatch, failure reading outgoing edges from the flow partition, or zero-dep stuck executions.
 
 ### 6.15 Eligibility Re-evaluation Scanner (Unblock Scanner)
 
@@ -1897,8 +1904,9 @@ One unified scanner handles all 4 block types per partition per lane.
 -- KEYS: exec_core, eligible_zset, delayed_zset, active_zset,
 --       suspended_zset, terminal_zset, lease_expiry_zset,
 --       blocked_deps, blocked_budget, blocked_quota,
---       blocked_route, blocked_operator, suspension_timeout
--- ARGV: execution_id
+--       blocked_route, blocked_operator, suspension_timeout,
+--       deps_meta, deps_unresolved
+-- ARGV: execution_id, now_ms
 
 local core = redis.call("HMGET", KEYS[1],
   "lifecycle_phase", "ownership_state", "eligibility_state",
@@ -1930,7 +1938,26 @@ elseif lp == "runnable" then
     score = 0 - (pri * 1000000000000) + created
   elseif es == "not_eligible_until_time" then
     correct_key = KEYS[3]; score = tonumber(core[8]) or 0
-  elseif es == "blocked_by_dependencies" then correct_key = KEYS[8]; score = 0
+  elseif es == "blocked_by_dependencies" then
+    -- Zero-dep promotion: if no deps remain, override to eligible
+    local unsatisfied = tonumber(redis.call("HGET", KEYS[14], "unsatisfied_required_count") or "0")
+    local unresolved_count = redis.call("SCARD", KEYS[15])
+    if unsatisfied == 0 and unresolved_count == 0 then
+      -- Override: promote to eligible (deps resolved or never applied)
+      redis.call("HSET", KEYS[1],
+        "eligibility_state", "eligible_now",
+        "blocking_reason", "waiting_for_worker",
+        "blocking_detail", "",
+        "public_state", "waiting",
+        "last_transition_at", tonumber(ARGV[2]) or 0,
+        "last_mutation_at", tonumber(ARGV[2]) or 0)
+      correct_key = KEYS[2]  -- eligible
+      local pri = tonumber(core[4]) or 0
+      local created = tonumber(core[5]) or 0
+      score = 0 - (pri * 1000000000000) + created
+    else
+      correct_key = KEYS[8]; score = 0
+    end
   elseif es == "blocked_by_budget" then correct_key = KEYS[9]; score = 0
   elseif es == "blocked_by_quota" then correct_key = KEYS[10]; score = 0
   elseif es == "blocked_by_route" then correct_key = KEYS[11]; score = 0
@@ -2575,9 +2602,15 @@ DONE:
 SUSPEND (external waits):
   7a. create_pending_waitpoint → returns waitpoint_key      [RFC-004]
   7b. call external system with waitpoint_key
-  7c. suspend_execution → releases lease, exits loop        [RFC-004]
-      on resume: re-claim via step 2 (claim_resumed)
-      worker reads continuation_metadata_pointer to resume
+  7c. suspend_execution                                     [RFC-004]
+      IF returns ALREADY_SATISFIED:
+        do NOT exit loop — lease still held
+        read matched signal payloads, continue processing
+        (external result arrived before suspension committed)
+      ELSE (returns OK):
+        lease released, exit processing loop
+        on resume: re-claim via step 2 (claim_resumed)
+        worker reads continuation_metadata_pointer to resume
 
 SHUTDOWN:
   deregister_worker(instance_id) — leases expire naturally  [RFC-009]
