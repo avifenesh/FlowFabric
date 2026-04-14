@@ -6,3 +6,4 @@ ferriskey/flamegraph.svg
 *.perf.data
 perf.data
 .remember/
+TEAM.md
