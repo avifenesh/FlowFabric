@@ -122,7 +122,7 @@ where
     let mut response_policies = HashMap::new();
 
     if let Some(route) = route {
-        let (addr, conn) = ClusterConnInner::get_connection(route, core, None)
+        let (addr, conn, _needs_asking) = ClusterConnInner::get_connection(route, core, None)
             .await
             .map_err(|err| (OperationTarget::NotFound, err))?;
 
@@ -231,9 +231,10 @@ where
         }
     }
 
-    let (address, conn) = ClusterConnInner::get_connection(routing, core, Some(cmd.clone()))
-        .await
-        .map_err(|err| (OperationTarget::NotFound, err))?;
+    let (address, conn, _needs_asking) =
+        ClusterConnInner::get_connection(routing, core, Some(cmd.clone()))
+            .await
+            .map_err(|err| (OperationTarget::NotFound, err))?;
 
     add_command_to_node_pipeline_map(pipeline_map, address, conn, cmd, index, None, false, false);
     Ok(())
@@ -780,7 +781,7 @@ where
                     match ClusterConnInner::get_connection(routing, core.clone(), Some(cmd.clone()))
                         .await
                     {
-                        Ok((addr, conn)) => {
+                        Ok((addr, conn, _needs_asking)) => {
                             add_command_to_node_pipeline_map(
                                 pipeline_map,
                                 addr,
@@ -862,7 +863,7 @@ where
         };
         let routing = InternalSingleNodeRouting::ByAddress(address.to_string());
         match ClusterConnInner::get_connection(routing, core.clone(), None).await {
-            Ok((addr, conn)) => {
+            Ok((addr, conn, _needs_asking)) => {
                 add_command_to_node_pipeline_map(
                     pipeline_map,
                     addr,

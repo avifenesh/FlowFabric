@@ -2938,24 +2938,58 @@ where
         };
         trace!("route request to single node");
 
-        let (address, mut conn) = Self::get_connection(routing, core, None)
+        let (address, mut conn, needs_asking) = Self::get_connection(routing, core, None)
             .await
             .map_err(|err| (OperationTarget::NotFound, err))?;
         if let Some(span) = span {
             set_routed_node_on_span(&span, &address);
         }
 
-        conn.send_packed_bytes(packed, is_fenced)
-            .await
-            .map(Response::Single)
-            .map_err(|err| {
-                (
-                    OperationTarget::Node {
-                        address: address.to_string(),
-                    },
-                    err,
-                )
-            })
+        if needs_asking {
+            // Send ASKING + real command atomically via a 2-command pipeline
+            // to prevent interleaving on the shared multiplexed connection.
+            let mut pipeline = crate::pipeline::Pipeline::with_capacity(2);
+            pipeline.add_command(crate::cmd::cmd("ASKING"));
+            pipeline.add_command(crate::cmd::Cmd::from_packed_command(packed));
+            let mut results = conn
+                .req_packed_commands(&pipeline, 1, 1, None)
+                .await
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })?;
+            results
+                .pop()
+                .unwrap_or(Err(Error::from((
+                    ErrorKind::ClientError,
+                    "Empty pipeline response for ASKING+command",
+                ))))
+                .map(Response::Single)
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })
+        } else {
+            conn.send_packed_bytes(packed, is_fenced)
+                .await
+                .map(Response::Single)
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })
+        }
     }
 
     /// Multi-node and fan-out path. Keeps full Arc<Cmd> for command splitting.
@@ -2979,49 +3013,107 @@ where
         };
         trace!("route request to single node");
 
-        let (address, mut conn) = Self::get_connection(routing, core, Some(cmd.clone()))
-            .await
-            .map_err(|err| (OperationTarget::NotFound, err))?;
+        let (address, mut conn, needs_asking) =
+            Self::get_connection(routing, core, Some(cmd.clone()))
+                .await
+                .map_err(|err| (OperationTarget::NotFound, err))?;
         if let Some(span) = cmd.span() {
             set_routed_node_on_span(&span, &address);
         }
 
-        conn.req_packed_command(&cmd)
-            .await
-            .map(Response::Single)
-            .map_err(|err| {
-                (
-                    OperationTarget::Node {
-                        address: address.to_string(),
-                    },
-                    err,
-                )
-            })
+        if needs_asking {
+            // Send ASKING + real command atomically via a 2-command pipeline.
+            let mut pipeline = crate::pipeline::Pipeline::with_capacity(2);
+            pipeline.add_command(crate::cmd::cmd("ASKING"));
+            pipeline.add_command_with_arc(cmd);
+            let mut results = conn
+                .req_packed_commands(&pipeline, 1, 1, None)
+                .await
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })?;
+            results
+                .pop()
+                .unwrap_or(Err(Error::from((
+                    ErrorKind::ClientError,
+                    "Empty pipeline response for ASKING+command",
+                ))))
+                .map(Response::Single)
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })
+        } else {
+            conn.req_packed_command(&cmd)
+                .await
+                .map(Response::Single)
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })
+        }
     }
 
     async fn try_pipeline_request(
         pipeline: Arc<crate::pipeline::Pipeline>,
         offset: usize,
         count: usize,
-        conn: impl Future<Output = Result<(Arc<str>, C)>>,
+        conn: impl Future<Output = Result<(Arc<str>, C, bool)>>,
     ) -> OperationResult {
         trace!("try_pipeline_request");
-        let (address, mut conn) = conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
+        let (address, mut conn, needs_asking) =
+            conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
         if let Some(span) = pipeline.span() {
             set_routed_node_on_span(&span, &address);
         }
 
-        conn.req_packed_commands(&pipeline, offset, count, None)
-            .await
-            .map(Response::Multiple)
-            .map_err(|err| {
-                (
-                    OperationTarget::Node {
-                        address: address.to_string(),
-                    },
-                    err,
-                )
-            })
+        // When needs_asking is true, prepend ASKING to the pipeline so
+        // it is sent atomically in a single write.  Adjust offset/count
+        // so the caller still gets only the responses it expects.
+        if needs_asking {
+            let mut asking_pipeline =
+                crate::pipeline::Pipeline::with_capacity(1 + pipeline.len());
+            asking_pipeline.add_command(crate::cmd::cmd("ASKING"));
+            for cmd in pipeline.cmd_iter() {
+                asking_pipeline.add_command_with_arc(Arc::clone(cmd));
+            }
+            conn.req_packed_commands(&asking_pipeline, offset + 1, count, None)
+                .await
+                .map(Response::Multiple)
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })
+        } else {
+            conn.req_packed_commands(&pipeline, offset, count, None)
+                .await
+                .map(Response::Multiple)
+                .map_err(|err| {
+                    (
+                        OperationTarget::Node {
+                            address: address.to_string(),
+                        },
+                        err,
+                    )
+                })
+        }
     }
 
     async fn try_request(info: RequestInfo<C>, core: Core<C>) -> OperationResult {
@@ -3264,7 +3356,7 @@ where
         routing: InternalSingleNodeRouting<C>,
         core: Core<C>,
         cmd: Option<Arc<Cmd>>,
-    ) -> Result<(Arc<str>, C)> {
+    ) -> Result<(Arc<str>, C, bool)> {
         let mut asking = false;
 
         let conn_check = match routing {
@@ -3368,12 +3460,12 @@ where
             }
             InternalSingleNodeRouting::Random => ConnectionCheck::RandomConnection,
             InternalSingleNodeRouting::Connection { address, conn } => {
-                return Ok((address, conn.await));
+                return Ok((address, conn.await, false));
             }
             InternalSingleNodeRouting::ByAddress(address) => {
                 let conn_option = core.conn_lock.read().connection_for_address(&address);
                 if let Some((address, conn)) = conn_option {
-                    return Ok((address, conn.await));
+                    return Ok((address, conn.await, false));
                 } else {
                     return Err((
                         ErrorKind::ConnectionNotFoundForRoute,
@@ -3385,7 +3477,7 @@ where
             }
         };
 
-        let (address, mut conn) = match conn_check {
+        let (address, conn) = match conn_check {
             ConnectionCheck::Found((address, connection)) => (address, connection.await),
             ConnectionCheck::OnlyAddress(address) => {
                 // Validate the address was previously seen in the cluster topology.
@@ -3464,21 +3556,7 @@ where
             }
         };
 
-        if asking {
-            // TODO(atomicity): ASKING and the subsequent command are sent as two
-            // separate writes on `conn`.  The cluster task is single-threaded, so
-            // *its own* requests cannot interleave, but `conn` is a shared
-            // multiplexed connection — concurrent direct-dispatch requests or
-            // pipeline fan-outs running on other Tokio tasks may write to the same
-            // connection between the ASKING response and the real command write.
-            // The correct fix is to pack ASKING + command into a single pipeline
-            // write (similar to how the pipeline fan-out path prepends ASKING in
-            // `collect_and_send_pending_requests`), or to use a per-connection
-            // write lock that spans both writes.  This requires a deeper
-            // architectural change and is deferred for now.
-            let _ = conn.req_packed_command(&crate::cmd::cmd("ASKING")).await;
-        }
-        Ok((address, conn))
+        Ok((address, conn, asking))
     }
 
     fn poll_recover(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<()>> {

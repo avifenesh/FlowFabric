@@ -38,6 +38,9 @@ pub struct Cmd {
     /// clone of this Cmd (or its Arc) is dropped. Used to decouple user-facing
     /// timeout from internal pipeline cleanup.
     inflight_tracker: Option<crate::value::InflightRequestTracker>,
+    /// When true, `data` already contains fully-serialized RESP bytes and
+    /// `write_packed_command` emits them verbatim (no re-serialization).
+    pre_packed: bool,
 }
 
 /// The PING command used to fence other commands for ordering guarantees
@@ -189,6 +192,9 @@ where
 
 pub(crate) fn cmd_len(cmd: &impl Borrow<Cmd>) -> usize {
     let cmd_ref: &Cmd = cmd.borrow();
+    if cmd_ref.pre_packed {
+        return cmd_ref.data.len();
+    }
     args_len(cmd_ref.args_iter(), cmd_ref.cursor.unwrap_or(0))
 }
 
@@ -300,6 +306,26 @@ impl Cmd {
             span: None,
             is_fenced: false,
             inflight_tracker: None,
+            pre_packed: false,
+        }
+    }
+
+    /// Creates a `Cmd` whose `data` already contains fully-serialized RESP
+    /// bytes.  [`write_packed_command`] emits them verbatim — no
+    /// re-serialization.  Argument introspection methods (`args_iter`,
+    /// `arg_idx`, etc.) will yield nothing meaningful.
+    ///
+    /// This exists so pre-packed command bytes can participate in
+    /// [`Pipeline`] packing (e.g. atomic ASKING + command pipelines).
+    pub(crate) fn from_packed_command(packed: impl Into<Vec<u8>>) -> Cmd {
+        Cmd {
+            data: packed.into(),
+            args: vec![],
+            cursor: None,
+            span: None,
+            is_fenced: false,
+            inflight_tracker: None,
+            pre_packed: true,
         }
     }
 
@@ -339,6 +365,11 @@ impl Cmd {
     }
 
     pub(crate) fn write_packed_command(&self, cmd: &mut Vec<u8>) {
+        if self.pre_packed {
+            cmd.reserve(self.data.len());
+            cmd.extend_from_slice(&self.data);
+            return;
+        }
         write_command_to_vec(
             cmd,
             self.args_iter(),
@@ -348,6 +379,10 @@ impl Cmd {
     }
 
     pub(crate) fn write_packed_command_preallocated(&self, cmd: &mut Vec<u8>) {
+        if self.pre_packed {
+            cmd.extend_from_slice(&self.data);
+            return;
+        }
         write_command(
             cmd,
             self.args_iter(),
