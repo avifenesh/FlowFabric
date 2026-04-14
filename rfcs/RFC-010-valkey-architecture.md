@@ -1954,7 +1954,7 @@ return ok("reconciled")
 | **Failure mode** | Safe to crash. Desync persists until next scan. |
 | **Idempotency** | ZADD on existing member is no-op. ZREM on non-member is no-op. |
 | **Batch size** | 100-200 SCAN iterations. Each Lua: ~13 keys, 1 HMGET + 1 ZADD + ~10 ZREM. |
-| **Discovery strategy** | `SMEMBERS ff:idx:{p:N}:all_executions` to get all execution IDs in the partition. O(N_executions) — avoids SCAN which is O(N_total_keys_on_node). For each execution_id: read lane_id from exec_core, construct per-lane index keys, call `reconcile_execution_index.lua`. Process in batches of 100-200 per cycle. |
+| **Discovery strategy** | Iterate `ff:idx:{p:N}:all_executions` to get execution IDs in the partition. For partitions with ≤10K members: use `SMEMBERS` (single response). For partitions with >10K members: use `SSCAN` with COUNT 200 to avoid large single-response payloads (~7 MB at 195K members). For each execution_id: read lane_id from exec_core, construct per-lane index keys, call `reconcile_execution_index.lua`. Process in batches of 100-200 per cycle. |
 
 **When this fires:** Under normal operation, finds nothing (ZADDs match, ZREMs find nothing). Exists for:
 - OOM partial writes (Lua aborted after state mutation but before index write)
@@ -2102,6 +2102,8 @@ Weighted average: **~47 KB per execution**.
 
 **Terminal retention impact:** The ratio of retained terminal executions to active ones dominates total memory. With 7-day retention and 1-hour average execution duration, the ratio is ~168:1. Aggressive terminal retention trimming (24-hour default for v1) is recommended.
 
+**Scaling beyond 1M active:** At 10M active executions with default 24-hour retention (10:1 terminal ratio): 110M total × 47 KB ≈ 5.2 TB. A typical 48-shard cluster with 64 GB per shard provides ~3 TB — insufficient. To reach 10M active: reduce terminal retention to 4-6 hours (ratio ~4:1, total ~50M × 47 KB ≈ 2.35 TB), or increase shard count to 96+, or apply aggressive stream MAXLEN (reducing the 47 KB weighted average). Memory is the first scaling bottleneck — claim throughput and Lua latency remain comfortable at this scale.
+
 ### 7.4 Hot-Path Memory Considerations
 
 | Hot path | Access pattern | Memory concern |
@@ -2151,6 +2153,43 @@ This is well within target for all v1 use cases: queue-compatible submission (ty
 | Large prod | 24-48 | ~50-100K | Each shard handles ~2-4K claims/sec worth of ops. Headroom for streaming and usage reporting. |
 
 At scale, the bottleneck is the `{p:N}` shard handling steps 3+4 (~23 commands per claim). A single Valkey shard handles ~200-400K simple commands/sec but Lua scripts are heavier (block the event loop). Practical Lua throughput is ~50-100K script executions/sec per shard for scripts of this complexity.
+
+### 7.6 End-to-End Latency Estimates
+
+Happy-path latency for key execution lifecycle operations. Assumes: Valkey on same-region network (<1ms RTT), scheduler running co-located, worker already running and idle.
+
+**Submit to first token:**
+
+| Step | Latency | Notes |
+|---|---|---|
+| `create_execution` (pipeline/MULTI) | ~1ms | Hash creation + ZADD eligible + SET NX idem |
+| Scheduler cycle (pick candidate) | ~5-15ms | Poll interval + fairness evaluation |
+| `issue_claim_grant` (Lua) | ~0.1ms | On {p:N} |
+| `claim_execution` (Lua) | ~0.1ms | On {p:N} |
+| Worker receives grant + claims | ~1-2ms | Network RTT |
+| Worker starts processing + first `append_frame` | ~0.05ms | On {p:N} |
+| **Total** | **~8-20ms** | Dominated by scheduler poll interval |
+
+**Signal to resume (tool call round-trip, excluding external tool time):**
+
+| Step | Latency | Notes |
+|---|---|---|
+| `deliver_signal` (Lua, signal satisfies condition) | ~0.1ms | On {p:N}, includes resume transition |
+| Scheduler cycle (pick resumed candidate) | ~5-15ms | Poll interval |
+| `issue_claim_grant` + `claim_resumed_execution` | ~0.2ms | On {p:N} |
+| Worker receives + reads continuation | ~1-2ms | Network RTT + get_suspension |
+| **Total** | **~7-18ms** | Dominated by scheduler poll interval |
+
+**Full tool-call round-trip (suspend → external tool → signal → resume):**
+
+| Step | Latency | Notes |
+|---|---|---|
+| `create_pending_waitpoint` + `suspend_execution` | ~0.2ms | On {p:N} |
+| External tool execution | variable | Not engine latency |
+| Signal delivery + resume + claim | ~7-18ms | See above |
+| **Total engine overhead** | **~8-20ms** | Excludes external tool time |
+
+**Key insight:** The scheduler poll interval (5-15ms) dominates. All Valkey Lua operations are sub-millisecond. To reduce latency below 10ms: decrease scheduler poll interval (costs more CPU) or implement push-based scheduling (Valkey keyspace notifications or the lifecycle event stream extension §9.2).
 
 ---
 
@@ -2283,6 +2322,70 @@ Aggregate scanner overhead at recommended cluster sizes. Most scans find nothing
 | 1M active | 48 | ~5 | ~13-27 | 0.7-1.4ms/s | <0.1% |
 
 Scanner overhead is negligible at all scales. The delayed promoter is the most frequent scanner — consider increasing its interval to 1-2s if Lua script contention becomes measurable.
+
+### 8.7 Failover and Data Loss
+
+Valkey Cluster uses **asynchronous replication**. The primary acknowledges writes before replication to replicas. During primary failover (~1-5s), the last few milliseconds of writes may be lost.
+
+**Worst-case scenario:** Worker calls `complete_execution` → primary ACKs → primary crashes before replicating → replica promotes → completion writes lost → execution still shows `active` → lease expires → reclaim → **duplicate execution**.
+
+**Mitigations:**
+
+| Strategy | Trade-off | Recommendation |
+|---|---|---|
+| **Worker re-reads state after complete** | +1 RTT per complete. Catches lost writes. | Recommended for all workloads. |
+| **AOF appendfsync=always** | Zero data loss. ~10x write latency. | Critical workloads only. |
+| **Idempotent execution design** | Application-level. Same result on re-execution. | Best practice regardless. |
+| **Accept rare duplicates** | No overhead. Failover × in-flight probability. | Non-critical workloads. |
+
+**Impact estimate:** At 1000 completes/sec with 5s failover: ~5 executions could duplicate. With re-read verification: 0. Failovers are rare (AWS ElastiCache Multi-AZ: <30s, ~0 planned).
+
+### 8.8 Recommended Metrics
+
+Counters and gauges the engine process exports (Prometheus/OpenTelemetry). Computed by engine, not stored in Valkey.
+
+**Throughput (per lane):**
+
+| Metric | Type |
+|---|---|
+| `ff_executions_created_total` | Counter |
+| `ff_executions_claimed_total` | Counter |
+| `ff_executions_completed_total` | Counter |
+| `ff_executions_failed_total` | Counter |
+| `ff_executions_cancelled_total` | Counter |
+| `ff_executions_suspended_total` | Counter |
+| `ff_executions_resumed_total` | Counter |
+| `ff_executions_reclaimed_total` | Counter (worker health indicator) |
+
+**Queue depth (per lane, from §6.13):**
+
+| Metric | Type |
+|---|---|
+| `ff_queue_waiting` | Gauge |
+| `ff_queue_delayed` | Gauge |
+| `ff_queue_active` | Gauge |
+| `ff_queue_suspended` | Gauge |
+| `ff_queue_blocked_budget` | Gauge |
+| `ff_queue_blocked_dependencies` | Gauge |
+
+**Latency:**
+
+| Metric | Type |
+|---|---|
+| `ff_claim_latency_ms` | Histogram |
+| `ff_complete_latency_ms` | Histogram |
+| `ff_signal_delivery_latency_ms` | Histogram |
+| `ff_scheduler_cycle_ms` | Histogram |
+| `ff_scanner_cycle_ms` | Histogram (per scanner) |
+
+**Resources:**
+
+| Metric | Type |
+|---|---|
+| `ff_budget_usage_ratio` | Gauge (per budget) |
+| `ff_budget_breach_total` | Counter |
+| `ff_worker_active_count` | Gauge |
+| `ff_worker_claim_count` | Gauge (per worker) |
 
 ---
 
@@ -2422,6 +2525,7 @@ The following are **not** goals for the v1 Valkey backend:
 - **Zero-downtime schema migration:** V1 key schemas are designed for forward compatibility (new fields can be added to hashes without migration), but structural changes (e.g., changing partition count) require a planned migration.
 - **Built-in observability backend:** FlowFabric exposes metrics and events for external observability (Prometheus, Grafana, OpenTelemetry), but does not include a built-in dashboard or time-series store.
 - **Namespace-based access control:** V1 does not enforce namespace/tenant isolation at the engine level. The `namespace` field on execution, flow, and budget objects is metadata used for fairness (RFC-009 §5.3), listing (namespace index), and idempotency scoping — **not a security boundary**. Any caller who knows an `execution_id` can read, signal, or inspect that execution regardless of namespace. Multi-tenant isolation must be enforced at the API gateway or control plane layer. Engine-level namespace enforcement is a designed-for extension.
+- **Trusted network assumption:** The Valkey backend assumes a trusted network between workers, schedulers, reconcilers, and Valkey. All callers are trusted to provide correct parameters (worker_id, lease_id, lease_epoch, usage deltas). The Lua scripts validate data consistency (lease fencing, state vector constraints) but do NOT authenticate callers. Untrusted callers must be mediated by an authenticated API gateway that validates identity, authorization, and input before invoking Lua scripts. Engine-level per-operation authentication (signed tokens, per-worker ACLs) is a post-v1 extension.
 - **Separate dead-letter queue:** FlowFabric does not have a DLQ. Terminal failed executions are stored in the per-lane terminal sorted set (`ff:idx:{p:N}:lane:<lane_id>:terminal`) alongside completed/cancelled/expired/skipped executions. Operators find failed executions via `list_executions(lane_id, public_state=failed)`. The `failure_category` field on the attempt record (RFC-002) distinguishes failure causes (`timeout`, `worker_error`, `provider_error`, `budget_exceeded`). Failed executions are replayable via `replay_execution` (RFC-001 §4.4). This design matches UC-07 (dead-letter handling): "move terminal failures into a durable failed state for inspection or replay."
 
 ---

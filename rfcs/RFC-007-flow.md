@@ -299,7 +299,7 @@ When `dynamic_expansion_enabled = true`, new member executions and new edges may
 
 Validation rules:
 
-1. the new execution must be explicitly added to membership
+1. the new execution must be explicitly added to membership. **Flow child executions are created with `eligibility_state = blocked_by_dependencies`** (RFC-001 `create_child_execution`). They are added to `blocked:dependencies`, NOT the eligible set. This prevents a race where the child is claimed before `apply_dependency_to_child` runs. Dependencies are then applied via steps 2-5. When all dependencies resolve (via `resolve_dependency`), the child transitions to `eligible_now`. For dependency-free flow children (e.g., root execution), the caller must explicitly resolve with zero deps or use `create_execution` (non-flow) which starts eligible.
 2. all new edges must refer to members of the same flow
 3. topology kind must permit the mutation
 4. DAG mode must reject cycles

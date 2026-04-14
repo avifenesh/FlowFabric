@@ -627,7 +627,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | `create_execution` | `lane_id`, `execution_kind`, `input_payload`, `policy?`, `idempotency_key?`, `tags?` | Creates execution in `submitted` phase. Engine resolves to `runnable` (possibly `delayed`). If `idempotency_key` matches existing execution within dedup window, returns existing. **Idempotency is TTL-bounded:** the dedup key (`ff:idem:<namespace>:<key>`) has `TTL = min(dedup_window, retention_window)`. After TTL expires, a retry with the same key creates a new execution. V1 default `dedup_window`: 24h. Idempotency is namespace-scoped — different tenants may safely reuse the same key. Callers requiring permanent dedup must enforce it externally before submission. |
 | `create_delayed_execution` | Same + `delay_until` | Creates execution in `runnable` with `eligibility_state = not_eligible_until_time`. |
 | `create_scheduled_execution` | Same + `schedule_spec` | Creates with schedule metadata. Engine handles recurring promotion. |
-| `create_child_execution` | `parent_execution_id`, `flow_id`, same as above | Creates with `parent_execution_id` and `flow_id` set. Adds to flow membership. |
+| `create_child_execution` | `parent_execution_id`, `flow_id`, same as above | Creates with `parent_execution_id` and `flow_id` set. **Starts with `eligibility_state = blocked_by_dependencies`** and `blocking_reason = waiting_for_children` — NOT added to eligible set. Added to `blocked:dependencies` set instead. This closes the race window between execution creation and `apply_dependency_to_child`. If the child has no dependencies, `apply_dependency_to_child` is never called and the child stays blocked — the caller must explicitly unblock it or use `create_execution` (without flow context) for dependency-free children. |
 
 #### 4.2 Claim / Ownership Operations (Class A — atomic)
 
@@ -1018,10 +1018,13 @@ if core.ownership_state ~= "unowned" then return err("lease_conflict") end
 if core.eligibility_state ~= "eligible_now" then return err("execution_not_leaseable") end
 if core.terminal_outcome ~= "none" then return err("execution_not_leaseable") end
 
--- Defense-in-depth: reject resume-from-suspension case.
--- The scheduler should dispatch to claim_resumed_execution for this state,
--- but if it dispatches here by mistake, creating a new attempt would destroy
--- the suspended attempt's continuation metadata. Fail loudly.
+-- Defense-in-depth guards (Invariant A3 + dispatch correctness):
+-- A3: at most one active attempt. If attempt_state=running_attempt, a bug
+-- elsewhere left the state inconsistent (V9 says runnable+running=invalid).
+if core.attempt_state == "running_attempt" then
+  return err("active_attempt_exists")
+end
+-- Dispatch: resume-from-suspension must use claim_resumed_execution.
 if core.attempt_state == "attempt_interrupted" then
   return err("use_claim_resumed_execution")
 end
