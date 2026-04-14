@@ -342,6 +342,8 @@ Flow-level cancellation is policy-controlled.
 
 The passive flow container does not suspend or wait during cancellation. It issues execution-level control actions and derives state from member outcomes.
 
+**Concurrent replay interaction:** `cancel_flow` iterates the member list once and cancels each member. It does NOT prevent concurrent `replay_execution` calls. If an operator replays a terminal member after `cancel_flow` has already iterated past it, the replayed execution escapes cancellation — it transitions from terminal back to runnable and is not re-visited. The flow remains non-terminal until the surviving member is separately cancelled or completes. Operators should verify `public_flow_state` after `cancel_flow` and re-cancel individual surviving members if needed.
+
 ### Flow State Model
 
 `public_flow_state` is derived from member execution states and flow policy.

@@ -88,7 +88,7 @@ All keys below share the hash tag `{p:N}` where `N = crc16(execution_id) % num_p
 | Key Pattern | Type | Lifecycle | Notes |
 |---|---|---|---|
 | `ff:exec:{p:N}:<execution_id>:waitpoints` | SET | **Required.** SADD on every `suspend_execution`. Deleted on retention purge. | Set of all `waitpoint_id`s ever created for this execution. Used by the cleanup cascade to discover and DEL all waitpoint-related keys (hash, :signals stream, :condition hash). Without this, old waitpoints from prior suspension episodes are orphaned. |
-| `ff:exec:{p:N}:<execution_id>:suspensions` | STREAM or ZSET | Optional. Append on each suspension episode close. | Historical suspension records for executions with multiple suspension episodes. |
+| `ff:exec:{p:N}:<execution_id>:suspensions` | STREAM or ZSET | **Designed-for v2.** No v1 script writes to this key. | Reserved for v2 unified event stream (§9.2). Historical suspension records for executions with multiple episodes. Implementers may skip creating this key until the unified event model is implemented. |
 
 ##### Partition-Local Indexes — `{p:N}`
 
@@ -105,7 +105,7 @@ All keys below share the hash tag `{p:N}` where `N = crc16(execution_id) % num_p
 | `ff:idx:{p:N}:lane:<lane_id>:blocked:operator` | ZSET | 001 | Member: `execution_id`. | Operator hold. |
 | `ff:idx:{p:N}:lane:<lane_id>:suspended` | ZSET | 001 | Member: `execution_id`. Score: `suspension_timeout_at` (ms) or MAX. | Per-lane suspended set. |
 | `ff:idx:{p:N}:lease_expiry` | ZSET | 001, 003 | Member: `execution_id`. Score: `lease_expires_at` (ms). | Cross-lane within partition. Reclaim scanner target. |
-| `ff:idx:{p:N}:worker:<worker_instance_id>:leases` | SET | 001, 003 | Member: `execution_id`. | Per-worker lease set within partition. Operator drain aid. Best-effort — authoritative ownership is on exec core. |
+| `ff:idx:{p:N}:worker:<worker_instance_id>:leases` | SET | 001, 003 | Member: `execution_id`. | Per-worker lease set within partition. Operator drain aid. Best-effort. **Worker→execution lookup:** iterate across all partitions. Monitoring layer should cache globally via lease history events. |
 | `ff:idx:{p:N}:suspension_timeout` | ZSET | 004 | Member: `execution_id`. Score: `timeout_at` (ms). | Suspension timeout scanner target. Cross-lane within partition. |
 | `ff:idx:{p:N}:pending_waitpoint_expiry` | ZSET | 004 | Member: `waitpoint_id`. Score: `expires_at` (ms). | Pending waitpoint cleanup scanner target. |
 | `ff:idx:{p:N}:attempt_timeout` | ZSET | 001, 010 | Member: `execution_id`. Score: `started_at + timeout_ms`. | Per-attempt timeout. ZADD on `claim_execution`/`claim_resumed_execution`. ZREM on `complete`/`fail`/`expire`. Scanned by §6.16. |
@@ -156,8 +156,9 @@ Quota keys use `{q:K}` where `K = crc16(quota_scope_id) % num_quota_partitions`.
 | Key Pattern | Type | RFC | Lifecycle | Notes |
 |---|---|---|---|---|
 | `ff:quota:{q:K}:<quota_policy_id>` | HASH | 008 | Created on `create_quota_policy`. | Quota policy definition: scope, rate limits, concurrency caps, breach actions. |
-| `ff:quota:{q:K}:<quota_policy_id>:window:<dimension>` | ZSET | 008 | Entries added on admission. Stale entries removed by `ZREMRANGEBYSCORE` on each check. | Sliding window. Member: `<execution_id>:<timestamp_ms>`. Score: `timestamp_ms`. |
+| `ff:quota:{q:K}:<quota_policy_id>:window:<dimension>` | ZSET | 008 | Entries added on admission. Stale entries removed by `ZREMRANGEBYSCORE` on each check. | Sliding window. Member: `execution_id` (not `execution_id:timestamp` — changed in R22 for idempotent retry, see script #32). Score: `timestamp_ms`. ZADD on existing member updates score without creating a duplicate entry. |
 | `ff:quota:{q:K}:<quota_policy_id>:concurrency` | STRING | 008 | Created on first INCR. INCR on lease acquire, DECR on lease release (async). | Active concurrency counter. Subject to drift; reconciled periodically. |
+| `ff:quota:{q:K}:<quota_policy_id>:admitted:<execution_id>` | STRING | 008 | SET NX on admission with TTL = window_size. Auto-expires. | Idempotency guard for `check_admission_and_record`. Prevents double-INCR of concurrency counter on retry. Value: `"1"`. If key exists, script returns `ALREADY_ADMITTED` without mutation. |
 | `ff:quota_attach:{q:K}:<scope_type>:<scope_id>` | SET | 008 | Created on `attach_quota_policy`. | Forward index: scope → attached quota_policy_ids. |
 
 #### 1.5 Global Keys (No Hash Tag)
@@ -169,6 +170,7 @@ These keys have no hash tag and land on a shard determined by the full key strin
 | `ff:lane:<lane_id>:config` | HASH | 009 | Created on lane creation. Updated on lane config changes. | Lane configuration: state, default policies, scheduling weight, max concurrency. |
 | `ff:lane:<lane_id>:counts` | HASH | 009 | Created with lane. Updated periodically by background aggregator. | Derived cached counts by public_state. Not authoritative — ZCARD on partition sets is authoritative but slower. |
 | `ff:worker:<worker_instance_id>` | HASH | 009 | Created on `register_worker`. TTL based on `last_heartbeat_at + worker_ttl_ms`. Auto-expires on heartbeat failure. | Worker registration: capabilities, status, capacity, heartbeat. |
+| `ff:idx:workers` | SET | 009 | SADD on `register_worker`, SREM on `deregister_worker`. Members auto-stale when worker TTL expires (scheduler checks `ff:worker:<wid>` EXISTS before using). | All registered worker instance IDs. Scheduler reads on startup to enumerate workers. |
 | `ff:idx:workers:cap:<key>:<value>` | SET | 009 | Updated atomically with worker registration. Members removed on deregistration or TTL expiry. | Capability index: which workers have a given capability. Member: `worker_instance_id`. |
 | `ff:sched:fairness:lane:<lane_id>:deficit` | STRING | 009 | Created by scheduler. TTL: `fairness_window_ms * 2`. | Ephemeral. Weighted deficit for cross-lane round-robin. Rebuilt from queue depths on restart. |
 | `ff:sched:fairness:tenant:<namespace>:lane:<lane_id>:claims` | STRING | 009 | Created by scheduler. TTL: `fairness_window_ms`. | Ephemeral. Tenant claim count in current fairness window. |
@@ -289,10 +291,9 @@ Worker                Scheduler                {q:K}              {b:M}         
   │◄──────────────────────────────────────────────────────────────────lease+attempt─│
 ```
 
-**Step 1 — Quota admission check (`{q:K}`)**
-- Lua: `check_admission_and_record.lua` on the quota partition.
-- Scope-level fast pre-check: sliding-window rate check + concurrency cap check.
-- If admitted: ZADD to window, INCR concurrency counter. Proceed.
+**Step 1 — Quota pre-check (`{q:K}`) — READ-ONLY**
+- Scheduler reads `ff:quota:{q:K}:<policy_id>:window:<dim>` (ZREMRANGEBYSCORE + ZCARD) and `concurrency` (GET). Compares against cached limits. **No mutation** — no ZADD, no INCR. The write-path `check_admission_and_record` (ZADD + INCR) runs at step 4a below, after candidate selection provides an execution_id.
+- If window full or concurrency cap reached: return rejection to worker. Stop.
 - If denied: return `rate_limit_exceeded` or `concurrency_limit_exceeded`. Stop.
 
 **Step 2 — Select candidate**
@@ -310,7 +311,14 @@ Worker                Scheduler                {q:K}              {b:M}         
 
 **Budget cache per scheduling cycle:** The scheduler caches budget breach status per `budget_id` during a single claim cycle. The first candidate sharing budget B triggers a cross-partition read to `{b:M}`; all subsequent candidates sharing B reuse the cached result. Cache invalidated at cycle end. This prevents O(N) reads to the same `{b:M}` hash when N candidates share a breached budget. Same caching pattern as the unblock scanner (§6.15).
 
-**Step 4 — Issue claim-grant (`{p:N}`)**
+**Step 4a — Quota admission record (`{q:K}`) — WRITE**
+- Now that a candidate is selected (execution_id known): run `check_admission_and_record.lua` on `{q:K}`.
+- This is the write-path: ZADD execution_id to window, SET NX admitted guard, INCR concurrency.
+- If the rate limit or concurrency cap was hit between the step 1 read and now: returns `RATE_EXCEEDED` or `CONCURRENCY_EXCEEDED`. Go back to step 2 with next candidate.
+- If `ALREADY_ADMITTED` (idempotent retry): proceed.
+- If `ADMITTED`: proceed.
+
+**Step 4b — Issue claim-grant (`{p:N}`)**
 - Lua: `issue_claim_grant.lua` on the execution's partition.
 - Validates execution is still `runnable` + `eligible_now` + `unowned`.
 - Writes `ff:exec:{p:N}:<execution_id>:claim_grant` with TTL.
@@ -593,7 +601,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 10 | `create_and_start_attempt` | RFC-002 | *See #1 (`claim_execution`). Same logical operation described from attempt perspective.* | A | — | *See #1* |
 | 11 | `end_attempt_and_decide` | RFC-002 | *See #3/#4. Same logical operation described from attempt perspective. Includes stream close.* | A | — | *See #3/#4* |
 | 12 | `interrupt_and_reclaim` | RFC-002 | *See #9 (`reclaim_execution`). Same logical operation described from attempt perspective. Includes stream close.* | A | — | *See #9* |
-| 12a | `cancel_execution` | RFC-001 | Cancel from any non-terminal state. **Exec_core HSET (terminal:cancelled) is FIRST mutation** (§4.8b Rule 2). Active: validate lease or operator override, end attempt, close stream, clear lease. Runnable: defensive ZREM from ALL scheduling sets. Suspended: close waitpoint+suspension (after exec_core). All paths: ZREM from attempt_timeout + execution_deadline. **ZADD terminal_zset is UNCONDITIONAL.** Uses defensive ZREM from ALL scheduling sorted sets (not a single source_state_zset) to avoid TOCTOU race where execution moves between sets between caller's state read and Lua execution. | A | 21 | exec_core, attempt_hash, stream_meta, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, wp_condition, suspension_timeout_zset, terminal_zset, attempt_timeout_zset, execution_deadline_zset, eligible_zset, delayed_zset, blocked_deps_zset, blocked_budget_zset, blocked_quota_zset, blocked_route_zset, blocked_operator_zset |
+| 12a | `cancel_execution` | RFC-001 | Cancel from any non-terminal state. **Exec_core HSET (terminal:cancelled) is FIRST mutation** (§4.8b Rule 2). Active: validate lease or operator override, end attempt, close stream, clear lease. Runnable: defensive ZREM from ALL scheduling sets. Suspended: HSET exec_core terminal (first), end attempt (suspended→ended_cancelled), close stream (closed_at, closed_reason=attempt_cancelled), close waitpoint+wp_condition+suspension, ZREM suspended+suspension_timeout. All paths: ZREM from attempt_timeout + execution_deadline. **ZADD terminal_zset is UNCONDITIONAL.** Uses defensive ZREM from ALL scheduling sorted sets (not a single source_state_zset) to avoid TOCTOU race where execution moves between sets between caller's state read and Lua execution. | A | 21 | exec_core, attempt_hash, stream_meta, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, wp_condition, suspension_timeout_zset, terminal_zset, attempt_timeout_zset, execution_deadline_zset, eligible_zset, delayed_zset, blocked_deps_zset, blocked_budget_zset, blocked_quota_zset, blocked_route_zset, blocked_operator_zset |
 | 12b | `replay_execution` | RFC-001 | Validate terminal, set `pending_replay_attempt` + lineage on exec core (does NOT create attempt — `claim_execution` creates it with type=replay), transition terminal→runnable. **If `terminal_outcome = skipped` AND `flow_id` set:** reset dep edges (impossible→unsatisfied), recompute `deps:meta` counts, set `blocked_by_dependencies` instead of `eligible_now`, ZADD blocked:deps (engine dispatches cross-partition `resolve_dependency` post-script). **Otherwise:** ZADD eligible. Both paths: ZREM terminal. | A | 4+N | exec_core, terminal_zset, eligible_zset, lease_history (base 4). **If skipped flow member:** +blocked_deps_zset, +deps_meta, +deps_unresolved, +N×dep_edge_hash (N = number of dep edges to reset, from 0 to edge_count). Non-flow or non-skipped replays use only the base 4 keys. |
 | 13 | `suspend_execution` | RFC-004 | Validate lease (incl. expiry + revocation checks matching complete_or_fail template), release ownership, create suspension + waitpoint (or activate pending), initialize wp_condition hash, ZADD suspended_zset, ZREM attempt_timeout, update execution state, update indexes | A | 16 | exec_core, attempt_record, lease_current, lease_history, lease_expiry_zset, worker_leases, suspension_current, waitpoint_hash, waitpoint_signals, suspension_timeout_zset, pending_wp_expiry_zset, active_index, suspended_zset, waitpoint_history, wp_condition, attempt_timeout_zset |
 | 14 | `resume_execution` | RFC-004 | Validate suspension + waitpoint satisfied, close suspension + waitpoint, ZREM suspended_zset, transition suspended→runnable, update indexes | A | 8 | exec_core, suspension_current, waitpoint_hash, waitpoint_signals, suspension_timeout_zset, eligible_zset, delayed_zset, suspended_zset |
@@ -620,6 +628,7 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 33 | `update_progress` | RFC-001 | Update progress_pct + progress_message. Validate lease (lease_id + epoch). | B | 1 | exec_core |
 | 34 | `report_usage_on_attempt` | RFC-001/008 | **Idempotent** via monotonic `usage_report_seq`. ARGV includes `usage_report_seq` (caller-supplied, monotonically increasing per attempt). Script checks `attempt_usage.last_usage_report_seq`: if `ARGV.seq <= last_seq` → return `ok_already_applied` (no-op). Otherwise: HINCRBY attempt usage counters + exec core usage totals, HSET `last_usage_report_seq = ARGV.seq`. Validate lease. Route to `{b:M}` budget check after return. Budget `report_usage_and_check` on `{b:M}` must also include the seq — if `ok_already_applied`, skip the budget call entirely. | B | 2 | exec_core, attempt_usage |
 | 35 | `promote_blocked_to_eligible` | RFC-007 | Promote zero-dep flow member from blocked:dependencies to eligible. Validate runnable + blocked_by_dependencies + unsatisfied_required_count=0 + deps:unresolved empty. Set eligible_now + waiting_for_worker + blocking_detail="". **Preserve attempt_state** (same logic as resolve_dependency satisfaction path). ZREM blocked:deps, ZADD eligible with composite priority score. Called by control plane immediately after flow setup for root members with zero dependencies. | A | 5 | exec_core, blocked_deps_zset, eligible_zset, deps_meta, deps_unresolved |
+| 36 | `close_waitpoint` | RFC-004 | Proactive close of pending or active waitpoint. Validate waitpoint exists and state is `pending` or `active` (not already closed/expired). HSET state=closed, closed_at=now, close_reason=ARGV.reason. If pending: ZREM from pending_wp_expiry. Does NOT change execution lifecycle state. Used by workers that created a pending waitpoint (SDK §10.3 step 7a) but decided not to suspend. | A | 3 | exec_core, waitpoint_hash, pending_wp_expiry_zset |
 | — | `skip_execution` | RFC-001 | *Implemented inline in `resolve_dependency` (#23) impossible path. Not a standalone script.* | — | — | — |
 | — | `release_lease` | RFC-001 | *Implemented inline in complete/fail/suspend/delay/move_to_waiting_children scripts. Not standalone.* | — | — | — |
 | — | `recover_abandoned_execution` | RFC-001 | *Same as `reclaim_execution` (#9). See RFC-003.* | — | — | — |
@@ -1666,10 +1675,18 @@ FlowFabric requires several background processes to maintain system correctness,
 | **Partition scope** | Per `{p:N}` execution partition |
 | **Index** | `ff:idx:{p:N}:lease_expiry` (ZSET, score = `lease_expires_at` ms) |
 | **Operation** | `ZRANGEBYSCORE ff:idx:{p:N}:lease_expiry -inf <now_ms> LIMIT 0 <batch_size>` |
-| **Per-item action** | Run `mark_lease_expired_if_due.lua` on the execution core. The script re-validates that the lease is actually expired (guards against clock skew or recent renewal). If confirmed, sets `ownership_state = lease_expired_reclaimable`. Optionally runs `reclaim_execution.lua` immediately or defers to the scheduler. |
+| **Per-item action** | Run `mark_lease_expired_if_due.lua` on the execution core. The script re-validates that the lease is actually expired (guards against clock skew or recent renewal). If confirmed, sets `ownership_state = lease_expired_reclaimable`. |
 | **Failure mode** | Safe to crash. On restart, re-scans from `-inf`. Items already processed are idempotent (script re-validates). |
 | **Idempotency** | The Lua script checks current lease state before acting. If already expired/reclaimed, it's a no-op. |
 | **Batch size** | 50-100 per scan cycle. Larger batches risk Lua script latency spikes. |
+
+**Reclaim discovery:** After `mark_lease_expired_if_due` transitions an execution to `lease_expired_reclaimable`, the scheduler must discover it for reclaim. Two approaches (implementation chooses one):
+
+**(a) Scanner-notifies-scheduler (recommended):** The lease expiry scanner, after marking an execution as reclaimable, notifies the scheduler directly (e.g., adds the execution_id to an in-memory queue if scanner and scheduler share a process, or XADDs to a `ff:sched:reclaim_candidates` stream). The scheduler then runs capability matching → `issue_reclaim_grant` → worker calls `reclaim_execution`.
+
+**(b) Scheduler polls lease_expiry index:** The scheduler periodically scans `ff:idx:{p:N}:lease_expiry` for entries with `score < now_ms`. For each, reads exec core to check `ownership_state = lease_expired_reclaimable`. If confirmed, proceeds with reclaim grant. This is simpler but duplicates the scanner's work.
+
+Both approaches converge: the execution is reclaimed within `scanner_frequency + scheduler_cycle` (worst case ~3-4s). The lease_expiry ZSET entry is NOT removed by `mark_lease_expired_if_due` — it stays until `reclaim_execution` or `cancel_execution` removes it. This means both approaches can safely discover the execution from the same index.
 
 ### 6.2 Suspension Timeout Scanner
 
@@ -2787,6 +2804,10 @@ The Valkey backend must support in v1:
 
 **Gap between lease_released(suspend) and lease_acquired(resume):** Lease history shows "released/suspend" then a gap until "acquired/resume_after_suspension". During this gap: signal delivery, resume condition evaluation, and the suspended→runnable transition are NOT visible in lease_history. They are visible in the waitpoint signal stream and the execution core state.
 
+**Operator debugging — dependency blocks:** Read `deps:meta` for unsatisfied count. For each edge in `deps:unresolved`: read `dep:<edge_id>` hash for `upstream_execution_id`, then cross-partition read upstream `public_state`. Implementation may wrap this in a convenience `explain_dependency_block(eid)` operation.
+
+**Operator emergency — force-unblock:** No direct `blocked→eligible` bypass exists by design — blocks have causes that should be resolved (`override_budget`, `enable_lane`, `register_worker`). Emergency escape: `cancel_execution` (terminal) followed by `replay_execution` (re-enters scheduling from scratch).
+
 **Per-execution lifecycle event stream (RECOMMENDED v1 extension, not blocking):**
 
 Recommended key: `ff:exec:{p:N}:<execution_id>:events` (Valkey Stream). One XADD per lifecycle transition:
@@ -2832,7 +2853,7 @@ Consolidates audit trail (currently across lease history + attempt records + sig
 3. Attempt sorted set.
 4. All stream data and metadata (per attempt, discovered via attempts ZSET).
 5. Lease current (if still present) and lease history.
-6. Suspension current record. Suspension history stream (if exists).
+6. DEL `ff:exec:{p:N}:<eid>:suspension:current` (suspension current hash). DEL `ff:exec:{p:N}:<eid>:suspensions` (suspension history stream, if exists).
 7. Per-execution signal index and individual signal records **including payload keys** (`ff:signal:{p:N}:<signal_id>` + `ff:signal:{p:N}:<signal_id>:payload`, discovered via `ff:exec:...:signals` ZSET).
 8. Dependency records: `ff:exec:{p:N}:<eid>:deps:meta` hash, all `ff:exec:{p:N}:<eid>:dep:<edge_id>` hashes (discovered via SCAN `ff:exec:{p:N}:<exec_id>:dep:*`), `ff:exec:{p:N}:<eid>:deps:unresolved` set.
 9. All waitpoint records: for each waitpoint_id in `ff:exec:...:waitpoints` SET (mandatory), DEL the waitpoint hash (`ff:wp:{p:N}:<wp_id>`), signals stream (`ff:wp:{p:N}:<wp_id>:signals`), and condition hash (`ff:wp:{p:N}:<wp_id>:condition`). Then DEL the waitpoints set itself.
@@ -2889,6 +2910,13 @@ Single coherent reference for SDK authors implementing a FlowFabric worker.
 
 The scheduler is a separate stateless process (§8.3). Workers request work via the scheduler's claim API. The scheduler performs fairness, capability matching, quota, and budget checks, then issues a `claim_grant` on the execution's `{p:N}` partition. The worker then calls `acquire_lease` (`claim_execution` or `claim_resumed_execution`) directly on Valkey. Two hops per claim: worker → scheduler (request), worker → Valkey (acquire).
 
+**Transport between worker and scheduler is implementation-defined.** The RFCs specify the Valkey Lua script interface; the scheduling protocol is left to the SDK/deployment. Recommended approaches:
+- **(a) gRPC** (recommended for low-latency claim cycles): scheduler exposes a `ClaimService.RequestClaim(caps, lanes)` RPC. Workers discover scheduler instances via service mesh or DNS.
+- **(b) HTTP/2**: scheduler exposes REST/JSON endpoint. Simpler but higher per-request overhead.
+- **(c) Valkey Streams**: worker XADDs to `ff:sched:requests:<scheduler_id>`, scheduler XREADs, writes grant, responds via a per-worker reply stream. Zero additional infrastructure but adds latency.
+
+The choice affects claim latency (gRPC: ~1ms, HTTP: ~2-5ms, Streams: ~5-15ms) but not correctness — the scheduler's output is always a `claim_grant` hash on `{p:N}`.
+
 ### 10.2 Recommended Timing Defaults
 
 | Parameter | Value | Rationale |
@@ -2913,6 +2941,12 @@ CLAIM:
          continuation_metadata_pointer from closed record
      ELSE:
        claim_execution → new attempt + lease                [RFC-001]
+
+  2b. Read execution context (after successful claim):
+      GET ff:exec:{p:N}:<exec_id>:payload     → input data
+      GET ff:exec:{p:N}:<exec_id>:policy      → ExecutionPolicySnapshot
+      HMGET ff:exec:{p:N}:<exec_id>:core      → execution_kind,
+            payload_encoding, namespace, lane_id (for routing context)
 
 PROCESS (loop while working):
   3. renew_lease(exec_id, lease_id, epoch) every 10s        [RFC-003]
@@ -2940,9 +2974,30 @@ SUSPEND (external waits):
         lease released, exit processing loop
         on resume: re-claim via step 2 (claim_resumed)
         worker reads continuation_metadata_pointer to resume
+  7d. IF worker decides NOT to suspend after step 7a
+      (e.g., external call returned synchronously, or worker
+       chooses move_to_waiting_children instead):
+        call close_waitpoint(waitpoint_ref, reason)         [RFC-004]
+        prevents orphaned pending waitpoints (otherwise cleaned
+        by pending_wp_expiry scanner in 30-60s)
 
-SHUTDOWN:
+SHUTDOWN (crash):
   deregister_worker(instance_id) — leases expire naturally  [RFC-009]
+  Lease expiry scanner detects + reclaim handles recovery.
+
+GRACEFUL SHUTDOWN:
+  1. Stop requesting new claims from scheduler.
+  2. For each active execution:
+     (a) If work can complete quickly (< remaining lease TTL):
+         complete_execution or fail_execution normally.
+     (b) If work is long-running (e.g., LLM call in progress):
+         call delay_execution(exec_id, lease_id, epoch, now_ms + 1)
+         to release lease immediately. Execution returns to
+         scheduling and is re-claimed by another worker.
+     (c) If neither is possible: let lease expire. Execution is
+         reclaimed within lease_ttl (default 30s).
+  3. deregister_worker(instance_id)                          [RFC-009]
+  4. Close Valkey connections.
 ```
 
 **Continuation on resume:** When `claim_resumed_execution` returns, the worker must read the closed suspension record via `get_suspension(exec_id)` (RFC-004) to retrieve the `continuation_metadata_pointer`. This pointer references worker-owned durable state (e.g., last completed step, checkpoint data, tool call context) that the worker needs to resume processing from where it left off. The engine does not own the continuation state — it stores only the pointer.

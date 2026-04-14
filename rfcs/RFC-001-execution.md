@@ -557,6 +557,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | `runnable` + `not_eligible_until_time` + `attempt_interrupted` | Worker called `delay_execution`. Attempt is paused during the backoff delay. When delay expires, promoter sets `eligible_now` (preserving `attempt_interrupted`). |
 | `runnable` + `eligible_now` + `pending_replay_attempt` | Operator called `replay_execution` on a non-skipped terminal execution. New replay attempt is pending claim via `claim_execution`. |
 | `runnable` + `blocked_by_dependencies` + `pending_replay_attempt` | Operator called `replay_execution` on a `skipped` flow member. Dep edges reset to unsatisfied, awaiting re-resolution before the replay attempt can be claimed. |
+| `runnable` + `blocked_by_dependencies` + `pending_first_attempt` | Flow child created via `create_child_execution`. Blocked until dependencies are applied and resolved. `promote_blocked_to_eligible` (RFC-010 #35) promotes to eligible once deps are satisfied or zero deps confirmed. |
 
 ---
 
