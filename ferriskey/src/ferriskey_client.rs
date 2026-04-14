@@ -106,17 +106,23 @@ impl Client {
     }
 
     /// Set a key to a value and return the old value.
+    ///
+    /// Uses `SET key value GET` (the GETSET command is deprecated since Redis 6.2).
     pub async fn get_set<T: FromValue>(
         &self,
         key: impl ToArgs,
         value: impl ToArgs,
     ) -> Result<Option<T>> {
-        let mut cmd = cmd("GETSET");
-        cmd.arg(key).arg(value);
+        let mut cmd = cmd("SET");
+        cmd.arg(key).arg(value).arg("GET");
         self.execute(cmd).await
     }
 
     /// Set a key to a value with an expiration time.
+    ///
+    /// Note: PSETEX wire format is `PSETEX key milliseconds value`, but the public
+    /// API takes `(key, value, ttl)`. The arguments are reordered here to match
+    /// the protocol: key first, then milliseconds, then value.
     pub async fn set_ex(&self, key: impl ToArgs, value: impl ToArgs, ttl: Duration) -> Result<()> {
         let mut cmd = cmd("PSETEX");
         cmd.arg(key).arg(duration_to_millis(ttl)?).arg(value);
@@ -202,6 +208,41 @@ impl Client {
                 "rpop(count > 1) is not representable as Option<String>; use cmd(\"RPOP\") instead",
             ))),
         }
+    }
+
+    /// Get the values of multiple keys at once.
+    ///
+    /// Returns a `Vec` with one entry per key; each entry is `None` if the key
+    /// does not exist.
+    pub async fn mget<T: FromValue>(&self, keys: &[impl ToArgs]) -> Result<Vec<Option<T>>> {
+        let mut cmd = cmd("MGET");
+        cmd.arg(keys);
+        self.execute(cmd).await
+    }
+
+    /// Set multiple key-value pairs at once.
+    pub async fn mset(&self, pairs: &[(impl ToArgs, impl ToArgs)]) -> Result<()> {
+        let mut cmd = cmd("MSET");
+        for (k, v) in pairs {
+            cmd.arg(k).arg(v);
+        }
+        self.execute(cmd).await
+    }
+
+    /// Get the remaining time-to-live of a key in seconds.
+    ///
+    /// Returns `-2` if the key does not exist, `-1` if it has no expiry.
+    pub async fn ttl(&self, key: impl ToArgs) -> Result<i64> {
+        let mut cmd = cmd("TTL");
+        cmd.arg(key);
+        self.execute(cmd).await
+    }
+
+    /// Append one or more elements to the tail of a list, returning the new length.
+    pub async fn rpush(&self, key: impl ToArgs, elements: &[impl ToArgs]) -> Result<i64> {
+        let mut cmd = cmd("RPUSH");
+        cmd.arg(key).arg(elements);
+        self.execute(cmd).await
     }
 
     /// Start building an arbitrary command by name.
@@ -519,11 +560,13 @@ impl TypedPipeline {
     }
 
     /// Queue a PEXPIRE command, returning `true` if the timeout was set.
-    pub fn expire(&mut self, key: impl ToArgs, ttl: Duration) -> PipeSlot<bool> {
+    ///
+    /// Returns an error slot if the duration overflows `u64` milliseconds.
+    pub fn expire(&mut self, key: impl ToArgs, ttl: Duration) -> Result<PipeSlot<bool>> {
         let mut c = cmd("PEXPIRE");
-        c.arg(key).arg(ttl.as_millis() as u64);
+        c.arg(key).arg(duration_to_millis(ttl)?);
         let idx = self.push_cmd(c);
-        self.slot(idx)
+        Ok(self.slot(idx))
     }
 
     /// Queue an EXISTS command.
@@ -618,7 +661,14 @@ impl<T: FromValue> PipeSlot<T> {
         let val = vals
             .get(self.index)
             .cloned()
-            .unwrap_or(Ok(crate::value::Value::Nil));
+            .ok_or_else(|| Error::from((
+                ErrorKind::ClientError,
+                "Pipeline result index out of bounds",
+                format!(
+                    "Requested index {} but pipeline returned only {} results",
+                    self.index, vals.len()
+                ),
+            )))?;
         from_owned_value(val?)
     }
 }

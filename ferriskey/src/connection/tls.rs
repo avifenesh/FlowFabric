@@ -123,15 +123,9 @@ pub struct ClientTlsParams {
 /// [`PrivateKeyDer`] does not implement `Clone` so we need to implement it manually.
 impl Clone for ClientTlsParams {
     fn clone(&self) -> Self {
-        use PrivateKeyDer::*;
         Self {
             client_cert_chain: self.client_cert_chain.clone(),
-            client_key: match &self.client_key {
-                Pkcs1(key) => Pkcs1(key.secret_pkcs1_der().to_vec().into()),
-                Pkcs8(key) => Pkcs8(key.secret_pkcs8_der().to_vec().into()),
-                Sec1(key) => Sec1(key.secret_sec1_der().to_vec().into()),
-                other => panic!("Unknown PrivateKeyDer variant: {other:?}"),
-            },
+            client_key: self.client_key.clone_key(),
         }
     }
 }

@@ -746,12 +746,17 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                 const MAX_DELAY_MS: u64 = 2000;
                 const MAX_ATTEMPTS: u32 = 8;
                 for _ in 0..MAX_ATTEMPTS {
-                    // Jitter: 80%-120% of base delay
+                    // Jitter: symmetric -20% to +20% of base delay
                     let jitter_range = delay_ms / 5; // 20% jitter
-                    let jitter = if jitter_range > 0 {
-                        (rand::random::<u64>() % (2 * jitter_range)).saturating_sub(jitter_range)
+                    let jitter_offset = if jitter_range > 0 {
+                        rand::random::<u64>() % (2 * jitter_range + 1)
                     } else { 0 };
-                    let actual_delay = Duration::from_millis(delay_ms.saturating_add(jitter));
+                    // jitter_offset is in [0, 2*jitter_range], subtract jitter_range for [-20%, +20%]
+                    let actual_delay = if jitter_offset >= jitter_range {
+                        Duration::from_millis(delay_ms + (jitter_offset - jitter_range))
+                    } else {
+                        Duration::from_millis(delay_ms - (jitter_range - jitter_offset))
+                    };
                     tokio::time::sleep(actual_delay).await;
                     let _ = tx.send(SyncEvent::DesiredChanged);
                     delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
@@ -1039,6 +1044,11 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                 return Ok(());
             }
 
+            // timeout_ms == 0 means "check once, return immediately"
+            if deadline.is_none() {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+
             self.trigger_reconciliation();
 
             if let Some(deadline) = deadline {
@@ -1053,6 +1063,8 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                     }
                 }
             } else {
+                // This branch is now unreachable due to the early return above,
+                // but kept for safety.
                 notified.await;
             }
         }

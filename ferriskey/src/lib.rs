@@ -46,10 +46,10 @@ pub use value::{
 
 pub mod client;
 pub mod compression;
-pub mod errors;
-pub mod ferriskey_client;
-pub mod otel_db_semantics;
-pub mod scripts_container;
+pub(crate) mod errors;
+pub(crate) mod ferriskey_client;
+pub(crate) mod otel_db_semantics;
+pub(crate) mod scripts_container;
 
 // High-level public API — the entry point for library users.
 pub use ferriskey_client::{
@@ -81,7 +81,4 @@ pub mod cluster_scan_container;
 pub mod iam;
 pub mod pubsub;
 pub mod request_type;
-pub use telemetrylib::{
-    DEFAULT_FLUSH_SIGNAL_INTERVAL_MS, DEFAULT_TRACE_SAMPLE_PERCENTAGE, FerrisKeyOtel,
-    FerrisKeyOtelConfigBuilder, FerrisKeySpan, OtelSignalsExporter, Telemetry,
-};
+pub use telemetrylib::Telemetry;

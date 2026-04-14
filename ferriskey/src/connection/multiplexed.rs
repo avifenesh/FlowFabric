@@ -181,9 +181,9 @@ where
     fn send_result(self: Pin<&mut Self>, result: Result<Value>) {
         let self_ = self.project();
 
-        // If response synchronization is lost, fail all requests
+        // If response synchronization is lost, eagerly drain and fail ALL in-flight requests
         if *self_.response_sync_lost {
-            if let Some(entry) = self_.in_flight.pop_front() {
+            while let Some(entry) = self_.in_flight.pop_front() {
                 let err = Error::from((
                     crate::value::ErrorKind::ProtocolDesync,
                     "Response synchronization lost - connection must be reestablished",
@@ -279,7 +279,7 @@ where
     ) {
         // Check if we already have a stored result (this is the second response - PONG)
         if let Some(stored_result) = entry.fenced_result.take() {
-            Self::handle_fenced_second_response(entry, result, stored_result, response_sync_lost);
+            Self::handle_fenced_second_response(entry, result, stored_result, in_flight, response_sync_lost);
         } else {
             // This is the first response from the fenced command
             Self::handle_fenced_first_response(entry, result, in_flight);
@@ -321,6 +321,7 @@ where
         entry: InFlight,
         pong_result: Result<Value>,
         stored_result: Result<Value>,
+        in_flight: &mut VecDeque<InFlight>,
         response_sync_lost: &mut bool,
     ) {
         // Verify we got PONG
@@ -342,10 +343,19 @@ where
                 format!("Response synchronization lost. Got: {:?}", pong_result),
             ));
             entry.output.send(Err(err)).ok();
+
+            // Eagerly drain and fail all remaining in-flight requests
+            while let Some(remaining) = in_flight.pop_front() {
+                let err = Error::from((
+                    crate::value::ErrorKind::ProtocolDesync,
+                    "Response synchronization lost - connection must be reestablished",
+                ));
+                remaining.output.send(Err(err)).ok();
+            }
             return;
         }
 
-        // ✅ Got PONG as expected, return the stored result
+        // Got PONG as expected, return the stored result
         let final_result = stored_result.and_then(|v| v.extract_error());
         entry.output.send(final_result).ok();
     }

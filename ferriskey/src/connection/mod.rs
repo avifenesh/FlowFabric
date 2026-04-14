@@ -181,37 +181,31 @@ where
             return Err(get_resp3_hello_command_error(err));
         }
     } else if let Some(password) = &connection_info.password {
+        let has_username = connection_info.username.is_some();
         let mut command = cmd("AUTH");
         if let Some(username) = &connection_info.username {
             command.arg(username);
         }
         match command.arg(password).query_async(con).await {
             Ok(Value::Okay) => (),
-            Err(e) => {
-                let err_msg = e.detail().ok_or((
-                    ErrorKind::AuthenticationFailed,
-                    "Password authentication failed",
-                ))?;
-
-                if !err_msg.contains("wrong number of arguments for 'auth' command") {
-                    fail!((
-                        ErrorKind::AuthenticationFailed,
-                        "Password authentication failed",
-                    ));
-                }
-
+            Err(e) if has_username => {
+                // AUTH with username failed -- the server may not support the
+                // two-argument AUTH form (e.g. older Redis/Valkey without ACL).
+                // Retry with password-only AUTH before giving up.
                 let mut command = cmd("AUTH");
                 match command.arg(password).query_async(con).await {
                     Ok(Value::Okay) => (),
                     _ => {
-                        fail!((
+                        // Both attempts failed; report the original error
+                        return Err(Error::from((
                             ErrorKind::AuthenticationFailed,
-                            "Password authentication failed"
-                        ));
+                            "Password authentication failed",
+                            format!("Initial AUTH (with username) error: {e}"),
+                        )));
                     }
                 }
             }
-            _ => {
+            Err(_) | Ok(_) => {
                 fail!((
                     ErrorKind::AuthenticationFailed,
                     "Password authentication failed"

@@ -479,13 +479,42 @@ pub mod zstd_backend {
 
             let compressed_data = &data[HEADER_SIZE..];
 
-            let decompressed_data = zstd::decode_all(compressed_data).map_err(|e| {
+            // Use streaming decoder with output size limit to prevent zip bombs
+            const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+
+            let mut decoder = zstd::stream::Decoder::new(compressed_data).map_err(|e| {
                 CompressionError::decompression_failed(
                     self.backend_name(),
                     data.len(),
                     e.to_string(),
                 )
             })?;
+
+            let mut decompressed_data = Vec::new();
+            let mut buf = [0u8; 64 * 1024]; // 64 KB read buffer
+            loop {
+                let n = std::io::Read::read(&mut decoder, &mut buf).map_err(|e| {
+                    CompressionError::decompression_failed(
+                        self.backend_name(),
+                        data.len(),
+                        e.to_string(),
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                if decompressed_data.len() + n > MAX_DECOMPRESSED_SIZE {
+                    return Err(CompressionError::decompression_failed(
+                        self.backend_name(),
+                        data.len(),
+                        format!(
+                            "Decompressed output exceeds maximum allowed size of {} bytes",
+                            MAX_DECOMPRESSED_SIZE
+                        ),
+                    ));
+                }
+                decompressed_data.extend_from_slice(&buf[..n]);
+            }
 
             Ok(decompressed_data)
         }
@@ -635,6 +664,20 @@ pub mod lz4_backend {
             let original_size_u32 =
                 u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]);
             let compressed_block = &compressed_data[4..];
+
+            // Validate decompressed size against a reasonable maximum to prevent
+            // attacker-controlled allocations from a tiny payload
+            const MAX_DECOMPRESSED_SIZE: u32 = 256 * 1024 * 1024; // 256 MB
+            if original_size_u32 > MAX_DECOMPRESSED_SIZE {
+                return Err(CompressionError::decompression_failed(
+                    self.backend_name(),
+                    data.len(),
+                    format!(
+                        "Declared uncompressed size {} bytes exceeds maximum allowed size of {} bytes",
+                        original_size_u32, MAX_DECOMPRESSED_SIZE
+                    ),
+                ));
+            }
 
             // LZ4 block decompression requires knowing the uncompressed size
             // The API uses i32, so we must reject sizes that don't fit

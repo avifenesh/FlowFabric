@@ -176,7 +176,10 @@ where
     let mut total_len = countdigits(args.len()).saturating_add(3);
     for item in args {
         total_len += bulklen(match item {
-            Arg::Cursor => countdigits(cursor as usize),
+            Arg::Cursor => {
+                let cursor_usize = usize::try_from(cursor).unwrap_or(usize::MAX);
+                countdigits(cursor_usize)
+            }
             Arg::Simple(val) => val.len(),
         });
     }

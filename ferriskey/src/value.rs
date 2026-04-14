@@ -1691,7 +1691,67 @@ fn get_owned_inner_value(v: Value) -> Value {
     }
 }
 
-macro_rules! from_value_for_num_internal {
+macro_rules! from_value_for_int_internal {
+    ($t:ty, $v:expr) => {{
+        let v = if let Value::Attribute {
+            data,
+            attributes: _,
+        } = $v
+        {
+            data
+        } else {
+            $v
+        };
+        match *v {
+            Value::Int(val) => <$t>::try_from(val).map_err(|_| {
+                Error::from((
+                    ErrorKind::TypeError,
+                    "Response was of incompatible type",
+                    format!(
+                        "i64 value {} out of range for {} (response was {:?})",
+                        val,
+                        stringify!($t),
+                        v,
+                    ),
+                ))
+            }),
+            Value::SimpleString(ref s) => match s.parse::<$t>() {
+                Ok(rv) => Ok(rv),
+                Err(_) => invalid_type_error!(v, "Could not convert from string."),
+            },
+            Value::BulkString(ref bytes) => match from_utf8(bytes)?.parse::<$t>() {
+                Ok(rv) => Ok(rv),
+                Err(_) => invalid_type_error!(v, "Could not convert from string."),
+            },
+            Value::Double(val) => {
+                if val.is_nan() || val.is_infinite() {
+                    invalid_type_error!(
+                        v,
+                        format!("f64 value {} cannot be converted to {}", val, stringify!($t))
+                    )
+                } else {
+                    // Check that the f64 value fits in the target integer type
+                    let truncated = val as i128;
+                    <$t>::try_from(truncated).map_err(|_| {
+                        Error::from((
+                            ErrorKind::TypeError,
+                            "Response was of incompatible type",
+                            format!(
+                                "f64 value {} out of range for {} (response was {:?})",
+                                val,
+                                stringify!($t),
+                                v,
+                            ),
+                        ))
+                    })
+                }
+            }
+            _ => invalid_type_error!(v, "Response type not convertible to numeric."),
+        }
+    }};
+}
+
+macro_rules! from_value_for_float_internal {
     ($t:ty, $v:expr) => {{
         let v = if let Value::Attribute {
             data,
@@ -1718,11 +1778,21 @@ macro_rules! from_value_for_num_internal {
     }};
 }
 
-macro_rules! from_value_for_num {
+macro_rules! from_value_for_int {
     ($t:ty) => {
         impl FromValue for $t {
             fn from_value(v: &Value) -> Result<$t> {
-                from_value_for_num_internal!($t, v)
+                from_value_for_int_internal!($t, v)
+            }
+        }
+    };
+}
+
+macro_rules! from_value_for_float {
+    ($t:ty) => {
+        impl FromValue for $t {
+            fn from_value(v: &Value) -> Result<$t> {
+                from_value_for_float_internal!($t, v)
             }
         }
     };
@@ -1730,7 +1800,7 @@ macro_rules! from_value_for_num {
 
 impl FromValue for u8 {
     fn from_value(v: &Value) -> Result<u8> {
-        from_value_for_num_internal!(u8, v)
+        from_value_for_int_internal!(u8, v)
     }
 
     // this hack allows us to specialize Vec<u8> to work with binary data.
@@ -1742,19 +1812,19 @@ impl FromValue for u8 {
     }
 }
 
-from_value_for_num!(i8);
-from_value_for_num!(i16);
-from_value_for_num!(u16);
-from_value_for_num!(i32);
-from_value_for_num!(u32);
-from_value_for_num!(i64);
-from_value_for_num!(u64);
-from_value_for_num!(i128);
-from_value_for_num!(u128);
-from_value_for_num!(f32);
-from_value_for_num!(f64);
-from_value_for_num!(isize);
-from_value_for_num!(usize);
+from_value_for_int!(i8);
+from_value_for_int!(i16);
+from_value_for_int!(u16);
+from_value_for_int!(i32);
+from_value_for_int!(u32);
+from_value_for_int!(i64);
+from_value_for_int!(u64);
+from_value_for_int!(i128);
+from_value_for_int!(u128);
+from_value_for_float!(f32);
+from_value_for_float!(f64);
+from_value_for_int!(isize);
+from_value_for_int!(usize);
 
 impl FromValue for bool {
     fn from_value(v: &Value) -> Result<bool> {
@@ -2223,7 +2293,13 @@ macro_rules! from_value_for_tuple {
                                 unreachable!()
                             };
                         },
-                        _ => {},
+                        _ => {
+                            fail!(Error::from((
+                                ErrorKind::TypeError,
+                                "Response was of incompatible type",
+                                format!("Expected Array value for tuple deserialization, got {:?}", item),
+                            )));
+                        },
 
                     }
                 }
@@ -2235,6 +2311,18 @@ macro_rules! from_value_for_tuple {
                     rv.push(($(from_value($name)?),*),);
                     return Ok(rv);
                 }
+                 let chunks = items.chunks_exact(n);
+                 let remainder = chunks.remainder();
+                 if !remainder.is_empty() {
+                     fail!(Error::from((
+                         ErrorKind::TypeError,
+                         "Response was of incompatible type",
+                         format!(
+                             "Item count {} is not a multiple of tuple size {} ({} trailing elements would be lost)",
+                             items.len(), n, remainder.len()
+                         ),
+                     )));
+                 }
                  for chunk in items.chunks_exact(n) {
                     match chunk {
                         [$($name),*] => rv.push(($(from_value($name)?),*),),
@@ -2266,7 +2354,13 @@ macro_rules! from_value_for_tuple {
                                 unreachable!()
                             };
                         },
-                        _ => {},
+                        _ => {
+                            fail!(Error::from((
+                                ErrorKind::TypeError,
+                                "Response was of incompatible type",
+                                format!("Expected Array value for tuple deserialization, got {:?}", item),
+                            )));
+                        },
                     }
                 }
                 if !rv.is_empty(){
