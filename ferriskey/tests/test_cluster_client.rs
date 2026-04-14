@@ -66,7 +66,7 @@ mod cluster_client_tests {
                 .send_command(&mut cmd, None)
                 .await
                 .unwrap();
-            let info = ferriskey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::from_owned_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 0);
@@ -97,7 +97,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::from_owned_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 0);
@@ -128,7 +128,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::from_owned_valkey_value::<HashMap<String, String>>(info).unwrap();
+            let info = ferriskey::from_owned_value::<HashMap<String, String>>(info).unwrap();
             let (primaries, replicas) = count_primaries_and_replicas(info);
             assert_eq!(primaries, 3);
             assert_eq!(replicas, 3);
@@ -158,7 +158,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::from_owned_valkey_value::<String>(info).unwrap();
+            let info = ferriskey::from_owned_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 1);
             assert_eq!(replicas, 0);
@@ -192,7 +192,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::from_owned_valkey_value::<String>(info).unwrap();
+            let info = ferriskey::from_owned_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 0);
             assert_eq!(replicas, 1);
@@ -226,7 +226,7 @@ mod cluster_client_tests {
                 )
                 .await
                 .unwrap();
-            let info = ferriskey::from_owned_valkey_value::<String>(info).unwrap();
+            let info = ferriskey::from_owned_value::<String>(info).unwrap();
             let (primaries, replicas) = count_primary_or_replica(&info);
             assert_eq!(primaries, 0);
             assert_eq!(replicas, 1);
@@ -259,7 +259,7 @@ mod cluster_client_tests {
                 .await
                 .unwrap();
 
-            let info_dict: InfoDict = ferriskey::from_owned_valkey_value(info).unwrap();
+            let info_dict: InfoDict = ferriskey::from_owned_value(info).unwrap();
             match info_dict.get::<String>("redis_version") {
                 Some(version) => match (Versioning::new(version), Versioning::new("7.0")) {
                     (Some(server_ver), Some(min_ver)) => {
@@ -269,7 +269,7 @@ mod cluster_client_tests {
                             let mut addresses = cluster.get_server_addresses();
                             addresses.truncate(1);
 
-                            let mut connection_request = ferriskey::ConnectionRequest {
+                            let mut connection_request = ferriskey::client::types::ConnectionRequest {
                                 addresses: addresses.iter().map(get_address_info).collect(),
                                 cluster_mode_enabled: true,
                                 ..Default::default()
@@ -879,7 +879,7 @@ mod cluster_client_tests {
                 .await
                 .expect("connect to cluster");
 
-            let ping: ferriskey::ValkeyResult<ferriskey::Value> = conn
+            let ping: ferriskey::Result<ferriskey::Value> = conn
                 .route_command(
                     &ferriskey::cmd("PING"),
                     ferriskey::cluster::routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),

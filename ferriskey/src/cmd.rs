@@ -8,7 +8,7 @@ use std::{borrow::Borrow, fmt, io};
 
 use crate::pipeline::Pipeline;
 use crate::value::{
-    FromValkeyValue, ToValkeyArgs, ValkeyResult, ValkeyWrite, from_owned_valkey_value,
+    FromValue, Result, ToArgs, Write, from_owned_value,
 };
 use telemetrylib::FerrisKeySpan;
 
@@ -46,25 +46,25 @@ const FENCE_COMMAND: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 use crate::connection::ConnectionLike as AsyncConnection;
 
 /// The inner future of AsyncIter
-struct AsyncIterInner<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
+struct AsyncIterInner<'a, T: FromValue + 'a, C: AsyncConnection + Send + 'a> {
     batch: std::vec::IntoIter<T>,
     con: &'a mut C,
     cmd: Cmd,
 }
 
 /// Represents the state of AsyncIter
-enum IterOrFuture<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
+enum IterOrFuture<'a, T: FromValue + 'a, C: AsyncConnection + Send + 'a> {
     Iter(AsyncIterInner<'a, T, C>),
     Future(BoxFuture<'a, (AsyncIterInner<'a, T, C>, Option<T>)>),
     Empty,
 }
 
 /// Represents a valkey iterator that can be used with async connections.
-pub struct AsyncIter<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> {
+pub struct AsyncIter<'a, T: FromValue + 'a, C: AsyncConnection + Send + 'a> {
     inner: IterOrFuture<'a, T, C>,
 }
 
-impl<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<'a, T, C> {
+impl<'a, T: FromValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<'a, T, C> {
     #[inline]
     pub async fn next_item(&mut self) -> Option<T> {
         loop {
@@ -80,7 +80,7 @@ impl<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner
             }
 
             let rv = self.con.req_packed_command(&self.cmd).await.ok()?;
-            let (cur, batch): (u64, Vec<T>) = from_owned_valkey_value(rv).ok()?;
+            let (cur, batch): (u64, Vec<T>) = from_owned_value(rv).ok()?;
 
             self.cmd.cursor = Some(cur);
             self.batch = batch.into_iter();
@@ -88,12 +88,12 @@ impl<'a, T: FromValkeyValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner
     }
 }
 
-impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a>
+impl<'a, T: FromValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unpin + 'a>
     AsyncIter<'a, T, C>
 {
     /// ```rust,ignore
     /// # use ferriskey::AsyncCommands;
-    /// # async fn scan_set() -> ferriskey::ValkeyResult<()> {
+    /// # async fn scan_set() -> ferriskey::Result<()> {
     /// # let client = ferriskey::Client::open("redis://127.0.0.1/")?;
     /// # let mut con = client.get_async_connection(None).await?;
     /// con.sadd::<_, _, ()>("my_set", 42i32).await?;
@@ -111,7 +111,7 @@ impl<'a, T: FromValkeyValue + 'a + Unpin + Send, C: AsyncConnection + Send + Unp
     }
 }
 
-impl<'a, T: FromValkeyValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unpin + 'a> Stream
+impl<'a, T: FromValue + Unpin + Send + 'a, C: AsyncConnection + Send + Unpin + 'a> Stream
     for AsyncIter<'a, T, C>
 {
     type Item = T;
@@ -240,7 +240,7 @@ where
     Ok(())
 }
 
-impl ValkeyWrite for Cmd {
+impl Write for Cmd {
     fn write_arg(&mut self, arg: &[u8]) {
         self.data.extend_from_slice(arg);
         self.args.push(Arg::Simple(self.data.len()));
@@ -307,7 +307,7 @@ impl Cmd {
     }
 
     /// Appends an argument to the command.  The argument passed must
-    /// be a type that implements `ToValkeyArgs`.  Most primitive types as
+    /// be a type that implements `ToArgs`.  Most primitive types as
     /// well as vectors of primitive types implement it.
     ///
     /// For instance all of the following are valid:
@@ -320,8 +320,8 @@ impl Cmd {
     /// ferriskey::cmd("SET").arg("my_key").arg(b"my_value");
     /// ```ignore
     #[inline]
-    pub fn arg<T: ToValkeyArgs>(&mut self, arg: T) -> &mut Cmd {
-        arg.write_valkey_args(self);
+    pub fn arg<T: ToArgs>(&mut self, arg: T) -> &mut Cmd {
+        arg.write_args(self);
         self
     }
 
@@ -356,12 +356,12 @@ impl Cmd {
     /// Sends the command as query to the async connection and converts the
     /// result to the target valkey value.
     #[inline]
-    pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
+    pub async fn query_async<C, T: FromValue>(&self, con: &mut C) -> Result<T>
     where
         C: crate::connection::ConnectionLike,
     {
         let val = con.req_packed_command(self).await?;
-        from_owned_valkey_value(val)
+        from_owned_value(val)
     }
 
     /// Returns an iterator over the arguments in this command (including the command name itself)

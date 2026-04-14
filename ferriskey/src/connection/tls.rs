@@ -1,12 +1,10 @@
-use std::io::Error;
-
 use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::connection::factory::Client;
 use crate::connection::info::{ConnectionAddr, ConnectionInfo};
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, Error, Result};
 
 /// Structure to hold mTLS client _certificate_ and _key_ binaries in PEM format
 ///
@@ -33,7 +31,7 @@ pub struct TlsCertificates {
 pub(crate) fn inner_build_with_tls(
     mut connection_info: ConnectionInfo,
     certificates: TlsCertificates,
-) -> ValkeyResult<Client> {
+) -> Result<Client> {
     let tls_params = retrieve_tls_certificates(certificates)?;
 
     connection_info.addr = if let ConnectionAddr::TcpTls {
@@ -50,7 +48,7 @@ pub(crate) fn inner_build_with_tls(
             tls_params: Some(tls_params),
         }
     } else {
-        return Err(ValkeyError::from((
+        return Err(Error::from((
             ErrorKind::InvalidClientConfig,
             "Constructing a TLS client requires a URL with the `rediss://` scheme",
         )));
@@ -63,7 +61,7 @@ pub(crate) fn inner_build_with_tls(
 ///
 /// Parses the provided TLS certificates and returns connection parameters
 /// that can be used to establish secure connections.
-pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> ValkeyResult<TlsConnParams> {
+pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> Result<TlsConnParams> {
     let TlsCertificates {
         client_tls,
         root_cert,
@@ -77,12 +75,12 @@ pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> ValkeyResult<
         // Parse certificates using rustls-pki-types v1.9.0+ API
         let certs = CertificateDer::pem_slice_iter(&client_cert);
         let client_cert_chain = certs
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::other(format!("Failed to parse certificate: {}", e)))?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| std::io::Error::other(format!("Failed to parse certificate: {}", e)))?;
 
         // Parse private key using rustls-pki-types v1.9.0+ API
         let client_key = PrivateKeyDer::from_pem_slice(&client_key)
-            .map_err(|e| Error::other(format!("Failed to parse private key: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("Failed to parse private key: {}", e)))?;
 
         Some(ClientTlsParams {
             client_cert_chain,
@@ -98,9 +96,9 @@ pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> ValkeyResult<
         let mut root_cert_store = RootCertStore::empty();
         for result in certs {
             let cert = result
-                .map_err(|e| Error::other(format!("Failed to parse root certificate: {}", e)))?;
+                .map_err(|e| std::io::Error::other(format!("Failed to parse root certificate: {}", e)))?;
             if root_cert_store.add(cert.to_owned()).is_err() {
-                return Err(Error::other("Unable to parse TLS trust anchors").into());
+                return Err(std::io::Error::other("Unable to parse TLS trust anchors").into());
             }
         }
 

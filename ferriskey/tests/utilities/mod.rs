@@ -5,7 +5,7 @@ use crate::constants::{HOSTNAME_TLS, IP_ADDRESS_V4, IP_ADDRESS_V6};
 use ferriskey::cluster::routing::{MultipleNodeRoutingInfo, RoutingInfo};
 use ferriskey::connection::factory::FerrisKeyConnectionOptions;
 use ferriskey::{
-    ConnectionAddr, ProtocolVersion, PushInfo, ValkeyConnectionInfo, ValkeyResult,
+    ConnectionAddr, ProtocolVersion, PushInfo, ValkeyConnectionInfo, Result,
     Value,
 };
 use ferriskey::{
@@ -333,6 +333,24 @@ where
     Ok(())
 }
 
+fn encode_result_iter<W>(
+    values: &[Result<Value>],
+    writer: &mut W,
+    prefix: &str,
+) -> io::Result<()>
+where
+    W: io::Write,
+{
+    write!(writer, "{}{}\r\n", prefix, values.len())?;
+    for val in values.iter() {
+        match val {
+            Ok(v) => encode_value(v, writer)?,
+            Err(e) => write!(writer, "-{}\r\n", e)?,
+        }
+    }
+    Ok(())
+}
+
 fn encode_map<W>(values: &[(Value, Value)], writer: &mut W, prefix: &str) -> io::Result<()>
 where
     W: io::Write,
@@ -358,7 +376,7 @@ where
             writer.write_all(val)?;
             writer.write_all(b"\r\n")
         }
-        Value::Array(ref values) => encode_iter(values, writer, "*"),
+        Value::Array(ref values) => encode_result_iter(values, writer, "*"),
         Value::Okay => write!(writer, "+OK\r\n"),
         Value::SimpleString(ref s) => write!(writer, "+{s}\r\n"),
         Value::Map(ref values) => encode_map(values, writer, "%"),
@@ -394,7 +412,7 @@ where
             }
             Ok(())
         }
-        Value::ServerError(ref err) => write!(writer, "server-error({err})\r\n"),
+        // Value::ServerError was removed; errors are now in Result wrapping
     }
 }
 
@@ -563,7 +581,7 @@ pub async fn wait_for_server_to_become_ready(server_address: &ConnectionAddr) {
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                let _: ValkeyResult<()> = ferriskey::cmd("FLUSHDB")
+                let _: Result<()> = ferriskey::cmd("FLUSHDB")
                     .query_async(&mut con)
                     .await;
                 break;
@@ -608,7 +626,7 @@ pub fn generate_random_string(length: usize) -> String {
         .collect()
 }
 
-pub async fn send_get(client: &mut Client, key: &str) -> ValkeyResult<Value> {
+pub async fn send_get(client: &mut Client, key: &str) -> Result<Value> {
     let mut get_command = ferriskey::Cmd::new();
     get_command.arg("GET").arg(key);
     client.send_command(&mut get_command, None).await

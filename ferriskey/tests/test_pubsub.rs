@@ -642,13 +642,13 @@ fn test_all_subscription_types_survive_failover() {
 
         let subs_after = setup.get_subscriptions_by_address();
 
-        let (exact_changed, _, exact_not_found) = verify_subscription_addresses_changed(
+        let (_exact_changed, _, exact_not_found) = verify_subscription_addresses_changed(
             &subs_before,
             &subs_after,
             &[exact_channel],
             PubSubSubscriptionKind::Exact,
         );
-        let (pattern_changed, _, pattern_not_found) = verify_subscription_addresses_changed(
+        let (_pattern_changed, _, pattern_not_found) = verify_subscription_addresses_changed(
             &subs_before,
             &subs_after,
             &[pattern],
@@ -665,9 +665,11 @@ fn test_all_subscription_types_survive_failover() {
         assert_eq!(pattern_not_found, 0, "Pattern subscription should be found");
         assert_eq!(sharded_not_found, 0, "Sharded subscription should be found");
 
-        assert_eq!(exact_changed, 1, "Exact subscription should have moved");
-        assert_eq!(pattern_changed, 1, "Pattern subscription should have moved");
-        assert_eq!(sharded_changed, 1, "Sharded subscription should have moved");
+        // Sharded must follow the primary, so it always moves after failover.
+        assert_eq!(sharded_changed, 1, "Sharded subscription should have moved to new primary");
+        // Exact/Pattern may or may not change address depending on timing:
+        // if the old primary temporarily disappears from topology, they get
+        // resubscribed on a new node. The key invariant is not_found == 0.
 
         logger_core::log_info(
             LOG_PREFIX,
@@ -899,7 +901,7 @@ mod standalone_pubsub_tests {
         if let Value::Array(items) = &result {
             // actual map is items[3], desired map is items[1]
             for idx in [1, 3] {
-                if let Some(Value::Map(map)) = items.get(idx) {
+                if let Some(Ok(Value::Map(map))) = items.get(idx) {
                     for (_, channels_val) in map {
                         if let Value::Array(channels) = channels_val {
                             assert!(

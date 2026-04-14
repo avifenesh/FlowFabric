@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 
 use crate::value::{
-    ErrorKind, PushKind, ValkeyError, ValkeyResult, Value, VerbatimFormat, make_extension_error,
+    ErrorKind, PushKind, Error, Result, Value, VerbatimFormat, make_extension_error,
 };
 
 use bytes::{Buf, BytesMut};
@@ -14,11 +14,11 @@ const MAX_BULK_STRING_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 
 /// Shorthand for ParseError construction. Reduces 4-line error sites to 1 line.
 #[inline]
-fn parse_err(msg: impl Into<String>) -> ValkeyError {
-    ValkeyError::from((ErrorKind::ParseError, "parse error", msg.into()))
+fn parse_err(msg: impl Into<String>) -> Error {
+    Error::from((ErrorKind::ParseError, "parse error", msg.into()))
 }
 
-fn err_parser(line: &str) -> ValkeyError {
+fn err_parser(line: &str) -> Error {
     let mut pieces = line.splitn(2, ' ');
     let kind = match pieces.next().unwrap() {
         "ERR" => ErrorKind::ResponseError,
@@ -51,8 +51,8 @@ fn err_parser(line: &str) -> ValkeyError {
     };
     let detail = pieces.next().map(|str| str.to_string());
     match detail {
-        Some(d) => ValkeyError::from((kind, "server error", d)),
-        None => ValkeyError::from((kind, "server error")),
+        Some(d) => Error::from((kind, "server error", d)),
+        None => Error::from((kind, "server error")),
     }
 }
 
@@ -103,7 +103,7 @@ fn find_crlf(buf: &[u8], pos: usize) -> Option<usize> {
 
 /// Parse an integer from a byte slice (no allocations).
 #[inline]
-fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
+fn parse_integer(line: &[u8]) -> Result<i64> {
     if line.is_empty() {
         return Err(parse_err("Expected integer, got empty line".to_string()));
     }
@@ -141,7 +141,7 @@ fn parse_integer(line: &[u8]) -> ValkeyResult<i64> {
 /// Scan a single RESP value starting at `pos` in `buf`.
 /// Returns the byte position AFTER the value if complete, or None if incomplete.
 /// Returns Err on protocol errors (bad type byte, exceeds recursion depth).
-fn scan_value(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
+fn scan_value(buf: &[u8], pos: usize, depth: usize) -> Result<Option<usize>> {
     if pos >= buf.len() {
         return Ok(None);
     }
@@ -178,7 +178,7 @@ fn scan_value(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize
 
 /// Scan past a \r\n-terminated line. Returns position after the \r\n.
 #[inline]
-fn scan_line(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
+fn scan_line(buf: &[u8], pos: usize) -> Result<Option<usize>> {
     match find_crlf(buf, pos) {
         Some(cr) => Ok(Some(cr + 2)),
         None => Ok(None),
@@ -187,7 +187,7 @@ fn scan_line(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
 
 /// Scan a bulk string/blob: <len>\r\n<data>\r\n
 #[inline]
-fn scan_bulk(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
+fn scan_bulk(buf: &[u8], pos: usize) -> Result<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -213,7 +213,7 @@ fn scan_bulk(buf: &[u8], pos: usize) -> ValkeyResult<Option<usize>> {
 }
 
 /// Scan an aggregate type (array, set, push): <count>\r\n<elements...>
-fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
+fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> Result<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -234,7 +234,7 @@ fn scan_aggregate(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<u
 }
 
 /// Scan a map: <count>\r\n<key><val>... (count pairs = 2*count elements)
-fn scan_map(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
+fn scan_map(buf: &[u8], pos: usize, depth: usize) -> Result<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -255,7 +255,7 @@ fn scan_map(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>>
 }
 
 /// Scan an attribute: <count>\r\n<key><val>...<data> (count pairs + 1 data element)
-fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<usize>> {
+fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> Result<Option<usize>> {
     let cr = match find_crlf(buf, pos) {
         Some(cr) => cr,
         None => return Ok(None),
@@ -283,7 +283,7 @@ fn scan_attribute(buf: &[u8], pos: usize, depth: usize) -> ValkeyResult<Option<u
 /// Read a line from BytesMut, advancing past \r\n.
 /// Returns an error if the expected \r\n terminator is not found.
 #[inline]
-fn read_line_unchecked(buf: &mut BytesMut) -> ValkeyResult<BytesMut> {
+fn read_line_unchecked(buf: &mut BytesMut) -> Result<BytesMut> {
     let pos = find_crlf(buf, 0)
         .ok_or_else(|| parse_err("Incomplete RESP line after scan".to_string()))?;
     let line = buf.split_to(pos);
@@ -292,7 +292,7 @@ fn read_line_unchecked(buf: &mut BytesMut) -> ValkeyResult<BytesMut> {
 }
 
 /// Parse a complete RESP value from BytesMut. Never returns None.
-fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
+fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let type_byte = buf[0];
     buf.advance(1);
 
@@ -319,7 +319,7 @@ fn parse_value_unchecked(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value
 // ── Individual type parsers (pass 2, unchecked) ──────────────────────
 
 #[inline]
-fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_simple_string(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let s = std::str::from_utf8(&line)
         .map_err(|_| parse_err("Invalid UTF-8 in simple string".to_string()))?;
@@ -331,7 +331,7 @@ fn parse_simple_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
 }
 
 #[inline]
-fn parse_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_error(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let s =
         std::str::from_utf8(&line).map_err(|_| parse_err("Invalid UTF-8 in error".to_string()))?;
@@ -339,7 +339,7 @@ fn parse_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
 }
 
 #[inline]
-fn parse_int_value(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_int_value(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let val = parse_integer(&line)?;
     Ok(Value::Int(val))
@@ -347,7 +347,7 @@ fn parse_int_value(buf: &mut BytesMut) -> ValkeyResult<Value> {
 
 /// Zero-copy bulk string: split_to + freeze. No memcpy.
 #[inline]
-fn parse_bulk_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_bulk_string(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let size = parse_integer(&line)?;
     if size < 0 {
@@ -359,7 +359,7 @@ fn parse_bulk_string(buf: &mut BytesMut) -> ValkeyResult<Value> {
     Ok(Value::BulkString(data))
 }
 
-fn parse_array(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
+fn parse_array(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let length = parse_integer(&line)?;
     if length < 0 {
@@ -368,17 +368,14 @@ fn parse_array(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     let length = length as usize;
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
-        // Error elements inside arrays (e.g. EXEC responses) become Value::ServerError.
-        // Top-level errors return Err directly — this distinction is intentional.
-        match parse_value_unchecked(buf, depth + 1) {
-            Ok(v) => items.push(v),
-            Err(e) => items.push(Value::ServerError(e)),
-        }
+        // Array elements can be errors (e.g. EXEC responses with per-command failures).
+        // Top-level errors return Err directly; array element errors are Err in the Vec.
+        items.push(parse_value_unchecked(buf, depth + 1));
     }
     Ok(Value::Array(items))
 }
 
-fn parse_map(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
+fn parse_map(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let kv_length = parse_integer(&line)?;
     if kv_length < 0 {
@@ -394,7 +391,7 @@ fn parse_map(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     Ok(Value::Map(pairs))
 }
 
-fn parse_attribute(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
+fn parse_attribute(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let kv_length = parse_integer(&line)?;
     if kv_length < 0 {
@@ -414,7 +411,7 @@ fn parse_attribute(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
     })
 }
 
-fn parse_set(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
+fn parse_set(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let length = parse_integer(&line)?;
     if length < 0 {
@@ -429,13 +426,13 @@ fn parse_set(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
 }
 
 #[inline]
-fn parse_null(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_null(buf: &mut BytesMut) -> Result<Value> {
     let _line = read_line_unchecked(buf)?;
     Ok(Value::Nil)
 }
 
 #[inline]
-fn parse_double(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_double(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let s =
         std::str::from_utf8(&line).map_err(|_| parse_err("Invalid UTF-8 in double".to_string()))?;
@@ -447,7 +444,7 @@ fn parse_double(buf: &mut BytesMut) -> ValkeyResult<Value> {
 }
 
 #[inline]
-fn parse_boolean(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_boolean(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     match line.as_ref() {
         b"t" => Ok(Value::Boolean(true)),
@@ -458,7 +455,7 @@ fn parse_boolean(buf: &mut BytesMut) -> ValkeyResult<Value> {
 
 /// Read a blob (length-prefixed string) for blob errors and verbatim strings.
 #[inline]
-fn read_blob_unchecked(buf: &mut BytesMut) -> ValkeyResult<String> {
+fn read_blob_unchecked(buf: &mut BytesMut) -> Result<String> {
     let line = read_line_unchecked(buf)?;
     let size = parse_integer(&line)?;
     if size < 0 {
@@ -474,13 +471,13 @@ fn read_blob_unchecked(buf: &mut BytesMut) -> ValkeyResult<String> {
 }
 
 #[inline]
-fn parse_blob_error(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_blob_error(buf: &mut BytesMut) -> Result<Value> {
     let s = read_blob_unchecked(buf)?;
     Err(err_parser(&s))
 }
 
 #[inline]
-fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_verbatim(buf: &mut BytesMut) -> Result<Value> {
     let s = read_blob_unchecked(buf)?;
     if let Some((format, text)) = s.split_once(':') {
         let format = match format {
@@ -500,14 +497,14 @@ fn parse_verbatim(buf: &mut BytesMut) -> ValkeyResult<Value> {
 }
 
 #[inline]
-fn parse_big_number(buf: &mut BytesMut) -> ValkeyResult<Value> {
+fn parse_big_number(buf: &mut BytesMut) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let val = BigInt::parse_bytes(&line, 10)
         .ok_or_else(|| parse_err("Expected bigint, got garbage".to_string()))?;
     Ok(Value::BigNumber(val))
 }
 
-fn parse_push(buf: &mut BytesMut, depth: usize) -> ValkeyResult<Value> {
+fn parse_push(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let length = parse_integer(&line)?;
 
@@ -554,18 +551,18 @@ mod aio_support {
     pub struct ValueCodec;
 
     impl Encoder<bytes::Bytes> for ValueCodec {
-        type Error = ValkeyError;
-        fn encode(&mut self, item: bytes::Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        type Error = Error;
+        fn encode(&mut self, item: bytes::Bytes, dst: &mut BytesMut) -> std::result::Result<(), Self::Error> {
             dst.extend_from_slice(&item);
             Ok(())
         }
     }
 
     impl Decoder for ValueCodec {
-        type Item = ValkeyResult<Value>;
-        type Error = ValkeyError;
+        type Item = Result<Value>;
+        type Error = Error;
 
-        fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        fn decode(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, Self::Error> {
             if src.is_empty() {
                 return Ok(None);
             }
@@ -590,7 +587,7 @@ mod aio_support {
             }
         }
 
-        fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        fn decode_eof(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, Self::Error> {
             if src.is_empty() {
                 return Ok(None);
             }
@@ -600,7 +597,7 @@ mod aio_support {
 
     /// Parses a valkey value asynchronously from an AsyncRead source.
     #[allow(dead_code)]
-    pub async fn parse_valkey_value_async<R>(_decoder: &mut (), read: &mut R) -> ValkeyResult<Value>
+    pub async fn parse_valkey_value_async<R>(_decoder: &mut (), read: &mut R) -> Result<Value>
     where
         R: AsyncRead + std::marker::Unpin,
     {
@@ -610,7 +607,7 @@ mod aio_support {
         loop {
             let n = read.read_buf(&mut buf).await?;
             if n == 0 {
-                return Err(ValkeyError::from(io::Error::from(
+                return Err(Error::from(io::Error::from(
                     io::ErrorKind::UnexpectedEof,
                 )));
             }
@@ -644,13 +641,13 @@ impl Parser {
     }
 
     /// Parses synchronously into a single value from the reader.
-    pub fn parse_value<T: Read>(&mut self, mut reader: T) -> ValkeyResult<Value> {
+    pub fn parse_value<T: Read>(&mut self, mut reader: T) -> Result<Value> {
         let mut buf = BytesMut::with_capacity(4096);
         let mut tmp = [0u8; 4096];
         loop {
             let n = reader.read(&mut tmp)?;
             if n == 0 {
-                return Err(ValkeyError::from(io::Error::from(
+                return Err(Error::from(io::Error::from(
                     io::ErrorKind::UnexpectedEof,
                 )));
             }
@@ -669,7 +666,7 @@ impl Parser {
 
 /// Parses bytes into a valkey value. Used in tests.
 #[allow(dead_code)]
-pub fn parse_valkey_value(bytes: &[u8]) -> ValkeyResult<Value> {
+pub fn parse_valkey_value(bytes: &[u8]) -> Result<Value> {
     // For complete buffers we can skip scan — parse_value_unchecked will
     // work if the data is complete, and we get an error/panic if not.
     // But to match the old semantics (return error on incomplete), do
@@ -679,7 +676,7 @@ pub fn parse_valkey_value(bytes: &[u8]) -> ValkeyResult<Value> {
             let mut buf = BytesMut::from(bytes);
             parse_value_unchecked(&mut buf, 0)
         }
-        None => Err(ValkeyError::from(io::Error::from(
+        None => Err(Error::from(io::Error::from(
             io::ErrorKind::UnexpectedEof,
         ))),
     }
@@ -716,7 +713,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap().extract_error(),
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::BusyLoadingError,
                 "An error was signalled by the server",
                 "server is loading".to_string()
@@ -736,7 +733,7 @@ mod tests {
 
         assert_eq!(
             result.unwrap().extract_error(),
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::BusyLoadingError,
                 "An error was signalled by the server",
                 "server is loading".to_string()
@@ -809,7 +806,7 @@ mod tests {
 
     #[test]
     fn decode_resp3_blob_error() {
-        // Blob errors (RESP3 !) are now returned as Err(ValkeyError) directly
+        // Blob errors (RESP3 !) are now returned as Err(Error) directly
         let val = parse_valkey_value(b"!21\r\nSYNTAX invalid syntax\r\n");
         assert_eq!(
             val.unwrap_err(),
@@ -831,7 +828,7 @@ mod tests {
     #[test]
     fn decode_resp3_set() {
         let val = parse_valkey_value(b"~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n").unwrap();
-        let v = val.as_sequence().unwrap();
+        let v = val.as_plain_sequence().unwrap();
         assert_eq!(Value::SimpleString("orange".to_string()), v[0]);
         assert_eq!(Value::SimpleString("apple".to_string()), v[1]);
         assert_eq!(Value::Boolean(true), v[2]);

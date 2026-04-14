@@ -1,6 +1,6 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-use crate::value::ValkeyError;
+use crate::value::Error;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestErrorType {
@@ -10,7 +10,7 @@ pub enum RequestErrorType {
     Disconnect = 3,
 }
 
-pub fn error_type(error: &ValkeyError) -> RequestErrorType {
+pub fn error_type(error: &Error) -> RequestErrorType {
     if error.is_timeout() {
         RequestErrorType::Timeout
     } else if error.is_unrecoverable_error() {
@@ -22,7 +22,7 @@ pub fn error_type(error: &ValkeyError) -> RequestErrorType {
     }
 }
 
-pub fn error_message(error: &ValkeyError) -> String {
+pub fn error_message(error: &Error) -> String {
     let error_message = error.to_string();
     if matches!(error_type(error), RequestErrorType::Disconnect) {
         format!("Received connection error `{error_message}`. Will attempt to reconnect")

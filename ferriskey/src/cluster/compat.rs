@@ -7,7 +7,7 @@ pub use crate::cluster::client::{ClusterClient, ClusterClientBuilder};
 use crate::cmd::Cmd;
 use crate::connection::info::{ConnectionAddr, ConnectionInfo, ValkeyConnectionInfo};
 use crate::connection::tls::TlsConnParams;
-use crate::value::{ErrorKind, ValkeyResult};
+use crate::value::{ErrorKind, Result};
 use std::str::FromStr;
 
 pub use crate::connection::info::TlsMode;
@@ -15,7 +15,7 @@ pub use crate::connection::info::TlsMode;
 pub(crate) fn get_connection_info(
     node: &str,
     cluster_params: crate::cluster::client::ClusterParams,
-) -> ValkeyResult<ConnectionInfo> {
+) -> Result<ConnectionInfo> {
     let invalid_error = || (ErrorKind::InvalidClientConfig, "Invalid node string");
     let (host, port) = node
         .rsplit_once(':')

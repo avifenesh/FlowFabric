@@ -45,7 +45,7 @@ use crate::cluster::topology::SLOT_SIZE;
 use crate::cluster::{ClusterConnInner, Connect, InnerCore, RefreshPolicy};
 use crate::cmd::cmd;
 use crate::connection::ConnectionLike;
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value, from_valkey_value};
+use crate::value::{ErrorKind, Error, Result, Value, from_value};
 use std::sync::Arc;
 use strum_macros::{Display, EnumString};
 
@@ -395,7 +395,7 @@ impl ScanState {
     async fn initiate_scan<C>(
         core: &InnerCore<C>,
         allow_non_covered_slots: bool,
-    ) -> ValkeyResult<ScanState>
+    ) -> Result<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
@@ -432,7 +432,7 @@ impl ScanState {
         core: Arc<InnerCore<C>>,
         allow_non_covered_slots: bool,
         new_scanned_slots_map: Option<SlotsBitsArray>,
-    ) -> ValkeyResult<ScanState>
+    ) -> Result<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
@@ -475,7 +475,7 @@ impl ScanState {
         &mut self,
         core: Arc<InnerCore<C>>,
         allow_non_covered_slots: bool,
-    ) -> ValkeyResult<ScanState>
+    ) -> Result<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
@@ -540,7 +540,7 @@ enum NextNodeResult {
 ///
 /// # Returns
 ///
-/// * `ValkeyResult<NextNodeResult>` - Returns the next node address to scan or indicates completion.
+/// * `Result<NextNodeResult>` - Returns the next node address to scan or indicates completion.
 ///
 /// # Type Parameters
 ///
@@ -551,7 +551,7 @@ async fn next_address_to_scan<C>(
     mut slot: u16,
     scanned_slots_map: &mut SlotsBitsArray,
     allow_non_covered_slots: bool,
-) -> ValkeyResult<NextNodeResult>
+) -> Result<NextNodeResult>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -563,7 +563,6 @@ where
         if let Some(addr) = core
             .conn_lock
             .read()
-            .await
             .slot_map
             .node_address_for_slot(slot, SlotAddr::ReplicaRequired)
         {
@@ -575,7 +574,7 @@ where
             slot = next_slot(scanned_slots_map).unwrap();
         } else {
             // Error if slots are not covered and scanning is not allowed
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                     ErrorKind::NotAllSlotsCovered,
                     "Could not find an address covering a slot, SCAN operation cannot continue \n 
                     If you want to continue scanning even if some slots are not covered, set allow_non_covered_slots to true \n 
@@ -618,9 +617,9 @@ fn next_slot(scanned_slots_map: &SlotsBitsArray) -> Option<u16> {
 ///
 /// # Returns
 ///
-/// * `ValkeyResult<(ScanStateRC, Vec<Value>)>` -
+/// * `Result<(ScanStateRC, Vec<Value>)>` -
 ///   - On success: A tuple containing the updated scan state (`ScanStateRC`) and a vector of `Value`s representing the found keys.
-///   - On failure: A `ValkeyError` detailing the reason for the failure.
+///   - On failure: A `Error` detailing the reason for the failure.
 ///
 /// # Type Parameters
 ///
@@ -629,7 +628,7 @@ fn next_slot(scanned_slots_map: &SlotsBitsArray) -> Option<u16> {
 pub(crate) async fn cluster_scan<C>(
     core: Arc<InnerCore<C>>,
     cluster_scan_args: ClusterScanArgs,
-) -> ValkeyResult<(ScanStateRC, Vec<Value>)>
+) -> Result<(ScanStateRC, Vec<Value>)>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -691,12 +690,12 @@ where
 ///
 /// # Returns
 ///
-/// A `ValkeyResult` containing the response from the `SCAN` command.
+/// A `Result` containing the response from the `SCAN` command.
 async fn send_scan<C>(
     scan_state: &ScanState,
     cluster_scan_args: &ClusterScanArgs,
     core: Arc<InnerCore<C>>,
-) -> ValkeyResult<Value>
+) -> Result<Value>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -718,7 +717,7 @@ where
         }
         conn.req_packed_command(&scan_command).await
     } else {
-        Err(ValkeyError::from((
+        Err(Error::from((
             ErrorKind::ConnectionNotFoundForRoute,
             "Cluster scan failed. No connection available for address: ",
             format!("{}", scan_state.address_in_scan),
@@ -729,7 +728,7 @@ where
 /// Checks if the error is retryable during scanning.
 /// Retryable errors include network issues, cluster topology changes, and unavailable connections.
 /// Scan operations are not keyspace operations, so they are not affected by keyspace errors like `MOVED`.
-fn is_scanwise_retryable_error(err: &ValkeyError) -> bool {
+fn is_scanwise_retryable_error(err: &Error) -> bool {
     matches!(
         err.kind(),
         ErrorKind::IoError
@@ -750,7 +749,7 @@ async fn next_scan_state<C>(
     core: &Arc<InnerCore<C>>,
     scan_state: &ScanState,
     cluster_scan_args: &ClusterScanArgs,
-) -> ValkeyResult<Option<ScanState>>
+) -> Result<Option<ScanState>>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -787,7 +786,7 @@ async fn try_scan<C>(
     scan_state: &ScanState,
     cluster_scan_args: &ClusterScanArgs,
     core: Arc<InnerCore<C>>,
-) -> ValkeyResult<((u64, Vec<Value>), ScanState)>
+) -> Result<((u64, Vec<Value>), ScanState)>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
@@ -797,7 +796,7 @@ where
         match send_scan(&new_scan_state, cluster_scan_args, core.clone()).await {
             Ok(scan_response) => {
                 let (new_cursor, new_keys) =
-                    from_valkey_value::<(u64, Vec<Value>)>(&scan_response)?;
+                    from_value::<(u64, Vec<Value>)>(&scan_response)?;
                 return Ok(((new_cursor, new_keys), new_scan_state));
             }
             Err(err) if is_scanwise_retryable_error(&err) => {

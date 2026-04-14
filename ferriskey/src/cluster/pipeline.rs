@@ -10,7 +10,7 @@ use crate::cluster::routing::{
 use crate::cmd::Cmd;
 use crate::connection::ConnectionLike;
 use crate::pipeline::Pipeline;
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
+use crate::value::{ErrorKind, Error, Result, Value};
 use crate::value::{RetryMethod, make_extension_error};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
@@ -72,7 +72,7 @@ impl<C> NodePipelineContext<C> {
 }
 
 /// `NodeResponse` represents a response from a node along with its source node address.
-type NodeResponse = (Option<Arc<str>>, ValkeyResult<Value>);
+type NodeResponse = (Option<Arc<str>>, Result<Value>);
 /// `PipelineResponses` represents the responses for each pipeline command.
 pub(crate) type PipelineResponses = Vec<Vec<NodeResponse>>;
 
@@ -118,7 +118,7 @@ pub(crate) async fn map_pipeline_to_nodes<C>(
     pipeline: &crate::pipeline::Pipeline,
     core: Core<C>,
     route: Option<InternalSingleNodeRouting<C>>,
-) -> Result<(NodePipelineMap<C>, ResponsePoliciesMap), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(NodePipelineMap<C>, ResponsePoliciesMap), (OperationTarget, Error)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -159,7 +159,7 @@ where
                     match multi_node_routing {
                         MultipleNodeRoutingInfo::AllNodes | MultipleNodeRoutingInfo::AllMasters => {
                             let connections: Vec<_> = {
-                                let lock = core.conn_lock.read().await;
+                                let lock = core.conn_lock.read();
                                 if matches!(multi_node_routing, MultipleNodeRoutingInfo::AllNodes) {
                                     lock.all_node_connections().collect()
                                 } else {
@@ -178,7 +178,7 @@ where
                                 };
                                 return Err((
                                     OperationTarget::NotFound,
-                                    ValkeyError::from((
+                                    Error::from((
                                         ErrorKind::AllConnectionsUnavailable,
                                         error_message,
                                     )),
@@ -223,7 +223,7 @@ async fn handle_pipeline_single_node_routing<C>(
     routing: InternalSingleNodeRouting<C>,
     core: Core<C>,
     index: usize,
-) -> Result<(), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(), (OperationTarget, Error)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -249,13 +249,13 @@ async fn handle_pipeline_multi_slot_routing<C>(
     cmd: Arc<Cmd>,
     index: usize,
     slots: Vec<(Route, Vec<usize>)>,
-) -> Result<(), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(), (OperationTarget, Error)>
 where
     C: Clone,
 {
     for (inner_index, (route, indices)) in slots.iter().enumerate() {
         let conn = {
-            let lock = core.conn_lock.read().await;
+            let lock = core.conn_lock.read();
             lock.connection_for_route(route)
         };
         if let Some((address, conn)) = conn {
@@ -273,7 +273,7 @@ where
         } else {
             return Err((
                 OperationTarget::NotFound,
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ConnectionNotFoundForRoute,
                     "No available connections for route: ",
                     format!("Slot: {} Slot Address: {}", route.slot(), route.slot_addr()),
@@ -290,7 +290,7 @@ pub(crate) async fn collect_and_send_pending_requests<C>(
     retry: u32,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) -> (
-    Vec<Result<ValkeyResult<Response>, RecvError>>,
+    Vec<std::result::Result<Result<Response>, RecvError>>,
     AddressAndIndices,
 )
 where
@@ -317,7 +317,7 @@ fn collect_pipeline_requests<C>(
     retry: u32,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) -> (
-    Vec<oneshot::Receiver<ValkeyResult<Response>>>,
+    Vec<oneshot::Receiver<Result<Response>>>,
     Vec<PendingRequest<C>>,
     AddressAndIndices,
 )
@@ -358,9 +358,9 @@ fn add_pipeline_result(
     pipeline_responses: &mut PipelineResponses,
     index: usize,
     inner_index: Option<usize>,
-    value: ValkeyResult<Value>,
+    value: Result<Value>,
     address: Arc<str>,
-) -> Result<(), (OperationTarget, ValkeyError)> {
+) -> std::result::Result<(), (OperationTarget, Error)> {
     if let Some(responses) = pipeline_responses.get_mut(index) {
         match inner_index {
             Some(inner_index) => {
@@ -386,7 +386,7 @@ fn add_pipeline_result(
                 } else {
                     return Err((
                         OperationTarget::FatalError,
-                        ValkeyError::from((
+                        Error::from((
                             ErrorKind::ClientError,
                             "Existing response is not a ServerError; cannot override.",
                         )),
@@ -398,7 +398,7 @@ fn add_pipeline_result(
     } else {
         Err((
             OperationTarget::FatalError,
-            ValkeyError::from((
+            Error::from((
                 ErrorKind::ClientError,
                 "Index not found in pipeline responses",
             )),
@@ -406,15 +406,15 @@ fn add_pipeline_result(
     }
 }
 
-type RetryEntry = ((usize, Option<usize>), Arc<str>, ValkeyError);
+type RetryEntry = ((usize, Option<usize>), Arc<str>, Error);
 type RetryMap = HashMap<RetryMethod, Vec<RetryEntry>>;
 
 fn process_pipeline_responses(
     pipeline_responses: &mut PipelineResponses,
-    responses: Vec<Result<ValkeyResult<Response>, RecvError>>,
+    responses: Vec<std::result::Result<Result<Response>, RecvError>>,
     addresses_and_indices: AddressAndIndices,
     pipeline_retry_strategy: PipelineRetryStrategy,
-) -> Result<RetryMap, (OperationTarget, ValkeyError)> {
+) -> std::result::Result<RetryMap, (OperationTarget, Error)> {
     let mut retry_map: RetryMap = HashMap::new();
     for ((address, command_indices), response_result) in
         addresses_and_indices.into_iter().zip(responses)
@@ -423,23 +423,12 @@ fn process_pipeline_responses(
             Ok(Ok(Response::Multiple(values))) => {
                 for ((index, inner_index, ignore), value) in command_indices.into_iter().zip(values)
                 {
-                    if let Value::ServerError(ref error) = value {
-                        let retry_method = error.retry_method();
-                        update_retry_map(
-                            &mut retry_map,
-                            retry_method,
-                            (index, inner_index),
-                            address.clone(),
-                            error.clone(),
-                            pipeline_retry_strategy,
-                        );
-                    }
                     if !ignore {
                         add_pipeline_result(
                             pipeline_responses,
                             index,
                             inner_index,
-                            Ok(value),
+                            value,
                             address.clone(),
                         )?;
                     }
@@ -507,7 +496,7 @@ fn update_retry_map(
     retry_method: RetryMethod,
     indices: (usize, Option<usize>),
     address: Arc<str>,
-    error: ValkeyError,
+    error: Error,
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) {
     let (index, inner_index) = indices;
@@ -546,13 +535,13 @@ fn update_retry_map(
 }
 
 pub(crate) async fn process_and_retry_pipeline_responses<C>(
-    mut responses: Vec<Result<ValkeyResult<Response>, RecvError>>,
+    mut responses: Vec<std::result::Result<Result<Response>, RecvError>>,
     mut addresses_and_indices: AddressAndIndices,
     pipeline: &crate::pipeline::Pipeline,
     core: Core<C>,
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
-) -> Result<PipelineResponses, (OperationTarget, ValkeyError)>
+) -> std::result::Result<PipelineResponses, (OperationTarget, Error)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -602,12 +591,12 @@ async fn handle_retry_map<C>(
     pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
-) -> Result<
+) -> std::result::Result<
     (
-        Vec<Result<ValkeyResult<Response>, RecvError>>,
+        Vec<std::result::Result<Result<Response>, RecvError>>,
         AddressAndIndices,
     ),
-    (OperationTarget, ValkeyError),
+    (OperationTarget, Error),
 >
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
@@ -668,7 +657,7 @@ async fn handle_reconnect_logic<C>(
     should_retry: bool,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(), (OperationTarget, Error)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -712,7 +701,7 @@ async fn handle_retry_logic<C>(
     pipeline_responses: &mut PipelineResponses,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(), (OperationTarget, Error)>
 where
     C: Clone + Sync + ConnectionLike + Send + Connect + 'static,
 {
@@ -760,12 +749,12 @@ async fn handle_redirect_logic<C>(
     pipeline_responses: &mut PipelineResponses,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(), (OperationTarget, Error)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     for (indices, address, mut error) in entries {
-        let valkey_error: ValkeyError = error.clone().into();
+        let valkey_error: Error = error.clone().into();
         let (index, inner_index) = indices;
 
         if matches!(retry_method, RetryMethod::MovedRedirect)
@@ -830,8 +819,8 @@ where
 
 async fn pipeline_handle_moved_redirect<C>(
     core: Core<C>,
-    valkey_error: &ValkeyError,
-) -> Result<(), ValkeyError>
+    valkey_error: &Error,
+) -> Result<()>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -858,7 +847,7 @@ async fn append_commands_to_retry<C>(
     entries: Vec<RetryEntry>,
     pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
-) -> Result<(), (OperationTarget, ValkeyError)>
+) -> std::result::Result<(), (OperationTarget, Error)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
@@ -911,7 +900,7 @@ fn get_original_cmd(
     index: usize,
     inner_index: Option<usize>,
     response_policies: Option<&ResponsePoliciesMap>,
-) -> Result<Arc<Cmd>, ValkeyError> {
+) -> Result<Arc<Cmd>> {
     let cmd = pipeline
         .get_command(index)
         .ok_or_else(|| make_extension_error(
@@ -937,7 +926,7 @@ fn get_original_cmd(
 
 pub(crate) fn route_for_pipeline(
     pipeline: &crate::pipeline::Pipeline,
-) -> ValkeyResult<Option<Route>> {
+) -> Result<Option<Route>> {
     fn route_for_command(cmd: &Cmd) -> Option<Route> {
         match cluster_routing::RoutingInfo::for_routable(cmd) {
             Some(cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => None,

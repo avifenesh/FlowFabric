@@ -10,7 +10,7 @@ use crate::pipeline::PipelineRetryStrategy;
 use crate::protocol::parser::ValueCodec;
 use crate::pubsub::push_manager::PushManager;
 use crate::value::{ProtocolVersion, PushKind};
-use crate::value::{ValkeyError, ValkeyResult, Value};
+use crate::value::{Error, Result, Value};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot},
@@ -38,19 +38,19 @@ use tokio_util::codec::Decoder;
 const DEFAULT_CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2000);
 
 // Senders which the result of a single request are sent through
-type PipelineOutput = oneshot::Sender<ValkeyResult<Value>>;
+type PipelineOutput = oneshot::Sender<Result<Value>>;
 
 enum ResponseAggregate {
     SingleCommand,
     Pipeline {
         expected_response_count: usize, // = offset + count, pipelines offset is 0
         current_response_count: usize,
-        buffer: Vec<Value>,
-        first_err: Option<ValkeyError>,
+        buffer: Vec<Result<Value>>,
+        first_err: Option<Error>,
         /// Whether this pipeline is a MULTI/EXEC transaction.
         /// In transaction mode, any server error (e.g. EXECABORT) fails the whole pipeline.
-        /// In non-transaction mode, per-command errors are stored in the buffer as
-        /// Value::ServerError to allow callers to inspect individual command results.
+        /// In non-transaction mode, per-command errors are stored as Err in the buffer
+        /// to allow callers to inspect individual command results.
         is_transaction: bool,
     },
 }
@@ -74,7 +74,7 @@ struct InFlight {
     output: PipelineOutput,
     response_aggregate: ResponseAggregate,
     is_fenced: bool,
-    fenced_result: Option<ValkeyResult<Value>>,
+    fenced_result: Option<Result<Value>>,
 }
 
 // A single message sent through the pipeline
@@ -112,7 +112,7 @@ pin_project! {
         #[pin]
         sink_stream: T,
         in_flight: VecDeque<InFlight>,
-        error: Option<ValkeyError>,
+        error: Option<Error>,
         push_manager: Arc<ArcSwap<PushManager>>,
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
         is_stream_closed: Arc<AtomicBool>,
@@ -136,7 +136,7 @@ pin_project! {
 
 impl<T> PipelineSink<T>
 where
-    T: Stream<Item = ValkeyResult<Value>> + 'static,
+    T: Stream<Item = Result<Value>> + 'static,
 {
     fn new<SinkItem>(
         sink_stream: T,
@@ -145,7 +145,7 @@ where
         is_stream_closed: Arc<AtomicBool>,
     ) -> Self
     where
-        T: Sink<SinkItem, Error = ValkeyError> + Stream<Item = ValkeyResult<Value>> + 'static,
+        T: Sink<SinkItem, Error = Error> + Stream<Item = Result<Value>> + 'static,
     {
         PipelineSink {
             sink_stream,
@@ -159,7 +159,7 @@ where
     }
 
     // Read messages from the stream and send them back to the caller
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<(), ()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<std::result::Result<(), ()>> {
         loop {
             let item = match ready!(self.as_mut().project().sink_stream.poll_next(cx)) {
                 Some(result) => result,
@@ -179,13 +179,13 @@ where
         }
     }
 
-    fn send_result(self: Pin<&mut Self>, result: ValkeyResult<Value>) {
+    fn send_result(self: Pin<&mut Self>, result: Result<Value>) {
         let self_ = self.project();
 
         // If response synchronization is lost, fail all requests
         if *self_.response_sync_lost {
             if let Some(entry) = self_.in_flight.pop_front() {
-                let err = ValkeyError::from((
+                let err = Error::from((
                     crate::value::ErrorKind::ProtocolDesync,
                     "Response synchronization lost - connection must be reestablished",
                 ));
@@ -230,7 +230,7 @@ where
             } => {
                 match result {
                     Ok(item) => {
-                        buffer.push(item);
+                        buffer.push(Ok(item));
                     }
                     Err(err) if *is_transaction => {
                         // Transaction errors (e.g. EXECABORT between MULTI/EXEC) fail the whole transaction.
@@ -239,10 +239,9 @@ where
                         }
                     }
                     Err(err) => {
-                        // Per-command errors in non-transaction pipelines are stored in the buffer
-                        // as Value::ServerError so callers can inspect individual command results.
-                        // This preserves the semantics of raise_on_error=false in send_pipeline.
-                        buffer.push(Value::ServerError(err));
+                        // Per-command errors in non-transaction pipelines are stored as Err
+                        // in the buffer to allow callers to inspect individual command results.
+                        buffer.push(Err(err));
                     }
                 }
 
@@ -275,7 +274,7 @@ where
     /// This function is only called for commands where `is_fenced` is true.
     fn handle_fenced_command(
         mut entry: InFlight,
-        result: ValkeyResult<Value>,
+        result: Result<Value>,
         in_flight: &mut VecDeque<InFlight>,
         response_sync_lost: &mut bool,
     ) {
@@ -291,7 +290,7 @@ where
     /// Handles the first response of a fenced command.
     fn handle_fenced_first_response(
         mut entry: InFlight,
-        result: ValkeyResult<Value>,
+        result: Result<Value>,
         in_flight: &mut VecDeque<InFlight>,
     ) {
         match result {
@@ -321,8 +320,8 @@ where
     /// Handles the second response of a fenced command (should be PONG).
     fn handle_fenced_second_response(
         entry: InFlight,
-        pong_result: ValkeyResult<Value>,
-        stored_result: ValkeyResult<Value>,
+        pong_result: Result<Value>,
+        stored_result: Result<Value>,
         response_sync_lost: &mut bool,
     ) {
         // Verify we got PONG
@@ -342,7 +341,7 @@ where
             );
 
             // Fail the current command
-            let err = ValkeyError::from((
+            let err = Error::from((
                 crate::value::ErrorKind::ProtocolDesync,
                 "Expected PONG for fenced command but received different response",
                 format!("Response synchronization lost. Got: {:?}", pong_result),
@@ -359,7 +358,7 @@ where
 
 impl<SinkItem, T> Sink<PipelineMessage<SinkItem>> for PipelineSink<T>
 where
-    T: Sink<SinkItem, Error = ValkeyError> + Stream<Item = ValkeyResult<Value>> + 'static,
+    T: Sink<SinkItem, Error = Error> + Stream<Item = Result<Value>> + 'static,
 {
     type Error = ();
 
@@ -367,7 +366,7 @@ where
     fn poll_ready(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         match ready!(self.as_mut().project().sink_stream.poll_ready(cx)) {
             Ok(()) => Ok(()).into(),
             Err(err) => {
@@ -386,7 +385,7 @@ where
             is_transaction,
             is_fenced,
         }: PipelineMessage<SinkItem>,
-    ) -> Result<(), Self::Error> {
+    ) -> std::result::Result<(), Self::Error> {
         // If there is nothing to receive our output we do not need to send the message as it is
         // ambiguous whether the message will be sent anyway. Helps shed some load on the
         // connection.
@@ -402,7 +401,7 @@ where
         }
 
         if *self_.response_sync_lost {
-            let err = ValkeyError::from((
+            let err = Error::from((
                 crate::value::ErrorKind::ProtocolDesync,
                 "Response synchronization lost - connection must be reestablished",
             ));
@@ -434,7 +433,7 @@ where
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         ready!(
             self.as_mut()
                 .project()
@@ -450,7 +449,7 @@ where
     fn poll_close(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         // No new requests will come in after the first call to `close` but we need to complete any
         // in progress requests before closing
         if !self.in_flight.is_empty() {
@@ -472,7 +471,7 @@ where
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> (Self, impl Future<Output = ()>)
     where
-        T: Sink<SinkItem, Error = ValkeyError> + Stream<Item = ValkeyResult<Value>> + 'static,
+        T: Sink<SinkItem, Error = Error> + Stream<Item = Result<Value>> + 'static,
         T: Send + 'static,
         T::Item: Send,
         T::Error: Send,
@@ -509,7 +508,7 @@ where
         item: SinkItem,
         timeout: Duration,
         is_fenced: bool,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         self.send_recv(item, None, timeout, true, is_fenced).await
     }
 
@@ -521,7 +520,7 @@ where
         timeout: Duration,
         is_atomic: bool,
         is_fenced: bool,
-    ) -> Result<Value, ValkeyError> {
+    ) -> Result<Value> {
         let (sender, receiver) = oneshot::channel();
 
         self.sender
@@ -537,7 +536,7 @@ where
                 // If an error occurs here, it means the request never reached the server, as guaranteed
                 // by the 'send' function. Since the server did not receive the data, it is safe to retry
                 // the request.
-                ValkeyError::from((
+                Error::from((
                     crate::value::ErrorKind::FatalSendError,
                     "Failed to send the request to the server",
                     err.to_string(),
@@ -549,7 +548,7 @@ where
                 // The `sender` was dropped, likely indicating a failure in the stream.
                 // This error suggests that it's unclear whether the server received the request before the connection failed,
                 // making it unsafe to retry. For example, retrying an INCR request could result in double increments.
-                Err(ValkeyError::from((
+                Err(Error::from((
                     crate::value::ErrorKind::FatalReceiveError,
                     "Failed to receive a response due to a fatal error",
                     err.to_string(),
@@ -599,7 +598,7 @@ impl MultiplexedConnection {
         connection_info: ConnectionInfo,
         stream: C,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
+    ) -> Result<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -619,7 +618,7 @@ impl MultiplexedConnection {
         stream: C,
         response_timeout: std::time::Duration,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<(Self, impl Future<Output = ()>)>
+    ) -> Result<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -660,7 +659,7 @@ impl MultiplexedConnection {
                     driver
                 }
                 futures_util::future::Either::Right(((), _)) => {
-                    return Err(ValkeyError::from((
+                    return Err(Error::from((
                         crate::value::ErrorKind::IoError,
                         "Multiplexed connection driver unexpectedly terminated",
                     )));
@@ -678,7 +677,7 @@ impl MultiplexedConnection {
 
     /// Sends an already encoded (packed) command into the TCP socket and
     /// reads the single response from it.
-    pub async fn send_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
+    pub async fn send_packed_command(&mut self, cmd: &Cmd) -> Result<Value> {
         let result = self
             .pipeline
             .send_single(
@@ -708,7 +707,7 @@ impl MultiplexedConnection {
         cmd: &crate::pipeline::Pipeline,
         offset: usize,
         count: usize,
-    ) -> ValkeyResult<Vec<Value>> {
+    ) -> Result<Vec<Result<Value>>> {
         let result = self
             .pipeline
             .send_recv(
@@ -736,7 +735,7 @@ impl MultiplexedConnection {
                 values.drain(..offset);
                 Ok(values)
             }
-            _ => Ok(vec![value]),
+            _ => Ok(vec![Ok(value)]),
         }
     }
 
@@ -756,7 +755,7 @@ impl MultiplexedConnection {
     pub async fn update_connection_password(
         &mut self,
         password: Option<String>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         self.password = password;
         Ok(Value::Okay)
     }
@@ -838,7 +837,7 @@ impl MultiplexedConnectionBuilder {
     }
 
     /// Builds and returns a new `MultiplexedConnection` instance using the configured settings.
-    pub async fn build(self) -> ValkeyResult<MultiplexedConnection> {
+    pub async fn build(self) -> Result<MultiplexedConnection> {
         let db = self.db.unwrap_or_default();
         let response_timeout = self
             .response_timeout
@@ -862,7 +861,7 @@ impl MultiplexedConnectionBuilder {
 }
 
 impl ConnectionLike for MultiplexedConnection {
-    async fn req_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
+    async fn req_packed_command(&mut self, cmd: &Cmd) -> Result<Value> {
         self.send_packed_command(cmd).await
     }
 
@@ -870,7 +869,7 @@ impl ConnectionLike for MultiplexedConnection {
         &mut self,
         packed: bytes::Bytes,
         is_fenced: bool,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let result = self
             .pipeline
             .send_single(packed, self.response_timeout, is_fenced)
@@ -893,7 +892,7 @@ impl ConnectionLike for MultiplexedConnection {
         offset: usize,
         count: usize,
         _pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> ValkeyResult<Vec<Value>> {
+    ) -> Result<Vec<Result<Value>>> {
         self.send_packed_commands(cmd, offset, count).await
     }
 
@@ -921,9 +920,9 @@ impl ConnectionLike for MultiplexedConnection {
 }
 impl MultiplexedConnection {
     /// Subscribes to a new channel.
-    pub async fn subscribe(&mut self, channel_name: String) -> ValkeyResult<()> {
+    pub async fn subscribe(&mut self, channel_name: String) -> Result<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
@@ -935,9 +934,9 @@ impl MultiplexedConnection {
     }
 
     /// Unsubscribes from channel.
-    pub async fn unsubscribe(&mut self, channel_name: String) -> ValkeyResult<()> {
+    pub async fn unsubscribe(&mut self, channel_name: String) -> Result<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
@@ -949,9 +948,9 @@ impl MultiplexedConnection {
     }
 
     /// Subscribes to a new channel with pattern.
-    pub async fn psubscribe(&mut self, channel_pattern: String) -> ValkeyResult<()> {
+    pub async fn psubscribe(&mut self, channel_pattern: String) -> Result<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));
@@ -963,9 +962,9 @@ impl MultiplexedConnection {
     }
 
     /// Unsubscribes from channel pattern.
-    pub async fn punsubscribe(&mut self, channel_pattern: String) -> ValkeyResult<()> {
+    pub async fn punsubscribe(&mut self, channel_pattern: String) -> Result<()> {
         if self.protocol == ProtocolVersion::RESP2 {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 crate::value::ErrorKind::InvalidClientConfig,
                 "RESP3 is required for this command",
             )));

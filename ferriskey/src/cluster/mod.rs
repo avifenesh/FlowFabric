@@ -61,8 +61,8 @@ use crate::connection::{
 use crate::pipeline::PipelineRetryStrategy;
 use crate::pubsub::push_manager::PushInfo;
 use crate::value::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, RetryMethod, ValkeyError,
-    ValkeyFuture, ValkeyResult, Value, make_extension_error,
+    ErrorKind, FromValue, InfoDict, ProtocolVersion, RetryMethod, Error,
+    Result, Value,
 };
 use connections::connect_and_check;
 use container::{
@@ -103,7 +103,7 @@ use strum_macros::Display;
 use telemetrylib::{FerrisKeyOtel, FerrisKeySpan, Telemetry};
 use tokio::{
     sync::{
-        Notify, RwLock as TokioRwLock, mpsc,
+        Notify, mpsc,
         oneshot::{self, Receiver},
     },
     task::JoinHandle,
@@ -142,11 +142,11 @@ fn parse_node_address(address: &str) -> Option<(&str, i64)> {
 /// This helper is **only for the direct-dispatch fast path** where we want a
 /// single opportunistic redirect without retry infrastructure.
 async fn try_redirect_to_known_node<C>(
-    conn_lock: &TokioRwLock<ConnectionsContainer<C>>,
-    error: &ValkeyError,
+    conn_lock: &ParkingLotRwLock<ConnectionsContainer<C>>,
+    error: &Error,
     packed: bytes::Bytes,
     is_fenced: bool,
-) -> Option<ValkeyResult<Value>>
+) -> Option<Result<Value>>
 where
     C: ConnectionLike + Clone + Send + Sync + 'static,
 {
@@ -159,7 +159,7 @@ where
 
     // Look up in the existing connection map only — never creates a new connection.
     let conn_future = {
-        let container = conn_lock.read().await;
+        let container = conn_lock.read();
         container.connection_for_address(addr).map(|(_, c)| c)
     }?;
 
@@ -182,9 +182,9 @@ where
     Some(conn.send_packed_bytes(packed, is_fenced).await)
 }
 
-type SharedConnFuture<C> = futures::future::Shared<futures_util::future::BoxFuture<'static, C>>;
+type SharedConnFuture<C> = futures::future::Shared<BoxFuture<'static, C>>;
 type DirectPipelineGroup<C> = (Arc<str>, crate::pipeline::Pipeline, Vec<usize>, SharedConnFuture<C>);
-type NodeResponseReceiver = (Option<Arc<str>>, oneshot::Receiver<ValkeyResult<Response>>);
+type NodeResponseReceiver = (Option<Arc<str>>, oneshot::Receiver<Result<Response>>);
 
 /// Sets the routed node's address on the command span for OTel reporting.
 /// Called after cluster routing resolves the actual target node.
@@ -217,7 +217,7 @@ where
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
-    ) -> ValkeyResult<ClusterConnection<C>> {
+    ) -> Result<ClusterConnection<C>> {
         ClusterConnInner::new(
             initial_nodes,
             cluster_params,
@@ -267,7 +267,7 @@ where
     /// # Example
     /// ```rust,ignore
     /// use ferriskey::cluster::ClusterClient;
-    /// use ferriskey::{ScanStateRC, from_valkey_value, Value, ObjectType, ClusterScanArgs};
+    /// use ferriskey::{ScanStateRC, from_value, Value, ObjectType, ClusterScanArgs};
     ///
     /// async fn scan_all_cluster() -> Vec<String> {
     ///     let nodes = vec!["redis://127.0.0.1/"];
@@ -282,7 +282,7 @@ where
     ///         scan_state_rc = next_cursor;
     ///         let mut scan_keys = scan_keys
     ///             .into_iter()
-    ///             .map(|v| from_valkey_value(&v).unwrap())
+    ///             .map(|v| from_value(&v).unwrap())
     ///             .collect::<Vec<String>>(); // Change the type of `keys` to `Vec<String>`
     ///         keys.append(&mut scan_keys);
     ///         if scan_state_rc.is_finished() {
@@ -296,7 +296,7 @@ where
         &mut self,
         scan_state_rc: ScanStateRC,
         mut cluster_scan_args: ClusterScanArgs,
-    ) -> ValkeyResult<(ScanStateRC, Vec<Value>)> {
+    ) -> Result<(ScanStateRC, Vec<Value>)> {
         cluster_scan_args.set_scan_state_cursor(scan_state_rc);
         self.route_cluster_scan(cluster_scan_args).await
     }
@@ -305,7 +305,7 @@ where
     async fn route_cluster_scan(
         &mut self,
         cluster_scan_args: ClusterScanArgs,
-    ) -> ValkeyResult<(ScanStateRC, Vec<Value>)> {
+    ) -> Result<(ScanStateRC, Vec<Value>)> {
         let (sender, receiver) = oneshot::channel();
         self.cluster_task
             .send(Message {
@@ -314,7 +314,7 @@ where
             })
             .await
             .map_err(|e| {
-                ValkeyError::from(io::Error::new(
+                Error::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Cluster: Error occurred while trying to send SCAN command to internal send task. {e:?}"),
                 ))
@@ -322,14 +322,14 @@ where
         receiver
             .await
             .unwrap_or_else(|e| {
-                Err(ValkeyError::from(io::Error::new(
+                Err(Error::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Cluster: Failed to receive SCAN command response from internal send task. {e:?}"),
                 )))
             })
             .and_then(|response| match response {
                 Response::ClusterScanResult(new_scan_state_ref, key) => Ok((new_scan_state_ref, key)),
-                Response::Single(_) | Response::Multiple(_) => Err(ValkeyError::from((
+                Response::Single(_) | Response::Multiple(_) => Err(Error::from((
                     ErrorKind::ResponseError,
                     "Unexpected response variant for cluster scan",
                 ))),
@@ -343,11 +343,11 @@ where
         &self,
         cmd: &Cmd,
         routing: &SingleNodeRoutingInfo,
-    ) -> Option<ValkeyResult<Value>> {
+    ) -> Option<Result<Value>> {
         // Resolve the route to a connection. Clone the connection (cheap — it's
         // just an mpsc sender clone) so we can drop the read lock before async work.
         let conn_future = {
-            let container = self.inner.conn_lock.read().await;
+            let container = self.inner.conn_lock.read();
             match routing {
                 SingleNodeRoutingInfo::SpecificNode(route) => {
                     container.connection_for_route(route)?.1
@@ -383,13 +383,13 @@ where
         &self,
         pipeline: &crate::pipeline::Pipeline,
         count: usize,
-    ) -> Option<ValkeyResult<Vec<Value>>> {
+    ) -> Option<Result<Vec<Result<Value>>>> {
         use tokio::task::JoinSet;
 
         // Step 1: Group commands by node address.
         // Hold conn_lock briefly, only for route resolution.
         let grouped: Vec<DirectPipelineGroup<C>> = {
-            let container = self.inner.conn_lock.read().await;
+            let container = self.inner.conn_lock.read();
             if container.is_empty() {
                 return None;
             }
@@ -451,7 +451,7 @@ where
 
         // Step 3: Collect results and reassemble in original command order.
         let total_cmds = count;
-        let mut final_results: Vec<Option<Value>> = vec![None; total_cmds];
+        let mut final_results: Vec<Option<Result<Value>>> = vec![None; total_cmds];
 
         while let Some(join_result) = join_set.join_next().await {
             let (node_idx, result) = match join_result {
@@ -477,9 +477,9 @@ where
         }
 
         // Fill any missing slots with Nil
-        let assembled: Vec<Value> = final_results
+        let assembled: Vec<Result<Value>> = final_results
             .into_iter()
-            .map(|opt| opt.unwrap_or(Value::Nil))
+            .map(|opt| opt.unwrap_or(Ok(Value::Nil)))
             .collect();
 
         Some(Ok(assembled))
@@ -490,7 +490,7 @@ where
         &mut self,
         cmd: &Cmd,
         routing: cluster_routing::RoutingInfo,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         trace!("route_command");
         let (sender, receiver) = oneshot::channel();
         let cmd_arg = match &routing {
@@ -512,7 +512,7 @@ where
             })
             .await
             .map_err(|e| {
-                ValkeyError::from(io::Error::new(
+                Error::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Cluster: Error occurred while trying to send command to internal sender. {e:?}"),
                 ))
@@ -520,7 +520,7 @@ where
         receiver
             .await
             .unwrap_or_else(|e| {
-                Err(ValkeyError::from(io::Error::new(
+                Err(Error::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!(
                         "Cluster: Failed to receive command response from internal sender. {e:?}"
@@ -530,7 +530,7 @@ where
             .and_then(|response| match response {
                 Response::Single(value) => Ok(value),
                 Response::ClusterScanResult(..) | Response::Multiple(_) => {
-                    Err(ValkeyError::from((
+                    Err(Error::from((
                         ErrorKind::ResponseError,
                         "Unexpected response variant for single command",
                     )))
@@ -550,7 +550,7 @@ where
         count: usize,
         route: Option<SingleNodeRoutingInfo>,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> ValkeyResult<Vec<Value>> {
+    ) -> Result<Vec<Result<Value>>> {
         let (sender, receiver) = oneshot::channel();
         self.cluster_task
             .send(Message {
@@ -566,20 +566,20 @@ where
             })
             .await
             .map_err(|err| {
-                ValkeyError::from(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
+                Error::from(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
             })?;
 
         receiver
             .await
             .unwrap_or_else(|err| {
-                Err(ValkeyError::from(io::Error::new(
+                Err(Error::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     err.to_string(),
                 )))
             })
             .and_then(|response| match response {
                 Response::Multiple(values) => Ok(values),
-                Response::ClusterScanResult(..) | Response::Single(_) => Err(ValkeyError::from((
+                Response::ClusterScanResult(..) | Response::Single(_) => Err(Error::from((
                     ErrorKind::ResponseError,
                     "Unexpected response variant for pipeline",
                 ))),
@@ -589,13 +589,13 @@ where
     pub async fn update_connection_password(
         &mut self,
         password: Option<String>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         self.route_operation_request(Operation::UpdateConnectionPassword(password))
             .await
     }
 
     /// Update the database ID used for all cluster connections
-    pub async fn update_connection_database(&mut self, database_id: i64) -> ValkeyResult<Value> {
+    pub async fn update_connection_database(&mut self, database_id: i64) -> Result<Value> {
         self.route_operation_request(Operation::UpdateConnectionDatabase(database_id))
             .await
     }
@@ -604,7 +604,7 @@ where
     pub async fn update_connection_client_name(
         &mut self,
         client_name: Option<String>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         self.route_operation_request(Operation::UpdateConnectionClientName(client_name))
             .await
     }
@@ -621,7 +621,7 @@ where
     pub async fn update_connection_username(
         &mut self,
         username: Option<String>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         self.route_operation_request(Operation::UpdateConnectionUsername(username))
             .await
     }
@@ -638,13 +638,13 @@ where
     pub async fn update_connection_protocol(
         &mut self,
         protocol: ProtocolVersion,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         self.route_operation_request(Operation::UpdateConnectionProtocol(protocol))
             .await
     }
 
     /// Get the username used to authenticate with all cluster servers
-    pub async fn get_username(&mut self) -> ValkeyResult<Value> {
+    pub async fn get_username(&mut self) -> Result<Value> {
         self.route_operation_request(Operation::GetUsername).await
     }
 
@@ -652,7 +652,7 @@ where
     async fn route_operation_request(
         &mut self,
         operation_request: Operation,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let (sender, receiver) = oneshot::channel();
         self.cluster_task
             .send(Message {
@@ -660,12 +660,12 @@ where
                 sender,
             })
             .await
-            .map_err(|_| ValkeyError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
+            .map_err(|_| Error::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
 
         receiver
             .await
             .unwrap_or_else(|err| {
-                Err(ValkeyError::from(io::Error::new(
+                Err(Error::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     err.to_string(),
                 )))
@@ -673,7 +673,7 @@ where
             .and_then(|response| match response {
                 Response::Single(values) => Ok(values),
                 Response::ClusterScanResult(..) | Response::Multiple(_) => {
-                    Err(ValkeyError::from((
+                    Err(Error::from((
                         ErrorKind::ResponseError,
                         "Unexpected response variant for operation request",
                     )))
@@ -717,7 +717,7 @@ type ConnectionMap<C> = container::ConnectionsMap<ConnectionFuture<C>>;
 type ConnectionsContainer<C> = self::container::ConnectionsContainer<ConnectionFuture<C>>;
 
 pub(crate) struct InnerCore<C> {
-    pub(crate) conn_lock: TokioRwLock<ConnectionsContainer<C>>,
+    pub(crate) conn_lock: ParkingLotRwLock<ConnectionsContainer<C>>,
     cluster_params: ParkingLotRwLock<ClusterParams>,
     pending_requests_tx: mpsc::UnboundedSender<PendingRequest<C>>,
     pending_requests_rx: std::sync::Mutex<mpsc::UnboundedReceiver<PendingRequest<C>>>,
@@ -753,13 +753,13 @@ where
     }
 
     // return epoch of node
-    pub(crate) async fn address_epoch(&self, node_address: &str) -> Result<u64, ValkeyError> {
+    pub(crate) async fn address_epoch(&self, node_address: &str) -> Result<u64> {
         let command = cmd("CLUSTER").arg("INFO").to_owned();
         let node_conn = {
-            let conn_lock = self.conn_lock.read().await;
+            let conn_lock = self.conn_lock.read();
             conn_lock.connection_for_address(node_address)
         }
-        .ok_or(ValkeyError::from((
+        .ok_or(Error::from((
             ErrorKind::ResponseError,
             "Failed to parse cluster info",
         )))?;
@@ -767,20 +767,20 @@ where
         let cluster_info = node_conn.1.await.req_packed_command(&command).await;
         match cluster_info {
             Ok(value) => {
-                let info_dict: Result<InfoDict, ValkeyError> =
-                    FromValkeyValue::from_valkey_value(&value);
+                let info_dict: Result<InfoDict> =
+                    FromValue::from_value(&value);
                 if let Ok(info_dict) = info_dict {
                     let epoch = info_dict.get("cluster_my_epoch");
                     if let Some(epoch) = epoch {
                         Ok(epoch)
                     } else {
-                        Err(ValkeyError::from((
+                        Err(Error::from((
                             ErrorKind::ResponseError,
                             "Failed to get epoch from cluster info",
                         )))
                     }
                 } else {
-                    Err(ValkeyError::from((
+                    Err(Error::from((
                         ErrorKind::ResponseError,
                         "Failed to parse cluster info",
                     )))
@@ -794,7 +794,6 @@ where
     pub(crate) async fn slots_of_address(&self, node_address: Arc<String>) -> Vec<u16> {
         self.conn_lock
             .read()
-            .await
             .slot_map
             .get_slots_of_node(node_address)
     }
@@ -806,7 +805,6 @@ where
     ) -> Option<ConnectionFuture<C>> {
         self.conn_lock
             .read()
-            .await
             .connection_for_address(address)
             .map(|(_, conn)| conn)
     }
@@ -817,7 +815,7 @@ pub(crate) struct ClusterConnInner<C> {
     state: ConnectionState,
     #[allow(clippy::complexity)]
     in_flight_requests: stream::FuturesUnordered<Pin<Box<Request<C>>>>,
-    refresh_error: Option<ValkeyError>,
+    refresh_error: Option<Error>,
     // Handler of the periodic check task.
     periodic_checks_handler: Option<JoinHandle<()>>,
     // Handler of fast connection validation task
@@ -826,7 +824,7 @@ pub(crate) struct ClusterConnInner<C> {
 
 impl<C> Dispose for ClusterConnInner<C> {
     fn dispose(self) {
-        if let Ok(conn_lock) = self.inner.conn_lock.try_read() {
+        if let Some(conn_lock) = self.inner.conn_lock.try_read() {
             // Each node may contain user and *maybe* a management connection
             let mut count = 0usize;
             for node in conn_lock.connection_map() {
@@ -989,7 +987,7 @@ fn boxed_sleep(duration: Duration) -> BoxFuture<'static, ()> {
 pub(crate) enum Response {
     Single(Value),
     ClusterScanResult(ScanStateRC, Vec<Value>),
-    Multiple(Vec<Value>),
+    Multiple(Vec<Result<Value>>),
 }
 
 #[derive(Debug)]
@@ -999,7 +997,7 @@ pub(crate) enum OperationTarget {
     NotFound,
     FatalError,
 }
-type OperationResult = Result<Response, (OperationTarget, ValkeyError)>;
+type OperationResult = std::result::Result<Response, (OperationTarget, Error)>;
 
 impl From<String> for OperationTarget {
     fn from(address: String) -> Self {
@@ -1028,11 +1026,11 @@ impl RedirectNode {
 
 struct Message<C: Sized> {
     cmd: CmdArg<C>,
-    sender: oneshot::Sender<ValkeyResult<Response>>,
+    sender: oneshot::Sender<Result<Response>>,
 }
 
 enum RecoverFuture {
-    RefreshingSlots(JoinHandle<ValkeyResult<()>>),
+    RefreshingSlots(JoinHandle<Result<()>>),
     ReconnectToInitialNodes(JoinHandle<()>),
     Reconnect(JoinHandle<()>),
 }
@@ -1142,7 +1140,7 @@ pin_project! {
         },
         UpdateMoved {
             #[pin]
-            future: BoxFuture<'static, ValkeyResult<()>>,
+            future: BoxFuture<'static, Result<()>>,
         },
     }
 }
@@ -1216,7 +1214,7 @@ mod iam_token_refresh_tests {
 
         let (pending_requests_tx, pending_requests_rx) = tokio::sync::mpsc::unbounded_channel();
         Arc::new(InnerCore {
-            conn_lock: TokioRwLock::new(ConnectionsContainer::default()),
+            conn_lock: ParkingLotRwLock::new(ConnectionsContainer::default()),
             cluster_params: ParkingLotRwLock::new(params),
             pending_requests_tx,
             pending_requests_rx: std::sync::Mutex::new(pending_requests_rx),
@@ -1293,7 +1291,7 @@ mod iam_token_refresh_tests {
 
 struct PendingRequest<C> {
     retry: u32,
-    sender: oneshot::Sender<ValkeyResult<Response>>,
+    sender: oneshot::Sender<Result<Response>>,
     info: RequestInfo<C>,
 }
 
@@ -1534,7 +1532,7 @@ impl<C> Future for Request<C> {
 }
 
 impl<C> Request<C> {
-    fn respond(self: Pin<&mut Self>, msg: ValkeyResult<Response>) {
+    fn respond(self: Pin<&mut Self>, msg: Result<Response>) {
         // If `send` errors the receiver has dropped and thus does not care about the message.
         // If the request was already taken (result sent once), this is a no-op.
         if let Some(req) = self.project().request.take() {
@@ -1559,7 +1557,7 @@ where
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn IAMTokenProvider>>,
-    ) -> ValkeyResult<Disposable<Self>> {
+    ) -> Result<Disposable<Self>> {
         let disconnect_notifier: Option<Box<dyn DisconnectNotifier>> =
             Some(Box::new(TokioDisconnectNotifier::new()));
 
@@ -1593,7 +1591,7 @@ where
         let slots_refresh_rate_limiter = cluster_params.slots_refresh_rate_limit;
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(InnerCore {
-            conn_lock: TokioRwLock::new(ConnectionsContainer::new(
+            conn_lock: ParkingLotRwLock::new(ConnectionsContainer::new(
                 Default::default(),
                 connections,
                 cluster_params.read_from_replicas.clone(),
@@ -1691,7 +1689,7 @@ where
         initial_nodes: &[ConnectionInfo],
         params: &ClusterParams,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<ConnectionMap<C>> {
+    ) -> Result<ConnectionMap<C>> {
         let initial_nodes: Vec<(String, Option<SocketAddr>)> =
             Self::try_to_expand_initial_nodes(initial_nodes).await;
         let connections = stream::iter(initial_nodes.iter().cloned())
@@ -1741,7 +1739,7 @@ where
                     None,
                 ),
                 |connections: (ConnectionMap<C>, Option<String>),
-                 addr_conn_res: ValkeyResult<_>| async move {
+                 addr_conn_res: Result<_>| async move {
                     match addr_conn_res {
                         Ok((addr, node)) => {
                             connections.0.0.insert(Arc::from(&*addr), node);
@@ -1753,7 +1751,7 @@ where
             )
             .await;
         if connections.0.0.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::IoError,
                 "Failed to create initial connections",
                 connections.1.unwrap_or("".to_string()),
@@ -1799,7 +1797,6 @@ where
             inner
                 .conn_lock
                 .write()
-                .await
                 .extend_connection_map(connection_map);
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
@@ -1834,7 +1831,7 @@ where
         let mut nodes_to_delete = Vec::new();
         let all_nodes_with_slots: HashSet<Arc<String>>;
         {
-            let connections_container = inner.conn_lock.read().await;
+            let connections_container = inner.conn_lock.read();
 
             all_nodes_with_slots = connections_container.slot_map.all_node_addresses();
 
@@ -1928,7 +1925,6 @@ where
             if let Some(existing_task) = inner
                 .conn_lock
                 .read()
-                .await
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .get(&*address)
@@ -1945,7 +1941,7 @@ where
             let address_clone_for_task = address.clone();
 
             let mut node_option = {
-                let conn_lock = inner.conn_lock.read().await;
+                let conn_lock = inner.conn_lock.read();
                 conn_lock.remove_node(&address)
             };
 
@@ -1966,7 +1962,7 @@ where
                     .unwrap_or_default();
                 let infinite_backoff_iter = retry_strategy.get_infinite_backoff_dur_iterator();
 
-                let mut node_result = Err(ValkeyError::from((
+                let mut node_result = Err(Error::from((
                     ErrorKind::ClientError,
                     "No attempts performed",
                 )));
@@ -1994,7 +1990,6 @@ where
                                 if let Some(ref mut conn_state) = inner_clone
                                     .conn_lock
                                     .write()
-                                    .await
                                     .refresh_conn_state
                                     .refresh_address_in_progress
                                     .get_mut(&*address_clone_for_task)
@@ -2022,7 +2017,6 @@ where
                         inner_clone
                             .conn_lock
                             .read()
-                            .await
                             .replace_or_add_connection_for_address(&*address_clone_for_task, node);
                     }
                     Err(err) => {
@@ -2036,7 +2030,6 @@ where
                 inner_clone
                     .conn_lock
                     .write()
-                    .await
                     .refresh_conn_state
                     .refresh_address_in_progress
                     .remove(&*address_clone_for_task);
@@ -2056,7 +2049,6 @@ where
             inner
                 .conn_lock
                 .write()
-                .await
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .insert(address, refresh_task_state);
@@ -2068,7 +2060,7 @@ where
     fn spawn_refresh_slots_task(
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
-    ) -> JoinHandle<ValkeyResult<()>> {
+    ) -> JoinHandle<Result<()>> {
         // Clone references for task
         let inner_clone = inner.clone();
         let policy_clone = policy.clone();
@@ -2091,33 +2083,33 @@ where
     ///
     /// # Arguments
     ///
-    /// * `receivers`: A list of `(node_address, oneshot::Receiver<ValkeyResult<Response>>)` pairs.
+    /// * `receivers`: A list of `(node_address, oneshot::Receiver<Result<Response>>)` pairs.
     ///   Each receiver will yield exactly one `Response` (or error) from its node.
     /// * `routing` – The routing information of the command (e.g., multi‐slot, `AllNodes`, `AllPrimaries`).
     /// * `response_policy` – An `Option<ResponsePolicy>` that dictates how to aggregate the results from the different nodes.
     ///
     /// # Returns
     ///
-    /// A `ValkeyResult<Value>` representing the aggregated result.
+    /// A `Result<Value>` representing the aggregated result.
     pub async fn aggregate_results(
         receivers: Vec<NodeResponseReceiver>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         // Helper: extract a single Value from a Response::Single.
         // Only Response::Single is expected for multi-node commands.
         let extract_result = |response| match response {
             Response::Single(value) => Ok(value),
-            Response::Multiple(_) | Response::ClusterScanResult(_, _) => Err(ValkeyError::from((
+            Response::Multiple(_) | Response::ClusterScanResult(_, _) => Err(Error::from((
                 ErrorKind::ResponseError,
                 "Unexpected response variant in aggregate_results",
             ))),
         };
 
-        // Converts a Result<ValkeyResult<Response>, _> into ValkeyResult<Value>
-        let convert_result = |res: Result<ValkeyResult<Response>, _>| {
+        // Converts a Result<Result<Response>, _> into Result<Value>
+        let convert_result = |res: std::result::Result<Result<Response>, _>| {
             res.map_err(|_| {
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ResponseError,
                     "Internal failure: receiver was dropped before delivering a response",
                 ))
@@ -2125,14 +2117,14 @@ where
             .and_then(|res| res.and_then(extract_result))
         };
 
-        // Helper: await a (addr, receiver) and return (addr, ValkeyResult<Value>)
-        let get_receiver = |(_, receiver): (_, oneshot::Receiver<ValkeyResult<Response>>)| async {
+        // Helper: await a (addr, receiver) and return (addr, Result<Value>)
+        let get_receiver = |(_, receiver): (_, oneshot::Receiver<Result<Response>>)| async {
             convert_result(receiver.await)
         };
 
         // Sanity check: if there are no receivers at all, this is a client‐error
         if receivers.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::ClientError,
                 "Client internal error",
                 "Failed to aggregate results for multi-slot command. Maybe a malformed command?"
@@ -2151,13 +2143,7 @@ where
                     Box::pin(get_receiver(tuple).map(|res| {
                         res.map(|val| {
                             // Each future in `receivers` represents a single response from a node.
-                            // If an error occurs, the value will be a `ServerError` directly, not a structure
-                            // like `Value::Array`  or `Value::Map` containing a `ServerError` inside.
-                            // Therefore, checking that val is a `ServerError` is sufficient—we do not need to check for nested errors within
-                            // composite values.
-                            if let Value::ServerError(err) = val {
-                                return Err(err);
-                            }
+                            // Errors come through as Err(...) from get_receiver, not as values.
                             Ok(val)
                         })
                     }))
@@ -2176,11 +2162,11 @@ where
                 // We want to see each response as it arrives, and:
                 //  • If we see `Ok(Value::Nil)`, increment a counter.
                 //  • If we see `Ok(other_value)`, return it immediately.
-                //  • If we see `Err(e)` or `Ok(Value::ServerError)`, remember it as `last_err`.
+                //  • If we see `Err(e)`, remember it as `last_err`.
                 //
                 // Once the stream is exhausted:
                 //  – if all successes were Nil → return Value::Nil (indicates that all shards are empty).
-                //  – else → return the last error we saw (or a generic “all‐unavailable” error).
+                //  – else → return the last error we saw (or a generic "all‐unavailable" error).
                 //
                 // If we received a mix of errors and `Nil`s, we can't determine if all shards are empty, thus we return the last received error instead of `Nil`.
                 let num_of_results: usize = receivers.len();
@@ -2193,12 +2179,8 @@ where
                 while let Some(result) = futures.next().await {
                     match result {
                         Ok(Value::Nil) => nil_counter += 1,
-                        // If the value is a `ServerError` → the command failed for this node.
-                        Ok(Value::ServerError(err)) => {
-                            last_err = Some(err);
-                        }
                         Ok(val) => return Ok(val),
-                        // If we received a ValkeyError, it means that this receiver returned a RecvError
+                        // If we received a Error, it means either the command failed or the receiver returned a RecvError
                         Err(e) => last_err = Some(e),
                     }
                 }
@@ -2233,7 +2215,7 @@ where
                 let collected = future::try_join_all(receivers.into_iter().map(
                     |(addr, receiver)| async move {
                         let res = convert_result(receiver.await)?;
-                        Ok::<(Option<Arc<str>>, Value), ValkeyError>((addr, res))
+                        Ok::<(Option<Arc<str>>, Value), Error>((addr, res))
                     },
                 ))
                 .await?;
@@ -2245,7 +2227,7 @@ where
     /// Synchronously folds a fully‐collected `Vec<(Option<String>, Value)>` according to `response_policy`.
     ///
     /// This helper is called after all node replies have been received and converted to `(addr, Value)`.
-    /// Each policy’s logic is applied to that vector of resolved results, returning a single `Value` or error.
+    /// Each policy's logic is applied to that vector of resolved results, returning a single `Value` or error.
     ///
     /// This function is used to handle the results of multi‐node commands, where the replies from multiple nodes are not collected using receivers,
     /// but rather already collected into a vector of `(Option<String>, Value)` pairs (e.g. within a pipeline).
@@ -2254,41 +2236,20 @@ where
     ///
     /// * `resolved` – A vector of `(Option<String>, Value)` pairs, where:
     ///     - `Option<String>` is the node address (used for map/policy keys).
-    ///     - `Value` is the node’s reply.
+    ///     - `Value` is the node's reply.
     /// * `routing` – The routing information of the command (e.g., multi‐slot, `AllNodes`, `AllPrimaries`).
     /// * `response_policy` – An `Option<ResponsePolicy>` that dictates how to aggregate the results from the different nodes.
     ///
     /// # Returns
     ///
-    /// A `ValkeyResult<Value>` representing the aggregated result.
+    /// A `Result<Value>` representing the aggregated result.
     fn aggregate_resolved_results(
         resolved: Vec<(Option<Arc<str>>, Value)>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
-    ) -> ValkeyResult<Value> {
-        // TODO: add support for returning partial results
-        let should_check_errors = match response_policy {
-            Some(ResponsePolicy::CombineArrays)
-            | Some(ResponsePolicy::Special)
-            | Some(ResponsePolicy::AllSucceeded)
-            | Some(ResponsePolicy::Aggregate(_))
-            | Some(ResponsePolicy::AggregateArray(_))
-            | Some(ResponsePolicy::AggregateLogical(_))
-            | Some(ResponsePolicy::CombineMaps)
-            | None => true,
-            Some(ResponsePolicy::OneSucceeded)
-            | Some(ResponsePolicy::FirstSucceededNonEmptyOrAllEmpty) => false,
-        };
-
-        // If we should check for errors, we iterate through the resolved values
-        // and return the first error we find.
-        if should_check_errors {
-            for (_addr, val) in resolved.iter() {
-                if let Value::ServerError(err) = val {
-                    return Err(err.clone());
-                }
-            }
-        }
+    ) -> Result<Value> {
+        // Note: errors are now propagated as Err(...) before reaching this function,
+        // so there's no need to check for server errors in the resolved values.
 
         let total = resolved.len();
 
@@ -2301,7 +2262,7 @@ where
                 .next_back()
                 .map(|(_, val)| val)
                 .ok_or_else(|| {
-                    ValkeyError::from((
+                    Error::from((
                         ErrorKind::ResponseError,
                         "No responses to aggregate for AllSucceeded",
                     ))
@@ -2366,7 +2327,7 @@ where
                     let key_bytes = match addr_opt {
                         Some(addr) => addr.as_bytes().to_vec(),
                         None => {
-                            return Err(ValkeyError::from((
+                            return Err(Error::from((
                                 ErrorKind::ResponseError,
                                 "No address provided for response in Special or None response policy",
                             )));
@@ -2388,52 +2349,32 @@ where
             // Any other in-flight responses are dropped.
             // ────────────────────────────────────────────────────────────────
             Some(ResponsePolicy::OneSucceeded) => {
-                // Return the first successful (non-error) response, or the last error if all failed.
-                let mut last_err = None;
-                for (_addr, val) in resolved {
-                    match val {
-                        Value::ServerError(err) => {
-                            last_err = Some(err);
-                        }
-                        val => return Ok(val),
-                    }
-                }
-                Err(last_err.unwrap_or_else(|| {
-                    (
-                        ErrorKind::AllConnectionsUnavailable,
-                        "Couldn't find any connection",
-                    )
-                        .into()
-                }))
+                // Return the first response, or error if none available.
+                // Errors are now propagated as Err(...) before reaching this function.
+                resolved
+                    .into_iter()
+                    .next()
+                    .map(|(_, val)| val)
+                    .ok_or_else(|| {
+                        (
+                            ErrorKind::AllConnectionsUnavailable,
+                            "Couldn't find any connection",
+                        )
+                            .into()
+                    })
             }
             // ────────────────────────────────────────────────────────────────
             // ResponsePolicy::FirstSucceededNonEmptyOrAllEmpty:
-            // Waits for each response:
-            //   - Returns the first non-Nil success immediately.
-            //   - If all are Ok(Nil), returns Value::Nil.
-            //   - If any error occurs (and no success is returned), returns the last error.
+            // Returns the first non-Nil value immediately.
+            // If all are Nil, returns Value::Nil.
             // ────────────────────────────────────────────────────────────────
             Some(ResponsePolicy::FirstSucceededNonEmptyOrAllEmpty) => {
-                // We want to see each response as it arrives, and:
-                //  • If we see `Value::Nil`, increment a counter.
-                //  • If we see `Value::ServerError`, remember it as `last_err`.
-                //  • If we see `other_value`, return it immediately.
-                //
-                // Once the stream is exhausted:
-                //  – if all successes were Nil → return Value::Nil (indicates that all shards are empty).
-                //  – else → return the last error we saw (or a generic “all‐unavailable” error).
-                //
-                // If we received a mix of errors and `Nil`s, we can't determine if all shards are empty, thus we return the last received error instead of `Nil`.
                 let mut nil_counter = 0;
-                let mut last_err = None;
                 let num_results = resolved.len();
 
                 for (_addr, val) in resolved {
                     match val {
                         Value::Nil => nil_counter += 1,
-                        Value::ServerError(err) => {
-                            last_err = Some(err);
-                        }
                         val => return Ok(val),
                     }
                 }
@@ -2441,13 +2382,11 @@ where
                 if nil_counter == num_results {
                     Ok(Value::Nil)
                 } else {
-                    Err(last_err.unwrap_or_else(|| {
-                        (
-                            ErrorKind::AllConnectionsUnavailable,
-                            "Couldn't find any connection",
-                        )
-                            .into()
-                    }))
+                    Err((
+                        ErrorKind::AllConnectionsUnavailable,
+                        "Couldn't find any connection",
+                    )
+                        .into())
                 }
             }
         }
@@ -2458,7 +2397,7 @@ where
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
         trigger: SlotRefreshTrigger,
-    ) -> ValkeyResult<()> {
+    ) -> Result<()> {
         let _guard = inner.topology_refresh_lock.lock().await;
         Self::refresh_slots_and_subscriptions_with_retries_inner(inner.clone(), policy, trigger)
             .await
@@ -2468,7 +2407,7 @@ where
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
         trigger: SlotRefreshTrigger,
-    ) -> ValkeyResult<()> {
+    ) -> Result<()> {
         let SlotRefreshState {
             in_progress,
             last_run,
@@ -2538,12 +2477,12 @@ where
     }
 
     /// Determines if the cluster topology has changed and refreshes slots and subscriptions if needed.
-    /// Returns `ValkeyResult` with `true` if changes were detected and slots were refreshed,
+    /// Returns `Result` with `true` if changes were detected and slots were refreshed,
     /// or `false` if no changes were found. Raises an error if refreshing the topology fails.
     pub(crate) async fn check_topology_and_refresh_if_diff(
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
-    ) -> ValkeyResult<bool> {
+    ) -> Result<bool> {
         let _guard = inner.topology_refresh_lock.lock().await;
 
         let topology_changed = Self::check_for_topology_diff(inner.clone()).await;
@@ -2602,7 +2541,7 @@ where
     /// topology view differs from the one currently stored in the connection manager.
     /// Returns true if change was detected, otherwise false.
     async fn check_for_topology_diff(inner: Arc<InnerCore<C>>) -> bool {
-        let num_of_nodes = inner.conn_lock.read().await.len();
+        let num_of_nodes = inner.conn_lock.read().len();
         let num_of_nodes_to_query =
             std::cmp::max(num_of_nodes.checked_ilog2().unwrap_or(0) as usize, 1);
         let TopologyQueryResult {
@@ -2617,7 +2556,7 @@ where
         .await;
 
         if let Ok((_, found_topology_hash)) = topology_result
-            && inner.conn_lock.read().await.get_current_topology_hash() != found_topology_hash
+            && inner.conn_lock.read().get_current_topology_hash() != found_topology_hash
         {
             return true;
         }
@@ -2645,7 +2584,7 @@ where
         inner: Arc<InnerCore<C>>,
         curr_retry: usize,
         trigger: SlotRefreshTrigger,
-    ) -> ValkeyResult<()> {
+    ) -> Result<()> {
         // Update the slot refresh last run timestamp
         let now = SystemTime::now();
         let mut last_run_wlock = inner.slot_refresh_state.last_run.write().await;
@@ -2659,8 +2598,8 @@ where
         inner: Arc<InnerCore<C>>,
         curr_retry: usize,
         trigger: SlotRefreshTrigger,
-    ) -> ValkeyResult<()> {
-        let num_of_nodes = inner.conn_lock.read().await.len();
+    ) -> Result<()> {
+        let num_of_nodes = inner.conn_lock.read().len();
         const MAX_REQUESTED_NODES: usize = 10;
         let num_of_nodes_to_query = num_of_nodes.min(MAX_REQUESTED_NODES);
 
@@ -2696,7 +2635,7 @@ where
                 // Issue: https://github.com/valkey-io/valkey-glide/issues/5298
                 let result = tokio::time::timeout(connection_timeout, async {
                     // Check for existing connection by direct address
-                    let node = inner.conn_lock.read().await.node_for_address(&addr);
+                    let node = inner.conn_lock.read().node_for_address(&addr);
 
                     let node = match node {
                         Some(n) => Some(n),
@@ -2709,7 +2648,7 @@ where
                             {
                                 if let Ok(mut socket_addresses) = get_socket_addrs(host, port).await
                                 {
-                                    let conn_lock = inner.conn_lock.read().await;
+                                    let conn_lock = inner.conn_lock.read();
                                     socket_addresses.find_map(|socket_addr| {
                                         conn_lock.node_for_address(&socket_addr.to_string())
                                     })
@@ -2763,24 +2702,26 @@ where
 
         info!("refresh_slots found nodes:\n{new_connections}");
         // Reset the current slot map and connection vector with the new ones
-        let mut write_guard = inner.conn_lock.write().await;
-        // Clear the refresh tasks of the prev instance
-        // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
-        write_guard.refresh_conn_state.clear_refresh_state();
-        let read_from_replicas =
-            inner.get_cluster_param(|params| params.read_from_replicas.clone());
-        *write_guard = ConnectionsContainer::new(
-            new_slots,
-            new_connections,
-            read_from_replicas,
-            topology_hash,
-        );
+        {
+            let mut write_guard = inner.conn_lock.write();
+            // Clear the refresh tasks of the prev instance
+            write_guard.refresh_conn_state.clear_refresh_state();
+            let read_from_replicas =
+                inner.get_cluster_param(|params| params.read_from_replicas.clone());
+            *write_guard = ConnectionsContainer::new(
+                new_slots,
+                new_connections,
+                read_from_replicas,
+                topology_hash,
+            );
+        }
+        // Write lock released — readers can proceed while we notify the synchronizer.
 
-        // Notify the PubSub synchronizer about the new topology (using same lock)
-        // Since handle_topology_refresh is sync, no other task can benefit from us
-        // holding a read lock instead - hence, we continue with the write lock.
+        // Notify the PubSub synchronizer about the new topology.
+        // Acquire a read lock (shared) for the slot_map reference.
         if let Some(sync) = &inner.ferriskey_connection_options.pubsub_synchronizer {
-            sync.handle_topology_refresh(&write_guard.slot_map);
+            let read_guard = inner.conn_lock.read();
+            sync.handle_topology_refresh(&read_guard.slot_map);
         }
 
         Ok(())
@@ -2805,13 +2746,13 @@ where
     /// * `new_primary` - The address of the node now responsible for the slot.
     ///
     /// # Returns
-    /// * `ValkeyResult<()>` indicating success or failure in updating slot mappings.
+    /// * `Result<()>` indicating success or failure in updating slot mappings.
     async fn update_upon_moved_error(
         inner: Arc<InnerCore<C>>,
         slot: u16,
         new_primary: Arc<String>,
-    ) -> ValkeyResult<()> {
-        let curr_shard_addrs = inner.conn_lock.read().await.slot_map.shard_addrs_for_slot(slot);
+    ) -> Result<()> {
+        let curr_shard_addrs = inner.conn_lock.read().slot_map.shard_addrs_for_slot(slot);
         // let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
         // Check if the new primary is part of the current shard and update if required
         if let Some(curr_shard_addrs) = curr_shard_addrs {
@@ -2826,7 +2767,7 @@ where
 
         // Scenario 3 & 4: Check if the new primary exists in other shards
 
-        let mut wlock_conn_container = inner.conn_lock.write().await;
+        let mut wlock_conn_container = inner.conn_lock.write();
         let mut nodes_iter = wlock_conn_container.slot_map_nodes();
         for (node_addr, (ip_addr, shard_addrs_arc)) in &mut nodes_iter {
             if node_addr == new_primary {
@@ -2839,7 +2780,7 @@ where
                         .slot_map
                         .update_slot_range(slot, shard_addrs_arc.clone());
                 } else {
-                    // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn’t own `slot`.
+                    // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn't own `slot`.
                     // Remove the replica from its existing shard and treat it as a new node in a new shard.
                     shard_addrs_arc.remove_replica(new_primary.clone())?;
                     drop(nodes_iter);
@@ -2873,7 +2814,7 @@ where
                 Item = Option<(Arc<Cmd>, ConnectionAndAddress<ConnectionFuture<C>>)>,
             >,
         ) -> (
-            Vec<(Option<Arc<str>>, Receiver<Result<Response, ValkeyError>>)>,
+            Vec<(Option<Arc<str>>, Receiver<Result<Response>>)>,
             Vec<Option<PendingRequest<C>>>,
         ) {
             iterator
@@ -2912,7 +2853,7 @@ where
         }
         let (receivers, requests): (Vec<_>, Vec<_>);
         {
-            let connections_container = core.conn_lock.read().await;
+            let connections_container = core.conn_lock.read();
             if connections_container.is_empty() {
                 return OperationResult::Err((
                     OperationTarget::FanOut,
@@ -2974,7 +2915,7 @@ where
             InternalRoutingInfo::MultiNode(_) => {
                 return Err((
                     OperationTarget::FanOut,
-                    ValkeyError::from((
+                    Error::from((
                         ErrorKind::ClientError,
                         "MultiNode routing reached single-node dispatch path",
                     )),
@@ -3048,7 +2989,7 @@ where
         pipeline: Arc<crate::pipeline::Pipeline>,
         offset: usize,
         count: usize,
-        conn: impl Future<Output = ValkeyResult<(Arc<str>, C)>>,
+        conn: impl Future<Output = Result<(Arc<str>, C)>>,
     ) -> OperationResult {
         trace!("try_pipeline_request");
         let (address, mut conn) = conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
@@ -3260,37 +3201,39 @@ where
     async fn aggregate_pipeline_multi_node_commands(
         pipeline_responses: PipelineResponses,
         response_policies: ResponsePoliciesMap,
-    ) -> Vec<Value> {
-        let mut final_responses = Vec::with_capacity(pipeline_responses.len());
+    ) -> Vec<Result<Value>> {
+        let mut final_responses: Vec<Result<Value>> = Vec::with_capacity(pipeline_responses.len());
 
         for (index, mut responses) in pipeline_responses.into_iter().enumerate() {
-            // If the first policy in the sorted vector matches the current command index, use it.
             if let Some(&(ref routing_info, response_policy)) = response_policies.get(&index) {
-                // Unwrap ValkeyResult<Value> → Value for aggregation
-                // (errors become Value::ServerError)
+                let mut first_error: Option<Error> = None;
                 let resolved: Vec<(Option<Arc<str>>, Value)> = responses
                     .into_iter()
-                    .map(|(addr, val)| (addr, val.unwrap_or_else(Value::ServerError)))
+                    .filter_map(|(addr, val)| match val {
+                        Ok(v) => Some((addr, v)),
+                        Err(err) => {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                            None
+                        }
+                    })
                     .collect();
-                let aggregated_response = match Self::aggregate_resolved_results(
-                    resolved,
-                    routing_info,
-                    response_policy,
-                ) {
-                    Ok(value) => value,
-                    Err(err) => Value::ServerError(err.into()),
+                let aggregated_response = if let Some(err) = first_error {
+                    Err(err)
+                } else {
+                    Self::aggregate_resolved_results(
+                        resolved,
+                        routing_info,
+                        response_policy,
+                    )
                 };
-
                 final_responses.push(aggregated_response);
             } else {
-                // If there's no policy for this index, use the first response if available.
                 if responses.len() == 1 {
-                    match responses.pop().unwrap().1 {
-                        Ok(val) => final_responses.push(val),
-                        Err(err) => final_responses.push(Value::ServerError(err)),
-                    }
+                    final_responses.push(responses.pop().unwrap().1);
                 } else {
-                    final_responses.push(Value::ServerError(make_extension_error(
+                    final_responses.push(Err(crate::value::make_extension_error(
                         "PipelineResponseError".to_string(),
                         Some(format!(
                             "Expected exactly one response for command {}, got {}",
@@ -3309,7 +3252,7 @@ where
         routing: InternalSingleNodeRouting<C>,
         core: Core<C>,
         cmd: Option<Arc<Cmd>>,
-    ) -> ValkeyResult<(Arc<str>, C)> {
+    ) -> Result<(Arc<str>, C)> {
         let mut asking = false;
 
         let conn_check = match routing {
@@ -3319,7 +3262,6 @@ where
             } => core
                 .conn_lock
                 .read()
-                .await
                 .connection_for_address(moved_addr.as_str())
                 .map_or(
                     ConnectionCheck::OnlyAddress(moved_addr),
@@ -3332,7 +3274,6 @@ where
                 asking = should_exec_asking;
                 core.conn_lock
                     .read()
-                    .await
                     .connection_for_address(ask_addr.as_str())
                     .map_or(
                         ConnectionCheck::OnlyAddress(ask_addr),
@@ -3342,7 +3283,7 @@ where
             InternalSingleNodeRouting::SpecificNode(route) => {
                 // Step 1: Attempt to get the connection directly using the route.
                 let conn_check = {
-                    let conn_lock = core.conn_lock.read().await;
+                    let conn_lock = core.conn_lock.read();
                     conn_lock
                         .connection_for_route(&route)
                         .map(ConnectionCheck::Found)
@@ -3378,7 +3319,7 @@ where
 
                     // Step 3: Obtain the reconnect notifier, ensuring the lock is released immediately after.
                     let reconnect_notifier = {
-                        let conn_lock = core.conn_lock.read().await;
+                        let conn_lock = core.conn_lock.read();
                         conn_lock.notifier_for_route(&route).clone()
                     };
 
@@ -3396,7 +3337,7 @@ where
 
                         // Step 5: Retry the connection lookup after waiting for the reconnect task.
                         if let Some((conn, address)) =
-                            core.conn_lock.read().await.connection_for_route(&route)
+                            core.conn_lock.read().connection_for_route(&route)
                         {
                             conn_check = ConnectionCheck::Found((conn, address));
                         } else {
@@ -3418,7 +3359,7 @@ where
                 return Ok((address, conn.await));
             }
             InternalSingleNodeRouting::ByAddress(address) => {
-                let conn_option = core.conn_lock.read().await.connection_for_address(&address);
+                let conn_option = core.conn_lock.read().connection_for_address(&address);
                 if let Some((address, conn)) = conn_option {
                     return Ok((address, conn.await));
                 } else {
@@ -3438,10 +3379,10 @@ where
                 // Validate the address was previously seen in the cluster topology.
                 // This prevents SSRF via crafted MOVED/ASK redirects to arbitrary hosts.
                 {
-                    let container = core.conn_lock.read().await;
+                    let container = core.conn_lock.read();
                     let known = container.slot_map.all_node_addresses();
                     if !known.iter().any(|a| a.as_str() == address) {
-                        return Err(ValkeyError::from((
+                        return Err(Error::from((
                             ErrorKind::ConnectionNotFoundForRoute,
                             "Redirect to unknown address rejected",
                             address,
@@ -3477,7 +3418,7 @@ where
                 }
 
                 // Try fetching the connection after the notifier resolves
-                let conn_option = core.conn_lock.read().await.connection_for_address(&address);
+                let conn_option = core.conn_lock.read().connection_for_address(&address);
 
                 if let Some((address, conn)) = conn_option {
                     debug!("get_connection: Connection found for address: {}", address);
@@ -3495,13 +3436,12 @@ where
                 let random_conn = core
                     .conn_lock
                     .read()
-                    .await
                     .random_connections(1, ConnectionType::User);
                 let (random_address, random_conn_future) =
                     match random_conn.and_then(|conn_iter| conn_iter.into_iter().next()) {
                         Some((address, future)) => (address, future),
                         None => {
-                            return Err(ValkeyError::from((
+                            return Err(Error::from((
                                 ErrorKind::AllConnectionsUnavailable,
                                 "No random connection found",
                             )));
@@ -3518,7 +3458,7 @@ where
         Ok((address, conn))
     }
 
-    fn poll_recover(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), ValkeyError>> {
+    fn poll_recover(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<()>> {
         trace!("entered poll_recover");
 
         let recover_future = match &mut self.state {
@@ -3587,7 +3527,7 @@ where
                             );
 
                             // Report this critical error to clients
-                            let err = ValkeyError::from((
+                            let err = Error::from((
                                 ErrorKind::ClientError,
                                 "Slot refresh task panicked",
                                 format!("{join_err:?}"),
@@ -3678,12 +3618,12 @@ where
         retry: u32,
         retry_params: RetryParams,
     ) {
-        let is_primary = core.conn_lock.read().await.is_primary(&address);
+        let is_primary = core.conn_lock.read().is_primary(&address);
 
         if !is_primary {
             // If the connection is a replica, remove the connection and retry.
             // The connection will be established again on the next call to refresh slots once the replica is no longer in loading state.
-            core.conn_lock.read().await.remove_node(&address);
+            core.conn_lock.read().remove_node(&address);
         } else {
             // If the connection is primary, just sleep and retry
             let sleep_duration = retry_params.wait_time_for_retry(retry);
@@ -3884,11 +3824,11 @@ where
 {
     type Error = ();
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, msg: Message<C>) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, msg: Message<C>) -> std::result::Result<(), Self::Error> {
         let Message { cmd, sender } = msg;
 
         let info = RequestInfo { cmd };
@@ -3904,7 +3844,7 @@ where
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         trace!("poll_flush: {:?}", self.state);
         loop {
             self.send_refresh_error();
@@ -3966,7 +3906,7 @@ where
     fn poll_close(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         // Try to drive any in flight requests to completion
         match self.poll_complete(cx) {
             Poll::Ready(PollFlushAction::None) => (),
@@ -4020,12 +3960,12 @@ struct InitialNodeConnectionsResult<C> {
 async fn get_random_connections_from_initial_nodes<C>(
     inner: &Core<C>,
     num_of_nodes_to_query: usize,
-) -> ValkeyResult<InitialNodeConnectionsResult<C>>
+) -> Result<InitialNodeConnectionsResult<C>>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     if inner.initial_nodes.is_empty() {
-        return Err(ValkeyError::from((
+        return Err(Error::from((
             ErrorKind::InvalidClientConfig,
             "Cannot refresh topology from initial nodes: no initial nodes configured",
         )));
@@ -4149,7 +4089,7 @@ where
     let original_addr_key = Arc::new(original_addr.to_string());
 
     let (canonical_addr, conn_opt) = {
-        let conn_lock = inner.conn_lock.read().await;
+        let conn_lock = inner.conn_lock.read();
 
         // Resolve canonical address using the lookup chain:
         let canonical_addr = if conn_lock
@@ -4187,7 +4127,7 @@ where
 /// Result of querying random cluster nodes for topology calculation.
 struct TopologyQueryResult {
     /// The calculated topology (slot map and hash), or an error if calculation failed
-    topology_result: ValkeyResult<(SlotMap, TopologyHash)>,
+    topology_result: Result<(SlotMap, TopologyHash)>,
     /// Optionally addresses of connections that failed during the query and need refresh
     failed_connections: Option<HashSet<String>>,
 }
@@ -4234,13 +4174,12 @@ where
     } else if let Some(random_conns) = inner
         .conn_lock
         .read()
-        .await
         .random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement)
     {
         (random_conns, HashSet::new())
     } else {
         return TopologyQueryResult {
-            topology_result: Err(ValkeyError::from((
+            topology_result: Err(Error::from((
                 ErrorKind::AllConnectionsUnavailable,
                 "No available connections to refresh slots from",
             ))),
@@ -4304,7 +4243,7 @@ impl<C> ConnectionLike for ClusterConnection<C>
 where
     C: ConnectionLike + Send + Clone + Unpin + Sync + Connect + 'static,
 {
-    async fn req_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
+    async fn req_packed_command(&mut self, cmd: &Cmd) -> Result<Value> {
         let routing = cluster_routing::RoutingInfo::for_routable(cmd).unwrap_or(
             cluster_routing::RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
         );
@@ -4327,13 +4266,16 @@ where
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> ValkeyResult<Vec<Value>> {
+    ) -> Result<Vec<Result<Value>>> {
         let route = route_for_pipeline(pipeline)?;
 
         // Fast path: same-slot pipeline dispatched directly to the node's mux connection.
         if let Some(ref route) = route {
             let conn_future = {
-                let container = self.inner.conn_lock.read().await;
+                let container = match self.inner.conn_lock.try_read() {
+                    Some(guard) => guard,
+                    None => self.inner.conn_lock.read(),
+                };
                 container.connection_for_route(route).map(|(_, conn)| conn)
             };
             if let Some(conn_future) = conn_future {
@@ -4391,7 +4333,7 @@ pub trait Connect: Sized {
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyFuture<'a, (Self, Option<IpAddr>)>
+    ) -> BoxFuture<'a, Result<(Self, Option<IpAddr>)>>
     where
         T: IntoConnectionInfo + Send + 'a;
 }
@@ -4403,7 +4345,7 @@ impl Connect for MultiplexedConnection {
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyFuture<'a, (MultiplexedConnection, Option<IpAddr>)>
+    ) -> BoxFuture<'a, Result<(MultiplexedConnection, Option<IpAddr>)>>
     where
         T: IntoConnectionInfo + Send + 'a,
     {
@@ -4440,7 +4382,7 @@ mod pipeline_routing_tests {
     };
     use crate::cmd::cmd;
     use crate::connection::MultiplexedConnection;
-    use crate::value::{ErrorKind, ValkeyError, Value, make_extension_error};
+    use crate::value::{ErrorKind, Error, Value};
 
     #[test]
     fn test_first_route_is_found() {
@@ -4504,9 +4446,9 @@ mod pipeline_routing_tests {
         assert_eq!(
             responses,
             vec![
-                Value::Int(10),
-                Value::BulkString(b"unchanged".to_vec().into()),
-                Value::Int(5)
+                Ok(Value::Int(10)),
+                Ok(Value::BulkString(b"unchanged".to_vec().into())),
+                Ok(Value::Int(5))
             ],
             "{responses:?}"
         );
@@ -4516,22 +4458,22 @@ mod pipeline_routing_tests {
     fn test_combine_arrays_response_aggregation_logic() {
         let pipeline_responses: PipelineResponses = vec![
             vec![
-                (Some(Arc::from("node1")), Ok(Value::Array(vec![Value::Int(1)]))),
-                (Some(Arc::from("node2")), Ok(Value::Array(vec![Value::Int(2)]))),
+                (Some(Arc::from("node1")), Ok(Value::Array(vec![Ok(Value::Int(1))]))),
+                (Some(Arc::from("node2")), Ok(Value::Array(vec![Ok(Value::Int(2))]))),
             ],
             vec![
                 (
                     Some(Arc::from("node2")),
                     Ok(Value::Array(vec![
-                        Value::BulkString("key1".into()),
-                        Value::BulkString("key3".into()),
+                        Ok(Value::BulkString("key1".into())),
+                        Ok(Value::BulkString("key3".into())),
                     ])),
                 ),
                 (
                     Some(Arc::from("node1")),
                     Ok(Value::Array(vec![
-                        Value::BulkString("key2".into()),
-                        Value::BulkString("key4".into()),
+                        Ok(Value::BulkString("key2".into())),
+                        Ok(Value::BulkString("key4".into())),
                     ])),
                 ),
             ],
@@ -4566,19 +4508,19 @@ mod pipeline_routing_tests {
             ),
         );
 
-        let mut expected = Value::Array(vec![Value::Int(1), Value::Int(2)]);
+        let mut expected = Value::Array(vec![Ok(Value::Int(1)), Ok(Value::Int(2))]);
         assert_eq!(
-            responses[0], expected,
+            responses[0], Ok(expected),
             "Expected combined array to include all elements"
         );
         expected = Value::Array(vec![
-            Value::BulkString("key1".into()),
-            Value::BulkString("key2".into()),
-            Value::BulkString("key3".into()),
-            Value::BulkString("key4".into()),
+            Ok(Value::BulkString("key1".into())),
+            Ok(Value::BulkString("key2".into())),
+            Ok(Value::BulkString("key3".into())),
+            Ok(Value::BulkString("key4".into())),
         ]);
         assert_eq!(
-            responses[1], expected,
+            responses[1], Ok(expected),
             "Expected combined array to include all elements"
         );
     }
@@ -4591,7 +4533,7 @@ mod pipeline_routing_tests {
                 (Some(Arc::from("node2")), Ok(Value::Int(7))),
                 (
                     Some(Arc::from("node3")),
-                    Err(ValkeyError::from((ErrorKind::Moved, "MOVED", "127.0.0.1".to_string()))),
+                    Err(Error::from((ErrorKind::Moved, "MOVED", "127.0.0.1".to_string()))),
                 ),
             ],
             vec![(
@@ -4615,13 +4557,10 @@ mod pipeline_routing_tests {
             ),
         );
 
-        assert_eq!(
-            responses,
-            vec![
-                Value::ServerError(ValkeyError::from((ErrorKind::Moved, "MOVED", "An error was signalled by the server: 127.0.0.1".to_string()))),
-                Value::BulkString(b"unchanged".to_vec().into()),
-            ]
-        );
+        // First element: error from MOVED is preserved as Err
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].is_err(), "Expected Err for MOVED response, got: {:?}", responses[0]);
+        assert_eq!(responses[1], Ok(Value::BulkString(b"unchanged".to_vec().into())));
     }
 
     #[test]
@@ -4637,13 +4576,9 @@ mod pipeline_routing_tests {
             ),
         );
 
-        assert_eq!(
-            responses,
-            vec![
-                Value::Int(1),
-                Value::ServerError(make_extension_error("PipelineResponseError".to_string(), Some("Expected exactly one response for command 1, got 0".to_string())))
-            ]
-        );
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0], Ok(Value::Int(1)));
+        assert!(responses[1].is_err(), "Expected Err for missing response, got: {:?}", responses[1]);
     }
 
     #[test]
@@ -4664,13 +4599,9 @@ mod pipeline_routing_tests {
             ),
         );
 
-        assert_eq!(
-            responses,
-            vec![
-                Value::Int(1),
-                Value::ServerError(make_extension_error("PipelineResponseError".to_string(), Some("Expected exactly one response for command 1, got 2".to_string())))
-            ]
-        );
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0], Ok(Value::Int(1)));
+        assert!(responses[1].is_err(), "Expected Err for duplicate response, got: {:?}", responses[1]);
     }
 
     #[test]
@@ -4804,7 +4735,7 @@ mod parse_node_address_tests {
 //
 // These tests exercise try_direct_dispatch and try_direct_pipeline_dispatch
 // in isolation by injecting a lightweight MockConn that records every bytes
-// payload it receives and returns pre-queued ValkeyResult<Value> responses.
+// payload it receives and returns pre-queued Result<Value> responses.
 // No real TCP connections are used.
 //
 // Slot facts used throughout (CRC-16/CCITT of the key name):
@@ -4835,7 +4766,7 @@ mod direct_dispatch_tests {
 
     #[derive(Clone)]
     struct MockConn {
-        responses: Arc<Mutex<VecDeque<ValkeyResult<Value>>>>,
+        responses: Arc<Mutex<VecDeque<Result<Value>>>>,
         /// Each entry is the raw bytes payload received by send_packed_bytes or
         /// req_packed_command (packed command bytes).
         received: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -4853,7 +4784,7 @@ mod direct_dispatch_tests {
             self.responses.lock().unwrap().push_back(Ok(v));
         }
 
-        fn push_err(&self, e: ValkeyError) {
+        fn push_err(&self, e: Error) {
             self.responses.lock().unwrap().push_back(Err(e));
         }
 
@@ -4866,7 +4797,7 @@ mod direct_dispatch_tests {
             self.received.lock().unwrap()[n].clone()
         }
 
-        fn pop_response(&self) -> ValkeyResult<Value> {
+        fn pop_response(&self) -> Result<Value> {
             self.responses
                 .lock()
                 .unwrap()
@@ -4876,7 +4807,7 @@ mod direct_dispatch_tests {
     }
 
     impl ConnectionLike for MockConn {
-        async fn req_packed_command(&mut self, cmd: &Cmd) -> ValkeyResult<Value> {
+        async fn req_packed_command(&mut self, cmd: &Cmd) -> Result<Value> {
             self.received
                 .lock()
                 .unwrap()
@@ -4890,11 +4821,11 @@ mod direct_dispatch_tests {
             _offset: usize,
             _count: usize,
             _retry: Option<PipelineRetryStrategy>,
-        ) -> ValkeyResult<Vec<Value>> {
+        ) -> Result<Vec<Result<Value>>> {
             self.received.lock().unwrap().push(b"<pipeline>".to_vec());
             match self.pop_response() {
                 Ok(Value::Array(vals)) => Ok(vals),
-                Ok(v) => Ok(vec![v]),
+                Ok(v) => Ok(vec![Ok(v)]),
                 Err(e) => Err(e),
             }
         }
@@ -4903,7 +4834,7 @@ mod direct_dispatch_tests {
             &mut self,
             packed: bytes::Bytes,
             _is_fenced: bool,
-        ) -> ValkeyResult<Value> {
+        ) -> Result<Value> {
             self.received.lock().unwrap().push(packed.to_vec());
             self.pop_response()
         }
@@ -4923,7 +4854,7 @@ mod direct_dispatch_tests {
             _connection_timeout: Duration,
             _socket_addr: Option<SocketAddr>,
             _opts: FerrisKeyConnectionOptions,
-        ) -> ValkeyFuture<'a, (Self, Option<IpAddr>)>
+        ) -> BoxFuture<'a, Result<(Self, Option<IpAddr>)>>
         where
             T: IntoConnectionInfo + Send + 'a,
         {
@@ -4972,7 +4903,7 @@ mod direct_dispatch_tests {
         let params = ClusterParams::default_for_test(None);
         let (pending_tx, pending_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(InnerCore {
-            conn_lock: TokioRwLock::new(container),
+            conn_lock: ParkingLotRwLock::new(container),
             cluster_params: ParkingLotRwLock::new(params),
             pending_requests_tx: pending_tx,
             pending_requests_rx: std::sync::Mutex::new(pending_rx),
@@ -5001,13 +4932,13 @@ mod direct_dispatch_tests {
     }
 
     /// Create a MOVED error that redirect_node() will parse as (addr, slot).
-    fn moved_err(slot: u16, addr: &str) -> ValkeyError {
-        ValkeyError::from((ErrorKind::Moved, "key moved", format!("{slot} {addr}")))
+    fn moved_err(slot: u16, addr: &str) -> Error {
+        Error::from((ErrorKind::Moved, "key moved", format!("{slot} {addr}")))
     }
 
     /// Create an ASK error that redirect_node() will parse as (addr, slot).
-    fn ask_err(slot: u16, addr: &str) -> ValkeyError {
-        ValkeyError::from((ErrorKind::Ask, "key moved (ask)", format!("{slot} {addr}")))
+    fn ask_err(slot: u16, addr: &str) -> Error {
+        Error::from((ErrorKind::Ask, "key moved (ask)", format!("{slot} {addr}")))
     }
 
     // ── Test 1 ──────────────────────────────────────────────────────────────
@@ -5173,12 +5104,12 @@ mod direct_dispatch_tests {
         let node_b = MockConn::new(); // owns slots 8192–16383
 
         // Each node returns its sub-pipeline results as a Value::Array.
-        node_b.push_ok(Value::Array(vec![Value::BulkString(
+        node_b.push_ok(Value::Array(vec![Ok(Value::BulkString(
             b"val_foo".to_vec().into(),
-        )]));
-        node_a.push_ok(Value::Array(vec![Value::BulkString(
+        ))]));
+        node_a.push_ok(Value::Array(vec![Ok(Value::BulkString(
             b"val_baz".to_vec().into(),
-        )]));
+        ))]));
 
         let conn = build_cluster(vec![
             ("127.0.0.1:7001", 0, 8191, node_a.clone()),
@@ -5199,12 +5130,12 @@ mod direct_dispatch_tests {
         assert_eq!(values.len(), 2);
         assert_eq!(
             values[0],
-            Value::BulkString(b"val_foo".to_vec().into()),
+            Ok(Value::BulkString(b"val_foo".to_vec().into())),
             "index 0 must be the result of GET foo"
         );
         assert_eq!(
             values[1],
-            Value::BulkString(b"val_baz".to_vec().into()),
+            Ok(Value::BulkString(b"val_baz".to_vec().into())),
             "index 1 must be the result of GET baz"
         );
     }
@@ -5217,8 +5148,8 @@ mod direct_dispatch_tests {
         let node_a = MockConn::new(); // will fail
         let node_b = MockConn::new(); // will succeed
 
-        node_b.push_ok(Value::Array(vec![Value::BulkString(b"ok".to_vec().into())]));
-        node_a.push_err(ValkeyError::from(std::io::Error::new(
+        node_b.push_ok(Value::Array(vec![Ok(Value::BulkString(b"ok".to_vec().into()))]));
+        node_a.push_err(Error::from(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "simulated connection drop",
         )));

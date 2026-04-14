@@ -1,5 +1,5 @@
 use crate::connection::{AsyncStream, RedisRuntime};
-use crate::value::ValkeyResult;
+use crate::value::Result;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 #[allow(unused_imports)] // fixes "Duration" unused when built with non-default feature set
@@ -102,7 +102,7 @@ impl AsyncRead for Tokio {
 
 #[async_trait]
 impl RedisRuntime for Tokio {
-    async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> ValkeyResult<Self> {
+    async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> Result<Self> {
         Ok(connect_tcp(&socket_addr, tcp_nodelay)
             .await
             .map(Tokio::Tcp)?)
@@ -114,7 +114,7 @@ impl RedisRuntime for Tokio {
         insecure: bool,
         tls_params: &Option<TlsConnParams>,
         tcp_nodelay: bool,
-    ) -> ValkeyResult<Self> {
+    ) -> Result<Self> {
         let config = create_rustls_config(insecure, tls_params.clone())?;
         let tls_connector = TlsConnector::from(Arc::new(config));
 
@@ -128,7 +128,7 @@ impl RedisRuntime for Tokio {
     }
 
     #[cfg(unix)]
-    async fn connect_unix(path: &Path) -> ValkeyResult<Self> {
+    async fn connect_unix(path: &Path) -> Result<Self> {
         Ok(UnixStreamTokio::connect(path).await.map(Tokio::Unix)?)
     }
 

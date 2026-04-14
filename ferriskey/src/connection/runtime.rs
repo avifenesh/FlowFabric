@@ -1,6 +1,6 @@
 use std::{io, time::Duration};
 
-use crate::value::ValkeyError;
+use crate::value::Error;
 use futures_util::Future;
 
 pub(crate) async fn timeout<F: Future>(
@@ -15,7 +15,7 @@ pub(crate) async fn timeout<F: Future>(
 #[derive(Debug)]
 pub(crate) struct Elapsed(());
 
-impl From<Elapsed> for ValkeyError {
+impl From<Elapsed> for Error {
     fn from(_: Elapsed) -> Self {
         io::Error::from(io::ErrorKind::TimedOut).into()
     }

@@ -15,7 +15,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::value::{ErrorKind, ValkeyError};
+use crate::value::{ErrorKind, Error};
 
 /// Maximum refresh interval in seconds (12 hours)
 const MAX_REFRESH_INTERVAL_SECONDS: u32 = 12 * 60 * 60; // 43200 seconds
@@ -48,11 +48,11 @@ pub enum ServiceType {
 /// Validate refresh interval (1 second to 12 hours, defaults to 5 minutes)
 fn validate_refresh_interval(
     refresh_interval_seconds: Option<u32>,
-) -> Result<Option<u32>, ValkeyError> {
+) -> std::result::Result<Option<u32>, Error> {
     match refresh_interval_seconds {
         Some(0) => {
             // Reject 0 as an invalid interval
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::ClientError,
                 "IAM refresh interval validation failed",
                 format!("actual=0 exceeds max={MAX_REFRESH_INTERVAL_SECONDS}"),
@@ -60,7 +60,7 @@ fn validate_refresh_interval(
         }
         Some(interval) => {
             if interval > MAX_REFRESH_INTERVAL_SECONDS {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::ClientError,
                     "IAM refresh interval validation failed",
                     format!("actual={interval} exceeds max={MAX_REFRESH_INTERVAL_SECONDS}"),
@@ -93,14 +93,14 @@ fn validate_refresh_interval(
 async fn get_signing_identity(
     region: &str,
     service_type: ServiceType,
-) -> Result<aws_credential_types::Credentials, ValkeyError> {
+) -> std::result::Result<aws_credential_types::Credentials, Error> {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()))
         .load()
         .await;
 
     let provider = config.credentials_provider().ok_or_else(|| {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::ClientError,
             "IAM credentials error",
             "No AWS credentials provider found".to_string(),
@@ -108,7 +108,7 @@ async fn get_signing_identity(
     })?;
 
     let creds = provider.provide_credentials().await.map_err(|e| {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::ClientError,
             "IAM credentials error",
             e.to_string(),
@@ -192,7 +192,7 @@ impl IAMTokenManager {
         region: String,
         service_type: ServiceType,
         refresh_interval_seconds: Option<u32>,
-    ) -> Result<Self, ValkeyError> {
+    ) -> std::result::Result<Self, Error> {
         let validated_refresh_interval = validate_refresh_interval(refresh_interval_seconds)?;
 
         let state = IamTokenState {
@@ -277,7 +277,7 @@ impl IAMTokenManager {
         cached_token: &Arc<RwLock<String>>,
         token_created_at: &Arc<RwLock<tokio::time::Instant>>,
         token_changed: &Arc<AtomicBool>,
-    ) -> Result<(), ValkeyError> {
+    ) -> std::result::Result<(), Error> {
         match Self::generate_token_with_backoff(iam_token_state).await {
             Ok(new_token) => {
                 Self::set_cached_token_static(cached_token, new_token.clone()).await;
@@ -304,7 +304,7 @@ impl IAMTokenManager {
     /// Returns token on success, last error on failure.
     pub(crate) async fn generate_token_with_backoff(
         state: &IamTokenState,
-    ) -> Result<String, ValkeyError> {
+    ) -> std::result::Result<String, Error> {
         let mut attempt: u32 = 0;
         let mut backoff_ms = TOKEN_GEN_INITIAL_BACKOFF_MS;
 
@@ -349,7 +349,7 @@ impl IAMTokenManager {
     /// Force refresh the token immediately
     ///
     /// Returns an error if token generation fails after retries.
-    pub async fn refresh_token(&self) -> Result<(), ValkeyError> {
+    pub async fn refresh_token(&self) -> std::result::Result<(), Error> {
         Self::handle_token_refresh(
             &self.iam_token_state,
             &self.cached_token,
@@ -404,7 +404,7 @@ impl IAMTokenManager {
     }
 
     /// Generate IAM authentication token using SigV4 signing (valid for 15 minutes)
-    async fn generate_token_static(state: &IamTokenState) -> Result<String, ValkeyError> {
+    async fn generate_token_static(state: &IamTokenState) -> std::result::Result<String, Error> {
         let service_name: &'static str = state.service_type.into();
         let signing_time = SystemTime::now();
         let hostname = state.cluster_name.clone();
@@ -427,7 +427,7 @@ impl IAMTokenManager {
             .settings(signing_settings)
             .build()
             .map_err(|e| {
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ClientError,
                     "IAM token generation failed",
                     format!("Failed to build signing params: {e}"),
@@ -443,7 +443,7 @@ impl IAMTokenManager {
             SignableBody::Bytes(b""),
         )
         .map_err(|e| {
-            ValkeyError::from((
+            Error::from((
                 ErrorKind::ClientError,
                 "IAM token generation failed",
                 format!("Failed to create signable request: {e}"),
@@ -453,7 +453,7 @@ impl IAMTokenManager {
         // Sign the request (with presigning settings, this will generate query parameters)
         let (instructions, _sig) = sign(signable_request, &signing_params)
             .map_err(|e| {
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ClientError,
                     "IAM token generation failed",
                     format!("Failed to sign: {e}"),
@@ -468,7 +468,7 @@ impl IAMTokenManager {
             .header("host", &hostname)
             .body(())
             .map_err(|e| {
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ClientError,
                     "IAM token generation failed",
                     format!("Build HTTP request failed: {e}"),

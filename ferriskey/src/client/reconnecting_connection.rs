@@ -6,7 +6,7 @@ use crate::connection::info::ValkeyConnectionInfo;
 use crate::connection::{DisconnectNotifier, MultiplexedConnection};
 use crate::pubsub::push_manager::PushInfo;
 use crate::retry_strategies::RetryStrategy;
-use crate::value::{ValkeyError, ValkeyResult};
+use crate::value::{Error, Result};
 use async_trait::async_trait;
 use futures_intrusive::sync::ManualResetEvent;
 use logger_core::{log_debug, log_error, log_trace, log_warn};
@@ -153,7 +153,7 @@ impl fmt::Debug for ReconnectingConnection {
 async fn get_multiplexed_connection(
     client: &crate::connection::factory::Client,
     connection_options: &FerrisKeyConnectionOptions,
-) -> ValkeyResult<MultiplexedConnection> {
+) -> Result<MultiplexedConnection> {
     run_with_timeout(
         Some(
             connection_options
@@ -210,7 +210,7 @@ async fn create_connection(
     connection_timeout: Duration,
     tcp_nodelay: bool,
     pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-) -> Result<ReconnectingConnection, (ReconnectingConnection, ValkeyError)> {
+) -> std::result::Result<ReconnectingConnection, (ReconnectingConnection, Error)> {
     let client = {
         let guard = connection_backend
             .connection_info
@@ -278,7 +278,7 @@ async fn create_connection(
             })
         }
         err => {
-            let err: ValkeyError = match err {
+            let err: Error = match err {
                 Ok(Err(e)) => e,
                 _ => std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
             };
@@ -340,7 +340,7 @@ impl ReconnectingConnection {
         tcp_nodelay: bool,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
         iam_token_handle: Option<IAMTokenHandle>,
-    ) -> Result<ReconnectingConnection, (ReconnectingConnection, ValkeyError)> {
+    ) -> std::result::Result<ReconnectingConnection, (ReconnectingConnection, Error)> {
         log_debug(
             "connection creation",
             format!("Attempting connection to {address}"),
@@ -400,7 +400,7 @@ impl ReconnectingConnection {
         }
     }
 
-    pub(super) async fn get_connection(&self) -> Result<MultiplexedConnection, ValkeyError> {
+    pub(super) async fn get_connection(&self) -> std::result::Result<MultiplexedConnection, Error> {
         loop {
             self.inner.backend.connection_available_signal.wait().await;
             if let Some(connection) = self.try_get_connection().await {

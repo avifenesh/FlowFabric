@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use crate::pipeline::Pipeline;
 use crate::value::ProtocolVersion;
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, Error, Result};
 
 use crate::connection::tls::TlsConnParams;
 
@@ -154,9 +154,9 @@ pub struct ValkeyConnectionInfo {
 }
 
 impl FromStr for ConnectionInfo {
-    type Err = ValkeyError;
+    type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         s.into_connection_info()
     }
 }
@@ -164,17 +164,17 @@ impl FromStr for ConnectionInfo {
 /// Converts an object into a connection info struct.
 pub trait IntoConnectionInfo {
     /// Converts the object into a connection info object.
-    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo>;
+    fn into_connection_info(self) -> Result<ConnectionInfo>;
 }
 
 impl IntoConnectionInfo for ConnectionInfo {
-    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
+    fn into_connection_info(self) -> Result<ConnectionInfo> {
         Ok(self)
     }
 }
 
 impl IntoConnectionInfo for &str {
-    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
+    fn into_connection_info(self) -> Result<ConnectionInfo> {
         match parse_redis_url(self) {
             Some(u) => u.into_connection_info(),
             None => fail!((ErrorKind::InvalidClientConfig, "Redis URL did not parse")),
@@ -186,7 +186,7 @@ impl<T> IntoConnectionInfo for (T, u16)
 where
     T: Into<String>,
 {
-    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
+    fn into_connection_info(self) -> Result<ConnectionInfo> {
         Ok(ConnectionInfo {
             addr: ConnectionAddr::Tcp(self.0.into(), self.1),
             valkey: ValkeyConnectionInfo::default(),
@@ -195,7 +195,7 @@ where
 }
 
 impl IntoConnectionInfo for String {
-    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
+    fn into_connection_info(self) -> Result<ConnectionInfo> {
         match parse_redis_url(&self) {
             Some(u) => u.into_connection_info(),
             None => fail!((ErrorKind::InvalidClientConfig, "Redis URL did not parse")),
@@ -203,7 +203,7 @@ impl IntoConnectionInfo for String {
     }
 }
 
-fn url_to_tcp_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
+fn url_to_tcp_connection_info(url: url::Url) -> Result<ConnectionInfo> {
     let host = match url.host() {
         Some(host) => match host {
             url::Host::Domain(path) => path.to_string(),
@@ -241,7 +241,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
         valkey: ValkeyConnectionInfo {
             db: match url.path().trim_matches('/') {
                 "" => 0,
-                path => path.parse::<i64>().map_err(|_| -> ValkeyError {
+                path => path.parse::<i64>().map_err(|_| -> Error {
                     (ErrorKind::InvalidClientConfig, "Invalid database number").into()
                 })?,
             },
@@ -283,15 +283,15 @@ fn url_to_tcp_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
 }
 
 #[cfg(unix)]
-fn url_to_unix_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
+fn url_to_unix_connection_info(url: url::Url) -> Result<ConnectionInfo> {
     let query: HashMap<_, _> = url.query_pairs().collect();
     Ok(ConnectionInfo {
-        addr: ConnectionAddr::Unix(url.to_file_path().map_err(|_| -> ValkeyError {
+        addr: ConnectionAddr::Unix(url.to_file_path().map_err(|_| -> Error {
             (ErrorKind::InvalidClientConfig, "Missing path").into()
         })?),
         valkey: ValkeyConnectionInfo {
             db: match query.get("db") {
-                Some(db) => db.parse::<i64>().map_err(|_| -> ValkeyError {
+                Some(db) => db.parse::<i64>().map_err(|_| -> Error {
                     (ErrorKind::InvalidClientConfig, "Invalid database number").into()
                 })?,
                 None => 0,
@@ -315,7 +315,7 @@ fn url_to_unix_connection_info(url: url::Url) -> ValkeyResult<ConnectionInfo> {
 }
 
 #[cfg(not(unix))]
-fn url_to_unix_connection_info(_: url::Url) -> ValkeyResult<ConnectionInfo> {
+fn url_to_unix_connection_info(_: url::Url) -> Result<ConnectionInfo> {
     fail!((
         ErrorKind::InvalidClientConfig,
         "Unix sockets are not available on this platform."
@@ -323,7 +323,7 @@ fn url_to_unix_connection_info(_: url::Url) -> ValkeyResult<ConnectionInfo> {
 }
 
 impl IntoConnectionInfo for url::Url {
-    fn into_connection_info(self) -> ValkeyResult<ConnectionInfo> {
+    fn into_connection_info(self) -> Result<ConnectionInfo> {
         match self.scheme() {
             "redis" | "rediss" => url_to_tcp_connection_info(self),
             "unix" | "redis+unix" => url_to_unix_connection_info(self),
@@ -340,7 +340,7 @@ impl IntoConnectionInfo for url::Url {
 pub(crate) fn create_rustls_config(
     insecure: bool,
     tls_params: Option<TlsConnParams>,
-) -> ValkeyResult<rustls::ClientConfig> {
+) -> Result<rustls::ClientConfig> {
     CRYPTO_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
@@ -409,8 +409,8 @@ pub(crate) fn create_rustls_config(
     Ok(config)
 }
 
-fn tls_config_error(context: &'static str, error: impl std::fmt::Display) -> ValkeyError {
-    ValkeyError::from((ErrorKind::InvalidClientConfig, context, error.to_string()))
+fn tls_config_error(context: &'static str, error: impl std::fmt::Display) -> Error {
+    Error::from((ErrorKind::InvalidClientConfig, context, error.to_string()))
 }
 
 struct NoCertificateVerification {
@@ -425,7 +425,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _server_name: &rustls::pki_types::ServerName,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -434,7 +434,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _message: &[u8],
         _cert: &rustls_pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -443,7 +443,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _message: &[u8],
         _cert: &rustls_pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -478,7 +478,7 @@ pub(crate) fn client_set_info_pipeline(lib_name: Option<&str>) -> Pipeline {
 }
 
 /// Common logic for checking real cause of hello3 command error
-pub fn get_resp3_hello_command_error(err: ValkeyError) -> ValkeyError {
+pub fn get_resp3_hello_command_error(err: Error) -> Error {
     if let Some(detail) = err.detail()
         && detail.starts_with("unknown command `HELLO`")
     {

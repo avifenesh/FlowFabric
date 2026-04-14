@@ -6,7 +6,7 @@ pub use crate::connection::info::{
 };
 use crate::pubsub::push_manager::PushInfo;
 pub use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
-pub use crate::value::{ErrorKind, ValkeyError};
+pub use crate::value::{ErrorKind, Error};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};

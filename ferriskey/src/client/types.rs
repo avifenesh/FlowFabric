@@ -40,7 +40,7 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_millis(2000);
 impl ConnectionRequest {
     /// Returns the connection timeout from the request, or the default if not specified.
     /// This centralizes the timeout logic to ensure consistency across all client types.
-    pub fn get_connection_timeout(&self) -> Duration {
+    pub(crate) fn get_connection_timeout(&self) -> Duration {
         self.connection_timeout
             .map(|val| Duration::from_millis(val as u64))
             .unwrap_or(DEFAULT_CONNECTION_TIMEOUT)

@@ -9,7 +9,7 @@ use crate::connection::info::{
 };
 use crate::pubsub::push_manager::PushInfo;
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
-use crate::value::{ErrorKind, PushKind, ValkeyError, ValkeyResult, Value};
+use crate::value::{ErrorKind, PushKind, Error, Result, Value};
 use async_trait::async_trait;
 use logger_core::{log_debug, log_warn};
 use once_cell::sync::Lazy;
@@ -199,7 +199,7 @@ impl MockPubSubSynchronizer {
         *self.reconciliation_task_handle.lock().unwrap() = Some(handle);
     }
 
-    pub(crate) fn reconcile_internal(&self) -> Result<(), String> {
+    pub(crate) fn reconcile_internal(&self) -> std::result::Result<(), String> {
         let can_subscribe = self.get_can_subscribe();
 
         if !can_subscribe {
@@ -393,7 +393,7 @@ impl PubSubSynchronizer for MockPubSubSynchronizer {
         (desired, actual)
     }
 
-    async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<ValkeyResult<Value>> {
+    async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<Result<Value>> {
         if MockPubSubBroker::is_pubsub_command(cmd) {
             Some(
                 self.broker
@@ -531,7 +531,7 @@ impl MockPubSubBroker {
             || Self::is_acl_pubsub_permission_command(cmd)
     }
 
-    pub async fn handle_pubsub_command(&self, client_id: &str, cmd: &Cmd) -> ValkeyResult<Value> {
+    pub async fn handle_pubsub_command(&self, client_id: &str, cmd: &Cmd) -> Result<Value> {
         let command_name = cmd.command().unwrap_or_default();
         let command_str = std::str::from_utf8(&command_name).unwrap_or("");
 
@@ -609,7 +609,7 @@ impl MockPubSubBroker {
             "PUBSUB SHARDCHANNELS" => self.handle_pubsub_shardchannels(cmd).await,
             "PUBSUB SHARDNUMSUB" => self.handle_pubsub_shardnumsub(cmd).await,
 
-            _ => Err(ValkeyError::from((
+            _ => Err(Error::from((
                 ErrorKind::ClientError,
                 "Unknown PubSub command",
             ))),
@@ -650,7 +650,7 @@ impl MockPubSubBroker {
 
     /// Handle PUBSUB CHANNELS
     /// Returns all active exact channels, optionally filtered by pattern
-    async fn handle_pubsub_channels(&self, cmd: &Cmd) -> ValkeyResult<Value> {
+    async fn handle_pubsub_channels(&self, cmd: &Cmd) -> Result<Value> {
         // Pattern is at arg_idx(2) - after "PUBSUB" and "CHANNELS"
         let pattern = cmd
             .arg_idx(2)
@@ -685,7 +685,7 @@ impl MockPubSubBroker {
 
     /// Handle PUBSUB NUMPAT
     /// Returns the number of unique patterns that are subscribed to
-    async fn handle_pubsub_numpat(&self) -> ValkeyResult<Value> {
+    async fn handle_pubsub_numpat(&self) -> Result<Value> {
         let clients = self.clients.read().await;
         let mut patterns: HashSet<Vec<u8>> = HashSet::new();
 
@@ -705,7 +705,7 @@ impl MockPubSubBroker {
 
     /// Handle PUBSUB NUMSUB
     /// Returns the number of subscribers for each specified channel
-    async fn handle_pubsub_numsub(&self, cmd: &Cmd) -> ValkeyResult<Value> {
+    async fn handle_pubsub_numsub(&self, cmd: &Cmd) -> Result<Value> {
         // Channels start at arg_idx(2) - after "PUBSUB" and "NUMSUB"
         let channels: Vec<Vec<u8>> = cmd
             .args_iter()
@@ -748,7 +748,7 @@ impl MockPubSubBroker {
 
     /// Handle PUBSUB SHARDCHANNELS
     /// Returns all active sharded channels, optionally filtered by pattern
-    async fn handle_pubsub_shardchannels(&self, cmd: &Cmd) -> ValkeyResult<Value> {
+    async fn handle_pubsub_shardchannels(&self, cmd: &Cmd) -> Result<Value> {
         // Pattern is at arg_idx(2) - after "PUBSUB" and "SHARDCHANNELS"
         let pattern = cmd
             .arg_idx(2)
@@ -783,7 +783,7 @@ impl MockPubSubBroker {
 
     /// Handle PUBSUB SHARDNUMSUB
     /// Returns the number of subscribers for each specified sharded channel
-    async fn handle_pubsub_shardnumsub(&self, cmd: &Cmd) -> ValkeyResult<Value> {
+    async fn handle_pubsub_shardnumsub(&self, cmd: &Cmd) -> Result<Value> {
         // Channels start at arg_idx(2) - after "PUBSUB" and "SHARDNUMSUB"
         let channels: Vec<Vec<u8>> = cmd
             .args_iter()
@@ -887,10 +887,10 @@ impl MockPubSubBroker {
         sync: Option<&Arc<MockPubSubSynchronizer>>,
         cmd: &Cmd,
         sub_type: PubSubSubscriptionKind,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let channels = Self::extract_channels_from_cmd(cmd);
         if channels.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::ClientError,
                 "No channels provided for subscription",
             )));
@@ -908,7 +908,7 @@ impl MockPubSubBroker {
         sync: Option<&Arc<MockPubSubSynchronizer>>,
         cmd: &Cmd,
         sub_type: PubSubSubscriptionKind,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let channels = Self::extract_channels_from_cmd(cmd);
         let channels = if channels.is_empty() {
             None
@@ -928,10 +928,10 @@ impl MockPubSubBroker {
         sync: Option<&Arc<MockPubSubSynchronizer>>,
         cmd: &Cmd,
         sub_type: PubSubSubscriptionKind,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let (channels, timeout_ms) = Self::extract_channels_and_timeout(cmd);
         if channels.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::ClientError,
                 "No channels provided for subscription",
             )));
@@ -989,7 +989,7 @@ impl MockPubSubBroker {
         sync: Option<&Arc<MockPubSubSynchronizer>>,
         cmd: &Cmd,
         sub_type: PubSubSubscriptionKind,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let (channels, timeout_ms) = Self::extract_channels_and_timeout(cmd);
 
         let channels_bytes: Option<Vec<PubSubChannelOrPattern>> = if channels.is_empty() {
@@ -1051,16 +1051,16 @@ impl MockPubSubBroker {
         Ok(Value::Nil)
     }
 
-    async fn handle_publish(&self, cmd: &Cmd, is_sharded: bool) -> ValkeyResult<Value> {
+    async fn handle_publish(&self, cmd: &Cmd, is_sharded: bool) -> Result<Value> {
         let channel = cmd
             .arg_idx(1)
-            .ok_or_else(|| ValkeyError::from((ErrorKind::ResponseError, "Missing channel")))?;
+            .ok_or_else(|| Error::from((ErrorKind::ResponseError, "Missing channel")))?;
         let message = cmd
             .arg_idx(2)
-            .ok_or_else(|| ValkeyError::from((ErrorKind::ResponseError, "Missing message")))?;
+            .ok_or_else(|| Error::from((ErrorKind::ResponseError, "Missing message")))?;
 
         let channel_str = std::str::from_utf8(channel)
-            .map_err(|_| ValkeyError::from((ErrorKind::ResponseError, "Invalid channel UTF-8")))?;
+            .map_err(|_| Error::from((ErrorKind::ResponseError, "Invalid channel UTF-8")))?;
 
         let count = self.publish(channel_str, message, is_sharded).await;
 

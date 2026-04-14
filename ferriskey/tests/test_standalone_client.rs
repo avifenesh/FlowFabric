@@ -12,7 +12,7 @@ mod standalone_client_tests {
         client::{Client as FerrisKeyClient, StandaloneClient},
         client::types::ReadFrom,
     };
-    use ferriskey::{FromValkeyValue, Value};
+    use ferriskey::{FromValue, Value};
     use rstest::rstest;
     use std::collections::HashMap;
     use utilities::*;
@@ -92,7 +92,7 @@ mod standalone_client_tests {
             info_clients_cmd.arg("INFO").arg("CLIENTS");
 
             // validate 2 connected clients
-            let info_clients: String = ferriskey::from_owned_valkey_value(
+            let info_clients: String = ferriskey::from_owned_value(
                 monitoring_client
                     .client
                     .send_command(&info_clients_cmd)
@@ -109,7 +109,7 @@ mod standalone_client_tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             // validate 2 connected clients
-            let info_clients: String = ferriskey::from_owned_valkey_value(
+            let info_clients: String = ferriskey::from_owned_value(
                 monitoring_client
                     .client
                     .send_command(&info_clients_cmd)
@@ -482,7 +482,7 @@ mod standalone_client_tests {
             .await;
             let mut client = test_basics.client;
 
-            let client_info: String = String::from_owned_valkey_value(
+            let client_info: String = String::from_owned_value(
                 client.send_command(&client_info_cmd).await.unwrap(),
             )
             .unwrap();
@@ -506,7 +506,7 @@ mod standalone_client_tests {
                     );
                     let client_info = retry(|| async {
                         let mut client = client.clone();
-                        String::from_owned_valkey_value(
+                        String::from_owned_value(
                             client.send_command(&client_info_cmd).await.unwrap(),
                         )
                         .ok()
@@ -516,7 +516,7 @@ mod standalone_client_tests {
                 }
                 Ok(response) => {
                     // Command succeeded, extract new client ID and compare
-                    let new_client_info: String = String::from_owned_valkey_value(response).unwrap();
+                    let new_client_info: String = String::from_owned_value(response).unwrap();
                     let new_client_id = extract_client_id(&new_client_info)
                         .expect("Failed to extract new client ID");
                     assert_ne!(

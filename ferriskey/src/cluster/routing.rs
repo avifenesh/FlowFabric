@@ -4,7 +4,7 @@ use strum_macros::Display;
 use crate::cluster::topology::get_slot;
 use crate::cmd::{Arg, Cmd};
 use crate::value::Value;
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, Error, Result};
 use core::cmp::Ordering;
 use std::borrow::Cow;
 use std::cmp::min;
@@ -138,7 +138,7 @@ where
 }
 
 /// Aggreagte numeric responses.
-pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> ValkeyResult<Value> {
+pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> Result<Value> {
     let initial_value = match op {
         AggregateOp::Min => i64::MAX,
         AggregateOp::Sum => 0,
@@ -147,7 +147,7 @@ pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> ValkeyResult<Value> {
         let int = match curr {
             Value::Int(int) => int,
             _ => {
-                return ValkeyResult::Err(
+                return Result::Err(
                     (
                         ErrorKind::TypeError,
                         "expected array of integers as response",
@@ -166,7 +166,7 @@ pub fn aggregate(values: Vec<Value>, op: AggregateOp) -> ValkeyResult<Value> {
 }
 
 /// Aggreagte numeric responses by a boolean operator.
-pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> ValkeyResult<Value> {
+pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> Result<Value> {
     let initial_value = match op {
         LogicalAggregateOp::And => true,
     };
@@ -174,7 +174,7 @@ pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> ValkeyRe
         let values = match curr {
             Value::Array(values) => values,
             _ => {
-                return ValkeyResult::Err(
+                return Result::Err(
                     (
                         ErrorKind::TypeError,
                         "expected array of integers as response",
@@ -190,7 +190,7 @@ pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> ValkeyRe
         };
         for (index, value) in values.into_iter().enumerate() {
             let int = match value {
-                Value::Int(int) => int,
+                Ok(Value::Int(int)) => int,
                 _ => {
                     return Err((
                         ErrorKind::TypeError,
@@ -208,13 +208,13 @@ pub fn logical_aggregate(values: Vec<Value>, op: LogicalAggregateOp) -> ValkeyRe
     Ok(Value::Array(
         results
             .into_iter()
-            .map(|result| Value::Int(result as i64))
+            .map(|result| Ok(Value::Int(result as i64)))
             .collect(),
     ))
 }
 
 /// Aggregate array responses element-wise according to a numeric operator.
-pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> ValkeyResult<Value> {
+pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> Result<Value> {
     let initial_value = match op {
         ArrayAggregateOp::Min => i64::MAX,
     };
@@ -222,7 +222,7 @@ pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> ValkeyResult
         let values = match curr {
             Value::Array(values) => values,
             _ => {
-                return ValkeyResult::Err(
+                return Result::Err(
                     (
                         ErrorKind::TypeError,
                         "expected array of integers as response",
@@ -238,7 +238,7 @@ pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> ValkeyResult
         };
         for (index, value) in values.into_iter().enumerate() {
             let int = match value {
-                Value::Int(int) => int,
+                Ok(Value::Int(int)) => int,
                 _ => {
                     return Err((
                         ErrorKind::TypeError,
@@ -253,10 +253,10 @@ pub fn aggregate_array(values: Vec<Value>, op: ArrayAggregateOp) -> ValkeyResult
         }
         Ok(acc)
     })?;
-    Ok(Value::Array(results.into_iter().map(Value::Int).collect()))
+    Ok(Value::Array(results.into_iter().map(|i| Ok(Value::Int(i))).collect()))
 }
 /// Aggregate array responses into a single map.
-pub fn combine_map_results(values: Vec<Value>) -> ValkeyResult<Value> {
+pub fn combine_map_results(values: Vec<Value>) -> Result<Value> {
     let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
 
     for value in values {
@@ -264,9 +264,9 @@ pub fn combine_map_results(values: Vec<Value>) -> ValkeyResult<Value> {
             Value::Array(elements) => {
                 let mut iter = elements.into_iter();
 
-                while let Some(key) = iter.next() {
+                while let Some(Ok(key)) = iter.next() {
                     if let Value::BulkString(key_bytes) = key {
-                        if let Some(Value::Int(value)) = iter.next() {
+                        if let Some(Ok(Value::Int(value))) = iter.next() {
                             *map.entry(key_bytes.to_vec()).or_insert(0) += value;
                         } else {
                             return Err((ErrorKind::TypeError, "expected integer value").into());
@@ -291,7 +291,7 @@ pub fn combine_map_results(values: Vec<Value>) -> ValkeyResult<Value> {
 }
 
 /// Aggregate array responses into a single array.
-pub fn combine_array_results(values: Vec<Value>) -> ValkeyResult<Value> {
+pub fn combine_array_results(values: Vec<Value>) -> Result<Value> {
     let mut results = Vec::new();
 
     for value in values {
@@ -336,11 +336,11 @@ type MultiSlotResIdxIter<'a> = std::iter::Map<
 fn calculate_multi_slot_result_indices<'a>(
     route_arg_indices: &'a [(Route, Vec<usize>)],
     args_pattern: &MultiSlotArgPattern,
-) -> ValkeyResult<MultiSlotResIdxIter<'a>> {
+) -> Result<MultiSlotResIdxIter<'a>> {
     let check_indices_input = |step_count: usize| {
         for (_, indices) in route_arg_indices {
             if indices.len() % step_count != 0 {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::ClientError,
                     "Invalid indices input detected",
                     format!(
@@ -416,23 +416,23 @@ fn calculate_multi_slot_result_indices<'a>(
 ///
 /// # Returns
 ///
-/// Returns a `ValkeyResult<Value>` containing the final ordered array (`Value::Array`) of combined results.
+/// Returns a `Result<Value>` containing the final ordered array (`Value::Array`) of combined results.
 pub(crate) fn combine_and_sort_array_results(
     values: Vec<Value>,
     route_arg_indices: &[(Route, Vec<usize>)],
     args_pattern: &MultiSlotArgPattern,
-) -> ValkeyResult<Value> {
+) -> Result<Value> {
     let result_indices = calculate_multi_slot_result_indices(route_arg_indices, args_pattern)?;
-    let mut results = Vec::new();
+    let mut results: Vec<Result<Value>> = Vec::new();
     results.resize(
         values.iter().fold(0, |acc, value| match value {
             Value::Array(values) => values.len() + acc,
             _ => 0,
         }),
-        Value::Nil,
+        Ok(Value::Nil),
     );
     if values.len() != result_indices.len() {
-        return Err(ValkeyError::from((
+        return Err(Error::from((
             ErrorKind::ClientError,
             "Mismatch in the number of multi-slot results compared to the expected result count.",
             format!(
@@ -1229,7 +1229,7 @@ impl Routable for Value {
     fn arg_idx(&self, idx: usize) -> Option<&[u8]> {
         match self {
             Value::Array(args) => match args.get(idx) {
-                Some(Value::BulkString(data)) => Some(&data[..]),
+                Some(Ok(Value::BulkString(data))) => Some(&data[..]),
                 _ => None,
             },
             _ => None,
@@ -1239,7 +1239,7 @@ impl Routable for Value {
     fn position(&self, candidate: &[u8]) -> Option<usize> {
         match self {
             Value::Array(args) => args.iter().position(|a| match a {
-                Value::BulkString(d) => d.eq_ignore_ascii_case(candidate),
+                Ok(Value::BulkString(d)) => d.eq_ignore_ascii_case(candidate),
                 _ => false,
             }),
             _ => None,
@@ -1423,23 +1423,26 @@ impl ShardAddrs {
             .position(|curr_replica| **curr_replica == *target_replica)
     }
 
+    /// Returns true if the given address is any member of this shard (primary or replica).
+    pub(crate) fn is_member(&self, addr: &str) -> bool {
+        if self.primary.read().expect(READ_LK_ERR_SHARDADDRS).as_str() == addr {
+            return true;
+        }
+        self.replicas
+            .read()
+            .expect(READ_LK_ERR_SHARDADDRS)
+            .iter()
+            .any(|r| r.as_str() == addr)
+    }
+
     /// Removes the specified `replica_to_remove` from the shard's replica list if it exists.
-    /// This method searches for the replica's index and removes it from the list. If the replica
-    /// is not found, it returns an error.
-    ///
-    /// # Arguments
-    /// * `replica_to_remove` - The address of the replica to be removed.
-    ///
-    /// # Returns
-    /// * `ValkeyResult<()>` - `Ok(())` if the replica was successfully removed, or an error if the
-    ///   replica was not found.
-    pub(crate) fn remove_replica(&self, replica_to_remove: Arc<String>) -> ValkeyResult<()> {
+    pub(crate) fn remove_replica(&self, replica_to_remove: Arc<String>) -> Result<()> {
         let mut replicas_lock = self.replicas.write().expect(WRITE_LK_ERR_SHARDADDRS);
         if let Some(index) = Self::replica_index(&replicas_lock, replica_to_remove.clone()) {
             replicas_lock.remove(index);
             Ok(())
         } else {
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::ClientError,
                 "Couldn't remove replica",
                 format!("Replica {replica_to_remove:?} not found"),
@@ -1910,12 +1913,12 @@ mod tests_routing {
     #[test]
     fn test_combining_results_into_single_array_only_keys() {
         // For example `MGET foo bar baz {baz}baz2 {bar}bar2 {foo}foo2`
-        let res1 = Value::Array(vec![Value::Nil, Value::Okay]);
+        let res1 = Value::Array(vec![Ok(Value::Nil), Ok(Value::Okay)]);
         let res2 = Value::Array(vec![
-            Value::BulkString("1".as_bytes().to_vec().into()),
-            Value::BulkString("4".as_bytes().to_vec().into()),
+            Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+            Ok(Value::BulkString("4".as_bytes().to_vec().into())),
         ]);
-        let res3 = Value::Array(vec![Value::SimpleString("2".to_string()), Value::Int(3)]);
+        let res3 = Value::Array(vec![Ok(Value::SimpleString("2".to_string())), Ok(Value::Int(3))]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2, res3],
             &[
@@ -1929,12 +1932,12 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::SimpleString("2".to_string()),
-                Value::BulkString("1".as_bytes().to_vec().into()),
-                Value::Nil,
-                Value::Okay,
-                Value::BulkString("4".as_bytes().to_vec().into()),
-                Value::Int(3),
+                Ok(Value::SimpleString("2".to_string())),
+                Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+                Ok(Value::Nil),
+                Ok(Value::Okay),
+                Ok(Value::BulkString("4".as_bytes().to_vec().into())),
+                Ok(Value::Int(3)),
             ])
         );
     }
@@ -1942,10 +1945,10 @@ mod tests_routing {
     #[test]
     fn test_combining_results_into_single_array_key_value_paires() {
         // For example `MSET foo bar foo2 bar2 {foo}foo3 bar3`
-        let res1 = Value::Array(vec![Value::Okay]);
+        let res1 = Value::Array(vec![Ok(Value::Okay)]);
         let res2 = Value::Array(vec![
-            Value::BulkString("1".as_bytes().to_vec().into()),
-            Value::Nil,
+            Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+            Ok(Value::Nil),
         ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
@@ -1959,9 +1962,9 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::BulkString("1".as_bytes().to_vec().into()),
-                Value::Okay,
-                Value::Nil
+                Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+                Ok(Value::Okay),
+                Ok(Value::Nil)
             ])
         );
     }
@@ -1969,10 +1972,10 @@ mod tests_routing {
     #[test]
     fn test_combining_results_into_single_array_keys_and_path() {
         // For example `JSON.MGET foo bar {foo}foo2 $.a`
-        let res1 = Value::Array(vec![Value::Okay]);
+        let res1 = Value::Array(vec![Ok(Value::Okay)]);
         let res2 = Value::Array(vec![
-            Value::BulkString("1".as_bytes().to_vec().into()),
-            Value::Nil,
+            Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+            Ok(Value::Nil),
         ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
@@ -1986,9 +1989,9 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::BulkString("1".as_bytes().to_vec().into()),
-                Value::Nil,
-                Value::Okay,
+                Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+                Ok(Value::Nil),
+                Ok(Value::Okay),
             ])
         );
     }
@@ -1996,10 +1999,10 @@ mod tests_routing {
     #[test]
     fn test_combining_results_into_single_array_key_with_two_arg_triples() {
         // For example `JSON.MSET foo $.a bar foo2 $.f.a bar2 {foo}foo3 $.f bar3`
-        let res1 = Value::Array(vec![Value::Okay]);
+        let res1 = Value::Array(vec![Ok(Value::Okay)]);
         let res2 = Value::Array(vec![
-            Value::BulkString("1".as_bytes().to_vec().into()),
-            Value::Nil,
+            Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+            Ok(Value::Nil),
         ]);
         let results = super::combine_and_sort_array_results(
             vec![res1, res2],
@@ -2013,9 +2016,9 @@ mod tests_routing {
         assert_eq!(
             results.unwrap(),
             Value::Array(vec![
-                Value::BulkString("1".as_bytes().to_vec().into()),
-                Value::Okay,
-                Value::Nil
+                Ok(Value::BulkString("1".as_bytes().to_vec().into())),
+                Ok(Value::Okay),
+                Ok(Value::Nil)
             ])
         );
     }
@@ -2028,16 +2031,16 @@ mod tests_routing {
 
         let input = vec![
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec().into()),
-                Value::Int(5),
-                Value::BulkString(b"key2".to_vec().into()),
-                Value::Int(10),
+                Ok(Value::BulkString(b"key1".to_vec().into())),
+                Ok(Value::Int(5)),
+                Ok(Value::BulkString(b"key2".to_vec().into())),
+                Ok(Value::Int(10)),
             ]),
             Value::Array(vec![
-                Value::BulkString(b"key1".to_vec().into()),
-                Value::Int(3),
-                Value::BulkString(b"key3".to_vec().into()),
-                Value::Int(15),
+                Ok(Value::BulkString(b"key1".to_vec().into())),
+                Ok(Value::Int(3)),
+                Ok(Value::BulkString(b"key3".to_vec().into())),
+                Ok(Value::Int(15)),
             ]),
         ];
         let result = super::combine_map_results(input).unwrap();

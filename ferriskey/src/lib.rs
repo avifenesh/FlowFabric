@@ -40,8 +40,8 @@ pub use connection::info::{
 pub use pubsub::push_manager::PushInfo;
 pub use retry_strategies::RetryStrategy;
 pub use value::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, PushKind, ToValkeyArgs, ValkeyError,
-    ValkeyResult, Value, from_owned_valkey_value, from_valkey_value,
+    Error, ErrorKind, FromValue, InfoDict, ProtocolVersion, PushKind, Result, ToArgs, Value,
+    from_owned_value, from_value,
 };
 
 pub mod client;
@@ -50,15 +50,10 @@ pub mod errors;
 pub mod ferriskey_client;
 pub mod otel_db_semantics;
 pub mod scripts_container;
-pub use client::ConnectionRequest;
 
 // High-level public API — the entry point for library users.
-pub type Error = ValkeyError;
-pub type Result<T> = FerrisKeyResult<T>;
-pub use ferriskey_client::Result as FerrisKeyResult;
 pub use ferriskey_client::{
-    Client, ClientBuilder, CommandBuilder, FerrisKeyError, FromValue, PipeCmdBuilder, PipeSlot,
-    ReadFrom, ToArgs, TypedPipeline,
+    Client, ClientBuilder, CommandBuilder, PipeCmdBuilder, PipeSlot, ReadFrom, TypedPipeline,
 };
 
 /// Connect to a standalone Valkey server.

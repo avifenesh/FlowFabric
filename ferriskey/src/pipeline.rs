@@ -4,7 +4,7 @@ use telemetrylib::FerrisKeySpan;
 
 use crate::cmd::{Cmd, cmd, cmd_len};
 use crate::value::{
-    ErrorKind, FromValkeyValue, HashSet, ToValkeyArgs, ValkeyResult, Value, from_owned_valkey_value,
+    ErrorKind, FromValue, HashSet, Result, ToArgs, Value, from_owned_value,
 };
 use std::sync::Arc;
 
@@ -86,7 +86,7 @@ impl Pipeline {
         encode_pipeline(&self.commands, self.transaction_mode).into()
     }
 
-    async fn execute_pipelined_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
+    async fn execute_pipelined_async<C>(&self, con: &mut C) -> Result<Value>
     where
         C: crate::connection::ConnectionLike,
     {
@@ -96,7 +96,7 @@ impl Pipeline {
         self.make_pipeline_results(value)
     }
 
-    async fn execute_transaction_async<C>(&self, con: &mut C) -> ValkeyResult<Value>
+    async fn execute_transaction_async<C>(&self, con: &mut C) -> Result<Value>
     where
         C: crate::connection::ConnectionLike,
     {
@@ -104,8 +104,9 @@ impl Pipeline {
             .req_packed_commands(self, self.commands.len() + 1, 1, None)
             .await?;
         match resp.pop() {
-            Some(Value::Nil) => Ok(Value::Nil),
-            Some(Value::Array(items)) => Ok(self.make_pipeline_results(items)?),
+            Some(Ok(Value::Nil)) => Ok(Value::Nil),
+            Some(Ok(Value::Array(items))) => Ok(self.make_pipeline_results(items)?),
+            Some(Err(e)) => Err(e),
             _ => Err((
                 ErrorKind::ResponseError,
                 "Invalid response when parsing multi response",
@@ -116,18 +117,18 @@ impl Pipeline {
 
     /// Executes the pipeline and fetches the return values.
     #[inline]
-    pub async fn query_async<C, T: FromValkeyValue>(&self, con: &mut C) -> ValkeyResult<T>
+    pub async fn query_async<C, T: FromValue>(&self, con: &mut C) -> Result<T>
     where
         C: crate::connection::ConnectionLike,
     {
         let v = if self.commands.is_empty() {
-            return from_owned_valkey_value(Value::Array(vec![]));
+            return from_owned_value(Value::Array(vec![]));
         } else if self.transaction_mode {
             self.execute_transaction_async(con).await?
         } else {
             self.execute_pipelined_async(con).await?
         };
-        from_owned_valkey_value(v)
+        from_owned_value(v)
     }
 
     /// Returns whether the pipeline is in transaction mode (atomic).
@@ -233,7 +234,7 @@ macro_rules! implement_pipeline_commands {
             ///
             /// Note that this function fails the task if executed on an empty pipeline.
             #[inline]
-            pub fn arg<T: ToValkeyArgs>(&mut self, arg: T) -> &mut Self {
+            pub fn arg<T: ToArgs>(&mut self, arg: T) -> &mut Self {
                 {
                     let cmd = self.get_last_command();
                     cmd.arg(arg);
@@ -260,7 +261,7 @@ macro_rules! implement_pipeline_commands {
                 Arc::get_mut(&mut self.commands[idx]).expect("Cannot modify the last command: multiple active references exist. Ensure the command is uniquely owned before mutating.")
             }
 
-            fn make_pipeline_results(&self, resp: Vec<Value>) -> ValkeyResult<Value> {
+            fn make_pipeline_results(&self, resp: Vec<Result<Value>>) -> Result<Value> {
                 let mut rv = Vec::with_capacity(resp.len() - self.ignored_commands.len());
                 for (idx, result) in resp.into_iter().enumerate() {
                     if !self.ignored_commands.contains(&idx) {

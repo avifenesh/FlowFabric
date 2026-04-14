@@ -129,9 +129,9 @@ async fn test_mget_multi_key() {
 
     if let Value::Array(items) = val {
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0], Value::BulkString(bytes::Bytes::from_static(b"v1")));
-        assert_eq!(items[1], Value::BulkString(bytes::Bytes::from_static(b"v2")));
-        assert_eq!(items[2], Value::BulkString(bytes::Bytes::from_static(b"v3")));
+        assert_eq!(items[0], Ok(Value::BulkString(bytes::Bytes::from_static(b"v1"))));
+        assert_eq!(items[1], Ok(Value::BulkString(bytes::Bytes::from_static(b"v2"))));
+        assert_eq!(items[2], Ok(Value::BulkString(bytes::Bytes::from_static(b"v3"))));
     } else {
         panic!("Expected Array, got {:?}", val);
     }

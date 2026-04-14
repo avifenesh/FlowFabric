@@ -15,7 +15,7 @@ use crate::connection::info::{
     PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind,
 };
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
+use crate::value::{ErrorKind, Error, Result, Value};
 use async_trait::async_trait;
 use logger_core::{log_debug, log_error};
 use once_cell::sync::OnceCell;
@@ -236,8 +236,16 @@ impl EventDrivenSynchronizer {
 
                 match event {
                     SyncEvent::DesiredChanged => {
-                        // Drain any additional DesiredChanged events (coalesce)
-                        while let Ok(SyncEvent::DesiredChanged) = events_rx.try_recv() {}
+                        // Drain any additional DesiredChanged events (coalesce).
+                        // Collect non-matching events to re-queue after drain.
+                        let mut deferred = Vec::new();
+                        while let Ok(evt) = events_rx.try_recv() {
+                            match evt {
+                                SyncEvent::DesiredChanged => {} // coalesce
+                                other => { deferred.push(other); break; }
+                            }
+                        }
+                        for evt in deferred { let _ = sync.events_tx.send(evt); }
                         if let Err(e) = sync.reconcile().await {
                             log_error("pubsub_sync", format!("Reconcile failed: {e:?}"));
                         }
@@ -246,19 +254,21 @@ impl EventDrivenSynchronizer {
                         // Drain additional TopologyChanged events, MERGING their data.
                         // Do NOT replace — a subsequent refresh with empty gone_subs would
                         // discard the important gone/migration data from the first event.
+                        // Collect non-matching events to re-queue after drain (NOT during,
+                        // which would create an infinite loop).
                         let mut latest_mig = migrations;
                         let mut latest_gone = gone_subs;
+                        let mut deferred = Vec::new();
                         while let Ok(evt) = events_rx.try_recv() {
                             match evt {
                                 SyncEvent::TopologyChanged { migrations, gone_subs } => {
                                     latest_mig.extend(migrations);
                                     latest_gone.extend(gone_subs);
                                 }
-                                other => {
-                                    let _ = sync.events_tx.send(other);
-                                }
+                                other => { deferred.push(other); break; }
                             }
                         }
+                        for evt in deferred { let _ = sync.events_tx.send(evt); }
                         sync.on_topology_changed(latest_mig, latest_gone).await;
                     }
                     SyncEvent::NodeDisconnected { addresses } => {
@@ -278,7 +288,7 @@ impl EventDrivenSynchronizer {
     }
 
     /// Compute diff between desired and confirmed, send subscribe/unsubscribe commands.
-    async fn reconcile(&self) -> ValkeyResult<()> {
+    async fn reconcile(&self) -> Result<()> {
         let desired = self
             .desired
             .read()
@@ -374,12 +384,15 @@ impl EventDrivenSynchronizer {
             }
         }
 
+        self.in_topology_change.store(false, std::sync::atomic::Ordering::Relaxed);
+
         // Step 2: Resubscribe to new owners via reconcile
         if let Err(e) = self.reconcile().await {
             log_error("pubsub_sync", format!("Post-topology reconcile failed: {e:?}"));
         }
 
-        self.in_topology_change.store(false, std::sync::atomic::Ordering::Relaxed);
+        // No explicit retry needed — periodic topology refreshes call handle_topology_refresh,
+        // which checks desired != confirmed and sends DesiredChanged if they diverge.
     }
 
     async fn on_node_disconnected(&self, addresses: &HashSet<String>) {
@@ -467,19 +480,19 @@ impl EventDrivenSynchronizer {
         &self,
         cmd: &mut Cmd,
         routing: Option<SingleNodeRoutingInfo>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let client_arc = self
             .internal_client
             .get()
             .ok_or_else(|| {
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ClientError,
                     "Internal client not set in synchronizer",
                 ))
             })?
             .upgrade()
             .ok_or_else(|| {
-                ValkeyError::from((ErrorKind::ClientError, "Internal client has been dropped"))
+                Error::from((ErrorKind::ClientError, "Internal client has been dropped"))
             })?;
 
         let mut client_wrapper = {
@@ -535,11 +548,11 @@ impl EventDrivenSynchronizer {
         cmd: &Cmd,
         kind: PubSubSubscriptionKind,
         is_subscribe: bool,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let channels = Self::extract_channels(cmd);
 
         if is_subscribe && channels.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::ClientError,
                 "No channels provided for subscription",
             )));
@@ -565,11 +578,11 @@ impl EventDrivenSynchronizer {
         cmd: &Cmd,
         kind: PubSubSubscriptionKind,
         is_subscribe: bool,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let (channels, timeout_ms) = Self::extract_channels_and_timeout(cmd);
 
         if is_subscribe && channels.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::ClientError,
                 "No channels provided for subscription",
             )));
@@ -604,16 +617,16 @@ impl EventDrivenSynchronizer {
         let (desired, actual) = self.get_subscription_state();
 
         Value::Array(vec![
-            Value::BulkString(bytes::Bytes::from_static(b"desired")),
-            sub_map_to_value(desired),
-            Value::BulkString(bytes::Bytes::from_static(b"actual")),
-            sub_map_to_value(actual),
+            Ok(Value::BulkString(bytes::Bytes::from_static(b"desired"))),
+            Ok(sub_map_to_value(desired)),
+            Ok(Value::BulkString(bytes::Bytes::from_static(b"actual"))),
+            Ok(sub_map_to_value(actual)),
         ])
     }
 
-    async fn run_with_timeout<T, F>(&self, f: F) -> ValkeyResult<T>
+    async fn run_with_timeout<T, F>(&self, f: F) -> Result<T>
     where
-        F: FnOnce() -> ValkeyResult<T> + Send,
+        F: FnOnce() -> Result<T> + Send,
         T: Send,
     {
         match tokio::time::timeout(self.request_timeout, async move { f() }).await {
@@ -800,7 +813,18 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                     for channel in channels {
                         let slot = crate::cluster::topology::get_slot(channel);
                         if let Some(shard_addrs) = new_slot_map.shard_addrs_for_slot(slot) {
-                            if shard_addrs.primary().as_str() != addr {
+                            let needs_migration = match kind {
+                                // Sharded subs must be on the primary (slot owner)
+                                PubSubSubscriptionKind::Sharded => {
+                                    shard_addrs.primary().as_str() != addr
+                                }
+                                // Exact/Pattern are broadcast — any shard member works
+                                PubSubSubscriptionKind::Exact
+                                | PubSubSubscriptionKind::Pattern => {
+                                    !shard_addrs.is_member(addr)
+                                }
+                            };
+                            if needs_migration {
                                 migrated.insert(channel.clone());
                             }
                         } else {
@@ -825,7 +849,16 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
             ),
         );
 
+        // Even if no migrations/gone, check if desired != confirmed and nudge reconcile.
+        // This makes every topology refresh a self-healing opportunity: if a prior
+        // reconcile's subscribe commands didn't get confirmed (cluster was settling),
+        // the next refresh will retry — no fixed retry count needed.
         if migrations.is_empty() && gone_subs.is_empty() {
+            let desired = self.desired.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let actual = self.confirmed.read().unwrap_or_else(|e| e.into_inner()).aggregate();
+            if desired != actual {
+                self.send_event(SyncEvent::DesiredChanged);
+            }
             return;
         }
 
@@ -854,7 +887,7 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         });
     }
 
-    async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<ValkeyResult<Value>> {
+    async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<Result<Value>> {
         let command_name = cmd.command().unwrap_or_default();
         let command_str = std::str::from_utf8(&command_name).unwrap_or("");
 
@@ -932,7 +965,7 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         expected_channels: Option<HashSet<PubSubChannelOrPattern>>,
         expected_patterns: Option<HashSet<PubSubChannelOrPattern>>,
         expected_sharded: Option<HashSet<PubSubChannelOrPattern>>,
-    ) -> ValkeyResult<()> {
+    ) -> Result<()> {
         let deadline = if timeout_ms > 0 {
             Some(Instant::now() + Duration::from_millis(timeout_ms))
         } else {
@@ -1019,9 +1052,9 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
     }
 }
 
-fn parse_address_routing(address: &str) -> ValkeyResult<SingleNodeRoutingInfo> {
+fn parse_address_routing(address: &str) -> Result<SingleNodeRoutingInfo> {
     let (host, port_str) = address.rsplit_once(':').ok_or_else(|| {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::ClientError,
             "Invalid address format",
             address.to_string(),
@@ -1029,7 +1062,7 @@ fn parse_address_routing(address: &str) -> ValkeyResult<SingleNodeRoutingInfo> {
     })?;
     let port = port_str
         .parse()
-        .map_err(|_| ValkeyError::from((ErrorKind::ClientError, "Invalid port")))?;
+        .map_err(|_| Error::from((ErrorKind::ClientError, "Invalid port")))?;
     Ok(SingleNodeRoutingInfo::ByAddress {
         host: host.to_string(),
         port,
@@ -1051,7 +1084,7 @@ fn sub_map_to_value(map: PubSubSubscriptionInfo) -> Value {
                 .collect();
             (
                 Value::BulkString(bytes::Bytes::from(key.as_bytes().to_vec())),
-                Value::Array(values_array),
+                Value::Array(values_array.into_iter().map(Ok).collect()),
             )
         })
         .collect();

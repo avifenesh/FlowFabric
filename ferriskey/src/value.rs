@@ -25,7 +25,7 @@ macro_rules! invalid_type_error {
 
 macro_rules! invalid_type_error_inner {
     ($v:expr, $det:expr) => {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::TypeError,
             "Response was of incompatible type",
             format!("{:?} (response was {:?})", $det, $v),
@@ -180,7 +180,7 @@ pub enum Value {
     BulkString(bytes::Bytes),
     /// A response containing an array with more data. This is generally used by redis
     /// to express nested structures.
-    Array(Vec<Value>),
+    Array(Vec<Result<Value>>),
     /// A simple string response, without line breaks and not binary safe.
     SimpleString(String),
     /// A status response which represents the string "OK".
@@ -216,14 +216,6 @@ pub enum Value {
         /// Remaining data from push message
         data: Vec<Value>,
     },
-    /// Error from the server.
-    ServerError(ValkeyError),
-}
-
-impl From<ValkeyError> for Value {
-    fn from(e: ValkeyError) -> Self {
-        Value::ServerError(e)
-    }
 }
 
 /// `VerbatimString`'s format types defined by spec
@@ -317,7 +309,6 @@ impl fmt::Display for PushKind {
 }
 
 pub enum MapIter<'a> {
-    Array(std::slice::Iter<'a, Value>),
     Map(std::slice::Iter<'a, (Value, Value)>),
 }
 
@@ -326,7 +317,6 @@ impl<'a> Iterator for MapIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            MapIter::Array(iter) => Some((iter.next()?, iter.next()?)),
             MapIter::Map(iter) => {
                 let (k, v) = iter.next()?;
                 Some((k, v))
@@ -336,14 +326,12 @@ impl<'a> Iterator for MapIter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            MapIter::Array(iter) => iter.size_hint(),
             MapIter::Map(iter) => iter.size_hint(),
         }
     }
 }
 
 pub enum OwnedMapIter {
-    Array(std::vec::IntoIter<Value>),
     Map(std::vec::IntoIter<(Value, Value)>),
 }
 
@@ -352,17 +340,12 @@ impl Iterator for OwnedMapIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            OwnedMapIter::Array(iter) => Some((iter.next()?, iter.next()?)),
             OwnedMapIter::Map(iter) => iter.next(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            OwnedMapIter::Array(iter) => {
-                let (low, high) = iter.size_hint();
-                (low / 2, high.map(|h| h / 2))
-            }
             OwnedMapIter::Map(iter) => iter.size_hint(),
         }
     }
@@ -370,7 +353,7 @@ impl Iterator for OwnedMapIter {
 
 /// Values are generally not used directly unless you are using the
 /// more low level functionality in the library.  For the most part
-/// this is hidden with the help of the `FromValkeyValue` trait.
+/// this is hidden with the help of the `FromValue` trait.
 ///
 /// While on the redis protocol there is an error type this is already
 /// separated at an early point so the value only holds the remaining
@@ -386,59 +369,52 @@ impl Value {
                 if items.len() != 2 {
                     return false;
                 }
-                matches!(items[0], Value::BulkString(_)) && matches!(items[1], Value::Array(_))
+                matches!(items[0], Ok(Value::BulkString(_))) && matches!(items[1], Ok(Value::Array(_)))
             }
             _ => false,
         }
     }
 
-    /// Returns an `&[Value]` if `self` is compatible with a sequence type
-    pub fn as_sequence(&self) -> Option<&[Value]> {
+    /// Returns an `&Vec<Result<Value>>` if `self` is an `Array`
+    pub fn as_sequence(&self) -> Option<&Vec<Result<Value>>> {
         match self {
-            Value::Array(items) => Some(&items[..]),
+            Value::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Returns an `&[Value]` if `self` is compatible with a plain sequence type (Set or Nil).
+    pub fn as_plain_sequence(&self) -> Option<&[Value]> {
+        match self {
             Value::Set(items) => Some(&items[..]),
             Value::Nil => Some(&[]),
             _ => None,
         }
     }
 
-    /// Returns a `Vec<Value>` if `self` is compatible with a sequence type,
+    /// Returns a `Vec<Result<Value>>` if `self` is compatible with a sequence type,
     /// otherwise returns `Err(self)`.
-    pub fn into_sequence(self) -> Result<Vec<Value>, Value> {
+    pub fn into_sequence(self) -> std::result::Result<Vec<Result<Value>>, Value> {
         match self {
             Value::Array(items) => Ok(items),
-            Value::Set(items) => Ok(items),
+            Value::Set(items) => Ok(items.into_iter().map(Ok).collect()),
             Value::Nil => Ok(vec![]),
             _ => Err(self),
         }
     }
 
-    /// Returns an iterator of `(&Value, &Value)` if `self` is compatible with a map type
+    /// Returns an iterator of `(&Value, &Value)` if `self` is a Map type
     pub fn as_map_iter(&self) -> Option<MapIter<'_>> {
         match self {
-            Value::Array(items) => {
-                if items.len() % 2 == 0 {
-                    Some(MapIter::Array(items.iter()))
-                } else {
-                    None
-                }
-            }
             Value::Map(items) => Some(MapIter::Map(items.iter())),
             _ => None,
         }
     }
 
-    /// Returns an iterator of `(Value, Value)` if `self` is compatible with a map type.
+    /// Returns an iterator of `(Value, Value)` if `self` is a Map type.
     /// If not, returns `Err(self)`.
-    pub fn into_map_iter(self) -> Result<OwnedMapIter, Value> {
+    pub fn into_map_iter(self) -> std::result::Result<OwnedMapIter, Value> {
         match self {
-            Value::Array(items) => {
-                if items.len() % 2 == 0 {
-                    Ok(OwnedMapIter::Array(items.into_iter()))
-                } else {
-                    Err(Value::Array(items))
-                }
-            }
             Value::Map(items) => Ok(OwnedMapIter::Map(items.into_iter())),
             _ => Err(self),
         }
@@ -446,27 +422,29 @@ impl Value {
 
     /// Extracts a server error from the value, if present.
     ///
-    /// If the value contains a `ServerError`, this function returns it as an `Err(ValkeyError)`.
+    /// If the value contains an `Err` element in an array, this function returns it as an `Err(ValkeyError)`.
     /// Otherwise, it wraps the value in `Ok`.
     ///
     /// If there are multiple errors (e.g., within an array or map), only the first encountered error is returned.
     ///
     /// This function is useful for extracting errors from values that may contain errors.
-    pub fn extract_error(self) -> ValkeyResult<Self> {
+    pub fn extract_error(self) -> Result<Self> {
         match self {
-            Self::Array(val) => Ok(Self::Array(Self::extract_error_vec(val)?)),
+            Self::Array(val) => {
+                Self::first_error_in_results(&val)?;
+                Ok(Self::Array(val))
+            }
             Self::Map(map) => Ok(Self::Map(Self::extract_error_map(map)?)),
             Self::Attribute { data, attributes } => {
                 let data = Box::new((*data).extract_error()?);
                 let attributes = Self::extract_error_map(attributes)?;
                 Ok(Value::Attribute { data, attributes })
             }
-            Self::Set(set) => Ok(Self::Set(Self::extract_error_vec(set)?)),
+            Self::Set(set) => Ok(Self::Set(Self::extract_error_plain_vec(set)?)),
             Self::Push { kind, data } => Ok(Self::Push {
                 kind,
-                data: Self::extract_error_vec(data)?,
+                data: Self::extract_error_plain_vec(data)?,
             }),
-            Value::ServerError(err) => Err(err.into()),
             Value::BigNumber(_)
             | Value::Boolean(_)
             | Value::BulkString(_)
@@ -479,14 +457,32 @@ impl Value {
         }
     }
 
-    /// Extract an error from vec of Values
-    pub fn extract_error_vec(vec: Vec<Self>) -> ValkeyResult<Vec<Self>> {
-        vec.into_iter()
-            .map(Self::extract_error)
-            .collect::<ValkeyResult<Vec<_>>>()
+    /// Check for the first `Err` in a slice of `Result<Value>`.
+    /// Returns `Ok(())` if no errors are found, or the first error.
+    fn first_error_in_results(items: &[Result<Value>]) -> Result<()> {
+        for item in items {
+            if let Err(e) = item {
+                return Err(e.clone());
+            }
+        }
+        Ok(())
     }
 
-    fn extract_error_map(map: Vec<(Self, Self)>) -> ValkeyResult<Vec<(Self, Self)>> {
+    /// Extract an error from vec of `Result<Value>` (Array elements).
+    /// Returns the first `Err` found, or the vec unchanged.
+    pub fn extract_error_vec(vec: Vec<Result<Self>>) -> Result<Vec<Result<Self>>> {
+        Self::first_error_in_results(&vec)?;
+        Ok(vec)
+    }
+
+    /// Extract an error from vec of plain Values (Set, Push elements).
+    fn extract_error_plain_vec(vec: Vec<Self>) -> Result<Vec<Self>> {
+        vec.into_iter()
+            .map(Self::extract_error)
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn extract_error_map(map: Vec<(Self, Self)>) -> Result<Vec<(Self, Self)>> {
         let mut vec = Vec::with_capacity(map.len());
         for (key, value) in map.into_iter() {
             vec.push((key.extract_error()?, value.extract_error()?));
@@ -504,7 +500,16 @@ impl fmt::Debug for Value {
                 Ok(x) => write!(fmt, "bulk-string('{x:?}')"),
                 Err(_) => write!(fmt, "binary-data({val:?})"),
             },
-            Value::Array(ref values) => write!(fmt, "array({values:?})"),
+            Value::Array(ref values) => {
+                write!(fmt, "array(")?;
+                fmt.debug_list()
+                    .entries(values.iter().map(|r| match r {
+                        Ok(v) => format!("{v:?}"),
+                        Err(e) => format!("err({e:?})"),
+                    }))
+                    .finish()?;
+                write!(fmt, ")")
+            }
             Value::Push { ref kind, ref data } => write!(fmt, "push({kind:?}, {data:?})"),
             Value::Okay => write!(fmt, "ok"),
             Value::SimpleString(ref s) => write!(fmt, "simple-string({s:?})"),
@@ -523,7 +528,6 @@ impl fmt::Debug for Value {
                 write!(fmt, "verbatim-string({format:?},{text:?})")
             }
             Value::BigNumber(ref m) => write!(fmt, "big-number({m:?})"),
-            Value::ServerError(ref err) => write!(fmt, "server-error({err:?})"),
         }
     }
 }
@@ -531,7 +535,7 @@ impl fmt::Debug for Value {
 /// Represents a valkey error.  For the most part you should be using
 /// the Error trait to interact with this rather than the actual
 /// struct.
-pub struct ValkeyError {
+pub struct Error {
     repr: ErrorRepr,
 }
 
@@ -543,9 +547,9 @@ enum ErrorRepr {
     IoError(io::Error),
 }
 
-impl Clone for ValkeyError {
+impl Clone for Error {
     fn clone(&self) -> Self {
-        ValkeyError {
+        Error {
             repr: match &self.repr {
                 ErrorRepr::WithDescription(k, s) => ErrorRepr::WithDescription(*k, s),
                 ErrorRepr::WithDescriptionAndDetail(k, s, d) => {
@@ -561,8 +565,8 @@ impl Clone for ValkeyError {
     }
 }
 
-impl PartialEq for ValkeyError {
-    fn eq(&self, other: &ValkeyError) -> bool {
+impl PartialEq for Error {
+    fn eq(&self, other: &Error) -> bool {
         match (&self.repr, &other.repr) {
             (&ErrorRepr::WithDescription(kind_a, _), &ErrorRepr::WithDescription(kind_b, _)) => {
                 kind_a == kind_b
@@ -577,31 +581,31 @@ impl PartialEq for ValkeyError {
     }
 }
 
-impl From<tokio::time::error::Elapsed> for ValkeyError {
-    fn from(_: tokio::time::error::Elapsed) -> ValkeyError {
-        ValkeyError::from(io::Error::from(io::ErrorKind::TimedOut))
+impl From<tokio::time::error::Elapsed> for Error {
+    fn from(_: tokio::time::error::Elapsed) -> Error {
+        Error::from(io::Error::from(io::ErrorKind::TimedOut))
     }
 }
 
-impl From<io::Error> for ValkeyError {
-    fn from(err: io::Error) -> ValkeyError {
-        ValkeyError {
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
+        Error {
             repr: ErrorRepr::IoError(err),
         }
     }
 }
 
-impl From<Utf8Error> for ValkeyError {
-    fn from(_: Utf8Error) -> ValkeyError {
-        ValkeyError {
+impl From<Utf8Error> for Error {
+    fn from(_: Utf8Error) -> Error {
+        Error {
             repr: ErrorRepr::WithDescription(ErrorKind::TypeError, "Invalid UTF-8"),
         }
     }
 }
 
-impl From<NulError> for ValkeyError {
-    fn from(err: NulError) -> ValkeyError {
-        ValkeyError {
+impl From<NulError> for Error {
+    fn from(err: NulError) -> Error {
+        Error {
             repr: ErrorRepr::WithDescriptionAndDetail(
                 ErrorKind::TypeError,
                 "Value contains interior nul terminator",
@@ -611,9 +615,9 @@ impl From<NulError> for ValkeyError {
     }
 }
 
-impl From<rustls::Error> for ValkeyError {
-    fn from(err: rustls::Error) -> ValkeyError {
-        ValkeyError {
+impl From<rustls::Error> for Error {
+    fn from(err: rustls::Error) -> Error {
+        Error {
             repr: ErrorRepr::WithDescriptionAndDetail(
                 ErrorKind::IoError,
                 "TLS error",
@@ -623,9 +627,9 @@ impl From<rustls::Error> for ValkeyError {
     }
 }
 
-impl From<rustls_pki_types::InvalidDnsNameError> for ValkeyError {
-    fn from(err: rustls_pki_types::InvalidDnsNameError) -> ValkeyError {
-        ValkeyError {
+impl From<rustls_pki_types::InvalidDnsNameError> for Error {
+    fn from(err: rustls_pki_types::InvalidDnsNameError) -> Error {
+        Error {
             repr: ErrorRepr::WithDescriptionAndDetail(
                 ErrorKind::IoError,
                 "TLS Error",
@@ -635,17 +639,17 @@ impl From<rustls_pki_types::InvalidDnsNameError> for ValkeyError {
     }
 }
 
-impl From<FromUtf8Error> for ValkeyError {
-    fn from(_: FromUtf8Error) -> ValkeyError {
-        ValkeyError {
+impl From<FromUtf8Error> for Error {
+    fn from(_: FromUtf8Error) -> Error {
+        Error {
             repr: ErrorRepr::WithDescription(ErrorKind::TypeError, "Cannot convert from UTF-8"),
         }
     }
 }
 
-impl From<ParseIntError> for ValkeyError {
-    fn from(_: ParseIntError) -> ValkeyError {
-        ValkeyError {
+impl From<ParseIntError> for Error {
+    fn from(_: ParseIntError) -> Error {
+        Error {
             repr: ErrorRepr::WithDescription(
                 ErrorKind::TypeError,
                 "Cannot parse string as an integer",
@@ -654,23 +658,23 @@ impl From<ParseIntError> for ValkeyError {
     }
 }
 
-impl From<(ErrorKind, &'static str)> for ValkeyError {
-    fn from((kind, desc): (ErrorKind, &'static str)) -> ValkeyError {
-        ValkeyError {
+impl From<(ErrorKind, &'static str)> for Error {
+    fn from((kind, desc): (ErrorKind, &'static str)) -> Error {
+        Error {
             repr: ErrorRepr::WithDescription(kind, desc),
         }
     }
 }
 
-impl From<(ErrorKind, &'static str, String)> for ValkeyError {
-    fn from((kind, desc, detail): (ErrorKind, &'static str, String)) -> ValkeyError {
-        ValkeyError {
+impl From<(ErrorKind, &'static str, String)> for Error {
+    fn from((kind, desc, detail): (ErrorKind, &'static str, String)) -> Error {
+        Error {
             repr: ErrorRepr::WithDescriptionAndDetail(kind, desc, detail),
         }
     }
 }
 
-impl error::Error for ValkeyError {
+impl error::Error for Error {
     #[allow(deprecated)]
     fn description(&self) -> &str {
         match self.repr {
@@ -689,8 +693,8 @@ impl error::Error for ValkeyError {
     }
 }
 
-impl fmt::Display for ValkeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         match self.repr {
             ErrorRepr::WithDescription(kind, desc) => {
                 desc.fmt(f)?;
@@ -714,8 +718,8 @@ impl fmt::Display for ValkeyError {
     }
 }
 
-impl fmt::Debug for ValkeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         fmt::Display::fmt(self, f)
     }
 }
@@ -734,7 +738,7 @@ pub(crate) enum RetryMethod {
 }
 
 /// Indicates a general failure in the library.
-impl ValkeyError {
+impl Error {
     /// Appends additional detail to the error message.
     /// Used when accumulating pipeline errors from multiple sources.
     pub(crate) fn append_detail(&mut self, extra: &str) {
@@ -1039,8 +1043,8 @@ impl ValkeyError {
     }
 }
 
-pub fn make_extension_error(code: String, detail: Option<String>) -> ValkeyError {
-    ValkeyError {
+pub fn make_extension_error(code: String, detail: Option<String>) -> Error {
+    Error {
         repr: ErrorRepr::ExtensionError(
             code,
             match detail {
@@ -1052,10 +1056,10 @@ pub fn make_extension_error(code: String, detail: Option<String>) -> ValkeyError
 }
 
 /// Library generic result type.
-pub type ValkeyResult<T> = Result<T, ValkeyError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// Library generic future type.
-pub(crate) type ValkeyFuture<'a, T> = futures_util::future::BoxFuture<'a, ValkeyResult<T>>;
+/// Library generic future type — a boxed future returning `Result<T>`.
+pub(crate) type ResultFuture<'a, T> = futures_util::future::BoxFuture<'a, Result<T>>;
 
 /// An info dictionary type.
 #[derive(Debug, Clone)]
@@ -1072,7 +1076,7 @@ pub struct InfoDict {
 /// in (master, slave) etc:
 ///
 /// ```rust,no_run,ignore
-/// # fn do_something() -> ferriskey::ValkeyResult<()> {
+/// # fn do_something() -> ferriskey::Result<()> {
 /// # let client = ferriskey::Client::open("redis://127.0.0.1/").unwrap();
 /// # let mut con = client.get_connection(None).unwrap();
 /// let info : ferriskey::InfoDict = ferriskey::cmd("INFO").query(&mut con)?;
@@ -1102,9 +1106,9 @@ impl InfoDict {
 
     /// Fetches a value by key and converts it into the given type.
     /// Typical types are `String`, `bool` and integer types.
-    pub fn get<T: FromValkeyValue>(&self, key: &str) -> Option<T> {
+    pub fn get<T: FromValue>(&self, key: &str) -> Option<T> {
         match self.find(&key) {
-            Some(x) => from_valkey_value(x).ok(),
+            Some(x) => from_value(x).ok(),
             None => None,
         }
     }
@@ -1139,8 +1143,8 @@ impl Deref for InfoDict {
 }
 
 /// Abstraction trait for valkey command abstractions.
-// Must stay pub: ToValkeyArgs (public) uses it in method signatures.
-pub trait ValkeyWrite {
+// Must stay pub: ToArgs (public) uses it in method signatures.
+pub trait Write {
     /// Accepts a serialized valkey command.
     fn write_arg(&mut self, arg: &[u8]);
 
@@ -1150,7 +1154,7 @@ pub trait ValkeyWrite {
     }
 }
 
-impl ValkeyWrite for Vec<Vec<u8>> {
+impl Write for Vec<Vec<u8>> {
     fn write_arg(&mut self, arg: &[u8]) {
         self.push(arg.to_owned());
     }
@@ -1163,15 +1167,15 @@ impl ValkeyWrite for Vec<Vec<u8>> {
 /// Used to convert a value into one or multiple redis argument
 /// strings.  Most values will produce exactly one item but in
 /// some cases it might make sense to produce more than one.
-pub trait ToValkeyArgs: Sized {
+pub trait ToArgs: Sized {
     /// This converts the value into a vector of bytes.  Each item
     /// is a single argument.  Most items generate a vector of a
     /// single item.
     ///
     /// The exception to this rule currently are vectors of items.
-    fn to_valkey_args(&self) -> Vec<Vec<u8>> {
+    fn to_args(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        self.write_valkey_args(&mut out);
+        self.write_args(&mut out);
         out
     }
 
@@ -1179,9 +1183,9 @@ pub trait ToValkeyArgs: Sized {
     /// is a single argument.  Most items generate a single item.
     ///
     /// The exception to this rule currently are vectors of items.
-    fn write_valkey_args<W>(&self, out: &mut W)
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite;
+        W: ?Sized + Write;
 
     /// Returns an information about the contained value with regards
     /// to it's numeric behavior in a valkey context.  This is used in
@@ -1204,7 +1208,7 @@ pub trait ToValkeyArgs: Sized {
     #[doc(hidden)]
     fn write_args_from_slice<W>(items: &[Self], out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         Self::make_arg_iter_ref(items.iter(), out)
     }
@@ -1214,12 +1218,12 @@ pub trait ToValkeyArgs: Sized {
     #[doc(hidden)]
     fn make_arg_iter_ref<'a, I, W>(items: I, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
         I: Iterator<Item = &'a Self>,
         Self: 'a,
     {
         for item in items {
-            item.write_valkey_args(out);
+            item.write_args(out);
         }
     }
 
@@ -1229,12 +1233,12 @@ pub trait ToValkeyArgs: Sized {
     }
 }
 
-macro_rules! itoa_based_to_valkey_impl {
+macro_rules! itoa_based_to_args_impl {
     ($t:ty, $numeric:expr) => {
-        impl ToValkeyArgs for $t {
-            fn write_valkey_args<W>(&self, out: &mut W)
+        impl ToArgs for $t {
+            fn write_args<W>(&self, out: &mut W)
             where
-                W: ?Sized + ValkeyWrite,
+                W: ?Sized + Write,
             {
                 let mut buf = ::itoa::Buffer::new();
                 let s = buf.format(*self);
@@ -1248,12 +1252,12 @@ macro_rules! itoa_based_to_valkey_impl {
     };
 }
 
-macro_rules! non_zero_itoa_based_to_valkey_impl {
+macro_rules! non_zero_itoa_based_to_args_impl {
     ($t:ty, $numeric:expr) => {
-        impl ToValkeyArgs for $t {
-            fn write_valkey_args<W>(&self, out: &mut W)
+        impl ToArgs for $t {
+            fn write_args<W>(&self, out: &mut W)
             where
-                W: ?Sized + ValkeyWrite,
+                W: ?Sized + Write,
             {
                 let mut buf = ::itoa::Buffer::new();
                 let s = buf.format(self.get());
@@ -1269,10 +1273,10 @@ macro_rules! non_zero_itoa_based_to_valkey_impl {
 
 macro_rules! ryu_based_to_redis_impl {
     ($t:ty, $numeric:expr) => {
-        impl ToValkeyArgs for $t {
-            fn write_valkey_args<W>(&self, out: &mut W)
+        impl ToArgs for $t {
+            fn write_args<W>(&self, out: &mut W)
             where
-                W: ?Sized + ValkeyWrite,
+                W: ?Sized + Write,
             {
                 let mut buf = ::ryu::Buffer::new();
                 let s = buf.format(*self);
@@ -1286,10 +1290,10 @@ macro_rules! ryu_based_to_redis_impl {
     };
 }
 
-impl ToValkeyArgs for u8 {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl ToArgs for u8 {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         let mut buf = ::itoa::Buffer::new();
         let s = buf.format(*self);
@@ -1298,7 +1302,7 @@ impl ToValkeyArgs for u8 {
 
     fn write_args_from_slice<W>(items: &[u8], out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         out.write_arg(items);
     }
@@ -1308,90 +1312,90 @@ impl ToValkeyArgs for u8 {
     }
 }
 
-itoa_based_to_valkey_impl!(i8, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(i16, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(u16, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(i32, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(u32, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(i64, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(u64, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(isize, NumericBehavior::NumberIsInteger);
-itoa_based_to_valkey_impl!(usize, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(i8, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(i16, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(u16, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(i32, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(u32, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(i64, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(u64, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(isize, NumericBehavior::NumberIsInteger);
+itoa_based_to_args_impl!(usize, NumericBehavior::NumberIsInteger);
 
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU8, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI8, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU16, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI16, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU32, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI32, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroU64, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroI64, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroUsize, NumericBehavior::NumberIsInteger);
-non_zero_itoa_based_to_valkey_impl!(core::num::NonZeroIsize, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroU8, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroI8, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroU16, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroI16, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroU32, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroI32, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroU64, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroI64, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroUsize, NumericBehavior::NumberIsInteger);
+non_zero_itoa_based_to_args_impl!(core::num::NonZeroIsize, NumericBehavior::NumberIsInteger);
 
 ryu_based_to_redis_impl!(f32, NumericBehavior::NumberIsFloat);
 ryu_based_to_redis_impl!(f64, NumericBehavior::NumberIsFloat);
 
-impl ToValkeyArgs for bool {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl ToArgs for bool {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         out.write_arg(if *self { b"1" } else { b"0" })
     }
 }
 
-impl ToValkeyArgs for String {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl ToArgs for String {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         out.write_arg(self.as_bytes())
     }
 }
 
-impl ToValkeyArgs for &str {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl ToArgs for &str {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         out.write_arg(self.as_bytes())
     }
 }
 
-impl<T: ToValkeyArgs> ToValkeyArgs for Vec<T> {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs> ToArgs for Vec<T> {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
-        ToValkeyArgs::write_args_from_slice(self, out)
+        ToArgs::write_args_from_slice(self, out)
     }
 
     fn is_single_arg(&self) -> bool {
-        ToValkeyArgs::is_single_vec_arg(&self[..])
+        ToArgs::is_single_vec_arg(&self[..])
     }
 }
 
-impl<T: ToValkeyArgs> ToValkeyArgs for &[T] {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs> ToArgs for &[T] {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
-        ToValkeyArgs::write_args_from_slice(self, out)
+        ToArgs::write_args_from_slice(self, out)
     }
 
     fn is_single_arg(&self) -> bool {
-        ToValkeyArgs::is_single_vec_arg(self)
+        ToArgs::is_single_vec_arg(self)
     }
 }
 
-impl<T: ToValkeyArgs> ToValkeyArgs for Option<T> {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs> ToArgs for Option<T> {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         if let Some(ref x) = *self {
-            x.write_valkey_args(out);
+            x.write_args(out);
         }
     }
 
@@ -1410,12 +1414,12 @@ impl<T: ToValkeyArgs> ToValkeyArgs for Option<T> {
     }
 }
 
-impl<T: ToValkeyArgs> ToValkeyArgs for &T {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs> ToArgs for &T {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
-        (*self).write_valkey_args(out)
+        (*self).write_args(out)
     }
 
     fn is_single_arg(&self) -> bool {
@@ -1426,14 +1430,14 @@ impl<T: ToValkeyArgs> ToValkeyArgs for &T {
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToValkeyArgs + Hash + Eq, S: BuildHasher + Default> ToValkeyArgs
+impl<T: ToArgs + Hash + Eq, S: BuildHasher + Default> ToArgs
     for std::collections::HashSet<T, S>
 {
-    fn write_valkey_args<W>(&self, out: &mut W)
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
-        ToValkeyArgs::make_arg_iter_ref(self.iter(), out)
+        ToArgs::make_arg_iter_ref(self.iter(), out)
     }
 
     fn is_single_arg(&self) -> bool {
@@ -1444,12 +1448,12 @@ impl<T: ToValkeyArgs + Hash + Eq, S: BuildHasher + Default> ToValkeyArgs
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToValkeyArgs + Hash + Eq + Ord> ToValkeyArgs for BTreeSet<T> {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs + Hash + Eq + Ord> ToArgs for BTreeSet<T> {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
-        ToValkeyArgs::make_arg_iter_ref(self.iter(), out)
+        ToArgs::make_arg_iter_ref(self.iter(), out)
     }
 
     fn is_single_arg(&self) -> bool {
@@ -1461,17 +1465,17 @@ impl<T: ToValkeyArgs + Hash + Eq + Ord> ToValkeyArgs for BTreeSet<T> {
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToValkeyArgs + Hash + Eq + Ord, V: ToValkeyArgs> ToValkeyArgs for BTreeMap<T, V> {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs + Hash + Eq + Ord, V: ToArgs> ToArgs for BTreeMap<T, V> {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         for (key, value) in self {
             // otherwise things like HMSET will simply NOT work
             assert!(key.is_single_arg() && value.is_single_arg());
 
-            key.write_valkey_args(out);
-            value.write_valkey_args(out);
+            key.write_args(out);
+            value.write_args(out);
         }
     }
 
@@ -1480,18 +1484,18 @@ impl<T: ToValkeyArgs + Hash + Eq + Ord, V: ToValkeyArgs> ToValkeyArgs for BTreeM
     }
 }
 
-impl<T: ToValkeyArgs + Hash + Eq + Ord, V: ToValkeyArgs> ToValkeyArgs
+impl<T: ToArgs + Hash + Eq + Ord, V: ToArgs> ToArgs
     for std::collections::HashMap<T, V>
 {
-    fn write_valkey_args<W>(&self, out: &mut W)
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
         for (key, value) in self {
             assert!(key.is_single_arg() && value.is_single_arg());
 
-            key.write_valkey_args(out);
-            value.write_valkey_args(out);
+            key.write_args(out);
+            value.write_args(out);
         }
     }
 
@@ -1500,17 +1504,17 @@ impl<T: ToValkeyArgs + Hash + Eq + Ord, V: ToValkeyArgs> ToValkeyArgs
     }
 }
 
-macro_rules! to_valkey_args_for_tuple {
+macro_rules! to_args_for_tuple {
     () => ();
     ($($name:ident,)+) => (
         #[doc(hidden)]
-        impl<$($name: ToValkeyArgs),*> ToValkeyArgs for ($($name,)*) {
+        impl<$($name: ToArgs),*> ToArgs for ($($name,)*) {
             // we have local variables named T1 as dummies and those
             // variables are unused.
             #[allow(non_snake_case, unused_variables)]
-            fn write_valkey_args<W>(&self, out: &mut W) where W: ?Sized + ValkeyWrite {
+            fn write_args<W>(&self, out: &mut W) where W: ?Sized + Write {
                 let ($(ref $name,)*) = *self;
-                $($name.write_valkey_args(out);)*
+                $($name.write_args(out);)*
             }
 
             #[allow(non_snake_case, unused_variables)]
@@ -1520,33 +1524,33 @@ macro_rules! to_valkey_args_for_tuple {
                 n == 1
             }
         }
-        to_valkey_args_for_tuple_peel!($($name,)*);
+        to_args_for_tuple_peel!($($name,)*);
     )
 }
 
 /// This chips of the leading one and recurses for the rest.  So if the first
 /// iteration was T1, T2, T3 it will recurse to T2, T3.  It stops for tuples
 /// of size 1 (does not implement down to unit).
-macro_rules! to_valkey_args_for_tuple_peel {
-    ($name:ident, $($other:ident,)*) => (to_valkey_args_for_tuple!($($other,)*);)
+macro_rules! to_args_for_tuple_peel {
+    ($name:ident, $($other:ident,)*) => (to_args_for_tuple!($($other,)*);)
 }
 
-to_valkey_args_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
+to_args_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
 
-impl<T: ToValkeyArgs, const N: usize> ToValkeyArgs for &[T; N] {
-    fn write_valkey_args<W>(&self, out: &mut W)
+impl<T: ToArgs, const N: usize> ToArgs for &[T; N] {
+    fn write_args<W>(&self, out: &mut W)
     where
-        W: ?Sized + ValkeyWrite,
+        W: ?Sized + Write,
     {
-        ToValkeyArgs::write_args_from_slice(self.as_slice(), out)
+        ToArgs::write_args_from_slice(self.as_slice(), out)
     }
 
     fn is_single_arg(&self) -> bool {
-        ToValkeyArgs::is_single_vec_arg(self.as_slice())
+        ToArgs::is_single_vec_arg(self.as_slice())
     }
 }
 
-fn vec_to_array<T, const N: usize>(items: Vec<T>, original_value: &Value) -> ValkeyResult<[T; N]> {
+fn vec_to_array<T, const N: usize>(items: Vec<T>, original_value: &Value) -> Result<[T; N]> {
     match items.try_into() {
         Ok(array) => Ok(array),
         Err(items) => {
@@ -1559,10 +1563,10 @@ fn vec_to_array<T, const N: usize>(items: Vec<T>, original_value: &Value) -> Val
     }
 }
 
-impl<T: FromValkeyValue, const N: usize> FromValkeyValue for [T; N] {
-    fn from_valkey_value(value: &Value) -> ValkeyResult<[T; N]> {
+impl<T: FromValue, const N: usize> FromValue for [T; N] {
+    fn from_value(value: &Value) -> Result<[T; N]> {
         match *value {
-            Value::BulkString(ref bytes) => match FromValkeyValue::from_byte_vec(bytes) {
+            Value::BulkString(ref bytes) => match FromValue::from_byte_vec(bytes) {
                 Some(items) => vec_to_array(items, value),
                 None => {
                     let msg = format!(
@@ -1573,7 +1577,7 @@ impl<T: FromValkeyValue, const N: usize> FromValkeyValue for [T; N] {
                 }
             },
             Value::Array(ref items) => {
-                let items = FromValkeyValue::from_valkey_values(items)?;
+                let items = FromValue::from_result_values(items)?;
                 vec_to_array(items, value)
             }
             Value::Nil => vec_to_array(vec![], value),
@@ -1593,51 +1597,74 @@ impl<T: FromValkeyValue, const N: usize> FromValkeyValue for [T; N] {
 ///
 /// In addition to what you can see from the docs, this is also implemented
 /// for tuples up to size 12 and for `Vec<u8>`.
-pub trait FromValkeyValue: Sized {
+pub trait FromValue: Sized {
     /// Given a valkey `Value` this attempts to convert it into the given
     /// destination type.  If that fails because it's not compatible an
     /// appropriate error is generated.
-    fn from_valkey_value(v: &Value) -> ValkeyResult<Self>;
+    fn from_value(v: &Value) -> Result<Self>;
 
     /// Given a valkey `Value` this attempts to convert it into the given
     /// destination type.  If that fails because it's not compatible an
     /// appropriate error is generated.
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<Self> {
-        // By default, fall back to `from_valkey_value`.
+    fn from_owned_value(v: Value) -> Result<Self> {
+        // By default, fall back to `from_value`.
         // This function only needs to be implemented if it can benefit
         // from taking `v` by value.
-        Self::from_valkey_value(&v)
+        Self::from_value(&v)
     }
 
-    /// Similar to `from_valkey_value` but constructs a vector of objects
+    /// Similar to `from_value` but constructs a vector of objects
     /// from another vector of values.  This primarily exists internally
     /// to customize the behavior for vectors of tuples.
-    fn from_valkey_values(items: &[Value]) -> ValkeyResult<Vec<Self>> {
+    fn from_values(items: &[Value]) -> Result<Vec<Self>> {
         items
             .iter()
-            .map(FromValkeyValue::from_valkey_value)
+            .map(FromValue::from_value)
             .collect()
     }
 
-    /// The same as `from_valkey_values`, but takes a `Vec<Value>` instead
+    /// Like `from_values` but for array elements that are `Result<Value>`.
+    /// Propagates the first `Err` found, then converts each `Ok(Value)`.
+    fn from_result_values(items: &[Result<Value>]) -> Result<Vec<Self>> {
+        items
+            .iter()
+            .map(|r| match r {
+                Ok(v) => FromValue::from_value(v),
+                Err(e) => Err(e.clone()),
+            })
+            .collect()
+    }
+
+    /// The same as `from_values`, but takes a `Vec<Value>` instead
     /// of a `&[Value]`.
-    fn from_owned_valkey_values(items: Vec<Value>) -> ValkeyResult<Vec<Self>> {
+    fn from_owned_values(items: Vec<Value>) -> Result<Vec<Self>> {
         items
             .into_iter()
-            .map(FromValkeyValue::from_owned_valkey_value)
+            .map(FromValue::from_owned_value)
+            .collect()
+    }
+
+    /// Like `from_owned_values` but for array elements that are `Result<Value>`.
+    fn from_owned_result_values(items: Vec<Result<Value>>) -> Result<Vec<Self>> {
+        items
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => FromValue::from_owned_value(v),
+                Err(e) => Err(e),
+            })
             .collect()
     }
 
     /// Convert bytes to a single element vector.
     fn from_byte_vec(_vec: &[u8]) -> Option<Vec<Self>> {
-        Self::from_owned_valkey_value(Value::BulkString(bytes::Bytes::copy_from_slice(_vec)))
+        Self::from_owned_value(Value::BulkString(bytes::Bytes::copy_from_slice(_vec)))
             .map(|rv| vec![rv])
             .ok()
     }
 
     /// Convert bytes to a single element vector.
-    fn from_owned_byte_vec(_vec: Vec<u8>) -> ValkeyResult<Vec<Self>> {
-        Self::from_owned_valkey_value(Value::BulkString(bytes::Bytes::from(_vec)))
+    fn from_owned_byte_vec(_vec: Vec<u8>) -> Result<Vec<Self>> {
+        Self::from_owned_value(Value::BulkString(bytes::Bytes::from(_vec)))
             .map(|rv| vec![rv])
     }
 }
@@ -1666,7 +1693,7 @@ fn get_owned_inner_value(v: Value) -> Value {
     }
 }
 
-macro_rules! from_valkey_value_for_num_internal {
+macro_rules! from_value_for_num_internal {
     ($t:ty, $v:expr) => {{
         let v = if let Value::Attribute {
             data,
@@ -1693,46 +1720,46 @@ macro_rules! from_valkey_value_for_num_internal {
     }};
 }
 
-macro_rules! from_valkey_value_for_num {
+macro_rules! from_value_for_num {
     ($t:ty) => {
-        impl FromValkeyValue for $t {
-            fn from_valkey_value(v: &Value) -> ValkeyResult<$t> {
-                from_valkey_value_for_num_internal!($t, v)
+        impl FromValue for $t {
+            fn from_value(v: &Value) -> Result<$t> {
+                from_value_for_num_internal!($t, v)
             }
         }
     };
 }
 
-impl FromValkeyValue for u8 {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<u8> {
-        from_valkey_value_for_num_internal!(u8, v)
+impl FromValue for u8 {
+    fn from_value(v: &Value) -> Result<u8> {
+        from_value_for_num_internal!(u8, v)
     }
 
     // this hack allows us to specialize Vec<u8> to work with binary data.
     fn from_byte_vec(vec: &[u8]) -> Option<Vec<u8>> {
         Some(vec.to_vec())
     }
-    fn from_owned_byte_vec(vec: Vec<u8>) -> ValkeyResult<Vec<u8>> {
+    fn from_owned_byte_vec(vec: Vec<u8>) -> Result<Vec<u8>> {
         Ok(vec)
     }
 }
 
-from_valkey_value_for_num!(i8);
-from_valkey_value_for_num!(i16);
-from_valkey_value_for_num!(u16);
-from_valkey_value_for_num!(i32);
-from_valkey_value_for_num!(u32);
-from_valkey_value_for_num!(i64);
-from_valkey_value_for_num!(u64);
-from_valkey_value_for_num!(i128);
-from_valkey_value_for_num!(u128);
-from_valkey_value_for_num!(f32);
-from_valkey_value_for_num!(f64);
-from_valkey_value_for_num!(isize);
-from_valkey_value_for_num!(usize);
+from_value_for_num!(i8);
+from_value_for_num!(i16);
+from_value_for_num!(u16);
+from_value_for_num!(i32);
+from_value_for_num!(u32);
+from_value_for_num!(i64);
+from_value_for_num!(u64);
+from_value_for_num!(i128);
+from_value_for_num!(u128);
+from_value_for_num!(f32);
+from_value_for_num!(f64);
+from_value_for_num!(isize);
+from_value_for_num!(usize);
 
-impl FromValkeyValue for bool {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<bool> {
+impl FromValue for bool {
+    fn from_value(v: &Value) -> Result<bool> {
         let v = get_inner_value(v);
         match *v {
             Value::Nil => Ok(false),
@@ -1762,8 +1789,8 @@ impl FromValkeyValue for bool {
     }
 }
 
-impl FromValkeyValue for CString {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<CString> {
+impl FromValue for CString {
+    fn from_value(v: &Value) -> Result<CString> {
         let v = get_inner_value(v);
         match *v {
             Value::BulkString(ref bytes) => Ok(CString::new(&bytes[..])?),
@@ -1772,7 +1799,7 @@ impl FromValkeyValue for CString {
             _ => invalid_type_error!(v, "Response type not CString compatible."),
         }
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<CString> {
+    fn from_owned_value(v: Value) -> Result<CString> {
         let v = get_owned_inner_value(v);
         match v {
             Value::BulkString(bytes) => Ok(CString::new(bytes.to_vec())?),
@@ -1783,8 +1810,8 @@ impl FromValkeyValue for CString {
     }
 }
 
-impl FromValkeyValue for String {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<String> {
+impl FromValue for String {
+    fn from_value(v: &Value) -> Result<String> {
         let v = get_inner_value(v);
         match *v {
             Value::BulkString(ref bytes) => Ok(from_utf8(bytes)?.to_string()),
@@ -1800,7 +1827,7 @@ impl FromValkeyValue for String {
         }
     }
 
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<String> {
+    fn from_owned_value(v: Value) -> Result<String> {
         let v = get_owned_inner_value(v);
         match v {
             Value::BulkString(bytes) => Ok(String::from_utf8(bytes.to_vec())?),
@@ -1814,34 +1841,34 @@ impl FromValkeyValue for String {
     }
 }
 
-/// Implement `FromValkeyValue` for `$Type` (which should use the generic parameter `$T`).
+/// Implement `FromValue` for `$Type` (which should use the generic parameter `$T`).
 ///
 /// The implementation parses the value into a vec, and then passes the value through `$convert`.
 /// If `$convert` is omitted, it defaults to `Into::into`.
-macro_rules! from_vec_from_valkey_value {
+macro_rules! from_vec_from_value {
     (<$T:ident> $Type:ty) => {
-        from_vec_from_valkey_value!(<$T> $Type; Into::into);
+        from_vec_from_value!(<$T> $Type; Into::into);
     };
 
     (<$T:ident> $Type:ty; $convert:expr) => {
-        impl<$T: FromValkeyValue> FromValkeyValue for $Type {
-            fn from_valkey_value(v: &Value) -> ValkeyResult<$Type> {
+        impl<$T: FromValue> FromValue for $Type {
+            fn from_value(v: &Value) -> Result<$Type> {
                 match v {
                     // All binary data except u8 will try to parse into a single element vector.
                     // u8 has its own implementation of from_byte_vec.
-                    Value::BulkString(bytes) => match FromValkeyValue::from_byte_vec(bytes) {
+                    Value::BulkString(bytes) => match FromValue::from_byte_vec(bytes) {
                         Some(x) => Ok($convert(x)),
                         None => invalid_type_error!(
                             v,
                             format!("Conversion to {} failed.", std::any::type_name::<$Type>())
                         ),
                     },
-                    Value::Array(items) => FromValkeyValue::from_valkey_values(items).map($convert),
-                    Value::Set(items) => FromValkeyValue::from_valkey_values(items).map($convert),
+                    Value::Array(items) => FromValue::from_result_values(items).map($convert),
+                    Value::Set(items) => FromValue::from_values(items).map($convert),
                     Value::Map(items) => {
                         let mut n: Vec<T> = vec![];
                         for item in items {
-                            match FromValkeyValue::from_valkey_value(&Value::Map(vec![item.clone()])) {
+                            match FromValue::from_value(&Value::Map(vec![item.clone()])) {
                                 Ok(v) => {
                                     n.push(v);
                                 }
@@ -1856,18 +1883,18 @@ macro_rules! from_vec_from_valkey_value {
                     _ => invalid_type_error!(v, "Response type not vector compatible."),
                 }
             }
-            fn from_owned_valkey_value(v: Value) -> ValkeyResult<$Type> {
+            fn from_owned_value(v: Value) -> Result<$Type> {
                 match v {
                     // Binary data is parsed into a single-element vector, except
                     // for the element type `u8`, which directly consumes the entire
                     // array of bytes.
-                    Value::BulkString(bytes) => FromValkeyValue::from_owned_byte_vec(bytes.to_vec().into()).map($convert),
-                    Value::Array(items) => FromValkeyValue::from_owned_valkey_values(items).map($convert),
-                    Value::Set(items) => FromValkeyValue::from_owned_valkey_values(items).map($convert),
+                    Value::BulkString(bytes) => FromValue::from_owned_byte_vec(bytes.to_vec().into()).map($convert),
+                    Value::Array(items) => FromValue::from_owned_result_values(items).map($convert),
+                    Value::Set(items) => FromValue::from_owned_values(items).map($convert),
                     Value::Map(items) => {
                         let mut n: Vec<T> = vec![];
                         for item in items {
-                            match FromValkeyValue::from_owned_valkey_value(Value::Map(vec![item])) {
+                            match FromValue::from_owned_value(Value::Map(vec![item])) {
                                 Ok(v) => {
                                     n.push(v);
                                 }
@@ -1886,128 +1913,208 @@ macro_rules! from_vec_from_valkey_value {
     };
 }
 
-from_vec_from_valkey_value!(<T> Vec<T>);
-from_vec_from_valkey_value!(<T> std::sync::Arc<[T]>);
-from_vec_from_valkey_value!(<T> Box<[T]>; Vec::into_boxed_slice);
+from_vec_from_value!(<T> Vec<T>);
+from_vec_from_value!(<T> std::sync::Arc<[T]>);
+from_vec_from_value!(<T> Box<[T]>; Vec::into_boxed_slice);
 
-impl<K: FromValkeyValue + Eq + Hash, V: FromValkeyValue, S: BuildHasher + Default> FromValkeyValue
+impl<K: FromValue + Eq + Hash, V: FromValue, S: BuildHasher + Default> FromValue
     for std::collections::HashMap<K, V, S>
 {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<std::collections::HashMap<K, V, S>> {
+    fn from_value(v: &Value) -> Result<std::collections::HashMap<K, V, S>> {
         let v = get_inner_value(v);
-        match *v {
+        match v {
             Value::Nil => Ok(Default::default()),
+            Value::Array(items) => {
+                if items.len() % 2 != 0 {
+                    return Err(invalid_type_error_inner!(v, "Response type not hashmap compatible"));
+                }
+                let mut map = std::collections::HashMap::with_capacity_and_hasher(items.len() / 2, S::default());
+                let mut iter = items.iter();
+                while let (Some(k_res), Some(v_res)) = (iter.next(), iter.next()) {
+                    let k_val = k_res.as_ref().map_err(|e| e.clone())?;
+                    let v_val = v_res.as_ref().map_err(|e| e.clone())?;
+                    map.insert(from_value(k_val)?, from_value(v_val)?);
+                }
+                Ok(map)
+            }
             _ => v
                 .as_map_iter()
                 .ok_or_else(|| {
                     invalid_type_error_inner!(v, "Response type not hashmap compatible")
                 })?
-                .map(|(k, v)| Ok((from_valkey_value(k)?, from_valkey_value(v)?)))
+                .map(|(k, v)| Ok((from_value(k)?, from_value(v)?)))
                 .collect(),
         }
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<std::collections::HashMap<K, V, S>> {
+    fn from_owned_value(v: Value) -> Result<std::collections::HashMap<K, V, S>> {
         let v = get_owned_inner_value(v);
         match v {
             Value::Nil => Ok(Default::default()),
+            Value::Array(items) => {
+                if items.len() % 2 != 0 {
+                    return Err(invalid_type_error_inner!(Value::Array(items), "Response type not hashmap compatible"));
+                }
+                let mut map = std::collections::HashMap::with_capacity_and_hasher(items.len() / 2, S::default());
+                let mut iter = items.into_iter();
+                while let (Some(k_res), Some(v_res)) = (iter.next(), iter.next()) {
+                    map.insert(from_owned_value(k_res?)?, from_owned_value(v_res?)?);
+                }
+                Ok(map)
+            }
             _ => v
                 .into_map_iter()
                 .map_err(|v| invalid_type_error_inner!(v, "Response type not hashmap compatible"))?
-                .map(|(k, v)| Ok((from_owned_valkey_value(k)?, from_owned_valkey_value(v)?)))
+                .map(|(k, v)| Ok((from_owned_value(k)?, from_owned_value(v)?)))
                 .collect(),
         }
     }
 }
 
-impl<K: FromValkeyValue + Eq + Hash, V: FromValkeyValue> FromValkeyValue for BTreeMap<K, V>
+impl<K: FromValue + Eq + Hash, V: FromValue> FromValue for BTreeMap<K, V>
 where
     K: Ord,
 {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<BTreeMap<K, V>> {
+    fn from_value(v: &Value) -> Result<BTreeMap<K, V>> {
         let v = get_inner_value(v);
-        v.as_map_iter()
-            .ok_or_else(|| invalid_type_error_inner!(v, "Response type not btreemap compatible"))?
-            .map(|(k, v)| Ok((from_valkey_value(k)?, from_valkey_value(v)?)))
-            .collect()
+        match v {
+            Value::Array(items) => {
+                if items.len() % 2 != 0 {
+                    return Err(invalid_type_error_inner!(v, "Response type not btreemap compatible"));
+                }
+                let mut map = BTreeMap::new();
+                let mut iter = items.iter();
+                while let (Some(k_res), Some(v_res)) = (iter.next(), iter.next()) {
+                    let k_val = k_res.as_ref().map_err(|e| e.clone())?;
+                    let v_val = v_res.as_ref().map_err(|e| e.clone())?;
+                    map.insert(from_value(k_val)?, from_value(v_val)?);
+                }
+                Ok(map)
+            }
+            _ => v
+                .as_map_iter()
+                .ok_or_else(|| invalid_type_error_inner!(v, "Response type not btreemap compatible"))?
+                .map(|(k, v)| Ok((from_value(k)?, from_value(v)?)))
+                .collect(),
+        }
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<BTreeMap<K, V>> {
+    fn from_owned_value(v: Value) -> Result<BTreeMap<K, V>> {
         let v = get_owned_inner_value(v);
-        v.into_map_iter()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not btreemap compatible"))?
-            .map(|(k, v)| Ok((from_owned_valkey_value(k)?, from_owned_valkey_value(v)?)))
-            .collect()
+        match v {
+            Value::Array(items) => {
+                if items.len() % 2 != 0 {
+                    return Err(invalid_type_error_inner!(Value::Array(items), "Response type not btreemap compatible"));
+                }
+                let mut map = BTreeMap::new();
+                let mut iter = items.into_iter();
+                while let (Some(k_res), Some(v_res)) = (iter.next(), iter.next()) {
+                    map.insert(from_owned_value(k_res?)?, from_owned_value(v_res?)?);
+                }
+                Ok(map)
+            }
+            _ => v
+                .into_map_iter()
+                .map_err(|v| invalid_type_error_inner!(v, "Response type not btreemap compatible"))?
+                .map(|(k, v)| Ok((from_owned_value(k)?, from_owned_value(v)?)))
+                .collect(),
+        }
     }
 }
 
-impl<T: FromValkeyValue + Eq + Hash, S: BuildHasher + Default> FromValkeyValue
+impl<T: FromValue + Eq + Hash, S: BuildHasher + Default> FromValue
     for std::collections::HashSet<T, S>
 {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<std::collections::HashSet<T, S>> {
+    fn from_value(v: &Value) -> Result<std::collections::HashSet<T, S>> {
         let v = get_inner_value(v);
-        let items = v
-            .as_sequence()
-            .ok_or_else(|| invalid_type_error_inner!(v, "Response type not hashset compatible"))?;
-        items.iter().map(|item| from_valkey_value(item)).collect()
+        match v {
+            Value::Array(items) => items
+                .iter()
+                .map(|r| {
+                    let val = r.as_ref().map_err(|e| e.clone())?;
+                    from_value(val)
+                })
+                .collect(),
+            Value::Set(items) => items.iter().map(|item| from_value(item)).collect(),
+            Value::Nil => Ok(Default::default()),
+            _ => Err(invalid_type_error_inner!(v, "Response type not hashset compatible")),
+        }
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<std::collections::HashSet<T, S>> {
+    fn from_owned_value(v: Value) -> Result<std::collections::HashSet<T, S>> {
         let v = get_owned_inner_value(v);
-        let items = v
-            .into_sequence()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not hashset compatible"))?;
-        items
-            .into_iter()
-            .map(|item| from_owned_valkey_value(item))
-            .collect()
+        match v {
+            Value::Array(items) => items
+                .into_iter()
+                .map(|r| from_owned_value(r?))
+                .collect(),
+            Value::Set(items) => items
+                .into_iter()
+                .map(|item| from_owned_value(item))
+                .collect(),
+            Value::Nil => Ok(Default::default()),
+            _ => Err(invalid_type_error_inner!(v, "Response type not hashset compatible")),
+        }
     }
 }
 
-impl<T: FromValkeyValue + Eq + Hash> FromValkeyValue for BTreeSet<T>
+impl<T: FromValue + Eq + Hash> FromValue for BTreeSet<T>
 where
     T: Ord,
 {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<BTreeSet<T>> {
+    fn from_value(v: &Value) -> Result<BTreeSet<T>> {
         let v = get_inner_value(v);
-        let items = v.as_sequence().ok_or_else(|| {
-            invalid_type_error_inner!(v, "Response type not btree_set compatible")
-        })?;
-        items.iter().map(|item| from_valkey_value(item)).collect()
+        match v {
+            Value::Array(items) => items
+                .iter()
+                .map(|r| {
+                    let val = r.as_ref().map_err(|e| e.clone())?;
+                    from_value(val)
+                })
+                .collect(),
+            Value::Set(items) => items.iter().map(|item| from_value(item)).collect(),
+            Value::Nil => Ok(Default::default()),
+            _ => Err(invalid_type_error_inner!(v, "Response type not btree_set compatible")),
+        }
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<BTreeSet<T>> {
+    fn from_owned_value(v: Value) -> Result<BTreeSet<T>> {
         let v = get_owned_inner_value(v);
-        let items = v
-            .into_sequence()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not btree_set compatible"))?;
-        items
-            .into_iter()
-            .map(|item| from_owned_valkey_value(item))
-            .collect()
+        match v {
+            Value::Array(items) => items
+                .into_iter()
+                .map(|r| from_owned_value(r?))
+                .collect(),
+            Value::Set(items) => items
+                .into_iter()
+                .map(|item| from_owned_value(item))
+                .collect(),
+            Value::Nil => Ok(Default::default()),
+            _ => Err(invalid_type_error_inner!(v, "Response type not btree_set compatible")),
+        }
     }
 }
 
-impl FromValkeyValue for Value {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<Value> {
+impl FromValue for Value {
+    fn from_value(v: &Value) -> Result<Value> {
         Ok(v.clone())
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<Self> {
+    fn from_owned_value(v: Value) -> Result<Self> {
         Ok(v)
     }
 }
 
-impl FromValkeyValue for () {
-    fn from_valkey_value(_v: &Value) -> ValkeyResult<()> {
+impl FromValue for () {
+    fn from_value(_v: &Value) -> Result<()> {
         Ok(())
     }
 }
 
-macro_rules! from_valkey_value_for_tuple {
+macro_rules! from_value_for_tuple {
     () => ();
     ($($name:ident,)+) => (
         #[doc(hidden)]
-        impl<$($name: FromValkeyValue),*> FromValkeyValue for ($($name,)*) {
+        impl<$($name: FromValue),*> FromValue for ($($name,)*) {
             // we have local variables named T1 as dummies and those
             // variables are unused.
             #[allow(non_snake_case, unused_variables)]
-            fn from_valkey_value(v: &Value) -> ValkeyResult<($($name,)*)> {
+            fn from_value(v: &Value) -> Result<($($name,)*)> {
                 let v = get_inner_value(v);
                 match *v {
                     Value::Array(ref items) => {
@@ -2021,8 +2128,8 @@ macro_rules! from_valkey_value_for_tuple {
                         // this is pretty ugly too.  The { i += 1; i - 1} is rust's
                         // postfix increment :)
                         let mut i = 0;
-                        Ok(($({let $name = (); from_valkey_value(
-                             &items[{ i += 1; i - 1 }])?},)*))
+                        Ok(($({let $name = (); let val = items[{ i += 1; i - 1 }].as_ref().map_err(|e| e.clone())?; from_value(
+                             val)?},)*))
                     }
 
                     Value::Map(ref items) => {
@@ -2042,7 +2149,7 @@ macro_rules! from_valkey_value_for_tuple {
                         // this is pretty ugly too.  The { i += 1; i - 1} is rust's
                         // postfix increment :)
                         let mut i = 0;
-                        Ok(($({let $name = (); from_valkey_value(
+                        Ok(($({let $name = (); from_value(
                              &flatten_items[{ i += 1; i - 1 }])?},)*))
                     }
 
@@ -2053,7 +2160,7 @@ macro_rules! from_valkey_value_for_tuple {
             // we have local variables named T1 as dummies and those
             // variables are unused.
             #[allow(non_snake_case, unused_variables)]
-            fn from_owned_valkey_value(v: Value) -> ValkeyResult<($($name,)*)> {
+            fn from_owned_value(v: Value) -> Result<($($name,)*)> {
                 let v = get_owned_inner_value(v);
                 match v {
                     Value::Array(mut items) => {
@@ -2067,8 +2174,8 @@ macro_rules! from_valkey_value_for_tuple {
                         // this is pretty ugly too.  The { i += 1; i - 1} is rust's
                         // postfix increment :)
                         let mut i = 0;
-                        Ok(($({let $name = (); from_owned_valkey_value(
-                            ::std::mem::replace(&mut items[{ i += 1; i - 1 }], Value::Nil)
+                        Ok(($({let $name = (); from_owned_value(
+                            ::std::mem::replace(&mut items[{ i += 1; i - 1 }], Ok(Value::Nil))?
                         )?},)*))
                     }
 
@@ -2089,7 +2196,7 @@ macro_rules! from_valkey_value_for_tuple {
                         // this is pretty ugly too.  The { i += 1; i - 1} is rust's
                         // postfix increment :)
                         let mut i = 0;
-                        Ok(($({let $name = (); from_valkey_value(
+                        Ok(($({let $name = (); from_value(
                              &flatten_items[{ i += 1; i - 1 }])?},)*))
                     }
 
@@ -2098,7 +2205,7 @@ macro_rules! from_valkey_value_for_tuple {
             }
 
             #[allow(non_snake_case, unused_variables)]
-            fn from_valkey_values(items: &[Value]) -> ValkeyResult<Vec<($($name,)*)>> {
+            fn from_values(items: &[Value]) -> Result<Vec<($($name,)*)>> {
                 // hacky way to count the tuple size
                 let mut n = 0;
                 $(let $name = (); n += 1;)*
@@ -2110,8 +2217,10 @@ macro_rules! from_valkey_value_for_tuple {
                 for item in items {
                     match item {
                         Value::Array(ch) => {
-                           if  let [$($name),*] = &ch[..] {
-                            rv.push(($(from_valkey_value(&$name)?),*),)
+                            // Each element in ch is Result<Value>, unwrap to get &Value
+                            let unwrapped: Vec<&Value> = ch.iter().map(|r| r.as_ref().map_err(|e| e.clone())).collect::<Result<Vec<_>>>()?;
+                           if  let [$($name),*] = &unwrapped[..] {
+                            rv.push(($(from_value($name)?),*),)
                            } else {
                                 unreachable!()
                             };
@@ -2125,12 +2234,12 @@ macro_rules! from_valkey_value_for_tuple {
                 }
 
                 if let  [$($name),*] = items{
-                    rv.push(($(from_valkey_value($name)?),*),);
+                    rv.push(($(from_value($name)?),*),);
                     return Ok(rv);
                 }
                  for chunk in items.chunks_exact(n) {
                     match chunk {
-                        [$($name),*] => rv.push(($(from_valkey_value($name)?),*),),
+                        [$($name),*] => rv.push(($(from_value($name)?),*),),
                          _ => {},
                     }
                 }
@@ -2138,7 +2247,7 @@ macro_rules! from_valkey_value_for_tuple {
             }
 
             #[allow(non_snake_case, unused_variables)]
-            fn from_owned_valkey_values(mut items: Vec<Value>) -> ValkeyResult<Vec<($($name,)*)>> {
+            fn from_owned_values(mut items: Vec<Value>) -> Result<Vec<($($name,)*)>> {
                 // hacky way to count the tuple size
                 let mut n = 0;
                 $(let $name = (); n += 1;)*
@@ -2151,9 +2260,10 @@ macro_rules! from_valkey_value_for_tuple {
                 for item in items.iter() {
                     match item {
                         Value::Array(ch) => {
-                            // TODO - this copies when we could've used the owned value. need to find out how to do this.
-                        if  let [$($name),*] = &ch[..] {
-                            rv.push(($(from_valkey_value($name)?),*),)
+                            // Each element in ch is Result<Value>, unwrap to get &Value
+                            let unwrapped: Vec<&Value> = ch.iter().map(|r| r.as_ref().map_err(|e| e.clone())).collect::<Result<Vec<_>>>()?;
+                        if  let [$($name),*] = &unwrapped[..] {
+                            rv.push(($(from_value($name)?),*),)
                            } else {
                                 unreachable!()
                             };
@@ -2175,65 +2285,65 @@ macro_rules! from_valkey_value_for_tuple {
                         // in its place. This allows each `Value` to be parsed without being copied.
                         // Since `items` is consume by this function and not used later, this replacement
                         // is not observable to the rest of the code.
-                        [$($name),*] => rv.push(($(from_owned_valkey_value(std::mem::replace($name, Value::Nil))?),*),),
+                        [$($name),*] => rv.push(($(from_owned_value(std::mem::replace($name, Value::Nil))?),*),),
                          _ => unreachable!(),
                     }
                 }
                 Ok(rv)
             }
         }
-        from_valkey_value_for_tuple_peel!($($name,)*);
+        from_value_for_tuple_peel!($($name,)*);
     )
 }
 
 /// This chips of the leading one and recurses for the rest.  So if the first
 /// iteration was T1, T2, T3 it will recurse to T2, T3.  It stops for tuples
 /// of size 1 (does not implement down to unit).
-macro_rules! from_valkey_value_for_tuple_peel {
-    ($name:ident, $($other:ident,)*) => (from_valkey_value_for_tuple!($($other,)*);)
+macro_rules! from_value_for_tuple_peel {
+    ($name:ident, $($other:ident,)*) => (from_value_for_tuple!($($other,)*);)
 }
 
-from_valkey_value_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
+from_value_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
 
-impl FromValkeyValue for InfoDict {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<InfoDict> {
+impl FromValue for InfoDict {
+    fn from_value(v: &Value) -> Result<InfoDict> {
         let v = get_inner_value(v);
-        let s: String = from_valkey_value(v)?;
+        let s: String = from_value(v)?;
         Ok(InfoDict::new(&s))
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<InfoDict> {
+    fn from_owned_value(v: Value) -> Result<InfoDict> {
         let v = get_owned_inner_value(v);
-        let s: String = from_owned_valkey_value(v)?;
+        let s: String = from_owned_value(v)?;
         Ok(InfoDict::new(&s))
     }
 }
 
-impl<T: FromValkeyValue> FromValkeyValue for Option<T> {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<Option<T>> {
+impl<T: FromValue> FromValue for Option<T> {
+    fn from_value(v: &Value) -> Result<Option<T>> {
         let v = get_inner_value(v);
         if *v == Value::Nil {
             return Ok(None);
         }
-        Ok(Some(from_valkey_value(v)?))
+        Ok(Some(from_value(v)?))
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<Option<T>> {
+    fn from_owned_value(v: Value) -> Result<Option<T>> {
         let v = get_owned_inner_value(v);
         if v == Value::Nil {
             return Ok(None);
         }
-        Ok(Some(from_owned_valkey_value(v)?))
+        Ok(Some(from_owned_value(v)?))
     }
 }
 
-impl FromValkeyValue for bytes::Bytes {
-    fn from_valkey_value(v: &Value) -> ValkeyResult<Self> {
+impl FromValue for bytes::Bytes {
+    fn from_value(v: &Value) -> Result<Self> {
         let v = get_inner_value(v);
         match v {
             Value::BulkString(bytes_vec) => Ok(bytes::Bytes::copy_from_slice(bytes_vec.as_ref())),
             _ => invalid_type_error!(v, "Not a bulk string"),
         }
     }
-    fn from_owned_valkey_value(v: Value) -> ValkeyResult<Self> {
+    fn from_owned_value(v: Value) -> Result<Self> {
         let v = get_owned_inner_value(v);
         match v {
             Value::BulkString(bytes_vec) => Ok(bytes_vec),
@@ -2242,16 +2352,16 @@ impl FromValkeyValue for bytes::Bytes {
     }
 }
 
-/// A shortcut function to invoke `FromValkeyValue::from_valkey_value`
+/// A shortcut function to invoke `FromValue::from_value`
 /// to make the API slightly nicer.
-pub fn from_valkey_value<T: FromValkeyValue>(v: &Value) -> ValkeyResult<T> {
-    FromValkeyValue::from_valkey_value(v)
+pub fn from_value<T: FromValue>(v: &Value) -> Result<T> {
+    FromValue::from_value(v)
 }
 
-/// A shortcut function to invoke `FromValkeyValue::from_owned_valkey_value`
+/// A shortcut function to invoke `FromValue::from_owned_value`
 /// to make the API slightly nicer.
-pub fn from_owned_valkey_value<T: FromValkeyValue>(v: Value) -> ValkeyResult<T> {
-    FromValkeyValue::from_owned_valkey_value(v)
+pub fn from_owned_value<T: FromValue>(v: Value) -> Result<T> {
+    FromValue::from_owned_value(v)
 }
 
 /// Enum representing the communication protocol with the server. This enum represents the types

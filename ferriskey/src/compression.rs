@@ -835,11 +835,14 @@ pub fn decompress_mget_response(
 
     match value {
         Value::Array(values) => {
-            let decompressed_values: Result<Vec<_>, _> = values
+            let decompressed: Vec<crate::value::Result<Value>> = values
                 .into_iter()
-                .map(|v| decompress_single_value_response(v, manager))
-                .collect();
-            Ok(Value::Array(decompressed_values?))
+                .map(|v| match v {
+                    Ok(val) => Ok(Ok(decompress_single_value_response(val, manager)?)),
+                    Err(e) => Ok(Err(e)),
+                })
+                .collect::<CompressionResult<Vec<_>>>()?;
+            Ok(Value::Array(decompressed))
         }
         _ => Ok(value),
     }

@@ -1,7 +1,7 @@
 use crate::connection::info::PubSubSubscriptionKind;
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 #[cfg(test)]
-use crate::value::ValkeyResult;
+use crate::value::Result;
 use crate::value::{PushKind, Value};
 use arc_swap::ArcSwap;
 use std::collections::HashSet;
@@ -41,7 +41,7 @@ impl PushManager {
 
     /// Checks if value is Ok and contains a Push, then sends it.
     #[cfg(test)]
-    pub(crate) fn try_send(&self, value: &ValkeyResult<Value>) {
+    pub(crate) fn try_send(&self, value: &Result<Value>) {
         if let Ok(value) = &value {
             self.try_send_raw(value);
         }

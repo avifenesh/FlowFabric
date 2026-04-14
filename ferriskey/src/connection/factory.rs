@@ -12,7 +12,7 @@ use crate::connection::{DisconnectNotifier, MultiplexedConnection, RedisRuntime,
 use crate::pubsub::push_manager::PushInfo;
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 use crate::retry_strategies::RetryStrategy;
-use crate::value::{ProtocolVersion, ValkeyResult};
+use crate::value::{ProtocolVersion, Result};
 
 /// The client type.
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ impl Client {
     /// Connects to a valkey server and returns a client.  This does not
     /// actually open a connection yet but it does perform some basic
     /// checks on the URL that might make the operation fail.
-    pub fn open<T: IntoConnectionInfo>(params: T) -> ValkeyResult<Client> {
+    pub fn open<T: IntoConnectionInfo>(params: T) -> Result<Client> {
         Ok(Client {
             connection_info: params.into_connection_info()?,
         })
@@ -95,7 +95,7 @@ impl Client {
     pub async fn get_multiplexed_async_connection(
         &self,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<MultiplexedConnection> {
+    ) -> Result<MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
@@ -110,7 +110,7 @@ impl Client {
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<MultiplexedConnection> {
+    ) -> Result<MultiplexedConnection> {
         let result = runtime::timeout(
             connection_timeout,
             self.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
@@ -134,7 +134,7 @@ impl Client {
     pub async fn get_multiplexed_async_connection_ip(
         &self,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<(MultiplexedConnection, Option<IpAddr>)> {
+    ) -> Result<(MultiplexedConnection, Option<IpAddr>)> {
         self.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
             Duration::MAX,
             None,
@@ -148,7 +148,7 @@ impl Client {
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> ValkeyResult<(MultiplexedConnection, Option<IpAddr>)>
+    ) -> Result<(MultiplexedConnection, Option<IpAddr>)>
     where
         T: RedisRuntime,
     {
@@ -194,7 +194,7 @@ impl Client {
     ///     root_cert_file: &str,
     ///     cert_file: &str,
     ///     key_file: &str
-    /// ) -> ferriskey::ValkeyResult<()> {
+    /// ) -> ferriskey::Result<()> {
     ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
     ///     let mut root_cert_vec = Vec::new();
     ///     BufReader::new(root_cert_file)
@@ -251,7 +251,7 @@ impl Client {
     pub fn build_with_tls<C: IntoConnectionInfo>(
         conn_info: C,
         tls_certs: TlsCertificates,
-    ) -> ValkeyResult<Client> {
+    ) -> Result<Client> {
         let connection_info = conn_info.into_connection_info()?;
 
         inner_build_with_tls(connection_info, tls_certs)

@@ -7,7 +7,7 @@ use crate::cmd::{Cmd, cmd};
 use crate::connection::info::{ValkeyConnectionInfo, get_resp3_hello_command_error};
 use crate::pipeline::PipelineRetryStrategy;
 use crate::value::{
-    ErrorKind, FromValkeyValue, InfoDict, ProtocolVersion, ValkeyError, ValkeyResult, Value,
+    ErrorKind, FromValue, InfoDict, ProtocolVersion, Error, Result, Value,
 };
 use ::tokio::io::{AsyncRead, AsyncWrite};
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ pub mod tokio;
 #[async_trait]
 pub(crate) trait RedisRuntime: AsyncStream + Send + Sync + Sized + 'static {
     /// Performs a TCP connection
-    async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> ValkeyResult<Self>;
+    async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> Result<Self>;
 
     // Performs a TCP TLS connection
     async fn connect_tcp_tls(
@@ -36,11 +36,11 @@ pub(crate) trait RedisRuntime: AsyncStream + Send + Sync + Sized + 'static {
         insecure: bool,
         tls_params: &Option<TlsConnParams>,
         tcp_nodelay: bool,
-    ) -> ValkeyResult<Self>;
+    ) -> Result<Self>;
 
     /// Performs a UNIX connection
     #[cfg(unix)]
-    async fn connect_unix(path: &Path) -> ValkeyResult<Self>;
+    async fn connect_unix(path: &Path) -> Result<Self>;
 
     fn spawn(f: impl Future<Output = ()> + Send + 'static);
 
@@ -60,7 +60,7 @@ pub trait ConnectionLike: Send {
     fn req_packed_command<'a>(
         &'a mut self,
         cmd: &'a Cmd,
-    ) -> impl Future<Output = ValkeyResult<Value>> + Send + 'a;
+    ) -> impl Future<Output = Result<Value>> + Send + 'a;
 
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement
@@ -76,7 +76,7 @@ pub trait ConnectionLike: Send {
         offset: usize,
         count: usize,
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
-    ) -> impl Future<Output = ValkeyResult<Vec<Value>>> + Send + 'a;
+    ) -> impl Future<Output = Result<Vec<Result<Value>>>> + Send + 'a;
 
     /// Sends pre-packed RESP bytes directly, skipping command serialization.
     /// Only meaningful on per-node connections (MultiplexedConnection).
@@ -85,9 +85,9 @@ pub trait ConnectionLike: Send {
         &'a mut self,
         _packed: bytes::Bytes,
         _is_fenced: bool,
-    ) -> impl Future<Output = ValkeyResult<Value>> + Send + 'a {
+    ) -> impl Future<Output = Result<Value>> + Send + 'a {
         async {
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::ClientError,
                 "send_packed_bytes not supported — use req_packed_command",
             )))
@@ -138,7 +138,7 @@ impl Clone for Box<dyn DisconnectNotifier> {
 }
 
 // Helper function to extract and update availability zone from INFO command
-async fn update_az_from_info<C>(con: &mut C) -> ValkeyResult<()>
+async fn update_az_from_info<C>(con: &mut C) -> Result<()>
 where
     C: ConnectionLike,
 {
@@ -146,7 +146,7 @@ where
 
     match info_res {
         Ok(value) => {
-            let info_dict: InfoDict = FromValkeyValue::from_valkey_value(&value)?;
+            let info_dict: InfoDict = FromValue::from_value(&value)?;
             if let Some(node_az) = info_dict.get::<String>("availability_zone") {
                 con.set_az(Some(node_az));
             }
@@ -154,7 +154,7 @@ where
         }
         Err(e) => {
             // Handle the error case for the INFO command
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::ResponseError,
                 "Failed to execute INFO command. ",
                 format!("{e:?}"),
@@ -170,13 +170,13 @@ async fn setup_connection<C>(
     // This parameter is set to 'true' if ReadFromReplica strategy is set to AZAffinity or AZAffinityReplicasAndPrimary.
     // An INFO command will be triggered in the connection's setup to update the 'availability_zone' property.
     discover_az: bool,
-) -> ValkeyResult<()>
+) -> Result<()>
 where
     C: ConnectionLike,
 {
     if connection_info.protocol != ProtocolVersion::RESP2 {
         let hello_cmd = resp3_hello(connection_info);
-        let val: ValkeyResult<Value> = hello_cmd.query_async(con).await;
+        let val: Result<Value> = hello_cmd.query_async(con).await;
         if let Err(err) = val {
             return Err(get_resp3_hello_command_error(err));
         }
@@ -251,7 +251,7 @@ where
 
     // result is ignored, as per the command's instructions.
     // https://redis.io/commands/client-setinfo/
-    let _: ValkeyResult<()> =
+    let _: Result<()> =
         crate::connection::info::client_set_info_pipeline(connection_info.lib_name.as_deref())
             .query_async(con)
             .await;
@@ -270,12 +270,12 @@ use futures_util::future::select_ok;
 pub(crate) async fn get_socket_addrs(
     host: &str,
     port: u16,
-) -> ValkeyResult<impl Iterator<Item = SocketAddr> + Send + '_> {
+) -> Result<impl Iterator<Item = SocketAddr> + Send + '_> {
     let socket_addrs = ::tokio::net::lookup_host((host, port)).await?;
     let mut socket_addrs = socket_addrs.peekable();
     match socket_addrs.peek() {
         Some(_) => Ok(socket_addrs),
-        None => Err(ValkeyError::from((
+        None => Err(Error::from((
             ErrorKind::InvalidClientConfig,
             "No address found for host",
         ))),
@@ -286,11 +286,11 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
     connection_info: &crate::connection::info::ConnectionInfo,
     _socket_addr: Option<SocketAddr>,
     tcp_nodelay: bool,
-) -> ValkeyResult<(T, Option<std::net::IpAddr>)> {
+) -> Result<(T, Option<std::net::IpAddr>)> {
     Ok(match connection_info.addr {
         ConnectionAddr::Tcp(ref host, port) => {
             if let Some(socket_addr) = _socket_addr {
-                return Ok::<_, ValkeyError>((
+                return Ok::<_, Error>((
                     <T>::connect_tcp(socket_addr, tcp_nodelay).await?,
                     Some(socket_addr.ip()),
                 ));
@@ -298,7 +298,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             let socket_addrs = get_socket_addrs(host, port).await?;
             select_ok(socket_addrs.map(|socket_addr| {
                 Box::pin(async move {
-                    Ok::<_, ValkeyError>((
+                    Ok::<_, Error>((
                         <T>::connect_tcp(socket_addr, tcp_nodelay).await?,
                         Some(socket_addr.ip()),
                     ))
@@ -314,7 +314,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             ref tls_params,
         } => {
             if let Some(socket_addr) = _socket_addr {
-                return Ok::<_, ValkeyError>((
+                return Ok::<_, Error>((
                     <T>::connect_tcp_tls(host, socket_addr, insecure, tls_params, tcp_nodelay)
                         .await?,
                     Some(socket_addr.ip()),
@@ -323,7 +323,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             let socket_addrs = get_socket_addrs(host, port).await?;
             select_ok(socket_addrs.map(|socket_addr| {
                 Box::pin(async move {
-                    Ok::<_, ValkeyError>((
+                    Ok::<_, Error>((
                         <T>::connect_tcp_tls(host, socket_addr, insecure, tls_params, tcp_nodelay)
                             .await?,
                         Some(socket_addr.ip()),
@@ -337,7 +337,7 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
         ConnectionAddr::Unix(ref path) => (<T>::connect_unix(path).await?, None),
         #[cfg(not(unix))]
         ConnectionAddr::Unix(_) => {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::InvalidClientConfig,
                 "Cannot connect to unix sockets on this platform",
             )));

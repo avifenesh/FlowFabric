@@ -3,19 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::{
-    AuthenticationInfo, Client as ClientInner, ConnectionRequest, NodeAddress,
-    TlsMode as ClientTlsMode,
+    AuthenticationInfo, Client as ClientInner, ConnectionRequest, ConnectionRetryStrategy,
+    NodeAddress, TlsMode as ClientTlsMode,
 };
 use crate::cmd::{Cmd, cmd};
 use crate::connection::info::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
-use crate::value::{ErrorKind, ProtocolVersion, ValkeyError, from_owned_valkey_value};
+use crate::value::{Error, ErrorKind, ProtocolVersion, from_owned_value};
 
 pub use crate::client::ReadFrom;
-pub use crate::value::FromValkeyValue as FromValue;
-pub use crate::value::ToValkeyArgs as ToArgs;
+pub use crate::value::FromValue;
+pub use crate::value::ToArgs;
 
-pub type FerrisKeyError = ValkeyError;
-pub type Result<T> = std::result::Result<T, FerrisKeyError>;
+pub type Result<T> = crate::value::Result<T>;
 
 /// High-level Valkey/Redis client with convenience methods for common operations.
 #[derive(Clone)]
@@ -54,7 +53,7 @@ impl Client {
     /// Connect to a Valkey/Redis cluster using one or more seed node URLs.
     pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
         if urls.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::InvalidClientConfig,
                 "Cluster URLs cannot be empty",
             )));
@@ -63,7 +62,7 @@ impl Client {
         let infos = urls
             .iter()
             .map(|url| (*url).into_connection_info())
-            .collect::<crate::value::ValkeyResult<Vec<_>>>()?;
+            .collect::<crate::value::Result<Vec<_>>>()?;
 
         let mut iter = infos.into_iter();
         let first = iter.next().expect("checked non-empty cluster URLs");
@@ -73,7 +72,7 @@ impl Client {
         for info in iter {
             let options = shared_connection_options(&info)?;
             if options != baseline {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "All cluster URLs must share TLS, auth, database, protocol, and client metadata",
                 )));
@@ -198,7 +197,7 @@ impl Client {
                 let values: Option<Vec<String>> = self.execute(cmd).await?;
                 Ok(values.and_then(|items| items.into_iter().next()))
             }
-            Some(_) => Err(ValkeyError::from((
+            Some(_) => Err(Error::from((
                 ErrorKind::InvalidClientConfig,
                 "rpop(count > 1) is not representable as Option<String>; use cmd(\"RPOP\") instead",
             ))),
@@ -233,7 +232,7 @@ impl Client {
     async fn execute<T: FromValue>(&self, mut cmd: Cmd) -> Result<T> {
         let mut inner = (*self.0).clone();
         let value = inner.send_command(&mut cmd, None).await?;
-        from_owned_valkey_value(value)
+        from_owned_value(value)
     }
 }
 
@@ -321,10 +320,51 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the connection retry strategy.
+    pub fn retry_strategy(mut self, strategy: ConnectionRetryStrategy) -> Self {
+        self.request.connection_retry_strategy = Some(strategy);
+        self
+    }
+
+    /// Set the client name sent to the server.
+    pub fn client_name(mut self, name: impl Into<String>) -> Self {
+        self.request.client_name = Some(name.into());
+        self
+    }
+
+    /// Set the RESP protocol version.
+    pub fn protocol(mut self, proto: crate::value::ProtocolVersion) -> Self {
+        self.request.protocol = Some(proto);
+        self
+    }
+
+    /// Enable lazy connection (connect on first command, not on build).
+    pub fn lazy_connect(mut self) -> Self {
+        self.request.lazy_connect = true;
+        self
+    }
+
+    /// Enable TCP_NODELAY.
+    pub fn tcp_nodelay(mut self) -> Self {
+        self.request.tcp_nodelay = true;
+        self
+    }
+
+    /// Set PubSub subscriptions for the connection.
+    pub fn pubsub_subscriptions(mut self, subs: crate::connection::info::PubSubSubscriptionInfo) -> Self {
+        self.request.pubsub_subscriptions = Some(subs);
+        self
+    }
+
+    /// Consume the builder and return the underlying `ConnectionRequest`.
+    pub(crate) fn into_request(self) -> ConnectionRequest {
+        self.request
+    }
+
     /// Build and connect the client.
     pub async fn build(self) -> Result<Client> {
         if self.request.addresses.is_empty() {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::InvalidClientConfig,
                 "ClientBuilder requires at least one address",
             )));
@@ -353,7 +393,7 @@ impl CommandBuilder {
         let mut inner = (*self.client).clone();
         let mut cmd = self.cmd;
         let value = inner.send_command(&mut cmd, None).await?;
-        from_owned_valkey_value(value)
+        from_owned_value(value)
     }
 }
 
@@ -373,7 +413,7 @@ impl CommandBuilder {
 pub struct TypedPipeline {
     inner: crate::pipeline::Pipeline,
     client: Arc<ClientInner>,
-    results: Arc<std::sync::OnceLock<Vec<crate::value::Value>>>,
+    results: Arc<std::sync::OnceLock<Vec<crate::value::Result<crate::value::Value>>>>,
     next_index: usize,
 }
 
@@ -384,7 +424,7 @@ pub struct TypedPipeline {
 /// `pipeline.execute()` to extract the typed result.
 pub struct PipeSlot<T> {
     index: usize,
-    results: Arc<std::sync::OnceLock<Vec<crate::value::Value>>>,
+    results: Arc<std::sync::OnceLock<Vec<crate::value::Result<crate::value::Value>>>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -530,7 +570,7 @@ impl TypedPipeline {
         };
         let vals = match value {
             crate::value::Value::Array(v) => v,
-            other => vec![other],
+            other => vec![Ok(other)],
         };
         let _ = self.results.set(vals);
         Ok(())
@@ -572,8 +612,8 @@ impl<T: FromValue> PipeSlot<T> {
         let val = vals
             .get(self.index)
             .cloned()
-            .unwrap_or(crate::value::Value::Nil);
-        from_owned_valkey_value(val)
+            .unwrap_or(Ok(crate::value::Value::Nil));
+        from_owned_value(val?)
     }
 }
 
@@ -624,7 +664,7 @@ fn node_address_from_addr(addr: ConnectionAddr) -> Result<NodeAddress> {
     match addr {
         ConnectionAddr::Tcp(host, port) => Ok(NodeAddress { host, port }),
         ConnectionAddr::TcpTls { host, port, .. } => Ok(NodeAddress { host, port }),
-        ConnectionAddr::Unix(_) => Err(ValkeyError::from((
+        ConnectionAddr::Unix(_) => Err(Error::from((
             ErrorKind::InvalidClientConfig,
             "Unix socket URLs are not supported by the high-level Client wrapper",
         ))),
@@ -670,7 +710,7 @@ fn apply_connection_info(request: &mut ConnectionRequest, info: ConnectionInfo) 
 
 fn duration_to_millis(ttl: Duration) -> Result<u64> {
     u64::try_from(ttl.as_millis()).map_err(|_| {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::InvalidClientConfig,
             "TTL is too large to encode in milliseconds",
         ))

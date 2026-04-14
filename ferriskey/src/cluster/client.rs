@@ -6,7 +6,7 @@ use crate::connection::info::TlsMode;
 use crate::connection::info::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
 use crate::pubsub::push_manager::PushInfo;
 use crate::retry_strategies::RetryStrategy;
-use crate::value::{ErrorKind, ProtocolVersion, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, ProtocolVersion, Error, Result};
 use rand::Rng;
 use std::ops::Add;
 use std::sync::Arc;
@@ -143,7 +143,7 @@ pub struct ClusterParams {
 }
 
 impl ClusterParams {
-    fn from(value: BuilderParams) -> ValkeyResult<Self> {
+    fn from(value: BuilderParams) -> Result<Self> {
         let tls_params = {
             let retrieved_tls_params = value.certs.clone().map(retrieve_tls_certificates);
 
@@ -202,7 +202,7 @@ impl ClusterParams {
 
 /// Used to configure and build a [`ClusterClient`].
 pub struct ClusterClientBuilder {
-    initial_nodes: ValkeyResult<Vec<ConnectionInfo>>,
+    initial_nodes: Result<Vec<ConnectionInfo>>,
     builder_params: BuilderParams,
 }
 
@@ -234,13 +234,13 @@ impl ClusterClientBuilder {
     ///
     /// Upon failure to parse initial nodes or if the initial nodes have different passwords or
     /// usernames, an error is returned.
-    pub fn build(self) -> ValkeyResult<ClusterClient> {
+    pub fn build(self) -> Result<ClusterClient> {
         let initial_nodes = self.initial_nodes?;
 
         let first_node = match initial_nodes.first() {
             Some(node) => node,
             None => {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "Initial nodes can't be empty.",
                 )));
@@ -282,21 +282,21 @@ impl ClusterClientBuilder {
         let mut nodes = Vec::with_capacity(initial_nodes.len());
         for mut node in initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.",
                 )));
             }
 
             if password.is_some() && node.valkey.password != *password {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different password among initial nodes.",
                 )));
             }
 
             if username.is_some() && node.valkey.username != *username {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different username among initial nodes.",
                 )));
@@ -305,7 +305,7 @@ impl ClusterClientBuilder {
             if node.valkey.client_name.is_some()
                 && node.valkey.client_name != cluster_params.client_name
             {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different client_name among initial nodes.",
                 )));
@@ -568,7 +568,7 @@ impl ClusterClient {
     /// usernames, an error is returned.
     pub fn new<T: IntoConnectionInfo>(
         initial_nodes: impl IntoIterator<Item = T>,
-    ) -> ValkeyResult<ClusterClient> {
+    ) -> Result<ClusterClient> {
         Self::builder(initial_nodes).build()
     }
 
@@ -592,7 +592,7 @@ impl ClusterClient {
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::synchronizer_trait::PubSubSynchronizer>>,
         iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>>,
-    ) -> ValkeyResult<cluster::ClusterConnection> {
+    ) -> Result<cluster::ClusterConnection> {
         cluster::ClusterConnection::new(
             &self.initial_nodes,
             self.cluster_params.clone(),
@@ -606,7 +606,7 @@ impl ClusterClient {
     #[doc(hidden)]
     pub async fn get_async_generic_connection<C>(
         &self,
-    ) -> ValkeyResult<cluster::ClusterConnection<C>>
+    ) -> Result<cluster::ClusterConnection<C>>
     where
         C: crate::connection::ConnectionLike
             + cluster::Connect

@@ -5,7 +5,7 @@ use crate::cluster::compat::get_connection_addr;
 use crate::cluster::routing::Slot;
 use crate::cluster::slotmap::{ReadFromReplicaStrategy, SlotMap};
 use crate::connection::info::TlsMode;
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult, Value};
+use crate::value::{ErrorKind, Error, Result, Value};
 use logger_core::log_warn;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -109,7 +109,7 @@ pub(crate) fn parse_and_count_slots(
     raw_slot_resp: &Value,
     tls: Option<TlsMode>,
     addr_of_answering_node: &str,
-) -> ValkeyResult<ParsedSlotsResult> {
+) -> Result<ParsedSlotsResult> {
     // Parse response.
     let mut slots = Vec::with_capacity(2);
     let mut slots_count = 0;
@@ -117,19 +117,19 @@ pub(crate) fn parse_and_count_slots(
 
     if let Value::Array(items) = raw_slot_resp {
         let mut iter = items.iter();
-        while let Some(Value::Array(item)) = iter.next() {
+        while let Some(Ok(Value::Array(item))) = iter.next() {
             if item.len() < 3 {
                 continue;
             }
 
             // Parse slot range boundaries
-            let start = if let Value::Int(start) = item[0] {
+            let start = if let Ok(Value::Int(start)) = item[0] {
                 start as u16
             } else {
                 continue;
             };
 
-            let end = if let Value::Int(end) = item[1] {
+            let end = if let Ok(Value::Int(end)) = item[1] {
                 end as u16
             } else {
                 continue;
@@ -145,14 +145,14 @@ pub(crate) fn parse_and_count_slots(
                 .iter()
                 .skip(2)
                 .filter_map(|node| {
-                    if let Value::Array(node) = node {
+                    if let Ok(Value::Array(node)) = node {
                         if node.len() < 2 {
                             return None;
                         }
                         // According to the CLUSTER SLOTS documentation:
                         // If the received hostname is an empty string or NULL, clients should utilize the hostname of the responding node.
                         // However, if the received hostname is "?", it should be regarded as an indication of an unknown node.
-                        let primary_identifier = if let Value::BulkString(ref bytes) = node[0] {
+                        let primary_identifier = if let Ok(Value::BulkString(ref bytes)) = node[0] {
                             let received_address = String::from_utf8_lossy(bytes);
                             if received_address.is_empty() {
                                 addr_of_answering_node.into()
@@ -161,7 +161,7 @@ pub(crate) fn parse_and_count_slots(
                             } else {
                                 received_address
                             }
-                        } else if let Value::Nil = node[0] {
+                        } else if let Ok(Value::Nil) = node[0] {
                             addr_of_answering_node.into()
                         } else {
                             return None;
@@ -172,7 +172,7 @@ pub(crate) fn parse_and_count_slots(
                         }
 
                         // Parse port from node[1]
-                        let port = if let Value::Int(port) = node[1] {
+                        let port = if let Ok(Value::Int(port)) = node[1] {
                             port as u16
                         } else {
                             return None;
@@ -203,7 +203,7 @@ pub(crate) fn parse_and_count_slots(
 
                             match &node[3] {
                                 // Array format: ["ip", "127.0.0.1", "hostname", "example.com", ...]
-                                Value::Array(metadata) => {
+                                Ok(Value::Array(metadata)) => {
                                     if metadata.len() % 2 != 0 {
                                         log_warn(
                                                 "cluster_topology",
@@ -211,7 +211,7 @@ pub(crate) fn parse_and_count_slots(
                                             );
                                     }
                                     for chunk in metadata.chunks_exact(2) {
-                                        if let (Value::BulkString(key), Value::BulkString(value)) =
+                                        if let (Ok(Value::BulkString(key)), Ok(Value::BulkString(value))) =
                                             (&chunk[0], &chunk[1])
                                         {
                                             process_kv(key, value);
@@ -219,7 +219,7 @@ pub(crate) fn parse_and_count_slots(
                                     }
                                 }
                                 // Map format: {("ip", "127.0.0.1"), ("hostname", "example.com")}
-                                Value::Map(metadata) => {
+                                Ok(Value::Map(metadata)) => {
                                     for (key, value) in metadata {
                                         if let (Value::BulkString(key_bytes), Value::BulkString(value_bytes)) =
                                             (key, value)
@@ -281,7 +281,7 @@ pub(crate) fn parse_and_count_slots(
         }
     }
     if slots.is_empty() {
-        return Err(ValkeyError::from((
+        return Err(Error::from((
             ErrorKind::ResponseError,
             "Error parsing slots: No healthy node found",
             format!("Raw slot map response: {raw_slot_resp:?}"),
@@ -321,7 +321,7 @@ pub(crate) fn calculate_topology<'a>(
     tls_mode: Option<TlsMode>,
     num_of_queried_nodes: usize,
     read_from_replica: ReadFromReplicaStrategy,
-) -> ValkeyResult<(SlotMap, TopologyHash)> {
+) -> Result<(SlotMap, TopologyHash)> {
     let mut hash_view_map = HashMap::new();
     for (host, view) in topology_views {
         if let Ok(ParsedSlotsResult {
@@ -345,7 +345,7 @@ pub(crate) fn calculate_topology<'a>(
     let mut most_frequent_topology = match vec_iter.next() {
         Some(view) => view,
         None => {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::ResponseError,
                 "No topology views found",
             )));
@@ -397,7 +397,7 @@ pub(crate) fn calculate_topology<'a>(
         if curr_retry >= DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES || num_of_queried_nodes < 3 {
             return parse_and_built_result(most_frequent_topology);
         }
-        return Err(ValkeyError::from((
+        return Err(Error::from((
             ErrorKind::ResponseError,
             "Slot refresh error: Failed to obtain a majority in topology views",
         )));
@@ -409,7 +409,7 @@ pub(crate) fn calculate_topology<'a>(
     if agreement_rate >= MIN_AGREEMENT_RATE {
         parse_and_built_result(most_frequent_topology)
     } else {
-        Err(ValkeyError::from((
+        Err(Error::from((
             ErrorKind::ResponseError,
             "Slot refresh error: The accuracy of the topology view is too low",
         )))
@@ -429,16 +429,16 @@ mod tests {
     }
 
     fn slot_value_with_replicas(start: u16, end: u16, nodes: Vec<(&str, u16)>) -> Value {
-        let mut node_values: Vec<Value> = nodes
+        let mut node_values: Vec<Result<Value>> = nodes
             .iter()
             .map(|(host, port)| {
-                Value::Array(vec![
-                    Value::BulkString(host.as_bytes().to_vec().into()),
-                    Value::Int(*port as i64),
-                ])
+                Ok(Value::Array(vec![
+                    Ok(Value::BulkString(host.as_bytes().to_vec().into())),
+                    Ok(Value::Int(*port as i64)),
+                ]))
             })
             .collect();
-        let mut slot_vec = vec![Value::Int(start as i64), Value::Int(end as i64)];
+        let mut slot_vec = vec![Ok(Value::Int(start as i64)), Ok(Value::Int(end as i64))];
         slot_vec.append(&mut node_values);
         Value::Array(slot_vec)
     }
@@ -455,24 +455,24 @@ mod tests {
         nodes: Vec<(&str, u16, Option<Vec<(&str, &str)>>)>, // (address, port, metadata)
         format: MetadataFormat,
     ) -> Value {
-        let node_values: Vec<Value> = nodes
+        let node_values: Vec<Result<Value>> = nodes
             .iter()
             .map(|(host, port, metadata)| {
-                let mut node_vec = vec![
-                    Value::BulkString(host.as_bytes().to_vec().into()),
-                    Value::Int(*port as i64),
-                    Value::BulkString(b"node-id-placeholder".to_vec().into()), // node ID
+                let mut node_vec: Vec<Result<Value>> = vec![
+                    Ok(Value::BulkString(host.as_bytes().to_vec().into())),
+                    Ok(Value::Int(*port as i64)),
+                    Ok(Value::BulkString(b"node-id-placeholder".to_vec().into())), // node ID
                 ];
 
                 if let Some(meta) = metadata {
                     let metadata_value = match format {
                         MetadataFormat::Array => {
-                            let meta_values: Vec<Value> = meta
+                            let meta_values: Vec<Result<Value>> = meta
                                 .iter()
                                 .flat_map(|(k, v)| {
                                     vec![
-                                        Value::BulkString(k.as_bytes().to_vec().into()),
-                                        Value::BulkString(v.as_bytes().to_vec().into()),
+                                        Ok(Value::BulkString(k.as_bytes().to_vec().into())),
+                                        Ok(Value::BulkString(v.as_bytes().to_vec().into())),
                                     ]
                                 })
                                 .collect();
@@ -491,14 +491,14 @@ mod tests {
                             Value::Map(meta_pairs)
                         }
                     };
-                    node_vec.push(metadata_value);
+                    node_vec.push(Ok(metadata_value));
                 }
 
-                Value::Array(node_vec)
+                Ok(Value::Array(node_vec))
             })
             .collect();
 
-        let mut slot_vec = vec![Value::Int(start as i64), Value::Int(end as i64)];
+        let mut slot_vec: Vec<Result<Value>> = vec![Ok(Value::Int(start as i64)), Ok(Value::Int(end as i64))];
         slot_vec.extend(node_values);
         Value::Array(slot_vec)
     }
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn parse_slots_with_different_replicas_order_returns_the_same_view() {
         let view1 = Value::Array(vec![
-            slot_value_with_replicas(
+            Ok(slot_value_with_replicas(
                 0,
                 4000,
                 vec![
@@ -527,8 +527,8 @@ mod tests {
                     ("replica1_2", 6379),
                     ("replica1_3", 6379),
                 ],
-            ),
-            slot_value_with_replicas(
+            )),
+            Ok(slot_value_with_replicas(
                 4001,
                 8000,
                 vec![
@@ -537,8 +537,8 @@ mod tests {
                     ("replica2_2", 6379),
                     ("replica2_3", 6379),
                 ],
-            ),
-            slot_value_with_replicas(
+            )),
+            Ok(slot_value_with_replicas(
                 8001,
                 16383,
                 vec![
@@ -547,11 +547,11 @@ mod tests {
                     ("replica3_2", 6379),
                     ("replica3_3", 6379),
                 ],
-            ),
+            )),
         ]);
 
         let view2 = Value::Array(vec![
-            slot_value_with_replicas(
+            Ok(slot_value_with_replicas(
                 0,
                 4000,
                 vec![
@@ -560,8 +560,8 @@ mod tests {
                     ("replica1_3", 6379),
                     ("replica1_2", 6379),
                 ],
-            ),
-            slot_value_with_replicas(
+            )),
+            Ok(slot_value_with_replicas(
                 4001,
                 8000,
                 vec![
@@ -570,8 +570,8 @@ mod tests {
                     ("replica2_3", 6379),
                     ("replica2_1", 6379),
                 ],
-            ),
-            slot_value_with_replicas(
+            )),
+            Ok(slot_value_with_replicas(
                 8001,
                 16383,
                 vec![
@@ -580,7 +580,7 @@ mod tests {
                     ("replica3_1", 6379),
                     ("replica3_2", 6379),
                 ],
-            ),
+            )),
         ]);
 
         let res1 = parse_and_count_slots(&view1, None, "foo").unwrap();
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn parse_slots_returns_slots_with_host_name_if_missing() {
-        let view = Value::Array(vec![slot_value(0, 4000, "", 6379)]);
+        let view = Value::Array(vec![Ok(slot_value(0, 4000, "", 6379))]);
 
         let ParsedSlotsResult {
             slots_count, slots, ..
@@ -613,9 +613,9 @@ mod tests {
     #[test]
     fn should_parse_and_hash_regardless_of_missing_host_name_and_replicas_order() {
         let view1 = Value::Array(vec![
-            slot_value(0, 4000, "", 6379),
-            slot_value(4001, 8000, "node2", 6380),
-            slot_value_with_replicas(
+            Ok(slot_value(0, 4000, "", 6379)),
+            Ok(slot_value(4001, 8000, "node2", 6380)),
+            Ok(slot_value_with_replicas(
                 8001,
                 16383,
                 vec![
@@ -624,13 +624,13 @@ mod tests {
                     ("replica3_2", 6379),
                     ("replica3_3", 6379),
                 ],
-            ),
+            )),
         ]);
 
         let view2 = Value::Array(vec![
-            slot_value(0, 4000, "node1", 6379),
-            slot_value(4001, 8000, "node2", 6380),
-            slot_value_with_replicas(
+            Ok(slot_value(0, 4000, "node1", 6379)),
+            Ok(slot_value(4001, 8000, "node2", 6380)),
+            Ok(slot_value_with_replicas(
                 8001,
                 16383,
                 vec![
@@ -639,7 +639,7 @@ mod tests {
                     ("replica3_2", 6379),
                     ("replica3_1", 6379),
                 ],
-            ),
+            )),
         ]);
 
         let res1 = parse_and_count_slots(&view1, None, "node1").unwrap();
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn parse_slots_hostname_primary_format_extracts_ip_from_metadata() {
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![
@@ -684,7 +684,7 @@ mod tests {
                     ),
                 ],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 slots_count,
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn parse_slots_ip_primary_format_extracts_hostname_from_metadata() {
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![
@@ -731,7 +731,7 @@ mod tests {
                     ),
                 ],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 slots_count,
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn parse_slots_valkey_format_without_hostname_uses_ip_as_address() {
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![
@@ -770,7 +770,7 @@ mod tests {
                     ("192.168.1.2", 6379, None),
                 ],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 slots_count,
@@ -798,11 +798,11 @@ mod tests {
     #[test]
     fn parse_slots_no_metadata_no_ip_mapping() {
         // Standard format without metadata - no IP mappings
-        let view = Value::Array(vec![slot_value_with_replicas(
+        let view = Value::Array(vec![Ok(slot_value_with_replicas(
             0,
             16383,
             vec![("node1", 6379), ("replica1", 6379)],
-        )]);
+        ))]);
 
         let ParsedSlotsResult {
             slots,
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn parse_slots_mixed_nodes_with_and_without_ip() {
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![
@@ -825,7 +825,7 @@ mod tests {
                     ("replica.example.com", 6379, None),
                 ],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 address_to_ip_map, ..
@@ -843,12 +843,12 @@ mod tests {
     #[test]
     fn parse_slots_invalid_ip_in_metadata_ignored() {
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![("node1.example.com", 6379, Some(vec![("ip", "not-an-ip")]))],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 slots,
@@ -865,7 +865,7 @@ mod tests {
     fn parse_slots_multiple_slot_ranges_with_ip_mapping() {
         run_with_both_formats(|format| {
             let view = Value::Array(vec![
-                slot_value_with_metadata(
+                Ok(slot_value_with_metadata(
                     0,
                     5461,
                     vec![
@@ -881,8 +881,8 @@ mod tests {
                         ),
                     ],
                     format,
-                ),
-                slot_value_with_metadata(
+                )),
+                Ok(slot_value_with_metadata(
                     5462,
                     10922,
                     vec![(
@@ -891,8 +891,8 @@ mod tests {
                         Some(vec![("ip", "10.0.2.1")]),
                     )],
                     format,
-                ),
-                slot_value_with_metadata(
+                )),
+                Ok(slot_value_with_metadata(
                     10923,
                     16383,
                     vec![(
@@ -901,7 +901,7 @@ mod tests {
                         Some(vec![("ip", "10.0.3.1")]),
                     )],
                     format,
-                ),
+                )),
             ]);
 
             let ParsedSlotsResult {
@@ -936,12 +936,12 @@ mod tests {
     #[test]
     fn parse_slots_ipv6_address_in_metadata() {
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![("node1.example.com", 6379, Some(vec![("ip", "2001:db8::1")]))],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 address_to_ip_map, ..
@@ -961,7 +961,7 @@ mod tests {
         // in CLUSTER SLOTS metadata. The parser should treat this as absent and
         // fall back to the IP address from the primary identifier.
         run_with_both_formats(|format| {
-            let view = Value::Array(vec![slot_value_with_metadata(
+            let view = Value::Array(vec![Ok(slot_value_with_metadata(
                 0,
                 16383,
                 vec![
@@ -969,7 +969,7 @@ mod tests {
                     ("172.20.78.117", 6379, Some(vec![("hostname", "")])),
                 ],
                 format,
-            )]);
+            ))]);
 
             let ParsedSlotsResult {
                 slots_count,
@@ -1005,24 +1005,24 @@ mod tests {
         match view_type {
             ViewType::SingleNodeViewFullCoverage => (
                 "first",
-                Value::Array(vec![slot_value(0, 16383, "node1", 6379)]),
+                Value::Array(vec![Ok(slot_value(0, 16383, "node1", 6379))]),
             ),
             ViewType::SingleNodeViewMissingSlots => (
                 "second",
-                Value::Array(vec![slot_value(0, 4000, "node1", 6379)]),
+                Value::Array(vec![Ok(slot_value(0, 4000, "node1", 6379))]),
             ),
             ViewType::TwoNodesViewFullCoverage => (
                 "third",
                 Value::Array(vec![
-                    slot_value(0, 4000, "node1", 6379),
-                    slot_value(4001, 16383, "node2", 6380),
+                    Ok(slot_value(0, 4000, "node1", 6379)),
+                    Ok(slot_value(4001, 16383, "node2", 6380)),
                 ]),
             ),
             ViewType::TwoNodesViewMissingSlots => (
                 "fourth",
                 Value::Array(vec![
-                    slot_value(0, 3000, "node3", 6381),
-                    slot_value(4001, 16383, "node4", 6382),
+                    Ok(slot_value(0, 3000, "node3", 6381)),
+                    Ok(slot_value(4001, 16383, "node4", 6382)),
                 ]),
             ),
         }

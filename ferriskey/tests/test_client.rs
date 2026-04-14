@@ -29,7 +29,7 @@ pub(crate) mod shared_client_tests {
     };
     use ferriskey::cluster::topology::get_slot;
     use ferriskey::pipeline::{Pipeline, PipelineRetryStrategy};
-    use ferriskey::{FromValkeyValue, InfoDict, ValkeyConnectionInfo, Value, cmd};
+    use ferriskey::{FromValue, InfoDict, ValkeyConnectionInfo, Result, Value, cmd};
     use std::collections::HashMap;
 
     use super::*;
@@ -213,7 +213,7 @@ pub(crate) mod shared_client_tests {
 
             let values: Vec<_> = match values {
                 Value::Map(map) => map.into_iter().filter_map(|(_, value)| {
-                    let map = InfoDict::from_owned_valkey_value(value).unwrap();
+                    let map = InfoDict::from_owned_value(value).unwrap();
                     map.get::<String>("cmdstat_get")?
                         .split_once(',')?
                         .0
@@ -261,7 +261,7 @@ pub(crate) mod shared_client_tests {
             )
             .await;
             let hello: std::collections::HashMap<String, Value> =
-                ferriskey::from_owned_valkey_value(
+                ferriskey::from_owned_value(
                     test_basics
                         .client
                         .send_command(&mut ferriskey::cmd("HELLO"), None)
@@ -434,7 +434,7 @@ pub(crate) mod shared_client_tests {
         refresh_interval_seconds: Option<u32>,
         cluster_mode: bool,
         service_type: ServiceType,
-    ) -> ferriskey::ConnectionRequest {
+    ) -> ferriskey::client::types::ConnectionRequest {
         let addresses_info = addresses.iter().map(get_address_info).collect();
 
         let iam_credentials = IamCredentials {
@@ -452,7 +452,7 @@ pub(crate) mod shared_client_tests {
             ..Default::default()
         };
 
-        ferriskey::ConnectionRequest {
+        ferriskey::client::types::ConnectionRequest {
             addresses: addresses_info,
             tls_mode: TlsMode::SecureTls.into(),
             cluster_mode_enabled: cluster_mode,
@@ -917,7 +917,7 @@ pub(crate) mod shared_client_tests {
 
             let addresses_info = vec![get_address_info(&address)];
 
-            let connection_request = ferriskey::ConnectionRequest {
+            let connection_request = ferriskey::client::types::ConnectionRequest {
                 addresses: addresses_info,
                 tls_mode: TlsMode::NoTls.into(),
                 cluster_mode_enabled: use_cluster,
@@ -1260,7 +1260,7 @@ pub(crate) mod shared_client_tests {
 
             let addresses_info = vec![get_address_info(&address)];
 
-            let connection_request = ferriskey::ConnectionRequest {
+            let connection_request = ferriskey::client::types::ConnectionRequest {
                 addresses: addresses_info,
                 tls_mode: TlsMode::NoTls.into(),
                 cluster_mode_enabled: use_cluster,
@@ -1587,11 +1587,11 @@ pub(crate) mod shared_client_tests {
                         .unwrap();
 
                     if use_cluster {
-                        ferriskey::from_owned_valkey_value(variant_res).unwrap()
+                        ferriskey::from_owned_value(variant_res).unwrap()
                     } else {
                         [(
                             "DONT_CARE".to_string(),
-                            ferriskey::from_owned_valkey_value(variant_res).unwrap(),
+                            ferriskey::from_owned_value(variant_res).unwrap(),
                         )]
                         .into()
                     }
@@ -1642,7 +1642,7 @@ pub(crate) mod shared_client_tests {
             )
             .await;
             let hello: std::collections::HashMap<String, Value> =
-                ferriskey::from_owned_valkey_value(
+                ferriskey::from_owned_value(
                     test_basics
                         .client
                         .send_command(&mut ferriskey::cmd("HELLO"), None)
@@ -1681,9 +1681,9 @@ pub(crate) mod shared_client_tests {
             assert_eq!(
                 result,
                 Value::Array(vec![
-                    Value::Int(1),
-                    Value::Int(1),
-                    Value::Map(vec![
+                    Ok(Value::Int(1)),
+                    Ok(Value::Int(1)),
+                    Ok(Value::Map(vec![
                         (
                             Value::BulkString(field.as_bytes().to_vec().into()),
                             Value::BulkString(value.as_bytes().to_vec().into())
@@ -1692,7 +1692,7 @@ pub(crate) mod shared_client_tests {
                             Value::BulkString(field2.as_bytes().to_vec().into()),
                             Value::BulkString(value2.as_bytes().to_vec().into())
                         )
-                    ])
+                    ]))
                 ]),
                 "Pipeline result: {result:?}"
             );
@@ -1760,14 +1760,14 @@ pub(crate) mod shared_client_tests {
                     assert_eq!(
                         &res[..2],
                         &[
-                            Value::Okay,
-                            Value::BulkString(value.as_bytes().to_vec().into()),
+                            Ok(Value::Okay),
+                            Ok(Value::BulkString(value.as_bytes().to_vec().into())),
                         ],
                         "Pipeline result: {res:?}"
                     );
 
                     assert!(
-                        matches!(res[2], Value::ServerError(ref err) if err.err_code().contains("WRONGTYPE"))
+                        matches!(&res[2], Err(err) if err.err_code().contains("WRONGTYPE"))
                     );
                 }
                 true => {
@@ -1837,10 +1837,10 @@ pub(crate) mod shared_client_tests {
             assert_eq!(
                 result,
                 Value::Array(vec![
-                    Value::Okay,
-                    Value::BulkString(b"value1".to_vec().into()),
-                    Value::Nil,
-                    Value::Nil,
+                    Ok(Value::Okay),
+                    Ok(Value::BulkString(b"value1".to_vec().into())),
+                    Ok(Value::Nil),
+                    Ok(Value::Nil),
                 ]),
                 "Pipeline with blocking command should return null for BLPOP and GET on a non-existent key {result:?}"
             );
@@ -1954,10 +1954,10 @@ pub(crate) mod shared_client_tests {
             assert_eq!(
                 res,
                 Value::Array(vec![
-                    Value::Okay,
-                    Value::BulkString(b"value1".to_vec().into()),
-                    Value::Nil,
-                    Value::Nil,
+                    Ok(Value::Okay),
+                    Ok(Value::BulkString(b"value1".to_vec().into())),
+                    Ok(Value::Nil),
+                    Ok(Value::Nil),
                 ]),
                 "Pipeline result: {res:?}"
             );
@@ -1999,7 +1999,7 @@ pub(crate) mod shared_client_tests {
 
             assert_eq!(
                 res,
-                Value::Array(vec![Value::Nil, Value::Nil,]),
+                Value::Array(vec![Ok(Value::Nil), Ok(Value::Nil)]),
                 "Transaction result: {res:?}"
             );
         });
@@ -2064,10 +2064,10 @@ pub(crate) mod shared_client_tests {
             .await;
 
             let expected = Value::Array(vec![
-                Value::Okay,
-                Value::BulkString(value.as_bytes().to_vec().into()),
-                Value::Okay,
-                Value::BulkString(value2.as_bytes().to_vec().into()),
+                Ok(Value::Okay),
+                Ok(Value::BulkString(value.as_bytes().to_vec().into())),
+                Ok(Value::Okay),
+                Ok(Value::BulkString(value2.as_bytes().to_vec().into())),
             ]);
 
             assert_eq!(res, expected, "Pipeline result: {res:?}");
@@ -2149,9 +2149,9 @@ pub(crate) mod shared_client_tests {
                     };
 
                     assert!(
-                        result.iter().all(|r| matches!(r, Value::ServerError(e) if e.err_code().contains("BrokenPipe"))
+                        result.iter().all(|r| matches!(r, Err(e) if e.err_code().contains("BrokenPipe"))
                             ),
-                        "Not all responses are ServerError: {result:?}"
+                        "Not all responses are Err: {result:?}"
                     );
                 }
                 false => {
@@ -2224,10 +2224,10 @@ pub(crate) mod shared_client_tests {
             .await;
 
             let expected = Value::Array(vec![
-                Value::Okay,
-                Value::BulkString("value1".as_bytes().to_vec().into()),
-                Value::Okay,
-                Value::BulkString("value2".as_bytes().to_vec().into()),
+                Ok(Value::Okay),
+                Ok(Value::BulkString("value1".as_bytes().to_vec().into())),
+                Ok(Value::Okay),
+                Ok(Value::BulkString("value2".as_bytes().to_vec().into())),
             ]);
 
             assert_eq!(res, expected, "Pipeline result: {res:?}");
@@ -2288,10 +2288,10 @@ pub(crate) mod shared_client_tests {
             ];
 
             let items = keys.iter().map(|key| (key, key)).collect::<Vec<_>>();
-            let expected = keys
+            let expected: Vec<Result<Value>> = keys
                 .iter()
-                .map(|key| Value::BulkString(key.as_bytes().to_vec().into()))
-                .collect::<Vec<_>>();
+                .map(|key| Ok(Value::BulkString(key.as_bytes().to_vec().into())))
+                .collect();
             let mut pipeline = Pipeline::new();
             pipeline.cmd("MSET").arg(&items);
             pipeline.cmd("MGET").arg(&keys);
@@ -2312,7 +2312,7 @@ pub(crate) mod shared_client_tests {
                 .expect("Pipeline failed");
             assert_eq!(
                 result,
-                Value::Array(vec![Value::Okay, Value::Array(expected)]),
+                Value::Array(vec![Ok(Value::Okay), Ok(Value::Array(expected))]),
                 "Pipeline result: {result:?}"
             );
         });
@@ -2358,11 +2358,11 @@ pub(crate) mod shared_client_tests {
             assert_eq!(
                 result,
                 Value::Array(vec![
-                    Value::Okay,
-                    Value::Map(vec![(
+                    Ok(Value::Okay),
+                    Ok(Value::Map(vec![(
                         Value::BulkString(b"appendonly".to_vec().into()),
                         Value::BulkString(b"no".to_vec().into()),
-                    )])
+                    )]))
                 ]),
                 "Pipeline result: {result:?}"
             );
@@ -2409,10 +2409,10 @@ pub(crate) mod shared_client_tests {
                 .expect("Pipeline execution failed");
 
             let expected = Value::Array(vec![
-                Value::SimpleString("PONG".to_string()),
-                Value::Okay,
-                Value::Okay,
-                Value::Int(0),
+                Ok(Value::SimpleString("PONG".to_string())),
+                Ok(Value::Okay),
+                Ok(Value::Okay),
+                Ok(Value::Int(0)),
             ]);
 
             assert_eq!(result, expected, "Pipeline result: {result:?}");
@@ -2471,9 +2471,9 @@ pub(crate) mod shared_client_tests {
                 _ => panic!("Expected array result, got: {result:?}"),
             };
 
-            assert_eq!(arr[0], Value::Okay, "Pipeline result: {arr:?}");
+            assert_eq!(arr[0], Ok(Value::Okay), "Pipeline result: {arr:?}");
             assert!(
-                matches!(&arr[1], Value::ServerError(err) if err.err_code().contains("WRONGTYPE")),
+                matches!(&arr[1], Err(err) if err.err_code().contains("WRONGTYPE")),
                 "Pipeline result: {arr:?}"
             );
         });
@@ -2604,16 +2604,16 @@ pub(crate) mod shared_client_tests {
             assert_eq!(
                 result,
                 Ok(Value::Array(vec![
-                    Value::Int(1),
-                    Value::Map(vec![(
+                    Ok(Value::Int(1)),
+                    Ok(Value::Map(vec![(
                         Value::BulkString(b"bar".to_vec().into()),
                         Value::BulkString(b"vaz".to_vec().into()),
-                    )]),
-                    Value::Boolean(true),
-                    Value::Int(1),
-                    Value::Okay,
-                    Value::Double(0.5),
-                    Value::Int(1),
+                    )])),
+                    Ok(Value::Boolean(true)),
+                    Ok(Value::Int(1)),
+                    Ok(Value::Okay),
+                    Ok(Value::Double(0.5)),
+                    Ok(Value::Int(1)),
                 ]),)
             );
         });
@@ -3080,7 +3080,7 @@ pub(crate) mod shared_client_tests {
                 .unwrap();
 
             let initial_hello: std::collections::HashMap<String, Value> =
-                ferriskey::from_owned_valkey_value(initial_hello_response).unwrap();
+                ferriskey::from_owned_value(initial_hello_response).unwrap();
             assert_eq!(initial_hello.get("proto").unwrap(), &Value::Int(2));
 
             // Use HELLO command to change to RESP3
@@ -3093,7 +3093,7 @@ pub(crate) mod shared_client_tests {
                 .unwrap();
 
             let hello_3_result: std::collections::HashMap<String, Value> =
-                ferriskey::from_owned_valkey_value(hello_3_response).unwrap();
+                ferriskey::from_owned_value(hello_3_response).unwrap();
             assert_eq!(hello_3_result.get("proto").unwrap(), &Value::Int(3));
 
             // Kill the connection to simulate a network drop
@@ -3105,7 +3105,7 @@ pub(crate) mod shared_client_tests {
                     let mut client = test_basics.client.clone();
                     let mut cmd = hello_cmd.clone();
                     let response = client.send_command(&mut cmd, None).await.ok()?;
-                    ferriskey::from_owned_valkey_value::<std::collections::HashMap<String, Value>>(
+                    ferriskey::from_owned_value::<std::collections::HashMap<String, Value>>(
                         response,
                     )
                     .ok()

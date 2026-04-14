@@ -3,7 +3,7 @@
 use crate::cluster::slotmap::SlotMap;
 use crate::cmd::Cmd;
 use crate::connection::info::{PubSubChannelOrPattern, PubSubSubscriptionKind};
-use crate::value::{ValkeyResult, Value};
+use crate::value::{Result, Value};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 
@@ -71,7 +71,7 @@ pub trait PubSubSynchronizer: Send + Sync {
     /// Try to intercept and handle a pubsub command.
     /// Returns Some(result) if the command was handled, None if it should go through normal path.
     /// This is async because it may involve blocking waits and message delivery.
-    async fn intercept_pubsub_command(&self, _cmd: &Cmd) -> Option<ValkeyResult<Value>> {
+    async fn intercept_pubsub_command(&self, _cmd: &Cmd) -> Option<Result<Value>> {
         None
     }
 
@@ -95,7 +95,7 @@ pub trait PubSubSynchronizer: Send + Sync {
         _expected_channels: Option<HashSet<Vec<u8>>>,
         _expected_patterns: Option<HashSet<Vec<u8>>>,
         _expected_sharded: Option<HashSet<Vec<u8>>>,
-    ) -> ValkeyResult<()> {
+    ) -> Result<()> {
         Ok(()) // Default: no-op
     }
 

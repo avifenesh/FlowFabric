@@ -21,7 +21,8 @@ use crate::pipeline::PipelineRetryStrategy;
 use crate::pubsub::push_manager::PushInfo;
 use crate::retry_strategies::RetryStrategy;
 use crate::scripts_container::get_script;
-use crate::value::{ErrorKind, FromValkeyValue, ValkeyError, ValkeyFuture, ValkeyResult, Value};
+use crate::value::{ErrorKind, Error, FromValue, Result, Value};
+use futures_util::future::BoxFuture;
 use futures::FutureExt;
 use logger_core::{log_debug, log_error, log_info, log_warn};
 pub use standalone_client::StandaloneClient;
@@ -202,8 +203,8 @@ pub struct Client {
 
 async fn run_with_timeout<T>(
     timeout: Option<Duration>,
-    future: impl futures::Future<Output = ValkeyResult<T>> + Send,
-) -> crate::value::ValkeyResult<T> {
+    future: impl futures::Future<Output = Result<T>> + Send,
+) -> crate::value::Result<T> {
     match timeout {
         Some(duration) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
@@ -244,9 +245,9 @@ enum RequestTimeoutOption {
 
 /// Helper function for parsing a timeout argument to f64.
 /// Attempts to parse the argument found at `timeout_idx` from bytes into an f64.
-fn parse_timeout_to_f64(cmd: &Cmd, timeout_idx: usize) -> ValkeyResult<f64> {
+fn parse_timeout_to_f64(cmd: &Cmd, timeout_idx: usize) -> Result<f64> {
     let create_err = |err_msg| {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::ResponseError,
             err_msg,
             format!(
@@ -273,11 +274,11 @@ fn get_timeout_from_cmd_arg(
     cmd: &Cmd,
     timeout_idx: usize,
     time_unit: TimeUnit,
-) -> ValkeyResult<RequestTimeoutOption> {
+) -> Result<RequestTimeoutOption> {
     let timeout_secs = parse_timeout_to_f64(cmd, timeout_idx)? / ((time_unit as i32) as f64);
     if timeout_secs < 0.0 {
         // Timeout cannot be negative, return the client's configured request timeout
-        Err(ValkeyError::from((
+        Err(Error::from((
             ErrorKind::ResponseError,
             "Timeout cannot be negative",
             format!("Received timeout = {timeout_secs:?}."),
@@ -288,7 +289,7 @@ fn get_timeout_from_cmd_arg(
     } else {
         // We limit the maximum timeout due to restrictions imposed by Valkey and the Duration crate
         if timeout_secs > u32::MAX as f64 {
-            Err(ValkeyError::from((
+            Err(Error::from((
                 ErrorKind::ResponseError,
                 "Timeout is out of range, max timeout is 2^32 - 1 (u32::MAX)",
                 format!("Received timeout = {timeout_secs:?}."),
@@ -304,7 +305,7 @@ fn get_timeout_from_cmd_arg(
     }
 }
 
-fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> ValkeyResult<Option<Duration>> {
+fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Duration>> {
     let command = cmd.command().unwrap_or_default();
     let timeout = match command.as_slice() {
         b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BZPOPMAX" | b"BZPOPMIN" | b"BRPOPLPUSH" => {
@@ -347,12 +348,12 @@ impl Client {
     /// Extracts the database ID from a SELECT command.
     /// Parses the first argument of the SELECT command as an i64 database ID.
     /// Returns appropriate errors for invalid formats or missing arguments.
-    fn extract_database_id_from_select(&self, cmd: &Cmd) -> ValkeyResult<i64> {
+    fn extract_database_id_from_select(&self, cmd: &Cmd) -> Result<i64> {
         // For both crate::cmd::cmd("SELECT").arg("5") and crate::cmd::Cmd::new().arg("SELECT").arg("5")
         // the database ID is at arg_idx(1)
         cmd.arg_idx(1)
             .ok_or_else(|| {
-                ValkeyError::from((
+                Error::from((
                     ErrorKind::ResponseError,
                     "SELECT command missing database argument",
                 ))
@@ -360,11 +361,11 @@ impl Client {
             .and_then(|db_bytes| {
                 std::str::from_utf8(db_bytes)
                     .map_err(|_| {
-                        ValkeyError::from((ErrorKind::ResponseError, "Invalid database ID format"))
+                        Error::from((ErrorKind::ResponseError, "Invalid database ID format"))
                     })
                     .and_then(|db_str| {
                         db_str.parse::<i64>().map_err(|_| {
-                            ValkeyError::from((
+                            Error::from((
                                 ErrorKind::ResponseError,
                                 "Database ID must be a valid integer",
                             ))
@@ -380,7 +381,7 @@ impl Client {
     /// into each request handler. If concurrent tasks issue SELECT, a cloned
     /// Client may report a stale `db_namespace` in OTel spans. This is an
     /// acceptable trade-off since concurrent SELECTs are rare in practice.
-    async fn handle_select_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
+    async fn handle_select_command(&mut self, cmd: &Cmd) -> Result<()> {
         let database_id = self.extract_database_id_from_select(cmd)?;
 
         self.update_stored_database_id(database_id).await?;
@@ -392,7 +393,7 @@ impl Client {
     /// Updates the stored database ID for different client types.
     /// Handles standalone, cluster, and lazy clients appropriately.
     /// Ensures thread-safe updates using existing synchronization mechanisms.
-    async fn update_stored_database_id(&self, database_id: i64) -> ValkeyResult<()> {
+    async fn update_stored_database_id(&self, database_id: i64) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -404,7 +405,7 @@ impl Client {
                 client.update_connection_database(database_id).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -434,7 +435,7 @@ impl Client {
 
     /// Handles CLIENT SETNAME command processing after successful execution.
     /// Updates connection name state for standalone, cluster, and lazy clients.
-    async fn handle_client_set_name_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
+    async fn handle_client_set_name_command(&mut self, cmd: &Cmd) -> Result<()> {
         // Extract client name from the CLIENT SETNAME command
         let client_name = self.extract_client_name_from_client_set_name(cmd);
 
@@ -446,7 +447,7 @@ impl Client {
     /// Updates the stored client name for different client types.
     /// Handles standalone, cluster, and lazy clients appropriately.
     /// Ensures thread-safe updates using existing synchronization mechanisms.
-    async fn update_stored_client_name(&self, client_name: Option<String>) -> ValkeyResult<()> {
+    async fn update_stored_client_name(&self, client_name: Option<String>) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -458,7 +459,7 @@ impl Client {
                 client.update_connection_client_name(client_name).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -500,7 +501,7 @@ impl Client {
 
     /// Handles AUTH command processing after successful execution.
     /// Updates username and password state for standalone, cluster, and lazy clients.
-    async fn handle_auth_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
+    async fn handle_auth_command(&mut self, cmd: &Cmd) -> Result<()> {
         let (username, password) = self.extract_auth_info(cmd);
 
         // Update username if provided
@@ -517,7 +518,7 @@ impl Client {
     }
 
     /// Updates the stored username for different client types.
-    async fn update_stored_username(&self, username: Option<String>) -> ValkeyResult<()> {
+    async fn update_stored_username(&self, username: Option<String>) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -528,7 +529,7 @@ impl Client {
                 client.update_connection_username(username).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -536,7 +537,7 @@ impl Client {
     }
 
     /// Updates the stored password for different client types.
-    async fn update_stored_password(&self, password: Option<String>) -> ValkeyResult<()> {
+    async fn update_stored_password(&self, password: Option<String>) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -547,7 +548,7 @@ impl Client {
                 client.update_connection_password(password).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -626,7 +627,7 @@ impl Client {
 
     /// Handles HELLO command processing after successful execution.
     /// Updates protocol version and optionally auth info and client name.
-    async fn handle_hello_command(&mut self, cmd: &Cmd) -> ValkeyResult<()> {
+    async fn handle_hello_command(&mut self, cmd: &Cmd) -> Result<()> {
         let (protocol, username, password, client_name) = self.extract_hello_info(cmd);
 
         // Update protocol version if provided
@@ -656,7 +657,7 @@ impl Client {
     async fn update_stored_protocol(
         &self,
         protocol: crate::value::ProtocolVersion,
-    ) -> ValkeyResult<()> {
+    ) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
             ClientWrapper::Standalone(client) => {
@@ -667,14 +668,14 @@ impl Client {
                 client.update_connection_protocol(protocol).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
         }
     }
 
-    async fn get_or_initialize_client(&self) -> ValkeyResult<ClientWrapper> {
+    async fn get_or_initialize_client(&self) -> Result<ClientWrapper> {
         {
             let guard = self.internal_client.read().await;
             if !matches!(&*guard, ClientWrapper::Lazy(_)) {
@@ -723,7 +724,7 @@ impl Client {
                 )
                 .await
                 .map_err(|e| {
-                    ValkeyError::from((
+                    Error::from((
                         ErrorKind::IoError,
                         "Standalone connect failed",
                         format!("{e:?}"),
@@ -764,7 +765,7 @@ impl Client {
         routing: Option<RoutingInfo>,
         client: ClientWrapper,
         compression_manager: Option<Arc<CompressionManager>>,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let raw_value = match client {
             ClientWrapper::Standalone(mut client) => client.send_command(&cmd).await,
             ClientWrapper::Cluster { mut client } => {
@@ -792,7 +793,7 @@ impl Client {
                 };
                 client.route_command(&cmd, final_routing).await
             }
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -845,7 +846,7 @@ impl Client {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::value::ValkeyFuture<'a, Value> {
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
             // Check for IAM token changes and update the password without authentication if needed (pull model)
             if let Some(iam_manager) = &self.iam_token_manager
@@ -853,7 +854,7 @@ impl Client {
             {
                 let current_token = iam_manager.get_token().await;
                 if current_token.is_empty() {
-                    return Err(ValkeyError::from((
+                    return Err(Error::from((
                         ErrorKind::ClientError,
                         "IAM token not available",
                     )));
@@ -882,7 +883,7 @@ impl Client {
             let tracker = match self.reserve_inflight_request() {
                 Some(t) => t,
                 None => {
-                    return Err(ValkeyError::from((
+                    return Err(Error::from((
                         ErrorKind::ClientError,
                         "Reached maximum inflight requests",
                     )));
@@ -970,7 +971,7 @@ impl Client {
         &'a mut self,
         scan_state_cursor: &'a ScanStateRC,
         cluster_scan_args: ClusterScanArgs,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         // Clone arguments before the async block (ScanStateRC is Arc, clone is cheap)
         let scan_state_cursor_clone = scan_state_cursor.clone();
         let cluster_scan_args_clone = cluster_scan_args.clone(); // Assuming ClusterScanArgs is Clone
@@ -991,10 +992,10 @@ impl Client {
                 } else {
                     Value::BulkString(insert_cluster_scan_cursor(cursor).into())
                 };
-                Ok(Value::Array(vec![cluster_cursor_id, Value::Array(keys)]))
+                Ok(Value::Array(vec![Ok(cluster_cursor_id), Ok(Value::Array(keys.into_iter().map(Ok).collect()))]))
             }
             // Lazy case is now handled by the initial check
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -1003,11 +1004,11 @@ impl Client {
 
     fn get_transaction_values(
         pipeline: &crate::pipeline::Pipeline,
-        mut values: Vec<Value>,
+        mut values: Vec<Result<Value>>,
         command_count: usize,
         offset: usize,
         raise_on_error: bool,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         if values.len() != 1 {
             return Err((
                 ErrorKind::ResponseError,
@@ -1017,13 +1018,14 @@ impl Client {
         }
         let value = values.pop();
         let values = match value {
-            Some(Value::Array(values)) => values,
-            Some(Value::Nil) => {
+            Some(Ok(Value::Array(values))) => values,
+            Some(Ok(Value::Nil)) => {
                 return Ok(Value::Nil);
             }
-            Some(value) => {
+            Some(Err(e)) => return Err(e),
+            Some(Ok(value)) => {
                 if offset == 2 {
-                    vec![value]
+                    vec![Ok(value)]
                 } else {
                     return Err((
                         ErrorKind::ResponseError,
@@ -1051,33 +1053,34 @@ impl Client {
 
     fn convert_pipeline_values_to_expected_types(
         pipeline: &crate::pipeline::Pipeline,
-        values: Vec<Value>,
+        values: Vec<Result<Value>>,
         command_count: usize,
         raise_on_error: bool,
-    ) -> ValkeyResult<Value> {
-        let values = values
-            .into_iter()
-            .map(|value| {
-                if raise_on_error {
-                    value.extract_error()
-                } else {
-                    Ok(value)
+    ) -> Result<Value> {
+        let mut results: Vec<Result<Value>> = Vec::with_capacity(command_count);
+        for (value, expected_type) in values.into_iter().zip(
+            pipeline
+                .cmd_iter()
+                .map(|cmd| expected_type_for_cmd(cmd.as_ref())),
+        ) {
+            match value {
+                Ok(val) => {
+                    let val = if raise_on_error {
+                        val.extract_error()?
+                    } else {
+                        val
+                    };
+                    results.push(Ok(convert_to_expected_type(val, expected_type)?));
                 }
-            })
-            .zip(
-                pipeline
-                    .cmd_iter()
-                    .map(|cmd| expected_type_for_cmd(cmd.as_ref())),
-            )
-            .map(|(value, expected_type)| convert_to_expected_type(value?, expected_type))
-            .try_fold(
-                Vec::with_capacity(command_count),
-                |mut acc, result| -> ValkeyResult<_> {
-                    acc.push(result?);
-                    Ok(acc)
-                },
-            )?;
-        Ok(Value::Array(values))
+                Err(e) => {
+                    if raise_on_error {
+                        return Err(e);
+                    }
+                    results.push(Err(e));
+                }
+            }
+        }
+        Ok(Value::Array(results))
     }
 
     /// Send a pipeline to the server.
@@ -1089,7 +1092,7 @@ impl Client {
         routing: Option<RoutingInfo>,
         transaction_timeout: Option<u32>,
         raise_on_error: bool,
-    ) -> crate::value::ValkeyFuture<'a, Value> {
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
             let client = self.get_or_initialize_client().await?;
 
@@ -1136,7 +1139,7 @@ impl Client {
                                 raise_on_error,
                             )
                         }
-                        ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                        ClientWrapper::Lazy(_) => Err(Error::from((
                             ErrorKind::ClientError,
                             "Client not yet initialized",
                         ))),
@@ -1166,13 +1169,13 @@ impl Client {
         raise_on_error: bool,
         pipeline_timeout: Option<u32>,
         pipeline_retry_strategy: PipelineRetryStrategy,
-    ) -> crate::value::ValkeyFuture<'a, Value> {
+    ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
             let client = self.get_or_initialize_client().await?;
 
             let command_count = pipeline.cmd_iter().count();
             if pipeline.is_empty() {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::ResponseError,
                     "Received empty pipeline",
                 )));
@@ -1210,7 +1213,7 @@ impl Client {
                                     .await
                             }
                         },
-                        ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                        ClientWrapper::Lazy(_) => Err(Error::from((
                             ErrorKind::ClientError,
                             "Client not yet initialized",
                         ))),
@@ -1234,7 +1237,7 @@ impl Client {
         keys: &[&[u8]],
         args: &[&[u8]],
         routing: Option<RoutingInfo>,
-    ) -> crate::value::ValkeyResult<Value> {
+    ) -> crate::value::Result<Value> {
         let _ = self.get_or_initialize_client().await?;
 
         let mut eval = eval_cmd(hash, keys, args);
@@ -1276,7 +1279,7 @@ impl Client {
         &mut self,
         password: Option<String>,
         immediate_auth: bool,
-    ) -> ValkeyResult<Value> {
+    ) -> Result<Value> {
         let timeout = self.request_timeout;
         // The password update operation is wrapped in a timeout to prevent it from blocking indefinitely.
         // If the operation times out, an error is returned.
@@ -1291,7 +1294,7 @@ impl Client {
                 ClientWrapper::Cluster { ref mut client } => {
                     client.update_connection_password(password.clone()).await
                 }
-                ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ClientWrapper::Lazy(_) => Err(Error::from((
                     ErrorKind::ClientError,
                     "Client not yet initialized",
                 ))),
@@ -1306,7 +1309,7 @@ impl Client {
                     result
                 }
             }
-            Err(_elapsed) => Err(ValkeyError::from((
+            Err(_elapsed) => Err(Error::from((
                 ErrorKind::IoError,
                 "Password update operation timed out, please check the connection",
             ))),
@@ -1314,11 +1317,11 @@ impl Client {
     }
 
     /// Send AUTH command using IAM token (preferred) or the provided password
-    async fn send_immediate_auth(&mut self, password: Option<String>) -> ValkeyResult<Value> {
+    async fn send_immediate_auth(&mut self, password: Option<String>) -> Result<Value> {
         // Determine the password to use for authentication
         let pass = if let Some(ref password) = password {
             if password.is_empty() {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::UserOperationError,
                     "Empty password provided for authentication",
                 )));
@@ -1326,7 +1329,7 @@ impl Client {
             log_debug("send_immediate_auth", "Using password for authentication");
             password.to_string()
         } else {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::UserOperationError,
                 "No password provided for authentication",
             )));
@@ -1348,26 +1351,26 @@ impl Client {
     }
 
     /// Returns the username if one was configured during client creation. Otherwise, returns None.
-    pub async fn get_username(&mut self) -> ValkeyResult<Option<String>> {
+    pub async fn get_username(&mut self) -> Result<Option<String>> {
         let client = self.get_or_initialize_client().await?;
 
         match client {
             ClientWrapper::Cluster { mut client } => match client.get_username().await {
                 Ok(Value::SimpleString(username)) => Ok(Some(username)),
                 Ok(Value::Nil) => Ok(None),
-                Ok(other) => Err(ValkeyError::from((
+                Ok(other) => Err(Error::from((
                     ErrorKind::ClientError,
                     "Unexpected type",
                     format!("Expected SimpleString or Nil, got: {other:?}"),
                 ))),
-                Err(e) => Err(ValkeyError::from((
+                Err(e) => Err(Error::from((
                     ErrorKind::ResponseError,
                     "Error getting username",
                     format!("Received error - {e:?}."),
                 ))),
             },
             ClientWrapper::Standalone(client) => Ok(client.get_username()),
-            ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+            ClientWrapper::Lazy(_) => Err(Error::from((
                 ErrorKind::ClientError,
                 "Client not yet initialized",
             ))),
@@ -1416,12 +1419,12 @@ impl Client {
     ///
     /// # Returns
     /// - `Ok(())` if the token was successfully refreshed and authentication succeeded
-    /// - `Err(ValkeyError)` if no IAM token manager is configured, token generation fails,
+    /// - `Err(Error)` if no IAM token manager is configured, token generation fails,
     ///   or authentication with the new token fails.
-    pub async fn refresh_iam_token(&mut self) -> ValkeyResult<()> {
+    pub async fn refresh_iam_token(&mut self) -> Result<()> {
         // Check if IAM token manager is available
         let iam_manager = self.iam_token_manager.as_ref().ok_or_else(|| {
-            ValkeyError::from((
+            Error::from((
                 ErrorKind::ClientError,
                 "No IAM token manager configured - IAM token refresh requires IAM authentication to be enabled during client creation",
             ))
@@ -1429,7 +1432,7 @@ impl Client {
 
         // Refresh the token using the IAM token manager
         iam_manager.refresh_token().await.map_err(|e| {
-            ValkeyError::from((
+            Error::from((
                 ErrorKind::ClientError,
                 "IAM token refresh failed",
                 e.to_string(),
@@ -1446,7 +1449,7 @@ pub trait PubSubCommandApplier: Send + Sync {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<SingleNodeRoutingInfo>,
-    ) -> Pin<Box<dyn Future<Output = ValkeyResult<Value>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>>;
 }
 
 /// Implement the trait for ClientWrapper
@@ -1455,7 +1458,7 @@ impl PubSubCommandApplier for ClientWrapper {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<SingleNodeRoutingInfo>,
-    ) -> Pin<Box<dyn Future<Output = ValkeyResult<Value>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
             match self {
                 ClientWrapper::Standalone(client) => {
@@ -1479,7 +1482,7 @@ impl PubSubCommandApplier for ClientWrapper {
                         .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
                     client.route_command(cmd, final_routing).await
                 }
-                ClientWrapper::Lazy(_) => Err(ValkeyError::from((
+                ClientWrapper::Lazy(_) => Err(Error::from((
                     ErrorKind::ClientError,
                     "Client not initialized",
                 ))),
@@ -1517,7 +1520,7 @@ async fn create_cluster_client(
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
     pubsub_synchronizer: Arc<dyn crate::pubsub::PubSubSynchronizer>,
-) -> ValkeyResult<crate::cluster::ClusterConnection> {
+) -> Result<crate::cluster::ClusterConnection> {
     let tls_mode = request.tls_mode.unwrap_or_default();
 
     let valkey_connection_info = get_valkey_connection_info(&request, iam_token_manager).await;
@@ -1526,7 +1529,7 @@ async fn create_cluster_client(
     let has_client_cert = !request.client_cert.is_empty();
     let has_client_key = !request.client_key.is_empty();
     if has_client_cert != has_client_key {
-        return Err(ValkeyError::from((
+        return Err(Error::from((
             ErrorKind::InvalidClientConfig,
             "client_cert and client_key must both be provided or both be empty",
         )));
@@ -1534,7 +1537,7 @@ async fn create_cluster_client(
 
     let (tls_params, tls_certificates) = if has_root_certs || has_client_cert || has_client_key {
         if tls_mode == TlsMode::NoTls {
-            return Err(ValkeyError::from((
+            return Err(Error::from((
                 ErrorKind::InvalidClientConfig,
                 "TLS certificates provided but TLS is disabled",
             )));
@@ -1544,7 +1547,7 @@ async fn create_cluster_client(
             let mut combined_certs = Vec::new();
             for cert in &request.root_certs {
                 if cert.is_empty() {
-                    return Err(ValkeyError::from((
+                    return Err(Error::from((
                         ErrorKind::InvalidClientConfig,
                         "Root certificate cannot be empty byte string",
                     )));
@@ -1679,26 +1682,26 @@ async fn create_cluster_client(
                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random),
             )
             .await?;
-        let info_dict: InfoDict = FromValkeyValue::from_valkey_value(&info_res)?;
+        let info_dict: InfoDict = FromValue::from_value(&info_res)?;
         match info_dict.get::<String>("valkey_version") {
             Some(version) => match (Versioning::new(version), Versioning::new("7.0")) {
                 (Some(server_ver), Some(min_ver)) => {
                     if server_ver < min_ver {
-                        return Err(ValkeyError::from((
+                        return Err(Error::from((
                             ErrorKind::InvalidClientConfig,
                             "Sharded subscriptions provided, but the engine version is < 7.0",
                         )));
                     }
                 }
                 _ => {
-                    return Err(ValkeyError::from((
+                    return Err(Error::from((
                         ErrorKind::ResponseError,
                         "Failed to parse engine version",
                     )));
                 }
             },
             _ => {
-                return Err(ValkeyError::from((
+                return Err(Error::from((
                     ErrorKind::ResponseError,
                     "Could not determine engine version from INFO result",
                 )));
@@ -1817,7 +1820,7 @@ fn sanitized_request_string(request: &ConnectionRequest) -> String {
 /// Returns None if compression is disabled or not configured
 fn create_compression_manager(
     compression_config: Option<CompressionConfig>,
-) -> Result<Option<Arc<CompressionManager>>, ValkeyError> {
+) -> std::result::Result<Option<Arc<CompressionManager>>, Error> {
     let Some(config) = compression_config else {
         return Ok(None);
     };
@@ -1832,7 +1835,7 @@ fn create_compression_manager(
     };
 
     let manager = CompressionManager::new(backend, config).map_err(|e| {
-        ValkeyError::from((
+        Error::from((
             ErrorKind::InvalidClientConfig,
             "Failed to create compression manager",
             e.to_string(),
@@ -1846,7 +1849,7 @@ impl Client {
     pub async fn new(
         request: ConnectionRequest,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    ) -> Result<Self, ValkeyError> {
+    ) -> std::result::Result<Self, Error> {
         // Add buffer to connection_timeout to allow inner connection logic to fully execute before the outer timeout triggers
         let client_creation_timeout = request.get_connection_timeout() + Duration::from_millis(500);
 
@@ -1997,7 +2000,7 @@ impl Client {
             Ok(client)
         })
         .await
-        .map_err(|_| ValkeyError::from(std::io::Error::from(std::io::ErrorKind::TimedOut)))?
+        .map_err(|_| Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut)))?
     }
 
     /// Check if compression is enabled for this client
@@ -2034,7 +2037,7 @@ pub trait ValkeyClientForTests {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> ValkeyFuture<'a, Value>;
+    ) -> BoxFuture<'a, Result<Value>>;
 }
 
 impl ValkeyClientForTests for Client {
@@ -2042,7 +2045,7 @@ impl ValkeyClientForTests for Client {
         &'a mut self,
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
-    ) -> ValkeyFuture<'a, Value> {
+    ) -> BoxFuture<'a, Result<Value>> {
         self.send_command(cmd, routing)
     }
 }
@@ -2052,7 +2055,7 @@ impl ValkeyClientForTests for StandaloneClient {
         &'a mut self,
         cmd: &'a mut Cmd,
         _routing: Option<RoutingInfo>,
-    ) -> ValkeyFuture<'a, Value> {
+    ) -> BoxFuture<'a, Result<Value>> {
         self.send_command(cmd).boxed()
     }
 }
@@ -2063,7 +2066,7 @@ impl ValkeyClientForTests for ClusterConnection {
         &'a mut self,
         cmd: &'a mut crate::cmd::Cmd,
         routing: Option<RoutingInfo>,
-    ) -> crate::value::ValkeyFuture<'a, Value> {
+    ) -> BoxFuture<'a, Result<Value>> {
         let final_routing =
             routing.unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
 

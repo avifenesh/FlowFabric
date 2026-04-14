@@ -7,7 +7,7 @@ use crate::cluster::compat::get_connection_info;
 use crate::cluster::slotmap::ReadFromReplicaStrategy;
 use crate::connection::factory::FerrisKeyConnectionOptions;
 use crate::connection::{ConnectionLike, DisconnectNotifier};
-use crate::value::{ErrorKind, ValkeyError, ValkeyResult};
+use crate::value::{ErrorKind, Error, Result};
 use std::net::{Ipv6Addr, SocketAddr};
 
 use futures::prelude::*;
@@ -33,7 +33,7 @@ pub enum RefreshConnectionType {
 fn failed_management_connection<C>(
     addr: &str,
     user_conn: ConnectionDetails<ConnectionFuture<C>>,
-    err: ValkeyError,
+    err: Error,
 ) -> ConnectAndCheckResult<C>
 where
     C: ConnectionLike + Send + Clone + Sync + Connect + 'static,
@@ -54,7 +54,7 @@ pub(crate) async fn get_or_create_conn<C>(
     params: &ClusterParams,
     conn_type: RefreshConnectionType,
     ferriskey_connection_options: FerrisKeyConnectionOptions,
-) -> ValkeyResult<AsyncClusterNode<C>>
+) -> Result<AsyncClusterNode<C>>
 where
     C: ConnectionLike + Send + Clone + Sync + Connect + 'static,
 {
@@ -154,7 +154,7 @@ where
         }
         (Err(err_1), Err(err_2)) => {
             // Neither of the connections succeeded.
-            ValkeyError::from((
+            Error::from((
                 ErrorKind::IoError,
                 "Failed to refresh both connections",
                 format!("Node: {addr:?} received errors: `{err_1:?}`, `{err_2:?}`"),
@@ -222,14 +222,14 @@ pub enum ConnectAndCheckResult<C> {
     // Returns a node that failed to create a management connection, but has a working user connection.
     ManagementConnectionFailed {
         node: AsyncClusterNode<C>,
-        err: ValkeyError,
+        err: Error,
     },
     // Request failed completely, could not return a node with any working connection.
-    Failed(ValkeyError),
+    Failed(Error),
 }
 
 impl<C> ConnectAndCheckResult<C> {
-    pub fn get_node(self) -> ValkeyResult<AsyncClusterNode<C>> {
+    pub fn get_node(self) -> Result<AsyncClusterNode<C>> {
         match self {
             ConnectAndCheckResult::Success(node) => Ok(node),
             ConnectAndCheckResult::ManagementConnectionFailed { node, .. } => Ok(node),
@@ -238,8 +238,8 @@ impl<C> ConnectAndCheckResult<C> {
     }
 }
 
-impl<C> From<ValkeyError> for ConnectAndCheckResult<C> {
-    fn from(value: ValkeyError) -> Self {
+impl<C> From<Error> for ConnectAndCheckResult<C> {
+    fn from(value: Error) -> Self {
         ConnectAndCheckResult::Failed(value)
     }
 }
@@ -250,8 +250,8 @@ impl<C> From<AsyncClusterNode<C>> for ConnectAndCheckResult<C> {
     }
 }
 
-impl<C> From<ValkeyResult<AsyncClusterNode<C>>> for ConnectAndCheckResult<C> {
-    fn from(value: ValkeyResult<AsyncClusterNode<C>>) -> Self {
+impl<C> From<Result<AsyncClusterNode<C>>> for ConnectAndCheckResult<C> {
+    fn from(value: Result<AsyncClusterNode<C>>) -> Self {
         match value {
             Ok(value) => value.into(),
             Err(err) => err.into(),
@@ -328,7 +328,7 @@ async fn create_and_setup_user_connection<C>(
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
     ferriskey_connection_options: FerrisKeyConnectionOptions,
-) -> ValkeyResult<ConnectionDetails<C>>
+) -> Result<ConnectionDetails<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -347,7 +347,7 @@ where
 async fn setup_user_connection<C>(
     conn_details: &mut ConnectionDetails<C>,
     params: ClusterParams,
-) -> ValkeyResult<()>
+) -> Result<()>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -368,7 +368,7 @@ where
 #[doc(hidden)]
 pub const MANAGEMENT_CONN_NAME: &str = "ferriskey_management_connection";
 
-async fn setup_management_connection<C>(conn: &mut C) -> ValkeyResult<()>
+async fn setup_management_connection<C>(conn: &mut C) -> Result<()>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -385,7 +385,7 @@ async fn create_connection<C>(
     socket_addr: Option<SocketAddr>,
     is_management: bool,
     mut ferriskey_connection_options: FerrisKeyConnectionOptions,
-) -> ValkeyResult<ConnectionDetails<C>>
+) -> Result<ConnectionDetails<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
 {
@@ -472,7 +472,7 @@ where
     }
 }
 
-async fn check_connection<C>(conn: &mut C, timeout: std::time::Duration) -> ValkeyResult<()>
+async fn check_connection<C>(conn: &mut C, timeout: std::time::Duration) -> Result<()>
 where
     C: ConnectionLike + Send + 'static,
 {
