@@ -801,7 +801,7 @@ In v1:
 - dynamic child spawning when enabled
 - flow summary and topology inspection
 
-**Known v1 limitation — large fan-out burst:** When a parent execution with N outgoing edges completes, the engine calls `resolve_dependency.lua` N times (once per downstream child, potentially across many `{p:N}` partitions). If all N children have this as their only dependency, all become eligible simultaneously. For N=10,000: ~10,000 Lua calls across ~256 partitions ≈ 40 per partition ≈ 1-2ms per partition. The burst is acceptable for v1. Natural backpressure exists: the scheduler's weighted round-robin fairness rate-limits claim-grant issuance, so the claim flood is paced. Future mitigation: batch by partition (group edges by downstream `{p:N}` and resolve multiple edges per Lua call) and stagger resolution in batches of 100-500 with small yields.
+**Known v1 limitation — large fan-out burst:** When a parent execution with N outgoing edges completes, `ff-engine::dispatch` calls `FCALL ff_resolve_dependency` N times (once per downstream child, potentially across many `{p:N}` partitions). If all N children have this as their only dependency, all become eligible simultaneously. For N=10,000: ~10,000 Lua calls across ~256 partitions ≈ 40 per partition ≈ 1-2ms per partition. The burst is acceptable for v1. Natural backpressure exists: the scheduler's weighted round-robin fairness rate-limits claim-grant issuance, so the claim flood is paced. Future mitigation: batch by partition (group edges by downstream `{p:N}` and resolve multiple edges per Lua call) and stagger resolution in batches of 100-500 with small yields.
 
 Designed for later but not required in v1:
 

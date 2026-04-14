@@ -1799,17 +1799,38 @@ Execution operations map to the crate architecture as follows:
 
 | Operation | Crate | Notes |
 |---|---|---|
-| `ff_create_execution` | `ff-script` (wrapper), called by `ff-server` (API layer) | Single-partition FCALL. |
-| `ff_claim_execution`, `ff_claim_resumed_execution` | `ff-script` (wrapper), called by `ff-sdk` after `ff-scheduler` issues grant | Single-partition FCALL. Scheduler owns the claim cycle (§3.1). |
-| `ff_complete_execution`, `ff_fail_execution` | `ff-script` (wrapper), called by `ff-sdk` directly | Single-partition FCALL. No cross-partition orchestration needed. |
-| `ff_renew_lease` | `ff-script` (wrapper), called by `ff-sdk` (independent renewal task) | Single-partition FCALL. |
-| `ff_suspend_execution`, `ff_create_pending_waitpoint` | `ff-engine::dispatch` (`suspend_and_wait` orchestrator), called by `ff-sdk` | Multi-step: create pending wp → call external → suspend. |
+| **Submission** | | |
+| `ff_create_execution` | `ff-script`, called by `ff-server` (API) | Single-partition FCALL. |
+| `ff_create_delayed_execution` | `ff-script`, called by `ff-server` (API) | Same script as create, different initial state. |
+| `ff_create_child_execution` | `ff-engine::dispatch`, called by `ff-server` | Two-phase: `{p:N}` create + `{fp:N}` flow membership (§3.8). |
+| **Claim / Ownership** | | |
+| `ff_claim_execution`, `ff_claim_resumed_execution` | `ff-script`, called by `ff-sdk` after `ff-scheduler` issues grant | Single-partition FCALL. Scheduler owns claim cycle (§3.1). |
+| `ff_renew_lease` | `ff-script`, called by `ff-sdk` (background renewal task) | Single-partition FCALL. |
+| `ff_revoke_lease` | `ff-script`, called by `ff-server` (operator API) | Single-partition FCALL. |
+| `ff_reclaim_execution` | `ff-script`, called by `ff-sdk` after `ff-scheduler` issues reclaim grant | Single-partition FCALL. Discovered via lease expiry scanner. |
+| **Runtime Mutation** | | |
+| `ff_complete_execution` | `ff-script`, called by `ff-sdk` directly | Single-partition FCALL. Post-FCALL: ff-engine handles quota DECR on `{q:K}` + dependency resolution on `{fp:N}`→`{p:N}`. |
+| `ff_fail_execution` | `ff-script`, called by `ff-sdk` directly | Single-partition FCALL. Post-FCALL: ff-engine handles quota DECR. |
+| `ff_cancel_execution`, `ff_expire_execution` | `ff-engine::dispatch`, called by `ff-server` (operator API) or `ff-engine::scanner` | Multi-source-state: may need defensive ZREM from all scheduling sets. |
+| `ff_delay_execution` | `ff-script`, called by `ff-sdk` directly | Single-partition FCALL. |
+| `ff_move_to_waiting_children` | `ff-script`, called by `ff-sdk` directly | Single-partition FCALL. |
+| `ff_suspend_execution`, `ff_create_pending_waitpoint` | `ff-engine::dispatch` (`suspend_and_wait`), called by `ff-sdk` | Multi-step: create pending wp → call external → suspend. |
+| `ff_resume_execution` | `ff-engine::dispatch` | Triggered by `ff_deliver_signal` (signal satisfaction) or operator API. Conceptual — the resume is inline in deliver_signal's Lua. Standalone resume (operator) calls the Lua directly. |
+| `ff_deliver_signal` | `ff-engine::dispatch`, called by `ff-server` (signal ingress API) | Decodes waitpoint_key → partition, FCALL. |
+| **Retry / Replay** | | |
+| `ff_replay_execution` | `ff-engine::dispatch`, called by `ff-server` (operator API) | May trigger dep edge re-resolution for skipped flow members. |
+| `ff_change_priority` | `ff-script`, called by `ff-server` (operator API) | Single-partition FCALL. |
+| **Output / Accounting** | | |
+| `ff_update_progress` | `ff-script`, called by `ff-sdk` directly | Single-partition FCALL (Class B). |
+| `ff_append_frame` | `ff-script`, called by `ff-sdk` directly | Single-partition FCALL (Class B). |
 | `report_usage` | `ff-engine::dispatch`, called by `ff-sdk` | Cross-partition: `{p:N}` HINCRBY → `{b:M}` check → conditional fail. |
-| `ff_append_frame` | `ff-script` (wrapper), called by `ff-sdk` directly | Single-partition FCALL (Class B). |
-| `ff_cancel_execution`, `ff_expire_execution` | `ff-engine::dispatch`, called by `ff-server` (operator API) or `ff-engine::scanner` | May be single or multi-partition depending on source state. |
-| `ff_deliver_signal` | `ff-engine::dispatch`, called by `ff-server` (signal ingress API) | Signal routing + FCALL. External API decodes waitpoint_key → partition. |
-| Dependency resolution | `ff-engine::dispatch` (post-complete) | Cross-partition: read `{fp:N}` edges → resolve on each child's `{p:N}`. |
+| **Inspection** | | |
+| `get_execution`, `get_execution_state`, `list_executions`, etc. | `ff-server` (API) → direct Valkey reads via ferriskey | Class C — no FCALL, direct HMGET/ZRANGE/XRANGE. |
+| **Background** | | |
+| Dependency resolution | `ff-engine::dispatch` (post-complete) | Cross-partition: `{fp:N}` edges → resolve on each child's `{p:N}`. |
 | Scanners (lease expiry, promoter, timeout, etc.) | `ff-engine::scanner` (tokio tasks in `ff-server`) | Pipelined partition scanning. |
+| `ff_promote_blocked_to_eligible` | `ff-engine::dispatch` (after flow setup for zero-dep roots) | Single-partition FCALL. |
+| `ff_close_waitpoint` | `ff-sdk` (worker decides not to suspend after creating pending wp) | Single-partition FCALL. |
 
 ---
 

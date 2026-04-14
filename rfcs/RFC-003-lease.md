@@ -912,7 +912,7 @@ Members:
 - member = `execution_id`
 - score = `lease_expires_at`
 
-Background scanner pattern:
+Scanner pattern:
 
 1. for each partition `p`
 2. `ZRANGEBYSCORE ff:idx:{p}:lease_expiry -inf now LIMIT 0 batch_size`
@@ -969,7 +969,7 @@ Only unresolved questions remain here. Locked decisions from the pre-RFC are not
 1. Should lease-duration policy resolve primarily from execution policy, lane defaults, or a merged policy with hard caps?
 2. Should `lease_revoked` render publicly as a distinct operator-facing state, or remain an ownership-state nuance under the broader execution public state?
 
-**Resolved:** Stream-frame appends require full lease validation (lease_id + lease_epoch + expiry check) in v1. See RFC-006 `append_frame.lua` which validates all three fields before every XADD.
+**Resolved:** Stream-frame appends require full lease validation (lease_id + lease_epoch + expiry check) in v1. See RFC-006 `ff_append_frame` which validates all three fields before every XADD.
 
 ## References
 

@@ -208,7 +208,7 @@ These reason codes map to execution `blocking_reason` values via `map_reason_to_
 | `step_boundary` | `waiting_for_signal` |
 | `manual_pause` | `paused_by_operator` |
 
-This mapping is implemented as a lookup table in the `suspend_execution.lua` script.
+This mapping is implemented as a lookup table in the `ff_suspend_execution` function.
 
 ### Resume Condition Model
 
@@ -380,9 +380,9 @@ Required continuation support:
 
 Recommended shape:
 
-- `ff-engine` stores a pointer or reference in the suspension record
+- the engine stores a pointer or reference in the suspension record (via the `ff_suspend_execution` Valkey Function)
 - the worker runtime (`ff-sdk`) owns the language-specific continuation material behind that pointer
-- this split is intentional: `ff-engine` owns suspension correctness and durability boundaries, while `ff-sdk` owns language/runtime-specific continuation data
+- this split is intentional: the engine owns suspension correctness and durability boundaries, while `ff-sdk` owns language/runtime-specific continuation data
 - resume hands the worker (`ff-sdk`):
   - execution identity
   - attempt index
@@ -1029,7 +1029,7 @@ Scanner pattern:
 - **RFC-002 Attempt**: the active attempt must leave running state on suspend; resume continues with durable continuation context and no active lease while suspended.
 - **RFC-003 Lease**: entering suspension atomically releases the lease and clears current ownership.
 - **RFC-005 Signal**: signal acceptance and waitpoint matching are defined there; this RFC defines the waiting-side storage and satisfaction semantics.
-- **Crate mapping**: `ff-sdk` calls `FCALL ff_suspend_execution` and `FCALL ff_create_pending_waitpoint`. `ff-engine::dispatch` handles cross-partition signal delivery routing. `ff-engine::scanner::suspension_timeout` and `ff-engine::scanner::pending_waitpoint_expiry` enforce time-based policies.
+- **Crate mapping**: `ff-sdk` calls `FCALL ff_suspend_execution` and `FCALL ff_create_pending_waitpoint`. `ff-server` API decodes `waitpoint_key` via `ff-core`, routes `FCALL ff_deliver_signal` to the correct `{p:N}` partition via `ff-script` (signal delivery is single-partition — no `ff-engine::dispatch` involvement). `ff-engine::scanner::suspension_timeout` and `ff-engine::scanner::pending_waitpoint_expiry` enforce time-based policies.
 
 ## V1 Scope
 

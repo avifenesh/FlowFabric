@@ -307,28 +307,28 @@ Worker                Scheduler                {q:K}              {b:M}         
 - For the selected candidate: read `budget_ids` from the execution's core hash (cached from prior partition scan or read inline). For each attached budget: check the **per-cycle budget cache** first. If not cached, read `ff:budget:{b:M}:<budget_id>:usage` and `:limits`, cache the result keyed by `budget_id`.
 - Advisory read — no mutation. Usage is not pre-charged.
 - If any attached budget's hard limit is already breached:
-  - Run `block_execution_for_admission.lua` on the candidate's `{p:N}` partition. This atomically sets `eligibility_state = blocked_by_budget`, `blocking_reason = waiting_for_budget`, ZREMs from eligible, ZADDs to `blocked:budget`.
+  - Run `ff_block_execution_for_admission` on the candidate's `{p:N}` partition. This atomically sets `eligibility_state = blocked_by_budget`, `blocking_reason = waiting_for_budget`, ZREMs from eligible, ZADDs to `blocked:budget`.
   - **Go back to step 2** with the next candidate. If no more candidates: return empty response to worker.
 - If all budgets have headroom: proceed.
 
 **Budget cache per scheduling cycle:** The scheduler caches budget breach status per `budget_id` during a single claim cycle. The first candidate sharing budget B triggers a cross-partition read to `{b:M}`; all subsequent candidates sharing B reuse the cached result. Cache invalidated at cycle end. This prevents O(N) reads to the same `{b:M}` hash when N candidates share a breached budget. Same caching pattern as the unblock scanner (§6.15).
 
 **Step 4a — Quota admission record (`{q:K}`) — WRITE**
-- Now that a candidate is selected (execution_id known): run `check_admission_and_record.lua` on `{q:K}`.
+- Now that a candidate is selected (execution_id known): run `ff_check_admission_and_record` on `{q:K}`.
 - This is the write-path: ZADD execution_id to window, SET NX admitted guard, INCR concurrency.
 - If the rate limit or concurrency cap was hit between the step 1 read and now: returns `RATE_EXCEEDED` or `CONCURRENCY_EXCEEDED`. Go back to step 2 with next candidate.
 - If `ALREADY_ADMITTED` (idempotent retry): proceed.
 - If `ADMITTED`: proceed.
 
 **Step 4b — Issue claim-grant (`{p:N}`)**
-- Lua: `issue_claim_grant.lua` on the execution's partition.
+- `FCALL ff_issue_claim_grant` on the execution's partition.
 - Validates execution is still `runnable` + `eligible_now` + `unowned`.
 - Writes `ff:exec:{p:N}:<execution_id>:claim_grant` with TTL.
 - ZREM from eligible sorted set (prevents double-grant).
 - If execution already claimed/cancelled: return error. Stop.
 
 **Step 5 — Acquire lease (`{p:N}`)**
-- Lua: `acquire_lease.lua` on the same partition as step 4.
+- `FCALL ff_claim_execution` (or `ff_claim_resumed_execution`) on the same partition as step 4b.
 - Validates and consumes the claim grant.
 - Creates lease, creates attempt, transitions execution to `active`.
 - Updates all partition-local indexes atomically.
@@ -415,7 +415,7 @@ Worker                  {p:N} (execution)        {b:M} (budget)
 
 **For execution-scoped budgets (colocated on `{p:N}`):** Usage increment + breach check is atomic in one Lua script. Class A.
 
-**For flow/lane/tenant-scoped budgets (on `{b:M}`):** After the `{p:N}` attempt usage update, the control plane issues a separate `report_usage_and_check.lua` call to each `{b:M}` partition. If a hard breach is detected, the control plane applies the enforcement action (fail/suspend) back on `{p:N}` in a separate call.
+**For flow/lane/tenant-scoped budgets (on `{b:M}`):** After the `{p:N}` attempt usage update, the control plane issues a separate `FCALL ff_report_usage_and_check` to each `{b:M}` partition. If a hard breach is detected, the control plane applies the enforcement action (fail/suspend) back on `{p:N}` in a separate call.
 
 **Failure modes and convergence:**
 
@@ -783,6 +783,10 @@ These are `local function` definitions in the library preamble, shared by all re
 | Helper | Purpose | Used By |
 |---|---|---|
 | `unpack_policy(json)` | `cjson.decode` → flat key-value pairs for HSET | `ff_claim_execution` (attempt policy) |
+| `clear_lease_and_indexes(keys, core, reason, now_ms, maxlen)` | DEL lease_current, ZREM lease_expiry + worker_leases + active_index, clear lease fields on exec_core, XADD lease_history "released". Consolidates the ~15-line lease release block shared by 7 functions. | `ff_complete_execution`, `ff_fail_execution` (terminal), `ff_cancel_execution` (from active), `ff_expire_execution`, `ff_suspend_execution`, `ff_delay_execution`, `ff_move_to_waiting_children` |
+| `defensive_zrem_all_indexes(keys, eid, except_key)` | ZREM execution_id from all scheduling + timeout indexes (eligible, delayed, active, suspended, terminal, 5 blocked sets, lease_expiry, suspension_timeout, attempt_timeout, execution_deadline, worker_leases) except `except_key`. ~14 ZREM/SREM calls. | `ff_cancel_execution`, `ff_expire_execution`, `ff_reconcile_execution_index`, cleanup cascade |
+
+**16 library-local helpers total** (14 original + 2 added for lease release and defensive index cleanup).
 
 **Note:** Budget/quota functions (`ff_report_usage_and_check`, `ff_check_admission_and_record`) use domain-specific return formats (`HARD_BREACH`, `ADMITTED`, etc.), not `ok()`/`err()`. They are engine-internal and do not share the worker-facing return convention (§4.9).
 
@@ -848,7 +852,7 @@ The composite score `-(priority * 1_000_000_000_000) + created_at_ms` is stored 
 Terminal-transition Lua scripts do NOT call `resolve_dependency` inline — they may be on different partitions. Instead, every terminal-transition script returns a flag or event indicating the execution has a `flow_id`. The engine layer (outside Lua) then:
 1. Reads outgoing edges from `{fp:N}` flow partition.
 2. **Re-reads the parent execution's `terminal_outcome` from `{p:N}` immediately before each `resolve_dependency` call.** If the parent is no longer terminal (e.g., operator replayed it between the terminal event and this dispatch), SKIP the dispatch for that edge. This prevents stale edge resolution — a replayed parent should not satisfy downstream dependencies using its old terminal outcome.
-3. For each downstream child where the parent is still terminal, calls `resolve_dependency.lua` on the child's `{p:N}` partition with the parent's current `terminal_outcome`.
+3. For each downstream child where the parent is still terminal, calls `ff_resolve_dependency` on the child's `{p:N}` partition with the parent's current `terminal_outcome`.
 
 **This dispatch applies to ALL terminal transitions, not just completion:**
 
@@ -966,13 +970,15 @@ All Lua pseudocode calls these helpers. Implementers must provide them.
 | `map_reason_to_blocking(reason)` | RFC-004 §Suspension Reason Categories: lookup table | Trivial |
 | `unpack_policy(json)` | RFC-002 §AttemptPolicySnapshot: JSON → HSET pairs | Moderate |
 
-**State mutation** (RFC-003 `complete_or_fail` template):
+**State mutation and index cleanup:**
 
 | Helper | Source | Complexity |
 |---|---|---|
 | `apply_attempt_outcome(key, outcome, ts, result)` | RFC-002 §Lifecycle States | Moderate |
 | `apply_execution_transition(key, outcome, ts, fields)` | RFC-001 §3 transition rules | Moderate |
 | `clear_current_lease_fields(key)` | RFC-001 §9.2 ownership fields → all `""` | Moderate |
+| `clear_lease_and_indexes(keys, core, reason, now_ms, maxlen)` | RFC-003 lease release + RFC-001 index cleanup. 7 consumers. | Moderate |
+| `defensive_zrem_all_indexes(keys, eid, except_key)` | RFC-010 §9.3 step 12 pattern. 3+ consumers. | Moderate |
 
 #### (m) Forward compatibility — or-default pattern for new fields
 
@@ -3052,6 +3058,12 @@ PROCESS (loop while working):
 DONE:
   6a. complete_execution(exec_id, lease_id, epoch, att_id)  [RFC-001]
   6b. fail_execution(exec_id, lease_id, epoch, att_id, ...) [RFC-001]
+      NOTE: complete/fail are single-partition for the primary FCALL.
+      Post-FCALL obligations (quota DECR on {q:K}, dependency
+      resolution dispatch on {fp:N}→{p:N}) are cross-partition,
+      handled by ff-engine::dispatch within the same ff-sdk call.
+      The worker sees a single async call; the SDK orchestrates
+      the multi-partition follow-up transparently.
 
 SUSPEND (external waits):
   7a. create_pending_waitpoint → returns waitpoint_key      [RFC-004]
@@ -3265,7 +3277,7 @@ flowfabric/
 
 **ff-script** — Bridge between Rust types and Valkey Functions. Declarative `ff_function!` macro generates: KEYS array construction from typed args, ARGV marshaling, `FCALL` invocation via ferriskey, return parsing from `{1,"OK",...}/{0,"ERROR",...}` into typed `Result<T, ScriptError>`. One macro invocation per function (~36 total). Embeds Lua library source via `include_str!` (from build.rs concatenation output). Startup: calls `ferriskey::function_load_replace()` with version check via `FCALL ff_version`.
 
-**ff-engine** — Cross-partition orchestration and background scanners. Partition router maps entity → partition → ferriskey connection. Cross-partition dispatchers: dependency resolution fan-out (§4.8e — complete on `{p:N}` → read edges from `{fp:N}` → resolve on each child's `{p:N}`), two-phase flow membership (`{p:N}` then `{fp:N}`), usage reporting (`{p:N}` then `{b:M}`). Scanner module (`ff_engine::scanner`): common `Scanner` trait with `scan_partition()` method, pipelined partition scanning, configurable intervals, metrics emission. All 20 scanners implemented here. Used as a library by both `ff-sdk` (for cross-partition orchestrators) and `ff-server` (for scanners + dispatchers).
+**ff-engine** — Cross-partition orchestration and background scanners. Partition router maps entity → partition → ferriskey connection. Cross-partition dispatchers: dependency resolution fan-out (§4.8e — complete on `{p:N}` → read edges from `{fp:N}` → resolve on each child's `{p:N}`), two-phase flow membership (`{p:N}` then `{fp:N}`), usage reporting (`{p:N}` then `{b:M}`). Scanner module (`ff_engine::scanner`): common `Scanner` trait with `scan_partition()` method, pipelined partition scanning, configurable intervals, metrics emission. All 12 scanner types from §4 implemented here (some with partition-scoped variants). Used as a library by both `ff-sdk` (for cross-partition orchestrators) and `ff-server` (for scanners + dispatchers).
 
 **ff-scheduler** — Claim-grant cycle: quota pre-check (read-only on `{q:K}`) → select candidate (weighted round-robin with deficit, capability matching) → per-candidate budget check on `{b:M}` (deny → block → next) → `ff_issue_claim_grant` on `{p:N}`. Lane management (4 states, registry). Fairness state (deficit counters, per-cycle budget cache). Depends on `ff-script + ff-core + ferriskey` only — does NOT depend on `ff-engine`. Embedded in `ff-server` for v1; crate boundary allows standalone extraction for horizontal scaling.
 
@@ -3297,15 +3309,19 @@ No circular dependencies. Single path from domain types to transport. ff-schedul
 
 Lua source files are split by domain for maintainability (~11 files, ~3000 lines total). A `build.rs` step concatenates them with a `#!lua name=flowfabric` preamble into a single `flowfabric.lua` blob. `helpers.lua` is always first (defines library-local functions). Order of subsequent files does not matter (all use `redis.register_function`). CI validates: load into real Valkey, run full integration suite.
 
+**Cluster deployment:** `FUNCTION LOAD REPLACE` is per-shard in Valkey Cluster — not auto-replicated across shards. `ff-server` startup must iterate all shard primaries and `FUNCTION LOAD REPLACE` each one. `ferriskey` provides `cluster_function_load_all()` for this. Library size ~200KB × 48 shards ≈ 10MB total, ~1s startup time. During rolling library updates, some shards may temporarily have v(N) while others have v(N+1). Functions must be backward-compatible within a single version increment — ensured by the `or`-default pattern (§4.8m) for new fields and by never removing function names (deprecated functions return a structured error instead).
+
 ### 12.5 Testing Strategy
 
 Three-layer testing. Lua functions are the spec — never mock them.
 
-**Layer 1 — Lua integration tests** (authoritative): Per-function tests against real Valkey. Happy path + every error path. State vector completeness validation after every mutation. Cross-function scenarios (full claim→complete, suspend→signal→resume, reclaim, replay, cancel-from-each-state). Version migration tests.
+**Layer 1 — Lua integration tests** (authoritative): Per-function tests against real Valkey. Happy path + every error path. State vector completeness validation after every mutation. Cross-function scenarios (full claim→complete, suspend→signal→resume, reclaim, replay, cancel-from-each-state). Version migration tests. Includes tests for `ff_promote_blocked_to_eligible` (#35: zero-dep root member promotion) and `ff_close_waitpoint` (#36: worker cancels pending waitpoint without suspending).
 
-**Layer 2 — Engine orchestration tests** (unit + integration): Trait-based `FcallExecutor` for unit tests of orchestration logic. Integration tests with real Valkey for end-to-end orchestration. Reconciler tests: insert specific desync states, run reconciler, verify correction.
+**Layer 2 — Engine orchestration tests** (unit + integration): Trait-based `FcallExecutor` for unit tests of orchestration logic. Integration tests with real Valkey for end-to-end orchestration. **Scanner correctness tests:** For each scanner type, insert a specific desync state (e.g., execution with `eligibility_state=eligible_now` but missing from eligible ZSET; execution with expired lease but `ownership_state=leased`), run one scanner partition scan, verify the correction was made. Tests scanner idempotency (run twice = same result), discovery (finds all eligible items), and no false positives (doesn't act on healthy items). Reconciler tests: same pattern for budget, quota, dependency, and index reconcilers.
 
-**Layer 3 — SDK + scanner end-to-end**: Full worker loop (register → claim → stream → report → complete). Full scanner cycle (create stale state → scan → verify cleanup). Slow but catches integration bugs between layers.
+**Layer 3 — SDK + scanner end-to-end**: Full worker loop (register → claim → stream → report → complete). Full scanner cycle (create stale state → scan → verify cleanup). Budget breach scenario (report_usage → HARD_BREACH → auto fail). Suspend-and-wait round-trip (pending wp → signal → already_satisfied path AND normal resume path). Slow but catches integration bugs between layers.
+
+**`ff-test` provides:** Embedded Valkey via testcontainers. `FUNCTION LOAD` fixture. Assertion helpers (`assert_execution_state!(exec_id, lifecycle=terminal, outcome=success)`, `assert_index_membership!(exec_id, index=eligible)`). Scenario builders (create + claim + complete in one call). Partition test config (4 execution, 2 flow, 2 budget, 2 quota — small but exercises cross-partition logic).
 
 ### 12.6 Phase 1 Crate Checklist
 
@@ -3320,19 +3336,9 @@ Three-layer testing. Lua functions are the spec — never mock them.
 | ff-test | Valkey fixture, `FUNCTION LOAD`, `assert_execution_state!` |
 | ff-server | Config, minimal gRPC (create, cancel), start engine+scheduler |
 
-### 11.1 Testing Strategy (`ff-test`)
+### 11.1 Testing Strategy
 
-Lua functions are the spec — **never mock them in tests**. Three test layers:
-
-| Layer | What | Mock? | Valkey? |
-|---|---|---|---|
-| **L1: Lua integration** | Each `ff_*` function against real Valkey. Validates preconditions, state transitions, index membership, return values. | No mocks. | Real Valkey (testcontainers). |
-| **L2: Engine orchestration** | `ff-engine::dispatch` multi-step sequences. May mock the FCALL executor for unit tests (verify dispatch order, error handling, retry logic). | Mock FCALL executor for unit tests. Real Valkey for integration. | Both. |
-| **L3: SDK + scanner e2e** | Full scenarios: create → claim → process → complete. Worker SDK against real engine + scheduler + scanners. | No mocks. | Real Valkey. |
-
-**L1 is authoritative.** If a Lua function test fails, the spec is wrong or the implementation is wrong. L2 and L3 are structural — they test the Rust dispatch/orchestration logic around the Lua functions.
-
-`ff-test` provides: embedded Valkey via testcontainers, `FUNCTION LOAD` fixture, assertion helpers (`assert_execution_state!(exec_id, lifecycle=terminal, outcome=success)`), scenario builders (create + claim + complete in one call), and partition test config (4 execution partitions, 2 flow, 2 budget, 2 quota — small but exercises cross-partition logic).
+See §12.5 for the authoritative testing strategy (`ff-test` crate, three-layer model, scanner correctness tests).
 
 ---
 

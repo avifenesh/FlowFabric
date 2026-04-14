@@ -51,14 +51,14 @@ The scheduling layer sits between execution state and lease acquisition. It does
 
 **Key separation:** The scheduler computes *what* to claim. The Valkey Function ensures *atomicity*. This avoids cross-slot reads inside atomic functions while keeping the final claim decision safe.
 
-**Three-partition routing:** A single claim decision may touch three different Valkey Cluster shards via sequential Lua calls:
+**Three-partition routing:** A single claim decision may touch three different Valkey Cluster shards via sequential `FCALL` invocations:
 
 1. **Quota check** on `{q:K}` partition (RFC-008) — scope-level sliding-window rate check + concurrency check (fast pre-check)
 2. **Candidate selection** (scheduler-local) — fairness, priority, capability match
 3. **Budget check** on `{b:M}` partition (RFC-008) — per-candidate remaining allowance check against all attached budgets. If denied: block candidate via `block_execution_for_admission` on `{p:N}`, return to step 2 with next candidate.
 4. **Claim-grant issuance** on `{p:N}` partition (this RFC) — validates execution eligibility, writes grant, removes from eligible set
 
-If step 1 rejects, the scheduler stops (scope-level denial). If step 3 denies the candidate, the scheduler blocks that candidate and tries the next (per-candidate budget check). The `acquire_lease` Lua script (RFC-003) subsequently runs on the same `{p:N}` partition as step 4, consuming the grant. Budget and quota are NOT re-validated inside the atomic claim Lua — they were checked by the scheduler before the grant was issued.
+If step 1 rejects, the scheduler stops (scope-level denial). If step 3 denies the candidate, the scheduler blocks that candidate and tries the next (per-candidate budget check). The `ff_claim_execution` function (RFC-001/003) subsequently runs on the same `{p:N}` partition as step 4, consuming the grant. Budget and quota are NOT re-validated inside the atomic claim function — they were checked by the scheduler before the grant was issued.
 
 ### 2. Scheduling Inputs
 
@@ -216,7 +216,7 @@ Flow-aware priority boosting (e.g. inheriting the parent flow's priority, or boo
 
 #### 5.5 Fairness Is Best-Effort
 
-Fairness is computed by the scheduling layer, not enforced by the atomic Lua script. This means:
+Fairness is computed by the scheduling layer, not enforced by the atomic Valkey Function. This means:
 
 - Under low contention, fairness has minimal effect — executions are claimed as they arrive.
 - Under high contention, fairness shapes claim distribution across lanes/tenants.
@@ -341,7 +341,7 @@ The scheduler prefers the highest-scoring eligible worker. Ties are broken by le
 | ID | Invariant | Rationale |
 |----|-----------|-----------|
 | C1 | **Requirements must be explicit.** Execution requirements are encoded on the execution, not inferred from lane name. | Prevents implicit routing that breaks when lanes are reconfigured. |
-| C2 | **Ineligible workers must not claim.** The claim-grant is only issued for workers that pass matching. The Lua script validates the capability hash. | Prevents misrouted work. |
+| C2 | **Ineligible workers must not claim.** The claim-grant is only issued for workers that pass matching. The `ff_claim_execution` function validates the capability hash. | Prevents misrouted work. |
 | C3 | **Capability view is inspectable.** `explain_capability_mismatch` must show why no worker matches. | "Why is this stuck?" for routing. |
 | C4 | **Matching is deterministic enough to debug.** Same inputs → same match result. | Operators can reproduce routing decisions. |
 
@@ -511,7 +511,7 @@ When the scheduler cannot issue a claim-grant, it must provide an **explainable 
 
 **Critical implementation note for structural blocks:** When the scheduler denies a claim due to budget, quota, route, or lane state, it MUST atomically update the execution's state vector AND move it between sorted sets. Otherwise the execution remains in the eligible set with `eligible_now` but is unclaimed — appearing as "waiting for worker" when the real cause is budget/quota/route. Specifically:
 
-- **Budget denial:** Run a Lua script on `{p:N}` that sets `eligibility_state = blocked_by_budget`, `blocking_reason = waiting_for_budget`, `public_state = rate_limited`, ZREMs from `ff:idx:{p:N}:lane:<lane_id>:eligible`, ZADDs to `ff:idx:{p:N}:lane:<lane_id>:blocked:budget`. All 7 state vector dimensions must be set.
+- **Budget denial:** Run `ff_block_execution_for_admission` on `{p:N}` that sets `eligibility_state = blocked_by_budget`, `blocking_reason = waiting_for_budget`, `public_state = rate_limited`, ZREMs from `ff:idx:{p:N}:lane:<lane_id>:eligible`, ZADDs to `ff:idx:{p:N}:lane:<lane_id>:blocked:budget`. All 7 state vector dimensions must be set.
 - **Quota denial:** Same pattern with `blocked_by_quota`, `waiting_for_quota`, ZADD to `blocked:quota`.
 - **Route denial:** Same pattern with `blocked_by_route`, `waiting_for_capable_worker` or `waiting_for_locality_match`, ZADD to `blocked:route`.
 - **Lane state denial:** Same pattern with `blocked_by_lane_state`, `paused_by_policy`, ZADD to `blocked:operator`.
@@ -523,14 +523,14 @@ When the blocking condition clears (budget increased, quota window resets, worke
 Implementation:
 1. Scanner maintains a consecutive-rejection counter per lane per cycle.
 2. When the counter reaches the batch-block threshold (default: 10), the scheduler stops scanning this lane for this cycle.
-3. It issues a single batch `block_execution_for_admission` Lua call per partition that blocks up to 100 executions from the eligible set head. The Lua script iterates `ZRANGE eligible 0 99`, checks each execution's routing requirements against the rejection reason, and ZREMs + ZADDs in bulk.
-4. A separate batch variant of `block_execution_for_admission` (script 29a-batch) is required for this:
+3. It issues a single batch `ff_block_execution_for_admission_batch` call per partition that blocks up to 100 executions from the eligible set head. The function iterates `ZRANGE eligible 0 99`, checks each execution's routing requirements against the rejection reason, and ZREMs + ZADDs in bulk.
+4. A separate batch variant `ff_block_execution_for_admission_batch` (script 29a-batch) is required for this:
 
 ```lua
 -- KEYS: eligible_zset, target_blocked_zset, exec_core_1..exec_core_N
 -- ARGV: block_eligibility_state, block_blocking_reason, block_blocking_detail,
 --       block_public_state, now_ms, execution_id_1..execution_id_N
--- Processes up to N executions in one Lua call (all on same {p:N}).
+-- Processes up to N executions in one FCALL (all on same {p:N}).
 -- For each: validate still eligible_now + runnable, HSET 7 dims, ZREM eligible, ZADD blocked.
 -- Returns count of actually blocked executions.
 ```
@@ -654,7 +654,7 @@ ff:lane:<lane_id>:counts  →  HASH
 
 Updated periodically by a background aggregator that scans partition-local sorted sets. Not authoritative — `ZCARD` on the sorted sets is authoritative but slower.
 
-#### 12.7 Scheduling Lua Script: Issue Claim-Grant
+#### 12.7 Issue Claim-Grant Function
 
 `ff_issue_claim_grant` (Valkey Function)
 
@@ -666,7 +666,7 @@ This script runs within a single partition. The scheduling layer calls it after 
 --       capability_hash, grant_ttl_ms, route_snapshot_json,
 --       admission_summary, now_ms
 -- NOTE: Budget/quota checked by scheduler before grant; not re-validated here.
---       Quota on {q:K}, budget on {b:M} — separate Lua calls before this one.
+--       Quota on {q:K}, budget on {b:M} — separate FCALL before this one.
 
 local now_ms = tonumber(ARGV.now_ms)
 local core = redis.call("HGETALL", KEYS[1])
@@ -843,7 +843,7 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 |-----------|-----|-------------|
 | **Execution** | RFC-001 | Scheduler reads `eligibility_state`, `priority`, `lane_id`, `routing_requirements`. Admission rejections update `eligibility_state` and `blocking_reason` on the execution. |
 | **Attempt** | RFC-002 | Claim-grant consumption creates a new attempt (or continues a suspended one). Route snapshot is stored on `AttemptPolicySnapshot`. |
-| **Lease** | RFC-003 | `acquire_lease` consumes the claim-grant atomically. Grant fields are validated inside the Lua script. |
+| **Lease** | RFC-003 | `ff_claim_execution` consumes the claim-grant atomically. Grant fields are validated inside the function. |
 | **Suspension** | RFC-004 | Resumed executions re-enter the eligible sorted set and are subject to normal scheduling. |
 | **Signal** | RFC-005 | Signals that trigger resume place the execution back in the eligible set for scheduling. |
 | **Flow** | RFC-007 | Flow dependency satisfaction moves executions from `blocked_by_dependencies` to `eligible_now`, making them visible to the scheduler. |
@@ -861,6 +861,9 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 | Worker registration, heartbeat | `ff-sdk` (via `ff-script`) | Direct HSET/HEXPIRE to `ff:worker:<instance_id>`. |
 | Fairness state (deficit counters) | `ff-scheduler` (in-memory + ephemeral Valkey keys) | Rebuilt from queue depths on restart. |
 | Capability matching | `ff-scheduler` (in-memory) | Reads worker registrations, caches capability indexes. |
+| `ff_check_admission_and_record` | `ff-script` (wrapper), called by `ff-scheduler` (step 4a of claim flow) | Single-partition FCALL on `{q:K}`. |
+| `ff_promote_delayed` | `ff-script` (wrapper), called by `ff-engine::scanner` (delayed promoter) | Single-partition FCALL. |
+| `explain_capability_mismatch` | `ff-server` (read-only API) | Direct Valkey reads: worker registrations + execution routing_requirements. |
 
 ---
 

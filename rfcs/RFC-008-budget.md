@@ -223,11 +223,11 @@ For **execution-scoped** budgets (colocated on the same `{p:N}` partition as the
 - All enforcement points are **strict** (Class A atomic). The budget usage hash shares the partition with the execution core, so HINCRBY + limit check + execution state update can run in one function call.
 
 For **cross-partition** budgets (flow-scoped on `{b:M}`, lane-scoped, tenant-scoped):
-- Enforcement is **best-effort-consistent**, not atomic with claim or spawn. The caller increments the budget on the budget's `{b:M}` partition in a separate Lua call. Between the budget check and the execution state transition, another concurrent request may also pass. Overshoot by one concurrent request is accepted.
+- Enforcement is **best-effort-consistent**, not atomic with claim or spawn. The caller increments the budget on the budget's `{b:M}` partition in a separate `FCALL`. Between the budget check and the execution state transition, another concurrent request may also pass. Overshoot by one concurrent request is accepted.
 - The budget is rechecked at the next enforcement point (e.g., during `report_usage` if the budget was checked at claim time). This provides convergent correctness without requiring cross-partition atomicity.
 - **Before claim**: `ff-scheduler` checks budget per-candidate (advisory read on `{b:M}`), issues claim grant on `{p:N}`. Grant consumption does not re-validate cross-partition budget.
 - **During active**: `ff-sdk::report_usage()` via `ff-engine::dispatch` increments the cross-partition budget and checks limits. If breached, the worker receives the breach and applies cooperative enforcement (§10.4).
-- **Before child spawn**: Caller checks flow-scoped budget before `add_execution_to_flow`. If exhausted with `on_hard_limit = deny_child`, the spawn is rejected. This check is a separate Lua call to the budget partition — not atomic with the flow mutation.
+- **Before child spawn**: Caller checks flow-scoped budget before `add_execution_to_flow`. If exhausted with `on_hard_limit = deny_child`, the spawn is rejected. This check is a separate `FCALL` to the budget partition — not atomic with the flow mutation.
 - **Before resume**: Advisory check. Re-evaluated at claim time.
 
 This design avoids impossible cross-slot atomicity in Valkey Cluster while providing convergent enforcement. The worst case is one extra request slipping through before the breach is detected at the next enforcement point.
