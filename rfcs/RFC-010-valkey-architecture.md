@@ -1740,39 +1740,98 @@ One unified scanner handles all 4 block types per partition per lane.
 
 **Source:** All RFCs. Safety net for OOM partial writes, crashes, and any state/index desync.
 
-**Purpose:** Detects inconsistencies between execution core state and partition-local index membership. Catches the case where a Lua script aborted mid-execution (e.g., OOM) — prior writes within the script persisted but later index writes did not, leaving the execution in a valid state but absent from the correct index.
+**Purpose:** Detects and repairs inconsistencies between execution core state and partition-local index membership. **Bidirectional:** adds executions to indexes they should be in AND removes them from indexes they shouldn't be in. Catches OOM partial writes, crashes, and accumulated phantom entries.
 
 | Property | Value |
 |---|---|
 | **Trigger** | Periodic timer |
 | **Frequency** | Every 30-60 seconds per partition |
 | **Partition scope** | Per `{p:N}` execution partition |
-| **Operation** | SCAN execution core hashes within the partition. For each execution, verify it is in the correct index for its current state. Fix any desync. |
+| **Operation** | SCAN execution core hashes. For each, determine correct index from state, ZADD if missing, ZREM from all incorrect indexes. |
 
-**Reconciliation rules:**
+**Reconciliation rules (bidirectional):**
 
-| Execution State | Expected Index | If Missing |
-|---|---|---|
-| `lifecycle=terminal` | `ff:idx:{p:N}:lane:<lane>:terminal` | ZADD to terminal_zset (prevents ghost terminals that never get purged). |
-| `lifecycle=active, ownership=leased` | `ff:idx:{p:N}:lease_expiry` | Run `mark_lease_expired_if_due` — treat as crashed worker. If lease is actually still valid, the script is a no-op. |
-| `lifecycle=runnable, eligibility=eligible_now` | `ff:idx:{p:N}:lane:<lane>:eligible` | ZADD to eligible_zset with correct priority score (overlaps with claim-grant reconciler §6.4 but catches additional cases). |
-| `lifecycle=runnable, eligibility=not_eligible_until_time` | `ff:idx:{p:N}:lane:<lane>:delayed` | ZADD to delayed_zset. |
-| `lifecycle=suspended` | `ff:idx:{p:N}:lane:<lane>:suspended` | ZADD to suspended_zset. If timeout_at is set: ZADD to suspension_timeout_zset. |
-| `lifecycle=runnable, eligibility=blocked_by_*` | `ff:idx:{p:N}:lane:<lane>:blocked:<reason>` | ZADD to appropriate blocked set. |
+| Execution State | Correct Index | Also ZADD | ZREM From All Others |
+|---|---|---|---|
+| `lifecycle=terminal` | `terminal` | — | eligible, delayed, active, suspended, all blocked |
+| `lifecycle=active` | `active` + `lease_expiry` | both | eligible, delayed, suspended, terminal, all blocked |
+| `lifecycle=runnable, es=eligible_now` | `eligible` | — | delayed, active, suspended, terminal, all blocked |
+| `lifecycle=runnable, es=not_eligible_until_time` | `delayed` | — | eligible, active, suspended, terminal, all blocked |
+| `lifecycle=suspended` | `suspended` (+ `suspension_timeout` if set) | both | eligible, delayed, active, terminal, all blocked |
+| `lifecycle=runnable, es=blocked_by_*` | `blocked:<reason>` | — | eligible, delayed, active, suspended, terminal, other blocked |
+
+**CRITICAL: Per-item fix MUST be an atomic Lua script.** Between the SCAN discovery and the fix, the execution's state may change (e.g., claimed by a worker). The Lua re-reads exec_core via HMGET and validates state before any writes. Without atomicity, the reconciler could create phantom index entries.
+
+**Pseudocode: `reconcile_execution_index.lua`**
+
+```lua
+-- KEYS: exec_core, eligible_zset, delayed_zset, active_zset,
+--       suspended_zset, terminal_zset, lease_expiry_zset,
+--       blocked_deps, blocked_budget, blocked_quota,
+--       blocked_route, blocked_operator, suspension_timeout
+-- ARGV: execution_id
+
+local core = redis.call("HMGET", KEYS[1],
+  "lifecycle_phase", "ownership_state", "eligibility_state",
+  "priority", "created_at", "completed_at",
+  "lease_expires_at", "delay_until")
+
+local lp, os, es = core[1], core[2], core[3]
+if lp == nil then return ok("purged") end
+
+local eid = ARGV[1]
+local all_sched = {KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6],
+                   KEYS[8], KEYS[9], KEYS[10], KEYS[11], KEYS[12]}
+
+local correct_key, score
+if lp == "terminal" then
+  correct_key = KEYS[6]
+  score = tonumber(core[6]) or 0
+elseif lp == "active" then
+  correct_key = KEYS[4]
+  score = tonumber(core[7]) or 0
+  redis.call("ZADD", KEYS[7], score, eid)  -- also ensure lease_expiry
+elseif lp == "suspended" then
+  correct_key = KEYS[5]; score = 0
+elseif lp == "runnable" then
+  if es == "eligible_now" then
+    correct_key = KEYS[2]
+    local pri = tonumber(core[4]) or 0
+    local created = tonumber(core[5]) or 0
+    score = 0 - (pri * 1000000000000) + created
+  elseif es == "not_eligible_until_time" then
+    correct_key = KEYS[3]; score = tonumber(core[8]) or 0
+  elseif es == "blocked_by_dependencies" then correct_key = KEYS[8]; score = 0
+  elseif es == "blocked_by_budget" then correct_key = KEYS[9]; score = 0
+  elseif es == "blocked_by_quota" then correct_key = KEYS[10]; score = 0
+  elseif es == "blocked_by_route" then correct_key = KEYS[11]; score = 0
+  elseif es == "blocked_by_operator" then correct_key = KEYS[12]; score = 0
+  end
+end
+if correct_key == nil then return ok("unknown_state") end
+
+-- ZADD to correct index
+redis.call("ZADD", correct_key, score, eid)
+-- ZREM from all OTHER scheduling indexes (bidirectional cleanup)
+for _, idx in ipairs(all_sched) do
+  if idx ~= correct_key then redis.call("ZREM", idx, eid) end
+end
+return ok("reconciled")
+```
 
 | Property | Value |
 |---|---|
-| **Per-item action** | ZADD/SADD to the correct index if missing. No state mutations — only index repairs. |
+| **Per-item action** | Atomic Lua: HMGET state, ZADD correct, ZREM all others. No state mutations — only index repairs. |
 | **Failure mode** | Safe to crash. Desync persists until next scan. |
-| **Idempotency** | ZADD on existing member with same score is a no-op. |
-| **Batch size** | 100-200 SCAN iterations per cycle. Lightweight — ZADD is O(log N). |
-| **SCAN strategy** | Use `SCAN 0 MATCH ff:exec:{p:N}:*:core COUNT 200` to iterate execution core hashes within the partition. Extract execution_id from key name. Read lifecycle_phase + eligibility_state + lane_id. Check index membership via ZSCORE/SISMEMBER. |
+| **Idempotency** | ZADD on existing member is no-op. ZREM on non-member is no-op. |
+| **Batch size** | 100-200 SCAN iterations. Each Lua: ~13 keys, 1 HMGET + 1 ZADD + ~10 ZREM. |
+| **SCAN strategy** | `SCAN 0 MATCH ff:exec:{p:N}:*:core COUNT 200`. Construct per-lane index keys. Call Lua per item. |
 
-**When this fires:** Under normal operation, this reconciler finds nothing. It exists for:
-- OOM partial writes (Lua script aborted after state mutation but before index write)
-- Engine crash during a multi-step operation (e.g., between state transition and index update)
-- Any bug that causes state/index desync
-- Operator peace of mind ("are all my executions indexed correctly?")
+**When this fires:** Under normal operation, finds nothing (ZADDs match, ZREMs find nothing). Exists for:
+- OOM partial writes (Lua aborted after state mutation but before index write)
+- Engine crash during multi-step operations
+- Accumulated phantom entries from any source
+- Operator verification ("are all my executions indexed correctly?")
 
 ### 6.18 Worker Claim Count Reconciler
 
@@ -1891,7 +1950,7 @@ An execution is in exactly one scheduling index at a time (eligible OR delayed O
 
 | Scenario | Attempts | Streaming | Suspension | Signals | Estimated Total |
 |---|---|---|---|---|---|
-| Simple fire-and-forget (no streaming, no suspension) | 1 | None | 0 | 0 | **~6 KB** |
+| Simple fire-and-forget (no streaming, no suspension) | 1 | None | 0 | 0 | **~7.4 KB** |
 | Single LLM call with token streaming | 1 | 500 frames | 0 | 0 | **~85 KB** |
 | LLM call with 1 retry | 2 | 500 frames × 2 | 0 | 0 | **~175 KB** |
 | Agent step with tool wait (suspension + signal) | 1 | 200 frames | 1 episode | 2 signals | **~45 KB** |
@@ -1900,15 +1959,15 @@ An execution is in exactly one scheduling index at a time (eligible OR delayed O
 
 ### 7.3 Scale Projections
 
-Assumes a mix: 60% simple (6 KB), 30% streaming (85 KB), 10% agent/complex (175 KB).
-Weighted average: **~40 KB per execution**.
+Assumes a mix: 60% simple (7.4 KB), 30% streaming (85 KB), 10% agent/complex (175 KB).
+Weighted average: **~47 KB per execution**.
 
 | Scale | Active Executions | Terminal (retained) | Total Execution Data | Index Overhead | Total Valkey Memory |
 |---|---|---|---|---|---|
-| 1K active | 1,000 | 10,000 | 440 MB | 5 MB | **~450 MB** |
-| 10K active | 10,000 | 100,000 | 4.4 GB | 50 MB | **~4.5 GB** |
-| 100K active | 100,000 | 1,000,000 | 44 GB | 500 MB | **~45 GB** |
-| 1M active | 1,000,000 | 10,000,000 | 440 GB | 5 GB | **~445 GB** |
+| 1K active | 1,000 | 10,000 | 520 MB | 5 MB | **~525 MB** |
+| 10K active | 10,000 | 100,000 | 5.2 GB | 50 MB | **~5.3 GB** |
+| 100K active | 100,000 | 1,000,000 | 52 GB | 500 MB | **~52 GB** |
+| 1M active | 1,000,000 | 10,000,000 | 520 GB | 5 GB | **~525 GB** |
 
 **Key insight:** Stream data dominates memory at scale. Aggressive stream retention (MAXLEN, short retention_ttl) is essential for 100K+ active executions. The `durable_summary` and `best_effort_live` durability modes (RFC-006, designed-for-deferred) will be critical at scale.
 
@@ -1926,6 +1985,42 @@ Weighted average: **~40 KB per execution**.
 
 No hot path requires loading the full execution record. The separation of core hash, payload, result, policy, and tags (RFC-001 §9.1) ensures hot-path operations touch minimal data.
 
+### 7.5 Claim Throughput and Latency Budget
+
+The claim flow is the highest-frequency critical path (§3.1). It crosses 3 partitions in 4 sequential Lua calls.
+
+**Per-claim Valkey command count:**
+
+| Step | Partition | Lua Script | Commands Inside | Notes |
+|---|---|---|---|---|
+| 1. Quota admission | `{q:K}` | `check_admission_and_record` | ~6 | TIME, ZREMRANGEBYSCORE, ZCARD, GET, ZADD, INCR |
+| 2. Budget advisory read | `{b:M}` | (HMGET reads) | ~2 | HMGET usage, HMGET limits. No mutation. |
+| 3. Issue claim-grant | `{p:N}` | `issue_claim_grant` | ~6 | HGETALL, EXISTS, ZRANK, HSET, PEXPIRE, ZREM |
+| 4. Acquire lease | `{p:N}` | `claim_execution` | ~17 | HGETALL×2, HSET×4 (core, lease, attempt, usage, policy), ZADD×3, SADD, DEL×2, XADD, PEXPIREAT |
+| **Total** | | **4 Lua calls** | **~31 commands** | |
+
+**Per-claim latency budget:**
+
+| Step | Network RTT | Lua Execution | Subtotal |
+|---|---|---|---|
+| 1. Quota (`{q:K}`) | 0.1 ms | 0.05-0.2 ms | ~0.2-0.3 ms |
+| 2. Budget (`{b:M}`) | 0.1 ms | 0.02-0.1 ms | ~0.1-0.2 ms |
+| 3. Grant (`{p:N}`) | 0.1 ms | 0.05-0.2 ms | ~0.2-0.3 ms |
+| 4. Acquire (`{p:N}`, same shard) | 0 ms (pipelined) | 0.1-0.5 ms | ~0.1-0.5 ms |
+| **Total claim latency** | | | **~0.6-1.3 ms** |
+
+This is well within target for all v1 use cases: queue-compatible submission (typical: 1-10 ms), LLM inference (100 ms-30 s per call), agent steps (seconds per step).
+
+**Throughput estimates by cluster size:**
+
+| Cluster | Shards | Max Claims/sec | Rationale |
+|---|---|---|---|
+| Small prod | 3 | ~5K | Steps 3+4 both hit one `{p:N}` shard: ~23 cmds × 5K = 115K ops/shard. Comfortable. |
+| Medium prod | 6-12 | ~20-40K | Partition distribution spreads claims across shards. |
+| Large prod | 24-48 | ~50-100K | Each shard handles ~2-4K claims/sec worth of ops. Headroom for streaming and usage reporting. |
+
+At scale, the bottleneck is the `{p:N}` shard handling steps 3+4 (~23 commands per claim). A single Valkey shard handles ~200-400K simple commands/sec but Lua scripts are heavier (block the event loop). Practical Lua throughput is ~50-100K script executions/sec per shard for scripts of this complexity.
+
 ---
 
 ## 8. Deployment Topology
@@ -1938,10 +2033,10 @@ FlowFabric v1 is **Valkey-native**. The Valkey cluster is the single durable sto
 
 | Scale | Shards | Replicas per Shard | Total Nodes | Estimated Memory per Shard |
 |---|---|---|---|---|
-| Dev/test (1K active) | 3 | 0 | 3 | ~150 MB |
-| Small prod (10K active) | 3 | 1 | 6 | ~1.5 GB |
-| Medium prod (100K active) | 6-12 | 1 | 12-24 | ~4-8 GB |
-| Large prod (1M active) | 24-48 | 1-2 | 48-144 | ~10-20 GB |
+| Dev/test (1K active) | 3 | 0 | 3 | ~175 MB |
+| Small prod (10K active) | 3 | 1 | 6 | ~1.8 GB |
+| Medium prod (100K active) | 6-12 | 1 | 12-24 | ~4-9 GB |
+| Large prod (1M active) | 24-48 | 1-2 | 48-144 | ~11-22 GB |
 
 **Shard count rationale:** Each shard handles ~16,384 / shard_count hash slots. More shards = more parallelism for Lua scripts (which block one shard at a time). At 100K+ active executions, Lua script latency on overloaded shards becomes the bottleneck.
 
@@ -2029,6 +2124,35 @@ FlowFabric workers and control-plane processes connect to Valkey via the **ferri
 - Per scheduler: 4-8 connections (higher concurrency for partition scanning).
 - Per reconciler: 2-4 connections.
 
+### 8.6 Background Scanner Capacity
+
+Aggregate scanner overhead at recommended cluster sizes. Most scans find nothing at steady state (empty ZRANGEBYSCORE returns in ~50μs). Cost increases during bursts when scans find items and trigger Lua scripts.
+
+**Aggregate scanner calls/sec (256 execution partitions):**
+
+| Scanner | Frequency | Calls/s |
+|---------|-----------|---------|
+| Delayed promoter | 0.5-1s | 256-512 |
+| Execution/attempt timeout | 1-2s | 128-256 |
+| Lease expiry | 1-2s | 128-256 |
+| Suspension timeout | 2-5s | 51-128 |
+| Claim-grant reconciler | 5-10s | 26-51 |
+| Pending waitpoint expiry | 5-10s | 26-51 |
+| Dependency reconciler | 10-30s | 9-26 |
+| Generalized index reconciler | 30-60s | 4-9 |
+| All others (budget/quota/flow/stream/terminal) | 10-300s | ~20 |
+| **Total** | | **~650-1300** |
+
+**Per-shard overhead:**
+
+| Scale | Shards | Partitions/shard | Scanner calls/shard/s | Overhead (@ 50μs/empty scan) | % of 1 core |
+|-------|--------|------------------|----------------------|------------------------------|-------------|
+| 10K active | 3 | ~85 | ~220-430 | 11-22ms/s | ~1-2% |
+| 100K active | 12 | ~21 | ~55-110 | 3-6ms/s | <1% |
+| 1M active | 48 | ~5 | ~13-27 | 0.7-1.4ms/s | <0.1% |
+
+Scanner overhead is negligible at all scales. The delayed promoter is the most frequent scanner — consider increasing its interval to 1-2s if Lua script contention becomes measurable.
+
 ---
 
 ## 9. V1 Scope and Non-Goals for the Backend
@@ -2097,6 +2221,10 @@ The Valkey backend must support in v1:
 
 **AOF/RDB persistence tuning:** V1 uses Valkey defaults or cloud provider defaults (e.g., ElastiCache automatic backups). Production persistence tuning (fsync policy, snapshot frequency, memory fragmentation management) is operational, not architectural.
 
+**Public API wire format (gRPC/REST/SDK):** V1 operations are invoked via Valkey Lua scripts through the ferriskey cluster client. No public API wire format is specified in these RFCs. An API server translating external gRPC/REST requests to Lua script invocations is a v1 companion component — its design is outside the scope of the execution engine RFCs. UC-62 (language-neutral control API) is addressed by the operation semantics defined here; the transport layer is deferred.
+
+**Cross-execution event feed:** V1 does not provide a lane-level or system-level event stream for observers and dashboards. Per-execution observability is available: attempt streams (XREAD BLOCK for live output, RFC-006), lease history streams (lifecycle events, RFC-003). Lane-level dashboards rely on periodic count aggregation (§6.13). A cross-execution event stream (one XADD per state transition, consumable by dashboards and webhooks) is a designed-for extension that would address UC-55 (execution event feed) more fully.
+
 ### 9.3 Retention and Cleanup Strategy
 
 **V1 retention defaults:**
@@ -2144,6 +2272,63 @@ The following are **not** goals for the v1 Valkey backend:
 - **Built-in observability backend:** FlowFabric exposes metrics and events for external observability (Prometheus, Grafana, OpenTelemetry), but does not include a built-in dashboard or time-series store.
 - **Namespace-based access control:** V1 does not enforce namespace/tenant isolation at the engine level. The `namespace` field on execution, flow, and budget objects is metadata used for fairness (RFC-009 §5.3), listing (namespace index), and idempotency scoping — **not a security boundary**. Any caller who knows an `execution_id` can read, signal, or inspect that execution regardless of namespace. Multi-tenant isolation must be enforced at the API gateway or control plane layer. Engine-level namespace enforcement is a designed-for extension.
 - **Separate dead-letter queue:** FlowFabric does not have a DLQ. Terminal failed executions are stored in the per-lane terminal sorted set (`ff:idx:{p:N}:lane:<lane_id>:terminal`) alongside completed/cancelled/expired/skipped executions. Operators find failed executions via `list_executions(lane_id, public_state=failed)`. The `failure_category` field on the attempt record (RFC-002) distinguishes failure causes (`timeout`, `worker_error`, `provider_error`, `budget_exceeded`). Failed executions are replayable via `replay_execution` (RFC-001 §4.4). This design matches UC-07 (dead-letter handling): "move terminal failures into a durable failed state for inspection or replay."
+
+---
+
+## 10. Worker SDK Contract
+
+Single coherent reference for SDK authors implementing a FlowFabric worker.
+
+### 10.1 Minimum Viable Worker Loop
+
+```
+STARTUP:
+  register_worker(worker_id, instance_id, capabilities)     [RFC-009]
+  start heartbeat_worker(instance_id) every 10-30s          [RFC-009]
+
+CLAIM:
+  1. claim_request(caps, lanes) → scheduler issues grant    [RFC-009]
+  2. IF attempt_state == attempt_interrupted:
+       claim_resumed_execution → same attempt, new lease    [RFC-001]
+     ELSE:
+       claim_execution → new attempt + lease                [RFC-001]
+
+PROCESS (loop while working):
+  3. renew_lease(exec_id, lease_id, epoch) every ttl/3      [RFC-003]
+  4. append_frame(exec_id, att_idx, lease_id, epoch, frame) [RFC-006]
+  5. report_usage(exec_id, att_idx, epoch, delta)           [RFC-008]
+
+DONE:
+  6a. complete_execution(exec_id, lease_id, epoch, att_id)  [RFC-001]
+  6b. fail_execution(exec_id, lease_id, epoch, att_id, ...) [RFC-001]
+
+SUSPEND (external waits):
+  7a. create_pending_waitpoint → returns waitpoint_key      [RFC-004]
+  7b. call external system with waitpoint_key
+  7c. suspend_execution → releases lease, exits loop        [RFC-004]
+      on resume: re-claim via step 2 (claim_resumed)
+
+SHUTDOWN:
+  deregister_worker(instance_id) — leases expire naturally  [RFC-009]
+```
+
+### 10.2 Error Handling
+
+| Error | Action |
+|-------|--------|
+| `no_eligible_execution` | Backoff 100ms-1s, retry. |
+| `claim_grant_expired` | Retry from step 1. |
+| `stale_lease` / `lease_expired` / `lease_revoked` | Stop. Do NOT complete/fail. Reclaimed. |
+| `execution_not_active` | On retry: check enriched return. Epoch match + success = my call won. |
+| `budget_exceeded` | Per policy: fail/suspend/warn. |
+
+### 10.3 SDK Requirements
+
+- Cluster-aware Valkey client: slot discovery, redirects, EVALSHA.
+- Independent heartbeat thread: must run even if processing blocks.
+- Independent lease renewal thread: must fire during slow LLM calls.
+- Partition awareness: track `partition_id` per execution for `{p:N}` keys.
+- Parse structured returns per §4.9: `{1, "OK", ...}` or `{0, "ERROR", ...}`.
 
 ---
 
