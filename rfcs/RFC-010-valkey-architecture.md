@@ -3224,6 +3224,101 @@ Background scanners should be added alongside their phase as listed above. The g
 
 ---
 
+## 12. Rust Crate Architecture
+
+### 12.1 Workspace Structure
+
+```
+flowfabric/
+├── Cargo.toml                       # workspace
+├── ferriskey/                       # Valkey client (our fork — shaped for FlowFabric)
+├── lua/                             # split Lua source files → build.rs concatenates
+│   ├── helpers.lua                  #   14 shared library-local helpers
+│   ├── execution.lua                #   ff_create/claim/claim_resumed/complete/fail/cancel/replay/expire/delay/move_to_waiting_children
+│   ├── lease.lua                    #   ff_renew_lease/revoke_lease/reclaim_execution/mark_lease_expired
+│   ├── suspension.lua               #   ff_suspend/resume/cancel_suspension/expire_suspension/create_pending_waitpoint
+│   ├── signal.lua                   #   ff_deliver_signal/buffer_signal/timeout_waitpoint
+│   ├── stream.lua                   #   ff_append_frame
+│   ├── flow.lua                     #   ff_stage_dep_edge/apply_dep_to_child/resolve_dep/evaluate_flow_eligibility
+│   ├── budget.lua                   #   ff_report_usage_and_check/reset_budget
+│   ├── quota.lua                    #   ff_check_admission_and_record
+│   ├── scheduling.lua               #   ff_issue_claim_grant/issue_reclaim_grant/block/unblock/promote_delayed/report_usage_on_attempt/update_progress/change_priority/promote_blocked_to_eligible/close_waitpoint
+│   └── reconciler.lua               #   ff_reconcile_execution_index
+├── crates/
+│   ├── ff-core/                     #   types, partition math, key builders, error codes
+│   ├── ff-script/                   #   ff_function! macro, typed FCALL wrappers, library loader
+│   ├── ff-engine/                   #   cross-partition dispatch + scanner module
+│   ├── ff-scheduler/                #   claim-grant cycle, fairness, capability matching, lanes
+│   ├── ff-sdk/                      #   worker public API
+│   ├── ff-test/                     #   integration test harness, fixtures, assertion helpers
+│   └── ff-server/                   #   binary: config, gRPC/HTTP API, startup, metrics
+```
+
+### 12.2 Crate Responsibilities
+
+**ferriskey** — Valkey client (our fork). Provides generic `fcall(name, keys, args) → Value`, `function_load_replace(source)`, `function_list(library)`. Cluster-aware routing via hash tag extraction (`{p:N}`, `{fp:N}`, `{b:M}`, `{q:K}`). Pipeline support for batching FCALLs across partitions. Connection pooling, TLS, topology refresh. We shape ferriskey to serve FlowFabric — if FCALL support needs improvement, we implement it here.
+
+**ff-core** — Leaf crate, no Valkey dependency. State vector enums (`LifecyclePhase`, `OwnershipState`, `EligibilityState`, `BlockingReason`, `TerminalOutcome`, `AttemptState`). Domain ID types (`ExecutionId`, `LeaseId`, `LeaseEpoch`, `FlowId`, `BudgetId`, `WaitpointKey`). Partition math: `partition_for(entity_id, family, num_partitions) → partition_number`. Key builders: `exec_core_key(partition, eid) → "ff:exec:{p:3}:<eid>:core"`. All 40+ error codes from §10.7. Policy types (`RetryPolicy`, `TimeoutPolicy`, `ExecutionPolicy`). Validity matrix assertion helpers.
+
+**ff-script** — Bridge between Rust types and Valkey Functions. Declarative `ff_function!` macro generates: KEYS array construction from typed args, ARGV marshaling, `FCALL` invocation via ferriskey, return parsing from `{1,"OK",...}/{0,"ERROR",...}` into typed `Result<T, ScriptError>`. One macro invocation per function (~36 total). Embeds Lua library source via `include_str!` (from build.rs concatenation output). Startup: calls `ferriskey::function_load_replace()` with version check via `FCALL ff_version`.
+
+**ff-engine** — Cross-partition orchestration and background scanners. Partition router maps entity → partition → ferriskey connection. Cross-partition dispatchers: dependency resolution fan-out (§4.8e — complete on `{p:N}` → read edges from `{fp:N}` → resolve on each child's `{p:N}`), two-phase flow membership (`{p:N}` then `{fp:N}`), usage reporting (`{p:N}` then `{b:M}`). Scanner module (`ff_engine::scanner`): common `Scanner` trait with `scan_partition()` method, pipelined partition scanning, configurable intervals, metrics emission. All 20 scanners implemented here. Used as a library by both `ff-sdk` (for cross-partition orchestrators) and `ff-server` (for scanners + dispatchers).
+
+**ff-scheduler** — Claim-grant cycle: quota pre-check (read-only on `{q:K}`) → select candidate (weighted round-robin with deficit, capability matching) → per-candidate budget check on `{b:M}` (deny → block → next) → `ff_issue_claim_grant` on `{p:N}`. Lane management (4 states, registry). Fairness state (deficit counters, per-cycle budget cache). Depends on `ff-script + ff-core + ferriskey` only — does NOT depend on `ff-engine`. Embedded in `ff-server` for v1; crate boundary allows standalone extraction for horizontal scaling.
+
+**ff-sdk** — Public API for worker authors. Clean surface: `connect()`, `claim_next()`, `complete()`, `fail()`, `suspend()`, `report_usage()`, `append_frame()`, `delay()`, `move_to_waiting_children()`. Auto lease renewal as background tokio task. Graceful shutdown (stop claims → delay active → wait). Idempotency key generation. Depends on `ff-engine` for cross-partition orchestrators (report_usage, suspend-and-wait). Simple single-partition operations (complete, fail, renew, append_frame) use `ff-script` wrappers directly.
+
+**ff-test** — Integration test harness. Embedded Valkey via testcontainers. `FUNCTION LOAD REPLACE` fixture. Assertion helpers: `assert_execution_state!`, `assert_index_membership!`. Scenario builders for multi-step test flows. State vector completeness validator (after every state-mutating FCALL, verify all 7 dimensions). Version migration tests (load v1, create state, load v2, verify forward compatibility).
+
+**ff-server** — Binary crate. Config loading (Valkey endpoints, partition counts, scanner intervals, TLS). Starts engine (scanners, dispatchers) + scheduler (embedded). gRPC/HTTP API for external operations (create_execution, cancel, replay, deliver_signal, query). Health checks, Prometheus metrics endpoint. Graceful shutdown. Validates partition config against Valkey-stored `ff:config:partitions` on startup.
+
+### 12.3 Dependency Graph
+
+```
+ferriskey                            (transport — generic Valkey client)
+    ↑
+ff-core                              (types — no Valkey dependency)
+    ↑
+ff-script                            (typed FCALL — ferriskey + ff-core)
+    ↑
+ff-engine                            (dispatch + scanners — ff-script)
+    ↑                    ↑
+ff-scheduler          ff-sdk          (scheduler: ff-script + ff-core + ferriskey only)
+    ↑                    ↑            (sdk: ff-engine + ff-script + ff-core)
+    └────── ff-server ───┘            (binary — imports all)
+```
+
+No circular dependencies. Single path from domain types to transport. ff-scheduler is intentionally isolated from ff-engine to allow standalone deployment.
+
+### 12.4 Lua Library Build
+
+Lua source files are split by domain for maintainability (~11 files, ~3000 lines total). A `build.rs` step concatenates them with a `#!lua name=flowfabric` preamble into a single `flowfabric.lua` blob. `helpers.lua` is always first (defines library-local functions). Order of subsequent files does not matter (all use `redis.register_function`). CI validates: load into real Valkey, run full integration suite.
+
+### 12.5 Testing Strategy
+
+Three-layer testing. Lua functions are the spec — never mock them.
+
+**Layer 1 — Lua integration tests** (authoritative): Per-function tests against real Valkey. Happy path + every error path. State vector completeness validation after every mutation. Cross-function scenarios (full claim→complete, suspend→signal→resume, reclaim, replay, cancel-from-each-state). Version migration tests.
+
+**Layer 2 — Engine orchestration tests** (unit + integration): Trait-based `FcallExecutor` for unit tests of orchestration logic. Integration tests with real Valkey for end-to-end orchestration. Reconciler tests: insert specific desync states, run reconciler, verify correction.
+
+**Layer 3 — SDK + scanner end-to-end**: Full worker loop (register → claim → stream → report → complete). Full scanner cycle (create stale state → scan → verify cleanup). Slow but catches integration bugs between layers.
+
+### 12.6 Phase 1 Crate Checklist
+
+| Crate | Phase 1 Scope |
+|-------|---------------|
+| ferriskey | `fcall()`, `function_load_replace()`, cluster routing (likely already present) |
+| ff-core | Core enums, ExecutionId, partition math, key builders, 15 error codes |
+| ff-script | Library loader + 7 function wrappers + `ff_function!` macro |
+| ff-engine | Minimal partition router, 3 scanners (lease expiry, delayed promoter, generalized reconciler) |
+| ff-scheduler | Single-lane claim cycle (no fairness, no capability matching) |
+| ff-sdk | `connect()`, `claim_next()`, `renew_lease()`, `complete()`, `cancel()` |
+| ff-test | Valkey fixture, `FUNCTION LOAD`, `assert_execution_state!` |
+| ff-server | Config, minimal gRPC (create, cancel), start engine+scheduler |
+
+---
+
 ## References
 
 - RFC-001: Execution Object and State Model
