@@ -785,7 +785,7 @@ return ok(ARGV.suspension_id, waitpoint_id, waitpoint_key)
 
 `ff_resume_execution`
 
-This script is called after a matching signal or explicit operator resume trigger has already been durably accepted.
+This function is called after a matching signal or explicit operator resume trigger has already been durably accepted.
 
 Keys:
 

@@ -41,7 +41,7 @@ The scheduling layer sits between execution state and lease acquisition. It does
 └─────────────┘     └────────┬───────────┘     └────────┬─────────┘
                              │ reads:                    │
                     ┌────────┼────────────┐     ┌────────▼─────────┐
-                    │ - eligible execs    │     │ acquire_lease.lua │
+                    │ - eligible execs    │     │ ff_claim_execution │
                     │ - worker caps       │     │ (RFC-003, atomic) │
                     │ - lane config       │     └──────────────────┘
                     │ - budget/quota      │

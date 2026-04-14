@@ -87,7 +87,7 @@ Execution is **not**: the user-facing product workflow object, the long-term bus
 | `routing_requirements` | `RoutingRequirements` | no | Required capabilities, preferred locality, isolation level. |
 | `dedup_window` | `Duration` | no | Window for idempotency_key dedup. V1 default: 24h. Actual TTL = `min(dedup_window, retention_window)` to prevent stale key outliving execution. |
 | `stream_policy` | `StreamPolicy` | no | Durability mode for attempt streams. |
-| `max_signals_per_execution` | `u32` | no | Maximum signal records accepted for this execution. Default: `10000`. Prevents unbounded memory growth from webhook retry storms. Enforced in `deliver_signal` Lua script. |
+| `max_signals_per_execution` | `u32` | no | Maximum signal records accepted for this execution. Default: `10000`. Prevents unbounded memory growth from webhook retry storms. Enforced in `ff_deliver_signal` function. |
 
 ##### Runtime State (the state vector — see §2)
 
@@ -791,7 +791,7 @@ FlowFabric supports three visibility levels to avoid forcing every caller to see
 | `operator` | Dashboards, admin APIs | Everything in `public` plus: full state vector, `lease_epoch`, `worker_id`, attempt history summary, retry/reclaim/replay counts, usage counters, `failure_reason`, `cancellation_reason`, `last_operator_action`. |
 | `internal` | Engine internals, debugging | Everything in `operator` plus: raw Valkey key references, scheduling scores, routing decision snapshots, policy snapshots, full event log pointers. |
 
-Visibility filtering is enforced at the API layer, not in Valkey Lua scripts. All fields are stored on the execution core hash; the API server reads the full record and projects the response based on the caller's authenticated visibility level. Lua scripts operate on the full record and do not filter by visibility.
+Visibility filtering is enforced at the API layer, not in Valkey Functions. All fields are stored on the execution core hash; the API server reads the full record and projects the response based on the caller's authenticated visibility level. Functions operate on the full record and do not filter by visibility.
 
 ---
 
@@ -799,7 +799,7 @@ Visibility filtering is enforced at the API layer, not in Valkey Lua scripts. Al
 
 #### 9.1 Partition Tag Model
 
-All keys that must participate in one atomic Lua script share the same Valkey Cluster hash tag. FlowFabric uses a **partition tag** `{p:N}` (aligned with RFC-003) rather than per-lane or per-execution tags.
+All keys that must participate in one atomic Valkey Function share the same Valkey Cluster hash tag. FlowFabric uses a **partition tag** `{p:N}` (aligned with RFC-003) rather than per-lane or per-execution tags.
 
 **Partition assignment:**
 - `partition = hash(execution_id) % num_partitions`
@@ -817,7 +817,7 @@ Each execution is stored as a Valkey hash:
 Key: ff:exec:{p:N}:<execution_id>:core
 ```
 
-All hash field names use their **long canonical form**. This is the authoritative field name list — all Lua scripts across all RFCs must use these exact names.
+All hash field names use their **long canonical form**. This is the authoritative field name list — all Valkey Functions across all RFCs must use these exact names.
 
 | Hash Field | Type | Notes |
 |-----------|------|-------|
@@ -898,7 +898,7 @@ ff:exec:{p:N}:<execution_id>:tags       → Valkey hash of tag key-value pairs
 
 #### 9.3 Scheduling and Indexing Structures
 
-All partition-local indexes use the same `{p:N}` hash tag, enabling atomic Lua scripts to update execution state and indexes in one call.
+All partition-local indexes use the same `{p:N}` hash tag, enabling atomic Valkey Functions to update execution state and indexes in one call.
 
 ##### Eligible queue (priority-ordered, partition-local)
 
@@ -985,7 +985,7 @@ Fields: worker_id, worker_instance_id, lane, capability_hash, grant_expires_at
 TTL: short (e.g. 5s)
 ```
 
-Pre-computed by the scheduler/admission layer. Consumed atomically by the claim Lua script. See RFC-003 for grant semantics.
+Pre-computed by the scheduler/admission layer. Consumed atomically by `ff_claim_execution`. See RFC-003 for grant semantics.
 
 ##### Flow-structural keys (authoritative, on `{fp:N}` partition — see RFC-007)
 
@@ -993,7 +993,7 @@ Pre-computed by the scheduler/admission layer. Consumed atomically by the claim 
 ff:flow:{fp:N}:<flow_id>:members    → Set (member: execution_id)
 ```
 
-Flow membership is authoritative topology data stored on the flow partition. Maintained atomically within `{fp:N}` Lua scripts. See RFC-007 and RFC-010 §1.2 for full flow key schema.
+Flow membership is authoritative topology data stored on the flow partition. Maintained atomically within `{fp:N}` Valkey Functions. See RFC-007 and RFC-010 §1.2 for full flow key schema.
 
 ##### Cross-partition secondary indexes (eventually consistent)
 
@@ -1003,7 +1003,7 @@ ff:idem:<namespace>:<idempotency_key> → String (value: execution_id, TTL: min(
 ff:tag:<namespace>:<key>:<value>    → Set (member: execution_id)
 ```
 
-These do not share the `{p:N}` hash tag and cannot participate in the atomic Lua scripts. They are maintained via best-effort secondary writes after the atomic transition succeeds.
+These do not share the `{p:N}` hash tag and cannot participate in the atomic Valkey Functions. They are maintained via best-effort secondary writes after the atomic transition succeeds.
 
 #### 9.4 Atomicity Model
 
@@ -1787,7 +1787,7 @@ Terminal execution records are retained according to lane retention policy. The 
 | **Attempt** | RFC-002 | Each execution has one or more attempts. `attempt_index` and `attempt_state` live on the execution state vector. Full attempt records (timing, route, usage attribution) are defined in RFC-002. |
 | **Lease** | RFC-003 | `ownership_state`, `lease_id`, `lease_epoch`, `lease_expires_at` on the execution record reference the lease primitive. Lease acquisition/renewal/revocation/reclaim semantics are defined in RFC-003. |
 | **Suspension / Waitpoint** | RFC-004 | `suspend_execution` creates a suspension record. Resume transitions `suspended` → `runnable`. Waitpoint model and pending waitpoints defined in RFC-004. |
-| **Signal** | RFC-005 | `signal_execution` delivers to a waitpoint. Resume condition evaluation and `suspended` → `runnable` transition in signal delivery Lua script. |
+| **Signal** | RFC-005 | `signal_execution` delivers to a waitpoint. Resume condition evaluation and `suspended` → `runnable` transition in `ff_deliver_signal` function. |
 | **Stream** | RFC-006 | Attempt-scoped output streams. Execution exposes merged stream view. Stream close is atomic with attempt termination. |
 | **Flow** | RFC-007 | `flow_id`, `parent_execution_id` link execution to flow coordination. Dependency satisfaction makes executions eligible. `skip_execution` triggered by dependency failure propagation. |
 | **Budget / Quota** | RFC-008 | `budget_ids` on policy. `eligibility_state = blocked_by_budget` / `blocked_by_quota` when exhausted. Usage reporting increments budget counters. |

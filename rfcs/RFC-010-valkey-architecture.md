@@ -384,7 +384,7 @@ Engine (on upstream     {fp:N} (flow)            {p:N} (child exec)
 ```
 
 1. **Read outgoing edges on `{fp:N}`**: `SMEMBERS ff:flow:{fp:N}:<flow_id>:out:<upstream_id>`. Get edge_ids.
-2. **For each edge, resolve on child's `{p:N}`**: `resolve_dependency.lua`. If upstream succeeded: mark edge `satisfied`, decrement unresolved count, if all resolved → set `eligible_now` + add to eligible sorted set. If upstream failed: mark edge `impossible`, increment impossible count → set execution to terminal `skipped`.
+2. **For each edge, resolve on child's `{p:N}`**: `FCALL ff_resolve_dependency`. If upstream succeeded: mark edge `satisfied`, decrement unresolved count, if all resolved → set `eligible_now` + add to eligible sorted set. If upstream failed: mark edge `impossible`, increment impossible count → set execution to terminal `skipped`.
 
 **Failure modes and convergence:**
 
@@ -558,19 +558,19 @@ Every periodic background process required by the architecture, consolidated in 
 | Scanner | Target Key | Frequency | Action | RFC |
 |---|---|---|---|---|
 | **Delayed → Eligible promotion** | `ff:idx:{p:N}:lane:<lane_id>:delayed` | 0.5–1s per partition | `ZRANGEBYSCORE -inf <now>`. Verify execution state, set `eligible_now`, ZADD eligible set with priority score. | 001, 009 |
-| **Lease expiry / reclaim** | `ff:idx:{p:N}:lease_expiry` | 1–2s per partition | `ZRANGEBYSCORE -inf <now>`. Run `mark_lease_expired_if_due.lua` or `reclaim_execution.lua`. Re-validates execution core; no-op if lease was renewed. | 003 |
-| **Suspension timeout** | `ff:idx:{p:N}:suspension_timeout` | 2–5s per partition | `ZRANGEBYSCORE -inf <now>`. Run `expire_suspension.lua`. Applies timeout behavior (fail/cancel/expire/auto_resume/escalate). | 004 |
+| **Lease expiry / reclaim** | `ff:idx:{p:N}:lease_expiry` | 1–2s per partition | `ZRANGEBYSCORE -inf <now>`. Run `FCALL ff_mark_lease_expired_if_due` or `FCALL ff_reclaim_execution`. Re-validates execution core; no-op if lease was renewed. | 003 |
+| **Suspension timeout** | `ff:idx:{p:N}:suspension_timeout` | 2–5s per partition | `ZRANGEBYSCORE -inf <now>`. Run `FCALL ff_expire_suspension`. Applies timeout behavior (fail/cancel/expire/auto_resume/escalate). | 004 |
 | **Pending waitpoint expiry** | `ff:idx:{p:N}:pending_waitpoint_expiry` | 5–10s per partition | `ZRANGEBYSCORE -inf <now>`. Close waitpoints with `close_reason = never_committed`. | 004 |
 | **Claim-grant expiry reconciler** | Execution core records | 5–10s per partition | Find executions where `lp = runnable` AND `es = eligible_now` but not in any eligible sorted set. Re-add if no grant key exists. | 009 |
 | **Budget counter reconciler** | `ff:budget:{b:M}:<budget_id>:usage` | 30–60s per budget partition | Sum actual attempt-level usage across attached executions. Compare against budget usage hash. Correct if diverged. | 008 |
 | **Quota concurrency reconciler** | `ff:quota:{q:K}:<policy_id>:concurrency` | 10–30s per quota scope | Count actual active leases for the scope (walk `{p:N}` partition worker-lease sets). Reset counter if drifted. | 008 |
-| **Budget reset** | `ff:idx:{b:M}:budget_resets` | 10–30s per budget partition | `ZRANGEBYSCORE -inf <now>`. Run `reset_budget.lua`. Zero usage, set `next_reset_at`, re-score in index. | 008 |
+| **Budget reset** | `ff:idx:{b:M}:budget_resets` | 10–30s per budget partition | `ZRANGEBYSCORE -inf <now>`. Run `FCALL ff_reset_budget`. Zero usage, set `next_reset_at`, re-score in index. | 008 |
 | **Flow summary projector** | `ff:flow:{fp:N}:<flow_id>:summary` | Event-driven + 10–30s catchup | Consume execution state-change events. Update member counts and aggregate usage. Derive `public_flow_state`. | 007 |
 | **Lease history trimmer** | `ff:exec:{p:N}:<execution_id>:lease:history` | Inline (`MAXLEN ~` on XADD) + 60–120s background | Inline: on every lease history append. Background: scan for streams exceeding size threshold and apply aggressive trim. | 003 |
 | **Stream time-based cleanup** | `ff:stream:{p:N}:*:meta` | 60s per partition | Check `closed_at + retention_ttl_ms < now`. Delete stream + meta keys. | 006 |
 | **Terminal retention** | `ff:idx:{p:N}:lane:<lane_id>:terminal` | Minutes–hours | `ZRANGEBYSCORE -inf <retention_cutoff>`. Purge execution + all sub-keys (cascade delete). | 001, 002, 005, 006 |
 | **Worker heartbeat expiry** | `ff:worker:<worker_instance_id>` | Handled by TTL | Valkey auto-expires worker registration keys when heartbeat TTL lapses. Scheduler skips expired workers. | 009 |
-| **Dependency resolution reconciler** | `ff:idx:{p:N}:lane:<lane_id>:blocked:dependencies` | 10–30s per partition | For each blocked execution: read upstream terminal states (cross-partition). If upstream is terminal, run `resolve_dependency.lua`. Safety net for engine crash between parent complete and child resolve dispatch. | 007, 010 |
+| **Dependency resolution reconciler** | `ff:idx:{p:N}:lane:<lane_id>:blocked:dependencies` | 10–30s per partition | For each blocked execution: read upstream terminal states (cross-partition). If upstream is terminal, run `FCALL ff_resolve_dependency`. Safety net for engine crash between parent complete and child resolve dispatch. | 007, 010 |
 | **Lane count aggregator** | `ff:lane:<lane_id>:counts` | 5–15s per lane | ZCARD across all `{p:N}` partitions for each per-lane sorted set. Write aggregate counts. | 009, 010 |
 | **Eligibility re-evaluation (unblock) scanner** | `ff:idx:{p:N}:lane:<lane>:blocked:*` | 5–10s per partition | Re-evaluate block condition. If cleared (budget increased, quota reset, worker registered, lane unpaused), move execution back to eligible set. | 008, 009, 010 |
 | **Execution/attempt timeout scanner** | `ff:idx:{p:N}:attempt_timeout`, `:execution_deadline` | 1–2s per partition | `ZRANGEBYSCORE -inf <now>`. Expire active executions that exceeded per-attempt timeout or total deadline. Distinct from lease expiry. | 001, 010 |
@@ -1475,7 +1475,7 @@ Engine Scanner          Scheduler           {p:N} Partition
 Worker (new)              │                     │
   │                       │                     │
   │ 6. RECLAIM            │                     │
-  │ reclaim_execution.lua │                     │
+  │ ff_reclaim_execution  │                     │
   │ (or interrupt_and_    │                     │
   │  reclaim.lua)         │                     │
   │─────────────────────────────────────────────►│
@@ -1799,7 +1799,7 @@ Both approaches converge: the execution is reclaimed within `scanner_frequency +
 | **Partition scope** | Per `{p:N}` execution partition |
 | **Index** | `ff:idx:{p:N}:suspension_timeout` (ZSET, score = `timeout_at` ms) |
 | **Operation** | `ZRANGEBYSCORE ff:idx:{p:N}:suspension_timeout -inf <now_ms> LIMIT 0 <batch_size>` |
-| **Per-item action** | Run `expire_suspension.lua`. The script re-validates that the execution is still suspended and the timeout is still due (guards against concurrent resume). Applies the configured `timeout_behavior` (fail/cancel/expire/auto_resume/escalate) atomically. Sets all 7 state vector dimensions. |
+| **Per-item action** | Run `FCALL ff_expire_suspension`. The script re-validates that the execution is still suspended and the timeout is still due (guards against concurrent resume). Applies the configured `timeout_behavior` (fail/cancel/expire/auto_resume/escalate) atomically. Sets all 7 state vector dimensions. |
 | **Failure mode** | Safe to crash. Un-processed timeouts remain in the index and are picked up on next scan. |
 | **Idempotency** | The script checks `lifecycle_phase == suspended` and `timeout_at <= now`. If already resumed/cancelled/timed-out, it's a no-op. |
 | **Batch size** | 20-50 per cycle. Timeout processing may involve multiple state transitions (close waitpoint, close suspension, update execution). |
@@ -2041,8 +2041,8 @@ No separate process evaluates flow completion. The projector is the **sole autho
 | **Frequency** | Every 10-30 seconds per partition |
 | **Partition scope** | Per `{p:N}` execution partition |
 | **Index** | `ff:idx:{p:N}:lane:<lane_id>:blocked:dependencies` (ZSET of executions blocked on upstream dependencies) |
-| **Operation** | For each execution in the blocked set: read `ff:exec:{p:N}:<execution_id>:deps:meta` to get `flow_id` and unsatisfied count. For each unresolved edge in `ff:exec:{p:N}:<execution_id>:deps:unresolved`: read the upstream execution's terminal state from its `{p:N}` partition (cross-partition read). If upstream is terminal, call `resolve_dependency.lua` on this child's partition. |
-| **Per-item action** | `resolve_dependency.lua` per stale unresolved edge. Idempotent — already-resolved edges return `already_resolved`. |
+| **Operation** | For each execution in the blocked set: read `ff:exec:{p:N}:<execution_id>:deps:meta` to get `flow_id` and unsatisfied count. For each unresolved edge in `ff:exec:{p:N}:<execution_id>:deps:unresolved`: read the upstream execution's terminal state from its `{p:N}` partition (cross-partition read). If upstream is terminal, call `FCALL ff_resolve_dependency` on this child's partition. |
+| **Per-item action** | `FCALL ff_resolve_dependency` per stale unresolved edge. Idempotent — already-resolved edges return `already_resolved`. |
 | **Failure mode** | Safe to crash. Unresolved dependencies remain in the blocked set and are picked up on next scan. |
 | **Idempotency** | `resolve_dependency` checks edge state before acting. Satisfied or impossible edges are skipped. |
 | **Batch size** | 20-50 per cycle. Each item may require 1-3 cross-partition reads (upstream execution states). |

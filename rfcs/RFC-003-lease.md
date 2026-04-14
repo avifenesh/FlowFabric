@@ -707,6 +707,7 @@ local function mark_expired(core, now_ms)
   redis.call("HSET", KEYS.core,
     "ownership_state", "lease_expired_reclaimable",
     "blocking_reason", "waiting_for_worker",
+    "blocking_detail", "lease expired, awaiting reclaim",
     "lease_expired_at", now_ms
   )
   redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",
@@ -788,6 +789,7 @@ local function mark_expired(core, now_ms)
   redis.call("HSET", KEYS.core,
     "ownership_state", "lease_expired_reclaimable",
     "blocking_reason", "waiting_for_worker",
+    "blocking_detail", "lease expired, awaiting reclaim",
     "lease_expired_at", now_ms
   )
   redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",

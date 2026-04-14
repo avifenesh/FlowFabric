@@ -346,7 +346,7 @@ Both operations are **Class A** because signal acceptance, resume condition eval
 
 #### 12.1 Key Schema
 
-All signal-related keys share the `{p:N}` partition tag of their target execution, enabling atomic Lua scripts for signal delivery + resume condition evaluation + state transition.
+All signal-related keys share the `{p:N}` partition tag of their target execution, enabling atomic Valkey Functions for signal delivery + resume condition evaluation + state transition.
 
 ##### Signal record (hash per signal)
 
