@@ -675,7 +675,10 @@ impl MockPubSubBroker {
             }
         }
 
-        let result: Vec<Value> = channels.into_iter().map(Value::BulkString).collect();
+        let result: Vec<Result<Value>> = channels
+            .into_iter()
+            .map(|ch| Ok(Value::BulkString(ch.into())))
+            .collect();
         Ok(Value::Array(result))
     }
 
@@ -736,7 +739,7 @@ impl MockPubSubBroker {
                     count += 1;
                 }
             }
-            result.push((Value::BulkString(channel.clone()), Value::Int(count)));
+            result.push((Value::BulkString(channel.clone().into()), Value::Int(count)));
         }
 
         Ok(Value::Map(result))
@@ -773,7 +776,10 @@ impl MockPubSubBroker {
             }
         }
 
-        let result: Vec<Value> = channels.into_iter().map(Value::BulkString).collect();
+        let result: Vec<Result<Value>> = channels
+            .into_iter()
+            .map(|ch| Ok(Value::BulkString(ch.into())))
+            .collect();
         Ok(Value::Array(result))
     }
 
@@ -814,7 +820,7 @@ impl MockPubSubBroker {
                     count += 1;
                 }
             }
-            result.push((Value::BulkString(channel.clone()), Value::Int(count)));
+            result.push((Value::BulkString(channel.clone().into()), Value::Int(count)));
         }
 
         Ok(Value::Map(result))
@@ -869,7 +875,10 @@ impl MockPubSubBroker {
                 PubSubSubscriptionKind::Pattern => "Pattern",
                 PubSubSubscriptionKind::Sharded => "Sharded",
             };
-            let values_array: Vec<Value> = values.into_iter().map(Value::BulkString).collect();
+            let values_array: Vec<Result<Value>> = values
+                .into_iter()
+                .map(|v| Ok(Value::BulkString(v.into())))
+                .collect();
             valkey_map.push((
                 Value::BulkString(key.as_bytes().to_vec().into()),
                 Value::Array(values_array),
@@ -1068,20 +1077,20 @@ impl MockPubSubBroker {
             let (desired, actual) = sync.get_subscription_state();
 
             let result = vec![
-                Value::BulkString(b"desired".to_vec().into()),
-                Self::convert_sub_map_to_value(desired),
-                Value::BulkString(b"actual".to_vec().into()),
-                Self::convert_sub_map_to_value(actual),
+                Ok(Value::BulkString(b"desired".to_vec().into())),
+                Ok(Self::convert_sub_map_to_value(desired)),
+                Ok(Value::BulkString(b"actual".to_vec().into())),
+                Ok(Self::convert_sub_map_to_value(actual)),
             ];
 
             Value::Array(result)
         } else {
             let empty_map = HashMap::new();
             let result = vec![
-                Value::BulkString(b"desired".to_vec().into()),
-                Self::convert_sub_map_to_value(empty_map.clone()),
-                Value::BulkString(b"actual".to_vec().into()),
-                Self::convert_sub_map_to_value(empty_map),
+                Ok(Value::BulkString(b"desired".to_vec().into())),
+                Ok(Self::convert_sub_map_to_value(empty_map.clone())),
+                Ok(Value::BulkString(b"actual".to_vec().into())),
+                Ok(Self::convert_sub_map_to_value(empty_map)),
             ];
             Value::Array(result)
         }

@@ -1,5 +1,18 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+//! Value conversion utilities for translating raw Valkey responses into expected return types.
+//!
+//! This module contains:
+//! - [`ExpectedReturnType`]: enum describing the expected shape of a command response
+//! - [`expected_type_for_cmd`]: maps a [`Cmd`] to its [`ExpectedReturnType`]
+//! - [`convert_to_expected_type`] and helpers: recursively transforms a raw [`Value`] into the
+//!   expected form (e.g. doubles, booleans, maps, sets, nested arrays, etc.)
+//!
+//! TODO: This file is ~3 900 lines. Consider splitting into sub-modules:
+//!   - `expected_types.rs`  — `ExpectedReturnType` + `expected_type_for_cmd`
+//!   - `conversion.rs`      — `convert_to_expected_type` and all its helpers
+//!   Re-export from this module so downstream callers are unaffected.
+
 use crate::cluster::routing::Routable;
 use crate::cmd::Cmd;
 use crate::value::{ErrorKind, Error, Result, Value, from_owned_value};

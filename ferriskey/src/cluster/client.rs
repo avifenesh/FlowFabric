@@ -156,14 +156,18 @@ impl ClusterParams {
             read_from_replicas: value.read_from_replicas,
             tls: value.tls,
             retry_params: value.retries_configuration,
-            connection_timeout: value.connection_timeout.unwrap_or(Duration::MAX),
+            connection_timeout: value
+                .connection_timeout
+                .unwrap_or(crate::connection::factory::NO_TIMEOUT),
             topology_checks_interval: value.topology_checks_interval,
             slots_refresh_rate_limit: value.slots_refresh_rate_limit,
             connections_validation_interval: value.connections_validation_interval,
             tls_params,
             client_name: value.client_name,
             lib_name: value.lib_name,
-            response_timeout: value.response_timeout.unwrap_or(Duration::MAX),
+            response_timeout: value
+                .response_timeout
+                .unwrap_or(crate::connection::factory::NO_TIMEOUT),
             protocol: value.protocol,
             reconnect_retry_strategy: value.reconnect_retry_strategy,
             refresh_topology_from_initial_nodes: value.refresh_topology_from_initial_nodes,
@@ -254,7 +258,7 @@ impl ClusterClientBuilder {
                 .clone_from(&first_node.valkey.password);
             &cluster_params.password
         } else {
-            &None
+            &cluster_params.password
         };
         let username = if cluster_params.username.is_none() {
             cluster_params
@@ -262,7 +266,7 @@ impl ClusterClientBuilder {
                 .clone_from(&first_node.valkey.username);
             &cluster_params.username
         } else {
-            &None
+            &cluster_params.username
         };
         if cluster_params.tls.is_none() {
             cluster_params.tls = match first_node.addr {
@@ -279,6 +283,23 @@ impl ClusterClientBuilder {
             };
         }
 
+        // Validate cross-seed TLS consistency: all seeds must agree on TLS vs non-TLS.
+        let mut has_tls = false;
+        let mut has_non_tls = false;
+        for node in &initial_nodes {
+            match &node.addr {
+                ConnectionAddr::TcpTls { .. } => has_tls = true,
+                ConnectionAddr::Tcp(..) => has_non_tls = true,
+                ConnectionAddr::Unix(_) => {} // rejected below
+            }
+        }
+        if has_tls && has_non_tls {
+            return Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "Cannot mix TLS and non-TLS seed nodes. All seeds must use the same scheme (redis:// or rediss://).",
+            )));
+        }
+
         let mut nodes = Vec::with_capacity(initial_nodes.len());
         for mut node in initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
@@ -288,14 +309,20 @@ impl ClusterClientBuilder {
                 )));
             }
 
-            if password.is_some() && node.valkey.password != *password {
+            if password.is_some()
+                && node.valkey.password.is_some()
+                && node.valkey.password != *password
+            {
                 return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different password among initial nodes.",
                 )));
             }
 
-            if username.is_some() && node.valkey.username != *username {
+            if username.is_some()
+                && node.valkey.username.is_some()
+                && node.valkey.username != *username
+            {
                 return Err(Error::from((
                     ErrorKind::InvalidClientConfig,
                     "Cannot use different username among initial nodes.",
@@ -712,13 +739,38 @@ mod tests {
 
     #[test]
     fn give_username_password_by_method() {
-        let client = ClusterClientBuilder::new(get_connection_data_with_password())
+        // Builder-set credentials work with seeds that have no embedded creds
+        let client = ClusterClientBuilder::new(get_connection_data())
             .password("pass".to_string())
             .username("user1".to_string())
             .build()
             .unwrap();
         assert_eq!(client.cluster_params.password, Some("pass".to_string()));
         assert_eq!(client.cluster_params.username, Some("user1".to_string()));
+    }
+
+    #[test]
+    fn give_username_password_by_method_matching_seeds() {
+        // Builder-set credentials that match seed credentials should succeed
+        let client = ClusterClientBuilder::new(get_connection_data_with_password())
+            .password("password".to_string())
+            .username("user1".to_string())
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.cluster_params.password,
+            Some("password".to_string())
+        );
+        assert_eq!(client.cluster_params.username, Some("user1".to_string()));
+    }
+
+    #[test]
+    fn give_password_by_method_mismatching_seeds() {
+        // Builder-set password that conflicts with seed passwords should fail
+        let result = ClusterClientBuilder::new(get_connection_data_with_password())
+            .password("different_pass".to_string())
+            .build();
+        assert!(result.is_err());
     }
 
     #[test]
@@ -769,5 +821,32 @@ mod tests {
                 .max_jitter_milli,
             DEFAULT_SLOTS_REFRESH_MAX_JITTER_MILLI
         );
+    }
+
+    #[test]
+    fn mixed_tls_and_non_tls_seeds_rejected() {
+        let result = ClusterClient::new(vec![
+            "redis://127.0.0.1:6379",
+            "rediss://127.0.0.1:6380",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn all_tls_seeds_accepted() {
+        let result = ClusterClient::new(vec![
+            "rediss://127.0.0.1:6379",
+            "rediss://127.0.0.1:6380",
+        ]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn all_non_tls_seeds_accepted() {
+        let result = ClusterClient::new(vec![
+            "redis://127.0.0.1:6379",
+            "redis://127.0.0.1:6380",
+        ]);
+        assert!(result.is_ok());
     }
 }

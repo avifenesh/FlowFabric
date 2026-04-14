@@ -405,10 +405,18 @@ pub(crate) fn calculate_topology<'a>(
         )));
     }
 
-    // The rate of agreement of the topology view is determined by assessing the number of nodes that share this view out of the total number queried
+    // The rate of agreement of the topology view is determined by assessing the number of nodes that share this view out of the total number queried.
+    // Require a strict majority (>0.5) under normal circumstances. On the last retry, relax to
+    // MIN_AGREEMENT_RATE_FALLBACK so that a degraded cluster can still make progress.
     let agreement_rate = most_frequent_topology.nodes_count as f32 / num_of_queried_nodes as f32;
-    const MIN_AGREEMENT_RATE: f32 = 0.2;
-    if agreement_rate >= MIN_AGREEMENT_RATE {
+    const MIN_AGREEMENT_RATE_MAJORITY: f32 = 0.5;
+    const MIN_AGREEMENT_RATE_FALLBACK: f32 = 0.2;
+    let min_rate = if curr_retry >= DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES {
+        MIN_AGREEMENT_RATE_FALLBACK
+    } else {
+        MIN_AGREEMENT_RATE_MAJORITY
+    };
+    if agreement_rate >= min_rate {
         parse_and_built_result(most_frequent_topology)
     } else {
         Err(Error::from((

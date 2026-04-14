@@ -90,6 +90,10 @@ pub trait IAMTokenProvider: Send + Sync {
     async fn get_valid_token(&self) -> Option<String>;
 }
 
+/// Sentinel value meaning "no timeout": effectively waits forever.
+/// Used where a `Duration` is required but the caller does not want to impose a deadline.
+pub(crate) const NO_TIMEOUT: std::time::Duration = std::time::Duration::MAX;
+
 impl Client {
     /// Returns an async multiplexed connection from the client.
     pub async fn get_multiplexed_async_connection(
@@ -97,8 +101,8 @@ impl Client {
         ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> Result<MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
-            std::time::Duration::MAX,
-            std::time::Duration::MAX,
+            NO_TIMEOUT,
+            NO_TIMEOUT,
             ferriskey_connection_options,
         )
         .await
@@ -137,7 +141,7 @@ impl Client {
         ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> Result<(MultiplexedConnection, Option<IpAddr>)> {
         self.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
-            Duration::MAX,
+            NO_TIMEOUT,
             None,
             ferriskey_connection_options,
         )

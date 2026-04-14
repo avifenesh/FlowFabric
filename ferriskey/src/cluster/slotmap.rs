@@ -197,13 +197,14 @@ impl SlotMap {
     }
 
     /// Returns a set of all primary node addresses in the cluster.
+    ///
+    /// Iterates the slot ranges (one entry per range) rather than the full
+    /// nodes map (which contains both primaries and replicas), so there are
+    /// far fewer entries to visit and no redundant replica lookups.
     pub fn addresses_for_all_primaries(&self) -> HashSet<Arc<String>> {
-        self.nodes_map
-            .iter()
-            .map(|map_item| {
-                let (_ip, shard_addrs) = map_item.value();
-                shard_addrs.primary().clone()
-            })
+        self.slots
+            .values()
+            .map(|slot_value| slot_value.addrs.primary().clone())
             .collect()
     }
 

@@ -600,7 +600,7 @@ impl MultiplexedConnection {
         Self::new_with_response_timeout(
             connection_info,
             stream,
-            std::time::Duration::MAX,
+            super::factory::NO_TIMEOUT,
             ferriskey_connection_options,
         )
         .await
