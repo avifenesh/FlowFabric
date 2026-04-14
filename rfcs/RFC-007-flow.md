@@ -305,6 +305,8 @@ Validation rules:
 4. DAG mode must reject cycles
 5. policy inheritance from flow to execution remains explicit and auditable
 6. if the flow has an attached budget with `on_hard_limit = deny_child`, exhausted allowance rejects the spawn before membership is committed
+
+**V1 limitation — dynamic dependencies on non-runnable executions:** `apply_dependency_to_child` only gates the execution (sets `blocked_by_dependencies`) if it is currently `runnable`. Dependencies added while an execution is `suspended` or `active` are recorded in `deps:meta` and `dep:<edge_id>` but do NOT change the execution's eligibility state. When the execution later resumes or completes a re-claim, the resume path (`deliver_signal`, `resume_execution`) sets `eligible_now` without checking dependency state. The generalized index reconciler (RFC-010 §6.17) corrects this within 30-60 seconds. A future version may add dependency checks to the resume path.
 7. every child execution requires a `lane_id`. If not explicitly provided, the child inherits the parent execution's `lane_id` or the flow's `default_routing_hints` lane. Every execution in FlowFabric must belong to a lane — there is no lane-less execution.
 
 ### Cancellation Propagation
@@ -544,7 +546,7 @@ Cycle check note:
 Pseudocode:
 
 ```lua
--- KEYS: exec_core, deps_meta, unresolved_set, dep_hash
+-- KEYS: exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, blocked_deps_zset
 -- ARGV: flow_id, edge_id, upstream_execution_id, graph_revision,
 --       dependency_kind, data_passing_ref, now_ms
 
@@ -582,6 +584,9 @@ if core.lifecycle_phase == "runnable" and core.terminal_outcome == "none" then
     "blocking_reason", "waiting_for_children",
     "public_state", "waiting_children"
   )
+  -- Move from eligible → blocked:dependencies (ZREM is no-op if not in eligible)
+  redis.call("ZREM", KEYS[5], core.execution_id)
+  redis.call("ZADD", KEYS[6], tonumber(core.created_at or "0"), core.execution_id)
 end
 
 return ok(unresolved)
@@ -596,7 +601,7 @@ When an upstream execution reaches a relevant terminal outcome, the engine uses 
 Pseudocode:
 
 ```lua
--- KEYS: exec_core, deps_meta, unresolved_set, dep_hash, runnable_index, terminal_zset
+-- KEYS: exec_core, deps_meta, unresolved_set, dep_hash, eligible_zset, terminal_zset, blocked_deps_zset
 -- ARGV: edge_id, upstream_outcome, now_ms
 
 local dep = redis.call("HGETALL", KEYS[4])
@@ -626,6 +631,8 @@ if ARGV.upstream_outcome == "success" then
       "public_state", "waiting",
       "last_tx", ARGV.now_ms, "last_mut", ARGV.now_ms
     )
+    -- Move from blocked:dependencies → eligible
+    redis.call("ZREM", KEYS[7], core.execution_id)
     local priority = tonumber(core.priority or "0")
     local created_at_ms = tonumber(core.created_at or "0")
     local score = 0 - (priority * 1000000000000) + created_at_ms
@@ -654,6 +661,8 @@ if core.terminal_outcome == "none" then
     "completed", ARGV.now_ms,
     "last_tx", ARGV.now_ms, "last_mut", ARGV.now_ms
   )
+  -- Move from blocked:dependencies → terminal
+  redis.call("ZREM", KEYS[7], core.execution_id)
   redis.call("ZADD", KEYS[6], ARGV.now_ms, core.execution_id)
 end
 

@@ -200,6 +200,8 @@ When multiple tenants (namespaces) share a lane, the scheduler applies a **tenan
 
 Within a lane, if the next candidate by priority belongs to a tenant that has consumed more than its fair share in the current window, the scheduler may skip it in favor of an underserved tenant's execution (subject to priority floor — a high-priority execution is never skipped below a configurable threshold).
 
+**Deficit cap:** Accumulated deficit per tenant and per lane is capped at `2 × weight`. This prevents runaway rebalancing after extended budget exhaustion or capacity outage. Without a cap, a tenant blocked by budget for hours would accumulate massive deficit that monopolizes claims for an extended period once the budget frees.
+
 #### 5.4 V1 Fairness Ignores Flow/Coordinator Priority
 
 V1 fairness operates at the lane and tenant level only. It does not consider flow-level priority, coordinator urgency, or DAG critical-path information. A flow member execution is scheduled by its own `priority` field and its lane/tenant fairness context — the scheduler has no concept of "this execution is on the critical path of a high-priority flow."
@@ -385,7 +387,7 @@ intake_open ──► intake_paused ──► draining ──► disabled
 | State | Submissions | Claims | Active Work |
 |-------|------------|--------|-------------|
 | `intake_open` | Accepted | Allowed | Continues |
-| `intake_paused` | Rejected | Allowed (existing eligible work) | Continues |
+| `intake_paused` | Rejected | Allowed — all eligible work including retries, reclaims, and resumes of existing executions. Only new `enqueue` submissions are blocked. | Continues |
 | `draining` | Rejected | Allowed (drain remaining) | Continues until empty |
 | `disabled` | Rejected | Blocked | Active work continues but no new claims |
 

@@ -390,6 +390,8 @@ Recommended shape:
   - matched signals
   - recent buffered signal summary
 
+Workers must not rely on re-reading their own attempt stream for continuation context across suspension. Stream frames may be trimmed by MAXLEN while the stream is open (RFC-006). All context needed for resumption must be stored behind the `continuation_metadata_pointer` or derived from matched signal payloads.
+
 ### Interaction with Execution State
 
 Suspension is a lifecycle state, not merely a blocking reason.

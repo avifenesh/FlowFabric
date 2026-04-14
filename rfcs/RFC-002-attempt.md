@@ -315,6 +315,7 @@ The execution record (RFC-001) should track:
 - Replay is only valid on terminal executions. Attempting to replay an active or suspended execution is an error.
 - Replay policy may impose limits (e.g., max replay count, replay cooldown period).
 - Each replay creates a completely fresh attempt — the worker receives no implicit state from prior attempts unless the execution's input payload includes continuation metadata.
+- Replay does NOT reset budget counters (RFC-008). Budget usage is cumulative across all attempts, including prior attempts from before the replay. To replay a budget-constrained execution, the operator must first increase the budget limit or reset usage via `override_budget`.
 
 ### Fallback Progression
 
