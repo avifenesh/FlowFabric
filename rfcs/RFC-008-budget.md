@@ -320,13 +320,14 @@ Budget and quota blocks map to RFC-001's `blocking_reason` enum. Fine-grained ca
 
 | `blocking_reason` (enum) | Source | `blocking_detail` (string, examples) | Public State |
 |---|---|---|---|
-| `waiting_for_budget` | Budget limit reached, execution blocked. | `"budget budget-abc123: total_cost 48M/50M (96%)"` | `rate_limited` |
-| `waiting_for_budget` | Budget soft limit, enforcement = warn + block. | `"budget budget-abc123: soft limit total_tokens 810K/800K"` | `rate_limited` |
+| `waiting_for_budget` | Budget hard limit reached, execution blocked. | `"budget budget-abc123: total_cost 48M/50M (96%)"` | `rate_limited` |
 | `waiting_for_quota` | Rate-limit window full. | `"quota quota-xyz: requests_per_window 100/100, resets in 12s"` | `rate_limited` |
 | `waiting_for_quota` | Token rate limit hit. | `"quota quota-xyz: tokens_per_minute 95K/100K, resets in 8s"` | `rate_limited` |
 | `waiting_for_quota` | Concurrency cap reached. | `"quota quota-xyz: active_concurrency 50/50"` | `rate_limited` |
 
-When budget enforcement action is `suspend`, the execution transitions to `suspended` with `blocking_reason = paused_by_budget` (an existing RFC-001 blocking_reason value used when lifecycle_phase = suspended).
+**V1 soft limits:** `on_soft_limit` defaults to `warn`. The Lua script returns `SOFT_BREACH` to the caller, which logs a warning and emits a metric. No execution state change occurs — the execution continues running. No `blocking_reason` is set. Graduated soft-limit enforcement (block, suspend, reroute on soft breach) is deferred to post-v1.
+
+When budget enforcement action is `suspend` (post-v1), the execution transitions to `suspended` with `blocking_reason = paused_by_budget` (an existing RFC-001 blocking_reason value used when lifecycle_phase = suspended).
 
 When budget enforcement action is `fail`, the execution transitions to `failed` with `failure_reason = budget_exceeded`. This is a terminal outcome, not a blocking reason.
 

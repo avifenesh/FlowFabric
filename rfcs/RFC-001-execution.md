@@ -775,7 +775,7 @@ FlowFabric supports three visibility levels to avoid forcing every caller to see
 | `operator` | Dashboards, admin APIs | Everything in `public` plus: full state vector, `lease_epoch`, `worker_id`, attempt history summary, retry/reclaim/replay counts, usage counters, `failure_reason`, `cancellation_reason`, `last_operator_action`. |
 | `internal` | Engine internals, debugging | Everything in `operator` plus: raw Valkey key references, scheduling scores, routing decision snapshots, policy snapshots, full event log pointers. |
 
-Visibility is enforced at the API layer, not at storage. All data is stored; the visibility level controls what the response includes.
+Visibility filtering is enforced at the API layer, not in Valkey Lua scripts. All fields are stored on the execution core hash; the API server reads the full record and projects the response based on the caller's authenticated visibility level. Lua scripts operate on the full record and do not filter by visibility.
 
 ---
 

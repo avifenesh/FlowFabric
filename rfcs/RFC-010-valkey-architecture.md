@@ -108,6 +108,7 @@ All keys below share the hash tag `{p:N}` where `N = crc16(execution_id) % num_p
 | `ff:idx:{p:N}:worker:<worker_instance_id>:leases` | SET | 001, 003 | Member: `execution_id`. | Per-worker lease set within partition. Operator drain aid. Best-effort — authoritative ownership is on exec core. |
 | `ff:idx:{p:N}:suspension_timeout` | ZSET | 004 | Member: `execution_id`. Score: `timeout_at` (ms). | Suspension timeout scanner target. Cross-lane within partition. |
 | `ff:idx:{p:N}:pending_waitpoint_expiry` | ZSET | 004 | Member: `waitpoint_id`. Score: `expires_at` (ms). | Pending waitpoint cleanup scanner target. |
+| `ff:idx:{p:N}:all_executions` | SET | 010 | Member: `execution_id`. | All execution IDs in this partition. SADD on `create_execution`, SREM on retention purge. Used by generalized index reconciler (§6.17) to iterate executions without SCAN. O(N_executions) instead of O(N_total_keys_on_node). |
 
 #### 1.2 Flow-Structural Partition Keys — `{fp:N}`
 
@@ -313,6 +314,10 @@ Worker                Scheduler                {q:K}              {b:M}         
 | Step 3 fails (execution gone) | Step 1 INCR'd, step 2 passed. | Same as above for step 1. No grant written — no orphan. |
 | Step 3 succeeds, step 4 never runs (worker crash) | Grant key exists with TTL. Execution removed from eligible set. | Grant TTL expires (5s). **Grant expiry reconciler** (RFC-009 §12.8) detects execution is `runnable` + `eligible_now` but not in eligible set, re-adds it. |
 | Step 3 succeeds, step 4 fails (execution state changed between 3 and 4) | Grant exists but execution no longer claimable. | Grant TTL expires. Reconciler checks execution state — since it's no longer `runnable`, no re-add needed. Grant key auto-deletes. |
+| **Quota partition `{q:K}` unreachable** (network partition, shard down) | Scheduler cannot check admission. | **FAIL-OPEN.** Proceed without quota check. Quota is admission pacing, not a correctness boundary. Over-admission is bounded by the claim-grant serialization on `{p:N}`. Reconcile quota counters when `{q:K}` recovers. |
+| **Budget partition `{b:M}` unreachable** — hard-limit budget | Scheduler cannot check budget. | **FAIL-CLOSED.** Do not issue claim grant. Budget hard limits are a correctness boundary (spending caps). Execution remains eligible but unclaimed until `{b:M}` recovers. |
+| **Budget partition `{b:M}` unreachable** — advisory/soft budget | Scheduler cannot check budget. | **FAIL-OPEN.** Proceed without budget check. Advisory budgets are monitoring tools, not hard enforcement. Log warning. |
+| **Execution partition `{p:N}` unreachable** | Cannot access execution state at all. | **FAIL.** Claim is impossible — the execution, lease, and attempt all live on `{p:N}`. Scheduler skips this execution until the partition recovers. |
 
 #### 3.2 Flow Dependency Resolution
 
@@ -1825,7 +1830,7 @@ return ok("reconciled")
 | **Failure mode** | Safe to crash. Desync persists until next scan. |
 | **Idempotency** | ZADD on existing member is no-op. ZREM on non-member is no-op. |
 | **Batch size** | 100-200 SCAN iterations. Each Lua: ~13 keys, 1 HMGET + 1 ZADD + ~10 ZREM. |
-| **SCAN strategy** | `SCAN 0 MATCH ff:exec:{p:N}:*:core COUNT 200`. Construct per-lane index keys. Call Lua per item. |
+| **Discovery strategy** | `SMEMBERS ff:idx:{p:N}:all_executions` to get all execution IDs in the partition. O(N_executions) — avoids SCAN which is O(N_total_keys_on_node). For each execution_id: read lane_id from exec_core, construct per-lane index keys, call `reconcile_execution_index.lua`. Process in batches of 100-200 per cycle. |
 
 **When this fires:** Under normal operation, finds nothing (ZADDs match, ZREMs find nothing). Exists for:
 - OOM partial writes (Lua aborted after state mutation but before index write)
@@ -2224,6 +2229,8 @@ The Valkey backend must support in v1:
 **Public API wire format (gRPC/REST/SDK):** V1 operations are invoked via Valkey Lua scripts through the ferriskey cluster client. No public API wire format is specified in these RFCs. An API server translating external gRPC/REST requests to Lua script invocations is a v1 companion component — its design is outside the scope of the execution engine RFCs. UC-62 (language-neutral control API) is addressed by the operation semantics defined here; the transport layer is deferred.
 
 **Cross-execution event feed:** V1 does not provide a lane-level or system-level event stream for observers and dashboards. Per-execution observability is available: attempt streams (XREAD BLOCK for live output, RFC-006), lease history streams (lifecycle events, RFC-003). Lane-level dashboards rely on periodic count aggregation (§6.13). A cross-execution event stream (one XADD per state transition, consumable by dashboards and webhooks) is a designed-for extension that would address UC-55 (execution event feed) more fully.
+
+**Unified per-execution audit trail:** V1 audit trail is reconstructable from four sources: lease history (ownership events with `reason` field — completed, failed, suspended), attempt records (per-attempt timing and outcome), signal records (delivery and resume effects), and suspension records (episodes and close reasons). A unified per-execution event stream (one XADD per lifecycle transition: created, claimed, completed, failed, cancelled, suspended, resumed, replayed, operator_override) is a designed-for extension that would consolidate audit into one queryable timeline.
 
 ### 9.3 Retention and Cleanup Strategy
 

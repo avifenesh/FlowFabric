@@ -534,8 +534,10 @@ Responsibilities:
 
 Cycle check note:
 
-- for v1, cycle detection may be done in control plane against the flow adjacency snapshot and then committed by script with `graph_revision` optimistic validation
-- the script must still reject stale graph revisions
+- **The Lua script validates `graph_revision` only. It does NOT independently verify acyclicity.** Cycle detection is the control plane's responsibility.
+- The control plane reads the flow's adjacency snapshot (all `out:<node>` sets), runs DFS reachability from the proposed downstream node. If the proposed upstream is reachable, the edge would create a cycle → reject before calling the Lua script.
+- The Lua script checks `expected_graph_revision == current_graph_revision`. If stale (another edge was added between snapshot read and script call), it returns `stale_graph_revision`. The control plane re-reads the adjacency, re-runs cycle detection, and retries.
+- This optimistic concurrency + retry loop correctly prevents cycles even under concurrent edge additions.
 
 #### `apply_dependency_to_child.lua` on child execution partition
 
