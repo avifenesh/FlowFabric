@@ -479,7 +479,8 @@ pub mod zstd_backend {
 
             let compressed_data = &data[HEADER_SIZE..];
 
-            // Use streaming decoder with output size limit to prevent zip bombs
+            // Use streaming decoder with output size limit to prevent zip bombs.
+            // Note: limit is approximate — actual output may exceed by up to one read chunk (~128KB).
             const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024; // 256 MB
 
             let mut decoder = zstd::stream::Decoder::new(compressed_data).map_err(|e| {

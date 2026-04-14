@@ -355,6 +355,9 @@ fn parse_bulk_string(buf: &mut BytesMut) -> Result<Value> {
     Ok(Value::BulkString(data))
 }
 
+/// Maximum array/map/set length to prevent DoS from crafted responses.
+const MAX_COLLECTION_LENGTH: usize = 1_000_000;
+
 fn parse_array(buf: &mut BytesMut, depth: usize) -> Result<Value> {
     let line = read_line_unchecked(buf)?;
     let length = parse_integer(&line)?;
@@ -362,6 +365,14 @@ fn parse_array(buf: &mut BytesMut, depth: usize) -> Result<Value> {
         return Ok(Value::Nil);
     }
     let length = length as usize;
+    if length > MAX_COLLECTION_LENGTH {
+        return Err((
+            ErrorKind::ParseError,
+            "Array length exceeds maximum",
+            format!("got {length}, max is {MAX_COLLECTION_LENGTH}"),
+        )
+            .into());
+    }
     let mut items = Vec::with_capacity(length);
     for _ in 0..length {
         // Array elements can be errors (e.g. EXEC responses with per-command failures).
@@ -378,6 +389,14 @@ fn parse_map(buf: &mut BytesMut, depth: usize) -> Result<Value> {
         return Ok(Value::Nil);
     }
     let kv_length = kv_length as usize;
+    if kv_length > MAX_COLLECTION_LENGTH {
+        return Err((
+            ErrorKind::ParseError,
+            "Map length exceeds maximum",
+            format!("got {kv_length}, max is {MAX_COLLECTION_LENGTH}"),
+        )
+            .into());
+    }
     let mut pairs = Vec::with_capacity(kv_length);
     for _ in 0..kv_length {
         let key = parse_value_unchecked(buf, depth + 1)?;

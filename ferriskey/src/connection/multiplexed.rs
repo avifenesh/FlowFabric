@@ -209,7 +209,7 @@ where
 
         // Handle fenced commands
         if entry.is_fenced {
-            Self::handle_fenced_command(entry, result, self_.in_flight, self_.response_sync_lost);
+            Self::handle_fenced_command(entry, result, self_.in_flight, self_.response_sync_lost, self_.is_stream_closed);
             return;
         }
 
@@ -276,10 +276,11 @@ where
         result: Result<Value>,
         in_flight: &mut VecDeque<InFlight>,
         response_sync_lost: &mut bool,
+        is_stream_closed: &Arc<AtomicBool>,
     ) {
         // Check if we already have a stored result (this is the second response - PONG)
         if let Some(stored_result) = entry.fenced_result.take() {
-            Self::handle_fenced_second_response(entry, result, stored_result, in_flight, response_sync_lost);
+            Self::handle_fenced_second_response(entry, result, stored_result, in_flight, response_sync_lost, is_stream_closed);
         } else {
             // This is the first response from the fenced command
             Self::handle_fenced_first_response(entry, result, in_flight);
@@ -323,6 +324,7 @@ where
         stored_result: Result<Value>,
         in_flight: &mut VecDeque<InFlight>,
         response_sync_lost: &mut bool,
+        is_stream_closed: &Arc<AtomicBool>,
     ) {
         // Verify we got PONG
         let is_pong = matches!(
@@ -333,6 +335,11 @@ where
         if !is_pong {
             // Set the flag - all future commands will fail
             *response_sync_lost = true;
+
+            // Mark the connection as closed so the cluster layer evicts it on
+            // the next routing attempt instead of continuing to send requests
+            // that will all fail with ProtocolDesync.
+            is_stream_closed.store(true, Ordering::Relaxed);
 
             tracing::error!("Fenced command - CRITICAL: Expected PONG for fenced command but got unexpected response. Response synchronization lost. All commands will fail until reconnection.");
 

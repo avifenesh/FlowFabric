@@ -139,7 +139,11 @@ fn parse_node_address(address: &str) -> Option<(&str, i64)> {
 /// keep their own MOVED/ASK handling because they participate in full retry
 /// state machines with slot-map refresh, backoff, and response aggregation.
 /// This helper is **only for the direct-dispatch fast path** where we want a
-/// single opportunistic redirect without retry infrastructure.
+/// single opportunistic MOVED redirect without retry infrastructure.
+///
+/// ASK redirects are NOT handled here — they require an atomic ASKING + command
+/// pair which cannot be guaranteed on a shared multiplexed connection. ASK errors
+/// fall back to the cluster task's single-threaded state machine instead.
 async fn try_redirect_to_known_node<C>(
     conn_lock: &ParkingLotRwLock<ConnectionsContainer<C>>,
     error: &Error,
@@ -149,8 +153,7 @@ async fn try_redirect_to_known_node<C>(
 where
     C: ConnectionLike + Clone + Send + Sync + 'static,
 {
-    let is_ask = error.kind() == ErrorKind::Ask;
-    if !is_ask && error.kind() != ErrorKind::Moved {
+    if error.kind() != ErrorKind::Moved {
         return None;
     }
 
@@ -163,20 +166,6 @@ where
     }?;
 
     let mut conn = conn_future.await;
-
-    if is_ask {
-        // NOTE: ASKING and the retried command are two separate writes on the
-        // multiplexed connection, so another command could be interleaved between
-        // them. A correct fix requires pipelining both into one write; tracked as
-        // a known limitation of the direct-dispatch path.
-        if conn
-            .req_packed_command(&crate::cmd::cmd("ASKING"))
-            .await
-            .is_err()
-        {
-            return None; // ASKING failed — fall back to cluster task
-        }
-    }
 
     Some(conn.send_packed_bytes(packed, is_fenced).await)
 }
@@ -365,10 +354,15 @@ where
 
         match result {
             Ok(val) => Some(Ok(val)),
-            Err(ref e) if matches!(e.kind(), ErrorKind::Moved | ErrorKind::Ask) => {
-                // Delegate to shared redirect helper. The cluster task will also
-                // receive a slot-refresh trigger (MOVED) or handle retries (ASK)
-                // via its own state machine — this is a best-effort fast path only.
+            Err(ref e) if e.kind() == ErrorKind::Ask => {
+                // ASK requires ASKING + command as an atomic pair. On a shared
+                // multiplexed connection the two writes can be interleaved by
+                // concurrent requests. Fall back to the cluster task which
+                // handles ASK correctly via its single-threaded state machine.
+                None
+            }
+            Err(ref e) if e.kind() == ErrorKind::Moved => {
+                // MOVED is safe to retry on the direct path — it's a single command.
                 try_redirect_to_known_node(&self.inner.conn_lock, e, packed, is_fenced).await
             }
             Err(_) => Some(result),
@@ -475,10 +469,14 @@ where
             }
         }
 
-        // Fill any missing slots with Nil
+        // If any command slot is still None, a node returned fewer replies than
+        // expected. Fall back to the cluster task rather than fabricating data.
+        if final_results.iter().any(|opt| opt.is_none()) {
+            return None;
+        }
         let assembled: Vec<Result<Value>> = final_results
             .into_iter()
-            .map(|opt| opt.unwrap_or(Ok(Value::Nil)))
+            .map(|opt| opt.expect("checked for None above"))
             .collect();
 
         Some(Ok(assembled))
@@ -2686,12 +2684,34 @@ where
         // Await all connection futures, this is bounded by `connection_timeout`.
         let results = futures::future::join_all(connection_futures).await;
 
-        // Collect successful connections
+        // Collect successful connections. For addresses that failed (e.g. timeout),
+        // preserve the existing healthy connection so a partial refresh doesn't
+        // discard connections that were working before the refresh.
         let new_connections = ConnectionsMap(DashMap::with_capacity(nodes_len));
+        let mut failed_addrs: Vec<String> = Vec::new();
         for (addr, result) in results {
             if let Ok(node) = result {
                 new_connections.0.insert(Arc::from(&*addr), node);
+            } else {
+                failed_addrs.push(addr);
             }
+        }
+
+        // Merge: for any address that failed reconnection, keep the old connection
+        // if one exists. This prevents a partial timeout from discarding all
+        // previously healthy connections.
+        if !failed_addrs.is_empty() {
+            let read_guard = inner.conn_lock.read();
+            for addr in &failed_addrs {
+                if let Some(existing_node) = read_guard.node_for_address(addr) {
+                    new_connections.0.insert(Arc::from(&**addr), existing_node);
+                }
+            }
+            drop(read_guard);
+            info!(
+                "refresh_slots: preserved existing connections for {} addresses that failed reconnection",
+                failed_addrs.len()
+            );
         }
 
         info!("refresh_slots found nodes:\n{new_connections}");
@@ -5040,19 +5060,15 @@ mod direct_dispatch_tests {
 
     // ── Test 4 ──────────────────────────────────────────────────────────────
     // ASK redirect: node_a returns ASK pointing to node_b.
-    // The redirect helper must send ASKING to node_b before the retried command.
-    // Because req_packed_command is used for ASKING and send_packed_bytes for
-    // the retry, node_b must record exactly 2 payloads in total.
+    // The direct dispatch path must NOT handle ASK (ASKING + command cannot
+    // be sent atomically on a shared multiplexed connection), so it returns
+    // None to fall back to the cluster task's single-threaded state machine.
     #[tokio::test]
     async fn test_try_direct_dispatch_ask_redirect() {
         let node_a = MockConn::new();
         let node_b = MockConn::new();
 
         node_a.push_err(ask_err(4813, "127.0.0.1:7002"));
-        // node_b will receive ASKING (via req_packed_command → push Ok)
-        // and then the actual command (via send_packed_bytes → push Ok).
-        node_b.push_ok(Value::Okay); // response to ASKING
-        node_b.push_ok(Value::BulkString(b"ask-value".to_vec().into())); // response to actual command
 
         let conn = build_cluster(vec![
             ("127.0.0.1:7001", 0, 8191, node_a.clone()),
@@ -5063,23 +5079,17 @@ mod direct_dispatch_tests {
         let routing = SingleNodeRoutingInfo::SpecificNode(Route::new(4813, SlotAddr::Master));
         let result = conn.try_direct_dispatch(&get_baz, &routing).await;
 
-        assert!(result.is_some());
-        assert_eq!(
-            result.unwrap(),
-            Ok(Value::BulkString(b"ask-value".to_vec().into()))
+        // ASK must fall back to cluster task — direct path cannot guarantee
+        // atomic ASKING + command on a shared multiplexed connection.
+        assert!(
+            result.is_none(),
+            "expected None for ASK redirect so cluster task handles it correctly"
         );
-        // node_b must have received ASKING (1st call) + the retried command (2nd call).
+        // node_b must NOT have received anything — the direct path did not attempt ASK.
         assert_eq!(
             node_b.received_count(),
-            2,
-            "node_b should receive ASKING then the retried command"
-        );
-        // The first payload sent to node_b must be the packed ASKING command.
-        let asking_bytes = cmd("ASKING").get_packed_command();
-        assert_eq!(
-            node_b.received_nth(0),
-            asking_bytes,
-            "first payload to node_b must be ASKING"
+            0,
+            "node_b should not receive any requests in the direct path for ASK"
         );
     }
 

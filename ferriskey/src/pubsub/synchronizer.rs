@@ -140,6 +140,11 @@ pub struct EventDrivenSynchronizer {
     /// Prevents backoff tasks from spawning for our own UNSUBSCRIBE command responses,
     /// which would create compounding retry loops.
     in_topology_change: std::sync::atomic::AtomicBool,
+
+    /// Prevents multiple backoff tasks from spawning simultaneously.
+    /// Only one backoff task runs at a time — additional remove_current_subscriptions
+    /// calls while a backoff is active are covered by the running task's reconciles.
+    backoff_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EventDrivenSynchronizer {
@@ -162,6 +167,7 @@ impl EventDrivenSynchronizer {
             reconcile_complete_notify: Notify::new(),
             request_timeout,
             in_topology_change: std::sync::atomic::AtomicBool::new(false),
+            backoff_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         sync.start_event_loop(events_rx);
@@ -740,7 +746,12 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
         // Don't spawn a backoff task if we're inside on_topology_changed — those UNSUBSCRIBE
         // responses are our own commands and should not trigger additional retry loops.
         let in_change = self.in_topology_change.load(std::sync::atomic::Ordering::Acquire);
-        if still_desired && !in_change {
+        // Only spawn one backoff task at a time. If 100 channels migrate simultaneously,
+        // the single running backoff task's reconcile attempts cover all of them.
+        if still_desired && !in_change
+            && !self.backoff_active.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let backoff_flag = self.backoff_active.clone();
             tokio::spawn(async move {
                 let mut delay_ms = 200u64;
                 const MAX_DELAY_MS: u64 = 2000;
@@ -761,6 +772,7 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
                     let _ = tx.send(SyncEvent::DesiredChanged);
                     delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
                 }
+                backoff_flag.store(false, std::sync::atomic::Ordering::Release);
             });
         }
     }

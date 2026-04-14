@@ -791,6 +791,8 @@ where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     let mut new_scan_state = scan_state.clone();
+    const MAX_SCAN_RETRIES: usize = 10;
+    let mut retries = 0;
 
     loop {
         match send_scan(&new_scan_state, cluster_scan_args, core.clone()).await {
@@ -800,6 +802,18 @@ where
                 return Ok(((new_cursor, new_keys), new_scan_state));
             }
             Err(err) if is_scanwise_retryable_error(&err) => {
+                retries += 1;
+                if retries > MAX_SCAN_RETRIES {
+                    return Err(Error::from((
+                        ErrorKind::AllConnectionsUnavailable,
+                        "Cluster scan exceeded maximum retry count",
+                        format!(
+                            "Failed after {} retries. Last error: {}",
+                            MAX_SCAN_RETRIES, err
+                        ),
+                    )));
+                }
+
                 ClusterConnInner::check_topology_and_refresh_if_diff(
                     core.clone(),
                     &RefreshPolicy::NotThrottable,

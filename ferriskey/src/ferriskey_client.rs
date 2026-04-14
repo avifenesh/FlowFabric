@@ -1,3 +1,7 @@
+// TODO: High-level API (Client, ClientBuilder, TypedPipeline) has zero integration
+// test coverage. A dedicated test session should add tests for each public method,
+// including edge cases like empty inputs and error paths.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +134,13 @@ impl Client {
     }
 
     /// Delete one or more keys, returning the number of keys removed.
+    ///
+    /// Returns `Ok(0)` immediately if `keys` is empty, avoiding a
+    /// round-trip for a no-op DEL command.
     pub async fn del(&self, keys: &[impl ToArgs]) -> Result<i64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
         let mut cmd = cmd("DEL");
         cmd.arg(keys);
         self.execute(cmd).await
@@ -183,6 +193,12 @@ impl Client {
 
     /// Prepend one or more elements to a list, returning the new length.
     pub async fn lpush(&self, key: impl ToArgs, elements: &[impl ToArgs]) -> Result<i64> {
+        if elements.is_empty() {
+            return Err(Error::from((
+                ErrorKind::ClientError,
+                "LPUSH requires at least one element",
+            )));
+        }
         let mut cmd = cmd("LPUSH");
         cmd.arg(key).arg(elements);
         self.execute(cmd).await
@@ -283,6 +299,11 @@ impl Client {
     }
 
     async fn execute<T: FromValue>(&self, mut cmd: Cmd) -> Result<T> {
+        // Clone is required: ClientInner::send_command takes &mut self because it
+        // may update the connection password (IAM token rotation) internally.
+        // Refactoring send_command to &self would require changing
+        // update_connection_password and the ValkeyClientForTests trait across the
+        // codebase. The clone is cheap (Arc fields + atomics).
         let mut inner = (*self.0).clone();
         let value = inner.send_command(&mut cmd, None).await?;
         from_owned_value(value)
