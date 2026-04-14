@@ -765,6 +765,54 @@ end
 return ok("eligible")
 ```
 
+#### `ff_promote_blocked_to_eligible` on child execution partition
+
+Called by `ff-engine::dispatch` immediately after flow setup for root members with zero dependencies. Avoids 10-60s reconciler delay.
+
+Pseudocode:
+
+```lua
+-- KEYS: exec_core, blocked_deps_zset, eligible_zset, deps_meta, deps_unresolved
+-- ARGV: execution_id, now_ms
+
+local core = redis.call("HGETALL", KEYS.exec_core)
+assert_execution_exists(core)
+
+if core.lifecycle_phase ~= "runnable" then return err("not_runnable") end
+if core.eligibility_state ~= "blocked_by_dependencies" then return err("not_blocked_by_deps") end
+if core.terminal_outcome ~= "none" then return err("terminal") end
+
+-- Verify zero deps: unsatisfied must be 0 and unresolved set must be empty
+local unsatisfied = tonumber(redis.call("HGET", KEYS.deps_meta, "unsatisfied_required_count") or "0")
+local unresolved_count = redis.call("SCARD", KEYS.deps_unresolved)
+if unsatisfied > 0 or unresolved_count > 0 then
+  return err("deps_not_satisfied", unsatisfied, unresolved_count)
+end
+
+-- Preserve attempt_state (same logic as resolve_dependency satisfaction path)
+local new_attempt_state = core.attempt_state
+if not is_set(new_attempt_state) or new_attempt_state == "none" then
+  new_attempt_state = "pending_first_attempt"
+end
+
+redis.call("HSET", KEYS.exec_core,
+  "eligibility_state", "eligible_now",
+  "blocking_reason", "waiting_for_worker",
+  "blocking_detail", "",
+  "attempt_state", new_attempt_state,
+  "public_state", "waiting",
+  "last_transition_at", ARGV.now_ms, "last_mutation_at", ARGV.now_ms
+)
+
+redis.call("ZREM", KEYS.blocked_deps_zset, ARGV.execution_id)
+local priority = tonumber(core.priority or "0")
+local created_at_ms = tonumber(core.created_at or "0")
+local score = 0 - (priority * 1000000000000) + created_at_ms
+redis.call("ZADD", KEYS.eligible_zset, score, ARGV.execution_id)
+
+return ok()
+```
+
 ### Flow summary projection (`ff-engine::scanner::flow_summary_projector`)
 
 Flow summary counts and aggregate usage should be maintained by `ff-engine::scanner::flow_summary_projector` consuming execution state changes and flow events.

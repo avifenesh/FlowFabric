@@ -992,6 +992,38 @@ Rules:
 - inserts the waitpoint into `ff:idx:{p:N}:pending_waitpoint_expiry`
 - does not change execution lifecycle or lease ownership
 
+### Proactive waitpoint closure
+
+`ff_close_waitpoint`
+
+Called by `ff-sdk` when the worker decides not to suspend after creating a pending waitpoint (SDK §10.3 step 7d). Prevents orphaned pending waitpoints.
+
+Pseudocode:
+
+```lua
+-- KEYS: exec_core, waitpoint_hash, pending_wp_expiry_zset
+-- ARGV: waitpoint_id, reason, now_ms
+
+local wp = redis.call("HGETALL", KEYS.waitpoint_hash)
+if not wp.waitpoint_id then
+  return err("waitpoint_not_found")
+end
+if wp.state ~= "pending" and wp.state ~= "active" then
+  return err("waitpoint_not_open")
+end
+
+redis.call("HSET", KEYS.waitpoint_hash,
+  "state", "closed",
+  "closed_at", ARGV.now_ms,
+  "close_reason", ARGV.reason
+)
+
+-- Remove from pending expiry index (no-op if not pending)
+redis.call("ZREM", KEYS.pending_wp_expiry_zset, ARGV.waitpoint_id)
+
+return ok()
+```
+
 ### Timeout scanner (`ff-engine::scanner::suspension_timeout`)
 
 Suspension timeouts are indexed in:

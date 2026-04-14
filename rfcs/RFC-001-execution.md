@@ -676,7 +676,7 @@ Orthogonal dimensions do **not** mean all combinations are legal. The engine mus
 | Operation | Parameters | Semantics |
 |-----------|-----------|-----------|
 | `update_progress` | `execution_id`, `lease_id`, `pct?`, `message?` | Updates progress snapshot. |
-| `report_usage` | `execution_id`, `lease_id`, `usage_delta`, `usage_report_seq` | **Idempotent.** Caller provides a monotonically increasing `usage_report_seq` per attempt (starts at 1). Script checks `attempt_usage.last_usage_report_seq`: if `seq <= last` → `ok_already_applied` (no-op, prevents double-counting on retry). Otherwise: HINCRBY attempt + exec core counters, HSET `last_usage_report_seq`. Triggers budget check on `{b:M}` only if HINCRBY occurred. |
+| `report_usage` | `execution_id`, `lease_id`, `usage_delta`, `usage_report_seq` | **Idempotent.** Caller provides a monotonically increasing `usage_report_seq` per attempt (starts at 1). Function checks `attempt_usage.last_usage_report_seq`: if `seq <= last` → `ok_already_applied` (no-op, prevents double-counting on retry). Otherwise: HINCRBY attempt + exec core counters, HSET `last_usage_report_seq`. Triggers budget check on `{b:M}` only if HINCRBY occurred. |
 | `record_result` | `execution_id`, `lease_id`, `result_payload` | Sets final result (normally part of `complete_execution`). |
 
 #### 4.6 Inspection Operations (Class C — derived/best-effort)
@@ -1801,7 +1801,7 @@ Execution operations map to the crate architecture as follows:
 |---|---|---|
 | **Submission** | | |
 | `ff_create_execution` | `ff-script`, called by `ff-server` (API) | Single-partition FCALL. |
-| `ff_create_delayed_execution` | `ff-script`, called by `ff-server` (API) | Same script as create, different initial state. |
+| `ff_create_delayed_execution` | `ff-script`, called by `ff-server` (API) | Same function as create, different initial state. |
 | `ff_create_child_execution` | `ff-engine::dispatch`, called by `ff-server` | Two-phase: `{p:N}` create + `{fp:N}` flow membership (§3.8). |
 | **Claim / Ownership** | | |
 | `ff_claim_execution`, `ff_claim_resumed_execution` | `ff-script`, called by `ff-sdk` after `ff-scheduler` issues grant | Single-partition FCALL. Scheduler owns claim cycle (§3.1). |

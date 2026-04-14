@@ -514,7 +514,7 @@ Operator / Engine       {fp:N} (flow)            {p:N} (member execs)
   │◄──member_list──────────│                         │
   │                        │                         │
   ├─for each member (policy-filtered):──────────────►│
-  │  cancel_execution.lua  │                         │
+  │  ff_cancel_execution   │                         │
   │  (per member's {p:N})  │                         │
   │◄─────────────────────────────────────────ok──────│
   │                        │                         │
@@ -1133,8 +1133,8 @@ Worker          Scheduler           {q:K}         {b:M}         {p:N}
   │                │ 1. QUOTA CHECK   │             │              │
   │                │ (scope-level,    │             │              │
   │                │  fast pre-check) │             │              │
-  │                │ check_admission_ │             │              │
-  │                │ and_record.lua   │             │              │
+  │                │ ff_check_admis-  │             │              │
+  │                │ sion_and_record  │             │              │
   │                │─────────────────►│             │              │
   │                │ (ADMITTED/DENIED)│             │              │
   │                │◄─────────────────│             │              │
@@ -1168,8 +1168,8 @@ Worker          Scheduler           {q:K}         {b:M}         {p:N}
   │                │                  │             │              │
   │                │ [IF BUDGET OK]:  │             │              │
   │                │ 4. ISSUE GRANT   │             │              │
-  │                │ issue_claim_     │             │              │
-  │                │ grant.lua        │             │              │
+  │                │ ff_issue_claim_  │             │              │
+  │                │ grant            │             │              │
   │                │──────────────────────────────────────────────►│
   │                │                  │             │  (grant key  │
   │                │                  │             │   written,   │
@@ -1180,8 +1180,8 @@ Worker          Scheduler           {q:K}         {b:M}         {p:N}
   │◄───────────────│                  │             │              │
   │                │                  │             │              │
   │ 5. ACQUIRE LEASE                  │             │              │
-  │ claim_execution.lua               │             │              │
-  │ (or claim_resumed_execution.lua   │             │              │
+  │ ff_claim_execution                │             │              │
+  │ (or ff_claim_resumed_execution    │             │              │
   │  if attempt_state = interrupted)  │             │              │
   │────────────────────────────────────────────────────────────────►
   │                                   │             │  (validate   │
@@ -1216,7 +1216,7 @@ Worker                                {p:N} Partition
   │  attempt_id, result)                  │
   │──────────────────────────────────────►│
   │                                       │
-  │  complete_execution.lua               │
+  │  ff_complete_execution                │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 2. Validate: lifecycle=active,     │
@@ -1259,7 +1259,7 @@ Worker                                {p:N} Partition
   │  attempt_id, reason, category)        │
   │──────────────────────────────────────►│
   │                                       │
-  │  fail_execution.lua                   │
+  │  ff_fail_execution                     │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 2. Validate lease                  │
@@ -1311,7 +1311,7 @@ Worker                                {p:N} Partition
 Worker                                {p:N} Partition
   │                                       │
   │ (optional) create_pending_            │
-  │ waitpoint.lua                         │
+  │ ff_create_wp                          │
   │ (before calling external tool)        │
   │──────────────────────────────────────►│
   │  writes pending waitpoint, returns    │
@@ -1325,7 +1325,7 @@ Worker                                {p:N} Partition
   │  lease_id, epoch, suspension_spec)    │
   │──────────────────────────────────────►│
   │                                       │
-  │  suspend_execution.lua                │
+  │  ff_suspend_execution                 │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 2. Validate: active + lease match  │
@@ -1375,7 +1375,7 @@ External System                       {p:N} Partition
   │  (Engine decodes waitpoint_key        │
   │   to extract partition + wp_id)       │
   │                                       │
-  │  deliver_signal.lua                   │
+  │  ff_deliver_signal                     │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 2. Validate: suspended or has      │
@@ -1422,7 +1422,7 @@ External System                       {p:N} Partition
   │                                       │
   │  (If resumed: worker claims via       │
   │   normal 5b flow using                │
-  │   claim_resumed_execution.lua)        │
+  │   ff_claim_resumed_execution)        │
 
   Lua scripts: deliver_signal (1 script)
   Partitions: {p:N} only
@@ -1464,7 +1464,7 @@ Engine Scanner          Scheduler           {p:N} Partition
   │                       │ 5. Issue reclaim     │
   │                       │    grant             │
   │                       │    (issue_reclaim_   │
-  │                       │     grant.lua —      │
+  │                       │     ff_grant —       │
   │                       │     validates        │
   │                       │     ownership_state  │
   │                       │     is reclaimable,  │
@@ -1477,7 +1477,7 @@ Worker (new)              │                     │
   │ 6. RECLAIM            │                     │
   │ ff_reclaim_execution  │                     │
   │ (or interrupt_and_    │                     │
-  │  reclaim.lua)         │                     │
+  │  ff_reclaim)          │                     │
   │─────────────────────────────────────────────►│
   │  ┌──────────────────────────────────────────┤
   │  │ a. Validate: ownership_state in          │
@@ -1529,7 +1529,7 @@ Coordinator Exec    Engine        {fp:N} Flow     {p:N} Child      {p:N} Parent
   │                   │──────────────────────────────►│               │
   │                   │                │               │               │
   │                   │ 3. Add to flow membership      │               │
-  │                   │    stage_dependency_edge.lua   │               │
+  │                   │    ff_stage_dependency_edge    │               │
   │                   │────────────────►│               │               │
   │                   │  (validate      │               │               │
   │                   │   members,      │               │               │
@@ -1540,7 +1540,7 @@ Coordinator Exec    Engine        {fp:N} Flow     {p:N} Child      {p:N} Parent
   │                   │                │               │               │
   │                   │ 4. Apply dependency to child   │               │
   │                   │    apply_dependency_to_        │               │
-  │                   │    child.lua                   │               │
+  │                   │    ff_child                    │               │
   │                   │──────────────────────────────►│               │
   │                   │  (create dep    │              │               │
   │                   │   record,       │              │               │
@@ -1554,7 +1554,7 @@ Coordinator Exec    Engine        {fp:N} Flow     {p:N} Child      {p:N} Parent
   ═══════════════════ LATER: parent completes ═══════════════════════
   │                   │               │              │               │
   │                   │ 5. Parent execution completes │               │
-  │                   │    (complete_execution.lua)   │               │
+  │                   │    (ff_complete_execution)    │               │
   │                   │───────────────────────────────────────────────►│
   │                   │◄──────────────────────────────────────────────│
   │                   │               │              │               │
@@ -1566,7 +1566,7 @@ Coordinator Exec    Engine        {fp:N} Flow     {p:N} Child      {p:N} Parent
   │                   │◄───────────────│              │               │
   │                   │               │              │               │
   │                   │ 7. For each downstream edge:  │               │
-  │                   │    resolve_dependency.lua     │               │
+  │                   │    ff_resolve_dependency      │               │
   │                   │    on child partition         │               │
   │                   │──────────────────────────────►│               │
   │                   │  ┌───────────────────────────┤               │
@@ -1605,7 +1605,7 @@ Operator/Owner                        {p:N} Partition
   │  lease_epoch?, operator_override?)    │
   │──────────────────────────────────────►│
   │                                       │
-  │  cancel_execution.lua                 │
+  │  ff_cancel_execution                  │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 1a. If terminal: return           │
@@ -1645,7 +1645,7 @@ Operator                              {p:N} Partition
   │  requested_by)                        │
   │──────────────────────────────────────►│
   │                                       │
-  │  replay_execution.lua                 │
+  │  ff_replay_execution                  │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 2. Validate: lifecycle=terminal    │
@@ -1711,7 +1711,7 @@ Worker                                {p:N} Partition
   │  attempt_id)                          │
   │──────────────────────────────────────►│
   │                                       │
-  │  renew_lease.lua                      │
+  │  ff_renew_lease                        │
   │  ┌────────────────────────────────────┤
   │  │ 1. HGETALL exec_core              │
   │  │ 2. Validate: active, not revoked, │
@@ -1773,8 +1773,8 @@ FlowFabric requires several background processes to maintain system correctness,
 | **Partition scope** | Per `{p:N}` execution partition |
 | **Index** | `ff:idx:{p:N}:lease_expiry` (ZSET, score = `lease_expires_at` ms) |
 | **Operation** | `ZRANGEBYSCORE ff:idx:{p:N}:lease_expiry -inf <now_ms> LIMIT 0 <batch_size>` |
-| **Per-item action** | Run `mark_lease_expired_if_due.lua` on the execution core. The script re-validates that the lease is actually expired (guards against clock skew or recent renewal). If confirmed, sets `ownership_state = lease_expired_reclaimable`. |
-| **Failure mode** | Safe to crash. On restart, re-scans from `-inf`. Items already processed are idempotent (script re-validates). |
+| **Per-item action** | `FCALL ff_mark_lease_expired_if_due` on the execution core. Re-validates that the lease is actually expired (guards against clock skew or recent renewal). If confirmed, sets `ownership_state = lease_expired_reclaimable`. |
+| **Failure mode** | Safe to crash. On restart, re-scans from `-inf`. Items already processed are idempotent (function re-validates). |
 | **Idempotency** | The Lua script checks current lease state before acting. If already expired/reclaimed, it's a no-op. |
 | **Batch size** | 50-100 per scan cycle. Larger batches risk Lua script latency spikes. |
 
@@ -1970,7 +1970,7 @@ No separate process evaluates flow completion. The projector is the **sole autho
 | **Partition scope** | Per `{p:N}` execution partition, per lane |
 | **Index** | `ff:idx:{p:N}:lane:<lane_id>:delayed` (ZSET, score = `delay_until` ms) |
 | **Operation** | `ZRANGEBYSCORE ff:idx:{p:N}:lane:<lane_id>:delayed -inf <now_ms> LIMIT 0 <batch_size>` |
-| **Per-item action** | Run `promote_delayed.lua`: verify execution is still `runnable` + `not_eligible_until_time`. Set `eligibility_state = eligible_now`, `blocking_reason = waiting_for_worker`, `blocking_detail = ""`, `public_state = waiting`. ZREM from delayed, ZADD to eligible with priority score. |
+| **Per-item action** | `FCALL ff_promote_delayed`: verify execution is still `runnable` + `not_eligible_until_time`. Set `eligibility_state = eligible_now`, `blocking_reason = waiting_for_worker`, `blocking_detail = ""`, `public_state = waiting`. ZREM from delayed, ZADD to eligible with priority score. |
 | **Failure mode** | Safe to crash. Delayed executions stay in the delayed set until promoted. Worst case: a few seconds of late promotion. |
 | **Idempotency** | Script checks current state before promoting. Already-eligible or already-claimed executions are skipped. |
 | **Batch size** | 100-200. Lightweight state transitions. |
@@ -1988,7 +1988,7 @@ No separate process evaluates flow completion. The projector is the **sole autho
 | **Partition scope** | Per `{b:M}` budget partition |
 | **Index** | `ff:idx:{b:M}:budget_resets` (ZSET, score = `next_reset_at` ms) |
 | **Operation** | `ZRANGEBYSCORE ff:idx:{b:M}:budget_resets -inf <now_ms> LIMIT 0 <batch_size>` |
-| **Per-item action** | Run `reset_budget.lua`: zero all usage counters, record reset event, compute `next_reset_at`, re-score in index. |
+| **Per-item action** | `FCALL ff_reset_budget`: zero all usage counters, record reset event, compute `next_reset_at`, re-score in index. |
 | **Failure mode** | Safe to crash. Overdue resets are processed on next scan. |
 | **Idempotency** | Script checks `next_reset_at` before resetting. If already reset (next_reset_at is in the future), it's a no-op. |
 | **Batch size** | 10-20. Budget resets are infrequent. |
@@ -2096,9 +2096,9 @@ Cache invalidated at cycle end. Staleness within one cycle (5-10s) is acceptable
 
 | Property | Value |
 |---|---|
-| **Per-item action** | Read exec core `blocking_reason`. If mismatch with expected: skip. If match: re-evaluate external condition. If cleared: run `unblock_execution.lua` — verify still blocked, set `eligibility_state = eligible_now`, `blocking_reason = waiting_for_worker`, `blocking_detail = ""` (clear per §4.8k), `public_state = waiting`, ZREM blocked set, ZADD eligible set with composite priority score. All 7 dims. |
+| **Per-item action** | Read exec core `blocking_reason`. If mismatch with expected: skip. If match: re-evaluate external condition. If cleared: run `ff_unblock_execution` — verify still blocked, set `eligibility_state = eligible_now`, `blocking_reason = waiting_for_worker`, `blocking_detail = ""` (clear per §4.8k), `public_state = waiting`, ZREM blocked set, ZADD eligible set with composite priority score. All 7 dims. |
 | **Failure mode** | Safe to crash. Blocked executions remain blocked until next scan. |
-| **Idempotency** | `unblock_execution.lua` checks `eligibility_state` before acting. Already-eligible or already-claimed executions are skipped. |
+| **Idempotency** | `ff_unblock_execution` checks `eligibility_state` before acting. Already-eligible or already-claimed executions are skipped. |
 | **Batch size** | 20-50 per blocked set per cycle. |
 
 **Latency note:** 5-10s scan frequency means up to 10s delay before unblocking. For latency-sensitive cases (lane unpause), `enable_lane` may trigger an immediate scan.
@@ -2124,7 +2124,7 @@ Cache invalidated at cycle end. Staleness within one cycle (5-10s) is acceptable
 | **Frequency** | Every 1-2 seconds per partition (latency-sensitive — timeouts should fire promptly) |
 | **Partition scope** | Per `{p:N}` execution partition |
 | **Operation** | `ZRANGEBYSCORE ff:idx:{p:N}:attempt_timeout -inf <now_ms> LIMIT 0 <batch>`. Same for `execution_deadline`. |
-| **Per-item action** | Run `expire_execution.lua`: validate execution is not already terminal. Handles three lifecycle phases: **(1) active** — close attempt (ended_failure with failure_reason=attempt_timeout or execution_deadline), close stream, release lease, ZREM from lease_expiry + worker_leases + active_index. **(2) runnable** — ZREM from current scheduling index (eligible/delayed/blocked set). If attempt exists (pending_retry/pending_replay), no attempt state change (attempt was never started). **(3) suspended** — close waitpoint (state=closed, close_reason=expired), close suspension (close_reason=timed_out_expire), terminate attempt (ended_failure), ZREM from suspended + suspension_timeout. **All paths:** set `terminal_outcome = expired`, `attempt_state = attempt_terminal` (or `none` if no attempt), `failure_reason = "attempt_timeout"` or `"execution_deadline"`, `blocking_detail = ""`. ZREM from attempt_timeout and execution_deadline. ZADD terminal. All 7 state vector dimensions. |
+| **Per-item action** | Run `FCALL ff_expire_execution`: validate execution is not already terminal. Handles three lifecycle phases: **(1) active** — close attempt (ended_failure with failure_reason=attempt_timeout or execution_deadline), close stream, release lease, ZREM from lease_expiry + worker_leases + active_index. **(2) runnable** — ZREM from current scheduling index (eligible/delayed/blocked set). If attempt exists (pending_retry/pending_replay), no attempt state change (attempt was never started). **(3) suspended** — close waitpoint (state=closed, close_reason=expired), close suspension (close_reason=timed_out_expire), terminate attempt (ended_failure), ZREM from suspended + suspension_timeout. **All paths:** set `terminal_outcome = expired`, `attempt_state = attempt_terminal` (or `none` if no attempt), `failure_reason = "attempt_timeout"` or `"execution_deadline"`, `blocking_detail = ""`. ZREM from attempt_timeout and execution_deadline. ZADD terminal. All 7 state vector dimensions. |
 | **Failure mode** | Safe to crash. Overdue entries remain in the index. Picked up on next scan. |
 | **Idempotency** | Script checks `lifecycle_phase != terminal` before acting. Already-terminal executions are no-ops. Handles active, runnable, and suspended phases. |
 | **Batch size** | 50-100 per cycle. |
@@ -2157,9 +2157,9 @@ Cache invalidated at cycle end. Staleness within one cycle (5-10s) is acceptable
 | `lifecycle=suspended` | `suspended` (+ `suspension_timeout` if set) | both | eligible, delayed, active, terminal, all blocked |
 | `lifecycle=runnable, es=blocked_by_*` | `blocked:<reason>` | — | eligible, delayed, active, suspended, terminal, other blocked |
 
-**CRITICAL: Per-item fix MUST be an atomic Lua script.** Between the SCAN discovery and the fix, the execution's state may change (e.g., claimed by a worker). The Lua re-reads exec_core via HMGET and validates state before any writes. Without atomicity, the reconciler could create phantom index entries.
+**CRITICAL: Per-item fix MUST be an atomic Valkey Function.** Between the SCAN discovery and the fix, the execution's state may change (e.g., claimed by a worker). The function re-reads exec_core via HMGET and validates state before any writes. Without atomicity, the reconciler could create phantom index entries.
 
-**Pseudocode: `reconcile_execution_index.lua`**
+**Pseudocode: `ff_reconcile_execution_index`**
 
 ```lua
 -- KEYS: exec_core, eligible_zset, delayed_zset, active_zset,
@@ -2325,7 +2325,7 @@ return ok("reconciled")
 | **Failure mode** | Safe to crash. Desync persists until next scan. |
 | **Idempotency** | ZADD on existing member is no-op. ZREM on non-member is no-op. |
 | **Batch size** | 100-200 SCAN iterations. Each Lua: ~17 keys, 1 HMGET + 1 ZADD + ~10 ZREM (scheduling) + ~4 ZREM (auxiliary). |
-| **Discovery strategy** | Iterate `ff:idx:{p:N}:all_executions` to get execution IDs in the partition. For partitions with ≤10K members: use `SMEMBERS` (single response). For partitions with >10K members: use `SSCAN` with COUNT 200 to avoid large single-response payloads (~7 MB at 195K members). For each execution_id: read lane_id from exec_core, construct per-lane index keys, call `reconcile_execution_index.lua`. Process in batches of 100-200 per cycle. |
+| **Discovery strategy** | Iterate `ff:idx:{p:N}:all_executions` to get execution IDs in the partition. For partitions with ≤10K members: use `SMEMBERS` (single response). For partitions with >10K members: use `SSCAN` with COUNT 200 to avoid large single-response payloads (~7 MB at 195K members). For each execution_id: read lane_id from exec_core, construct per-lane index keys, call `FCALL ff_reconcile_execution_index`. Process in batches of 100-200 per cycle. |
 
 **When this fires:** Under normal operation, finds nothing (ZADDs match, ZREMs find nothing). Exists for:
 - OOM partial writes (Lua aborted after state mutation but before index write)
@@ -3032,6 +3032,11 @@ STARTUP:
 
 CLAIM:
   1. claim_request(caps, lanes) → scheduler issues grant    [RFC-009]
+     Scheduler returns to SDK: {execution_id, partition_id,
+       lane_id, attempt_state, lease_ttl_ms, attempt_timeout_ms,
+       execution_deadline_at}
+     SDK uses partition_id for {p:N} key construction,
+     attempt_state for claim dispatch (§4.6).
   2. IF attempt_state == attempt_interrupted:
        claim_resumed_execution → same attempt, new lease    [RFC-001]
        read continuation: get_suspension(exec_id) to get
@@ -3223,13 +3228,13 @@ Build incrementally. Each phase adds a testable capability. All functions are re
 | Phase | Capability | Functions | Scanners | Crates | RFCs |
 |---|---|---|---|---|---|
 | **0. Library bootstrap** | `FUNCTION LOAD REPLACE` with shared helpers + `ff_version` | `ff_version` + shared helpers | — | ferriskey (FCALL), ff-core, ff-script (loader + lua/) | RFC-010 |
-| **1. Hello world** | create → claim → renew → complete, cancel, lease expiry | 7: create, claim, complete, renew, mark_expired, cancel, issue_claim_grant | Lease expiry, delayed promoter, index reconciler | + ff-engine (minimal dispatch + 3 scanners), ff-scheduler (minimal single-lane), ff-sdk (register/claim/complete), ff-server, ff-test | RFC-001, RFC-002, RFC-003, RFC-009 |
-| **2. Failure + retry + reclaim** | fail → retry → backoff → reclaim | 5: fail, issue_reclaim_grant, reclaim, expire, promote_delayed | Attempt timeout scanner | + ff-engine (reclaim discovery), ff-script (+5 wrappers) | RFC-001, RFC-002, RFC-003 |
-| **3. Suspend + signal + resume** | suspend → signal → resume → re-claim | 4: suspend, deliver_signal, claim_resumed, create_pending_waitpoint | Suspension timeout, pending wp expiry | + ff-engine (suspend_and_wait orchestrator), ff-sdk (+suspend/resume) | RFC-004, RFC-005 |
+| **1. Hello world** | create → claim → renew → complete, cancel, delay, priority, progress | 12: create, claim, complete, renew, mark_expired, cancel, issue_claim_grant, revoke_lease, delay_execution, move_to_waiting_children, change_priority, update_progress | Lease expiry, delayed promoter, index reconciler | + ff-engine (minimal dispatch + 3 scanners), ff-scheduler (minimal single-lane), ff-sdk (register/claim/complete/delay), ff-server, ff-test | RFC-001, RFC-002, RFC-003, RFC-009 |
+| **2. Failure + retry + reclaim** | fail → retry → backoff → reclaim → expire | 5: fail, issue_reclaim_grant, reclaim, expire_execution, promote_delayed | Attempt timeout scanner | + ff-engine (reclaim discovery), ff-script (+5 wrappers) | RFC-001, RFC-002, RFC-003 |
+| **3. Suspend + signal + resume** | suspend → signal → resume → re-claim, timeout | 8: suspend, deliver_signal, claim_resumed, create_pending_waitpoint, buffer_signal, expire_suspension, resume_execution, close_waitpoint | Suspension timeout, pending wp expiry | + ff-engine (suspend_and_wait orchestrator), ff-sdk (+suspend/resume) | RFC-004, RFC-005 |
 | **4. Streaming** | append frames, tail, close on terminal | 1: append_frame | Stream retention trimmer | + ff-sdk (+stream append/tail) | RFC-006 |
 | **5. Budget + quota** | usage reporting, breach, admission | 5: report_usage_on_attempt, report_usage_and_check, check_admission_and_record, block_execution, unblock_execution | Budget reset, budget reconciler, quota reconciler, unblock scanner | + ff-engine (report_usage orchestrator), ff-scheduler (+budget/quota checks) | RFC-008, RFC-009 |
-| **6. Flow coordination** | deps, resolution, skip, replay | 4: stage_dependency_edge, apply_dependency_to_child, resolve_dependency, replay_execution | Dependency reconciler, flow summary projector | + ff-engine (dep resolution dispatch, flow cancellation) | RFC-007 |
-| **Total** | All core paths | **~26 scripts** | 12 scanners | |
+| **6. Flow coordination** | deps, resolution, skip, replay, eligibility | 6: stage_dependency_edge, apply_dependency_to_child, resolve_dependency, replay_execution, evaluate_flow_eligibility, promote_blocked_to_eligible | Dependency reconciler, flow summary projector | + ff-engine (dep resolution dispatch, flow cancellation) | RFC-007 |
+| **Total** | All core paths | **~37 functions** (26 unique after overlap dedup) | 12 scanners | |
 
 **Phase 1 is the minimum viable execution engine.** It proves the partition model, claim-grant mechanism, lease fencing, state vector management, and basic operator control (cancel). `renew_lease` is essential even for "Hello World" — without it, every execution expires after 30s. `cancel_execution` is needed for operator control of stuck executions. The delayed promoter is included because `create_delayed_execution` is a Phase 1 submission mode.
 

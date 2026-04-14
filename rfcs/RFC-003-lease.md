@@ -42,7 +42,7 @@ The lease is modeled as a current lease record plus immutable history entries. T
 | `lease_id` | opaque string | yes | Unique per lease issuance. New on every acquire, reclaim, and handoff. |
 | `lease_epoch` | u64 | yes | Monotonic fencing token per execution. Increments on each new lease issuance. Does not change on renew. |
 | `execution_id` | string | yes | Stable logical execution identity. |
-| `attempt_index` | u32 | yes | Zero-based attempt index for the attempt currently bound to the lease. Primary lease-attempt binding key in script validation. |
+| `attempt_index` | u32 | yes | Zero-based attempt index for the attempt currently bound to the lease. Primary lease-attempt binding key in function validation. |
 | `attempt_id` | string | yes | The lease belongs to the currently running attempt defined by RFC-002. |
 | `worker_id` | string | yes | Logical worker identity. |
 | `worker_instance_id` | string | yes | Concrete worker process / runtime instance identity. |
@@ -269,7 +269,7 @@ Implications by public state:
 
 #### Admission model boundary
 
-Capability, fairness, quota, and route scoring may be computed outside the lease script, but their final commit must be represented by durable claim context that the claim script validates atomically.
+Capability, fairness, quota, and route scoring may be computed outside the lease acquisition function, but their final commit must be represented by durable claim context that `ff_acquire_lease` validates atomically.
 
 Recommended v1 shape:
 - the scheduler/control plane computes routing and admission
@@ -319,9 +319,9 @@ Expiration handling rules:
    - create the new attempt
    - issue the new lease
    - bump the epoch
-   - make the new owner authoritative in one script
+   - make the new owner authoritative in one atomic function call
 
-Shared script helper:
+Shared library-local helper:
 
 - `mark_expired(core, now_ms)` updates the execution core atomically to:
   - `ownership_state = lease_expired_reclaimable`
@@ -465,11 +465,11 @@ Partition assignment algorithm:
 - `partition_number = hash(execution_id) % num_partitions`
 - the partition is computed exactly once when the execution is created
 - `num_partitions` is fixed at deployment time for one cluster topology generation
-- the chosen `partition_number` is stored on the execution core record and reused by every later script
+- the chosen `partition_number` is stored on the execution core record and reused by every later function call
 
-This ensures that execution, lease, attempt, and local indexes remain scriptable in one slot without recomputing placement from mutable runtime data.
+This ensures that execution, lease, attempt, and local indexes remain accessible in one slot without recomputing placement from mutable runtime data.
 
-All keys that must participate in one atomic lease script share the same hash tag:
+All keys that must participate in one atomic lease function share the same hash tag:
 
 - `ff:exec:{p:N}:<execution_id>:core`
 - `ff:exec:{p:N}:<execution_id>:lease:current`
@@ -482,7 +482,7 @@ All keys that must participate in one atomic lease script share the same hash ta
 - `ff:idx:{p:N}:worker:<worker_instance_id>:leases`
 - `ff:exec:{p:N}:<execution_id>:claim_grant`
 
-This lets one script update:
+This lets one function call update:
 - the execution core record
 - the current lease record
 - the attempt pointer
