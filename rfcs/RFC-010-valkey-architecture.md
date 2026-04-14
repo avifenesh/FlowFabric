@@ -583,6 +583,15 @@ Every Lua script defined across RFC-001 through RFC-009. All scripts within a si
 | 29a | `block_execution_for_admission` | RFC-009 | Parameterized block: set eligibility/blocking/public for budget/quota/route/lane denial, ZREM eligible, ZADD target blocked set. All 7 dims. | A | 3 | exec_core, eligible_zset, target_blocked_zset |
 | 29b | `unblock_execution` | RFC-010 | Re-evaluate blocked execution, set eligible_now + waiting_for_worker, ZREM blocked set, ZADD eligible with composite priority score. All 7 dims. | A | 3 | exec_core, source_blocked_zset, eligible_zset |
 | 29c | `expire_execution` | RFC-001 | Engine-initiated on attempt timeout or execution deadline. Validate active + running. Set terminal_outcome=expired, all 7 dims. Clear lease, close stream, ZREM from lease_expiry + worker_leases + active_index + attempt_timeout + execution_deadline. ZADD terminal. | A | 12 | exec_core, attempt_hash, lease_expiry_zset, worker_leases, terminal_zset, lease_current, lease_history, active_index, stream_meta, attempt_timeout_zset, execution_deadline_zset, suspended_zset |
+| 30 | `delay_execution` | RFC-001 | Worker delays its own active execution. Validate lease, release ownership, set not_eligible_until_time + delay_until, all 7 dims. ZREM from active + lease_expiry + attempt_timeout. ZADD delayed. | A | 8 | exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases, active_index, delayed_zset, attempt_timeout_zset |
+| 31 | `move_to_waiting_children` | RFC-001 | Worker blocks on child dependencies. Validate lease, release ownership, set blocked_by_dependencies + waiting_for_children, all 7 dims. ZREM from active + lease_expiry + attempt_timeout. ZADD blocked:dependencies. | A | 7 | exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases, active_index, blocked_deps_zset |
+| 32 | `change_priority` | RFC-001 | Update priority field + re-score in current scheduling sorted set. Validate runnable + eligible. ZREM old score, ZADD new composite score. | A | 2 | exec_core, eligible_zset |
+| 33 | `update_progress` | RFC-001 | Update progress_pct + progress_message. Validate lease (lease_id + epoch). | B | 1 | exec_core |
+| 34 | `report_usage_on_attempt` | RFC-001/008 | HINCRBY attempt usage counters + exec core usage totals. Validate lease. Route to {b:M} budget check after return. | B | 2 | exec_core, attempt_usage |
+| — | `skip_execution` | RFC-001 | *Implemented inline in `resolve_dependency` (#23) impossible path. Not a standalone script.* | — | — | — |
+| — | `release_lease` | RFC-001 | *Implemented inline in complete/fail/suspend/delay/move_to_waiting_children scripts. Not standalone.* | — | — | — |
+| — | `recover_abandoned_execution` | RFC-001 | *Same as `reclaim_execution` (#9). See RFC-003.* | — | — | — |
+| — | `record_result` | RFC-001 | *Inline in `complete_execution` (#3) — SET on result key. Standalone use for partial results: direct SET with lease validation (Class B, 2 keys).* | — | — | — |
 
 ### 4.2 Flow Partition Scripts (`{fp:N}`)
 
@@ -744,6 +753,72 @@ The scheduler must scan eligible sorted sets across all partitions to find a can
 Quota and budget policy lookups (which policies attach to a lane or tenant) require cross-partition reads to `{q:K}` and `{b:M}`. These policies change rarely.
 
 **V1 approach:** Scheduler caches lane-attached quota policies and budget summaries at startup. Refreshes every 60s. Only the actual `check_admission_and_record` Lua call (per-candidate) needs to be real-time — it reads the sliding window and concurrency counter, which are current.
+
+#### (k) blocking_detail MUST accompany blocking_reason
+
+Every HSET that changes `blocking_reason` MUST also set `blocking_detail` with a specific, human-readable explanation. When `blocking_reason = none`, set `blocking_detail = ""`.
+
+| blocking_reason | blocking_detail example |
+|---|---|
+| `waiting_for_budget` | `"budget budget-abc123: total_cost 48M/50M (96%)"` |
+| `waiting_for_quota` | `"quota quota-xyz: tokens_per_minute 95K/100K, resets in 8s"` |
+| `waiting_for_children` | `"3 of 5 deps unresolved: [edge_A, edge_B, edge_C]"` |
+| `waiting_for_capable_worker` | `"requires gpu=true, no registered worker has it"` |
+| `waiting_for_locality_match` | `"requires region=us-east-1, nearest worker in eu-west-1"` |
+| `waiting_for_retry_backoff` | `"retry backoff until 2026-04-14T10:30:00Z (attempt 3 of 5)"` |
+| `waiting_for_resume_delay` | `"resume delay 5000ms, eligible at 2026-04-14T10:30:05Z"` |
+| `paused_by_operator` | `"operator jane@example.com placed hold at 2026-04-14T10:25:00Z"` |
+| `paused_by_policy` | `"lane inference-fast is in draining state"` |
+| `none` | `""` |
+
+#### (l) Helper Function Reference
+
+All Lua pseudocode calls these helpers. Implementers must provide them.
+
+**Return wrappers** (§4.9 defines format):
+
+| Helper | Implementation | Complexity |
+|---|---|---|
+| `err(name)` | `return {0, name}` | Trivial |
+| `ok(values...)` | `return {1, "OK", ...}` | Trivial |
+| `ok_already_satisfied(...)` | `return {1, "ALREADY_SATISFIED", ...}` | Trivial |
+| `ok_duplicate(sig_id)` | `return {1, "DUPLICATE", sig_id}` | Trivial |
+
+**Validation** (inline):
+
+| Helper | Source | Complexity |
+|---|---|---|
+| `assert_execution_exists(core)` | Check core not nil/empty | Trivial |
+| `assert_flow_membership(core, fid)` | RFC-007 F2: `core.flow_id == fid` | Trivial |
+| `assert_active_suspension(susp)` | RFC-004: suspension_id set, closed_at empty | Trivial |
+| `assert_waitpoint_belongs(wp, eid, sid, wid)` | RFC-004: match execution+suspension+waitpoint | Trivial |
+| `validate_claim_grant(grant, wid, wiid, lane, cap)` | RFC-003 §Acquisition: fields match caller | Trivial |
+| `validate_pending_waitpoint(wp, eid, idx, key, now)` | RFC-004 §Pending: state=pending, not expired | Moderate |
+
+**Condition evaluation** (shared module — implement together):
+
+| Helper | Source | Complexity |
+|---|---|---|
+| `initialize_condition(json)` | RFC-004 §Resume Condition Model: parse → matcher table | Moderate |
+| `write_condition_hash(key, cond, ts)` | RFC-005 §12.1: HSET condition fields | Moderate |
+| `evaluate_signal_against_condition(cond, name, id)` | RFC-005 §8.3: match signal to matchers | Moderate |
+| `is_condition_satisfied(cond)` | RFC-005 §8.3: check mode (any/all/count) | Moderate |
+| `extract_field(fields, name)` | Valkey Stream entry array → named field | Trivial |
+
+**Mapping/transform:**
+
+| Helper | Source | Complexity |
+|---|---|---|
+| `map_reason_to_blocking(reason)` | RFC-004 §Suspension Reason Categories: lookup table | Trivial |
+| `unpack_policy(json)` | RFC-002 §AttemptPolicySnapshot: JSON → HSET pairs | Moderate |
+
+**State mutation** (RFC-003 `complete_or_fail` template):
+
+| Helper | Source | Complexity |
+|---|---|---|
+| `apply_attempt_outcome(key, outcome, ts, result)` | RFC-002 §Lifecycle States | Moderate |
+| `apply_execution_transition(key, outcome, ts, fields)` | RFC-001 §3 transition rules | Moderate |
+| `clear_current_lease_fields(key)` | RFC-001 §9.2 ownership fields → all `""` | Moderate |
 
 ### 4.9 Lua Script Return Convention
 

@@ -46,6 +46,7 @@ An attempt record contains the following fields, grouped by purpose.
 | `started_at` | `i64` (ms epoch) | No | When a worker began executing this attempt (lease acquired). `None` if the attempt was superseded before starting. |
 | `ended_at` | `i64` (ms epoch) | No | When this attempt reached a terminal state. |
 | `suspended_at` | `i64` (ms epoch) | No | When this attempt was paused by intentional suspension (RFC-004). Cleared on resume. |
+| `resumed_at` | `i64` (ms epoch) | No | When this attempt resumed after suspension. Set on `claim_resumed_execution`. Not set for initial claims or reclaims. |
 | `suspension_id` | `UUID` | No | Suspension episode that paused this attempt. Set by `suspend_attempt`, cleared by `resume_attempt`. Used for correlation between attempt and suspension records. |
 
 #### Outcome

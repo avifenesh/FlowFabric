@@ -125,6 +125,9 @@ Execution is **not**: the user-facing product workflow object, the long-term bus
 | `lease_reclaim_count` | `u32` | no | Count of reclaim-driven ownership turnovers. |
 | `lease_revoked_at` | `Timestamp` | no | Set when lease was intentionally revoked. |
 | `lease_revoke_reason` | `String` | no | Operator or system reason for revocation. |
+| `lease_expired_at` | `Timestamp` | no | Set when lease expiry is detected by scanner or mutation path. |
+| `current_suspension_id` | `UUID` | no | Current suspension episode if suspended. Cleared on resume/cancel/timeout. |
+| `current_waitpoint_id` | `UUID` | no | Current waitpoint if suspended. Cleared on resume/cancel/timeout. |
 
 ##### Relationships
 

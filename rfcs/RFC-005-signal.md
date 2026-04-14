@@ -462,12 +462,21 @@ if not core.id then return err("target_not_found") end
 
 local lp = core.lifecycle_phase
 if lp == "active" or lp == "terminal" or lp == "submitted" then
-  -- Check for pending waitpoint (pre-suspension buffer case)
+  -- Safety check: execution is not suspended. Check for pending waitpoint.
+  -- NOTE: If waitpoint state=pending, the engine should have dispatched to
+  -- buffer_signal_for_pending_waitpoint (#18), not this script.
+  -- This check catches misrouted calls.
   local wp = redis.call("HGETALL", KEYS[8])
-  if not wp.state or (wp.state ~= "pending" and wp.state ~= "active") then
+  if not wp.state or wp.state == "" then
     return err("target_not_signalable")
   end
-  -- Pending/active waitpoint exists — allow delivery
+  if wp.state == "pending" then
+    return err("waitpoint_pending_use_buffer_script")
+  end
+  if wp.state ~= "active" then
+    return err("target_not_signalable")
+  end
+  -- Active waitpoint on non-suspended execution — unusual but valid (race window)
 end
 
 -- 2. Validate waitpoint is open
