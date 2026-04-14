@@ -380,10 +380,10 @@ Required continuation support:
 
 Recommended shape:
 
-- the engine stores a pointer or reference in the suspension record
-- the worker runtime owns the language-specific continuation material behind that pointer
-- this split is intentional: the engine owns suspension correctness and durability boundaries, while the worker runtime owns language/runtime-specific continuation data
-- resume hands the worker:
+- `ff-engine` stores a pointer or reference in the suspension record
+- the worker runtime (`ff-sdk`) owns the language-specific continuation material behind that pointer
+- this split is intentional: `ff-engine` owns suspension correctness and durability boundaries, while `ff-sdk` owns language/runtime-specific continuation data
+- resume hands the worker (`ff-sdk`):
   - execution identity
   - attempt index
   - continuation pointer
@@ -557,7 +557,7 @@ The stream is the authoritative per-waitpoint signal history. `buffered_signal_s
 
 ### Waitpoint key routing
 
-Because `waitpoint_key` must route to the correct partition without a cross-slot lookup, the engine should derive it from the partitioned waitpoint identity:
+Because `waitpoint_key` must route to the correct partition without a cross-slot lookup, `ff-core` should derive it from the partitioned waitpoint identity:
 
 - encode `partition_number`, `waitpoint_id`, `execution_id`, and a MAC into the opaque external key
 - when a signal arrives with `waitpoint_key`, the control plane decodes the partition and routes the operation to the matching `{p:N}` keys
@@ -992,13 +992,13 @@ Rules:
 - inserts the waitpoint into `ff:idx:{p:N}:pending_waitpoint_expiry`
 - does not change execution lifecycle or lease ownership
 
-### Timeout scanner
+### Timeout scanner (`ff-engine::scanner::suspension_timeout`)
 
 Suspension timeouts are indexed in:
 
 - `ff:idx:{p:N}:suspension_timeout`
 
-Background scanner pattern:
+Scanner pattern:
 
 1. `ZRANGEBYSCORE ff:idx:{p:N}:suspension_timeout -inf now LIMIT 0 batch_size`
 2. for each execution:
@@ -1006,13 +1006,13 @@ Background scanner pattern:
    - revalidate that the execution is still suspended and the timeout is still due
    - apply the configured timeout behavior atomically
 
-### Pending waitpoint expiry scanner
+### Pending waitpoint expiry scanner (`ff-engine::scanner::pending_waitpoint_expiry`)
 
 Pending waitpoint expiries are indexed in:
 
 - `ff:idx:{p:N}:pending_waitpoint_expiry`
 
-Background scanner pattern:
+Scanner pattern:
 
 1. `ZRANGEBYSCORE ff:idx:{p:N}:pending_waitpoint_expiry -inf now LIMIT 0 batch_size`
 2. for each waitpoint:
@@ -1029,6 +1029,7 @@ Background scanner pattern:
 - **RFC-002 Attempt**: the active attempt must leave running state on suspend; resume continues with durable continuation context and no active lease while suspended.
 - **RFC-003 Lease**: entering suspension atomically releases the lease and clears current ownership.
 - **RFC-005 Signal**: signal acceptance and waitpoint matching are defined there; this RFC defines the waiting-side storage and satisfaction semantics.
+- **Crate mapping**: `ff-sdk` calls `FCALL ff_suspend_execution` and `FCALL ff_create_pending_waitpoint`. `ff-engine::dispatch` handles cross-partition signal delivery routing. `ff-engine::scanner::suspension_timeout` and `ff-engine::scanner::pending_waitpoint_expiry` enforce time-based policies.
 
 ## V1 Scope
 

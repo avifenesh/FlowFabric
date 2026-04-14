@@ -532,13 +532,13 @@ All flow-related Lua functions are registered in the `flowfabric` library (singl
 
 External API semantics:
 
-- `add_dependency` is Class A from the engine’s point of view
+- `add_dependency` is Class A from `ff-engine`’s point of view
 
-Implementation strategy:
+Implementation strategy (`ff-engine::dispatch`):
 
-1. validate and stage the edge on the flow partition
+1. validate and stage the edge on the flow partition (`FCALL ff_stage_dependency_edge` on `{fp:N}`)
 2. issue an idempotent mutation grant
-3. consume the grant on the child execution partition to update dependency gating
+3. consume the grant on the child execution partition (`FCALL ff_apply_dependency_to_child` on `{p:N}`)
 4. finalize the edge as active
 
 This keeps structural truth and runtime truth consistent without pretending a single cross-slot Lua function can do impossible work.
@@ -558,7 +558,7 @@ Responsibilities:
 Self-loop and cycle check note:
 
 - **Self-loops (A→A) are rejected by the function directly, not by DFS.** The function checks `upstream_execution_id == downstream_execution_id` before any other validation and returns `self_referencing_edge`. This is necessary because the DFS-based cycle detection traverses *existing* edges — when no edges exist yet, a self-loop has no path to detect. The explicit check prevents permanent deadlock (execution blocked on its own completion).
-- **The function validates `graph_revision` only for multi-node cycles. It does NOT independently verify acyclicity.** Cycle detection for A→B→...→A is the control plane's responsibility.
+- **The function validates `graph_revision` only for multi-node cycles. It does NOT independently verify acyclicity.** Cycle detection for A→B→...→A is `ff-engine::dispatch`'s responsibility.
 - The control plane reads the flow's adjacency snapshot (all `out:<node>` sets), runs DFS reachability from the proposed downstream node. If the proposed upstream is reachable, the edge would create a cycle → reject before calling the function.
 - The function checks `expected_graph_revision == current_graph_revision`. If stale (another edge was added between snapshot read and function call), it returns `stale_graph_revision`. The control plane re-reads the adjacency, re-runs cycle detection, and retries.
 - This optimistic concurrency + retry loop correctly prevents cycles even under concurrent edge additions.
@@ -618,7 +618,7 @@ return ok(unresolved)
 
 ### Resolve dependency
 
-When an upstream execution reaches a relevant terminal outcome, the engine uses the flow partition’s outgoing adjacency to drive child-local updates.
+When an upstream execution reaches a relevant terminal outcome, `ff-engine::dispatch` uses the flow partition’s outgoing adjacency to drive child-local updates.
 
 #### `ff_resolve_dependency` on child execution partition
 
@@ -765,9 +765,9 @@ end
 return ok("eligible")
 ```
 
-### Flow summary projection
+### Flow summary projection (`ff-engine::scanner::flow_summary_projector`)
 
-Flow summary counts and aggregate usage should be maintained by a projector consuming execution state changes and flow events.
+Flow summary counts and aggregate usage should be maintained by `ff-engine::scanner::flow_summary_projector` consuming execution state changes and flow events.
 
 Why projection:
 
@@ -786,6 +786,7 @@ Correctness boundary:
 - **RFC-002 Attempt**: attempts remain execution-local; flow coordinates executions, not attempts directly.
 - **RFC-003 Lease**: the flow container never owns leases. Active work remains execution-owned.
 - **RFC-008 Budget**: budgets may attach at flow scope and influence member admission and derived blocked state.
+- **Crate mapping**: `ff-engine::dispatch` owns two-phase `add_execution_to_flow`, dependency edge staging + application, and terminal dependency resolution fan-out. `ff-engine::scanner::dependency_reconciler` and `ff-engine::scanner::flow_summary_projector` maintain eventual consistency. `ff-engine::scanner::flow_retention` purges terminal flows. `ff-sdk` workers call `FCALL ff_move_to_waiting_children` to block on child deps.
 
 ## V1 Scope
 

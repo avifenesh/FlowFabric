@@ -737,6 +737,16 @@ Signal records follow the execution's retention policy. When an execution is pur
 | **Suspension / Waitpoint** | RFC-004 | Suspension creates waitpoints. Signals are delivered to waitpoints. Resume conditions are defined on waitpoints and evaluated by signal delivery. Pending waitpoints enable pre-suspension buffering. |
 | **Flow** | Later RFC | Passive flow containers do not own waitpoints. Flow-level signal coordination uses a coordinator execution inside the flow. |
 
+## Implementation Mapping
+
+| Operation | Crate | Entry Point |
+|---|---|---|
+| `ff_deliver_signal` | `ff-engine::dispatch` | External API call via `ff-server` (decodes `waitpoint_key` → partition, calls FCALL). |
+| `ff_buffer_signal_for_pending_waitpoint` | `ff-engine::dispatch` | Same entry, dispatched when waitpoint state=pending. |
+| `ff_timeout_waitpoint` | `ff-engine::scanner` | Suspension timeout scanner detects `timeout_at < now`, calls FCALL. |
+| `send_signal` (public API) | `ff-server` (gRPC/HTTP) | Decodes waitpoint_key (MAC verify), routes to correct `{p:N}`, delegates to ff-engine. |
+| Signal payload read on resume | `ff-sdk` (via `ff-script`) | Worker reads `ff:wp:{p:N}:<wp_id>:signals` via XRANGE after `claim_resumed_execution`. |
+
 ---
 
 ## V1 Scope

@@ -181,11 +181,11 @@ Usage is reported through explicit increment operations. The engine does NOT inf
 **Post-hoc charge model (v1):** Workers report actual usage after it is known. This is the primary model because LLM token counts are only known after inference completes (or incrementally during streaming).
 
 **Reporting flow:**
-1. Worker streams tokens → appends `usage_update` frame to attempt stream (RFC-006).
-2. Worker reports usage delta → calls `report_usage(execution_id, attempt_index, lease_epoch, usage_delta)`.
-3. Engine step (a): Lua on `{p:N}` — validates lease, HINCRBY attempt usage hash (all dimensions), HINCRBY execution core usage (built-in dimensions only). Returns attached `budget_ids` (read from exec core `budget_ids` field).
-4. Engine step (b): For each attached budget, calls `report_usage_and_check.lua` on the budget's `{b:M}` partition (separate Lua call, NOT atomic with step 3a). Returns breach status per budget.
-5. If breach: engine applies enforcement action. Worker receives the breach in the response.
+1. Worker streams tokens → appends `usage_update` frame to attempt stream (RFC-006, `ff-sdk` via `ff-script`).
+2. Worker reports usage delta → calls `ff-sdk::report_usage(execution_id, attempt_index, lease_epoch, usage_delta)`.
+3. `ff-engine::dispatch` step (a): `FCALL ff_report_usage_on_attempt` on `{p:N}` — validates lease, HINCRBY attempt usage hash (all dimensions), HINCRBY execution core usage (built-in dimensions only). Returns attached `budget_ids`.
+4. `ff-engine::dispatch` step (b): For each attached budget, `FCALL ff_report_usage_and_check` on the budget's `{b:M}` partition (separate call, NOT atomic with step 3). Returns breach status per budget.
+5. If breach: worker applies cooperative enforcement per RFC-010 §10.4 (calls `ff_fail_execution` on `{p:N}`).
 
 **Usage delta structure:**
 
@@ -211,8 +211,8 @@ Budget checks happen at several distinct points in the execution lifecycle:
 
 | Enforcement Point | When | What is Checked |
 |---|---|---|
-| Before claim | Scheduler evaluates budget before allowing a worker to claim. | All attached budgets for the execution. |
-| During active execution | On each `report_usage` call. | Incremental usage against remaining budget. |
+| Before claim | `ff-scheduler` reads budget on `{b:M}` per-candidate (RFC-009 §3.1 step 4). If denied, blocks candidate via `ff_block_execution_for_admission`. | All attached budgets for the selected candidate. |
+| During active execution | On each `ff-sdk::report_usage()` call, orchestrated by `ff-engine::dispatch`. | Incremental usage against remaining budget. |
 | Before child spawn | When a flow execution creates a child. | Flow-scoped budget remaining allowance. |
 | Before fallback escalation | When advancing to next fallback tier. | Budget for the new tier's expected cost. |
 | Before resume from suspension | When a suspended execution becomes eligible. | All attached budgets (may have changed during suspension). |
@@ -225,8 +225,8 @@ For **execution-scoped** budgets (colocated on the same `{p:N}` partition as the
 For **cross-partition** budgets (flow-scoped on `{b:M}`, lane-scoped, tenant-scoped):
 - Enforcement is **best-effort-consistent**, not atomic with claim or spawn. The caller increments the budget on the budget's `{b:M}` partition in a separate Lua call. Between the budget check and the execution state transition, another concurrent request may also pass. Overshoot by one concurrent request is accepted.
 - The budget is rechecked at the next enforcement point (e.g., during `report_usage` if the budget was checked at claim time). This provides convergent correctness without requiring cross-partition atomicity.
-- **Before claim**: Scheduler checks budget (advisory read), issues claim grant. Grant consumption does not re-validate cross-partition budget.
-- **During active**: `report_usage` increments the cross-partition budget and checks limits. If breached, the worker receives the breach in the response and the engine applies the enforcement action.
+- **Before claim**: `ff-scheduler` checks budget per-candidate (advisory read on `{b:M}`), issues claim grant on `{p:N}`. Grant consumption does not re-validate cross-partition budget.
+- **During active**: `ff-sdk::report_usage()` via `ff-engine::dispatch` increments the cross-partition budget and checks limits. If breached, the worker receives the breach and applies cooperative enforcement (§10.4).
 - **Before child spawn**: Caller checks flow-scoped budget before `add_execution_to_flow`. If exhausted with `on_hard_limit = deny_child`, the spawn is rejected. This check is a separate Lua call to the budget partition — not atomic with the flow mutation.
 - **Before resume**: Advisory check. Re-evaluated at claim time.
 
@@ -699,9 +699,10 @@ A background scanner processes `ff:idx:{b:M}:budget_resets`:
 
 ### RFC-009 — Admission / Scheduling (later batch, W2)
 
-- Quota `check_admission` is called by the scheduler before issuing claim grants.
-- Concurrency counters are decremented by lease-release operations (RFC-003).
-- Admission decisions are recorded in the execution's RuntimeAdmissionContext.
+- Quota `ff_check_admission_and_record` is called by `ff-scheduler` before issuing claim grants (scope-level pre-check on `{q:K}`).
+- Budget check per-candidate is called by `ff-scheduler` after candidate selection (advisory read on `{b:M}`).
+- Concurrency counters are decremented asynchronously after lease-release functions return (RFC-003).
+- Budget counter reconciler runs in `ff-engine::scanner` (RFC-010 §6.5).
 
 ---
 

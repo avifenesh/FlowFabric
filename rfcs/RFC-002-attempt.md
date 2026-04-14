@@ -436,7 +436,7 @@ The `PricingSnapshot`:
 
 #### create_attempt
 
-Creates a new attempt for an execution.
+Creates a new attempt for an execution. Attempt creation is inline within `ff_claim_execution` (initial/retry/fallback, called by `ff-sdk` via `ff-script`), `ff_reclaim_execution` (reclaim, called by `ff-engine::scanner`), or `ff_replay_execution` (replay, called by `ff-sdk`).
 
 **Parameters:**
 - `execution_id: UUID` — target execution
@@ -482,7 +482,7 @@ Transitions an attempt from `created` to `started` when a worker acquires a leas
 
 #### end_attempt
 
-Transitions an attempt to a terminal state.
+Transitions an attempt to a terminal state. Inline within `ff_complete_execution` or `ff_fail_execution` (called by `ff-sdk` via `ff-script`).
 
 **Parameters:**
 - `execution_id: UUID`
@@ -555,7 +555,7 @@ Transitions an attempt from `suspended` back to `started` when the execution is 
 
 #### interrupt_attempt
 
-Transitions an attempt to `interrupted_reclaimed`. Called by the engine during reclaim, not by workers.
+Transitions an attempt to `interrupted_reclaimed`. Called by `ff_reclaim_execution` during reclaim (`ff-engine::scanner`), not by workers.
 
 **Parameters:**
 - `execution_id: UUID`
@@ -574,7 +574,7 @@ Transitions an attempt to `interrupted_reclaimed`. Called by the engine during r
 
 #### report_attempt_usage
 
-Incrementally reports usage against the current active attempt.
+Incrementally reports usage against the current active attempt. Workers call `ff-sdk::report_usage()`, which orchestrates the cross-partition sequence via `ff-engine::dispatch`: (1) `ff_report_usage_on_attempt` on `{p:N}` (this operation), then (2) `ff_report_usage_and_check` on each `{b:M}` budget partition (RFC-008).
 
 **Parameters:**
 - `execution_id: UUID`
@@ -584,9 +584,9 @@ Incrementally reports usage against the current active attempt.
 
 **Semantics:**
 - Validates attempt is in `started` state and `lease_epoch` matches.
-- Atomically increments usage fields.
-- If budget enforcement is active, checks budget thresholds (cross-reference with budget RFC).
-- **Atomicity class: B** (durable append; budget check may elevate to A if enforcement requires atomic breach detection).
+- Atomically increments usage fields on `{p:N}` (attempt hash + exec core).
+- Budget check is a separate `FCALL` on `{b:M}`, orchestrated by `ff-engine::dispatch`.
+- **Atomicity class: B** on `{p:N}`. Budget check is cross-partition best-effort (RFC-008 §1.7).
 
 **Errors:**
 - `attempt_not_started`
@@ -595,7 +595,7 @@ Incrementally reports usage against the current active attempt.
 
 #### get_attempt
 
-Returns the full attempt record.
+Returns the full attempt record (`ff-sdk` via `ff-script`, single `{p:N}` read).
 
 **Parameters:**
 - `execution_id: UUID`
@@ -820,7 +820,7 @@ Registered as `ff_reclaim_execution` in the `flowfabric` library. See RFC-003 fo
 
 #### Retention and Cleanup
 
-Attempt records should follow the execution's retention policy. When an execution is purged:
+Attempt records follow the execution's retention policy. Purged by the terminal retention scanner (`ff-engine::scanner`) as part of the execution cleanup cascade (RFC-010 §9.3 steps 2-3):
 1. Delete `ff:attempt:{p:N}:{execution_id}:*` (all attempt hashes, usage hashes, policy hashes).
 2. Delete `ff:exec:{p:N}:{execution_id}:attempts` (the sorted set).
 

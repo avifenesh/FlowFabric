@@ -1793,6 +1793,24 @@ Terminal execution records are retained according to lane retention policy. The 
 | **Budget / Quota** | RFC-008 | `budget_ids` on policy. `eligibility_state = blocked_by_budget` / `blocked_by_quota` when exhausted. Usage reporting increments budget counters. |
 | **Scheduling / Lane** | RFC-009 | `lane_id` is the submission surface. Lane state affects `eligibility_state = blocked_by_lane_state`. Claim-grant model, priority ordering, fairness, capability matching. |
 
+## Implementation Mapping
+
+Execution operations map to the crate architecture as follows:
+
+| Operation | Crate | Notes |
+|---|---|---|
+| `ff_create_execution` | `ff-script` (wrapper), called by `ff-server` (API layer) | Single-partition FCALL. |
+| `ff_claim_execution`, `ff_claim_resumed_execution` | `ff-script` (wrapper), called by `ff-sdk` after `ff-scheduler` issues grant | Single-partition FCALL. Scheduler owns the claim cycle (§3.1). |
+| `ff_complete_execution`, `ff_fail_execution` | `ff-script` (wrapper), called by `ff-sdk` directly | Single-partition FCALL. No cross-partition orchestration needed. |
+| `ff_renew_lease` | `ff-script` (wrapper), called by `ff-sdk` (independent renewal task) | Single-partition FCALL. |
+| `ff_suspend_execution`, `ff_create_pending_waitpoint` | `ff-engine::dispatch` (`suspend_and_wait` orchestrator), called by `ff-sdk` | Multi-step: create pending wp → call external → suspend. |
+| `report_usage` | `ff-engine::dispatch`, called by `ff-sdk` | Cross-partition: `{p:N}` HINCRBY → `{b:M}` check → conditional fail. |
+| `ff_append_frame` | `ff-script` (wrapper), called by `ff-sdk` directly | Single-partition FCALL (Class B). |
+| `ff_cancel_execution`, `ff_expire_execution` | `ff-engine::dispatch`, called by `ff-server` (operator API) or `ff-engine::scanner` | May be single or multi-partition depending on source state. |
+| `ff_deliver_signal` | `ff-engine::dispatch`, called by `ff-server` (signal ingress API) | Signal routing + FCALL. External API decodes waitpoint_key → partition. |
+| Dependency resolution | `ff-engine::dispatch` (post-complete) | Cross-partition: read `{fp:N}` edges → resolve on each child's `{p:N}`. |
+| Scanners (lease expiry, promoter, timeout, etc.) | `ff-engine::scanner` (tokio tasks in `ff-server`) | Pipelined partition scanning. |
+
 ---
 
 ## V1 Scope

@@ -427,13 +427,13 @@ Operators must be able to:
 
 #### Drain semantics
 
-Worker drain is a control-plane operation, not a worker mutation. Recommended flow:
+Worker drain is a control-plane operation (`ff-engine`), not a worker mutation. Recommended flow:
 
 1. mark the worker instance draining
 2. enumerate current leases by worker-instance secondary index
 3. for each candidate execution, re-read the execution core and revoke only if the core still shows that worker instance as the authoritative current owner
 4. either:
-   - allow the scheduler to reclaim naturally, or
+   - allow `ff-scheduler` to reclaim naturally (via `ff-engine::scanner::lease_expiry`), or
    - force reclaim selected executions immediately
 
 Correctness does not depend on the worker index being globally perfect. It is an operator aid. The execution-local lease validation remains the real fence.
@@ -849,7 +849,7 @@ The same validation block is reused for:
 - move to waiting-children
 - cooperative release into a legal non-active state
 
-**Post-script caller obligation:** After this script returns, the caller must issue an async DECR to the quota concurrency counter on the `{q:K}` partition (RFC-008 §4.5). This is a cross-partition operation and cannot be included in this atomic script.
+**Post-function caller obligation:** After this function returns, `ff-engine::dispatch` must issue an async DECR to the quota concurrency counter on the `{q:K}` partition (RFC-008 §4.5). This is a cross-partition operation and cannot be included in this atomic function.
 
 ### Revoke and reclaim functions
 
@@ -862,7 +862,7 @@ The same validation block is reused for:
 - remove from the expiry zset
 - append a `revoked` history event using `XADD ... MAXLEN ~ <lease_history_maxlen>` with fields: `event`, `lease_id`, `lease_epoch`, `attempt_index`, `attempt_id`, `worker_id`, `worker_instance_id`, `reason`, `ts`
 
-**Post-script caller obligation:** After this script returns, the caller must issue an async DECR to the quota concurrency counter on the `{q:K}` partition (RFC-008 §4.5).
+**Post-function caller obligation:** After this function returns, `ff-engine::dispatch` must issue an async DECR to the quota concurrency counter on the `{q:K}` partition (RFC-008 §4.5).
 
 `ff_reclaim_execution`:
 
@@ -887,7 +887,7 @@ The same validation block is reused for:
 - refresh `ff:idx:{p}:lease_expiry` with the new `expires_at`
 - update the worker-instance lease set for the new owner
 
-**Post-script caller obligation:** After this script returns, the caller must issue an async DECR to the quota concurrency counter on the `{q:K}` partition for the old worker, and an async INCR for the new worker (RFC-008 §4.5).
+**Post-function caller obligation:** After this function returns, `ff-engine::dispatch` must issue an async DECR to the quota concurrency counter on the `{q:K}` partition for the old worker, and an async INCR for the new worker (RFC-008 §4.5).
 
 Reclaim is never modeled as "delete old lease, then later maybe create a new one". That gap would reintroduce split-brain risk and break audit clarity.
 
@@ -900,9 +900,9 @@ Rules:
 1. `lease_expires_at` in the execution core is authoritative.
 2. `PEXPIREAT` on `...:lease:current` is cleanup and operator convenience only.
 3. Expiry decisions must compare `now_ms` against `lease_expires_at`.
-4. The engine must not rely on keyspace notifications for correctness.
+4. `ff-engine` must not rely on keyspace notifications for correctness.
 
-### Reclaim scan pattern
+### Reclaim scan pattern (`ff-engine::scanner::lease_expiry`)
 
 Each partition has a local expiry index:
 
@@ -917,9 +917,9 @@ Background scanner pattern:
 1. for each partition `p`
 2. `ZRANGEBYSCORE ff:idx:{p}:lease_expiry -inf now LIMIT 0 batch_size`
 3. for each returned execution:
-   - run `mark_lease_expired_if_due.lua` or `reclaim_execution.lua`
-   - the script re-validates the execution core fields
-   - if the lease was renewed in the meantime, the script is a no-op
+   - `ff-engine::scanner::lease_expiry` calls `FCALL ff_mark_lease_expired_if_due` or notifies `ff-scheduler` to issue a reclaim grant
+   - the function re-validates the execution core fields
+   - if the lease was renewed in the meantime, the function is a no-op
 
 This makes expiry observable without trusting passive key deletion.
 
@@ -940,7 +940,7 @@ This makes expiry observable without trusting passive key deletion.
 - **RFC-001 Execution**: execution state vector, public-state derivation, and legal transitions are the base that lease mutations act on.
 - **RFC-002 Attempt**: reclaim creates a new attempt on the same execution; lease ownership is attempt-scoped.
 - **RFC-004 Suspension**: suspension explicitly clears ownership and never retains a valid lease.
-- **Scheduling / Admission RFC (later)**: route scoring, fairness, quota, and claim-grant issuance feed `acquire_lease` but do not weaken its atomicity requirements.
+- **RFC-009 Scheduling**: `ff-scheduler` performs route scoring, fairness, quota, and claim-grant issuance that feed `acquire_lease` but do not weaken its atomicity requirements.
 
 ## V1 Scope
 

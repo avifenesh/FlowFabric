@@ -268,11 +268,13 @@ These are two distinct operations that operators must not confuse:
 
 ### 3. Cross-Partition Operation Catalog
 
-Every operation that spans more than one partition family. For each: the partition sequence, what happens at each step, failure modes, and convergence mechanism.
+Every operation that spans more than one partition family. These multi-step sequences are implemented in `ff-engine::dispatch` (for engine-side orchestration) or `ff-sdk` (for worker-side orchestration via ff-engine). The exception is the claim flow (§3.1), which is implemented in `ff-scheduler` — the scheduler owns its own dispatch for the claim sequence and does NOT depend on ff-engine.
 
-#### 3.1 Three-Partition Claim Flow
+For each operation: the partition sequence, what happens at each step, failure modes, and convergence mechanism.
 
-**Operation:** Worker claims an eligible execution.
+#### 3.1 Three-Partition Claim Flow (`ff-scheduler`)
+
+**Operation:** Worker claims an eligible execution. **Implemented in `ff-scheduler`** — the scheduler owns this 5-step sequence and calls `ff-script` FCALL wrappers directly. `ff-scheduler` does NOT depend on `ff-engine`.
 **Partitions touched:** `{q:K}` → `{b:M}` (per-candidate) → `{p:N}` (→ `{p:N}` again for `acquire_lease`)
 
 ```
@@ -347,7 +349,7 @@ Worker                Scheduler                {q:K}              {b:M}         
 | **Budget partition `{b:M}` unreachable** — advisory/soft budget | Scheduler cannot check budget for selected candidate. | **FAIL-OPEN.** Proceed without budget check. Log warning. |
 | **Execution partition `{p:N}` unreachable** | Cannot access execution state at all. | **FAIL.** Claim impossible — skip until partition recovers. |
 
-#### 3.2 Flow Dependency Resolution
+#### 3.2 Flow Dependency Resolution (`ff-engine::dispatch`)
 
 **Operation:** Add a dependency edge between two flow member executions, then later resolve it when the upstream completes.
 
@@ -392,7 +394,7 @@ Engine (on upstream     {fp:N} (flow)            {p:N} (child exec)
 | Step 2 succeeds, step 3 (finalize) fails | Edge applied to child but still `pending` on flow. Child is correctly gated. | Control plane retries step 3. `graph_revision` ensures stale finalizations are rejected. |
 | Resolve: flow read succeeds, child resolution fails for one child | Some children resolved, some not. | Engine retries failed child resolutions. `resolve_dependency` is idempotent — already-resolved edges return `already_resolved`. |
 
-#### 3.3 Budget Enforcement on Usage Report
+#### 3.3 Budget Enforcement on Usage Report (`ff-engine::dispatch`, called by `ff-sdk`)
 
 **Operation:** Worker reports usage during active execution. Budget must be checked.
 **Partitions touched:** `{p:N}` (attempt usage) → `{b:M}` (each attached budget)
@@ -434,7 +436,7 @@ Worker                  {p:N} (execution)        {b:M} (budget)
 
 **Failure modes:** If step 1 passes but another concurrent spawn exhausts the budget before step 3 completes, the child is created but the budget is over-consumed by one request. Convergent via next enforcement point.
 
-#### 3.5 Async Quota Concurrency Decrement
+#### 3.5 Async Quota Concurrency Decrement (`ff-engine::dispatch`)
 
 **Operation:** Lease released on `{p:N}` → concurrency counter decremented on `{q:K}`.
 **Partitions touched:** `{p:N}` → `{q:K}`
@@ -454,7 +456,7 @@ The lease-release Lua scripts (complete/fail/suspend/revoke/reclaim on `{p:N}`) 
 
 **Reconciler frequency:** Every 30–60 seconds per quota scope. Walks the authoritative `{p:N}` partition-local worker lease sets and execution core records to compute actual active count.
 
-#### 3.6 Flow Summary Projection
+#### 3.6 Flow Summary Projection (`ff-engine::scanner`)
 
 **Operation:** Execution state changes on `{p:N}` → flow summary updated on `{fp:N}`.
 **Partitions touched:** `{p:N}` → `{fp:N}`
@@ -478,7 +480,7 @@ Flow summary counters (members_active, members_completed, aggregate_tokens, etc.
 
 **Staleness impact:** A `list_executions` query using the namespace index may briefly miss a just-created execution or include a just-deleted one. Queries that require authoritative data should use partition-local indexes.
 
-#### 3.8 Add Execution to Flow (Two-Phase Ownership Claim)
+#### 3.8 Add Execution to Flow (`ff-engine::dispatch`)
 
 **Operation:** Add an execution to a flow's membership. Enforces single-flow invariant (F2) cross-partition.
 **Partitions touched:** (optional `{b:M}` budget check) → `{p:N}` (execution) → `{fp:N}` (flow)
@@ -496,7 +498,7 @@ Flow summary counters (members_active, members_completed, aggregate_tokens, etc.
 | Phase 1 succeeds, phase 2 fails | Execution has `flow_id` set but is not in the flow's membership set. | Retry phase 2. SADD is idempotent. Flow summary projector will eventually detect the member when it reads exec core. |
 | Two concurrent adds to different flows | Both reach phase 1 on the same `{p:N}` — serialized. First wins, second gets `execution_already_in_flow`. | Immediate — {p:N} serialization prevents the race. |
 
-#### 3.9 Flow Cancellation Propagation
+#### 3.9 Flow Cancellation Propagation (`ff-engine::dispatch`)
 
 **Operation:** Flow is cancelled — propagate to member executions.
 **Partitions touched:** `{fp:N}` (flow members) → `{p:N}` (each member execution)
@@ -547,7 +549,7 @@ Operator / Engine       {fp:N} (flow)            {p:N} (member execs)
 
 ### 4. Background Scanners and Reconcilers
 
-Every periodic background process required by the architecture, consolidated in one place.
+Every periodic background process required by the architecture, consolidated in one place. **All scanners are implemented in `ff-engine::scanner`.** There is no separate scanner process — scanners run as tokio tasks within `ff-server`. Each scanner is a `tokio::spawn`'d loop that pipelines across partitions using `ferriskey`.
 
 **Scanner timing model:** Frequencies listed are **wall-clock intervals per partition**, but partitions are scanned via **pipelined batches**, not sequentially. A scanner with "1s per partition" and 256 partitions does NOT take 256s. Implementation: pipeline `ZRANGEBYSCORE` across all partitions in batches (pipeline depth ~32-64). With 256 partitions and pipeline depth 32: ~8 batches × network RTT (~1ms) = ~8ms total scan time for empty results. Processing found items adds Lua script execution time per item. **Total cycle time for all P partitions = ceil(P / pipeline_depth) × (RTT + per_item_processing).** For 256 partitions with empty results: < 50ms. The frequency defines the **sleep interval between cycles**, not per-partition sequential delay.
 
@@ -584,7 +586,9 @@ Every periodic background process required by the architecture, consolidated in 
 
 All FlowFabric operations are deployed as a **single Valkey Function library** (`flowfabric`). Functions are loaded via `FUNCTION LOAD REPLACE` on engine startup and persist across Valkey restarts. Invocation uses `FCALL ff_<operation> <numkeys> KEYS... ARGS...` (not EVALSHA). Every function within a single invocation touches only keys sharing one hash tag (`{p:N}`, `{b:M}`, `{q:K}`, or `{fp:N}`).
 
-**Library structure:**
+**Library source layout:** The Lua source is split into domain files for maintainability: `lua/helpers.lua` (shared helpers), `lua/execution.lua` (claim/complete/fail/etc.), `lua/lease.lua` (renew/mark_expired), `lua/suspension.lua`, `lua/signal.lua`, `lua/stream.lua`, `lua/flow.lua`, `lua/budget.lua`, `lua/quota.lua`, `lua/scheduling.lua`, `lua/scanners.lua`. A `build.rs` step in `ff-script` concatenates them with the `#!lua name=flowfabric` preamble into a single blob for `FUNCTION LOAD REPLACE`. `helpers.lua` is always first (shared helpers must be defined before any function that uses them).
+
+**Concatenated library structure:**
 ```lua
 #!lua name=flowfabric
 
@@ -2637,48 +2641,47 @@ Partitions are logical groupings that map to Valkey hash slots. They control whi
 
 **Hash slot mapping:** Valkey CRC16 on the hash tag `{p:N}` determines the shard. The partition count should be chosen so partitions distribute evenly across shards. If shard_count = 6 and partition_count = 256, each shard gets ~42-43 partitions.
 
-### 8.3 Scheduler Process Placement
+### 8.3 Crate Architecture and Process Placement
 
-The scheduler is a stateless control-plane process that reads execution state, worker registrations, and resource policy, then issues claim-grants.
+FlowFabric is implemented as a workspace of Rust crates sharing `ferriskey` for Valkey transport:
 
-**Recommended v1 deployment:**
-
-| Component | Instances | Placement |
+| Crate | Purpose | Depends On |
 |---|---|---|
-| Scheduler | 2-3 (active-active) | Separate processes, co-located with or near the Valkey cluster. |
-| Worker fleet | N (scaled to workload) | May be remote. Connect to Valkey via ferriskey cluster client. |
+| `ferriskey` | Valkey cluster client: FCALL, FUNCTION LOAD REPLACE, pipelines, TLS, cluster routing. | (standalone) |
+| `ff-core` | Types, enums, state vector, partition math, key construction, error types. | (standalone) |
+| `ff-script` | Typed FCALL wrappers (`ff_complete_execution(...)→CompleteResult`). Macro-generated. Lua library source + loader. | ff-core, ferriskey |
+| `ff-engine` | Cross-partition dispatch (§3 operations). Scanner module (§6). Partition router. | ff-script, ff-core, ferriskey |
+| `ff-scheduler` | Claim-grant cycle (§3.1), fairness (§5), capability matching (§7), lane management. Does NOT depend on ff-engine — owns its own dispatch for the claim sequence. | ff-script, ff-core, ferriskey |
+| `ff-sdk` | Worker SDK (§10). Uses ff-engine for cross-partition orchestrators (report_usage, suspend_and_wait). Uses ff-script directly for single-partition ops (complete, fail, renew, append_frame). Scheduler client trait for grant requests. | ff-engine, ff-script, ff-core, ferriskey |
+| `ff-server` | Binary: config, gRPC API, startup, composes ff-engine (scanners) + ff-scheduler. | all crates |
+| `ff-test` | Integration test harness: Valkey fixtures, assertion helpers, scenario builders. | ff-core, ff-script, ferriskey |
+| `lua/` | Lua source files (helpers.lua, execution.lua, etc.) concatenated by build.rs into flowfabric library. | (build-time only) |
 
-**Scheduler coordination:** Multiple scheduler instances may operate concurrently. The claim-grant model (RFC-009) prevents double-claims: the `issue_claim_grant.lua` script atomically removes the execution from the eligible set and writes the grant. If two schedulers race, one wins the ZREM and the other finds the execution missing from the set.
+**Process model (v1):**
 
-**No leader election required for v1.** Duplicate scheduling work is wasted but not incorrect. At very high scale, partition-affine scheduling (each scheduler owns a subset of partitions) can reduce contention.
+| Process | Crate Composition | Instances |
+|---|---|---|
+| **ff-server** | ff-engine (scanners as tokio tasks) + ff-scheduler (claim loop as tokio task) + gRPC API | 2-3 (active-active) |
+| **Worker** | ff-sdk (imports ff-engine for orchestration + ff-script for direct FCALL) | N (scaled to workload) |
+
+The scheduler is embedded in ff-server for v1. The `ff-scheduler` crate boundary enables extraction to a separate process in v2 (partition-affine scheduling at high scale). Multiple ff-server instances operate concurrently — the claim-grant model (RFC-009) prevents double-claims atomically.
+
+**No leader election required for v1.** Duplicate scheduling work is wasted but not incorrect.
+
+**Partition configuration:** Partition counts (`num_execution_partitions`, `num_flow_partitions`, `num_budget_partitions`, `num_quota_partitions`) are stored in `ff:config:partitions` on Valkey. All processes (ff-server, workers) read this key on startup and reject if it mismatches local config. This prevents silent partition misconfiguration across restarts or deployments.
 
 ### 8.4 Background Scanner Distribution
 
-Background scanners should be distributed across processes to avoid single-point-of-failure and to parallelize partition scanning.
+All scanners are implemented in the `ff-engine::scanner` module. There is no separate scanner process — scanners run as **tokio tasks within ff-server**. Each scanner is a `tokio::spawn`'d loop with a configurable interval.
 
-**Recommended v1 deployment:**
-
-| Scanner | Process Affinity | Parallelism |
+| Scanner | Tokio Task | Parallelism |
 |---|---|---|
-| Lease expiry scanner | Scheduler process or dedicated scanner | 1 scanner per partition shard (parallelize across shards). |
-| Delayed execution promoter | Scheduler process | Same as lease expiry scanner. |
-| Suspension timeout scanner | Scheduler process or dedicated scanner | 1 scanner per partition shard. |
-| Pending waitpoint expiry | Scheduler process | Lower priority. Can share with suspension scanner. |
-| Claim-grant reconciler | Scheduler process | 1 per scheduler instance (covers its own grants). |
-| Budget/quota reconcilers | Dedicated reconciler process | 1 process, iterates budget/quota partitions sequentially. |
-| Flow summary projector | Dedicated projector process | 1 per flow partition shard, or event-driven with periodic fallback. |
-| Stream retention trimmer | Dedicated cleanup process | Low priority. 1 process, iterates execution partitions. |
-| Terminal execution retention | Dedicated cleanup process | Low priority. Same process as stream trimmer. |
-| Lease history trimmer | Inline (MAXLEN on XADD) | No separate process needed. |
-| Budget reset scanner | Reconciler process | Low frequency. Shares with budget reconciler. |
+| All partition-scoped scanners (lease expiry, delayed promoter, timeout, suspension, etc.) | One task per scanner type, pipelines across all partitions per cycle | Partition batches parallelized via ferriskey pipeline |
+| Budget/quota reconcilers | Shared reconciler task | Sequential per budget/quota partition |
+| Flow summary projector | Dedicated task | Per flow partition, event-driven + periodic |
+| Retention scanners (stream, terminal, lease history) | Shared cleanup task | Low priority, sequential |
 
-**Minimum v1 process set:**
-1. **Scheduler process** (2-3 instances): Handles claim scheduling, lease expiry scanning, delayed promotion, suspension timeout, pending waitpoint expiry, claim-grant reconciliation.
-2. **Reconciler process** (1-2 instances): Handles budget/quota reconciliation, budget reset scanning.
-3. **Projector process** (1 instance): Handles flow summary projection.
-4. **Cleanup process** (1 instance): Handles stream retention, terminal retention, lease history trimming.
-
-Total: **5-7 background processes** for a medium production deployment.
+**Minimum v1 deployment:** 1 ff-server process with all scanner tasks. For production: 2-3 ff-server instances (scanners run on all instances; idempotency guarantees correctness with overlap).
 
 ### 8.5 Client Connection Model
 
@@ -2990,9 +2993,9 @@ The following are **not** goals for the v1 Valkey backend:
 
 ---
 
-## 10. Worker SDK Contract
+## 10. Worker SDK Contract (`ff-sdk`)
 
-Single coherent reference for SDK authors implementing a FlowFabric worker.
+The `ff-sdk` crate provides the worker-facing API. Workers `use ff_sdk::FlowFabricWorker`. The SDK depends on `ff-engine` for cross-partition orchestrators (`report_usage`, `suspend_and_wait`) and on `ff-script` directly for single-partition operations (`complete`, `fail`, `renew`, `append_frame`). Grant requests go through a `SchedulerClient` trait (gRPC or in-process).
 
 ### 10.1 Communication Model
 
@@ -3205,15 +3208,15 @@ Every error code returned by worker-facing scripts, classified by SDK action.
 
 Build incrementally. Each phase adds a testable capability. All functions are registered in the `flowfabric` library via `FUNCTION LOAD REPLACE`.
 
-| Phase | Capability | Functions | Scanners | RFCs |
-|---|---|---|---|---|
-| **0. Library bootstrap** | `FUNCTION LOAD REPLACE` with shared helpers + `ff_version` | `ff_version` (1 function) + all shared helpers (§4.8 Library-Local Helpers) | — | RFC-010 |
-| **1. Hello world** | create → claim → renew → complete, cancel, lease expiry | `create_execution`, `issue_claim_grant`, `claim_execution`, `complete_execution`, `renew_lease`, `mark_lease_expired_if_due`, `cancel_execution` (7 scripts) | Lease expiry scanner, delayed promoter | RFC-001, RFC-002, RFC-003, RFC-009 |
-| **2. Failure + retry + reclaim** | fail → retry decision (sets pending state, no attempt creation) → backoff → reclaim after crash | `fail_execution`, `issue_reclaim_grant`, `reclaim_execution`, `expire_execution`, `promote_delayed` (5 scripts) | Execution/attempt timeout scanner | RFC-001, RFC-002, RFC-003 |
-| **3. Suspend + signal + resume** | suspend → signal delivery → resume → re-claim | `suspend_execution`, `deliver_signal`, `claim_resumed_execution`, `create_pending_waitpoint` (4 scripts) | Suspension timeout scanner, pending waitpoint expiry scanner | RFC-004, RFC-005 |
-| **4. Streaming** | append frames, tail stream, close on terminal | `append_frame` (1 script; close is inline in complete/fail) | Stream retention trimmer | RFC-006 |
-| **5. Budget + quota** | usage reporting, breach detection, admission checks | `report_usage_on_attempt`, `report_usage_and_check`, `check_admission_and_record`, `block_execution_for_admission`, `unblock_execution` (5 scripts) | Budget reset scanner, budget reconciler, quota concurrency reconciler, eligibility re-evaluation scanner | RFC-008, RFC-009 |
-| **6. Flow coordination** | dependency edges, resolution, skip propagation, replay | `stage_dependency_edge`, `apply_dependency_to_child`, `resolve_dependency`, `replay_execution` (4 scripts) | Dependency resolution reconciler, flow summary projector | RFC-007 |
+| Phase | Capability | Functions | Scanners | Crates | RFCs |
+|---|---|---|---|---|---|
+| **0. Library bootstrap** | `FUNCTION LOAD REPLACE` with shared helpers + `ff_version` | `ff_version` + shared helpers | — | ferriskey (FCALL), ff-core, ff-script (loader + lua/) | RFC-010 |
+| **1. Hello world** | create → claim → renew → complete, cancel, lease expiry | 7: create, claim, complete, renew, mark_expired, cancel, issue_claim_grant | Lease expiry, delayed promoter, index reconciler | + ff-engine (minimal dispatch + 3 scanners), ff-scheduler (minimal single-lane), ff-sdk (register/claim/complete), ff-server, ff-test | RFC-001, RFC-002, RFC-003, RFC-009 |
+| **2. Failure + retry + reclaim** | fail → retry → backoff → reclaim | 5: fail, issue_reclaim_grant, reclaim, expire, promote_delayed | Attempt timeout scanner | + ff-engine (reclaim discovery), ff-script (+5 wrappers) | RFC-001, RFC-002, RFC-003 |
+| **3. Suspend + signal + resume** | suspend → signal → resume → re-claim | 4: suspend, deliver_signal, claim_resumed, create_pending_waitpoint | Suspension timeout, pending wp expiry | + ff-engine (suspend_and_wait orchestrator), ff-sdk (+suspend/resume) | RFC-004, RFC-005 |
+| **4. Streaming** | append frames, tail, close on terminal | 1: append_frame | Stream retention trimmer | + ff-sdk (+stream append/tail) | RFC-006 |
+| **5. Budget + quota** | usage reporting, breach, admission | 5: report_usage_on_attempt, report_usage_and_check, check_admission_and_record, block_execution, unblock_execution | Budget reset, budget reconciler, quota reconciler, unblock scanner | + ff-engine (report_usage orchestrator), ff-scheduler (+budget/quota checks) | RFC-008, RFC-009 |
+| **6. Flow coordination** | deps, resolution, skip, replay | 4: stage_dependency_edge, apply_dependency_to_child, resolve_dependency, replay_execution | Dependency reconciler, flow summary projector | + ff-engine (dep resolution dispatch, flow cancellation) | RFC-007 |
 | **Total** | All core paths | **~26 scripts** | 12 scanners | |
 
 **Phase 1 is the minimum viable execution engine.** It proves the partition model, claim-grant mechanism, lease fencing, state vector management, and basic operator control (cancel). `renew_lease` is essential even for "Hello World" — without it, every execution expires after 30s. `cancel_execution` is needed for operator control of stuck executions. The delayed promoter is included because `create_delayed_execution` is a Phase 1 submission mode.
@@ -3316,6 +3319,20 @@ Three-layer testing. Lua functions are the spec — never mock them.
 | ff-sdk | `connect()`, `claim_next()`, `renew_lease()`, `complete()`, `cancel()` |
 | ff-test | Valkey fixture, `FUNCTION LOAD`, `assert_execution_state!` |
 | ff-server | Config, minimal gRPC (create, cancel), start engine+scheduler |
+
+### 11.1 Testing Strategy (`ff-test`)
+
+Lua functions are the spec — **never mock them in tests**. Three test layers:
+
+| Layer | What | Mock? | Valkey? |
+|---|---|---|---|
+| **L1: Lua integration** | Each `ff_*` function against real Valkey. Validates preconditions, state transitions, index membership, return values. | No mocks. | Real Valkey (testcontainers). |
+| **L2: Engine orchestration** | `ff-engine::dispatch` multi-step sequences. May mock the FCALL executor for unit tests (verify dispatch order, error handling, retry logic). | Mock FCALL executor for unit tests. Real Valkey for integration. | Both. |
+| **L3: SDK + scanner e2e** | Full scenarios: create → claim → process → complete. Worker SDK against real engine + scheduler + scanners. | No mocks. | Real Valkey. |
+
+**L1 is authoritative.** If a Lua function test fails, the spec is wrong or the implementation is wrong. L2 and L3 are structural — they test the Rust dispatch/orchestration logic around the Lua functions.
+
+`ff-test` provides: embedded Valkey via testcontainers, `FUNCTION LOAD` fixture, assertion helpers (`assert_execution_state!(exec_id, lifecycle=terminal, outcome=success)`), scenario builders (create + claim + complete in one call), and partition test config (4 execution partitions, 2 flow, 2 budget, 2 quota — small but exercises cross-partition logic).
 
 ---
 

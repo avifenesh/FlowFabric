@@ -849,6 +849,19 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 | **Flow** | RFC-007 | Flow dependency satisfaction moves executions from `blocked_by_dependencies` to `eligible_now`, making them visible to the scheduler. |
 | **Budget/Quota** | RFC-008 | Scheduler checks budget/quota admission before issuing claim-grants. Budget exhaustion moves executions to `blocked_by_budget`/`blocked_by_quota`. |
 
+## Implementation Mapping
+
+| Component | Crate | Notes |
+|---|---|---|
+| Claim cycle (§3.1 steps 1-5) | `ff-scheduler` | Owns the full claim sequence. Calls `ff-script` wrappers directly. Does NOT depend on `ff-engine`. |
+| `ff_issue_claim_grant`, `ff_issue_reclaim_grant` | `ff-script` (wrappers), called by `ff-scheduler` | Single-partition FCALL. |
+| `ff_block_execution_for_admission` | `ff-script` (wrapper), called by `ff-scheduler` (per-candidate budget/route/quota denial) | Single-partition FCALL. |
+| `ff_unblock_execution` | `ff-script` (wrapper), called by `ff-engine::scanner` (eligibility re-evaluation) | Single-partition FCALL. Scanner detects cleared conditions. |
+| Lane management (pause, drain, enable) | `ff-server` (operator API) | Direct Valkey writes to `ff:lane:<id>:config`. |
+| Worker registration, heartbeat | `ff-sdk` (via `ff-script`) | Direct HSET/HEXPIRE to `ff:worker:<instance_id>`. |
+| Fairness state (deficit counters) | `ff-scheduler` (in-memory + ephemeral Valkey keys) | Rebuilt from queue depths on restart. |
+| Capability matching | `ff-scheduler` (in-memory) | Reads worker registrations, caches capability indexes. |
+
 ---
 
 ## V1 Scope

@@ -261,7 +261,7 @@ Mixing them in one stream would force consumers to filter constantly, complicate
 
 #### append_frame
 
-Appends a frame to the current attempt's stream.
+Appends a frame to the current attempt's stream. This is the highest-throughput function — called once per token during LLM streaming. Called by `ff-sdk` directly via `ff-script` (`FCALL ff_append_frame`). Single-partition `{p:N}` — no `ff-engine` orchestration needed.
 
 **Parameters:**
 - `execution_id: UUID`
@@ -276,7 +276,7 @@ Appends a frame to the current attempt's stream.
 - Appends frame via XADD. Valkey assigns the sequence.
 - If MAXLEN retention is configured, applies `XTRIM MAXLEN ~{limit}` (approximate trim for performance).
 - Updates stream metadata: `last_sequence`, `frame_count`.
-- **Atomicity class: B** (durable append with lease pre-check).
+- **Atomicity class: B** (durable append with lease pre-check). Single `FCALL`, no cross-partition calls.
 
 **Errors:**
 - `stale_owner_cannot_append` — lease_id or lease_epoch mismatch.
@@ -306,7 +306,7 @@ Appends a frame from privileged system context (no lease required).
 
 #### read_attempt_stream
 
-Reads frames from a specific attempt's stream.
+Reads frames from a specific attempt's stream. Called by `ff-sdk` via direct `XRANGE` (no Valkey Function needed — native Valkey command).
 
 **Parameters:**
 - `execution_id: UUID`
@@ -579,11 +579,11 @@ This ensures stream close is atomic with attempt termination — no window where
 
 **Per-stream MAXLEN:** Applied on each append via `XTRIM MAXLEN ~{limit}`. The `~` (approximate) flag allows Valkey to batch trim operations for better performance.
 
-**Time-based cleanup:** A background scanner checks `ff:stream:{p:N}:{execution_id}:{attempt_index}:meta` for streams where `closed_at + retention_ttl_ms < now`. Expired streams are deleted entirely:
+**Time-based cleanup:** The stream retention trimmer (`ff-engine::scanner`, RFC-010 §6.8) checks `ff:stream:{p:N}:{execution_id}:{attempt_index}:meta` for streams where `closed_at + retention_ttl_ms < now`. Expired streams are deleted entirely:
 - `DEL ff:stream:{p:N}:{execution_id}:{attempt_index}`
 - `DEL ff:stream:{p:N}:{execution_id}:{attempt_index}:meta`
 
-**Execution-level cleanup:** When an execution is purged (RFC-002 retention), all its streams are purged. The cleanup process iterates the attempt sorted set and deletes each attempt's stream keys.
+**Execution-level cleanup:** When an execution is purged by the terminal retention scanner (`ff-engine::scanner`, RFC-010 §6.12), all its streams are purged as part of the cleanup cascade (§9.3 step 4).
 
 #### Memory Considerations
 
