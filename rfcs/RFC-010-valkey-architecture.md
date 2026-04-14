@@ -820,6 +820,14 @@ All Lua pseudocode calls these helpers. Implementers must provide them.
 | `apply_execution_transition(key, outcome, ts, fields)` | RFC-001 §3 transition rules | Moderate |
 | `clear_current_lease_fields(key)` | RFC-001 §9.2 ownership fields → all `""` | Moderate |
 
+#### (m) Forward compatibility — or-default pattern for new fields
+
+All field reads in Lua must use the `or` default pattern: `core.field or "default"`. This allows new fields to be added to exec_core (or any hash) in v2+ without migrating existing records. Valkey hashes are schema-less — HGET on a nonexistent field returns nil. Existing v1 records missing the new field simply get the default value. No migration, no backfill, no downtime.
+
+#### (n) Script consolidation — v2 shared modules
+
+V1 uses separate Lua scripts for each operation for clarity and auditability. Several scripts share a common "validate lease → release ownership → clear indexes → transition state" preamble (delay_execution, move_to_waiting_children, suspend_execution, complete_execution, fail_execution, expire_execution). V2 may extract shared helper modules (via Valkey FUNCTION LOAD or inline inclusion) for the lease-release preamble. This reduces maintenance burden without sacrificing the validate-then-mutate correctness pattern.
+
 ### 4.9 Lua Script Return Convention
 
 All Lua scripts use `err()` and `ok()` in pseudocode. Concrete return format:
@@ -2106,6 +2114,8 @@ Weighted average: **~47 KB per execution**.
 
 No hot path requires loading the full execution record. The separation of core hash, payload, result, policy, and tags (RFC-001 §9.1) ensures hot-path operations touch minimal data.
 
+**Per-execution key count:** A typical execution lifecycle (create → claim → stream → suspend → signal → resume → complete) creates **~22 dedicated Valkey keys** (hashes, strings, streams, sets) plus **~11 entries in shared sorted sets/sets** (eligible, active, terminal, lease_expiry, suspension_timeout, attempt_timeout, all_executions, namespace_index, worker_leases, etc.). Simpler executions (no suspension, no streaming) create ~12 keys. This count drives the cleanup cascade cost (§9.3).
+
 ### 7.5 Claim Throughput and Latency Budget
 
 The claim flow is the highest-frequency critical path (§3.1). It crosses 3 partitions in 4 sequential Lua calls.
@@ -2399,7 +2409,7 @@ Consolidates audit trail (currently across lease history + attempt records + sig
 11. SREM from `ff:idx:{p:N}:all_executions`.
 12. Defensive ZREM/SREM from all non-terminal scheduling and timeout indexes (execution should NOT be in these, but catches any state/index desync): `ff:idx:{p:N}:lane:<lane>:eligible`, `:delayed`, `:active`, `:suspended`, `ff:idx:{p:N}:lane:<lane>:blocked:dependencies`, `:blocked:budget`, `:blocked:quota`, `:blocked:route`, `:blocked:operator`, `ff:idx:{p:N}:lease_expiry`, `ff:idx:{p:N}:suspension_timeout`, `ff:idx:{p:N}:attempt_timeout`, `ff:idx:{p:N}:execution_deadline`, `ff:idx:{p:N}:worker:<worker_id>:leases`. ZREM/SREM on non-existent members are no-ops.
 
-This cascade is implemented as a Lua script per partition (all keys share `{p:N}`), ensuring atomic cleanup within the partition. The script reads the execution core first (to extract flow_id, lane_id, namespace, tags, worker_id), then the attempts ZSET (for attempt/stream keys), the signals ZSET (for signal keys), and the waitpoints SET (for waitpoint keys), before deleting everything. The defensive ZREM step is cheap (O(log N) per set, ~12 sets) and guarantees no orphaned index entries survive.
+The cascade runs as **one Lua script per execution** (not one script for the entire batch). Each execution cleanup issues ~47 Valkey commands (4 reads + ~23 DELs + ~20 ZREM/SREM) and takes ~0.5ms, blocking the shard briefly. The retention scanner iterates the terminal sorted set and calls the cascade Lua once per execution, processing `batch_size` executions per cycle. All keys share `{p:N}`, ensuring each call is partition-local. The script reads the execution core first (to extract flow_id, lane_id, namespace, tags, worker_id), then the attempts ZSET (for attempt/stream keys), the signals ZSET (for signal keys), and the waitpoints SET (for waitpoint keys), before deleting everything. The defensive ZREM step is cheap (O(log N) per set, ~14 sets) and guarantees no orphaned index entries survive.
 
 Cross-partition references (flow membership, budget attachment) are cleaned lazily: the flow summary projector (§6.7) SREM's stale members on member-not-found, and budget reconcilers remove stale execution references.
 
@@ -2488,6 +2498,26 @@ SHUTDOWN:
 - Independent lease renewal thread: must fire during slow LLM calls.
 - Partition awareness: track `partition_id` per execution for `{p:N}` keys.
 - Parse structured returns per §4.9: `{1, "OK", ...}` or `{0, "ERROR", ...}`.
+
+---
+
+## 11. Recommended Implementation Order
+
+Build incrementally. Each phase adds a testable capability. ~14 Lua scripts cover all core execution paths.
+
+| Phase | Capability | Scripts | RFCs |
+|---|---|---|---|
+| **1. Hello world** | create → claim → complete | `create_execution`, `issue_claim_grant`, `claim_execution`, `complete_execution` (4 scripts) | RFC-001, RFC-002, RFC-003, RFC-009 |
+| **2. Failure + retry** | fail → retry with backoff → reclaim | `fail_execution` (1 script, handles retry decision + new attempt) | RFC-001, RFC-002 |
+| **3. Suspend + signal + resume** | suspend → signal delivery → resume → re-claim | `suspend_execution`, `deliver_signal`, `claim_resumed_execution` (3 scripts) | RFC-004, RFC-005 |
+| **4. Streaming** | append frames, tail stream, close on terminal | `append_frame` (1 script; close is inline in complete/fail) | RFC-006 |
+| **5. Budget + quota** | usage reporting, breach detection, admission checks | `report_usage_and_check`, `check_admission_and_record` (2 scripts) | RFC-008 |
+| **6. Flow coordination** | dependency edges, resolution, skip propagation | `stage_dependency_edge`, `apply_dependency_to_child`, `resolve_dependency` (3 scripts) | RFC-007 |
+| **Total** | All core paths | **~14 scripts** | |
+
+**Phase 1 is the minimum viable execution engine.** It proves the partition model, claim-grant mechanism, lease fencing, and state vector management. Each subsequent phase adds one primitive and its associated scanner(s).
+
+Background scanners should be added alongside their phase: lease expiry scanner with phase 1, delayed promoter with phase 2, suspension timeout scanner with phase 3, stream retention trimmer with phase 4, budget reset scanner with phase 5, dependency reconciler with phase 6.
 
 ---
 
