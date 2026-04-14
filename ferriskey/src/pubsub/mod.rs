@@ -41,18 +41,21 @@ pub async fn create_pubsub_synchronizer(
             reconciliation_interval,
         )
         .await;
-        // Only set if the weak pointer can be upgraded (is not empty)
+        // Only set if the weak pointer can be upgraded (is not empty).
+        // The downcast is safe here because we just created the concrete type above,
+        // but we use if-let to avoid panicking if the trait object is ever swapped.
         if internal_client.upgrade().is_some() {
-            sync.as_any()
-                .downcast_ref::<mock::MockPubSubSynchronizer>()
-                .expect("Expected MockPubSubSynchronizer")
-                .set_internal_client(internal_client);
+            if let Some(concrete) = sync.as_any().downcast_ref::<mock::MockPubSubSynchronizer>() {
+                concrete.set_internal_client(internal_client);
+            }
         }
         sync
     }
 
     #[cfg(not(feature = "test-util"))]
     {
+        // `new()` returns `Arc<EventDrivenSynchronizer>` -- call set_internal_client
+        // directly on the concrete type to avoid a panicking downcast.
         let sync = synchronizer::EventDrivenSynchronizer::new(
             initial_subscriptions,
             is_cluster,
@@ -60,10 +63,7 @@ pub async fn create_pubsub_synchronizer(
             _request_timeout,
         );
         if internal_client.upgrade().is_some() {
-            sync.as_any()
-                .downcast_ref::<synchronizer::EventDrivenSynchronizer>()
-                .expect("Expected EventDrivenSynchronizer")
-                .set_internal_client(internal_client);
+            sync.set_internal_client(internal_client);
         }
         sync
     }

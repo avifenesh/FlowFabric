@@ -1922,9 +1922,10 @@ where
         let mut notifiers = Vec::<Arc<Notify>>::new();
 
         for address in addresses {
-            if let Some(existing_task) = inner
-                .conn_lock
-                .read()
+            // Use a single write lock to atomically check-and-insert, preventing
+            // duplicate refresh tasks from racing between the check and insert.
+            let mut conn_container = inner.conn_lock.write();
+            if let Some(existing_task) = conn_container
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .get(&*address)
@@ -1934,20 +1935,18 @@ where
                     notifiers.push(notifier.get_notifier());
                 }
                 debug!("Skipping refresh for {}: already in progress", address);
+                drop(conn_container);
                 continue; // Skip creating a new refresh task
             }
 
-            let inner_clone = inner.clone();
-            let address_clone_for_task = address.clone();
-
-            let mut node_option = {
-                let conn_lock = inner.conn_lock.read();
-                conn_lock.remove_node(&address)
-            };
+            let mut node_option = conn_container.remove_node(&address);
 
             if !check_existing_conn {
                 node_option = None;
             }
+
+            let inner_clone = inner.clone();
+            let address_clone_for_task = address.clone();
 
             let handle = tokio::spawn(async move {
                 info!(
@@ -2046,12 +2045,11 @@ where
             // Keep the task handle and notifier into the RefreshState of this address
             let refresh_task_state = RefreshTaskState::new(handle, notifier);
 
-            inner
-                .conn_lock
-                .write()
+            conn_container
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .insert(address, refresh_task_state);
+            // Write lock is dropped here at end of loop iteration
         }
         debug!("trigger_refresh_connection_tasks: Done");
         notifiers

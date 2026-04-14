@@ -525,7 +525,6 @@ impl StandaloneClient {
             .iter()
             .map(|node| Self::send_request(cmd, node));
 
-        // TODO - once Value::Error will be merged, these will need to be updated to handle this new value.
         match response_policy {
             Some(ResponsePolicy::AllSucceeded) => {
                 future::try_join_all(requests)
@@ -583,7 +582,6 @@ impl StandaloneClient {
 
             None => {
                 // This is our assumption - if there's no coherent way to aggregate the responses, we just collect them in an array, and pass it to the user.
-                // TODO - once Value::Error is merged, we can use join_all and report separate errors and also pass successes.
                 future::try_join_all(requests).await.map(|vals| Value::Array(vals.into_iter().map(Ok).collect()))
             }
         }

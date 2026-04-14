@@ -12,6 +12,12 @@ use std::str::FromStr;
 
 pub use crate::connection::info::TlsMode;
 
+// NOTE: The host:port parsing below duplicates logic in
+// `connections::get_host_and_port_from_addr`. The two are kept separate because
+// this function couples parsing with `ConnectionInfo` construction and
+// `ClusterParams` consumption, whereas the connections.rs helper is a pure
+// `(&str) -> Option<(&str, u16)>` utility. If either parser is changed, check
+// the other for consistency.
 pub(crate) fn get_connection_info(
     node: &str,
     cluster_params: crate::cluster::client::ClusterParams,

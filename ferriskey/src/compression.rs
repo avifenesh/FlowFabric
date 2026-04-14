@@ -283,21 +283,6 @@ pub enum CommandCompressionBehavior {
     NoCompression,
 }
 
-impl CommandCompressionBehavior {
-    #[allow(dead_code)]
-    pub fn description(&self) -> &'static str {
-        match self {
-            CommandCompressionBehavior::CompressValues => {
-                "Compress values before sending to server"
-            }
-            CommandCompressionBehavior::DecompressValues => {
-                "Decompress values after receiving from server"
-            }
-            CommandCompressionBehavior::NoCompression => "No compression processing required",
-        }
-    }
-}
-
 impl std::fmt::Display for CommandCompressionBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

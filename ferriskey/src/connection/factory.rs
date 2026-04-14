@@ -105,7 +105,7 @@ impl Client {
     }
 
     /// Returns an async connection from the client.
-    pub async fn get_multiplexed_async_connection_with_timeouts(
+    pub(crate) async fn get_multiplexed_async_connection_with_timeouts(
         &self,
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
@@ -131,7 +131,8 @@ impl Client {
 
     /// For TCP connections: returns (async connection, Some(the direct IP address))
     /// For Unix connections, returns (async connection, None)
-    pub async fn get_multiplexed_async_connection_ip(
+    #[allow(dead_code)]
+    pub(crate) async fn get_multiplexed_async_connection_ip(
         &self,
         ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> Result<(MultiplexedConnection, Option<IpAddr>)> {
@@ -248,7 +249,8 @@ impl Client {
     ///     Ok(())
     /// }
     /// ```
-    pub fn build_with_tls<C: IntoConnectionInfo>(
+    #[allow(dead_code)]
+    pub(crate) fn build_with_tls<C: IntoConnectionInfo>(
         conn_info: C,
         tls_certs: TlsCertificates,
     ) -> Result<Client> {

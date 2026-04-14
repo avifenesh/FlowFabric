@@ -254,15 +254,13 @@ macro_rules! implement_pipeline_commands {
 
             #[inline]
             fn get_last_command(&mut self) -> &mut Cmd {
-                let idx = match self.commands.len() {
-                    0 => panic!("No command on stack"),
-                    x => x - 1,
-                };
+                let idx = self.commands.len().checked_sub(1)
+                    .expect("No command on stack");
                 Arc::get_mut(&mut self.commands[idx]).expect("Cannot modify the last command: multiple active references exist. Ensure the command is uniquely owned before mutating.")
             }
 
             fn make_pipeline_results(&self, resp: Vec<Result<Value>>) -> Result<Value> {
-                let mut rv = Vec::with_capacity(resp.len() - self.ignored_commands.len());
+                let mut rv = Vec::with_capacity(resp.len().saturating_sub(self.ignored_commands.len()));
                 for (idx, result) in resp.into_iter().enumerate() {
                     if !self.ignored_commands.contains(&idx) {
                         rv.push(result);

@@ -13,7 +13,7 @@ use crate::connection::tls::TlsConnParams;
 
 static CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
-static DEFAULT_PORT: u16 = 6379;
+const DEFAULT_PORT: u16 = 6379;
 
 /// Checks if a given string is a valid redis URL.
 pub fn parse_redis_url(input: &str) -> Option<url::Url> {
@@ -349,10 +349,9 @@ pub(crate) fn create_rustls_config(
     use rustls_platform_verifier::BuilderVerifierExt;
 
     let config = match tls_params {
-        Some(tls_params) if tls_params.root_cert_store.is_some() => {
-            let root_cert_store = tls_params.root_cert_store.unwrap();
+        Some(TlsConnParams { root_cert_store: Some(root_cert_store), client_tls_params }) => {
             let config = rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
-            match tls_params.client_tls_params {
+            match client_tls_params {
                 Some(ClientTlsParams {
                     client_cert_chain: client_cert,
                     client_key,

@@ -1270,9 +1270,9 @@ impl Slot {
         self.master.as_str()
     }
 
-    #[allow(dead_code)] // used in tests
-    pub fn replicas(&self) -> Vec<String> {
-        self.replicas.clone()
+    #[cfg(test)]
+    pub fn replicas(&self) -> &[String] {
+        &self.replicas
     }
 }
 

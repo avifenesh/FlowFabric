@@ -116,21 +116,27 @@ pub(crate) fn parse_and_count_slots(
     let mut address_to_ip_map = HashMap::new();
 
     if let Value::Array(items) = raw_slot_resp {
-        let mut iter = items.iter();
-        while let Some(Ok(Value::Array(item))) = iter.next() {
-            if item.len() < 3 {
-                continue;
-            }
+        for entry in items.iter() {
+            let item = match entry {
+                Ok(Value::Array(item)) if item.len() >= 3 => item,
+                _ => continue,
+            };
 
             // Parse slot range boundaries
             let start = if let Ok(Value::Int(start)) = item[0] {
-                start as u16
+                match u16::try_from(start) {
+                    Ok(v) => v,
+                    Err(_) => continue, // skip slot range with out-of-range start value
+                }
             } else {
                 continue;
             };
 
             let end = if let Ok(Value::Int(end)) = item[1] {
-                end as u16
+                match u16::try_from(end) {
+                    Ok(v) => v,
+                    Err(_) => continue, // skip slot range with out-of-range end value
+                }
             } else {
                 continue;
             };
@@ -173,7 +179,10 @@ pub(crate) fn parse_and_count_slots(
 
                         // Parse port from node[1]
                         let port = if let Ok(Value::Int(port)) = node[1] {
-                            port as u16
+                            match u16::try_from(port) {
+                                Ok(v) => v,
+                                Err(_) => return None, // skip node with out-of-range port
+                            }
                         } else {
                             return None;
                         };

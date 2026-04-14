@@ -28,6 +28,7 @@ pub struct TlsCertificates {
     pub root_cert: Option<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn inner_build_with_tls(
     mut connection_info: ConnectionInfo,
     certificates: TlsCertificates,
@@ -50,7 +51,7 @@ pub(crate) fn inner_build_with_tls(
     } else {
         return Err(Error::from((
             ErrorKind::InvalidClientConfig,
-            "Constructing a TLS client requires a URL with the `rediss://` scheme",
+            "Constructing a TLS client requires a URL with the `rediss://` or `valkeys://` scheme",
         )));
     };
 

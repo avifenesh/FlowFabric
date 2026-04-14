@@ -370,7 +370,7 @@ impl EventDrivenSynchronizer {
 
         // Suppress backoff-task spawning during this handler so UNSUBSCRIBE echo responses
         // don't spawn additional retry loops on top of the ones already running.
-        self.in_topology_change.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.in_topology_change.store(true, std::sync::atomic::Ordering::Release);
 
         // Step 1: Unsubscribe from old owners FIRST
         for (addr, kind, channels) in migrations.iter().chain(gone_subs.iter()) {
@@ -384,7 +384,7 @@ impl EventDrivenSynchronizer {
             }
         }
 
-        self.in_topology_change.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.in_topology_change.store(false, std::sync::atomic::Ordering::Release);
 
         // Step 2: Resubscribe to new owners via reconcile
         if let Err(e) = self.reconcile().await {
@@ -515,6 +515,12 @@ impl EventDrivenSynchronizer {
             .collect()
     }
 
+    /// Parse a blocking subscribe/unsubscribe command into (channels, timeout_ms).
+    ///
+    /// Protocol convention for `*_BLOCKING` commands: all arguments except the
+    /// last are channel names; the last argument is the timeout in milliseconds.
+    /// If the last argument is not a valid u64 it is treated as a channel name
+    /// with timeout 0 (no timeout).
     fn extract_channels_and_timeout(cmd: &Cmd) -> (Vec<PubSubChannelOrPattern>, u64) {
         let args: Vec<_> = cmd
             .args_iter()
@@ -529,18 +535,27 @@ impl EventDrivenSynchronizer {
             return (Vec::new(), 0);
         }
 
-        let timeout_ms = args
-            .last()
-            .and_then(|arg| String::from_utf8_lossy(arg).parse::<u64>().ok())
-            .unwrap_or(0);
+        // Try to parse the last argument as a timeout. If it parses as u64
+        // AND there are other arguments, use it as the timeout. When there is
+        // only a single argument that happens to look numeric (e.g. a channel
+        // named "42"), treat it as a channel with timeout 0 to avoid silently
+        // discarding subscriptions.
+        let last_is_timeout = args.len() > 1
+            && args
+                .last()
+                .and_then(|arg| String::from_utf8_lossy(arg).parse::<u64>().ok())
+                .is_some();
 
-        let channels = if args.len() > 1 {
-            args[..args.len() - 1].to_vec()
+        if last_is_timeout {
+            let timeout_ms = String::from_utf8_lossy(args.last().unwrap())
+                .parse::<u64>()
+                .unwrap_or(0);
+            let channels = args[..args.len() - 1].to_vec();
+            (channels, timeout_ms)
         } else {
-            Vec::new()
-        };
-
-        (channels, timeout_ms)
+            // Single arg or last arg non-numeric: all args are channels, no timeout
+            (args, 0)
+        }
     }
 
     fn handle_lazy(
@@ -731,7 +746,7 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
             .is_some_and(|channels_set| channels.iter().any(|ch| channels_set.contains(ch)));
         // Don't spawn a backoff task if we're inside on_topology_changed — those UNSUBSCRIBE
         // responses are our own commands and should not trigger additional retry loops.
-        let in_change = self.in_topology_change.load(std::sync::atomic::Ordering::Relaxed);
+        let in_change = self.in_topology_change.load(std::sync::atomic::Ordering::Acquire);
         if still_desired && !in_change {
             tokio::spawn(async move {
                 let mut delay_ms = 200u64;

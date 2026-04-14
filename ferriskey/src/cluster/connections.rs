@@ -44,7 +44,6 @@ where
     );
     ConnectAndCheckResult::ManagementConnectionFailed {
         node: AsyncClusterNode::new(user_conn, None),
-        err,
     }
 }
 
@@ -145,12 +144,21 @@ where
                 Err(err) => failed_management_connection(addr, user_conn.into_future(), err),
             }
         }
-        (Ok(mut connection), Err(err)) | (Err(err), Ok(mut connection)) => {
-            // Only a single connection was successfully established. Use it for the user connection
-            match setup_user_connection(&mut connection, params).await {
-                Ok(_) => failed_management_connection(addr, connection.into_future(), err),
+        (Ok(mut user_conn), Err(err)) => {
+            // User connection succeeded but management connection failed
+            match setup_user_connection(&mut user_conn, params).await {
+                Ok(_) => failed_management_connection(addr, user_conn.into_future(), err),
                 Err(err) => err.into(),
             }
+        }
+        (Err(err_user), Ok(_mgmt_conn)) => {
+            // Only the management connection succeeded; user connection failed — report failure
+            Error::from((
+                ErrorKind::IoError,
+                "Failed to create user connection",
+                format!("Node: {addr:?}, user connection error: `{err_user:?}`"),
+            ))
+            .into()
         }
         (Err(err_1), Err(err_2)) => {
             // Neither of the connections succeeded.
@@ -215,15 +223,12 @@ where
 
 #[doc(hidden)]
 #[must_use]
-#[allow(dead_code)] // err field retained for future diagnostics
 pub enum ConnectAndCheckResult<C> {
     // Returns a node that was fully connected according to the request.
     Success(AsyncClusterNode<C>),
     // Returns a node that failed to create a management connection, but has a working user connection.
-    ManagementConnectionFailed {
-        node: AsyncClusterNode<C>,
-        err: Error,
-    },
+    // The error is logged in `failed_management_connection` before this variant is constructed.
+    ManagementConnectionFailed { node: AsyncClusterNode<C> },
     // Request failed completely, could not return a node with any working connection.
     Failed(Error),
 }
@@ -232,7 +237,7 @@ impl<C> ConnectAndCheckResult<C> {
     pub fn get_node(self) -> Result<AsyncClusterNode<C>> {
         match self {
             ConnectAndCheckResult::Success(node) => Ok(node),
-            ConnectAndCheckResult::ManagementConnectionFailed { node, .. } => Ok(node),
+            ConnectAndCheckResult::ManagementConnectionFailed { node } => Ok(node),
             ConnectAndCheckResult::Failed(err) => Err(err),
         }
     }
@@ -413,7 +418,6 @@ where
 }
 
 /// The function returns None if the checked connection/s are healthy. Otherwise, it returns the type of the unhealthy connection/s.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub async fn check_node_connections<C>(
     node: &AsyncClusterNode<C>,

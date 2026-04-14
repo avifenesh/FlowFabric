@@ -55,7 +55,7 @@ fn validate_refresh_interval(
             Err(Error::from((
                 ErrorKind::ClientError,
                 "IAM refresh interval validation failed",
-                format!("actual=0 exceeds max={MAX_REFRESH_INTERVAL_SECONDS}"),
+                "interval must be at least 1 second, got 0".to_string(),
             )))
         }
         Some(interval) => {
@@ -327,19 +327,24 @@ impl IAMTokenManager {
                         return Err(e);
                     }
 
+                    // Apply ±20% jitter to the current backoff for the sleep duration,
+                    // but advance the base backoff independently to avoid compounding.
+                    let sleep_ms = {
+                        let jitter = (backoff_ms as f64 * 0.2) as u64;
+                        let min = backoff_ms.saturating_sub(jitter);
+                        let max = backoff_ms.saturating_add(jitter);
+                        let mut rng = rand::rng();
+                        rng.random_range(min..=max)
+                    };
+
                     log_warn(
                         "IAM token generation failed",
-                        format!(" {}. Retrying in {}ms", e, backoff_ms),
+                        format!(" {}. Retrying in {}ms", e, sleep_ms),
                     );
 
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
 
-                    // Add random jitter of ±20% to backoff_ms, then double with cap
-                    let jitter = (backoff_ms as f64 * 0.2) as u64;
-                    let min = backoff_ms.saturating_sub(jitter);
-                    let max = backoff_ms.saturating_add(jitter);
-                    let mut rng = rand::rng();
-                    backoff_ms = rng.random_range(min..=max);
+                    // Double the clean base backoff (no jitter drift)
                     backoff_ms = (backoff_ms.saturating_mul(2)).min(TOKEN_GEN_MAX_BACKOFF_MS);
                 }
             }
@@ -881,8 +886,32 @@ mod tests {
             );
         }
 
-        // Test invalid refresh intervals (0, or strictly greater than 43200 seconds / 12 hours)
-        let invalid_intervals = [0, 43201, 86400, 172800]; // 0, just over 12 hours, 24 hours, 48 hours
+        // Test invalid refresh interval: 0 (below minimum)
+        {
+            let result = IAMTokenManager::new(
+                cluster_name.clone(),
+                username.clone(),
+                region.clone(),
+                ServiceType::ElastiCache,
+                Some(0),
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "IAMTokenManager creation should fail with interval 0"
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ClientError);
+            let detail = error.detail().unwrap_or_default();
+            assert!(
+                detail.contains("0"),
+                "Expected '0' in error detail, got: {detail}"
+            );
+        }
+
+        // Test invalid refresh intervals (strictly greater than 43200 seconds / 12 hours)
+        let invalid_intervals = [43201, 86400, 172800]; // just over 12 hours, 24 hours, 48 hours
         for interval in invalid_intervals {
             let result = IAMTokenManager::new(
                 cluster_name.clone(),

@@ -356,11 +356,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Consume the builder and return the underlying `ConnectionRequest`.
-    pub(crate) fn into_request(self) -> ConnectionRequest {
-        self.request
-    }
-
     /// Build and connect the client.
     pub async fn build(self) -> Result<Client> {
         if self.request.addresses.is_empty() {
@@ -553,7 +548,17 @@ impl TypedPipeline {
     ///
     /// Automatically uses MULTI/EXEC when [`atomic()`](TypedPipeline::atomic)
     /// was called (or when created via [`Client::transaction()`]).
+    ///
+    /// Returns an error if called more than once on the same pipeline, since
+    /// the second execution's results would silently be lost.
     pub async fn execute(&mut self) -> Result<()> {
+        if self.results.get().is_some() {
+            return Err(Error::from((
+                ErrorKind::ClientError,
+                "Pipeline already executed; create a new pipeline for additional commands",
+            )));
+        }
+
         let mut inner = (*self.client).clone();
         let value = if self.inner.is_atomic() {
             inner.send_transaction(&self.inner, None, None, true).await?
@@ -601,14 +606,15 @@ impl<'a, T: FromValue> PipeCmdBuilder<'a, T> {
 impl<T: FromValue> PipeSlot<T> {
     /// Extract the typed value from the pipeline results.
     ///
-    /// # Panics
-    ///
-    /// Panics if called before [`TypedPipeline::execute()`].
+    /// Returns an error if called before [`TypedPipeline::execute()`].
     pub fn value(self) -> Result<T> {
         let vals = self
             .results
             .get()
-            .expect("PipeSlot::value() called before pipeline.execute()");
+            .ok_or_else(|| Error::from((
+                ErrorKind::ClientError,
+                "PipeSlot::value() called before pipeline.execute()",
+            )))?;
         let val = vals
             .get(self.index)
             .cloned()

@@ -24,8 +24,6 @@ use tokio_retry2::{Retry, RetryError};
 
 use super::{run_with_timeout, types::DEFAULT_CONNECTION_TIMEOUT};
 
-const WRITE_LOCK_ERR: &str = "Failed to acquire the write lock";
-const READ_LOCK_ERR: &str = "Failed to acquire the read lock";
 
 /// The reason behind the call to `reconnect()`
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -215,7 +213,7 @@ async fn create_connection(
         let guard = connection_backend
             .connection_info
             .read()
-            .expect(READ_LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         guard.clone()
     };
 
@@ -322,7 +320,7 @@ fn get_client(
 impl ConnectionBackend {
     /// Returns a read-only reference to the client's connection information
     fn get_backend_client(&self) -> RwLockReadGuard<'_, crate::connection::factory::Client> {
-        self.connection_info.read().expect(READ_LOCK_ERR)
+        self.connection_info.read().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -477,7 +475,7 @@ impl ReconnectingConnection {
                         .backend
                         .connection_info
                         .write()
-                        .expect(WRITE_LOCK_ERR);
+                        .unwrap_or_else(|e| e.into_inner());
                     client.update_password(Some(valid_token));
                     log_debug(
                         "reconnect",
@@ -551,7 +549,7 @@ impl ReconnectingConnection {
             .backend
             .connection_info
             .write()
-            .expect(WRITE_LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         client.update_password(new_password);
     }
 
@@ -570,7 +568,7 @@ impl ReconnectingConnection {
             .backend
             .connection_info
             .write()
-            .expect(WRITE_LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         client.update_database(new_database_id);
     }
 
@@ -581,7 +579,7 @@ impl ReconnectingConnection {
             .backend
             .connection_info
             .write()
-            .expect(WRITE_LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         client.update_client_name(new_client_name);
     }
 
@@ -599,7 +597,7 @@ impl ReconnectingConnection {
             .backend
             .connection_info
             .write()
-            .expect(WRITE_LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         client.update_username(new_username);
     }
 
@@ -617,7 +615,7 @@ impl ReconnectingConnection {
             .backend
             .connection_info
             .write()
-            .expect(WRITE_LOCK_ERR);
+            .unwrap_or_else(|e| e.into_inner());
         client.update_protocol(new_protocol);
     }
 

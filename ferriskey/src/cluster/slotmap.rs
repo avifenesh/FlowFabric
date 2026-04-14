@@ -56,22 +56,26 @@ fn get_address_from_slot(
     slot: &SlotMapValue,
     read_from_replica: ReadFromReplicaStrategy,
     slot_addr: SlotAddr,
-) -> Arc<String> {
+) -> Result<Arc<String>> {
     let addrs = &slot.addrs;
     if slot_addr == SlotAddr::Master || addrs.replicas().is_empty() {
-        return addrs.primary();
+        return Ok(addrs.primary());
     }
     match read_from_replica {
-        ReadFromReplicaStrategy::AlwaysFromPrimary => addrs.primary(),
+        ReadFromReplicaStrategy::AlwaysFromPrimary => Ok(addrs.primary()),
         ReadFromReplicaStrategy::RoundRobin => {
             let index = slot
                 .last_used_replica
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % addrs.replicas().len();
-            addrs.replicas()[index].clone()
+            Ok(addrs.replicas()[index].clone())
         }
-        ReadFromReplicaStrategy::AZAffinity(_az) => todo!(), // Drop sync client
-        ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_az) => todo!(), // Drop sync client
+        ReadFromReplicaStrategy::AZAffinity(_) | ReadFromReplicaStrategy::AZAffinityReplicasAndPrimary(_) => {
+            Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "AZAffinity and AZAffinityReplicasAndPrimary are not supported in the sync client",
+            )))
+        }
     }
 }
 
@@ -163,12 +167,13 @@ impl SlotMap {
 
     /// Returns the node address for the given route based on the configured read-from-replica strategy.
     pub fn slot_addr_for_route(&self, route: &Route) -> Option<Arc<String>> {
-        self.slot_value_for_route(route).map(|slot_value| {
+        self.slot_value_for_route(route).and_then(|slot_value| {
             get_address_from_slot(
                 slot_value,
                 self.read_from_replica.clone(),
                 route.slot_addr(),
             )
+            .ok()
         })
     }
 
@@ -246,11 +251,12 @@ impl SlotMap {
     pub fn node_address_for_slot(&self, slot: u16, slot_addr: SlotAddr) -> Option<Arc<String>> {
         self.slots.range(slot..).next().and_then(|(_, slot_value)| {
             if slot_value.start <= slot {
-                Some(get_address_from_slot(
+                get_address_from_slot(
                     slot_value,
                     self.read_from_replica.clone(),
                     slot_addr,
-                ))
+                )
+                .ok()
             } else {
                 None
             }

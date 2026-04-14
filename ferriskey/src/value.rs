@@ -698,7 +698,7 @@ impl fmt::Display for Error {
         match self.repr {
             ErrorRepr::WithDescription(kind, desc) => {
                 desc.fmt(f)?;
-                f.write_str("- ")?;
+                f.write_str(" - ")?;
                 fmt::Debug::fmt(&kind, f)
             }
             ErrorRepr::WithDescriptionAndDetail(kind, desc, ref detail) => {
@@ -843,7 +843,7 @@ impl Error {
             ErrorKind::ParseError => "parse error",
             ErrorKind::NotAllSlotsCovered => "not all slots are covered",
             ErrorKind::UserOperationError => "Wrong usage of management operation",
-            ErrorKind::ProtocolDesync => "Response processing has goten out of sync",
+            ErrorKind::ProtocolDesync => "Response processing has gotten out of sync",
         }
     }
 
@@ -1058,8 +1058,6 @@ pub fn make_extension_error(code: String, detail: Option<String>) -> Error {
 /// Library generic result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Library generic future type — a boxed future returning `Result<T>`.
-pub(crate) type ResultFuture<'a, T> = futures_util::future::BoxFuture<'a, Result<T>>;
 
 /// An info dictionary type.
 #[derive(Debug, Clone)]

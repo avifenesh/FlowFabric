@@ -378,27 +378,39 @@ impl Cmd {
         })
     }
 
-    // Get a reference to the argument at `idx`
+    // Get a reference to the argument at `idx`.
+    // Returns `None` if `idx` is out of bounds or points to a Cursor argument.
     pub(crate) fn arg_idx(&self, idx: usize) -> Option<&[u8]> {
         if idx >= self.args.len() {
             return None;
         }
 
+        // The target argument must be Simple; Cursor args have no data.
+        let end = match self.args[idx] {
+            Arg::Simple(n) => n,
+            Arg::Cursor => return None,
+        };
+
+        // Walk backwards to find the nearest preceding Simple arg's end offset,
+        // which is where this argument's data starts. Cursor args don't advance
+        // the data offset, so we must skip over them.
         let start = if idx == 0 {
             0
         } else {
-            match self.args[idx - 1] {
-                Arg::Simple(n) => n,
-                _ => 0,
+            let mut i = idx - 1;
+            loop {
+                match self.args[i] {
+                    Arg::Simple(n) => break n,
+                    Arg::Cursor => {
+                        if i == 0 {
+                            break 0;
+                        }
+                        i -= 1;
+                    }
+                }
             }
         };
-        let end = match self.args[idx] {
-            Arg::Simple(n) => n,
-            _ => 0,
-        };
-        if start == 0 && end == 0 {
-            return None;
-        }
+
         Some(&self.data[start..end])
     }
 
