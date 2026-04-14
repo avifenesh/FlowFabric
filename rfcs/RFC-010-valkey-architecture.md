@@ -164,6 +164,7 @@ These keys have no hash tag and land on a shard determined by the full key strin
 | `ff:idx:workers:cap:<key>:<value>` | SET | 009 | Updated atomically with worker registration. Members removed on deregistration or TTL expiry. | Capability index: which workers have a given capability. Member: `worker_instance_id`. |
 | `ff:sched:fairness:lane:<lane_id>:deficit` | STRING | 009 | Created by scheduler. TTL: `fairness_window_ms * 2`. | Ephemeral. Weighted deficit for cross-lane round-robin. Rebuilt from queue depths on restart. |
 | `ff:sched:fairness:tenant:<namespace>:lane:<lane_id>:claims` | STRING | 009 | Created by scheduler. TTL: `fairness_window_ms`. | Ephemeral. Tenant claim count in current fairness window. |
+| `ff:idx:lanes` | SET | 009 | SADD on `create_lane`, SREM on `delete_lane`. | Lane registry. Members: `lane_id`. Scheduler reads at startup + periodic refresh for cross-lane fairness discovery. |
 
 #### 1.6 Cross-Partition Secondary Indexes (Eventually Consistent)
 
@@ -672,9 +673,23 @@ Example: if `HSET exec_core lifecycle_phase=terminal` succeeds but the subsequen
 
 No raw `HSET` calls from application code. Every state transition is an atomic Lua script that validates preconditions, updates the state vector, and maintains indexes in one call. A raw `HSET` that skips validation can violate invariants (e.g., setting `lifecycle_phase = active` without creating a lease).
 
-#### (c) Empty string means "cleared", not nil
+#### (c) Empty string means "cleared" — use is_set() helper for checks
 
-Lua scripts use `""` (empty string) to represent cleared optional fields, not `nil`. Valkey hashes cannot store nil — `HSET key field ""` stores an empty string. Check cleared fields with `field == ""` or `field == nil` (nil if the field was never set). Both mean "no value."
+Lua scripts use `""` (empty string) to represent cleared optional fields. Valkey hashes cannot store nil — `HSET key field ""` stores an empty string. A field that was never HSET'd does not exist in the hash; `HGETALL` omits it (resulting in `nil` in the Lua table), and `HMGET` returns `false` for it.
+
+**Use `is_set()` for all "does this field have a value?" checks:**
+
+```lua
+local function is_set(v)
+  return v ~= nil and v ~= false and v ~= ""
+end
+```
+
+The check `field ~= ""` is WRONG for fields that may not exist — `nil ~= ""` and `false ~= ""` are both `true`, which incorrectly treats a never-set field as having a value. This matters for optional fields like `lease_revoked_at`, `lease_expired_at`, `cancellation_reason`, etc.
+
+#### (c2) ARGV ordering is positional
+
+All pseudocode uses named ARGV references (`ARGV.lease_id`, `ARGV.execution_id`) for clarity. In implementation, ARGV is a positional array (`ARGV[1]`, `ARGV[2]`, ...). Map named references to positional indices during implementation. The ordering is implementation-defined.
 
 #### (d) Priority score is IEEE 754 double — safe up to ~priority 9000
 
@@ -714,6 +729,20 @@ The `current_claim_count` field on `ff:worker:<worker_instance_id>` (global key)
 
 Without this pattern, `current_claim_count` stays at 0 and `max_concurrent_claims` is never enforced.
 
+#### (i) Partition scanning strategy for candidate selection
+
+The scheduler must scan eligible sorted sets across all partitions to find a candidate. With 256 execution partitions and 10 lanes, a naive scan requires 2,560 ZRANGEBYSCORE calls per scheduling cycle.
+
+**V1 approach:** Pipeline all partition scans for the selected lane. Valkey pipeline round-trip for 256 ZRANGEBYSCORE commands is ~1-2ms. At 1000 claims/sec this is 1-2s of pipeline time — acceptable for 2-3 scheduler instances sharing the load.
+
+**Future optimization:** Maintain a per-lane partition bitmap tracking which partitions have non-empty eligible sets. Update on ZADD/ZREM. Skip empty partitions (reduces calls by 90%+ under typical load). Alternatively, random partition sampling for very high partition counts.
+
+#### (j) Quota policy caching
+
+Quota and budget policy lookups (which policies attach to a lane or tenant) require cross-partition reads to `{q:K}` and `{b:M}`. These policies change rarely.
+
+**V1 approach:** Scheduler caches lane-attached quota policies and budget summaries at startup. Refreshes every 60s. Only the actual `check_admission_and_record` Lua call (per-candidate) needs to be real-time — it reads the sliding window and concurrency counter, which are current.
+
 ### 4.9 Lua Script Return Convention
 
 All Lua scripts use `err()` and `ok()` in pseudocode. Concrete return format:
@@ -741,6 +770,16 @@ Client SDK parses element 1: `1` = success, `0` = failure.
 local function ok(...)  return {1, "OK", ...} end
 local function err(...) return {0, ...} end
 ```
+
+**RFC-008 Lua return → API error name mapping:** RFC-008 budget/quota Lua scripts use uppercase status names internally. The API layer maps these to the error names in RFC-008's error model:
+
+| Lua Return | API Error Name |
+|---|---|
+| `HARD_BREACH` | `budget_exceeded` |
+| `SOFT_BREACH` | `budget_soft_exceeded` |
+| `RATE_EXCEEDED` | `rate_limit_exceeded` |
+| `CONCURRENCY_EXCEEDED` | `concurrency_limit_exceeded` |
+| `OK` / `ADMITTED` | success |
 
 ### 4.10 Usage Counter Consistency Model
 
@@ -2264,8 +2303,10 @@ The Valkey backend must support in v1:
 8. Dependency records: `deps:meta` hash, all `dep:<edge_id>` hashes (discovered via SCAN `ff:exec:{p:N}:<exec_id>:dep:*`), `deps:unresolved` set.
 9. All waitpoint records: for each waitpoint_id in `ff:exec:...:waitpoints` SET (mandatory), DEL the waitpoint hash (`ff:wp:{p:N}:<wp_id>`), signals stream (`ff:wp:{p:N}:<wp_id>:signals`), and condition hash (`ff:wp:{p:N}:<wp_id>:condition`). Then DEL the waitpoints set itself.
 10. ZREM from terminal sorted set, namespace index, tag indexes.
+11. SREM from `ff:idx:{p:N}:all_executions`.
+12. Defensive ZREM/SREM from all non-terminal scheduling indexes (execution should NOT be in these, but catches any state/index desync): `ff:idx:{p:N}:lane:<lane>:eligible`, `:delayed`, `:active`, `:suspended`, `ff:idx:{p:N}:lane:<lane>:blocked:dependencies`, `:blocked:budget`, `:blocked:quota`, `:blocked:route`, `:blocked:operator`, `ff:idx:{p:N}:lease_expiry`, `ff:idx:{p:N}:suspension_timeout`, `ff:idx:{p:N}:worker:<worker_id>:leases`. ZREM/SREM on non-existent members are no-ops.
 
-This cascade is implemented as a Lua script per partition (all keys share `{p:N}`), ensuring atomic cleanup within the partition. The script reads the execution core first (to extract flow_id, lane_id, namespace, tags), then the attempts ZSET (for attempt/stream keys), the signals ZSET (for signal keys), and the waitpoints SET (for waitpoint keys), before deleting everything.
+This cascade is implemented as a Lua script per partition (all keys share `{p:N}`), ensuring atomic cleanup within the partition. The script reads the execution core first (to extract flow_id, lane_id, namespace, tags, worker_id), then the attempts ZSET (for attempt/stream keys), the signals ZSET (for signal keys), and the waitpoints SET (for waitpoint keys), before deleting everything. The defensive ZREM step is cheap (O(log N) per set, ~12 sets) and guarantees no orphaned index entries survive.
 
 Cross-partition references (flow membership, budget attachment) are cleaned lazily: the flow summary projector (§6.7) SREM's stale members on member-not-found, and budget reconcilers remove stale execution references.
 

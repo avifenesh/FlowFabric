@@ -534,6 +534,15 @@ ff:lane:<lane_id>:config  →  HASH
 
 Lane config is a global key (not partitioned) — there are few lanes and they are read frequently. Config changes are infrequent.
 
+**Lane registry:**
+
+```
+ff:idx:lanes  →  SET
+  member: lane_id
+```
+
+SADD on `create_lane`, SREM on `delete_lane`. The scheduler reads this set at startup and refreshes periodically (every 60s) to discover new or removed lanes. Required for cross-lane fairness round-robin.
+
 #### 12.2 Per-Partition Eligible Sorted Sets
 
 Already defined in RFC-001 §9.3. The scheduler reads from these:
@@ -787,6 +796,9 @@ This prevents grant-related execution loss. The reconciler is a safety net — u
 | `no_capacity_available` | Capable workers exist but all at max concurrent claims. |
 | `budget_admission_denied` | Budget check prevents claim. |
 | `quota_admission_denied` | Quota/rate-limit check prevents claim. |
+| `execution_not_eligible` | Execution is not runnable, not eligible, not unowned, or not non-terminal. Returned by `issue_claim_grant`. |
+| `execution_not_in_eligible_set` | Execution was removed from eligible set by another scheduler (race). Returned by `issue_claim_grant`. |
+| `execution_not_reclaimable` | Execution is not in a reclaimable ownership state. Returned by `issue_reclaim_grant`. |
 | `grant_already_exists` | Claim-grant already issued for this execution. |
 | `grant_expired` | Claim-grant TTL elapsed before `acquire_lease` consumed it. |
 | `grant_mismatch` | Worker/capability in `acquire_lease` doesn't match grant. |

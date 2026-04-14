@@ -745,7 +745,8 @@ local new_renewal_deadline = now_ms + tonumber(ARGV.renew_before_ms)
 redis.call("HSET", KEYS.core,
   "lease_last_renewed_at", now_ms,
   "lease_renewal_deadline", new_renewal_deadline,
-  "lease_expires_at", new_expires_at
+  "lease_expires_at", new_expires_at,
+  "last_mutation_at", now_ms
 )
 redis.call("HSET", KEYS.current_lease,
   "last_renewed_at", now_ms,
@@ -754,14 +755,17 @@ redis.call("HSET", KEYS.current_lease,
 )
 redis.call("PEXPIREAT", KEYS.current_lease, new_expires_at + tonumber(ARGV.lease_history_grace_ms))
 redis.call("ZADD", KEYS.lease_expiry, new_expires_at, ARGV.execution_id)
-redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",
-  "event", "renewed",
-  "lease_id", ARGV.lease_id,
-  "lease_epoch", ARGV.lease_epoch,
-  "attempt_index", ARGV.attempt_index,
-  "attempt_id", ARGV.attempt_id,
-  "ts", now_ms
-)
+
+-- Renewal history event is OPTIONAL (§4.8g of RFC-010). Default OFF for v1.
+-- Uncomment or gate behind a flag when detailed ownership audit trails are needed.
+-- redis.call("XADD", KEYS.lease_history, "MAXLEN", "~", ARGV.lease_history_maxlen, "*",
+--   "event", "renewed",
+--   "lease_id", ARGV.lease_id,
+--   "lease_epoch", ARGV.lease_epoch,
+--   "attempt_index", ARGV.attempt_index,
+--   "attempt_id", ARGV.attempt_id,
+--   "ts", now_ms
+-- )
 
 return ok(new_expires_at)
 ```

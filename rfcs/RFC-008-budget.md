@@ -183,8 +183,9 @@ Usage is reported through explicit increment operations. The engine does NOT inf
 **Reporting flow:**
 1. Worker streams tokens → appends `usage_update` frame to attempt stream (RFC-006).
 2. Worker reports usage delta → calls `report_usage(execution_id, attempt_index, lease_epoch, usage_delta)`.
-3. Engine atomically: increments attempt-level usage (RFC-002), increments all attached budget counters, checks limits, returns breach status.
-4. If breach: engine applies enforcement action. Worker receives the breach in the response.
+3. Engine step (a): Lua on `{p:N}` — validates lease, HINCRBY attempt usage hash (all dimensions), HINCRBY execution core usage (built-in dimensions only). Returns attached `budget_ids` (read from exec core `budget_ids` field).
+4. Engine step (b): For each attached budget, calls `report_usage_and_check.lua` on the budget's `{b:M}` partition (separate Lua call, NOT atomic with step 3a). Returns breach status per budget.
+5. If breach: engine applies enforcement action. Worker receives the breach in the response.
 
 **Usage delta structure:**
 
@@ -196,11 +197,13 @@ Usage is reported through explicit increment operations. The engine does NOT inf
 
 | Counter | Location | Updated How | Authoritative For |
 |---|---|---|---|
-| Attempt usage | `ff:attempt:{p:N}:{eid}:{idx}:usage` | HINCRBY in Lua on `{p:N}` | Per-attempt attribution (which run consumed what). |
-| Execution usage | `ff:exec:{p:N}:{eid}:core` (total_input_tokens, etc.) | HINCRBY in same Lua script on `{p:N}` | Execution-level inspection (fast read, no scan of attempt hashes). |
-| Budget usage | `ff:budget:{b:M}:{bid}:usage` | HINCRBY in separate Lua on `{b:M}` | Budget enforcement (breach checks). |
+| Attempt usage | `ff:attempt:{p:N}:{eid}:{idx}:usage` | HINCRBY in Lua on `{p:N}` — ALL dimensions including custom | Per-attempt attribution (which run consumed what). |
+| Execution usage | `ff:exec:{p:N}:{eid}:core` (total_input_tokens, etc.) | HINCRBY in same Lua script on `{p:N}` — **built-in dimensions only** | Execution-level inspection (fast read, no scan of attempt hashes). |
+| Budget usage | `ff:budget:{b:M}:{bid}:usage` | HINCRBY in separate Lua on `{b:M}` — ALL dimensions including custom | Budget enforcement (breach checks). |
 
-Attempt and execution counters are updated atomically in one Lua script (same `{p:N}` partition). Budget counters are updated in a separate call to `{b:M}`. At any point in time, attempt and execution counters agree with each other, but budget counters may lag by one concurrent `report_usage` call. This is the documented cross-partition consistency model from RFC-010 §3.3.
+**Built-in dimensions for exec core HINCRBY** (hardcoded in the Lua script): `total_input_tokens`, `total_output_tokens`, `total_thinking_tokens`, `total_cost_micros`, `total_latency_ms`. Custom dimensions (e.g., `custom:effort_units`) are tracked on the attempt usage hash and budget usage hash but NOT on the execution core hash. This prevents unbounded custom fields from polluting the core hash.
+
+Attempt and execution counters are updated atomically in one Lua script (same `{p:N}` partition). Budget counters are updated in a separate call to `{b:M}`. At any point in time, attempt and execution counters agree with each other for built-in dimensions, but budget counters may lag by one concurrent `report_usage` call. This is the documented cross-partition consistency model from RFC-010 §3.3.
 
 #### 1.7 Enforcement Timing
 

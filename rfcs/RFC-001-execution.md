@@ -864,6 +864,7 @@ All hash field names use their **long canonical form**. This is the authoritativ
 | `creator_identity` | String | |
 | `last_operator_action` | String | Optional |
 | `last_operator_action_at` | timestamp ms | Optional |
+| `budget_ids` | String | Comma-separated list of attached budget UUIDs. Denormalized from ExecutionPolicySnapshot for fast access during `report_usage` without JSON parsing. Empty string if no budgets attached. |
 
 Payload and result are stored separately to avoid loading large blobs on every state read:
 
@@ -996,7 +997,8 @@ Creates a new attempt and lease for a fresh or retried execution. Does NOT apply
 ```lua
 -- KEYS: exec_core, claim_grant, eligible_zset, lease_expiry_zset,
 --       worker_leases, attempt_hash, attempt_usage, attempt_policy,
---       attempts_zset, lease_current, lease_history, active_index
+--       attempts_zset, lease_current, lease_history, active_index,
+--       attempt_timeout_zset, execution_deadline_zset
 -- ARGV: execution_id, worker_id, worker_instance_id, lane,
 --       capability_snapshot_hash, lease_id, lease_ttl_ms,
 --       renew_before_ms, attempt_id, attempt_policy_json
@@ -1095,6 +1097,14 @@ redis.call("ZADD", KEYS[4], expires_at, ARGV.execution_id) -- add to lease_expir
 redis.call("SADD", KEYS[5], ARGV.execution_id)       -- add to worker leases
 redis.call("ZADD", KEYS[12], expires_at, ARGV.execution_id) -- add to per-lane active
 
+-- 7a. Timeout indexes (§6.16)
+if ARGV.attempt_timeout_ms ~= "" and ARGV.attempt_timeout_ms ~= "0" then
+  redis.call("ZADD", KEYS[13], now_ms + tonumber(ARGV.attempt_timeout_ms), ARGV.execution_id)
+end
+if ARGV.execution_deadline_at ~= "" and ARGV.execution_deadline_at ~= "0" then
+  redis.call("ZADD", KEYS[14], tonumber(ARGV.execution_deadline_at), ARGV.execution_id)
+end
+
 -- 8. Lease history event (includes attempt_index)
 redis.call("XADD", KEYS[11], "*",
   "event", "acquired", "lease_id", ARGV.lease_id,
@@ -1112,7 +1122,7 @@ Used after a suspended execution is resumed (signal satisfied the waitpoint, exe
 ```lua
 -- KEYS: exec_core, claim_grant, eligible_zset, lease_expiry_zset,
 --       worker_leases, existing_attempt_hash, lease_current, lease_history,
---       active_index
+--       active_index, attempt_timeout_zset, execution_deadline_zset
 -- ARGV: execution_id, worker_id, worker_instance_id, lane,
 --       capability_snapshot_hash, lease_id, lease_ttl_ms,
 --       renew_before_ms
@@ -1200,6 +1210,14 @@ redis.call("ZADD", KEYS[4], expires_at, ARGV.execution_id) -- add to lease_expir
 redis.call("SADD", KEYS[5], ARGV.execution_id)       -- add to worker leases
 redis.call("ZADD", KEYS[9], expires_at, ARGV.execution_id) -- add to per-lane active
 
+-- 8a. Timeout indexes (§6.16) — use remaining timeout from pre-suspension
+if ARGV.attempt_timeout_at ~= "" and ARGV.attempt_timeout_at ~= "0" then
+  redis.call("ZADD", KEYS[10], tonumber(ARGV.attempt_timeout_at), ARGV.execution_id)
+end
+if ARGV.execution_deadline_at ~= "" and ARGV.execution_deadline_at ~= "0" then
+  redis.call("ZADD", KEYS[11], tonumber(ARGV.execution_deadline_at), ARGV.execution_id)
+end
+
 -- 9. Lease history event (includes attempt_index)
 redis.call("XADD", KEYS[8], "*",
   "event", "acquired", "lease_id", ARGV.lease_id,
@@ -1216,7 +1234,7 @@ return ok(ARGV.lease_id, next_epoch, expires_at, existing_attempt_id, existing_a
 ```lua
 -- KEYS: exec_core, attempt_hash, lease_expiry_zset, worker_leases,
 --       terminal_zset, lease_current, lease_history, active_index,
---       stream_meta, result_key
+--       stream_meta, result_key, attempt_timeout_zset, execution_deadline_zset
 -- ARGV: execution_id, lease_id, lease_epoch, attempt_id, result_payload
 
 local now = redis.call("TIME")
@@ -1271,6 +1289,8 @@ redis.call("ZREM", KEYS[3], ARGV.execution_id)       -- remove from lease_expiry
 redis.call("SREM", KEYS[4], ARGV.execution_id)       -- remove from worker leases
 redis.call("ZADD", KEYS[5], now_ms, ARGV.execution_id) -- add to terminal
 redis.call("ZREM", KEYS[8], ARGV.execution_id)       -- remove from per-lane active
+redis.call("ZREM", KEYS[11], ARGV.execution_id)      -- remove from attempt_timeout (§6.16)
+redis.call("ZREM", KEYS[12], ARGV.execution_id)      -- remove from execution_deadline (§6.16)
 
 -- Clean up lease
 redis.call("DEL", KEYS[6])
@@ -1288,7 +1308,7 @@ return ok()
 -- KEYS: exec_core, attempt_hash, lease_expiry_zset, worker_leases,
 --       terminal_zset, delayed_zset, lease_current, lease_history,
 --       new_attempt_hash, new_attempt_usage, new_attempt_policy, attempts_zset,
---       active_index, stream_meta
+--       active_index, stream_meta, attempt_timeout_zset, execution_deadline_zset
 -- ARGV: execution_id, lease_id, lease_epoch, attempt_id, failure_reason,
 --       failure_category, max_retries, backoff_ms, new_attempt_id,
 --       new_attempt_policy_json
@@ -1366,6 +1386,8 @@ if can_retry then
   redis.call("SREM", KEYS[4], ARGV.execution_id)     -- remove from worker leases
   redis.call("ZADD", KEYS[6], delay_until, ARGV.execution_id) -- add to delayed
   redis.call("ZREM", KEYS[13], ARGV.execution_id)   -- remove from per-lane active
+  redis.call("ZREM", KEYS[15], ARGV.execution_id)   -- remove old attempt_timeout (§6.16)
+  -- Note: new attempt timeout ZADD happens on next claim, not here (attempt is in delayed/created state)
 
   redis.call("DEL", KEYS[7])
   redis.call("XADD", KEYS[8], "*",
@@ -1397,6 +1419,8 @@ else
   redis.call("SREM", KEYS[4], ARGV.execution_id)
   redis.call("ZADD", KEYS[5], now_ms, ARGV.execution_id)
   redis.call("ZREM", KEYS[13], ARGV.execution_id)   -- remove from per-lane active
+  redis.call("ZREM", KEYS[15], ARGV.execution_id)   -- remove from attempt_timeout (§6.16)
+  redis.call("ZREM", KEYS[16], ARGV.execution_id)   -- remove from execution_deadline (§6.16)
 
   redis.call("DEL", KEYS[7])
   redis.call("XADD", KEYS[8], "*",
