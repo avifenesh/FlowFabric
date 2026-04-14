@@ -584,6 +584,7 @@ Keys:
 - lane active index
 - lane suspended index
 - waitpoint history set
+- waitpoint condition hash
 
 Pseudocode:
 
@@ -673,6 +674,10 @@ else
     "matched_signal_count", 0,
     "last_signal_at", ""
   )
+  -- Initialize condition hash from resume condition spec.
+  -- Without this, deliver_signal returns waitpoint_not_found (condition hash missing).
+  local wp_cond = initialize_condition(ARGV.resume_condition_json)
+  write_condition_hash(KEYS.wp_condition, wp_cond, now_ms)
 end
 
 -- Record waitpoint_id in mandatory history set (required for cleanup cascade)

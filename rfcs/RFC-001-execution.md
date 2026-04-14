@@ -95,6 +95,7 @@ Execution is **not**: the user-facing product workflow object, the long-term bus
 | `ownership_state` | `OwnershipState` | yes | Who may mutate. |
 | `eligibility_state` | `EligibilityState` | yes | Can it run now. |
 | `blocking_reason` | `BlockingReason` | yes | Why not progressing. |
+| `blocking_detail` | `String` | no | Extended human-readable explanation when `blocking_reason` is set (e.g., `"budget budget-abc123: total_cost 48M/50M"`). Cleared when `blocking_reason = none`. |
 | `terminal_outcome` | `TerminalOutcome` | yes | How it ended (if terminal). |
 | `attempt_state` | `AttemptState` | yes | Current attempt layer state. |
 | `public_state` | `PublicState` | yes | Engine-derived user-facing label. |
@@ -815,6 +816,7 @@ All hash field names use their **long canonical form**. This is the authoritativ
 | `ownership_state` | String | State vector dimension B |
 | `eligibility_state` | String | State vector dimension C |
 | `blocking_reason` | String | State vector dimension D |
+| `blocking_detail` | String | Extended human-readable explanation when blocking_reason is set. Cleared when blocking_reason=none. |
 | `terminal_outcome` | String | State vector dimension E |
 | `attempt_state` | String | State vector dimension F |
 | `public_state` | String | Derived, stored for read efficiency |
