@@ -177,8 +177,9 @@ where
     for item in args {
         total_len += bulklen(match item {
             Arg::Cursor => {
-                let cursor_usize = usize::try_from(cursor).unwrap_or(usize::MAX);
-                countdigits(cursor_usize)
+                // Use itoa to get exact digit count, matching what write_command uses.
+                let mut buf = itoa::Buffer::new();
+                buf.format(cursor).len()
             }
             Arg::Simple(val) => val.len(),
         });

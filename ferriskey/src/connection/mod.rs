@@ -188,10 +188,16 @@ where
         }
         match command.arg(password).query_async(con).await {
             Ok(Value::Okay) => (),
-            Err(e) if has_username => {
-                // AUTH with username failed -- the server may not support the
-                // two-argument AUTH form (e.g. older Redis/Valkey without ACL).
+            Err(e) if has_username && e.kind() == ErrorKind::ResponseError => {
+                // AUTH with username failed with an ERR response -- this
+                // typically means the server doesn't support the two-argument
+                // AUTH form (e.g. older Redis/Valkey without ACL support),
+                // returning "ERR wrong number of arguments for 'auth' command".
                 // Retry with password-only AUTH before giving up.
+                //
+                // Other error kinds (WRONGPASS, NOPERM, etc.) indicate the
+                // server understood the command but rejected the credentials;
+                // falling back would silently authenticate as the default user.
                 let mut command = cmd("AUTH");
                 match command.arg(password).query_async(con).await {
                     Ok(Value::Okay) => (),
@@ -204,6 +210,16 @@ where
                         )));
                     }
                 }
+            }
+            Err(e) if has_username => {
+                // The server understood the two-argument AUTH but rejected
+                // the credentials (WRONGPASS, NOPERM, etc.). Preserve the
+                // original error rather than masking it with a fallback.
+                return Err(Error::from((
+                    ErrorKind::AuthenticationFailed,
+                    "Password authentication failed",
+                    format!("AUTH (with username) error: {e}"),
+                )));
             }
             Err(_) | Ok(_) => {
                 fail!((

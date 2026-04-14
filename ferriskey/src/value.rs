@@ -2371,11 +2371,24 @@ macro_rules! from_value_for_tuple {
                 if items.len() == 0 {
                     return Ok(rv)
                 }
+                // Guard: item count must be a multiple of the tuple size,
+                // otherwise the final short chunk would silently lose data.
+                let remainder = items.len() % n;
+                if remainder != 0 {
+                    fail!(Error::from((
+                        ErrorKind::TypeError,
+                        "Response was of incompatible type",
+                        format!(
+                            "Item count {} is not a multiple of tuple size {} ({} trailing elements would be lost)",
+                            items.len(), n, remainder
+                        ),
+                    )));
+                }
                 for chunk in items.chunks_mut(n) {
                     match chunk {
                         // Take each element out of the chunk with `std::mem::replace`, leaving a `Value::Nil`
                         // in its place. This allows each `Value` to be parsed without being copied.
-                        // Since `items` is consume by this function and not used later, this replacement
+                        // Since `items` is consumed by this function and not used later, this replacement
                         // is not observable to the rest of the code.
                         [$($name),*] => rv.push(($(from_owned_value(std::mem::replace($name, Value::Nil))?),*),),
                          _ => unreachable!(),

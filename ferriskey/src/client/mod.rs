@@ -83,6 +83,9 @@ fn extract_request_type_from_cmd(cmd: &Cmd) -> Option<RequestType> {
         "GETEX" => Some(RequestType::GetEx),
         "GETDEL" => Some(RequestType::GetDel),
         "GETSET" => Some(RequestType::GetSet),
+        // SET key value ... GET is the modern replacement for GETSET.
+        // The GET flag makes the server return the old value, which needs decompression.
+        "SET" if cmd.position(b"GET").is_some() => Some(RequestType::GetSet),
         _ => None, // Unknown command or write command, no decompression needed
     }
 }

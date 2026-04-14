@@ -215,6 +215,9 @@ impl Client {
     /// Returns a `Vec` with one entry per key; each entry is `None` if the key
     /// does not exist.
     pub async fn mget<T: FromValue>(&self, keys: &[impl ToArgs]) -> Result<Vec<Option<T>>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
         let mut cmd = cmd("MGET");
         cmd.arg(keys);
         self.execute(cmd).await
@@ -222,6 +225,9 @@ impl Client {
 
     /// Set multiple key-value pairs at once.
     pub async fn mset(&self, pairs: &[(impl ToArgs, impl ToArgs)]) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
         let mut cmd = cmd("MSET");
         for (k, v) in pairs {
             cmd.arg(k).arg(v);
@@ -240,6 +246,12 @@ impl Client {
 
     /// Append one or more elements to the tail of a list, returning the new length.
     pub async fn rpush(&self, key: impl ToArgs, elements: &[impl ToArgs]) -> Result<i64> {
+        if elements.is_empty() {
+            return Err(Error::from((
+                ErrorKind::ClientError,
+                "RPUSH requires at least one element",
+            )));
+        }
         let mut cmd = cmd("RPUSH");
         cmd.arg(key).arg(elements);
         self.execute(cmd).await

@@ -301,6 +301,12 @@ impl ClusterClientBuilder {
         }
 
         let mut nodes = Vec::with_capacity(initial_nodes.len());
+        // Validate per-seed credentials and settings. Seeds without embedded
+        // credentials (username/password = None) are allowed -- they inherit
+        // the credentials set on the builder (or extracted from the first node
+        // above). Only seeds that *explicitly* set credentials to a *different*
+        // value than the builder's are rejected, ensuring a single consistent
+        // identity across the cluster.
         for mut node in initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
                 return Err(Error::from((

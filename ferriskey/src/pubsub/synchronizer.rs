@@ -1051,21 +1051,17 @@ impl PubSubSynchronizer for EventDrivenSynchronizer {
 
             self.trigger_reconciliation();
 
-            if let Some(deadline) = deadline {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+            // deadline is always Some here (None is handled by early return above)
+            let deadline = deadline.unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(remaining) => {
                     return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
                 }
-                tokio::select! {
-                    _ = notified => {}
-                    _ = tokio::time::sleep(remaining) => {
-                        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
-                    }
-                }
-            } else {
-                // This branch is now unreachable due to the early return above,
-                // but kept for safety.
-                notified.await;
             }
         }
     }
