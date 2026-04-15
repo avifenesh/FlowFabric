@@ -1,0 +1,21 @@
+[package]
+name = "ff-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FlowFabric server binary"
+
+[dependencies]
+ff-core = { workspace = true }
+ff-script = { workspace = true }
+ff-engine = { workspace = true }
+ff-scheduler = { workspace = true }
+ff-sdk = { workspace = true }
+ferriskey = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

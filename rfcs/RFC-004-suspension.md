@@ -1097,3 +1097,12 @@ No unresolved questions remain.
 
 - Pre-RFC: `flowfabric_use_cases_and_primitives (2).md`
 - Related RFCs: RFC-001, RFC-002, RFC-003, RFC-005
+
+---
+
+## Implementation Notes (v1)
+
+- **`waitpoint_key` uses simple `wpk:<uuid>` format,** not the HMAC-SHA256 cryptographic token described in §Waitpoint key routing. The crypto token (75 bytes raw, MAC secret rotation, dual-key verification) is deferred to v2 when multi-tenant security requires unguessable tokens. Current tokens are guessable but sufficient for single-tenant deployment. The routing problem is solved by storing the partition number on the waitpoint hash and looking it up via the waitpoint_id embedded in the key.
+- **`auto_resume_with_timeout_signal` does not append a synthetic timeout signal.** The timeout scanner triggers resume directly without injecting a signal into the waitpoint buffer. Synthetic signal injection is deferred to v2.
+- **Suspension timeout scanner and pending waitpoint expiry scanner are fully implemented** as Rust-only scanners in `ff-engine::scanner`. They use `ZRANGEBYSCORE` on the respective timeout indexes.
+- **OOM-safe write ordering is enforced.** `ff_suspend_execution` writes `exec_core` HSET first (lifecycle → suspended), then creates sub-objects. `ff_resume_execution` writes `exec_core` first (lifecycle → runnable), then closes sub-objects.

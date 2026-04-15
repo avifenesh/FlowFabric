@@ -1,0 +1,425 @@
+//! Valkey connection fixtures for integration testing.
+//!
+//! Provides [`TestCluster`] — a managed ferriskey [`Client`] connection with
+//! automatic FlowFabric library loading and key cleanup between tests.
+//!
+//! # Environment variables
+//!
+//! - `FF_HOST`: Valkey hostname (default: `localhost`)
+//! - `FF_PORT`: Valkey port (default: `6379`)
+//! - `FF_TLS`: Enable TLS (`1` or `true`)
+//! - `FF_CLUSTER`: Enable cluster mode (`1` or `true`)
+//! - `FF_TEST_PARTITION_CONFIG`: JSON-encoded [`PartitionConfig`] override
+//!   (default: small config suitable for testing: 4/2/2/2)
+
+use std::collections::HashMap;
+use ferriskey::{Client, ClientBuilder, Value};
+use ff_core::partition::PartitionConfig;
+use ff_core::types::{ExecutionId, LaneId, Namespace, TimestampMs};
+use tokio::sync::OnceCell;
+
+const DEFAULT_HOST: &str = "localhost";
+const DEFAULT_PORT: u16 = 6379;
+
+/// Small partition config for testing — exercises cross-partition logic
+/// without creating hundreds of partitions.
+pub const TEST_PARTITION_CONFIG: PartitionConfig = PartitionConfig {
+    num_execution_partitions: 4,
+    num_flow_partitions: 2,
+    num_budget_partitions: 2,
+    num_quota_partitions: 2,
+};
+
+/// Managed Valkey connection for FlowFabric integration tests.
+///
+/// Handles connection setup, FlowFabric library loading, and cleanup.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use ff_test::fixtures::TestCluster;
+///
+/// #[tokio::test]
+/// async fn my_test() {
+///     let tc = TestCluster::connect().await;
+///     tc.cleanup().await;
+///     // ... use tc.client() for Valkey operations
+/// }
+/// ```
+pub struct TestCluster {
+    client: Client,
+    config: PartitionConfig,
+    /// Unique prefix for this test run to avoid collisions in parallel tests.
+    test_prefix: String,
+}
+
+/// Tracks whether the library has been loaded in this process.
+static LIBRARY_LOADED: OnceCell<()> = OnceCell::const_new();
+
+impl TestCluster {
+    /// Connect to Valkey and ensure the FlowFabric library is loaded.
+    ///
+    /// Each test gets a fresh connection to avoid shared-state issues.
+    /// Library loading happens once (first test loads, others verify).
+    pub async fn connect() -> Self {
+        let client = build_client_from_env()
+            .await
+            .unwrap_or_else(|e| panic!("Failed to connect to Valkey: {e}"));
+
+        // Load library once per process
+        LIBRARY_LOADED
+            .get_or_init(|| async {
+                load_library(&client).await;
+            })
+            .await;
+
+        let config = test_partition_config();
+        let test_prefix = format!("test-{}", uuid::Uuid::new_v4());
+
+        Self {
+            client,
+            config,
+            test_prefix,
+        }
+    }
+
+    /// Get a reference to the ferriskey [`Client`].
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Get the test partition config (small, suitable for testing).
+    pub fn partition_config(&self) -> &PartitionConfig {
+        &self.config
+    }
+
+    /// Get the unique test prefix for this test run.
+    pub fn test_prefix(&self) -> &str {
+        &self.test_prefix
+    }
+
+    /// Create a unique namespace scoped to this test run.
+    pub fn test_namespace(&self) -> Namespace {
+        Namespace::new(&self.test_prefix)
+    }
+
+    /// Create a lane ID scoped to this test run.
+    pub fn test_lane(&self) -> LaneId {
+        LaneId::new(format!("lane-{}", self.test_prefix))
+    }
+
+    /// Generate a fresh ExecutionId.
+    pub fn new_execution_id(&self) -> ExecutionId {
+        ExecutionId::new()
+    }
+
+    /// Current timestamp.
+    pub fn now(&self) -> TimestampMs {
+        TimestampMs::now()
+    }
+
+    /// Clean up all FlowFabric keys from the database.
+    ///
+    /// Uses SCAN to find all `ff:*` keys and DEL them in batches.
+    /// Safe for standalone mode. For cluster mode, this would need
+    /// to be run per-shard.
+    pub async fn cleanup(&self) {
+        self.cleanup_ff_keys().await;
+    }
+
+    /// Clear all data keys for a clean test slate.
+    /// Uses FLUSHDB — safe for test environments. Preserves loaded functions.
+    async fn cleanup_ff_keys(&self) {
+        let _: String = self
+            .client
+            .cmd("FLUSHDB")
+            .execute()
+            .await
+            .expect("FLUSHDB failed");
+    }
+
+    /// Read all fields from an execution core hash.
+    pub async fn read_exec_core(&self, key: &str) -> HashMap<String, String> {
+        self.client
+            .hgetall(key)
+            .await
+            .expect("HGETALL on exec_core failed")
+    }
+
+    /// Check if a member exists in a ZSET (returns the score or None).
+    pub async fn zscore(&self, key: &str, member: &str) -> Option<f64> {
+        let result: Value = self
+            .client
+            .cmd("ZSCORE")
+            .arg(key)
+            .arg(member)
+            .execute()
+            .await
+            .expect("ZSCORE failed");
+
+        match result {
+            Value::Nil => None,
+            Value::BulkString(bytes) => {
+                let s = String::from_utf8_lossy(&bytes);
+                s.parse::<f64>().ok()
+            }
+            Value::Double(d) => Some(d),
+            Value::Int(i) => Some(i as f64),
+            _ => None,
+        }
+    }
+
+    /// Check if a member exists in a SET.
+    pub async fn sismember(&self, key: &str, member: &str) -> bool {
+        let result: Value = self
+            .client
+            .cmd("SISMEMBER")
+            .arg(key)
+            .arg(member)
+            .execute()
+            .await
+            .expect("SISMEMBER failed");
+        match result {
+            Value::Boolean(b) => b,
+            Value::Int(i) => i == 1,
+            _ => false,
+        }
+    }
+
+    /// Read a single hash field.
+    pub async fn hget(&self, key: &str, field: &str) -> Option<String> {
+        self.client
+            .hget(key, field)
+            .await
+            .expect("HGET failed")
+    }
+
+    /// Check if a key exists.
+    pub async fn exists(&self, key: &str) -> bool {
+        self.client.exists(key).await.expect("EXISTS failed")
+    }
+}
+
+/// Load the flowfabric library (called once per process via LIBRARY_LOADED).
+async fn load_library(client: &Client) {
+    load_library_if_available(client).await;
+}
+
+/// Read connection config from environment and return a connected Client.
+///
+/// Uses `ClientBuilder` — no URL parsing. Config via:
+/// - `FF_HOST` (default: `localhost`)
+/// - `FF_PORT` (default: `6379`)
+/// - `FF_TLS` (default: `false`)
+/// - `FF_CLUSTER` (default: `false`)
+pub async fn build_client_from_env() -> ferriskey::Result<Client> {
+    let host = std::env::var("FF_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_owned());
+    let port: u16 = std::env::var("FF_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let tls = env_flag("FF_TLS");
+    let cluster = env_flag("FF_CLUSTER");
+
+    let mut builder = ClientBuilder::new().host(&host, port);
+    if tls {
+        builder = builder.tls();
+    }
+    if cluster {
+        builder = builder.cluster();
+    }
+
+    tracing::info!(
+        host = %host, port, tls, cluster,
+        "connecting to Valkey via ClientBuilder"
+    );
+    builder.build().await
+}
+
+/// Read an env var as a boolean flag (1, true, yes → true).
+pub fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
+/// Load the test partition config from env or use defaults.
+fn test_partition_config() -> PartitionConfig {
+    if let Ok(json) = std::env::var("FF_TEST_PARTITION_CONFIG") {
+        serde_json::from_str(&json).expect("invalid FF_TEST_PARTITION_CONFIG JSON")
+    } else {
+        TEST_PARTITION_CONFIG
+    }
+}
+
+/// Attempt to load the FlowFabric Lua library.
+///
+/// Strategy:
+/// 1. Try concatenating lua/ source files (for development)
+/// 2. If lua/ files don't exist, log a warning and skip
+///    (tests that need FCALL will fail explicitly)
+async fn load_library_if_available(client: &Client) {
+    // Always reload from lua/ source files to pick up any code changes.
+    // Previous behavior skipped reload if ff_version succeeded, which caused
+    // tests to run against stale Lua code after editing lua/ files.
+    tracing::debug!("loading flowfabric library from lua/ files (always reload)");
+
+    // Try loading from lua/ source files
+    let lua_source = build_lua_library_from_source();
+    match lua_source {
+        Some(source) => {
+            let result: ferriskey::Result<String> =
+                client.function_load_replace(&source).await;
+            match result {
+                Ok(name) => {
+                    tracing::info!(library = %name, "loaded flowfabric library from lua/ sources");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load flowfabric library — FCALL tests will fail");
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "no lua/ source files found and library not pre-loaded — FCALL tests will fail"
+            );
+        }
+    }
+}
+
+/// Build the Lua library by concatenating files from the lua/ directory.
+/// Returns None if the directory or key files don't exist.
+fn build_lua_library_from_source() -> Option<String> {
+    let project_root = find_project_root()?;
+    let lua_dir = project_root.join("lua");
+
+    if !lua_dir.exists() {
+        return None;
+    }
+
+    let mut source = String::from("#!lua name=flowfabric\n");
+
+    // helpers.lua must come first
+    let helpers_path = lua_dir.join("helpers.lua");
+    if helpers_path.exists() {
+        let helpers = std::fs::read_to_string(&helpers_path).ok()?;
+        source.push_str(&helpers);
+        source.push('\n');
+    }
+
+    // Then all other .lua files in alphabetical order
+    let mut entries: Vec<_> = std::fs::read_dir(&lua_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".lua") && name != "helpers.lua"
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let content = std::fs::read_to_string(entry.path()).ok()?;
+        source.push_str(&content);
+        source.push('\n');
+    }
+
+    // Only return if we have at least the preamble + something
+    if source.len() > 30 {
+        Some(source)
+    } else {
+        None
+    }
+}
+
+/// Walk up from the crate directory to find the project root (where Cargo.toml workspace lives).
+fn find_project_root() -> Option<std::path::PathBuf> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let mut path = std::path::PathBuf::from(manifest_dir);
+
+    // Walk up looking for the workspace Cargo.toml (has [workspace] section)
+    for _ in 0..5 {
+        let cargo_toml = path.join("Cargo.toml");
+        if cargo_toml.exists()
+            && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+            && content.contains("[workspace]")
+        {
+            return Some(path);
+        }
+        if !path.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Parse a SCAN result: `[cursor, [key1, key2, ...]]`
+#[cfg(test)]
+fn parse_scan_result(value: &Value) -> (String, Vec<String>) {
+    match value {
+        Value::Array(arr) if arr.len() == 2 => {
+            let cursor = match &arr[0] {
+                Ok(Value::BulkString(b)) => String::from_utf8_lossy(b).to_string(),
+                Ok(Value::SimpleString(s)) => s.clone(),
+                _ => "0".to_string(),
+            };
+
+            let keys = match &arr[1] {
+                Ok(Value::Array(keys)) => keys
+                    .iter()
+                    .filter_map(|v| match v {
+                        Ok(Value::BulkString(b)) => {
+                            Some(String::from_utf8_lossy(b).to_string())
+                        }
+                        Ok(Value::SimpleString(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => vec![],
+            };
+
+            (cursor, keys)
+        }
+        _ => ("0".to_string(), vec![]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_partition_config_is_small() {
+        assert_eq!(TEST_PARTITION_CONFIG.num_execution_partitions, 4);
+        assert_eq!(TEST_PARTITION_CONFIG.num_flow_partitions, 2);
+        assert_eq!(TEST_PARTITION_CONFIG.num_budget_partitions, 2);
+        assert_eq!(TEST_PARTITION_CONFIG.num_quota_partitions, 2);
+    }
+
+    #[test]
+    fn env_flag_defaults_false() {
+        // Verify env_flag doesn't panic on missing vars
+        assert!(!env_flag("FF_NONEXISTENT_TEST_FLAG"));
+    }
+
+    #[test]
+    fn find_project_root_from_crate() {
+        let root = find_project_root();
+        // This test runs from crates/ff-test, should find the workspace root
+        if let Some(r) = root {
+            assert!(r.join("Cargo.toml").exists());
+        }
+    }
+
+    #[test]
+    fn parse_scan_result_empty() {
+        let val = Value::Array(vec![
+            Ok(Value::BulkString("0".into())),
+            Ok(Value::Array(vec![])),
+        ]);
+        let (cursor, keys) = parse_scan_result(&val);
+        assert_eq!(cursor, "0");
+        assert!(keys.is_empty());
+    }
+}

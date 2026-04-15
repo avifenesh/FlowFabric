@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "ferriskey",
+    "crates/ff-core",
+    "crates/ff-script",
+    "crates/ff-engine",
+    "crates/ff-scheduler",
+    "crates/ff-sdk",
+    "crates/ff-test",
+    "crates/ff-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["FlowFabric Contributors"]
+
+[workspace.dependencies]
+# Internal crates
+ff-core = { path = "crates/ff-core" }
+ff-script = { path = "crates/ff-script" }
+ff-engine = { path = "crates/ff-engine" }
+ff-scheduler = { path = "crates/ff-scheduler" }
+ff-sdk = { path = "crates/ff-sdk" }
+ff-test = { path = "crates/ff-test" }
+ff-server = { path = "crates/ff-server" }
+ferriskey = { path = "ferriskey" }
+
+# Shared external deps
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+tracing = "0.1"
+thiserror = "2"
+crc16 = "0.4"
