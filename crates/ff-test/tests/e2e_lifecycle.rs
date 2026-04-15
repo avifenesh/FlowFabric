@@ -4495,3 +4495,374 @@ async fn test_flow_full_lifecycle_with_staging() {
         assert_in_terminal(&tc, eid, &lane_id).await;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// ROUND 9: SDK suspend → signal → resume → re-claim end-to-end
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Full SDK suspend/resume cycle: claim → suspend → deliver_signal → re-claim → complete.
+/// Tests the R8 fix (claim_resumed_execution fallback in claim_next).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_sdk_suspend_signal_resume_reclaim() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Write partition config for SDK
+    let config = test_config();
+    let config_key = "ff:config:partitions";
+    let _: () = tc.client().cmd("HSET")
+        .arg(config_key)
+        .arg("num_execution_partitions").arg(config.num_execution_partitions.to_string().as_str())
+        .arg("num_flow_partitions").arg(config.num_flow_partitions.to_string().as_str())
+        .arg("num_budget_partitions").arg(config.num_budget_partitions.to_string().as_str())
+        .arg("num_quota_partitions").arg(config.num_quota_partitions.to_string().as_str())
+        .execute().await.unwrap();
+
+    // Create an execution via raw FCALL
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "sdk_suspend_test", 0).await;
+
+    // Build SDK worker
+    let worker_config = ff_sdk::WorkerConfig {
+        valkey_url: "redis://localhost:6379".into(),
+        tls: false,
+        worker_id: ff_core::types::WorkerId::new("suspend-test-worker"),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new("suspend-test-inst"),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 10,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    // 1. Claim via SDK
+    let task1 = worker.claim_next().await.unwrap();
+    assert!(task1.is_some(), "should claim the execution");
+    let task1 = task1.unwrap();
+    let eid_claimed = task1.execution_id().clone();
+    assert_eq!(eid_claimed, eid);
+
+    // 2. Suspend with a signal condition
+    let outcome = task1.suspend(
+        "waiting_for_signal",
+        &[ff_sdk::task::ConditionMatcher { signal_name: "test_signal".into() }],
+        Some(60_000), // 60s timeout
+        ff_sdk::task::TimeoutBehavior::Fail,
+    ).await.unwrap();
+
+    let (waitpoint_id, _waitpoint_key) = match outcome {
+        ff_sdk::task::SuspendOutcome::Suspended { waitpoint_id, waitpoint_key, .. } => {
+            (waitpoint_id, waitpoint_key)
+        }
+        ff_sdk::task::SuspendOutcome::AlreadySatisfied { .. } => {
+            panic!("should not be already satisfied");
+        }
+    };
+
+    // Verify execution is suspended
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Suspended),
+        public_state: Some(ff_core::state::PublicState::Suspended),
+        ..Default::default()
+    }).await;
+
+    // 3. Deliver signal to resume
+    let signal = ff_sdk::task::Signal {
+        signal_name: "test_signal".into(),
+        signal_category: "test".into(),
+        payload: Some(b"hello".to_vec()),
+        source_type: "test".into(),
+        source_identity: "test-runner".into(),
+        idempotency_key: None,
+    };
+    let sig_outcome = worker.deliver_signal(&eid, &waitpoint_id, signal).await.unwrap();
+    match sig_outcome {
+        ff_sdk::task::SignalOutcome::TriggeredResume { .. } => {}
+        other => panic!("expected TriggeredResume, got {other:?}"),
+    }
+
+    // Verify execution is now runnable/eligible (resumed)
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Runnable),
+        eligibility_state: Some(ff_core::state::EligibilityState::EligibleNow),
+        public_state: Some(ff_core::state::PublicState::Waiting),
+        ..Default::default()
+    }).await;
+
+    // 4. Re-claim via SDK (tests R8 claim_resumed_execution fallback)
+    let task2 = worker.claim_next().await.unwrap();
+    assert!(task2.is_some(), "should re-claim the resumed execution via claim_resumed path");
+    let task2 = task2.unwrap();
+    assert_eq!(*task2.execution_id(), eid, "should be the same execution");
+
+    // 5. Complete
+    task2.complete(Some(b"done after resume".to_vec())).await.unwrap();
+
+    // Verify terminal
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Success),
+        public_state: Some(ff_core::state::PublicState::Completed),
+        ..Default::default()
+    }).await;
+    assert_state_vector_complete(&tc, &eid).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ROUND 9: Quota reconciler self-healing test
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Test that the quota reconciler corrects a drifted concurrency counter.
+///
+/// 1. Admit 2 executions (concurrency cap 2)
+/// 2. Verify counter = 2
+/// 3. Manually corrupt counter to 5 (simulating missed DECRs)
+/// 4. Run quota_reconciler scan
+/// 5. Verify counter corrected to 2 (matches live admitted:* guard keys)
+/// 6. Admit a 3rd → should be rejected (cap is 2, counter is 2)
+#[tokio::test]
+#[serial_test::serial]
+async fn test_quota_reconciler_self_healing() {
+    use ff_engine::scanner::Scanner;
+
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let policy_id = "reconciler-test-quota";
+    let tag = "{q:0}";
+    let window_key = format!("ff:quota:{}:{}:window:requests", tag, policy_id);
+    let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, policy_id);
+    let def_key = format!("ff:quota:{}:{}", tag, policy_id);
+
+    // Create quota definition with concurrency_cap=2
+    let _: i64 = tc.client()
+        .cmd("HSET").arg(&def_key)
+        .arg("quota_policy_id").arg(policy_id)
+        .arg("active_concurrency_cap").arg("2")
+        .execute().await.unwrap();
+
+    // Admit E1 and E2
+    let e1 = ExecutionId::new();
+    let e2 = ExecutionId::new();
+    let r1 = fcall_admit(&tc, policy_id, &e1, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r1, "ADMITTED");
+    let r2 = fcall_admit(&tc, policy_id, &e2, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r2, "ADMITTED");
+
+    // Verify counter is 2
+    let counter: Option<String> = tc.client()
+        .cmd("GET").arg(&concurrency_key)
+        .execute().await.unwrap();
+    assert_eq!(counter.as_deref(), Some("2"), "counter should be 2 after 2 admissions");
+
+    // Corrupt counter to 5 (simulates missed DECRs from completed executions)
+    let _: () = tc.client()
+        .cmd("SET").arg(&concurrency_key).arg("5")
+        .execute().await.unwrap();
+    let corrupted: Option<String> = tc.client()
+        .cmd("GET").arg(&concurrency_key)
+        .execute().await.unwrap();
+    assert_eq!(corrupted.as_deref(), Some("5"), "counter should be corrupted to 5");
+
+    // Verify 3rd admission is rejected (counter=5 >= cap=2)
+    let e3 = ExecutionId::new();
+    let r3 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r3, "CONCURRENCY_EXCEEDED", "should be rejected with corrupted counter");
+
+    // Run quota reconciler scan on partition 0
+    let reconciler = ff_engine::scanner::quota_reconciler::QuotaReconciler::new(
+        std::time::Duration::from_secs(30),
+    );
+    let result = reconciler.scan_partition(tc.client(), 0).await;
+    assert!(result.errors == 0, "reconciler should not error");
+
+    // Verify counter was corrected to 2 (only 2 live admitted:* guard keys)
+    let fixed: Option<String> = tc.client()
+        .cmd("GET").arg(&concurrency_key)
+        .execute().await.unwrap();
+    assert_eq!(
+        fixed.as_deref(), Some("2"),
+        "reconciler should correct counter from 5 to 2 (2 live guard keys)"
+    );
+
+    // Now 3rd admission should still be rejected (2/2 active)
+    let r4 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r4, "CONCURRENCY_EXCEEDED", "still at capacity after reconciliation");
+}
+
+/// SDK smoke test: exercises fail(), cancel(), update_progress(), append_frame()
+/// through the actual SDK, not raw FCALL helpers.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_sdk_all_methods_smoke() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Write partition config so SDK reads the test config
+    let config = test_config();
+    let config_key = "ff:config:partitions";
+    let _: () = tc.client().cmd("HSET")
+        .arg(config_key)
+        .arg("num_execution_partitions")
+        .arg(config.num_execution_partitions.to_string().as_str())
+        .arg("num_flow_partitions")
+        .arg(config.num_flow_partitions.to_string().as_str())
+        .arg("num_budget_partitions")
+        .arg(config.num_budget_partitions.to_string().as_str())
+        .arg("num_quota_partitions")
+        .arg(config.num_quota_partitions.to_string().as_str())
+        .execute()
+        .await
+        .unwrap();
+
+    let worker_config = ff_sdk::WorkerConfig {
+        valkey_url: "redis://localhost:6379".into(),
+        tls: false,
+        worker_id: ff_core::types::WorkerId::new("sdk-smoke-worker"),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new("sdk-smoke-inst"),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 10,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    // ── Test 1: update_progress + append_frame + complete (happy path) ──
+    let eid1 = ExecutionId::new();
+    fcall_create_execution(&tc, &eid1, NS, LANE, "sdk_smoke_1", 0).await;
+    let task1 = worker.claim_next().await.unwrap().expect("should claim eid1");
+
+    // update_progress via SDK (was broken pre-R6 — UUID in progress_pct)
+    task1.update_progress(75, "three quarters").await.unwrap();
+    let partition1 = execution_partition(&eid1, &config);
+    let ctx1 = ExecKeyContext::new(&partition1, &eid1);
+    let pct = tc.hget(&ctx1.core(), "progress_pct").await;
+    assert_eq!(pct.as_deref(), Some("75"), "progress_pct via SDK should be '75'");
+    let msg = tc.hget(&ctx1.core(), "progress_message").await;
+    assert_eq!(msg.as_deref(), Some("three quarters"));
+
+    // append_frame via SDK
+    let frame_result = task1.append_frame("delta", b"hello world", None).await.unwrap();
+    assert!(!frame_result.stream_id.is_empty(), "stream_id should be non-empty");
+    assert_eq!(frame_result.frame_count, 1);
+
+    // complete via SDK
+    task1.complete(Some(b"sdk_result".to_vec())).await.unwrap();
+    assert_execution_state(&tc, &eid1, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Success),
+        ..Default::default()
+    }).await;
+
+    // ── Test 2: fail() via SDK → terminal ──
+    let eid2 = ExecutionId::new();
+    fcall_create_execution(&tc, &eid2, NS, LANE, "sdk_smoke_2", 0).await;
+    let task2 = worker.claim_next().await.unwrap().expect("should claim eid2");
+
+    let fail_outcome = task2.fail("test_error", "transient").await.unwrap();
+    assert_eq!(fail_outcome, ff_sdk::FailOutcome::TerminalFailed,
+        "no retry policy → terminal failed");
+    assert_execution_state(&tc, &eid2, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Failed),
+        ..Default::default()
+    }).await;
+
+    // ── Test 3: cancel() via SDK ──
+    let eid3 = ExecutionId::new();
+    fcall_create_execution(&tc, &eid3, NS, LANE, "sdk_smoke_3", 0).await;
+    let task3 = worker.claim_next().await.unwrap().expect("should claim eid3");
+
+    task3.cancel("user_requested").await.unwrap();
+    assert_execution_state(&tc, &eid3, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Cancelled),
+        ..Default::default()
+    }).await;
+}
+
+/// Verify that claim_execution extracts attempt_index correctly (field position fix).
+/// On retry, attempt_index should be 1 (not 0 from misread expires_at).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_sdk_claim_retry_attempt_index() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Write partition config
+    let config = test_config();
+    let _: () = tc.client().cmd("HSET")
+        .arg("ff:config:partitions")
+        .arg("num_execution_partitions")
+        .arg(config.num_execution_partitions.to_string().as_str())
+        .arg("num_flow_partitions")
+        .arg(config.num_flow_partitions.to_string().as_str())
+        .arg("num_budget_partitions")
+        .arg(config.num_budget_partitions.to_string().as_str())
+        .arg("num_quota_partitions")
+        .arg(config.num_quota_partitions.to_string().as_str())
+        .execute()
+        .await
+        .unwrap();
+
+    let worker_config = ff_sdk::WorkerConfig {
+        valkey_url: "redis://localhost:6379".into(),
+        tls: false,
+        worker_id: ff_core::types::WorkerId::new("retry-idx-worker"),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new("retry-idx-inst"),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 10,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    // Create execution with retry policy
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "retry_idx_test", 0).await;
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let _: () = tc.client()
+        .cmd("SET")
+        .arg(&ctx.policy())
+        .arg(r#"{"retry_policy":{"max_retries":3,"backoff":{"type":"fixed","delay_ms":10}}}"#)
+        .execute()
+        .await
+        .unwrap();
+
+    // Claim attempt 0 via SDK
+    let task = worker.claim_next().await.unwrap().expect("should claim");
+    assert_eq!(task.attempt_index(), AttemptIndex::new(0), "first attempt should be index 0");
+
+    // Fail it (triggers retry)
+    let outcome = task.fail("test_retry", "transient").await.unwrap();
+    assert!(matches!(outcome, ff_sdk::FailOutcome::RetryScheduled { .. }),
+        "should schedule retry, got: {outcome:?}");
+
+    // Wait for backoff + promote
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    fcall_promote_delayed(&tc, &eid, LANE).await;
+
+    // Claim attempt 1 via SDK — THIS is the critical test.
+    // Pre-fix: attempt_index would be 0 (misread from expires_at).
+    // Post-fix: attempt_index should be 1.
+    let task2 = worker.claim_next().await.unwrap().expect("should claim retry");
+    assert_eq!(task2.attempt_index(), AttemptIndex::new(1),
+        "retry attempt should be index 1 (not 0 from misread expires_at)");
+
+    // Verify attempt type is retry
+    let att_type = tc.hget(
+        &ctx.core(), "current_attempt_index"
+    ).await;
+    assert_eq!(att_type.as_deref(), Some("1"), "current_attempt_index should be 1");
+
+    // Complete it
+    task2.complete(Some(b"done".to_vec())).await.unwrap();
+}

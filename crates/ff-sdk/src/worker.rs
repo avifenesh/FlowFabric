@@ -424,12 +424,15 @@ impl FlowFabricWorker {
                 .unwrap_or_default()
         };
 
+        // Lua returns: ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)
+        // Positions:       0         1       2           3            4              5
         let lease_id = LeaseId::parse(&field_str(0))
             .unwrap_or_else(|_| LeaseId::new());
         let lease_epoch = LeaseEpoch::new(field_str(1).parse().unwrap_or(1));
-        let attempt_index = AttemptIndex::new(field_str(2).parse().unwrap_or(0));
+        // field_str(2) is expires_at — skip it (lease timing managed by renewal)
         let attempt_id = AttemptId::parse(&field_str(3))
             .unwrap_or_else(|_| AttemptId::new());
+        let attempt_index = AttemptIndex::new(field_str(4).parse().unwrap_or(0));
 
         // Read execution payload and metadata
         let (input_payload, execution_kind, tags) = self
