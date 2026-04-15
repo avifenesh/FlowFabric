@@ -20,4 +20,5 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+ff-server = { workspace = true }
 serial_test = "3"

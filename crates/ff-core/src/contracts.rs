@@ -765,6 +765,29 @@ pub enum CreateQuotaPolicyResult {
     AlreadySatisfied { quota_policy_id: crate::types::QuotaPolicyId },
 }
 
+// ─── budget_status (read-only) ───
+
+/// Operator-facing budget status snapshot (not an FCALL — direct HGETALL reads).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetStatus {
+    pub budget_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub enforcement_mode: String,
+    /// Current usage per dimension: {dimension_name: current_value}.
+    pub usage: HashMap<String, u64>,
+    /// Hard limits per dimension: {dimension_name: limit}.
+    pub hard_limits: HashMap<String, u64>,
+    /// Soft limits per dimension: {dimension_name: limit}.
+    pub soft_limits: HashMap<String, u64>,
+    pub breach_count: u64,
+    pub soft_breach_count: u64,
+    pub last_breach_at: Option<String>,
+    pub last_breach_dim: Option<String>,
+    pub next_reset_at: Option<String>,
+    pub created_at: Option<String>,
+}
+
 // ─── report_usage_and_check ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1041,6 +1064,24 @@ pub struct ReplayExecutionArgs {
 pub enum ReplayExecutionResult {
     /// Replayed to runnable.
     Replayed { public_state: PublicState },
+}
+
+// ─── get_execution (full read) ───
+
+/// Full execution info returned by `Server::get_execution`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionInfo {
+    pub execution_id: ExecutionId,
+    pub namespace: String,
+    pub lane_id: String,
+    pub priority: i32,
+    pub execution_kind: String,
+    pub state_vector: StateVector,
+    pub public_state: PublicState,
+    pub created_at: String,
+    pub current_attempt_index: u32,
+    pub flow_id: Option<String>,
+    pub blocking_detail: String,
 }
 
 // ─── Common sub-types ───

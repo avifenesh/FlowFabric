@@ -25,6 +25,7 @@ ff-engine = { path = "crates/ff-engine" }
 ff-scheduler = { path = "crates/ff-scheduler" }
 ff-sdk = { path = "crates/ff-sdk" }
 ff-test = { path = "crates/ff-test" }
+ff-server = { path = "crates/ff-server" }
 ferriskey = { path = "ferriskey" }
 
 # Shared external deps

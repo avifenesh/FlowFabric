@@ -5284,3 +5284,514 @@ async fn test_flow_cancel() {
     assert_eq!(status, 0, "second cancel should fail");
     assert_eq!(field_str(arr, 1), "flow_already_terminal");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE C TESTS: Server API — budget/quota
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Build a Server instance suitable for testing.
+/// Uses the test partition config (4/2/2/2) and connects to the local Valkey.
+async fn test_server() -> ff_server::server::Server {
+    use ff_server::config::ServerConfig;
+    let config = test_config();
+    let server_config = ServerConfig {
+        valkey_url: "redis://localhost:6379".into(),
+        tls: false,
+        partition_config: config,
+        lanes: vec![LaneId::new(LANE)],
+        listen_addr: "0.0.0.0:0".into(),
+        engine_config: ff_engine::EngineConfig {
+            partition_config: config,
+            lanes: vec![LaneId::new(LANE)],
+            ..Default::default()
+        },
+    };
+    ff_server::server::Server::start(server_config)
+        .await
+        .expect("Server::start failed")
+}
+
+/// Server::create_budget → Server::get_budget_status → verify all fields.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_create_budget() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let server = test_server().await;
+
+    let budget_id = BudgetId::new();
+    let now = TimestampMs::now();
+    let args = ff_core::contracts::CreateBudgetArgs {
+        budget_id: budget_id.clone(),
+        scope_type: "lane".into(),
+        scope_id: "test-lane".into(),
+        enforcement_mode: "strict".into(),
+        on_hard_limit: "fail".into(),
+        on_soft_limit: "warn".into(),
+        reset_interval_ms: 3_600_000, // 1 hour
+        dimensions: vec!["tokens".into(), "cost".into()],
+        hard_limits: vec![1000, 50],
+        soft_limits: vec![800, 40],
+        now,
+    };
+
+    // Create budget via Server API
+    let result = server.create_budget(&args).await.unwrap();
+    assert!(matches!(result, ff_core::contracts::CreateBudgetResult::Created { .. }),
+        "expected Created, got: {result:?}");
+
+    // Read back via Server::get_budget_status
+    let status = server.get_budget_status(&budget_id).await.unwrap();
+    assert_eq!(status.budget_id, budget_id.to_string());
+    assert_eq!(status.scope_type, "lane");
+    assert_eq!(status.scope_id, "test-lane");
+    assert_eq!(status.enforcement_mode, "strict");
+    assert_eq!(status.hard_limits.get("tokens"), Some(&1000));
+    assert_eq!(status.hard_limits.get("cost"), Some(&50));
+    assert_eq!(status.soft_limits.get("tokens"), Some(&800));
+    assert_eq!(status.soft_limits.get("cost"), Some(&40));
+    assert_eq!(status.breach_count, 0);
+    assert_eq!(status.soft_breach_count, 0);
+    assert!(status.next_reset_at.is_some(), "reset_interval_ms > 0 should set next_reset_at");
+    assert!(status.created_at.is_some(), "created_at should be set");
+
+    server.shutdown().await;
+}
+
+/// Server::create_quota_policy → ff_check_admission → verify works end-to-end.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_create_quota() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let server = test_server().await;
+
+    let qid = QuotaPolicyId::new();
+    let now = TimestampMs::now();
+    let args = ff_core::contracts::CreateQuotaPolicyArgs {
+        quota_policy_id: qid.clone(),
+        window_seconds: 60,
+        max_requests_per_window: 100,
+        max_concurrent: 5,
+        now,
+    };
+
+    // Create quota via Server API
+    let result = server.create_quota_policy(&args).await.unwrap();
+    assert!(matches!(result, ff_core::contracts::CreateQuotaPolicyResult::Created { .. }),
+        "expected Created, got: {result:?}");
+
+    // Verify the policy was stored correctly by reading from Valkey
+    let config = test_config();
+    let partition = ff_core::partition::quota_partition(&qid, &config);
+    let qctx = ff_core::keys::QuotaKeyContext::new(&partition, &qid);
+
+    let stored_cap = tc.hget(&qctx.definition(), "active_concurrency_cap").await;
+    assert_eq!(stored_cap.as_deref(), Some("5"), "concurrency cap should be 5");
+    let stored_window = tc.hget(&qctx.definition(), "requests_per_window_seconds").await;
+    assert_eq!(stored_window.as_deref(), Some("60"), "window should be 60s");
+
+    // Verify admission works against the policy we created
+    let eid = ExecutionId::new();
+    let guard_key = qctx.admitted(&eid);
+    let admit_keys: Vec<String> = vec![
+        qctx.window("requests_per_window"),
+        qctx.concurrency(),
+        qctx.definition(),
+        guard_key,
+    ];
+    let admit_args: Vec<String> = vec![
+        TimestampMs::now().to_string(), "60".to_owned(), "100".to_owned(),
+        "5".to_owned(), eid.to_string(), "0".to_owned(),
+    ];
+    let kr: Vec<&str> = admit_keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = admit_args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_check_admission_and_record", &kr, &ar)
+        .await
+        .expect("FCALL admission check");
+    let admission = parse_admission_result(&raw);
+    assert_eq!(admission, "ADMITTED", "admission against server-created policy should work");
+
+    server.shutdown().await;
+}
+
+/// Server::create_budget twice → second returns AlreadySatisfied.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_budget_idempotent() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let server = test_server().await;
+
+    let budget_id = BudgetId::new();
+    let now = TimestampMs::now();
+    let args = ff_core::contracts::CreateBudgetArgs {
+        budget_id: budget_id.clone(),
+        scope_type: "lane".into(),
+        scope_id: "idem-lane".into(),
+        enforcement_mode: "strict".into(),
+        on_hard_limit: "fail".into(),
+        on_soft_limit: "warn".into(),
+        reset_interval_ms: 0,
+        dimensions: vec!["tokens".into()],
+        hard_limits: vec![100],
+        soft_limits: vec![80],
+        now,
+    };
+
+    // First create → Created
+    let r1 = server.create_budget(&args).await.unwrap();
+    assert!(matches!(r1, ff_core::contracts::CreateBudgetResult::Created { .. }),
+        "first should be Created, got: {r1:?}");
+
+    // Second create → AlreadySatisfied
+    let r2 = server.create_budget(&args).await.unwrap();
+    assert!(matches!(r2, ff_core::contracts::CreateBudgetResult::AlreadySatisfied { .. }),
+        "second should be AlreadySatisfied, got: {r2:?}");
+
+    // Verify original data preserved
+    let status = server.get_budget_status(&budget_id).await.unwrap();
+    assert_eq!(status.hard_limits.get("tokens"), Some(&100));
+
+    server.shutdown().await;
+}
+
+/// Server flow lifecycle: create_flow → add 2 members → stage edge →
+/// complete upstream → verify downstream eligible → cancel_flow remainder.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_flow_lifecycle() {
+    use ff_core::contracts::{
+        AddExecutionToFlowArgs, CancelFlowArgs, CreateFlowArgs,
+    };
+
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let server = test_server().await;
+    let now = TimestampMs::now();
+
+    // 1. Create flow via Server API
+    let flow_id = FlowId::new();
+    let create_flow_result = server
+        .create_flow(&CreateFlowArgs {
+            flow_id: flow_id.clone(),
+            flow_kind: "test_lifecycle".to_owned(),
+            namespace: Namespace::new(NS),
+            now,
+        })
+        .await
+        .expect("create_flow failed");
+    assert!(
+        matches!(create_flow_result, ff_core::contracts::CreateFlowResult::Created { .. }),
+        "expected Created, got {create_flow_result:?}"
+    );
+
+    // 2. Create 2 executions
+    let upstream = ExecutionId::new();
+    let downstream = ExecutionId::new();
+    fcall_create_execution(&tc, &upstream, NS, LANE, "upstream_task", 0).await;
+    fcall_create_execution(&tc, &downstream, NS, LANE, "downstream_task", 0).await;
+
+    // 3. Add both to flow via Server API
+    let add_up = server
+        .add_execution_to_flow(&AddExecutionToFlowArgs {
+            flow_id: flow_id.clone(),
+            execution_id: upstream.clone(),
+            now,
+        })
+        .await
+        .expect("add upstream failed");
+    assert!(
+        matches!(add_up, ff_core::contracts::AddExecutionToFlowResult::Added { .. }),
+        "expected Added, got {add_up:?}"
+    );
+
+    let add_down = server
+        .add_execution_to_flow(&AddExecutionToFlowArgs {
+            flow_id: flow_id.clone(),
+            execution_id: downstream.clone(),
+            now,
+        })
+        .await
+        .expect("add downstream failed");
+    assert!(
+        matches!(add_down, ff_core::contracts::AddExecutionToFlowResult::Added { .. }),
+        "expected Added, got {add_down:?}"
+    );
+
+    // Verify flow_id was set on exec_core (Phase 2 of add_execution_to_flow)
+    let config = test_config();
+    let up_partition = execution_partition(&upstream, &config);
+    let up_ctx = ExecKeyContext::new(&up_partition, &upstream);
+    let stored_fid: Option<String> = tc.client().cmd("HGET").arg(&up_ctx.core())
+        .arg("flow_id").execute().await.unwrap();
+    assert_eq!(stored_fid.as_deref(), Some(flow_id.to_string().as_str()),
+        "flow_id should be set on upstream exec_core");
+
+    // 4. Stage dependency edge (upstream → downstream) — partition-aware
+    let edge_id = uuid::Uuid::new_v4().to_string();
+    let fpart = ff_core::partition::flow_partition(&flow_id, &config);
+    let fctx = ff_core::keys::FlowKeyContext::new(&fpart, &flow_id);
+    let flow_id_str = flow_id.to_string();
+    {
+        let edge_eid = ff_core::types::EdgeId::parse(&edge_id).unwrap();
+        let keys: Vec<String> = vec![
+            fctx.core(), fctx.members(),
+            fctx.edge(&edge_eid),
+            fctx.outgoing(&upstream),
+            fctx.incoming(&downstream),
+            fctx.grant(&edge_id),
+        ];
+        let now_stage = TimestampMs::now();
+        // graph_revision = 2 after adding 2 members
+        let args: Vec<String> = vec![
+            flow_id_str.clone(), edge_id.clone(),
+            upstream.to_string(), downstream.to_string(),
+            "success_only".to_owned(), String::new(),
+            "2".to_owned(), now_stage.to_string(),
+        ];
+        let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let raw: Value = tc.client()
+            .fcall("ff_stage_dependency_edge", &kr, &ar)
+            .await
+            .expect("FCALL ff_stage_dependency_edge");
+        expect_success_array(&raw, "ff_stage_dependency_edge");
+    }
+
+    // 5. Apply dependency to downstream
+    fcall_apply_dependency(&tc, &downstream, &flow_id_str, &edge_id, &upstream).await;
+
+    // Verify downstream is blocked
+    assert_execution_state(&tc, &downstream, &ExpectedState {
+        eligibility_state: Some(ff_core::state::EligibilityState::BlockedByDependencies),
+        public_state: Some(ff_core::state::PublicState::WaitingChildren),
+        ..Default::default()
+    }).await;
+
+    // 6. Complete upstream execution
+    fcall_issue_claim_grant(&tc, &upstream, LANE, WORKER, WORKER_INST).await;
+    let (la, ea, _, aa) = fcall_claim_execution(&tc, &upstream, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &upstream, LANE, WORKER_INST, &la, &ea, &aa).await;
+
+    // 7. Resolve dependency → downstream becomes eligible
+    let resolve_result = fcall_resolve_dependency(&tc, &downstream, &edge_id, "success").await;
+    assert_eq!(resolve_result, "satisfied");
+
+    assert_in_eligible(&tc, &downstream, &LaneId::new(LANE)).await;
+
+    // 8. Cancel flow via Server API — should cancel downstream
+    let cancel_result = server
+        .cancel_flow(&CancelFlowArgs {
+            flow_id: flow_id.clone(),
+            reason: "test_done".to_owned(),
+            cancellation_policy: "cancel_all".to_owned(),
+            now: TimestampMs::now(),
+        })
+        .await
+        .expect("cancel_flow failed");
+
+    let ff_core::contracts::CancelFlowResult::Cancelled {
+        ref cancellation_policy,
+        ref member_execution_ids,
+    } = cancel_result;
+    assert_eq!(cancellation_policy, "cancel_all");
+    assert_eq!(member_execution_ids.len(), 2);
+
+    // Verify downstream is now cancelled (upstream was already terminal:success,
+    // cancel_execution on it would fail — that's expected and logged as warning)
+    let down_state = server.get_execution_state(&downstream).await.unwrap();
+    assert_eq!(down_state, ff_core::state::PublicState::Cancelled,
+        "downstream should be cancelled after cancel_flow");
+
+    // Verify flow core state is cancelled (reuse fctx from step 4)
+    let flow_state: Option<String> = tc.client().cmd("HGET").arg(&fctx.core())
+        .arg("public_flow_state").execute().await.unwrap();
+    assert_eq!(flow_state.as_deref(), Some("cancelled"));
+
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE C TESTS: Server API — execution operations (Worker-2)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Server::deliver_signal: create → claim → suspend → deliver_signal → verify resumed.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_deliver_signal() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let server = test_server().await;
+
+    // 1. Create and claim
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "signal_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, lease_epoch, _, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // 2. Suspend with resume condition
+    let cond_json = build_resume_condition_json(&["test_signal"], "fail");
+    let (_susp_id, wp_id_str, _wp_key, sub) = fcall_suspend_execution(
+        &tc, &eid, LANE, WORKER_INST, &lease_id, &lease_epoch,
+        "0", &attempt_id, "waiting_signal", &cond_json, None, "fail",
+    ).await;
+    assert_ne!(sub, "ALREADY_SATISFIED", "should suspend normally");
+
+    // Verify suspended
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Suspended),
+        public_state: Some(ff_core::state::PublicState::Suspended),
+        ..Default::default()
+    }).await;
+
+    // 3. Deliver signal via Server API
+    let wp_id = WaitpointId::parse(&wp_id_str).unwrap();
+    let sig_id = SignalId::new();
+    let signal_args = ff_core::contracts::DeliverSignalArgs {
+        execution_id: eid.clone(),
+        waitpoint_id: wp_id,
+        signal_id: sig_id.clone(),
+        signal_name: "test_signal".into(),
+        signal_category: "test".into(),
+        source_type: "external_api".into(),
+        source_identity: "e2e-test".into(),
+        payload: None,
+        payload_encoding: None,
+        idempotency_key: Some("idem-1".into()),
+        correlation_id: None,
+        target_scope: "waitpoint".into(),
+        created_at: None,
+        dedup_ttl_ms: Some(86_400_000),
+        resume_delay_ms: None,
+        max_signals_per_execution: None,
+        signal_maxlen: None,
+        now: TimestampMs::now(),
+    };
+    let result = server.deliver_signal(&signal_args).await.unwrap();
+    assert!(matches!(result, ff_core::contracts::DeliverSignalResult::Accepted { .. }),
+        "expected Accepted, got: {result:?}");
+
+    // 4. Verify execution is back to runnable (resumed by signal)
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Runnable),
+        public_state: Some(ff_core::state::PublicState::Waiting),
+        ..Default::default()
+    }).await;
+
+    server.shutdown().await;
+}
+
+/// Server::change_priority: create → change priority → verify new priority.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_change_priority() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let server = test_server().await;
+
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "prio_test", 100).await;
+
+    // Verify initial priority
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let prio: Option<String> = tc.client().cmd("HGET")
+        .arg(&ctx.core()).arg("priority").execute().await.unwrap();
+    assert_eq!(prio.as_deref(), Some("100"));
+
+    // Change priority via Server API
+    let result = server.change_priority(&eid, 500).await.unwrap();
+    assert!(matches!(result, ff_core::contracts::ChangePriorityResult::Changed { .. }),
+        "expected Changed, got: {result:?}");
+
+    // Verify new priority in exec_core
+    let new_prio: Option<String> = tc.client().cmd("HGET")
+        .arg(&ctx.core()).arg("priority").execute().await.unwrap();
+    assert_eq!(new_prio.as_deref(), Some("500"));
+
+    server.shutdown().await;
+}
+
+/// Server::get_execution: create → get full info → verify all fields.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_get_execution() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let server = test_server().await;
+
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "get_test", 42).await;
+
+    let info = server.get_execution(&eid).await.unwrap();
+
+    assert_eq!(info.execution_id, eid);
+    assert_eq!(info.namespace, NS);
+    assert_eq!(info.lane_id, LANE);
+    assert_eq!(info.priority, 42);
+    assert_eq!(info.execution_kind, "get_test");
+    assert_eq!(info.state_vector.lifecycle_phase, ff_core::state::LifecyclePhase::Runnable);
+    assert_eq!(info.state_vector.ownership_state, ff_core::state::OwnershipState::Unowned);
+    assert_eq!(info.state_vector.eligibility_state, ff_core::state::EligibilityState::EligibleNow);
+    assert_eq!(info.state_vector.blocking_reason, ff_core::state::BlockingReason::WaitingForWorker);
+    assert_eq!(info.state_vector.terminal_outcome, ff_core::state::TerminalOutcome::None);
+    assert_eq!(info.state_vector.attempt_state, ff_core::state::AttemptState::PendingFirstAttempt);
+    assert_eq!(info.public_state, ff_core::state::PublicState::Waiting);
+    assert_eq!(info.current_attempt_index, 0);
+    assert!(info.flow_id.is_none(), "no flow_id for standalone execution");
+    assert!(!info.created_at.is_empty(), "created_at should be set");
+
+    // Verify not-found
+    let missing = ExecutionId::new();
+    let err = server.get_execution(&missing).await;
+    assert!(err.is_err(), "non-existent execution should error");
+
+    server.shutdown().await;
+}
+
+/// Server::replay_execution: create → claim → complete → replay → verify back to runnable.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_replay() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let server = test_server().await;
+
+    // Create, claim, complete
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "replay_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lid, lep, _, aid) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &eid, LANE, WORKER_INST, &lid, &lep, &aid).await;
+
+    // Verify terminal
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Success),
+        ..Default::default()
+    }).await;
+
+    // Replay via Server API
+    let result = server.replay_execution(&eid).await.unwrap();
+    assert!(matches!(result, ff_core::contracts::ReplayExecutionResult::Replayed {
+        public_state: ff_core::state::PublicState::Waiting,
+    }), "expected Replayed(Waiting), got: {result:?}");
+
+    // Verify back to runnable
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Runnable),
+        public_state: Some(ff_core::state::PublicState::Waiting),
+        ..Default::default()
+    }).await;
+
+    server.shutdown().await;
+}

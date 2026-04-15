@@ -949,6 +949,7 @@ dependencies = [
  "ff-scheduler",
  "ff-script",
  "ff-sdk",
+ "ff-server",
  "serde",
  "serde_json",
  "serial_test",
