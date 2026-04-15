@@ -22,3 +22,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 ff-server = { workspace = true }
 serial_test = "3"
+axum = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
