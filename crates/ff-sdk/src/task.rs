@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferriskey::{Client, Value};
+use ff_core::contracts::ReportUsageResult;
 use ff_core::error::ScriptError;
-use ff_core::keys::{ExecKeyContext, IndexKeys};
-use ff_core::partition::{execution_partition, PartitionConfig};
+use ff_core::keys::{BudgetKeyContext, ExecKeyContext, IndexKeys};
+use ff_core::partition::{budget_partition, execution_partition, PartitionConfig};
 use ff_core::types::*;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
@@ -505,6 +506,46 @@ impl ClaimedTask {
         parse_success_result(&raw, "ff_update_progress")
     }
 
+    /// Report usage against a budget and check limits.
+    ///
+    /// Non-consuming — the worker can report usage multiple times.
+    /// `dimensions` is a slice of `(dimension_name, delta)` pairs.
+    pub async fn report_usage(
+        &self,
+        budget_id: &BudgetId,
+        dimensions: &[(&str, u64)],
+    ) -> Result<ReportUsageResult, SdkError> {
+        let partition = budget_partition(budget_id, &self.partition_config);
+        let bctx = BudgetKeyContext::new(&partition, budget_id);
+
+        // KEYS (3): budget_usage, budget_limits, budget_def
+        let keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
+
+        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms
+        let now = TimestampMs::now();
+        let dim_count = dimensions.len();
+        let mut argv: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+        argv.push(dim_count.to_string());
+        for (dim, _) in dimensions {
+            argv.push((*dim).to_string());
+        }
+        for (_, delta) in dimensions {
+            argv.push(delta.to_string());
+        }
+        argv.push(now.to_string());
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_report_usage_and_check", &key_refs, &argv_refs)
+            .await
+            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+
+        parse_report_usage_result(&raw)
+    }
+
     // ── Phase 4: Streaming ──
 
     /// Append a frame to the current attempt's output stream.
@@ -858,6 +899,60 @@ fn is_terminal_renewal_error(err: &ScriptError) -> bool {
 }
 
 // ── FCALL result parsing ──
+
+/// Parse ff_report_usage_and_check result.
+/// Domain-specific: {"OK"}, {"SOFT_BREACH", dim, action}, {"HARD_BREACH", dim, action, current, limit}
+fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => {
+            return Err(SdkError::Script(ScriptError::Parse(
+                "ff_report_usage_and_check: expected Array".into(),
+            )));
+        }
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
+        Some(Ok(Value::SimpleString(s))) => s.clone(),
+        _ => {
+            return Err(SdkError::Script(ScriptError::Parse(
+                "ff_report_usage_and_check: expected status string".into(),
+            )));
+        }
+    };
+    match status.as_str() {
+        "OK" => Ok(ReportUsageResult::Ok),
+        "SOFT_BREACH" => {
+            let dim = usage_field_str(arr, 1);
+            let action = usage_field_str(arr, 2);
+            Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+        }
+        "HARD_BREACH" => {
+            let dim = usage_field_str(arr, 1);
+            let action = usage_field_str(arr, 2);
+            let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
+            let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
+            Ok(ReportUsageResult::HardBreach {
+                dimension: dim,
+                action,
+                current_usage: current,
+                hard_limit: limit,
+            })
+        }
+        _ => Err(SdkError::Script(ScriptError::Parse(format!(
+            "ff_report_usage_and_check: unknown status: {status}"
+        )))),
+    }
+}
+
+fn usage_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> String {
+    match arr.get(index) {
+        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
+        Some(Ok(Value::SimpleString(s))) => s.clone(),
+        Some(Ok(Value::Int(n))) => n.to_string(),
+        _ => String::new(),
+    }
+}
 
 /// Parse a standard {1, "OK", ...} / {0, "error", ...} FCALL result.
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {

@@ -1,5 +1,6 @@
 //! REST API layer — thin axum handlers over Server methods.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -94,9 +95,12 @@ pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
         .route("/v1/flows", post(create_flow))
         .route("/v1/flows/{id}/members", post(add_execution_to_flow))
         .route("/v1/flows/{id}/cancel", post(cancel_flow))
+        .route("/v1/flows/{id}/edges", post(stage_dependency_edge))
+        .route("/v1/flows/{id}/edges/apply", post(apply_dependency_to_child))
         // Budgets
         .route("/v1/budgets", post(create_budget))
         .route("/v1/budgets/{id}", get(get_budget_status))
+        .route("/v1/budgets/{id}/usage", post(report_usage))
         // Quotas
         .route("/v1/quotas", post(create_quota_policy))
         // Health
@@ -230,6 +234,29 @@ async fn cancel_flow(
     Ok(Json(server.cancel_flow(&args).await?))
 }
 
+async fn stage_dependency_edge(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    AppJson(mut args): AppJson<StageDependencyEdgeArgs>,
+) -> Result<(StatusCode, Json<StageDependencyEdgeResult>), ApiError> {
+    let path_fid = parse_flow_id(&id)?;
+    check_id_match(&path_fid, &args.flow_id, "flow_id")?;
+    args.flow_id = path_fid;
+    let result = server.stage_dependency_edge(&args).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn apply_dependency_to_child(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    AppJson(mut args): AppJson<ApplyDependencyToChildArgs>,
+) -> Result<Json<ApplyDependencyToChildResult>, ApiError> {
+    let path_fid = parse_flow_id(&id)?;
+    check_id_match(&path_fid, &args.flow_id, "flow_id")?;
+    args.flow_id = path_fid;
+    Ok(Json(server.apply_dependency_to_child(&args).await?))
+}
+
 // ── Budget / Quota handlers ──
 
 async fn create_budget(
@@ -250,6 +277,28 @@ async fn get_budget_status(
 ) -> Result<Json<BudgetStatus>, ApiError> {
     let bid = parse_budget_id(&id)?;
     Ok(Json(server.get_budget_status(&bid).await?))
+}
+
+#[derive(Deserialize)]
+struct ReportUsageBody {
+    dimensions: HashMap<String, u64>,
+    now: ff_core::types::TimestampMs,
+}
+
+async fn report_usage(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    AppJson(body): AppJson<ReportUsageBody>,
+) -> Result<Json<ReportUsageResult>, ApiError> {
+    let bid = parse_budget_id(&id)?;
+    let dims: Vec<String> = body.dimensions.keys().cloned().collect();
+    let deltas: Vec<u64> = dims.iter().map(|d| body.dimensions[d]).collect();
+    let args = ReportUsageArgs {
+        dimensions: dims,
+        deltas,
+        now: body.now,
+    };
+    Ok(Json(server.report_usage(&bid, &args).await?))
 }
 
 async fn create_quota_policy(
