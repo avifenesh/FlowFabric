@@ -26,5 +26,7 @@ TEAM.md
 ferriskey/.claude/
 
 # ── Environment / secrets ──
+.env
+*.env.local
 # ferriskey/.env is tracked (only contains LANG=C, not secrets)
 # TLS test certs in utils/tls_crts/ are self-signed test certs (safe to track)

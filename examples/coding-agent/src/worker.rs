@@ -286,15 +286,15 @@ fn parse_agent_response(response: &str) -> (String, String, String) {
         if let Some(rest) = trimmed.strip_prefix("THOUGHT:") {
             thought = rest.trim().to_string();
             in_action_input = false;
-        } else if let Some(rest) = trimmed.strip_prefix("ACTION:") {
-            action = rest.trim().to_lowercase();
-            in_action_input = false;
         } else if let Some(rest) = trimmed.strip_prefix("ACTION_INPUT:") {
             action_input = rest.trim().to_string();
             in_action_input = true;
+        } else if let Some(rest) = trimmed.strip_prefix("ACTION:") {
+            action = rest.trim().to_lowercase();
+            in_action_input = false;
         } else if in_action_input {
             action_input.push('\n');
-            action_input.push_str(trimmed);
+            action_input.push_str(line);
         }
     }
 
