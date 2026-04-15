@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use ff_core::types::BudgetId;
 use ff_sdk::{ConditionMatcher, FlowFabricWorker, SuspendOutcome, TimeoutBehavior, WorkerConfig};
 use tokio::sync::Mutex;
 
@@ -38,6 +39,10 @@ struct Args {
     /// FlowFabric lane.
     #[arg(long, default_value = DEFAULT_LANE)]
     lane: String,
+
+    /// Budget ID for token tracking. If set, reports usage after each LLM turn.
+    #[arg(long, env = "FF_BUDGET_ID")]
+    budget_id: Option<String>,
 }
 
 const SYSTEM_PROMPT: &str = "\
@@ -77,7 +82,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // we look it up and complete immediately.
     let pending: Arc<Mutex<HashMap<String, PatchResult>>> = Default::default();
 
-    tracing::info!(model = %args.model, "coding-agent worker started");
+    let budget_id = args.budget_id.as_ref().map(|id| {
+        BudgetId::parse(id).unwrap_or_else(|e| {
+            eprintln!("invalid --budget-id: {e}");
+            std::process::exit(1);
+        })
+    });
+
+    tracing::info!(
+        model = %args.model,
+        budget_id = budget_id.as_ref().map(|b| b.to_string()).as_deref(),
+        "coding-agent worker started"
+    );
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -102,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
-                        if let Err(e) = process_task(task, &llm, &args.model, &pending).await {
+                        if let Err(e) = process_task(task, &llm, &args.model, budget_id.as_ref(), &pending).await {
                             tracing::error!(execution_id = %eid, error = %e, "task processing failed");
                         }
                     }
@@ -125,6 +141,7 @@ async fn process_task(
     task: ff_sdk::ClaimedTask,
     llm: &LlmClient,
     model_name: &str,
+    budget_id: Option<&BudgetId>,
     pending: &Arc<Mutex<HashMap<String, PatchResult>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let eid = task.execution_id().to_string();
@@ -172,6 +189,23 @@ async fn process_task(
         total_usage.prompt_tokens += usage.prompt_tokens;
         total_usage.completion_tokens += usage.completion_tokens;
         total_usage.total_tokens += usage.total_tokens;
+
+        if let Some(bid) = budget_id {
+            let dims: &[(&str, u64)] = &[
+                ("prompt_tokens", usage.prompt_tokens),
+                ("completion_tokens", usage.completion_tokens),
+                ("total_tokens", usage.total_tokens),
+            ];
+            match task.report_usage(bid, dims).await {
+                Ok(ff_core::contracts::ReportUsageResult::Ok) => {}
+                Ok(result) => {
+                    tracing::warn!(execution_id = %eid, ?result, "budget limit reached");
+                }
+                Err(e) => {
+                    tracing::warn!(execution_id = %eid, error = %e, "report_usage failed");
+                }
+            }
+        }
 
         let (thought, action, action_input) = parse_agent_response(&response);
 
