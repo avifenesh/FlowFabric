@@ -336,17 +336,11 @@ fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Du
 }
 
 impl Client {
-    /// Checks if the given command is a SELECT command.
-    /// Returns true if the command is "SELECT", false otherwise.
-    /// Handles cases where command() returns None gracefully.
-    /// Note: The underlying ferriskey library normalizes commands to uppercase.
     fn is_select_command(&self, cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"SELECT")
     }
 
-    /// Extracts the database ID from a SELECT command.
-    /// Parses the first argument of the SELECT command as an i64 database ID.
-    /// Returns appropriate errors for invalid formats or missing arguments.
+    /// Extract the database ID from a SELECT command's first argument.
     fn extract_database_id_from_select(&self, cmd: &Cmd) -> Result<i64> {
         // For both crate::cmd::cmd("SELECT").arg("5") and crate::cmd::Cmd::new().arg("SELECT").arg("5")
         // the database ID is at arg_idx(1)
@@ -373,8 +367,7 @@ impl Client {
             })
     }
 
-    /// Handles SELECT command processing after successful execution.
-    /// Updates database state for standalone, cluster, and lazy clients.
+    /// Handle SELECT: update stored database ID and OTel metadata.
     ///
     /// Note: `db_namespace` is updated on `&mut self`, but `Client` is cloned
     /// into each request handler. If concurrent tasks issue SELECT, a cloned
@@ -389,9 +382,6 @@ impl Client {
         Ok(())
     }
 
-    /// Updates the stored database ID for different client types.
-    /// Handles standalone, cluster, and lazy clients appropriately.
-    /// Ensures thread-safe updates using existing synchronization mechanisms.
     async fn update_stored_database_id(&self, database_id: i64) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
@@ -411,17 +401,11 @@ impl Client {
         }
     }
 
-    /// Checks if the given command is a CLIENT SETNAME command.
-    /// Returns true if the command is "CLIENT SETNAME", false otherwise.
     fn is_client_set_name_command(&self, cmd: &Cmd) -> bool {
-        // Check if the command is "CLIENT SETNAME"
         cmd.command()
             .is_some_and(|bytes| bytes == b"CLIENT SETNAME")
     }
 
-    /// Extracts the client name from a CLIENT SETNAME command.
-    /// Parses the client name argument from the CLIENT SETNAME command.
-    /// Returns None if the argument is missing or invalid.
     fn extract_client_name_from_client_set_name(&self, cmd: &Cmd) -> Option<String> {
         // For crate::cmd::cmd("CLIENT").arg("SETNAME").arg("name")
         // the client name is at arg_idx(2) (after "SETNAME")
@@ -432,20 +416,12 @@ impl Client {
         })
     }
 
-    /// Handles CLIENT SETNAME command processing after successful execution.
-    /// Updates connection name state for standalone, cluster, and lazy clients.
     async fn handle_client_set_name_command(&mut self, cmd: &Cmd) -> Result<()> {
-        // Extract client name from the CLIENT SETNAME command
         let client_name = self.extract_client_name_from_client_set_name(cmd);
-
-        // Update client name state for all client types
         self.update_stored_client_name(client_name).await?;
         Ok(())
     }
 
-    /// Updates the stored client name for different client types.
-    /// Handles standalone, cluster, and lazy clients appropriately.
-    /// Ensures thread-safe updates using existing synchronization mechanisms.
     async fn update_stored_client_name(&self, client_name: Option<String>) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
@@ -465,18 +441,11 @@ impl Client {
         }
     }
 
-    /// Checks if the given command is an AUTH command.
-    /// Returns true if the command is "AUTH", false otherwise.
     fn is_auth_command(&self, cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"AUTH")
     }
 
-    /// Extracts authentication information from an AUTH command.
-    /// Returns (username, password) tuple where username is None for password-only auth.
-    ///
-    /// AUTH command formats:
-    /// - AUTH password (args: \[password\])
-    /// - AUTH username password (args: \[username, password\])
+    /// Extract (username, password) from an AUTH command.
     fn extract_auth_info(&self, cmd: &Cmd) -> (Option<String>, Option<String>) {
         // Get the first argument
         let first_arg = cmd
@@ -498,17 +467,11 @@ impl Client {
         }
     }
 
-    /// Handles AUTH command processing after successful execution.
-    /// Updates username and password state for standalone, cluster, and lazy clients.
     async fn handle_auth_command(&mut self, cmd: &Cmd) -> Result<()> {
         let (username, password) = self.extract_auth_info(cmd);
-
-        // Update username if provided
         if username.is_some() {
             self.update_stored_username(username).await?;
         }
-
-        // Update password if provided (updateConnectionPassword handles this, so we track it too)
         if password.is_some() {
             self.update_stored_password(password).await?;
         }
@@ -516,7 +479,6 @@ impl Client {
         Ok(())
     }
 
-    /// Updates the stored username for different client types.
     async fn update_stored_username(&self, username: Option<String>) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
@@ -535,7 +497,6 @@ impl Client {
         }
     }
 
-    /// Updates the stored password for different client types.
     async fn update_stored_password(&self, password: Option<String>) -> Result<()> {
         let mut guard = self.internal_client.write().await;
         match &mut *guard {
@@ -554,14 +515,11 @@ impl Client {
         }
     }
 
-    /// Checks if the given command is a HELLO command.
-    /// Returns true if the command is "HELLO", false otherwise.
     fn is_hello_command(&self, cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"HELLO")
     }
 
-    /// Extracts protocol version and optional auth info from a HELLO command.
-    /// Returns (protocol_version, username, password, client_name) tuple.
+    /// Extract (protocol, username, password, client_name) from a HELLO command.
     ///
     /// HELLO command formats:
     /// - HELLO 3
@@ -624,8 +582,6 @@ impl Client {
         (protocol, username, password, client_name)
     }
 
-    /// Handles HELLO command processing after successful execution.
-    /// Updates protocol version and optionally auth info and client name.
     async fn handle_hello_command(&mut self, cmd: &Cmd) -> Result<()> {
         let (protocol, username, password, client_name) = self.extract_hello_info(cmd);
 
@@ -652,7 +608,6 @@ impl Client {
         Ok(())
     }
 
-    /// Updates the stored protocol version for different client types.
     async fn update_stored_protocol(
         &self,
         protocol: crate::value::ProtocolVersion,
@@ -958,7 +913,10 @@ impl Client {
 
         match client {
             ClientWrapper::Standalone(_) => {
-                unreachable!("Cluster scan is not supported in standalone mode")
+                Err(crate::value::Error::from((
+                    crate::value::ErrorKind::InvalidClientConfig,
+                    "Cluster scan is not supported in standalone mode",
+                )))
             }
             ClientWrapper::Cluster { mut client } => {
                 let (cursor, keys) = client

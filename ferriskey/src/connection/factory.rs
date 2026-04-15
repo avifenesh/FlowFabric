@@ -7,8 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::info::{ConnectionInfo, IntoConnectionInfo};
 use crate::connection::runtime;
-use crate::connection::tls::{TlsCertificates, inner_build_with_tls};
-use crate::connection::{DisconnectNotifier, MultiplexedConnection, RedisRuntime, connect_simple};
+use crate::connection::{DisconnectNotifier, MultiplexedConnection, ValkeyRuntime, connect_simple};
 use crate::pubsub::push_manager::PushInfo;
 use crate::pubsub::synchronizer_trait::PubSubSynchronizer;
 use crate::retry_strategies::RetryStrategy;
@@ -20,7 +19,7 @@ pub struct Client {
     pub(crate) connection_info: ConnectionInfo,
 }
 
-/// The client acts as connector to the redis server.  By itself it does not
+/// The client acts as connector to the Valkey server.  By itself it does not
 /// do much other than providing a convenient way to fetch a connection from
 /// it.  In the future the plan is to provide a connection pool in the client.
 ///
@@ -133,21 +132,6 @@ impl Client {
         .map(|(conn, _ip)| conn)
     }
 
-    /// For TCP connections: returns (async connection, Some(the direct IP address))
-    /// For Unix connections, returns (async connection, None)
-    #[allow(dead_code)]
-    pub(crate) async fn get_multiplexed_async_connection_ip(
-        &self,
-        ferriskey_connection_options: FerrisKeyConnectionOptions,
-    ) -> Result<(MultiplexedConnection, Option<IpAddr>)> {
-        self.get_multiplexed_async_connection_inner::<crate::connection::tokio::Tokio>(
-            NO_TIMEOUT,
-            None,
-            ferriskey_connection_options,
-        )
-        .await
-    }
-
     pub(crate) async fn get_multiplexed_async_connection_inner<T>(
         &self,
         response_timeout: std::time::Duration,
@@ -155,7 +139,7 @@ impl Client {
         ferriskey_connection_options: FerrisKeyConnectionOptions,
     ) -> Result<(MultiplexedConnection, Option<IpAddr>)>
     where
-        T: RedisRuntime,
+        T: ValkeyRuntime,
     {
         let conn_info = self.connection_info.clone();
         let (con, ip) = connect_simple::<T>(
@@ -175,109 +159,12 @@ impl Client {
         Ok((connection, ip))
     }
 
-    /// Constructs a new `Client` with parameters necessary to create a TLS connection.
-    ///
-    /// - `conn_info` - URL using the `rediss://` scheme.
-    /// - `tls_certs` - `TlsCertificates` structure containing:
-    ///   -- `client_tls` - Optional `ClientTlsConfig` containing byte streams for
-    ///   -- `client_cert` - client's byte stream containing client certificate in PEM format
-    ///   -- `client_key` - client's byte stream containing private key in PEM format
-    ///   -- `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
-    ///
-    /// If `ClientTlsConfig` ( cert+key pair ) is not provided, then client-side authentication is not enabled.
-    /// If `root_cert` is not provided, then system root certificates are used instead.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use std::{fs::File, io::{BufReader, Read}};
-    ///
-    /// use ferriskey::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
-    ///
-    /// async fn do_redis_code(
-    ///     url: &str,
-    ///     root_cert_file: &str,
-    ///     cert_file: &str,
-    ///     key_file: &str
-    /// ) -> ferriskey::Result<()> {
-    ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
-    ///     let mut root_cert_vec = Vec::new();
-    ///     BufReader::new(root_cert_file)
-    ///         .read_to_end(&mut root_cert_vec)
-    ///         .expect("Unable to read ROOT cert file");
-    ///
-    ///     let cert_file = File::open(cert_file).expect("cannot open private cert file");
-    ///     let mut client_cert_vec = Vec::new();
-    ///     BufReader::new(cert_file)
-    ///         .read_to_end(&mut client_cert_vec)
-    ///         .expect("Unable to read client cert file");
-    ///
-    ///     let key_file = File::open(key_file).expect("cannot open private key file");
-    ///     let mut client_key_vec = Vec::new();
-    ///     BufReader::new(key_file)
-    ///         .read_to_end(&mut client_key_vec)
-    ///         .expect("Unable to read client key file");
-    ///
-    ///     let client = Client::build_with_tls(
-    ///         url,
-    ///         TlsCertificates {
-    ///             client_tls: Some(ClientTlsConfig{
-    ///                 client_cert: client_cert_vec,
-    ///                 client_key: client_key_vec,
-    ///             }),
-    ///             root_cert: Some(root_cert_vec),
-    ///         }
-    ///     )
-    ///     .expect("Unable to build client");
-    ///
-    ///     let connection_info = client.get_connection_info();
-    ///
-    ///     println!(">>> connection info: {connection_info:?}");
-    ///
-    ///     let mut con = client.get_async_connection(None).await?;
-    ///
-    ///     con.set::<_, _, ()>("key1", b"foo").await?;
-    ///
-    ///     ferriskey::cmd("SET")
-    ///         .arg(&["key2", "bar"])
-    ///         .query_async::<_, ()>(&mut con)
-    ///         .await?;
-    ///
-    ///     let result = ferriskey::cmd("MGET")
-    ///         .arg(&["key1", "key2"])
-    ///         .query_async(&mut con)
-    ///         .await;
-    ///     assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
-    ///     println!("Result from MGET: {result:?}");
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    #[allow(dead_code)]
-    pub(crate) fn build_with_tls<C: IntoConnectionInfo>(
-        conn_info: C,
-        tls_certs: TlsCertificates,
-    ) -> Result<Client> {
-        let connection_info = conn_info.into_connection_info()?;
-
-        inner_build_with_tls(connection_info, tls_certs)
-    }
-
     /// Updates the password in connection_info.
     pub fn update_password(&mut self, password: Option<String>) {
         self.connection_info.valkey.password = password;
     }
 
     /// Updates the database ID in connection_info.
-    ///
-    /// This method updates the database field in the connection information,
-    /// which will be used for subsequent connections and reconnections.
-    ///
-    /// # Arguments
-    ///
-    /// * `database_id` - The database ID to use for connections (typically 0-15)
-    ///
-    /// ```
     pub fn update_database(&mut self, database_id: i64) {
         self.connection_info.valkey.db = database_id;
     }
@@ -288,29 +175,11 @@ impl Client {
     }
 
     /// Updates the username in connection_info.
-    ///
-    /// This method updates the username field in the connection information,
-    /// which will be used for subsequent connections and reconnections.
-    /// Typically updated when AUTH command is used with a username.
-    ///
-    /// # Arguments
-    ///
-    /// * `username` - The username to use for authentication (None to clear)
-    ///
     pub fn update_username(&mut self, username: Option<String>) {
         self.connection_info.valkey.username = username;
     }
 
     /// Updates the protocol version in connection_info.
-    ///
-    /// This method updates the protocol field in the connection information,
-    /// which will be used for subsequent connections and reconnections.
-    /// Typically updated when HELLO command is used to change protocol version.
-    ///
-    /// # Arguments
-    ///
-    /// * `protocol` - The protocol version to use (RESP2 or RESP3)
-    ///
     pub fn update_protocol(&mut self, protocol: ProtocolVersion) {
         self.connection_info.valkey.protocol = protocol;
     }
