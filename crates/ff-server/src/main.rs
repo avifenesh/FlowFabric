@@ -1,17 +1,20 @@
+use std::sync::Arc;
+
+use ff_server::api;
 use ff_server::config::ServerConfig;
 use ff_server::server::Server;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ff_server=info,ff_engine=info,ff_script=info".into()),
+                .unwrap_or_else(|_| {
+                    "ff_server=info,ff_engine=info,ff_script=info,tower_http=debug".into()
+                }),
         )
         .init();
 
-    // Load config
     let config = match ServerConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -20,7 +23,9 @@ async fn main() {
         }
     };
 
-    // Start server
+    let listen_addr = config.listen_addr.clone();
+    let cors_origins = config.cors_origins.clone();
+
     let server = match Server::start(config).await {
         Ok(s) => s,
         Err(e) => {
@@ -29,15 +34,33 @@ async fn main() {
         }
     };
 
-    // Wait for shutdown signal
-    wait_for_shutdown_signal().await;
+    let server = Arc::new(server);
+    let app = api::router(server.clone(), &cors_origins);
 
-    // Graceful shutdown
-    server.shutdown().await;
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(addr = %listen_addr, error = %e, "failed to bind listener");
+            std::process::exit(1);
+        });
+
+    tracing::info!(addr = %listen_addr, "HTTP API listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "HTTP server error");
+        });
+
+    // Graceful engine shutdown after HTTP server stops
+    match Arc::try_unwrap(server) {
+        Ok(s) => s.shutdown().await,
+        Err(_) => tracing::warn!("could not take exclusive server ownership for shutdown"),
+    }
 }
 
-/// Wait for SIGTERM or SIGINT (Ctrl+C).
-async fn wait_for_shutdown_signal() {
+async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
