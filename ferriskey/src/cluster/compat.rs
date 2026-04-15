@@ -1,4 +1,4 @@
-//! This module provides Redis Cluster support.
+//! This module provides Valkey Cluster support.
 //!
 //! The primary entry point is [`ClusterClientBuilder`] which configures
 //! cluster connections used by the async cluster module.

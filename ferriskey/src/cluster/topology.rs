@@ -1,4 +1,4 @@
-//! This module provides the functionality to refresh and calculate the cluster topology for Redis Cluster.
+//! This module provides the functionality to refresh and calculate the cluster topology for Valkey Cluster.
 
 use crate::cluster::client::SlotsRefreshRateLimit;
 use crate::cluster::compat::get_connection_addr;

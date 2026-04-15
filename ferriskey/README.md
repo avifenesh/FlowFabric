@@ -1,66 +1,78 @@
-# Rust core
+# ferriskey
 
-## Tests
+A Rust client for [Valkey](https://valkey.io), built for [FlowFabric](https://github.com/avifenesh/FlowFabric).
 
-To run all tests:
+Ferriskey descends from [glide-core](https://github.com/valkey-io/valkey-glide) (part of valkey-glide), which itself evolved from redis-rs. It has been refactored for FlowFabric's needs:
 
-```bash
-cargo test
+- **ClientBuilder API** -- host/port/tls/cluster configuration without URL parsing
+- **First-class FCALL** -- `client.fcall()` and `client.fcall_readonly()` for Valkey Functions
+- **Function management** -- `function_load_replace()`, `function_list()`, `function_delete()`
+- **Typed pipelines** -- `TypedPipeline` with slot-based result extraction
+- **RESP3 protocol** -- native support for all Valkey value types
+- **Cluster mode** -- automatic slot routing, redirection handling, read replicas
+- **TLS** -- rustls-based, platform certificate verification
+- **AWS IAM auth** -- ElastiCache/MemoryDB token-based authentication
+- **Compression** -- client-side zstd/lz4 support
+
+## Quick start
+
+```rust
+use ferriskey::ClientBuilder;
+
+#[tokio::main]
+async fn main() -> ferriskey::Result<()> {
+    let client = ClientBuilder::new()
+        .host("localhost", 6379)
+        .build()
+        .await?;
+
+    // Basic key/value
+    let _: () = client.set("key", "value").await?;
+    let val: Option<String> = client.get("key").await?;
+    assert_eq!(val.as_deref(), Some("value"));
+
+    // Raw command
+    let pong: String = client.cmd("PING").execute().await?;
+    assert_eq!(pong, "PONG");
+
+    // FCALL (Valkey Functions)
+    let result: ferriskey::Value = client
+        .fcall("my_function", &["key1"], &["arg1"])
+        .await?;
+
+    Ok(())
+}
 ```
 
-To run specific tests:
+## Cluster mode
 
-```bash
-cargo test <pattern>
+```rust
+let client = ClientBuilder::new()
+    .host("node1", 6379)
+    .cluster()
+    .tls()
+    .build()
+    .await?;
 ```
 
-For example:
+## Typed pipelines
 
-```bash
-cargo test <module_name>          # Filter test(s) by module name
-cargo test <test_name>            # Filter test(s) by function name
+```rust
+let mut pipe = client.pipeline();
+let slot_a = pipe.set("a", "1");
+let slot_b = pipe.get::<String>("a");
+pipe.execute().await?;
+
+let val: Option<String> = slot_b.value()?;
 ```
 
-### IAM Authentication Tests
+## Heritage
 
-To run [IAM authentication tests](tests/test_client.rs) locally with mock credentials:
+This project incorporates code from:
 
-```bash
-AWS_ACCESS_KEY_ID=test_access_key \
-AWS_SECRET_ACCESS_KEY=test_secret_key \
-AWS_SESSION_TOKEN=test_session_token \
-cargo test test_iam_authentication
-```
+- [valkey-glide](https://github.com/valkey-io/valkey-glide) (Apache-2.0)
+- [redis-rs](https://github.com/redis-rs/redis-rs) (BSD-3-Clause)
 
-If any of these environment variables are not set, IAM authentication tests will be skipped.
+## License
 
-**Note:** The credential values shown above (`test_access_key`, etc.) are arbitrary placeholder strings. The AWS SDK uses them to generate an authentication token, but the local test server doesn't validate the token. These tests verify that the IAM authentication flow works correctly (token generation, connection establishment, and token refresh), not that the credentials are valid.
-
-### DNS Tests
-
-To run [DNS tests](tests/test_dns.rs) locally:
-
-1. Add the following entries to your hosts file:
-   - Linux/macOS: `/etc/hosts`
-   - Windows: `C:\Windows\System32\drivers\etc\hosts`
-
-   ```text
-   127.0.0.1 valkey.glide.test.tls.com
-   127.0.0.1 valkey.glide.test.no_tls.com
-   ::1 valkey.glide.test.tls.com
-   ::1 valkey.glide.test.no_tls.com
-   ```
-
-2. Set the environment variable:
-
-   ```bash
-   export VALKEY_GLIDE_DNS_TESTS_ENABLED=1
-   ```
-
-If the environment variable is not set, DNS tests will be skipped.
-
-## Recommended VSCode extensions
-
-[rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) - Rust language server.
-[CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb) - Debugger.
-[Even Better TOML](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml) - TOML language support.
+Apache-2.0

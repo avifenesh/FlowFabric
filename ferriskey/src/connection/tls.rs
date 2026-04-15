@@ -2,9 +2,7 @@ use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::connection::factory::Client;
-use crate::connection::info::{ConnectionAddr, ConnectionInfo};
-use crate::value::{ErrorKind, Error, Result};
+use crate::value::Result;
 
 /// Structure to hold mTLS client _certificate_ and _key_ binaries in PEM format
 ///
@@ -26,36 +24,6 @@ pub struct TlsCertificates {
     pub client_tls: Option<ClientTlsConfig>,
     /// root certificate byte stream in PEM format if the local truststore is *not* to be used
     pub root_cert: Option<Vec<u8>>,
-}
-
-#[allow(dead_code)]
-pub(crate) fn inner_build_with_tls(
-    mut connection_info: ConnectionInfo,
-    certificates: TlsCertificates,
-) -> Result<Client> {
-    let tls_params = retrieve_tls_certificates(certificates)?;
-
-    connection_info.addr = if let ConnectionAddr::TcpTls {
-        host,
-        port,
-        insecure,
-        ..
-    } = connection_info.addr
-    {
-        ConnectionAddr::TcpTls {
-            host,
-            port,
-            insecure,
-            tls_params: Some(tls_params),
-        }
-    } else {
-        return Err(Error::from((
-            ErrorKind::InvalidClientConfig,
-            "Constructing a TLS client requires a URL with the `rediss://` or `valkeys://` scheme",
-        )));
-    };
-
-    Ok(Client { connection_info })
 }
 
 /// Retrieve TLS connection parameters from certificates.
