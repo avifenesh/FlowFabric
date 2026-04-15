@@ -1,0 +1,12 @@
+[package]
+name = "ff-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FlowFabric claim-grant scheduler"
+
+[dependencies]
+ff-core = { workspace = true }
+ferriskey = { workspace = true }
+tracing = { workspace = true }

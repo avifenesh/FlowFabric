@@ -273,6 +273,63 @@ impl Client {
         self.execute(cmd).await
     }
 
+    /// Call a Valkey Function (server-side Lua registered via FUNCTION LOAD).
+    ///
+    /// Wire format: `FCALL function numkeys key [key ...] arg [arg ...]`
+    pub async fn fcall<T: FromValue>(
+        &self,
+        function: &str,
+        keys: &[impl ToArgs],
+        args: &[impl ToArgs],
+    ) -> Result<T> {
+        let mut c = cmd("FCALL");
+        c.arg(function).arg(keys.len()).arg(keys).arg(args);
+        self.execute(c).await
+    }
+
+    /// Call a Valkey Function in read-only mode (safe for replicas).
+    ///
+    /// Wire format: `FCALL_RO function numkeys key [key ...] arg [arg ...]`
+    pub async fn fcall_readonly<T: FromValue>(
+        &self,
+        function: &str,
+        keys: &[impl ToArgs],
+        args: &[impl ToArgs],
+    ) -> Result<T> {
+        let mut c = cmd("FCALL_RO");
+        c.arg(function).arg(keys.len()).arg(keys).arg(args);
+        self.execute(c).await
+    }
+
+    /// Load (or replace) a Valkey Functions library.
+    ///
+    /// Wire format: `FUNCTION LOAD REPLACE <library_code>`
+    /// Returns the library name on success.
+    pub async fn function_load_replace(&self, library_code: &str) -> Result<String> {
+        let mut c = cmd("FUNCTION");
+        c.arg("LOAD").arg("REPLACE").arg(library_code);
+        self.execute(c).await
+    }
+
+    /// List loaded function libraries matching the given library name.
+    ///
+    /// Wire format: `FUNCTION LIST LIBRARYNAME <library_name>`
+    /// Returns the raw Value for caller to inspect.
+    pub async fn function_list(&self, library_name: &str) -> Result<crate::value::Value> {
+        let mut c = cmd("FUNCTION");
+        c.arg("LIST").arg("LIBRARYNAME").arg(library_name);
+        self.execute(c).await
+    }
+
+    /// Delete a loaded function library by name.
+    ///
+    /// Wire format: `FUNCTION DELETE <library_name>`
+    pub async fn function_delete(&self, library_name: &str) -> Result<()> {
+        let mut c = cmd("FUNCTION");
+        c.arg("DELETE").arg(library_name);
+        self.execute(c).await
+    }
+
     /// Start building an arbitrary command by name.
     pub fn cmd(&self, name: &str) -> CommandBuilder {
         CommandBuilder {
@@ -606,6 +663,19 @@ impl TypedPipeline {
     pub fn exists(&mut self, key: impl ToArgs) -> PipeSlot<bool> {
         let mut c = cmd("EXISTS");
         c.arg(key);
+        let idx = self.push_cmd(c);
+        self.slot(idx)
+    }
+
+    /// Queue an FCALL command, returning a typed slot for the result.
+    pub fn fcall<T: FromValue>(
+        &mut self,
+        function: &str,
+        keys: &[impl ToArgs],
+        args: &[impl ToArgs],
+    ) -> PipeSlot<T> {
+        let mut c = cmd("FCALL");
+        c.arg(function).arg(keys.len()).arg(keys).arg(args);
         let idx = self.push_cmd(c);
         self.slot(idx)
     }

@@ -1879,3 +1879,13 @@ Execution operations map to the crate architecture as follows:
 - RFC-002: Attempt Model (worker-3)
 - RFC-003: Lease and Fencing Semantics (worker-1)
 - RFC-004: Suspension and Signal Semantics (later batch)
+
+---
+
+## Implementation Notes (v1)
+
+- **`submitted` phase is skipped.** `ff_create_execution` transitions directly to `runnable` (or `runnable` + `not_eligible_until_time` for delayed). The `submitted` phase was designed for async validation but is unnecessary in the current synchronous create path. The phase remains in the state model for future use.
+- **Claim-grant model is fully implemented.** Scheduler pre-computes routing/admission and issues an ephemeral `claim_grant` key (5s TTL). `ff_claim_execution` and `ff_claim_resumed_execution` atomically consume the grant.
+- **`ff_claim_resumed_execution` is a separate FCALL.** `ff_claim_execution` rejects `attempt_state = attempt_interrupted` with `use_claim_resumed_execution`. The SDK catches this error and dispatches to the correct claim path.
+- **Enriched error responses.** `execution_not_active` returns `{terminal_outcome, lease_epoch}` so the SDK can distinguish "my completion won" from "someone else terminated it."
+- **OOM-safe write ordering.** All terminal transitions write `exec_core` HSET first (point of no return), then update sub-objects and indexes. This ensures scanners can recover from partial writes.

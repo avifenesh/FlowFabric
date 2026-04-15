@@ -873,3 +873,13 @@ Only genuinely unresolved questions remain here.
 
 - Pre-RFC: `flowfabric_use_cases_and_primitives (2).md`
 - Related RFCs: RFC-001, RFC-002, RFC-003, RFC-008
+
+---
+
+## Implementation Notes (v1)
+
+- **Cycle detection is implemented in Lua (`ff_stage_dependency_edge`),** not in `ff-engine::dispatch` as originally specified. BFS from downstream through outgoing edges, `MAX_CYCLE_CHECK_NODES=1000`. This is strictly better than the RFC design — cycle check is atomic with edge creation, eliminating the race window between staging and validation.
+- **Edge `edge_state` values use `pending`/`satisfied`/`impossible`,** not `blocked_impossible` as the RFC edge object definition (§Dependency Edge Definition) suggests. The `cancelled` state is also defined but not used in v1. All Lua functions (`ff_resolve_dependency`, `ff_replay_execution` dep reset) use the `impossible` value.
+- **All 9 flow Lua functions are implemented.** `ff_create_flow` (KEYS 2, ARGV 4, idempotent via EXISTS), `ff_add_execution_to_flow` (KEYS 2, ARGV 3, {fp:N} only — caller must separately HSET flow_id on exec_core via {p:N}), and `ff_cancel_flow` (KEYS 2, ARGV 4, returns member list for cross-partition cancellation dispatch). Server API methods wire these with correct partition routing and two-phase cross-partition semantics for `add_execution_to_flow`. `ff_stage_dependency_edge`, `ff_apply_dependency_to_child`, `ff_resolve_dependency`, `ff_promote_blocked_to_eligible`, and `ff_evaluate_flow_eligibility` are also fully implemented.
+- **Terminal flow guard.** `ff_add_execution_to_flow` and `ff_stage_dependency_edge` reject mutations on terminal flows (cancelled/completed/failed) with `err("flow_already_terminal")`. Prevents adding members or edges to a cancelled flow.
+- **Cancel cascade for `skipped` children is implemented in `ff-engine::dispatch`.** When `ff_resolve_dependency` returns `impossible` + `child_skipped`, dispatch recursively resolves downstream edges with `Box::pin` async recursion, `MAX_CASCADE_DEPTH=50`.

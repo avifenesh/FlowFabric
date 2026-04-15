@@ -1,9 +1,30 @@
+# ── Build artifacts ──
+target/
 ferriskey/target/
+
+# ── Editor / IDE ──
 .cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Profiling / benchmarks ──
 ferriskey/bench-results-*.json
 ferriskey/benchmarks/
 ferriskey/flamegraph.svg
 *.perf.data
 perf.data
-.remember/
+
+# ── Team coordination (internal, not public) ──
 TEAM.md
+.remember/
+
+# ── Claude / agent artifacts ──
+ferriskey/.claude/
+
+# ── Environment / secrets ──
+# ferriskey/.env is tracked (only contains LANG=C, not secrets)
+# TLS test certs in utils/tls_crts/ are self-signed test certs (safe to track)
