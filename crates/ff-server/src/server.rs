@@ -941,11 +941,18 @@ impl Server {
         let mut fcall_args: Vec<String> = vec![execution_id.to_string(), now.to_string()];
 
         if is_skipped_flow_member {
-            // Read dep edge IDs from deps:unresolved set
+            // Read ALL inbound edge IDs from the flow partition's adjacency set.
+            // Cannot use deps:unresolved because impossible edges were SREM'd
+            // by ff_resolve_dependency. The flow's in:<eid> set has all edges.
+            let flow_id = FlowId::parse(&flow_id_str)
+                .map_err(|e| ServerError::Script(format!("bad flow_id: {e}")))?;
+            let flow_part =
+                flow_partition(&flow_id, &self.config.partition_config);
+            let flow_ctx = FlowKeyContext::new(&flow_part, &flow_id);
             let edge_ids: Vec<String> = self
                 .client
                 .cmd("SMEMBERS")
-                .arg(ctx.deps_unresolved())
+                .arg(flow_ctx.incoming(execution_id))
                 .execute()
                 .await
                 .unwrap_or_default();
