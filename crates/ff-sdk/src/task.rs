@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,6 +139,10 @@ pub struct ClaimedTask {
     renewal_handle: JoinHandle<()>,
     /// Signal to stop renewal (used before consuming self).
     renewal_stop: Arc<Notify>,
+    /// Consecutive lease renewal failures. Shared with the background renewal
+    /// task. Reset to 0 on each successful renewal. Workers should check
+    /// `is_lease_healthy()` before committing expensive side effects.
+    renewal_failures: Arc<AtomicU32>,
     /// Concurrency permit from the worker's semaphore. Held for the lifetime
     /// of the task; released on complete/fail/cancel/drop.
     _concurrency_permit: Option<OwnedSemaphorePermit>,
@@ -162,6 +167,7 @@ impl ClaimedTask {
         tags: HashMap<String, String>,
     ) -> Self {
         let renewal_stop = Arc::new(Notify::new());
+        let renewal_failures = Arc::new(AtomicU32::new(0));
 
         let renewal_handle = spawn_renewal_task(
             client.clone(),
@@ -173,6 +179,7 @@ impl ClaimedTask {
             lease_epoch,
             lease_ttl_ms,
             renewal_stop.clone(),
+            renewal_failures.clone(),
         );
 
         Self {
@@ -191,6 +198,7 @@ impl ClaimedTask {
             tags,
             renewal_handle,
             renewal_stop,
+            renewal_failures,
             _concurrency_permit: None,
         }
     }
@@ -237,6 +245,24 @@ impl ClaimedTask {
 
     pub fn lane_id(&self) -> &LaneId {
         &self.lane_id
+    }
+
+    /// Check if the lease is likely still valid based on renewal success.
+    ///
+    /// Returns `false` if 3 or more consecutive renewal attempts have failed.
+    /// Workers should check this before committing expensive or irreversible
+    /// side effects. A `false` return means Valkey may have already expired
+    /// the lease and another worker could be processing this execution.
+    pub fn is_lease_healthy(&self) -> bool {
+        self.renewal_failures.load(Ordering::Relaxed) < 3
+    }
+
+    /// Number of consecutive lease renewal failures since the last success.
+    ///
+    /// Returns 0 when renewals are working normally. Useful for observability
+    /// and custom health policies beyond the default threshold of 3.
+    pub fn consecutive_renewal_failures(&self) -> u32 {
+        self.renewal_failures.load(Ordering::Relaxed)
     }
 
     // ── Terminal operations (consume self) ──
@@ -756,6 +782,7 @@ fn spawn_renewal_task(
     lease_epoch: LeaseEpoch,
     lease_ttl_ms: u64,
     stop_signal: Arc<Notify>,
+    failure_counter: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
     let interval = Duration::from_millis(lease_ttl_ms / 3);
 
@@ -787,12 +814,14 @@ fn spawn_renewal_task(
                     .await
                     {
                         Ok(()) => {
+                            failure_counter.store(0, Ordering::Relaxed);
                             tracing::trace!(
                                 execution_id = %execution_id,
                                 "lease renewed"
                             );
                         }
                         Err(SdkError::Script(ref e)) if is_terminal_renewal_error(e) => {
+                            failure_counter.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 execution_id = %execution_id,
                                 error = %e,
@@ -801,9 +830,11 @@ fn spawn_renewal_task(
                             return;
                         }
                         Err(e) => {
+                            let count = failure_counter.fetch_add(1, Ordering::Relaxed) + 1;
                             tracing::warn!(
                                 execution_id = %execution_id,
                                 error = %e,
+                                consecutive_failures = count,
                                 "lease renewal failed (will retry next interval)"
                             );
                         }

@@ -15,6 +15,16 @@ use crate::SdkError;
 /// FlowFabric worker — connects to Valkey, claims executions, and provides
 /// the worker-facing API.
 ///
+/// # Admission Control
+///
+/// **`claim_next()` bypasses budget and quota admission checks.** The SDK's
+/// inline claim path reads the eligible ZSET directly and issues claim grants
+/// without consulting budget (`{b:M}`) or quota (`{q:K}`) policies. In
+/// production deployments, use the Scheduler (`ff-scheduler`) which enforces
+/// admission control (budget breach check, quota sliding-window check,
+/// concurrency cap) before issuing claim grants. The SDK's inline claim is
+/// suitable for trusted workers, development, and testing.
+///
 /// # Usage
 ///
 /// ```rust,ignore

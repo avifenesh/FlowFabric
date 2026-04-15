@@ -1,7 +1,7 @@
 // ff-engine: cross-partition dispatch and background scanners
 
 pub mod budget;
-pub mod dispatch;
+pub mod partition_router;
 pub mod scanner;
 
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use ff_core::types::LaneId;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use dispatch::PartitionRouter;
+use partition_router::PartitionRouter;
 use scanner::ScannerRunner;
 use scanner::attempt_timeout::AttemptTimeoutScanner;
 use scanner::execution_deadline::ExecutionDeadlineScanner;

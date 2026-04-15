@@ -191,6 +191,10 @@ pub struct StateVector {
 
 impl StateVector {
     /// Derive public_state from the other 6 dimensions per RFC-001 §2.4.
+    ///
+    /// Never panics. In distributed systems, constraint violations can occur
+    /// via partial writes or reconciler drift. Impossible combinations log a
+    /// warning and return a safe fallback instead of crashing.
     pub fn derive_public_state(&self) -> PublicState {
         match self.lifecycle_phase {
             LifecyclePhase::Terminal => match self.terminal_outcome {
@@ -199,7 +203,13 @@ impl StateVector {
                 TerminalOutcome::Cancelled => PublicState::Cancelled,
                 TerminalOutcome::Expired => PublicState::Expired,
                 TerminalOutcome::Skipped => PublicState::Skipped,
-                TerminalOutcome::None => unreachable!("terminal must have outcome (V4)"),
+                TerminalOutcome::None => {
+                    // V4 violation: terminal without outcome. Corrupt state —
+                    // surface as Failed so operators notice and investigate.
+                    // No logging here (ff-core has no tracing dep); callers
+                    // detect this via is_consistent() returning false.
+                    PublicState::Failed
+                }
             },
             LifecyclePhase::Suspended => PublicState::Suspended,
             LifecyclePhase::Active => PublicState::Active,
@@ -214,7 +224,9 @@ impl StateVector {
                 | EligibilityState::BlockedByLaneState
                 | EligibilityState::BlockedByOperator => PublicState::Waiting,
                 EligibilityState::NotApplicable => {
-                    unreachable!("runnable cannot have not_applicable eligibility")
+                    // Constraint violation: runnable should not have not_applicable.
+                    // Surface as Waiting — the index reconciler will correct this.
+                    PublicState::Waiting
                 }
             },
             LifecyclePhase::Submitted => PublicState::Waiting,

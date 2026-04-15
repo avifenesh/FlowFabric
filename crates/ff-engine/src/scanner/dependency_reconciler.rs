@@ -1,7 +1,7 @@
 //! Dependency resolution reconciler.
 //!
 //! Safety net for cross-partition dependency resolution. When an upstream
-//! execution completes, ff-engine::dispatch normally calls ff_resolve_dependency
+//! execution completes, ff-engine::partition_router normally calls ff_resolve_dependency
 //! on each downstream child. If the engine crashes between the upstream's
 //! completion and the child resolution dispatch, children remain stuck in
 //! blocked_by_dependencies. This reconciler detects and resolves that gap.

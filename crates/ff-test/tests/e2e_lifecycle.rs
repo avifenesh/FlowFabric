@@ -6295,3 +6295,123 @@ async fn test_server_create_cancel_roundtrip() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX #5: System-level test with all 14 scanners running concurrently
+// ═══════════════════════════════════════════════════════════════════════
+
+/// System test: Engine with 14 scanners + create → delayed → promote → claim → complete.
+///
+/// Unlike all other tests which call individual Lua functions, this test starts
+/// the full Engine (all 14 background scanners) and lets the delayed promoter
+/// scanner naturally promote a delayed execution to eligible. This exercises
+/// concurrent scanner timing, partition iteration, and the create→claim→complete
+/// lifecycle under real background processing.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_system_engine_with_concurrent_scanners() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Start the full server (includes Engine with all 14 scanners)
+    // Use short intervals so scanners fire quickly in tests
+    let config = test_config();
+    let server_config = {
+        use ff_server::config::ServerConfig;
+        let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
+        let port: u16 = std::env::var("FF_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6379);
+        let tls = std::env::var("FF_TLS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let cluster = std::env::var("FF_CLUSTER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        ServerConfig {
+            host,
+            port,
+            tls,
+            cluster,
+            partition_config: config,
+            lanes: vec![LaneId::new(LANE)],
+            listen_addr: "0.0.0.0:0".into(),
+            engine_config: ff_engine::EngineConfig {
+                partition_config: config,
+                lanes: vec![LaneId::new(LANE)],
+                // Short intervals for test responsiveness
+                delayed_promoter_interval: std::time::Duration::from_millis(100),
+                lease_expiry_interval: std::time::Duration::from_millis(500),
+                ..Default::default()
+            },
+            skip_library_load: true,
+        }
+    };
+    let server = ff_server::server::Server::start(server_config)
+        .await
+        .expect("Server::start with 14 scanners");
+
+    // 1. Create a DELAYED execution (delay_until = 50ms from now)
+    let eid = ExecutionId::new();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+    let now = TimestampMs::now();
+    let delay_until = TimestampMs::from_millis(now.0 + 50); // 50ms from now
+
+    let delayed_key = idx.lane_delayed(&lane_id);
+    let keys: Vec<String> = vec![
+        ctx.core(), ctx.payload(), ctx.policy(), ctx.tags(),
+        delayed_key.clone(), // scheduling_zset = delayed (not eligible)
+        ctx.noop(), // idem_key placeholder
+        idx.execution_deadline(), idx.all_executions(),
+    ];
+    let args: Vec<String> = vec![
+        eid.to_string(), NS.to_owned(), LANE.to_owned(), "system_test".to_owned(),
+        "0".to_owned(), "system-creator".to_owned(), "{}".to_owned(),
+        "system-input".to_owned(), delay_until.0.to_string(), // delay_until
+        String::new(), "{}".to_owned(), String::new(), "0".to_owned(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let _: Value = tc.client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await.expect("create delayed execution");
+
+    // 2. Verify it's in the delayed set, NOT eligible
+    assert_not_in_eligible(&tc, &eid, &lane_id).await;
+
+    // 3. Wait for the delayed promoter scanner to promote it.
+    //    Scanner interval = 100ms, delay = 50ms. Should promote within ~200ms.
+    let mut promoted = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let score = tc.zscore(&idx.lane_eligible(&lane_id), &eid.to_string()).await;
+        if score.is_some() {
+            promoted = true;
+            break;
+        }
+    }
+    assert!(promoted, "delayed promoter scanner should have promoted execution to eligible");
+
+    // 4. Verify execution is now eligible (promoted by the background scanner)
+    assert_in_eligible(&tc, &eid, &lane_id).await;
+
+    // 5. Claim + complete through the normal FCALL path
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, _att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &attempt_id).await;
+
+    // 6. Verify terminal state
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Success),
+        public_state: Some(ff_core::state::PublicState::Completed),
+        ..Default::default()
+    }).await;
+
+    server.shutdown().await;
+}
