@@ -722,7 +722,7 @@ The scheduler must dispatch to the correct claim script based on execution state
 | `{b:M}` budget | 2 | Usage increment + breach check, reset. |
 | `{q:K}` quota | 1 | Admission check + record. |
 | **Total listed** | **34** | Including cross-reference entries for overlap groups. |
-| **Unique `redis.register_function` calls** | **~26** | After deduplicating overlap groups A-D + `ff_version`. All registered in one `flowfabric` library. |
+| **Unique `redis.register_function` calls** | **38** | After deduplicating overlap groups A-D + `ff_version`. All registered in one `flowfabric` library. Breakdown: execution.lua (9), lease.lua (3), scheduling.lua (5), suspension.lua (5), signal.lua (3), stream.lua (1), budget.lua (4), quota.lua (1), flow.lua (6), version.lua (1). |
 
 ### 4.8 Implementation Notes for Valkey Functions
 
@@ -3344,6 +3344,40 @@ Three-layer testing. Lua functions are the spec — never mock them.
 ### 11.1 Testing Strategy
 
 See §12.5 for the authoritative testing strategy (`ff-test` crate, three-layer model, scanner correctness tests).
+
+---
+
+## Addendum: Adversarial Review Discoveries
+
+The following implementation constraints and improvements were found and fixed during 11 rounds of adversarial testing. Each item documents a production-affecting issue not covered by the original RFC text.
+
+### A.1 Priority Clamp [0, 9000] (Round 4)
+
+Composite eligible-ZSET scores use the formula `-(priority * 1_000_000_000_000) + created_at_ms`. Lua numbers are IEEE 754 doubles with a 53-bit mantissa, so priority values above 9007 cause integer overflow and score corruption. `ff_create_execution` and `ff_change_priority` clamp priority to the range [0, 9000] in Lua before computing the composite score. This is enforced at the Lua layer, not at the Rust type level, because the overflow is a Valkey/Lua numeric representation issue.
+
+### A.2 Dedup Key TTL Guard (Round 6)
+
+`SET key value PX 0` or `PX -1` causes a Valkey error inside a Lua function *after* partial writes have already committed, leaving the data store in an inconsistent state. All four dedup-key sites (`ff_create_execution`, `ff_deliver_signal`, `ff_buffer_signal_for_pending_waitpoint`, `ff_check_admission_and_record`) guard with `dedup_ms > 0` before issuing the `SET PX` command. When dedup_ms is zero or absent, the dedup key is not written.
+
+### A.3 Quota Reconciler Self-Healing (Round 8)
+
+Quota concurrency counters grow monotonically because `INCR` happens on admission (partition `{q:K}`) but there is no corresponding `DECR` when executions complete/fail/cancel (those run on partition `{p:N}`). The `quota_reconciler` scanner periodically SCANs `admitted:<eid>` guard keys (which have TTL = window_ms and auto-expire) and SETs the concurrency counter to the actual count of live guard keys. Drift corrects within one reconciliation cycle (~30s default).
+
+### A.4 Execution Deadline Scanner (Round 4)
+
+The 14th background scanner. Scans `execution_deadline_zset` for executions past their absolute deadline and calls `ff_expire_execution` for each. Unlike the lease-expiry scanner (which only handles active/leased executions), this scanner handles runnable-state executions (eligible, delayed, blocked) via dynamic key construction for index cleanup.
+
+### A.5 Defensive Runnable-Path in ff_expire_execution (Round 5)
+
+When `execution_deadline` fires on a runnable execution (one in eligible, delayed, or blocked state rather than active/leased), `ff_expire_execution` must ZREM from the correct source index. The function uses a defensive catch-all `else` branch that ZREMs from all 7 runnable-state index types (lane eligible, lane delayed, lane blocked, global equivalents, and priority override sets) for forward compatibility with new index types.
+
+### A.6 SDK claim_resumed_execution Fallback (Round 8)
+
+When `ff_claim_execution` returns the error code `use_claim_resumed_execution` (indicating the grant targets a suspended→resumed execution), the SDK `claim_next()` method falls back to calling `ff_claim_resumed_execution` with the execution_id from the grant. Without this fallback, resumed executions would be permanently unclaimed despite having valid grants in the ready queue.
+
+### A.7 Claim Field Extraction Positions (Round 9)
+
+`ff_claim_execution` returns `ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)` — six fields at positions 0–5. The SDK must read `field_str(4)` for `attempt_index`, not `field_str(2)` (which is `expires_at`, a 13-digit millisecond timestamp). A positional mismatch here is masked on first attempts (index 0, which happens to match `unwrap_or(0)` on parse failure) but breaks retry and reclaim paths. All SDK response parsers were audited for positional correctness.
 
 ---
 

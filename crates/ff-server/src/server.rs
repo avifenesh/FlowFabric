@@ -44,7 +44,7 @@ impl Server {
     /// 1. Connect to Valkey
     /// 2. Validate or create partition config key
     /// 3. Load the FlowFabric Lua library
-    /// 4. Start engine (3 background scanners)
+    /// 4. Start engine (14 background scanners)
     pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
         // Step 1: Connect to Valkey
         tracing::info!(url = %config.valkey_url, "connecting to Valkey");
@@ -103,7 +103,7 @@ impl Server {
             quota_partitions = config.partition_config.num_quota_partitions,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
             listen_addr = %config.listen_addr,
-            "FlowFabric server started. Partitions: {}/{}/{}/{}. Scanners: 3 active.",
+            "FlowFabric server started. Partitions: {}/{}/{}/{}. Scanners: 14 active.",
             config.partition_config.num_execution_partitions,
             config.partition_config.num_flow_partitions,
             config.partition_config.num_budget_partitions,
