@@ -213,6 +213,33 @@ impl FlowFabricWorker {
                     task.set_concurrency_permit(permit);
                     return Ok(Some(task));
                 }
+                Err(SdkError::Script(ff_core::error::ScriptError::UseClaimResumedExecution)) => {
+                    // Execution was resumed from suspension — attempt_interrupted.
+                    // ff_claim_execution rejects this; use ff_claim_resumed_execution
+                    // which reuses the existing attempt instead of creating a new one.
+                    tracing::debug!(
+                        execution_id = %execution_id,
+                        "execution is resumed, using claim_resumed path"
+                    );
+                    match self
+                        .claim_resumed_execution(&execution_id, &lane_id, &partition)
+                        .await
+                    {
+                        Ok(mut task) => {
+                            task.set_concurrency_permit(permit);
+                            return Ok(Some(task));
+                        }
+                        Err(SdkError::Script(ref e2)) if is_retryable_claim_error(e2) => {
+                            tracing::debug!(
+                                execution_id = %execution_id,
+                                error = %e2,
+                                "claim_resumed failed (retryable), trying next partition"
+                            );
+                            continue;
+                        }
+                        Err(e2) => return Err(e2),
+                    }
+                }
                 Err(SdkError::Script(ref e)) if is_retryable_claim_error(e) => {
                     tracing::debug!(
                         execution_id = %execution_id,
@@ -277,7 +304,7 @@ impl FlowFabricWorker {
         execution_id: &ExecutionId,
         lane_id: &LaneId,
         partition: &ff_core::partition::Partition,
-        now: TimestampMs,
+        _now: TimestampMs,
     ) -> Result<ClaimedTask, SdkError> {
         let ctx = ExecKeyContext::new(partition, execution_id);
         let idx = IndexKeys::new(partition);
@@ -405,6 +432,148 @@ impl FlowFabricWorker {
             .unwrap_or_else(|_| AttemptId::new());
 
         // Read execution payload and metadata
+        let (input_payload, execution_kind, tags) = self
+            .read_execution_context(execution_id, partition)
+            .await?;
+
+        Ok(ClaimedTask::new(
+            self.client.clone(),
+            self.partition_config,
+            execution_id.clone(),
+            attempt_index,
+            attempt_id,
+            lease_id,
+            lease_epoch,
+            self.config.lease_ttl_ms,
+            lane_id.clone(),
+            self.config.worker_instance_id.clone(),
+            input_payload,
+            execution_kind,
+            tags,
+        ))
+    }
+
+    /// Claim a resumed execution (attempt_interrupted after suspension/delay).
+    ///
+    /// Uses ff_claim_resumed_execution which reuses the existing attempt
+    /// instead of creating a new one. Called as fallback when ff_claim_execution
+    /// returns UseClaimResumedExecution.
+    async fn claim_resumed_execution(
+        &self,
+        execution_id: &ExecutionId,
+        lane_id: &LaneId,
+        partition: &ff_core::partition::Partition,
+    ) -> Result<ClaimedTask, SdkError> {
+        let ctx = ExecKeyContext::new(partition, execution_id);
+        let idx = IndexKeys::new(partition);
+
+        // Pre-read current_attempt_index for the existing attempt hash key.
+        let att_idx_str: Option<String> = self.client
+            .cmd("HGET")
+            .arg(&ctx.core())
+            .arg("current_attempt_index")
+            .execute()
+            .await
+            .unwrap_or(None);
+        let att_idx = AttemptIndex::new(
+            att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
+        );
+
+        let lease_id = LeaseId::new().to_string();
+
+        // KEYS (11): must match lua/signal.lua ff_claim_resumed_execution
+        let keys: Vec<String> = vec![
+            ctx.core(),                                             // 1  exec_core
+            ctx.claim_grant(),                                      // 2  claim_grant
+            idx.lane_eligible(lane_id),                             // 3  eligible_zset
+            idx.lease_expiry(),                                     // 4  lease_expiry_zset
+            idx.worker_leases(&self.config.worker_instance_id),     // 5  worker_leases
+            ctx.attempt_hash(att_idx),                              // 6  existing_attempt_hash
+            ctx.lease_current(),                                    // 7  lease_current
+            ctx.lease_history(),                                    // 8  lease_history
+            idx.lane_active(lane_id),                               // 9  active_index
+            idx.attempt_timeout(),                                  // 10 attempt_timeout_zset
+            idx.execution_deadline(),                               // 11 execution_deadline_zset
+        ];
+
+        // ARGV (8): must match lua/signal.lua ff_claim_resumed_execution
+        let args: Vec<String> = vec![
+            execution_id.to_string(),                               // 1  execution_id
+            self.config.worker_id.to_string(),                      // 2  worker_id
+            self.config.worker_instance_id.to_string(),             // 3  worker_instance_id
+            lane_id.to_string(),                                    // 4  lane
+            String::new(),                                          // 5  capability_hash
+            lease_id.clone(),                                       // 6  lease_id
+            self.config.lease_ttl_ms.to_string(),                   // 7  lease_ttl_ms
+            String::new(),                                          // 8  remaining_attempt_timeout_ms
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_claim_resumed_execution", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+
+        // Parse result — same format as ff_claim_execution:
+        // {1, "OK", lease_id, lease_epoch, expires_at, attempt_id, attempt_index, attempt_type}
+        let arr = match &raw {
+            Value::Array(arr) => arr,
+            _ => {
+                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                    "ff_claim_resumed_execution: expected Array".into(),
+                )));
+            }
+        };
+
+        let status_code = match arr.first() {
+            Some(Ok(Value::Int(n))) => *n,
+            _ => {
+                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                    "ff_claim_resumed_execution: bad status code".into(),
+                )));
+            }
+        };
+
+        if status_code != 1 {
+            let error_code = arr
+                .get(1)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "unknown".to_owned());
+
+            return Err(SdkError::Script(
+                ff_core::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                    ff_core::error::ScriptError::Parse(format!(
+                        "ff_claim_resumed_execution: {error_code}"
+                    ))
+                }),
+            ));
+        }
+
+        let field_str = |idx: usize| -> String {
+            arr.get(idx + 2)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    Ok(Value::Int(n)) => Some(n.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+
+        let lease_id = LeaseId::parse(&field_str(0))
+            .unwrap_or_else(|_| LeaseId::new());
+        let lease_epoch = LeaseEpoch::new(field_str(1).parse().unwrap_or(1));
+        let attempt_index = AttemptIndex::new(field_str(4).parse().unwrap_or(0));
+        let attempt_id = AttemptId::parse(&field_str(3))
+            .unwrap_or_else(|_| AttemptId::new());
+
         let (input_payload, execution_kind, tags) = self
             .read_execution_context(execution_id, partition)
             .await?;

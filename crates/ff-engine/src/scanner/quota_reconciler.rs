@@ -182,6 +182,14 @@ async fn reconcile_one_quota(
     }
 
     // 3. Reconcile concurrency counter (if quota has concurrency cap)
+    //
+    // The concurrency counter is INCRed on admission (ff_check_admission_and_record)
+    // but never DECRed when executions complete/fail/cancel — those run on different
+    // partitions ({p:N} vs {q:K}). Without reconciliation, the counter grows
+    // monotonically and eventually blocks all new admissions.
+    //
+    // Fix: count live `admitted:<eid>` guard keys (which have TTL = window_ms)
+    // and SET the counter to the actual count of currently-admitted executions.
     let concurrency_cap: Option<String> = client
         .cmd("HGET")
         .arg(&def_key)
@@ -194,6 +202,13 @@ async fn reconcile_one_quota(
             if cap > 0 {
                 let counter_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
 
+                // Count live admitted:* guard keys for this quota.
+                // These keys have TTL = window_ms and auto-expire when the
+                // admission window closes. The count of live keys IS the
+                // true concurrency count.
+                let pattern = format!("ff:quota:{}:{}:admitted:*", tag, quota_id);
+                let actual_count = count_keys_by_pattern(client, &pattern).await;
+
                 // Read stored counter
                 let stored: Option<String> = client
                     .cmd("GET")
@@ -205,18 +220,19 @@ async fn reconcile_one_quota(
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
 
-                // Guard: counter should never be negative
-                if stored_count < 0 {
+                // Correct if drifted (counter > actual live keys)
+                if stored_count != actual_count as i64 {
                     let _: () = client
                         .cmd("SET")
                         .arg(&counter_key)
-                        .arg("0")
+                        .arg(actual_count.to_string().as_str())
                         .execute()
                         .await?;
-                    tracing::warn!(
+                    tracing::info!(
                         quota_id,
-                        stored_count,
-                        "quota_reconciler: corrected negative concurrency counter"
+                        stored = stored_count,
+                        actual = actual_count,
+                        "quota_reconciler: corrected concurrency counter drift"
                     );
                     did_work = true;
                 }
@@ -225,6 +241,40 @@ async fn reconcile_one_quota(
     }
 
     Ok(did_work)
+}
+
+/// Count keys matching a pattern via SCAN. Used to count live admitted:* guard keys.
+async fn count_keys_by_pattern(
+    client: &ferriskey::Client,
+    pattern: &str,
+) -> u64 {
+    let mut count: u64 = 0;
+    let mut cursor = "0".to_string();
+
+    loop {
+        let result: ferriskey::Value = match client
+            .cmd("SCAN")
+            .arg(&cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg("100")
+            .execute()
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+
+        let (next_cursor, keys) = parse_scan_result(&result);
+        count += keys.len() as u64;
+        cursor = next_cursor;
+        if cursor == "0" {
+            break;
+        }
+    }
+
+    count
 }
 
 fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {

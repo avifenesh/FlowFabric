@@ -3475,8 +3475,10 @@ async fn test_flow_replay_after_skip() {
 /// Verify that priority values outside [0, 9000] are clamped, and that
 /// higher-priority executions appear first in the eligible ZSET (lower score).
 #[tokio::test]
+#[serial_test::serial]
 async fn test_priority_clamp_and_ordering() {
     let tc = TestCluster::connect().await;
+    tc.cleanup().await;
 
     // Create execution with priority=10000 (should be clamped to 9000)
     let high = ExecutionId::new();

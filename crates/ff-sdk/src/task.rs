@@ -253,8 +253,6 @@ impl ClaimedTask {
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
 
-        let now = TimestampMs::now();
-
         // KEYS (12): must match lua/execution.lua ff_complete_execution positional order
         // exec_core, attempt_hash, lease_expiry_zset, worker_leases,
         // terminal_zset, lease_current, lease_history, active_index,

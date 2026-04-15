@@ -337,6 +337,7 @@ fn find_project_root() -> Option<std::path::PathBuf> {
 }
 
 /// Parse a SCAN result: `[cursor, [key1, key2, ...]]`
+#[cfg(test)]
 fn parse_scan_result(value: &Value) -> (String, Vec<String>) {
     match value {
         Value::Array(arr) if arr.len() == 2 => {

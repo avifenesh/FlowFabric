@@ -228,14 +228,15 @@ async fn purge_execution(
     }
 
     // Read waitpoints set to discover all waitpoint-related keys
+    let waitpoints_key = format!("ff:exec:{}:{}:waitpoints", tag, eid_str);
     let wp_ids: Vec<String> = client
         .cmd("SMEMBERS")
-        .arg(&format!("ff:exec:{}:{}:waitpoints", tag, eid_str))
+        .arg(&waitpoints_key)
         .execute()
         .await
         .unwrap_or_default();
 
-    del_keys.push(format!("ff:exec:{}:{}:waitpoints", tag, eid_str));
+    del_keys.push(waitpoints_key);
 
     for wp_id_str in &wp_ids {
         del_keys.push(format!("ff:wp:{}:{}", tag, wp_id_str));
