@@ -58,8 +58,8 @@ redis.register_function('ff_create_execution', function(keys, args)
   if A.priority < 0 then A.priority = 0 end
   if A.priority > 9000 then A.priority = 9000 end
 
-  -- 1. Idempotency check
-  if is_set(A.dedup_ttl_ms) and is_set(A.idem_key) then
+  -- 1. Idempotency check (only when dedup_ttl_ms > 0 and idem_key provided)
+  if is_set(A.idem_key) and (tonumber(A.dedup_ttl_ms) or 0) > 0 then
     local existing = redis.call("GET", K.idem_key)
     if existing then
       return {1, "DUPLICATE", existing}
@@ -192,9 +192,12 @@ redis.register_function('ff_create_execution', function(keys, args)
   end
 
   -- 11. Set idempotency key with TTL
-  if is_set(A.dedup_ttl_ms) and is_set(A.idem_key) then
+  -- Guard: PX 0 or PX <0 causes Valkey error ("invalid expire time"),
+  -- which would abort the FCALL after exec_core was already written (step 4).
+  local dedup_ms = tonumber(A.dedup_ttl_ms) or 0
+  if dedup_ms > 0 and is_set(A.idem_key) then
     redis.call("SET", K.idem_key, A.execution_id,
-      "PX", tonumber(A.dedup_ttl_ms), "NX")
+      "PX", dedup_ms, "NX")
   end
 
   return ok(A.execution_id, public_state)

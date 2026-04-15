@@ -374,8 +374,6 @@ impl ClaimedTask {
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
 
-        let now = TimestampMs::now();
-
         // ff_cancel_execution needs 21 KEYS. The Lua constructs active_index
         // and suspended_key dynamically (C2 fix). KEYS[9]/[10] (waitpoint_hash,
         // wp_condition) need the real waitpoint_id — read from exec_core.
@@ -415,14 +413,14 @@ impl ClaimedTask {
             idx.lane_blocked_operator(&self.lane_id),          // 21
         ];
 
+        // ARGV (5): must match lua/execution.lua ff_cancel_execution positional order
+        // execution_id, reason, source, lease_id, lease_epoch
         let args: Vec<String> = vec![
-            self.execution_id.to_string(),
-            reason.to_owned(),
-            "worker".to_owned(),     // source
-            self.lease_id.to_string(),
-            self.lease_epoch.to_string(),
-            self.attempt_id.to_string(),
-            now.to_string(),
+            self.execution_id.to_string(),     // 1  execution_id
+            reason.to_owned(),                 // 2  reason
+            "worker".to_owned(),               // 3  source
+            self.lease_id.to_string(),         // 4  lease_id
+            self.lease_epoch.to_string(),      // 5  lease_epoch
         ];
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -459,19 +457,17 @@ impl ClaimedTask {
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
 
-        let now = TimestampMs::now();
-
-        // TODO: Replace with typed ff_script wrapper when Step 1.2 is complete.
+        // KEYS (1): exec_core
         let keys: Vec<String> = vec![ctx.core()];
 
+        // ARGV (5): execution_id, lease_id, lease_epoch,
+        //           progress_pct, progress_message
         let args: Vec<String> = vec![
             self.execution_id.to_string(),
             self.lease_id.to_string(),
             self.lease_epoch.to_string(),
-            self.attempt_id.to_string(),
             pct.to_string(),
             message.to_owned(),
-            now.to_string(),
         ];
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();

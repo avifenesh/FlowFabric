@@ -85,7 +85,9 @@ fn crc16_ccitt(bytes: &[u8]) -> u16 {
 }
 
 /// Compute the partition index for a UUID-based entity.
+/// Panics if `num_partitions` is 0 — this is a configuration error.
 fn partition_for_uuid(uuid_bytes: &[u8; 16], num_partitions: u16) -> u16 {
+    assert!(num_partitions > 0, "num_partitions must be > 0 (division by zero)");
     crc16_ccitt(uuid_bytes) % num_partitions
 }
 

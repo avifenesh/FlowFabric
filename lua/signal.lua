@@ -112,13 +112,15 @@ redis.register_function('ff_deliver_signal', function(keys, args)
   end
 
   -- 5. Idempotency check
-  if A.idempotency_key ~= "" then
+  -- Guard: (A.dedup_ttl_ms or 0) handles nil from tonumber("") safely.
+  local dedup_ms = A.dedup_ttl_ms or 0
+  if A.idempotency_key ~= "" and dedup_ms > 0 then
     local existing = redis.call("GET", K.idem_key)
     if existing then
       return ok_duplicate(existing)
     end
     redis.call("SET", K.idem_key, A.signal_id,
-      "PX", A.dedup_ttl_ms, "NX")
+      "PX", dedup_ms, "NX")
   end
 
   -- 6. Record signal hash
@@ -354,13 +356,15 @@ redis.register_function('ff_buffer_signal_for_pending_waitpoint', function(keys,
   end
 
   -- 3. Idempotency check
-  if A.idempotency_key ~= "" then
+  -- Guard: (A.dedup_ttl_ms or 0) handles nil from tonumber("") safely.
+  local dedup_ms = A.dedup_ttl_ms or 0
+  if A.idempotency_key ~= "" and dedup_ms > 0 then
     local existing = redis.call("GET", K.idem_key)
     if existing then
       return ok_duplicate(existing)
     end
     redis.call("SET", K.idem_key, A.signal_id,
-      "PX", A.dedup_ttl_ms, "NX")
+      "PX", dedup_ms, "NX")
   end
 
   -- 4. Record signal hash with tentative effect

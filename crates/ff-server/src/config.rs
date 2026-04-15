@@ -43,13 +43,20 @@ impl ServerConfig {
         let lanes: Vec<LaneId> = env_or("FF_LANES", "default")
             .split(',')
             .map(|s| LaneId::new(s.trim()))
+            .filter(|l| !l.as_str().is_empty())
             .collect();
+        if lanes.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                var: "FF_LANES".to_owned(),
+                message: "at least one non-empty lane name is required".to_owned(),
+            });
+        }
 
         let partition_config = PartitionConfig {
-            num_execution_partitions: env_u16("FF_EXEC_PARTITIONS", 256)?,
-            num_flow_partitions: env_u16("FF_FLOW_PARTITIONS", 64)?,
-            num_budget_partitions: env_u16("FF_BUDGET_PARTITIONS", 32)?,
-            num_quota_partitions: env_u16("FF_QUOTA_PARTITIONS", 32)?,
+            num_execution_partitions: env_u16_positive("FF_EXEC_PARTITIONS", 256)?,
+            num_flow_partitions: env_u16_positive("FF_FLOW_PARTITIONS", 64)?,
+            num_budget_partitions: env_u16_positive("FF_BUDGET_PARTITIONS", 32)?,
+            num_quota_partitions: env_u16_positive("FF_QUOTA_PARTITIONS", 32)?,
         };
 
         let lease_expiry_interval =
@@ -155,6 +162,18 @@ fn env_u16(key: &str, default: u16) -> Result<u16, ConfigError> {
         }),
         Err(_) => Ok(default),
     }
+}
+
+/// Like env_u16 but rejects 0 (for partition counts that are used as divisors).
+fn env_u16_positive(key: &str, default: u16) -> Result<u16, ConfigError> {
+    let val = env_u16(key, default)?;
+    if val == 0 {
+        return Err(ConfigError::InvalidValue {
+            var: key.to_owned(),
+            message: "must be > 0 (used as divisor in partition math)".to_owned(),
+        });
+    }
+    Ok(val)
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64, ConfigError> {

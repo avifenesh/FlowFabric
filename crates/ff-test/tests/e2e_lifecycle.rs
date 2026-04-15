@@ -525,6 +525,27 @@ async fn fcall_change_priority(
 
 // ─── FCALL result parsing helpers ───
 
+/// Check that a raw FCALL result is an error with the given code.
+fn assert_err(raw: &Value, expected_code: &str, function_name: &str) {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => panic!("{function_name}: expected Array, got {raw:?}"),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        other => panic!("{function_name}: expected Int status, got {other:?}"),
+    };
+    assert_eq!(
+        status, 0,
+        "{function_name}: expected status=0 (error), got status={status}. Full: {raw:?}"
+    );
+    let code = field_str(arr, 1);
+    assert_eq!(
+        code, expected_code,
+        "{function_name}: expected error code '{expected_code}', got '{code}'. Full: {raw:?}"
+    );
+}
+
 fn assert_ok(raw: &Value, function_name: &str) {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -3730,4 +3751,745 @@ async fn test_execution_deadline_expire_runnable() {
     // Verify: failure_reason captures the deadline type
     let fr = tc.hget(&ctx.core(), "failure_reason").await;
     assert_eq!(fr.as_deref(), Some("execution_deadline"));
+}
+
+// ─── Phase 7: Negative / error path tests ───
+
+/// Verify error paths that production users will hit.
+/// These ensure errors return structured codes (not panics or empty arrays).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_error_paths() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let config = test_config();
+
+    // ── 1. Claim grant on nonexistent execution → execution_not_found ──
+    let fake_eid = ExecutionId::new();
+    let partition = execution_partition(&fake_eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &fake_eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.claim_grant(),
+        idx.lane_eligible(&lane_id),
+    ];
+    let args: Vec<String> = vec![
+        fake_eid.to_string(),
+        WORKER.to_owned(),
+        WORKER_INST.to_owned(),
+        LANE.to_owned(),
+        String::new(),
+        "5000".to_owned(),
+        String::new(),
+        String::new(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_issue_claim_grant", &kr, &ar)
+        .await
+        .expect("FCALL should not fail at transport level");
+    assert_err(&raw, "execution_not_found", "ff_issue_claim_grant on nonexistent");
+
+    // ── 2. Complete with wrong lease_id → stale_lease ──
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "error_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, _att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // Try complete with wrong lease_id
+    let partition2 = execution_partition(&eid, &config);
+    let ctx2 = ExecKeyContext::new(&partition2, &eid);
+    let idx2 = IndexKeys::new(&partition2);
+    let wrong_keys: Vec<String> = vec![
+        ctx2.core(),
+        ctx2.attempt_hash(AttemptIndex::new(0)),
+        idx2.lease_expiry(),
+        idx2.worker_leases(&WorkerInstanceId::new(WORKER_INST)),
+        idx2.lane_terminal(&lane_id),
+        ctx2.lease_current(),
+        ctx2.lease_history(),
+        idx2.lane_active(&lane_id),
+        ctx2.stream_meta(AttemptIndex::new(0)),
+        ctx2.result(),
+        idx2.attempt_timeout(),
+        idx2.execution_deadline(),
+    ];
+    let wrong_args: Vec<String> = vec![
+        eid.to_string(),
+        "wrong-lease-id-00000000".to_owned(),  // WRONG lease_id
+        epoch.clone(),
+        attempt_id.clone(),
+        r#"{"done":true}"#.to_owned(),
+    ];
+    let wkr: Vec<&str> = wrong_keys.iter().map(|s| s.as_str()).collect();
+    let war: Vec<&str> = wrong_args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_complete_execution", &wkr, &war)
+        .await
+        .expect("FCALL should not fail at transport level");
+    assert_err(&raw, "stale_lease", "ff_complete_execution with wrong lease_id");
+
+    // Clean up: complete with correct lease
+    fcall_complete_execution(&tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &attempt_id).await;
+
+    // ── 3. Create with duplicate dedup key → DUPLICATE ──
+    let eid3 = ExecutionId::new();
+    let partition3 = execution_partition(&eid3, &config);
+    let ctx3 = ExecKeyContext::new(&partition3, &eid3);
+    let idx3 = IndexKeys::new(&partition3);
+    let idem_key = format!("ff:dedup:{}:test-idem-key", partition3.hash_tag());
+
+    let dedup_keys: Vec<String> = vec![
+        ctx3.core(),
+        ctx3.payload(),
+        ctx3.policy(),
+        ctx3.tags(),
+        idx3.lane_eligible(&lane_id),
+        idem_key.clone(),
+        idx3.execution_deadline(),
+        idx3.all_executions(),
+    ];
+    let dedup_args: Vec<String> = vec![
+        eid3.to_string(),
+        NS.to_owned(),
+        LANE.to_owned(),
+        "dedup_test".to_owned(),
+        "0".to_owned(),
+        "e2e-test".to_owned(),
+        "{}".to_owned(),
+        r#"{"test":"dedup"}"#.to_owned(),
+        String::new(),       // delay_until
+        "60000".to_owned(),  // dedup_ttl_ms
+        "{}".to_owned(),     // tags_json
+        String::new(),       // execution_deadline_at
+        partition3.index.to_string(),
+    ];
+    let dkr: Vec<&str> = dedup_keys.iter().map(|s| s.as_str()).collect();
+    let dar: Vec<&str> = dedup_args.iter().map(|s| s.as_str()).collect();
+    let raw1: Value = tc.client()
+        .fcall("ff_create_execution", &dkr, &dar)
+        .await
+        .expect("first create should succeed");
+    assert_ok(&raw1, "ff_create_execution (first)");
+
+    // Second create with SAME execution ID → DUPLICATE (hits EXISTS guard)
+    let raw2: Value = tc.client()
+        .fcall("ff_create_execution", &dkr, &dar)
+        .await
+        .expect("second create should return DUPLICATE");
+    // DUPLICATE returns {1, "DUPLICATE", existing_eid} — status=1
+    let arr2 = expect_success_array(&raw2, "ff_create_execution (duplicate)");
+    let dup_status = field_str(arr2, 1);
+    assert_eq!(dup_status, "DUPLICATE", "second create should return DUPLICATE");
+
+    // ── 4. Fail with max retries exhausted → terminal_failed ──
+    let eid4 = ExecutionId::new();
+    // Create with a retry policy that has max_retries=0
+    fcall_create_execution(&tc, &eid4, NS, LANE, "retry_test", 0).await;
+
+    // Set a policy that allows 0 retries
+    let partition4 = execution_partition(&eid4, &config);
+    let ctx4 = ExecKeyContext::new(&partition4, &eid4);
+    let policy = r#"{"retry_policy":{"max_retries":0}}"#;
+    let _: () = tc.client()
+        .cmd("SET")
+        .arg(&ctx4.policy())
+        .arg(policy)
+        .execute()
+        .await
+        .unwrap();
+
+    // Claim the execution
+    fcall_issue_claim_grant(&tc, &eid4, LANE, WORKER, WORKER_INST).await;
+    let (lease_id4, epoch4, _att_idx4, attempt_id4) =
+        fcall_claim_execution(&tc, &eid4, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // Fail it — max_retries=0 means terminal immediately
+    let idx4 = IndexKeys::new(&partition4);
+    let fail_keys: Vec<String> = vec![
+        ctx4.core(),
+        ctx4.attempt_hash(AttemptIndex::new(0)),
+        idx4.lease_expiry(),
+        idx4.worker_leases(&WorkerInstanceId::new(WORKER_INST)),
+        idx4.lane_terminal(&lane_id),
+        idx4.lane_delayed(&lane_id),
+        ctx4.lease_current(),
+        ctx4.lease_history(),
+        idx4.lane_active(&lane_id),
+        ctx4.stream_meta(AttemptIndex::new(0)),
+        idx4.attempt_timeout(),
+        idx4.execution_deadline(),
+    ];
+    let fail_args: Vec<String> = vec![
+        eid4.to_string(),
+        lease_id4,
+        epoch4,
+        attempt_id4,
+        "test_failure".to_owned(),
+        "transient".to_owned(),
+        r#"{"max_retries":0}"#.to_owned(),
+    ];
+    let fkr: Vec<&str> = fail_keys.iter().map(|s| s.as_str()).collect();
+    let far: Vec<&str> = fail_args.iter().map(|s| s.as_str()).collect();
+    let raw4: Value = tc.client()
+        .fcall("ff_fail_execution", &fkr, &far)
+        .await
+        .expect("fail should succeed");
+    // Should return ok("terminal_failed")
+    let arr4 = expect_success_array(&raw4, "ff_fail_execution (terminal)");
+    let outcome = field_str(arr4, 2);
+    assert_eq!(outcome, "terminal_failed", "max_retries=0 should go terminal");
+
+    // Verify terminal state
+    assert_execution_state(&tc, &eid4, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Failed),
+        public_state: Some(ff_core::state::PublicState::Failed),
+        ..Default::default()
+    }).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ROUND 7: ff-scheduler integration test
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Test the ff-scheduler claim_for_worker() path end-to-end.
+///
+/// Creates 3 executions with different priorities on the same lane.
+/// Uses the Scheduler struct (not raw FCALL) to issue claim grants.
+/// Verifies priority ordering: highest priority execution is granted first.
+/// Then consumes the grant via ff_claim_execution to prove it's valid.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_scheduler_claim_priority_ordering() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let config = test_config();
+    let lane_id = LaneId::new(LANE);
+    let worker_id = ff_core::types::WorkerId::new(WORKER);
+    let wiid = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+
+    // Create 3 executions with different priorities on the SAME partition.
+    // The scheduler iterates partitions sequentially and takes the top candidate
+    // per partition — priority ordering is only guaranteed within a partition.
+    // Generate UUIDs until all 3 hash to the same execution partition.
+    let (eid_low, eid_mid, eid_high) = {
+        let mut low;
+        let mut mid;
+        let mut high;
+        loop {
+            low = ExecutionId::new();
+            mid = ExecutionId::new();
+            high = ExecutionId::new();
+            let p_low = ff_core::partition::execution_partition(&low, &config);
+            let p_mid = ff_core::partition::execution_partition(&mid, &config);
+            let p_high = ff_core::partition::execution_partition(&high, &config);
+            if p_low.index == p_mid.index && p_mid.index == p_high.index {
+                break;
+            }
+        }
+        (low, mid, high)
+    };
+
+    fcall_create_execution(&tc, &eid_low, NS, LANE, "sched_test", 10).await;
+    // Small sleep to ensure different created_at for tiebreaking
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    fcall_create_execution(&tc, &eid_mid, NS, LANE, "sched_test", 100).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    fcall_create_execution(&tc, &eid_high, NS, LANE, "sched_test", 1000).await;
+
+    // Use the Scheduler to issue claim grants
+    let scheduler = ff_scheduler::claim::Scheduler::new(
+        tc.client().clone(),
+        config,
+    );
+
+    // First grant should go to highest priority (1000)
+    let grant1 = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .await
+        .expect("scheduler claim 1 should not error");
+    let grant1 = grant1.expect("should find an eligible execution");
+    assert_eq!(
+        grant1.execution_id, eid_high,
+        "first grant should go to priority=1000 execution"
+    );
+
+    // Consume the grant to transition execution out of eligible
+    fcall_claim_execution(
+        &tc, &grant1.execution_id, LANE, WORKER, WORKER_INST, 30_000,
+    ).await;
+
+    // Second grant should go to next highest priority (100)
+    let grant2 = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .await
+        .expect("scheduler claim 2 should not error");
+    let grant2 = grant2.expect("should find second eligible execution");
+    assert_eq!(
+        grant2.execution_id, eid_mid,
+        "second grant should go to priority=100 execution"
+    );
+
+    // Consume grant2
+    fcall_claim_execution(
+        &tc, &grant2.execution_id, LANE, WORKER, WORKER_INST, 30_000,
+    ).await;
+
+    // Third grant should go to lowest priority (10)
+    let grant3 = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .await
+        .expect("scheduler claim 3 should not error");
+    let grant3 = grant3.expect("should find third eligible execution");
+    assert_eq!(
+        grant3.execution_id, eid_low,
+        "third grant should go to priority=10 execution"
+    );
+
+    // Consume grant3
+    fcall_claim_execution(
+        &tc, &grant3.execution_id, LANE, WORKER, WORKER_INST, 30_000,
+    ).await;
+
+    // Fourth claim: nothing left
+    let grant4 = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .await
+        .expect("scheduler claim 4 should not error");
+    assert!(grant4.is_none(), "no more eligible executions");
+}
+
+// ─── Phase 7: Integration tests ───
+
+/// Budget enforcement e2e: report 5 tokens (OK), report 6 more (HARD_BREACH),
+/// verify breach metadata recorded.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_budget_enforcement_with_breach_metadata() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let budget_id = "breach-meta-budget";
+    setup_test_budget(&tc, budget_id, &[("tokens", 10)], &[]).await;
+
+    // Report 5 tokens → OK
+    let r1 = fcall_report_usage(&tc, budget_id, &[("tokens", 5)]).await;
+    assert_eq!(r1[0], "OK", "5 tokens within limit 10. Got: {r1:?}");
+
+    // Verify usage is 5
+    let usage_key = format!("ff:budget:{{b:0}}:{budget_id}:usage");
+    let usage: Option<String> = tc.client()
+        .cmd("HGET").arg(&usage_key).arg("tokens")
+        .execute().await.unwrap();
+    assert_eq!(usage.as_deref(), Some("5"));
+
+    // Report 6 more (total 11 > limit 10) → HARD_BREACH
+    let r2 = fcall_report_usage(&tc, budget_id, &[("tokens", 6)]).await;
+    assert_eq!(r2[0], "HARD_BREACH", "11 tokens > limit 10. Got: {r2:?}");
+    assert_eq!(r2[1], "tokens", "breach should be on 'tokens' dim");
+    assert_eq!(r2[2], "fail", "on_hard_limit action should be 'fail'");
+
+    // Verify usage is STILL 5 (check-before-increment: no overshoot)
+    let usage2: Option<String> = tc.client()
+        .cmd("HGET").arg(&usage_key).arg("tokens")
+        .execute().await.unwrap();
+    assert_eq!(usage2.as_deref(), Some("5"), "breach should not increment usage");
+
+    // Verify breach metadata
+    let def_key = format!("ff:budget:{{b:0}}:{budget_id}");
+    let breach_count: Option<String> = tc.client()
+        .cmd("HGET").arg(&def_key).arg("breach_count")
+        .execute().await.unwrap();
+    assert_eq!(breach_count.as_deref(), Some("1"), "breach_count should be 1");
+
+    let last_breach_dim: Option<String> = tc.client()
+        .cmd("HGET").arg(&def_key).arg("last_breach_dim")
+        .execute().await.unwrap();
+    assert_eq!(last_breach_dim.as_deref(), Some("tokens"));
+}
+
+/// Stream payload size enforcement: 1KB OK, 64KB OK, 65KB rejected.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_stream_payload_size_enforcement() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_size_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // 1KB payload → OK
+    let payload_1k = "x".repeat(1024);
+    let (stream_id, _) = fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "delta", &payload_1k, 10000,
+    ).await;
+    assert!(!stream_id.is_empty(), "1KB append should succeed");
+
+    // 64KB payload (exactly at limit) → OK
+    let payload_64k = "y".repeat(65536);
+    let (stream_id2, _) = fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "delta", &payload_64k, 10000,
+    ).await;
+    assert!(!stream_id2.is_empty(), "64KB append should succeed");
+
+    // 65KB payload (over limit) → should fail with retention_limit_exceeded
+    let payload_65k = "z".repeat(65537);
+    let raw = fcall_append_frame_raw(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "delta", &payload_65k,
+    ).await;
+    assert_err(&raw, "retention_limit_exceeded", "ff_append_frame 65KB");
+
+    // Verify stream has exactly 2 frames
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let att = AttemptIndex::new(att_idx.parse().unwrap());
+    let frame_count: Option<String> = tc.client()
+        .cmd("HGET").arg(&ctx.stream_meta(att)).arg("frame_count")
+        .execute().await.unwrap();
+    assert_eq!(frame_count.as_deref(), Some("2"), "only 2 frames should exist");
+
+    // Use previously-unused assert_stream_exists helper
+    assert_stream_exists(&tc, &eid, att).await;
+}
+
+/// Quota concurrency enforcement: max_concurrent=2, admit 2, reject 3rd.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_quota_concurrency_enforcement() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let policy_id = "concurrency-quota";
+    let window_key = format!("ff:quota:{{q:0}}:{policy_id}:window:requests");
+    let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
+    let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
+
+    tc.client()
+        .cmd("HSET").arg(&def_key)
+        .arg("quota_policy_id").arg(policy_id)
+        .execute::<i64>()
+        .await.unwrap();
+
+    // Admit E1 → ADMITTED (concurrency_cap=2, no rate limit)
+    let e1 = ExecutionId::new();
+    let r1 = fcall_admit(&tc, policy_id, &e1, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r1, "ADMITTED");
+
+    // Admit E2 → ADMITTED
+    let e2 = ExecutionId::new();
+    let r2 = fcall_admit(&tc, policy_id, &e2, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r2, "ADMITTED");
+
+    // Admit E3 → CONCURRENCY_EXCEEDED
+    let e3 = ExecutionId::new();
+    let r3 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r3, "CONCURRENCY_EXCEEDED", "3rd admission should be rejected (cap=2)");
+
+    // Simulate E1 completing: decrement concurrency counter
+    let _: i64 = tc.client()
+        .cmd("DECR").arg(&concurrency_key)
+        .execute().await.unwrap();
+
+    // Admit E3 again → ADMITTED (one slot freed)
+    let r4 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r4, "ADMITTED", "after DECR, 3rd should be admitted");
+}
+
+/// Helper for quota admission tests.
+async fn fcall_admit(
+    tc: &TestCluster,
+    policy_id: &str,
+    eid: &ExecutionId,
+    window_key: &str,
+    concurrency_key: &str,
+    def_key: &str,
+) -> String {
+    let guard = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{eid}");
+    let now = TimestampMs::now();
+    let keys: Vec<String> = vec![
+        window_key.to_owned(), concurrency_key.to_owned(),
+        def_key.to_owned(), guard,
+    ];
+    let args: Vec<String> = vec![
+        now.to_string(), "60".to_owned(), "0".to_owned(),
+        "2".to_owned(), eid.to_string(), "0".to_owned(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_check_admission_and_record", &kr, &ar)
+        .await.expect("FCALL admission failed");
+    parse_admission_result(&raw)
+}
+
+/// Golden path: exercises EVERY major operation in sequence.
+/// create → claim → update_progress → append_frame → renew_lease → suspend → signal → resume → complete
+#[tokio::test]
+#[serial_test::serial]
+async fn test_golden_path_all_methods() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let lane_id = LaneId::new(LANE);
+
+    // 1. Create
+    fcall_create_execution(&tc, &eid, NS, LANE, "golden_path", 0).await;
+
+    // 2. Claim
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // 3. Update progress (exercises the R6 ARGV fix)
+    let keys_p: Vec<String> = vec![ctx.core()];
+    let args_p: Vec<String> = vec![
+        eid.to_string(), lease_id.clone(), epoch.clone(),
+        "50".to_owned(), "halfway there".to_owned(),
+    ];
+    let kr_p: Vec<&str> = keys_p.iter().map(|s| s.as_str()).collect();
+    let ar_p: Vec<&str> = args_p.iter().map(|s| s.as_str()).collect();
+    let raw_p: Value = tc.client()
+        .fcall("ff_update_progress", &kr_p, &ar_p)
+        .await.expect("FCALL ff_update_progress");
+    assert_ok(&raw_p, "ff_update_progress");
+
+    // Verify progress stored correctly (not UUID corruption from pre-R6 bug)
+    let pct = tc.hget(&ctx.core(), "progress_pct").await;
+    assert_eq!(pct.as_deref(), Some("50"), "progress_pct should be '50', not a UUID");
+    let msg = tc.hget(&ctx.core(), "progress_message").await;
+    assert_eq!(msg.as_deref(), Some("halfway there"));
+
+    // 4. Append frame
+    let (stream_id, count) = fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "delta", r#"{"token":"hello"}"#, 10000,
+    ).await;
+    assert!(!stream_id.is_empty());
+    assert_eq!(count, "1");
+
+    // 5. Renew lease
+    fcall_renew_lease(&tc, &eid, &att_idx, &attempt_id, &lease_id, &epoch, 30_000).await;
+
+    // 6. Suspend
+    let resume_cond = build_resume_condition_json(&["continue"], "fail");
+    let (_susp_id, wp_id_str, _wp_key, sub_status) = fcall_suspend_execution(
+        &tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &att_idx, &attempt_id,
+        "waiting_for_signal", &resume_cond, None, "fail",
+    ).await;
+    assert_eq!(sub_status, "OK");
+
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Suspended),
+        attempt_state: Some(ff_core::state::AttemptState::AttemptInterrupted),
+        ..Default::default()
+    }).await;
+
+    // Verify blocking_detail contains the reason code
+    let detail = tc.hget(&ctx.core(), "blocking_detail").await.unwrap_or_default();
+    assert!(detail.contains("waiting_for_signal"),
+        "blocking_detail should contain 'waiting_for_signal', got: {detail}");
+
+    // 7. Deliver signal → triggers resume
+    let (sig_id, effect) = fcall_deliver_signal(
+        &tc, &eid, LANE, &wp_id_str, "continue", "api", "",
+    ).await;
+    assert!(!sig_id.is_empty());
+    assert_eq!(effect, "resume_condition_satisfied");
+
+    // Verify runnable/eligible after resume
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Runnable),
+        eligibility_state: Some(ff_core::state::EligibilityState::EligibleNow),
+        attempt_state: Some(ff_core::state::AttemptState::AttemptInterrupted),
+        ..Default::default()
+    }).await;
+
+    // 8. Re-claim (resumed execution — same attempt continues)
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id2, epoch2, att_idx2, attempt_id2) =
+        fcall_claim_resumed_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+    assert_eq!(att_idx2, "0", "resumed claim should reuse attempt 0");
+    assert_eq!(epoch2, "2", "resumed claim should be epoch 2");
+
+    // 9. Complete
+    fcall_complete_execution(&tc, &eid, LANE, WORKER_INST, &lease_id2, &epoch2, &attempt_id2).await;
+
+    // Final state: terminal/completed
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Success),
+        public_state: Some(ff_core::state::PublicState::Completed),
+        attempt_state: Some(ff_core::state::AttemptState::AttemptTerminal),
+        ..Default::default()
+    }).await;
+    assert_state_vector_complete(&tc, &eid).await;
+    assert_in_terminal(&tc, &eid, &lane_id).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ROUND 7: Full flow lifecycle with edge staging + cycle detection
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: stage a dependency edge via ff_stage_dependency_edge on {fp:0}.
+async fn fcall_stage_dependency_edge(
+    tc: &TestCluster, flow_id: &str,
+    edge_id: &str, upstream: &ExecutionId, downstream: &ExecutionId,
+    expected_rev: &str,
+) -> String {
+    let prefix = format!("ff:flow:{{fp:0}}:{flow_id}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+        format!("{prefix}:edge:{edge_id}"),
+        format!("{prefix}:out:{upstream}"),
+        format!("{prefix}:in:{downstream}"),
+        format!("{prefix}:grant:{edge_id}"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        flow_id.to_owned(), edge_id.to_owned(),
+        upstream.to_string(), downstream.to_string(),
+        "success_only".to_owned(), String::new(),
+        expected_rev.to_owned(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_stage_dependency_edge", &kr, &ar)
+        .await
+        .expect("FCALL ff_stage_dependency_edge");
+    let arr = expect_success_array(&raw, "ff_stage_dependency_edge");
+    field_str(arr, 3)
+}
+
+/// Helper: stage edge that should fail; returns error code.
+async fn fcall_stage_dependency_edge_expect_err(
+    tc: &TestCluster, flow_id: &str,
+    edge_id: &str, upstream: &ExecutionId, downstream: &ExecutionId,
+    expected_rev: &str,
+) -> String {
+    let prefix = format!("ff:flow:{{fp:0}}:{flow_id}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+        format!("{prefix}:edge:{edge_id}"),
+        format!("{prefix}:out:{upstream}"),
+        format!("{prefix}:in:{downstream}"),
+        format!("{prefix}:grant:{edge_id}"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        flow_id.to_owned(), edge_id.to_owned(),
+        upstream.to_string(), downstream.to_string(),
+        "success_only".to_owned(), String::new(),
+        expected_rev.to_owned(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_stage_dependency_edge", &kr, &ar)
+        .await
+        .expect("FCALL should not fail at transport level");
+    let arr = match &raw {
+        Value::Array(a) => a,
+        _ => panic!("expected array"),
+    };
+    field_str(arr, 1)
+}
+
+/// Full flow lifecycle with edge staging and cycle detection.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_full_lifecycle_with_staging() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let fid = "flow-r7";
+    let a = ExecutionId::new();
+    let b = ExecutionId::new();
+    let c = ExecutionId::new();
+    let e_ab = uuid::Uuid::new_v4().to_string();
+    let e_bc = uuid::Uuid::new_v4().to_string();
+    let lane_id = LaneId::new(LANE);
+
+    // 1. Create 3 executions
+    fcall_create_execution(&tc, &a, NS, LANE, "r7_a", 5).await;
+    fcall_create_execution(&tc, &b, NS, LANE, "r7_b", 5).await;
+    fcall_create_execution(&tc, &c, NS, LANE, "r7_c", 5).await;
+
+    // 2. Create flow + members
+    setup_test_flow(&tc, fid, &[&a, &b, &c]).await;
+    set_flow_id_on_exec(&tc, &a, fid).await;
+    set_flow_id_on_exec(&tc, &b, fid).await;
+    set_flow_id_on_exec(&tc, &c, fid).await;
+
+    // 3. Stage edges
+    let rev1 = fcall_stage_dependency_edge(&tc, fid, &e_ab, &a, &b, "0").await;
+    assert_eq!(rev1, "1");
+    let rev2 = fcall_stage_dependency_edge(&tc, fid, &e_bc, &b, &c, "1").await;
+    assert_eq!(rev2, "2");
+
+    // 4. Cycle detection: C->A rejected
+    let err = fcall_stage_dependency_edge_expect_err(
+        &tc, fid, &uuid::Uuid::new_v4().to_string(), &c, &a, "2",
+    ).await;
+    assert_eq!(err, "cycle_detected");
+
+    // 5. Apply deps
+    fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
+    fcall_apply_dependency(&tc, &c, fid, &e_bc, &b).await;
+    assert_in_eligible(&tc, &a, &lane_id).await;
+    assert_not_in_eligible(&tc, &b, &lane_id).await;
+    assert_not_in_eligible(&tc, &c, &lane_id).await;
+
+    // 6. Complete A, resolve A->B, B eligible
+    fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
+    let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
+    assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "success").await, "satisfied");
+    assert_in_eligible(&tc, &b, &lane_id).await;
+    assert_not_in_eligible(&tc, &c, &lane_id).await;
+
+    // 7. Complete B, resolve B->C, C eligible
+    fcall_issue_claim_grant(&tc, &b, LANE, WORKER, WORKER_INST).await;
+    let (lb, eb, _, ab) = fcall_claim_execution(&tc, &b, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &b, LANE, WORKER_INST, &lb, &eb, &ab).await;
+    assert_eq!(fcall_resolve_dependency(&tc, &c, &e_bc, "success").await, "satisfied");
+    assert_in_eligible(&tc, &c, &lane_id).await;
+
+    // 8. Complete C
+    fcall_issue_claim_grant(&tc, &c, LANE, WORKER, WORKER_INST).await;
+    let (lc, ec, _, ac) = fcall_claim_execution(&tc, &c, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &c, LANE, WORKER_INST, &lc, &ec, &ac).await;
+
+    // 9. All terminal/success
+    for eid in [&a, &b, &c] {
+        assert_execution_state(&tc, eid, &ExpectedState {
+            lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+            terminal_outcome: Some(ff_core::state::TerminalOutcome::Success),
+            public_state: Some(ff_core::state::PublicState::Completed),
+            ..Default::default()
+        }).await;
+        assert_state_vector_complete(&tc, eid).await;
+        assert_in_terminal(&tc, eid, &lane_id).await;
+    }
 }

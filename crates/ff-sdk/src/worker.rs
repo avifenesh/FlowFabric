@@ -599,6 +599,7 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
         fields
             .get(field)
             .and_then(|v| v.parse().ok())
+            .filter(|&n: &u16| n > 0)
             .unwrap_or(default)
     };
 

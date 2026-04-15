@@ -71,7 +71,10 @@ redis.register_function('ff_check_admission_and_record', function(keys, args)
   redis.call("ZADD", K.window_zset, A.now_ms, A.execution_id)
 
   -- 6. Set admitted guard key with TTL = window size
-  redis.call("SET", K.admitted_guard_key, "1", "PX", window_ms, "NX")
+  -- Guard: PX 0 or PX <0 causes Valkey error inside Lua (after ZADD committed).
+  if window_ms > 0 then
+    redis.call("SET", K.admitted_guard_key, "1", "PX", window_ms, "NX")
+  end
 
   -- 7. Increment concurrency counter if cap is set
   if A.concurrency_cap > 0 then
