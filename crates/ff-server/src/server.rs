@@ -652,7 +652,7 @@ impl Server {
                 let cancel_args = CancelExecutionArgs {
                     execution_id: eid,
                     reason: args.reason.clone(),
-                    source: Some("cancel_flow".to_owned()),
+                    source: Some("operator_override".to_owned()),
                     lease_id: None,
                     lease_epoch: None,
                     attempt_id: None,
