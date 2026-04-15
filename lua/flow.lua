@@ -53,6 +53,143 @@ local function detect_cycle(flow_prefix, start_eid, target_eid)
 end
 
 ---------------------------------------------------------------------------
+-- ff_create_flow  (on {fp:N})
+--
+-- Create a new flow container. Idempotent: if flow_core already exists,
+-- returns ok_already_satisfied.
+--
+-- KEYS (2): flow_core, members_set
+-- ARGV (4): flow_id, flow_kind, namespace, now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_create_flow', function(keys, args)
+  local K = {
+    flow_core   = keys[1],
+    members_set = keys[2],
+  }
+
+  local A = {
+    flow_id   = args[1],
+    flow_kind = args[2],
+    namespace = args[3],
+    now_ms    = args[4],
+  }
+
+  -- Idempotency: if flow already exists, return already_satisfied
+  if redis.call("EXISTS", K.flow_core) == 1 then
+    return ok_already_satisfied(A.flow_id)
+  end
+
+  -- Create flow core record
+  redis.call("HSET", K.flow_core,
+    "flow_id", A.flow_id,
+    "flow_kind", A.flow_kind,
+    "namespace", A.namespace,
+    "graph_revision", 0,
+    "node_count", 0,
+    "edge_count", 0,
+    "public_flow_state", "open",
+    "created_at", A.now_ms,
+    "last_mutation_at", A.now_ms)
+
+  return ok(A.flow_id)
+end)
+
+---------------------------------------------------------------------------
+-- ff_add_execution_to_flow  (on {fp:N} ONLY)
+--
+-- Add a member execution to a flow. Does NOT set flow_id on exec_core
+-- (that's on {p:N}, caller must do it separately).
+--
+-- KEYS (2): flow_core, members_set
+-- ARGV (3): flow_id, execution_id, now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_add_execution_to_flow', function(keys, args)
+  local K = {
+    flow_core   = keys[1],
+    members_set = keys[2],
+  }
+
+  local A = {
+    flow_id      = args[1],
+    execution_id = args[2],
+    now_ms       = args[3],
+  }
+
+  -- 1. Validate flow exists
+  local raw = redis.call("HGETALL", K.flow_core)
+  if #raw == 0 then return err("flow_not_found") end
+
+  -- 2. Idempotency: already a member
+  if redis.call("SISMEMBER", K.members_set, A.execution_id) == 1 then
+    local nc = redis.call("HGET", K.flow_core, "node_count") or "0"
+    return ok_already_satisfied(A.execution_id, nc)
+  end
+
+  -- 3. Add to membership set
+  redis.call("SADD", K.members_set, A.execution_id)
+
+  -- 4. Increment node_count and graph_revision
+  local new_nc = redis.call("HINCRBY", K.flow_core, "node_count", 1)
+  local new_rev = redis.call("HINCRBY", K.flow_core, "graph_revision", 1)
+  redis.call("HSET", K.flow_core, "last_mutation_at", A.now_ms)
+
+  return ok(A.execution_id, tostring(new_nc))
+end)
+
+---------------------------------------------------------------------------
+-- ff_cancel_flow  (on {fp:N})
+--
+-- Cancel a flow. Returns the member list for the caller to dispatch
+-- individual cancellations cross-partition.
+--
+-- KEYS (2): flow_core, members_set
+-- ARGV (4): flow_id, reason, cancellation_policy, now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_cancel_flow', function(keys, args)
+  local K = {
+    flow_core   = keys[1],
+    members_set = keys[2],
+  }
+
+  local A = {
+    flow_id              = args[1],
+    reason               = args[2],
+    cancellation_policy  = args[3],
+    now_ms               = args[4],
+  }
+
+  -- 1. Validate flow exists
+  local raw = redis.call("HGETALL", K.flow_core)
+  if #raw == 0 then return err("flow_not_found") end
+  local flow = hgetall_to_table(raw)
+
+  -- 2. Check not already terminal
+  local pfs = flow.public_flow_state or ""
+  if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
+    return err("flow_already_terminal")
+  end
+
+  -- 3. Get all member execution IDs
+  local members = redis.call("SMEMBERS", K.members_set)
+
+  -- 4. Update flow state
+  redis.call("HSET", K.flow_core,
+    "public_flow_state", "cancelled",
+    "cancelled_at", A.now_ms,
+    "cancel_reason", A.reason,
+    "last_mutation_at", A.now_ms)
+
+  -- 5. Return: ok(cancellation_policy, member1, member2, ...)
+  -- Build array manually to include variable member list.
+  local result = {1, "OK", A.cancellation_policy}
+  for _, eid in ipairs(members) do
+    result[#result + 1] = eid
+  end
+
+  return result
+end)
+
+---------------------------------------------------------------------------
 -- #29  ff_stage_dependency_edge  (on {fp:N})
 --
 -- Validate membership + topology, check graph_revision, create edge,

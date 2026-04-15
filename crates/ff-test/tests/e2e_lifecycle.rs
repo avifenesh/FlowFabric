@@ -2611,59 +2611,119 @@ async fn test_stream_maxlen_trimming() {
 // PHASE 5 TESTS: budget, quota, block/unblock
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Helper: set up a budget directly in Valkey (no ff_create_budget function yet).
+/// Helper: create a budget via ff_create_budget FCALL.
 /// Uses a fixed {b:0} tag for test simplicity.
-async fn setup_test_budget(
+async fn fcall_create_budget(
     tc: &TestCluster,
     budget_id: &str,
     hard_limits: &[(&str, u64)],
     soft_limits: &[(&str, u64)],
-) {
+) -> Vec<String> {
+    fcall_create_budget_full(tc, budget_id, hard_limits, soft_limits, 0).await
+}
+
+/// Helper: create a budget via ff_create_budget with reset interval.
+async fn fcall_create_budget_full(
+    tc: &TestCluster,
+    budget_id: &str,
+    hard_limits: &[(&str, u64)],
+    soft_limits: &[(&str, u64)],
+    reset_interval_ms: u64,
+) -> Vec<String> {
     let def_key = format!("ff:budget:{{b:0}}:{budget_id}");
     let limits_key = format!("ff:budget:{{b:0}}:{budget_id}:limits");
     let usage_key = format!("ff:budget:{{b:0}}:{budget_id}:usage");
+    let resets_key = "ff:idx:{b:0}:budget_resets".to_string();
 
-    // Budget definition
-    tc.client()
-        .cmd("HSET").arg(&def_key)
-        .arg("budget_id").arg(budget_id)
-        .arg("scope_type").arg("lane")
-        .arg("scope_id").arg("test-lane")
-        .arg("on_hard_limit").arg("fail")
-        .arg("on_soft_limit").arg("warn")
-        .arg("enforcement_mode").arg("strict")
-        .arg("breach_count").arg("0")
-        .arg("soft_breach_count").arg("0")
-        .arg("last_updated_at").arg("0")
-        .execute::<i64>()
-        .await
-        .expect("HSET budget_def failed");
+    let now = TimestampMs::now();
 
-    // Budget limits
-    for (dim, limit) in hard_limits {
-        tc.client()
-            .cmd("HSET").arg(&limits_key)
-            .arg(format!("hard:{dim}")).arg(limit.to_string())
-            .execute::<i64>()
-            .await
-            .expect("HSET hard limit failed");
+    // Build ARGV: budget_id, scope_type, scope_id, enforcement_mode,
+    //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
+    //   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
+    let dim_count = hard_limits.len();
+    let mut args: Vec<String> = Vec::new();
+    args.push(budget_id.to_owned());
+    args.push("lane".to_owned());
+    args.push("test-lane".to_owned());
+    args.push("strict".to_owned());
+    args.push("fail".to_owned());
+    args.push("warn".to_owned());
+    args.push(reset_interval_ms.to_string());
+    args.push(now.to_string());
+    args.push(dim_count.to_string());
+    for (dim, _) in hard_limits {
+        args.push((*dim).to_owned());
     }
-    for (dim, limit) in soft_limits {
-        tc.client()
-            .cmd("HSET").arg(&limits_key)
-            .arg(format!("soft:{dim}")).arg(limit.to_string())
-            .execute::<i64>()
-            .await
-            .expect("HSET soft limit failed");
+    for (_, limit) in hard_limits {
+        args.push(limit.to_string());
+    }
+    for i in 0..dim_count {
+        // Match soft limits by index, default 0 if not provided
+        let soft = soft_limits.get(i).map(|(_, v)| *v).unwrap_or(0);
+        args.push(soft.to_string());
     }
 
-    // Empty usage hash (ensure it exists)
-    tc.client()
-        .cmd("HSET").arg(&usage_key)
-        .arg("_init").arg("0")
-        .execute::<i64>()
+    let keys: Vec<String> = vec![def_key, limits_key, usage_key, resets_key];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw: Value = tc
+        .client()
+        .fcall("ff_create_budget", &key_refs, &arg_refs)
         .await
-        .expect("HSET usage init failed");
+        .expect("FCALL ff_create_budget failed");
+
+    parse_ok_result(&raw)
+}
+
+/// Helper: create a quota policy via ff_create_quota_policy FCALL.
+/// Uses a fixed {q:0} tag for test simplicity.
+async fn fcall_create_quota_policy(
+    tc: &TestCluster,
+    policy_id: &str,
+    window_seconds: u64,
+    max_requests_per_window: u64,
+    max_concurrent: u64,
+) -> Vec<String> {
+    let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
+    let window_key = format!("ff:quota:{{q:0}}:{policy_id}:window:requests");
+    let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
+
+    let now = TimestampMs::now();
+    let keys: Vec<String> = vec![def_key, window_key, concurrency_key];
+    let args: Vec<String> = vec![
+        policy_id.to_owned(),
+        window_seconds.to_string(),
+        max_requests_per_window.to_string(),
+        max_concurrent.to_string(),
+        now.to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw: Value = tc
+        .client()
+        .fcall("ff_create_quota_policy", &key_refs, &arg_refs)
+        .await
+        .expect("FCALL ff_create_quota_policy failed");
+
+    parse_ok_result(&raw)
+}
+
+/// Parse {1, status, ...fields} → vec of string fields (status + rest).
+fn parse_ok_result(raw: &Value) -> Vec<String> {
+    match raw {
+        Value::Array(arr) => {
+            arr.iter().skip(1).filter_map(|v| match v {
+                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                Ok(Value::SimpleString(s)) => Some(s.clone()),
+                Ok(Value::Int(n)) => Some(n.to_string()),
+                _ => None,
+            }).collect()
+        }
+        _ => panic!("expected Array result, got: {raw:?}"),
+    }
 }
 
 /// Call ff_report_usage_and_check. Returns the raw result array elements.
@@ -2746,7 +2806,7 @@ async fn test_budget_report_and_breach() {
     tc.cleanup().await;
 
     let budget_id = "test-budget-1";
-    setup_test_budget(&tc, budget_id,
+    fcall_create_budget(&tc, budget_id,
         &[("total_tokens", 100)],
         &[("total_tokens", 80)],
     ).await;
@@ -2775,7 +2835,7 @@ async fn test_budget_report_and_breach() {
 
     // ── Multi-dimension test: if one dimension breaches, NONE get incremented ──
     let budget_id2 = "test-budget-multi";
-    setup_test_budget(&tc, budget_id2,
+    fcall_create_budget(&tc, budget_id2,
         &[("tokens", 1000), ("cost", 50)],
         &[],
     ).await;
@@ -2805,20 +2865,13 @@ async fn test_budget_reset() {
     tc.cleanup().await;
 
     let budget_id = "test-budget-reset";
-    setup_test_budget(&tc, budget_id,
+    fcall_create_budget_full(&tc, budget_id,
         &[("total_tokens", 1000)],
         &[],
+        3_600_000, // 1 hour reset interval
     ).await;
 
-    // Set reset_interval_ms on the budget def
     let def_key = format!("ff:budget:{{b:0}}:{budget_id}");
-    tc.client()
-        .cmd("HSET").arg(&def_key)
-        .arg("reset_interval_ms").arg("3600000") // 1 hour
-        .arg("reset_count").arg("0")
-        .execute::<i64>()
-        .await
-        .expect("HSET reset_interval_ms failed");
 
     // Report 500 tokens
     let result = fcall_report_usage(&tc, budget_id, &[("total_tokens", 500)]).await;
@@ -3014,13 +3067,8 @@ async fn test_quota_admission() {
     let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
     let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
 
-    // Set up quota def
-    tc.client()
-        .cmd("HSET").arg(&def_key)
-        .arg("quota_policy_id").arg(policy_id)
-        .arg("on_rate_breach").arg("delay_until_window")
-        .execute::<i64>()
-        .await.unwrap();
+    // Create quota policy: window=1s, rate limit=2, no concurrency cap
+    fcall_create_quota_policy(&tc, policy_id, 1, 2, 0).await;
 
     // Admit execution 1 → ADMITTED
     let eid1 = ExecutionId::new();
@@ -3108,29 +3156,99 @@ fn parse_admission_result(raw: &Value) -> String {
 // PHASE 6 TESTS: flow coordination and dependencies
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Set up a flow directly in Valkey.
-async fn setup_test_flow(tc: &TestCluster, flow_id: &str, members: &[&ExecutionId]) {
-    let flow_core = format!("ff:flow:{{fp:0}}:{flow_id}:core");
-    let members_key = format!("ff:flow:{{fp:0}}:{flow_id}:members");
-    let nc = members.len().to_string();
-    tc.client().cmd("HSET").arg(&flow_core)
-        .arg("flow_id").arg(flow_id).arg("flow_kind").arg("test")
-        .arg("namespace").arg(NS).arg("graph_revision").arg("0")
-        .arg("node_count").arg(nc.as_str()).arg("edge_count").arg("0")
-        .arg("public_flow_state").arg("open")
-        .execute::<i64>().await.expect("HSET flow_core");
-    for eid in members {
-        tc.client().cmd("SADD").arg(&members_key).arg(eid.to_string())
-            .execute::<i64>().await.expect("SADD member");
-    }
-}
-
 async fn set_flow_id_on_exec(tc: &TestCluster, eid: &ExecutionId, flow_id: &str) {
     let config = test_config();
     let partition = execution_partition(eid, &config);
     let ctx = ExecKeyContext::new(&partition, eid);
     tc.client().cmd("HSET").arg(&ctx.core()).arg("flow_id").arg(flow_id)
         .execute::<i64>().await.expect("HSET flow_id");
+}
+
+/// FCALL ff_create_flow — returns flow_id or "already_satisfied".
+async fn fcall_create_flow(tc: &TestCluster, flow_id: &str) -> String {
+    let prefix = format!("ff:flow:{{fp:0}}:{flow_id}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        flow_id.to_owned(), "test".to_owned(), NS.to_owned(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_create_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_create_flow");
+    let arr = expect_success_array(&raw, "ff_create_flow");
+    field_str(arr, 2)
+}
+
+/// FCALL ff_add_execution_to_flow — returns (eid_or_status, node_count).
+async fn fcall_add_execution_to_flow(
+    tc: &TestCluster, flow_id: &str, execution_id: &ExecutionId,
+) -> (String, String) {
+    let prefix = format!("ff:flow:{{fp:0}}:{flow_id}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        flow_id.to_owned(), execution_id.to_string(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_add_execution_to_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_add_execution_to_flow");
+    let arr = expect_success_array(&raw, "ff_add_execution_to_flow");
+    (field_str(arr, 2), field_str(arr, 3))
+}
+
+/// FCALL ff_cancel_flow — returns (cancellation_policy, member_eids).
+async fn fcall_cancel_flow(
+    tc: &TestCluster, flow_id: &str, reason: &str, policy: &str,
+) -> (String, Vec<String>) {
+    let prefix = format!("ff:flow:{{fp:0}}:{flow_id}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        flow_id.to_owned(), reason.to_owned(), policy.to_owned(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_cancel_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_cancel_flow");
+    let arr = expect_success_array(&raw, "ff_cancel_flow");
+    let cancellation_policy = field_str(arr, 2);
+    let mut members = Vec::new();
+    let mut i = 3;
+    loop {
+        let s = field_str(arr, i);
+        if s.is_empty() {
+            break;
+        }
+        members.push(s);
+        i += 1;
+    }
+    (cancellation_policy, members)
+}
+
+/// Higher-level helper: create flow + add members + set flow_id on exec_core.
+async fn setup_flow_via_fcall(tc: &TestCluster, flow_id: &str, members: &[&ExecutionId]) {
+    fcall_create_flow(tc, flow_id).await;
+    for eid in members {
+        fcall_add_execution_to_flow(tc, flow_id, eid).await;
+        set_flow_id_on_exec(tc, eid, flow_id).await;
+    }
 }
 
 async fn fcall_apply_dependency(
@@ -3206,10 +3324,7 @@ async fn test_flow_linear_chain() {
     fcall_create_execution(&tc, &a, NS, LANE, "chain_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "chain_b", 0).await;
     fcall_create_execution(&tc, &c, NS, LANE, "chain_c", 0).await;
-    setup_test_flow(&tc, fid, &[&a, &b, &c]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
-    set_flow_id_on_exec(&tc, &c, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b, &c]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
     fcall_apply_dependency(&tc, &c, fid, &e_bc, &b).await;
     // B,C blocked; A eligible
@@ -3259,10 +3374,7 @@ async fn test_flow_fan_out() {
     fcall_create_execution(&tc, &a, NS, LANE, "fo_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "fo_b", 0).await;
     fcall_create_execution(&tc, &c, NS, LANE, "fo_c", 0).await;
-    setup_test_flow(&tc, fid, &[&a, &b, &c]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
-    set_flow_id_on_exec(&tc, &c, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b, &c]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
     fcall_apply_dependency(&tc, &c, fid, &e_ac, &a).await;
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
@@ -3289,10 +3401,7 @@ async fn test_flow_dependency_failure_propagation() {
     fcall_create_execution(&tc, &a, NS, LANE, "fp_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "fp_b", 0).await;
     fcall_create_execution(&tc, &c, NS, LANE, "fp_c", 0).await;
-    setup_test_flow(&tc, fid, &[&a, &b, &c]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
-    set_flow_id_on_exec(&tc, &c, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b, &c]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
     fcall_apply_dependency(&tc, &c, fid, &e_bc, &b).await;
     // Complete A, resolve A->B
@@ -3328,9 +3437,7 @@ async fn test_flow_resolve_idempotency() {
     let e_ab = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "ri_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "ri_b", 0).await;
-    setup_test_flow(&tc, fid, &[&a, &b]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
     assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "failed").await, "impossible");
     // Second resolve -> already_resolved
@@ -3354,9 +3461,7 @@ async fn test_flow_with_execution_lifecycle() {
     let e_ab = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fl_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "fl_b", 0).await;
-    setup_test_flow(&tc, fid, &[&a, &b]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
     assert_in_eligible(&tc, &a, &LaneId::new(LANE)).await;
     assert_execution_state(&tc, &b, &ExpectedState {
@@ -3395,9 +3500,7 @@ async fn test_flow_replay_after_skip() {
 
     fcall_create_execution(&tc, &a, NS, LANE, "rep_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "rep_b", 0).await;
-    setup_test_flow(&tc, fid, &[&a, &b]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
 
     // Fail A (terminal)
@@ -4080,7 +4183,7 @@ async fn test_budget_enforcement_with_breach_metadata() {
     tc.cleanup().await;
 
     let budget_id = "breach-meta-budget";
-    setup_test_budget(&tc, budget_id, &[("tokens", 10)], &[]).await;
+    fcall_create_budget(&tc, budget_id, &[("tokens", 10)], &[]).await;
 
     // Report 5 tokens → OK
     let r1 = fcall_report_usage(&tc, budget_id, &[("tokens", 5)]).await;
@@ -4181,11 +4284,8 @@ async fn test_quota_concurrency_enforcement() {
     let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
     let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
 
-    tc.client()
-        .cmd("HSET").arg(&def_key)
-        .arg("quota_policy_id").arg(policy_id)
-        .execute::<i64>()
-        .await.unwrap();
+    // Create quota policy: window=60s, no rate limit, concurrency cap=2
+    fcall_create_quota_policy(&tc, policy_id, 60, 0, 2).await;
 
     // Admit E1 → ADMITTED (concurrency_cap=2, no rate limit)
     let e1 = ExecutionId::new();
@@ -4439,20 +4539,17 @@ async fn test_flow_full_lifecycle_with_staging() {
     fcall_create_execution(&tc, &c, NS, LANE, "r7_c", 5).await;
 
     // 2. Create flow + members
-    setup_test_flow(&tc, fid, &[&a, &b, &c]).await;
-    set_flow_id_on_exec(&tc, &a, fid).await;
-    set_flow_id_on_exec(&tc, &b, fid).await;
-    set_flow_id_on_exec(&tc, &c, fid).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b, &c]).await;
 
-    // 3. Stage edges
-    let rev1 = fcall_stage_dependency_edge(&tc, fid, &e_ab, &a, &b, "0").await;
-    assert_eq!(rev1, "1");
-    let rev2 = fcall_stage_dependency_edge(&tc, fid, &e_bc, &b, &c, "1").await;
-    assert_eq!(rev2, "2");
+    // 3. Stage edges (graph_revision starts at 3 after adding 3 members)
+    let rev1 = fcall_stage_dependency_edge(&tc, fid, &e_ab, &a, &b, "3").await;
+    assert_eq!(rev1, "4");
+    let rev2 = fcall_stage_dependency_edge(&tc, fid, &e_bc, &b, &c, "4").await;
+    assert_eq!(rev2, "5");
 
     // 4. Cycle detection: C->A rejected
     let err = fcall_stage_dependency_edge_expect_err(
-        &tc, fid, &uuid::Uuid::new_v4().to_string(), &c, &a, "2",
+        &tc, fid, &uuid::Uuid::new_v4().to_string(), &c, &a, "5",
     ).await;
     assert_eq!(err, "cycle_detected");
 
@@ -4865,4 +4962,325 @@ async fn test_sdk_claim_retry_attempt_index() {
 
     // Complete it
     task2.complete(Some(b"done".to_vec())).await.unwrap();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE B TESTS: ff_create_budget, ff_create_quota_policy
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Create budget → report usage (OK) → report usage (HARD_BREACH) → verify breach_count.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_budget_create_and_enforce() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let budget_id = "create-enforce-budget";
+
+    // Create budget: tokens dimension, hard=10, soft=8
+    let create_result = fcall_create_budget(&tc, budget_id,
+        &[("tokens", 10)],
+        &[("tokens", 8)],
+    ).await;
+    assert_eq!(create_result[0], "OK", "create should return OK, got: {create_result:?}");
+    assert!(create_result[1].contains(budget_id),
+        "should return budget_id, got: {create_result:?}");
+
+    // Verify budget def created
+    let def_key = format!("ff:budget:{{b:0}}:{budget_id}");
+    let stored_id = tc.hget(&def_key, "budget_id").await;
+    assert_eq!(stored_id.as_deref(), Some(budget_id));
+    let enforcement = tc.hget(&def_key, "enforcement_mode").await;
+    assert_eq!(enforcement.as_deref(), Some("strict"));
+
+    // Verify limits stored
+    let limits_key = format!("ff:budget:{{b:0}}:{budget_id}:limits");
+    let hard: Option<String> = tc.client()
+        .cmd("HGET").arg(&limits_key).arg("hard:tokens")
+        .execute().await.unwrap();
+    assert_eq!(hard.as_deref(), Some("10"));
+    let soft: Option<String> = tc.client()
+        .cmd("HGET").arg(&limits_key).arg("soft:tokens")
+        .execute().await.unwrap();
+    assert_eq!(soft.as_deref(), Some("8"));
+
+    // Report 5 tokens → OK
+    let r1 = fcall_report_usage(&tc, budget_id, &[("tokens", 5)]).await;
+    assert_eq!(r1[0], "OK", "5 tokens under limit 10. Got: {r1:?}");
+
+    // Report 6 more (total 11 > limit 10) → HARD_BREACH
+    let r2 = fcall_report_usage(&tc, budget_id, &[("tokens", 6)]).await;
+    assert_eq!(r2[0], "HARD_BREACH", "11 > 10 should breach. Got: {r2:?}");
+
+    // Verify breach_count=1
+    let breach_count = tc.hget(&def_key, "breach_count").await;
+    assert_eq!(breach_count.as_deref(), Some("1"), "breach_count should be 1");
+
+    // Verify usage is still 5 (check-before-increment)
+    let usage_key = format!("ff:budget:{{b:0}}:{budget_id}:usage");
+    let usage: Option<String> = tc.client()
+        .cmd("HGET").arg(&usage_key).arg("tokens")
+        .execute().await.unwrap();
+    assert_eq!(usage.as_deref(), Some("5"), "hard breach should not increment usage");
+}
+
+/// Create budget twice → second returns ALREADY_SATISFIED.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_budget_create_idempotent() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let budget_id = "idempotent-budget";
+
+    // First create → OK
+    let r1 = fcall_create_budget(&tc, budget_id,
+        &[("tokens", 100)],
+        &[("tokens", 80)],
+    ).await;
+    assert_eq!(r1[0], "OK", "first create should be OK, got: {r1:?}");
+
+    // Second create → ALREADY_SATISFIED
+    let r2 = fcall_create_budget(&tc, budget_id,
+        &[("tokens", 200)], // different limits — should be ignored
+        &[("tokens", 150)],
+    ).await;
+    assert_eq!(r2[0], "ALREADY_SATISFIED",
+        "second create should be ALREADY_SATISFIED, got: {r2:?}");
+
+    // Verify original limits preserved (not overwritten)
+    let limits_key = format!("ff:budget:{{b:0}}:{budget_id}:limits");
+    let hard: Option<String> = tc.client()
+        .cmd("HGET").arg(&limits_key).arg("hard:tokens")
+        .execute().await.unwrap();
+    assert_eq!(hard.as_deref(), Some("100"), "limits should not be overwritten on idempotent create");
+}
+
+/// Create quota policy → admit 2 (cap=2) → 3rd rejected.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_quota_create_and_enforce() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let policy_id = "create-enforce-quota";
+
+    // Create quota policy: window=60s, no rate limit, max_concurrent=2
+    let create_result = fcall_create_quota_policy(&tc, policy_id, 60, 0, 2).await;
+    assert_eq!(create_result[0], "OK", "create should return OK, got: {create_result:?}");
+
+    // Verify quota def created
+    let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
+    let stored_id = tc.hget(&def_key, "quota_policy_id").await;
+    assert_eq!(stored_id.as_deref(), Some(policy_id));
+    let cap = tc.hget(&def_key, "active_concurrency_cap").await;
+    assert_eq!(cap.as_deref(), Some("2"));
+
+    // Verify concurrency counter initialized to 0
+    let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
+    let counter: Option<String> = tc.client()
+        .cmd("GET").arg(&concurrency_key)
+        .execute().await.unwrap();
+    assert_eq!(counter.as_deref(), Some("0"));
+
+    // Admit E1 → ADMITTED
+    let window_key = format!("ff:quota:{{q:0}}:{policy_id}:window:requests");
+    let e1 = ExecutionId::new();
+    let r1 = fcall_admit(&tc, policy_id, &e1, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r1, "ADMITTED");
+
+    // Admit E2 → ADMITTED
+    let e2 = ExecutionId::new();
+    let r2 = fcall_admit(&tc, policy_id, &e2, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r2, "ADMITTED");
+
+    // Admit E3 → CONCURRENCY_EXCEEDED
+    let e3 = ExecutionId::new();
+    let r3 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
+    assert_eq!(r3, "CONCURRENCY_EXCEEDED", "3rd should be rejected (cap=2)");
+}
+
+/// Create quota policy twice → second returns ALREADY_SATISFIED.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_quota_create_idempotent() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let policy_id = "idempotent-quota";
+
+    // First create → OK
+    let r1 = fcall_create_quota_policy(&tc, policy_id, 60, 100, 5).await;
+    assert_eq!(r1[0], "OK", "first create should be OK, got: {r1:?}");
+
+    // Second create → ALREADY_SATISFIED
+    let r2 = fcall_create_quota_policy(&tc, policy_id, 120, 200, 10).await;
+    assert_eq!(r2[0], "ALREADY_SATISFIED",
+        "second create should be ALREADY_SATISFIED, got: {r2:?}");
+
+    // Verify original config preserved
+    let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
+    let cap = tc.hget(&def_key, "active_concurrency_cap").await;
+    assert_eq!(cap.as_deref(), Some("5"), "config should not be overwritten");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE B TESTS: flow lifecycle functions
+// ═══════════════════════════════════════════════════════════════════════
+
+/// ff_create_flow + ff_add_execution_to_flow x3 → SMEMBERS=3, node_count=3, graph_revision=3.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_create_and_membership() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let fid = "flow-create-test";
+    let a = ExecutionId::new();
+    let b = ExecutionId::new();
+    let c = ExecutionId::new();
+
+    // Create flow
+    let result = fcall_create_flow(&tc, fid).await;
+    assert_eq!(result, fid, "ff_create_flow should return flow_id");
+
+    // Verify flow_core exists with open state
+    let flow_core_key = format!("ff:flow:{{fp:0}}:{fid}:core");
+    let pfs: Option<String> = tc.client().cmd("HGET").arg(&flow_core_key)
+        .arg("public_flow_state").execute().await.unwrap();
+    assert_eq!(pfs.as_deref(), Some("open"));
+
+    // Add 3 members
+    let (eid1, nc1) = fcall_add_execution_to_flow(&tc, fid, &a).await;
+    assert_eq!(eid1, a.to_string());
+    assert_eq!(nc1, "1");
+
+    let (eid2, nc2) = fcall_add_execution_to_flow(&tc, fid, &b).await;
+    assert_eq!(eid2, b.to_string());
+    assert_eq!(nc2, "2");
+
+    let (eid3, nc3) = fcall_add_execution_to_flow(&tc, fid, &c).await;
+    assert_eq!(eid3, c.to_string());
+    assert_eq!(nc3, "3");
+
+    // Verify SMEMBERS = 3
+    let members_key = format!("ff:flow:{{fp:0}}:{fid}:members");
+    let member_count: u32 = tc.client().cmd("SCARD").arg(&members_key)
+        .execute().await.unwrap();
+    assert_eq!(member_count, 3, "should have 3 members");
+
+    // Verify node_count = 3
+    let nc: Option<String> = tc.client().cmd("HGET").arg(&flow_core_key)
+        .arg("node_count").execute().await.unwrap();
+    assert_eq!(nc.as_deref(), Some("3"));
+
+    // Verify graph_revision = 3
+    let gr: Option<String> = tc.client().cmd("HGET").arg(&flow_core_key)
+        .arg("graph_revision").execute().await.unwrap();
+    assert_eq!(gr.as_deref(), Some("3"));
+}
+
+/// ff_create_flow idempotency: second call returns already_satisfied.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_create_idempotent() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let fid = "flow-idem-test";
+
+    // First create
+    let result1 = fcall_create_flow(&tc, fid).await;
+    assert_eq!(result1, fid);
+
+    // Second create — parse raw to check "already_satisfied" status
+    let prefix = format!("ff:flow:{{fp:0}}:{fid}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        fid.to_owned(), "test".to_owned(), NS.to_owned(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_create_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_create_flow 2");
+    let arr = expect_success_array(&raw, "ff_create_flow idempotent");
+    // ok_already_satisfied(id) → {1, "ALREADY_SATISFIED", id}
+    let status_str = field_str(arr, 1);
+    assert_eq!(status_str, "ALREADY_SATISFIED",
+        "second ff_create_flow should return ALREADY_SATISFIED");
+    let fid_returned = field_str(arr, 2);
+    assert_eq!(fid_returned, fid);
+}
+
+/// ff_cancel_flow: create flow + add members → cancel → verify state + member list returned.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_cancel() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let fid = "flow-cancel-test";
+    let a = ExecutionId::new();
+    let b = ExecutionId::new();
+    let c = ExecutionId::new();
+
+    // Create flow and add 3 members
+    fcall_create_flow(&tc, fid).await;
+    fcall_add_execution_to_flow(&tc, fid, &a).await;
+    fcall_add_execution_to_flow(&tc, fid, &b).await;
+    fcall_add_execution_to_flow(&tc, fid, &c).await;
+
+    // Cancel with cancel_all policy
+    let (policy, members) = fcall_cancel_flow(&tc, fid, "test_cancel", "cancel_all").await;
+    assert_eq!(policy, "cancel_all");
+    assert_eq!(members.len(), 3, "should return 3 member eids");
+
+    // Verify all 3 eids are in the returned list
+    let mut member_set: std::collections::HashSet<String> = members.into_iter().collect();
+    assert!(member_set.remove(&a.to_string()), "A in cancel list");
+    assert!(member_set.remove(&b.to_string()), "B in cancel list");
+    assert!(member_set.remove(&c.to_string()), "C in cancel list");
+
+    // Verify flow is cancelled in Valkey
+    let flow_core_key = format!("ff:flow:{{fp:0}}:{fid}:core");
+    let pfs: Option<String> = tc.client().cmd("HGET").arg(&flow_core_key)
+        .arg("public_flow_state").execute().await.unwrap();
+    assert_eq!(pfs.as_deref(), Some("cancelled"));
+
+    let reason: Option<String> = tc.client().cmd("HGET").arg(&flow_core_key)
+        .arg("cancel_reason").execute().await.unwrap();
+    assert_eq!(reason.as_deref(), Some("test_cancel"));
+
+    // Second cancel should return error (already terminal)
+    let prefix = format!("ff:flow:{{fp:0}}:{fid}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+    ];
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        fid.to_owned(), "again".to_owned(), "cancel_all".to_owned(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_cancel_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_cancel_flow 2");
+    let arr = match &raw {
+        Value::Array(a) => a,
+        _ => panic!("expected array"),
+    };
+    let status = match &arr[0] {
+        Ok(Value::Int(n)) => *n,
+        _ => panic!("expected Int status"),
+    };
+    assert_eq!(status, 0, "second cancel should fail");
+    assert_eq!(field_str(arr, 1), "flow_already_terminal");
 }

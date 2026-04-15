@@ -4,6 +4,52 @@
 -- Depends on helpers: ok, err, is_set
 
 ---------------------------------------------------------------------------
+-- ff_create_quota_policy  (on {q:K})
+--
+-- Create a new quota/rate-limit policy.
+-- Idempotent: if EXISTS quota_def → return ok_already_satisfied.
+--
+-- KEYS (3): quota_def, quota_window_zset, quota_concurrency_counter
+-- ARGV (5): quota_policy_id, window_seconds, max_requests_per_window,
+--           max_concurrent, now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_create_quota_policy', function(keys, args)
+  local K = {
+    def_key          = keys[1],
+    window_zset      = keys[2],
+    concurrency_key  = keys[3],
+  }
+
+  local A = {
+    quota_policy_id         = args[1],
+    window_seconds          = args[2],
+    max_requests_per_window = args[3],
+    max_concurrent          = args[4],
+    now_ms                  = args[5],
+  }
+
+  -- Idempotency: already exists → return immediately
+  if redis.call("EXISTS", K.def_key) == 1 then
+    return ok_already_satisfied(A.quota_policy_id)
+  end
+
+  -- HSET quota definition
+  redis.call("HSET", K.def_key,
+    "quota_policy_id", A.quota_policy_id,
+    "requests_per_window_seconds", A.window_seconds,
+    "max_requests_per_window", A.max_requests_per_window,
+    "active_concurrency_cap", A.max_concurrent,
+    "created_at", A.now_ms)
+
+  -- Init concurrency counter to 0
+  redis.call("SET", K.concurrency_key, "0")
+
+  -- quota_window_zset left empty (populated by ff_check_admission_and_record)
+
+  return ok(A.quota_policy_id)
+end)
+
+---------------------------------------------------------------------------
 -- #32  ff_check_admission_and_record  (on {q:K})
 --
 -- Idempotent sliding-window rate check + concurrency check.

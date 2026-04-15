@@ -4,13 +4,50 @@ use ff_core::contracts::*;
 use ff_core::error::ScriptError;
 use ff_core::keys::QuotaKeyContext;
 
-use crate::result::FromFcallResult;
+use crate::result::{FcallResult, FromFcallResult};
 
 /// Key context for quota admission check on {q:K}.
 pub struct QuotaOpKeys<'a> {
     pub ctx: &'a QuotaKeyContext,
     pub dimension: &'a str,
     pub execution_id: &'a ff_core::types::ExecutionId,
+}
+
+// ─── ff_create_quota_policy ───────────────────────────────────────────
+//
+// Lua KEYS (3): quota_def, quota_window_zset, quota_concurrency_counter
+// Lua ARGV (5): quota_policy_id, window_seconds, max_requests_per_window,
+//               max_concurrent, now_ms
+
+ff_function! {
+    pub ff_create_quota_policy(args: CreateQuotaPolicyArgs) -> CreateQuotaPolicyResult {
+        keys(k: &QuotaOpKeys<'_>) {
+            k.ctx.definition(),
+            k.ctx.window(k.dimension),
+            k.ctx.concurrency(),
+        }
+        argv {
+            args.quota_policy_id.to_string(),
+            args.window_seconds.to_string(),
+            args.max_requests_per_window.to_string(),
+            args.max_concurrent.to_string(),
+            args.now.to_string(),
+        }
+    }
+}
+
+impl FromFcallResult for CreateQuotaPolicyResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let id_str = r.field_str(0);
+        let qid = ff_core::types::QuotaPolicyId::parse(&id_str)
+            .map_err(|e| ScriptError::Parse(format!("invalid quota_policy_id: {e}")))?;
+        match r.status.as_str() {
+            "OK" => Ok(CreateQuotaPolicyResult::Created { quota_policy_id: qid }),
+            "ALREADY_SATISFIED" => Ok(CreateQuotaPolicyResult::AlreadySatisfied { quota_policy_id: qid }),
+            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+        }
+    }
 }
 
 // ─── ff_check_admission_and_record ────────────────────────────────────

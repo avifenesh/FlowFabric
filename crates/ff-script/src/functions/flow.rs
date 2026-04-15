@@ -19,6 +19,126 @@ pub struct DepOpKeys<'a> {
     pub lane_id: &'a ff_core::types::LaneId,
 }
 
+// ─── ff_create_flow ──────────────────────────────────────────────────
+// KEYS (2): flow_core, members_set
+// ARGV (4): flow_id, flow_kind, namespace, now_ms
+
+ff_function! {
+    pub ff_create_flow(args: CreateFlowArgs) -> CreateFlowResult {
+        keys(k: &FlowStructOpKeys<'_>) {
+            k.fctx.core(),
+            k.fctx.members(),
+        }
+        argv {
+            args.flow_id.to_string(),
+            args.flow_kind.clone(),
+            args.namespace.to_string(),
+            args.now.to_string(),
+        }
+    }
+}
+
+impl FromFcallResult for CreateFlowResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let fid_str = r.field_str(0);
+        let fid = ff_core::types::FlowId::parse(&fid_str)
+            .map_err(|e| ScriptError::Parse(format!("bad flow_id: {e}")))?;
+        match r.status.as_str() {
+            "OK" => Ok(CreateFlowResult::Created { flow_id: fid }),
+            "ALREADY_SATISFIED" => Ok(CreateFlowResult::AlreadySatisfied { flow_id: fid }),
+            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+        }
+    }
+}
+
+// ─── ff_add_execution_to_flow ────────────────────────────────────────
+// KEYS (2): flow_core, members_set
+// ARGV (3): flow_id, execution_id, now_ms
+
+ff_function! {
+    pub ff_add_execution_to_flow(args: AddExecutionToFlowArgs) -> AddExecutionToFlowResult {
+        keys(k: &FlowStructOpKeys<'_>) {
+            k.fctx.core(),
+            k.fctx.members(),
+        }
+        argv {
+            args.flow_id.to_string(),
+            args.execution_id.to_string(),
+            args.now.to_string(),
+        }
+    }
+}
+
+impl FromFcallResult for AddExecutionToFlowResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let eid_str = r.field_str(0);
+        let nc_str = r.field_str(1);
+        match r.status.as_str() {
+            "ALREADY_SATISFIED" => {
+                let eid = ff_core::types::ExecutionId::parse(&eid_str)
+                    .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+                let nc: u32 = nc_str.parse().unwrap_or(0);
+                Ok(AddExecutionToFlowResult::AlreadyMember {
+                    execution_id: eid,
+                    node_count: nc,
+                })
+            }
+            "OK" => {
+                let eid = ff_core::types::ExecutionId::parse(&eid_str)
+                    .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+                let nc: u32 = nc_str.parse().unwrap_or(0);
+                Ok(AddExecutionToFlowResult::Added {
+                    execution_id: eid,
+                    new_node_count: nc,
+                })
+            }
+            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+        }
+    }
+}
+
+// ─── ff_cancel_flow ──────────────────────────────────────────────────
+// KEYS (2): flow_core, members_set
+// ARGV (4): flow_id, reason, cancellation_policy, now_ms
+
+ff_function! {
+    pub ff_cancel_flow(args: CancelFlowArgs) -> CancelFlowResult {
+        keys(k: &FlowStructOpKeys<'_>) {
+            k.fctx.core(),
+            k.fctx.members(),
+        }
+        argv {
+            args.flow_id.to_string(),
+            args.reason.clone(),
+            args.cancellation_policy.clone(),
+            args.now.to_string(),
+        }
+    }
+}
+
+impl FromFcallResult for CancelFlowResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let policy = r.field_str(0);
+        let mut members = Vec::new();
+        let mut i = 1;
+        loop {
+            let s = r.field_str(i);
+            if s.is_empty() {
+                break;
+            }
+            members.push(s);
+            i += 1;
+        }
+        Ok(CancelFlowResult::Cancelled {
+            cancellation_policy: policy,
+            member_execution_ids: members,
+        })
+    }
+}
+
 // ─── ff_evaluate_flow_eligibility ─────────────────────────────────────
 // KEYS (2): exec_core, deps_meta
 // ARGV (0)

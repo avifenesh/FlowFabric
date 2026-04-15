@@ -4,6 +4,78 @@
 -- Depends on helpers: ok, err, is_set, hgetall_to_table
 
 ---------------------------------------------------------------------------
+-- ff_create_budget  (on {b:M})
+--
+-- Create a new budget policy with hard/soft limits on N dimensions.
+-- Idempotent: if EXISTS budget_def → return ok_already_satisfied.
+--
+-- KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+-- ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
+--   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
+--   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
+---------------------------------------------------------------------------
+redis.register_function('ff_create_budget', function(keys, args)
+  local K = {
+    def_key      = keys[1],
+    limits_key   = keys[2],
+    usage_key    = keys[3],
+    resets_zset  = keys[4],
+  }
+
+  local A = {
+    budget_id         = args[1],
+    scope_type        = args[2],
+    scope_id          = args[3],
+    enforcement_mode  = args[4],
+    on_hard_limit     = args[5],
+    on_soft_limit     = args[6],
+    reset_interval_ms = args[7],
+    now_ms            = args[8],
+  }
+
+  -- Idempotency: already exists → return immediately
+  if redis.call("EXISTS", K.def_key) == 1 then
+    return ok_already_satisfied(A.budget_id)
+  end
+
+  local dim_count = tonumber(args[9])
+
+  -- HSET budget definition
+  redis.call("HSET", K.def_key,
+    "budget_id", A.budget_id,
+    "scope_type", A.scope_type,
+    "scope_id", A.scope_id,
+    "enforcement_mode", A.enforcement_mode,
+    "on_hard_limit", A.on_hard_limit,
+    "on_soft_limit", A.on_soft_limit,
+    "reset_interval_ms", A.reset_interval_ms,
+    "breach_count", "0",
+    "soft_breach_count", "0",
+    "created_at", A.now_ms,
+    "last_updated_at", A.now_ms)
+
+  -- HSET per-dimension hard and soft limits
+  for i = 1, dim_count do
+    local dim  = args[9 + i]
+    local hard = args[9 + dim_count + i]
+    local soft = args[9 + 2 * dim_count + i]
+    redis.call("HSET", K.limits_key, "hard:" .. dim, hard, "soft:" .. dim, soft)
+  end
+
+  -- budget_usage left empty — first report_usage will create fields
+
+  -- Schedule periodic reset if reset_interval_ms > 0
+  local interval_ms = tonumber(A.reset_interval_ms)
+  if interval_ms > 0 then
+    local next_reset_at = tostring(tonumber(A.now_ms) + interval_ms)
+    redis.call("HSET", K.def_key, "next_reset_at", next_reset_at)
+    redis.call("ZADD", K.resets_zset, tonumber(next_reset_at), A.budget_id)
+  end
+
+  return ok(A.budget_id)
+end)
+
+---------------------------------------------------------------------------
 -- #30  ff_report_usage_and_check  (on {b:M})
 --
 -- Check-before-increment: read current usage, check hard limits. If any

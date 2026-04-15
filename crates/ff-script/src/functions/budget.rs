@@ -20,6 +20,75 @@ pub struct BlockOpKeys<'a> {
     pub lane_id: &'a ff_core::types::LaneId,
 }
 
+// ─── ff_create_budget ─────────────────────────────────────────────────
+//
+// Lua KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+// Lua ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
+//   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
+//   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
+//
+// Manual implementation because ff_function! macro cannot handle variable-length ARGV.
+
+pub async fn ff_create_budget(
+    conn: &ferriskey::Client,
+    k: &BudgetOpKeys<'_>,
+    resets_zset: &str,
+    args: &CreateBudgetArgs,
+) -> Result<CreateBudgetResult, ScriptError> {
+    let keys: Vec<String> = vec![
+        k.def_key.to_string(),
+        k.limits_key.to_string(),
+        k.usage_key.to_string(),
+        resets_zset.to_string(),
+    ];
+
+    let dim_count = args.dimensions.len();
+    // ARGV: budget_id, scope_type, scope_id, enforcement_mode,
+    //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
+    //   dim_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
+    let mut argv: Vec<String> = Vec::with_capacity(9 + dim_count * 3);
+    argv.push(args.budget_id.to_string());
+    argv.push(args.scope_type.clone());
+    argv.push(args.scope_id.clone());
+    argv.push(args.enforcement_mode.clone());
+    argv.push(args.on_hard_limit.clone());
+    argv.push(args.on_soft_limit.clone());
+    argv.push(args.reset_interval_ms.to_string());
+    argv.push(args.now.to_string());
+    argv.push(dim_count.to_string());
+    for dim in &args.dimensions {
+        argv.push(dim.clone());
+    }
+    for hard in &args.hard_limits {
+        argv.push(hard.to_string());
+    }
+    for soft in &args.soft_limits {
+        argv.push(soft.to_string());
+    }
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_create_budget", &key_refs, &argv_refs)
+        .await
+        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+    <CreateBudgetResult as FromFcallResult>::from_fcall_result(&raw)
+}
+
+impl FromFcallResult for CreateBudgetResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let id_str = r.field_str(0);
+        let budget_id = ff_core::types::BudgetId::parse(&id_str)
+            .map_err(|e| ScriptError::Parse(format!("invalid budget_id: {e}")))?;
+        match r.status.as_str() {
+            "OK" => Ok(CreateBudgetResult::Created { budget_id }),
+            "ALREADY_SATISFIED" => Ok(CreateBudgetResult::AlreadySatisfied { budget_id }),
+            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+        }
+    }
+}
+
 // ─── ff_report_usage_and_check ────────────────────────────────────────
 //
 // Lua KEYS (3): budget_usage, budget_limits, budget_def
@@ -100,19 +169,32 @@ impl FromFcallResult for ReportUsageResult {
 //
 // Lua KEYS (3): budget_def, budget_usage, budget_resets_zset
 // Lua ARGV (2): budget_id, now_ms
+//
+// Manual implementation: BudgetOpKeys doesn't carry resets_zset, so we
+// accept it as a separate parameter (same pattern as ff_create_budget).
 
-ff_function! {
-    pub ff_reset_budget(args: ResetBudgetArgs) -> ResetBudgetResult {
-        keys(k: &BudgetOpKeys<'_>) {
-            k.def_key.to_string(),
-            k.usage_key.to_string(),
-            k.limits_key.to_string(),  // reused as resets_zset
-        }
-        argv {
-            args.budget_id.to_string(),
-            args.now.to_string(),
-        }
-    }
+pub async fn ff_reset_budget(
+    conn: &ferriskey::Client,
+    k: &BudgetOpKeys<'_>,
+    resets_zset: &str,
+    args: &ResetBudgetArgs,
+) -> Result<ResetBudgetResult, ScriptError> {
+    let keys: Vec<String> = vec![
+        k.def_key.to_string(),
+        k.usage_key.to_string(),
+        resets_zset.to_string(),
+    ];
+    let argv: Vec<String> = vec![
+        args.budget_id.to_string(),
+        args.now.to_string(),
+    ];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_reset_budget", &key_refs, &argv_refs)
+        .await
+        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+    <ResetBudgetResult as FromFcallResult>::from_fcall_result(&raw)
 }
 
 impl FromFcallResult for ResetBudgetResult {

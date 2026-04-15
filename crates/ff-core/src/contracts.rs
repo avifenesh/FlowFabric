@@ -718,6 +718,53 @@ pub enum AppendFrameResult {
 // Phase 5 contracts: budget, quota, block/unblock
 // ═══════════════════════════════════════════════════════════════════════
 
+// ─── create_budget ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateBudgetArgs {
+    pub budget_id: crate::types::BudgetId,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub enforcement_mode: String,
+    pub on_hard_limit: String,
+    pub on_soft_limit: String,
+    pub reset_interval_ms: u64,
+    /// Dimension names.
+    pub dimensions: Vec<String>,
+    /// Hard limits per dimension (parallel with dimensions).
+    pub hard_limits: Vec<u64>,
+    /// Soft limits per dimension (parallel with dimensions).
+    pub soft_limits: Vec<u64>,
+    pub now: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateBudgetResult {
+    /// Budget created.
+    Created { budget_id: crate::types::BudgetId },
+    /// Already exists (idempotent).
+    AlreadySatisfied { budget_id: crate::types::BudgetId },
+}
+
+// ─── create_quota_policy ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateQuotaPolicyArgs {
+    pub quota_policy_id: crate::types::QuotaPolicyId,
+    pub window_seconds: u64,
+    pub max_requests_per_window: u64,
+    pub max_concurrent: u64,
+    pub now: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateQuotaPolicyResult {
+    /// Quota policy created.
+    Created { quota_policy_id: crate::types::QuotaPolicyId },
+    /// Already exists (idempotent).
+    AlreadySatisfied { quota_policy_id: crate::types::QuotaPolicyId },
+}
+
 // ─── report_usage_and_check ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -823,6 +870,66 @@ pub enum UnblockExecutionResult {
 // ═══════════════════════════════════════════════════════════════════════
 // Phase 6 contracts: flow coordination and dependencies
 // ═══════════════════════════════════════════════════════════════════════
+
+// ─── create_flow ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateFlowArgs {
+    pub flow_id: crate::types::FlowId,
+    pub flow_kind: String,
+    pub namespace: Namespace,
+    pub now: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateFlowResult {
+    /// Flow created successfully.
+    Created { flow_id: crate::types::FlowId },
+    /// Flow already exists (idempotent).
+    AlreadySatisfied { flow_id: crate::types::FlowId },
+}
+
+// ─── add_execution_to_flow ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AddExecutionToFlowArgs {
+    pub flow_id: crate::types::FlowId,
+    pub execution_id: ExecutionId,
+    pub now: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AddExecutionToFlowResult {
+    /// Execution added to flow.
+    Added {
+        execution_id: ExecutionId,
+        new_node_count: u32,
+    },
+    /// Already a member (idempotent).
+    AlreadyMember {
+        execution_id: ExecutionId,
+        node_count: u32,
+    },
+}
+
+// ─── cancel_flow ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CancelFlowArgs {
+    pub flow_id: crate::types::FlowId,
+    pub reason: String,
+    pub cancellation_policy: String,
+    pub now: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancelFlowResult {
+    /// Flow cancelled. Member EIDs returned for cross-partition dispatch.
+    Cancelled {
+        cancellation_policy: String,
+        member_execution_ids: Vec<String>,
+    },
+}
 
 // ─── stage_dependency_edge ───
 
