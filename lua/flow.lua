@@ -4,6 +4,55 @@
 -- Depends on helpers: ok, err, is_set, hgetall_to_table
 
 ---------------------------------------------------------------------------
+-- Cycle detection helper
+---------------------------------------------------------------------------
+
+-- Max nodes to visit during cycle detection BFS.
+local MAX_CYCLE_CHECK_NODES = 1000
+
+-- Detect if adding an edge upstream→downstream would create a cycle.
+-- BFS from downstream through existing outgoing edges: if upstream is
+-- reachable, the new edge closes a loop (A→B→C→A deadlock).
+-- All keys share the same {fp:N} slot (flow-partition co-location).
+-- @param flow_prefix  e.g. "ff:flow:{fp:0}:<flow_id>"
+-- @param start_eid    downstream of proposed edge (BFS start)
+-- @param target_eid   upstream of proposed edge (looking for this)
+-- @return true if a cycle would be created
+local function detect_cycle(flow_prefix, start_eid, target_eid)
+  local visited = {}
+  local queue = {start_eid}
+  local count = 0
+
+  while #queue > 0 do
+    local next_queue = {}
+    for _, eid in ipairs(queue) do
+      if eid == target_eid then
+        return true
+      end
+      if not visited[eid] then
+        visited[eid] = true
+        count = count + 1
+        if count > MAX_CYCLE_CHECK_NODES then
+          return true  -- graph too large to verify; reject conservatively
+        end
+        local out_key = flow_prefix .. ":out:" .. eid
+        local edges = redis.call("SMEMBERS", out_key)
+        for _, edge_id in ipairs(edges) do
+          local edge_key = flow_prefix .. ":edge:" .. edge_id
+          local next_eid = redis.call("HGET", edge_key, "downstream_execution_id")
+          if next_eid and next_eid ~= "" and not visited[next_eid] then
+            next_queue[#next_queue + 1] = next_eid
+          end
+        end
+      end
+    end
+    queue = next_queue
+  end
+
+  return false
+end
+
+---------------------------------------------------------------------------
 -- #29  ff_stage_dependency_edge  (on {fp:N})
 --
 -- Validate membership + topology, check graph_revision, create edge,
@@ -57,6 +106,13 @@ redis.register_function('ff_stage_dependency_edge', function(keys, args)
   end
   if redis.call("SISMEMBER", K.members_set, A.downstream_eid) == 0 then
     return err("execution_not_in_flow")
+  end
+
+  -- 4b. Transitive cycle detection: walk from downstream through outgoing
+  -- edges to check if upstream is reachable (A→B→C→A deadlock prevention).
+  local flow_prefix = string.sub(K.flow_core, 1, -6)  -- strip ":core"
+  if detect_cycle(flow_prefix, A.downstream_eid, A.upstream_eid) then
+    return err("cycle_detected")
   end
 
   -- 5. Check edge doesn't already exist
@@ -270,8 +326,10 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
   redis.call("HSET", K.deps_meta, "last_dependency_update_at", A.now_ms)
 
   local raw = redis.call("HGETALL", K.core_key)
-  if #raw == 0 then return ok("impossible") end
+  if #raw == 0 then return ok("impossible", "") end
   local core = hgetall_to_table(raw)
+
+  local child_skipped = false
 
   if core.terminal_outcome == "none" then
     -- Determine attempt_state for skip
@@ -307,9 +365,10 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
       "last_mutation_at", A.now_ms)
     redis.call("ZREM", K.blocked_deps_zset, core.execution_id or "")
     redis.call("ZADD", K.terminal_zset, tonumber(A.now_ms), core.execution_id or "")
+    child_skipped = true
   end
 
-  return ok("impossible")
+  return ok("impossible", child_skipped and "child_skipped" or "")
 end)
 
 ---------------------------------------------------------------------------

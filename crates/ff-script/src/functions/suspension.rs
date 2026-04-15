@@ -111,30 +111,22 @@ impl FromFcallResult for SuspendExecutionResult {
 //               eligible_zset, delayed_zset, suspended_zset
 // Lua ARGV (3): execution_id, trigger_type, resume_delay_ms
 
-/// Lighter key context for resume — no worker_instance_id needed.
+/// Key context for resume — caller must pre-read current_waitpoint_id from
+/// exec_core so the correct waitpoint keys can be passed to the Lua.
 pub struct ResumeOpKeys<'a> {
     pub ctx: &'a ExecKeyContext,
     pub idx: &'a IndexKeys,
     pub lane_id: &'a LaneId,
+    pub waitpoint_id: &'a WaitpointId,
 }
 
-// WARNING: This wrapper uses PLACEHOLDER KEYS for waitpoint_hash [3] and
-// waitpoint_signals [4]. The Lua reads from these keys directly — it does
-// NOT construct them dynamically. Passing suspension_current as a placeholder
-// will CORRUPT the suspension record (HSET waitpoint fields onto it).
-//
-// DO NOT USE THIS WRAPPER. Use raw FCALL with pre-read waitpoint_id instead
-// (see SuspensionTimeoutScanner for the correct pattern).
-//
-// To fix: the caller must pre-read current_waitpoint_id from exec_core and
-// pass real waitpoint keys: ctx.waitpoint(&wp_id), ctx.waitpoint_signals(&wp_id).
 ff_function! {
     pub ff_resume_execution(args: ResumeExecutionArgs) -> ResumeExecutionResult {
         keys(k: &ResumeOpKeys<'_>) {
             k.ctx.core(),                                              // 1
             k.ctx.suspension_current(),                                // 2
-            k.ctx.suspension_current(),                                // 3 BROKEN PLACEHOLDER: should be waitpoint_hash
-            k.ctx.suspension_current(),                                // 4 BROKEN PLACEHOLDER: should be waitpoint_signals
+            k.ctx.waitpoint(k.waitpoint_id),                           // 3
+            k.ctx.waitpoint_signals(k.waitpoint_id),                   // 4
             k.idx.suspension_timeout(),                                // 5
             k.idx.lane_eligible(k.lane_id),                            // 6
             k.idx.lane_delayed(k.lane_id),                             // 7
@@ -212,16 +204,14 @@ impl FromFcallResult for CreatePendingWaitpointResult {
 //                lease_history
 // Lua ARGV (1): execution_id
 
-// WARNING: This wrapper uses PLACEHOLDER KEYS for waitpoint_hash [3],
-// wp_condition [4], attempt_hash [5], and stream_meta [6]. The Lua reads
-// from these keys directly — it does NOT construct them dynamically.
-//
-// DO NOT USE THIS WRAPPER. Use raw FCALL with pre-read waitpoint_id and
-// attempt_index instead (see SuspensionTimeoutScanner for the correct pattern).
+/// Key context for expire_suspension — caller must pre-read current_waitpoint_id
+/// and current_attempt_index from exec_core so correct keys can be passed.
 pub struct ExpireSuspensionOpKeys<'a> {
     pub ctx: &'a ExecKeyContext,
     pub idx: &'a IndexKeys,
     pub lane_id: &'a LaneId,
+    pub waitpoint_id: &'a WaitpointId,
+    pub attempt_index: AttemptIndex,
 }
 
 ff_function! {
@@ -229,10 +219,10 @@ ff_function! {
         keys(k: &ExpireSuspensionOpKeys<'_>) {
             k.ctx.core(),                                              // 1
             k.ctx.suspension_current(),                                // 2
-            k.ctx.suspension_current(),                                // 3 BROKEN PLACEHOLDER: should be waitpoint_hash
-            k.ctx.suspension_current(),                                // 4 BROKEN PLACEHOLDER: should be wp_condition
-            k.ctx.attempt_hash(AttemptIndex::new(0)),                  // 5 BROKEN PLACEHOLDER: wrong for att_idx > 0
-            k.ctx.stream_meta(AttemptIndex::new(0)),                   // 6 BROKEN PLACEHOLDER: wrong for att_idx > 0
+            k.ctx.waitpoint(k.waitpoint_id),                           // 3
+            k.ctx.waitpoint_condition(k.waitpoint_id),                 // 4
+            k.ctx.attempt_hash(k.attempt_index),                       // 5
+            k.ctx.stream_meta(k.attempt_index),                        // 6
             k.idx.suspension_timeout(),                                // 7
             k.idx.lane_suspended(k.lane_id),                           // 8
             k.idx.lane_terminal(k.lane_id),                            // 9

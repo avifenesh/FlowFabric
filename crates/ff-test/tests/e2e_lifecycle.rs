@@ -3448,3 +3448,286 @@ async fn test_flow_replay_after_skip() {
     assert_in_index(&tc, &idx_b.lane_blocked_dependencies(&lane_id), &b).await;
     assert_not_in_index(&tc, &idx_b.lane_terminal(&lane_id), &b).await;
 }
+
+// ─── Priority clamp + ordering ─────────────────────────────────────────
+
+/// Verify that priority values outside [0, 9000] are clamped, and that
+/// higher-priority executions appear first in the eligible ZSET (lower score).
+#[tokio::test]
+async fn test_priority_clamp_and_ordering() {
+    let tc = TestCluster::connect().await;
+
+    // Create execution with priority=10000 (should be clamped to 9000)
+    let high = ExecutionId::new();
+    let (_, _) = fcall_create_execution(
+        &tc, &high, "ns_prio", "default", "clamp_test", 10000,
+    ).await;
+
+    let config = test_config();
+    let partition_high = execution_partition(&high, &config);
+    let ctx_high = ExecKeyContext::new(&partition_high, &high);
+
+    // Read stored priority — should be 9000, not 10000
+    let stored_priority: Option<String> = tc.hget(&ctx_high.core(), "priority").await;
+    assert_eq!(
+        stored_priority.as_deref(),
+        Some("9000"),
+        "priority=10000 should be clamped to 9000"
+    );
+
+    // Create execution with priority=-5 (should be clamped to 0)
+    let neg = ExecutionId::new();
+    let (_, _) = fcall_create_execution(
+        &tc, &neg, "ns_prio", "default", "clamp_test", -5,
+    ).await;
+
+    let partition_neg = execution_partition(&neg, &config);
+    let ctx_neg = ExecKeyContext::new(&partition_neg, &neg);
+
+    let stored_neg: Option<String> = tc.hget(&ctx_neg.core(), "priority").await;
+    assert_eq!(
+        stored_neg.as_deref(),
+        Some("0"),
+        "priority=-5 should be clamped to 0"
+    );
+
+    // Create execution with priority=50 (should be stored as-is)
+    let low = ExecutionId::new();
+    let (_, _) = fcall_create_execution(
+        &tc, &low, "ns_prio", "default", "clamp_test", 50,
+    ).await;
+
+    let partition_low = execution_partition(&low, &config);
+    let ctx_low = ExecKeyContext::new(&partition_low, &low);
+
+    let stored_low: Option<String> = tc.hget(&ctx_low.core(), "priority").await;
+    assert_eq!(
+        stored_low.as_deref(),
+        Some("50"),
+        "priority=50 should be stored as-is"
+    );
+
+    // Verify ordering in eligible ZSET: higher priority = lower score = first
+    // If high and low are on the same partition, we can compare scores directly.
+    // The score formula is: -(priority * 1_000_000_000_000) + created_at
+    // priority=9000 should have a MUCH lower score than priority=50.
+    if partition_high.index == partition_low.index {
+        let idx = IndexKeys::new(&partition_high);
+        let lane_id = LaneId::new("default");
+        let eligible_key = idx.lane_eligible(&lane_id);
+
+        // ZSCORE for both
+        let score_high: Option<String> = tc.client()
+            .cmd("ZSCORE")
+            .arg(&eligible_key)
+            .arg(high.to_string().as_str())
+            .execute()
+            .await
+            .unwrap_or(None);
+
+        let score_low: Option<String> = tc.client()
+            .cmd("ZSCORE")
+            .arg(&eligible_key)
+            .arg(low.to_string().as_str())
+            .execute()
+            .await
+            .unwrap_or(None);
+
+        if let (Some(sh), Some(sl)) = (score_high, score_low) {
+            let sh_f: f64 = sh.parse().unwrap();
+            let sl_f: f64 = sl.parse().unwrap();
+            assert!(
+                sh_f < sl_f,
+                "priority=9000 (score={sh_f}) should have lower score than priority=50 (score={sl_f})"
+            );
+        }
+    }
+}
+
+// ─── Phase 7: SDK concurrency enforcement ───
+
+/// Verify that FlowFabricWorker.max_concurrent_tasks is enforced via semaphore.
+/// Create 3 executions. Claim 2 (max). 3rd claim returns None. Complete one.
+/// 4th claim succeeds (permit freed).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_max_concurrent_tasks_enforcement() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Write the test partition config to Valkey so the SDK worker reads the
+    // same 4-partition layout that fcall_create_execution uses.
+    let config = test_config();
+    let config_key = "ff:config:partitions";
+    let _: () = tc.client().cmd("HSET")
+        .arg(config_key)
+        .arg("num_execution_partitions")
+        .arg(config.num_execution_partitions.to_string().as_str())
+        .arg("num_flow_partitions")
+        .arg(config.num_flow_partitions.to_string().as_str())
+        .arg("num_budget_partitions")
+        .arg(config.num_budget_partitions.to_string().as_str())
+        .arg("num_quota_partitions")
+        .arg(config.num_quota_partitions.to_string().as_str())
+        .execute()
+        .await
+        .unwrap();
+
+    // Create 3 eligible executions via raw FCALL
+    let eids: Vec<ExecutionId> = (0..3).map(|_| ExecutionId::new()).collect();
+    for eid in &eids {
+        fcall_create_execution(&tc, eid, NS, LANE, "concurrency_test", 0).await;
+    }
+
+    // Build a worker with max_concurrent_tasks = 2
+    let worker_config = ff_sdk::WorkerConfig {
+        valkey_url: "redis://localhost:6379".into(),
+        tls: false,
+        worker_id: ff_core::types::WorkerId::new("concurrency-test-worker"),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new("concurrency-test-inst"),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 2,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    // Claim 1: should succeed
+    let task1 = worker.claim_next().await.unwrap();
+    assert!(task1.is_some(), "claim 1 should succeed (0/2 active)");
+    let task1 = task1.unwrap();
+
+    // Claim 2: should succeed
+    let task2 = worker.claim_next().await.unwrap();
+    assert!(task2.is_some(), "claim 2 should succeed (1/2 active)");
+    let task2 = task2.unwrap();
+
+    // Claim 3: should return None (at capacity, 2/2 active)
+    let task3 = worker.claim_next().await.unwrap();
+    assert!(task3.is_none(), "claim 3 should return None (2/2 active — at capacity)");
+
+    // Complete task1 — frees one permit
+    task1.complete(Some(b"done".to_vec())).await.unwrap();
+
+    // Claim 4: should now succeed (1/2 active after completion)
+    let task4 = worker.claim_next().await.unwrap();
+    assert!(task4.is_some(), "claim 4 should succeed after completing task1 (1/2 active)");
+
+    // Cleanup: complete remaining tasks
+    task2.complete(Some(b"done".to_vec())).await.unwrap();
+    task4.unwrap().complete(Some(b"done".to_vec())).await.unwrap();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ROUND 5: execution_deadline expiry on runnable (unclaimed) execution
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Expire a RUNNABLE (never-claimed) execution via ff_expire_execution.
+/// Exercises the execution_deadline scanner's primary use case: absolute
+/// deadline fires while the execution is still waiting in the eligible set.
+/// Verifies: terminal/expired state, ZREM from eligible, ZADD to terminal,
+/// execution_deadline index cleaned, no attempt ended (none existed).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_execution_deadline_expire_runnable() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+
+    // Create execution with an absolute deadline (1 ms from now — already expired)
+    let now_ms = TimestampMs::now().0;
+    let deadline_at = (now_ms + 1).to_string();
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.payload(),
+        ctx.policy(),
+        ctx.tags(),
+        idx.lane_eligible(&lane_id),
+        String::new(), // idem_key
+        idx.execution_deadline(),
+        idx.all_executions(),
+    ];
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        NS.to_owned(),
+        LANE.to_owned(),
+        "deadline_test".to_owned(),
+        "0".to_owned(),
+        "e2e-test".to_owned(),
+        "{}".to_owned(),
+        r#"{"test":"deadline"}"#.to_owned(),
+        String::new(),      // delay_until
+        String::new(),      // dedup_ttl_ms
+        "{}".to_owned(),    // tags_json
+        deadline_at,        // execution_deadline_at
+        partition.index.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await
+        .expect("FCALL ff_create_execution with deadline");
+    assert_ok(&raw, "ff_create_execution");
+
+    // Verify: in eligible set
+    assert_in_eligible(&tc, &eid, &lane_id).await;
+
+    // Verify: in execution_deadline index
+    let deadline_key = idx.execution_deadline();
+    let score: Option<String> = tc.client()
+        .cmd("ZSCORE")
+        .arg(&deadline_key)
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .unwrap_or(None);
+    assert!(score.is_some(), "execution should be in execution_deadline index");
+
+    // Expire via ff_expire_execution (simulates execution_deadline scanner)
+    fcall_expire_execution(&tc, &eid, LANE, "execution_deadline").await;
+
+    // Verify: terminal/expired
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
+        terminal_outcome: Some(ff_core::state::TerminalOutcome::Expired),
+        public_state: Some(ff_core::state::PublicState::Expired),
+        ..Default::default()
+    }).await;
+    assert_state_vector_complete(&tc, &eid).await;
+    assert_public_state_consistent(&tc, &eid).await;
+
+    // Verify: NOT in eligible set (runnable path cleaned it up)
+    assert_not_in_eligible(&tc, &eid, &lane_id).await;
+
+    // Verify: IN terminal set
+    assert_in_terminal(&tc, &eid, &lane_id).await;
+
+    // Verify: execution_deadline index cleaned
+    let score_after: Option<String> = tc.client()
+        .cmd("ZSCORE")
+        .arg(&deadline_key)
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .unwrap_or(None);
+    assert!(score_after.is_none(), "should be removed from execution_deadline index");
+
+    // Verify: attempt_state is pending_first_attempt (no attempt existed)
+    let att_state = tc.hget(&ctx.core(), "attempt_state").await;
+    assert_eq!(att_state.as_deref(), Some("pending_first_attempt"),
+        "runnable execution should keep pending_first_attempt");
+
+    // Verify: failure_reason captures the deadline type
+    let fr = tc.hget(&ctx.core(), "failure_reason").await;
+    assert_eq!(fr.as_deref(), Some("execution_deadline"));
+}

@@ -95,6 +95,9 @@ impl ServerConfig {
             flow_projector_interval: Duration::from_secs(
                 env_u64("FF_FLOW_PROJECTOR_INTERVAL_S", 15)?
             ),
+            execution_deadline_interval: Duration::from_secs(
+                env_u64("FF_EXECUTION_DEADLINE_INTERVAL_S", 5)?
+            ),
         };
 
         Ok(Self {

@@ -24,42 +24,41 @@ pub struct BlockOpKeys<'a> {
 //
 // Lua KEYS (3): budget_usage, budget_limits, budget_def
 // Lua ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms
-
-ff_function! {
-    pub ff_report_usage_and_check(args: ReportUsageArgs) -> ReportUsageResult {
-        keys(k: &BudgetOpKeys<'_>) {
-            k.usage_key.to_string(),
-            k.limits_key.to_string(),
-            k.def_key.to_string(),
-        }
-        argv {
-            args.dimensions.len().to_string(),
-            {
-                // Flatten dimensions + deltas + now_ms into a single string
-                // The macro creates individual ARGV elements, but we need N+N+1 elements.
-                // Use a JSON-encoded list that the Lua unpacks... no, the Lua
-                // reads positional args. We need to build a flat representation.
-                //
-                // Workaround: encode as JSON for the wrapper to flatten later.
-                // Actually the ff_function! macro creates Vec<String> from these expressions.
-                // Each expression becomes one element. We need dimension_count + N dims + N deltas + now_ms.
-                //
-                // This doesn't work cleanly with the ff_function! macro since we need
-                // a variable number of ARGV. Use a manual implementation instead.
-                serde_json::to_string(&args.dimensions).unwrap_or_default()
-            },
-            serde_json::to_string(&args.deltas).unwrap_or_default(),
-            args.now.to_string(),
-        }
-    }
-}
-
-// WARNING: ff_report_usage_and_check ARGV IS BROKEN. The Lua expects positional
-// ARGV: [dim_count, dim1, dim2, ..., delta1, delta2, ..., now_ms]. This wrapper
-// serializes dimensions/deltas as JSON strings which the Lua cannot parse.
 //
-// DO NOT USE THIS WRAPPER. Use a manual FCALL that flattens the dimension/delta
-// arrays into positional ARGV elements. See budget_reconciler.rs for reference.
+// Manual implementation because ff_function! macro cannot handle variable-length
+// ARGV. The Lua reads positional args: [dim_count, dim1..dimN, delta1..deltaN, now_ms].
+
+pub async fn ff_report_usage_and_check(
+    conn: &ferriskey::Client,
+    k: &BudgetOpKeys<'_>,
+    args: &ReportUsageArgs,
+) -> Result<ReportUsageResult, ScriptError> {
+    let keys: Vec<String> = vec![
+        k.usage_key.to_string(),
+        k.limits_key.to_string(),
+        k.def_key.to_string(),
+    ];
+
+    // Build flat ARGV: [dim_count, dim1..dimN, delta1..deltaN, now_ms]
+    let dim_count = args.dimensions.len();
+    let mut argv: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+    argv.push(dim_count.to_string());
+    for dim in &args.dimensions {
+        argv.push(dim.clone());
+    }
+    for delta in &args.deltas {
+        argv.push(delta.to_string());
+    }
+    argv.push(args.now.to_string());
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_report_usage_and_check", &key_refs, &argv_refs)
+        .await
+        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+    <ReportUsageResult as FromFcallResult>::from_fcall_result(&raw)
+}
 
 impl FromFcallResult for ReportUsageResult {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {

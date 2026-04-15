@@ -7,7 +7,7 @@ use ff_core::error::ScriptError;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{execution_partition, PartitionConfig};
 use ff_core::types::*;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 
 use crate::SdkError;
@@ -139,6 +139,9 @@ pub struct ClaimedTask {
     renewal_handle: JoinHandle<()>,
     /// Signal to stop renewal (used before consuming self).
     renewal_stop: Arc<Notify>,
+    /// Concurrency permit from the worker's semaphore. Held for the lifetime
+    /// of the task; released on complete/fail/cancel/drop.
+    _concurrency_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ClaimedTask {
@@ -189,7 +192,14 @@ impl ClaimedTask {
             tags,
             renewal_handle,
             renewal_stop,
+            _concurrency_permit: None,
         }
+    }
+
+    /// Attach a concurrency permit from the worker's semaphore.
+    /// The permit is held for the task's lifetime and released on drop.
+    pub(crate) fn set_concurrency_permit(&mut self, permit: OwnedSemaphorePermit) {
+        self._concurrency_permit = Some(permit);
     }
 
     // ── Accessors ──
@@ -245,37 +255,36 @@ impl ClaimedTask {
 
         let now = TimestampMs::now();
 
-        // TODO: Replace with typed ff_script wrapper when Step 1.2 is complete.
-        // KEYS: exec_core, attempt_hash, attempt_usage, lease_current, lease_history,
-        //       lease_expiry, worker_leases, active_index, terminal_index,
-        //       stream_meta, result_key, attempt_timeout
+        // KEYS (12): must match lua/execution.lua ff_complete_execution positional order
+        // exec_core, attempt_hash, lease_expiry_zset, worker_leases,
+        // terminal_zset, lease_current, lease_history, active_index,
+        // stream_meta, result_key, attempt_timeout_zset, execution_deadline_zset
         let keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.attempt_hash(self.attempt_index),
-            ctx.attempt_usage(self.attempt_index),
-            ctx.lease_current(),
-            ctx.lease_history(),
-            idx.lease_expiry(),
-            idx.worker_leases(&self.worker_instance_id),
-            idx.lane_active(&self.lane_id),
-            idx.lane_terminal(&self.lane_id),
-            ctx.stream_meta(self.attempt_index),
-            ctx.result(),
-            idx.attempt_timeout(),
+            ctx.core(),                                        // 1  exec_core
+            ctx.attempt_hash(self.attempt_index),              // 2  attempt_hash
+            idx.lease_expiry(),                                // 3  lease_expiry_zset
+            idx.worker_leases(&self.worker_instance_id),       // 4  worker_leases
+            idx.lane_terminal(&self.lane_id),                  // 5  terminal_zset
+            ctx.lease_current(),                               // 6  lease_current
+            ctx.lease_history(),                               // 7  lease_history
+            idx.lane_active(&self.lane_id),                    // 8  active_index
+            ctx.stream_meta(self.attempt_index),               // 9  stream_meta
+            ctx.result(),                                      // 10 result_key
+            idx.attempt_timeout(),                             // 11 attempt_timeout_zset
+            idx.execution_deadline(),                          // 12 execution_deadline_zset
         ];
 
         let result_bytes = result_payload.unwrap_or_default();
         let result_str = String::from_utf8_lossy(&result_bytes);
 
+        // ARGV (5): must match lua/execution.lua ff_complete_execution positional order
+        // execution_id, lease_id, lease_epoch, attempt_id, result_payload
         let args: Vec<String> = vec![
             self.execution_id.to_string(),
             self.lease_id.to_string(),
             self.lease_epoch.to_string(),
-            self.attempt_index.to_string(),
             self.attempt_id.to_string(),
             result_str.into_owned(),
-            "json".to_owned(), // result_encoding
-            now.to_string(),
         ];
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();

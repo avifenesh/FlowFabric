@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferriskey::{Client, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::*;
+use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
 use crate::task::ClaimedTask;
@@ -36,6 +38,10 @@ pub struct FlowFabricWorker {
     partition_config: PartitionConfig,
     /// Round-robin lane index for multi-lane claim rotation.
     lane_index: AtomicUsize,
+    /// Concurrency limiter: permits = max_concurrent_tasks.
+    /// Each claimed task holds a permit (via OwnedSemaphorePermit in ClaimedTask).
+    /// claim_next() acquires a permit before attempting to claim.
+    concurrency_semaphore: Arc<Semaphore>,
 }
 
 impl FlowFabricWorker {
@@ -66,14 +72,25 @@ impl FlowFabricWorker {
             )));
         }
 
-        // Use default partition config for now.
-        // TODO: Read ff:config:partitions from Valkey (set by ff-server on startup).
-        let partition_config = PartitionConfig::default();
+        // Read partition config from Valkey (set by ff-server on startup).
+        // Falls back to defaults if key doesn't exist (e.g. SDK-only testing).
+        let partition_config = read_partition_config(&client).await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "ff:config:partitions not found, using defaults"
+                );
+                PartitionConfig::default()
+            });
+
+        let max_tasks = config.max_concurrent_tasks.max(1);
+        let concurrency_semaphore = Arc::new(Semaphore::new(max_tasks));
 
         tracing::info!(
             worker_id = %config.worker_id,
             instance_id = %config.worker_instance_id,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+            max_concurrent_tasks = max_tasks,
             "FlowFabricWorker connected"
         );
 
@@ -82,6 +99,7 @@ impl FlowFabricWorker {
             config,
             partition_config,
             lane_index: AtomicUsize::new(0),
+            concurrency_semaphore,
         })
     }
 
@@ -113,6 +131,14 @@ impl FlowFabricWorker {
     /// Returns `Ok(None)` if no eligible execution is found.
     /// Returns `Err` on Valkey errors or script failures.
     pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {
+        // Enforce max_concurrent_tasks: try to acquire a semaphore permit.
+        // try_acquire returns immediately — if no permits available, the worker
+        // is at capacity and should not claim more work.
+        let permit = match self.concurrency_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Ok(None), // At capacity — no claim attempted
+        };
+
         let lane_id = self.next_lane();
         let now = TimestampMs::now();
 
@@ -180,7 +206,13 @@ impl FlowFabricWorker {
                 .claim_execution(&execution_id, &lane_id, &partition, now)
                 .await
             {
-                Ok(task) => return Ok(Some(task)),
+                Ok(mut task) => {
+                    // Transfer concurrency permit to the task. When the task is
+                    // completed/failed/cancelled/dropped the permit returns to
+                    // the semaphore, allowing another claim.
+                    task.set_concurrency_permit(permit);
+                    return Ok(Some(task));
+                }
                 Err(SdkError::Script(ref e)) if is_retryable_claim_error(e) => {
                     tracing::debug!(
                         execution_id = %execution_id,
@@ -546,4 +578,34 @@ fn extract_first_array_string(value: &Value) -> Option<String> {
         },
         _ => None,
     }
+}
+
+/// Read partition config from Valkey's `ff:config:partitions` hash.
+/// Returns Err if the key doesn't exist or can't be read.
+async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkError> {
+    let key = ff_core::keys::global_config_partitions();
+    let fields: HashMap<String, String> = client
+        .hgetall(&key)
+        .await
+        .map_err(|e| SdkError::Valkey(format!("HGETALL {key}: {e}")))?;
+
+    if fields.is_empty() {
+        return Err(SdkError::Config(
+            "ff:config:partitions not found in Valkey".into(),
+        ));
+    }
+
+    let parse = |field: &str, default: u16| -> u16 {
+        fields
+            .get(field)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+
+    Ok(PartitionConfig {
+        num_execution_partitions: parse("num_execution_partitions", 256),
+        num_flow_partitions: parse("num_flow_partitions", 64),
+        num_budget_partitions: parse("num_budget_partitions", 32),
+        num_quota_partitions: parse("num_quota_partitions", 32),
+    })
 }

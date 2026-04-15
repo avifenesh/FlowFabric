@@ -241,20 +241,10 @@ fn test_partition_config() -> PartitionConfig {
 /// 2. If lua/ files don't exist, log a warning and skip
 ///    (tests that need FCALL will fail explicitly)
 async fn load_library_if_available(client: &Client) {
-    // Try to check if library is already loaded
-    let version_result: ferriskey::Result<String> = client
-        .fcall("ff_version", &[] as &[&str], &[] as &[&str])
-        .await;
-
-    match version_result {
-        Ok(v) => {
-            tracing::info!(version = %v, "flowfabric library already loaded");
-            return;
-        }
-        Err(_) => {
-            tracing::debug!("flowfabric library not loaded, attempting to load from lua/ files");
-        }
-    }
+    // Always reload from lua/ source files to pick up any code changes.
+    // Previous behavior skipped reload if ff_version succeeded, which caused
+    // tests to run against stale Lua code after editing lua/ files.
+    tracing::debug!("loading flowfabric library from lua/ files (always reload)");
 
     // Try loading from lua/ source files
     let lua_source = build_lua_library_from_source();

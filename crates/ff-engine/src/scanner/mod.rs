@@ -7,6 +7,7 @@
 
 pub mod attempt_timeout;
 pub mod budget_reconciler;
+pub mod execution_deadline;
 pub mod budget_reset;
 pub mod delayed_promoter;
 pub mod dependency_reconciler;

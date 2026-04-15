@@ -118,6 +118,10 @@ redis.register_function('ff_change_priority', function(keys, args)
 
   local old_priority = tonumber(core.priority or "0")
 
+  -- Clamp to safe range (same as ff_create_execution)
+  if A.new_priority < 0 then A.new_priority = 0 end
+  if A.new_priority > 9000 then A.new_priority = 9000 end
+
   -- 2. Update exec_core priority
   redis.call("HSET", K.core_key,
     "priority", tostring(A.new_priority),

@@ -92,7 +92,7 @@ impl Scanner for AttemptTimeoutScanner {
         let lane = self.lanes.first().cloned().unwrap_or_else(|| LaneId::new("default"));
 
         for eid_str in &timed_out {
-            match expire_execution(client, &p, &idx, &lane, eid_str, "attempt_timeout").await {
+            match expire_execution_raw(client, &p, &idx, &lane, eid_str, "attempt_timeout").await {
                 Ok(()) => processed += 1,
                 Err(e) => {
                     tracing::warn!(
@@ -123,7 +123,9 @@ impl Scanner for AttemptTimeoutScanner {
 /// reads current_attempt_index from exec_core to find the actual attempt.
 /// Same approach as ff_claim_execution — Lua constructs the real key
 /// from the hash tag when the passed key doesn't match the actual index.
-async fn expire_execution(
+///
+/// Public so execution_deadline scanner can reuse it.
+pub async fn expire_execution_raw(
     client: &ferriskey::Client,
     partition: &Partition,
     idx: &IndexKeys,

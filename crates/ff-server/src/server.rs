@@ -92,6 +92,7 @@ impl Server {
             unblock_interval: config.engine_config.unblock_interval,
             dependency_reconciler_interval: config.engine_config.dependency_reconciler_interval,
             flow_projector_interval: config.engine_config.flow_projector_interval,
+            execution_deadline_interval: config.engine_config.execution_deadline_interval,
         };
         let engine = Engine::start(engine_cfg, client.clone());
 

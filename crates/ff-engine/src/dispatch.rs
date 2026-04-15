@@ -64,13 +64,37 @@ impl PartitionRouter {
 /// Reads outgoing edges from the flow partition, then for each downstream
 /// child, calls FCALL ff_resolve_dependency on the child's partition.
 ///
-/// Returns the number of edges resolved.
+/// If a child is transitioned to terminal (skipped) by the resolution,
+/// cascades dispatch for the skipped child's outgoing edges so that
+/// grandchildren don't wait for the reconciler (up to 15s/level).
 pub async fn dispatch_dependency_resolution(
     client: &ferriskey::Client,
     router: &PartitionRouter,
     eid: &ExecutionId,
     flow_id: Option<&str>,
 ) {
+    dispatch_dependency_resolution_inner(client, router, eid, flow_id, 0).await;
+}
+
+/// Max cascade depth to prevent runaway recursion on degenerate graphs.
+const MAX_CASCADE_DEPTH: u32 = 50;
+
+async fn dispatch_dependency_resolution_inner(
+    client: &ferriskey::Client,
+    router: &PartitionRouter,
+    eid: &ExecutionId,
+    flow_id: Option<&str>,
+    cascade_depth: u32,
+) {
+    if cascade_depth > MAX_CASCADE_DEPTH {
+        tracing::warn!(
+            execution_id = %eid,
+            cascade_depth,
+            "dispatch_dep: cascade depth limit reached, reconciler will catch remaining"
+        );
+        return;
+    }
+
     let flow_id_str = match flow_id {
         Some(fid) if !fid.is_empty() => fid,
         _ => return, // not in a flow
@@ -146,6 +170,7 @@ pub async fn dispatch_dependency_resolution(
 
     let now_ms = ff_core::types::TimestampMs::now().0.to_string();
     let mut resolved: u32 = 0;
+    let mut skipped_children: Vec<(ExecutionId, String)> = Vec::new();
 
     for edge_id in &edge_ids {
         // Read the edge record from flow partition to find downstream_execution_id
@@ -232,7 +257,7 @@ pub async fn dispatch_dependency_resolution(
             .fcall::<ferriskey::Value>("ff_resolve_dependency", &keys, &argv)
             .await
         {
-            Ok(_) => {
+            Ok(val) => {
                 resolved += 1;
                 tracing::debug!(
                     edge_id = edge_id.as_str(),
@@ -240,6 +265,14 @@ pub async fn dispatch_dependency_resolution(
                     outcome = upstream_outcome,
                     "dispatch_dep: resolved dependency"
                 );
+                // Check if child was skipped (transitioned to terminal).
+                // If so, cascade dispatch for the child's outgoing edges.
+                if is_child_skipped_result(&val) {
+                    skipped_children.push((
+                        downstream_eid.clone(),
+                        flow_id_str.to_string(),
+                    ));
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -258,7 +291,39 @@ pub async fn dispatch_dependency_resolution(
             flow_id = flow_id_str,
             resolved,
             total_edges = edge_ids.len(),
+            skipped_cascade = skipped_children.len(),
             "dispatch_dep: dependency resolution complete"
         );
+    }
+
+    // Cascade: dispatch for children that were skipped by dependency
+    // impossibility. Without this, grandchildren stay blocked until the
+    // dependency_reconciler picks them up (up to reconciler_interval per level).
+    for (child_eid, child_flow_id) in &skipped_children {
+        Box::pin(dispatch_dependency_resolution_inner(
+            client, router, child_eid, Some(child_flow_id.as_str()),
+            cascade_depth + 1,
+        )).await;
+    }
+}
+
+/// Check if an ff_resolve_dependency result indicates the child was skipped.
+/// Result format: [1, "OK", "impossible", "child_skipped"]
+fn is_child_skipped_result(value: &ferriskey::Value) -> bool {
+    match value {
+        ferriskey::Value::Array(arr) => {
+            arr.get(3)
+                .and_then(|v| match v {
+                    Ok(ferriskey::Value::BulkString(b)) => {
+                        Some(&b[..] == b"child_skipped")
+                    }
+                    Ok(ferriskey::Value::SimpleString(s)) => {
+                        Some(s == "child_skipped")
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false)
+        }
+        _ => false,
     }
 }

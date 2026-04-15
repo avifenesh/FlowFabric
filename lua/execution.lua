@@ -50,6 +50,14 @@ redis.register_function('ff_create_execution', function(keys, args)
   local t = redis.call("TIME")
   local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
+  -- Clamp priority to [0, 9000]. The composite eligible-ZSET score formula
+  -- -(priority * 1_000_000_000_000) + created_at uses Lua doubles (IEEE 754,
+  -- 53-bit mantissa). priority > 9007 overflows the multiplication step;
+  -- priority > ~8300 overflows the combined score when created_at is added.
+  -- Clamping to 9000 keeps a safe margin while supporting 4+ orders of magnitude.
+  if A.priority < 0 then A.priority = 0 end
+  if A.priority > 9000 then A.priority = 9000 end
+
   -- 1. Idempotency check
   if is_set(A.dedup_ttl_ms) and is_set(A.idem_key) then
     local existing = redis.call("GET", K.idem_key)
@@ -1180,7 +1188,18 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
 
     redis.call("DEL", K.lease_current_key)
     redis.call("ZREM", K.lease_expiry_key, A.execution_id)
+    redis.call("SREM", K.worker_leases_key, A.execution_id)
+    -- Dynamic worker_leases SREM: K.worker_leases_key targets the NEW (reclaiming)
+    -- worker's set, but the entry is in the OLD (expired) worker's set. Use
+    -- current_worker_instance_id from exec_core to SREM from the correct set.
+    local wiid = core.current_worker_instance_id or ""
+    if wiid ~= "" then
+      local tag_wl = string.match(K.core_key, "(%b{})")
+      redis.call("SREM", "ff:idx:" .. tag_wl .. ":worker:" .. wiid .. ":leases", A.execution_id)
+    end
     redis.call("ZREM", K.active_index_key, A.execution_id)
+    redis.call("ZREM", K.attempt_timeout_key, A.execution_id)
+    redis.call("ZREM", K.execution_deadline_key, A.execution_id)
 
     -- ZADD terminal (construct key from hash tag + lane)
     local tag = string.match(K.core_key, "(%b{})")
@@ -1379,6 +1398,14 @@ redis.register_function('ff_expire_execution', function(keys, args)
     redis.call("DEL", K.lease_current_key)
     redis.call("ZREM", K.lease_expiry_key, A.execution_id)
     redis.call("SREM", K.worker_leases_key, A.execution_id)
+    -- Dynamic worker_leases SREM: the scanner passes empty WorkerInstanceId
+    -- in KEYS[7] (it can't know which worker holds the lease). Use the actual
+    -- worker_instance_id from exec_core to SREM from the correct set.
+    local wiid = core.current_worker_instance_id or ""
+    if wiid ~= "" then
+      local tag = string.match(K.core_key, "(%b{})")
+      redis.call("SREM", "ff:idx:" .. tag .. ":worker:" .. wiid .. ":leases", A.execution_id)
+    end
     redis.call("ZREM", K.active_index_key, A.execution_id)
     -- Lease history
     redis.call("XADD", K.lease_history_key, "MAXLEN", "~", "1000", "*",
@@ -1414,6 +1441,42 @@ redis.register_function('ff_expire_execution', function(keys, args)
     -- ZREM from suspended indexes
     redis.call("ZREM", K.suspended_zset, A.execution_id)
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
+  end
+
+  -- PATH: Runnable (execution_deadline fires while execution is waiting/delayed/blocked)
+  -- These indexes are not in the 14 KEYS array, so construct dynamically from
+  -- hash tag + lane_id (same C2 pattern as ff_cancel_execution).
+  if core.lifecycle_phase == "runnable" then
+    local tag = string.match(K.core_key, "(%b{})")
+    local lane = core.lane_id or core.current_lane or "default"
+    local es = core.eligibility_state or ""
+
+    if es == "eligible_now" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":eligible", A.execution_id)
+    elseif es == "not_eligible_until_time" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":delayed", A.execution_id)
+    elseif es == "blocked_by_dependencies" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":blocked:dependencies", A.execution_id)
+    elseif es == "blocked_by_budget" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":blocked:budget", A.execution_id)
+    elseif es == "blocked_by_quota" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":blocked:quota", A.execution_id)
+    elseif es == "blocked_by_route" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":blocked:route", A.execution_id)
+    elseif es == "blocked_by_operator" then
+      redis.call("ZREM", "ff:idx:" .. tag .. ":lane:" .. lane .. ":blocked:operator", A.execution_id)
+    else
+      -- Defensive catch-all: handles blocked_by_lane_state and any future
+      -- eligibility states. ZREM from ALL runnable-state indexes — idempotent.
+      local lp = "ff:idx:" .. tag .. ":lane:" .. lane
+      redis.call("ZREM", lp .. ":eligible", A.execution_id)
+      redis.call("ZREM", lp .. ":delayed", A.execution_id)
+      redis.call("ZREM", lp .. ":blocked:dependencies", A.execution_id)
+      redis.call("ZREM", lp .. ":blocked:budget", A.execution_id)
+      redis.call("ZREM", lp .. ":blocked:quota", A.execution_id)
+      redis.call("ZREM", lp .. ":blocked:route", A.execution_id)
+      redis.call("ZREM", lp .. ":blocked:operator", A.execution_id)
+    end
   end
 
   -- ALL PATHS: terminal transition

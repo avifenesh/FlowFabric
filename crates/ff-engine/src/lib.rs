@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use dispatch::PartitionRouter;
 use scanner::ScannerRunner;
 use scanner::attempt_timeout::AttemptTimeoutScanner;
+use scanner::execution_deadline::ExecutionDeadlineScanner;
 use scanner::budget_reconciler::BudgetReconciler;
 use scanner::budget_reset::BudgetResetScanner;
 use scanner::delayed_promoter::DelayedPromoter;
@@ -59,6 +60,8 @@ pub struct EngineConfig {
     pub dependency_reconciler_interval: Duration,
     /// Flow summary projector interval. Default: 15s.
     pub flow_projector_interval: Duration,
+    /// Execution deadline scanner interval. Default: 5s.
+    pub execution_deadline_interval: Duration,
 }
 
 impl Default for EngineConfig {
@@ -79,6 +82,7 @@ impl Default for EngineConfig {
             unblock_interval: Duration::from_secs(5),
             dependency_reconciler_interval: Duration::from_secs(15),
             flow_projector_interval: Duration::from_secs(15),
+            execution_deadline_interval: Duration::from_secs(5),
         }
     }
 }
@@ -218,7 +222,7 @@ impl Engine {
         // Dependency reconciler (iterates execution partitions)
         let dep_reconciler = Arc::new(DependencyReconciler::new(
             config.dependency_reconciler_interval,
-            config.lanes,
+            config.lanes.clone(),
             config.partition_config,
         ));
         handles.push(ScannerRunner::spawn(
@@ -246,8 +250,20 @@ impl Engine {
         ));
         handles.push(ScannerRunner::spawn(
             flow_projector,
-            client,
+            client.clone(),
             config.partition_config.num_flow_partitions,
+            shutdown_rx.clone(),
+        ));
+
+        // Execution deadline scanner (iterates execution partitions)
+        let deadline_scanner = Arc::new(ExecutionDeadlineScanner::new(
+            config.execution_deadline_interval,
+            config.lanes,
+        ));
+        handles.push(ScannerRunner::spawn(
+            deadline_scanner,
+            client,
+            num_partitions,
             shutdown_rx,
         ));
 
@@ -256,7 +272,7 @@ impl Engine {
             budget_partitions = config.partition_config.num_budget_partitions,
             quota_partitions = config.partition_config.num_quota_partitions,
             flow_partitions = config.partition_config.num_flow_partitions,
-            "engine started with 13 scanners"
+            "engine started with 14 scanners"
         );
 
         Self {
