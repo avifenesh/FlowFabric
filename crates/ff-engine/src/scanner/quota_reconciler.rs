@@ -114,10 +114,8 @@ async fn scan_quota_ids(
 
         for key in keys {
             // Only take definition keys (no :window:, :concurrency, :admitted: suffix)
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                if !rest.contains(':') {
-                    quota_ids.push(rest.to_string());
-                }
+            if let Some(rest) = key.strip_prefix(&prefix) && !rest.contains(':') {
+                quota_ids.push(rest.to_string());
             }
         }
 
@@ -152,32 +150,31 @@ async fn reconcile_one_quota(
         .await?;
 
     // 2. Clean expired entries from the requests_per_window sliding window ZSET
-    if let Some(ref ws) = window_secs {
-        if let Ok(secs) = ws.parse::<u64>() {
-            if secs > 0 {
-                let window_ms = secs * 1000;
-                let window_key =
-                    format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id);
-                let cutoff = now_ms.saturating_sub(window_ms);
+    if let Some(ref ws) = window_secs
+        && let Ok(secs) = ws.parse::<u64>()
+        && secs > 0
+    {
+        let window_ms = secs * 1000;
+        let window_key =
+            format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id);
+        let cutoff = now_ms.saturating_sub(window_ms);
 
-                let removed: u32 = client
-                    .cmd("ZREMRANGEBYSCORE")
-                    .arg(&window_key)
-                    .arg("-inf")
-                    .arg(cutoff.to_string().as_str())
-                    .execute()
-                    .await
-                    .unwrap_or(0);
+        let removed: u32 = client
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(&window_key)
+            .arg("-inf")
+            .arg(cutoff.to_string().as_str())
+            .execute()
+            .await
+            .unwrap_or(0);
 
-                if removed > 0 {
-                    did_work = true;
-                    tracing::debug!(
-                        quota_id,
-                        removed,
-                        "quota_reconciler: trimmed expired window entries"
-                    );
-                }
-            }
+        if removed > 0 {
+            did_work = true;
+            tracing::debug!(
+                quota_id,
+                removed,
+                "quota_reconciler: trimmed expired window entries"
+            );
         }
     }
 
@@ -197,46 +194,45 @@ async fn reconcile_one_quota(
         .execute()
         .await?;
 
-    if let Some(ref cap_str) = concurrency_cap {
-        if let Ok(cap) = cap_str.parse::<u64>() {
-            if cap > 0 {
-                let counter_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
+    if let Some(ref cap_str) = concurrency_cap
+        && let Ok(cap) = cap_str.parse::<u64>()
+        && cap > 0
+    {
+        let counter_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
 
-                // Count live admitted:* guard keys for this quota.
-                // These keys have TTL = window_ms and auto-expire when the
-                // admission window closes. The count of live keys IS the
-                // true concurrency count.
-                let pattern = format!("ff:quota:{}:{}:admitted:*", tag, quota_id);
-                let actual_count = count_keys_by_pattern(client, &pattern).await;
+        // Count live admitted:* guard keys for this quota.
+        // These keys have TTL = window_ms and auto-expire when the
+        // admission window closes. The count of live keys IS the
+        // true concurrency count.
+        let pattern = format!("ff:quota:{}:{}:admitted:*", tag, quota_id);
+        let actual_count = count_keys_by_pattern(client, &pattern).await;
 
-                // Read stored counter
-                let stored: Option<String> = client
-                    .cmd("GET")
-                    .arg(&counter_key)
-                    .execute()
-                    .await?;
-                let stored_count: i64 = stored
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+        // Read stored counter
+        let stored: Option<String> = client
+            .cmd("GET")
+            .arg(&counter_key)
+            .execute()
+            .await?;
+        let stored_count: i64 = stored
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
-                // Correct if drifted (counter > actual live keys)
-                if stored_count != actual_count as i64 {
-                    let _: () = client
-                        .cmd("SET")
-                        .arg(&counter_key)
-                        .arg(actual_count.to_string().as_str())
-                        .execute()
-                        .await?;
-                    tracing::info!(
-                        quota_id,
-                        stored = stored_count,
-                        actual = actual_count,
-                        "quota_reconciler: corrected concurrency counter drift"
-                    );
-                    did_work = true;
-                }
-            }
+        // Correct if drifted (counter > actual live keys)
+        if stored_count != actual_count as i64 {
+            let _: () = client
+                .cmd("SET")
+                .arg(&counter_key)
+                .arg(actual_count.to_string().as_str())
+                .execute()
+                .await?;
+            tracing::info!(
+                quota_id,
+                stored = stored_count,
+                actual = actual_count,
+                "quota_reconciler: corrected concurrency counter drift"
+            );
+            did_work = true;
         }
     }
 

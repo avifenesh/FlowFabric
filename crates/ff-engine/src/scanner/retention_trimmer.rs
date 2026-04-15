@@ -132,6 +132,7 @@ impl Scanner for RetentionTrimmer {
 
 /// Purge all keys for one terminal execution. Returns Ok(true) if purged,
 /// Ok(false) if skipped (custom retention not yet due).
+#[allow(clippy::too_many_arguments)]
 async fn purge_execution(
     client: &ferriskey::Client,
     partition: &Partition,

@@ -89,6 +89,7 @@ impl Scanner for UnblockScanner {
 }
 
 /// Scan one blocked set and unblock executions whose condition has cleared.
+#[allow(clippy::too_many_arguments)]
 async fn scan_blocked_set(
     client: &ferriskey::Client,
     partition: &Partition,

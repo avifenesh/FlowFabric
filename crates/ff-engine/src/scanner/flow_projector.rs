@@ -123,10 +123,10 @@ async fn scan_flow_ids(
 
         for key in keys {
             // Key format: ff:flow:{fp:N}:<flow_id>:core
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                if let Some(fid) = rest.strip_suffix(":core") {
-                    flow_ids.push(fid.to_string());
-                }
+            if let Some(rest) = key.strip_prefix(&prefix)
+                && let Some(fid) = rest.strip_suffix(":core")
+            {
+                flow_ids.push(fid.to_string());
             }
         }
 

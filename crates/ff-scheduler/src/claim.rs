@@ -497,6 +497,7 @@ impl Scheduler {
 
     /// Block a candidate that failed budget/quota check.
     /// FCALL ff_block_execution_for_admission on {p:N}.
+    #[allow(clippy::too_many_arguments)]
     async fn block_candidate(
         &self,
         partition: &Partition,

@@ -24,6 +24,7 @@ pub struct DepOpKeys<'a> {
 // ARGV (0)
 
 ff_function! {
+    #[allow(unused_variables)]
     pub ff_evaluate_flow_eligibility(args: EvaluateFlowEligibilityArgs) -> EvaluateFlowEligibilityResult {
         keys(k: &DepOpKeys<'_>) {
             k.ctx.core(),

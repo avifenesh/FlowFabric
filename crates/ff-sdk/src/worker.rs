@@ -315,7 +315,7 @@ impl FlowFabricWorker {
         // we pass the correct index for documentation/debugging.
         let total_str: Option<String> = self.client
             .cmd("HGET")
-            .arg(&ctx.core())
+            .arg(ctx.core())
             .arg("total_attempt_count")
             .execute()
             .await
@@ -473,7 +473,7 @@ impl FlowFabricWorker {
         // Pre-read current_attempt_index for the existing attempt hash key.
         let att_idx_str: Option<String> = self.client
             .cmd("HGET")
-            .arg(&ctx.core())
+            .arg(ctx.core())
             .arg("current_attempt_index")
             .execute()
             .await

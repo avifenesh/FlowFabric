@@ -159,10 +159,8 @@ async fn reconcile_one_budget(
         .await?;
 
     // Skip resetting budgets — cannot reconcile by summing all-time usage
-    if let Some(ref rp) = reset_policy {
-        if !rp.is_empty() {
-            return Ok(false);
-        }
+    if let Some(ref rp) = reset_policy && !rp.is_empty() {
+        return Ok(false);
     }
 
     // Read current usage counters

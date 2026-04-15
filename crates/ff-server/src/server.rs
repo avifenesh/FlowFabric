@@ -238,7 +238,7 @@ impl Server {
         let dyn_fields: Vec<Option<String>> = self
             .client
             .cmd("HMGET")
-            .arg(&ctx.core())
+            .arg(ctx.core())
             .arg("current_attempt_index")
             .arg("current_waitpoint_id")
             .arg("current_worker_instance_id")
