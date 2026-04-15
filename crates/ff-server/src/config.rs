@@ -23,6 +23,8 @@ pub struct ServerConfig {
     pub engine_config: EngineConfig,
     /// Skip library loading (for tests where TestCluster already loaded it).
     pub skip_library_load: bool,
+    /// Allowed CORS origins. `["*"]` means permissive (all origins).
+    pub cors_origins: Vec<String>,
 }
 
 impl ServerConfig {
@@ -40,6 +42,7 @@ impl ServerConfig {
     /// | `FF_FLOW_PARTITIONS` | `64` | Flow partition count |
     /// | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
     /// | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
+    /// | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins (`*` = permissive) |
     /// | `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease expiry scanner interval |
     /// | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed promoter interval |
     /// | `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval |
@@ -49,6 +52,11 @@ impl ServerConfig {
         let tls = env_bool("FF_TLS");
         let cluster = env_bool("FF_CLUSTER");
         let listen_addr = env_or("FF_LISTEN_ADDR", "0.0.0.0:9090");
+        let cors_origins: Vec<String> = env_or("FF_CORS_ORIGINS", "*")
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         let lanes: Vec<LaneId> = env_or("FF_LANES", "default")
             .split(',')
@@ -127,6 +135,7 @@ impl ServerConfig {
             listen_addr,
             engine_config,
             skip_library_load: false,
+            cors_origins,
         })
     }
 }
@@ -149,6 +158,7 @@ impl Default for ServerConfig {
                 ..Default::default()
             },
             skip_library_load: false,
+            cors_origins: vec!["*".to_owned()],
         }
     }
 }
