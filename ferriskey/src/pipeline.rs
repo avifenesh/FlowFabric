@@ -19,7 +19,7 @@ pub struct Pipeline {
 }
 
 /// A pipeline allows you to send multiple commands in one go to the
-/// redis server.  API wise it's very similar to just using a command
+/// Valkey server.  API wise it's very similar to just using a command
 /// but it allows multiple commands to be chained and some features such
 /// as iteration are not available.
 ///

@@ -1,4 +1,4 @@
-use crate::connection::{AsyncStream, RedisRuntime};
+use crate::connection::{AsyncStream, ValkeyRuntime};
 use crate::value::Result;
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -101,7 +101,7 @@ impl AsyncRead for Tokio {
 }
 
 #[async_trait]
-impl RedisRuntime for Tokio {
+impl ValkeyRuntime for Tokio {
     async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> Result<Self> {
         Ok(connect_tcp(&socket_addr, tcp_nodelay)
             .await

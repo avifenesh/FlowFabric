@@ -527,15 +527,7 @@ impl ReconnectingConnection {
         client.update_password(new_password);
     }
 
-    /// Updates the database ID that's saved inside connection_info, that will be used in case of disconnection from the server.
-    ///
-    /// This method is called when a SELECT command is successfully executed to track the current database.
-    /// During reconnection, the stored database ID will be automatically used to re-select the correct
-    /// database via a SELECT command during connection establishment.
-    ///
-    /// # Arguments
-    /// * `new_database_id` - The database ID to store for future reconnections
-    ///
+    /// Updates the database ID in connection_info (used on reconnect).
     pub(crate) fn update_connection_database(&self, new_database_id: i64) {
         let mut client = self
             .inner
@@ -557,14 +549,7 @@ impl ReconnectingConnection {
         client.update_client_name(new_client_name);
     }
 
-    /// Updates the username that's saved inside connection_info, that will be used in case of disconnection from the server.
-    ///
-    /// This method is called when an AUTH command is successfully executed with a username to track the current user.
-    /// During reconnection, the stored username will be automatically used for authentication.
-    ///
-    /// # Arguments
-    /// * `new_username` - The username to store for future reconnections (None to clear)
-    ///
+    /// Updates the username in connection_info (used on reconnect).
     pub(crate) fn update_connection_username(&self, new_username: Option<String>) {
         let mut client = self
             .inner
@@ -575,14 +560,7 @@ impl ReconnectingConnection {
         client.update_username(new_username);
     }
 
-    /// Updates the protocol version that's saved inside connection_info, that will be used in case of disconnection from the server.
-    ///
-    /// This method is called when a HELLO command is successfully executed to track the current protocol version.
-    /// During reconnection, the stored protocol version will be automatically used for connection establishment.
-    ///
-    /// # Arguments
-    /// * `new_protocol` - The protocol version to store for future reconnections
-    ///
+    /// Updates the protocol version in connection_info (used on reconnect).
     pub(crate) fn update_connection_protocol(&self, new_protocol: crate::value::ProtocolVersion) {
         let mut client = self
             .inner

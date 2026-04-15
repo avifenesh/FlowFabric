@@ -1,4 +1,4 @@
-//! This module provides async functionality for Redis Cluster.
+//! This module provides async functionality for Valkey Cluster.
 //!
 //! By default, [`ClusterConnection`] makes use of [`MultiplexedConnection`] and maintains a pool
 //! of connections to each node in the cluster. While it  generally behaves similarly to

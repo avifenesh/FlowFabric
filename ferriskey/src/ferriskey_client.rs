@@ -20,7 +20,7 @@ pub use crate::value::ToArgs;
 
 pub type Result<T> = crate::value::Result<T>;
 
-/// High-level Valkey/Redis client with convenience methods for common operations.
+/// High-level Valkey client with convenience methods for common operations.
 #[derive(Clone)]
 pub struct Client(Arc<ClientInner>);
 
@@ -47,14 +47,14 @@ struct SharedConnectionOptions {
 }
 
 impl Client {
-    /// Connect to a standalone Valkey/Redis server by URL.
+    /// Connect to a standalone Valkey server by URL.
     pub async fn connect(url: &str) -> Result<Client> {
         let request = connection_request_from_url(url, false)?;
         let inner = ClientInner::new(request, None).await?;
         Ok(Self(Arc::new(inner)))
     }
 
-    /// Connect to a Valkey/Redis cluster using one or more seed node URLs.
+    /// Connect to a Valkey cluster using one or more seed node URLs.
     pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
         if urls.is_empty() {
             return Err(Error::from((
@@ -111,7 +111,7 @@ impl Client {
 
     /// Set a key to a value and return the old value.
     ///
-    /// Uses `SET key value GET` (the GETSET command is deprecated since Redis 6.2).
+    /// Uses `SET key value GET` (the GETSET command is deprecated since Valkey/Redis 6.2).
     pub async fn get_set<T: FromValue>(
         &self,
         key: impl ToArgs,

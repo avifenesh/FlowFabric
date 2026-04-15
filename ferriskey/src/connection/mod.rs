@@ -25,7 +25,7 @@ pub mod tokio;
 
 /// Represents the ability of connecting via TCP or via Unix socket
 #[async_trait]
-pub(crate) trait RedisRuntime: AsyncStream + Send + Sync + Sized + 'static {
+pub(crate) trait ValkeyRuntime: AsyncStream + Send + Sync + Sized + 'static {
     /// Performs a TCP connection
     async fn connect_tcp(socket_addr: SocketAddr, tcp_nodelay: bool) -> Result<Self>;
 
@@ -292,7 +292,7 @@ pub(crate) async fn get_socket_addrs(
     }
 }
 
-pub(crate) async fn connect_simple<T: RedisRuntime>(
+pub(crate) async fn connect_simple<T: ValkeyRuntime>(
     connection_info: &crate::connection::info::ConnectionInfo,
     _socket_addr: Option<SocketAddr>,
     tcp_nodelay: bool,
