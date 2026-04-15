@@ -115,9 +115,14 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
     now_ms       = args[3],
   }
 
-  -- 1. Validate flow exists
+  -- 1. Validate flow exists and is not terminal
   local raw = redis.call("HGETALL", K.flow_core)
   if #raw == 0 then return err("flow_not_found") end
+  local flow = hgetall_to_table(raw)
+  local pfs = flow.public_flow_state or ""
+  if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
+    return err("flow_already_terminal")
+  end
 
   -- 2. Idempotency: already a member
   if redis.call("SISMEMBER", K.members_set, A.execution_id) == 1 then
@@ -231,6 +236,12 @@ redis.register_function('ff_stage_dependency_edge', function(keys, args)
   local raw = redis.call("HGETALL", K.flow_core)
   if #raw == 0 then return err("flow_not_found") end
   local flow = hgetall_to_table(raw)
+
+  -- 2b. Reject mutations on terminal flows
+  local pfs = flow.public_flow_state or ""
+  if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
+    return err("flow_already_terminal")
+  end
 
   -- 3. Check graph_revision
   if tostring(flow.graph_revision or "0") ~= A.expected_graph_revision then

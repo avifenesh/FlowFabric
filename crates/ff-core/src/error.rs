@@ -231,6 +231,10 @@ pub enum ScriptError {
     #[error("self_referencing_edge: upstream and downstream are the same")]
     SelfReferencingEdge,
 
+    /// Flow is already in a terminal state (cancelled/completed/failed).
+    #[error("flow_already_terminal: flow is already terminal")]
+    FlowAlreadyTerminal,
+
     /// Dependencies not yet satisfied (for promote_blocked_to_eligible).
     #[error("deps_not_satisfied: dependencies still unresolved")]
     DepsNotSatisfied,
@@ -384,6 +388,7 @@ impl ScriptError {
             | Self::ExecutionNotInFlow
             | Self::DependencyAlreadyExists
             | Self::SelfReferencingEdge
+            | Self::FlowAlreadyTerminal
             | Self::InvalidWaitpointForExecution
             | Self::InvalidBlockingReason
             | Self::NotRunnable
@@ -507,6 +512,7 @@ impl ScriptError {
             "execution_not_in_flow" => Self::ExecutionNotInFlow,
             "dependency_already_exists" => Self::DependencyAlreadyExists,
             "self_referencing_edge" => Self::SelfReferencingEdge,
+            "flow_already_terminal" => Self::FlowAlreadyTerminal,
             "deps_not_satisfied" => Self::DepsNotSatisfied,
             "not_blocked_by_deps" => Self::NotBlockedByDeps,
             "not_runnable" => Self::NotRunnable,
@@ -645,6 +651,7 @@ mod tests {
             // Phase 5+6 additions:
             "flow_not_found", "execution_not_in_flow",
             "dependency_already_exists", "self_referencing_edge",
+            "flow_already_terminal",
             "deps_not_satisfied", "not_blocked_by_deps",
             "not_runnable", "terminal", "invalid_blocking_reason",
             "waitpoint_not_pending", "pending_waitpoint_expired",
@@ -706,6 +713,21 @@ mod tests {
             "stale_graph_revision",
             "execution_already_in_flow",
             "cycle_detected",
+            "flow_not_found",
+            "execution_not_in_flow",
+            "dependency_already_exists",
+            "self_referencing_edge",
+            "flow_already_terminal",
+            "deps_not_satisfied",
+            "not_blocked_by_deps",
+            "not_runnable",
+            "terminal",
+            "invalid_blocking_reason",
+            "waitpoint_not_pending",
+            "pending_waitpoint_expired",
+            "invalid_waitpoint_for_execution",
+            "waitpoint_already_exists",
+            "waitpoint_not_open",
             "ok_already_applied",
             "attempt_not_found",
             "attempt_not_in_created_state",

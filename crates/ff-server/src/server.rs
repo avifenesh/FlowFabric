@@ -1362,15 +1362,16 @@ fn parse_deliver_signal_result(
     if status == 1 {
         let sub = fcall_field_str(arr, 1);
         if sub == "DUPLICATE" {
+            // ok_duplicate(existing_signal_id) → {1, "DUPLICATE", existing_signal_id}
             Ok(DeliverSignalResult::Duplicate {
                 existing_signal_id: signal_id.clone(),
             })
         } else {
-            // Effect is in field 2 (e.g., "recorded", "resumed", "buffered")
-            let effect = fcall_field_str(arr, 2);
+            // ok(signal_id, effect) → {1, "OK", signal_id, effect}
+            let effect = fcall_field_str(arr, 3);
             Ok(DeliverSignalResult::Accepted {
                 signal_id: signal_id.clone(),
-                effect: if effect.is_empty() { sub } else { effect },
+                effect,
             })
         }
     } else {
