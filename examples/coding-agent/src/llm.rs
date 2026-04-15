@@ -71,7 +71,8 @@ impl LlmClient {
             .choices
             .first()
             .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
+            .filter(|s| !s.is_empty())
+            .ok_or("LLM returned empty response")?;
 
         let usage = chat_resp.usage.unwrap_or(Usage {
             prompt_tokens: 0,
