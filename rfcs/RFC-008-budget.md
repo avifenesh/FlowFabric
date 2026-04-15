@@ -484,6 +484,43 @@ ff:quota_attach:{q:K}:{scope_type}:{scope_id}  →  SET
   member: quota_policy_id
 ```
 
+#### 4.3a Budget Creation (Valkey Function)
+
+`ff_create_budget` — registered in the `flowfabric` library. Idempotent budget policy creation with N-dimensional limits. If the budget already exists, returns `ALREADY_SATISFIED` without modifying state.
+
+```lua
+-- KEYS (on budget partition {b:M}):
+--   [1] budget_def_hash
+--   [2] budget_limits_hash
+--   [3] budget_usage_hash
+--   [4] budget_resets_zset
+-- ARGV:
+--   [1] budget_id, [2] scope_type, [3] scope_id, [4] enforcement_mode,
+--   [5] on_hard_limit, [6] on_soft_limit, [7] reset_interval_ms, [8] now_ms,
+--   [9] dimension_count,
+--   [10..10+N-1] dimension names,
+--   [10+N..10+2N-1] hard limits,
+--   [10+2N..10+3N-1] soft limits
+```
+
+Stores definition fields on the budget_def_hash, `hard:<dim>`/`soft:<dim>` pairs on the limits hash, and optionally schedules periodic reset via ZADD on the resets ZSET. Usage hash is left empty (populated on first `ff_report_usage_and_check` call).
+
+#### 4.3b Quota Policy Creation (Valkey Function)
+
+`ff_create_quota_policy` — registered in the `flowfabric` library. Idempotent quota policy creation. Initializes the concurrency counter to 0. Window ZSET is left empty (populated by `ff_check_admission_and_record`).
+
+```lua
+-- KEYS (on quota partition {q:K}):
+--   [1] quota_def_hash
+--   [2] quota_window_zset
+--   [3] quota_concurrency_counter
+-- ARGV:
+--   [1] quota_policy_id, [2] window_seconds, [3] max_requests_per_window,
+--   [4] max_concurrent, [5] now_ms
+```
+
+Stores `requests_per_window_seconds`, `max_requests_per_window`, and `active_concurrency_cap` on the quota definition hash. The field names match what the quota reconciler reads (§6.6).
+
 #### 4.4 Atomic Usage Report + Breach Check (Valkey Function)
 
 `ff_report_usage_and_check` — registered in the `flowfabric` library. **Check-before-increment**: reads current usage, checks limits, only HINRBYs if under limit. Since this runs as a Valkey Function on one `{b:M}` partition, the read-check-write sequence is **atomic** — concurrent calls are serialized by Valkey. This eliminates budget overshoot entirely. Invoked via `FCALL ff_report_usage_and_check <numkeys> <keys...> <args...>`. Returns domain-specific status (`HARD_BREACH`, `SOFT_BREACH`, `OK`) — see RFC-010 §4.9 for mapping to API error names.

@@ -586,7 +586,7 @@ Every periodic background process required by the architecture, consolidated in 
 
 All FlowFabric operations are deployed as a **single Valkey Function library** (`flowfabric`). Functions are loaded via `FUNCTION LOAD REPLACE` on engine startup and persist across Valkey restarts. Invocation uses `FCALL ff_<operation> <numkeys> KEYS... ARGS...` (not EVALSHA). Every function within a single invocation touches only keys sharing one hash tag (`{p:N}`, `{b:M}`, `{q:K}`, or `{fp:N}`).
 
-**Library source layout:** The Lua source is split into domain files for maintainability: `lua/helpers.lua` (shared helpers), `lua/execution.lua` (claim/complete/fail/etc.), `lua/lease.lua` (renew/mark_expired), `lua/suspension.lua`, `lua/signal.lua`, `lua/stream.lua`, `lua/flow.lua`, `lua/budget.lua`, `lua/quota.lua`, `lua/scheduling.lua`, `lua/scanners.lua`. A `build.rs` step in `ff-script` concatenates them with the `#!lua name=flowfabric` preamble into a single blob for `FUNCTION LOAD REPLACE`. `helpers.lua` is always first (shared helpers must be defined before any function that uses them).
+**Library source layout:** The Lua source is split into 11 domain files for maintainability: `lua/helpers.lua` (shared helpers), `lua/version.lua` (ff_version), `lua/execution.lua` (create/claim/complete/fail/cancel/delay/reclaim/expire), `lua/lease.lua` (renew/mark_expired/revoke), `lua/suspension.lua` (suspend/resume/pending_wp/expire/close_wp), `lua/signal.lua` (deliver/buffer/claim_resumed), `lua/stream.lua` (append_frame), `lua/flow.lua` (create_flow/add_member/cancel_flow/stage_edge/apply_dep/resolve_dep/evaluate/promote/replay), `lua/budget.lua` (create_budget/report_usage/reset/unblock/block), `lua/quota.lua` (create_quota_policy/check_admission), `lua/scheduling.lua` (issue_grant/change_priority/update_progress/promote_delayed/issue_reclaim_grant). A `build.rs` step in `ff-script` concatenates them with the `#!lua name=flowfabric` preamble into a single blob for `FUNCTION LOAD REPLACE`. `helpers.lua` is always first (shared helpers must be defined before any function that uses them).
 
 **Concatenated library structure:**
 ```lua
@@ -673,11 +673,15 @@ redis.register_function('ff_claim_execution', function(keys, args) ... end)
 | # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{fp:N}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
 | 29 | `stage_dependency_edge` | RFC-007 | Validate membership + topology, check `expected_graph_revision` matches current (reject with `stale_graph_revision` on mismatch), create edge record, increment graph_revision, create mutation grant. ARGV must include `expected_graph_revision`. | A | 6 | flow_core, members_set, edge_hash, out_adj_set, in_adj_set, grant_hash |
+| — | `create_flow` | RFC-007 | Create flow container. Idempotent (EXISTS → ok_already_satisfied). Sets graph_revision=0, node_count=0, edge_count=0, public_flow_state=open. | A | 2 | flow_core, members_set |
+| — | `add_execution_to_flow` | RFC-007 | Add member to flow. Idempotent (SISMEMBER). Increments node_count + graph_revision. Does NOT set flow_id on exec_core (cross-partition). | A | 2 | flow_core, members_set |
+| — | `cancel_flow` | RFC-007 | Cancel flow. Rejects if terminal. Returns member list for cross-partition cancel dispatch. Sets public_flow_state=cancelled. | A | 2 | flow_core, members_set |
 
 ### 4.3 Budget Partition Functions (`{b:M}`)
 
 | # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{b:M}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
+| — | `create_budget` | RFC-008 | Create budget policy with hard/soft limits on N dimensions. Idempotent. Variable ARGV for dimensions. Schedules periodic reset if reset_interval_ms > 0. | A | 4 | budget_def, budget_limits, budget_usage, budget_resets_zset |
 | 30 | `report_usage_and_check` | RFC-008 | **Check-before-increment.** Read current usage, check hard limits. If any dimension would breach: return HARD_BREACH without incrementing (zero overshoot). If safe: HINCRBY all dimensions, check soft limits. Atomic Lua serialization on `{b:M}` guarantees no concurrent overshoot. | A | 3 | budget_usage, budget_limits, budget_def |
 | 31 | `reset_budget` | RFC-008 | Zero all usage counters, record reset event, compute next_reset_at, re-score in reset index | A | 3 | budget_usage, budget_def, budget_resets_zset |
 
@@ -685,6 +689,7 @@ redis.register_function('ff_claim_execution', function(keys, args) ... end)
 
 | # | Function (`ff_*`) | RFC | Purpose | Class | Key Count | KEYS (all `{q:K}`) |
 |---|-------------|-----|---------|-------|-----------|---------------------|
+| — | `create_quota_policy` | RFC-008 | Create quota/rate-limit policy. Idempotent. Stores window_seconds, max_requests_per_window, active_concurrency_cap. Inits concurrency counter to 0. | A | 3 | quota_def, quota_window_zset, quota_concurrency_counter |
 | 32 | `check_admission_and_record` | RFC-008 | **Idempotent.** Checks admitted guard key (`ff:quota:{q:K}:<policy_id>:admitted:<execution_id>`) — if exists, return `ALREADY_ADMITTED`. Otherwise: sliding-window ZREMRANGEBYSCORE + ZCARD rate check, INCR concurrency check, ZADD (member=execution_id alone, not execution_id:timestamp) + SET NX guard + INCR on admit. Guard TTL = window size. | A | 4 | window_zset, concurrency_counter, quota_def, admitted_guard_key |
 
 ### 4.5 Function Overlap Notes
@@ -718,11 +723,11 @@ The scheduler must dispatch to the correct claim script based on execution state
 | Partition | Function Count | Notes |
 |-----------|---------------|-------|
 | `{p:N}` execution | 30 | All claim/lease/attempt/suspension/signal/stream/promotion/cancel/replay functions. |
-| `{fp:N}` flow | 1 | Topology validation + edge staging. |
-| `{b:M}` budget | 2 | Usage increment + breach check, reset. |
-| `{q:K}` quota | 1 | Admission check + record. |
-| **Total listed** | **34** | Including cross-reference entries for overlap groups. |
-| **Unique `redis.register_function` calls** | **38** | After deduplicating overlap groups A-D + `ff_version`. All registered in one `flowfabric` library. Breakdown: execution.lua (9), lease.lua (3), scheduling.lua (5), suspension.lua (5), signal.lua (3), stream.lua (1), budget.lua (4), quota.lua (1), flow.lua (6), version.lua (1). |
+| `{fp:N}` flow | 4 | Flow lifecycle (create, add member, cancel) + edge staging. |
+| `{b:M}` budget | 3 | Budget create, usage increment + breach check, reset. |
+| `{q:K}` quota | 2 | Quota policy create, admission check + record. |
+| **Total listed** | **39** | Including cross-reference entries for overlap groups. |
+| **Unique `redis.register_function` calls** | **43** | After deduplicating overlap groups A-D + `ff_version`. All registered in one `flowfabric` library. Breakdown: execution.lua (9), lease.lua (3), scheduling.lua (5), suspension.lua (5), signal.lua (3), stream.lua (1), budget.lua (5), quota.lua (2), flow.lua (9), version.lua (1). |
 
 ### 4.8 Implementation Notes for Valkey Functions
 
@@ -2869,7 +2874,7 @@ The Valkey backend must support in v1:
 - Concurrency caps with async reconciliation.
 
 **Background processes:**
-- All 12 scanners/reconcilers listed in §6.
+- All 14 scanners/reconcilers (§6 lists 19 designed; 14 implemented in v1, including execution_deadline added in adversarial round 4).
 - Idempotent, crash-safe, partition-parallel.
 
 ### 9.2 Designed-For but Deferred
@@ -3189,7 +3194,23 @@ Every error code returned by worker-facing scripts, classified by SDK action.
 | `stale_graph_revision` | RETRYABLE | Re-read adjacency, retry. |
 | `execution_already_in_flow` | TERMINAL | Already in another flow. |
 | `cycle_detected` | TERMINAL | Edge would create cycle. Reject. |
+| `flow_not_found` | TERMINAL | Flow does not exist. |
+| `flow_already_terminal` | TERMINAL | Flow is cancelled/completed/failed. Mutation rejected. |
+| `execution_not_in_flow` | TERMINAL | Execution not a member of the specified flow. |
+| `dependency_already_exists` | TERMINAL | Edge already exists between these executions. |
+| `self_referencing_edge` | TERMINAL | Upstream and downstream are the same execution. |
+| `deps_not_satisfied` | INFORMATIONAL | Dependencies still unresolved (for promote_blocked). |
+| `not_blocked_by_deps` | INFORMATIONAL | Execution not blocked by dependencies. |
 | `ok_already_applied` | INFORMATIONAL | Usage seq already processed. No-op. |
+| `no_active_lease` | INFORMATIONAL | Revoke target has no active lease. No-op. |
+| `not_runnable` | TERMINAL | Execution not in runnable state (for block/unblock). |
+| `invalid_blocking_reason` | TERMINAL | Unrecognized blocking reason string. |
+| **RFC-004 Suspension/Waitpoint** | | |
+| `pending_waitpoint_expired` | INFORMATIONAL | Pending waitpoint aged out before suspension committed. |
+| `waitpoint_not_pending` | TERMINAL | Waitpoint not in pending state. |
+| `waitpoint_already_exists` | INFORMATIONAL | Waitpoint already exists (pending or active). |
+| `waitpoint_not_open` | INFORMATIONAL | Waitpoint not in pending or active state. |
+| `invalid_waitpoint_for_execution` | TERMINAL | Waitpoint/execution binding mismatch. |
 | **RFC-002 Attempt** | | |
 | `attempt_not_found` | TERMINAL | Attempt index doesn't exist. |
 | `active_attempt_exists` | BUG | Should never reach — invariant violation. Log + alert. |
@@ -3234,7 +3255,7 @@ Build incrementally. Each phase adds a testable capability. All functions are re
 | **4. Streaming** | append frames, tail, close on terminal | 1: append_frame | Stream retention trimmer | + ff-sdk (+stream append/tail) | RFC-006 |
 | **5. Budget + quota** | usage reporting, breach, admission | 5: report_usage_on_attempt, report_usage_and_check, check_admission_and_record, block_execution, unblock_execution | Budget reset, budget reconciler, quota reconciler, unblock scanner | + ff-engine (report_usage orchestrator), ff-scheduler (+budget/quota checks) | RFC-008, RFC-009 |
 | **6. Flow coordination** | deps, resolution, skip, replay, eligibility | 6: stage_dependency_edge, apply_dependency_to_child, resolve_dependency, replay_execution, evaluate_flow_eligibility, promote_blocked_to_eligible | Dependency reconciler, flow summary projector | + ff-engine (dep resolution dispatch, flow cancellation) | RFC-007 |
-| **Total** | All core paths | **~37 functions** (26 unique after overlap dedup) | 12 scanners | |
+| **Total** | All core paths | **43 functions** (31 unique after overlap dedup) | 14 scanners | |
 
 **Phase 1 is the minimum viable execution engine.** It proves the partition model, claim-grant mechanism, lease fencing, state vector management, and basic operator control (cancel). `renew_lease` is essential even for "Hello World" — without it, every execution expires after 30s. `cancel_execution` is needed for operator control of stuck executions. The delayed promoter is included because `create_delayed_execution` is a Phase 1 submission mode.
 
@@ -3253,17 +3274,17 @@ flowfabric/
 ├── Cargo.toml                       # workspace
 ├── ferriskey/                       # Valkey client (our fork — shaped for FlowFabric)
 ├── lua/                             # split Lua source files → build.rs concatenates
-│   ├── helpers.lua                  #   14 shared library-local helpers
-│   ├── execution.lua                #   ff_create/claim/claim_resumed/complete/fail/cancel/replay/expire/delay/move_to_waiting_children
-│   ├── lease.lua                    #   ff_renew_lease/revoke_lease/reclaim_execution/mark_lease_expired
-│   ├── suspension.lua               #   ff_suspend/resume/cancel_suspension/expire_suspension/create_pending_waitpoint
-│   ├── signal.lua                   #   ff_deliver_signal/buffer_signal/timeout_waitpoint
-│   ├── stream.lua                   #   ff_append_frame
-│   ├── flow.lua                     #   ff_stage_dep_edge/apply_dep_to_child/resolve_dep/evaluate_flow_eligibility
-│   ├── budget.lua                   #   ff_report_usage_and_check/reset_budget
-│   ├── quota.lua                    #   ff_check_admission_and_record
-│   ├── scheduling.lua               #   ff_issue_claim_grant/issue_reclaim_grant/block/unblock/promote_delayed/report_usage_on_attempt/update_progress/change_priority/promote_blocked_to_eligible/close_waitpoint
-│   └── reconciler.lua               #   ff_reconcile_execution_index
+│   ├── helpers.lua                  #   shared library-local helpers (ok/err/ok_duplicate/hgetall_to_table/etc.)
+│   ├── version.lua                  #   ff_version (1 fn)
+│   ├── execution.lua                #   ff_create/claim/complete/cancel/delay/move_to_waiting_children/fail/reclaim/expire (9 fns)
+│   ├── lease.lua                    #   ff_renew_lease/mark_lease_expired_if_due/revoke_lease (3 fns)
+│   ├── suspension.lua               #   ff_suspend/resume/create_pending_wp/expire_suspension/close_waitpoint (5 fns)
+│   ├── signal.lua                   #   ff_deliver_signal/buffer_signal_for_pending_wp/claim_resumed_execution (3 fns)
+│   ├── stream.lua                   #   ff_append_frame (1 fn)
+│   ├── flow.lua                     #   ff_create_flow/add_execution_to_flow/cancel_flow/stage_dep_edge/apply_dep/resolve_dep/evaluate_eligibility/promote_blocked/replay (9 fns)
+│   ├── budget.lua                   #   ff_create_budget/report_usage_and_check/reset_budget/unblock_execution/block_execution (5 fns)
+│   ├── quota.lua                    #   ff_create_quota_policy/check_admission_and_record (2 fns)
+│   └── scheduling.lua               #   ff_issue_claim_grant/change_priority/update_progress/promote_delayed/issue_reclaim_grant (5 fns)
 ├── crates/
 │   ├── ff-core/                     #   types, partition math, key builders, error codes
 │   ├── ff-script/                   #   ff_function! macro, typed FCALL wrappers, library loader
@@ -3280,9 +3301,9 @@ flowfabric/
 
 **ff-core** — Leaf crate, no Valkey dependency. State vector enums (`LifecyclePhase`, `OwnershipState`, `EligibilityState`, `BlockingReason`, `TerminalOutcome`, `AttemptState`). Domain ID types (`ExecutionId`, `LeaseId`, `LeaseEpoch`, `FlowId`, `BudgetId`, `WaitpointKey`). Partition math: `partition_for(entity_id, family, num_partitions) → partition_number`. Key builders: `exec_core_key(partition, eid) → "ff:exec:{p:3}:<eid>:core"`. All 40+ error codes from §10.7. Policy types (`RetryPolicy`, `TimeoutPolicy`, `ExecutionPolicy`). Validity matrix assertion helpers.
 
-**ff-script** — Bridge between Rust types and Valkey Functions. Declarative `ff_function!` macro generates: KEYS array construction from typed args, ARGV marshaling, `FCALL` invocation via ferriskey, return parsing from `{1,"OK",...}/{0,"ERROR",...}` into typed `Result<T, ScriptError>`. One macro invocation per function (~36 total). Embeds Lua library source via `include_str!` (from build.rs concatenation output). Startup: calls `ferriskey::function_load_replace()` with version check via `FCALL ff_version`.
+**ff-script** — Bridge between Rust types and Valkey Functions. Declarative `ff_function!` macro generates: KEYS array construction from typed args, ARGV marshaling, `FCALL` invocation via ferriskey, return parsing from `{1,"OK",...}/{0,"ERROR",...}` into typed `Result<T, ScriptError>`. One macro invocation per function (~43 total). Embeds Lua library source via `include_str!` (from build.rs concatenation output). Startup: calls `ferriskey::function_load_replace()` with version check via `FCALL ff_version`.
 
-**ff-engine** — Cross-partition orchestration and background scanners. Partition router maps entity → partition → ferriskey connection. Cross-partition dispatchers: dependency resolution fan-out (§4.8e — complete on `{p:N}` → read edges from `{fp:N}` → resolve on each child's `{p:N}`), two-phase flow membership (`{p:N}` then `{fp:N}`), usage reporting (`{p:N}` then `{b:M}`). Scanner module (`ff_engine::scanner`): common `Scanner` trait with `scan_partition()` method, pipelined partition scanning, configurable intervals, metrics emission. All 12 scanner types from §4 implemented here (some with partition-scoped variants). Used as a library by both `ff-sdk` (for cross-partition orchestrators) and `ff-server` (for scanners + dispatchers).
+**ff-engine** — Cross-partition orchestration and background scanners. Partition router maps entity → partition → ferriskey connection. Cross-partition dispatchers: dependency resolution fan-out (§4.8e — complete on `{p:N}` → read edges from `{fp:N}` → resolve on each child's `{p:N}`), two-phase flow membership (`{p:N}` then `{fp:N}`), usage reporting (`{p:N}` then `{b:M}`). Scanner module (`ff_engine::scanner`): common `Scanner` trait with `scan_partition()` method, pipelined partition scanning, configurable intervals, metrics emission. All 14 scanner types from §6 implemented here (some with partition-scoped variants, including execution_deadline added in adversarial round 4). Used as a library by both `ff-sdk` (for cross-partition orchestrators) and `ff-server` (for scanners + dispatchers).
 
 **ff-scheduler** — Claim-grant cycle: quota pre-check (read-only on `{q:K}`) → select candidate (weighted round-robin with deficit, capability matching) → per-candidate budget check on `{b:M}` (deny → block → next) → `ff_issue_claim_grant` on `{p:N}`. Lane management (4 states, registry). Fairness state (deficit counters, per-cycle budget cache). Depends on `ff-script + ff-core + ferriskey` only — does NOT depend on `ff-engine`. Embedded in `ff-server` for v1; crate boundary allows standalone extraction for horizontal scaling.
 
@@ -3290,7 +3311,7 @@ flowfabric/
 
 **ff-test** — Integration test harness. Embedded Valkey via testcontainers. `FUNCTION LOAD REPLACE` fixture. Assertion helpers: `assert_execution_state!`, `assert_index_membership!`. Scenario builders for multi-step test flows. State vector completeness validator (after every state-mutating FCALL, verify all 7 dimensions). Version migration tests (load v1, create state, load v2, verify forward compatibility).
 
-**ff-server** — Binary crate. Config loading (Valkey endpoints, partition counts, scanner intervals, TLS). Starts engine (scanners, dispatchers) + scheduler (embedded). gRPC/HTTP API for external operations (create_execution, cancel, replay, deliver_signal, query). Health checks, Prometheus metrics endpoint. Graceful shutdown. Validates partition config against Valkey-stored `ff:config:partitions` on startup.
+**ff-server** — Binary crate. Config loading (Valkey endpoints, partition counts, scanner intervals, TLS). Starts engine (14 scanners) + scheduler (embedded). 13 API methods: create_execution, cancel_execution, get_execution_state, get_execution (full HGETALL), deliver_signal (13K/17A), change_priority, replay_execution (variable KEYS), create_budget (variable ARGV), create_quota_policy, get_budget_status, create_flow, add_execution_to_flow, cancel_flow (+ cross-partition cancel dispatch). Graceful shutdown. Validates partition config against Valkey-stored `ff:config:partitions` on startup.
 
 ### 12.3 Dependency Graph
 
@@ -3378,6 +3399,10 @@ When `ff_claim_execution` returns the error code `use_claim_resumed_execution` (
 ### A.7 Claim Field Extraction Positions (Round 9)
 
 `ff_claim_execution` returns `ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)` — six fields at positions 0–5. The SDK must read `field_str(4)` for `attempt_index`, not `field_str(2)` (which is `expires_at`, a 13-digit millisecond timestamp). A positional mismatch here is masked on first attempts (index 0, which happens to match `unwrap_or(0)` on parse failure) but breaks retry and reclaim paths. All SDK response parsers were audited for positional correctness.
+
+### A.8 deliver_signal Effect Index (Phase C Review Round 2)
+
+`ff_deliver_signal` returns `ok(signal_id, effect)` → `{1, "OK", signal_id, effect}`. Server `parse_deliver_signal_result` originally read the effect at array index 2 (which is signal_id), not index 3 (the actual effect string like `resume_condition_satisfied` or `appended_to_waitpoint`). This was masked because the test only checked `Accepted { .. }` without asserting the effect value. Fixed by reading `fcall_field_str(arr, 3)` and adding an assertion on the effect string.
 
 ---
 

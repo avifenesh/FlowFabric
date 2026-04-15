@@ -977,3 +977,12 @@ Only unresolved questions remain here. Locked decisions from the pre-RFC are not
 
 - Pre-RFC: `flowfabric_use_cases_and_primitives (2).md`
 - Related RFCs: RFC-001, RFC-002, RFC-004
+
+---
+
+## Implementation Notes (v1)
+
+- **`capability_snapshot` is stored as a canonical hash string,** not the full structured capability object. `ff_claim_execution` receives `capability_snapshot_hash` as ARGV and stores it on the attempt record. Sufficient for audit; full capability restore is deferred.
+- **Lease renewal events are not written to lease_history.** `ff_renew_lease` extends TTL and updates `lease_last_renewed_at` on exec_core but does not XADD to lease_history. Reduces write volume on long-running executions with frequent renewals. Acquire/release/revoke events are recorded.
+- **`PEXPIREAT` is not set on initial lease acquire.** The `lease_current` hash has no TTL — expiry is tracked via the `lease_expiry` ZSET and the lease expiry scanner. The scanner calls `ff_mark_lease_expired_if_due` which validates and transitions state. This avoids relying on Valkey key expiry notifications for correctness.
+- **3 Lua functions:** `ff_renew_lease` (KEYS 4, ARGV 7), `ff_mark_lease_expired_if_due` (KEYS 4, ARGV 1), `ff_revoke_lease` (KEYS 5, ARGV 3). All headers verified against code.
