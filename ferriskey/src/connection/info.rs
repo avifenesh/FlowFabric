@@ -19,7 +19,7 @@ const DEFAULT_PORT: u16 = 6379;
 pub fn parse_redis_url(input: &str) -> Option<url::Url> {
     match url::Url::parse(input) {
         Ok(result) => match result.scheme() {
-            "redis" | "rediss" | "redis+unix" | "unix" | "valkey" | "valkeys" => Some(result),
+            "redis" | "rediss" | "redis+unix" | "unix" => Some(result),
             _ => None,
         },
         Err(_) => None,

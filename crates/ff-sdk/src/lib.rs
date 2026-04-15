@@ -9,7 +9,8 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), ff_sdk::SdkError> {
 //!     let config = WorkerConfig::new(
-//!         "valkey://localhost:6379",
+//!         "localhost",
+//!         6379,
 //!         "my-worker",
 //!         "my-worker-instance-1",
 //!         "default",

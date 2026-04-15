@@ -20,7 +20,7 @@ use crate::SdkError;
 /// ```rust,ignore
 /// use ff_sdk::{FlowFabricWorker, WorkerConfig};
 ///
-/// let config = WorkerConfig::new("valkey://localhost:6379", "w1", "w1-i1", "default", "main");
+/// let config = WorkerConfig::new("localhost", 6379, "w1", "w1-i1", "default", "main");
 /// let worker = FlowFabricWorker::connect(config).await?;
 ///
 /// loop {
