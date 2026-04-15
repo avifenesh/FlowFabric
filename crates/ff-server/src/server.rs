@@ -41,6 +41,12 @@ pub enum ServerError {
     LibraryLoad(String),
     #[error("partition mismatch: {0}")]
     PartitionMismatch(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("operation failed: {0}")]
+    OperationFailed(String),
     #[error("script: {0}")]
     Script(String),
 }
@@ -368,7 +374,7 @@ impl Server {
                     ))
                 })
             }
-            None => Err(ServerError::Script(format!(
+            None => Err(ServerError::NotFound(format!(
                 "execution not found: {execution_id}"
             ))),
         }
@@ -485,7 +491,7 @@ impl Server {
             .map_err(|e| ServerError::Valkey(format!("HGETALL budget_def: {e}")))?;
 
         if def.is_empty() {
-            return Err(ServerError::Script(format!(
+            return Err(ServerError::NotFound(format!(
                 "budget not found: {budget_id}"
             )));
         }
@@ -849,7 +855,7 @@ impl Server {
             .map_err(|e| ServerError::Valkey(format!("HGETALL exec_core: {e}")))?;
 
         if fields.is_empty() {
-            return Err(ServerError::Script(format!(
+            return Err(ServerError::NotFound(format!(
                 "execution not found: {execution_id}"
             )));
         }
@@ -1119,7 +1125,7 @@ fn parse_create_result(
                 _ => None,
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_create_execution failed: {error_code}"
         )))
     }
@@ -1153,7 +1159,7 @@ fn parse_cancel_result(
                 _ => None,
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_cancel_execution failed: {error_code}"
         )))
     }
@@ -1201,7 +1207,7 @@ fn parse_budget_create_result(
                 _ => None,
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_create_budget failed: {error_code}"
         )))
     }
@@ -1249,7 +1255,7 @@ fn parse_quota_create_result(
                 _ => None,
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_create_quota_policy failed: {error_code}"
         )))
     }
@@ -1282,7 +1288,7 @@ fn parse_create_flow_result(
         }
     } else {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_create_flow failed: {error_code}"
         )))
     }
@@ -1327,7 +1333,7 @@ fn parse_add_execution_to_flow_result(
         }
     } else {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_add_execution_to_flow failed: {error_code}"
         )))
     }
@@ -1361,7 +1367,7 @@ fn parse_cancel_flow_result(raw: &Value) -> Result<CancelFlowResult, ServerError
         })
     } else {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_cancel_flow failed: {error_code}"
         )))
     }
@@ -1398,7 +1404,7 @@ fn parse_deliver_signal_result(
         }
     } else {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_deliver_signal failed: {error_code}"
         )))
     }
@@ -1422,7 +1428,7 @@ fn parse_change_priority_result(
         })
     } else {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_change_priority failed: {error_code}"
         )))
     }
@@ -1448,7 +1454,7 @@ fn parse_replay_result(raw: &Value) -> Result<ReplayExecutionResult, ServerError
         Ok(ReplayExecutionResult::Replayed { public_state: ps })
     } else {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::Script(format!(
+        Err(ServerError::OperationFailed(format!(
             "ff_replay_execution failed: {error_code}"
         )))
     }

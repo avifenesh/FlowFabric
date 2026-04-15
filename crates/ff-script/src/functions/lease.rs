@@ -12,7 +12,6 @@ use ff_core::error::ScriptError;
 use ff_core::keys::ExecKeyContext;
 use ff_core::types::TimestampMs;
 
-use crate::ff_function;
 use crate::result::{FcallResult, FromFcallResult};
 
 // ─── FromFcallResult implementations ───
