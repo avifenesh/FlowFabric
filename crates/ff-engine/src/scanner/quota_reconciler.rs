@@ -7,10 +7,13 @@
 //! (on lease release) happen on different partitions and are not atomic
 //! with each other.
 //!
+//! Cluster-safe: uses SMEMBERS on indexed SETs instead of SCAN.
+//!
 //! Reference: RFC-008 §Quota Reconciliation, RFC-010 §6.6
 
 use std::time::Duration;
 
+use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
 
 use super::{ScanResult, Scanner};
@@ -53,11 +56,17 @@ impl Scanner for QuotaReconciler {
             }
         };
 
-        // Discover quota policies on this partition via SCAN
-        let quota_ids = match scan_quota_ids(client, &tag).await {
+        // Discover quota policies via partition-level index SET (cluster-safe)
+        let policies_key = keys::quota_policies_index(&tag);
+        let quota_ids: Vec<String> = match client
+            .cmd("SMEMBERS")
+            .arg(&policies_key)
+            .execute()
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => {
-                tracing::warn!(partition, error = %e, "quota_reconciler: discovery failed");
+                tracing::warn!(partition, error = %e, "quota_reconciler: SMEMBERS failed");
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
@@ -89,45 +98,6 @@ impl Scanner for QuotaReconciler {
     }
 }
 
-/// Discover quota policy IDs on a partition via SCAN.
-async fn scan_quota_ids(
-    client: &ferriskey::Client,
-    tag: &str,
-) -> Result<Vec<String>, ferriskey::Error> {
-    let mut quota_ids = Vec::new();
-    let pattern = format!("ff:quota:{}:*", tag);
-    let prefix = format!("ff:quota:{}:", tag);
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await?;
-
-        let (next_cursor, keys) = parse_scan_result(&result);
-
-        for key in keys {
-            // Only take definition keys (no :window:, :concurrency, :admitted: suffix)
-            if let Some(rest) = key.strip_prefix(&prefix) && !rest.contains(':') {
-                quota_ids.push(rest.to_string());
-            }
-        }
-
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    Ok(quota_ids)
-}
-
 /// Reconcile one quota policy. Returns Ok(true) if something was cleaned.
 async fn reconcile_one_quota(
     client: &ferriskey::Client,
@@ -138,9 +108,6 @@ async fn reconcile_one_quota(
     let mut did_work = false;
 
     // 1. Read quota definition to find rate-limit window dimensions.
-    // RFC-008 §4.3: quota hash stores individual named fields, not a JSON blob.
-    // Known dimension: "requests_per_window" with fields:
-    //   requests_per_window_seconds → window duration
     let def_key = format!("ff:quota:{}:{}", tag, quota_id);
     let window_secs: Option<String> = client
         .cmd("HGET")
@@ -180,13 +147,9 @@ async fn reconcile_one_quota(
 
     // 3. Reconcile concurrency counter (if quota has concurrency cap)
     //
-    // The concurrency counter is INCRed on admission (ff_check_admission_and_record)
-    // but never DECRed when executions complete/fail/cancel — those run on different
-    // partitions ({p:N} vs {q:K}). Without reconciliation, the counter grows
-    // monotonically and eventually blocks all new admissions.
-    //
-    // Fix: count live `admitted:<eid>` guard keys (which have TTL = window_ms)
-    // and SET the counter to the actual count of currently-admitted executions.
+    // Strategy: read admitted_set (SMEMBERS), check each guard key (EXISTS).
+    // If guard expired → SREM from set. Count live = true concurrency.
+    // SET counter to live count. No SCAN needed (cluster-safe).
     let concurrency_cap: Option<String> = client
         .cmd("HGET")
         .arg(&def_key)
@@ -199,13 +162,37 @@ async fn reconcile_one_quota(
         && cap > 0
     {
         let counter_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
+        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id);
 
-        // Count live admitted:* guard keys for this quota.
-        // These keys have TTL = window_ms and auto-expire when the
-        // admission window closes. The count of live keys IS the
-        // true concurrency count.
-        let pattern = format!("ff:quota:{}:{}:admitted:*", tag, quota_id);
-        let actual_count = count_keys_by_pattern(client, &pattern).await;
+        // Read all members from the admitted set
+        let members: Vec<String> = client
+            .cmd("SMEMBERS")
+            .arg(&admitted_set_key)
+            .execute()
+            .await
+            .unwrap_or_default();
+
+        // Check each guard key — if expired, SREM from set
+        let mut live_count: u64 = 0;
+        for eid in &members {
+            let guard_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid);
+            let exists: bool = client
+                .exists(&guard_key)
+                .await
+                .unwrap_or(false);
+            if exists {
+                live_count += 1;
+            } else {
+                // Guard expired — clean up from admitted set
+                let _: () = client
+                    .cmd("SREM")
+                    .arg(&admitted_set_key)
+                    .arg(eid.as_str())
+                    .execute()
+                    .await
+                    .unwrap_or_default();
+            }
+        }
 
         // Read stored counter
         let stored: Option<String> = client
@@ -218,18 +205,18 @@ async fn reconcile_one_quota(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // Correct if drifted (counter > actual live keys)
-        if stored_count != actual_count as i64 {
+        // Correct if drifted
+        if stored_count != live_count as i64 {
             let _: () = client
                 .cmd("SET")
                 .arg(&counter_key)
-                .arg(actual_count.to_string().as_str())
+                .arg(live_count.to_string().as_str())
                 .execute()
                 .await?;
             tracing::info!(
                 quota_id,
                 stored = stored_count,
-                actual = actual_count,
+                actual = live_count,
                 "quota_reconciler: corrected concurrency counter drift"
             );
             did_work = true;
@@ -237,67 +224,4 @@ async fn reconcile_one_quota(
     }
 
     Ok(did_work)
-}
-
-/// Count keys matching a pattern via SCAN. Used to count live admitted:* guard keys.
-async fn count_keys_by_pattern(
-    client: &ferriskey::Client,
-    pattern: &str,
-) -> u64 {
-    let mut count: u64 = 0;
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = match client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-
-        let (next_cursor, keys) = parse_scan_result(&result);
-        count += keys.len() as u64;
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    count
-}
-
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
-                }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
-        }
-        _ => ("0".to_string(), vec![]),
-    }
 }

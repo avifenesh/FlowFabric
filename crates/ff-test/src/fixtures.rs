@@ -5,23 +5,21 @@
 //!
 //! # Environment variables
 //!
-//! - `VALKEY_URL`: Connection URL (default: `redis://localhost:6379`)
-//! - `VALKEY_TLS`: Set to `"1"` or `"true"` to force TLS on the URL
+//! - `FF_HOST`: Valkey hostname (default: `localhost`)
+//! - `FF_PORT`: Valkey port (default: `6379`)
+//! - `FF_TLS`: Enable TLS (`1` or `true`)
+//! - `FF_CLUSTER`: Enable cluster mode (`1` or `true`)
 //! - `FF_TEST_PARTITION_CONFIG`: JSON-encoded [`PartitionConfig`] override
 //!   (default: small config suitable for testing: 4/2/2/2)
 
 use std::collections::HashMap;
-use ferriskey::{Client, Value};
+use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::{ExecutionId, LaneId, Namespace, TimestampMs};
 use tokio::sync::OnceCell;
 
-/// Default standalone Valkey URL for local development.
-const DEFAULT_VALKEY_URL: &str = "redis://localhost:6379";
-
-/// CI/cloud Valkey endpoint (TLS, standalone).
-const CI_VALKEY_URL: &str =
-    "valkeys://master.ferriskey-standalone-test.nra7gl.use1.cache.amazonaws.com:6379";
+const DEFAULT_HOST: &str = "localhost";
+const DEFAULT_PORT: u16 = 6379;
 
 /// Small partition config for testing — exercises cross-partition logic
 /// without creating hundreds of partitions.
@@ -64,10 +62,9 @@ impl TestCluster {
     /// Each test gets a fresh connection to avoid shared-state issues.
     /// Library loading happens once (first test loads, others verify).
     pub async fn connect() -> Self {
-        let url = resolve_valkey_url();
-        let client = Client::connect(&url)
+        let client = build_client_from_env()
             .await
-            .unwrap_or_else(|e| panic!("Failed to connect to Valkey at {url}: {e}"));
+            .unwrap_or_else(|e| panic!("Failed to connect to Valkey: {e}"));
 
         // Load library once per process
         LIBRARY_LOADED
@@ -208,21 +205,42 @@ async fn load_library(client: &Client) {
     load_library_if_available(client).await;
 }
 
-/// Resolve the Valkey URL from environment or defaults.
-fn resolve_valkey_url() -> String {
-    if let Ok(url) = std::env::var("VALKEY_URL") {
-        return url;
+/// Read connection config from environment and return a connected Client.
+///
+/// Uses `ClientBuilder` — no URL parsing. Config via:
+/// - `FF_HOST` (default: `localhost`)
+/// - `FF_PORT` (default: `6379`)
+/// - `FF_TLS` (default: `false`)
+/// - `FF_CLUSTER` (default: `false`)
+pub async fn build_client_from_env() -> ferriskey::Result<Client> {
+    let host = std::env::var("FF_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_owned());
+    let port: u16 = std::env::var("FF_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let tls = env_flag("FF_TLS");
+    let cluster = env_flag("FF_CLUSTER");
+
+    let mut builder = ClientBuilder::new().host(&host, port);
+    if tls {
+        builder = builder.tls();
+    }
+    if cluster {
+        builder = builder.cluster();
     }
 
-    // Check if TLS is requested
-    if std::env::var("VALKEY_TLS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    tracing::info!(
+        host = %host, port, tls, cluster,
+        "connecting to Valkey via ClientBuilder"
+    );
+    builder.build().await
+}
+
+/// Read an env var as a boolean flag (1, true, yes → true).
+pub fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(false)
-    {
-        return CI_VALKEY_URL.to_string();
-    }
-
-    DEFAULT_VALKEY_URL.to_string()
 }
 
 /// Load the test partition config from env or use defaults.
@@ -380,10 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_url_defaults_to_localhost() {
-        // Only works when VALKEY_URL is not set — can't safely test in all envs
-        // Just verify the function doesn't panic
-        let _url = resolve_valkey_url();
+    fn env_flag_defaults_false() {
+        // Verify env_flag doesn't panic on missing vars
+        assert!(!env_flag("FF_NONEXISTENT_TEST_FLAG"));
     }
 
     #[test]

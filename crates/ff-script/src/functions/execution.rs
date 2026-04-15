@@ -41,9 +41,9 @@ ff_function! {
             } else {
                 k.idx.lane_eligible(k.lane_id)
             },
-            args.idempotency_key.as_ref().map(|ik| {
-                ff_core::keys::idempotency_key(args.namespace.as_str(), ik)
-            }).unwrap_or_default(),
+            args.idempotency_key.as_ref().filter(|ik| !ik.is_empty()).map(|ik| {
+                ff_core::keys::idempotency_key(k.ctx.hash_tag(), args.namespace.as_str(), ik)
+            }).unwrap_or_else(|| k.ctx.noop()),
             k.idx.execution_deadline(),
             k.idx.all_executions(),
         }

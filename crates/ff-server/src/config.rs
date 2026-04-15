@@ -5,10 +5,14 @@ use std::time::Duration;
 
 /// Server configuration, loaded from environment variables.
 pub struct ServerConfig {
-    /// Valkey connection URL.
-    pub valkey_url: String,
-    /// Whether to use TLS for Valkey connections.
+    /// Valkey host. Default: `"localhost"`.
+    pub host: String,
+    /// Valkey port. Default: `6379`.
+    pub port: u16,
+    /// Enable TLS for Valkey connections.
     pub tls: bool,
+    /// Enable Valkey cluster mode.
+    pub cluster: bool,
     /// Partition counts (execution/flow/budget/quota).
     pub partition_config: PartitionConfig,
     /// Lanes to manage. Default: `["default"]`.
@@ -17,6 +21,8 @@ pub struct ServerConfig {
     pub listen_addr: String,
     /// Scanner intervals and engine config.
     pub engine_config: EngineConfig,
+    /// Skip library loading (for tests where TestCluster already loaded it).
+    pub skip_library_load: bool,
 }
 
 impl ServerConfig {
@@ -24,8 +30,10 @@ impl ServerConfig {
     ///
     /// | Variable | Default | Description |
     /// |----------|---------|-------------|
-    /// | `FF_VALKEY_URL` | `valkey://localhost:6379` | Valkey connection URL |
+    /// | `FF_HOST` | `localhost` | Valkey host |
+    /// | `FF_PORT` | `6379` | Valkey port |
     /// | `FF_TLS` | `false` | Enable TLS (`1` or `true`) |
+    /// | `FF_CLUSTER` | `false` | Enable cluster mode (`1` or `true`) |
     /// | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
     /// | `FF_LANES` | `default` | Comma-separated lane names |
     /// | `FF_EXEC_PARTITIONS` | `256` | Execution partition count |
@@ -36,8 +44,10 @@ impl ServerConfig {
     /// | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed promoter interval |
     /// | `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval |
     pub fn from_env() -> Result<Self, ConfigError> {
-        let valkey_url = env_or("FF_VALKEY_URL", "valkey://localhost:6379");
+        let host = env_or("FF_HOST", "localhost");
+        let port = env_u16("FF_PORT", 6379)?;
         let tls = env_bool("FF_TLS");
+        let cluster = env_bool("FF_CLUSTER");
         let listen_addr = env_or("FF_LISTEN_ADDR", "0.0.0.0:9090");
 
         let lanes: Vec<LaneId> = env_or("FF_LANES", "default")
@@ -108,12 +118,15 @@ impl ServerConfig {
         };
 
         Ok(Self {
-            valkey_url,
+            host,
+            port,
             tls,
+            cluster,
             partition_config,
             lanes,
             listen_addr,
             engine_config,
+            skip_library_load: false,
         })
     }
 }
@@ -123,8 +136,10 @@ impl Default for ServerConfig {
         let lanes = vec![LaneId::new("default")];
         let partition_config = PartitionConfig::default();
         Self {
-            valkey_url: "valkey://localhost:6379".into(),
+            host: "localhost".into(),
+            port: 6379,
             tls: false,
+            cluster: false,
             partition_config,
             lanes: lanes.clone(),
             listen_addr: "0.0.0.0:9090".into(),
@@ -133,6 +148,7 @@ impl Default for ServerConfig {
                 lanes,
                 ..Default::default()
             },
+            skip_library_load: false,
         }
     }
 }

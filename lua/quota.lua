@@ -9,7 +9,8 @@
 -- Create a new quota/rate-limit policy.
 -- Idempotent: if EXISTS quota_def → return ok_already_satisfied.
 --
--- KEYS (3): quota_def, quota_window_zset, quota_concurrency_counter
+-- KEYS (5): quota_def, quota_window_zset, quota_concurrency_counter,
+--           admitted_set, quota_policies_index
 -- ARGV (5): quota_policy_id, window_seconds, max_requests_per_window,
 --           max_concurrent, now_ms
 ---------------------------------------------------------------------------
@@ -18,6 +19,8 @@ redis.register_function('ff_create_quota_policy', function(keys, args)
     def_key          = keys[1],
     window_zset      = keys[2],
     concurrency_key  = keys[3],
+    admitted_set     = keys[4],
+    policies_index   = keys[5],
   }
 
   local A = {
@@ -44,7 +47,10 @@ redis.register_function('ff_create_quota_policy', function(keys, args)
   -- Init concurrency counter to 0
   redis.call("SET", K.concurrency_key, "0")
 
-  -- quota_window_zset left empty (populated by ff_check_admission_and_record)
+  -- Register in partition-level policy index (for cluster-safe discovery)
+  redis.call("SADD", K.policies_index, A.quota_policy_id)
+
+  -- admitted_set + quota_window_zset left empty (populated on admission)
 
   return ok(A.quota_policy_id)
 end)
@@ -53,9 +59,11 @@ end)
 -- #32  ff_check_admission_and_record  (on {q:K})
 --
 -- Idempotent sliding-window rate check + concurrency check.
--- If admitted: ZADD window, SET NX guard, optional INCR concurrency.
+-- If admitted: ZADD window, SET NX guard, optional INCR concurrency,
+-- SADD to admitted_set (for cluster-safe reconciler discovery).
 --
--- KEYS (4): window_zset, concurrency_counter, quota_def, admitted_guard_key
+-- KEYS (5): window_zset, concurrency_counter, quota_def, admitted_guard_key,
+--           admitted_set
 -- ARGV (6): now_ms, window_seconds, rate_limit, concurrency_cap,
 --           execution_id, jitter_ms
 ---------------------------------------------------------------------------
@@ -65,6 +73,7 @@ redis.register_function('ff_check_admission_and_record', function(keys, args)
     concurrency_key    = keys[2],
     quota_def          = keys[3],
     admitted_guard_key = keys[4],
+    admitted_set       = keys[5],
   }
 
   local A = {
@@ -126,6 +135,9 @@ redis.register_function('ff_check_admission_and_record', function(keys, args)
   if A.concurrency_cap > 0 then
     redis.call("INCR", K.concurrency_key)
   end
+
+  -- 8. Track in admitted set (for cluster-safe reconciler — replaces SCAN)
+  redis.call("SADD", K.admitted_set, A.execution_id)
 
   return { "ADMITTED" }
 end)

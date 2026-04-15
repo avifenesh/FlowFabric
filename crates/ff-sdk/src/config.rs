@@ -2,10 +2,14 @@ use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 
 /// Configuration for a FlowFabric worker.
 pub struct WorkerConfig {
-    /// Valkey connection URL (e.g., `valkey://localhost:6379`).
-    pub valkey_url: String,
-    /// Whether to use TLS for the Valkey connection.
+    /// Valkey hostname. Default: `"localhost"`.
+    pub host: String,
+    /// Valkey port. Default: `6379`.
+    pub port: u16,
+    /// Enable TLS for the Valkey connection.
     pub tls: bool,
+    /// Enable Valkey cluster mode.
+    pub cluster: bool,
     /// Logical worker identity (e.g., "gpu-worker-pool-1").
     pub worker_id: WorkerId,
     /// Concrete worker process/runtime instance identity (e.g., container ID).
@@ -27,15 +31,18 @@ pub struct WorkerConfig {
 impl WorkerConfig {
     /// Create a minimal config for a single-lane worker.
     pub fn new(
-        valkey_url: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
         worker_id: impl Into<String>,
         worker_instance_id: impl Into<String>,
         namespace: impl Into<String>,
         lane: impl Into<String>,
     ) -> Self {
         Self {
-            valkey_url: valkey_url.into(),
+            host: host.into(),
+            port,
             tls: false,
+            cluster: false,
             worker_id: WorkerId::new(worker_id),
             worker_instance_id: WorkerInstanceId::new(worker_instance_id),
             namespace: Namespace::new(namespace),

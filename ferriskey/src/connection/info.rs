@@ -19,7 +19,7 @@ const DEFAULT_PORT: u16 = 6379;
 pub fn parse_redis_url(input: &str) -> Option<url::Url> {
     match url::Url::parse(input) {
         Ok(result) => match result.scheme() {
-            "redis" | "rediss" | "redis+unix" | "unix" => Some(result),
+            "redis" | "rediss" | "redis+unix" | "unix" | "valkey" | "valkeys" => Some(result),
             _ => None,
         },
         Err(_) => None,
@@ -213,7 +213,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> Result<ConnectionInfo> {
         None => fail!((ErrorKind::InvalidClientConfig, "Missing hostname")),
     };
     let port = url.port().unwrap_or(DEFAULT_PORT);
-    let addr = if url.scheme() == "rediss" {
+    let addr = if url.scheme() == "rediss" || url.scheme() == "valkeys" {
         match url.fragment() {
             Some("insecure") => ConnectionAddr::TcpTls {
                 host,
@@ -325,7 +325,7 @@ fn url_to_unix_connection_info(_: url::Url) -> Result<ConnectionInfo> {
 impl IntoConnectionInfo for url::Url {
     fn into_connection_info(self) -> Result<ConnectionInfo> {
         match self.scheme() {
-            "redis" | "rediss" => url_to_tcp_connection_info(self),
+            "redis" | "rediss" | "valkey" | "valkeys" => url_to_tcp_connection_info(self),
             "unix" | "redis+unix" => url_to_unix_connection_info(self),
             _ => fail!((
                 ErrorKind::InvalidClientConfig,

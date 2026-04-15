@@ -406,6 +406,7 @@ impl Scheduler {
         let window_key = format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id_str);
         let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id_str);
         let admitted_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id_str, eid_s);
+        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id_str);
 
         // Read quota limits from policy hash
         let rate_limit: Option<String> = self.client
@@ -432,7 +433,7 @@ impl Scheduler {
         }
 
         // FCALL ff_check_admission_and_record on {q:K}
-        let keys: [&str; 4] = [&window_key, &concurrency_key, &quota_def_key, &admitted_key];
+        let keys: [&str; 5] = [&window_key, &concurrency_key, &quota_def_key, &admitted_key, &admitted_set_key];
         let now_s = now_ms.to_string();
         let ws = window_secs.to_string();
         let rl = rate_limit.to_string();

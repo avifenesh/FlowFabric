@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ferriskey::{Client, Value};
+use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, BudgetStatus, CancelExecutionArgs,
     CancelExecutionResult, CancelFlowArgs, CancelFlowResult, ChangePriorityResult,
@@ -54,9 +54,21 @@ impl Server {
     /// 3. Load the FlowFabric Lua library
     /// 4. Start engine (14 background scanners)
     pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
-        // Step 1: Connect to Valkey
-        tracing::info!(url = %config.valkey_url, "connecting to Valkey");
-        let client = Client::connect(&config.valkey_url)
+        // Step 1: Connect to Valkey via ClientBuilder
+        tracing::info!(
+            host = %config.host, port = config.port,
+            tls = config.tls, cluster = config.cluster,
+            "connecting to Valkey"
+        );
+        let mut builder = ClientBuilder::new().host(&config.host, config.port);
+        if config.tls {
+            builder = builder.tls();
+        }
+        if config.cluster {
+            builder = builder.cluster();
+        }
+        let client = builder
+            .build()
             .await
             .map_err(|e| ServerError::Valkey(format!("connect failed: {e}")))?;
 
@@ -76,11 +88,15 @@ impl Server {
         // Step 2: Validate or create partition config
         validate_or_create_partition_config(&client, &config.partition_config).await?;
 
-        // Step 3: Load Lua library
-        tracing::info!("loading flowfabric Lua library");
-        ff_script::loader::ensure_library(&client)
-            .await
-            .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+        // Step 3: Load Lua library (skippable for tests where fixture already loaded)
+        if !config.skip_library_load {
+            tracing::info!("loading flowfabric Lua library");
+            ff_script::loader::ensure_library(&client)
+                .await
+                .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+        } else {
+            tracing::info!("skipping library load (skip_library_load=true)");
+        }
 
         // Step 4: Start engine with scanners
         // Build a fresh EngineConfig rather than cloning (EngineConfig doesn't derive Clone).
@@ -154,11 +170,12 @@ impl Server {
         let idx = IndexKeys::new(&partition);
 
         let lane = &args.lane_id;
+        let tag = partition.hash_tag();
         let idem_key = match &args.idempotency_key {
             Some(k) if !k.is_empty() => {
-                keys::idempotency_key(args.namespace.as_str(), k)
+                keys::idempotency_key(&tag, args.namespace.as_str(), k)
             }
-            _ => String::new(),
+            _ => ctx.noop(),
         };
 
         let delay_str = args
@@ -420,11 +437,14 @@ impl Server {
         let partition = quota_partition(&args.quota_policy_id, &self.config.partition_config);
         let qctx = QuotaKeyContext::new(&partition, &args.quota_policy_id);
 
-        // KEYS (3): quota_def, quota_window_zset, quota_concurrency_counter
+        // KEYS (5): quota_def, quota_window_zset, quota_concurrency_counter,
+        //           admitted_set, quota_policies_index
         let fcall_keys: Vec<String> = vec![
             qctx.definition(),
             qctx.window("requests_per_window"),
             qctx.concurrency(),
+            qctx.admitted_set(),
+            keys::quota_policies_index(qctx.hash_tag()),
         ];
 
         // ARGV (5): quota_policy_id, window_seconds, max_requests_per_window,
@@ -700,7 +720,7 @@ impl Server {
             .as_ref()
             .filter(|k| !k.is_empty())
             .map(|k| ctx.signal_dedup(wp_id, k))
-            .unwrap_or_default();
+            .unwrap_or_else(|| ctx.noop());
 
         // KEYS (13): exec_core, wp_condition, wp_signals_stream,
         //            exec_signals_zset, signal_hash, signal_payload,

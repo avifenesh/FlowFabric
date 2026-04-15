@@ -169,6 +169,13 @@ impl ExecKeyContext {
 
     // ── Accessor ──
 
+    /// Dummy key on this partition, used as a placeholder for unused KEYS
+    /// positions (e.g. empty idempotency key). Ensures all KEYS in an FCALL
+    /// share the same hash tag, preventing CrossSlot errors in cluster mode.
+    pub fn noop(&self) -> String {
+        format!("ff:noop:{}", self.tag)
+    }
+
     pub fn hash_tag(&self) -> &str {
         &self.tag
     }
@@ -449,9 +456,21 @@ impl QuotaKeyContext {
         format!("ff:quota:{}:{}:admitted:{}", self.tag, self.qid, eid)
     }
 
+    /// `ff:quota:{q:K}:<quota_policy_id>:admitted_set` — SET of admitted execution IDs.
+    /// Used by the quota reconciler instead of SCAN (cluster-safe).
+    pub fn admitted_set(&self) -> String {
+        format!("ff:quota:{}:{}:admitted_set", self.tag, self.qid)
+    }
+
     pub fn hash_tag(&self) -> &str {
         &self.tag
     }
+}
+
+/// Quota policy index — SET of policy IDs on this partition.
+/// Used by the quota reconciler for cluster-safe discovery (replaces SCAN).
+pub fn quota_policies_index(tag: &str) -> String {
+    format!("ff:idx:{}:quota_policies", tag)
 }
 
 /// Quota attachment key.
@@ -504,9 +523,21 @@ pub fn namespace_executions_key(namespace: &str) -> String {
     format!("ff:ns:{}:executions", namespace)
 }
 
-/// `ff:idem:<namespace>:<idempotency_key>`
-pub fn idempotency_key(namespace: &str, idem_key: &str) -> String {
-    format!("ff:idem:{}:{}", namespace, idem_key)
+/// `ff:idem:{p:N}:<namespace>:<idempotency_key>`
+///
+/// Includes the execution partition hash tag so the key hashes to the same
+/// Valkey cluster slot as all other KEYS in the ff_create_execution FCALL.
+pub fn idempotency_key(tag: &str, namespace: &str, idem_key: &str) -> String {
+    format!("ff:idem:{}:{}:{}", tag, namespace, idem_key)
+}
+
+/// Placeholder key that shares a hash tag with other KEYS in the same FCALL.
+///
+/// Used when an optional key (e.g. idempotency key) is absent. The Lua
+/// function never reads/writes this key, but Valkey cluster requires all
+/// KEYS in a single FCALL to hash to the same slot.
+pub fn noop_key(tag: &str) -> String {
+    format!("ff:noop:{}", tag)
 }
 
 /// `ff:tag:<namespace>:<key>:<value>`

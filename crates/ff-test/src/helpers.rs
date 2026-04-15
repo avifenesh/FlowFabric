@@ -262,7 +262,7 @@ pub async fn create_test_execution_via_fcall(
         idx.lane_eligible(&params.lane_id),
         idx.lane_delayed(&params.lane_id),
         idx.all_executions(),
-        ff_core::keys::idempotency_key(params.namespace.as_str(), ""), // placeholder
+        ctx.noop(), // idempotency placeholder — must share hash tag for cluster mode
     ];
 
     // ARGV: eid, namespace, lane, kind, payload, encoding, priority, creator,

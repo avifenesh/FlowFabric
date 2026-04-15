@@ -15,7 +15,8 @@ pub struct QuotaOpKeys<'a> {
 
 // ─── ff_create_quota_policy ───────────────────────────────────────────
 //
-// Lua KEYS (3): quota_def, quota_window_zset, quota_concurrency_counter
+// Lua KEYS (5): quota_def, quota_window_zset, quota_concurrency_counter,
+//               admitted_set, quota_policies_index
 // Lua ARGV (5): quota_policy_id, window_seconds, max_requests_per_window,
 //               max_concurrent, now_ms
 
@@ -25,6 +26,8 @@ ff_function! {
             k.ctx.definition(),
             k.ctx.window(k.dimension),
             k.ctx.concurrency(),
+            k.ctx.admitted_set(),
+            ff_core::keys::quota_policies_index(k.ctx.hash_tag()),
         }
         argv {
             args.quota_policy_id.to_string(),
@@ -52,7 +55,8 @@ impl FromFcallResult for CreateQuotaPolicyResult {
 
 // ─── ff_check_admission_and_record ────────────────────────────────────
 //
-// Lua KEYS (4): window_zset, concurrency_counter, quota_def, admitted_guard
+// Lua KEYS (5): window_zset, concurrency_counter, quota_def, admitted_guard,
+//               admitted_set
 // Lua ARGV (6): now_ms, window_seconds, rate_limit, concurrency_cap,
 //               execution_id, jitter_ms
 
@@ -63,6 +67,7 @@ ff_function! {
             k.ctx.concurrency(),
             k.ctx.definition(),
             k.ctx.admitted(k.execution_id),
+            k.ctx.admitted_set(),
         }
         argv {
             args.now.to_string(),

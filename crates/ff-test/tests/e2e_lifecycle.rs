@@ -45,7 +45,7 @@ async fn fcall_create_execution(
         ctx.policy(),
         ctx.tags(),
         eligible_key,
-        String::new(), // idem_key (empty = no dedup)
+        ctx.noop(), // idem_key placeholder (must share {p:N} hash tag for cluster)
         idx.execution_deadline(),
         idx.all_executions(),
     ];
@@ -1526,7 +1526,7 @@ async fn fcall_deliver_signal(
     let now = TimestampMs::now();
 
     let idem_key = if idempotency_key.is_empty() {
-        String::new()
+        ctx.noop() // placeholder sharing {p:N} hash tag for cluster mode
     } else {
         ctx.signal_dedup(&wp_id, idempotency_key)
     };
@@ -1711,7 +1711,7 @@ async fn fcall_buffer_signal(
     let now = TimestampMs::now();
 
     let idem_key = if idempotency_key.is_empty() {
-        String::new()
+        ctx.noop() // placeholder sharing {p:N} hash tag for cluster mode
     } else {
         ctx.signal_dedup(&wp_id, idempotency_key)
     };
@@ -2688,9 +2688,13 @@ async fn fcall_create_quota_policy(
     let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
     let window_key = format!("ff:quota:{{q:0}}:{policy_id}:window:requests");
     let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
+    let admitted_set_key = format!("ff:quota:{{q:0}}:{policy_id}:admitted_set");
+    let policies_index_key = "ff:idx:{q:0}:quota_policies".to_owned();
 
     let now = TimestampMs::now();
-    let keys: Vec<String> = vec![def_key, window_key, concurrency_key];
+    let keys: Vec<String> = vec![
+        def_key, window_key, concurrency_key, admitted_set_key, policies_index_key,
+    ];
     let args: Vec<String> = vec![
         policy_id.to_owned(),
         window_seconds.to_string(),
@@ -3066,6 +3070,7 @@ async fn test_quota_admission() {
     let window_key = format!("ff:quota:{{q:0}}:{policy_id}:window:requests");
     let concurrency_key = format!("ff:quota:{{q:0}}:{policy_id}:concurrency");
     let def_key = format!("ff:quota:{{q:0}}:{policy_id}");
+    let admitted_set_key = format!("ff:quota:{{q:0}}:{policy_id}:admitted_set");
 
     // Create quota policy: window=1s, rate limit=2, no concurrency cap
     fcall_create_quota_policy(&tc, policy_id, 1, 2, 0).await;
@@ -3074,7 +3079,7 @@ async fn test_quota_admission() {
     let eid1 = ExecutionId::new();
     let guard1 = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid1);
     let now1 = TimestampMs::now();
-    let keys1: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard1];
+    let keys1: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard1, admitted_set_key.clone()];
     let args1: Vec<String> = vec![
         now1.to_string(), "1".to_owned(), "2".to_owned(), // window=1s, limit=2
         "0".to_owned(), eid1.to_string(), "0".to_owned(), // no concurrency cap, no jitter
@@ -3091,7 +3096,7 @@ async fn test_quota_admission() {
     let eid2 = ExecutionId::new();
     let guard2 = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid2);
     let now2 = TimestampMs::now();
-    let keys2: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard2];
+    let keys2: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard2, admitted_set_key.clone()];
     let args2: Vec<String> = vec![
         now2.to_string(), "1".to_owned(), "2".to_owned(),
         "0".to_owned(), eid2.to_string(), "0".to_owned(),
@@ -3107,7 +3112,7 @@ async fn test_quota_admission() {
     let eid3 = ExecutionId::new();
     let guard3 = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid3);
     let now3 = TimestampMs::now();
-    let keys3: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard3];
+    let keys3: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard3, admitted_set_key.clone()];
     let args3: Vec<String> = vec![
         now3.to_string(), "1".to_owned(), "2".to_owned(),
         "0".to_owned(), eid3.to_string(), "0".to_owned(),
@@ -3125,7 +3130,7 @@ async fn test_quota_admission() {
     // Admit execution 3 again → should be ADMITTED (window expired)
     let now4 = TimestampMs::now();
     let guard3b = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid3);
-    let keys4: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard3b];
+    let keys4: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard3b, admitted_set_key.clone()];
     let args4: Vec<String> = vec![
         now4.to_string(), "1".to_owned(), "2".to_owned(),
         "0".to_owned(), eid3.to_string(), "0".to_owned(),
@@ -3707,8 +3712,10 @@ async fn test_max_concurrent_tasks_enforcement() {
 
     // Build a worker with max_concurrent_tasks = 2
     let worker_config = ff_sdk::WorkerConfig {
-        valkey_url: "redis://localhost:6379".into(),
-        tls: false,
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
         worker_id: ff_core::types::WorkerId::new("concurrency-test-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("concurrency-test-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -3778,7 +3785,7 @@ async fn test_execution_deadline_expire_runnable() {
         ctx.policy(),
         ctx.tags(),
         idx.lane_eligible(&lane_id),
-        String::new(), // idem_key
+        ctx.noop(), // idem_key placeholder (cluster-safe)
         idx.execution_deadline(),
         idx.all_executions(),
     ];
@@ -4322,10 +4329,11 @@ async fn fcall_admit(
     def_key: &str,
 ) -> String {
     let guard = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{eid}");
+    let admitted_set = format!("ff:quota:{{q:0}}:{policy_id}:admitted_set");
     let now = TimestampMs::now();
     let keys: Vec<String> = vec![
         window_key.to_owned(), concurrency_key.to_owned(),
-        def_key.to_owned(), guard,
+        def_key.to_owned(), guard, admitted_set,
     ];
     let args: Vec<String> = vec![
         now.to_string(), "60".to_owned(), "0".to_owned(),
@@ -4622,8 +4630,10 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
 
     // Build SDK worker
     let worker_config = ff_sdk::WorkerConfig {
-        valkey_url: "redis://localhost:6379".into(),
-        tls: false,
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
         worker_id: ff_core::types::WorkerId::new("suspend-test-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("suspend-test-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -4734,12 +4744,8 @@ async fn test_quota_reconciler_self_healing() {
     let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, policy_id);
     let def_key = format!("ff:quota:{}:{}", tag, policy_id);
 
-    // Create quota definition with concurrency_cap=2
-    let _: i64 = tc.client()
-        .cmd("HSET").arg(&def_key)
-        .arg("quota_policy_id").arg(policy_id)
-        .arg("active_concurrency_cap").arg("2")
-        .execute().await.unwrap();
+    // Create quota via FCALL (registers in policies_index for reconciler discovery)
+    fcall_create_quota_policy(&tc, policy_id, 60, 0, 2).await;
 
     // Admit E1 and E2
     let e1 = ExecutionId::new();
@@ -4816,8 +4822,10 @@ async fn test_sdk_all_methods_smoke() {
         .unwrap();
 
     let worker_config = ff_sdk::WorkerConfig {
-        valkey_url: "redis://localhost:6379".into(),
-        tls: false,
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
         worker_id: ff_core::types::WorkerId::new("sdk-smoke-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("sdk-smoke-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -4908,8 +4916,10 @@ async fn test_sdk_claim_retry_attempt_index() {
         .unwrap();
 
     let worker_config = ff_sdk::WorkerConfig {
-        valkey_url: "redis://localhost:6379".into(),
-        tls: false,
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
         worker_id: ff_core::types::WorkerId::new("retry-idx-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("retry-idx-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -5294,9 +5304,22 @@ async fn test_flow_cancel() {
 async fn test_server() -> ff_server::server::Server {
     use ff_server::config::ServerConfig;
     let config = test_config();
+    let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
+    let port: u16 = std::env::var("FF_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6379);
+    let tls = std::env::var("FF_TLS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cluster = std::env::var("FF_CLUSTER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let server_config = ServerConfig {
-        valkey_url: "redis://localhost:6379".into(),
-        tls: false,
+        host,
+        port,
+        tls,
+        cluster,
         partition_config: config,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "0.0.0.0:0".into(),
@@ -5305,6 +5328,7 @@ async fn test_server() -> ff_server::server::Server {
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
         },
+        skip_library_load: true, // TestCluster::connect() already loaded it
     };
     ff_server::server::Server::start(server_config)
         .await
@@ -5401,6 +5425,7 @@ async fn test_server_create_quota() {
         qctx.concurrency(),
         qctx.definition(),
         guard_key,
+        qctx.admitted_set(),
     ];
     let admit_args: Vec<String> = vec![
         TimestampMs::now().to_string(), "60".to_owned(), "100".to_owned(),

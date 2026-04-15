@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ferriskey::{Client, Value};
+use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::*;
@@ -56,7 +56,14 @@ impl FlowFabricWorker {
             return Err(SdkError::Config("at least one lane is required".into()));
         }
 
-        let client = Client::connect(&config.valkey_url)
+        let mut builder = ClientBuilder::new().host(&config.host, config.port);
+        if config.tls {
+            builder = builder.tls();
+        }
+        if config.cluster {
+            builder = builder.cluster();
+        }
+        let client = builder.build()
             .await
             .map_err(|e| SdkError::Valkey(format!("failed to connect: {e}")))?;
 
@@ -662,7 +669,7 @@ impl FlowFabricWorker {
         let idem_key = if let Some(ref ik) = signal.idempotency_key {
             ctx.signal_dedup(waitpoint_id, ik)
         } else {
-            String::new()
+            ctx.noop() // must share {p:N} hash tag for cluster mode
         };
         let keys: Vec<String> = vec![
             ctx.core(),                                    // 1

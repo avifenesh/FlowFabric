@@ -42,9 +42,9 @@ ff_function! {
             k.ctx.exec_signals(),                                      // 4
             k.ctx.signal(&args.signal_id),                             // 5
             k.ctx.signal_payload(&args.signal_id),                     // 6
-            args.idempotency_key.as_ref().map(|ik| {
+            args.idempotency_key.as_ref().filter(|ik| !ik.is_empty()).map(|ik| {
                 k.ctx.signal_dedup(&args.waitpoint_id, ik)
-            }).unwrap_or_default(),                                    // 7
+            }).unwrap_or_else(|| k.ctx.noop()),                        // 7
             k.ctx.waitpoint(&args.waitpoint_id),                       // 8
             k.ctx.suspension_current(),                                // 9
             k.idx.lane_eligible(k.lane_id),                            // 10
@@ -117,9 +117,9 @@ ff_function! {
             k.ctx.exec_signals(),                                      // 4
             k.ctx.signal(&args.signal_id),                             // 5
             k.ctx.signal_payload(&args.signal_id),                     // 6
-            args.idempotency_key.as_ref().map(|ik| {
+            args.idempotency_key.as_ref().filter(|ik| !ik.is_empty()).map(|ik| {
                 k.ctx.signal_dedup(&args.waitpoint_id, ik)
-            }).unwrap_or_default(),                                    // 7
+            }).unwrap_or_else(|| k.ctx.noop()),                        // 7
         }
         argv {
             args.signal_id.to_string(),                                // 1
