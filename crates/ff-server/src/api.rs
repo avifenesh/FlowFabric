@@ -1,5 +1,6 @@
 //! REST API layer — thin axum handlers over Server methods.
 
+use std::fmt;
 use std::sync::Arc;
 
 use axum::{
@@ -10,7 +11,8 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use axum::http::{HeaderName, Method};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use ff_core::contracts::*;
@@ -65,15 +67,9 @@ struct ErrorBody {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self.0 {
-            ServerError::Script(msg) if msg.contains("not found") => {
-                (StatusCode::NOT_FOUND, msg.clone())
-            }
-            ServerError::Script(msg) if msg.contains("invalid") => {
-                (StatusCode::BAD_REQUEST, msg.clone())
-            }
-            ServerError::Script(msg) if msg.contains("failed:") => {
-                (StatusCode::BAD_REQUEST, msg.clone())
-            }
+            ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            ServerError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ServerError::OperationFailed(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         };
         (status, Json(ErrorBody { error: message })).into_response()
@@ -82,7 +78,9 @@ impl IntoResponse for ApiError {
 
 // ── Router ──
 
-pub fn router(server: Arc<Server>) -> Router {
+pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
+    let cors = build_cors_layer(cors_origins);
+
     Router::new()
         // Executions
         .route("/v1/executions", post(create_execution))
@@ -104,8 +102,22 @@ pub fn router(server: Arc<Server>) -> Router {
         // Health
         .route("/healthz", get(healthz))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(server)
+}
+
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    if origins.iter().any(|o| o == "*") {
+        return CorsLayer::permissive();
+    }
+    let parsed: Vec<_> = origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(parsed))
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_headers([HeaderName::from_static("content-type")])
 }
 
 // ── Execution handlers ──
@@ -143,7 +155,9 @@ async fn cancel_execution(
     Path(id): Path<String>,
     AppJson(mut args): AppJson<CancelExecutionArgs>,
 ) -> Result<Json<CancelExecutionResult>, ApiError> {
-    args.execution_id = parse_execution_id(&id)?;
+    let path_eid = parse_execution_id(&id)?;
+    check_id_match(&path_eid, &args.execution_id, "execution_id")?;
+    args.execution_id = path_eid;
     Ok(Json(server.cancel_execution(&args).await?))
 }
 
@@ -152,7 +166,9 @@ async fn deliver_signal(
     Path(id): Path<String>,
     AppJson(mut args): AppJson<DeliverSignalArgs>,
 ) -> Result<Json<DeliverSignalResult>, ApiError> {
-    args.execution_id = parse_execution_id(&id)?;
+    let path_eid = parse_execution_id(&id)?;
+    check_id_match(&path_eid, &args.execution_id, "execution_id")?;
+    args.execution_id = path_eid;
     Ok(Json(server.deliver_signal(&args).await?))
 }
 
@@ -197,7 +213,9 @@ async fn add_execution_to_flow(
     Path(id): Path<String>,
     AppJson(mut args): AppJson<AddExecutionToFlowArgs>,
 ) -> Result<Json<AddExecutionToFlowResult>, ApiError> {
-    args.flow_id = parse_flow_id(&id)?;
+    let path_fid = parse_flow_id(&id)?;
+    check_id_match(&path_fid, &args.flow_id, "flow_id")?;
+    args.flow_id = path_fid;
     Ok(Json(server.add_execution_to_flow(&args).await?))
 }
 
@@ -206,7 +224,9 @@ async fn cancel_flow(
     Path(id): Path<String>,
     AppJson(mut args): AppJson<CancelFlowArgs>,
 ) -> Result<Json<CancelFlowResult>, ApiError> {
-    args.flow_id = parse_flow_id(&id)?;
+    let path_fid = parse_flow_id(&id)?;
+    check_id_match(&path_fid, &args.flow_id, "flow_id")?;
+    args.flow_id = path_fid;
     Ok(Json(server.cancel_flow(&args).await?))
 }
 
@@ -265,17 +285,27 @@ async fn healthz(
 
 // ── ID parsing helpers ──
 
+/// Return 400 if the body contains an ID that differs from the path ID.
+fn check_id_match<T: PartialEq + fmt::Display>(path_id: &T, body_id: &T, id_name: &str) -> Result<(), ApiError> {
+    if body_id != path_id {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "path {id_name} does not match body {id_name}"
+        ))));
+    }
+    Ok(())
+}
+
 fn parse_execution_id(s: &str) -> Result<ExecutionId, ApiError> {
     ExecutionId::parse(s)
-        .map_err(|e| ApiError(ServerError::Script(format!("invalid execution_id: {e}"))))
+        .map_err(|e| ApiError(ServerError::InvalidInput(format!("invalid execution_id: {e}"))))
 }
 
 fn parse_flow_id(s: &str) -> Result<FlowId, ApiError> {
     FlowId::parse(s)
-        .map_err(|e| ApiError(ServerError::Script(format!("invalid flow_id: {e}"))))
+        .map_err(|e| ApiError(ServerError::InvalidInput(format!("invalid flow_id: {e}"))))
 }
 
 fn parse_budget_id(s: &str) -> Result<BudgetId, ApiError> {
     BudgetId::parse(s)
-        .map_err(|e| ApiError(ServerError::Script(format!("invalid budget_id: {e}"))))
+        .map_err(|e| ApiError(ServerError::InvalidInput(format!("invalid budget_id: {e}"))))
 }
