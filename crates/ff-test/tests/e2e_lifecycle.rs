@@ -6205,3 +6205,68 @@ async fn test_cancel_empty_flow_then_add_member() {
     assert!(err_msg.contains("flow_already_terminal"), "got: {err_msg}");
     server.shutdown().await;
 }
+
+/// create_execution → create_flow → add_execution_to_flow → cancel_flow →
+/// verify execution is cancelled via get_execution_state.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_create_cancel_roundtrip() {
+    use ff_core::contracts::{
+        AddExecutionToFlowArgs, CancelFlowArgs, CreateExecutionArgs, CreateFlowArgs,
+    };
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let server = test_server().await;
+    let config = test_config();
+    let now = TimestampMs::now();
+
+    // Create execution via Server
+    let eid = ExecutionId::new();
+    server.create_execution(&CreateExecutionArgs {
+        execution_id: eid.clone(), namespace: Namespace::new(NS),
+        lane_id: LaneId::new(LANE), execution_kind: "roundtrip_task".to_owned(),
+        input_payload: b"{}".to_vec(), payload_encoding: Some("json".to_owned()),
+        priority: 0, creator_identity: "test".to_owned(),
+        idempotency_key: None, tags: std::collections::HashMap::new(),
+        policy_json: "{}".to_owned(), delay_until: None,
+        partition_id: ff_core::partition::execution_partition(&eid, &config).index, now,
+    }).await.expect("create_execution");
+
+    // Verify waiting
+    assert_eq!(server.get_execution_state(&eid).await.unwrap(),
+        ff_core::state::PublicState::Waiting);
+
+    // Create flow + add member via Server
+    let flow_id = FlowId::new();
+    server.create_flow(&CreateFlowArgs {
+        flow_id: flow_id.clone(), flow_kind: "roundtrip".to_owned(),
+        namespace: Namespace::new(NS), now,
+    }).await.expect("create_flow");
+    server.add_execution_to_flow(&AddExecutionToFlowArgs {
+        flow_id: flow_id.clone(), execution_id: eid.clone(), now,
+    }).await.expect("add member");
+
+    // Cancel flow via Server (cancel_all dispatches cancel_execution)
+    let result = server.cancel_flow(&CancelFlowArgs {
+        flow_id: flow_id.clone(), reason: "roundtrip_test".to_owned(),
+        cancellation_policy: "cancel_all".to_owned(), now: TimestampMs::now(),
+    }).await.expect("cancel_flow");
+    let ff_core::contracts::CancelFlowResult::Cancelled {
+        ref member_execution_ids, ..
+    } = result;
+    assert_eq!(member_execution_ids.len(), 1);
+
+    // Verify execution is cancelled via Server
+    assert_eq!(server.get_execution_state(&eid).await.unwrap(),
+        ff_core::state::PublicState::Cancelled,
+        "execution should be cancelled after cancel_flow");
+
+    // Verify flow is cancelled
+    let fpart = ff_core::partition::flow_partition(&flow_id, &config);
+    let fctx = ff_core::keys::FlowKeyContext::new(&fpart, &flow_id);
+    let pfs: Option<String> = tc.client().cmd("HGET").arg(&fctx.core())
+        .arg("public_flow_state").execute().await.unwrap();
+    assert_eq!(pfs.as_deref(), Some("cancelled"));
+
+    server.shutdown().await;
+}

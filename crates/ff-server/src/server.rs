@@ -1363,8 +1363,10 @@ fn parse_deliver_signal_result(
         let sub = fcall_field_str(arr, 1);
         if sub == "DUPLICATE" {
             // ok_duplicate(existing_signal_id) → {1, "DUPLICATE", existing_signal_id}
+            let existing_str = fcall_field_str(arr, 2);
+            let existing_id = SignalId::parse(&existing_str).unwrap_or_else(|_| signal_id.clone());
             Ok(DeliverSignalResult::Duplicate {
-                existing_signal_id: signal_id.clone(),
+                existing_signal_id: existing_id,
             })
         } else {
             // ok(signal_id, effect) → {1, "OK", signal_id, effect}
