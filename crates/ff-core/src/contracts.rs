@@ -996,6 +996,8 @@ pub enum StageDependencyEdgeResult {
 pub struct ApplyDependencyToChildArgs {
     pub flow_id: crate::types::FlowId,
     pub edge_id: crate::types::EdgeId,
+    /// The child execution that receives the dependency.
+    pub downstream_execution_id: ExecutionId,
     pub upstream_execution_id: ExecutionId,
     pub graph_revision: u64,
     #[serde(default = "default_dependency_kind")]
