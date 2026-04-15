@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["FlowFabric Contributors"]
+description = "Rust client for Valkey, built for FlowFabric. Forked from glide-core (valkey-glide)."
+repository = "https://github.com/avifenesh/FlowFabric"
+keywords = ["valkey", "redis", "client", "async"]
+categories = ["database"]
 
 [dependencies]
 # Allocator — mimalloc on supported platforms, system allocator elsewhere

@@ -15,7 +15,7 @@ static CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
 const DEFAULT_PORT: u16 = 6379;
 
-/// Checks if a given string is a valid redis URL.
+/// Checks if a given string is a valid Valkey URL.
 pub fn parse_redis_url(input: &str) -> Option<url::Url> {
     match url::Url::parse(input) {
         Ok(result) => match result.scheme() {
@@ -136,7 +136,7 @@ pub type PubSubChannelOrPattern = Vec<u8>;
 /// Type for pubsub channels/patterns
 pub type PubSubSubscriptionInfo = HashMap<PubSubSubscriptionKind, HashSet<PubSubChannelOrPattern>>;
 
-/// Redis specific/connection independent information used to establish a connection to redis.
+/// Valkey connection information used to establish a connection.
 #[derive(Clone, Debug, Default)]
 pub struct ValkeyConnectionInfo {
     /// The database number to use.  This is usually `0`.

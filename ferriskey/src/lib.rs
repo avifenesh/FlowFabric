@@ -1,3 +1,9 @@
+//! Ferriskey — a Rust client for Valkey.
+//!
+//! Forked from glide-core (valkey-glide), descended from redis-rs.
+//! Refactored for FlowFabric: ClientBuilder API, first-class FCALL support,
+//! no URL-based connections required.
+
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 // Use mimalloc as the global allocator on supported platforms.
@@ -46,11 +52,7 @@ pub use value::{
 
 pub mod client;
 pub mod compression;
-#[allow(dead_code)]
-pub(crate) mod errors;
 pub(crate) mod ferriskey_client;
-#[allow(dead_code)]
-pub(crate) mod otel_db_semantics;
 #[allow(dead_code)]
 pub(crate) mod scripts_container;
 
