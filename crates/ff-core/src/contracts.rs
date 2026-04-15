@@ -64,6 +64,8 @@ pub struct IssueClaimGrantArgs {
     #[serde(default)]
     pub admission_summary: Option<String>,
     pub grant_ttl_ms: u64,
+    /// Caller-side timestamp for bookkeeping. NOT passed to the Lua FCALL —
+    /// ff_issue_claim_grant uses `redis.call("TIME")` for grant_expires_at.
     pub now: TimestampMs,
 }
 
@@ -362,12 +364,17 @@ pub struct IssueReclaimGrantArgs {
     pub route_snapshot_json: Option<String>,
     #[serde(default)]
     pub admission_summary: Option<String>,
+    /// Caller-side timestamp for bookkeeping. NOT passed to the Lua FCALL —
+    /// ff_issue_reclaim_grant uses `redis.call("TIME")` for grant_expires_at
+    /// (same as ff_issue_claim_grant). Kept for contract symmetry with
+    /// IssueClaimGrantArgs and scheduler audit logging.
+    pub now: TimestampMs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueReclaimGrantResult {
     /// Reclaim grant issued.
-    Granted { expires_at_ms: u64 },
+    Granted { expires_at_ms: TimestampMs },
 }
 
 // ─── reclaim_execution ───
