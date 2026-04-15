@@ -98,7 +98,6 @@ pub enum FailOutcome {
     /// Retry was scheduled — execution is in delayed backoff.
     RetryScheduled {
         delay_until: TimestampMs,
-        next_attempt_index: AttemptIndex,
     },
     /// No retries left — execution is terminal failed.
     TerminalFailed,
@@ -1096,7 +1095,7 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
 }
 
 /// Parse ff_fail_execution result:
-///   ok("retry_scheduled", delay_until, next_attempt_index)
+///   ok("retry_scheduled", delay_until)
 ///   ok("terminal_failed")
 fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
     let arr = match raw {
@@ -1145,6 +1144,8 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
 
     match sub_status.as_str() {
         "retry_scheduled" => {
+            // Lua returns: ok("retry_scheduled", tostring(delay_until))
+            // arr[3] = delay_until
             let delay_str = arr
                 .get(3)
                 .and_then(|v| match v {
@@ -1155,19 +1156,8 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
                 .unwrap_or_default();
             let delay_until = delay_str.parse::<i64>().unwrap_or(0);
 
-            let next_idx_str = arr
-                .get(4)
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::Int(n)) => Some(n.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let next_idx = next_idx_str.parse::<u32>().unwrap_or(1);
-
             Ok(FailOutcome::RetryScheduled {
                 delay_until: TimestampMs::from_millis(delay_until),
-                next_attempt_index: AttemptIndex::new(next_idx),
             })
         }
         "terminal_failed" => Ok(FailOutcome::TerminalFailed),
