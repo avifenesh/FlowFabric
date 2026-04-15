@@ -6,7 +6,10 @@ use ff_core::contracts::{
     CancelExecutionResult, CancelFlowArgs, CancelFlowResult, ChangePriorityResult,
     CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
+    ApplyDependencyToChildArgs, ApplyDependencyToChildResult,
     DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ReplayExecutionResult,
+    ReportUsageArgs, ReportUsageResult,
+    StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
     self, BudgetKeyContext, ExecKeyContext, FlowKeyContext, IndexKeys, QuotaKeyContext,
@@ -551,6 +554,42 @@ impl Server {
         })
     }
 
+    /// Report usage against a budget and check limits.
+    pub async fn report_usage(
+        &self,
+        budget_id: &BudgetId,
+        args: &ReportUsageArgs,
+    ) -> Result<ReportUsageResult, ServerError> {
+        let partition = budget_partition(budget_id, &self.config.partition_config);
+        let bctx = BudgetKeyContext::new(&partition, budget_id);
+
+        // KEYS (3): budget_usage, budget_limits, budget_def
+        let fcall_keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
+
+        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms
+        let dim_count = args.dimensions.len();
+        let mut fcall_args: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+        fcall_args.push(dim_count.to_string());
+        for dim in &args.dimensions {
+            fcall_args.push(dim.clone());
+        }
+        for delta in &args.deltas {
+            fcall_args.push(delta.to_string());
+        }
+        fcall_args.push(args.now.to_string());
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_report_usage_and_check", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+
+        parse_report_usage_result(&raw)
+    }
+
     // ── Flow API ──
 
     /// Create a new flow container.
@@ -695,6 +734,110 @@ impl Server {
         }
 
         Ok(result)
+    }
+
+    /// Stage a dependency edge between two executions in a flow.
+    ///
+    /// Runs on the flow partition {fp:N}.
+    /// KEYS (6), ARGV (8) — matches lua/flow.lua ff_stage_dependency_edge.
+    pub async fn stage_dependency_edge(
+        &self,
+        args: &StageDependencyEdgeArgs,
+    ) -> Result<StageDependencyEdgeResult, ServerError> {
+        let partition = flow_partition(&args.flow_id, &self.config.partition_config);
+        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+
+        // KEYS (6): flow_core, members_set, edge_hash, out_adj_set, in_adj_set, grant_hash
+        let fcall_keys: Vec<String> = vec![
+            fctx.core(),
+            fctx.members(),
+            fctx.edge(&args.edge_id),
+            fctx.outgoing(&args.upstream_execution_id),
+            fctx.incoming(&args.downstream_execution_id),
+            fctx.grant(&args.edge_id.to_string()),
+        ];
+
+        // ARGV (8): flow_id, edge_id, upstream_eid, downstream_eid,
+        //           dependency_kind, data_passing_ref, expected_graph_revision, now_ms
+        let fcall_args: Vec<String> = vec![
+            args.flow_id.to_string(),
+            args.edge_id.to_string(),
+            args.upstream_execution_id.to_string(),
+            args.downstream_execution_id.to_string(),
+            args.dependency_kind.clone(),
+            args.data_passing_ref.clone().unwrap_or_default(),
+            args.expected_graph_revision.to_string(),
+            args.now.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_stage_dependency_edge", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+
+        parse_stage_dependency_edge_result(&raw)
+    }
+
+    /// Apply a staged dependency edge to the child execution.
+    ///
+    /// Runs on the child execution partition {p:N}.
+    /// KEYS (6), ARGV (7) — matches lua/flow.lua ff_apply_dependency_to_child.
+    pub async fn apply_dependency_to_child(
+        &self,
+        args: &ApplyDependencyToChildArgs,
+    ) -> Result<ApplyDependencyToChildResult, ServerError> {
+        let partition = execution_partition(
+            &args.downstream_execution_id,
+            &self.config.partition_config,
+        );
+        let ctx = ExecKeyContext::new(&partition, &args.downstream_execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // Pre-read lane_id for index keys
+        let lane_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| ServerError::Valkey(format!("HGET lane_id: {e}")))?;
+        let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
+
+        // KEYS (6): exec_core, deps_meta, unresolved_set, dep_hash,
+        //           eligible_zset, blocked_deps_zset
+        let fcall_keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.deps_meta(),
+            ctx.deps_unresolved(),
+            ctx.dep_edge(&args.edge_id),
+            idx.lane_eligible(&lane),
+            idx.lane_blocked_dependencies(&lane),
+        ];
+
+        // ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
+        //           dependency_kind, data_passing_ref, now_ms
+        let fcall_args: Vec<String> = vec![
+            args.flow_id.to_string(),
+            args.edge_id.to_string(),
+            args.upstream_execution_id.to_string(),
+            args.graph_revision.to_string(),
+            args.dependency_kind.clone(),
+            args.data_passing_ref.clone().unwrap_or_default(),
+            args.now.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_apply_dependency_to_child", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+
+        parse_apply_dependency_result(&raw)
     }
 
     // ── Execution operations API ──
@@ -1373,6 +1516,66 @@ fn parse_cancel_flow_result(raw: &Value) -> Result<CancelFlowResult, ServerError
     }
 }
 
+fn parse_stage_dependency_edge_result(
+    raw: &Value,
+) -> Result<StageDependencyEdgeResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_stage_dependency_edge: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        _ => return Err(ServerError::Script("ff_stage_dependency_edge: bad status code".into())),
+    };
+    if status == 1 {
+        let edge_id_str = fcall_field_str(arr, 2);
+        let rev_str = fcall_field_str(arr, 3);
+        let edge_id = EdgeId::parse(&edge_id_str)
+            .map_err(|e| ServerError::Script(format!("bad edge_id: {e}")))?;
+        let rev: u64 = rev_str.parse().unwrap_or(0);
+        Ok(StageDependencyEdgeResult::Staged {
+            edge_id,
+            new_graph_revision: rev,
+        })
+    } else {
+        let error_code = fcall_field_str(arr, 1);
+        Err(ServerError::OperationFailed(format!(
+            "ff_stage_dependency_edge failed: {error_code}"
+        )))
+    }
+}
+
+fn parse_apply_dependency_result(
+    raw: &Value,
+) -> Result<ApplyDependencyToChildResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_apply_dependency_to_child: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        _ => return Err(ServerError::Script("ff_apply_dependency_to_child: bad status code".into())),
+    };
+    if status == 1 {
+        let sub = fcall_field_str(arr, 1);
+        if sub == "ALREADY_APPLIED" || sub == "already_applied" {
+            Ok(ApplyDependencyToChildResult::AlreadyApplied)
+        } else {
+            // OK status — field at index 2 is unsatisfied count
+            let count_str = fcall_field_str(arr, 2);
+            let count: u32 = count_str.parse().unwrap_or(0);
+            Ok(ApplyDependencyToChildResult::Applied {
+                unsatisfied_count: count,
+            })
+        }
+    } else {
+        let error_code = fcall_field_str(arr, 1);
+        Err(ServerError::OperationFailed(format!(
+            "ff_apply_dependency_to_child failed: {error_code}"
+        )))
+    }
+}
+
 fn parse_deliver_signal_result(
     raw: &Value,
     signal_id: &SignalId,
@@ -1467,5 +1670,46 @@ fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
         Some(Ok(Value::SimpleString(s))) => s.clone(),
         Some(Ok(Value::Int(n))) => n.to_string(),
         _ => String::new(),
+    }
+}
+
+/// Parse ff_report_usage_and_check result.
+/// Domain-specific: {"OK"}, {"SOFT_BREACH", dim, action}, {"HARD_BREACH", dim, action, current, limit}
+fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_report_usage_and_check: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
+        Some(Ok(Value::SimpleString(s))) => s.clone(),
+        _ => {
+            return Err(ServerError::Script(
+                "ff_report_usage_and_check: expected status string".into(),
+            ))
+        }
+    };
+    match status.as_str() {
+        "OK" => Ok(ReportUsageResult::Ok),
+        "SOFT_BREACH" => {
+            let dim = fcall_field_str(arr, 1);
+            let action = fcall_field_str(arr, 2);
+            Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+        }
+        "HARD_BREACH" => {
+            let dim = fcall_field_str(arr, 1);
+            let action = fcall_field_str(arr, 2);
+            let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
+            let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
+            Ok(ReportUsageResult::HardBreach {
+                dimension: dim,
+                action,
+                current_usage: current,
+                hard_limit: limit,
+            })
+        }
+        _ => Err(ServerError::OperationFailed(format!(
+            "ff_report_usage_and_check failed: {status}"
+        ))),
     }
 }
