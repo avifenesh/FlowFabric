@@ -133,6 +133,7 @@ async fn api_create_execution(api: &TestApi, eid: &ExecutionId, priority: i32) {
         tags: Default::default(),
         policy: None,
         delay_until: None,
+        execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(eid, &ff_test::fixtures::TEST_PARTITION_CONFIG).index,
         now: TimestampMs::now(),
     };
@@ -187,6 +188,7 @@ async fn test_api_create_and_get_execution() {
         tags: Default::default(),
         policy: None,
         delay_until: None,
+        execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(&eid, &ff_test::fixtures::TEST_PARTITION_CONFIG).index,
         now,
     };
@@ -250,6 +252,7 @@ async fn test_api_cancel_execution() {
         tags: Default::default(),
         policy: None,
         delay_until: None,
+        execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(&eid, &ff_test::fixtures::TEST_PARTITION_CONFIG).index,
         now,
     };

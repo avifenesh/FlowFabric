@@ -436,7 +436,7 @@ impl Scheduler {
 
         // Read quota limits from policy hash
         let rate_limit: Option<String> = self.client
-            .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_limit")
+            .cmd("HGET").arg(&quota_def_key).arg("max_requests_per_window")
             .execute().await?;
         let window_secs: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_seconds")

@@ -271,7 +271,9 @@ impl Server {
                 .map(|_| "86400000".to_string())
                 .unwrap_or_default(),                // 10 dedup_ttl_ms
             tags_json,                               // 11
-            String::new(),                           // 12 execution_deadline_at
+            args.execution_deadline_at
+                .map(|d| d.to_string())
+                .unwrap_or_default(),                // 12 execution_deadline_at
             args.partition_id.to_string(),           // 13
         ];
 
@@ -605,7 +607,13 @@ impl Server {
             fcall_args.push(delta.to_string());
         }
         fcall_args.push(args.now.to_string());
-        fcall_args.push(args.dedup_key.clone().unwrap_or_default());
+        let dedup_key_val = args
+            .dedup_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("ff:usagededup:{}:{}", bctx.hash_tag(), k))
+            .unwrap_or_default();
+        fcall_args.push(dedup_key_val);
 
         let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();

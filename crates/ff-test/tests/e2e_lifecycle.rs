@@ -6147,7 +6147,7 @@ async fn test_server_full_flow_lifecycle() {
             input_payload: b"{}".to_vec(), payload_encoding: Some("json".to_owned()),
             priority: 0, creator_identity: "test".to_owned(),
             idempotency_key: None, tags: std::collections::HashMap::new(),
-            policy: None, delay_until: None,
+            policy: None, delay_until: None, execution_deadline_at: None,
             partition_id: ff_core::partition::execution_partition(eid, &config).index, now,
         }).await.expect("create_execution");
     }
@@ -6261,7 +6261,7 @@ async fn test_server_create_cancel_roundtrip() {
         input_payload: b"{}".to_vec(), payload_encoding: Some("json".to_owned()),
         priority: 0, creator_identity: "test".to_owned(),
         idempotency_key: None, tags: std::collections::HashMap::new(),
-        policy: None, delay_until: None,
+        policy: None, delay_until: None, execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(&eid, &config).index, now,
     }).await.expect("create_execution");
 
