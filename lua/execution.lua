@@ -1217,7 +1217,7 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
 
     -- ZADD terminal (construct key from hash tag + lane)
     local tag = string.match(K.core_key, "(%b{})")
-    local lane = core.current_lane or "default"
+    local lane = core.lane_id or core.current_lane or "default"
     local terminal_key = "ff:idx:" .. tag .. ":lane:" .. lane .. ":terminal"
     redis.call("ZADD", terminal_key, now_ms, A.execution_id)
 

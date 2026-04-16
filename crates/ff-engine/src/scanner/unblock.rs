@@ -302,9 +302,11 @@ async fn is_budget_breached(
         }
     };
 
-    for i in (0..limits.len()).step_by(2) {
+    let mut i = 0;
+    while i + 1 < limits.len() {
         let field = &limits[i];
         let limit_str = &limits[i + 1];
+        i += 2;
 
         if !field.starts_with("hard:") {
             continue;
@@ -392,7 +394,7 @@ async fn check_quota_cleared(
     let def_fields: Vec<Option<String>> = match client
         .cmd("HMGET")
         .arg(&quota_def_key)
-        .arg("requests_per_window_limit")
+        .arg("max_requests_per_window")
         .arg("requests_per_window_seconds")
         .arg("active_concurrency_cap")
         .execute()

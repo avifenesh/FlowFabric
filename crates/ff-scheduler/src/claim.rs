@@ -113,8 +113,7 @@ impl BudgetChecker {
         // Read all limit dimensions via hgetall (returns HashMap, not flat pairs)
         let limits: std::collections::HashMap<String, String> = client
             .hgetall(limits_key)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         // Parse hard limits
         for (field, limit_val) in &limits {
@@ -423,16 +422,16 @@ impl Scheduler {
         // Read quota limits from policy hash
         let rate_limit: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_limit")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
         let window_secs: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_seconds")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
         let concurrency_cap: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("active_concurrency_cap")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
         let jitter: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("jitter_ms")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
 
         let rate_limit = rate_limit.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
         let window_secs = window_secs.as_deref().and_then(|s| s.parse().ok()).unwrap_or(60u64);

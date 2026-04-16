@@ -147,7 +147,7 @@ async fn purge_execution(
     let exec_core_key = format!("ff:exec:{}:{}:core", tag, eid_str);
 
     // Read completed_at and total_attempt_count from exec_core
-    let fields: Vec<String> = client
+    let fields: Vec<Option<String>> = client
         .cmd("HMGET")
         .arg(&exec_core_key)
         .arg("completed_at")
@@ -156,9 +156,11 @@ async fn purge_execution(
         .await?;
 
     let completed_at: u64 = fields.first()
+        .and_then(|v| v.as_ref())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let total_attempts: u32 = fields.get(1)
+        .and_then(|v| v.as_ref())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
