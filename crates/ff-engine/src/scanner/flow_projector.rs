@@ -88,7 +88,7 @@ impl Scanner for FlowProjector {
 
         for fid_str in &flow_ids {
             match project_flow_summary(
-                client, &tag, fid_str, now_ms, &self.partition_config,
+                client, &tag, &flow_index_key, fid_str, now_ms, &self.partition_config,
             ).await {
                 Ok(true) => processed += 1,
                 Ok(false) => {} // no members or already up-to-date
@@ -112,12 +112,28 @@ impl Scanner for FlowProjector {
 async fn project_flow_summary(
     client: &ferriskey::Client,
     tag: &str,
+    flow_index_key: &str,
     fid_str: &str,
     now_ms: u64,
     config: &PartitionConfig,
 ) -> Result<bool, ferriskey::Error> {
+    let core_key = format!("ff:flow:{}:{}:core", tag, fid_str);
     let members_key = format!("ff:flow:{}:{}:members", tag, fid_str);
     let summary_key = format!("ff:flow:{}:{}:summary", tag, fid_str);
+
+    // Defensive prune: index entry for a flow whose core is gone (manual
+    // delete / retention purge) — drop it so SMEMBERS stays correct.
+    let core_exists: bool = client.exists(&core_key).await.unwrap_or(true);
+    if !core_exists {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(flow_index_key)
+            .arg(fid_str)
+            .execute()
+            .await
+            .unwrap_or(None);
+        return Ok(false);
+    }
 
     // Get true membership count for accurate total_members reporting.
     let true_total: u64 = client
@@ -223,6 +239,20 @@ async fn project_flow_summary(
         .arg("last_summary_update_at").arg(now_ms.to_string().as_str())
         .execute()
         .await?;
+
+    // Prune the index entry once every member is terminal. The flow core
+    // lives on for replay/inspection, but keeping terminal flows in the
+    // active flow_index would grow cardinality unboundedly across the
+    // lifetime of the partition.
+    if all_terminal {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(flow_index_key)
+            .arg(fid_str)
+            .execute()
+            .await
+            .unwrap_or(None);
+    }
 
     Ok(true)
 }

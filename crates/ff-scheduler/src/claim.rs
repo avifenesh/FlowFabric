@@ -649,10 +649,12 @@ pub enum SchedulerError {
 }
 
 impl SchedulerError {
-    /// Returns the underlying ferriskey ErrorKind.
-    pub fn valkey_kind(&self) -> ferriskey::ErrorKind {
+    /// Returns the underlying ferriskey ErrorKind, if this is a Valkey error.
+    /// Matches `ServerError::valkey_kind` and `ScriptError::valkey_kind` so
+    /// callers can treat all three uniformly.
+    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
-            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => e.kind(),
+            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
         }
     }
 }

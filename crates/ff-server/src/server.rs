@@ -681,10 +681,24 @@ impl Server {
     /// `ff_cancel_flow` on `{fp:N}`. For `cancel_all` policy, member
     /// executions must be cancelled cross-partition; this dispatch runs in
     /// the background and the call returns [`CancelFlowResult::CancellationScheduled`]
-    /// immediately. For all other policies (or flows with no members), the
-    /// call returns [`CancelFlowResult::Cancelled`].
+    /// immediately. For all other policies (or flows with no members), or
+    /// when the flow was already in a terminal state (idempotent retry),
+    /// the call returns [`CancelFlowResult::Cancelled`].
     ///
     /// Clients that need synchronous completion can call [`Self::cancel_flow_wait`].
+    ///
+    /// # Backpressure
+    ///
+    /// Each call that hits the async dispatch path spawns a new task into
+    /// the shared background `JoinSet`. Rapid repeated calls against the
+    /// same flow will spawn *multiple* overlapping dispatch tasks. This is
+    /// not a correctness issue — each member cancel is idempotent and
+    /// terminal flows short-circuit via [`ParsedCancelFlow::AlreadyTerminal`]
+    /// — but heavy burst callers should either use `?wait=true` (serialises
+    /// the dispatch on the HTTP thread, giving natural backpressure) or
+    /// implement client-side deduplication on `flow_id`. The `JoinSet` is
+    /// drained with a 15s timeout on [`Self::shutdown`], so very long
+    /// dispatch tails may be aborted during graceful shutdown.
     pub async fn cancel_flow(
         &self,
         args: &CancelFlowArgs,
@@ -729,7 +743,25 @@ impl Server {
             .fcall_with_reload("ff_cancel_flow", &key_refs, &arg_refs)
             .await?;
 
-        let (policy, members) = parse_cancel_flow_raw(&raw)?;
+        let (policy, members) = match parse_cancel_flow_raw(&raw)? {
+            ParsedCancelFlow::Cancelled { policy, member_execution_ids } => {
+                (policy, member_execution_ids)
+            }
+            // Idempotent retry: flow was already cancelled/completed/failed.
+            // Return Cancelled with the same policy the caller requested and
+            // an empty member list — there is nothing left to dispatch and
+            // the HTTP client can safely re-issue the cancel without a 4xx.
+            ParsedCancelFlow::AlreadyTerminal => {
+                tracing::debug!(
+                    flow_id = %args.flow_id,
+                    "cancel_flow: flow already terminal, returning idempotent Cancelled"
+                );
+                return Ok(CancelFlowResult::Cancelled {
+                    cancellation_policy: args.cancellation_policy.clone(),
+                    member_execution_ids: Vec::new(),
+                });
+            }
+        };
         let needs_dispatch = policy == "cancel_all" && !members.is_empty();
 
         if !needs_dispatch {
@@ -1748,12 +1780,25 @@ fn parse_add_execution_to_flow_result(
     }
 }
 
-/// Parse the raw `ff_cancel_flow` FCALL response into (policy, member_eids).
+/// Outcome of parsing a raw `ff_cancel_flow` FCALL response.
 ///
-/// The caller decides whether to return [`CancelFlowResult::Cancelled`] or
-/// [`CancelFlowResult::CancellationScheduled`] based on whether member
-/// dispatch is synchronous or spawned into the background.
-fn parse_cancel_flow_raw(raw: &Value) -> Result<(String, Vec<String>), ServerError> {
+/// Keeps `AlreadyTerminal` distinct from other script errors so the caller
+/// can treat cancel on an already-cancelled/completed/failed flow as
+/// idempotent success instead of surfacing a 400 to the client.
+enum ParsedCancelFlow {
+    Cancelled {
+        policy: String,
+        member_execution_ids: Vec<String>,
+    },
+    AlreadyTerminal,
+}
+
+/// Parse the raw `ff_cancel_flow` FCALL response.
+///
+/// Returns [`ParsedCancelFlow::Cancelled`] on success, [`ParsedCancelFlow::AlreadyTerminal`]
+/// when the flow was already in a terminal state (idempotent retry), or a
+/// [`ServerError`] for any other failure.
+fn parse_cancel_flow_raw(raw: &Value) -> Result<ParsedCancelFlow, ServerError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => return Err(ServerError::Script("ff_cancel_flow: expected Array".into())),
@@ -1764,6 +1809,9 @@ fn parse_cancel_flow_raw(raw: &Value) -> Result<(String, Vec<String>), ServerErr
     };
     if status != 1 {
         let error_code = fcall_field_str(arr, 1);
+        if error_code == "flow_already_terminal" {
+            return Ok(ParsedCancelFlow::AlreadyTerminal);
+        }
         return Err(ServerError::OperationFailed(format!(
             "ff_cancel_flow failed: {error_code}"
         )));
@@ -1780,7 +1828,7 @@ fn parse_cancel_flow_raw(raw: &Value) -> Result<(String, Vec<String>), ServerErr
         members.push(s);
         i += 1;
     }
-    Ok((policy, members))
+    Ok(ParsedCancelFlow::Cancelled { policy, member_execution_ids: members })
 }
 
 fn parse_stage_dependency_edge_result(

@@ -371,11 +371,6 @@ impl FlowIndexKeys {
         }
     }
 
-    /// `ff:idx:{fp:N}:terminal_flows`
-    pub fn terminal_flows(&self) -> String {
-        format!("ff:idx:{}:terminal_flows", self.tag)
-    }
-
     /// `ff:idx:{fp:N}:flow_index` — SET of flow IDs on this partition.
     /// Used by the flow projector for cluster-safe discovery (replaces SCAN).
     pub fn flow_index(&self) -> String {
