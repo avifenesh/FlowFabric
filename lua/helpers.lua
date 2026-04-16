@@ -273,7 +273,9 @@ local function initialize_condition(json)
   local matchers = {}
   local names = spec.required_signal_names or {}
   if #names == 0 then
-    -- Single wildcard matcher (matches any signal name)
+    -- Empty required_signal_names acts as wildcard: ANY signal satisfies the condition.
+    -- To require explicit operator resume (no signal match), pass a sentinel name
+    -- that no real signal will match, or use a different resume mechanism.
     matchers[1] = { name = "", satisfied = false, signal_id = "" }
   else
     for i, name in ipairs(names) do

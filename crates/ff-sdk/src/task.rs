@@ -27,13 +27,34 @@ pub enum TimeoutBehavior {
 }
 
 impl TimeoutBehavior {
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Fail => "fail",
             Self::Cancel => "cancel",
             Self::Expire => "expire",
             Self::AutoResume => "auto_resume_with_timeout_signal",
             Self::Escalate => "escalate",
+        }
+    }
+}
+
+impl std::fmt::Display for TimeoutBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TimeoutBehavior {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fail" => Ok(Self::Fail),
+            "cancel" => Ok(Self::Cancel),
+            "expire" => Ok(Self::Expire),
+            "auto_resume_with_timeout_signal" | "auto_resume" => Ok(Self::AutoResume),
+            "escalate" => Ok(Self::Escalate),
+            other => Err(format!("unknown timeout behavior: {other}")),
         }
     }
 }
@@ -83,6 +104,16 @@ pub enum SignalOutcome {
     TriggeredResume { signal_id: SignalId },
     /// Duplicate signal (idempotency key matched).
     Duplicate { existing_signal_id: String },
+}
+
+impl SignalOutcome {
+    /// Parse a raw `ff_deliver_signal` FCALL result into a `SignalOutcome`.
+    ///
+    /// Consuming packages that call `ff_deliver_signal` directly can use this
+    /// to interpret the Lua return value without depending on SDK internals.
+    pub fn from_fcall_value(raw: &Value) -> Result<Self, SdkError> {
+        parse_signal_result(raw)
+    }
 }
 
 /// Outcome of `append_frame()`.
@@ -774,6 +805,10 @@ impl ClaimedTask {
     /// The execution transitions to `suspended` and the worker loses ownership.
     /// An external signal matching the condition will resume the execution.
     ///
+    /// If `condition_matchers` is empty, a wildcard matcher is created that
+    /// matches ANY signal name. To require an explicit operator resume with
+    /// no signal match, pass a sentinel name that no real signal will use.
+    ///
     /// If buffered signals on a pending waitpoint already satisfy the condition,
     /// returns `AlreadySatisfied` and the lease is NOT released.
     ///
@@ -1070,7 +1105,8 @@ fn is_terminal_renewal_error(err: &ScriptError) -> bool {
 // ── FCALL result parsing ──
 
 /// Parse ff_report_usage_and_check result.
-/// Domain-specific: {"OK"}, {"SOFT_BREACH", dim, action}, {"HARD_BREACH", dim, action, current, limit}
+/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
+///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
 fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -1080,37 +1116,44 @@ fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError>
             )));
         }
     };
-    let status = match arr.first() {
-        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(Value::SimpleString(s))) => s.clone(),
+    let status_code = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
         _ => {
             return Err(SdkError::Script(ScriptError::Parse(
-                "ff_report_usage_and_check: expected status string".into(),
+                "ff_report_usage_and_check: expected Int status code".into(),
             )));
         }
     };
-    match status.as_str() {
+    if status_code != 1 {
+        let error_code = usage_field_str(arr, 1);
+        return Err(SdkError::Script(
+            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                ScriptError::Parse(format!("ff_report_usage_and_check: {error_code}"))
+            }),
+        ));
+    }
+    let sub_status = usage_field_str(arr, 1);
+    match sub_status.as_str() {
         "OK" => Ok(ReportUsageResult::Ok),
         "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
-            let dim = usage_field_str(arr, 1);
-            let action = usage_field_str(arr, 2);
-            Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+            let dim = usage_field_str(arr, 2);
+            let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
+            let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
+            Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
         }
         "HARD_BREACH" => {
-            let dim = usage_field_str(arr, 1);
-            let action = usage_field_str(arr, 2);
+            let dim = usage_field_str(arr, 2);
             let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
             let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
             Ok(ReportUsageResult::HardBreach {
                 dimension: dim,
-                action,
                 current_usage: current,
                 hard_limit: limit,
             })
         }
         _ => Err(SdkError::Script(ScriptError::Parse(format!(
-            "ff_report_usage_and_check: unknown status: {status}"
+            "ff_report_usage_and_check: unknown sub-status: {sub_status}"
         )))),
     }
 }

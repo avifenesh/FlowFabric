@@ -2764,10 +2764,16 @@ async fn fcall_report_usage(
         .await
         .expect("FCALL ff_report_usage_and_check failed");
 
-    // Parse result array — domain-specific format (not ok/err convention)
+    // Parse result array — standard format {1, status, ...}
+    // Skip the status code (index 0) so callers see [status, field1, field2, ...]
     match &raw {
         Value::Array(arr) => {
-            arr.iter().filter_map(|v| match v {
+            let status_code = match arr.first() {
+                Some(Ok(Value::Int(n))) => *n,
+                _ => panic!("ff_report_usage_and_check: expected Int status code, got {raw:?}"),
+            };
+            assert_eq!(status_code, 1, "ff_report_usage_and_check returned error: {raw:?}");
+            arr.iter().skip(1).filter_map(|v| match v {
                 Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
                 Ok(Value::SimpleString(s)) => Some(s.clone()),
                 Ok(Value::Int(n)) => Some(n.to_string()),
@@ -4207,7 +4213,8 @@ async fn test_budget_enforcement_with_breach_metadata() {
     let r2 = fcall_report_usage(&tc, budget_id, &[("tokens", 6)]).await;
     assert_eq!(r2[0], "HARD_BREACH", "11 tokens > limit 10. Got: {r2:?}");
     assert_eq!(r2[1], "tokens", "breach should be on 'tokens' dim");
-    assert_eq!(r2[2], "fail", "on_hard_limit action should be 'fail'");
+    assert_eq!(r2[2], "5", "current_usage should be 5. Got: {r2:?}");
+    assert_eq!(r2[3], "10", "hard_limit should be 10. Got: {r2:?}");
 
     // Verify usage is STILL 5 (check-before-increment: no overshoot)
     let usage2: Option<String> = tc.client()
@@ -5883,7 +5890,7 @@ async fn test_server_methods_wrong_execution_id() {
     let cancel_args = ff_core::contracts::CancelExecutionArgs {
         execution_id: bogus,
         reason: "test".into(),
-        source: None,
+        source: CancelSource::OperatorOverride,
         lease_id: None,
         lease_epoch: None,
         attempt_id: None,
@@ -6140,7 +6147,7 @@ async fn test_server_full_flow_lifecycle() {
             input_payload: b"{}".to_vec(), payload_encoding: Some("json".to_owned()),
             priority: 0, creator_identity: "test".to_owned(),
             idempotency_key: None, tags: std::collections::HashMap::new(),
-            policy_json: "{}".to_owned(), delay_until: None,
+            policy: None, delay_until: None,
             partition_id: ff_core::partition::execution_partition(eid, &config).index, now,
         }).await.expect("create_execution");
     }
@@ -6254,7 +6261,7 @@ async fn test_server_create_cancel_roundtrip() {
         input_payload: b"{}".to_vec(), payload_encoding: Some("json".to_owned()),
         priority: 0, creator_identity: "test".to_owned(),
         idempotency_key: None, tags: std::collections::HashMap::new(),
-        policy_json: "{}".to_owned(), delay_until: None,
+        policy: None, delay_until: None,
         partition_id: ff_core::partition::execution_partition(&eid, &config).index, now,
     }).await.expect("create_execution");
 

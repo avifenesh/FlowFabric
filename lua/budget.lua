@@ -104,7 +104,7 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
   if dedup_key ~= "" then
     local existing = redis.call("GET", dedup_key)
     if existing then
-      return { "ALREADY_APPLIED" }
+      return {1, "ALREADY_APPLIED"}
     end
   end
 
@@ -126,8 +126,7 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
           "last_breach_at", now_ms,
           "last_breach_dim", dim,
           "last_updated_at", now_ms)
-        local action = redis.call("HGET", K.def_key, "on_hard_limit") or "fail"
-        return { "HARD_BREACH", dim, action, tostring(current), tostring(hard_limit) }
+        return {1, "HARD_BREACH", dim, tostring(current), tostring(hard_limit)}
       end
     end
   end
@@ -161,11 +160,12 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
 
   if breached_soft then
     redis.call("HINCRBY", K.def_key, "soft_breach_count", 1)
-    local action = redis.call("HGET", K.def_key, "on_soft_limit") or "warn"
-    return { "SOFT_BREACH", breached_soft, action }
+    local soft_val = tonumber(redis.call("HGET", K.limits_key, "soft:" .. breached_soft) or "0")
+    local cur_val = tonumber(redis.call("HGET", K.usage_key, breached_soft) or "0")
+    return {1, "SOFT_BREACH", breached_soft, tostring(cur_val), tostring(soft_val)}
   end
 
-  return { "OK" }
+  return {1, "OK"}
 end)
 
 ---------------------------------------------------------------------------

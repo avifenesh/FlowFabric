@@ -132,37 +132,27 @@ pub async fn ff_report_usage_and_check(
 
 impl FromFcallResult for ReportUsageResult {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
-        // Domain-specific return: {"OK"}, {"SOFT_BREACH", dim, action},
-        // {"HARD_BREACH", dim, action, current, limit}
-        let arr = match raw {
-            ferriskey::Value::Array(arr) => arr,
-            _ => return Err(ScriptError::Parse("expected Array".into())),
-        };
-        let status = match arr.first() {
-            Some(Ok(ferriskey::Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-            _ => return Err(ScriptError::Parse("expected status string".into())),
-        };
-        match status.as_str() {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        match r.status.as_str() {
             "OK" => Ok(ReportUsageResult::Ok),
             "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
             "SOFT_BREACH" => {
-                let dim = field_str_from_arr(arr, 1);
-                let action = field_str_from_arr(arr, 2);
-                Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+                let dim = r.field_str(0);
+                let current: u64 = r.field_str(1).parse().unwrap_or(0);
+                let limit: u64 = r.field_str(2).parse().unwrap_or(0);
+                Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
             }
             "HARD_BREACH" => {
-                let dim = field_str_from_arr(arr, 1);
-                let action = field_str_from_arr(arr, 2);
-                let current: u64 = field_str_from_arr(arr, 3).parse().unwrap_or(0);
-                let limit: u64 = field_str_from_arr(arr, 4).parse().unwrap_or(0);
+                let dim = r.field_str(0);
+                let current: u64 = r.field_str(1).parse().unwrap_or(0);
+                let limit: u64 = r.field_str(2).parse().unwrap_or(0);
                 Ok(ReportUsageResult::HardBreach {
                     dimension: dim,
-                    action,
                     current_usage: current,
                     hard_limit: limit,
                 })
             }
-            _ => Err(ScriptError::Parse(format!("unknown budget status: {status}"))),
+            _ => Err(ScriptError::Parse(format!("unknown budget status: {}", r.status))),
         }
     }
 }
@@ -277,13 +267,3 @@ impl FromFcallResult for UnblockExecutionResult {
     }
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────
-
-fn field_str_from_arr(arr: &[Result<ferriskey::Value, ferriskey::Error>], index: usize) -> String {
-    match arr.get(index) {
-        Some(Ok(ferriskey::Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(ferriskey::Value::SimpleString(s))) => s.clone(),
-        Some(Ok(ferriskey::Value::Int(n))) => n.to_string(),
-        _ => String::new(),
-    }
-}

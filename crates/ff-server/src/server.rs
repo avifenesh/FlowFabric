@@ -262,7 +262,9 @@ impl Server {
             args.execution_kind.clone(),             // 4
             args.priority.to_string(),               // 5
             args.creator_identity.clone(),           // 6
-            args.policy_json.clone(),                // 7
+            args.policy.as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "{}".to_owned()))
+                .unwrap_or_else(|| "{}".to_owned()), // 7
             String::from_utf8_lossy(&args.input_payload).into_owned(), // 8
             delay_str,                               // 9
             args.idempotency_key.as_ref()
@@ -360,7 +362,7 @@ impl Server {
         let fcall_args: Vec<String> = vec![
             args.execution_id.to_string(),
             args.reason.clone(),
-            args.source.clone().unwrap_or_else(|| "operator_override".to_owned()),
+            args.source.to_string(),
             args.lease_id
                 .as_ref()
                 .map(|l| l.to_string())
@@ -762,7 +764,7 @@ impl Server {
                 let cancel_args = CancelExecutionArgs {
                     execution_id: eid,
                     reason: args.reason.clone(),
-                    source: Some("operator_override".to_owned()),
+                    source: CancelSource::OperatorOverride,
                     lease_id: None,
                     lease_epoch: None,
                     attempt_id: None,
@@ -1888,43 +1890,49 @@ fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
 }
 
 /// Parse ff_report_usage_and_check result.
-/// Domain-specific: {"OK"}, {"SOFT_BREACH", dim, action}, {"HARD_BREACH", dim, action, current, limit}
+/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
+///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
 fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, ServerError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => return Err(ServerError::Script("ff_report_usage_and_check: expected Array".into())),
     };
-    let status = match arr.first() {
-        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(Value::SimpleString(s))) => s.clone(),
+    let status_code = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
         _ => {
             return Err(ServerError::Script(
-                "ff_report_usage_and_check: expected status string".into(),
+                "ff_report_usage_and_check: expected Int status code".into(),
             ))
         }
     };
-    match status.as_str() {
+    if status_code != 1 {
+        let error_code = fcall_field_str(arr, 1);
+        return Err(ServerError::OperationFailed(format!(
+            "ff_report_usage_and_check failed: {error_code}"
+        )));
+    }
+    let sub_status = fcall_field_str(arr, 1);
+    match sub_status.as_str() {
         "OK" => Ok(ReportUsageResult::Ok),
         "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
-            let dim = fcall_field_str(arr, 1);
-            let action = fcall_field_str(arr, 2);
-            Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+            let dim = fcall_field_str(arr, 2);
+            let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
+            let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
+            Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
         }
         "HARD_BREACH" => {
-            let dim = fcall_field_str(arr, 1);
-            let action = fcall_field_str(arr, 2);
+            let dim = fcall_field_str(arr, 2);
             let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
             let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
             Ok(ReportUsageResult::HardBreach {
                 dimension: dim,
-                action,
                 current_usage: current,
                 hard_limit: limit,
             })
         }
         _ => Err(ServerError::OperationFailed(format!(
-            "ff_report_usage_and_check failed: {status}"
+            "ff_report_usage_and_check: unknown sub-status: {sub_status}"
         ))),
     }
 }
