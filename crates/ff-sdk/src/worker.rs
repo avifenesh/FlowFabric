@@ -60,6 +60,12 @@ pub struct FlowFabricWorker {
     /// chunk)` polls every partition is covered. The initial value is
     /// derived from `worker_instance_id` so idle workers spread their
     /// scans across different partitions from the first poll onward.
+    ///
+    /// Overflow: on 64-bit targets `usize` is `u64` — overflow after
+    /// ~2^64 polls (billions of years at any realistic rate). On 32-bit
+    /// targets (wasm32, i686) `usize` is `u32` and wraps after ~4 years
+    /// at 1 poll/sec — acceptable; on wrap, the modulo preserves
+    /// correctness because the sequence simply restarts a new cycle.
     #[cfg(feature = "insecure-direct-claim")]
     scan_cursor: AtomicUsize,
 }
@@ -872,4 +878,31 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
         num_budget_partitions: parse("num_budget_partitions", 32),
         num_quota_partitions: parse("num_quota_partitions", 32),
     })
+}
+
+#[cfg(all(test, feature = "insecure-direct-claim"))]
+mod scan_cursor_tests {
+    use super::scan_cursor_seed;
+
+    #[test]
+    fn stable_for_same_input() {
+        assert_eq!(scan_cursor_seed("w1", 256), scan_cursor_seed("w1", 256));
+    }
+
+    #[test]
+    fn distinct_for_different_ids() {
+        assert_ne!(scan_cursor_seed("w1", 256), scan_cursor_seed("w2", 256));
+    }
+
+    #[test]
+    fn bounded_by_partition_count() {
+        for i in 0..100 {
+            assert!(scan_cursor_seed(&format!("w{i}"), 256) < 256);
+        }
+    }
+
+    #[test]
+    fn zero_partitions_returns_zero() {
+        assert_eq!(scan_cursor_seed("w1", 0), 0);
+    }
 }

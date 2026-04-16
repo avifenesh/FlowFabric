@@ -8,38 +8,26 @@ use ferriskey::Client;
 use crate::{LIBRARY_SOURCE, LIBRARY_VERSION};
 
 /// Errors from the library loader.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// ferriskey returned an error unrelated to "function not found".
-    Valkey(ferriskey::Error),
+    /// Preserves `ferriskey::ErrorKind` so callers can distinguish
+    /// timeout / auth / NOSCRIPT / cluster-redirect on library-load failures.
+    #[error("valkey: {0}")]
+    Valkey(#[from] ferriskey::Error),
     /// Version mismatch after load — another process may have loaded a
     /// different version concurrently.
+    #[error("version mismatch after load: expected {expected}, got {got}")]
     VersionMismatch { expected: String, got: String },
 }
 
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl LoadError {
+    /// Returns the underlying ferriskey ErrorKind, if this is a Valkey error.
+    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
-            LoadError::Valkey(e) => write!(f, "valkey error: {e}"),
-            LoadError::VersionMismatch { expected, got } => {
-                write!(f, "version mismatch after load: expected {expected}, got {got}")
-            }
+            Self::Valkey(e) => Some(e.kind()),
+            _ => None,
         }
-    }
-}
-
-impl std::error::Error for LoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            LoadError::Valkey(e) => Some(e),
-            LoadError::VersionMismatch { .. } => None,
-        }
-    }
-}
-
-impl From<ferriskey::Error> for LoadError {
-    fn from(e: ferriskey::Error) -> Self {
-        LoadError::Valkey(e)
     }
 }
 

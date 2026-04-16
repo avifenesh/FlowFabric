@@ -35,6 +35,12 @@ redis.register_function('ff_create_budget', function(keys, args)
     now_ms            = args[8],
   }
 
+  -- Maintain budget_policies_index BEFORE the idempotency guard. SADD is
+  -- itself idempotent (no-op on existing members), and hoisting it heals
+  -- any pre-existing budget_def that was created before this index was
+  -- introduced — no migration script required.
+  redis.call("SADD", K.policies_index, A.budget_id)
+
   -- Idempotency: already exists → return immediately
   if redis.call("EXISTS", K.def_key) == 1 then
     return ok_already_satisfied(A.budget_id)
@@ -74,9 +80,6 @@ redis.register_function('ff_create_budget', function(keys, args)
     redis.call("HSET", K.def_key, "next_reset_at", next_reset_at)
     redis.call("ZADD", K.resets_zset, tonumber(next_reset_at), A.budget_id)
   end
-
-  -- Register in partition-level policy index (for cluster-safe discovery)
-  redis.call("SADD", K.policies_index, A.budget_id)
 
   return ok(A.budget_id)
 end)

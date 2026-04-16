@@ -59,7 +59,7 @@ pub enum ServerError {
     #[error("config: {0}")]
     Config(#[from] crate::config::ConfigError),
     #[error("library load: {0}")]
-    LibraryLoad(String),
+    LibraryLoad(#[from] ff_script::loader::LoadError),
     #[error("partition mismatch: {0}")]
     PartitionMismatch(String),
     #[error("not found: {0}")]
@@ -73,10 +73,13 @@ pub enum ServerError {
 }
 
 impl ServerError {
-    /// Returns the underlying ferriskey ErrorKind, if this is a Valkey error.
+    /// Returns the underlying ferriskey ErrorKind, if this error carries one.
+    /// Covers direct Valkey variants and library-load failures that bubble a
+    /// `ferriskey::Error` through `LoadError::Valkey`.
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
             Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
+            Self::LibraryLoad(e) => e.valkey_kind(),
             _ => None,
         }
     }
@@ -133,7 +136,7 @@ impl Server {
             tracing::info!("loading flowfabric Lua library");
             ff_script::loader::ensure_library(&client)
                 .await
-                .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+                .map_err(ServerError::LibraryLoad)?;
         } else {
             tracing::info!("skipping library load (skip_library_load=true)");
         }
@@ -699,6 +702,23 @@ impl Server {
     /// implement client-side deduplication on `flow_id`. The `JoinSet` is
     /// drained with a 15s timeout on [`Self::shutdown`], so very long
     /// dispatch tails may be aborted during graceful shutdown.
+    ///
+    /// # Orphan-member semantics on shutdown abort
+    ///
+    /// If shutdown fires `JoinSet::abort_all()` after its drain timeout
+    /// while a dispatch loop is mid-iteration, the already-issued
+    /// `ff_cancel_execution` FCALLs (atomic Lua) complete cleanly with
+    /// `terminal_outcome = cancelled` and the caller-supplied reason. The
+    /// members not yet visited are abandoned mid-loop. They remain in
+    /// whichever state they were in (active/eligible/suspended) until the
+    /// natural lifecycle scanners reach them: active leases expire
+    /// (`lease_expiry`) and attempt-timeout them to `expired`, suspended
+    /// members time out to `skipped`, eligible ones sit until retention
+    /// trim. So no orphan state — but the terminal_outcome for the
+    /// abandoned members will be `expired`/`skipped` rather than
+    /// `cancelled`, and the operator-supplied `reason` is lost for them.
+    /// Audit tooling that requires reason fidelity across shutdowns should
+    /// use `?wait=true`.
     pub async fn cancel_flow(
         &self,
         args: &CancelFlowArgs,
@@ -748,17 +768,41 @@ impl Server {
                 (policy, member_execution_ids)
             }
             // Idempotent retry: flow was already cancelled/completed/failed.
-            // Return Cancelled with the same policy the caller requested and
-            // an empty member list — there is nothing left to dispatch and
-            // the HTTP client can safely re-issue the cancel without a 4xx.
+            // Return Cancelled with the *stored* policy and member list so
+            // observability tooling gets the real historical state rather
+            // than echoing the caller's retry intent. One extra HGET +
+            // SMEMBERS on the idempotent path — both on {fp:N}, same slot.
             ParsedCancelFlow::AlreadyTerminal => {
+                let stored_policy: Option<String> = self
+                    .client
+                    .hget(&fctx.core(), "cancellation_policy")
+                    .await
+                    .map_err(|e| ServerError::ValkeyContext {
+                        source: e,
+                        context: "HGET flow_core cancellation_policy".into(),
+                    })?;
+                let stored_members: Vec<String> = self
+                    .client
+                    .cmd("SMEMBERS")
+                    .arg(fctx.members())
+                    .execute()
+                    .await
+                    .map_err(|e| ServerError::ValkeyContext {
+                        source: e,
+                        context: "SMEMBERS flow members (already terminal)".into(),
+                    })?;
                 tracing::debug!(
                     flow_id = %args.flow_id,
+                    member_count = stored_members.len(),
                     "cancel_flow: flow already terminal, returning idempotent Cancelled"
                 );
                 return Ok(CancelFlowResult::Cancelled {
-                    cancellation_policy: args.cancellation_policy.clone(),
-                    member_execution_ids: Vec::new(),
+                    // Fall back to caller's policy if the stored field is
+                    // missing (pre-policy flows or unusual flow_core state).
+                    cancellation_policy: stored_policy
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| args.cancellation_policy.clone()),
+                    member_execution_ids: stored_members,
                 });
             }
         };
@@ -804,34 +848,45 @@ impl Server {
         let now = args.now;
         let dispatch_members = members.clone();
         let flow_id = args.flow_id.clone();
-        self.background_tasks
-            .lock()
-            .await
-            .spawn(async move {
-                for eid_str in &dispatch_members {
-                    if let Err(e) = cancel_member_execution(
-                        &client,
-                        &partition_config,
-                        eid_str,
-                        &reason,
-                        now,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            flow_id = %flow_id,
-                            execution_id = %eid_str,
-                            error = %e,
-                            "cancel_flow(async): individual execution cancel failed (may be terminal)"
-                        );
-                    }
+        // Every async cancel_flow contends on this lock, but the critical
+        // section is tiny: try_join_next drain + spawn. Drain is amortized
+        // O(1) — each completed task is reaped exactly once across all
+        // callers, and spawn is synchronous. At realistic cancel rates the
+        // lock hold time is microseconds and does not bottleneck handlers.
+        let mut guard = self.background_tasks.lock().await;
+
+        // Reap completed background dispatches before spawning the next.
+        // Without this sweep, JoinSet accumulates Ok(()) results for every
+        // async cancel ever issued — a memory leak in long-running servers
+        // that would otherwise only drain on Server::shutdown.
+        while guard.try_join_next().is_some() {}
+
+        guard.spawn(async move {
+            for eid_str in &dispatch_members {
+                if let Err(e) = cancel_member_execution(
+                    &client,
+                    &partition_config,
+                    eid_str,
+                    &reason,
+                    now,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        flow_id = %flow_id,
+                        execution_id = %eid_str,
+                        error = %e,
+                        "cancel_flow(async): individual execution cancel failed (may be terminal)"
+                    );
                 }
-                tracing::debug!(
-                    flow_id = %flow_id,
-                    member_count = dispatch_members.len(),
-                    "cancel_flow: background member dispatch complete"
-                );
-            });
+            }
+            tracing::debug!(
+                flow_id = %flow_id,
+                member_count = dispatch_members.len(),
+                "cancel_flow: background member dispatch complete"
+            );
+        });
+        drop(guard);
 
         let member_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
         Ok(CancelFlowResult::CancellationScheduled {
@@ -1818,15 +1873,11 @@ fn parse_cancel_flow_raw(raw: &Value) -> Result<ParsedCancelFlow, ServerError> {
     }
     // {1, "OK", cancellation_policy, member1, member2, ...}
     let policy = fcall_field_str(arr, 2);
-    let mut members = Vec::new();
-    let mut i = 3;
-    loop {
-        let s = fcall_field_str(arr, i);
-        if s.is_empty() {
-            break;
-        }
-        members.push(s);
-        i += 1;
+    // Iterate to arr.len() rather than breaking on the first empty string —
+    // safer against malformed Lua responses and clearer than a sentinel loop.
+    let mut members = Vec::with_capacity(arr.len().saturating_sub(3));
+    for i in 3..arr.len() {
+        members.push(fcall_field_str(arr, i));
     }
     Ok(ParsedCancelFlow::Cancelled { policy, member_execution_ids: members })
 }
@@ -2099,7 +2150,7 @@ async fn fcall_with_reload_on_client(
             tracing::warn!(function, "Lua library not found on server, reloading");
             ff_script::loader::ensure_library(client)
                 .await
-                .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+                .map_err(ServerError::LibraryLoad)?;
             client
                 .fcall(function, keys, args)
                 .await

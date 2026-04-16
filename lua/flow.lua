@@ -75,6 +75,12 @@ redis.register_function('ff_create_flow', function(keys, args)
     now_ms    = args[4],
   }
 
+  -- Maintain flow_index BEFORE the idempotency guard. SADD is itself
+  -- idempotent (no-op on existing members), and hoisting it heals any
+  -- pre-existing flow_core that was created before this index was
+  -- introduced — no migration script required.
+  redis.call("SADD", K.flow_index, A.flow_id)
+
   -- Idempotency: if flow already exists, return already_satisfied
   if redis.call("EXISTS", K.flow_core) == 1 then
     return ok_already_satisfied(A.flow_id)
@@ -91,9 +97,6 @@ redis.register_function('ff_create_flow', function(keys, args)
     "public_flow_state", "open",
     "created_at", A.now_ms,
     "last_mutation_at", A.now_ms)
-
-  -- Register in partition-level flow index (for cluster-safe discovery)
-  redis.call("SADD", K.flow_index, A.flow_id)
 
   return ok(A.flow_id)
 end)
