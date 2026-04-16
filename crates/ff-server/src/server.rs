@@ -1291,7 +1291,7 @@ impl Server {
             .arg("terminal_outcome")
             .execute()
             .await
-            .unwrap_or_default();
+            .map_err(|e| ServerError::Valkey(format!("HMGET replay pre-read: {e}")))?;
         let lane = LaneId::new(
             dyn_fields
                 .first()
@@ -1339,7 +1339,7 @@ impl Server {
                 .arg(flow_ctx.incoming(execution_id))
                 .execute()
                 .await
-                .unwrap_or_default();
+                .map_err(|e| ServerError::Valkey(format!("SMEMBERS replay edges: {e}")))?;
 
             // Extended KEYS: blocked_deps_zset, deps_meta, deps_unresolved, dep_edge_0..N
             fcall_keys.push(idx.lane_blocked_dependencies(&lane)); // 5

@@ -649,7 +649,7 @@ impl FlowFabricWorker {
             .client
             .hgetall(&ctx.tags())
             .await
-            .unwrap_or_default();
+            .map_err(|e| SdkError::Valkey(format!("HGETALL tags: {e}")))?;
 
         Ok((input_payload, execution_kind, tags))
     }

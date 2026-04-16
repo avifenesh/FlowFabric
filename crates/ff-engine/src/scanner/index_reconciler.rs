@@ -131,7 +131,7 @@ async fn check_execution_index(
         .arg("lifecycle_phase")
         .arg("eligibility_state")
         .arg("ownership_state")
-        .arg("current_lane")
+        .arg("lane_id")
         .execute()
         .await?;
 

@@ -11,7 +11,7 @@
 
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
-use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, TimestampMs, WorkerId, WorkerInstanceId};
+use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
 
 /// A claim grant issued by the scheduler for a specific execution.
 ///
@@ -248,7 +248,17 @@ impl Scheduler {
             let exec_ctx = ExecKeyContext::new(&partition, &eid);
             let core_key = exec_ctx.core();
             let eid_s = eid.to_string();
-            let now_ms = TimestampMs::now().0 as u64;
+            let now_ms = match server_time_ms(&self.client).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        partition = p_idx,
+                        error = %e,
+                        "scheduler: failed to get server time, skipping partition"
+                    );
+                    continue;
+                }
+            };
 
             // ── Budget pre-check (cross-partition, cached per cycle) ──
             if let Some(block_detail) = self
@@ -544,6 +554,27 @@ impl Scheduler {
             }
         }
     }
+}
+
+/// Get server time in milliseconds via the TIME command.
+async fn server_time_ms(client: &ferriskey::Client) -> Result<u64, ferriskey::Error> {
+    let result: Vec<String> = client
+        .cmd("TIME")
+        .execute()
+        .await?;
+    if result.len() < 2 {
+        return Err(ferriskey::Error::from((
+            ferriskey::ErrorKind::ClientError,
+            "TIME returned fewer than 2 elements",
+        )));
+    }
+    let secs: u64 = result[0].parse().map_err(|_| {
+        ferriskey::Error::from((ferriskey::ErrorKind::ClientError, "TIME: invalid seconds"))
+    })?;
+    let micros: u64 = result[1].parse().map_err(|_| {
+        ferriskey::Error::from((ferriskey::ErrorKind::ClientError, "TIME: invalid microseconds"))
+    })?;
+    Ok(secs * 1000 + micros / 1000)
 }
 
 /// Errors from the scheduler.

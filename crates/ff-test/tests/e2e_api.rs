@@ -4,6 +4,20 @@
 //! then exercises the API with reqwest.
 //!
 //! Run with: cargo test -p ff-test --test e2e_api -- --test-threads=1
+//!
+//! TODO: Untested API endpoints (tested at Server/FCALL layer but not HTTP):
+//! - POST /v1/executions/{id}/revoke-lease
+//! - GET  /v1/executions?partition=N (list_executions)
+//! - POST /v1/budgets/{id}/usage (report_usage)
+//! - POST /v1/budgets/{id}/reset (reset_budget)
+//! - POST /v1/flows/{id}/edges (stage_dependency_edge)
+//! - POST /v1/flows/{id}/edges/apply (apply_dependency_to_child)
+//! TODO: Untested SDK methods (no test at any layer):
+//! - ClaimedTask::move_to_waiting_children()
+//! TODO: Untested Server methods (tested via FCALL but not typed Server API):
+//! - Server::revoke_lease()
+//! - Server::reset_budget()
+//! - Server::list_executions()
 
 use std::sync::Arc;
 
@@ -569,7 +583,7 @@ async fn test_api_add_execution_to_flow() {
         .send()
         .await
         .expect("add to flow request failed");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     let result: AddExecutionToFlowResult = resp.json().await.expect("add result parse failed");
     match result {

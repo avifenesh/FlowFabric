@@ -656,7 +656,6 @@ redis.register_function('ff_replay_execution', function(keys, args)
 
   local A = {
     execution_id = args[1],
-    now_ms       = args[2],
   }
 
   local t = redis.call("TIME")
@@ -672,9 +671,17 @@ redis.register_function('ff_replay_execution', function(keys, args)
     return err("execution_not_terminal")
   end
 
-  -- 3. Check replay limit
+  -- 3. Check replay limit (read from policy, same pattern as ff_reclaim_execution)
   local replay_count = tonumber(core.replay_count or "0")
-  local max_replays = tonumber(core.max_replays or "10")
+  local max_replays = 10  -- default
+  local policy_key = string.gsub(K.core_key, ":core$", ":policy")
+  local policy_raw = redis.call("GET", policy_key)
+  if policy_raw then
+    local ok_p, pol = pcall(cjson.decode, policy_raw)
+    if ok_p and type(pol) == "table" then
+      max_replays = tonumber(pol.max_replay_count) or 10
+    end
+  end
   if replay_count >= max_replays then
     return err("max_replays_exhausted")
   end
