@@ -276,7 +276,7 @@ impl Scheduler {
             {
                 // Budget breached — block candidate and try next
                 self.block_candidate(
-                    &partition, &idx, lane, &eid_s, &eligible_key,
+                    &partition, &idx, lane, &eid, &eligible_key,
                     "waiting_for_budget", &block_detail, now_ms,
                 ).await;
                 continue;
@@ -289,7 +289,7 @@ impl Scheduler {
             match &quota_admission {
                 QuotaCheckOutcome::Blocked(block_detail) => {
                     self.block_candidate(
-                        &partition, &idx, lane, &eid_s, &eligible_key,
+                        &partition, &idx, lane, &eid, &eligible_key,
                         "waiting_for_quota", block_detail, now_ms,
                     ).await;
                     continue;
@@ -534,14 +534,15 @@ impl Scheduler {
         partition: &Partition,
         idx: &IndexKeys,
         lane: &LaneId,
-        eid_s: &str,
+        eid: &ExecutionId,
         eligible_key: &str,
         block_reason: &str,
         blocking_detail: &str,
         now_ms: u64,
     ) {
-        let exec_ctx = ExecKeyContext::new(partition, &ExecutionId::parse(eid_s).unwrap());
+        let exec_ctx = ExecKeyContext::new(partition, eid);
         let core_key = exec_ctx.core();
+        let eid_s = eid.to_string();
         let blocked_key = match block_reason {
             "waiting_for_budget" => idx.lane_blocked_budget(lane),
             "waiting_for_quota" => idx.lane_blocked_quota(lane),
@@ -550,7 +551,7 @@ impl Scheduler {
 
         let keys: [&str; 3] = [&core_key, eligible_key, &blocked_key];
         let now_s = now_ms.to_string();
-        let argv: [&str; 4] = [eid_s, block_reason, blocking_detail, &now_s];
+        let argv: [&str; 4] = [&eid_s, block_reason, blocking_detail, &now_s];
 
         match self.client
             .fcall::<ferriskey::Value>("ff_block_execution_for_admission", &keys, &argv)
