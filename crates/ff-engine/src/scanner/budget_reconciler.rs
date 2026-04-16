@@ -7,10 +7,13 @@
 //! Budgets with `reset_policy` set are SKIPPED — resetting budgets cannot
 //! be reconciled by summing all-time usage (the sum would undo the reset).
 //!
+//! Cluster-safe: uses SMEMBERS on a partition-level index SET instead of SCAN.
+//!
 //! Reference: RFC-008 §Budget Reconciliation, RFC-010 §6.5
 
 use std::time::Duration;
 
+use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
 
 use super::{ScanResult, Scanner};
@@ -56,12 +59,17 @@ impl Scanner for BudgetReconciler {
             }
         };
 
-        // Discover budgets on this partition via SCAN for budget definition keys.
-        // Pattern: ff:budget:{b:M}:*  (but only definition keys, not :usage/:limits)
-        let budget_ids = match scan_budget_ids(client, &tag).await {
+        // Discover budgets via partition-level index SET (cluster-safe)
+        let policies_key = keys::budget_policies_index(&tag);
+        let budget_ids: Vec<String> = match client
+            .cmd("SMEMBERS")
+            .arg(&policies_key)
+            .execute()
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => {
-                tracing::warn!(partition, error = %e, "budget_reconciler: budget discovery failed");
+                tracing::warn!(partition, error = %e, "budget_reconciler: SMEMBERS failed");
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
@@ -91,51 +99,6 @@ impl Scanner for BudgetReconciler {
 
         ScanResult { processed, errors }
     }
-}
-
-/// Discover budget IDs on a partition via SCAN.
-async fn scan_budget_ids(
-    client: &ferriskey::Client,
-    tag: &str,
-) -> Result<Vec<String>, ferriskey::Error> {
-    let mut budget_ids = Vec::new();
-    let pattern = format!("ff:budget:{}:*", tag);
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await?;
-
-        let (next_cursor, keys) = parse_scan_result(&result);
-
-        for key in keys {
-            // Only take definition keys (no :usage, :limits, :executions suffix)
-            // Definition key format: ff:budget:{b:M}:<budget_id>
-            if !key.contains(":usage")
-                && !key.contains(":limits")
-                && !key.contains(":executions")
-            {
-                // Extract budget_id from key
-                if let Some(bid) = key.strip_prefix(&format!("ff:budget:{}:", tag)) {
-                    budget_ids.push(bid.to_string());
-                }
-            }
-        }
-
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    Ok(budget_ids)
 }
 
 /// Reconcile one budget. Returns Ok(true) if corrected, Ok(false) if skipped.
@@ -277,31 +240,3 @@ fn pairs_to_map(flat: &[String]) -> std::collections::HashMap<&str, &str> {
     map
 }
 
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
-                }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
-        }
-        _ => ("0".to_string(), vec![]),
-    }
-}

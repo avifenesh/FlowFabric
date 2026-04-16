@@ -58,13 +58,14 @@ end
 -- Create a new flow container. Idempotent: if flow_core already exists,
 -- returns ok_already_satisfied.
 --
--- KEYS (2): flow_core, members_set
+-- KEYS (3): flow_core, members_set, flow_index
 -- ARGV (4): flow_id, flow_kind, namespace, now_ms
 ---------------------------------------------------------------------------
 redis.register_function('ff_create_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
+    flow_index  = keys[3],
   }
 
   local A = {
@@ -90,6 +91,9 @@ redis.register_function('ff_create_flow', function(keys, args)
     "public_flow_state", "open",
     "created_at", A.now_ms,
     "last_mutation_at", A.now_ms)
+
+  -- Register in partition-level flow index (for cluster-safe discovery)
+  redis.call("SADD", K.flow_index, A.flow_id)
 
   return ok(A.flow_id)
 end)
@@ -147,13 +151,14 @@ end)
 -- Cancel a flow. Returns the member list for the caller to dispatch
 -- individual cancellations cross-partition.
 --
--- KEYS (2): flow_core, members_set
+-- KEYS (3): flow_core, members_set, flow_index
 -- ARGV (4): flow_id, reason, cancellation_policy, now_ms
 ---------------------------------------------------------------------------
 redis.register_function('ff_cancel_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
+    flow_index  = keys[3],
   }
 
   local A = {
@@ -183,6 +188,9 @@ redis.register_function('ff_cancel_flow', function(keys, args)
     "cancelled_at", A.now_ms,
     "cancel_reason", A.reason,
     "last_mutation_at", A.now_ms)
+
+  -- 4b. Remove from active flow_index (projector skips cancelled flows)
+  redis.call("SREM", K.flow_index, A.flow_id)
 
   -- 5. Return: ok(cancellation_policy, member1, member2, ...)
   -- Build array manually to include variable member list.
@@ -299,8 +307,8 @@ end)
 -- Create dep record on child execution partition, increment unsatisfied
 -- count. If child is runnable: set blocked_by_dependencies.
 --
--- KEYS (6): exec_core, deps_meta, unresolved_set, dep_hash,
---           eligible_zset, blocked_deps_zset
+-- KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
+--           eligible_zset, blocked_deps_zset, deps_all_edges
 -- ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
 --           dependency_kind, data_passing_ref, now_ms
 ---------------------------------------------------------------------------
@@ -312,6 +320,7 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
     dep_hash         = keys[4],
     eligible_zset    = keys[5],
     blocked_deps_zset = keys[6],
+    deps_all_edges   = keys[7],
   }
 
   local A = {
@@ -352,6 +361,10 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
 
   -- 5. Update deps:meta
   redis.call("SADD", K.unresolved_set, A.edge_id)
+  -- Register edge in the per-execution all-edges index (cluster-safe
+  -- retention discovery; retained across resolve, purged wholesale on
+  -- retention trim).
+  redis.call("SADD", K.deps_all_edges, A.edge_id)
   local unresolved = redis.call("HINCRBY", K.deps_meta, "unsatisfied_required_count", 1)
   redis.call("HSET", K.deps_meta,
     "flow_id", A.flow_id,

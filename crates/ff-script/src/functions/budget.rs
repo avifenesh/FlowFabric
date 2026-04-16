@@ -22,7 +22,8 @@ pub struct BlockOpKeys<'a> {
 
 // ─── ff_create_budget ─────────────────────────────────────────────────
 //
-// Lua KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+// Lua KEYS (5): budget_def, budget_limits, budget_usage, budget_resets_zset,
+//               budget_policies_index
 // Lua ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
 //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
 //   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
@@ -33,6 +34,7 @@ pub async fn ff_create_budget(
     conn: &ferriskey::Client,
     k: &BudgetOpKeys<'_>,
     resets_zset: &str,
+    policies_index: &str,
     args: &CreateBudgetArgs,
 ) -> Result<CreateBudgetResult, ScriptError> {
     let keys: Vec<String> = vec![
@@ -40,6 +42,7 @@ pub async fn ff_create_budget(
         k.limits_key.to_string(),
         k.usage_key.to_string(),
         resets_zset.to_string(),
+        policies_index.to_string(),
     ];
 
     let dim_count = args.dimensions.len();

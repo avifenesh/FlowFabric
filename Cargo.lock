@@ -951,6 +951,7 @@ version = "0.1.0"
 dependencies = [
  "ferriskey",
  "ff-core",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
