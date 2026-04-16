@@ -233,9 +233,10 @@ string_id! {
 
 /// Source of a cancel operation, determining authorization behavior.
 /// "operator_override" bypasses lease checks; "lease_holder" requires valid lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelSource {
+    #[default]
     OperatorOverride,
     LeaseHolder,
     FlowCascade,
@@ -273,12 +274,6 @@ impl std::str::FromStr for CancelSource {
             "system_timeout" => Self::SystemTimeout,
             other => Self::Custom(other.to_owned()),
         })
-    }
-}
-
-impl Default for CancelSource {
-    fn default() -> Self {
-        Self::OperatorOverride
     }
 }
 
