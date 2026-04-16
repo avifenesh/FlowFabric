@@ -196,7 +196,7 @@ async fn process_task(
                 ("completion_tokens", usage.completion_tokens),
                 ("total_tokens", usage.total_tokens),
             ];
-            match task.report_usage(bid, dims).await {
+            match task.report_usage(bid, dims, None).await {
                 Ok(ff_core::contracts::ReportUsageResult::Ok) => {}
                 Ok(result) => {
                     tracing::warn!(execution_id = %eid, ?result, "budget limit reached");

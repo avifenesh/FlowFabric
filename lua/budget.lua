@@ -86,7 +86,7 @@ end)
 -- Atomic Lua serialization on {b:M} guarantees zero overshoot.
 --
 -- KEYS (3): budget_usage, budget_limits, budget_def
--- ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms
+-- ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
 ---------------------------------------------------------------------------
 redis.register_function('ff_report_usage_and_check', function(keys, args)
   local K = {
@@ -98,6 +98,15 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
   local dim_count = require_number(args[1], "dim_count")
   if type(dim_count) == "table" then return dim_count end
   local now_ms = args[2 * dim_count + 2]
+  local dedup_key = args[2 * dim_count + 3] or ""
+
+  -- Idempotency: if dedup_key provided, check for prior application
+  if dedup_key ~= "" then
+    local existing = redis.call("GET", dedup_key)
+    if existing then
+      return { "ALREADY_APPLIED" }
+    end
+  end
 
   -- Phase 1: CHECK all dimensions BEFORE any increment.
   -- If any hard limit would be breached, reject the entire report.
@@ -144,6 +153,11 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
 
   -- Update metadata
   redis.call("HSET", K.def_key, "last_updated_at", now_ms)
+
+  -- Mark dedup key after successful increment (24h TTL)
+  if dedup_key ~= "" then
+    redis.call("SET", dedup_key, "1", "PX", 86400000)
+  end
 
   if breached_soft then
     redis.call("HINCRBY", K.def_key, "soft_breach_count", 1)

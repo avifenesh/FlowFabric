@@ -624,10 +624,12 @@ impl ClaimedTask {
     ///
     /// Non-consuming — the worker can report usage multiple times.
     /// `dimensions` is a slice of `(dimension_name, delta)` pairs.
+    /// `dedup_key` prevents double-counting on retries (must share `{b:M}` hash tag).
     pub async fn report_usage(
         &self,
         budget_id: &BudgetId,
         dimensions: &[(&str, u64)],
+        dedup_key: Option<&str>,
     ) -> Result<ReportUsageResult, SdkError> {
         let partition = budget_partition(budget_id, &self.partition_config);
         let bctx = BudgetKeyContext::new(&partition, budget_id);
@@ -635,10 +637,10 @@ impl ClaimedTask {
         // KEYS (3): budget_usage, budget_limits, budget_def
         let keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
 
-        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms
+        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
         let now = TimestampMs::now();
         let dim_count = dimensions.len();
-        let mut argv: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+        let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
         argv.push(dim_count.to_string());
         for (dim, _) in dimensions {
             argv.push((*dim).to_string());
@@ -647,6 +649,7 @@ impl ClaimedTask {
             argv.push(delta.to_string());
         }
         argv.push(now.to_string());
+        argv.push(dedup_key.unwrap_or("").to_owned());
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -1088,6 +1091,7 @@ fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError>
     };
     match status.as_str() {
         "OK" => Ok(ReportUsageResult::Ok),
+        "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
             let dim = usage_field_str(arr, 1);
             let action = usage_field_str(arr, 2);

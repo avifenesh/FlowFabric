@@ -592,9 +592,9 @@ impl Server {
         // KEYS (3): budget_usage, budget_limits, budget_def
         let fcall_keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
 
-        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms
+        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
         let dim_count = args.dimensions.len();
-        let mut fcall_args: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+        let mut fcall_args: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
         fcall_args.push(dim_count.to_string());
         for dim in &args.dimensions {
             fcall_args.push(dim.clone());
@@ -603,6 +603,7 @@ impl Server {
             fcall_args.push(delta.to_string());
         }
         fcall_args.push(args.now.to_string());
+        fcall_args.push(args.dedup_key.clone().unwrap_or_default());
 
         let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
@@ -1904,6 +1905,7 @@ fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, ServerErr
     };
     match status.as_str() {
         "OK" => Ok(ReportUsageResult::Ok),
+        "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
             let dim = fcall_field_str(arr, 1);
             let action = fcall_field_str(arr, 2);
