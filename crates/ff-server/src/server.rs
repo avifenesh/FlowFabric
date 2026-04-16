@@ -7,8 +7,10 @@ use ff_core::contracts::{
     CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     ApplyDependencyToChildArgs, ApplyDependencyToChildResult,
-    DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ReplayExecutionResult,
-    ReportUsageArgs, ReportUsageResult,
+    DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ExecutionSummary,
+    ListExecutionsResult, ReplayExecutionResult,
+    ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
+    RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
@@ -590,6 +592,34 @@ impl Server {
         parse_report_usage_result(&raw)
     }
 
+    /// Reset a budget's usage counters and schedule the next reset.
+    pub async fn reset_budget(
+        &self,
+        budget_id: &BudgetId,
+    ) -> Result<ResetBudgetResult, ServerError> {
+        let partition = budget_partition(budget_id, &self.config.partition_config);
+        let bctx = BudgetKeyContext::new(&partition, budget_id);
+        let resets_key = keys::budget_resets_key(bctx.hash_tag());
+
+        // KEYS (3): budget_def, budget_usage, budget_resets_zset
+        let fcall_keys: Vec<String> = vec![bctx.definition(), bctx.usage(), resets_key];
+
+        // ARGV (2): budget_id, now_ms
+        let now = TimestampMs::now();
+        let fcall_args: Vec<String> = vec![budget_id.to_string(), now.to_string()];
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_reset_budget", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+
+        parse_reset_budget_result(&raw)
+    }
+
     // ── Flow API ──
 
     /// Create a new flow container.
@@ -983,6 +1013,51 @@ impl Server {
         parse_change_priority_result(&raw, execution_id)
     }
 
+    /// Revoke an active lease (operator-initiated).
+    pub async fn revoke_lease(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<RevokeLeaseResult, ServerError> {
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // Pre-read worker_instance_id for worker_leases key
+        let wiid_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "current_worker_instance_id")
+            .await
+            .map_err(|e| ServerError::Valkey(format!("HGET worker_instance_id: {e}")))?;
+        let wiid = WorkerInstanceId::new(wiid_str.unwrap_or_default());
+
+        // KEYS (5): exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases
+        let fcall_keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&wiid),
+        ];
+
+        // ARGV (3): execution_id, expected_lease_id (empty = skip check), revoke_reason
+        let fcall_args: Vec<String> = vec![
+            execution_id.to_string(),
+            String::new(), // no expected_lease_id check
+            "operator_revoke".to_owned(),
+        ];
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_revoke_lease", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+
+        parse_revoke_lease_result(&raw)
+    }
+
     /// Get full execution info via HGETALL on exec_core.
     pub async fn get_execution(
         &self,
@@ -1051,6 +1126,134 @@ impl Server {
                 .unwrap_or(0),
             flow_id: flow_id_val,
             blocking_detail: parse_enum("blocking_detail"),
+        })
+    }
+
+    /// List executions from a partition's index ZSET.
+    ///
+    /// No FCALL — direct ZRANGE + pipelined HMGET reads.
+    pub async fn list_executions(
+        &self,
+        partition_id: u16,
+        lane: &LaneId,
+        state_filter: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<ListExecutionsResult, ServerError> {
+        let partition = ff_core::partition::Partition {
+            family: ff_core::partition::PartitionFamily::Execution,
+            index: partition_id,
+        };
+        let idx = IndexKeys::new(&partition);
+
+        let zset_key = match state_filter {
+            "eligible" => idx.lane_eligible(lane),
+            "delayed" => idx.lane_delayed(lane),
+            "terminal" => idx.lane_terminal(lane),
+            "suspended" => idx.lane_suspended(lane),
+            "active" => idx.lane_active(lane),
+            other => {
+                return Err(ServerError::InvalidInput(format!(
+                    "invalid state_filter: {other}. Use: eligible, delayed, terminal, suspended, active"
+                )));
+            }
+        };
+
+        // ZRANGE key -inf +inf BYSCORE LIMIT offset count
+        let eids: Vec<String> = self
+            .client
+            .cmd("ZRANGE")
+            .arg(&zset_key)
+            .arg("-inf")
+            .arg("+inf")
+            .arg("BYSCORE")
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(limit)
+            .execute()
+            .await
+            .unwrap_or_default();
+
+        if eids.is_empty() {
+            return Ok(ListExecutionsResult {
+                executions: vec![],
+                total_returned: 0,
+            });
+        }
+
+        // Parse execution IDs, warning on corrupt ZSET members
+        let mut parsed = Vec::with_capacity(eids.len());
+        for eid_str in &eids {
+            match ExecutionId::parse(eid_str) {
+                Ok(id) => parsed.push(id),
+                Err(e) => {
+                    tracing::warn!(
+                        raw_id = %eid_str,
+                        error = %e,
+                        zset = %zset_key,
+                        "list_executions: ZSET member failed to parse as ExecutionId (data corruption?)"
+                    );
+                }
+            }
+        }
+
+        if parsed.is_empty() {
+            return Ok(ListExecutionsResult {
+                executions: vec![],
+                total_returned: 0,
+            });
+        }
+
+        // Pipeline all HMGETs into a single round-trip
+        let mut pipe = self.client.pipeline();
+        let mut slots = Vec::with_capacity(parsed.len());
+        for eid in &parsed {
+            let ep = execution_partition(eid, &self.config.partition_config);
+            let ctx = ExecKeyContext::new(&ep, eid);
+            let slot = pipe
+                .cmd::<Vec<Option<String>>>("HMGET")
+                .arg(ctx.core())
+                .arg("namespace")
+                .arg("lane_id")
+                .arg("execution_kind")
+                .arg("public_state")
+                .arg("priority")
+                .arg("created_at")
+                .finish();
+            slots.push(slot);
+        }
+
+        pipe.execute()
+            .await
+            .map_err(|e| ServerError::Valkey(format!("pipeline HMGET: {e}")))?;
+
+        let mut summaries = Vec::with_capacity(parsed.len());
+        for (eid, slot) in parsed.into_iter().zip(slots) {
+            let fields: Vec<Option<String>> = slot.value().unwrap_or_default();
+
+            let field = |i: usize| -> String {
+                fields
+                    .get(i)
+                    .and_then(|v| v.as_ref())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+
+            summaries.push(ExecutionSummary {
+                execution_id: eid,
+                namespace: field(0),
+                lane_id: field(1),
+                execution_kind: field(2),
+                public_state: field(3),
+                priority: field(4).parse().unwrap_or(0),
+                created_at: field(5),
+            });
+        }
+
+        let total = summaries.len();
+        Ok(ListExecutionsResult {
+            executions: summaries,
+            total_returned: total,
         })
     }
 
@@ -1711,5 +1914,58 @@ fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, ServerErr
         _ => Err(ServerError::OperationFailed(format!(
             "ff_report_usage_and_check failed: {status}"
         ))),
+    }
+}
+
+fn parse_revoke_lease_result(raw: &Value) -> Result<RevokeLeaseResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_revoke_lease: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        _ => return Err(ServerError::Script("ff_revoke_lease: bad status code".into())),
+    };
+    if status == 1 {
+        let sub = fcall_field_str(arr, 1);
+        if sub == "ALREADY_SATISFIED" {
+            let reason = fcall_field_str(arr, 2);
+            Ok(RevokeLeaseResult::AlreadySatisfied { reason })
+        } else {
+            let lid = fcall_field_str(arr, 2);
+            let epoch = fcall_field_str(arr, 3);
+            Ok(RevokeLeaseResult::Revoked {
+                lease_id: lid,
+                lease_epoch: epoch,
+            })
+        }
+    } else {
+        let error_code = fcall_field_str(arr, 1);
+        Err(ServerError::OperationFailed(format!(
+            "ff_revoke_lease failed: {error_code}"
+        )))
+    }
+}
+
+fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_reset_budget: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        _ => return Err(ServerError::Script("ff_reset_budget: bad status code".into())),
+    };
+    if status == 1 {
+        let next_str = fcall_field_str(arr, 2);
+        let next_ms: i64 = next_str.parse().unwrap_or(0);
+        Ok(ResetBudgetResult::Reset {
+            next_reset_at: TimestampMs::from_millis(next_ms),
+        })
+    } else {
+        let error_code = fcall_field_str(arr, 1);
+        Err(ServerError::OperationFailed(format!(
+            "ff_reset_budget failed: {error_code}"
+        )))
     }
 }

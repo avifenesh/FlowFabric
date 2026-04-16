@@ -1,8 +1,9 @@
-// ff-engine: cross-partition dispatch and background scanners
+//! ff-engine: cross-partition dispatch and background scanners.
 
 pub mod budget;
 pub mod partition_router;
 pub mod scanner;
+pub mod supervisor;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use partition_router::PartitionRouter;
-use scanner::ScannerRunner;
+use supervisor::supervised_spawn;
 use scanner::attempt_timeout::AttemptTimeoutScanner;
 use scanner::execution_deadline::ExecutionDeadlineScanner;
 use scanner::budget_reconciler::BudgetReconciler;
@@ -107,7 +108,7 @@ impl Engine {
 
         // Lease expiry scanner
         let lease_scanner = Arc::new(LeaseExpiryScanner::new(config.lease_expiry_interval));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             lease_scanner,
             client.clone(),
             num_partitions,
@@ -119,7 +120,7 @@ impl Engine {
             config.delayed_promoter_interval,
             config.lanes.clone(),
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             delayed_scanner,
             client.clone(),
             num_partitions,
@@ -131,7 +132,7 @@ impl Engine {
             config.index_reconciler_interval,
             config.lanes.clone(),
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             reconciler,
             client.clone(),
             num_partitions,
@@ -143,7 +144,7 @@ impl Engine {
             config.attempt_timeout_interval,
             config.lanes.clone(),
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             timeout_scanner,
             client.clone(),
             num_partitions,
@@ -154,7 +155,7 @@ impl Engine {
         let suspension_scanner = Arc::new(SuspensionTimeoutScanner::new(
             config.suspension_timeout_interval,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             suspension_scanner,
             client.clone(),
             num_partitions,
@@ -165,7 +166,7 @@ impl Engine {
         let pending_wp_scanner = Arc::new(PendingWaitpointExpiryScanner::new(
             config.pending_wp_expiry_interval,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             pending_wp_scanner,
             client.clone(),
             num_partitions,
@@ -177,7 +178,7 @@ impl Engine {
             config.retention_trimmer_interval,
             config.lanes.clone(),
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             retention_scanner,
             client.clone(),
             num_partitions,
@@ -188,7 +189,7 @@ impl Engine {
         let budget_reset = Arc::new(BudgetResetScanner::new(
             config.budget_reset_interval,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             budget_reset,
             client.clone(),
             config.partition_config.num_budget_partitions,
@@ -199,7 +200,7 @@ impl Engine {
         let budget_reconciler = Arc::new(BudgetReconciler::new(
             config.budget_reconciler_interval,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             budget_reconciler,
             client.clone(),
             config.partition_config.num_budget_partitions,
@@ -212,7 +213,7 @@ impl Engine {
             config.lanes.clone(),
             config.partition_config,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             unblock_scanner,
             client.clone(),
             num_partitions,
@@ -225,7 +226,7 @@ impl Engine {
             config.lanes.clone(),
             config.partition_config,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             dep_reconciler,
             client.clone(),
             num_partitions,
@@ -236,7 +237,7 @@ impl Engine {
         let quota_reconciler = Arc::new(QuotaReconciler::new(
             config.quota_reconciler_interval,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             quota_reconciler,
             client.clone(),
             config.partition_config.num_quota_partitions,
@@ -248,7 +249,7 @@ impl Engine {
             config.flow_projector_interval,
             config.partition_config,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             flow_projector,
             client.clone(),
             config.partition_config.num_flow_partitions,
@@ -260,7 +261,7 @@ impl Engine {
             config.execution_deadline_interval,
             config.lanes,
         ));
-        handles.push(ScannerRunner::spawn(
+        handles.push(supervised_spawn(
             deadline_scanner,
             client,
             num_partitions,

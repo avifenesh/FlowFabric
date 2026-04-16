@@ -17,6 +17,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["FlowFabric Contributors"]
+repository = "https://github.com/avifenesh/FlowFabric"
+homepage = "https://github.com/avifenesh/FlowFabric"
+keywords = ["valkey", "execution-engine", "workflow", "async"]
+categories = ["database", "asynchronous"]
 
 [workspace.dependencies]
 # Internal crates

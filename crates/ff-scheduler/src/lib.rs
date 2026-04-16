@@ -1,4 +1,4 @@
-// ff-scheduler: claim-grant cycle, fairness, capability matching
+//! ff-scheduler: claim-grant cycle, fairness, capability matching.
 
 pub mod claim;
 

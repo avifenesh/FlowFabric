@@ -1145,3 +1145,24 @@ mod tests {
         assert_eq!(result, parsed);
     }
 }
+
+// ─── list_executions ───
+
+/// Summary of an execution for list views.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionSummary {
+    pub execution_id: ExecutionId,
+    pub namespace: String,
+    pub lane_id: String,
+    pub execution_kind: String,
+    pub public_state: String,
+    pub priority: i32,
+    pub created_at: String,
+}
+
+/// Result of a list_executions query.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListExecutionsResult {
+    pub executions: Vec<ExecutionSummary>,
+    pub total_returned: usize,
+}
