@@ -181,8 +181,7 @@ pub struct ClaimedTask {
 }
 
 impl ClaimedTask {
-    /// Create a new ClaimedTask and start the background lease renewal task.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn new(
         client: Client,
         partition_config: PartitionConfig,
@@ -237,6 +236,7 @@ impl ClaimedTask {
 
     /// Attach a concurrency permit from the worker's semaphore.
     /// The permit is held for the task's lifetime and released on drop.
+    #[allow(dead_code)]
     pub(crate) fn set_concurrency_permit(&mut self, permit: OwnedSemaphorePermit) {
         self._concurrency_permit = Some(permit);
     }
@@ -339,7 +339,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_delay_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
         parse_success_result(&raw, "ff_delay_execution")
@@ -384,7 +384,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_move_to_waiting_children", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
         parse_success_result(&raw, "ff_move_to_waiting_children")
@@ -448,7 +448,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_complete_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
         parse_success_result(&raw, "ff_complete_execution")
@@ -515,7 +515,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_fail_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
         parse_fail_result(&raw)
@@ -551,7 +551,7 @@ impl ClaimedTask {
             .client
             .hget(&ctx.core(), "current_waitpoint_id")
             .await
-            .map_err(|e| SdkError::Valkey(format!("read current_waitpoint_id: {e}")))?;
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "read current_waitpoint_id".into() })?;
         let wp_id = match wp_id_str.as_deref().filter(|s| !s.is_empty()) {
             Some(s) => match WaitpointId::parse(s) {
                 Ok(id) => id,
@@ -608,7 +608,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_cancel_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
         parse_success_result(&raw, "ff_cancel_execution")
@@ -656,7 +656,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_update_progress", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_success_result(&raw, "ff_update_progress")
     }
@@ -703,7 +703,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_report_usage_and_check", &key_refs, &argv_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_report_usage_result(&raw)
     }
@@ -749,7 +749,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_create_pending_waitpoint", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_success_result(&raw, "ff_create_pending_waitpoint")?;
         Ok(waitpoint_id)
@@ -807,7 +807,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_append_frame", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_append_frame_result(&raw)
     }
@@ -923,7 +923,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_suspend_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
         parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
@@ -940,7 +940,7 @@ impl ClaimedTask {
             .client
             .get(&ctx.policy())
             .await
-            .map_err(|e| SdkError::Valkey(format!("read retry policy: {e}")))?;
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "read retry policy".into() })?;
 
         match policy_str {
             Some(json) => {
@@ -1027,7 +1027,7 @@ async fn renew_lease_inner(
     let raw: Value = client
         .fcall("ff_renew_lease", &key_refs, &arg_refs)
         .await
-        .map_err(|e| SdkError::Valkey(e.to_string()))?;
+        .map_err(SdkError::Valkey)?;
 
     parse_success_result(&raw, "ff_renew_lease")
 }
@@ -1038,7 +1038,7 @@ async fn renew_lease_inner(
 /// - `stop_signal` is notified (complete/fail/cancel called)
 /// - Renewal fails with a terminal error (stale_lease, lease_expired, etc.)
 /// - The task handle is aborted (ClaimedTask dropped)
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn spawn_renewal_task(
     client: Client,
     partition_config: PartitionConfig,
@@ -1114,6 +1114,7 @@ fn spawn_renewal_task(
 }
 
 /// Check if a script error means renewal should stop permanently.
+#[allow(dead_code)]
 fn is_terminal_renewal_error(err: &ScriptError) -> bool {
     matches!(
         err,

@@ -5337,6 +5337,7 @@ async fn test_server() -> ff_server::server::Server {
         },
         skip_library_load: true, // TestCluster::connect() already loaded it
         cors_origins: vec!["*".to_owned()],
+        api_token: None,
     };
     ff_server::server::Server::start(server_config)
         .await
@@ -6355,6 +6356,7 @@ async fn test_system_engine_with_concurrent_scanners() {
             },
             skip_library_load: true,
             cors_origins: vec!["*".to_owned()],
+            api_token: None,
         }
     };
     let server = ff_server::server::Server::start(server_config)

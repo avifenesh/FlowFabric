@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric worker SDK — public API for worker authors"
 
+[features]
+insecure-direct-claim = []
+
 [dependencies]
 ff-core = { workspace = true }
 ff-engine = { workspace = true }
