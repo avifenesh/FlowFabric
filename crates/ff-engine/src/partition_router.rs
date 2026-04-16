@@ -312,6 +312,15 @@ async fn dispatch_dependency_resolution_inner(
 fn is_child_skipped_result(value: &ferriskey::Value) -> bool {
     match value {
         ferriskey::Value::Array(arr) => {
+            if arr.len() < 4 {
+                if arr.len() != 2 {
+                    tracing::warn!(
+                        arr_len = arr.len(),
+                        "is_child_skipped_result: unexpected array length (expected 2 or 4)"
+                    );
+                }
+                return false;
+            }
             arr.get(3)
                 .and_then(|v| match v {
                     Ok(ferriskey::Value::BulkString(b)) => {
@@ -324,6 +333,11 @@ fn is_child_skipped_result(value: &ferriskey::Value) -> bool {
                 })
                 .unwrap_or(false)
         }
-        _ => false,
+        _ => {
+            tracing::warn!(
+                "is_child_skipped_result: expected Array, got non-array value"
+            );
+            false
+        }
     }
 }

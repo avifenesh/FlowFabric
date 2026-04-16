@@ -5,8 +5,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -41,8 +42,12 @@ where
             Ok(Json(value)) => Ok(AppJson(value)),
             Err(rejection) => {
                 let status = rejection.status();
+                tracing::debug!(detail = %rejection.body_text(), "JSON rejection");
                 let body = ErrorBody {
-                    error: rejection.body_text(),
+                    error: format!(
+                        "invalid JSON: {}",
+                        status.canonical_reason().unwrap_or("bad request"),
+                    ),
                 };
                 Err((status, Json(body)).into_response())
             }
@@ -79,10 +84,10 @@ impl IntoResponse for ApiError {
 
 // ── Router ──
 
-pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
+pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<String>) -> Router {
     let cors = build_cors_layer(cors_origins);
 
-    Router::new()
+    let mut app = Router::new()
         // Executions
         .route("/v1/executions", get(list_executions).post(create_execution))
         .route("/v1/executions/{id}", get(get_execution))
@@ -105,11 +110,62 @@ pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
         .route("/v1/budgets/{id}/reset", post(reset_budget))
         // Quotas
         .route("/v1/quotas", post(create_quota_policy))
-        // Health
-        .route("/healthz", get(healthz))
-        .layer(TraceLayer::new_for_http())
+        // Health (always unauthenticated)
+        .route("/healthz", get(healthz));
+
+    if let Some(token) = api_token {
+        let token = Arc::new(token);
+        app = app.layer(middleware::from_fn(move |req, next| {
+            let token = token.clone();
+            auth_middleware(token, req, next)
+        }));
+    }
+
+    app.layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(server)
+}
+
+async fn auth_middleware(
+    token: Arc<String>,
+    req: Request,
+    next: middleware::Next,
+) -> Response {
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let authorized = auth_header
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "missing or invalid Authorization header".to_owned(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {

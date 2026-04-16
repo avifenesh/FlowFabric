@@ -25,6 +25,9 @@ pub struct ServerConfig {
     pub skip_library_load: bool,
     /// Allowed CORS origins. `["*"]` means permissive (all origins).
     pub cors_origins: Vec<String>,
+    /// Shared-secret API token. If set, all requests except GET /healthz must
+    /// include `Authorization: Bearer <token>`. If unset, auth is disabled.
+    pub api_token: Option<String>,
 }
 
 impl ServerConfig {
@@ -43,6 +46,7 @@ impl ServerConfig {
     /// | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
     /// | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
     /// | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins (`*` = permissive) |
+    /// | `FF_API_TOKEN` | *(none)* | Shared-secret Bearer token. If set, all non-healthz requests require it. |
     /// | `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease expiry scanner interval |
     /// | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed promoter interval |
     /// | `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval |
@@ -57,6 +61,8 @@ impl ServerConfig {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .collect();
+
+        let api_token = std::env::var("FF_API_TOKEN").ok().filter(|s| !s.is_empty());
 
         let lanes: Vec<LaneId> = env_or("FF_LANES", "default")
             .split(',')
@@ -136,6 +142,7 @@ impl ServerConfig {
             engine_config,
             skip_library_load: false,
             cors_origins,
+            api_token,
         })
     }
 }
@@ -159,6 +166,7 @@ impl Default for ServerConfig {
             },
             skip_library_load: false,
             cors_origins: vec!["*".to_owned()],
+            api_token: None,
         }
     }
 }

@@ -85,7 +85,7 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
                 );
                 last_err = Some(e);
                 if attempt < MAX_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }

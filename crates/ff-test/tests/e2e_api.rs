@@ -60,7 +60,7 @@ impl TestApi {
             .expect("Server::start failed");
 
         let server = Arc::new(server);
-        let app = ff_server::api::router(server.clone(), &["*".to_owned()]);
+        let app = ff_server::api::router(server.clone(), &["*".to_owned()], None);
 
         // 3. Bind to random port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -113,6 +113,7 @@ fn test_server_config() -> ff_server::config::ServerConfig {
         },
         skip_library_load: true,
         cors_origins: vec!["*".to_owned()],
+        api_token: None,
     }
 }
 
