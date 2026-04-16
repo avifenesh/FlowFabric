@@ -267,7 +267,7 @@ async fn get_upstream_outcome(
     let upstream_core = format!("ff:exec:{}:{}:core", upstream_tag, upstream_id);
 
     // Read lifecycle_phase + terminal_outcome
-    let fields: Vec<String> = client
+    let fields: Vec<Option<String>> = client
         .cmd("HMGET")
         .arg(&upstream_core)
         .arg("lifecycle_phase")
@@ -276,8 +276,8 @@ async fn get_upstream_outcome(
         .await
         .unwrap_or_default();
 
-    let lifecycle = fields.first().cloned().unwrap_or_default();
-    let outcome = fields.get(1).cloned().unwrap_or_default();
+    let lifecycle = fields.first().and_then(|v| v.clone()).unwrap_or_default();
+    let outcome = fields.get(1).and_then(|v| v.clone()).unwrap_or_default();
 
     let result = if lifecycle == "terminal" && !outcome.is_empty() && outcome != "none" {
         outcome

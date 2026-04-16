@@ -484,6 +484,21 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     local skip_attempt_state = core.attempt_state or "none"
     if skip_attempt_state == "running_attempt"
        or skip_attempt_state == "attempt_interrupted" then
+      -- NOTE: If the child is active (worker holding lease), this FCALL runs
+      -- on {p:N} (exec partition) so we CAN write exec_core and attempt_hash.
+      -- However, lease_current, lease_expiry_zset, worker_leases, and
+      -- active_index also live on {p:N} — but the KEYS array for this
+      -- function does not include them (only 9 KEYS).  Cleaning them here
+      -- would require adding more KEYS slots and pre-reading worker_instance_id
+      -- to construct the worker_leases key.  Instead, lease cleanup is
+      -- delegated to the lease_expiry scanner (1.5s default interval):
+      --   1. lease_expiry_scanner sees expired lease → ff_mark_lease_expired_if_due
+      --   2. Worker's renewal sees terminal → stops with terminal error
+      --   3. ff_expire_execution (attempt_timeout/deadline scanner) does full cleanup
+      -- Race window: between this skip and scanner cleanup, exec_core is
+      -- terminal(skipped) but stale entries remain in active/lease indexes.
+      -- Bounded by lease_expiry_interval (default 1.5s).  Index reconciler
+      -- detects and logs any residual inconsistency at 45s intervals.
       skip_attempt_state = "attempt_terminal"
       -- End real attempt + close stream
       redis.call("HSET", K.attempt_hash,
