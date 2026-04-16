@@ -268,6 +268,99 @@ impl ClaimedTask {
 
     // ── Terminal operations (consume self) ──
 
+    /// Delay the execution until `delay_until`.
+    ///
+    /// Releases the lease. The execution moves to `delayed` state.
+    /// Consumes self — the task cannot be used after delay.
+    pub async fn delay_execution(self, delay_until: TimestampMs) -> Result<(), SdkError> {
+        self.stop_renewal();
+
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
+        //           lease_expiry_zset, worker_leases, active_index,
+        //           delayed_zset, attempt_timeout_zset
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.attempt_hash(self.attempt_index),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&self.worker_instance_id),
+            idx.lane_active(&self.lane_id),
+            idx.lane_delayed(&self.lane_id),
+            idx.attempt_timeout(),
+        ];
+
+        // ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, delay_until
+        let args: Vec<String> = vec![
+            self.execution_id.to_string(),
+            self.lease_id.to_string(),
+            self.lease_epoch.to_string(),
+            self.attempt_id.to_string(),
+            delay_until.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_delay_execution", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+
+        parse_success_result(&raw, "ff_delay_execution")
+    }
+
+    /// Move execution to waiting_children state.
+    ///
+    /// Releases the lease. The execution waits for child dependencies to complete.
+    /// Consumes self.
+    pub async fn move_to_waiting_children(self) -> Result<(), SdkError> {
+        self.stop_renewal();
+
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
+        //           lease_expiry_zset, worker_leases, active_index,
+        //           blocked_deps_zset, attempt_timeout_zset
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.attempt_hash(self.attempt_index),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&self.worker_instance_id),
+            idx.lane_active(&self.lane_id),
+            idx.lane_blocked_dependencies(&self.lane_id),
+            idx.attempt_timeout(),
+        ];
+
+        // ARGV (4): execution_id, lease_id, lease_epoch, attempt_id
+        let args: Vec<String> = vec![
+            self.execution_id.to_string(),
+            self.lease_id.to_string(),
+            self.lease_epoch.to_string(),
+            self.attempt_id.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_move_to_waiting_children", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+
+        parse_success_result(&raw, "ff_move_to_waiting_children")
+    }
+
     /// Complete the execution successfully.
     ///
     /// Stops lease renewal, then calls `ff_complete_execution` via FCALL.
@@ -544,6 +637,53 @@ impl ClaimedTask {
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
         parse_report_usage_result(&raw)
+    }
+
+    /// Create a pending waitpoint for future signal delivery.
+    ///
+    /// Non-consuming — the worker keeps the lease. Signals delivered to the
+    /// waitpoint are buffered. When the worker later calls `suspend()` with
+    /// `use_pending_waitpoint`, buffered signals may immediately satisfy the
+    /// resume condition.
+    pub async fn create_pending_waitpoint(
+        &self,
+        waitpoint_key: &str,
+        expires_in_ms: u64,
+    ) -> Result<WaitpointId, SdkError> {
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        let waitpoint_id = WaitpointId::new();
+        let expires_at = TimestampMs::from_millis(TimestampMs::now().0 + expires_in_ms as i64);
+
+        // KEYS (3): exec_core, waitpoint_hash, pending_wp_expiry_zset
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.waitpoint(&waitpoint_id),
+            idx.pending_waitpoint_expiry(),
+        ];
+
+        // ARGV (5): execution_id, attempt_index, waitpoint_id, waitpoint_key, expires_at
+        let args: Vec<String> = vec![
+            self.execution_id.to_string(),
+            self.attempt_index.to_string(),
+            waitpoint_id.to_string(),
+            waitpoint_key.to_owned(),
+            expires_at.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_create_pending_waitpoint", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+
+        parse_success_result(&raw, "ff_create_pending_waitpoint")?;
+        Ok(waitpoint_id)
     }
 
     // ── Phase 4: Streaming ──

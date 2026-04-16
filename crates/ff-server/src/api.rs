@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -84,13 +84,14 @@ pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
 
     Router::new()
         // Executions
-        .route("/v1/executions", post(create_execution))
+        .route("/v1/executions", get(list_executions).post(create_execution))
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/state", get(get_execution_state))
         .route("/v1/executions/{id}/cancel", post(cancel_execution))
         .route("/v1/executions/{id}/signal", post(deliver_signal))
         .route("/v1/executions/{id}/priority", put(change_priority))
         .route("/v1/executions/{id}/replay", post(replay_execution))
+        .route("/v1/executions/{id}/revoke-lease", post(revoke_lease))
         // Flows
         .route("/v1/flows", post(create_flow))
         .route("/v1/flows/{id}/members", post(add_execution_to_flow))
@@ -101,6 +102,7 @@ pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
         .route("/v1/budgets", post(create_budget))
         .route("/v1/budgets/{id}", get(get_budget_status))
         .route("/v1/budgets/{id}/usage", post(report_usage))
+        .route("/v1/budgets/{id}/reset", post(reset_budget))
         // Quotas
         .route("/v1/quotas", post(create_quota_policy))
         // Health
@@ -125,6 +127,35 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 }
 
 // ── Execution handlers ──
+
+#[derive(Deserialize)]
+struct ListExecutionsParams {
+    partition: u16,
+    #[serde(default = "default_lane")]
+    lane: String,
+    #[serde(default = "default_state_filter")]
+    state: String,
+    #[serde(default = "default_limit")]
+    limit: u64,
+    #[serde(default)]
+    offset: u64,
+}
+
+fn default_lane() -> String { "default".to_owned() }
+fn default_state_filter() -> String { "eligible".to_owned() }
+fn default_limit() -> u64 { 50 }
+
+async fn list_executions(
+    State(server): State<Arc<Server>>,
+    Query(params): Query<ListExecutionsParams>,
+) -> Result<Json<ListExecutionsResult>, ApiError> {
+    let lane = ff_core::types::LaneId::new(&params.lane);
+    let limit = params.limit.min(1000);
+    let result = server
+        .list_executions(params.partition, &lane, &params.state, params.offset, limit)
+        .await?;
+    Ok(Json(result))
+}
 
 async fn create_execution(
     State(server): State<Arc<Server>>,
@@ -196,6 +227,14 @@ async fn replay_execution(
 ) -> Result<Json<ReplayExecutionResult>, ApiError> {
     let eid = parse_execution_id(&id)?;
     Ok(Json(server.replay_execution(&eid).await?))
+}
+
+async fn revoke_lease(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<RevokeLeaseResult>, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    Ok(Json(server.revoke_lease(&eid).await?))
 }
 
 // ── Flow handlers ──
@@ -299,6 +338,14 @@ async fn report_usage(
         now: body.now,
     };
     Ok(Json(server.report_usage(&bid, &args).await?))
+}
+
+async fn reset_budget(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<ResetBudgetResult>, ApiError> {
+    let bid = parse_budget_id(&id)?;
+    Ok(Json(server.reset_budget(&bid).await?))
 }
 
 async fn create_quota_policy(

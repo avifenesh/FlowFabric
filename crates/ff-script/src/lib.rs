@@ -1,3 +1,5 @@
+//! Typed FCALL wrappers and Lua library loader for FlowFabric Valkey Functions.
+
 #[macro_use]
 pub mod macros;
 pub mod result;
