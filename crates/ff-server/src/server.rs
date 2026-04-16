@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferriskey::{Client, ClientBuilder, Value};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinSet;
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, BudgetStatus, CancelExecutionArgs,
     CancelExecutionResult, CancelFlowArgs, CancelFlowResult, ChangePriorityResult,
@@ -15,7 +18,8 @@ use ff_core::contracts::{
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
-    self, BudgetKeyContext, ExecKeyContext, FlowKeyContext, IndexKeys, QuotaKeyContext,
+    self, BudgetKeyContext, ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys,
+    QuotaKeyContext,
 };
 use ff_core::partition::{
     budget_partition, execution_partition, flow_partition, quota_partition, PartitionConfig,
@@ -34,13 +38,24 @@ pub struct Server {
     client: Client,
     engine: Engine,
     config: ServerConfig,
+    /// Background tasks spawned by async handlers (e.g. cancel_flow member
+    /// dispatch). Drained on shutdown with a bounded timeout.
+    background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
 }
 
 /// Server error type.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
+    /// Valkey connection or command error (preserves ErrorKind for caller inspection).
     #[error("valkey: {0}")]
-    Valkey(String),
+    Valkey(#[from] ferriskey::Error),
+    /// Valkey error with additional context (preserves ErrorKind via #[source]).
+    #[error("valkey ({context}): {source}")]
+    ValkeyContext {
+        #[source]
+        source: ferriskey::Error,
+        context: String,
+    },
     #[error("config: {0}")]
     Config(#[from] crate::config::ConfigError),
     #[error("library load: {0}")]
@@ -55,6 +70,16 @@ pub enum ServerError {
     OperationFailed(String),
     #[error("script: {0}")]
     Script(String),
+}
+
+impl ServerError {
+    /// Returns the underlying ferriskey ErrorKind, if this is a Valkey error.
+    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
+        match self {
+            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
+            _ => None,
+        }
+    }
 }
 
 impl Server {
@@ -85,16 +110,16 @@ impl Server {
         let client = builder
             .build()
             .await
-            .map_err(|e| ServerError::Valkey(format!("connect failed: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "connect".into() })?;
 
         // Verify connectivity
         let pong: String = client
             .cmd("PING")
             .execute()
             .await
-            .map_err(|e| ServerError::Valkey(format!("PING failed: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "PING".into() })?;
         if pong != "PONG" {
-            return Err(ServerError::Valkey(format!(
+            return Err(ServerError::OperationFailed(format!(
                 "unexpected PING response: {pong}"
             )));
         }
@@ -153,6 +178,7 @@ impl Server {
             client,
             engine,
             config,
+            background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
         })
     }
 
@@ -173,20 +199,7 @@ impl Server {
         keys: &[&str],
         args: &[&str],
     ) -> Result<Value, ServerError> {
-        match self.client.fcall(function, keys, args).await {
-            Ok(v) => Ok(v),
-            Err(e) if is_function_not_loaded(&e) => {
-                tracing::warn!(function, "Lua library not found on server, reloading");
-                ff_script::loader::ensure_library(&self.client)
-                    .await
-                    .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
-                self.client
-                    .fcall(function, keys, args)
-                    .await
-                    .map_err(|e| ServerError::Valkey(e.to_string()))
-            }
-            Err(e) => Err(ServerError::Valkey(e.to_string())),
-        }
+        fcall_with_reload_on_client(&self.client, function, keys, args).await
     }
 
     /// Get the server config.
@@ -292,97 +305,28 @@ impl Server {
         &self,
         args: &CancelExecutionArgs,
     ) -> Result<CancelExecutionResult, ServerError> {
-        let partition = execution_partition(&args.execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // Determine lane from exec_core for index key construction
-        let lane_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| ServerError::Valkey(format!("HGET lane_id: {e}")))?;
-        let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
-
-        // Read dynamic fields from exec_core for correct key construction
-        let dyn_fields: Vec<Option<String>> = self
-            .client
-            .cmd("HMGET")
-            .arg(ctx.core())
-            .arg("current_attempt_index")
-            .arg("current_waitpoint_id")
-            .arg("current_worker_instance_id")
-            .execute()
-            .await
-            .map_err(|e| ServerError::Valkey(format!("HMGET cancel pre-read: {e}")))?;
-        let att_idx_val = dyn_fields.first()
-            .and_then(|v| v.as_ref())
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        let att_idx = AttemptIndex::new(att_idx_val);
-        let wp_id_str = dyn_fields.get(1)
-            .and_then(|v| v.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let wp_id = if wp_id_str.is_empty() {
-            WaitpointId::new() // placeholder
-        } else {
-            WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
-        };
-        let wiid_str = dyn_fields.get(2)
-            .and_then(|v| v.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let wiid = WorkerInstanceId::new(&wiid_str);
-
-        // KEYS (21): must match lua/execution.lua ff_cancel_execution positional order
-        let fcall_keys: Vec<String> = vec![
-            ctx.core(),                              // 1
-            ctx.attempt_hash(att_idx),               // 2
-            ctx.stream_meta(att_idx),                // 3
-            ctx.lease_current(),                     // 4
-            ctx.lease_history(),                     // 5
-            idx.lease_expiry(),                      // 6
-            idx.worker_leases(&wiid),                // 7
-            ctx.suspension_current(),                // 8
-            ctx.waitpoint(&wp_id),                   // 9
-            ctx.waitpoint_condition(&wp_id),         // 10
-            idx.suspension_timeout(),                // 11
-            idx.lane_terminal(&lane),                // 12
-            idx.attempt_timeout(),                   // 13
-            idx.execution_deadline(),                // 14
-            idx.lane_eligible(&lane),                // 15
-            idx.lane_delayed(&lane),                 // 16
-            idx.lane_blocked_dependencies(&lane),    // 17
-            idx.lane_blocked_budget(&lane),          // 18
-            idx.lane_blocked_quota(&lane),           // 19
-            idx.lane_blocked_route(&lane),           // 20
-            idx.lane_blocked_operator(&lane),        // 21
-        ];
-
-        // ARGV (5): execution_id, reason, source, lease_id, lease_epoch
-        let fcall_args: Vec<String> = vec![
-            args.execution_id.to_string(),
-            args.reason.clone(),
-            args.source.to_string(),
-            args.lease_id
-                .as_ref()
-                .map(|l| l.to_string())
-                .unwrap_or_default(),
-            args.lease_epoch
-                .as_ref()
-                .map(|e| e.to_string())
-                .unwrap_or_default(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_cancel_execution", &key_refs, &arg_refs)
+        let raw = self
+            .fcall_cancel_execution_with_reload(args)
             .await?;
-
         parse_cancel_result(&raw, &args.execution_id)
+    }
+
+    /// Build KEYS/ARGV for `ff_cancel_execution` and invoke via the server's
+    /// reload-capable FCALL. Shared by the inline method and background
+    /// cancel_flow dispatch via [`Self::fcall_cancel_execution_with_reload`].
+    async fn fcall_cancel_execution_with_reload(
+        &self,
+        args: &CancelExecutionArgs,
+    ) -> Result<Value, ServerError> {
+        let (keys, argv) = build_cancel_execution_fcall(
+            &self.client,
+            &self.config.partition_config,
+            args,
+        )
+        .await?;
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        self.fcall_with_reload("ff_cancel_execution", &key_refs, &arg_refs).await
     }
 
     /// Get the public state of an execution.
@@ -400,7 +344,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "public_state")
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGET public_state: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET public_state".into() })?;
 
         match state_str {
             Some(s) => {
@@ -427,13 +371,16 @@ impl Server {
         let partition = budget_partition(&args.budget_id, &self.config.partition_config);
         let bctx = BudgetKeyContext::new(&partition, &args.budget_id);
         let resets_key = keys::budget_resets_key(bctx.hash_tag());
+        let policies_index = keys::budget_policies_index(bctx.hash_tag());
 
-        // KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+        // KEYS (5): budget_def, budget_limits, budget_usage, budget_resets_zset,
+        //           budget_policies_index
         let fcall_keys: Vec<String> = vec![
             bctx.definition(),
             bctx.limits(),
             bctx.usage(),
             resets_key,
+            policies_index,
         ];
 
         // ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
@@ -521,7 +468,7 @@ impl Server {
             .client
             .hgetall(&bctx.definition())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGETALL budget_def: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL budget_def".into() })?;
 
         if def.is_empty() {
             return Err(ServerError::NotFound(format!(
@@ -534,7 +481,7 @@ impl Server {
             .client
             .hgetall(&bctx.usage())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGETALL budget_usage: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL budget_usage".into() })?;
         let usage: HashMap<String, u64> = usage_raw
             .into_iter()
             .filter(|(k, _)| k != "_init")
@@ -546,7 +493,7 @@ impl Server {
             .client
             .hgetall(&bctx.limits())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGETALL budget_limits: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL budget_limits".into() })?;
         let mut hard_limits = HashMap::new();
         let mut soft_limits = HashMap::new();
         for (k, v) in &limits_raw {
@@ -660,9 +607,10 @@ impl Server {
     ) -> Result<CreateFlowResult, ServerError> {
         let partition = flow_partition(&args.flow_id, &self.config.partition_config);
         let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
 
-        // KEYS (2): flow_core, members_set
-        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members()];
+        // KEYS (3): flow_core, members_set, flow_index
+        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members(), fidx.flow_index()];
 
         // ARGV (4): flow_id, flow_kind, namespace, now_ms
         let fcall_args: Vec<String> = vec![
@@ -722,24 +670,49 @@ impl Server {
         self.client
             .hset(&ectx.core(), "flow_id", &args.flow_id.to_string())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HSET flow_id on exec_core: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET flow_id on exec_core".into() })?;
 
         Ok(result)
     }
 
     /// Cancel a flow.
     ///
-    /// Calls ff_cancel_flow on {fp:N}, then dispatches individual execution
-    /// cancellations cross-partition for cancel_all policy.
+    /// Flips `public_flow_state` to `cancelled` atomically via
+    /// `ff_cancel_flow` on `{fp:N}`. For `cancel_all` policy, member
+    /// executions must be cancelled cross-partition; this dispatch runs in
+    /// the background and the call returns [`CancelFlowResult::CancellationScheduled`]
+    /// immediately. For all other policies (or flows with no members), the
+    /// call returns [`CancelFlowResult::Cancelled`].
+    ///
+    /// Clients that need synchronous completion can call [`Self::cancel_flow_wait`].
     pub async fn cancel_flow(
         &self,
         args: &CancelFlowArgs,
     ) -> Result<CancelFlowResult, ServerError> {
+        self.cancel_flow_inner(args, false).await
+    }
+
+    /// Cancel a flow and wait for all member cancellations to complete
+    /// inline. Slower than [`Self::cancel_flow`] for large flows, but
+    /// guarantees every member is in a terminal state on return.
+    pub async fn cancel_flow_wait(
+        &self,
+        args: &CancelFlowArgs,
+    ) -> Result<CancelFlowResult, ServerError> {
+        self.cancel_flow_inner(args, true).await
+    }
+
+    async fn cancel_flow_inner(
+        &self,
+        args: &CancelFlowArgs,
+        wait: bool,
+    ) -> Result<CancelFlowResult, ServerError> {
         let partition = flow_partition(&args.flow_id, &self.config.partition_config);
         let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
 
-        // KEYS (2): flow_core, members_set
-        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members()];
+        // KEYS (3): flow_core, members_set, flow_index
+        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members(), fidx.flow_index()];
 
         // ARGV (4): flow_id, reason, cancellation_policy, now_ms
         let fcall_args: Vec<String> = vec![
@@ -756,39 +729,84 @@ impl Server {
             .fcall_with_reload("ff_cancel_flow", &key_refs, &arg_refs)
             .await?;
 
-        let result = parse_cancel_flow_result(&raw)?;
+        let (policy, members) = parse_cancel_flow_raw(&raw)?;
+        let needs_dispatch = policy == "cancel_all" && !members.is_empty();
 
-        // For cancel_all: dispatch individual cancellations cross-partition
-        let CancelFlowResult::Cancelled {
-            ref cancellation_policy,
-            ref member_execution_ids,
-        } = result;
-        if cancellation_policy == "cancel_all" {
-            for eid_str in member_execution_ids {
-                let eid = match ExecutionId::parse(eid_str) {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
-                let cancel_args = CancelExecutionArgs {
-                    execution_id: eid,
-                    reason: args.reason.clone(),
-                    source: CancelSource::OperatorOverride,
-                    lease_id: None,
-                    lease_epoch: None,
-                    attempt_id: None,
-                    now: args.now,
-                };
-                if let Err(e) = self.cancel_execution(&cancel_args).await {
+        if !needs_dispatch {
+            return Ok(CancelFlowResult::Cancelled {
+                cancellation_policy: policy,
+                member_execution_ids: members,
+            });
+        }
+
+        if wait {
+            // Synchronous dispatch — cancel every member inline before returning.
+            for eid_str in &members {
+                if let Err(e) = cancel_member_execution(
+                    &self.client,
+                    &self.config.partition_config,
+                    eid_str,
+                    &args.reason,
+                    args.now,
+                )
+                .await
+                {
                     tracing::warn!(
                         execution_id = %eid_str,
                         error = %e,
-                        "cancel_flow: individual execution cancel failed (may be terminal)"
+                        "cancel_flow(wait): individual execution cancel failed (may be terminal)"
                     );
                 }
             }
+            return Ok(CancelFlowResult::Cancelled {
+                cancellation_policy: policy,
+                member_execution_ids: members,
+            });
         }
 
-        Ok(result)
+        // Asynchronous dispatch — spawn into the shared JoinSet so Server::shutdown
+        // can wait for pending cancellations (bounded by a shutdown timeout).
+        let client = self.client.clone();
+        let partition_config = self.config.partition_config;
+        let reason = args.reason.clone();
+        let now = args.now;
+        let dispatch_members = members.clone();
+        let flow_id = args.flow_id.clone();
+        self.background_tasks
+            .lock()
+            .await
+            .spawn(async move {
+                for eid_str in &dispatch_members {
+                    if let Err(e) = cancel_member_execution(
+                        &client,
+                        &partition_config,
+                        eid_str,
+                        &reason,
+                        now,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            flow_id = %flow_id,
+                            execution_id = %eid_str,
+                            error = %e,
+                            "cancel_flow(async): individual execution cancel failed (may be terminal)"
+                        );
+                    }
+                }
+                tracing::debug!(
+                    flow_id = %flow_id,
+                    member_count = dispatch_members.len(),
+                    "cancel_flow: background member dispatch complete"
+                );
+            });
+
+        let member_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
+        Ok(CancelFlowResult::CancellationScheduled {
+            cancellation_policy: policy,
+            member_count,
+            member_execution_ids: members,
+        })
     }
 
     /// Stage a dependency edge between two executions in a flow.
@@ -838,7 +856,7 @@ impl Server {
     /// Apply a staged dependency edge to the child execution.
     ///
     /// Runs on the child execution partition {p:N}.
-    /// KEYS (6), ARGV (7) — matches lua/flow.lua ff_apply_dependency_to_child.
+    /// KEYS (7), ARGV (7) — matches lua/flow.lua ff_apply_dependency_to_child.
     pub async fn apply_dependency_to_child(
         &self,
         args: &ApplyDependencyToChildArgs,
@@ -855,11 +873,11 @@ impl Server {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGET lane_id: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
-        // KEYS (6): exec_core, deps_meta, unresolved_set, dep_hash,
-        //           eligible_zset, blocked_deps_zset
+        // KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
+        //           eligible_zset, blocked_deps_zset, deps_all_edges
         let fcall_keys: Vec<String> = vec![
             ctx.core(),
             ctx.deps_meta(),
@@ -867,6 +885,7 @@ impl Server {
             ctx.dep_edge(&args.edge_id),
             idx.lane_eligible(&lane),
             idx.lane_blocked_dependencies(&lane),
+            ctx.deps_all_edges(),
         ];
 
         // ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
@@ -910,7 +929,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGET lane_id: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         let wp_id = &args.waitpoint_id;
@@ -1008,7 +1027,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGET lane_id: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         // KEYS (2): exec_core, eligible_zset
@@ -1044,7 +1063,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "current_worker_instance_id")
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGET worker_instance_id: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET worker_instance_id".into() })?;
         let wiid = match wiid_str {
             Some(ref s) if !s.is_empty() => WorkerInstanceId::new(s),
             _ => {
@@ -1092,7 +1111,7 @@ impl Server {
             .client
             .hgetall(&ctx.core())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HGETALL exec_core: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL exec_core".into() })?;
 
         if fields.is_empty() {
             return Err(ServerError::NotFound(format!(
@@ -1194,7 +1213,7 @@ impl Server {
             .arg(limit)
             .execute()
             .await
-            .map_err(|e| ServerError::Valkey(format!("ZRANGE {zset_key}: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: format!("ZRANGE {zset_key}") })?;
 
         if eids.is_empty() {
             return Ok(ListExecutionsResult {
@@ -1247,12 +1266,12 @@ impl Server {
 
         pipe.execute()
             .await
-            .map_err(|e| ServerError::Valkey(format!("pipeline HMGET: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "pipeline HMGET".into() })?;
 
         let mut summaries = Vec::with_capacity(parsed.len());
         for (eid, slot) in parsed.into_iter().zip(slots) {
             let fields: Vec<Option<String>> = slot.value()
-                .map_err(|e| ServerError::Valkey(format!("pipeline slot: {e}")))?;
+                .map_err(|e| ServerError::ValkeyContext { source: e, context: "pipeline slot".into() })?;
 
             let field = |i: usize| -> String {
                 fields
@@ -1302,7 +1321,7 @@ impl Server {
             .arg("terminal_outcome")
             .execute()
             .await
-            .map_err(|e| ServerError::Valkey(format!("HMGET replay pre-read: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HMGET replay pre-read".into() })?;
         let lane = LaneId::new(
             dyn_fields
                 .first()
@@ -1350,7 +1369,7 @@ impl Server {
                 .arg(flow_ctx.incoming(execution_id))
                 .execute()
                 .await
-                .map_err(|e| ServerError::Valkey(format!("SMEMBERS replay edges: {e}")))?;
+                .map_err(|e| ServerError::ValkeyContext { source: e, context: "SMEMBERS replay edges".into() })?;
 
             // Extended KEYS: blocked_deps_zset, deps_meta, deps_unresolved, dep_edge_0..N
             fcall_keys.push(idx.lane_blocked_dependencies(&lane)); // 5
@@ -1374,9 +1393,32 @@ impl Server {
         parse_replay_result(&raw)
     }
 
-    /// Graceful shutdown — stops scanners and waits for them to finish.
+    /// Graceful shutdown — stops scanners, drains background handler tasks
+    /// (e.g. cancel_flow member dispatch) with a bounded timeout, then waits
+    /// for scanners to finish.
     pub async fn shutdown(self) {
         tracing::info!("shutting down FlowFabric server");
+
+        // Drain handler-spawned background tasks with the same ceiling as
+        // Engine::shutdown. If dispatch is still running at the deadline,
+        // drop the JoinSet to abort remaining tasks.
+        let drain_timeout = Duration::from_secs(15);
+        let background = self.background_tasks.clone();
+        let drain = async move {
+            let mut guard = background.lock().await;
+            while guard.join_next().await.is_some() {}
+        };
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(()) => {}
+            Err(_) => {
+                tracing::warn!(
+                    timeout_s = drain_timeout.as_secs(),
+                    "shutdown: background tasks did not finish in time, aborting"
+                );
+                self.background_tasks.lock().await.abort_all();
+            }
+        }
+
         self.engine.shutdown().await;
         tracing::info!("FlowFabric server shutdown complete");
     }
@@ -1397,7 +1439,7 @@ async fn validate_or_create_partition_config(
     let existing: HashMap<String, String> = client
         .hgetall(&key)
         .await
-        .map_err(|e| ServerError::Valkey(format!("HGETALL {key}: {e}")))?;
+        .map_err(|e| ServerError::ValkeyContext { source: e, context: format!("HGETALL {key}") })?;
 
     if existing.is_empty() {
         // First boot — create the config
@@ -1405,19 +1447,19 @@ async fn validate_or_create_partition_config(
         client
             .hset(&key, "num_execution_partitions", &config.num_execution_partitions.to_string())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HSET: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_execution_partitions".into() })?;
         client
             .hset(&key, "num_flow_partitions", &config.num_flow_partitions.to_string())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HSET: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_flow_partitions".into() })?;
         client
             .hset(&key, "num_budget_partitions", &config.num_budget_partitions.to_string())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HSET: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_budget_partitions".into() })?;
         client
             .hset(&key, "num_quota_partitions", &config.num_quota_partitions.to_string())
             .await
-            .map_err(|e| ServerError::Valkey(format!("HSET: {e}")))?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_quota_partitions".into() })?;
         return Ok(());
     }
 
@@ -1706,7 +1748,12 @@ fn parse_add_execution_to_flow_result(
     }
 }
 
-fn parse_cancel_flow_result(raw: &Value) -> Result<CancelFlowResult, ServerError> {
+/// Parse the raw `ff_cancel_flow` FCALL response into (policy, member_eids).
+///
+/// The caller decides whether to return [`CancelFlowResult::Cancelled`] or
+/// [`CancelFlowResult::CancellationScheduled`] based on whether member
+/// dispatch is synchronous or spawned into the background.
+fn parse_cancel_flow_raw(raw: &Value) -> Result<(String, Vec<String>), ServerError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => return Err(ServerError::Script("ff_cancel_flow: expected Array".into())),
@@ -1715,29 +1762,25 @@ fn parse_cancel_flow_result(raw: &Value) -> Result<CancelFlowResult, ServerError
         Some(Ok(Value::Int(n))) => *n,
         _ => return Err(ServerError::Script("ff_cancel_flow: bad status code".into())),
     };
-    if status == 1 {
-        // {1, "OK", cancellation_policy, member1, member2, ...}
-        let policy = fcall_field_str(arr, 2);
-        let mut members = Vec::new();
-        let mut i = 3;
-        loop {
-            let s = fcall_field_str(arr, i);
-            if s.is_empty() {
-                break;
-            }
-            members.push(s);
-            i += 1;
-        }
-        Ok(CancelFlowResult::Cancelled {
-            cancellation_policy: policy,
-            member_execution_ids: members,
-        })
-    } else {
+    if status != 1 {
         let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
+        return Err(ServerError::OperationFailed(format!(
             "ff_cancel_flow failed: {error_code}"
-        )))
+        )));
     }
+    // {1, "OK", cancellation_policy, member1, member2, ...}
+    let policy = fcall_field_str(arr, 2);
+    let mut members = Vec::new();
+    let mut i = 3;
+    loop {
+        let s = fcall_field_str(arr, i);
+        if s.is_empty() {
+            break;
+        }
+        members.push(s);
+        i += 1;
+    }
+    Ok((policy, members))
 }
 
 fn parse_stage_dependency_edge_result(
@@ -1992,6 +2035,133 @@ fn is_function_not_loaded(e: &ferriskey::Error) -> bool {
         })
         .unwrap_or(false)
         || e.to_string().contains("Function not loaded")
+}
+
+/// Free-function form of [`Server::fcall_with_reload`] — callable from
+/// background tasks that own a cloned `Client` but no `&Server`.
+async fn fcall_with_reload_on_client(
+    client: &Client,
+    function: &str,
+    keys: &[&str],
+    args: &[&str],
+) -> Result<Value, ServerError> {
+    match client.fcall(function, keys, args).await {
+        Ok(v) => Ok(v),
+        Err(e) if is_function_not_loaded(&e) => {
+            tracing::warn!(function, "Lua library not found on server, reloading");
+            ff_script::loader::ensure_library(client)
+                .await
+                .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+            client
+                .fcall(function, keys, args)
+                .await
+                .map_err(ServerError::Valkey)
+        }
+        Err(e) => Err(ServerError::Valkey(e)),
+    }
+}
+
+/// Build the `ff_cancel_execution` KEYS (21) and ARGV (5) by pre-reading
+/// dynamic fields from `exec_core`. Shared by [`Server::cancel_execution`]
+/// and the async cancel_flow member-dispatch path.
+async fn build_cancel_execution_fcall(
+    client: &Client,
+    partition_config: &PartitionConfig,
+    args: &CancelExecutionArgs,
+) -> Result<(Vec<String>, Vec<String>), ServerError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let lane_str: Option<String> = client
+        .hget(&ctx.core(), "lane_id")
+        .await
+        .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+    let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
+
+    let dyn_fields: Vec<Option<String>> = client
+        .cmd("HMGET")
+        .arg(ctx.core())
+        .arg("current_attempt_index")
+        .arg("current_waitpoint_id")
+        .arg("current_worker_instance_id")
+        .execute()
+        .await
+        .map_err(|e| ServerError::ValkeyContext { source: e, context: "HMGET cancel pre-read".into() })?;
+
+    let att_idx_val = dyn_fields.first()
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let att_idx = AttemptIndex::new(att_idx_val);
+    let wp_id_str = dyn_fields.get(1).and_then(|v| v.as_ref()).cloned().unwrap_or_default();
+    let wp_id = if wp_id_str.is_empty() {
+        WaitpointId::new()
+    } else {
+        WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
+    };
+    let wiid_str = dyn_fields.get(2).and_then(|v| v.as_ref()).cloned().unwrap_or_default();
+    let wiid = WorkerInstanceId::new(&wiid_str);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),                              // 1
+        ctx.attempt_hash(att_idx),               // 2
+        ctx.stream_meta(att_idx),                // 3
+        ctx.lease_current(),                     // 4
+        ctx.lease_history(),                     // 5
+        idx.lease_expiry(),                      // 6
+        idx.worker_leases(&wiid),                // 7
+        ctx.suspension_current(),                // 8
+        ctx.waitpoint(&wp_id),                   // 9
+        ctx.waitpoint_condition(&wp_id),         // 10
+        idx.suspension_timeout(),                // 11
+        idx.lane_terminal(&lane),                // 12
+        idx.attempt_timeout(),                   // 13
+        idx.execution_deadline(),                // 14
+        idx.lane_eligible(&lane),                // 15
+        idx.lane_delayed(&lane),                 // 16
+        idx.lane_blocked_dependencies(&lane),    // 17
+        idx.lane_blocked_budget(&lane),          // 18
+        idx.lane_blocked_quota(&lane),           // 19
+        idx.lane_blocked_route(&lane),           // 20
+        idx.lane_blocked_operator(&lane),        // 21
+    ];
+    let argv: Vec<String> = vec![
+        args.execution_id.to_string(),
+        args.reason.clone(),
+        args.source.to_string(),
+        args.lease_id.as_ref().map(|l| l.to_string()).unwrap_or_default(),
+        args.lease_epoch.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+    ];
+    Ok((keys, argv))
+}
+
+/// Cancel a single member execution from a cancel_flow dispatch context.
+/// Parses the flow-member EID string, builds the FCALL via the shared helper,
+/// and executes with the same reload-on-failover semantics as the inline path.
+async fn cancel_member_execution(
+    client: &Client,
+    partition_config: &PartitionConfig,
+    eid_str: &str,
+    reason: &str,
+    now: TimestampMs,
+) -> Result<(), ServerError> {
+    let execution_id = ExecutionId::parse(eid_str)
+        .map_err(|e| ServerError::InvalidInput(format!("bad execution_id '{eid_str}': {e}")))?;
+    let args = CancelExecutionArgs {
+        execution_id: execution_id.clone(),
+        reason: reason.to_owned(),
+        source: CancelSource::OperatorOverride,
+        lease_id: None,
+        lease_epoch: None,
+        attempt_id: None,
+        now,
+    };
+    let (keys, argv) = build_cancel_execution_fcall(client, partition_config, &args).await?;
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let raw = fcall_with_reload_on_client(client, "ff_cancel_execution", &key_refs, &arg_refs).await?;
+    parse_cancel_result(&raw, &execution_id).map(|_| ())
 }
 
 fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerError> {

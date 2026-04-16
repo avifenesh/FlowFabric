@@ -208,26 +208,22 @@ async fn purge_execution(
     del_keys.push(format!("ff:exec:{}:{}:suspension:current", tag, eid_str));
 
     // Dependency keys (RFC-007)
-    // Read deps:unresolved to discover per-edge dep hashes BEFORE deleting the set
-    let deps_unresolved_key = format!("ff:exec:{}:{}:deps:unresolved", tag, eid_str);
+    // deps:all_edges holds every edge ID ever applied to this exec (never
+    // pruned on resolve), so SMEMBERS gives us the full set of dep hashes to
+    // drop — cluster-safe, no SCAN.
+    let deps_all_edges_key = format!("ff:exec:{}:{}:deps:all_edges", tag, eid_str);
     let dep_edge_ids: Vec<String> = client
         .cmd("SMEMBERS")
-        .arg(&deps_unresolved_key)
+        .arg(&deps_all_edges_key)
         .execute()
         .await
         .unwrap_or_default();
 
     del_keys.push(format!("ff:exec:{}:{}:deps:meta", tag, eid_str));
-    del_keys.push(deps_unresolved_key);
+    del_keys.push(format!("ff:exec:{}:{}:deps:unresolved", tag, eid_str));
+    del_keys.push(deps_all_edges_key);
     for edge_id in &dep_edge_ids {
         del_keys.push(format!("ff:exec:{}:{}:dep:{}", tag, eid_str, edge_id));
-    }
-    // Also scan for any satisfied/impossible edges that were removed from unresolved
-    // but still have hash keys. Use SCAN with pattern match.
-    let dep_pattern = format!("ff:exec:{}:{}:dep:*", tag, eid_str);
-    let extra_dep_keys = scan_keys_by_pattern(client, &dep_pattern).await;
-    for k in extra_dep_keys {
-        del_keys.push(k);
     }
 
     // Read waitpoints set to discover all waitpoint-related keys
@@ -327,66 +323,3 @@ async fn read_retention_ms(
         .unwrap_or(default_retention_ms)
 }
 
-/// Scan for keys matching a pattern. Used for discovering dep edge hashes
-/// that may have been removed from deps:unresolved (satisfied/impossible).
-async fn scan_keys_by_pattern(
-    client: &ferriskey::Client,
-    pattern: &str,
-) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = match client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-
-        let (next_cursor, found) = parse_scan_result(&result);
-        keys.extend(found);
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    keys
-}
-
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
-                }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
-        }
-        _ => ("0".to_string(), vec![]),
-    }
-}

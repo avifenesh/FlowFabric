@@ -55,7 +55,20 @@ pub struct FlowFabricWorker {
     lane_index: AtomicUsize,
     #[cfg(feature = "insecure-direct-claim")]
     concurrency_semaphore: Arc<Semaphore>,
+    /// Rolling offset for chunked partition scans. Each poll advances the
+    /// cursor by `PARTITION_SCAN_CHUNK`, so over `ceil(num_partitions /
+    /// chunk)` polls every partition is covered. The initial value is
+    /// derived from `worker_instance_id` so idle workers spread their
+    /// scans across different partitions from the first poll onward.
+    #[cfg(feature = "insecure-direct-claim")]
+    scan_cursor: AtomicUsize,
 }
+
+/// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
+/// load at O(PARTITION_SCAN_CHUNK) per worker-second instead of
+/// O(num_execution_partitions).
+#[cfg(feature = "insecure-direct-claim")]
+const PARTITION_SCAN_CHUNK: usize = 32;
 
 impl FlowFabricWorker {
     /// Connect to Valkey and prepare the worker.
@@ -118,6 +131,12 @@ impl FlowFabricWorker {
             "FlowFabricWorker connected"
         );
 
+        #[cfg(feature = "insecure-direct-claim")]
+        let scan_cursor_init = scan_cursor_seed(
+            config.worker_instance_id.as_str(),
+            partition_config.num_execution_partitions.max(1) as usize,
+        );
+
         Ok(Self {
             client,
             config,
@@ -126,6 +145,8 @@ impl FlowFabricWorker {
             lane_index: AtomicUsize::new(0),
             #[cfg(feature = "insecure-direct-claim")]
             concurrency_semaphore,
+            #[cfg(feature = "insecure-direct-claim")]
+            scan_cursor: AtomicUsize::new(scan_cursor_init),
         })
     }
 
@@ -168,12 +189,24 @@ impl FlowFabricWorker {
         let now = TimestampMs::now();
 
         // Phase 1: We scan eligible executions directly by reading the eligible
-        // ZSET across all execution partitions. In production, the scheduler
+        // ZSET across execution partitions. In production the scheduler
         // (ff-scheduler) would handle this. For Phase 1, the SDK does a
         // simplified inline claim.
+        //
+        // Chunked scan: each poll covers at most PARTITION_SCAN_CHUNK
+        // partitions starting at a rolling offset. This keeps idle Valkey
+        // load at O(chunk) per worker-second instead of O(num_partitions),
+        // and the worker-instance-seeded initial cursor spreads concurrent
+        // workers across different partition windows.
+        let num_partitions = self.partition_config.num_execution_partitions as usize;
+        if num_partitions == 0 {
+            return Ok(None);
+        }
+        let chunk = PARTITION_SCAN_CHUNK.min(num_partitions);
+        let start = self.scan_cursor.fetch_add(chunk, Ordering::Relaxed) % num_partitions;
 
-        // Try each execution partition until we find eligible work.
-        for partition_idx in 0..self.partition_config.num_execution_partitions {
+        for step in 0..chunk {
+            let partition_idx = ((start + step) % num_partitions) as u16;
             let partition = ff_core::partition::Partition {
                 family: ff_core::partition::PartitionFamily::Execution,
                 index: partition_idx,
@@ -766,6 +799,23 @@ fn is_retryable_claim_error(err: &ff_core::error::ScriptError) -> bool {
         err.class(),
         ErrorClass::Retryable | ErrorClass::Informational
     )
+}
+
+/// Initial offset for [`FlowFabricWorker::scan_cursor`]. Hashes the worker
+/// instance id with FNV-1a to place distinct worker processes on different
+/// partition windows from their first poll. Zero is valid for single-worker
+/// clusters but spreads work in multi-worker deployments.
+#[cfg(feature = "insecure-direct-claim")]
+fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
+    if num_partitions == 0 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in worker_instance_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    (hash as usize) % num_partitions
 }
 
 #[cfg(feature = "insecure-direct-claim")]

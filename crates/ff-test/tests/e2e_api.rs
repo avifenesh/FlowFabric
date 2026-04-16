@@ -632,8 +632,11 @@ async fn test_api_cancel_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let result: CancelFlowResult = resp.json().await.expect("cancel flow result parse failed");
+    // Accept either variant — the default HTTP path returns CancellationScheduled
+    // when the flow has members, Cancelled otherwise.
     match result {
-        CancelFlowResult::Cancelled { cancellation_policy, .. } => {
+        CancelFlowResult::Cancelled { cancellation_policy, .. }
+        | CancelFlowResult::CancellationScheduled { cancellation_policy, .. } => {
             assert_eq!(cancellation_policy, "cancel_all");
         }
     }

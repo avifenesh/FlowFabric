@@ -2634,6 +2634,7 @@ async fn fcall_create_budget_full(
     let limits_key = format!("ff:budget:{{b:0}}:{budget_id}:limits");
     let usage_key = format!("ff:budget:{{b:0}}:{budget_id}:usage");
     let resets_key = "ff:idx:{b:0}:budget_resets".to_string();
+    let policies_index = "ff:idx:{b:0}:budget_policies".to_string();
 
     let now = TimestampMs::now();
 
@@ -2663,7 +2664,7 @@ async fn fcall_create_budget_full(
         args.push(soft.to_string());
     }
 
-    let keys: Vec<String> = vec![def_key, limits_key, usage_key, resets_key];
+    let keys: Vec<String> = vec![def_key, limits_key, usage_key, resets_key, policies_index];
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -3181,6 +3182,7 @@ async fn fcall_create_flow(tc: &TestCluster, flow_id: &str) -> String {
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3227,6 +3229,7 @@ async fn fcall_cancel_flow(
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3276,6 +3279,7 @@ async fn fcall_apply_dependency(
         ctx.core(), ctx.deps_meta(), ctx.deps_unresolved(),
         ctx.dep_edge(&eid_p), idx.lane_eligible(&lane_id),
         idx.lane_blocked_dependencies(&lane_id),
+        ctx.deps_all_edges(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -5215,6 +5219,7 @@ async fn test_flow_create_idempotent() {
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -5279,6 +5284,7 @@ async fn test_flow_cancel() {
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -5619,9 +5625,11 @@ async fn test_server_flow_lifecycle() {
 
     assert_in_eligible(&tc, &downstream, &LaneId::new(LANE)).await;
 
-    // 8. Cancel flow via Server API — should cancel downstream
+    // 8. Cancel flow via Server API — should cancel downstream.
+    // Use cancel_flow_wait so the assertion on downstream state directly
+    // below observes the synchronous dispatch outcome.
     let cancel_result = server
-        .cancel_flow(&CancelFlowArgs {
+        .cancel_flow_wait(&CancelFlowArgs {
             flow_id: flow_id.clone(),
             reason: "test_done".to_owned(),
             cancellation_policy: "cancel_all".to_owned(),
@@ -5630,10 +5638,13 @@ async fn test_server_flow_lifecycle() {
         .await
         .expect("cancel_flow failed");
 
-    let ff_core::contracts::CancelFlowResult::Cancelled {
-        ref cancellation_policy,
-        ref member_execution_ids,
-    } = cancel_result;
+    let (cancellation_policy, member_execution_ids) = match &cancel_result {
+        ff_core::contracts::CancelFlowResult::Cancelled {
+            cancellation_policy,
+            member_execution_ids,
+        } => (cancellation_policy, member_execution_ids),
+        other => panic!("expected Cancelled from cancel_flow_wait, got {other:?}"),
+    };
     assert_eq!(cancellation_policy, "cancel_all");
     assert_eq!(member_execution_ids.len(), 2);
 
@@ -6280,14 +6291,19 @@ async fn test_server_create_cancel_roundtrip() {
         flow_id: flow_id.clone(), execution_id: eid.clone(), now,
     }).await.expect("add member");
 
-    // Cancel flow via Server (cancel_all dispatches cancel_execution)
-    let result = server.cancel_flow(&CancelFlowArgs {
+    // Cancel flow via Server (cancel_all dispatches cancel_execution).
+    // Use the wait variant so the execution-state assertion below is
+    // deterministic without a polling loop.
+    let result = server.cancel_flow_wait(&CancelFlowArgs {
         flow_id: flow_id.clone(), reason: "roundtrip_test".to_owned(),
         cancellation_policy: "cancel_all".to_owned(), now: TimestampMs::now(),
     }).await.expect("cancel_flow");
-    let ff_core::contracts::CancelFlowResult::Cancelled {
-        ref member_execution_ids, ..
-    } = result;
+    let member_execution_ids = match &result {
+        ff_core::contracts::CancelFlowResult::Cancelled { member_execution_ids, .. } => {
+            member_execution_ids
+        }
+        other => panic!("expected Cancelled from cancel_flow_wait, got {other:?}"),
+    };
     assert_eq!(member_execution_ids.len(), 1);
 
     // Verify execution is cancelled via Server

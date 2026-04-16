@@ -2,7 +2,7 @@
 
 use ff_core::contracts::*;
 use ff_core::error::ScriptError;
-use ff_core::keys::{ExecKeyContext, FlowKeyContext, IndexKeys};
+use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::state::PublicState;
 
 use crate::result::{FcallResult, FromFcallResult};
@@ -10,6 +10,7 @@ use crate::result::{FcallResult, FromFcallResult};
 /// Key context for flow-structural operations on {fp:N}.
 pub struct FlowStructOpKeys<'a> {
     pub fctx: &'a FlowKeyContext,
+    pub fidx: &'a FlowIndexKeys,
 }
 
 /// Key context for child-local dependency operations on {p:N}.
@@ -20,7 +21,7 @@ pub struct DepOpKeys<'a> {
 }
 
 // ─── ff_create_flow ──────────────────────────────────────────────────
-// KEYS (2): flow_core, members_set
+// KEYS (3): flow_core, members_set, flow_index
 // ARGV (4): flow_id, flow_kind, namespace, now_ms
 
 ff_function! {
@@ -28,6 +29,7 @@ ff_function! {
         keys(k: &FlowStructOpKeys<'_>) {
             k.fctx.core(),
             k.fctx.members(),
+            k.fidx.flow_index(),
         }
         argv {
             args.flow_id.to_string(),
@@ -100,7 +102,7 @@ impl FromFcallResult for AddExecutionToFlowResult {
 }
 
 // ─── ff_cancel_flow ──────────────────────────────────────────────────
-// KEYS (2): flow_core, members_set
+// KEYS (3): flow_core, members_set, flow_index
 // ARGV (4): flow_id, reason, cancellation_policy, now_ms
 
 ff_function! {
@@ -108,6 +110,7 @@ ff_function! {
         keys(k: &FlowStructOpKeys<'_>) {
             k.fctx.core(),
             k.fctx.members(),
+            k.fidx.flow_index(),
         }
         argv {
             args.flow_id.to_string(),
@@ -165,8 +168,8 @@ impl FromFcallResult for EvaluateFlowEligibilityResult {
 }
 
 // ─── ff_apply_dependency_to_child ─────────────────────────────────────
-// KEYS (6): exec_core, deps_meta, unresolved_set, dep_hash,
-//           eligible_zset, blocked_deps_zset
+// KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
+//           eligible_zset, blocked_deps_zset, deps_all_edges
 // ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
 //           dependency_kind, data_passing_ref, now_ms
 
@@ -179,6 +182,7 @@ ff_function! {
             k.ctx.dep_edge(&args.edge_id),
             k.idx.lane_eligible(k.lane_id),
             k.idx.lane_blocked_dependencies(k.lane_id),
+            k.ctx.deps_all_edges(),
         }
         argv {
             args.flow_id.to_string(),

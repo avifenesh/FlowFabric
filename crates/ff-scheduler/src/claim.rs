@@ -634,30 +634,26 @@ async fn server_time_ms(client: &ferriskey::Client) -> Result<u64, ferriskey::Er
 }
 
 /// Errors from the scheduler.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
-    Valkey(ferriskey::Error),
+    /// Valkey connection or command error (preserves ErrorKind for caller inspection).
+    #[error("valkey: {0}")]
+    Valkey(#[from] ferriskey::Error),
+    /// Valkey error with additional context (preserves ErrorKind via #[source]).
+    #[error("valkey ({context}): {source}")]
+    ValkeyContext {
+        #[source]
+        source: ferriskey::Error,
+        context: String,
+    },
 }
 
-impl std::fmt::Display for SchedulerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl SchedulerError {
+    /// Returns the underlying ferriskey ErrorKind.
+    pub fn valkey_kind(&self) -> ferriskey::ErrorKind {
         match self {
-            Self::Valkey(e) => write!(f, "valkey error: {e}"),
+            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => e.kind(),
         }
-    }
-}
-
-impl std::error::Error for SchedulerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Valkey(e) => Some(e),
-        }
-    }
-}
-
-impl From<ferriskey::Error> for SchedulerError {
-    fn from(e: ferriskey::Error) -> Self {
-        Self::Valkey(e)
     }
 }
 

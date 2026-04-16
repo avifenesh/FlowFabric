@@ -7,11 +7,14 @@
 //!
 //! Interval: 15s (catchup mode — event-driven in production).
 //!
+//! Cluster-safe: uses SMEMBERS on a partition-level index SET instead of SCAN.
+//!
 //! Reference: RFC-007 §Flow Summary Projection, RFC-010 §6.7
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ff_core::keys::FlowIndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily};
 
 use super::{ScanResult, Scanner};
@@ -51,12 +54,19 @@ impl Scanner for FlowProjector {
             index: partition,
         };
         let tag = p.hash_tag();
+        let fidx = FlowIndexKeys::new(&p);
 
-        // Discover flows on this partition via SCAN
-        let flow_ids = match scan_flow_ids(client, &tag).await {
+        // Discover flows via partition-level index SET (cluster-safe)
+        let flow_index_key = fidx.flow_index();
+        let flow_ids: Vec<String> = match client
+            .cmd("SMEMBERS")
+            .arg(&flow_index_key)
+            .execute()
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => {
-                tracing::warn!(partition, error = %e, "flow_projector: discovery failed");
+                tracing::warn!(partition, error = %e, "flow_projector: SMEMBERS failed");
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
@@ -96,47 +106,6 @@ impl Scanner for FlowProjector {
 
         ScanResult { processed, errors }
     }
-}
-
-/// Discover flow IDs on a partition via SCAN.
-async fn scan_flow_ids(
-    client: &ferriskey::Client,
-    tag: &str,
-) -> Result<Vec<String>, ferriskey::Error> {
-    let mut flow_ids = Vec::new();
-    let pattern = format!("ff:flow:{}:*:core", tag);
-    let prefix = format!("ff:flow:{}:", tag);
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await?;
-
-        let (next_cursor, keys) = parse_scan_result(&result);
-
-        for key in keys {
-            // Key format: ff:flow:{fp:N}:<flow_id>:core
-            if let Some(rest) = key.strip_prefix(&prefix)
-                && let Some(fid) = rest.strip_suffix(":core")
-            {
-                flow_ids.push(fid.to_string());
-            }
-        }
-
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    Ok(flow_ids)
 }
 
 /// Project the summary for one flow. Returns Ok(true) if updated.
@@ -258,31 +227,3 @@ async fn project_flow_summary(
     Ok(true)
 }
 
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
-                }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
-        }
-        _ => ("0".to_string(), vec![]),
-    }
-}

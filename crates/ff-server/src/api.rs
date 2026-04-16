@@ -76,6 +76,25 @@ impl IntoResponse for ApiError {
             ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ServerError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ServerError::OperationFailed(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ServerError::Valkey(e) => {
+                tracing::error!(
+                    kind = ?e.kind(),
+                    code = e.code().unwrap_or(""),
+                    detail = e.detail().unwrap_or(""),
+                    "valkey error"
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string())
+            }
+            ServerError::ValkeyContext { source, context } => {
+                tracing::error!(
+                    kind = ?source.kind(),
+                    code = source.code().unwrap_or(""),
+                    detail = source.detail().unwrap_or(""),
+                    context = %context,
+                    "valkey error"
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string())
+            }
             other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         };
         (status, Json(ErrorBody { error: message })).into_response()
@@ -330,15 +349,34 @@ async fn add_execution_to_flow(
     Ok((status, Json(result)))
 }
 
+/// Cancel a flow.
+///
+/// By default the handler returns immediately with
+/// [`CancelFlowResult::CancellationScheduled`] (or `Cancelled` for flows
+/// with no members / non-cancel_all policies), and the individual member
+/// execution cancellations run in a background task on the server.
+/// Clients can track per-member progress by polling
+/// `GET /v1/executions/{id}/state` for each id in `member_execution_ids`.
+///
+/// Pass `?wait=true` to run the dispatch loop inline; the handler will not
+/// return until every member has been cancelled. Useful for tests and
+/// callers that need synchronous completion.
 async fn cancel_flow(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     AppJson(mut args): AppJson<CancelFlowArgs>,
 ) -> Result<Json<CancelFlowResult>, ApiError> {
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    Ok(Json(server.cancel_flow(&args).await?))
+    let wait = params.get("wait").is_some_and(|v| v == "true" || v == "1");
+    let result = if wait {
+        server.cancel_flow_wait(&args).await?
+    } else {
+        server.cancel_flow(&args).await?
+    };
+    Ok(Json(result))
 }
 
 async fn stage_dependency_edge(
@@ -446,7 +484,7 @@ async fn healthz(
         .cmd("PING")
         .execute()
         .await
-        .map_err(|e| ApiError(ServerError::Valkey(e.to_string())))?;
+        .map_err(|e| ApiError(ServerError::ValkeyContext { source: e, context: "healthz PING".into() }))?;
     Ok(Json(HealthResponse { status: "ok" }))
 }
 

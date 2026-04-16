@@ -9,17 +9,19 @@
 -- Create a new budget policy with hard/soft limits on N dimensions.
 -- Idempotent: if EXISTS budget_def → return ok_already_satisfied.
 --
--- KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+-- KEYS (5): budget_def, budget_limits, budget_usage, budget_resets_zset,
+--           budget_policies_index
 -- ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
 --   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
 --   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
 ---------------------------------------------------------------------------
 redis.register_function('ff_create_budget', function(keys, args)
   local K = {
-    def_key      = keys[1],
-    limits_key   = keys[2],
-    usage_key    = keys[3],
-    resets_zset  = keys[4],
+    def_key         = keys[1],
+    limits_key      = keys[2],
+    usage_key       = keys[3],
+    resets_zset     = keys[4],
+    policies_index  = keys[5],
   }
 
   local A = {
@@ -72,6 +74,9 @@ redis.register_function('ff_create_budget', function(keys, args)
     redis.call("HSET", K.def_key, "next_reset_at", next_reset_at)
     redis.call("ZADD", K.resets_zset, tonumber(next_reset_at), A.budget_id)
   end
+
+  -- Register in partition-level policy index (for cluster-safe discovery)
+  redis.call("SADD", K.policies_index, A.budget_id)
 
   return ok(A.budget_id)
 end)
