@@ -120,6 +120,13 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
         .iter()
         .filter_map(|o| o.parse().ok())
         .collect();
+    if parsed.is_empty() && !origins.is_empty() {
+        tracing::warn!(
+            configured = ?origins,
+            "all configured CORS origins failed to parse, falling back to permissive"
+        );
+        return CorsLayer::permissive();
+    }
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(parsed))
         .allow_methods([Method::GET, Method::POST, Method::PUT])

@@ -273,8 +273,6 @@ impl ClaimedTask {
     /// Releases the lease. The execution moves to `delayed` state.
     /// Consumes self — the task cannot be used after delay.
     pub async fn delay_execution(self, delay_until: TimestampMs) -> Result<(), SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -312,6 +310,7 @@ impl ClaimedTask {
             .await
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
+        self.stop_renewal();
         parse_success_result(&raw, "ff_delay_execution")
     }
 
@@ -320,8 +319,6 @@ impl ClaimedTask {
     /// Releases the lease. The execution waits for child dependencies to complete.
     /// Consumes self.
     pub async fn move_to_waiting_children(self) -> Result<(), SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -358,6 +355,7 @@ impl ClaimedTask {
             .await
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
+        self.stop_renewal();
         parse_success_result(&raw, "ff_move_to_waiting_children")
     }
 
