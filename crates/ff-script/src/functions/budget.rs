@@ -74,7 +74,7 @@ pub async fn ff_create_budget(
     let raw = conn
         .fcall::<ferriskey::Value>("ff_create_budget", &key_refs, &argv_refs)
         .await
-        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+        .map_err(ScriptError::Valkey)?;
     <CreateBudgetResult as FromFcallResult>::from_fcall_result(&raw)
 }
 
@@ -129,7 +129,7 @@ pub async fn ff_report_usage_and_check(
     let raw = conn
         .fcall::<ferriskey::Value>("ff_report_usage_and_check", &key_refs, &argv_refs)
         .await
-        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+        .map_err(ScriptError::Valkey)?;
     <ReportUsageResult as FromFcallResult>::from_fcall_result(&raw)
 }
 
@@ -188,7 +188,7 @@ pub async fn ff_reset_budget(
     let raw = conn
         .fcall::<ferriskey::Value>("ff_reset_budget", &key_refs, &argv_refs)
         .await
-        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+        .map_err(ScriptError::Valkey)?;
     <ResetBudgetResult as FromFcallResult>::from_fcall_result(&raw)
 }
 

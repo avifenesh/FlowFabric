@@ -18,9 +18,6 @@ use ff_core::partition::{Partition, PartitionFamily};
 
 use super::{ScanResult, Scanner};
 
-/// Max execution reads per budget per cycle to avoid cross-partition fan-out.
-const MAX_EXEC_READS_PER_BUDGET: usize = 100;
-
 pub struct BudgetReconciler {
     interval: Duration,
 }
@@ -82,7 +79,7 @@ impl Scanner for BudgetReconciler {
         let mut errors: u32 = 0;
 
         for bid in &budget_ids {
-            match reconcile_one_budget(client, &tag, bid, now_ms).await {
+            match reconcile_one_budget(client, &tag, &policies_key, bid, now_ms).await {
                 Ok(true) => processed += 1,
                 Ok(false) => {} // skipped (resetting budget or no drift)
                 Err(e) => {
@@ -105,24 +102,41 @@ impl Scanner for BudgetReconciler {
 async fn reconcile_one_budget(
     client: &ferriskey::Client,
     tag: &str,
+    policies_key: &str,
     budget_id: &str,
     now_ms: u64,
 ) -> Result<bool, ferriskey::Error> {
     let def_key = format!("ff:budget:{}:{}", tag, budget_id);
     let usage_key = format!("ff:budget:{}:{}:usage", tag, budget_id);
     let limits_key = format!("ff:budget:{}:{}:limits", tag, budget_id);
-    let executions_key = format!("ff:budget:{}:{}:executions", tag, budget_id);
 
-    // Read budget definition to check for reset_interval_ms
-    let reset_interval: Option<String> = client
-        .cmd("HGET")
+    // Defensive prune: index entry for a budget whose definition is gone
+    // (manual delete / retention purge) — drop it so SMEMBERS stays correct.
+    let def_raw: Vec<String> = client
+        .cmd("HGETALL")
         .arg(&def_key)
-        .arg("reset_interval_ms")
         .execute()
-        .await?;
+        .await
+        .unwrap_or_default();
+    if def_raw.is_empty() {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(policies_key)
+            .arg(budget_id)
+            .execute()
+            .await
+            .unwrap_or(None);
+        return Ok(false);
+    }
+
+    let def_map = pairs_to_map(&def_raw);
+    let reset_interval = def_map.get("reset_interval_ms").copied();
 
     // Skip resetting budgets — cannot reconcile by summing all-time usage
-    if let Some(ref ri) = reset_interval && !ri.is_empty() && ri != "0" {
+    if let Some(ri) = reset_interval
+        && !ri.is_empty()
+        && ri != "0"
+    {
         return Ok(false);
     }
 
@@ -199,33 +213,11 @@ async fn reconcile_one_budget(
         tracing::info!(budget_id, "budget_reconciler: cleared budget breach");
     }
 
-    // Clean stale execution references (incremental — one batch per cycle)
-    let exec_ids: Vec<String> = client
-        .cmd("SRANDMEMBER")
-        .arg(&executions_key)
-        .arg(MAX_EXEC_READS_PER_BUDGET.to_string().as_str())
-        .execute()
-        .await
-        .unwrap_or_default();
-
-    for eid in &exec_ids {
-        // Check if the execution still exists (cross-partition read)
-        // We can't know the exact partition without the UUID bytes, so
-        // we check via the exec_core key existence using a hash-tag-less
-        // approach. Since we only need existence, use EXISTS.
-        // NOTE: In v1, stale cleanup is best-effort. The retention trimmer
-        // on {p:N} doesn't know about {b:M} reverse indexes. We clean here.
-        // For now, skip the cross-partition check and just verify the
-        // member is non-empty.
-        if eid.is_empty() {
-            let _: u32 = client
-                .cmd("SREM")
-                .arg(&executions_key)
-                .arg(eid.as_str())
-                .execute()
-                .await?;
-        }
-    }
+    // TODO: cross-partition stale-execution cleanup for ff:budget:{b:M}:<id>:executions.
+    // Retention on {p:N} can't reach this {b:M} reverse index, so entries
+    // accumulate after executions are purged. Needs a partition-aware EXISTS
+    // check (parse UUID → execution_partition(config) → core key) — deferred
+    // to a later pass since it requires PartitionConfig plumbing here.
 
     Ok(any_breached != currently_breached) // true if we corrected something
 }

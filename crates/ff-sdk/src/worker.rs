@@ -173,7 +173,20 @@ impl FlowFabricWorker {
     /// (`ff-scheduler`) for production deployments. Enable with:
     /// `ff-sdk = { ..., features = ["insecure-direct-claim"] }`
     ///
-    /// Returns `Ok(None)` if no eligible execution is found.
+    /// # `None` semantics
+    ///
+    /// `Ok(None)` means **no work was found in the partition window this
+    /// poll covered**, not "the cluster is idle". Each call scans a chunk
+    /// of [`PARTITION_SCAN_CHUNK`] partitions starting at the rolling
+    /// `scan_cursor`; the cursor advances by that chunk size on every
+    /// invocation, so a worker covers every partition exactly once every
+    /// `ceil(num_execution_partitions / PARTITION_SCAN_CHUNK)` polls.
+    ///
+    /// Callers should treat `None` as "poll again soon" (typically after
+    /// `config.claim_poll_interval_ms`) rather than "sleep for a long
+    /// time". Backing off too aggressively on `None` can starve workers
+    /// when work lives on partitions outside the current window.
+    ///
     /// Returns `Err` on Valkey errors or script failures.
     #[cfg(feature = "insecure-direct-claim")]
     pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {

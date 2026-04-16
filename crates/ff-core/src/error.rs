@@ -24,8 +24,12 @@ pub enum ErrorClass {
 
 /// All error codes returned by FlowFabric Valkey Functions.
 /// Matches RFC-010 §10.7 exactly.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, thiserror::Error)]
-#[serde(rename_all = "snake_case")]
+///
+/// Does not derive `Serialize`/`Deserialize`/`PartialEq`/`Eq`/`Hash` because the
+/// `Valkey` variant wraps `ferriskey::Error`, which implements none of those.
+/// Call sites compare via `matches!`/`.class()` rather than `==`, so this is
+/// not a regression.
+#[derive(Debug, thiserror::Error)]
 pub enum ScriptError {
     // ── Lease/Ownership errors ──
     /// Stop. Lease superseded by reclaim.
@@ -356,13 +360,24 @@ pub enum ScriptError {
     InvalidInput(String),
 
     // ── Transport-level errors (not from Lua) ──
-    /// Valkey connection or protocol error.
-    #[error("valkey error: {0}")]
-    Valkey(String),
+    /// Valkey connection or protocol error. Preserves `ferriskey::ErrorKind` so
+    /// callers can distinguish transient/permanent/NOSCRIPT/MOVED/etc.
+    #[error("valkey: {0}")]
+    Valkey(#[from] ferriskey::Error),
 
     /// Failed to parse FCALL return value.
     #[error("parse error: {0}")]
     Parse(String),
+}
+
+impl ScriptError {
+    /// Returns the underlying ferriskey ErrorKind if this is a transport error.
+    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
+        match self {
+            Self::Valkey(e) => Some(e.kind()),
+            _ => None,
+        }
+    }
 }
 
 impl ScriptError {

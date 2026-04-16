@@ -63,7 +63,7 @@ macro_rules! ff_function {
                 let raw = conn
                     .fcall::<ferriskey::Value>(stringify!($fn_name), &key_refs, &argv_refs)
                     .await
-                    .map_err(|e| ff_core::error::ScriptError::Valkey(e.to_string()))?;
+                    .map_err(ff_core::error::ScriptError::Valkey)?;
                 <$result_type as $crate::result::FromFcallResult>::from_fcall_result(&raw)
             }
         )*
