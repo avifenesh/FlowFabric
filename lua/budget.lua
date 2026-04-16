@@ -38,7 +38,8 @@ redis.register_function('ff_create_budget', function(keys, args)
     return ok_already_satisfied(A.budget_id)
   end
 
-  local dim_count = tonumber(args[9])
+  local dim_count = require_number(args[9], "dim_count")
+  if type(dim_count) == "table" then return dim_count end
 
   -- HSET budget definition
   redis.call("HSET", K.def_key,

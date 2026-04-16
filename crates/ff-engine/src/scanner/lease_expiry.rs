@@ -12,18 +12,19 @@ use std::time::Duration;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 
-use super::{ScanResult, Scanner};
+use super::{FailureTracker, ScanResult, Scanner};
 
 /// Batch size per ZRANGEBYSCORE call.
 const BATCH_SIZE: u32 = 50;
 
 pub struct LeaseExpiryScanner {
     interval: Duration,
+    failures: FailureTracker,
 }
 
 impl LeaseExpiryScanner {
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self { interval, failures: FailureTracker::new() }
     }
 }
 
@@ -80,6 +81,10 @@ impl Scanner for LeaseExpiryScanner {
             return ScanResult { processed: 0, errors: 0 };
         }
 
+        if partition == 0 {
+            self.failures.advance_cycle();
+        }
+
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
 
@@ -87,6 +92,10 @@ impl Scanner for LeaseExpiryScanner {
         // KEYS(4): exec_core, lease_current, lease_expiry_zset, lease_history
         // ARGV(1): execution_id
         for eid_str in &expired {
+            if self.failures.should_skip(eid_str) {
+                continue;
+            }
+
             let exec_core = format!("ff:exec:{}:{}:core", p.hash_tag(), eid_str);
             let lease_current = format!("ff:exec:{}:{}:lease:current", p.hash_tag(), eid_str);
             let lease_history = format!("ff:exec:{}:{}:lease:history", p.hash_tag(), eid_str);
@@ -103,7 +112,10 @@ impl Scanner for LeaseExpiryScanner {
                 &keys,
                 &[eid_str.as_str()],
             ).await {
-                Ok(_) => processed += 1,
+                Ok(_) => {
+                    self.failures.record_success(eid_str);
+                    processed += 1;
+                }
                 Err(e) => {
                     tracing::warn!(
                         partition,
@@ -111,6 +123,7 @@ impl Scanner for LeaseExpiryScanner {
                         error = %e,
                         "lease_expiry: ff_mark_lease_expired_if_due failed"
                     );
+                    self.failures.record_failure(eid_str, "lease_expiry");
                     errors += 1;
                 }
             }

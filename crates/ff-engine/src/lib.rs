@@ -284,11 +284,22 @@ impl Engine {
     }
 
     /// Signal all scanners to stop and wait for them to finish.
+    ///
+    /// Waits up to 15 seconds for scanners to drain. If any scanner is
+    /// blocked on a hung Valkey command, the timeout prevents shutdown
+    /// from hanging indefinitely (Kubernetes SIGKILL safety).
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
-        for handle in self.handles {
-            let _ = handle.await;
+        let join_all = async {
+            for handle in self.handles {
+                let _ = handle.await;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(15), join_all).await {
+            Ok(()) => tracing::info!("engine shutdown complete"),
+            Err(_) => tracing::warn!(
+                "engine shutdown timed out after 15s, abandoning remaining scanners"
+            ),
         }
-        tracing::info!("engine shutdown complete");
     }
 }

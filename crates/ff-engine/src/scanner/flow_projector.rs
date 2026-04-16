@@ -1,9 +1,9 @@
 //! Flow summary projector scanner.
 //!
-//! Scans flow partitions ({fp:N}). For each flow: reads member executions
-//! (SMEMBERS), reads each member's public_state (cross-partition), and
-//! updates the flow summary hash with aggregate counts and derived
-//! public_flow_state.
+//! Scans flow partitions ({fp:N}). For each flow: samples up to BATCH_SIZE
+//! member executions (SRANDMEMBER), reads each member's public_state
+//! (cross-partition), and updates the flow summary hash with aggregate
+//! counts and derived public_flow_state.
 //!
 //! Interval: 15s (catchup mode — event-driven in production).
 //!
@@ -150,10 +150,13 @@ async fn project_flow_summary(
     let members_key = format!("ff:flow:{}:{}:members", tag, fid_str);
     let summary_key = format!("ff:flow:{}:{}:summary", tag, fid_str);
 
-    // Read all member execution IDs
+    // Sample up to BATCH_SIZE member execution IDs (avoids loading the
+    // entire membership set into memory for large flows).
+    // SRANDMEMBER key count returns up to `count` distinct members.
     let member_eids: Vec<String> = client
-        .cmd("SMEMBERS")
+        .cmd("SRANDMEMBER")
         .arg(&members_key)
+        .arg(BATCH_SIZE.to_string().as_str())
         .execute()
         .await
         .unwrap_or_default();
@@ -162,11 +165,11 @@ async fn project_flow_summary(
         return Ok(false);
     }
 
-    // Count public_state for each member (cross-partition reads)
+    // Count public_state for each sampled member (cross-partition reads)
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut total: u32 = 0;
 
-    for eid_str in member_eids.iter().take(BATCH_SIZE) {
+    for eid_str in &member_eids {
         let eid = match ff_core::types::ExecutionId::parse(eid_str) {
             Ok(id) => id,
             Err(_) => continue,

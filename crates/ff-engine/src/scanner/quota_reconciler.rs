@@ -164,33 +164,44 @@ async fn reconcile_one_quota(
         let counter_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
         let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id);
 
-        // Read all members from the admitted set
-        let members: Vec<String> = client
-            .cmd("SMEMBERS")
-            .arg(&admitted_set_key)
-            .execute()
-            .await
-            .unwrap_or_default();
-
-        // Check each guard key — if expired, SREM from set
+        // SSCAN the admitted set in batches (instead of unbounded SMEMBERS)
         let mut live_count: u64 = 0;
-        for eid in &members {
-            let guard_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid);
-            let exists: bool = client
-                .exists(&guard_key)
-                .await
-                .unwrap_or(false);
-            if exists {
-                live_count += 1;
-            } else {
-                // Guard expired — clean up from admitted set
-                let _: () = client
-                    .cmd("SREM")
-                    .arg(&admitted_set_key)
-                    .arg(eid.as_str())
-                    .execute()
+        let mut cursor = "0".to_string();
+        loop {
+            let result: ferriskey::Value = client
+                .cmd("SSCAN")
+                .arg(&admitted_set_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await?;
+
+            let (next_cursor, members) = parse_sscan_response(&result);
+
+            for eid in &members {
+                let guard_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid);
+                let exists: bool = client
+                    .exists(&guard_key)
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or(false);
+                if exists {
+                    live_count += 1;
+                } else {
+                    // Guard expired — clean up from admitted set
+                    let _: () = client
+                        .cmd("SREM")
+                        .arg(&admitted_set_key)
+                        .arg(eid.as_str())
+                        .execute()
+                        .await
+                        .unwrap_or_default();
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
             }
         }
 
@@ -224,4 +235,39 @@ async fn reconcile_one_quota(
     }
 
     Ok(did_work)
+}
+
+/// Parse SSCAN response: [cursor, [member1, member2, ...]]
+fn parse_sscan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                if let Ok(ferriskey::Value::BulkString(b)) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                if let ferriskey::Value::BulkString(b) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (cursor, members)
 }

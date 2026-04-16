@@ -363,11 +363,19 @@ impl ClaimedTask {
 
     /// Complete the execution successfully.
     ///
-    /// Stops lease renewal, then calls `ff_complete_execution` via FCALL.
+    /// Calls `ff_complete_execution` via FCALL, then stops lease renewal.
+    /// Renewal continues during the FCALL to prevent lease expiry under
+    /// network latency — the Lua fences on lease_id+epoch atomically.
     /// Consumes self — the task cannot be used after completion.
+    ///
+    /// # Connection errors
+    ///
+    /// If the Valkey connection drops during this call, the returned error
+    /// does **not** guarantee the operation failed — the Lua function may
+    /// have committed before the response was lost. Callers should treat
+    /// connection errors on `complete()` as "possibly succeeded" and verify
+    /// the execution state via `get_execution_state()` before retrying.
     pub async fn complete(self, result_payload: Option<Vec<u8>>) -> Result<(), SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -413,6 +421,7 @@ impl ClaimedTask {
             .await
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
+        self.stop_renewal();
         parse_success_result(&raw, "ff_complete_execution")
     }
 
@@ -421,13 +430,19 @@ impl ClaimedTask {
     /// If the execution policy allows retries, the engine schedules a retry
     /// (delayed backoff). Otherwise, the execution becomes terminal failed.
     /// Returns [`FailOutcome`] so the caller knows what happened.
+    ///
+    /// # Connection errors
+    ///
+    /// If the Valkey connection drops during this call, the returned error
+    /// does **not** guarantee the operation failed — the Lua function may
+    /// have committed before the response was lost. Callers should treat
+    /// connection errors on `fail()` as "possibly succeeded" and verify
+    /// the execution state via `get_execution_state()` before retrying.
     pub async fn fail(
         self,
         reason: &str,
         error_category: &str,
     ) -> Result<FailOutcome, SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -452,7 +467,7 @@ impl ClaimedTask {
 
         // ARGV (7): eid, lease_id, lease_epoch, attempt_id,
         //           failure_reason, failure_category, retry_policy_json
-        let retry_policy_json = self.read_retry_policy_json(&ctx).await;
+        let retry_policy_json = self.read_retry_policy_json(&ctx).await?;
 
         let args: Vec<String> = vec![
             self.execution_id.to_string(),
@@ -473,6 +488,7 @@ impl ClaimedTask {
             .await
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
+        self.stop_renewal();
         parse_fail_result(&raw)
     }
 
@@ -480,8 +496,15 @@ impl ClaimedTask {
     ///
     /// Stops lease renewal, then calls `ff_cancel_execution` via FCALL.
     /// Consumes self.
+    ///
+    /// # Connection errors
+    ///
+    /// If the Valkey connection drops during this call, the returned error
+    /// does **not** guarantee the operation failed — the Lua function may
+    /// have committed before the response was lost. Callers should treat
+    /// connection errors on `cancel()` as "possibly succeeded" and verify
+    /// the execution state via `get_execution_state()` before retrying.
     pub async fn cancel(self, reason: &str) -> Result<(), SdkError> {
-        self.stop_renewal();
         self.cancel_inner(reason).await
     }
 
@@ -499,8 +522,7 @@ impl ClaimedTask {
             .client
             .hget(&ctx.core(), "current_waitpoint_id")
             .await
-            .ok()
-            .flatten();
+            .map_err(|e| SdkError::Valkey(format!("read current_waitpoint_id: {e}")))?;
         let wp_id = wp_id_str
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -549,6 +571,7 @@ impl ClaimedTask {
             .await
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
+        self.stop_renewal();
         parse_success_result(&raw, "ff_cancel_execution")
     }
 
@@ -761,8 +784,6 @@ impl ClaimedTask {
         timeout_ms: Option<u64>,
         timeout_behavior: TimeoutBehavior,
     ) -> Result<SuspendOutcome, SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -854,6 +875,7 @@ impl ClaimedTask {
             .await
             .map_err(|e| SdkError::Valkey(e.to_string()))?;
 
+        self.stop_renewal();
         parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
     }
 
@@ -863,13 +885,12 @@ impl ClaimedTask {
     }
 
     /// Read the retry policy JSON from the execution's policy key.
-    async fn read_retry_policy_json(&self, ctx: &ExecKeyContext) -> String {
+    async fn read_retry_policy_json(&self, ctx: &ExecKeyContext) -> Result<String, SdkError> {
         let policy_str: Option<String> = self
             .client
             .get(&ctx.policy())
             .await
-            .ok()
-            .flatten();
+            .map_err(|e| SdkError::Valkey(format!("read retry policy: {e}")))?;
 
         match policy_str {
             Some(json) => {
@@ -877,11 +898,11 @@ impl ClaimedTask {
                 if let Ok(policy) = serde_json::from_str::<serde_json::Value>(&json)
                     && let Some(retry) = policy.get("retry_policy")
                 {
-                    return serde_json::to_string(retry).unwrap_or_default();
+                    return Ok(serde_json::to_string(retry).unwrap_or_default());
                 }
-                String::new()
+                Ok(String::new())
             }
-            None => String::new(),
+            None => Ok(String::new()),
         }
     }
 }
@@ -892,6 +913,12 @@ impl Drop for ClaimedTask {
         // This is a safety net — complete/fail/cancel already stop renewal
         // via notify before consuming self. But if the task is dropped
         // without being consumed (e.g., panic), abort prevents leaked renewals.
+        if !self.renewal_handle.is_finished() {
+            tracing::warn!(
+                execution_id = %self.execution_id,
+                "ClaimedTask dropped without terminal operation — lease will expire"
+            );
+        }
         self.renewal_handle.abort();
     }
 }
@@ -969,6 +996,7 @@ fn spawn_renewal_task(
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the first immediate tick — the lease was just acquired.
         tick.tick().await;
 
@@ -1289,7 +1317,11 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
         })
         .unwrap_or_default();
 
-    let signal_id = SignalId::parse(&signal_id_str).unwrap_or_else(|_| SignalId::new());
+    let signal_id = SignalId::parse(&signal_id_str).map_err(|e| {
+        SdkError::Script(ScriptError::Parse(format!(
+            "ff_deliver_signal: invalid signal_id from Lua: {e}"
+        )))
+    })?;
 
     if effect == "resume_condition_satisfied" {
         Ok(SignalOutcome::TriggeredResume { signal_id })

@@ -16,20 +16,19 @@ use std::time::Duration;
 
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
-use ff_core::types::LaneId;
 
-use super::{ScanResult, Scanner};
+use super::{FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
 pub struct ExecutionDeadlineScanner {
     interval: Duration,
-    lanes: Vec<LaneId>,
+    failures: FailureTracker,
 }
 
 impl ExecutionDeadlineScanner {
-    pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
-        Self { interval, lanes }
+    pub fn new(interval: Duration, _lanes: Vec<ff_core::types::LaneId>) -> Self {
+        Self { interval, failures: FailureTracker::new() }
     }
 }
 
@@ -85,19 +84,29 @@ impl Scanner for ExecutionDeadlineScanner {
             return ScanResult { processed: 0, errors: 0 };
         }
 
+        if partition == 0 {
+            self.failures.advance_cycle();
+        }
+
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
 
-        let lane = self.lanes.first().cloned().unwrap_or_else(|| LaneId::new("default"));
-
         for eid_str in &expired {
+            if self.failures.should_skip(eid_str) {
+                continue;
+            }
+
             // Reuse the same expire_execution helper as attempt_timeout —
             // ff_expire_execution handles all lifecycle phases and ZREMs from
             // both attempt_timeout and execution_deadline indexes.
+            // Lane is now pre-read from exec_core inside expire_execution_raw.
             match crate::scanner::attempt_timeout::expire_execution_raw(
-                client, &p, &idx, &lane, eid_str, "execution_deadline",
+                client, &p, &idx, eid_str, "execution_deadline",
             ).await {
-                Ok(()) => processed += 1,
+                Ok(()) => {
+                    self.failures.record_success(eid_str);
+                    processed += 1;
+                }
                 Err(e) => {
                     tracing::warn!(
                         partition,
@@ -105,6 +114,7 @@ impl Scanner for ExecutionDeadlineScanner {
                         error = %e,
                         "execution_deadline: ff_expire_execution failed"
                     );
+                    self.failures.record_failure(eid_str, "execution_deadline");
                     errors += 1;
                 }
             }
