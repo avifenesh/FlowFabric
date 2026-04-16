@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
@@ -66,7 +67,10 @@ impl FlowFabricWorker {
             return Err(SdkError::Config("at least one lane is required".into()));
         }
 
-        let mut builder = ClientBuilder::new().host(&config.host, config.port);
+        let mut builder = ClientBuilder::new()
+            .host(&config.host, config.port)
+            .connect_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_millis(5000));
         if config.tls {
             builder = builder.tls();
         }
@@ -488,13 +492,14 @@ impl FlowFabricWorker {
         let idx = IndexKeys::new(partition);
 
         // Pre-read current_attempt_index for the existing attempt hash key.
+        // This is load-bearing: KEYS[6] must point to the real attempt hash.
         let att_idx_str: Option<String> = self.client
             .cmd("HGET")
             .arg(ctx.core())
             .arg("current_attempt_index")
             .execute()
             .await
-            .unwrap_or(None);
+            .map_err(|e| SdkError::Valkey(format!("read attempt_index: {e}")))?;
         let att_idx = AttemptIndex::new(
             att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
         );
@@ -668,8 +673,14 @@ impl FlowFabricWorker {
         let signal_id = ff_core::types::SignalId::new();
         let now = TimestampMs::now();
 
-        // Determine lane for index keys — use first configured lane
-        let lane_id = &self.config.lanes[0];
+        // Pre-read lane_id from exec_core — the execution may be on any lane,
+        // not necessarily one of this worker's configured lanes.
+        let lane_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| SdkError::Valkey(format!("HGET lane_id: {e}")))?;
+        let lane_id = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         // KEYS (13): exec_core, wp_condition, wp_signals_stream,
         //            exec_signals_zset, signal_hash, signal_payload,
@@ -691,9 +702,9 @@ impl FlowFabricWorker {
             idem_key,                                      // 7
             ctx.waitpoint(waitpoint_id),                   // 8
             ctx.suspension_current(),                      // 9
-            idx.lane_eligible(lane_id),                    // 10
-            idx.lane_suspended(lane_id),                   // 11
-            idx.lane_delayed(lane_id),                     // 12
+            idx.lane_eligible(&lane_id),                   // 10
+            idx.lane_suspended(&lane_id),                  // 11
+            idx.lane_delayed(&lane_id),                    // 12
             idx.suspension_timeout(),                      // 13
         ];
 

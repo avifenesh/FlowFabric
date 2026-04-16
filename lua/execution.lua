@@ -31,12 +31,15 @@ redis.register_function('ff_create_execution', function(keys, args)
     all_executions_set  = keys[8],
   }
 
+  local priority_n = require_number(args[5], "priority")
+  if type(priority_n) == "table" then return priority_n end
+
   local A = {
     execution_id        = args[1],
     namespace           = args[2],
     lane_id             = args[3],
     execution_kind      = args[4],
-    priority            = tonumber(args[5]),
+    priority            = priority_n,
     creator_identity    = args[6],
     policy_json         = args[7],
     input_payload       = args[8],
@@ -236,6 +239,11 @@ redis.register_function('ff_claim_execution', function(keys, args)
     execution_deadline_key = keys[14],
   }
 
+  local lease_ttl_n = require_number(args[7], "lease_ttl_ms")
+  if type(lease_ttl_n) == "table" then return lease_ttl_n end
+  local renew_before_n = require_number(args[8], "renew_before_ms")
+  if type(renew_before_n) == "table" then return renew_before_n end
+
   local A = {
     execution_id         = args[1],
     worker_id            = args[2],
@@ -243,8 +251,8 @@ redis.register_function('ff_claim_execution', function(keys, args)
     lane                 = args[4],
     capability_hash      = args[5],
     lease_id             = args[6],
-    lease_ttl_ms         = tonumber(args[7]),
-    renew_before_ms      = tonumber(args[8]),
+    lease_ttl_ms         = lease_ttl_n,
+    renew_before_ms      = renew_before_n,
     attempt_id           = args[9],
     attempt_policy_json  = args[10],
     attempt_timeout_ms   = args[11],  -- "" or ms
@@ -1129,13 +1137,16 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
     execution_deadline_key = keys[14],
   }
 
+  local reclaim_ttl_n = require_number(args[6], "lease_ttl_ms")
+  if type(reclaim_ttl_n) == "table" then return reclaim_ttl_n end
+
   local A = {
     execution_id        = args[1],
     worker_id           = args[2],
     worker_instance_id  = args[3],
     lane                = args[4],
     lease_id            = args[5],
-    lease_ttl_ms        = tonumber(args[6]),
+    lease_ttl_ms        = reclaim_ttl_n,
     attempt_id          = args[7],
     attempt_policy_json = args[8] or "",
   }

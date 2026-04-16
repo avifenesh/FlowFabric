@@ -15,6 +15,17 @@ local function err(...)
   return {0, ...}
 end
 
+-- Require a numeric value from ARGV. Returns the number on success or
+-- an err() tuple on failure. Callers must check: if type(n) == "table"
+-- then return n end  (the table IS the err tuple).
+local function require_number(val, name)
+  local n = tonumber(val)
+  if n == nil then
+    return err("invalid_input", name .. " must be a number, got: " .. tostring(val))
+  end
+  return n
+end
+
 local function ok_already_satisfied(...)
   return {1, "ALREADY_SATISFIED", ...}
 end

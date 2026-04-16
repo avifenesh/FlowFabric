@@ -12,17 +12,18 @@ use std::time::Duration;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 
-use super::{ScanResult, Scanner};
+use super::{FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
 pub struct SuspensionTimeoutScanner {
     interval: Duration,
+    failures: FailureTracker,
 }
 
 impl SuspensionTimeoutScanner {
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self { interval, failures: FailureTracker::new() }
     }
 }
 
@@ -79,12 +80,23 @@ impl Scanner for SuspensionTimeoutScanner {
             return ScanResult { processed: 0, errors: 0 };
         }
 
+        if partition == 0 {
+            self.failures.advance_cycle();
+        }
+
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
 
         for eid_str in &timed_out {
+            if self.failures.should_skip(eid_str) {
+                continue;
+            }
+
             match expire_suspension(client, &tag, &idx, eid_str).await {
-                Ok(()) => processed += 1,
+                Ok(()) => {
+                    self.failures.record_success(eid_str);
+                    processed += 1;
+                }
                 Err(e) => {
                     tracing::warn!(
                         partition,
@@ -92,6 +104,7 @@ impl Scanner for SuspensionTimeoutScanner {
                         error = %e,
                         "suspension_timeout: ff_expire_suspension failed"
                     );
+                    self.failures.record_failure(eid_str, "suspension_timeout");
                     errors += 1;
                 }
             }

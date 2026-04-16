@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::contracts::{
@@ -71,7 +72,10 @@ impl Server {
             tls = config.tls, cluster = config.cluster,
             "connecting to Valkey"
         );
-        let mut builder = ClientBuilder::new().host(&config.host, config.port);
+        let mut builder = ClientBuilder::new()
+            .host(&config.host, config.port)
+            .connect_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_millis(5000));
         if config.tls {
             builder = builder.tls();
         }
@@ -155,6 +159,34 @@ impl Server {
     /// Get a reference to the ferriskey client.
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Execute an FCALL with automatic Lua library reload on "function not loaded".
+    ///
+    /// After a Valkey failover the new primary may not have the Lua library
+    /// loaded (replication lag or cold replica). This wrapper detects that
+    /// condition, reloads the library via `ff_script::loader::ensure_library`,
+    /// and retries the FCALL once.
+    async fn fcall_with_reload(
+        &self,
+        function: &str,
+        keys: &[&str],
+        args: &[&str],
+    ) -> Result<Value, ServerError> {
+        match self.client.fcall(function, keys, args).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_function_not_loaded(&e) => {
+                tracing::warn!(function, "Lua library not found on server, reloading");
+                ff_script::loader::ensure_library(&self.client)
+                    .await
+                    .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+                self.client
+                    .fcall(function, keys, args)
+                    .await
+                    .map_err(|e| ServerError::Valkey(e.to_string()))
+            }
+            Err(e) => Err(ServerError::Valkey(e.to_string())),
+        }
     }
 
     /// Get the server config.
@@ -245,10 +277,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_execution", &key_refs, &arg_refs)
+            .await?;
 
         parse_create_result(&raw, &args.execution_id)
     }
@@ -280,7 +310,7 @@ impl Server {
             .arg("current_worker_instance_id")
             .execute()
             .await
-            .unwrap_or_default();
+            .map_err(|e| ServerError::Valkey(format!("HMGET cancel pre-read: {e}")))?;
         let att_idx_val = dyn_fields.first()
             .and_then(|v| v.as_ref())
             .and_then(|s| s.parse::<u32>().ok())
@@ -345,10 +375,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_cancel_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_cancel_execution", &key_refs, &arg_refs)
+            .await?;
 
         parse_cancel_result(&raw, &args.execution_id)
     }
@@ -432,10 +460,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_budget", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_budget", &key_refs, &arg_refs)
+            .await?;
 
         parse_budget_create_result(&raw, &args.budget_id)
     }
@@ -472,10 +498,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_quota_policy", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_quota_policy", &key_refs, &arg_refs)
+            .await?;
 
         parse_quota_create_result(&raw, &args.quota_policy_id)
     }
@@ -584,10 +608,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_report_usage_and_check", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_report_usage_and_check", &key_refs, &arg_refs)
+            .await?;
 
         parse_report_usage_result(&raw)
     }
@@ -612,10 +634,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_reset_budget", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_reset_budget", &key_refs, &arg_refs)
+            .await?;
 
         parse_reset_budget_result(&raw)
     }
@@ -645,10 +665,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_flow", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_flow", &key_refs, &arg_refs)
+            .await?;
 
         parse_create_flow_result(&raw, &args.flow_id)
     }
@@ -680,10 +698,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_add_execution_to_flow", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_add_execution_to_flow", &key_refs, &arg_refs)
+            .await?;
 
         let result = parse_add_execution_to_flow_result(&raw)?;
 
@@ -726,10 +742,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_cancel_flow", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_cancel_flow", &key_refs, &arg_refs)
+            .await?;
 
         let result = parse_cancel_flow_result(&raw)?;
 
@@ -804,10 +818,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_stage_dependency_edge", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_stage_dependency_edge", &key_refs, &arg_refs)
+            .await?;
 
         parse_stage_dependency_edge_result(&raw)
     }
@@ -862,10 +874,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_apply_dependency_to_child", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_apply_dependency_to_child", &key_refs, &arg_refs)
+            .await?;
 
         parse_apply_dependency_result(&raw)
     }
@@ -964,10 +974,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_deliver_signal", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_deliver_signal", &key_refs, &arg_refs)
+            .await?;
 
         parse_deliver_signal_result(&raw, &args.signal_id)
     }
@@ -1005,10 +1013,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_change_priority", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_change_priority", &key_refs, &arg_refs)
+            .await?;
 
         parse_change_priority_result(&raw, execution_id)
     }
@@ -1050,10 +1056,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_revoke_lease", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_revoke_lease", &key_refs, &arg_refs)
+            .await?;
 
         parse_revoke_lease_result(&raw)
     }
@@ -1172,7 +1176,7 @@ impl Server {
             .arg(limit)
             .execute()
             .await
-            .unwrap_or_default();
+            .map_err(|e| ServerError::Valkey(format!("ZRANGE {zset_key}: {e}")))?;
 
         if eids.is_empty() {
             return Ok(ListExecutionsResult {
@@ -1345,10 +1349,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_replay_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_replay_execution", &key_refs, &arg_refs)
+            .await?;
 
         parse_replay_result(&raw)
     }
@@ -1945,6 +1947,25 @@ fn parse_revoke_lease_result(raw: &Value) -> Result<RevokeLeaseResult, ServerErr
             "ff_revoke_lease failed: {error_code}"
         )))
     }
+}
+
+/// Detect Valkey errors indicating the Lua function library is not loaded.
+///
+/// After a failover, the new primary may not have the library if replication
+/// was incomplete. Valkey returns `ERR Function not loaded` for FCALL calls
+/// targeting missing functions.
+fn is_function_not_loaded(e: &ferriskey::Error) -> bool {
+    if matches!(e.kind(), ferriskey::ErrorKind::NoScriptError) {
+        return true;
+    }
+    e.detail()
+        .map(|d| {
+            d.contains("Function not loaded")
+                || d.contains("No matching function")
+                || d.contains("function not found")
+        })
+        .unwrap_or(false)
+        || e.to_string().contains("Function not loaded")
 }
 
 fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerError> {

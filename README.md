@@ -84,6 +84,15 @@ cargo run --bin submit -- --issue "Write a Rust function that checks if a string
 | `ff-server` | HTTP API server, Valkey connection, boot sequence |
 | `ff-test` | Integration test harness, fixtures, assertion helpers |
 
+## Production considerations
+
+- **No API rate limiting** — deploy behind a reverse proxy (nginx, Envoy) with rate limiting configured
+- **No HTTP connection limit** — axum accepts unbounded connections; configure limits at the load balancer
+- **cancel_flow on large flows** blocks the API handler while sequentially cancelling each member execution; consider async fan-out for flows with >1K members
+- **detect_cycle BFS** can issue ~100K `redis.call` operations on large DAGs (up to 1000 nodes × edges per node), blocking the Valkey event loop; keep flow graph fan-out moderate
+- **Terminal operation ambiguity** — if the Valkey connection drops during `complete()`, `fail()`, or `cancel()`, the operation may have committed server-side; callers should verify execution state via `get_execution_state()` before retrying
+- **Lua library after failover** — the server auto-reloads the Lua library on first "function not found" error after a Valkey failover, but the first request in the new epoch will fail and be retried
+
 ## License
 
 Apache-2.0
