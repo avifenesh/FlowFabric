@@ -43,12 +43,10 @@ where
             Err(rejection) => {
                 let status = rejection.status();
                 tracing::debug!(detail = %rejection.body_text(), "JSON rejection");
-                let body = ErrorBody {
-                    error: format!(
-                        "invalid JSON: {}",
-                        status.canonical_reason().unwrap_or("bad request"),
-                    ),
-                };
+                let body = ErrorBody::plain(format!(
+                    "invalid JSON: {}",
+                    status.canonical_reason().unwrap_or("bad request"),
+                ));
                 Err((status, Json(body)).into_response())
             }
         }
@@ -65,17 +63,36 @@ impl From<ServerError> for ApiError {
     }
 }
 
+/// HTTP error body. `kind`/`retryable` are populated for 500s backed by a
+/// `ferriskey::Error` so HTTP clients (e.g. cairn-fabric) can make retry
+/// decisions without parsing the `error` string.
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+}
+
+impl ErrorBody {
+    fn plain(error: String) -> Self {
+        Self { error, kind: None, retryable: None }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self.0 {
-            ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-            ServerError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            ServerError::OperationFailed(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+        let (status, body) = match &self.0 {
+            ServerError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, ErrorBody::plain(msg.clone()))
+            }
+            ServerError::InvalidInput(msg) => {
+                (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
+            }
+            ServerError::OperationFailed(msg) => {
+                (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
+            }
             ServerError::Valkey(e) => {
                 tracing::error!(
                     kind = ?e.kind(),
@@ -83,7 +100,14 @@ impl IntoResponse for ApiError {
                     detail = e.detail().unwrap_or(""),
                     "valkey error"
                 );
-                (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorBody {
+                        error: self.0.to_string(),
+                        kind: Some(format!("{:?}", e.kind())),
+                        retryable: Some(self.0.is_retryable()),
+                    },
+                )
             }
             ServerError::ValkeyContext { source, context } => {
                 tracing::error!(
@@ -93,11 +117,37 @@ impl IntoResponse for ApiError {
                     context = %context,
                     "valkey error"
                 );
-                (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorBody {
+                        error: self.0.to_string(),
+                        kind: Some(format!("{:?}", source.kind())),
+                        retryable: Some(self.0.is_retryable()),
+                    },
+                )
             }
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            ServerError::LibraryLoad(load_err) => {
+                let kind = load_err.valkey_kind();
+                tracing::error!(
+                    kind = ?kind,
+                    error = %load_err,
+                    "library load failure"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorBody {
+                        error: format!("library load: {load_err}"),
+                        kind: kind.map(|k| format!("{k:?}")),
+                        retryable: Some(self.0.is_retryable()),
+                    },
+                )
+            }
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody::plain(other.to_string()),
+            ),
         };
-        (status, Json(ErrorBody { error: message })).into_response()
+        (status, Json(body)).into_response()
     }
 }
 
@@ -168,9 +218,9 @@ async fn auth_middleware(
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(ErrorBody {
-                error: "missing or invalid Authorization header".to_owned(),
-            }),
+            Json(ErrorBody::plain(
+                "missing or invalid Authorization header".to_owned(),
+            )),
         )
             .into_response()
     }

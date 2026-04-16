@@ -15,7 +15,6 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crc16 = { workspace = true }
-ferriskey = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

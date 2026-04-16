@@ -3206,6 +3206,7 @@ async fn fcall_add_execution_to_flow(
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![

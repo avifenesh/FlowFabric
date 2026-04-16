@@ -1,7 +1,7 @@
 //! Typed FCALL wrapper for stream append function (lua/stream.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::ExecKeyContext;
 
 use crate::result::{FcallResult, FromFcallResult};

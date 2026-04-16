@@ -83,6 +83,41 @@ impl ServerError {
             _ => None,
         }
     }
+
+    /// Whether this error is safely retryable by a caller. Semantics match
+    /// `ScriptError::class() == Retryable` for Lua errors plus a kind-aware
+    /// check for transport/library-load failures. Business-logic rejections
+    /// (NotFound, InvalidInput, OperationFailed, Script, Config, PartitionMismatch)
+    /// return false — those won't change on retry.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => {
+                is_retryable_kind(e.kind())
+            }
+            Self::LibraryLoad(load_err) => load_err
+                .valkey_kind()
+                .map(is_retryable_kind)
+                .unwrap_or(false),
+            Self::Config(_)
+            | Self::PartitionMismatch(_)
+            | Self::NotFound(_)
+            | Self::InvalidInput(_)
+            | Self::OperationFailed(_)
+            | Self::Script(_) => false,
+        }
+    }
+}
+
+/// Classify a ferriskey `ErrorKind` as retryable. Conservative: only kinds
+/// that are known-safe to retry (idempotent or server-didn't-see-request)
+/// return true. `FatalReceiveError` is explicitly NOT retryable because the
+/// request may have been processed but the response was lost.
+fn is_retryable_kind(kind: ferriskey::ErrorKind) -> bool {
+    use ferriskey::ErrorKind::*;
+    matches!(
+        kind,
+        IoError | FatalSendError | TryAgain | BusyLoadingError | ClusterDown | Moved | Ask
+    )
 }
 
 impl Server {
@@ -644,10 +679,11 @@ impl Server {
     ) -> Result<AddExecutionToFlowResult, ServerError> {
         let partition = flow_partition(&args.flow_id, &self.config.partition_config);
         let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
 
         // Phase 1: FCALL on {fp:N}
-        // KEYS (2): flow_core, members_set
-        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members()];
+        // KEYS (3): flow_core, members_set, flow_index
+        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members(), fidx.flow_index()];
 
         // ARGV (3): flow_id, execution_id, now_ms
         let fcall_args: Vec<String> = vec![
@@ -770,17 +806,31 @@ impl Server {
             // Idempotent retry: flow was already cancelled/completed/failed.
             // Return Cancelled with the *stored* policy and member list so
             // observability tooling gets the real historical state rather
-            // than echoing the caller's retry intent. One extra HGET +
-            // SMEMBERS on the idempotent path — both on {fp:N}, same slot.
+            // than echoing the caller's retry intent. One HMGET + SMEMBERS
+            // on the idempotent path — both on {fp:N}, same slot.
             ParsedCancelFlow::AlreadyTerminal => {
-                let stored_policy: Option<String> = self
+                let flow_meta: Vec<Option<String>> = self
                     .client
-                    .hget(&fctx.core(), "cancellation_policy")
+                    .cmd("HMGET")
+                    .arg(fctx.core())
+                    .arg("cancellation_policy")
+                    .arg("cancel_reason")
+                    .execute()
                     .await
                     .map_err(|e| ServerError::ValkeyContext {
                         source: e,
-                        context: "HGET flow_core cancellation_policy".into(),
+                        context: "HMGET flow_core cancellation_policy,cancel_reason".into(),
                     })?;
+                let stored_policy = flow_meta
+                    .first()
+                    .and_then(|v| v.as_ref())
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let stored_reason = flow_meta
+                    .get(1)
+                    .and_then(|v| v.as_ref())
+                    .filter(|s| !s.is_empty())
+                    .cloned();
                 let stored_members: Vec<String> = self
                     .client
                     .cmd("SMEMBERS")
@@ -793,14 +843,16 @@ impl Server {
                     })?;
                 tracing::debug!(
                     flow_id = %args.flow_id,
+                    stored_policy = stored_policy.as_deref().unwrap_or(""),
+                    stored_reason = stored_reason.as_deref().unwrap_or(""),
                     member_count = stored_members.len(),
                     "cancel_flow: flow already terminal, returning idempotent Cancelled"
                 );
                 return Ok(CancelFlowResult::Cancelled {
-                    // Fall back to caller's policy if the stored field is
-                    // missing (pre-policy flows or unusual flow_core state).
+                    // Fall back to caller's policy only if the stored field
+                    // is missing (flows cancelled by older Lua that did not
+                    // persist cancellation_policy).
                     cancellation_policy: stored_policy
-                        .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| args.cancellation_policy.clone()),
                     member_execution_ids: stored_members,
                 });
@@ -858,8 +910,17 @@ impl Server {
         // Reap completed background dispatches before spawning the next.
         // Without this sweep, JoinSet accumulates Ok(()) results for every
         // async cancel ever issued — a memory leak in long-running servers
-        // that would otherwise only drain on Server::shutdown.
-        while guard.try_join_next().is_some() {}
+        // that would otherwise only drain on Server::shutdown. Surface any
+        // panicked/aborted dispatches via tracing so silent failures in
+        // cancel_member_execution are visible in logs.
+        while let Some(joined) = guard.try_join_next() {
+            if let Err(e) = joined {
+                tracing::warn!(
+                    error = %e,
+                    "cancel_flow: background dispatch task panicked or was aborted"
+                );
+            }
+        }
 
         guard.spawn(async move {
             for eid_str in &dispatch_members {

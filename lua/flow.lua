@@ -107,13 +107,14 @@ end)
 -- Add a member execution to a flow. Does NOT set flow_id on exec_core
 -- (that's on {p:N}, caller must do it separately).
 --
--- KEYS (2): flow_core, members_set
+-- KEYS (3): flow_core, members_set, flow_index
 -- ARGV (3): flow_id, execution_id, now_ms
 ---------------------------------------------------------------------------
 redis.register_function('ff_add_execution_to_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
+    flow_index  = keys[3],
   }
 
   local A = {
@@ -121,6 +122,13 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
     execution_id = args[2],
     now_ms       = args[3],
   }
+
+  -- Self-heal flow_index: the projector may have SREMd this flow after
+  -- observing an all-terminal sample, but the flow is still "open" per
+  -- flow_core and can accept new members. Re-add idempotently so the
+  -- next projector cycle picks the flow back up. Same {fp:N} slot as the
+  -- other KEYS, so atomic with the membership mutation below.
+  redis.call("SADD", K.flow_index, A.flow_id)
 
   -- 1. Validate flow exists and is not terminal
   local raw = redis.call("HGETALL", K.flow_core)
@@ -186,10 +194,14 @@ redis.register_function('ff_cancel_flow', function(keys, args)
   local members = redis.call("SMEMBERS", K.members_set)
 
   -- 4. Update flow state
+  -- cancellation_policy is persisted so an AlreadyTerminal retry can
+  -- return the authoritative stored policy instead of echoing the
+  -- caller's retry intent.
   redis.call("HSET", K.flow_core,
     "public_flow_state", "cancelled",
     "cancelled_at", A.now_ms,
     "cancel_reason", A.reason,
+    "cancellation_policy", A.cancellation_policy,
     "last_mutation_at", A.now_ms)
 
   -- 4b. Remove from active flow_index (projector skips cancelled flows)

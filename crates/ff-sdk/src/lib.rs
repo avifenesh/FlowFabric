@@ -63,7 +63,7 @@ pub enum SdkError {
 
     /// FlowFabric Lua script error.
     #[error("script: {0}")]
-    Script(#[from] ff_core::error::ScriptError),
+    Script(#[from] ff_script::error::ScriptError),
 
     /// Configuration error.
     #[error("config: {0}")]

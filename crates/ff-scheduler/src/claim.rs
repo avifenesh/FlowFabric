@@ -657,6 +657,25 @@ impl SchedulerError {
             Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
         }
     }
+
+    /// Whether this error is safely retryable by a caller. Mirrors
+    /// `ServerError::is_retryable` semantics.
+    pub fn is_retryable(&self) -> bool {
+        self.valkey_kind()
+            .map(is_retryable_kind)
+            .unwrap_or(false)
+    }
+}
+
+/// Classify a ferriskey `ErrorKind` as retryable. Conservative: only kinds
+/// that are known-safe to retry return true. `FatalReceiveError` is NOT
+/// retryable because the request may have been processed.
+fn is_retryable_kind(kind: ferriskey::ErrorKind) -> bool {
+    use ferriskey::ErrorKind::*;
+    matches!(
+        kind,
+        IoError | FatalSendError | TryAgain | BusyLoadingError | ClusterDown | Moved | Ask
+    )
 }
 
 

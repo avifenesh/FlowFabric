@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ferriskey::{Client, Value};
 use ff_core::contracts::ReportUsageResult;
-use ff_core::error::ScriptError;
+use ff_script::error::ScriptError;
 use ff_core::keys::{BudgetKeyContext, ExecKeyContext, IndexKeys};
 use ff_core::partition::{budget_partition, execution_partition, PartitionConfig};
 use ff_core::types::*;

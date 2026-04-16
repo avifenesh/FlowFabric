@@ -2,7 +2,7 @@
 //! (lua/suspension.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::state::PublicState;
 use ff_core::types::*;
