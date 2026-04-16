@@ -240,11 +240,21 @@ async fn project_flow_summary(
         .execute()
         .await?;
 
-    // Prune the index entry once every member is terminal. The flow core
-    // lives on for replay/inspection, but keeping terminal flows in the
-    // active flow_index would grow cardinality unboundedly across the
-    // lifetime of the partition.
-    if all_terminal {
+    // Prune the index entry only when we've observed EVERY member in this
+    // cycle and all of them are terminal. Gating on the full walk (not the
+    // sample) matters for two reasons:
+    //   1. For flows larger than BATCH_SIZE, a sample being "all terminal"
+    //      does not imply the flow is actually done; unsampled members
+    //      may still be running. Pruning on the sample would freeze the
+    //      summary mid-flight.
+    //   2. ff_replay_execution runs on {p:N}, so it cannot re-SADD the
+    //      {fp:N} flow_index when a terminal flow member is revived.
+    //      If we SREM while any revival path is reachable, the flow never
+    //      comes back into the projector's view.
+    // For large flows that never satisfy sampled == true_total, the
+    // defensive HGETALL-empty prune and retention deletion still clean up
+    // eventually. We accept a modest cardinality cost for correctness.
+    if all_terminal && (sampled as u64) == true_total {
         let _: Option<i64> = client
             .cmd("SREM")
             .arg(flow_index_key)

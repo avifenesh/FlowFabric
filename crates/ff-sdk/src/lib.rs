@@ -56,6 +56,7 @@ pub enum SdkError {
     /// Valkey error with additional context.
     #[error("valkey: {context}: {source}")]
     ValkeyContext {
+        #[source]
         source: ferriskey::Error,
         context: String,
     },
