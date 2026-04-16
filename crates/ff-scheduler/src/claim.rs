@@ -11,7 +11,7 @@
 
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
-use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, TimestampMs, WorkerId, WorkerInstanceId};
+use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
 
 /// A claim grant issued by the scheduler for a specific execution.
 ///
@@ -36,6 +36,16 @@ pub enum BudgetCheckResult {
     Ok,
     /// Budget hard limit breached. Contains (dimension, detail_string).
     HardBreach { dimension: String, detail: String },
+}
+
+/// Outcome of a quota admission check.
+enum QuotaCheckOutcome {
+    /// No quota attached to this execution.
+    NoQuota,
+    /// Quota admitted — carries context for release on subsequent failure.
+    Admitted { tag: String, quota_id: String, eid: String },
+    /// Quota denied — execution should be blocked.
+    Blocked(String),
 }
 
 /// Cross-partition budget checker with per-cycle caching.
@@ -110,13 +120,10 @@ impl BudgetChecker {
         usage_key: &str,
         limits_key: &str,
     ) -> Result<BudgetCheckResult, ferriskey::Error> {
-        // Read all limit dimensions
-        let limits: Vec<(String, String)> = client
-            .cmd("HGETALL")
-            .arg(limits_key)
-            .execute()
-            .await
-            .unwrap_or_default();
+        // Read all limit dimensions via hgetall (returns HashMap, not flat pairs)
+        let limits: std::collections::HashMap<String, String> = client
+            .hgetall(limits_key)
+            .await?;
 
         // Parse hard limits
         for (field, limit_val) in &limits {
@@ -250,32 +257,44 @@ impl Scheduler {
             let exec_ctx = ExecKeyContext::new(&partition, &eid);
             let core_key = exec_ctx.core();
             let eid_s = eid.to_string();
-            let now_ms = TimestampMs::now().0 as u64;
+            let now_ms = match server_time_ms(&self.client).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        partition = p_idx,
+                        error = %e,
+                        "scheduler: failed to get server time, skipping partition"
+                    );
+                    continue;
+                }
+            };
 
             // ── Budget pre-check (cross-partition, cached per cycle) ──
             if let Some(block_detail) = self
                 .check_budgets(&mut budget_checker, &exec_ctx, &core_key, &eid_s)
-                .await
+                .await?
             {
                 // Budget breached — block candidate and try next
                 self.block_candidate(
-                    &partition, &idx, lane, &eid_s, &eligible_key,
+                    &partition, &idx, lane, &eid, &eligible_key,
                     "waiting_for_budget", &block_detail, now_ms,
                 ).await;
                 continue;
             }
 
             // ── Quota pre-check (cross-partition FCALL on {q:K}) ──
-            if let Some(block_detail) = self
+            let quota_admission = self
                 .check_quota(&exec_ctx, &core_key, &eid_s, now_ms)
-                .await
-            {
-                // Quota denied — block candidate and try next
-                self.block_candidate(
-                    &partition, &idx, lane, &eid_s, &eligible_key,
-                    "waiting_for_quota", &block_detail, now_ms,
-                ).await;
-                continue;
+                .await?;
+            match &quota_admission {
+                QuotaCheckOutcome::Blocked(block_detail) => {
+                    self.block_candidate(
+                        &partition, &idx, lane, &eid, &eligible_key,
+                        "waiting_for_quota", block_detail, now_ms,
+                    ).await;
+                    continue;
+                }
+                QuotaCheckOutcome::NoQuota | QuotaCheckOutcome::Admitted { .. } => {}
             }
 
             // ── All checks passed — issue claim grant ──
@@ -323,6 +342,9 @@ impl Scheduler {
                         error = %e,
                         "scheduler: ff_issue_claim_grant rejected, trying next"
                     );
+                    if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
+                        self.release_admission(tag, quota_id, eid).await;
+                    }
                     continue;
                 }
             }
@@ -339,7 +361,7 @@ impl Scheduler {
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
         _eid_s: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, SchedulerError> {
         // Read budget_ids from exec_core (comma-separated or JSON list)
         let budget_ids_str: Option<String> = self
             .client
@@ -347,12 +369,14 @@ impl Scheduler {
             .arg(core_key)
             .arg("budget_ids")
             .execute()
-            .await
-            .unwrap_or(None);
+            .await?;
 
-        let budget_ids_str = budget_ids_str?;
+        let budget_ids_str = match budget_ids_str {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         if budget_ids_str.is_empty() {
-            return None; // no budgets attached
+            return Ok(None); // no budgets attached
         }
 
         // Parse comma-separated budget IDs
@@ -363,21 +387,21 @@ impl Scheduler {
             }
             let result = checker.check_budget(&self.client, budget_id).await;
             if let BudgetCheckResult::HardBreach { detail, .. } = result {
-                return Some(detail.clone());
+                return Ok(Some(detail.clone()));
             }
         }
 
-        None
+        Ok(None)
     }
 
-    /// Check quota admission for the candidate. Returns block detail if denied.
+    /// Check quota admission for the candidate.
     async fn check_quota(
         &self,
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
         eid_s: &str,
         now_ms: u64,
-    ) -> Option<String> {
+    ) -> Result<QuotaCheckOutcome, SchedulerError> {
         // Read quota_policy_id from exec_core
         let quota_id_str: Option<String> = self
             .client
@@ -385,12 +409,14 @@ impl Scheduler {
             .arg(core_key)
             .arg("quota_policy_id")
             .execute()
-            .await
-            .unwrap_or(None);
+            .await?;
 
-        let quota_id_str = quota_id_str?;
+        let quota_id_str = match quota_id_str {
+            Some(s) => s,
+            None => return Ok(QuotaCheckOutcome::NoQuota),
+        };
         if quota_id_str.is_empty() {
-            return None; // no quota attached
+            return Ok(QuotaCheckOutcome::NoQuota);
         }
 
         // Compute real {q:K} partition tag from quota_policy_id
@@ -410,26 +436,26 @@ impl Scheduler {
 
         // Read quota limits from policy hash
         let rate_limit: Option<String> = self.client
-            .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_limit")
-            .execute().await.unwrap_or(None);
+            .cmd("HGET").arg(&quota_def_key).arg("max_requests_per_window")
+            .execute().await?;
         let window_secs: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_seconds")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
         let concurrency_cap: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("active_concurrency_cap")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
         let jitter: Option<String> = self.client
             .cmd("HGET").arg(&quota_def_key).arg("jitter_ms")
-            .execute().await.unwrap_or(None);
+            .execute().await?;
 
         let rate_limit = rate_limit.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
         let window_secs = window_secs.as_deref().and_then(|s| s.parse().ok()).unwrap_or(60u64);
         let concurrency_cap = concurrency_cap.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
         let jitter_ms = jitter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
 
-        // No limits configured — admit
+        // No limits configured — admit without recording
         if rate_limit == 0 && concurrency_cap == 0 {
-            return None;
+            return Ok(QuotaCheckOutcome::NoQuota);
         }
 
         // FCALL ff_check_admission_and_record on {q:K}
@@ -450,22 +476,26 @@ impl Scheduler {
                 // {"CONCURRENCY_EXCEEDED"}, {"ALREADY_ADMITTED"}
                 let status = Self::parse_admission_status(&result);
                 match status.as_str() {
-                    "ADMITTED" | "ALREADY_ADMITTED" => None,
-                    "RATE_EXCEEDED" => Some(format!(
+                    "ADMITTED" | "ALREADY_ADMITTED" => Ok(QuotaCheckOutcome::Admitted {
+                        tag: tag.clone(),
+                        quota_id: quota_id_str.clone(),
+                        eid: eid_s.to_owned(),
+                    }),
+                    "RATE_EXCEEDED" => Ok(QuotaCheckOutcome::Blocked(format!(
                         "quota {}: rate limit {}/{} per {}s window",
                         quota_id_str, rate_limit, rate_limit, window_secs
-                    )),
-                    "CONCURRENCY_EXCEEDED" => Some(format!(
+                    ))),
+                    "CONCURRENCY_EXCEEDED" => Ok(QuotaCheckOutcome::Blocked(format!(
                         "quota {}: concurrency cap {}",
                         quota_id_str, concurrency_cap
-                    )),
+                    ))),
                     _ => {
                         tracing::warn!(
                             quota_id = quota_id_str.as_str(),
                             status = status.as_str(),
                             "scheduler: unexpected admission result"
                         );
-                        None // allow on unknown status (advisory)
+                        Ok(QuotaCheckOutcome::NoQuota)
                     }
                 }
             }
@@ -473,9 +503,9 @@ impl Scheduler {
                 tracing::warn!(
                     quota_id = quota_id_str.as_str(),
                     error = %e,
-                    "scheduler: quota check failed, allowing (advisory)"
+                    "scheduler: quota FCALL failed, allowing (advisory)"
                 );
-                None // allow on error (advisory)
+                Ok(QuotaCheckOutcome::NoQuota) // allow on FCALL error (advisory)
             }
         }
     }
@@ -504,14 +534,15 @@ impl Scheduler {
         partition: &Partition,
         idx: &IndexKeys,
         lane: &LaneId,
-        eid_s: &str,
+        eid: &ExecutionId,
         eligible_key: &str,
         block_reason: &str,
         blocking_detail: &str,
         now_ms: u64,
     ) {
-        let exec_ctx = ExecKeyContext::new(partition, &ExecutionId::parse(eid_s).unwrap());
+        let exec_ctx = ExecKeyContext::new(partition, eid);
         let core_key = exec_ctx.core();
+        let eid_s = eid.to_string();
         let blocked_key = match block_reason {
             "waiting_for_budget" => idx.lane_blocked_budget(lane),
             "waiting_for_quota" => idx.lane_blocked_quota(lane),
@@ -520,7 +551,7 @@ impl Scheduler {
 
         let keys: [&str; 3] = [&core_key, eligible_key, &blocked_key];
         let now_s = now_ms.to_string();
-        let argv: [&str; 4] = [eid_s, block_reason, blocking_detail, &now_s];
+        let argv: [&str; 4] = [&eid_s, block_reason, blocking_detail, &now_s];
 
         match self.client
             .fcall::<ferriskey::Value>("ff_block_execution_for_admission", &keys, &argv)
@@ -542,6 +573,64 @@ impl Scheduler {
             }
         }
     }
+
+    /// Release a previously-recorded quota admission slot.
+    /// Called when ff_issue_claim_grant fails after admission was recorded.
+    async fn release_admission(
+        &self,
+        tag: &str,
+        quota_id: &str,
+        eid_s: &str,
+    ) {
+        let admitted_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid_s);
+        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id);
+        let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
+
+        let keys: [&str; 3] = [&admitted_key, &admitted_set_key, &concurrency_key];
+        let argv: [&str; 1] = [eid_s];
+
+        match self.client
+            .fcall::<ferriskey::Value>("ff_release_admission", &keys, &argv)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    execution_id = eid_s,
+                    quota_id,
+                    "scheduler: released admission after claim failure"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = eid_s,
+                    quota_id,
+                    error = %e,
+                    "scheduler: ff_release_admission failed (slot will expire via TTL)"
+                );
+            }
+        }
+    }
+}
+
+/// Get server time in milliseconds via the TIME command.
+async fn server_time_ms(client: &ferriskey::Client) -> Result<u64, ferriskey::Error> {
+    let result: Vec<String> = client
+        .cmd("TIME")
+        .execute()
+        .await?;
+    if result.len() < 2 {
+        return Err(ferriskey::Error::from((
+            ferriskey::ErrorKind::ClientError,
+            "TIME returned fewer than 2 elements",
+        )));
+    }
+    let secs: u64 = result[0].parse().map_err(|_| {
+        ferriskey::Error::from((ferriskey::ErrorKind::ClientError, "TIME: invalid seconds"))
+    })?;
+    let micros: u64 = result[1].parse().map_err(|_| {
+        ferriskey::Error::from((ferriskey::ErrorKind::ClientError, "TIME: invalid microseconds"))
+    })?;
+    Ok(secs * 1000 + micros / 1000)
 }
 
 /// Errors from the scheduler.

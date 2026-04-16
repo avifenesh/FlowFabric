@@ -1,14 +1,19 @@
 use std::collections::HashMap;
+#[cfg(feature = "insecure-direct-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "insecure-direct-claim")]
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::*;
+#[cfg(feature = "insecure-direct-claim")]
 use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
+#[cfg(feature = "insecure-direct-claim")]
 use crate::task::ClaimedTask;
 use crate::SdkError;
 
@@ -46,11 +51,9 @@ pub struct FlowFabricWorker {
     client: Client,
     config: WorkerConfig,
     partition_config: PartitionConfig,
-    /// Round-robin lane index for multi-lane claim rotation.
+    #[cfg(feature = "insecure-direct-claim")]
     lane_index: AtomicUsize,
-    /// Concurrency limiter: permits = max_concurrent_tasks.
-    /// Each claimed task holds a permit (via OwnedSemaphorePermit in ClaimedTask).
-    /// claim_next() acquires a permit before attempting to claim.
+    #[cfg(feature = "insecure-direct-claim")]
     concurrency_semaphore: Arc<Semaphore>,
 }
 
@@ -66,7 +69,10 @@ impl FlowFabricWorker {
             return Err(SdkError::Config("at least one lane is required".into()));
         }
 
-        let mut builder = ClientBuilder::new().host(&config.host, config.port);
+        let mut builder = ClientBuilder::new()
+            .host(&config.host, config.port)
+            .connect_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_millis(5000));
         if config.tls {
             builder = builder.tls();
         }
@@ -75,16 +81,16 @@ impl FlowFabricWorker {
         }
         let client = builder.build()
             .await
-            .map_err(|e| SdkError::Valkey(format!("failed to connect: {e}")))?;
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "failed to connect".into() })?;
 
         // Verify connectivity
         let pong: String = client
             .cmd("PING")
             .execute()
             .await
-            .map_err(|e| SdkError::Valkey(format!("PING failed: {e}")))?;
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "PING failed".into() })?;
         if pong != "PONG" {
-            return Err(SdkError::Valkey(format!(
+            return Err(SdkError::Config(format!(
                 "unexpected PING response: {pong}"
             )));
         }
@@ -100,14 +106,15 @@ impl FlowFabricWorker {
                 PartitionConfig::default()
             });
 
+        #[cfg(feature = "insecure-direct-claim")]
         let max_tasks = config.max_concurrent_tasks.max(1);
+        #[cfg(feature = "insecure-direct-claim")]
         let concurrency_semaphore = Arc::new(Semaphore::new(max_tasks));
 
         tracing::info!(
             worker_id = %config.worker_id,
             instance_id = %config.worker_instance_id,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-            max_concurrent_tasks = max_tasks,
             "FlowFabricWorker connected"
         );
 
@@ -115,7 +122,9 @@ impl FlowFabricWorker {
             client,
             config,
             partition_config,
+            #[cfg(feature = "insecure-direct-claim")]
             lane_index: AtomicUsize::new(0),
+            #[cfg(feature = "insecure-direct-claim")]
             concurrency_semaphore,
         })
     }
@@ -139,14 +148,13 @@ impl FlowFabricWorker {
     /// 4. Read execution payload + tags
     /// 5. Return a [`ClaimedTask`] with auto lease renewal
     ///
-    /// WARNING: This Phase 1 claim path BYPASSES budget/quota checks that the
-    /// production scheduler (ff-scheduler::Scheduler::claim_for_worker) enforces.
-    /// In production, workers should receive pre-granted claim tokens from the
-    /// scheduler instead of calling claim_next() directly. Budget-blocked
-    /// executions may be claimed via this path without enforcement.
+    /// **This bypasses budget/quota admission control.** Use the Scheduler
+    /// (`ff-scheduler`) for production deployments. Enable with:
+    /// `ff-sdk = { ..., features = ["insecure-direct-claim"] }`
     ///
     /// Returns `Ok(None)` if no eligible execution is found.
     /// Returns `Err` on Valkey errors or script failures.
+    #[cfg(feature = "insecure-direct-claim")]
     pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {
         // Enforce max_concurrent_tasks: try to acquire a semaphore permit.
         // try_acquire returns immediately — if no permits available, the worker
@@ -187,7 +195,7 @@ impl FlowFabricWorker {
                 .arg("1")
                 .execute()
                 .await
-                .map_err(|e| SdkError::Valkey(format!("ZRANGEBYSCORE failed: {e}")))?;
+                .map_err(|e| SdkError::ValkeyContext { source: e, context: "ZRANGEBYSCORE failed".into() })?;
 
             let execution_id_str = match extract_first_array_string(&result) {
                 Some(s) => s,
@@ -273,7 +281,7 @@ impl FlowFabricWorker {
         Ok(None)
     }
 
-    /// Issue a claim grant for an execution.
+    #[cfg(feature = "insecure-direct-claim")]
     async fn issue_claim_grant(
         &self,
         execution_id: &ExecutionId,
@@ -310,12 +318,12 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_issue_claim_grant", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         crate::task::parse_success_result(&raw, "ff_issue_claim_grant")
     }
 
-    /// Claim an execution (consumes the grant, creates lease + attempt).
+    #[cfg(feature = "insecure-direct-claim")]
     async fn claim_execution(
         &self,
         execution_id: &ExecutionId,
@@ -388,7 +396,7 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_claim_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         // Parse claim result: {1, "OK", lease_id, lease_epoch, attempt_index,
         //                      attempt_id, attempt_type, lease_expires_at}
@@ -473,11 +481,7 @@ impl FlowFabricWorker {
         ))
     }
 
-    /// Claim a resumed execution (attempt_interrupted after suspension/delay).
-    ///
-    /// Uses ff_claim_resumed_execution which reuses the existing attempt
-    /// instead of creating a new one. Called as fallback when ff_claim_execution
-    /// returns UseClaimResumedExecution.
+    #[cfg(feature = "insecure-direct-claim")]
     async fn claim_resumed_execution(
         &self,
         execution_id: &ExecutionId,
@@ -488,13 +492,14 @@ impl FlowFabricWorker {
         let idx = IndexKeys::new(partition);
 
         // Pre-read current_attempt_index for the existing attempt hash key.
+        // This is load-bearing: KEYS[6] must point to the real attempt hash.
         let att_idx_str: Option<String> = self.client
             .cmd("HGET")
             .arg(ctx.core())
             .arg("current_attempt_index")
             .execute()
             .await
-            .unwrap_or(None);
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "read attempt_index".into() })?;
         let att_idx = AttemptIndex::new(
             att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
         );
@@ -535,7 +540,7 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_claim_resumed_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         // Parse result — same format as ff_claim_execution:
         // {1, "OK", lease_id, lease_epoch, expires_at, attempt_id, attempt_index, attempt_type}
@@ -615,7 +620,7 @@ impl FlowFabricWorker {
         ))
     }
 
-    /// Read execution payload, kind, and tags after claiming.
+    #[cfg(feature = "insecure-direct-claim")]
     async fn read_execution_context(
         &self,
         execution_id: &ExecutionId,
@@ -628,7 +633,7 @@ impl FlowFabricWorker {
             .client
             .get(&ctx.payload())
             .await
-            .map_err(|e| SdkError::Valkey(format!("GET payload failed: {e}")))?;
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "GET payload failed".into() })?;
         let input_payload = payload.unwrap_or_default().into_bytes();
 
         // Read execution_kind from core
@@ -636,7 +641,7 @@ impl FlowFabricWorker {
             .client
             .hget(&ctx.core(), "execution_kind")
             .await
-            .map_err(|e| SdkError::Valkey(format!("HGET execution_kind failed: {e}")))?;
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGET execution_kind failed".into() })?;
         let execution_kind = kind.unwrap_or_default();
 
         // Read tags
@@ -644,7 +649,7 @@ impl FlowFabricWorker {
             .client
             .hgetall(&ctx.tags())
             .await
-            .unwrap_or_default();
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGETALL tags".into() })?;
 
         Ok((input_payload, execution_kind, tags))
     }
@@ -668,8 +673,14 @@ impl FlowFabricWorker {
         let signal_id = ff_core::types::SignalId::new();
         let now = TimestampMs::now();
 
-        // Determine lane for index keys — use first configured lane
-        let lane_id = &self.config.lanes[0];
+        // Pre-read lane_id from exec_core — the execution may be on any lane,
+        // not necessarily one of this worker's configured lanes.
+        let lane_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+        let lane_id = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         // KEYS (13): exec_core, wp_condition, wp_signals_stream,
         //            exec_signals_zset, signal_hash, signal_payload,
@@ -691,9 +702,9 @@ impl FlowFabricWorker {
             idem_key,                                      // 7
             ctx.waitpoint(waitpoint_id),                   // 8
             ctx.suspension_current(),                      // 9
-            idx.lane_eligible(lane_id),                    // 10
-            idx.lane_suspended(lane_id),                   // 11
-            idx.lane_delayed(lane_id),                     // 12
+            idx.lane_eligible(&lane_id),                   // 10
+            idx.lane_suspended(&lane_id),                  // 11
+            idx.lane_delayed(&lane_id),                    // 12
             idx.suspension_timeout(),                      // 13
         ];
 
@@ -736,19 +747,19 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_deliver_signal", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         crate::task::parse_signal_result(&raw)
     }
 
-    /// Pick the next lane in round-robin order.
+    #[cfg(feature = "insecure-direct-claim")]
     fn next_lane(&self) -> LaneId {
         let idx = self.lane_index.fetch_add(1, Ordering::Relaxed) % self.config.lanes.len();
         self.config.lanes[idx].clone()
     }
 }
 
-/// Check if a claim error is retryable (should try next candidate).
+#[cfg(feature = "insecure-direct-claim")]
 fn is_retryable_claim_error(err: &ff_core::error::ScriptError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
@@ -757,7 +768,7 @@ fn is_retryable_claim_error(err: &ff_core::error::ScriptError) -> bool {
     )
 }
 
-/// Extract the first string from a Value::Array result.
+#[cfg(feature = "insecure-direct-claim")]
 fn extract_first_array_string(value: &Value) -> Option<String> {
     match value {
         Value::Array(arr) if !arr.is_empty() => match &arr[0] {
@@ -776,7 +787,7 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
     let fields: HashMap<String, String> = client
         .hgetall(&key)
         .await
-        .map_err(|e| SdkError::Valkey(format!("HGETALL {key}: {e}")))?;
+        .map_err(|e| SdkError::ValkeyContext { source: e, context: format!("HGETALL {key}") })?;
 
     if fields.is_empty() {
         return Err(SdkError::Config(

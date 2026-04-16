@@ -13,19 +13,18 @@ use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 
-use super::{ScanResult, Scanner};
+use super::{FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
 pub struct AttemptTimeoutScanner {
     interval: Duration,
-    /// Lanes to construct index keys. Phase 1: just "default".
-    lanes: Vec<LaneId>,
+    failures: FailureTracker,
 }
 
 impl AttemptTimeoutScanner {
-    pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
-        Self { interval, lanes }
+    pub fn new(interval: Duration, _lanes: Vec<LaneId>) -> Self {
+        Self { interval, failures: FailureTracker::new() }
     }
 }
 
@@ -77,6 +76,10 @@ impl Scanner for AttemptTimeoutScanner {
             }
         };
 
+        if partition == 0 {
+            self.failures.advance_cycle();
+        }
+
         if timed_out.is_empty() {
             return ScanResult { processed: 0, errors: 0 };
         }
@@ -84,16 +87,16 @@ impl Scanner for AttemptTimeoutScanner {
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
 
-        // For each timed-out execution, call ff_expire_execution
-        // ff_expire_execution takes 23 KEYS (RFC-010 #29c) — it handles
-        // active/runnable/suspended paths with defensive ZREM from all indexes.
-        // We need the lane to construct lane-scoped index keys.
-        // Phase 1: use the first configured lane.
-        let lane = self.lanes.first().cloned().unwrap_or_else(|| LaneId::new("default"));
-
         for eid_str in &timed_out {
-            match expire_execution_raw(client, &p, &idx, &lane, eid_str, "attempt_timeout").await {
-                Ok(()) => processed += 1,
+            if self.failures.should_skip(eid_str) {
+                continue;
+            }
+
+            match expire_execution_raw(client, &p, &idx, eid_str, "attempt_timeout").await {
+                Ok(()) => {
+                    self.failures.record_success(eid_str);
+                    processed += 1;
+                }
                 Err(e) => {
                     tracing::warn!(
                         partition,
@@ -101,6 +104,7 @@ impl Scanner for AttemptTimeoutScanner {
                         error = %e,
                         "attempt_timeout: ff_expire_execution failed"
                     );
+                    self.failures.record_failure(eid_str, "attempt_timeout");
                     errors += 1;
                 }
             }
@@ -119,17 +123,15 @@ impl Scanner for AttemptTimeoutScanner {
 ///                suspension_timeout_zset, suspension_current
 /// ARGV (2): execution_id, expire_reason
 ///
-/// NOTE: attempt_hash and stream_meta use index=0 placeholder. The Lua
-/// reads current_attempt_index from exec_core to find the actual attempt.
-/// Same approach as ff_claim_execution — Lua constructs the real key
-/// from the hash tag when the passed key doesn't match the actual index.
+/// Pre-reads `lane_id` from exec_core so that lane-scoped index keys
+/// (active, terminal, suspended) point to the correct ZSET. Same pattern
+/// as suspension_timeout::expire_suspension.
 ///
 /// Public so execution_deadline scanner can reuse it.
 pub async fn expire_execution_raw(
     client: &ferriskey::Client,
     partition: &Partition,
     idx: &IndexKeys,
-    lane: &LaneId,
     eid_str: &str,
     reason: &str,
 ) -> Result<(), ferriskey::Error> {
@@ -137,20 +139,40 @@ pub async fn expire_execution_raw(
 
     // Entity-level keys
     let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
-    let attempt_hash = format!("ff:attempt:{}:{}:0", tag, eid_str);
-    let stream_meta = format!("ff:stream:{}:{}:0:meta", tag, eid_str);
     let lease_current = format!("ff:exec:{}:{}:lease:current", tag, eid_str);
     let lease_history = format!("ff:exec:{}:{}:lease:history", tag, eid_str);
     let susp_current = format!("ff:exec:{}:{}:suspension:current", tag, eid_str);
 
+    // Pre-read lane_id and current_attempt_index from exec_core
+    // (same pattern as suspension_timeout — need real attempt index for
+    // correct attempt_hash and stream_meta keys)
+    let pre_fields: Vec<Option<String>> = client
+        .cmd("HMGET")
+        .arg(&exec_core)
+        .arg("lane_id")
+        .arg("current_attempt_index")
+        .execute()
+        .await?;
+    let lane = ff_core::types::LaneId::new(
+        pre_fields.first()
+            .and_then(|v| v.as_deref())
+            .unwrap_or("default"),
+    );
+    let att_idx = pre_fields.get(1)
+        .and_then(|v| v.as_deref())
+        .unwrap_or("0");
+
+    let attempt_hash = format!("ff:attempt:{}:{}:{}", tag, eid_str, att_idx);
+    let stream_meta = format!("ff:stream:{}:{}:{}:meta", tag, eid_str, att_idx);
+
     // Partition-level index keys
     let lease_expiry = idx.lease_expiry();
     let worker_leases = idx.worker_leases(&ff_core::types::WorkerInstanceId::new(""));
-    let active = idx.lane_active(lane);
-    let terminal = idx.lane_terminal(lane);
+    let active = idx.lane_active(&lane);
+    let terminal = idx.lane_terminal(&lane);
     let attempt_timeout = idx.attempt_timeout();
     let execution_deadline = idx.execution_deadline();
-    let suspended = idx.lane_suspended(lane);
+    let suspended = idx.lane_suspended(&lane);
     let suspension_timeout = idx.suspension_timeout();
 
     // KEYS must match Lua's positional order exactly

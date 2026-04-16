@@ -300,7 +300,7 @@ where
         let _ = core.pending_requests_tx.send(request);
     }
 
-    let responses: Vec<_> = futures::future::join_all(receivers.into_iter())
+    let responses: Vec<_> = futures::future::join_all(receivers)
         .await
         .into_iter()
         .collect();

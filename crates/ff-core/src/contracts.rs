@@ -3,10 +3,11 @@
 //! Each Args struct defines the typed inputs to a Valkey Function.
 //! Each Result enum defines the possible outcomes (success variants + error codes).
 
+use crate::policy::ExecutionPolicy;
 use crate::state::{AttemptType, PublicState, StateVector};
 use crate::types::{
-    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseEpoch, LeaseId, Namespace, SignalId,
-    SuspensionId, TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
+    AttemptId, AttemptIndex, CancelSource, ExecutionId, LaneId, LeaseEpoch, LeaseId, Namespace,
+    SignalId, SuspensionId, TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,11 +29,15 @@ pub struct CreateExecutionArgs {
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub tags: HashMap<String, String>,
-    /// JSON-encoded ExecutionPolicy.
-    pub policy_json: String,
+    /// Execution policy (retry, timeout, suspension, routing, etc.).
+    #[serde(default)]
+    pub policy: Option<ExecutionPolicy>,
     /// If set and in the future, execution starts delayed.
     #[serde(default)]
     pub delay_until: Option<TimestampMs>,
+    /// Absolute deadline timestamp (ms). Execution expires if not complete by this time.
+    #[serde(default)]
+    pub execution_deadline_at: Option<TimestampMs>,
     /// Partition ID (pre-computed).
     pub partition_id: u16,
     pub now: TimestampMs,
@@ -190,9 +195,8 @@ pub enum MarkLeaseExpiredResult {
 pub struct CancelExecutionArgs {
     pub execution_id: ExecutionId,
     pub reason: String,
-    /// "operator_override" bypasses lease check.
     #[serde(default)]
-    pub source: Option<String>,
+    pub source: CancelSource,
     /// Required if not operator_override and execution is active.
     #[serde(default)]
     pub lease_id: Option<LeaseId>,
@@ -804,6 +808,10 @@ pub struct ReportUsageArgs {
     /// Increment values (parallel with dimensions).
     pub deltas: Vec<u64>,
     pub now: TimestampMs,
+    /// Optional idempotency key to prevent double-counting on retries.
+    /// Must share the budget's `{b:M}` hash tag for cluster safety.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -813,15 +821,17 @@ pub enum ReportUsageResult {
     /// Soft limit breached on a dimension (advisory, increments applied).
     SoftBreach {
         dimension: String,
-        action: String,
+        current_usage: u64,
+        soft_limit: u64,
     },
     /// Hard limit breached (increments NOT applied).
     HardBreach {
         dimension: String,
-        action: String,
         current_usage: u64,
         hard_limit: u64,
     },
+    /// Dedup key matched — usage already applied in a prior call.
+    AlreadyApplied,
 }
 
 // ─── reset_budget ───
@@ -861,6 +871,18 @@ pub enum CheckAdmissionResult {
     RateExceeded { retry_after_ms: u64 },
     /// Concurrency cap hit.
     ConcurrencyExceeded,
+}
+
+// ─── release_admission ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReleaseAdmissionArgs {
+    pub execution_id: ExecutionId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReleaseAdmissionResult {
+    Released,
 }
 
 // ─── block_execution_for_admission ───
@@ -1119,8 +1141,9 @@ mod tests {
             creator_identity: "test-user".to_owned(),
             idempotency_key: None,
             tags: HashMap::new(),
-            policy_json: "{}".to_owned(),
+            policy: None,
             delay_until: None,
+            execution_deadline_at: None,
             partition_id: 42,
             now: TimestampMs::now(),
         };
@@ -1144,4 +1167,25 @@ mod tests {
         let parsed: ClaimExecutionResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, parsed);
     }
+}
+
+// ─── list_executions ───
+
+/// Summary of an execution for list views.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionSummary {
+    pub execution_id: ExecutionId,
+    pub namespace: String,
+    pub lane_id: String,
+    pub execution_kind: String,
+    pub public_state: String,
+    pub priority: i32,
+    pub created_at: String,
+}
+
+/// Result of a list_executions query.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListExecutionsResult {
+    pub executions: Vec<ExecutionSummary>,
+    pub total_returned: usize,
 }

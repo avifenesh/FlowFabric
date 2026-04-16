@@ -17,7 +17,7 @@ use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 
-use super::{ScanResult, Scanner};
+use super::{FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
@@ -25,11 +25,12 @@ pub struct DelayedPromoter {
     interval: Duration,
     /// Lanes to scan. Phase 1: just "default".
     lanes: Vec<LaneId>,
+    failures: FailureTracker,
 }
 
 impl DelayedPromoter {
     pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
-        Self { interval, lanes }
+        Self { interval, lanes, failures: FailureTracker::new() }
     }
 }
 
@@ -60,6 +61,10 @@ impl Scanner for DelayedPromoter {
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
+
+        if partition == 0 {
+            self.failures.advance_cycle();
+        }
 
         let mut total_processed: u32 = 0;
         let mut total_errors: u32 = 0;
@@ -99,6 +104,10 @@ impl Scanner for DelayedPromoter {
             // KEYS(3): exec_core, delayed_zset, eligible_zset
             // ARGV(2): execution_id, now_ms
             for eid_str in &due {
+                if self.failures.should_skip(eid_str) {
+                    continue;
+                }
+
                 let exec_core = format!("ff:exec:{}:{}:core", p.hash_tag(), eid_str);
                 let keys: [&str; 3] = [&exec_core, &delayed_key, &eligible_key];
                 let now_str = now_ms.to_string();
@@ -109,7 +118,10 @@ impl Scanner for DelayedPromoter {
                     &keys,
                     &argv,
                 ).await {
-                    Ok(_) => total_processed += 1,
+                    Ok(_) => {
+                        self.failures.record_success(eid_str);
+                        total_processed += 1;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             partition,
@@ -118,6 +130,7 @@ impl Scanner for DelayedPromoter {
                             error = %e,
                             "delayed_promoter: ff_promote_delayed failed"
                         );
+                        self.failures.record_failure(eid_str, "delayed_promoter");
                         total_errors += 1;
                     }
                 }

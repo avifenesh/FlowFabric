@@ -4,6 +4,20 @@
 //! then exercises the API with reqwest.
 //!
 //! Run with: cargo test -p ff-test --test e2e_api -- --test-threads=1
+//!
+//! TODO: Untested API endpoints (tested at Server/FCALL layer but not HTTP):
+//! - POST /v1/executions/{id}/revoke-lease
+//! - GET  /v1/executions?partition=N (list_executions)
+//! - POST /v1/budgets/{id}/usage (report_usage)
+//! - POST /v1/budgets/{id}/reset (reset_budget)
+//! - POST /v1/flows/{id}/edges (stage_dependency_edge)
+//! - POST /v1/flows/{id}/edges/apply (apply_dependency_to_child)
+//! TODO: Untested SDK methods (no test at any layer):
+//! - ClaimedTask::move_to_waiting_children()
+//! TODO: Untested Server methods (tested via FCALL but not typed Server API):
+//! - Server::revoke_lease()
+//! - Server::reset_budget()
+//! - Server::list_executions()
 
 use std::sync::Arc;
 
@@ -46,7 +60,7 @@ impl TestApi {
             .expect("Server::start failed");
 
         let server = Arc::new(server);
-        let app = ff_server::api::router(server.clone(), &["*".to_owned()]);
+        let app = ff_server::api::router(server.clone(), &["*".to_owned()], None);
 
         // 3. Bind to random port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -99,6 +113,7 @@ fn test_server_config() -> ff_server::config::ServerConfig {
         },
         skip_library_load: true,
         cors_origins: vec!["*".to_owned()],
+        api_token: None,
     }
 }
 
@@ -117,8 +132,9 @@ async fn api_create_execution(api: &TestApi, eid: &ExecutionId, priority: i32) {
         creator_identity: "api-test".into(),
         idempotency_key: None,
         tags: Default::default(),
-        policy_json: "{}".into(),
+        policy: None,
         delay_until: None,
+        execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(eid, &ff_test::fixtures::TEST_PARTITION_CONFIG).index,
         now: TimestampMs::now(),
     };
@@ -171,8 +187,9 @@ async fn test_api_create_and_get_execution() {
         creator_identity: "api-test".into(),
         idempotency_key: None,
         tags: Default::default(),
-        policy_json: "{}".into(),
+        policy: None,
         delay_until: None,
+        execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(&eid, &ff_test::fixtures::TEST_PARTITION_CONFIG).index,
         now,
     };
@@ -234,8 +251,9 @@ async fn test_api_cancel_execution() {
         creator_identity: "api-test".into(),
         idempotency_key: None,
         tags: Default::default(),
-        policy_json: "{}".into(),
+        policy: None,
         delay_until: None,
+        execution_deadline_at: None,
         partition_id: ff_core::partition::execution_partition(&eid, &ff_test::fixtures::TEST_PARTITION_CONFIG).index,
         now,
     };
@@ -253,7 +271,7 @@ async fn test_api_cancel_execution() {
     let cancel_args = CancelExecutionArgs {
         execution_id: eid.clone(), // will be overridden by path
         reason: "api-test-cancel".into(),
-        source: Some("operator_override".into()),
+        source: CancelSource::OperatorOverride,
         lease_id: None,
         lease_epoch: None,
         attempt_id: None,
@@ -496,7 +514,7 @@ async fn test_api_replay_execution() {
     let cancel_args = CancelExecutionArgs {
         execution_id: eid.clone(),
         reason: "setup-for-replay".into(),
-        source: Some("operator_override".into()),
+        source: CancelSource::OperatorOverride,
         lease_id: None,
         lease_epoch: None,
         attempt_id: None,
@@ -569,7 +587,7 @@ async fn test_api_add_execution_to_flow() {
         .send()
         .await
         .expect("add to flow request failed");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     let result: AddExecutionToFlowResult = resp.json().await.expect("add result parse failed");
     match result {

@@ -27,13 +27,34 @@ pub enum TimeoutBehavior {
 }
 
 impl TimeoutBehavior {
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Fail => "fail",
             Self::Cancel => "cancel",
             Self::Expire => "expire",
             Self::AutoResume => "auto_resume_with_timeout_signal",
             Self::Escalate => "escalate",
+        }
+    }
+}
+
+impl std::fmt::Display for TimeoutBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TimeoutBehavior {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fail" => Ok(Self::Fail),
+            "cancel" => Ok(Self::Cancel),
+            "expire" => Ok(Self::Expire),
+            "auto_resume_with_timeout_signal" | "auto_resume" => Ok(Self::AutoResume),
+            "escalate" => Ok(Self::Escalate),
+            other => Err(format!("unknown timeout behavior: {other}")),
         }
     }
 }
@@ -83,6 +104,16 @@ pub enum SignalOutcome {
     TriggeredResume { signal_id: SignalId },
     /// Duplicate signal (idempotency key matched).
     Duplicate { existing_signal_id: String },
+}
+
+impl SignalOutcome {
+    /// Parse a raw `ff_deliver_signal` FCALL result into a `SignalOutcome`.
+    ///
+    /// Consuming packages that call `ff_deliver_signal` directly can use this
+    /// to interpret the Lua return value without depending on SDK internals.
+    pub fn from_fcall_value(raw: &Value) -> Result<Self, SdkError> {
+        parse_signal_result(raw)
+    }
 }
 
 /// Outcome of `append_frame()`.
@@ -150,8 +181,7 @@ pub struct ClaimedTask {
 }
 
 impl ClaimedTask {
-    /// Create a new ClaimedTask and start the background lease renewal task.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn new(
         client: Client,
         partition_config: PartitionConfig,
@@ -206,6 +236,7 @@ impl ClaimedTask {
 
     /// Attach a concurrency permit from the worker's semaphore.
     /// The permit is held for the task's lifetime and released on drop.
+    #[allow(dead_code)]
     pub(crate) fn set_concurrency_permit(&mut self, permit: OwnedSemaphorePermit) {
         self._concurrency_permit = Some(permit);
     }
@@ -268,13 +299,112 @@ impl ClaimedTask {
 
     // ── Terminal operations (consume self) ──
 
+    /// Delay the execution until `delay_until`.
+    ///
+    /// Releases the lease. The execution moves to `delayed` state.
+    /// Consumes self — the task cannot be used after delay.
+    pub async fn delay_execution(self, delay_until: TimestampMs) -> Result<(), SdkError> {
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
+        //           lease_expiry_zset, worker_leases, active_index,
+        //           delayed_zset, attempt_timeout_zset
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.attempt_hash(self.attempt_index),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&self.worker_instance_id),
+            idx.lane_active(&self.lane_id),
+            idx.lane_delayed(&self.lane_id),
+            idx.attempt_timeout(),
+        ];
+
+        // ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, delay_until
+        let args: Vec<String> = vec![
+            self.execution_id.to_string(),
+            self.lease_id.to_string(),
+            self.lease_epoch.to_string(),
+            self.attempt_id.to_string(),
+            delay_until.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_delay_execution", &key_refs, &arg_refs)
+            .await
+            .map_err(SdkError::Valkey)?;
+
+        self.stop_renewal();
+        parse_success_result(&raw, "ff_delay_execution")
+    }
+
+    /// Move execution to waiting_children state.
+    ///
+    /// Releases the lease. The execution waits for child dependencies to complete.
+    /// Consumes self.
+    pub async fn move_to_waiting_children(self) -> Result<(), SdkError> {
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
+        //           lease_expiry_zset, worker_leases, active_index,
+        //           blocked_deps_zset, attempt_timeout_zset
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.attempt_hash(self.attempt_index),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&self.worker_instance_id),
+            idx.lane_active(&self.lane_id),
+            idx.lane_blocked_dependencies(&self.lane_id),
+            idx.attempt_timeout(),
+        ];
+
+        // ARGV (4): execution_id, lease_id, lease_epoch, attempt_id
+        let args: Vec<String> = vec![
+            self.execution_id.to_string(),
+            self.lease_id.to_string(),
+            self.lease_epoch.to_string(),
+            self.attempt_id.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_move_to_waiting_children", &key_refs, &arg_refs)
+            .await
+            .map_err(SdkError::Valkey)?;
+
+        self.stop_renewal();
+        parse_success_result(&raw, "ff_move_to_waiting_children")
+    }
+
     /// Complete the execution successfully.
     ///
-    /// Stops lease renewal, then calls `ff_complete_execution` via FCALL.
+    /// Calls `ff_complete_execution` via FCALL, then stops lease renewal.
+    /// Renewal continues during the FCALL to prevent lease expiry under
+    /// network latency — the Lua fences on lease_id+epoch atomically.
     /// Consumes self — the task cannot be used after completion.
+    ///
+    /// # Connection errors
+    ///
+    /// If the Valkey connection drops during this call, the returned error
+    /// does **not** guarantee the operation failed — the Lua function may
+    /// have committed before the response was lost. Callers should treat
+    /// connection errors on `complete()` as "possibly succeeded" and verify
+    /// the execution state via `get_execution_state()` before retrying.
     pub async fn complete(self, result_payload: Option<Vec<u8>>) -> Result<(), SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -318,8 +448,9 @@ impl ClaimedTask {
             .client
             .fcall("ff_complete_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
+        self.stop_renewal();
         parse_success_result(&raw, "ff_complete_execution")
     }
 
@@ -328,13 +459,19 @@ impl ClaimedTask {
     /// If the execution policy allows retries, the engine schedules a retry
     /// (delayed backoff). Otherwise, the execution becomes terminal failed.
     /// Returns [`FailOutcome`] so the caller knows what happened.
+    ///
+    /// # Connection errors
+    ///
+    /// If the Valkey connection drops during this call, the returned error
+    /// does **not** guarantee the operation failed — the Lua function may
+    /// have committed before the response was lost. Callers should treat
+    /// connection errors on `fail()` as "possibly succeeded" and verify
+    /// the execution state via `get_execution_state()` before retrying.
     pub async fn fail(
         self,
         reason: &str,
         error_category: &str,
     ) -> Result<FailOutcome, SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -359,7 +496,7 @@ impl ClaimedTask {
 
         // ARGV (7): eid, lease_id, lease_epoch, attempt_id,
         //           failure_reason, failure_category, retry_policy_json
-        let retry_policy_json = self.read_retry_policy_json(&ctx).await;
+        let retry_policy_json = self.read_retry_policy_json(&ctx).await?;
 
         let args: Vec<String> = vec![
             self.execution_id.to_string(),
@@ -378,8 +515,9 @@ impl ClaimedTask {
             .client
             .fcall("ff_fail_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
+        self.stop_renewal();
         parse_fail_result(&raw)
     }
 
@@ -387,8 +525,15 @@ impl ClaimedTask {
     ///
     /// Stops lease renewal, then calls `ff_cancel_execution` via FCALL.
     /// Consumes self.
+    ///
+    /// # Connection errors
+    ///
+    /// If the Valkey connection drops during this call, the returned error
+    /// does **not** guarantee the operation failed — the Lua function may
+    /// have committed before the response was lost. Callers should treat
+    /// connection errors on `cancel()` as "possibly succeeded" and verify
+    /// the execution state via `get_execution_state()` before retrying.
     pub async fn cancel(self, reason: &str) -> Result<(), SdkError> {
-        self.stop_renewal();
         self.cancel_inner(reason).await
     }
 
@@ -406,13 +551,22 @@ impl ClaimedTask {
             .client
             .hget(&ctx.core(), "current_waitpoint_id")
             .await
-            .ok()
-            .flatten();
-        let wp_id = wp_id_str
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| WaitpointId::parse(s).ok())
-            .unwrap_or_default();
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "read current_waitpoint_id".into() })?;
+        let wp_id = match wp_id_str.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => match WaitpointId::parse(s) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %self.execution_id,
+                        raw = %s,
+                        error = %e,
+                        "corrupt waitpoint_id in exec_core, using placeholder"
+                    );
+                    WaitpointId::new()
+                }
+            },
+            None => WaitpointId::default(),
+        };
         let keys: Vec<String> = vec![
             ctx.core(),                                        // 1
             ctx.attempt_hash(self.attempt_index),              // 2
@@ -454,8 +608,9 @@ impl ClaimedTask {
             .client
             .fcall("ff_cancel_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
+        self.stop_renewal();
         parse_success_result(&raw, "ff_cancel_execution")
     }
 
@@ -501,7 +656,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_update_progress", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_success_result(&raw, "ff_update_progress")
     }
@@ -510,10 +665,12 @@ impl ClaimedTask {
     ///
     /// Non-consuming — the worker can report usage multiple times.
     /// `dimensions` is a slice of `(dimension_name, delta)` pairs.
+    /// `dedup_key` prevents double-counting on retries (auto-prefixed with budget hash tag).
     pub async fn report_usage(
         &self,
         budget_id: &BudgetId,
         dimensions: &[(&str, u64)],
+        dedup_key: Option<&str>,
     ) -> Result<ReportUsageResult, SdkError> {
         let partition = budget_partition(budget_id, &self.partition_config);
         let bctx = BudgetKeyContext::new(&partition, budget_id);
@@ -521,10 +678,10 @@ impl ClaimedTask {
         // KEYS (3): budget_usage, budget_limits, budget_def
         let keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
 
-        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms
+        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
         let now = TimestampMs::now();
         let dim_count = dimensions.len();
-        let mut argv: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+        let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
         argv.push(dim_count.to_string());
         for (dim, _) in dimensions {
             argv.push((*dim).to_string());
@@ -533,6 +690,11 @@ impl ClaimedTask {
             argv.push(delta.to_string());
         }
         argv.push(now.to_string());
+        let dedup_key_val = dedup_key
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("ff:usagededup:{}:{}", bctx.hash_tag(), k))
+            .unwrap_or_default();
+        argv.push(dedup_key_val);
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -541,9 +703,56 @@ impl ClaimedTask {
             .client
             .fcall("ff_report_usage_and_check", &key_refs, &argv_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_report_usage_result(&raw)
+    }
+
+    /// Create a pending waitpoint for future signal delivery.
+    ///
+    /// Non-consuming — the worker keeps the lease. Signals delivered to the
+    /// waitpoint are buffered. When the worker later calls `suspend()` with
+    /// `use_pending_waitpoint`, buffered signals may immediately satisfy the
+    /// resume condition.
+    pub async fn create_pending_waitpoint(
+        &self,
+        waitpoint_key: &str,
+        expires_in_ms: u64,
+    ) -> Result<WaitpointId, SdkError> {
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        let waitpoint_id = WaitpointId::new();
+        let expires_at = TimestampMs::from_millis(TimestampMs::now().0 + expires_in_ms as i64);
+
+        // KEYS (3): exec_core, waitpoint_hash, pending_wp_expiry_zset
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.waitpoint(&waitpoint_id),
+            idx.pending_waitpoint_expiry(),
+        ];
+
+        // ARGV (5): execution_id, attempt_index, waitpoint_id, waitpoint_key, expires_at
+        let args: Vec<String> = vec![
+            self.execution_id.to_string(),
+            self.attempt_index.to_string(),
+            waitpoint_id.to_string(),
+            waitpoint_key.to_owned(),
+            expires_at.to_string(),
+        ];
+
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .client
+            .fcall("ff_create_pending_waitpoint", &key_refs, &arg_refs)
+            .await
+            .map_err(SdkError::Valkey)?;
+
+        parse_success_result(&raw, "ff_create_pending_waitpoint")?;
+        Ok(waitpoint_id)
     }
 
     // ── Phase 4: Streaming ──
@@ -598,7 +807,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_append_frame", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
         parse_append_frame_result(&raw)
     }
@@ -609,6 +818,10 @@ impl ClaimedTask {
     ///
     /// The execution transitions to `suspended` and the worker loses ownership.
     /// An external signal matching the condition will resume the execution.
+    ///
+    /// If `condition_matchers` is empty, a wildcard matcher is created that
+    /// matches ANY signal name. To require an explicit operator resume with
+    /// no signal match, pass a sentinel name that no real signal will use.
     ///
     /// If buffered signals on a pending waitpoint already satisfy the condition,
     /// returns `AlreadySatisfied` and the lease is NOT released.
@@ -621,8 +834,6 @@ impl ClaimedTask {
         timeout_ms: Option<u64>,
         timeout_behavior: TimeoutBehavior,
     ) -> Result<SuspendOutcome, SdkError> {
-        self.stop_renewal();
-
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -712,8 +923,9 @@ impl ClaimedTask {
             .client
             .fcall("ff_suspend_execution", &key_refs, &arg_refs)
             .await
-            .map_err(|e| SdkError::Valkey(e.to_string()))?;
+            .map_err(SdkError::Valkey)?;
 
+        self.stop_renewal();
         parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
     }
 
@@ -723,25 +935,33 @@ impl ClaimedTask {
     }
 
     /// Read the retry policy JSON from the execution's policy key.
-    async fn read_retry_policy_json(&self, ctx: &ExecKeyContext) -> String {
+    async fn read_retry_policy_json(&self, ctx: &ExecKeyContext) -> Result<String, SdkError> {
         let policy_str: Option<String> = self
             .client
             .get(&ctx.policy())
             .await
-            .ok()
-            .flatten();
+            .map_err(|e| SdkError::ValkeyContext { source: e, context: "read retry policy".into() })?;
 
         match policy_str {
             Some(json) => {
-                // Extract just the retry_policy sub-object
-                if let Ok(policy) = serde_json::from_str::<serde_json::Value>(&json)
-                    && let Some(retry) = policy.get("retry_policy")
-                {
-                    return serde_json::to_string(retry).unwrap_or_default();
+                match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(policy) => {
+                        if let Some(retry) = policy.get("retry_policy") {
+                            return Ok(serde_json::to_string(retry).unwrap_or_default());
+                        }
+                        Ok(String::new())
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %self.execution_id,
+                            error = %e,
+                            "malformed retry policy JSON, treating as no policy"
+                        );
+                        Ok(String::new())
+                    }
                 }
-                String::new()
             }
-            None => String::new(),
+            None => Ok(String::new()),
         }
     }
 }
@@ -752,6 +972,12 @@ impl Drop for ClaimedTask {
         // This is a safety net — complete/fail/cancel already stop renewal
         // via notify before consuming self. But if the task is dropped
         // without being consumed (e.g., panic), abort prevents leaked renewals.
+        if !self.renewal_handle.is_finished() {
+            tracing::warn!(
+                execution_id = %self.execution_id,
+                "ClaimedTask dropped without terminal operation — lease will expire"
+            );
+        }
         self.renewal_handle.abort();
     }
 }
@@ -801,7 +1027,7 @@ async fn renew_lease_inner(
     let raw: Value = client
         .fcall("ff_renew_lease", &key_refs, &arg_refs)
         .await
-        .map_err(|e| SdkError::Valkey(e.to_string()))?;
+        .map_err(SdkError::Valkey)?;
 
     parse_success_result(&raw, "ff_renew_lease")
 }
@@ -812,7 +1038,7 @@ async fn renew_lease_inner(
 /// - `stop_signal` is notified (complete/fail/cancel called)
 /// - Renewal fails with a terminal error (stale_lease, lease_expired, etc.)
 /// - The task handle is aborted (ClaimedTask dropped)
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn spawn_renewal_task(
     client: Client,
     partition_config: PartitionConfig,
@@ -829,6 +1055,7 @@ fn spawn_renewal_task(
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the first immediate tick — the lease was just acquired.
         tick.tick().await;
 
@@ -887,6 +1114,7 @@ fn spawn_renewal_task(
 }
 
 /// Check if a script error means renewal should stop permanently.
+#[allow(dead_code)]
 fn is_terminal_renewal_error(err: &ScriptError) -> bool {
     matches!(
         err,
@@ -901,7 +1129,8 @@ fn is_terminal_renewal_error(err: &ScriptError) -> bool {
 // ── FCALL result parsing ──
 
 /// Parse ff_report_usage_and_check result.
-/// Domain-specific: {"OK"}, {"SOFT_BREACH", dim, action}, {"HARD_BREACH", dim, action, current, limit}
+/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
+///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
 fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -911,36 +1140,44 @@ fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError>
             )));
         }
     };
-    let status = match arr.first() {
-        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(Value::SimpleString(s))) => s.clone(),
+    let status_code = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
         _ => {
             return Err(SdkError::Script(ScriptError::Parse(
-                "ff_report_usage_and_check: expected status string".into(),
+                "ff_report_usage_and_check: expected Int status code".into(),
             )));
         }
     };
-    match status.as_str() {
+    if status_code != 1 {
+        let error_code = usage_field_str(arr, 1);
+        return Err(SdkError::Script(
+            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                ScriptError::Parse(format!("ff_report_usage_and_check: {error_code}"))
+            }),
+        ));
+    }
+    let sub_status = usage_field_str(arr, 1);
+    match sub_status.as_str() {
         "OK" => Ok(ReportUsageResult::Ok),
+        "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
-            let dim = usage_field_str(arr, 1);
-            let action = usage_field_str(arr, 2);
-            Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+            let dim = usage_field_str(arr, 2);
+            let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
+            let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
+            Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
         }
         "HARD_BREACH" => {
-            let dim = usage_field_str(arr, 1);
-            let action = usage_field_str(arr, 2);
+            let dim = usage_field_str(arr, 2);
             let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
             let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
             Ok(ReportUsageResult::HardBreach {
                 dimension: dim,
-                action,
                 current_usage: current,
                 hard_limit: limit,
             })
         }
         _ => Err(SdkError::Script(ScriptError::Parse(format!(
-            "ff_report_usage_and_check: unknown status: {status}"
+            "ff_report_usage_and_check: unknown sub-status: {sub_status}"
         )))),
     }
 }
@@ -1149,7 +1386,11 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
         })
         .unwrap_or_default();
 
-    let signal_id = SignalId::parse(&signal_id_str).unwrap_or_else(|_| SignalId::new());
+    let signal_id = SignalId::parse(&signal_id_str).map_err(|e| {
+        SdkError::Script(ScriptError::Parse(format!(
+            "ff_deliver_signal: invalid signal_id from Lua: {e}"
+        )))
+    })?;
 
     if effect == "resume_condition_satisfied" {
         Ok(SignalOutcome::TriggeredResume { signal_id })

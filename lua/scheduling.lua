@@ -28,10 +28,13 @@ redis.register_function('ff_issue_claim_grant', function(keys, args)
     worker_instance_id  = args[3],
     lane_id             = args[4],
     capability_hash     = args[5] or "",
-    grant_ttl_ms        = tonumber(args[6]),
     route_snapshot_json = args[7] or "",
     admission_summary   = args[8] or "",
   }
+
+  local grant_ttl_n = require_number(args[6], "grant_ttl_ms")
+  if type(grant_ttl_n) == "table" then return grant_ttl_n end
+  A.grant_ttl_ms = grant_ttl_n
 
   local t = redis.call("TIME")
   local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -96,9 +99,12 @@ redis.register_function('ff_change_priority', function(keys, args)
     eligible_zset = keys[2],
   }
 
+  local new_priority_n = require_number(args[2], "new_priority")
+  if type(new_priority_n) == "table" then return new_priority_n end
+
   local A = {
     execution_id = args[1],
-    new_priority = tonumber(args[2]),
+    new_priority = new_priority_n,
   }
 
   local t = redis.call("TIME")
@@ -217,9 +223,12 @@ redis.register_function('ff_promote_delayed', function(keys, args)
     eligible_zset = keys[3],
   }
 
+  local now_ms_n = require_number(args[2], "now_ms")
+  if type(now_ms_n) == "table" then return now_ms_n end
+
   local A = {
     execution_id = args[1],
-    now_ms       = tonumber(args[2]),
+    now_ms       = now_ms_n,
   }
 
   -- Read and validate
@@ -306,10 +315,13 @@ redis.register_function('ff_issue_reclaim_grant', function(keys, args)
     worker_instance_id  = args[3],
     lane_id             = args[4],
     capability_hash     = args[5] or "",
-    grant_ttl_ms        = tonumber(args[6]),
     route_snapshot_json = args[7] or "",
     admission_summary   = args[8] or "",
   }
+
+  local grant_ttl_n = require_number(args[6], "grant_ttl_ms")
+  if type(grant_ttl_n) == "table" then return grant_ttl_n end
+  A.grant_ttl_ms = grant_ttl_n
 
   local t = redis.call("TIME")
   local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)

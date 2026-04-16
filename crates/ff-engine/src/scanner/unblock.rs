@@ -142,7 +142,15 @@ async fn scan_blocked_set(
             .await
         {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = eid_str.as_str(),
+                    error = %e,
+                    "unblock_scanner: HGET blocking_reason failed, skipping"
+                );
+                errors += 1;
+                continue;
+            }
         };
 
         let reason = reason.unwrap_or_default();
@@ -173,7 +181,15 @@ async fn scan_blocked_set(
 
         let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
             Ok(t) => t.to_string(),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = eid_str.as_str(),
+                    error = %e,
+                    "unblock_scanner: server TIME failed, skipping unblock"
+                );
+                errors += 1;
+                continue;
+            }
         };
         let argv: [&str; 3] = [eid_str, &now_ms, expected_reason];
 
@@ -267,17 +283,30 @@ async fn is_budget_breached(
     let usage_key = format!("ff:budget:{}:{}:usage", tag, budget_id);
     let limits_key = format!("ff:budget:{}:{}:limits", tag, budget_id);
 
-    // Read hard limits
-    let limits: Vec<String> = client
+    // Read hard limits — fail-closed: if Valkey read fails, treat as breached
+    // (keep execution blocked) rather than silently unblocking
+    let limits: Vec<String> = match client
         .cmd("HGETALL")
         .arg(&limits_key)
         .execute()
         .await
-        .unwrap_or_default();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                budget_id,
+                error = %e,
+                "unblock_scanner: budget limits read failed, keeping blocked (fail-closed)"
+            );
+            return true; // treat as breached
+        }
+    };
 
-    for i in (0..limits.len()).step_by(2) {
+    let mut i = 0;
+    while i + 1 < limits.len() {
         let field = &limits[i];
         let limit_str = &limits[i + 1];
+        i += 2;
 
         if !field.starts_with("hard:") {
             continue;
@@ -288,13 +317,24 @@ async fn is_budget_breached(
             _ => continue,
         };
 
-        let usage_str: Option<String> = client
+        let usage_str: Option<String> = match client
             .cmd("HGET")
             .arg(&usage_key)
             .arg(dimension)
             .execute()
             .await
-            .unwrap_or(None);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    budget_id,
+                    dimension,
+                    error = %e,
+                    "unblock_scanner: budget usage read failed, keeping blocked (fail-closed)"
+                );
+                return true; // treat as breached
+            }
+        };
         let usage: u64 = usage_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
 
         if usage >= limit {
@@ -314,14 +354,24 @@ async fn check_quota_cleared(
     _eid_str: &str,
     config: &PartitionConfig,
 ) -> bool {
-    // Read quota_policy_id from exec_core
-    let quota_id: Option<String> = client
+    // Read quota_policy_id from exec_core — fail-closed on Valkey error
+    let quota_id: Option<String> = match client
         .cmd("HGET")
         .arg(core_key)
         .arg("quota_policy_id")
         .execute()
         .await
-        .unwrap_or(None);
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                core_key,
+                error = %e,
+                "unblock_scanner: quota_policy_id read failed, keeping blocked (fail-closed)"
+            );
+            return false;
+        }
+    };
 
     let quota_id = match quota_id {
         Some(s) if !s.is_empty() => s,
@@ -340,20 +390,37 @@ async fn check_quota_cleared(
     let window_key = format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id);
     let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
 
-    let rate_limit: u64 = client
-        .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_limit")
-        .execute().await.ok().flatten()
-        .and_then(|s: String| s.parse().ok())
+    // Read quota definition fields — fail-closed on Valkey error
+    let def_fields: Vec<Option<String>> = match client
+        .cmd("HMGET")
+        .arg(&quota_def_key)
+        .arg("max_requests_per_window")
+        .arg("requests_per_window_seconds")
+        .arg("active_concurrency_cap")
+        .execute()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                quota_id = %quota_id,
+                error = %e,
+                "unblock_scanner: quota definition read failed, keeping blocked (fail-closed)"
+            );
+            return false;
+        }
+    };
+    let rate_limit: u64 = def_fields.first()
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let window_secs: u64 = client
-        .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_seconds")
-        .execute().await.ok().flatten()
-        .and_then(|s: String| s.parse().ok())
+    let window_secs: u64 = def_fields.get(1)
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse().ok())
         .unwrap_or(60);
-    let concurrency_cap: u64 = client
-        .cmd("HGET").arg(&quota_def_key).arg("active_concurrency_cap")
-        .execute().await.ok().flatten()
-        .and_then(|s: String| s.parse().ok())
+    let concurrency_cap: u64 = def_fields.get(2)
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
     // Check rate: clean window, count

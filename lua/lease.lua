@@ -23,14 +23,19 @@ redis.register_function('ff_renew_lease', function(keys, args)
   }
 
   -- Positional ARGV
+  local lease_ttl_n = require_number(args[6], "lease_ttl_ms")
+  if type(lease_ttl_n) == "table" then return lease_ttl_n end
+  local grace_n = require_number(args[7], "lease_history_grace_ms")
+  if type(grace_n) == "table" then return grace_n end
+
   local A = {
     execution_id         = args[1],
     attempt_index        = args[2],
     attempt_id           = args[3],
     lease_id             = args[4],
     lease_epoch          = args[5],
-    lease_ttl_ms         = tonumber(args[6]),
-    lease_history_grace_ms = tonumber(args[7]),
+    lease_ttl_ms         = lease_ttl_n,
+    lease_history_grace_ms = grace_n,
   }
 
   -- Server time

@@ -5,12 +5,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RetryPolicy {
     /// Maximum number of retry attempts (not counting the initial attempt).
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Backoff strategy.
+    #[serde(default)]
     pub backoff: BackoffStrategy,
     /// Error categories eligible for automatic retry.
     #[serde(default)]
     pub retryable_categories: Vec<String>,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            backoff: BackoffStrategy::default(),
+            retryable_categories: Vec::new(),
+        }
+    }
 }
 
 /// Backoff strategy for retries.
@@ -27,6 +43,17 @@ pub enum BackoffStrategy {
         #[serde(default)]
         jitter: bool,
     },
+}
+
+impl Default for BackoffStrategy {
+    fn default() -> Self {
+        Self::Exponential {
+            initial_delay_ms: 1000,
+            max_delay_ms: 60_000,
+            multiplier: 2.0,
+            jitter: false,
+        }
+    }
 }
 
 /// Timeout configuration for an execution.
@@ -228,6 +255,51 @@ mod tests {
         let policy: TimeoutPolicy = serde_json::from_str(json).unwrap();
         assert_eq!(policy.attempt_timeout_ms, Some(30_000));
         assert_eq!(policy.max_reclaim_count, 100);
+    }
+
+    #[test]
+    fn retry_policy_defaults() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(
+            policy.backoff,
+            BackoffStrategy::Exponential {
+                initial_delay_ms: 1000,
+                max_delay_ms: 60_000,
+                multiplier: 2.0,
+                jitter: false,
+            }
+        );
+        assert!(policy.retryable_categories.is_empty());
+    }
+
+    #[test]
+    fn retry_policy_lua_compatible_json() {
+        let policy = RetryPolicy::default();
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["max_retries"], 3);
+        let backoff = &json["backoff"];
+        assert_eq!(backoff["type"], "exponential");
+        assert_eq!(backoff["initial_delay_ms"], 1000);
+        assert_eq!(backoff["max_delay_ms"], 60_000);
+        assert_eq!(backoff["multiplier"], 2.0);
+
+        let fixed = RetryPolicy {
+            max_retries: 1,
+            backoff: BackoffStrategy::Fixed { delay_ms: 5000 },
+            retryable_categories: vec![],
+        };
+        let json = serde_json::to_value(&fixed).unwrap();
+        assert_eq!(json["backoff"]["type"], "fixed");
+        assert_eq!(json["backoff"]["delay_ms"], 5000);
+    }
+
+    #[test]
+    fn retry_policy_deserialize_minimal() {
+        let json = r#"{"max_retries": 5}"#;
+        let policy: RetryPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(policy.max_retries, 5);
+        assert_eq!(policy.backoff, BackoffStrategy::default());
     }
 
     #[test]

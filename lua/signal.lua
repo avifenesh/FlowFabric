@@ -438,6 +438,9 @@ redis.register_function('ff_claim_resumed_execution', function(keys, args)
     execution_deadline_key = keys[11],
   }
 
+  local lease_ttl_n = require_number(args[7], "lease_ttl_ms")
+  if type(lease_ttl_n) == "table" then return lease_ttl_n end
+
   local A = {
     execution_id                  = args[1],
     worker_id                     = args[2],
@@ -445,7 +448,7 @@ redis.register_function('ff_claim_resumed_execution', function(keys, args)
     lane                          = args[4],
     capability_snapshot_hash      = args[5] or "",
     lease_id                      = args[6],
-    lease_ttl_ms                  = tonumber(args[7]),
+    lease_ttl_ms                  = lease_ttl_n,
     remaining_attempt_timeout_ms  = args[8] or "",
   }
 

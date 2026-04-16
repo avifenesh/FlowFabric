@@ -49,9 +49,16 @@ pub use worker::FlowFabricWorker;
 /// SDK error type.
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
-    /// Valkey connection or command error.
+    /// Valkey connection or command error (preserves ErrorKind for caller inspection).
     #[error("valkey: {0}")]
-    Valkey(String),
+    Valkey(#[from] ferriskey::Error),
+
+    /// Valkey error with additional context.
+    #[error("valkey: {context}: {source}")]
+    ValkeyContext {
+        source: ferriskey::Error,
+        context: String,
+    },
 
     /// FlowFabric Lua script error.
     #[error("script: {0}")]
