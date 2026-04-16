@@ -1034,7 +1034,14 @@ impl Server {
             .hget(&ctx.core(), "current_worker_instance_id")
             .await
             .map_err(|e| ServerError::Valkey(format!("HGET worker_instance_id: {e}")))?;
-        let wiid = WorkerInstanceId::new(wiid_str.unwrap_or_default());
+        let wiid = match wiid_str {
+            Some(ref s) if !s.is_empty() => WorkerInstanceId::new(s),
+            _ => {
+                return Err(ServerError::NotFound(format!(
+                    "no active lease for execution {execution_id} (no current_worker_instance_id)"
+                )));
+            }
+        };
 
         // KEYS (5): exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases
         let fcall_keys: Vec<String> = vec![
@@ -1233,7 +1240,8 @@ impl Server {
 
         let mut summaries = Vec::with_capacity(parsed.len());
         for (eid, slot) in parsed.into_iter().zip(slots) {
-            let fields: Vec<Option<String>> = slot.value().unwrap_or_default();
+            let fields: Vec<Option<String>> = slot.value()
+                .map_err(|e| ServerError::Valkey(format!("pipeline slot: {e}")))?;
 
             let field = |i: usize| -> String {
                 fields
