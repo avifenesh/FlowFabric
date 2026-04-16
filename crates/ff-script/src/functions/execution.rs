@@ -54,7 +54,7 @@ ff_function! {
             args.execution_kind.clone(),
             args.priority.to_string(),
             args.creator_identity.clone(),
-            args.policy_json.clone(),
+            args.policy.as_ref().map(|p| serde_json::to_string(p).unwrap_or_else(|_| "{}".into())).unwrap_or_else(|| "{}".into()),
             String::from_utf8_lossy(&args.input_payload).into_owned(),
             args.delay_until.map(|t| t.to_string()).unwrap_or_default(),
             args.idempotency_key.as_ref().map(|_| "86400000".to_string()).unwrap_or_default(),
@@ -258,7 +258,7 @@ ff_function! {
         argv {
             args.execution_id.to_string(),
             args.reason.clone(),
-            args.source.clone().unwrap_or_default(),
+            args.source.to_string(),
             args.lease_id.as_ref().map(|l| l.to_string()).unwrap_or_default(),
             args.lease_epoch.as_ref().map(|e| e.to_string()).unwrap_or_default(),
         }

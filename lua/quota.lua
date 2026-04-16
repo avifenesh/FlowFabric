@@ -150,3 +150,36 @@ redis.register_function('ff_check_admission_and_record', function(keys, args)
 
   return { "ADMITTED" }
 end)
+
+---------------------------------------------------------------------------
+-- ff_release_admission  (on {q:K})
+--
+-- Release a previously-recorded admission slot. Called when a claim grant
+-- fails after admission was recorded, preventing leaked concurrency slots.
+--
+-- KEYS (3): admitted_guard_key, admitted_set, concurrency_counter
+-- ARGV (1): execution_id
+---------------------------------------------------------------------------
+redis.register_function('ff_release_admission', function(keys, args)
+  local K = {
+    admitted_guard_key = keys[1],
+    admitted_set       = keys[2],
+    concurrency_key    = keys[3],
+  }
+
+  local execution_id = args[1]
+
+  -- 1. Delete the guard key (idempotent — DEL returns 0 if absent)
+  redis.call("DEL", K.admitted_guard_key)
+
+  -- 2. Remove from admitted set
+  redis.call("SREM", K.admitted_set, execution_id)
+
+  -- 3. Decrement concurrency counter (floor at 0)
+  local current = tonumber(redis.call("GET", K.concurrency_key) or "0")
+  if current > 0 then
+    redis.call("DECR", K.concurrency_key)
+  end
+
+  return {1, "OK", "released"}
+end)

@@ -116,3 +116,28 @@ impl FromFcallResult for CheckAdmissionResult {
         }
     }
 }
+
+// ─── ff_release_admission ────────────────────────────────────────────
+//
+// Lua KEYS (3): admitted_guard_key, admitted_set, concurrency_counter
+// Lua ARGV (1): execution_id
+
+ff_function! {
+    pub ff_release_admission(args: ReleaseAdmissionArgs) -> ReleaseAdmissionResult {
+        keys(k: &QuotaOpKeys<'_>) {
+            k.ctx.admitted(k.execution_id),
+            k.ctx.admitted_set(),
+            k.ctx.concurrency(),
+        }
+        argv {
+            args.execution_id.to_string(),
+        }
+    }
+}
+
+impl FromFcallResult for ReleaseAdmissionResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let _r = FcallResult::parse(raw)?.into_success()?;
+        Ok(ReleaseAdmissionResult::Released)
+    }
+}

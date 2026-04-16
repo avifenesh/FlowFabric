@@ -38,6 +38,16 @@ pub enum BudgetCheckResult {
     HardBreach { dimension: String, detail: String },
 }
 
+/// Outcome of a quota admission check.
+enum QuotaCheckOutcome {
+    /// No quota attached to this execution.
+    NoQuota,
+    /// Quota admitted — carries context for release on subsequent failure.
+    Admitted { tag: String, quota_id: String, eid: String },
+    /// Quota denied — execution should be blocked.
+    Blocked(String),
+}
+
 /// Cross-partition budget checker with per-cycle caching.
 ///
 /// Reads budget usage/limits once per scan cycle (not per candidate).
@@ -273,16 +283,18 @@ impl Scheduler {
             }
 
             // ── Quota pre-check (cross-partition FCALL on {q:K}) ──
-            if let Some(block_detail) = self
+            let quota_admission = self
                 .check_quota(&exec_ctx, &core_key, &eid_s, now_ms)
-                .await?
-            {
-                // Quota denied — block candidate and try next
-                self.block_candidate(
-                    &partition, &idx, lane, &eid_s, &eligible_key,
-                    "waiting_for_quota", &block_detail, now_ms,
-                ).await;
-                continue;
+                .await?;
+            match &quota_admission {
+                QuotaCheckOutcome::Blocked(block_detail) => {
+                    self.block_candidate(
+                        &partition, &idx, lane, &eid_s, &eligible_key,
+                        "waiting_for_quota", block_detail, now_ms,
+                    ).await;
+                    continue;
+                }
+                QuotaCheckOutcome::NoQuota | QuotaCheckOutcome::Admitted { .. } => {}
             }
 
             // ── All checks passed — issue claim grant ──
@@ -330,6 +342,9 @@ impl Scheduler {
                         error = %e,
                         "scheduler: ff_issue_claim_grant rejected, trying next"
                     );
+                    if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
+                        self.release_admission(tag, quota_id, eid).await;
+                    }
                     continue;
                 }
             }
@@ -379,14 +394,14 @@ impl Scheduler {
         Ok(None)
     }
 
-    /// Check quota admission for the candidate. Returns block detail if denied.
+    /// Check quota admission for the candidate.
     async fn check_quota(
         &self,
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
         eid_s: &str,
         now_ms: u64,
-    ) -> Result<Option<String>, SchedulerError> {
+    ) -> Result<QuotaCheckOutcome, SchedulerError> {
         // Read quota_policy_id from exec_core
         let quota_id_str: Option<String> = self
             .client
@@ -398,10 +413,10 @@ impl Scheduler {
 
         let quota_id_str = match quota_id_str {
             Some(s) => s,
-            None => return Ok(None),
+            None => return Ok(QuotaCheckOutcome::NoQuota),
         };
         if quota_id_str.is_empty() {
-            return Ok(None); // no quota attached
+            return Ok(QuotaCheckOutcome::NoQuota);
         }
 
         // Compute real {q:K} partition tag from quota_policy_id
@@ -438,9 +453,9 @@ impl Scheduler {
         let concurrency_cap = concurrency_cap.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
         let jitter_ms = jitter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
 
-        // No limits configured — admit
+        // No limits configured — admit without recording
         if rate_limit == 0 && concurrency_cap == 0 {
-            return Ok(None);
+            return Ok(QuotaCheckOutcome::NoQuota);
         }
 
         // FCALL ff_check_admission_and_record on {q:K}
@@ -461,12 +476,16 @@ impl Scheduler {
                 // {"CONCURRENCY_EXCEEDED"}, {"ALREADY_ADMITTED"}
                 let status = Self::parse_admission_status(&result);
                 match status.as_str() {
-                    "ADMITTED" | "ALREADY_ADMITTED" => Ok(None),
-                    "RATE_EXCEEDED" => Ok(Some(format!(
+                    "ADMITTED" | "ALREADY_ADMITTED" => Ok(QuotaCheckOutcome::Admitted {
+                        tag: tag.clone(),
+                        quota_id: quota_id_str.clone(),
+                        eid: eid_s.to_owned(),
+                    }),
+                    "RATE_EXCEEDED" => Ok(QuotaCheckOutcome::Blocked(format!(
                         "quota {}: rate limit {}/{} per {}s window",
                         quota_id_str, rate_limit, rate_limit, window_secs
                     ))),
-                    "CONCURRENCY_EXCEEDED" => Ok(Some(format!(
+                    "CONCURRENCY_EXCEEDED" => Ok(QuotaCheckOutcome::Blocked(format!(
                         "quota {}: concurrency cap {}",
                         quota_id_str, concurrency_cap
                     ))),
@@ -476,7 +495,7 @@ impl Scheduler {
                             status = status.as_str(),
                             "scheduler: unexpected admission result"
                         );
-                        Ok(None) // allow on unknown status (advisory)
+                        Ok(QuotaCheckOutcome::NoQuota)
                     }
                 }
             }
@@ -486,7 +505,7 @@ impl Scheduler {
                     error = %e,
                     "scheduler: quota FCALL failed, allowing (advisory)"
                 );
-                Ok(None) // allow on FCALL error (advisory — budget HGET errors propagate above)
+                Ok(QuotaCheckOutcome::NoQuota) // allow on FCALL error (advisory)
             }
         }
     }
@@ -549,6 +568,43 @@ impl Scheduler {
                     execution_id = eid_s,
                     error = %e,
                     "scheduler: ff_block_execution_for_admission failed"
+                );
+            }
+        }
+    }
+
+    /// Release a previously-recorded quota admission slot.
+    /// Called when ff_issue_claim_grant fails after admission was recorded.
+    async fn release_admission(
+        &self,
+        tag: &str,
+        quota_id: &str,
+        eid_s: &str,
+    ) {
+        let admitted_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid_s);
+        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id);
+        let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
+
+        let keys: [&str; 3] = [&admitted_key, &admitted_set_key, &concurrency_key];
+        let argv: [&str; 1] = [eid_s];
+
+        match self.client
+            .fcall::<ferriskey::Value>("ff_release_admission", &keys, &argv)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    execution_id = eid_s,
+                    quota_id,
+                    "scheduler: released admission after claim failure"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = eid_s,
+                    quota_id,
+                    error = %e,
+                    "scheduler: ff_release_admission failed (slot will expire via TTL)"
                 );
             }
         }
