@@ -552,11 +552,21 @@ impl ClaimedTask {
             .hget(&ctx.core(), "current_waitpoint_id")
             .await
             .map_err(|e| SdkError::Valkey(format!("read current_waitpoint_id: {e}")))?;
-        let wp_id = wp_id_str
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| WaitpointId::parse(s).ok())
-            .unwrap_or_default();
+        let wp_id = match wp_id_str.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => match WaitpointId::parse(s) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %self.execution_id,
+                        raw = %s,
+                        error = %e,
+                        "corrupt waitpoint_id in exec_core, using placeholder"
+                    );
+                    WaitpointId::new()
+                }
+            },
+            None => WaitpointId::default(),
+        };
         let keys: Vec<String> = vec![
             ctx.core(),                                        // 1
             ctx.attempt_hash(self.attempt_index),              // 2
@@ -655,7 +665,7 @@ impl ClaimedTask {
     ///
     /// Non-consuming — the worker can report usage multiple times.
     /// `dimensions` is a slice of `(dimension_name, delta)` pairs.
-    /// `dedup_key` prevents double-counting on retries (must share `{b:M}` hash tag).
+    /// `dedup_key` prevents double-counting on retries (auto-prefixed with budget hash tag).
     pub async fn report_usage(
         &self,
         budget_id: &BudgetId,
@@ -680,7 +690,11 @@ impl ClaimedTask {
             argv.push(delta.to_string());
         }
         argv.push(now.to_string());
-        argv.push(dedup_key.unwrap_or("").to_owned());
+        let dedup_key_val = dedup_key
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("ff:usagededup:{}:{}", bctx.hash_tag(), k))
+            .unwrap_or_default();
+        argv.push(dedup_key_val);
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -930,13 +944,22 @@ impl ClaimedTask {
 
         match policy_str {
             Some(json) => {
-                // Extract just the retry_policy sub-object
-                if let Ok(policy) = serde_json::from_str::<serde_json::Value>(&json)
-                    && let Some(retry) = policy.get("retry_policy")
-                {
-                    return Ok(serde_json::to_string(retry).unwrap_or_default());
+                match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(policy) => {
+                        if let Some(retry) = policy.get("retry_policy") {
+                            return Ok(serde_json::to_string(retry).unwrap_or_default());
+                        }
+                        Ok(String::new())
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %self.execution_id,
+                            error = %e,
+                            "malformed retry policy JSON, treating as no policy"
+                        );
+                        Ok(String::new())
+                    }
                 }
-                Ok(String::new())
             }
             None => Ok(String::new()),
         }

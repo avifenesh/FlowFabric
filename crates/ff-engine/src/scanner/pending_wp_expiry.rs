@@ -75,12 +75,12 @@ impl Scanner for PendingWaitpointExpiryScanner {
             }
         };
 
-        if expired.is_empty() {
-            return ScanResult { processed: 0, errors: 0 };
-        }
-
         if partition == 0 {
             self.failures.advance_cycle();
+        }
+
+        if expired.is_empty() {
+            return ScanResult { processed: 0, errors: 0 };
         }
 
         let mut processed: u32 = 0;

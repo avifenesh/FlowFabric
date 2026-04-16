@@ -35,6 +35,9 @@ pub struct CreateExecutionArgs {
     /// If set and in the future, execution starts delayed.
     #[serde(default)]
     pub delay_until: Option<TimestampMs>,
+    /// Absolute deadline timestamp (ms). Execution expires if not complete by this time.
+    #[serde(default)]
+    pub execution_deadline_at: Option<TimestampMs>,
     /// Partition ID (pre-computed).
     pub partition_id: u16,
     pub now: TimestampMs,
@@ -1140,6 +1143,7 @@ mod tests {
             tags: HashMap::new(),
             policy: None,
             delay_until: None,
+            execution_deadline_at: None,
             partition_id: 42,
             now: TimestampMs::now(),
         };
