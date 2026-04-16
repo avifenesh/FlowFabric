@@ -150,6 +150,18 @@ async fn project_flow_summary(
     let members_key = format!("ff:flow:{}:{}:members", tag, fid_str);
     let summary_key = format!("ff:flow:{}:{}:summary", tag, fid_str);
 
+    // Get true membership count for accurate total_members reporting.
+    let true_total: u64 = client
+        .cmd("SCARD")
+        .arg(&members_key)
+        .execute()
+        .await
+        .unwrap_or(0);
+
+    if true_total == 0 {
+        return Ok(false);
+    }
+
     // Sample up to BATCH_SIZE member execution IDs (avoids loading the
     // entire membership set into memory for large flows).
     // SRANDMEMBER key count returns up to `count` distinct members.
@@ -167,7 +179,7 @@ async fn project_flow_summary(
 
     // Count public_state for each sampled member (cross-partition reads)
     let mut counts: HashMap<String, u32> = HashMap::new();
-    let mut total: u32 = 0;
+    let mut sampled: u32 = 0;
 
     for eid_str in &member_eids {
         let eid = match ff_core::types::ExecutionId::parse(eid_str) {
@@ -188,10 +200,10 @@ async fn project_flow_summary(
 
         let state = ps.unwrap_or_else(|| "unknown".to_string());
         *counts.entry(state).or_insert(0) += 1;
-        total += 1;
+        sampled += 1;
     }
 
-    // Derive public_flow_state
+    // Derive public_flow_state from sample
     let completed = *counts.get("completed").unwrap_or(&0);
     let skipped = *counts.get("skipped").unwrap_or(&0);
     let failed = *counts.get("failed").unwrap_or(&0);
@@ -205,7 +217,7 @@ async fn project_flow_summary(
     let waiting_children = *counts.get("waiting_children").unwrap_or(&0);
 
     let terminal_count = completed + skipped + failed + cancelled + expired;
-    let all_terminal = terminal_count == total && total > 0;
+    let all_terminal = terminal_count == sampled && sampled > 0;
 
     let flow_state = if all_terminal {
         if failed > 0 || cancelled > 0 || expired > 0 {
@@ -225,7 +237,7 @@ async fn project_flow_summary(
     let _: () = client
         .cmd("HSET")
         .arg(&summary_key)
-        .arg("total_members").arg(total.to_string().as_str())
+        .arg("total_members").arg(true_total.to_string().as_str())
         .arg("members_completed").arg(completed.to_string().as_str())
         .arg("members_failed").arg(failed.to_string().as_str())
         .arg("members_cancelled").arg(cancelled.to_string().as_str())

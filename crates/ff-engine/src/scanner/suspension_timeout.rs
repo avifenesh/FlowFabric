@@ -167,7 +167,7 @@ async fn expire_suspension(
     let lane: Option<String> = client
         .cmd("HGET")
         .arg(&exec_core)
-        .arg("current_lane")
+        .arg("lane_id")
         .execute()
         .await?;
     let lane_str = lane.unwrap_or_else(|| "default".to_string());

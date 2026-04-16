@@ -158,7 +158,7 @@ impl ScannerRunner {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let name = scanner.name();
-            let interval = scanner.interval();
+            let interval = scanner.interval().max(Duration::from_millis(100));
             tracing::info!(scanner = name, ?interval, partitions = num_partitions, "scanner started");
 
             loop {

@@ -262,11 +262,16 @@ async fn add_execution_to_flow(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
     AppJson(mut args): AppJson<AddExecutionToFlowArgs>,
-) -> Result<Json<AddExecutionToFlowResult>, ApiError> {
+) -> Result<(StatusCode, Json<AddExecutionToFlowResult>), ApiError> {
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    Ok(Json(server.add_execution_to_flow(&args).await?))
+    let result = server.add_execution_to_flow(&args).await?;
+    let status = match &result {
+        AddExecutionToFlowResult::Added { .. } => StatusCode::CREATED,
+        AddExecutionToFlowResult::AlreadyMember { .. } => StatusCode::OK,
+    };
+    Ok((status, Json(result)))
 }
 
 async fn cancel_flow(

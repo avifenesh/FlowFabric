@@ -997,12 +997,12 @@ redis.register_function('ff_fail_execution', function(keys, args)
         can_retry = true
         local bt = policy.backoff or {}
         if bt.type == "exponential" then
-          local initial = tonumber(bt.initial_delay_ms or "1000")
-          local max_d = tonumber(bt.max_delay_ms or "60000")
-          local mult = tonumber(bt.multiplier or "2")
+          local initial = (tonumber(bt.initial_delay_ms) or 1000)
+          local max_d = (tonumber(bt.max_delay_ms) or 60000)
+          local mult = (tonumber(bt.multiplier) or 2)
           backoff_ms = math.min(initial * (mult ^ retry_count), max_d)
         elseif bt.type == "fixed" then
-          backoff_ms = tonumber(bt.delay_ms or "1000")
+          backoff_ms = (tonumber(bt.delay_ms) or 1000)
         end
       end
     end
