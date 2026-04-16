@@ -1,7 +1,7 @@
 //! Typed FCALL wrappers for budget functions (lua/budget.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 
 use crate::result::{FcallResult, FromFcallResult};

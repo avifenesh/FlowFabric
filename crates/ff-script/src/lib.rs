@@ -2,9 +2,12 @@
 
 #[macro_use]
 pub mod macros;
+pub mod error;
 pub mod result;
 pub mod loader;
 pub mod functions;
+
+pub use error::ScriptError;
 
 /// The compiled FlowFabric Lua library source, concatenated by build.rs.
 /// Includes the `#!lua name=flowfabric` preamble, all shared helpers,

@@ -6,7 +6,7 @@
 //!
 //! The FCALL result comes back as a ferriskey `Value::Array`.
 
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ferriskey::Value;
 
 /// Parsed FCALL result from a FlowFabric Lua function.

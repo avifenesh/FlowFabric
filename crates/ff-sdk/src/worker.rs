@@ -255,7 +255,7 @@ impl FlowFabricWorker {
             };
 
             let execution_id = ExecutionId::parse(&execution_id_str).map_err(|e| {
-                SdkError::Script(ff_core::error::ScriptError::Parse(format!(
+                SdkError::Script(ff_script::error::ScriptError::Parse(format!(
                     "bad execution_id in eligible set: {e}"
                 )))
             })?;
@@ -290,7 +290,7 @@ impl FlowFabricWorker {
                     task.set_concurrency_permit(permit);
                     return Ok(Some(task));
                 }
-                Err(SdkError::Script(ff_core::error::ScriptError::UseClaimResumedExecution)) => {
+                Err(SdkError::Script(ff_script::error::ScriptError::UseClaimResumedExecution)) => {
                     // Execution was resumed from suspension — attempt_interrupted.
                     // ff_claim_execution rejects this; use ff_claim_resumed_execution
                     // which reuses the existing attempt instead of creating a new one.
@@ -455,7 +455,7 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_execution: expected Array".into(),
                 )));
             }
@@ -464,7 +464,7 @@ impl FlowFabricWorker {
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_execution: bad status code".into(),
                 )));
             }
@@ -481,8 +481,8 @@ impl FlowFabricWorker {
                 .unwrap_or_else(|| "unknown".to_owned());
 
             return Err(SdkError::Script(
-                ff_core::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
-                    ff_core::error::ScriptError::Parse(format!(
+                ff_script::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                    ff_script::error::ScriptError::Parse(format!(
                         "ff_claim_execution: {error_code}"
                     ))
                 }),
@@ -599,7 +599,7 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_resumed_execution: expected Array".into(),
                 )));
             }
@@ -608,7 +608,7 @@ impl FlowFabricWorker {
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_resumed_execution: bad status code".into(),
                 )));
             }
@@ -625,8 +625,8 @@ impl FlowFabricWorker {
                 .unwrap_or_else(|| "unknown".to_owned());
 
             return Err(SdkError::Script(
-                ff_core::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
-                    ff_core::error::ScriptError::Parse(format!(
+                ff_script::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                    ff_script::error::ScriptError::Parse(format!(
                         "ff_claim_resumed_execution: {error_code}"
                     ))
                 }),
@@ -812,7 +812,7 @@ impl FlowFabricWorker {
 }
 
 #[cfg(feature = "insecure-direct-claim")]
-fn is_retryable_claim_error(err: &ff_core::error::ScriptError) -> bool {
+fn is_retryable_claim_error(err: &ff_script::error::ScriptError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
         err.class(),

@@ -1,7 +1,7 @@
 //! Typed FCALL wrappers for execution lifecycle functions (lua/execution.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::state::{AttemptType, PublicState};
 use ff_core::types::*;

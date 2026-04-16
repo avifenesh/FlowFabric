@@ -927,7 +927,6 @@ name = "ff-core"
 version = "0.1.0"
 dependencies = [
  "crc16",
- "ferriskey",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -975,6 +974,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-engine",
+ "ff-script",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

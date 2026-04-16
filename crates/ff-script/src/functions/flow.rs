@@ -1,7 +1,7 @@
 //! Typed FCALL wrappers for flow coordination functions (lua/flow.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::state::PublicState;
 
@@ -55,7 +55,7 @@ impl FromFcallResult for CreateFlowResult {
 }
 
 // ─── ff_add_execution_to_flow ────────────────────────────────────────
-// KEYS (2): flow_core, members_set
+// KEYS (3): flow_core, members_set, flow_index
 // ARGV (3): flow_id, execution_id, now_ms
 
 ff_function! {
@@ -63,6 +63,7 @@ ff_function! {
         keys(k: &FlowStructOpKeys<'_>) {
             k.fctx.core(),
             k.fctx.members(),
+            k.fidx.flow_index(),
         }
         argv {
             args.flow_id.to_string(),
