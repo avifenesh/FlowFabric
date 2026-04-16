@@ -334,6 +334,8 @@ async fn get_budget_status(
 struct ReportUsageBody {
     dimensions: HashMap<String, u64>,
     now: ff_core::types::TimestampMs,
+    #[serde(default)]
+    dedup_key: Option<String>,
 }
 
 async fn report_usage(
@@ -348,6 +350,7 @@ async fn report_usage(
         dimensions: dims,
         deltas,
         now: body.now,
+        dedup_key: body.dedup_key,
     };
     Ok(Json(server.report_usage(&bid, &args).await?))
 }

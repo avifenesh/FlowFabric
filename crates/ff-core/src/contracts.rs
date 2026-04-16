@@ -804,6 +804,10 @@ pub struct ReportUsageArgs {
     /// Increment values (parallel with dimensions).
     pub deltas: Vec<u64>,
     pub now: TimestampMs,
+    /// Optional idempotency key to prevent double-counting on retries.
+    /// Must share the budget's `{b:M}` hash tag for cluster safety.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -822,6 +826,8 @@ pub enum ReportUsageResult {
         current_usage: u64,
         hard_limit: u64,
     },
+    /// Dedup key matched — usage already applied in a prior call.
+    AlreadyApplied,
 }
 
 // ─── reset_budget ───

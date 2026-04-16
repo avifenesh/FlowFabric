@@ -92,10 +92,10 @@ impl FromFcallResult for CreateBudgetResult {
 // ─── ff_report_usage_and_check ────────────────────────────────────────
 //
 // Lua KEYS (3): budget_usage, budget_limits, budget_def
-// Lua ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms
+// Lua ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
 //
 // Manual implementation because ff_function! macro cannot handle variable-length
-// ARGV. The Lua reads positional args: [dim_count, dim1..dimN, delta1..deltaN, now_ms].
+// ARGV. The Lua reads positional args: [dim_count, dim1..dimN, delta1..deltaN, now_ms, dedup_key].
 
 pub async fn ff_report_usage_and_check(
     conn: &ferriskey::Client,
@@ -108,9 +108,9 @@ pub async fn ff_report_usage_and_check(
         k.def_key.to_string(),
     ];
 
-    // Build flat ARGV: [dim_count, dim1..dimN, delta1..deltaN, now_ms]
+    // Build flat ARGV: [dim_count, dim1..dimN, delta1..deltaN, now_ms, dedup_key]
     let dim_count = args.dimensions.len();
-    let mut argv: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+    let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
     argv.push(dim_count.to_string());
     for dim in &args.dimensions {
         argv.push(dim.clone());
@@ -119,6 +119,7 @@ pub async fn ff_report_usage_and_check(
         argv.push(delta.to_string());
     }
     argv.push(args.now.to_string());
+    argv.push(args.dedup_key.clone().unwrap_or_default());
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -143,6 +144,7 @@ impl FromFcallResult for ReportUsageResult {
         };
         match status.as_str() {
             "OK" => Ok(ReportUsageResult::Ok),
+            "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
             "SOFT_BREACH" => {
                 let dim = field_str_from_arr(arr, 1);
                 let action = field_str_from_arr(arr, 2);
