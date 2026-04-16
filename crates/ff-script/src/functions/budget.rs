@@ -92,10 +92,10 @@ impl FromFcallResult for CreateBudgetResult {
 // ─── ff_report_usage_and_check ────────────────────────────────────────
 //
 // Lua KEYS (3): budget_usage, budget_limits, budget_def
-// Lua ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms
+// Lua ARGV (variable): dimension_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
 //
 // Manual implementation because ff_function! macro cannot handle variable-length
-// ARGV. The Lua reads positional args: [dim_count, dim1..dimN, delta1..deltaN, now_ms].
+// ARGV. The Lua reads positional args: [dim_count, dim1..dimN, delta1..deltaN, now_ms, dedup_key].
 
 pub async fn ff_report_usage_and_check(
     conn: &ferriskey::Client,
@@ -108,9 +108,9 @@ pub async fn ff_report_usage_and_check(
         k.def_key.to_string(),
     ];
 
-    // Build flat ARGV: [dim_count, dim1..dimN, delta1..deltaN, now_ms]
+    // Build flat ARGV: [dim_count, dim1..dimN, delta1..deltaN, now_ms, dedup_key]
     let dim_count = args.dimensions.len();
-    let mut argv: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+    let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
     argv.push(dim_count.to_string());
     for dim in &args.dimensions {
         argv.push(dim.clone());
@@ -119,6 +119,7 @@ pub async fn ff_report_usage_and_check(
         argv.push(delta.to_string());
     }
     argv.push(args.now.to_string());
+    argv.push(args.dedup_key.clone().unwrap_or_default());
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -131,36 +132,27 @@ pub async fn ff_report_usage_and_check(
 
 impl FromFcallResult for ReportUsageResult {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
-        // Domain-specific return: {"OK"}, {"SOFT_BREACH", dim, action},
-        // {"HARD_BREACH", dim, action, current, limit}
-        let arr = match raw {
-            ferriskey::Value::Array(arr) => arr,
-            _ => return Err(ScriptError::Parse("expected Array".into())),
-        };
-        let status = match arr.first() {
-            Some(Ok(ferriskey::Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-            _ => return Err(ScriptError::Parse("expected status string".into())),
-        };
-        match status.as_str() {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        match r.status.as_str() {
             "OK" => Ok(ReportUsageResult::Ok),
+            "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
             "SOFT_BREACH" => {
-                let dim = field_str_from_arr(arr, 1);
-                let action = field_str_from_arr(arr, 2);
-                Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+                let dim = r.field_str(0);
+                let current: u64 = r.field_str(1).parse().unwrap_or(0);
+                let limit: u64 = r.field_str(2).parse().unwrap_or(0);
+                Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
             }
             "HARD_BREACH" => {
-                let dim = field_str_from_arr(arr, 1);
-                let action = field_str_from_arr(arr, 2);
-                let current: u64 = field_str_from_arr(arr, 3).parse().unwrap_or(0);
-                let limit: u64 = field_str_from_arr(arr, 4).parse().unwrap_or(0);
+                let dim = r.field_str(0);
+                let current: u64 = r.field_str(1).parse().unwrap_or(0);
+                let limit: u64 = r.field_str(2).parse().unwrap_or(0);
                 Ok(ReportUsageResult::HardBreach {
                     dimension: dim,
-                    action,
                     current_usage: current,
                     hard_limit: limit,
                 })
             }
-            _ => Err(ScriptError::Parse(format!("unknown budget status: {status}"))),
+            _ => Err(ScriptError::Parse(format!("unknown budget status: {}", r.status))),
         }
     }
 }
@@ -275,13 +267,3 @@ impl FromFcallResult for UnblockExecutionResult {
     }
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────
-
-fn field_str_from_arr(arr: &[Result<ferriskey::Value, ferriskey::Error>], index: usize) -> String {
-    match arr.get(index) {
-        Some(Ok(ferriskey::Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(ferriskey::Value::SimpleString(s))) => s.clone(),
-        Some(Ok(ferriskey::Value::Int(n))) => n.to_string(),
-        _ => String::new(),
-    }
-}

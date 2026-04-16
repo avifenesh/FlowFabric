@@ -47,7 +47,7 @@ impl From<ferriskey::Error> for LoadError {
 /// the expected version.
 ///
 /// 1. `FCALL ff_version 0` — check if library is loaded and version matches
-/// 2. If missing or version mismatch → `FUNCTION LOAD REPLACE`
+/// 2. If missing or version mismatch → `FUNCTION LOAD REPLACE` (with retry)
 /// 3. Verify by calling `ff_version` again
 pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
     match check_version(client).await {
@@ -63,8 +63,36 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
         }
     }
 
-    // Load the library
-    let _name: String = client.function_load_replace(LIBRARY_SOURCE).await?;
+    // Load the library with retry for transient errors
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client.function_load_replace(LIBRARY_SOURCE).await {
+            Ok(_name) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                if is_permanent_load_error(&e) {
+                    tracing::error!(attempt, error = %e, "FUNCTION LOAD failed with permanent error");
+                    return Err(LoadError::Valkey(e));
+                }
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    "FUNCTION LOAD failed (transient), retrying in 1s"
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(LoadError::Valkey(e));
+    }
 
     // Verify
     match check_version(client).await {
@@ -81,6 +109,12 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
         }
         Err(e) => Err(LoadError::Valkey(e)),
     }
+}
+
+/// Check if a FUNCTION LOAD error is permanent (syntax error in Lua) vs transient.
+fn is_permanent_load_error(e: &ferriskey::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Error compiling") || msg.contains("syntax error") || msg.contains("ERR Error")
 }
 
 /// Check if ff_version returns the expected version.

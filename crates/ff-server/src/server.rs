@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::contracts::{
@@ -7,8 +8,10 @@ use ff_core::contracts::{
     CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     ApplyDependencyToChildArgs, ApplyDependencyToChildResult,
-    DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ReplayExecutionResult,
-    ReportUsageArgs, ReportUsageResult,
+    DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ExecutionSummary,
+    ListExecutionsResult, ReplayExecutionResult,
+    ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
+    RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
@@ -69,7 +72,10 @@ impl Server {
             tls = config.tls, cluster = config.cluster,
             "connecting to Valkey"
         );
-        let mut builder = ClientBuilder::new().host(&config.host, config.port);
+        let mut builder = ClientBuilder::new()
+            .host(&config.host, config.port)
+            .connect_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_millis(5000));
         if config.tls {
             builder = builder.tls();
         }
@@ -155,6 +161,34 @@ impl Server {
         &self.client
     }
 
+    /// Execute an FCALL with automatic Lua library reload on "function not loaded".
+    ///
+    /// After a Valkey failover the new primary may not have the Lua library
+    /// loaded (replication lag or cold replica). This wrapper detects that
+    /// condition, reloads the library via `ff_script::loader::ensure_library`,
+    /// and retries the FCALL once.
+    async fn fcall_with_reload(
+        &self,
+        function: &str,
+        keys: &[&str],
+        args: &[&str],
+    ) -> Result<Value, ServerError> {
+        match self.client.fcall(function, keys, args).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_function_not_loaded(&e) => {
+                tracing::warn!(function, "Lua library not found on server, reloading");
+                ff_script::loader::ensure_library(&self.client)
+                    .await
+                    .map_err(|e| ServerError::LibraryLoad(e.to_string()))?;
+                self.client
+                    .fcall(function, keys, args)
+                    .await
+                    .map_err(|e| ServerError::Valkey(e.to_string()))
+            }
+            Err(e) => Err(ServerError::Valkey(e.to_string())),
+        }
+    }
+
     /// Get the server config.
     pub fn config(&self) -> &ServerConfig {
         &self.config
@@ -228,14 +262,18 @@ impl Server {
             args.execution_kind.clone(),             // 4
             args.priority.to_string(),               // 5
             args.creator_identity.clone(),           // 6
-            args.policy_json.clone(),                // 7
+            args.policy.as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "{}".to_owned()))
+                .unwrap_or_else(|| "{}".to_owned()), // 7
             String::from_utf8_lossy(&args.input_payload).into_owned(), // 8
             delay_str,                               // 9
             args.idempotency_key.as_ref()
                 .map(|_| "86400000".to_string())
                 .unwrap_or_default(),                // 10 dedup_ttl_ms
             tags_json,                               // 11
-            String::new(),                           // 12 execution_deadline_at
+            args.execution_deadline_at
+                .map(|d| d.to_string())
+                .unwrap_or_default(),                // 12 execution_deadline_at
             args.partition_id.to_string(),           // 13
         ];
 
@@ -243,10 +281,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_execution", &key_refs, &arg_refs)
+            .await?;
 
         parse_create_result(&raw, &args.execution_id)
     }
@@ -278,7 +314,7 @@ impl Server {
             .arg("current_worker_instance_id")
             .execute()
             .await
-            .unwrap_or_default();
+            .map_err(|e| ServerError::Valkey(format!("HMGET cancel pre-read: {e}")))?;
         let att_idx_val = dyn_fields.first()
             .and_then(|v| v.as_ref())
             .and_then(|s| s.parse::<u32>().ok())
@@ -328,7 +364,7 @@ impl Server {
         let fcall_args: Vec<String> = vec![
             args.execution_id.to_string(),
             args.reason.clone(),
-            args.source.clone().unwrap_or_else(|| "operator_override".to_owned()),
+            args.source.to_string(),
             args.lease_id
                 .as_ref()
                 .map(|l| l.to_string())
@@ -343,10 +379,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_cancel_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_cancel_execution", &key_refs, &arg_refs)
+            .await?;
 
         parse_cancel_result(&raw, &args.execution_id)
     }
@@ -430,10 +464,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_budget", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_budget", &key_refs, &arg_refs)
+            .await?;
 
         parse_budget_create_result(&raw, &args.budget_id)
     }
@@ -470,10 +502,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_quota_policy", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_quota_policy", &key_refs, &arg_refs)
+            .await?;
 
         parse_quota_create_result(&raw, &args.quota_policy_id)
     }
@@ -566,9 +596,9 @@ impl Server {
         // KEYS (3): budget_usage, budget_limits, budget_def
         let fcall_keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
 
-        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms
+        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
         let dim_count = args.dimensions.len();
-        let mut fcall_args: Vec<String> = Vec::with_capacity(2 + dim_count * 2);
+        let mut fcall_args: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
         fcall_args.push(dim_count.to_string());
         for dim in &args.dimensions {
             fcall_args.push(dim.clone());
@@ -577,17 +607,48 @@ impl Server {
             fcall_args.push(delta.to_string());
         }
         fcall_args.push(args.now.to_string());
+        let dedup_key_val = args
+            .dedup_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("ff:usagededup:{}:{}", bctx.hash_tag(), k))
+            .unwrap_or_default();
+        fcall_args.push(dedup_key_val);
 
         let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_report_usage_and_check", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_report_usage_and_check", &key_refs, &arg_refs)
+            .await?;
 
         parse_report_usage_result(&raw)
+    }
+
+    /// Reset a budget's usage counters and schedule the next reset.
+    pub async fn reset_budget(
+        &self,
+        budget_id: &BudgetId,
+    ) -> Result<ResetBudgetResult, ServerError> {
+        let partition = budget_partition(budget_id, &self.config.partition_config);
+        let bctx = BudgetKeyContext::new(&partition, budget_id);
+        let resets_key = keys::budget_resets_key(bctx.hash_tag());
+
+        // KEYS (3): budget_def, budget_usage, budget_resets_zset
+        let fcall_keys: Vec<String> = vec![bctx.definition(), bctx.usage(), resets_key];
+
+        // ARGV (2): budget_id, now_ms
+        let now = TimestampMs::now();
+        let fcall_args: Vec<String> = vec![budget_id.to_string(), now.to_string()];
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .fcall_with_reload("ff_reset_budget", &key_refs, &arg_refs)
+            .await?;
+
+        parse_reset_budget_result(&raw)
     }
 
     // ── Flow API ──
@@ -615,10 +676,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_create_flow", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_create_flow", &key_refs, &arg_refs)
+            .await?;
 
         parse_create_flow_result(&raw, &args.flow_id)
     }
@@ -650,10 +709,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_add_execution_to_flow", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_add_execution_to_flow", &key_refs, &arg_refs)
+            .await?;
 
         let result = parse_add_execution_to_flow_result(&raw)?;
 
@@ -696,10 +753,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_cancel_flow", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_cancel_flow", &key_refs, &arg_refs)
+            .await?;
 
         let result = parse_cancel_flow_result(&raw)?;
 
@@ -717,7 +772,7 @@ impl Server {
                 let cancel_args = CancelExecutionArgs {
                     execution_id: eid,
                     reason: args.reason.clone(),
-                    source: Some("operator_override".to_owned()),
+                    source: CancelSource::OperatorOverride,
                     lease_id: None,
                     lease_epoch: None,
                     attempt_id: None,
@@ -774,10 +829,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_stage_dependency_edge", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_stage_dependency_edge", &key_refs, &arg_refs)
+            .await?;
 
         parse_stage_dependency_edge_result(&raw)
     }
@@ -832,10 +885,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_apply_dependency_to_child", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_apply_dependency_to_child", &key_refs, &arg_refs)
+            .await?;
 
         parse_apply_dependency_result(&raw)
     }
@@ -934,10 +985,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_deliver_signal", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_deliver_signal", &key_refs, &arg_refs)
+            .await?;
 
         parse_deliver_signal_result(&raw, &args.signal_id)
     }
@@ -975,12 +1024,60 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_change_priority", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_change_priority", &key_refs, &arg_refs)
+            .await?;
 
         parse_change_priority_result(&raw, execution_id)
+    }
+
+    /// Revoke an active lease (operator-initiated).
+    pub async fn revoke_lease(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<RevokeLeaseResult, ServerError> {
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // Pre-read worker_instance_id for worker_leases key
+        let wiid_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "current_worker_instance_id")
+            .await
+            .map_err(|e| ServerError::Valkey(format!("HGET worker_instance_id: {e}")))?;
+        let wiid = match wiid_str {
+            Some(ref s) if !s.is_empty() => WorkerInstanceId::new(s),
+            _ => {
+                return Err(ServerError::NotFound(format!(
+                    "no active lease for execution {execution_id} (no current_worker_instance_id)"
+                )));
+            }
+        };
+
+        // KEYS (5): exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases
+        let fcall_keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&wiid),
+        ];
+
+        // ARGV (3): execution_id, expected_lease_id (empty = skip check), revoke_reason
+        let fcall_args: Vec<String> = vec![
+            execution_id.to_string(),
+            String::new(), // no expected_lease_id check
+            "operator_revoke".to_owned(),
+        ];
+
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: Value = self
+            .fcall_with_reload("ff_revoke_lease", &key_refs, &arg_refs)
+            .await?;
+
+        parse_revoke_lease_result(&raw)
     }
 
     /// Get full execution info via HGETALL on exec_core.
@@ -1054,6 +1151,135 @@ impl Server {
         })
     }
 
+    /// List executions from a partition's index ZSET.
+    ///
+    /// No FCALL — direct ZRANGE + pipelined HMGET reads.
+    pub async fn list_executions(
+        &self,
+        partition_id: u16,
+        lane: &LaneId,
+        state_filter: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<ListExecutionsResult, ServerError> {
+        let partition = ff_core::partition::Partition {
+            family: ff_core::partition::PartitionFamily::Execution,
+            index: partition_id,
+        };
+        let idx = IndexKeys::new(&partition);
+
+        let zset_key = match state_filter {
+            "eligible" => idx.lane_eligible(lane),
+            "delayed" => idx.lane_delayed(lane),
+            "terminal" => idx.lane_terminal(lane),
+            "suspended" => idx.lane_suspended(lane),
+            "active" => idx.lane_active(lane),
+            other => {
+                return Err(ServerError::InvalidInput(format!(
+                    "invalid state_filter: {other}. Use: eligible, delayed, terminal, suspended, active"
+                )));
+            }
+        };
+
+        // ZRANGE key -inf +inf BYSCORE LIMIT offset count
+        let eids: Vec<String> = self
+            .client
+            .cmd("ZRANGE")
+            .arg(&zset_key)
+            .arg("-inf")
+            .arg("+inf")
+            .arg("BYSCORE")
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(limit)
+            .execute()
+            .await
+            .map_err(|e| ServerError::Valkey(format!("ZRANGE {zset_key}: {e}")))?;
+
+        if eids.is_empty() {
+            return Ok(ListExecutionsResult {
+                executions: vec![],
+                total_returned: 0,
+            });
+        }
+
+        // Parse execution IDs, warning on corrupt ZSET members
+        let mut parsed = Vec::with_capacity(eids.len());
+        for eid_str in &eids {
+            match ExecutionId::parse(eid_str) {
+                Ok(id) => parsed.push(id),
+                Err(e) => {
+                    tracing::warn!(
+                        raw_id = %eid_str,
+                        error = %e,
+                        zset = %zset_key,
+                        "list_executions: ZSET member failed to parse as ExecutionId (data corruption?)"
+                    );
+                }
+            }
+        }
+
+        if parsed.is_empty() {
+            return Ok(ListExecutionsResult {
+                executions: vec![],
+                total_returned: 0,
+            });
+        }
+
+        // Pipeline all HMGETs into a single round-trip
+        let mut pipe = self.client.pipeline();
+        let mut slots = Vec::with_capacity(parsed.len());
+        for eid in &parsed {
+            let ep = execution_partition(eid, &self.config.partition_config);
+            let ctx = ExecKeyContext::new(&ep, eid);
+            let slot = pipe
+                .cmd::<Vec<Option<String>>>("HMGET")
+                .arg(ctx.core())
+                .arg("namespace")
+                .arg("lane_id")
+                .arg("execution_kind")
+                .arg("public_state")
+                .arg("priority")
+                .arg("created_at")
+                .finish();
+            slots.push(slot);
+        }
+
+        pipe.execute()
+            .await
+            .map_err(|e| ServerError::Valkey(format!("pipeline HMGET: {e}")))?;
+
+        let mut summaries = Vec::with_capacity(parsed.len());
+        for (eid, slot) in parsed.into_iter().zip(slots) {
+            let fields: Vec<Option<String>> = slot.value()
+                .map_err(|e| ServerError::Valkey(format!("pipeline slot: {e}")))?;
+
+            let field = |i: usize| -> String {
+                fields
+                    .get(i)
+                    .and_then(|v| v.as_ref())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+
+            summaries.push(ExecutionSummary {
+                execution_id: eid,
+                namespace: field(0),
+                lane_id: field(1),
+                execution_kind: field(2),
+                public_state: field(3),
+                priority: field(4).parse().unwrap_or(0),
+                created_at: field(5),
+            });
+        }
+
+        let total = summaries.len();
+        Ok(ListExecutionsResult {
+            executions: summaries,
+            total_returned: total,
+        })
+    }
+
     /// Replay a terminal execution.
     ///
     /// Pre-reads exec_core for flow_id and dep edges (variable KEYS).
@@ -1076,7 +1302,7 @@ impl Server {
             .arg("terminal_outcome")
             .execute()
             .await
-            .unwrap_or_default();
+            .map_err(|e| ServerError::Valkey(format!("HMGET replay pre-read: {e}")))?;
         let lane = LaneId::new(
             dyn_fields
                 .first()
@@ -1124,7 +1350,7 @@ impl Server {
                 .arg(flow_ctx.incoming(execution_id))
                 .execute()
                 .await
-                .unwrap_or_default();
+                .map_err(|e| ServerError::Valkey(format!("SMEMBERS replay edges: {e}")))?;
 
             // Extended KEYS: blocked_deps_zset, deps_meta, deps_unresolved, dep_edge_0..N
             fcall_keys.push(idx.lane_blocked_dependencies(&lane)); // 5
@@ -1142,10 +1368,8 @@ impl Server {
         let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
 
         let raw: Value = self
-            .client
-            .fcall("ff_replay_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(|e| ServerError::Valkey(e.to_string()))?;
+            .fcall_with_reload("ff_replay_execution", &key_refs, &arg_refs)
+            .await?;
 
         parse_replay_result(&raw)
     }
@@ -1674,42 +1898,121 @@ fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
 }
 
 /// Parse ff_report_usage_and_check result.
-/// Domain-specific: {"OK"}, {"SOFT_BREACH", dim, action}, {"HARD_BREACH", dim, action, current, limit}
+/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
+///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
 fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, ServerError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => return Err(ServerError::Script("ff_report_usage_and_check: expected Array".into())),
     };
-    let status = match arr.first() {
-        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(Value::SimpleString(s))) => s.clone(),
+    let status_code = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
         _ => {
             return Err(ServerError::Script(
-                "ff_report_usage_and_check: expected status string".into(),
+                "ff_report_usage_and_check: expected Int status code".into(),
             ))
         }
     };
-    match status.as_str() {
+    if status_code != 1 {
+        let error_code = fcall_field_str(arr, 1);
+        return Err(ServerError::OperationFailed(format!(
+            "ff_report_usage_and_check failed: {error_code}"
+        )));
+    }
+    let sub_status = fcall_field_str(arr, 1);
+    match sub_status.as_str() {
         "OK" => Ok(ReportUsageResult::Ok),
+        "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
-            let dim = fcall_field_str(arr, 1);
-            let action = fcall_field_str(arr, 2);
-            Ok(ReportUsageResult::SoftBreach { dimension: dim, action })
+            let dim = fcall_field_str(arr, 2);
+            let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
+            let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
+            Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
         }
         "HARD_BREACH" => {
-            let dim = fcall_field_str(arr, 1);
-            let action = fcall_field_str(arr, 2);
+            let dim = fcall_field_str(arr, 2);
             let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
             let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
             Ok(ReportUsageResult::HardBreach {
                 dimension: dim,
-                action,
                 current_usage: current,
                 hard_limit: limit,
             })
         }
         _ => Err(ServerError::OperationFailed(format!(
-            "ff_report_usage_and_check failed: {status}"
+            "ff_report_usage_and_check: unknown sub-status: {sub_status}"
         ))),
+    }
+}
+
+fn parse_revoke_lease_result(raw: &Value) -> Result<RevokeLeaseResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_revoke_lease: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        _ => return Err(ServerError::Script("ff_revoke_lease: bad status code".into())),
+    };
+    if status == 1 {
+        let sub = fcall_field_str(arr, 1);
+        if sub == "ALREADY_SATISFIED" {
+            let reason = fcall_field_str(arr, 2);
+            Ok(RevokeLeaseResult::AlreadySatisfied { reason })
+        } else {
+            let lid = fcall_field_str(arr, 2);
+            let epoch = fcall_field_str(arr, 3);
+            Ok(RevokeLeaseResult::Revoked {
+                lease_id: lid,
+                lease_epoch: epoch,
+            })
+        }
+    } else {
+        let error_code = fcall_field_str(arr, 1);
+        Err(ServerError::OperationFailed(format!(
+            "ff_revoke_lease failed: {error_code}"
+        )))
+    }
+}
+
+/// Detect Valkey errors indicating the Lua function library is not loaded.
+///
+/// After a failover, the new primary may not have the library if replication
+/// was incomplete. Valkey returns `ERR Function not loaded` for FCALL calls
+/// targeting missing functions.
+fn is_function_not_loaded(e: &ferriskey::Error) -> bool {
+    if matches!(e.kind(), ferriskey::ErrorKind::NoScriptError) {
+        return true;
+    }
+    e.detail()
+        .map(|d| {
+            d.contains("Function not loaded")
+                || d.contains("No matching function")
+                || d.contains("function not found")
+        })
+        .unwrap_or(false)
+        || e.to_string().contains("Function not loaded")
+}
+
+fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerError> {
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => return Err(ServerError::Script("ff_reset_budget: expected Array".into())),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        _ => return Err(ServerError::Script("ff_reset_budget: bad status code".into())),
+    };
+    if status == 1 {
+        let next_str = fcall_field_str(arr, 2);
+        let next_ms: i64 = next_str.parse().unwrap_or(0);
+        Ok(ResetBudgetResult::Reset {
+            next_reset_at: TimestampMs::from_millis(next_ms),
+        })
+    } else {
+        let error_code = fcall_field_str(arr, 1);
+        Err(ServerError::OperationFailed(format!(
+            "ff_reset_budget failed: {error_code}"
+        )))
     }
 }

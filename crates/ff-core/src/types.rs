@@ -231,6 +231,52 @@ string_id! {
     WaitpointKey
 }
 
+/// Source of a cancel operation, determining authorization behavior.
+/// "operator_override" bypasses lease checks; "lease_holder" requires valid lease.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelSource {
+    #[default]
+    OperatorOverride,
+    LeaseHolder,
+    FlowCascade,
+    SystemTimeout,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl CancelSource {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OperatorOverride => "operator_override",
+            Self::LeaseHolder => "lease_holder",
+            Self::FlowCascade => "flow_cascade",
+            Self::SystemTimeout => "system_timeout",
+            Self::Custom(s) => s,
+        }
+    }
+}
+
+impl fmt::Display for CancelSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for CancelSource {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "operator_override" => Self::OperatorOverride,
+            "lease_holder" => Self::LeaseHolder,
+            "flow_cascade" => Self::FlowCascade,
+            "system_timeout" => Self::SystemTimeout,
+            other => Self::Custom(other.to_owned()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -351,6 +351,10 @@ pub enum ScriptError {
     #[error("invalid_quota_spec: malformed quota policy definition")]
     InvalidQuotaSpec,
 
+    /// Caller supplied a non-numeric value where a number is required.
+    #[error("invalid_input: {0}")]
+    InvalidInput(String),
+
     // ── Transport-level errors (not from Lua) ──
     /// Valkey connection or protocol error.
     #[error("valkey error: {0}")]
@@ -407,6 +411,7 @@ impl ScriptError {
             | Self::QuotaPolicyNotFound
             | Self::QuotaAttachConflict
             | Self::InvalidQuotaSpec
+            | Self::InvalidInput(_)
             | Self::Valkey(_)
             | Self::Parse(_) => ErrorClass::Terminal,
 
@@ -541,6 +546,7 @@ impl ScriptError {
             "concurrency_limit_exceeded" => Self::ConcurrencyLimitExceeded,
             "quota_attach_conflict" => Self::QuotaAttachConflict,
             "invalid_quota_spec" => Self::InvalidQuotaSpec,
+            "invalid_input" => Self::InvalidInput(String::new()),
             _ => return None,
         })
     }

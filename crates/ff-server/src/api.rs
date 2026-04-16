@@ -5,8 +5,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -41,8 +42,12 @@ where
             Ok(Json(value)) => Ok(AppJson(value)),
             Err(rejection) => {
                 let status = rejection.status();
+                tracing::debug!(detail = %rejection.body_text(), "JSON rejection");
                 let body = ErrorBody {
-                    error: rejection.body_text(),
+                    error: format!(
+                        "invalid JSON: {}",
+                        status.canonical_reason().unwrap_or("bad request"),
+                    ),
                 };
                 Err((status, Json(body)).into_response())
             }
@@ -79,18 +84,19 @@ impl IntoResponse for ApiError {
 
 // ── Router ──
 
-pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
+pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<String>) -> Router {
     let cors = build_cors_layer(cors_origins);
 
-    Router::new()
+    let mut app = Router::new()
         // Executions
-        .route("/v1/executions", post(create_execution))
+        .route("/v1/executions", get(list_executions).post(create_execution))
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/state", get(get_execution_state))
         .route("/v1/executions/{id}/cancel", post(cancel_execution))
         .route("/v1/executions/{id}/signal", post(deliver_signal))
         .route("/v1/executions/{id}/priority", put(change_priority))
         .route("/v1/executions/{id}/replay", post(replay_execution))
+        .route("/v1/executions/{id}/revoke-lease", post(revoke_lease))
         // Flows
         .route("/v1/flows", post(create_flow))
         .route("/v1/flows/{id}/members", post(add_execution_to_flow))
@@ -101,13 +107,65 @@ pub fn router(server: Arc<Server>, cors_origins: &[String]) -> Router {
         .route("/v1/budgets", post(create_budget))
         .route("/v1/budgets/{id}", get(get_budget_status))
         .route("/v1/budgets/{id}/usage", post(report_usage))
+        .route("/v1/budgets/{id}/reset", post(reset_budget))
         // Quotas
         .route("/v1/quotas", post(create_quota_policy))
-        // Health
-        .route("/healthz", get(healthz))
-        .layer(TraceLayer::new_for_http())
+        // Health (always unauthenticated)
+        .route("/healthz", get(healthz));
+
+    if let Some(token) = api_token {
+        let token = Arc::new(token);
+        app = app.layer(middleware::from_fn(move |req, next| {
+            let token = token.clone();
+            auth_middleware(token, req, next)
+        }));
+    }
+
+    app.layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(server)
+}
+
+async fn auth_middleware(
+    token: Arc<String>,
+    req: Request,
+    next: middleware::Next,
+) -> Response {
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let authorized = auth_header
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes()));
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "missing or invalid Authorization header".to_owned(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
@@ -118,6 +176,13 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
         .iter()
         .filter_map(|o| o.parse().ok())
         .collect();
+    if parsed.is_empty() && !origins.is_empty() {
+        tracing::warn!(
+            configured = ?origins,
+            "all configured CORS origins failed to parse, falling back to permissive"
+        );
+        return CorsLayer::permissive();
+    }
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(parsed))
         .allow_methods([Method::GET, Method::POST, Method::PUT])
@@ -125,6 +190,35 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 }
 
 // ── Execution handlers ──
+
+#[derive(Deserialize)]
+struct ListExecutionsParams {
+    partition: u16,
+    #[serde(default = "default_lane")]
+    lane: String,
+    #[serde(default = "default_state_filter")]
+    state: String,
+    #[serde(default = "default_limit")]
+    limit: u64,
+    #[serde(default)]
+    offset: u64,
+}
+
+fn default_lane() -> String { "default".to_owned() }
+fn default_state_filter() -> String { "eligible".to_owned() }
+fn default_limit() -> u64 { 50 }
+
+async fn list_executions(
+    State(server): State<Arc<Server>>,
+    Query(params): Query<ListExecutionsParams>,
+) -> Result<Json<ListExecutionsResult>, ApiError> {
+    let lane = ff_core::types::LaneId::new(&params.lane);
+    let limit = params.limit.min(1000);
+    let result = server
+        .list_executions(params.partition, &lane, &params.state, params.offset, limit)
+        .await?;
+    Ok(Json(result))
+}
 
 async fn create_execution(
     State(server): State<Arc<Server>>,
@@ -198,6 +292,14 @@ async fn replay_execution(
     Ok(Json(server.replay_execution(&eid).await?))
 }
 
+async fn revoke_lease(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<RevokeLeaseResult>, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    Ok(Json(server.revoke_lease(&eid).await?))
+}
+
 // ── Flow handlers ──
 
 async fn create_flow(
@@ -216,11 +318,16 @@ async fn add_execution_to_flow(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
     AppJson(mut args): AppJson<AddExecutionToFlowArgs>,
-) -> Result<Json<AddExecutionToFlowResult>, ApiError> {
+) -> Result<(StatusCode, Json<AddExecutionToFlowResult>), ApiError> {
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    Ok(Json(server.add_execution_to_flow(&args).await?))
+    let result = server.add_execution_to_flow(&args).await?;
+    let status = match &result {
+        AddExecutionToFlowResult::Added { .. } => StatusCode::CREATED,
+        AddExecutionToFlowResult::AlreadyMember { .. } => StatusCode::OK,
+    };
+    Ok((status, Json(result)))
 }
 
 async fn cancel_flow(
@@ -283,6 +390,8 @@ async fn get_budget_status(
 struct ReportUsageBody {
     dimensions: HashMap<String, u64>,
     now: ff_core::types::TimestampMs,
+    #[serde(default)]
+    dedup_key: Option<String>,
 }
 
 async fn report_usage(
@@ -297,8 +406,17 @@ async fn report_usage(
         dimensions: dims,
         deltas,
         now: body.now,
+        dedup_key: body.dedup_key,
     };
     Ok(Json(server.report_usage(&bid, &args).await?))
+}
+
+async fn reset_budget(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<ResetBudgetResult>, ApiError> {
+    let bid = parse_budget_id(&id)?;
+    Ok(Json(server.reset_budget(&bid).await?))
 }
 
 async fn create_quota_policy(

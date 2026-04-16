@@ -15,6 +15,17 @@ local function err(...)
   return {0, ...}
 end
 
+-- Require a numeric value from ARGV. Returns the number on success or
+-- an err() tuple on failure. Callers must check: if type(n) == "table"
+-- then return n end  (the table IS the err tuple).
+local function require_number(val, name)
+  local n = tonumber(val)
+  if n == nil then
+    return err("invalid_input", name .. " must be a number, got: " .. tostring(val))
+  end
+  return n
+end
+
 local function ok_already_satisfied(...)
   return {1, "ALREADY_SATISFIED", ...}
 end
@@ -262,7 +273,9 @@ local function initialize_condition(json)
   local matchers = {}
   local names = spec.required_signal_names or {}
   if #names == 0 then
-    -- Single wildcard matcher (matches any signal name)
+    -- Empty required_signal_names acts as wildcard: ANY signal satisfies the condition.
+    -- To require explicit operator resume (no signal match), pass a sentinel name
+    -- that no real signal will match, or use a different resume mechanism.
     matchers[1] = { name = "", satisfied = false, signal_id = "" }
   else
     for i, name in ipairs(names) do

@@ -129,6 +129,10 @@ impl TestCluster {
 
     /// Clear all data keys for a clean test slate.
     /// Uses FLUSHDB — safe for test environments. Preserves loaded functions.
+    ///
+    /// This means tests MUST run with `--test-threads=1`. Parallel test
+    /// execution on the same Valkey instance is not supported — a concurrent
+    /// FLUSHDB from one test would destroy another test's data.
     async fn cleanup_ff_keys(&self) {
         let _: String = self
             .client

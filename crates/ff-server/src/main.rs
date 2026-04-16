@@ -25,6 +25,7 @@ async fn main() {
 
     let listen_addr = config.listen_addr.clone();
     let cors_origins = config.cors_origins.clone();
+    let api_token = config.api_token.clone();
 
     let server = match Server::start(config).await {
         Ok(s) => s,
@@ -35,7 +36,7 @@ async fn main() {
     };
 
     let server = Arc::new(server);
-    let app = api::router(server.clone(), &cors_origins);
+    let app = api::router(server.clone(), &cors_origins, api_token);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await

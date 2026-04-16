@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ferriskey::Value;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::execution_partition;
 use ff_core::policy::ExecutionPolicy;
@@ -225,103 +224,6 @@ pub async fn create_test_execution_direct(
     params.execution_id.clone()
 }
 
-/// Create a test execution via FCALL (when ff-script wrappers are available).
-///
-/// This calls `ff_create_execution` through ferriskey's raw FCALL interface.
-/// Returns the execution ID on success, panics on failure.
-///
-/// # Key construction
-///
-/// The FCALL wrapper needs KEYS passed in a specific order matching the Lua
-/// script's `KEYS[n]` references. The exact KEYS layout will be defined by
-/// the `ff_function!` macro in Step 1.2. For now, this function constructs
-/// a reasonable set of keys and ARGV.
-pub async fn create_test_execution_via_fcall(
-    tc: &TestCluster,
-    params: &CreateTestExecutionParams,
-) -> ExecutionId {
-    let config = tc.partition_config();
-    let partition = execution_partition(&params.execution_id, config);
-    let ctx = ExecKeyContext::new(&partition, &params.execution_id);
-    let idx = IndexKeys::new(&partition);
-    let now = tc.now();
-
-    let policy_json = serde_json::to_string(&params.policy).unwrap();
-    let tags_json = serde_json::to_string(&params.tags).unwrap();
-    let delay_str = params
-        .delay_until
-        .map(|d| d.0.to_string())
-        .unwrap_or_default();
-
-    // KEYS: core, payload, policy, tags, eligible_idx, delayed_idx, all_exec, idem_key
-    let keys: Vec<String> = vec![
-        ctx.core(),
-        ctx.payload(),
-        ctx.policy(),
-        ctx.tags(),
-        idx.lane_eligible(&params.lane_id),
-        idx.lane_delayed(&params.lane_id),
-        idx.all_executions(),
-        ctx.noop(), // idempotency placeholder — must share hash tag for cluster mode
-    ];
-
-    // ARGV: eid, namespace, lane, kind, payload, encoding, priority, creator,
-    //        idem_key, policy_json, tags_json, delay_until, partition_id, now
-    let args: Vec<String> = vec![
-        params.execution_id.to_string(),
-        params.namespace.to_string(),
-        params.lane_id.to_string(),
-        params.execution_kind.clone(),
-        params.input_payload.clone(),
-        "json".to_owned(),
-        params.priority.to_string(),
-        params.creator_identity.clone(),
-        String::new(), // idempotency_key
-        policy_json,
-        tags_json,
-        delay_str,
-        partition.index.to_string(),
-        now.to_string(),
-    ];
-
-    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    let result: Value = tc
-        .client()
-        .fcall("ff_create_execution", &key_refs, &arg_refs)
-        .await
-        .unwrap_or_else(|e| {
-            panic!("FCALL ff_create_execution failed: {e}. Is the flowfabric library loaded?")
-        });
-
-    // Parse result: expect {1, "OK", execution_id, public_state}
-    match &result {
-        Value::Array(arr) if !arr.is_empty() => {
-            match &arr[0] {
-                Ok(Value::Int(1)) => {
-                    // Success
-                    params.execution_id.clone()
-                }
-                Ok(Value::Int(0)) => {
-                    // Error — extract error message
-                    let err_msg = arr
-                        .get(1)
-                        .and_then(|v| match v {
-                            Ok(Value::BulkString(b)) => {
-                                Some(String::from_utf8_lossy(b).to_string())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "unknown error".to_string());
-                    panic!("ff_create_execution returned error: {err_msg}");
-                }
-                other => panic!("unexpected FCALL return format: {other:?}"),
-            }
-        }
-        other => panic!("unexpected FCALL return: {other:?}"),
-    }
-}
 
 /// Poll until the execution reaches the expected public state, or timeout.
 ///

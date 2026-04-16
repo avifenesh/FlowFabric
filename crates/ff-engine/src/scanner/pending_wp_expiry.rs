@@ -11,17 +11,18 @@ use std::time::Duration;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 
-use super::{ScanResult, Scanner};
+use super::{FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 100;
 
 pub struct PendingWaitpointExpiryScanner {
     interval: Duration,
+    failures: FailureTracker,
 }
 
 impl PendingWaitpointExpiryScanner {
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self { interval, failures: FailureTracker::new() }
     }
 }
 
@@ -74,6 +75,10 @@ impl Scanner for PendingWaitpointExpiryScanner {
             }
         };
 
+        if partition == 0 {
+            self.failures.advance_cycle();
+        }
+
         if expired.is_empty() {
             return ScanResult { processed: 0, errors: 0 };
         }
@@ -82,8 +87,15 @@ impl Scanner for PendingWaitpointExpiryScanner {
         let mut errors: u32 = 0;
 
         for wp_id_str in &expired {
+            if self.failures.should_skip(wp_id_str) {
+                continue;
+            }
+
             match close_expired_waitpoint(client, &tag, &idx, wp_id_str).await {
-                Ok(()) => processed += 1,
+                Ok(()) => {
+                    self.failures.record_success(wp_id_str);
+                    processed += 1;
+                }
                 Err(e) => {
                     tracing::warn!(
                         partition,
@@ -91,6 +103,7 @@ impl Scanner for PendingWaitpointExpiryScanner {
                         error = %e,
                         "pending_wp_expiry: ff_close_waitpoint failed"
                     );
+                    self.failures.record_failure(wp_id_str, "pending_wp_expiry");
                     errors += 1;
                 }
             }

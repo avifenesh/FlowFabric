@@ -129,9 +129,9 @@ redis.register_function('ff_append_frame', function(keys, args)
     "last_frame_at", tostring(now_ms))
 
   -- 7. Apply retention trim (approximate for performance)
-  if A.retention_maxlen > 0 then
-    redis.call("XTRIM", K.stream_key, "MAXLEN", "~", A.retention_maxlen)
-  end
+  local maxlen = A.retention_maxlen
+  if maxlen == 0 then maxlen = 10000 end  -- default cap prevents unbounded growth
+  redis.call("XTRIM", K.stream_key, "MAXLEN", "~", maxlen)
 
   return ok(entry_id, tostring(frame_count))
 end)

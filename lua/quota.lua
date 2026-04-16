@@ -76,11 +76,20 @@ redis.register_function('ff_check_admission_and_record', function(keys, args)
     admitted_set       = keys[5],
   }
 
+  local now_ms_n          = require_number(args[1], "now_ms")
+  if type(now_ms_n) == "table" then return now_ms_n end
+  local window_seconds_n  = require_number(args[2], "window_seconds")
+  if type(window_seconds_n) == "table" then return window_seconds_n end
+  local rate_limit_n      = require_number(args[3], "rate_limit")
+  if type(rate_limit_n) == "table" then return rate_limit_n end
+  local concurrency_cap_n = require_number(args[4], "concurrency_cap")
+  if type(concurrency_cap_n) == "table" then return concurrency_cap_n end
+
   local A = {
-    now_ms          = tonumber(args[1]),
-    window_seconds  = tonumber(args[2]),
-    rate_limit      = tonumber(args[3]),
-    concurrency_cap = tonumber(args[4]),
+    now_ms          = now_ms_n,
+    window_seconds  = window_seconds_n,
+    rate_limit      = rate_limit_n,
+    concurrency_cap = concurrency_cap_n,
     execution_id    = args[5],
     jitter_ms       = tonumber(args[6] or "0"),
   }
@@ -140,4 +149,37 @@ redis.register_function('ff_check_admission_and_record', function(keys, args)
   redis.call("SADD", K.admitted_set, A.execution_id)
 
   return { "ADMITTED" }
+end)
+
+---------------------------------------------------------------------------
+-- ff_release_admission  (on {q:K})
+--
+-- Release a previously-recorded admission slot. Called when a claim grant
+-- fails after admission was recorded, preventing leaked concurrency slots.
+--
+-- KEYS (3): admitted_guard_key, admitted_set, concurrency_counter
+-- ARGV (1): execution_id
+---------------------------------------------------------------------------
+redis.register_function('ff_release_admission', function(keys, args)
+  local K = {
+    admitted_guard_key = keys[1],
+    admitted_set       = keys[2],
+    concurrency_key    = keys[3],
+  }
+
+  local execution_id = args[1]
+
+  -- 1. Delete the guard key (idempotent — DEL returns 0 if absent)
+  redis.call("DEL", K.admitted_guard_key)
+
+  -- 2. Remove from admitted set
+  redis.call("SREM", K.admitted_set, execution_id)
+
+  -- 3. Decrement concurrency counter (floor at 0)
+  local current = tonumber(redis.call("GET", K.concurrency_key) or "0")
+  if current > 0 then
+    redis.call("DECR", K.concurrency_key)
+  end
+
+  return {1, "OK", "released"}
 end)

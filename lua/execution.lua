@@ -31,12 +31,15 @@ redis.register_function('ff_create_execution', function(keys, args)
     all_executions_set  = keys[8],
   }
 
+  local priority_n = require_number(args[5], "priority")
+  if type(priority_n) == "table" then return priority_n end
+
   local A = {
     execution_id        = args[1],
     namespace           = args[2],
     lane_id             = args[3],
     execution_kind      = args[4],
-    priority            = tonumber(args[5]),
+    priority            = priority_n,
     creator_identity    = args[6],
     policy_json         = args[7],
     input_payload       = args[8],
@@ -58,11 +61,11 @@ redis.register_function('ff_create_execution', function(keys, args)
   if A.priority < 0 then A.priority = 0 end
   if A.priority > 9000 then A.priority = 9000 end
 
-  -- 1. Idempotency check (only when dedup_ttl_ms > 0 and idem_key provided)
-  if is_set(A.idem_key) and (tonumber(A.dedup_ttl_ms) or 0) > 0 then
+  -- 1. Idempotency check (only when idem_key is a real key, not the noop placeholder)
+  if K.idem_key ~= "" and not string.find(K.idem_key, "ff:noop:") then
     local existing = redis.call("GET", K.idem_key)
     if existing then
-      return {1, "DUPLICATE", existing}
+      return ok_duplicate(existing)
     end
   end
 
@@ -195,9 +198,9 @@ redis.register_function('ff_create_execution', function(keys, args)
   -- Guard: PX 0 or PX <0 causes Valkey error ("invalid expire time"),
   -- which would abort the FCALL after exec_core was already written (step 4).
   local dedup_ms = tonumber(A.dedup_ttl_ms) or 0
-  if dedup_ms > 0 and is_set(A.idem_key) then
+  if dedup_ms > 0 and K.idem_key ~= "" and not string.find(K.idem_key, "ff:noop:") then
     redis.call("SET", K.idem_key, A.execution_id,
-      "PX", dedup_ms, "NX")
+      "PX", dedup_ms)
   end
 
   return ok(A.execution_id, public_state)
@@ -236,6 +239,11 @@ redis.register_function('ff_claim_execution', function(keys, args)
     execution_deadline_key = keys[14],
   }
 
+  local lease_ttl_n = require_number(args[7], "lease_ttl_ms")
+  if type(lease_ttl_n) == "table" then return lease_ttl_n end
+  local renew_before_n = require_number(args[8], "renew_before_ms")
+  if type(renew_before_n) == "table" then return renew_before_n end
+
   local A = {
     execution_id         = args[1],
     worker_id            = args[2],
@@ -243,8 +251,8 @@ redis.register_function('ff_claim_execution', function(keys, args)
     lane                 = args[4],
     capability_hash      = args[5],
     lease_id             = args[6],
-    lease_ttl_ms         = tonumber(args[7]),
-    renew_before_ms      = tonumber(args[8]),
+    lease_ttl_ms         = lease_ttl_n,
+    renew_before_ms      = renew_before_n,
     attempt_id           = args[9],
     attempt_policy_json  = args[10],
     attempt_timeout_ms   = args[11],  -- "" or ms
@@ -989,12 +997,12 @@ redis.register_function('ff_fail_execution', function(keys, args)
         can_retry = true
         local bt = policy.backoff or {}
         if bt.type == "exponential" then
-          local initial = tonumber(bt.initial_delay_ms or "1000")
-          local max_d = tonumber(bt.max_delay_ms or "60000")
-          local mult = tonumber(bt.multiplier or "2")
+          local initial = (tonumber(bt.initial_delay_ms) or 1000)
+          local max_d = (tonumber(bt.max_delay_ms) or 60000)
+          local mult = (tonumber(bt.multiplier) or 2)
           backoff_ms = math.min(initial * (mult ^ retry_count), max_d)
         elseif bt.type == "fixed" then
-          backoff_ms = tonumber(bt.delay_ms or "1000")
+          backoff_ms = (tonumber(bt.delay_ms) or 1000)
         end
       end
     end
@@ -1129,13 +1137,16 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
     execution_deadline_key = keys[14],
   }
 
+  local reclaim_ttl_n = require_number(args[6], "lease_ttl_ms")
+  if type(reclaim_ttl_n) == "table" then return reclaim_ttl_n end
+
   local A = {
     execution_id        = args[1],
     worker_id           = args[2],
     worker_instance_id  = args[3],
     lane                = args[4],
     lease_id            = args[5],
-    lease_ttl_ms        = tonumber(args[6]),
+    lease_ttl_ms        = reclaim_ttl_n,
     attempt_id          = args[7],
     attempt_policy_json = args[8] or "",
   }
@@ -1206,7 +1217,7 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
 
     -- ZADD terminal (construct key from hash tag + lane)
     local tag = string.match(K.core_key, "(%b{})")
-    local lane = core.current_lane or "default"
+    local lane = core.lane_id or core.current_lane or "default"
     local terminal_key = "ff:idx:" .. tag .. ":lane:" .. lane .. ":terminal"
     redis.call("ZADD", terminal_key, now_ms, A.execution_id)
 
