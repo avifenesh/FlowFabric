@@ -95,7 +95,8 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
     def_key    = keys[3],
   }
 
-  local dim_count = tonumber(args[1])
+  local dim_count = require_number(args[1], "dim_count")
+  if type(dim_count) == "table" then return dim_count end
   local now_ms = args[2 * dim_count + 2]
 
   -- Phase 1: CHECK all dimensions BEFORE any increment.

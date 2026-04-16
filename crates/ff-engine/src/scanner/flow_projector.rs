@@ -238,6 +238,7 @@ async fn project_flow_summary(
         .cmd("HSET")
         .arg(&summary_key)
         .arg("total_members").arg(true_total.to_string().as_str())
+        .arg("sampled_members").arg(sampled.to_string().as_str())
         .arg("members_completed").arg(completed.to_string().as_str())
         .arg("members_failed").arg(failed.to_string().as_str())
         .arg("members_cancelled").arg(cancelled.to_string().as_str())

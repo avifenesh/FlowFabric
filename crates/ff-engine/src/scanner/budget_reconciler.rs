@@ -150,16 +150,16 @@ async fn reconcile_one_budget(
     let limits_key = format!("ff:budget:{}:{}:limits", tag, budget_id);
     let executions_key = format!("ff:budget:{}:{}:executions", tag, budget_id);
 
-    // Read budget definition to check for reset_policy
-    let reset_policy: Option<String> = client
+    // Read budget definition to check for reset_interval_ms
+    let reset_interval: Option<String> = client
         .cmd("HGET")
         .arg(&def_key)
-        .arg("reset_policy")
+        .arg("reset_interval_ms")
         .execute()
         .await?;
 
     // Skip resetting budgets — cannot reconcile by summing all-time usage
-    if let Some(ref rp) = reset_policy && !rp.is_empty() {
+    if let Some(ref ri) = reset_interval && !ri.is_empty() && ri != "0" {
         return Ok(false);
     }
 

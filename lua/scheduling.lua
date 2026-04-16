@@ -223,9 +223,12 @@ redis.register_function('ff_promote_delayed', function(keys, args)
     eligible_zset = keys[3],
   }
 
+  local now_ms_n = require_number(args[2], "now_ms")
+  if type(now_ms_n) == "table" then return now_ms_n end
+
   local A = {
     execution_id = args[1],
-    now_ms       = tonumber(args[2]),
+    now_ms       = now_ms_n,
   }
 
   -- Read and validate
