@@ -110,11 +110,9 @@ impl BudgetChecker {
         usage_key: &str,
         limits_key: &str,
     ) -> Result<BudgetCheckResult, ferriskey::Error> {
-        // Read all limit dimensions
-        let limits: Vec<(String, String)> = client
-            .cmd("HGETALL")
-            .arg(limits_key)
-            .execute()
+        // Read all limit dimensions via hgetall (returns HashMap, not flat pairs)
+        let limits: std::collections::HashMap<String, String> = client
+            .hgetall(limits_key)
             .await
             .unwrap_or_default();
 
@@ -255,7 +253,7 @@ impl Scheduler {
             // ── Budget pre-check (cross-partition, cached per cycle) ──
             if let Some(block_detail) = self
                 .check_budgets(&mut budget_checker, &exec_ctx, &core_key, &eid_s)
-                .await
+                .await?
             {
                 // Budget breached — block candidate and try next
                 self.block_candidate(
@@ -268,7 +266,7 @@ impl Scheduler {
             // ── Quota pre-check (cross-partition FCALL on {q:K}) ──
             if let Some(block_detail) = self
                 .check_quota(&exec_ctx, &core_key, &eid_s, now_ms)
-                .await
+                .await?
             {
                 // Quota denied — block candidate and try next
                 self.block_candidate(
@@ -339,7 +337,7 @@ impl Scheduler {
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
         _eid_s: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, SchedulerError> {
         // Read budget_ids from exec_core (comma-separated or JSON list)
         let budget_ids_str: Option<String> = self
             .client
@@ -347,12 +345,14 @@ impl Scheduler {
             .arg(core_key)
             .arg("budget_ids")
             .execute()
-            .await
-            .unwrap_or(None);
+            .await?;
 
-        let budget_ids_str = budget_ids_str?;
+        let budget_ids_str = match budget_ids_str {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         if budget_ids_str.is_empty() {
-            return None; // no budgets attached
+            return Ok(None); // no budgets attached
         }
 
         // Parse comma-separated budget IDs
@@ -363,11 +363,11 @@ impl Scheduler {
             }
             let result = checker.check_budget(&self.client, budget_id).await;
             if let BudgetCheckResult::HardBreach { detail, .. } = result {
-                return Some(detail.clone());
+                return Ok(Some(detail.clone()));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Check quota admission for the candidate. Returns block detail if denied.
@@ -377,7 +377,7 @@ impl Scheduler {
         core_key: &str,
         eid_s: &str,
         now_ms: u64,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, SchedulerError> {
         // Read quota_policy_id from exec_core
         let quota_id_str: Option<String> = self
             .client
@@ -385,12 +385,14 @@ impl Scheduler {
             .arg(core_key)
             .arg("quota_policy_id")
             .execute()
-            .await
-            .unwrap_or(None);
+            .await?;
 
-        let quota_id_str = quota_id_str?;
+        let quota_id_str = match quota_id_str {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         if quota_id_str.is_empty() {
-            return None; // no quota attached
+            return Ok(None); // no quota attached
         }
 
         // Compute real {q:K} partition tag from quota_policy_id
@@ -429,7 +431,7 @@ impl Scheduler {
 
         // No limits configured — admit
         if rate_limit == 0 && concurrency_cap == 0 {
-            return None;
+            return Ok(None);
         }
 
         // FCALL ff_check_admission_and_record on {q:K}
@@ -450,22 +452,22 @@ impl Scheduler {
                 // {"CONCURRENCY_EXCEEDED"}, {"ALREADY_ADMITTED"}
                 let status = Self::parse_admission_status(&result);
                 match status.as_str() {
-                    "ADMITTED" | "ALREADY_ADMITTED" => None,
-                    "RATE_EXCEEDED" => Some(format!(
+                    "ADMITTED" | "ALREADY_ADMITTED" => Ok(None),
+                    "RATE_EXCEEDED" => Ok(Some(format!(
                         "quota {}: rate limit {}/{} per {}s window",
                         quota_id_str, rate_limit, rate_limit, window_secs
-                    )),
-                    "CONCURRENCY_EXCEEDED" => Some(format!(
+                    ))),
+                    "CONCURRENCY_EXCEEDED" => Ok(Some(format!(
                         "quota {}: concurrency cap {}",
                         quota_id_str, concurrency_cap
-                    )),
+                    ))),
                     _ => {
                         tracing::warn!(
                             quota_id = quota_id_str.as_str(),
                             status = status.as_str(),
                             "scheduler: unexpected admission result"
                         );
-                        None // allow on unknown status (advisory)
+                        Ok(None) // allow on unknown status (advisory)
                     }
                 }
             }
@@ -473,9 +475,9 @@ impl Scheduler {
                 tracing::warn!(
                     quota_id = quota_id_str.as_str(),
                     error = %e,
-                    "scheduler: quota check failed, allowing (advisory)"
+                    "scheduler: quota FCALL failed, allowing (advisory)"
                 );
-                None // allow on error (advisory)
+                Ok(None) // allow on FCALL error (advisory — budget HGET errors propagate above)
             }
         }
     }
