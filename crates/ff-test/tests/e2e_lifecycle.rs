@@ -5284,13 +5284,23 @@ async fn test_flow_index_self_heal_on_add() {
     assert!(healed, "flow_index should be self-healed by ff_add_execution_to_flow");
 
     // 5. Negative: self-heal must NOT resurrect a cancelled flow. Cancel,
-    //    then a subsequent add attempt must fail with flow_already_terminal
-    //    AND leave the index empty.
+    //    then a subsequent add attempt must fail with flow_already_terminal.
+    //
+    //    NOTE on flow_index ownership: cancel_flow does NOT SREM flow_index
+    //    (the projector is the sole writer — it SREMs once it observes
+    //    sampled==true_total all-terminal members). So we assert the
+    //    negative invariant that matters for correctness: the *rejected*
+    //    add MUST NOT ADD the flow back to the index if a prior SREM had
+    //    dropped it. We pre-SREM the index here to simulate a projector
+    //    prune that ran between cancel and the retry, then confirm the
+    //    rejected add leaves it absent.
     fcall_cancel_flow(&tc, fid, "test_heal_cancel", "cancel_all").await;
-    let after_cancel: bool = tc.client()
-        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+
+    // Simulate the projector having already observed all-terminal and
+    // SREMd the flow (in real life this would take a projector cycle).
+    let _: u32 = tc.client()
+        .cmd("SREM").arg(flow_index_key).arg(fid)
         .execute().await.unwrap();
-    assert!(!after_cancel, "cancel should remove flow from flow_index");
 
     // Direct FCALL so we can inspect the error result without panicking
     let prefix = format!("ff:flow:{{fp:0}}:{fid}");

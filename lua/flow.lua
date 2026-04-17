@@ -178,15 +178,21 @@ end)
 -- Cancel a flow. Returns the member list for the caller to dispatch
 -- individual cancellations cross-partition.
 --
--- KEYS (3): flow_core, members_set, flow_index
+-- KEYS (3): flow_core, members_set, flow_index (RESERVED — see below)
 -- ARGV (4): flow_id, reason, cancellation_policy, now_ms (IGNORED —
 --   server time used so `cancelled_at` agrees with peer Lua fields)
+--
+-- KEYS[3] (flow_index) is accepted for caller-compatibility with the
+-- shared FlowStructOpKeys wrapper, but this function does NOT mutate
+-- flow_index. The projector is the sole SREM writer (see the "4b" note
+-- in the body below).
 ---------------------------------------------------------------------------
 redis.register_function('ff_cancel_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
-    flow_index  = keys[3],
+    -- keys[3] is flow_index; present in KEYS for wrapper symmetry but
+    -- unused in this function (see rationale near the end of the body).
   }
 
   local A = {
@@ -229,8 +235,16 @@ redis.register_function('ff_cancel_flow', function(keys, args)
     "cancellation_policy", A.cancellation_policy,
     "last_mutation_at", now_ms)
 
-  -- 4b. Remove from active flow_index (projector skips cancelled flows)
-  redis.call("SREM", K.flow_index, A.flow_id)
+  -- Do NOT SREM flow_index here. Member cancellations dispatch
+  -- asynchronously from ff-server; flow_projector needs to keep
+  -- projecting the flow while those cancels land so the summary
+  -- reflects the real progression (running/blocked → cancelled). The
+  -- projector owns the SREM once it observes sampled==true_total
+  -- all-terminal (see crates/ff-engine/src/scanner/flow_projector.rs).
+  -- A projector-owned SREM is also the right place because it is
+  -- the only writer that can prove every member has actually reached
+  -- terminal state. Removing the entry here would freeze the summary
+  -- at whatever snapshot was current when cancel_flow fired.
 
   -- 5. Return: ok(cancellation_policy, member1, member2, ...)
   -- Build array manually to include variable member list.

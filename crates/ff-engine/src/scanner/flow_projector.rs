@@ -68,25 +68,7 @@ impl Scanner for FlowProjector {
         };
         let tag = p.hash_tag();
         let fidx = FlowIndexKeys::new(&p);
-
-        // Discover flows via partition-level index SET (cluster-safe)
         let flow_index_key = fidx.flow_index();
-        let flow_ids: Vec<String> = match client
-            .cmd("SMEMBERS")
-            .arg(&flow_index_key)
-            .execute()
-            .await
-        {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!(partition, error = %e, "flow_projector: SMEMBERS failed");
-                return ScanResult { processed: 0, errors: 1 };
-            }
-        };
-
-        if flow_ids.is_empty() {
-            return ScanResult { processed: 0, errors: 0 };
-        }
 
         let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
             Ok(t) => t,
@@ -98,22 +80,53 @@ impl Scanner for FlowProjector {
 
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
+        let mut cursor = "0".to_string();
 
-        for fid_str in &flow_ids {
-            match project_flow_summary(
-                client, &tag, &flow_index_key, fid_str, now_ms, &self.partition_config,
-            ).await {
-                Ok(true) => processed += 1,
-                Ok(false) => {} // no members or already up-to-date
+        // Stream flow_index in SSCAN batches (COUNT 100) instead of a
+        // single SMEMBERS. SMEMBERS on a partition with many flows would
+        // materialise every flow_id into one Vec<String> before we could
+        // project the first one; SSCAN bounds memory to one batch and
+        // keeps the Valkey command's server-side work bounded per call.
+        loop {
+            let result: ferriskey::Value = match client
+                .cmd("SSCAN")
+                .arg(&flow_index_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await
+            {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(
-                        partition,
-                        flow_id = fid_str.as_str(),
-                        error = %e,
-                        "flow_projector: projection failed"
-                    );
-                    errors += 1;
+                    tracing::warn!(partition, error = %e, "flow_projector: SSCAN failed");
+                    return ScanResult { processed, errors: errors + 1 };
                 }
+            };
+
+            let (next_cursor, flow_ids) = parse_sscan_response(&result);
+
+            for fid_str in &flow_ids {
+                match project_flow_summary(
+                    client, &tag, &flow_index_key, fid_str, now_ms, &self.partition_config,
+                ).await {
+                    Ok(true) => processed += 1,
+                    Ok(false) => {} // no members or already up-to-date
+                    Err(e) => {
+                        tracing::warn!(
+                            partition,
+                            flow_id = fid_str.as_str(),
+                            error = %e,
+                            "flow_projector: projection failed"
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
             }
         }
 
@@ -278,5 +291,42 @@ async fn project_flow_summary(
     }
 
     Ok(true)
+}
+
+/// Parse an SSCAN reply `[cursor, [member1, member2, ...]]` into
+/// `(cursor, Vec<member>)`. Mirrors the helper in quota_reconciler so
+/// both scanners agree on the wire shape.
+fn parse_sscan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                if let Ok(ferriskey::Value::BulkString(b)) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                if let ferriskey::Value::BulkString(b) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (cursor, members)
 }
 

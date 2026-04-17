@@ -930,27 +930,49 @@ impl Server {
         }
 
         guard.spawn(async move {
-            for eid_str in &dispatch_members {
-                if let Err(e) = cancel_member_execution(
-                    &client,
-                    &partition_config,
-                    eid_str,
-                    &reason,
-                    now,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        flow_id = %flow_id,
-                        execution_id = %eid_str,
-                        error = %e,
-                        "cancel_flow(async): individual execution cancel failed (may be terminal)"
-                    );
-                }
-            }
+            // Bounded parallel dispatch via futures::stream::buffer_unordered.
+            // Sequential cancel of a 1000-member flow at ~2ms/FCALL is ~2s —
+            // too long to finish inside a 15s shutdown abort window for
+            // large flows. Bounding at CONCURRENCY keeps Valkey load
+            // predictable while still cutting wall-clock dispatch time by
+            // ~CONCURRENCY× for large member sets.
+            use futures::stream::StreamExt;
+            const CONCURRENCY: usize = 16;
+
+            let member_count = dispatch_members.len();
+            let flow_id_for_log = flow_id.clone();
+            futures::stream::iter(dispatch_members.into_iter())
+                .map(|eid_str| {
+                    let client = client.clone();
+                    let reason = reason.clone();
+                    let flow_id = flow_id.clone();
+                    async move {
+                        if let Err(e) = cancel_member_execution(
+                            &client,
+                            &partition_config,
+                            &eid_str,
+                            &reason,
+                            now,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                flow_id = %flow_id,
+                                execution_id = %eid_str,
+                                error = %e,
+                                "cancel_flow(async): individual execution cancel failed (may be terminal)"
+                            );
+                        }
+                    }
+                })
+                .buffer_unordered(CONCURRENCY)
+                .for_each(|()| async {})
+                .await;
+
             tracing::debug!(
-                flow_id = %flow_id,
-                member_count = dispatch_members.len(),
+                flow_id = %flow_id_for_log,
+                member_count,
+                concurrency = CONCURRENCY,
                 "cancel_flow: background member dispatch complete"
             );
         });
