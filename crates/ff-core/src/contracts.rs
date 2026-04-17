@@ -978,8 +978,15 @@ pub struct CancelFlowArgs {
 pub enum CancelFlowResult {
     /// Flow cancelled and all member cancellations (if any) have completed
     /// synchronously. Used when `cancellation_policy != "cancel_all"`, when
-    /// the flow has no members, or when the caller opted into synchronous
-    /// dispatch (e.g. `?wait=true`).
+    /// the flow has no members, when the caller opted into synchronous
+    /// dispatch (e.g. `?wait=true`), or when the flow was already in a
+    /// terminal state (idempotent retry).
+    ///
+    /// On the idempotent-retry path `member_execution_ids` may be *capped*
+    /// at the server (default 1000 entries) to bound response bandwidth on
+    /// flows with very large membership. The first (non-idempotent) call
+    /// always returns the full list, so clients that need every member id
+    /// should persist the initial response.
     Cancelled {
         cancellation_policy: String,
         member_execution_ids: Vec<String>,

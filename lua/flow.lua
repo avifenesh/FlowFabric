@@ -123,13 +123,6 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
     now_ms       = args[3],
   }
 
-  -- Self-heal flow_index: the projector may have SREMd this flow after
-  -- observing an all-terminal sample, but the flow is still "open" per
-  -- flow_core and can accept new members. Re-add idempotently so the
-  -- next projector cycle picks the flow back up. Same {fp:N} slot as the
-  -- other KEYS, so atomic with the membership mutation below.
-  redis.call("SADD", K.flow_index, A.flow_id)
-
   -- 1. Validate flow exists and is not terminal
   local raw = redis.call("HGETALL", K.flow_core)
   if #raw == 0 then return err("flow_not_found") end
@@ -138,6 +131,16 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
     return err("flow_already_terminal")
   end
+
+  -- Self-heal flow_index for LIVE flows only. The projector may have
+  -- SREMd this flow after observing an all-terminal sample, yet the
+  -- flow is still "open" per flow_core and can accept new members.
+  -- Re-add idempotently so the next projector cycle picks the flow
+  -- back up. Runs only after the terminal-state guard above so we do
+  -- not resurrect cancelled/completed/failed flows into the active
+  -- index. Same {fp:N} slot as the other KEYS, so atomic with the
+  -- membership mutation below.
+  redis.call("SADD", K.flow_index, A.flow_id)
 
   -- 2. Idempotency: already a member
   if redis.call("SISMEMBER", K.members_set, A.execution_id) == 1 then
@@ -197,6 +200,12 @@ redis.register_function('ff_cancel_flow', function(keys, args)
   -- cancellation_policy is persisted so an AlreadyTerminal retry can
   -- return the authoritative stored policy instead of echoing the
   -- caller's retry intent.
+  --
+  -- NOTE: this field is persisted from this library version onward.
+  -- Flows cancelled before this deploy reach public_flow_state='cancelled'
+  -- without a cancellation_policy value. The Rust caller detects the
+  -- empty field on HMGET and falls back to args.cancellation_policy, so
+  -- no backfill migration is needed.
   redis.call("HSET", K.flow_core,
     "public_flow_state", "cancelled",
     "cancelled_at", A.now_ms,

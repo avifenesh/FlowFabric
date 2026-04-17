@@ -96,9 +96,10 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 
 ## Production considerations
 
+- **Auth is opt-in** — if `FF_API_TOKEN` is unset, every endpoint except `GET /healthz` is reachable without authentication. Always set `FF_API_TOKEN` (and consider CORS via `FF_CORS_ORIGINS`) before exposing the server beyond localhost.
 - **No API rate limiting** — deploy behind a reverse proxy (nginx, Envoy) with rate limiting configured
 - **No HTTP connection limit** — axum accepts unbounded connections; configure limits at the load balancer
-- **cancel_flow on large flows** blocks the API handler while sequentially cancelling each member execution; consider async fan-out for flows with >1K members
+- **cancel_flow** returns `CancellationScheduled` immediately for `cancel_all` policy and dispatches member cancellations asynchronously (see `POST /v1/flows/{id}/cancel`); append `?wait=true` for synchronous completion. Background dispatch is drained with a 15s timeout on shutdown and may be aborted for very large flows.
 - **detect_cycle BFS** can issue ~100K `redis.call` operations on large DAGs (up to 1000 nodes × edges per node), blocking the Valkey event loop; keep flow graph fan-out moderate
 - **Terminal operation ambiguity** — if the Valkey connection drops during `complete()`, `fail()`, or `cancel()`, the operation may have committed server-side; callers should verify execution state via `get_execution_state()` before retrying
 - **Lua library after failover** — the server auto-reloads the Lua library on first "function not found" error after a Valkey failover, but the first request in the new epoch will fail and be retried

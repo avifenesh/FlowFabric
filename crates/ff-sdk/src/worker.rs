@@ -114,6 +114,35 @@ impl FlowFabricWorker {
             )));
         }
 
+        // Guard against two worker processes sharing the same
+        // `worker_instance_id`. A duplicate instance would clobber each
+        // other's lease_current/active_index entries and double-claim work.
+        // SET NX on a liveness key with 2× lease TTL; if the key already
+        // exists another process is live. The key auto-expires if this
+        // process crashes without renewal, so a restart after a hard crash
+        // just waits at most 2× lease_ttl_ms for the ghost entry to clear.
+        let alive_key = format!("ff:worker:{}:alive", config.worker_instance_id);
+        let alive_ttl_ms = (config.lease_ttl_ms.saturating_mul(2)).max(1_000);
+        let set_result: Option<String> = client
+            .cmd("SET")
+            .arg(&alive_key)
+            .arg("1")
+            .arg("NX")
+            .arg("PX")
+            .arg(alive_ttl_ms.to_string().as_str())
+            .execute()
+            .await
+            .map_err(|e| SdkError::ValkeyContext {
+                source: e,
+                context: "SET NX worker alive key".into(),
+            })?;
+        if set_result.is_none() {
+            return Err(SdkError::Config(format!(
+                "duplicate worker_instance_id '{}': another process already holds {alive_key}",
+                config.worker_instance_id
+            )));
+        }
+
         // Read partition config from Valkey (set by ff-server on startup).
         // Falls back to defaults if key doesn't exist (e.g. SDK-only testing).
         let partition_config = read_partition_config(&client).await

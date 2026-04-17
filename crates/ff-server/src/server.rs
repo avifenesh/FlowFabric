@@ -27,8 +27,15 @@ use ff_core::partition::{
 use ff_core::state::{PublicState, StateVector};
 use ff_core::types::*;
 use ff_engine::Engine;
+use ff_script::retry::is_retryable_kind;
 
 use crate::config::ServerConfig;
+
+/// Upper bound on `member_execution_ids` returned in the
+/// [`CancelFlowResult::Cancelled`] response when the flow was already in a
+/// terminal state (idempotent retry). The first (non-idempotent) cancel call
+/// returns the full list; retries only need a sample.
+const ALREADY_TERMINAL_MEMBER_CAP: usize = 1000;
 
 /// FlowFabric server — connects everything together.
 ///
@@ -106,18 +113,6 @@ impl ServerError {
             | Self::Script(_) => false,
         }
     }
-}
-
-/// Classify a ferriskey `ErrorKind` as retryable. Conservative: only kinds
-/// that are known-safe to retry (idempotent or server-didn't-see-request)
-/// return true. `FatalReceiveError` is explicitly NOT retryable because the
-/// request may have been processed but the response was lost.
-fn is_retryable_kind(kind: ferriskey::ErrorKind) -> bool {
-    use ferriskey::ErrorKind::*;
-    matches!(
-        kind,
-        IoError | FatalSendError | TryAgain | BusyLoadingError | ClusterDown | Moved | Ask
-    )
 }
 
 impl Server {
@@ -831,7 +826,7 @@ impl Server {
                     .and_then(|v| v.as_ref())
                     .filter(|s| !s.is_empty())
                     .cloned();
-                let stored_members: Vec<String> = self
+                let all_members: Vec<String> = self
                     .client
                     .cmd("SMEMBERS")
                     .arg(fctx.members())
@@ -841,11 +836,23 @@ impl Server {
                         source: e,
                         context: "SMEMBERS flow members (already terminal)".into(),
                     })?;
+                // Cap the returned list to avoid pathological bandwidth on
+                // idempotent retries for flows with 10k+ members. Clients
+                // already received the authoritative member list on the
+                // first (non-idempotent) call; subsequent retries just need
+                // enough to confirm the operation and trigger per-member
+                // polling if desired.
+                let total_members = all_members.len();
+                let stored_members: Vec<String> = all_members
+                    .into_iter()
+                    .take(ALREADY_TERMINAL_MEMBER_CAP)
+                    .collect();
                 tracing::debug!(
                     flow_id = %args.flow_id,
                     stored_policy = stored_policy.as_deref().unwrap_or(""),
                     stored_reason = stored_reason.as_deref().unwrap_or(""),
-                    member_count = stored_members.len(),
+                    total_members,
+                    returned_members = stored_members.len(),
                     "cancel_flow: flow already terminal, returning idempotent Cancelled"
                 );
                 return Ok(CancelFlowResult::Cancelled {
@@ -2344,5 +2351,88 @@ fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerErr
         Err(ServerError::OperationFailed(format!(
             "ff_reset_budget failed: {error_code}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferriskey::ErrorKind;
+
+    fn mk_fk_err(kind: ErrorKind) -> ferriskey::Error {
+        ferriskey::Error::from((kind, "synthetic"))
+    }
+
+    #[test]
+    fn is_retryable_valkey_variant_uses_kind_table() {
+        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::IoError)).is_retryable());
+        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::FatalSendError)).is_retryable());
+        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::TryAgain)).is_retryable());
+        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::BusyLoadingError)).is_retryable());
+        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::ClusterDown)).is_retryable());
+
+        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::FatalReceiveError)).is_retryable());
+        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::AuthenticationFailed)).is_retryable());
+        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::NoScriptError)).is_retryable());
+        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::Moved)).is_retryable());
+        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::Ask)).is_retryable());
+        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::ReadOnly)).is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_valkey_context_uses_kind_table() {
+        let err = ServerError::ValkeyContext {
+            source: mk_fk_err(ErrorKind::IoError),
+            context: "HGET test".into(),
+        };
+        assert!(err.is_retryable());
+
+        let err = ServerError::ValkeyContext {
+            source: mk_fk_err(ErrorKind::AuthenticationFailed),
+            context: "auth".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_library_load_delegates_to_inner_kind() {
+        let err = ServerError::LibraryLoad(ff_script::loader::LoadError::Valkey(
+            mk_fk_err(ErrorKind::IoError),
+        ));
+        assert!(err.is_retryable());
+
+        let err = ServerError::LibraryLoad(ff_script::loader::LoadError::Valkey(
+            mk_fk_err(ErrorKind::AuthenticationFailed),
+        ));
+        assert!(!err.is_retryable());
+
+        let err = ServerError::LibraryLoad(ff_script::loader::LoadError::VersionMismatch {
+            expected: "1".into(),
+            got: "2".into(),
+        });
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_business_logic_variants_are_false() {
+        assert!(!ServerError::NotFound("x".into()).is_retryable());
+        assert!(!ServerError::InvalidInput("x".into()).is_retryable());
+        assert!(!ServerError::OperationFailed("x".into()).is_retryable());
+        assert!(!ServerError::Script("x".into()).is_retryable());
+        assert!(!ServerError::PartitionMismatch("x".into()).is_retryable());
+    }
+
+    #[test]
+    fn valkey_kind_delegates_through_library_load() {
+        let err = ServerError::LibraryLoad(ff_script::loader::LoadError::Valkey(
+            mk_fk_err(ErrorKind::ClusterDown),
+        ));
+        assert_eq!(err.valkey_kind(), Some(ErrorKind::ClusterDown));
+
+        let err = ServerError::LibraryLoad(ff_script::loader::LoadError::VersionMismatch {
+            expected: "1".into(),
+            got: "2".into(),
+        });
+        assert_eq!(err.valkey_kind(), None);
     }
 }
