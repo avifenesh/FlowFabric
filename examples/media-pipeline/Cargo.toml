@@ -1,0 +1,43 @@
+[workspace]
+
+[package]
+name = "media-pipeline"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "media_pipeline"
+path = "src/lib.rs"
+
+[[bin]]
+name = "transcribe"
+path = "src/bin/transcribe.rs"
+
+[[bin]]
+name = "summarize"
+path = "src/bin/summarize.rs"
+
+[[bin]]
+name = "embed"
+path = "src/bin/embed.rs"
+
+[[bin]]
+name = "submit"
+path = "src/bin/submit.rs"
+
+[[bin]]
+name = "review"
+path = "src/bin/review.rs"
+
+[dependencies]
+ff-core = { path = "../../crates/ff-core" }
+ff-sdk = { path = "../../crates/ff-sdk", features = ["insecure-direct-claim"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "signal", "fs", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
