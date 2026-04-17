@@ -994,21 +994,7 @@ dependencies = [
  "crc16",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "uuid",
-]
-
-[[package]]
-name = "ff-engine"
-version = "0.1.0"
-dependencies = [
- "ferriskey",
- "ff-core",
- "ff-script",
- "futures",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1029,14 +1015,11 @@ version = "0.1.0"
 dependencies = [
  "ferriskey",
  "ff-core",
- "ff-engine",
  "ff-script",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

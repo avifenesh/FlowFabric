@@ -11,4 +11,7 @@
 pub mod report;
 pub mod workload;
 
-pub use report::{write_report, HostInfo, LatencyMs, Percentiles, Report, SYSTEM_FLOWFABRIC};
+pub use report::{
+    git_sha, host_info, iso8601_utc, valkey_version, write_report, HostInfo, LatencyMs,
+    Percentiles, Report, SYSTEM_FLOWFABRIC,
+};

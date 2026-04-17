@@ -14,6 +14,14 @@ name = "baseline-scenario1"
 path = "src/scenario1.rs"
 
 [dependencies]
+# ff-bench path dep covers the shared report-metadata helpers
+# (host_info, valkey_version, git_sha, iso8601_utc). Brings in
+# ff-sdk / reqwest as a transitive cost, but that's cheaper than
+# maintaining two copies of platform-gated CPU probing — and those
+# deps don't touch the hot path (no import in scenario1.rs beyond
+# the metadata fns). Still no FlowFabric code in the measured
+# workload: it's RPUSH / BLMPOP / INCR end-to-end.
+ff-bench = { path = "../../harness" }
 redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }

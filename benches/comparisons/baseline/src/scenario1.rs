@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::Parser;
 use redis::AsyncCommands;
-use tokio::sync::Mutex;
 
 const SCENARIO: &str = "submit_claim_complete";
 const SYSTEM: &str = "baseline";
@@ -69,35 +68,42 @@ async fn main() -> Result<()> {
         submit_wall.as_millis()
     );
 
-    let latencies: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::with_capacity(args.tasks)));
+    // Per-worker latency buffers — each task owns its Vec<u64> and
+    // returns it via the JoinHandle. No Arc<Mutex> on the hot path, so
+    // the measurement isn't biased by lock contention under 16-worker
+    // concurrency (PR#10 bot review).
     let drain_start = Instant::now();
     let stop_at = Arc::new(std::sync::atomic::AtomicUsize::new(args.tasks));
     let mut handles = Vec::with_capacity(WORKER_COUNT);
     for wi in 0..WORKER_COUNT {
         let client = client.clone();
-        let latencies = latencies.clone();
         let stop_at = stop_at.clone();
         handles.push(tokio::spawn(async move {
-            drive_worker(wi, client, latencies, stop_at).await
+            drive_worker(wi, client, stop_at).await
         }));
     }
+    let mut lat: Vec<u64> = Vec::with_capacity(args.tasks);
     for h in handles {
-        h.await??;
+        let mut per_worker = h.await??;
+        lat.append(&mut per_worker);
     }
     let wall = drain_start.elapsed();
 
-    let lat = std::mem::take(&mut *latencies.lock().await);
     let throughput = args.tasks as f64 / wall.as_secs_f64();
     let (p50, p95, p99) = percentiles(&lat);
 
+    // Metadata helpers live in the ff-bench harness crate so every
+    // bench — harness + baseline + future apalis/faktory — emits the
+    // same report shape with the same platform-gated probes. The
+    // measured workload above is untouched.
     let report = serde_json::json!({
         "scenario": SCENARIO,
         "system": SYSTEM,
-        "git_sha": git_sha(),
-        "valkey_version": "unknown",
-        "host": host_info(),
+        "git_sha": ff_bench::git_sha(),
+        "valkey_version": ff_bench::valkey_version(),
+        "host": ff_bench::host_info(),
         "cluster": false,
-        "timestamp_utc": iso8601_utc(),
+        "timestamp_utc": ff_bench::iso8601_utc(),
         "config": { "tasks": args.tasks, "workers": WORKER_COUNT, "payload_bytes": PAYLOAD_BYTES },
         "throughput_ops_per_sec": throughput,
         "latency_ms": { "p50": p50, "p95": p95, "p99": p99 },
@@ -142,14 +148,14 @@ async fn seed_queue(client: &redis::Client, n: usize, payload: &[u8]) -> Result<
 async fn drive_worker(
     _wi: usize,
     client: redis::Client,
-    latencies: Arc<Mutex<Vec<u64>>>,
     stop_at: Arc<std::sync::atomic::AtomicUsize>,
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     use std::sync::atomic::Ordering;
     let mut con = client.get_multiplexed_async_connection().await?;
+    let mut local: Vec<u64> = Vec::new();
     loop {
         if stop_at.load(Ordering::Relaxed) == 0 {
-            return Ok(());
+            return Ok(local);
         }
         let t0 = Instant::now();
         let popped: Option<(String, Vec<Vec<u8>>)> =
@@ -167,10 +173,7 @@ async fn drive_worker(
         match popped {
             Some((_, values)) if !values.is_empty() => {
                 let _: () = con.incr(COMPLETED_KEY, 1).await?;
-                latencies
-                    .lock()
-                    .await
-                    .push(t0.elapsed().as_micros() as u64);
+                local.push(t0.elapsed().as_micros() as u64);
                 stop_at.fetch_sub(1, Ordering::Relaxed);
             }
             _ => {
@@ -210,74 +213,3 @@ fn filler_payload(size: usize) -> Vec<u8> {
         .collect()
 }
 
-fn git_sha() -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| o.status.success().then(|| o.stdout))
-        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn host_info() -> serde_json::Value {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|t| {
-            t.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.splitn(2, ':').nth(1))
-                .map(|s| s.trim().to_owned())
-        })
-        .unwrap_or_else(|| "unknown".to_owned());
-    serde_json::json!({ "cpu": cpu, "cores": cores, "mem_gb": 0 })
-}
-
-fn iso8601_utc() -> String {
-    // Share logic with the harness' report.rs via duplication — the
-    // baseline crate is deliberately free of ff-bench deps so its
-    // numbers are untainted by any FlowFabric code path.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let s = (secs % 60) as u32;
-    let secs = secs / 60;
-    let min = (secs % 60) as u32;
-    let secs = secs / 60;
-    let hour = (secs % 24) as u32;
-    let mut days = (secs / 24) as i64;
-    let mut year: i64 = 1970;
-    loop {
-        let yd = if is_leap(year) { 366 } else { 365 };
-        if days < yd {
-            break;
-        }
-        days -= yd;
-        year += 1;
-    }
-    let months = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let feb = if is_leap(year) { 29 } else { 28 };
-    let mut m = 0;
-    while m < 12 {
-        let dim = if m == 1 { feb } else { months[m] };
-        if days < dim {
-            break;
-        }
-        days -= dim;
-        m += 1;
-    }
-    let day = (days + 1) as u32;
-    let month = (m + 1) as u32;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hour, min, s
-    )
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}

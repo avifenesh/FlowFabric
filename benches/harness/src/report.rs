@@ -105,7 +105,8 @@ pub fn write_report(report: &Report, results_dir: &Path) -> anyhow::Result<PathB
     Ok(path)
 }
 
-fn git_sha() -> String {
+/// Short git sha of the current HEAD, or `"unknown"` outside a repo.
+pub fn git_sha() -> String {
     let out = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -115,35 +116,92 @@ fn git_sha() -> String {
     out.unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn valkey_version() -> String {
-    // Asks the live server on localhost:6379 for its version. Fails-soft
-    // to "unknown" so a server-less dev-check still produces a valid
-    // report.
-    let out = Command::new("valkey-cli")
-        .args(["-p", "6379", "INFO", "server"])
-        .output()
-        .ok();
-    let text = match out {
-        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => return "unknown".to_owned(),
-    };
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("valkey_version:").or_else(|| line.strip_prefix("redis_version:")) {
-            return v.trim().to_owned();
+/// Version string of the live Valkey / Redis pointed at by
+/// `FF_BENCH_VALKEY_HOST`:`FF_BENCH_VALKEY_PORT`. Falls back to
+/// `"unknown"` when neither `valkey-cli` nor `redis-cli` is on PATH.
+pub fn valkey_version() -> String {
+    // Ask the live server for its version. The harness already honours
+    // `FF_BENCH_VALKEY_HOST` / `FF_BENCH_VALKEY_PORT` (see workload.rs);
+    // reuse the same env vars so a bench pointed at a non-localhost
+    // Valkey doesn't report the wrong version.
+    //
+    // Try `valkey-cli` first, fall back to `redis-cli`, fall back to
+    // `"unknown"`. Both CLIs accept the same `-h/-p/INFO server` args
+    // and speak the same RESP — the distinction is only the binary
+    // name on disk.
+    let host = std::env::var("FF_BENCH_VALKEY_HOST").unwrap_or_else(|_| "localhost".to_owned());
+    let port = std::env::var("FF_BENCH_VALKEY_PORT").unwrap_or_else(|_| "6379".to_owned());
+
+    for cli in ["valkey-cli", "redis-cli"] {
+        let out = Command::new(cli)
+            .args(["-h", &host, "-p", &port, "INFO", "server"])
+            .output();
+        let text = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => continue,
+        };
+        for line in text.lines() {
+            if let Some(v) = line
+                .strip_prefix("valkey_version:")
+                .or_else(|| line.strip_prefix("redis_version:"))
+            {
+                return v.trim().to_owned();
+            }
         }
     }
     "unknown".to_owned()
 }
 
-fn host_info() -> HostInfo {
+/// Inspect the machine running the bench. Shared across the harness
+/// and every comparison package so the report JSON is uniform.
+///
+/// Portable across the CI matrix: Linux reads `/proc/{cpuinfo,meminfo}`,
+/// macOS asks `sysctl`, any other target falls through to `"unknown"`
+/// / `0` — a report still serialises, the unknown fields are just less
+/// useful.
+pub fn host_info() -> HostInfo {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let cpu = read_proc_cpu_model().unwrap_or_else(|| "unknown".to_owned());
-    let mem_gb = read_proc_mem_gb().unwrap_or(0);
+    let cpu = probe_cpu_model().unwrap_or_else(|| "unknown".to_owned());
+    let mem_gb = probe_mem_gb().unwrap_or(0);
     HostInfo { cpu, cores, mem_gb }
 }
 
+fn probe_cpu_model() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return read_proc_cpu_model();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return read_sysctl("machdep.cpu.brand_string");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return None;
+    }
+}
+
+fn probe_mem_gb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        return read_proc_mem_gb();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `sysctl -n hw.memsize` returns bytes.
+        return read_sysctl("hw.memsize")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b / (1024 * 1024 * 1024));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return None;
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read_proc_cpu_model() -> Option<String> {
     let text = fs::read_to_string("/proc/cpuinfo").ok()?;
     for line in text.lines() {
@@ -161,6 +219,7 @@ fn read_proc_cpu_model() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn read_proc_mem_gb() -> Option<u64> {
     let text = fs::read_to_string("/proc/meminfo").ok()?;
     for line in text.lines() {
@@ -172,7 +231,21 @@ fn read_proc_mem_gb() -> Option<u64> {
     None
 }
 
-fn iso8601_utc() -> String {
+#[cfg(target_os = "macos")]
+fn read_sysctl(key: &str) -> Option<String> {
+    let out = Command::new("sysctl").args(["-n", key]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Seconds-precision ISO 8601 UTC timestamp. No external date-time
+/// dependency — the bench harness avoids `chrono` / `time` so the
+/// comparison packages can copy the field verbatim without inheriting
+/// a crate.
+pub fn iso8601_utc() -> String {
     // Second-precision is enough for bench reports; avoid pulling chrono
     // into a harness dep graph.
     let secs = SystemTime::now()

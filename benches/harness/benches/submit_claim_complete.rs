@@ -24,7 +24,6 @@ use ff_bench::{
 };
 use ff_sdk::{ClaimedTask, FlowFabricWorker, WorkerConfig};
 use reqwest::Client;
-use tokio::sync::Mutex;
 
 const SCENARIO: &str = "submit_claim_complete";
 const WORKER_COUNT: usize = 16;
@@ -96,7 +95,6 @@ async fn drain_once_with_stats(
     n: usize,
 ) -> anyhow::Result<DrainStats> {
     let client = ff_bench::workload::http_client()?;
-    let latencies: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::with_capacity(n)));
 
     // Pre-seed BEFORE starting workers so the claim loop measures
     // steady-state and isn't racing the submitter. Submissions are
@@ -111,28 +109,35 @@ async fn drain_once_with_stats(
         "seeded executions"
     );
 
-    // Start worker pool. Workers claim → capture latency → complete.
+    // Start worker pool. Each worker writes to a PER-TASK local buffer
+    // and returns it via the JoinHandle — no shared Arc<Mutex>, so the
+    // hot path has zero cross-worker synchronisation beyond the
+    // `stop_at` atomic decrement. PR#10 review caught that the prior
+    // shared-vec collection biased both throughput and latency.
     let drain_start = Instant::now();
     let mut worker_handles = Vec::with_capacity(WORKER_COUNT);
     let stop_at = Arc::new(std::sync::atomic::AtomicUsize::new(n));
     for wi in 0..WORKER_COUNT {
         let env = env.clone();
-        let latencies = latencies.clone();
         let stop_at = stop_at.clone();
         worker_handles.push(tokio::spawn(async move {
-            drive_worker(wi, env, latencies, stop_at).await
+            drive_worker(wi, env, stop_at).await
         }));
     }
+    let mut latencies_us: Vec<u64> = Vec::with_capacity(n);
     for h in worker_handles {
-        let _ = h.await;
+        match h.await {
+            Ok(Ok(mut v)) => latencies_us.append(&mut v),
+            Ok(Err(e)) => tracing::warn!(error = %e, "worker returned error"),
+            Err(e) => tracing::warn!(error = %e, "worker join failed"),
+        }
     }
     let wall = drain_start.elapsed();
 
-    let lat = std::mem::take(&mut *latencies.lock().await);
     Ok(DrainStats {
         tasks: n,
         wall,
-        latencies_us: lat,
+        latencies_us,
     })
 }
 
@@ -172,9 +177,8 @@ async fn seed_executions(
 async fn drive_worker(
     wi: usize,
     env: ff_bench::workload::BenchEnv,
-    latencies: Arc<Mutex<Vec<u64>>>,
     stop_at: Arc<std::sync::atomic::AtomicUsize>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u64>> {
     use std::sync::atomic::Ordering;
 
     let mut config = WorkerConfig::new(
@@ -189,17 +193,21 @@ async fn drive_worker(
     config.claim_poll_interval_ms = POLL_INTERVAL_MS;
     let worker = FlowFabricWorker::connect(config).await?;
 
+    // Per-worker buffer: no lock, no contention. Merged by the driver
+    // after every worker finishes.
+    let mut local: Vec<u64> = Vec::new();
+
     loop {
         // stop_at starts at N and counts down as tasks complete. Exit
         // once every task is accounted for; avoids workers spinning on
         // an empty queue after the drain.
         if stop_at.load(Ordering::Relaxed) == 0 {
-            return Ok(());
+            return Ok(local);
         }
         match worker.claim_next().await? {
             Some(task) => {
                 let lat = complete_one(task).await?;
-                latencies.lock().await.push(lat);
+                local.push(lat);
                 stop_at.fetch_sub(1, Ordering::Relaxed);
             }
             None => {

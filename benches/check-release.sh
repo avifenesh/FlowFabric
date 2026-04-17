@@ -30,6 +30,17 @@ cd "$ROOT"
 : "${FF_BENCH_VALKEY_HOST:=localhost}"
 : "${FF_BENCH_VALKEY_PORT:=6379}"
 
+# Pre-flight: the version-bootstrap path parses `cargo metadata` via
+# jq. jq is a hard dep for that one fallback — declare it up-front so
+# the failure isn't a surprise three steps later.
+for tool in curl jq python3; do
+    if ! command -v "${tool}" >/dev/null 2>&1; then
+        echo "[release-gate] FAIL: required tool missing: ${tool}" >&2
+        echo "[release-gate]   curl, jq, python3 must all be on PATH" >&2
+        exit 2
+    fi
+done
+
 # Pre-flight: server must be reachable. Failing here is infrastructure,
 # not a regression — exit 2.
 if ! curl -sS --max-time 2 "${FF_BENCH_SERVER}/healthz" > /dev/null; then
@@ -68,10 +79,18 @@ done
 if [[ -z "${PREV_TAG}" ]] || [[ ! -d "benches/results/${PREV_TAG}" ]]; then
     echo "[release-gate] no prior baseline at benches/results/${PREV_TAG:-<none>}"
     echo "[release-gate] first run — snapshotting current as baseline"
-    # Workspace version is defined once under [workspace.package] in the
-    # root Cargo.toml; member crates use `version.workspace = true`.
-    CURRENT_VERSION="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml 2>/dev/null)"
+    # Prefer cargo metadata — it parses the manifest the same way the
+    # release toolchain does, so we don't diverge if someone ever moves
+    # `version` out of `[workspace.package]`, wraps it in a comment, or
+    # reformats the TOML. ff-core is chosen as the canonical workspace
+    # member (all product crates share the same workspace version).
+    CURRENT_VERSION=""
+    if command -v jq >/dev/null 2>&1; then
+        CURRENT_VERSION="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+            | jq -r '.packages[] | select(.name == "ff-core") | .version')"
+    fi
     if [[ -z "${CURRENT_VERSION:-}" ]]; then
+        echo "[release-gate] WARN: could not resolve workspace version via cargo metadata + jq — using 'dev'"
         CURRENT_VERSION="dev"
     fi
     SNAPSHOT_DIR="benches/results/v${CURRENT_VERSION}"
