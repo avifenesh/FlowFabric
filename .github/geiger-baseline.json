@@ -1,0 +1,30 @@
+{
+  "commit": "fb36cdc2c426645704c8ae0502b653e48aaea255",
+  "crates": {
+    "ferriskey": {
+      "unsafe_expressions": 30
+    },
+    "ff-core": {
+      "unsafe_expressions": 0
+    },
+    "ff-engine": {
+      "unsafe_expressions": 0
+    },
+    "ff-scheduler": {
+      "unsafe_expressions": 0
+    },
+    "ff-script": {
+      "unsafe_expressions": 0
+    },
+    "ff-sdk": {
+      "unsafe_expressions": 0
+    },
+    "ff-server": {
+      "unsafe_expressions": 0
+    },
+    "ff-test": {
+      "unsafe_expressions": 0
+    }
+  },
+  "generated_at": "2026-04-17T09:46:24Z"
+}

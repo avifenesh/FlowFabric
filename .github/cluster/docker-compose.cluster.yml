@@ -1,0 +1,94 @@
+# 6-node Valkey cluster (3 masters + 3 replicas) for CI integration tests.
+#
+# Bootstrap expected by the workflow:
+#   1. docker compose up -d            — launches all 6 nodes
+#   2. scripts/wait-for-cluster.sh     — polls until every node accepts commands
+#   3. valkey-cli --cluster create ... — slots the masters, promotes replicas
+#
+# Ports: 7000-7005 on the host; ports are host-mapped straight through so the
+# FF server (running on the host) sees the cluster at 127.0.0.1:7000+.
+#
+# Persistence: disabled (`--save "" --appendonly no`). CI runs are ephemeral.
+#
+# ARM64 + x86_64: the `valkey/valkey` image is multi-arch; no arch-specific
+# overrides needed — same compose file runs on ubuntu-latest and
+# ubuntu-24.04-arm.
+
+services:
+  valkey-0:
+    image: ${VALKEY_IMAGE:-valkey/valkey:7.2}
+    command: >-
+      valkey-server
+      --port 7000
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --save ""
+      --appendonly no
+    network_mode: host
+    restart: no
+
+  valkey-1:
+    image: ${VALKEY_IMAGE:-valkey/valkey:7.2}
+    command: >-
+      valkey-server
+      --port 7001
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --save ""
+      --appendonly no
+    network_mode: host
+    restart: no
+
+  valkey-2:
+    image: ${VALKEY_IMAGE:-valkey/valkey:7.2}
+    command: >-
+      valkey-server
+      --port 7002
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --save ""
+      --appendonly no
+    network_mode: host
+    restart: no
+
+  valkey-3:
+    image: ${VALKEY_IMAGE:-valkey/valkey:7.2}
+    command: >-
+      valkey-server
+      --port 7003
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --save ""
+      --appendonly no
+    network_mode: host
+    restart: no
+
+  valkey-4:
+    image: ${VALKEY_IMAGE:-valkey/valkey:7.2}
+    command: >-
+      valkey-server
+      --port 7004
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --save ""
+      --appendonly no
+    network_mode: host
+    restart: no
+
+  valkey-5:
+    image: ${VALKEY_IMAGE:-valkey/valkey:7.2}
+    command: >-
+      valkey-server
+      --port 7005
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --save ""
+      --appendonly no
+    network_mode: host
+    restart: no

@@ -114,6 +114,25 @@ The version string lives in **`lua/version.lua`** (single source of truth). `cra
 
 Future: per-FCALL version negotiation. For now: drain old instances before starting new ones, or run a single writer at a time.
 
+## CI coverage
+
+Two PR-time GitHub Actions workflows gate merges:
+
+- **`.github/workflows/matrix.yml`** — 10-job host × Valkey × mode matrix:
+  - linux x86_64 (`ubuntu-latest`) and linux arm64 (`ubuntu-24.04-arm`) × Valkey 7.2 + latest × {standalone, cluster}
+  - mac arm64 (`macos-latest`) and mac x86_64 (`macos-13`) × Valkey latest × standalone
+  - Linux covers the full version matrix where we deploy. Mac runners validate cross-arch Rust correctness against the latest Valkey release only (Homebrew does not package 7.2 and docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
+  - Cluster mode on linux uses a 3-master 3-replica cluster via `.github/cluster/docker-compose.cluster.yml` + `bootstrap.sh`.
+- **`.github/workflows/security-and-quality.yml`** — 6 independent gates, any one blocks merge:
+  - `cargo audit` with `--deny warnings`; ignore list in `.cargo/audit.toml`
+  - `cargo deny check` (licenses, bans, sources, advisories); policy in `deny.toml`
+  - `cargo geiger` unsafe-expression ratchet against a committed baseline at `.github/geiger-baseline.json`. Refresh with `bin/update-geiger-baseline.sh` in a PR that deliberately changes the unsafe count.
+  - CodeQL gate (polls `codeql.yml` for the same SHA)
+  - `cargo machete` unused-dep detection on `crates/` + `ferriskey` (benches and examples are out of scope — their authors own hygiene there)
+  - `cargo semver-checks` against the latest `v*.*.*` git tag; skips gracefully before the first release.
+
+`cargo install` takes a minute per tool; the `Swatinem/rust-cache@v2` key partitioning in both workflows amortises this across PR pushes.
+
 ## License
 
 Apache-2.0

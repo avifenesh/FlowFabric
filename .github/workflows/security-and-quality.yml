@@ -1,0 +1,171 @@
+name: Security & Quality
+
+# Six independent gates that must pass before a PR can merge.
+# Each runs in parallel on ubuntu-latest; failure on any blocks merge.
+#
+#   audit         — cargo-audit against the RustSec advisory DB
+#   deny          — cargo-deny (licenses, bans, sources, advisories)
+#   geiger        — unsafe-expression ratchet vs committed baseline
+#   codeql-gate   — waits on the separate CodeQL workflow (codeql.yml)
+#   machete       — unused dependency detection
+#   semver-checks — breaking change detection on publish-bound crates
+#                   (skips gracefully until the first git tag lands)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: security-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit (--deny warnings; ignore list in .cargo/audit.toml)
+        run: cargo audit --deny warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deny
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check (licenses, bans, sources, advisories)
+        run: cargo deny check
+
+  geiger:
+    name: cargo-geiger (unsafe ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: geiger
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+      - name: Verify no crate's unsafe count exceeds the committed baseline
+        run: bash bin/check-geiger-baseline.sh
+      - name: Summarize in job output
+        if: always()
+        run: |
+          echo "## Unsafe-expression ratchet" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat .github/geiger-baseline.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  codeql-gate:
+    name: CodeQL gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This job exists so branch protection can gate merges on CodeQL's
+    # status without changing codeql.yml's schedule triggers. It polls
+    # the companion CodeQL workflow run for the same SHA and waits for
+    # success. If codeql is still running past the timeout, this job
+    # fails — PR author re-runs when codeql finishes.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for CodeQL workflow (same SHA)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Safe: github.event.pull_request.head.sha and github.sha are
+          # SHA-1 hex strings, not user-controlled text.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          deadline=$(( $(date +%s) + 480 ))
+          while :; do
+            runs_json=$(gh run list \
+              --workflow=codeql.yml \
+              --commit="$HEAD_SHA" \
+              --limit 1 \
+              --json status,conclusion)
+            status=$(echo "$runs_json" | jq -r '.[0].status // "queued"')
+            conclusion=$(echo "$runs_json" | jq -r '.[0].conclusion // ""')
+            echo "codeql @ $HEAD_SHA: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CodeQL passed"; exit 0
+              fi
+              echo "CodeQL finished with conclusion=$conclusion" >&2
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "timeout waiting for CodeQL" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+  machete:
+    name: cargo-machete (unused deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: machete
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+      - name: cargo machete (workspace members only; benches/examples excluded)
+        # benches/ and examples/ are sibling to the main workspace and
+        # out of scope for this gate. Their unused-dep hygiene is the
+        # benchmark harness owner's and example authors' responsibility.
+        run: cargo machete crates/ ferriskey
+
+  semver-checks:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags to derive baseline-rev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semver-checks
+      - name: Install cargo-semver-checks
+        # Pin to a version that supports our current toolchain (stable
+        # 1.90). Bump in lockstep with rust-toolchain.toml.
+        run: cargo install cargo-semver-checks --locked --version 0.46.0
+      - name: Run semver-checks on publish-bound crates
+        # On a repo with no v*.*.* tag yet (pre-first-release), skip
+        # with a visible note. Once a tag exists, compare against it.
+        run: |
+          latest_tag="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1)"
+          if [ -z "$latest_tag" ]; then
+            echo "::notice::No v*.*.* git tag yet — semver-checks has no baseline. Skipping until the first release tag."
+            exit 0
+          fi
+          echo "Checking against baseline $latest_tag"
+          cargo semver-checks check-release \
+            --baseline-rev "$latest_tag" \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server

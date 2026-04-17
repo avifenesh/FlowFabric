@@ -14,8 +14,6 @@ description = "FlowFabric server library and HTTP binary"
 ff-core = { workspace = true }
 ff-script = { workspace = true }
 ff-engine = { workspace = true }
-ff-scheduler = { workspace = true }
-ff-sdk = { workspace = true }
 ferriskey = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 tracing = { workspace = true }

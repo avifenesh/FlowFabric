@@ -929,7 +929,6 @@ dependencies = [
  "crc16",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -939,7 +938,6 @@ version = "0.1.0"
 dependencies = [
  "ferriskey",
  "ff-core",
- "ff-script",
  "futures",
  "serde_json",
  "tokio",
@@ -975,14 +973,11 @@ version = "0.1.0"
 dependencies = [
  "ferriskey",
  "ff-core",
- "ff-engine",
  "ff-script",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -993,9 +988,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-engine",
- "ff-scheduler",
  "ff-script",
- "ff-sdk",
  "futures",
  "serde",
  "serde_json",

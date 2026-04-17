@@ -1,0 +1,163 @@
+name: Matrix CI
+
+# Cross-host + cross-Valkey-version + cross-mode verification.
+#
+# Matrix coverage (10 jobs):
+#
+#   linux x86_64  × valkey 7.2    × standalone   → ubuntu-latest
+#   linux x86_64  × valkey 7.2    × cluster      → ubuntu-latest
+#   linux x86_64  × valkey latest × standalone   → ubuntu-latest
+#   linux x86_64  × valkey latest × cluster      → ubuntu-latest
+#   linux arm64   × valkey 7.2    × standalone   → ubuntu-24.04-arm
+#   linux arm64   × valkey 7.2    × cluster      → ubuntu-24.04-arm
+#   linux arm64   × valkey latest × standalone   → ubuntu-24.04-arm
+#   linux arm64   × valkey latest × cluster      → ubuntu-24.04-arm
+#   macos arm64   × valkey latest × standalone   → macos-latest
+#   macos x86_64  × valkey latest × standalone   → macos-13
+#
+# Mac runners validate cross-arch Rust correctness on the latest Valkey
+# release; the 7.2 × mac combination is intentionally skipped because
+# Homebrew does not package 7.2 and docker-on-mac on GitHub runners is
+# flaky under privileged-mode requirements. Linux covers the full
+# version matrix where we actually deploy.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: ${{ matrix.host.os }} · valkey ${{ matrix.valkey.version }} · ${{ matrix.mode }}
+    runs-on: ${{ matrix.host.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          - { os: ubuntu-latest,    kind: linux, arch: x86_64 }
+          - { os: ubuntu-24.04-arm, kind: linux, arch: arm64 }
+          - { os: macos-latest,     kind: mac,   arch: arm64 }
+          - { os: macos-13,         kind: mac,   arch: x86_64 }
+        valkey:
+          - { version: "7.2",    image: "valkey/valkey:7.2" }
+          - { version: "latest", image: "valkey/valkey:latest" }
+        mode: [standalone, cluster]
+        exclude:
+          # Mac: latest Valkey only, standalone only. Homebrew has no
+          # 7.2 formula + docker-on-mac cluster setup is unsupported on
+          # GitHub hosted runners.
+          - host: { os: macos-latest, kind: mac, arch: arm64 }
+            valkey: { version: "7.2", image: "valkey/valkey:7.2" }
+          - host: { os: macos-13, kind: mac, arch: x86_64 }
+            valkey: { version: "7.2", image: "valkey/valkey:7.2" }
+          - host: { os: macos-latest, kind: mac, arch: arm64 }
+            mode: cluster
+          - host: { os: macos-13, kind: mac, arch: x86_64 }
+            mode: cluster
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.host.os }}-${{ matrix.valkey.version }}-${{ matrix.mode }}
+
+      # ── Valkey setup ──────────────────────────────────────────────
+
+      - name: Start Valkey (linux · standalone)
+        if: matrix.host.kind == 'linux' && matrix.mode == 'standalone'
+        env:
+          VALKEY_IMAGE: ${{ matrix.valkey.image }}
+        run: |
+          docker run -d --name valkey \
+            -p 6379:6379 \
+            --health-cmd 'valkey-cli ping' --health-interval 3s --health-retries 10 \
+            "$VALKEY_IMAGE" \
+            valkey-server --save "" --appendonly no
+          for _ in $(seq 1 30); do
+            if docker exec valkey valkey-cli ping 2>/dev/null | grep -q PONG; then
+              echo "valkey ready"; break
+            fi
+            sleep 1
+          done
+
+      - name: Start Valkey cluster (linux)
+        if: matrix.host.kind == 'linux' && matrix.mode == 'cluster'
+        env:
+          VALKEY_IMAGE: ${{ matrix.valkey.image }}
+        run: |
+          cd .github/cluster
+          docker compose up -d
+          sudo apt-get update -qq && sudo apt-get install -yqq redis-tools
+          bash bootstrap.sh
+
+      - name: Start Valkey (mac · standalone)
+        if: matrix.host.kind == 'mac'
+        run: |
+          brew update
+          brew install valkey
+          valkey-server --daemonize yes --port 6379 --save "" --appendonly no
+          for _ in $(seq 1 30); do
+            if valkey-cli ping 2>/dev/null | grep -q PONG; then
+              echo "valkey ready"; break
+            fi
+            sleep 1
+          done
+
+      # ── Verification steps ────────────────────────────────────────
+
+      - name: cargo check
+        run: cargo check --workspace --all-features
+
+      - name: cargo clippy
+        run: |
+          cargo clippy \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server -p ff-test \
+            --features ff-sdk/insecure-direct-claim \
+            -- -D warnings
+
+      - name: Unit tests
+        env:
+          FF_HOST: 127.0.0.1
+          FF_PORT: ${{ matrix.mode == 'cluster' && '7000' || '6379' }}
+          FF_CLUSTER: ${{ matrix.mode == 'cluster' && '1' || '0' }}
+        run: |
+          cargo test \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server \
+            --features ff-sdk/insecure-direct-claim
+
+      - name: Integration tests (serial)
+        env:
+          FF_HOST: 127.0.0.1
+          FF_PORT: ${{ matrix.mode == 'cluster' && '7000' || '6379' }}
+          FF_CLUSTER: ${{ matrix.mode == 'cluster' && '1' || '0' }}
+        run: |
+          cargo test -p ff-test -- --test-threads=1
+
+      # ── Diagnostics on failure ────────────────────────────────────
+
+      - name: Dump Valkey logs (linux · standalone)
+        if: failure() && matrix.host.kind == 'linux' && matrix.mode == 'standalone'
+        run: docker logs valkey 2>&1 | tail -200 || true
+
+      - name: Dump Valkey cluster logs (linux · cluster)
+        if: failure() && matrix.host.kind == 'linux' && matrix.mode == 'cluster'
+        run: |
+          cd .github/cluster
+          docker compose logs --tail=80 2>&1 || true
