@@ -39,18 +39,16 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, AddBos, LlamaModel},
     sampling::LlamaSampler,
 };
-use media_pipeline::{SummarizeResult, TranscribeResult, SIGNAL_NAME_APPROVAL};
+use media_pipeline::{
+    SummarizeResult, TranscribeResult, FRAME_FIELD_PAYLOAD, FRAME_FIELD_TYPE,
+    SIGNAL_NAME_APPROVAL, SUMMARY_CHAR_CAP,
+};
 
 /// Frame type used to persist the final SummarizeResult across worker
 /// restarts / cross-worker resume (RFC-004 "any worker can resume" —
 /// avoids process-local HashMap stash that would leak across re-claims
 /// by a different worker process).
 const FRAME_SUMMARY_FINAL: &str = "summary_final";
-
-/// Hard cap on summary chars before embed. MiniLM-L6-v2 truncates to 256
-/// tokens (~1000 chars) anyway; 4096 is a belt-and-suspenders guard on
-/// lease-healthy embed time. Aligns with embed.rs F5.
-const SUMMARY_CHAR_CAP: usize = 4096;
 
 #[derive(Parser)]
 #[command(name = "summarize", about = "FlowFabric media-pipeline summarize worker")]
@@ -142,7 +140,14 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(Some(task)) => {
                         let eid = task.execution_id().to_string();
-                        if let Err(e) = handle(task, engine.clone(), args.max_new_tokens, args.skip_approval, worker.client()).await {
+                        if let Err(e) = handle(
+                            task,
+                            engine.clone(),
+                            args.max_new_tokens,
+                            args.skip_approval,
+                            worker.client(),
+                            worker.partition_config(),
+                        ).await {
                             tracing::error!(execution_id = %eid, error = %e, "task failed");
                         }
                     }
@@ -168,8 +173,9 @@ async fn handle(
     max_new_tokens: usize,
     skip_approval: bool,
     client: &ferriskey::Client,
+    partition_config: &ff_core::partition::PartitionConfig,
 ) -> anyhow::Result<()> {
-    if let Some(result) = load_persisted_result(&task, client).await? {
+    if let Some(result) = load_persisted_result(&task, client, partition_config).await? {
         tracing::info!(
             execution_id = %task.execution_id(),
             tokens = result.token_count,
@@ -191,11 +197,11 @@ async fn handle(
 async fn load_persisted_result(
     task: &ClaimedTask,
     client: &ferriskey::Client,
+    partition_config: &ff_core::partition::PartitionConfig,
 ) -> anyhow::Result<Option<SummarizeResult>> {
-    let partition_config = ff_core::partition::PartitionConfig::default();
     let frames = read_stream(
         client,
-        &partition_config,
+        partition_config,
         task.execution_id(),
         task.attempt_index(),
         "-",
@@ -205,9 +211,9 @@ async fn load_persisted_result(
     .await
     .context("read_stream for resume check")?;
     for frame in frames.frames.iter().rev() {
-        let ft = frame.fields.get("frame_type").map(|s| s.as_str()).unwrap_or("");
+        let ft = frame.fields.get(FRAME_FIELD_TYPE).map(|s| s.as_str()).unwrap_or("");
         if ft == FRAME_SUMMARY_FINAL {
-            let payload = frame.fields.get("payload").cloned().unwrap_or_default();
+            let payload = frame.fields.get(FRAME_FIELD_PAYLOAD).cloned().unwrap_or_default();
             let result: SummarizeResult = serde_json::from_str(&payload)
                 .context("decode summary_final payload")?;
             return Ok(Some(result));
@@ -254,10 +260,22 @@ async fn process(
     // F1: persist the final result BEFORE any control-plane action so any
     // worker that re-claims after resume can find it. Emitted as a frame
     // (stream is durable; append_frame is synchronously replicated).
+    //
+    // R2-F28: on persist failure, call task.fail explicitly so retry goes
+    // through the engine's retry policy (with the caller's retry budget
+    // honoured) rather than a silent lease-expiry / scanner re-queue which
+    // would repeat the full LLM inference on the retry.
     let result_bytes = serde_json::to_vec(&result)?;
-    task.append_frame(FRAME_SUMMARY_FINAL, &result_bytes, None)
+    if let Err(e) = task
+        .append_frame(FRAME_SUMMARY_FINAL, &result_bytes, None)
         .await
-        .context("append summary_final frame")?;
+    {
+        let reason = format!("persist summary_final failed: {e}");
+        // Best-effort: if the task.fail itself errors we still bubble the
+        // original append error so the claim loop logs both.
+        let _ = task.fail(&reason, "persist_failed").await;
+        anyhow::bail!(reason);
+    }
 
     if skip_approval {
         task.complete(Some(result_bytes)).await?;
@@ -295,18 +313,19 @@ async fn process(
             // before suspend. We never call create_pending_waitpoint, so the
             // engine has no buffered signals and this arm cannot fire.
             //
-            // If a future revision adds a pre-suspend buffer, lifting this
-            // into a working complete() call requires an ff-sdk change:
-            // `suspend()` consumes self, so when AlreadySatisfied fires the
-            // lease is retained but the ClaimedTask handle is gone. Tracked
-            // as a Batch C ff-sdk follow-up. Until then we log + rely on
-            // lease expiry -> scanner re-queue, which surfaces the bug
-            // loudly rather than silently dropping the work.
-            tracing::error!(
+            // If a future revision adds a pre-suspend buffer, this branch
+            // self-heals via the F1 persisted-result path: the summary_final
+            // frame was already appended before suspend, so when lease
+            // expiry + scanner re-queue drive a re-claim, the resume branch
+            // in `handle()` finds the frame and completes. No LLM re-run,
+            // no stuck execution. The only cost is one lease-TTL delay.
+            // Tracked as a Batch C ff-sdk follow-up ("suspend should return
+            // the ClaimedTask on AlreadySatisfied so we can complete
+            // immediately").
+            tracing::warn!(
                 execution_id = %eid,
-                "SuspendOutcome::AlreadySatisfied fired unexpectedly — \
-                 lease will expire and scanner will re-queue. \
-                 Track as ff-sdk follow-up."
+                "SuspendOutcome::AlreadySatisfied — lease will expire and \
+                 re-claim will pick up the persisted summary_final frame"
             );
         }
         Err(e) => {
@@ -427,6 +446,11 @@ fn utf8_prefix_len(buf: &[u8]) -> usize {
 /// t=2s on the same partition ZSETs. 200–1200ms random keeps aggregate
 /// claim QPS on the cluster similar to a 1Hz mean without the clock-
 /// aligned thundering herd.
+///
+/// Seed source: `SystemTime::now().subsec_nanos()`. This is NOT a
+/// cryptographic RNG — it's a cheap uniform-ish draw to de-phase
+/// concurrent workers. Skipping a `rand` dep keeps the example crate
+/// graph lean; jitter is the only randomness we need.
 async fn idle_sleep() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

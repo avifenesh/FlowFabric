@@ -51,6 +51,21 @@ pub enum ApprovalDecision {
 /// Signal name expected by the summarize worker's resume condition.
 pub const SIGNAL_NAME_APPROVAL: &str = "summary_approved";
 
+/// Field name used by `ff_append_frame` (lua/stream.lua:112) for the frame
+/// body bytes. Single source of truth so summarize/submit/review don't
+/// drift if RFC-006 ever renames the field.
+pub const FRAME_FIELD_PAYLOAD: &str = "payload";
+
+/// Field name used by `ff_append_frame` for the frame-type tag
+/// (lua/stream.lua:110). See [`FRAME_FIELD_PAYLOAD`].
+pub const FRAME_FIELD_TYPE: &str = "frame_type";
+
+/// Soft cap on summary length shared between summarize (pre-persist) and
+/// embed (pre-vectorize). MiniLM-L6-v2 truncates to 256 tokens (~1000
+/// chars) anyway; 4096 is a belt-and-suspenders upper bound on
+/// lease-healthy embed time.
+pub const SUMMARY_CHAR_CAP: usize = 4096;
+
 /// Execution kinds — informational; scheduling is by capability.
 pub const KIND_TRANSCRIBE: &str = "media.transcribe";
 pub const KIND_SUMMARIZE: &str = "media.summarize";

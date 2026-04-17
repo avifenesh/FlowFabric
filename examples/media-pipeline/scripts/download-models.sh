@@ -33,6 +33,12 @@ QWEN_URL="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/$Q
 # bytes "GGUF". A partial download with an HTTP 200 (seen on HF CDN when
 # a connection drops mid-stream) yields a truncated file that won't parse
 # when llama-cpp-2 loads it; catch that here with a clear error.
+#
+# Limitations (R2-F34): this catches truncation + totally-wrong-format
+# but NOT arbitrary mid-file corruption (bit flips, zero-fill). A full
+# sha256 check would be stronger, but Hugging Face doesn't expose stable
+# checksums per file revision. If we ever move to a registry that does
+# (e.g. ollama / an S3 bucket with ETag), switch to sha256.
 is_valid_gguf() {
     local f="$1"
     [[ -s "$f" ]] || return 1
@@ -67,7 +73,11 @@ fi
 # reliable check. Requires the `embed` binary to have been built (e.g.
 # `cargo build -p media-pipeline --bin embed`).
 echo "[warm] fastembed MiniLM-L6-v2 via embed --warm"
-if ! cargo run --quiet --release --manifest-path "$PKG_DIR/Cargo.toml" --bin embed -- --warm; then
+# Debug build on purpose: a fresh checkout builds the whole example crate
+# here, and --release adds 5–10 min for a one-time cache warmup run. The
+# embed binary does fastembed::try_new + one trivial embed() call — debug
+# build is plenty fast for that.
+if ! cargo run --quiet --manifest-path "$PKG_DIR/Cargo.toml" --bin embed -- --warm; then
     echo "[error] fastembed warmup failed — check cargo/embed build + network" >&2
     exit 1
 fi

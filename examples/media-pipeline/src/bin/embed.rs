@@ -12,14 +12,8 @@ use anyhow::Context;
 use clap::Parser;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use ff_sdk::{ClaimedTask, FlowFabricWorker, WorkerConfig};
-use media_pipeline::{EmbedResult, SummarizeResult};
+use media_pipeline::{EmbedResult, SummarizeResult, SUMMARY_CHAR_CAP};
 use tokio::sync::Mutex;
-
-/// Hard cap on the summary string before embedding. MiniLM-L6-v2's tokenizer
-/// truncates to 256 tokens (~1000 chars) anyway; 4096 is a safety bound
-/// on lease-healthy embed time if a caller passes a pathological input.
-/// Kept in sync with SUMMARY_CHAR_CAP in summarize.rs.
-const SUMMARY_CHAR_CAP: usize = 4096;
 
 #[derive(Parser)]
 #[command(name = "embed", about = "FlowFabric media-pipeline embed worker")]
@@ -53,6 +47,11 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Synchronous: TextEmbedding::try_new blocks the thread while it
+    // downloads MiniLM (~90MB on first run) and opens ONNX Runtime. Fine
+    // here — we run this BEFORE the worker is connected to Valkey, so no
+    // claim loop is starved waiting. On a warm cache (see
+    // scripts/download-models.sh) init is sub-second.
     let mut model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
         .context("fastembed init")?;
 
@@ -156,6 +155,18 @@ async fn process(task: ClaimedTask, model: Arc<Mutex<TextEmbedding>>) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("fastembed returned empty vector set"))?;
     let dim = vector.len() as u32;
 
+    // R2-F31: fastembed is not cancellable mid-call; a pathological summary
+    // can push embed past lease TTL. Re-check lease health before complete;
+    // if stale, fail cleanly rather than submitting a doomed complete (which
+    // the engine would reject as StaleLease, dropping the task without a
+    // terminal operation — the scanner would then re-queue and a second
+    // embed worker would repeat the work).
+    if !task.is_lease_healthy() {
+        task.fail("lease expired during embed", "lease_stale")
+            .await?;
+        anyhow::bail!("lease unhealthy post-embed");
+    }
+
     let result = EmbedResult { vector, dim };
     task.complete(Some(serde_json::to_vec(&result)?)).await?;
     tracing::info!(dim, "embed complete");
@@ -165,6 +176,9 @@ async fn process(task: ClaimedTask, model: Arc<Mutex<TextEmbedding>>) -> anyhow:
 /// Jittered idle sleep for `claim_next` → `Ok(None)`. Mirrors summarize.rs
 /// (F25): random 200–1200ms avoids N workers waking on the same second and
 /// dog-piling partition ZSET reads.
+///
+/// Seed from `SystemTime::now().subsec_nanos()` — non-cryptographic, the
+/// only randomness the example needs; keeps the crate graph `rand`-free.
 async fn idle_sleep() {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
