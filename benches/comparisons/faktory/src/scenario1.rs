@@ -17,6 +17,17 @@
 //!     to an existing Faktory host)
 //!   * No authentication required (the start script runs with an
 //!     empty password)
+//!
+//! Out of scope: restart detection. If Faktory crashes or is
+//! restarted during the bench, connect errors surface but the
+//! harness does not attempt reconnect or partial-result salvage.
+//!
+//! Wire parity: Faktory args are JSON, so the raw 4 KiB filler is
+//! hex-encoded to 8 KiB on the wire. The report emits
+//! `config.wire_bytes = 2 * config.payload_bytes` so comparison
+//! consumers see the real wire cost — raw-throughput numbers vs
+//! FlowFabric/baseline (which send bytes directly) should account
+//! for the 2x per-op wire overhead.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -165,13 +176,21 @@ async fn main() -> Result<()> {
         "config": {
             "tasks": args.tasks,
             "workers": WORKER_COUNT,
+            // Raw filler size (source bytes). Matches what
+            // FlowFabric + baseline send on their wires.
             "payload_bytes": PAYLOAD_BYTES,
+            // Actual bytes going through Faktory's JSON-args
+            // protocol: 2 chars/byte lowercase hex of the raw
+            // filler. Surfaced separately because Faktory's hex
+            // overhead vs FlowFabric/baseline raw bytes is real and
+            // real-world callers see the larger wire cost.
+            "wire_bytes": PAYLOAD_BYTES * 2,
             "faktory_url": args.faktory_url,
             "queue": QUEUE,
         },
         "throughput_ops_per_sec": throughput,
         "latency_ms": { "p50": p50, "p95": p95, "p99": p99 },
-        "notes": "faktory = Producer::enqueue + Worker::run_one pool; lease equivalent is implicit",
+        "notes": "faktory = Producer::enqueue + Worker::run_one pool; lease equivalent is implicit. Wire payload is hex-encoded (2x source bytes) — see config.wire_bytes. Throughput figure is not directly comparable against systems that send raw bytes on the wire (FlowFabric, baseline) at the same ops rate — Faktory pushes 2x the bytes per op.",
     });
 
     let results_dir = std::path::Path::new(&args.results_dir);
@@ -203,7 +222,15 @@ async fn seed_jobs(client: &mut Client, n: usize, payload: &[u8]) -> Result<()> 
                 // base64-style hex nibble string (cheap, no extra dep).
                 // The handler ignores args entirely — we only care
                 // about queue round-trip cost.
-                let arg = serde_json::Value::String(hex_prefix(payload, 32));
+                // Full hex encoding of the 4 KiB source payload.
+                // Faktory args are JSON so raw bytes go through hex;
+                // keep parity with FlowFabric/baseline which send
+                // the full 4 KiB on the wire by sending the full
+                // 8 KiB hex here. Earlier revisions truncated to 64
+                // bytes of hex for size, which understated Faktory's
+                // wire cost and let it out-throughput the other
+                // systems unfairly.
+                let arg = serde_json::Value::String(hex_encode(payload));
                 Job::new(JOB_KIND, vec![arg]).on_queue(QUEUE)
             })
             .collect();
@@ -240,14 +267,16 @@ fn filler_payload(size: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Render the first `max_bytes` of the payload as a lowercase hex
-/// string. Full 4 KiB would bloat the Faktory job serialization
-/// pointlessly; the worker never reads the arg value so a prefix is
-/// representative for the queue round-trip cost being measured.
-fn hex_prefix(payload: &[u8], max_bytes: usize) -> String {
-    let take = payload.len().min(max_bytes);
-    let mut s = String::with_capacity(take * 2);
-    for b in &payload[..take] {
+/// Render `payload` as a lowercase hex string (2 chars per byte).
+/// Used to convey the full PAYLOAD_BYTES raw filler through
+/// Faktory's JSON-args wire in an apples-to-apples shape with
+/// FlowFabric / baseline, both of which send the filler as raw
+/// bytes. Input 4 KiB → 8 KiB hex on the wire; the reports state
+/// this as `wire_bytes = PAYLOAD_BYTES * 2` so comparison consumers
+/// don't mistake the wire cost.
+fn hex_encode(payload: &[u8]) -> String {
+    let mut s = String::with_capacity(payload.len() * 2);
+    for b in payload {
         use std::fmt::Write as _;
         let _ = write!(&mut s, "{:02x}", b);
     }

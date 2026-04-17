@@ -15,6 +15,24 @@
 //!     "each system run in its idiomatic deployment".
 //!
 //! Prereq: `scripts/start-faktory.sh` (or an equivalent Faktory host).
+//!
+//! Out of scope: restart detection. If Faktory crashes or is
+//! restarted during the 5-minute run, connect errors surface but
+//! the harness does not attempt reconnect or partial-result
+//! salvage.
+//!
+//! Wire parity: Faktory args are JSON so raw 4 KiB filler is
+//! hex-encoded to 8 KiB on the wire. Reports surface both as
+//! `config.payload_bytes` (raw) and `config.wire_bytes` (hex) so
+//! throughput comparisons against systems that send raw bytes on
+//! the wire can account for the 2x per-op overhead.
+//!
+//! Heartbeat accounting: Faktory BEATs live on the worker's TCP
+//! connection, not per-job. `config.heartbeat_ops_per_s_approx`
+//! surfaces the approximate extra server load (~N/15 ops/s at the
+//! default 15-second heartbeat cadence for N workers) so readers
+//! of the headline throughput number see Faktory's hidden baseline
+//! traffic.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -263,7 +281,14 @@ async fn main() -> Result<()> {
             "seed": args.seed,
             "refill_topup_per_interval": REFILL_TOPUP,
             "refill_interval_ms": REFILL_EVERY_MS,
+            // Raw filler size (matches FlowFabric / baseline).
             "payload_bytes": PAYLOAD_BYTES,
+            // JSON-args wire bytes for comparison honesty: Faktory
+            // hex-encodes args so a 4 KiB filler is 8 KiB on the
+            // wire. FlowFabric/baseline send raw bytes; a 1:1
+            // throughput comparison must account for the 2x wire
+            // cost per op.
+            "wire_bytes": PAYLOAD_BYTES * 2,
             "deadline_per_task_ms": TASK_DEADLINE_MS,
             "task_work_ms": TASK_WORK_MS,
             "faktory_url": args.faktory_url,
@@ -272,9 +297,18 @@ async fn main() -> Result<()> {
             "completed": completed_n,
             "missed_deadline_count": missed_n,
             "missed_deadline_pct": missed_pct,
+            // Faktory uses per-worker-connection BEAT heartbeats at
+            // ~15 s cadence (see contribsys/faktory docs), not
+            // per-job lease renewals. Schema-compatible 0 here means
+            // "no per-job renewal primitive", NOT "zero heartbeat
+            // cost" — a 100-worker pool sends ~6.7 BEATs/s which
+            // contributes to server load that this metric does not
+            // capture. Document explicitly in `notes`.
             "lease_renewal_count": 0,
             "lease_renewal_overhead_pct": 0.0,
             "lease_renewal_overhead_method": "n/a_faktory_heartbeats_not_leases",
+            "heartbeat_interval_s_approx": 15,
+            "heartbeat_ops_per_s_approx": (args.workers as f64) / 15.0,
             "rss_start_mb": rss_start_mb,
             "rss_mid_mb": rss_mid_mb,
             "rss_end_mb": rss_end_mb,
@@ -282,7 +316,7 @@ async fn main() -> Result<()> {
         },
         "throughput_ops_per_sec": throughput,
         "latency_ms": { "p50": p50, "p95": p95, "p99": p99 },
-        "notes": "faktory uses per-connection BEAT heartbeats, not per-job leases; renewal fields are reported as 0 for schema compatibility",
+        "notes": "faktory uses per-connection BEAT heartbeats at ~15 s cadence, not per-job leases. `lease_renewal_*` fields are 0 for schema compatibility — actual heartbeat cost (~N/15 ops/s on the server) is NOT measured here. Wire payload is hex-encoded (2x raw bytes); see config.wire_bytes. missed_deadline_pct computed against submit-to-complete via Faktory's enqueued_at timestamp; refill batches cause per-batch spikes because every task in a batch shares `enqueued_at` — headline is long-window aggregate, not per-refill instantaneous.",
     });
 
     let results_dir = std::path::Path::new(&args.results_dir);
@@ -311,7 +345,11 @@ async fn seed_jobs(client: &mut Client, n: usize, payload: &[u8]) -> Result<()> 
         let take = remaining.min(CHUNK);
         let batch: Vec<Job> = (0..take)
             .map(|_| {
-                let arg = serde_json::Value::String(hex_prefix(payload, 32));
+                // Full hex encoding of the 4 KiB filler. Matches
+                // wire parity with FlowFabric/baseline — see
+                // scenario1.rs `hex_encode` comment for the
+                // rationale.
+                let arg = serde_json::Value::String(hex_encode(payload));
                 Job::new(JOB_KIND, vec![arg]).on_queue(QUEUE)
             })
             .collect();
@@ -343,10 +381,12 @@ fn filler_payload(size: usize) -> Vec<u8> {
         .collect()
 }
 
-fn hex_prefix(payload: &[u8], max_bytes: usize) -> String {
-    let take = payload.len().min(max_bytes);
-    let mut s = String::with_capacity(take * 2);
-    for b in &payload[..take] {
+/// See scenario1.rs `hex_encode`. Full 2 chars/byte encoding of the
+/// raw filler so Faktory's wire cost is apples-to-apples with
+/// FlowFabric / baseline.
+fn hex_encode(payload: &[u8]) -> String {
+    let mut s = String::with_capacity(payload.len() * 2);
+    for b in payload {
         use std::fmt::Write as _;
         let _ = write!(&mut s, "{:02x}", b);
     }

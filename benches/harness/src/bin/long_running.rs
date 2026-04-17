@@ -63,9 +63,39 @@ const PAYLOAD_BYTES: usize = 4 * 1024;
 const TASK_WORK_MS: u64 = 3_000;
 const TASK_DEADLINE_MS: i64 = 60_000;
 const POLL_INTERVAL_MS: u64 = 50;
+// Refill cadence tuned so drain roughly keeps pace: 100 workers at
+// 3 s per task = ~33 ops/s; refilling ~20 tasks every 10 s adds
+// ~2 ops/s to the backlog so some tasks miss the 60 s deadline
+// (back-pressure signal) but most complete within it. Earlier
+// refill (1000/10 s = 100 ops/s) over-saturated — queue grew
+// unboundedly and every task missed, hiding the signal.
 const REFILL_EVERY_MS: u64 = 10_000;
-const REFILL_TOPUP: usize = 1_000;
+const REFILL_TOPUP: usize = 20;
 const SHUTDOWN_GRACE_S: u64 = 30;
+
+// RSS sampling interval. 10 s over a 300 s default run = 30 samples.
+// 3-point start/mid/end can't distinguish sawtooth from monotonic
+// leak; the series + slope detect both.
+const RSS_SAMPLE_EVERY_MS: u64 = 10_000;
+
+// Steady-state window size, seconds. Reported as
+// `steady_state_throughput_ops_per_sec = completions_in_last_WINDOW /
+// WINDOW`. The top-level `throughput_ops_per_sec` still reports
+// whole-run for reference but steady-state is the headline number
+// the consumer wants (cairn-rs doesn't care how fast you drain a
+// pre-warmed queue on startup).
+const STEADY_STATE_WINDOW_S: u64 = 60;
+
+// Payload layout: first 16 bytes are an ASCII-hex-encoded
+// little-endian i64 Unix-ms timestamp stamped at seed time.
+// ASCII-hex rather than raw bytes because ff-server's
+// create_execution path passes input_payload through
+// `String::from_utf8_lossy` (server.rs:505) which replaces any
+// non-UTF-8 byte with U+FFFD — a binary `submit_ms.to_le_bytes()`
+// would be silently corrupted. Workers decode 16 hex chars →
+// Unix-ms at claim time. Remaining bytes are random filler to hit
+// the documented PAYLOAD_BYTES wire size.
+const PAYLOAD_HEADER_BYTES: usize = 16;
 
 // Lease TTL tuned so renewals actually fire during the 3 s work sleep:
 // renewal tick is `lease_ttl_ms / 3` (see `ff_sdk::config`), so a 6 s
@@ -164,12 +194,12 @@ where
         id: &tracing::span::Id,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if let Some(span) = ctx.span(id) {
-            if Self::is_renewal(span.metadata()) {
-                let mut guard = self.active.lock().expect("renewal mutex");
-                if let Some(state) = guard.get_mut(id) {
-                    state.last_enter = Instant::now();
-                }
+        if let Some(span) = ctx.span(id)
+            && Self::is_renewal(span.metadata())
+        {
+            let mut guard = self.active.lock().expect("renewal mutex");
+            if let Some(state) = guard.get_mut(id) {
+                state.last_enter = Instant::now();
             }
         }
     }
@@ -179,12 +209,12 @@ where
         id: &tracing::span::Id,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if let Some(span) = ctx.span(id) {
-            if Self::is_renewal(span.metadata()) {
-                let mut guard = self.active.lock().expect("renewal mutex");
-                if let Some(state) = guard.get_mut(id) {
-                    state.busy_ns += state.last_enter.elapsed().as_nanos() as u64;
-                }
+        if let Some(span) = ctx.span(id)
+            && Self::is_renewal(span.metadata())
+        {
+            let mut guard = self.active.lock().expect("renewal mutex");
+            if let Some(state) = guard.get_mut(id) {
+                state.busy_ns += state.last_enter.elapsed().as_nanos() as u64;
             }
         }
     }
@@ -257,9 +287,18 @@ fn read_rss_mb() -> Option<u64> {
 /// the aggregator can compute percentiles without any cross-worker
 /// locking in the hot path.
 struct WorkerOutcome {
-    /// claim-to-complete latency samples, microseconds.
+    /// claim-to-complete latency samples, microseconds. One entry per
+    /// completed task.
     latencies_us: Vec<u64>,
+    /// Completion timestamps (Unix-ms). Parallel to `latencies_us`;
+    /// used at aggregation time to bucket completions into the
+    /// steady-state window for honest throughput reporting.
+    completion_ms: Vec<i64>,
     completed: u64,
+    /// Tasks whose (now_complete - submit_ms) exceeded
+    /// TASK_DEADLINE_MS. Computed from the payload-header submit
+    /// timestamp — the real submit-to-complete primitive, not the
+    /// claim-to-complete undercount.
     missed: u64,
     failed: u64,
 }
@@ -366,19 +405,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Midpoint RSS sample via a dedicated timer task so it fires
-    // regardless of what the workers are doing.
-    let rss_mid_cell: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-    let mid_deadline_ms = args.duration.saturating_mul(1_000) / 2;
-    let rss_mid_cell_clone = rss_mid_cell.clone();
-    let rss_mid_shutdown = shutdown.clone();
-    let rss_mid = tokio::spawn(async move {
-        tokio::select! {
-            _ = rss_mid_shutdown.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(mid_deadline_ms)) => {
-                let sample = read_rss_mb();
-                *rss_mid_cell_clone.lock().await = sample;
-                tracing::info!(rss_mid_mb = ?sample, "midpoint RSS sample");
+    // RSS time-series sampler. 3-point start/mid/end can't
+    // distinguish sawtooth from monotonic leak — a linear-slope fit
+    // over a dense series is the honest leak signal. One sample
+    // every RSS_SAMPLE_EVERY_MS into a Vec<(t_s_from_start, rss_mb)>
+    // owned by the sampler; swapped out to the aggregator at
+    // shutdown.
+    let rss_series_cell: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let rss_series_cell_clone = rss_series_cell.clone();
+    let rss_series_shutdown = shutdown.clone();
+    let rss_series_start = drain_start;
+    let rss_series = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(RSS_SAMPLE_EVERY_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = rss_series_shutdown.notified() => return,
+                _ = ticker.tick() => {
+                    if let Some(mb) = read_rss_mb() {
+                        let t_s = rss_series_start.elapsed().as_secs();
+                        rss_series_cell_clone.lock().await.push((t_s, mb));
+                    }
+                }
             }
         }
     });
@@ -409,33 +457,68 @@ async fn main() -> Result<()> {
     })
     .await;
     refiller.abort();
-    rss_mid.abort();
-    let _ = rss_mid.await;
+    rss_series.abort();
+    let _ = rss_series.await;
     let _ = refiller.await;
 
     let wall = drain_start.elapsed();
     let rss_end_mb = read_rss_mb();
-    let rss_mid_mb = *rss_mid_cell.lock().await;
+    // Snapshot the sampler's series + append a final end-of-run
+    // sample so the last data point matches the end-of-wall.
+    let mut rss_series_vec = rss_series_cell.lock().await.clone();
+    if let Some(end_mb) = rss_end_mb {
+        rss_series_vec.push((wall.as_secs(), end_mb));
+    }
+    let (rss_min_mb, rss_max_mb, rss_slope_mb_per_min) =
+        rss_summary(rss_start_mb, &rss_series_vec);
 
     // Aggregate worker outcomes.
     let outcomes = outcomes.lock().await;
     let mut all_latencies: Vec<u64> = Vec::new();
+    let mut all_completion_ms: Vec<i64> = Vec::new();
     let mut completed: u64 = 0;
     let mut missed: u64 = 0;
     let mut failed: u64 = 0;
     for o in outcomes.iter() {
         all_latencies.extend(&o.latencies_us);
+        all_completion_ms.extend(&o.completion_ms);
         completed += o.completed;
         missed += o.missed;
         failed += o.failed;
     }
     drop(outcomes);
 
+    // Whole-run throughput — kept for reference but NOT the headline
+    // under a pre-seeded queue shape. Default 300 s run drains a
+    // 10 000-task pre-seeded queue in the first minutes and the
+    // refiller then keeps it topped up; whole-run throughput is
+    // therefore burst-dominated. Use `steady_state_throughput` below
+    // as the headline, and see the notes field for the caveat.
     let throughput = if wall.as_secs_f64() > 0.0 {
         completed as f64 / wall.as_secs_f64()
     } else {
         0.0
     };
+
+    // Steady-state throughput: count completions in the final
+    // STEADY_STATE_WINDOW_S seconds of the run and divide by the
+    // window. Honest primitive for "how fast does the engine churn
+    // under sustained load". Requires wall > window; shorter runs
+    // (smoke tests) fall back to whole-run throughput and the notes
+    // field explains.
+    let window_ms = (STEADY_STATE_WINDOW_S * 1_000) as i64;
+    let run_end_ms = ff_bench::workload::now_ms();
+    let window_start_ms = run_end_ms - window_ms;
+    let in_window = all_completion_ms
+        .iter()
+        .filter(|&&ts| ts >= window_start_ms)
+        .count() as u64;
+    let steady_state_throughput = if wall.as_secs() >= STEADY_STATE_WINDOW_S {
+        in_window as f64 / STEADY_STATE_WINDOW_S as f64
+    } else {
+        throughput
+    };
+
     let latency = Percentiles::from_micros(&all_latencies);
     let renewal_count = renewal_counters.count.load(Ordering::Relaxed);
     let renewal_total_ns = renewal_counters.total_ns.load(Ordering::Relaxed);
@@ -461,14 +544,17 @@ async fn main() -> Result<()> {
         missed,
         failed,
         throughput_ops_s = throughput,
+        steady_state_throughput_ops_s = steady_state_throughput,
         p50_ms = latency.p50,
         p95_ms = latency.p95,
         p99_ms = latency.p99,
         renewal_count,
         renewal_overhead_pct,
         rss_start_mb = ?rss_start_mb,
-        rss_mid_mb = ?rss_mid_mb,
         rss_end_mb = ?rss_end_mb,
+        rss_min_mb,
+        rss_max_mb,
+        rss_slope_mb_per_min,
         "scenario 3 complete"
     );
 
@@ -477,6 +563,11 @@ async fn main() -> Result<()> {
         (Some(s), Some(e)) if s > 0 => Some(((e as f64 - s as f64) / s as f64) * 100.0),
         _ => None,
     };
+    // Serialize the RSS series as an array of [t_s, mb] 2-tuples so
+    // JSON consumers (check_release.py) can plot a line without
+    // reshaping.
+    let rss_series_json: Vec<[u64; 2]> =
+        rss_series_vec.iter().map(|&(t, mb)| [t, mb]).collect();
     let config = serde_json::json!({
         "duration_s": args.duration,
         "workers": args.workers,
@@ -491,14 +582,22 @@ async fn main() -> Result<()> {
         "failed": failed,
         "missed_deadline_count": missed,
         "missed_deadline_pct": missed_pct,
+        "missed_deadline_primitive": "submit_to_complete",
+        "steady_state_throughput_ops_per_sec": steady_state_throughput,
+        "steady_state_window_s": STEADY_STATE_WINDOW_S,
+        "steady_state_window_completions": in_window,
         "lease_renewal_count": renewal_count,
         "lease_renewal_total_ns": renewal_total_ns,
         "lease_renewal_overhead_pct": renewal_overhead_pct,
         "lease_renewal_overhead_method": "span_enter_exit_measured",
         "rss_start_mb": rss_start_mb,
-        "rss_mid_mb": rss_mid_mb,
         "rss_end_mb": rss_end_mb,
         "rss_growth_pct": rss_growth_pct,
+        "rss_sample_every_ms": RSS_SAMPLE_EVERY_MS,
+        "rss_series": rss_series_json,
+        "rss_min_mb": rss_min_mb,
+        "rss_max_mb": rss_max_mb,
+        "rss_slope_mb_per_min": rss_slope_mb_per_min,
     });
     let mut report = Report::fill_env(
         SCENARIO,
@@ -512,11 +611,28 @@ async fn main() -> Result<()> {
             p99: latency.p99,
         },
     );
+    // Always emit the refill-artifact caveat so consumers of the
+    // missed_deadline_pct metric see it in context; refilling N tasks
+    // at once (REFILL_TOPUP per REFILL_EVERY_MS) gives every task in
+    // a batch the same `submit_ms`, so under back-pressure the miss
+    // rate spikes near batch boundaries rather than smoothing out.
+    // headline-is-steady-state note (S3-F2) also lives here.
+    let mut notes = String::from(
+        "steady_state_throughput_ops_per_sec is the headline; \
+         whole-run throughput_ops_per_sec is burst-dominated by the \
+         pre-seeded queue drain. missed_deadline_pct is \
+         submit-to-complete; refill batches cause per-batch spikes \
+         because every task in a batch shares `submit_ms`, so the \
+         rate smooths only over windows >> refill_interval_ms. \
+         lease renewal overhead measured via span enter/exit — real \
+         under steady-state load, not a quiescent calibration.",
+    );
     if termination_reason != "duration_elapsed" {
-        report.notes = Some(format!(
-            "terminated early: {termination_reason}; metrics cover partial run"
+        notes.push_str(&format!(
+            " terminated early: {termination_reason}; metrics cover partial run."
         ));
     }
+    report.notes = Some(notes);
     let dir = resolve_results_dir(&args.results_dir);
     match write_report(&report, &dir) {
         Ok(path) => println!("[bench] wrote {}", path.display()),
@@ -530,6 +646,49 @@ async fn main() -> Result<()> {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/// Compact summary of the RSS time series: (min, max, slope).
+///
+/// `slope_mb_per_min` is a least-squares linear fit across
+/// (t_seconds, rss_mb) — positive means monotonic growth (leak
+/// signal), near-zero means steady. `start_mb` seeds the series at
+/// t=0 so a short run with one-sample series still produces a
+/// meaningful slope.
+fn rss_summary(
+    start_mb: Option<u64>,
+    series: &[(u64, u64)],
+) -> (Option<u64>, Option<u64>, Option<f64>) {
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(series.len() + 1);
+    if let Some(s) = start_mb {
+        pts.push((0.0, s as f64));
+    }
+    for &(t, mb) in series {
+        pts.push((t as f64, mb as f64));
+    }
+    if pts.is_empty() {
+        return (None, None, None);
+    }
+    let min = pts.iter().map(|&(_, y)| y as u64).min();
+    let max = pts.iter().map(|&(_, y)| y as u64).max();
+    let slope = if pts.len() < 2 {
+        Some(0.0)
+    } else {
+        let n = pts.len() as f64;
+        let sum_x: f64 = pts.iter().map(|&(x, _)| x).sum();
+        let sum_y: f64 = pts.iter().map(|&(_, y)| y).sum();
+        let sum_xy: f64 = pts.iter().map(|&(x, y)| x * y).sum();
+        let sum_xx: f64 = pts.iter().map(|&(x, _)| x * x).sum();
+        let denom = n * sum_xx - sum_x * sum_x;
+        if denom.abs() < 1e-9 {
+            None
+        } else {
+            // per-second slope → per-minute
+            let per_s = (n * sum_xy - sum_x * sum_y) / denom;
+            Some(per_s * 60.0)
+        }
+    };
+    (min, max, slope)
+}
 
 fn estimated_tasks_per_worker(args: &Args) -> usize {
     // Rough upper bound: (duration / work_ms_per_task) — used only to
@@ -569,7 +728,13 @@ async fn seed_tasks(
     const CONC: usize = 32;
     use tokio::sync::Semaphore;
     let sem = Arc::new(Semaphore::new(CONC));
-    let payload = ff_bench::workload::filler_payload(PAYLOAD_BYTES);
+    // Filler body (static shared across tasks). The header is
+    // per-task and stamped inside the spawned submitter so each
+    // job carries its own submit timestamp. Pre-compute the
+    // filler once so N parallel submitters aren't racing on
+    // filler generation.
+    let filler = ff_bench::workload::filler_payload(PAYLOAD_BYTES - PAYLOAD_HEADER_BYTES);
+    let filler = Arc::new(filler);
     let mut handles = Vec::with_capacity(n);
     for _ in 0..n {
         let permit = sem
@@ -579,9 +744,20 @@ async fn seed_tasks(
             .context("semaphore closed")?;
         let client = client.clone();
         let env = env.clone();
-        let payload = payload.clone();
+        let filler = filler.clone();
         handles.push(tokio::spawn(async move {
-            let deadline = ff_bench::workload::now_ms() + TASK_DEADLINE_MS;
+            // Stamp submit_ms in the first 16 bytes as ASCII-hex so
+            // workers can read it without a separate server
+            // round-trip — see PAYLOAD_HEADER_BYTES comment for why
+            // hex and not raw bytes.
+            let submit_ms = ff_bench::workload::now_ms();
+            let header = format!("{:016x}", submit_ms as u64);
+            debug_assert_eq!(header.len(), PAYLOAD_HEADER_BYTES);
+            let mut payload = Vec::with_capacity(PAYLOAD_BYTES);
+            payload.extend_from_slice(header.as_bytes());
+            payload.extend_from_slice(&filler);
+            debug_assert_eq!(payload.len(), PAYLOAD_BYTES);
+            let deadline = submit_ms + TASK_DEADLINE_MS;
             let res = ff_bench::workload::create_execution_with_deadline(
                 &client,
                 &env,
@@ -622,6 +798,7 @@ async fn drive_worker(
 
     let mut out = WorkerOutcome {
         latencies_us: Vec::with_capacity(cap),
+        completion_ms: Vec::with_capacity(cap),
         completed: 0,
         missed: 0,
         failed: 0,
@@ -640,21 +817,32 @@ async fn drive_worker(
         };
         match claim {
             Ok(Some(task)) => {
+                // Read submit timestamp from the payload header
+                // BEFORE the task is moved into process_task. The
+                // header is an 8-byte little-endian i64 Unix-ms
+                // stamped by seed_tasks — no server round-trip
+                // needed to resolve deadline state.
+                let submit_ms = parse_submit_ms(task.input_payload());
                 let t_claim = Instant::now();
                 match process_task(task).await {
                     Ok(_) => {
                         let lat_us = t_claim.elapsed().as_micros() as u64;
+                        let complete_ms = ff_bench::workload::now_ms();
                         out.latencies_us.push(lat_us);
+                        out.completion_ms.push(complete_ms);
                         out.completed += 1;
-                        // TASK_DEADLINE_MS worth of total latency
-                        // (claim + work + complete) means the
-                        // submit→complete gap is > deadline once you
-                        // add the queue wait before claim. We're
-                        // over-counting misses a little here — this
-                        // metric is the back-pressure signal, not an
-                        // SLA number.
-                        let total_ms = lat_us / 1000;
-                        if total_ms as i64 > TASK_DEADLINE_MS {
+                        // Submit-to-complete is the honest deadline
+                        // primitive: queue wait + claim + work +
+                        // complete. Under steady-state the queue
+                        // wait dominates; measuring only
+                        // claim-to-complete (as the earlier draft
+                        // did) artificially suppressed the miss
+                        // rate because no task missed the 60 s
+                        // deadline on claim-to-complete alone
+                        // (claim-to-complete ~= work_ms = 3 s).
+                        if let Some(submit_ms) = submit_ms
+                            && complete_ms - submit_ms > TASK_DEADLINE_MS
+                        {
                             out.missed += 1;
                         }
                     }
@@ -679,6 +867,19 @@ async fn drive_worker(
             }
         }
     }
+}
+
+/// Parse the 16-ASCII-hex-char submit-timestamp header. See
+/// PAYLOAD_HEADER_BYTES comment for the encoding rationale
+/// (server collapses non-UTF-8 bytes to U+FFFD). Returns None on
+/// any shape / encoding mismatch — None widens the miss-rate
+/// undercount rather than crashing a bench mid-run.
+fn parse_submit_ms(payload: &[u8]) -> Option<i64> {
+    if payload.len() < PAYLOAD_HEADER_BYTES {
+        return None;
+    }
+    let hex = std::str::from_utf8(&payload[..PAYLOAD_HEADER_BYTES]).ok()?;
+    u64::from_str_radix(hex, 16).ok().map(|v| v as i64)
 }
 
 async fn process_task(task: ClaimedTask) -> Result<()> {
