@@ -59,7 +59,12 @@ end
 -- returns ok_already_satisfied.
 --
 -- KEYS (3): flow_core, members_set, flow_index
--- ARGV (4): flow_id, flow_kind, namespace, now_ms
+-- ARGV (4): flow_id, flow_kind, namespace, now_ms (IGNORED — see note below)
+--
+-- NOTE: ARGV[4] (`now_ms`) is accepted for caller compatibility but NOT
+-- used for stored timestamps. We read server time via redis.call("TIME")
+-- so created_at / last_mutation_at agree with fields written by other
+-- Lua functions (ff_complete_execution etc.) under client clock skew.
 ---------------------------------------------------------------------------
 redis.register_function('ff_create_flow', function(keys, args)
   local K = {
@@ -72,8 +77,12 @@ redis.register_function('ff_create_flow', function(keys, args)
     flow_id   = args[1],
     flow_kind = args[2],
     namespace = args[3],
-    now_ms    = args[4],
+    -- args[4] is client-provided now_ms; intentionally ignored.
   }
+
+  -- Server time (not client-provided) so created_at / last_mutation_at
+  -- agree with timestamps written by ff_complete_execution and peers.
+  local now_ms = server_time_ms()
 
   -- Maintain flow_index BEFORE the idempotency guard. SADD is itself
   -- idempotent (no-op on existing members), and hoisting it heals any
@@ -95,8 +104,8 @@ redis.register_function('ff_create_flow', function(keys, args)
     "node_count", 0,
     "edge_count", 0,
     "public_flow_state", "open",
-    "created_at", A.now_ms,
-    "last_mutation_at", A.now_ms)
+    "created_at", now_ms,
+    "last_mutation_at", now_ms)
 
   return ok(A.flow_id)
 end)
@@ -108,7 +117,7 @@ end)
 -- (that's on {p:N}, caller must do it separately).
 --
 -- KEYS (3): flow_core, members_set, flow_index
--- ARGV (3): flow_id, execution_id, now_ms
+-- ARGV (3): flow_id, execution_id, now_ms (IGNORED — server time used)
 ---------------------------------------------------------------------------
 redis.register_function('ff_add_execution_to_flow', function(keys, args)
   local K = {
@@ -120,8 +129,12 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   local A = {
     flow_id      = args[1],
     execution_id = args[2],
-    now_ms       = args[3],
+    -- args[3] is client-provided now_ms; intentionally ignored in favour
+    -- of redis.call("TIME") to keep last_mutation_at consistent with
+    -- timestamps stamped by ff_complete_execution and peers.
   }
+
+  local now_ms = server_time_ms()
 
   -- 1. Validate flow exists and is not terminal
   local raw = redis.call("HGETALL", K.flow_core)
@@ -154,7 +167,7 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   -- 4. Increment node_count and graph_revision
   local new_nc = redis.call("HINCRBY", K.flow_core, "node_count", 1)
   local new_rev = redis.call("HINCRBY", K.flow_core, "graph_revision", 1)
-  redis.call("HSET", K.flow_core, "last_mutation_at", A.now_ms)
+  redis.call("HSET", K.flow_core, "last_mutation_at", now_ms)
 
   return ok(A.execution_id, tostring(new_nc))
 end)
@@ -166,7 +179,8 @@ end)
 -- individual cancellations cross-partition.
 --
 -- KEYS (3): flow_core, members_set, flow_index
--- ARGV (4): flow_id, reason, cancellation_policy, now_ms
+-- ARGV (4): flow_id, reason, cancellation_policy, now_ms (IGNORED —
+--   server time used so `cancelled_at` agrees with peer Lua fields)
 ---------------------------------------------------------------------------
 redis.register_function('ff_cancel_flow', function(keys, args)
   local K = {
@@ -179,8 +193,10 @@ redis.register_function('ff_cancel_flow', function(keys, args)
     flow_id              = args[1],
     reason               = args[2],
     cancellation_policy  = args[3],
-    now_ms               = args[4],
+    -- args[4] is client-provided now_ms; intentionally ignored.
   }
+
+  local now_ms = server_time_ms()
 
   -- 1. Validate flow exists
   local raw = redis.call("HGETALL", K.flow_core)
@@ -208,10 +224,10 @@ redis.register_function('ff_cancel_flow', function(keys, args)
   -- no backfill migration is needed.
   redis.call("HSET", K.flow_core,
     "public_flow_state", "cancelled",
-    "cancelled_at", A.now_ms,
+    "cancelled_at", now_ms,
     "cancel_reason", A.reason,
     "cancellation_policy", A.cancellation_policy,
-    "last_mutation_at", A.now_ms)
+    "last_mutation_at", now_ms)
 
   -- 4b. Remove from active flow_index (projector skips cancelled flows)
   redis.call("SREM", K.flow_index, A.flow_id)

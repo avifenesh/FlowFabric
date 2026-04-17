@@ -4,6 +4,21 @@
 -- Reference: RFC-010 §4.8
 
 ---------------------------------------------------------------------------
+-- Time
+---------------------------------------------------------------------------
+
+-- Returns the Valkey server time as milliseconds. Always prefer this over
+-- a caller-supplied now_ms for fields that are used in retention windows,
+-- eligibility scoring, lease expiry, or any cross-execution causal
+-- comparison. Client-supplied timestamps are trivially skewable and
+-- produce observability drift when compared against fields written by
+-- other Lua functions (which already use redis.call("TIME")).
+local function server_time_ms()
+  local t = redis.call("TIME")
+  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
+
+---------------------------------------------------------------------------
 -- Return wrappers (§4.9)
 ---------------------------------------------------------------------------
 

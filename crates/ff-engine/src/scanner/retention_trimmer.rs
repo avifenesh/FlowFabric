@@ -179,14 +179,19 @@ async fn purge_execution(
     }
 
     // ── Cascading delete ──
-    // Collect all keys to delete in a single pipeline-style batch.
+    // Collect subordinate keys first. exec_core and the policy key are
+    // held out of this list and DELeted LAST, after every other chunk
+    // succeeds. Rationale: if an intermediate chunk fails with a
+    // transient error, the next retention pass needs to re-read
+    // `exec_core.total_attempt_count` and `policy.retention_ttl_ms` to
+    // rebuild the full del_keys list — so we must not destroy those two
+    // keys until the rest of the cascade has committed. ZREM on the
+    // terminal_zset entry also happens last (existing invariant).
     let mut del_keys: Vec<String> = Vec::with_capacity(16 + total_attempts as usize * 5);
 
-    // Execution-level keys
-    del_keys.push(exec_core_key);
+    // Execution-level keys (safe to delete before exec_core)
     del_keys.push(format!("ff:exec:{}:{}:payload", tag, eid_str));
     del_keys.push(format!("ff:exec:{}:{}:result", tag, eid_str));
-    del_keys.push(policy_key);
     del_keys.push(format!("ff:exec:{}:{}:tags", tag, eid_str));
 
     // Lease keys
@@ -262,7 +267,10 @@ async fn purge_execution(
     }
 
     // Batch DEL in chunks of 500 to avoid oversized commands on
-    // executions with many attempts/signals/waitpoints/deps.
+    // executions with many attempts/signals/waitpoints/deps. Subordinate
+    // keys go first; if any chunk errors with `?`, exec_core and
+    // policy_key remain untouched so the next retention pass can
+    // re-read them and rebuild the full del_keys list.
     for chunk in del_keys.chunks(500) {
         let key_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
         let _: u32 = client
@@ -272,7 +280,17 @@ async fn purge_execution(
             .await?;
     }
 
-    // Remove from terminal ZSET and all_executions SET
+    // Finalize: drop exec_core and policy together (both on {p:N}), then
+    // sweep the terminal-zset entry and the partition-wide all_executions
+    // index. Doing this after the subordinate chunks guarantees that a
+    // partial retention failure is idempotently retriable without
+    // orphaning keys that retention discovers by reading exec_core.
+    let _: u32 = client
+        .cmd("DEL")
+        .arg(&[exec_core_key.as_str(), policy_key.as_str()][..])
+        .execute()
+        .await?;
+
     let _: u32 = client.cmd("ZREM").arg(terminal_key).arg(eid_str).execute().await?;
     let all_exec_key = idx.all_executions();
     let _: u32 = client.cmd("SREM").arg(&all_exec_key).arg(eid_str).execute().await?;

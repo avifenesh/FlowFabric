@@ -2303,9 +2303,35 @@ async fn build_cancel_execution_fcall(
     Ok((keys, argv))
 }
 
+/// Backoff schedule for transient Valkey errors during async cancel_flow
+/// dispatch. Length = retry-attempt count (including the initial attempt).
+/// The last entry is not slept on because it's the final attempt.
+const CANCEL_MEMBER_RETRY_DELAYS_MS: [u64; 3] = [100, 500, 2_000];
+
+/// Reach into a `ServerError` for a `ferriskey::ErrorKind` when one is
+/// available. Matches the variants that can carry a transport-layer kind:
+/// direct `Valkey`, `ValkeyContext`, and `LibraryLoad` (which itself wraps
+/// a `ferriskey::Error`).
+fn extract_valkey_kind(e: &ServerError) -> Option<ferriskey::ErrorKind> {
+    match e {
+        ServerError::Valkey(err) | ServerError::ValkeyContext { source: err, .. } => {
+            Some(err.kind())
+        }
+        ServerError::LibraryLoad(load_err) => load_err.valkey_kind(),
+        _ => None,
+    }
+}
+
 /// Cancel a single member execution from a cancel_flow dispatch context.
 /// Parses the flow-member EID string, builds the FCALL via the shared helper,
 /// and executes with the same reload-on-failover semantics as the inline path.
+///
+/// Wrapped in a bounded retry loop (see [`CANCEL_MEMBER_RETRY_DELAYS_MS`]) so
+/// that transient Valkey errors mid-dispatch (failover, `TryAgain`,
+/// `ClusterDown`, `IoError`, `FatalSendError`) do not silently leak
+/// non-cancelled members. `FatalReceiveError` and non-retryable kinds bubble
+/// up immediately — those either indicate the Lua ran server-side anyway or a
+/// permanent mismatch that retries cannot fix.
 async fn cancel_member_execution(
     client: &Client,
     partition_config: &PartitionConfig,
@@ -2324,11 +2350,54 @@ async fn cancel_member_execution(
         attempt_id: None,
         now,
     };
-    let (keys, argv) = build_cancel_execution_fcall(client, partition_config, &args).await?;
+
+    let attempts = CANCEL_MEMBER_RETRY_DELAYS_MS.len();
+    for (attempt_idx, delay_ms) in CANCEL_MEMBER_RETRY_DELAYS_MS.iter().enumerate() {
+        let is_last = attempt_idx + 1 == attempts;
+        match try_cancel_member_once(client, partition_config, &args).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Only retry transport-layer transients; business-logic
+                // errors (Script / OperationFailed / NotFound / InvalidInput)
+                // won't change on retry.
+                let retryable = extract_valkey_kind(&e)
+                    .map(ff_script::retry::is_retryable_kind)
+                    .unwrap_or(false);
+                if !retryable || is_last {
+                    return Err(e);
+                }
+                tracing::debug!(
+                    execution_id = %execution_id,
+                    attempt = attempt_idx + 1,
+                    delay_ms = *delay_ms,
+                    error = %e,
+                    "cancel_member_execution: transient error, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+        }
+    }
+    // Unreachable: the loop above either returns Ok, returns Err on the
+    // last attempt, or returns Err on a non-retryable error. Keep a
+    // defensive fallback for future edits to the retry structure.
+    Err(ServerError::OperationFailed(format!(
+        "cancel_member_execution: retries exhausted for {execution_id}"
+    )))
+}
+
+/// Single cancel attempt — pre-read + FCALL + parse. Factored out so the
+/// retry loop in [`cancel_member_execution`] can invoke it cleanly.
+async fn try_cancel_member_once(
+    client: &Client,
+    partition_config: &PartitionConfig,
+    args: &CancelExecutionArgs,
+) -> Result<(), ServerError> {
+    let (keys, argv) = build_cancel_execution_fcall(client, partition_config, args).await?;
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let raw = fcall_with_reload_on_client(client, "ff_cancel_execution", &key_refs, &arg_refs).await?;
-    parse_cancel_result(&raw, &execution_id).map(|_| ())
+    let raw =
+        fcall_with_reload_on_client(client, "ff_cancel_execution", &key_refs, &arg_refs).await?;
+    parse_cancel_result(&raw, &args.execution_id).map(|_| ())
 }
 
 fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerError> {
