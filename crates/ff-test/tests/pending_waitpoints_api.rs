@@ -390,6 +390,66 @@ async fn test_list_pending_waitpoints_empty_for_unsuspended() {
     assert!(list.is_empty(), "expected no waitpoints, got {list:?}");
 }
 
+/// End-to-end review-CLI path: after suspend, POST /signal with a
+/// tampered token must surface as HTTP 400 carrying the `invalid_token`
+/// error code. Matches what `review --tamper-token` does in the
+/// media-pipeline example.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_signal_delivery_with_tampered_token_rejected() {
+    let api = TestApi::setup().await;
+    let tc = TestCluster::connect().await;
+
+    let eid = ExecutionId::new();
+    let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
+    let (wp_id, _wp_key, token) =
+        fcall_suspend(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
+
+    // Flip the last hex char — matches review.rs's tamper().
+    let mut chars: Vec<char> = token.chars().collect();
+    let last = chars.last_mut().expect("token non-empty");
+    *last = match *last {
+        'a' => 'b',
+        'A' => 'B',
+        '0' => '1',
+        _ => '0',
+    };
+    let tampered: String = chars.into_iter().collect();
+    assert_ne!(tampered, token, "tamper must produce a different token");
+
+    let body = serde_json::json!({
+        "execution_id": eid,
+        "waitpoint_id": wp_id,
+        "signal_id": uuid::Uuid::new_v4().to_string(),
+        "signal_name": "pwp_signal",
+        "signal_category": "human_review",
+        "source_type": "human",
+        "source_identity": "reviewer-tamper-test",
+        "target_scope": "execution",
+        "waitpoint_token": tampered,
+        "now": TimestampMs::now().0,
+    });
+
+    let resp = api
+        .client
+        .post(api.url(&format!("/v1/executions/{eid}/signal")))
+        .json(&body)
+        .send()
+        .await
+        .expect("signal request failed");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "tampered token must surface as 400"
+    );
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        text.contains("invalid_token"),
+        "expected invalid_token in body, got: {text}"
+    );
+}
+
 /// A nonexistent execution returns 404.
 #[tokio::test]
 #[serial_test::serial]

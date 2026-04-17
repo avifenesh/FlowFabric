@@ -96,6 +96,11 @@ async fn main() -> Result<()> {
     create_flow(&client, &args, &flow_id).await?;
     log(&stdout, "flow created").await;
 
+    // graph_revision is incremented atomically by the server on every
+    // add_member and every stage_edge. Track locally so the next mutation
+    // can pass the right `expected_graph_revision`.
+    let mut graph_rev: u64 = 0;
+
     // Create transcribe execution (input = PipelineInput).
     let pipeline_input = PipelineInput {
         audio_path: args.audio.clone(),
@@ -111,6 +116,7 @@ async fn main() -> Result<()> {
     )
     .await?;
     add_to_flow(&client, &args, &flow_id, &eid_transcribe).await?;
+    graph_rev += 1;
     log(&stdout, "transcribe execution created").await;
 
     // Ctrl-C handler: cancel the flow.
@@ -169,7 +175,16 @@ async fn main() -> Result<()> {
     )
     .await?;
     add_to_flow(&client, &args, &flow_id, &eid_summarize).await?;
-    wire_edge(&client, &args, &flow_id, &eid_transcribe, &eid_summarize, 1).await?;
+    graph_rev += 1;
+    graph_rev = wire_edge(
+        &client,
+        &args,
+        &flow_id,
+        &eid_transcribe,
+        &eid_summarize,
+        graph_rev,
+    )
+    .await?;
 
     let tail_summarize = spawn_tail(
         client.clone(),
@@ -204,7 +219,17 @@ async fn main() -> Result<()> {
     )
     .await?;
     add_to_flow(&client, &args, &flow_id, &eid_embed).await?;
-    wire_edge(&client, &args, &flow_id, &eid_summarize, &eid_embed, 2).await?;
+    graph_rev += 1;
+    graph_rev = wire_edge(
+        &client,
+        &args,
+        &flow_id,
+        &eid_summarize,
+        &eid_embed,
+        graph_rev,
+    )
+    .await?;
+    let _ = graph_rev; // silence unused on trailing assignment
 
     let tail_embed = spawn_tail(
         client.clone(),
@@ -284,6 +309,10 @@ async fn create_execution(
     check_ok(resp, "create_execution").await
 }
 
+/// Add an execution to a flow. Each successful call bumps the flow's
+/// graph_revision by 1 on the server side; callers track it locally by
+/// incrementing after each successful response (both node_count and
+/// graph_revision move together on add_member — see lua/flow.lua).
 async fn add_to_flow(client: &Client, args: &Args, flow_id: &str, eid: &str) -> Result<()> {
     let body = serde_json::json!({
         "flow_id": flow_id,
@@ -295,18 +324,22 @@ async fn add_to_flow(client: &Client, args: &Args, flow_id: &str, eid: &str) -> 
     check_ok(resp, "add_to_flow").await
 }
 
-/// Stage + apply a `success_only` dependency edge. `graph_rev` is the
-/// expected revision the caller thinks it's writing against. Since we
-/// always start from a fresh flow and know the number of edges added so
-/// far, we can pass the count as `expected_graph_revision`.
+/// Stage + apply a `success_only` dependency edge.
+///
+/// `expected_graph_rev` is the revision the caller believes the flow is
+/// at right now. Stage atomically bumps the revision to
+/// `expected_graph_rev + 1`; apply runs on the downstream execution's
+/// partition and does NOT touch the flow record. Returns the new
+/// graph_revision parsed out of the stage response so the caller can
+/// chain further mutations.
 async fn wire_edge(
     client: &Client,
     args: &Args,
     flow_id: &str,
     upstream: &str,
     downstream: &str,
-    graph_rev: u64,
-) -> Result<()> {
+    expected_graph_rev: u64,
+) -> Result<u64> {
     let edge_id = uuid::Uuid::new_v4().to_string();
 
     let stage_body = serde_json::json!({
@@ -315,25 +348,37 @@ async fn wire_edge(
         "upstream_execution_id": upstream,
         "downstream_execution_id": downstream,
         "dependency_kind": "success_only",
-        "expected_graph_revision": graph_rev,
+        "expected_graph_revision": expected_graph_rev,
         "now": now_ms(),
     });
     let stage_url = format!("{}/v1/flows/{flow_id}/edges", args.server);
     let resp = client.post(&stage_url).json(&stage_body).send().await?;
-    check_ok(resp, "stage_edge").await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("stage_edge failed ({status}): {body}");
+    }
+    // StageDependencyEdgeResult::Staged { edge_id, new_graph_revision }
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("stage_edge: decode body {body}"))?;
+    let new_rev = v
+        .pointer("/Staged/new_graph_revision")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("stage_edge: missing new_graph_revision in {v}"))?;
 
     let apply_body = serde_json::json!({
         "flow_id": flow_id,
         "edge_id": edge_id,
         "downstream_execution_id": downstream,
         "upstream_execution_id": upstream,
-        "graph_revision": graph_rev + 1,
+        "graph_revision": new_rev,
         "dependency_kind": "success_only",
         "now": now_ms(),
     });
     let apply_url = format!("{}/v1/flows/{flow_id}/edges/apply", args.server);
     let resp = client.post(&apply_url).json(&apply_body).send().await?;
-    check_ok(resp, "apply_edge").await
+    check_ok(resp, "apply_edge").await?;
+    Ok(new_rev)
 }
 
 /// Poll execution state until it reaches a terminal value. Returns the
