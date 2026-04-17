@@ -1,0 +1,63 @@
+=== media-pipeline smoke: golden end-to-end output ===
+sample: samples/tech.wav
+wall clock: 734s (CPU-only, primarily Qwen inference at ~3.4s/token)
+
+--- [submit] driver output ---
+[submit] flow_id=04f6edfc-9c4d-4354-a2a0-a43570521ae6
+[submit] transcribe=43656074-3f7e-42b1-abb4-65949dfd0616
+[submit] summarize=6a000e03-8f08-4cca-af64-0f7bc17233a2
+[submit] embed=93b4c324-2c81-4f94-83a5-add85623c9b5
+[submit] flow created
+[submit] transcribe execution created
+[submit] transcribe done (298 chars, 979 ms)
+[submit] summarize done (200 tokens, 1117 chars)
+[submit] embed done — pipeline complete
+
+--- [review] auto-approve output ---
+[review] tailing 6a000e03-8f08-4cca-af64-0f7bc17233a2 — waiting for suspend
+[review] execution suspended — fetching waitpoint token
+[review] signal delivered: {"Accepted":{"signal_id":"9b3bc3eb-9888-4bba-b1e0-3730102d9f4c","effect":"resume_condition_satisfied"}}
+[review] waiting for summarize to complete
+
+--- first 20 summary tokens (of 200) ---
+[summarize] summary_token:  Distributed
+[summarize] summary_token:  consensus
+[summarize] summary_token:  algorithms
+[summarize] summary_token:  like
+[summarize] summary_token:  wrapped
+[summarize] summary_token: -and
+[summarize] summary_token: -p
+[summarize] summary_token: acks
+[summarize] summary_token:  and
+[summarize] summary_token:  qu
+[summarize] summary_token: orum
+[summarize] summary_token:  voting
+[summarize] summary_token:  are
+[summarize] summary_token:  used
+[summarize] summary_token:  to
+[summarize] summary_token:  reach
+[summarize] summary_token:  agreement
+[summarize] summary_token:  across
+[summarize] summary_token:  unreliable
+[summarize] summary_token:  networks
+
+--- final SummarizeResult (from summary_final frame) ---
+{
+  "summary": "Distributed consensus algorithms like wrapped-and-packs and quorum voting are used to reach agreement across unreliable networks. These algorithms are based on the concept of a quorum, which is a group of nodes that can reach a consensus. The distributed consensus algorithms are used to ensure strong consistency in the system. The electa leader replicate logs and tolerate failure through quorum voting, modern systems like it, and foundation to be relied on these primitives for strong consistency. The electa leader replicate logs and tolerate failure through quorum voting, modern systems like it, and foundation to be relied on these primitives for strong consistency. The electa leader replicate logs and tolerate failure through quorum voting, modern systems like it, and foundation to be relied on these primitives for strong consistency. The electa leader replicate logs and tolerate failure through quorum voting, modern systems like it, and foundation to be relied on these primitives for strong consistency. The electa leader replicate logs and tolerate failure through quorum voting, modern systems like",
+  "token_count": 200
+}
+
+--- EmbedResult shape ---
+{
+  "dim": 384,
+  "vec_len": 384,
+  "first_3_dims": [
+    -0.05659846,
+    0.00094851427,
+    -0.054991327
+  ]
+}
+
+--- HMAC waitpoint token surfacing ---
+REVIEW_NEEDED eid=6a000e03-8f08-4cca-af64-0f7bc17233a2 wp=7f3d4a42-03aa-4d4e-b7c8-e23a705877a7
+WAITPOINT_TOKEN=k1:<REDACTED:len=40>

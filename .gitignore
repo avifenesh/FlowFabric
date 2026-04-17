@@ -25,6 +25,9 @@ TEAM.md
 # ── Claude / agent artifacts ──
 ferriskey/.claude/
 
+# ── Model caches (fastembed writes to $CWD-relative .fastembed_cache/) ──
+.fastembed_cache/
+
 # ── Environment / secrets ──
 .env
 *.env.local

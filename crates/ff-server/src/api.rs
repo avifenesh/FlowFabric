@@ -182,6 +182,11 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
         .route("/v1/executions", get(list_executions).post(create_execution))
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/state", get(get_execution_state))
+        .route(
+            "/v1/executions/{id}/pending-waitpoints",
+            get(list_pending_waitpoints),
+        )
+        .route("/v1/executions/{id}/result", get(get_execution_result))
         .route("/v1/executions/{id}/cancel", post(cancel_execution))
         .route("/v1/executions/{id}/signal", post(deliver_signal))
         .route("/v1/executions/{id}/priority", put(change_priority))
@@ -347,6 +352,78 @@ async fn get_execution_state(
 ) -> Result<Json<PublicState>, ApiError> {
     let eid = parse_execution_id(&id)?;
     Ok(Json(server.get_execution_state(&eid).await?))
+}
+
+/// Returns the actionable (`pending`/`active`) waitpoints for an
+/// execution, including the HMAC `waitpoint_token` required to deliver
+/// signals. Human reviewers use this to look up the token originally
+/// returned only to the suspending worker's `SuspendOutcome`.
+///
+/// SECURITY: `waitpoint_token` is a bearer credential for signal
+/// delivery; leaking it lets a third party forge authority to resume or
+/// influence the execution. Gate the endpoint behind `FF_API_TOKEN` in
+/// any deployment reachable from untrusted networks. The auth middleware
+/// only mounts when `FF_API_TOKEN` is set; this endpoint is
+/// unauthenticated without it, and the server logs a loud warning at
+/// startup so operators notice.
+async fn list_pending_waitpoints(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<PendingWaitpointInfo>>, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    Ok(Json(server.list_pending_waitpoints(&eid).await?))
+}
+
+/// Returns the raw result payload bytes written by the worker's
+/// `ff_complete_execution` call. 404 when the execution has no stored
+/// result (missing entirely, still in-flight, or trimmed by retention —
+/// see below).
+///
+/// # Ordering (required)
+///
+/// Callers MUST poll `GET /v1/executions/{id}/state` until it returns
+/// `completed` before fetching `/result`. Early polls may return 404
+/// because completion writes `public_state = completed` and the result
+/// `SET` in the same atomic Lua; in the normal path the window is
+/// effectively zero, but network round-trip ordering between a state
+/// poll and a result fetch can make the result appear briefly absent
+/// during replay (`ff_replay_execution`).
+///
+/// # Retention / 404 after completed
+///
+/// `get_execution_state == completed` is authoritative for completion.
+/// This endpoint additionally depends on the result bytes not having
+/// been trimmed — v1 sets no retention policy, so
+/// `state = completed` should always pair with a 200 here. Any
+/// future retention-policy feature must call this contract out in its
+/// own docs.
+///
+/// CONTENT-TYPE: `application/octet-stream`. The server is payload-format
+/// agnostic — workers choose the encoding via the SDK's `complete(bytes)`
+/// call, and callers must know the contract. The media-pipeline example
+/// uses JSON by convention (`serde_json::to_vec(&Result)`); adapters can
+/// pick any binary format.
+///
+/// SECURITY: completion payloads can contain PII (e.g. LLM summaries of
+/// user audio). Treat this endpoint like any other read — gate behind
+/// `FF_API_TOKEN` in any deployment reachable from untrusted networks.
+/// The auth middleware only mounts when `FF_API_TOKEN` is set.
+async fn get_execution_result(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    match server.get_execution_result(&eid).await? {
+        Some(bytes) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response()),
+        None => Err(ApiError(ServerError::NotFound(format!(
+            "execution result not found: {eid}"
+        )))),
+    }
 }
 
 async fn cancel_execution(

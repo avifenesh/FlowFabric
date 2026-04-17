@@ -12,7 +12,7 @@ use ff_core::contracts::{
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     ApplyDependencyToChildArgs, ApplyDependencyToChildResult,
     DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ExecutionSummary,
-    ListExecutionsResult, ReplayExecutionResult,
+    ListExecutionsResult, PendingWaitpointInfo, ReplayExecutionResult,
     ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
     RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
@@ -361,6 +361,19 @@ impl Server {
                  FF_API_TOKEN for any deployment reachable from untrusted \
                  networks."
             );
+            // Explicit callout for the credential-bearing read endpoints.
+            // Auditors grep for these on a per-endpoint basis; lumping
+            // into the admin warning alone hides the fact that
+            // /pending-waitpoints returns HMAC tokens and /result
+            // returns completion payload bytes.
+            tracing::warn!(
+                listen_addr = %config.listen_addr,
+                "FF_API_TOKEN is unset — GET /v1/executions/{{id}}/pending-waitpoints \
+                 returns HMAC waitpoint_tokens (bearer credentials for signal delivery) \
+                 and GET /v1/executions/{{id}}/result returns raw completion payload \
+                 bytes (may contain PII). Both are UNAUTHENTICATED in this \
+                 configuration."
+            );
         }
 
         tracing::info!(
@@ -570,6 +583,389 @@ impl Server {
                 "execution not found: {execution_id}"
             ))),
         }
+    }
+
+    /// Read the raw result payload written by `ff_complete_execution`.
+    ///
+    /// The Lua side stores the payload at `ctx.result()` via plain `SET`.
+    /// No FCALL — this is a direct GET; returns `Ok(None)` when the
+    /// execution is missing, not yet complete, or (in a future
+    /// retention-policy world) when the result was trimmed.
+    ///
+    /// # Contract vs `get_execution_state`
+    ///
+    /// `get_execution_state` is the authoritative completion signal. If
+    /// a caller observes `state == completed` but `get_execution_result`
+    /// returns `None`, the result bytes are unavailable — not a caller
+    /// bug and not a server bug, just the retention policy trimming the
+    /// blob. V1 sets no retention, so callers on v1 can treat
+    /// `state == completed` + `Ok(None)` as a server bug.
+    ///
+    /// # Ordering
+    ///
+    /// Callers MUST wait for `state == completed` before calling this
+    /// method; polls issued before the state transition may hit a
+    /// narrow window where the completion Lua has written
+    /// `public_state = completed` but the `result` key SET is still
+    /// on-wire. The current Lua `ff_complete_execution` writes both in
+    /// the same atomic script, so the window is effectively zero for
+    /// direct callers — but retries via `ff_replay_execution` open it
+    /// briefly.
+    pub async fn get_execution_result(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+
+        // Binary-safe read. Decoding into `String` would reject any
+        // non-UTF-8 payload (bincode-encoded f32 vectors, compressed
+        // artifacts, arbitrary binary stages) with a ferriskey decode
+        // error that surfaces as HTTP 500. The endpoint response is
+        // already `application/octet-stream`; `Vec<u8>` has a
+        // ferriskey-specialized `FromValue` impl that preserves raw
+        // bytes without UTF-8 validation (see ferriskey/src/value.rs:
+        // `from_byte_vec`). Nil → None via the blanket
+        // `Option<T: FromValue>` wrapper.
+        let payload: Option<Vec<u8>> = self
+            .client
+            .cmd("GET")
+            .arg(ctx.result())
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "GET exec result".into(),
+            })?;
+        Ok(payload)
+    }
+
+    /// List the active (`pending` or `active`) waitpoints for an execution.
+    ///
+    /// Returns one [`PendingWaitpointInfo`] per open waitpoint, including the
+    /// HMAC-SHA1 `waitpoint_token` needed to deliver authenticated signals.
+    /// `closed` waitpoints are elided — callers looking at history should
+    /// read the stream or lease history instead.
+    ///
+    /// Read plan: SSCAN `ctx.waitpoints()` with `COUNT 100` (bounded
+    /// page size, matching the unblock / flow-projector / budget-
+    /// reconciler convention) to enumerate waitpoint IDs, then TWO
+    /// pipelines:
+    ///
+    /// * Pass 1 — single round-trip containing, per waitpoint, one
+    ///   HMGET over the documented field set + one HGET for
+    ///   `total_matchers` on the condition hash.
+    /// * Pass 2 (conditional) — single round-trip containing an
+    ///   HMGET per waitpoint with `total_matchers > 0` to read the
+    ///   `matcher:N:name` fields.
+    ///
+    /// No FCALL — this is a read-only view built from already-
+    /// persisted state, so skipping Lua keeps the Valkey single-
+    /// writer path uncontended. HMGET (vs HGETALL) bounds the per-
+    /// waitpoint read to the documented field set and defends
+    /// against a poisoned waitpoint hash with unbounded extra fields
+    /// accumulating response memory.
+    ///
+    /// # Empty result semantics (TOCTOU)
+    ///
+    /// An empty `Vec` is returned in three cases:
+    ///
+    /// 1. The execution exists but has never suspended.
+    /// 2. All existing waitpoints are `closed` (already resolved).
+    /// 3. A narrow teardown race: `SSCAN` read the waitpoint set after
+    ///    a concurrent `ff_close_waitpoint` or execution-cleanup script
+    ///    deleted the waitpoint hashes but before it SREM'd the set
+    ///    members. Each HMGET returns all-None and we skip.
+    ///
+    /// Callers that get an unexpected empty list should cross-check
+    /// execution state (`get_execution_state`) to distinguish "pipeline
+    /// moved past suspended" from "nothing to review yet".
+    ///
+    /// A waitpoint hash that's present but missing its `waitpoint_token`
+    /// field is similarly elided and a server-side WARN is emitted —
+    /// this indicates storage corruption (a write that half-populated
+    /// the hash) and operators should investigate.
+    pub async fn list_pending_waitpoints(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<PendingWaitpointInfo>, ServerError> {
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+
+        let core_exists: bool = self
+            .client
+            .cmd("EXISTS")
+            .arg(ctx.core())
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "EXISTS exec_core (pending waitpoints)".into(),
+            })?;
+        if !core_exists {
+            return Err(ServerError::NotFound(format!(
+                "execution not found: {execution_id}"
+            )));
+        }
+
+        // SSCAN the waitpoints set in bounded pages. SMEMBERS would
+        // load the entire set in one reply — fine for today's
+        // single-waitpoint executions, but the codebase convention
+        // (budget_reconciler, flow_projector, unblock scanner) is SSCAN
+        // COUNT 100 so response size per round-trip is bounded as the
+        // set grows. Match the precedent instead of carving a new
+        // pattern here.
+        const WAITPOINTS_SSCAN_COUNT: usize = 100;
+        let waitpoints_key = ctx.waitpoints();
+        let mut wp_ids_raw: Vec<String> = Vec::new();
+        let mut cursor: String = "0".to_owned();
+        loop {
+            let reply: (String, Vec<String>) = self
+                .client
+                .cmd("SSCAN")
+                .arg(&waitpoints_key)
+                .arg(&cursor)
+                .arg("COUNT")
+                .arg(WAITPOINTS_SSCAN_COUNT.to_string().as_str())
+                .execute()
+                .await
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: "SSCAN waitpoints".into(),
+                })?;
+            cursor = reply.0;
+            wp_ids_raw.extend(reply.1);
+            if cursor == "0" {
+                break;
+            }
+        }
+
+        // SSCAN may observe a member more than once across iterations —
+        // that is documented Valkey behavior, not a bug (see
+        // https://valkey.io/commands/sscan/). Dedup in-place before
+        // building the typed id list so the HTTP response and the
+        // downstream pipelined HMGETs don't duplicate work. Sort +
+        // dedup keeps this O(n log n) without a BTreeSet allocation;
+        // typical n is 1 (the single waitpoint on a suspended exec).
+        wp_ids_raw.sort_unstable();
+        wp_ids_raw.dedup();
+
+        if wp_ids_raw.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Parse + filter out malformed waitpoint_ids up-front so the
+        // downstream pipeline indexes stay aligned to the Vec of
+        // typed ids.
+        let mut wp_ids: Vec<WaitpointId> = Vec::with_capacity(wp_ids_raw.len());
+        for raw in &wp_ids_raw {
+            match WaitpointId::parse(raw) {
+                Ok(id) => wp_ids.push(id),
+                Err(e) => tracing::warn!(
+                    raw_id = %raw,
+                    error = %e,
+                    execution_id = %execution_id,
+                    "list_pending_waitpoints: skipping unparseable waitpoint_id"
+                ),
+            }
+        }
+        if wp_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Bounded HMGET field set — these are the six hash fields that
+        // surface in `PendingWaitpointInfo`. Fixed-size indexing into
+        // the response below tracks this order.
+        const WP_FIELDS: [&str; 6] = [
+            "state",
+            "waitpoint_key",
+            "waitpoint_token",
+            "created_at",
+            "activated_at",
+            "expires_at",
+        ];
+
+        // Pass 1 pipeline: waitpoint HMGET + condition HGET
+        // total_matchers, one of each per waitpoint, in a SINGLE
+        // round-trip. Sequential HMGETs were an N-round-trip latency
+        // floor on flows with fan-out waitpoints.
+        let mut pass1 = self.client.pipeline();
+        let mut wp_slots = Vec::with_capacity(wp_ids.len());
+        let mut cond_slots = Vec::with_capacity(wp_ids.len());
+        for wp_id in &wp_ids {
+            let mut cmd = pass1.cmd::<Vec<Option<String>>>("HMGET");
+            cmd = cmd.arg(ctx.waitpoint(wp_id));
+            for f in WP_FIELDS {
+                cmd = cmd.arg(f);
+            }
+            wp_slots.push(cmd.finish());
+
+            cond_slots.push(
+                pass1
+                    .cmd::<Option<String>>("HGET")
+                    .arg(ctx.waitpoint_condition(wp_id))
+                    .arg("total_matchers")
+                    .finish(),
+            );
+        }
+        pass1
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "pipeline HMGET waitpoints + HGET total_matchers".into(),
+            })?;
+
+        // Collect pass-1 results + queue pass-2 HMGETs for condition
+        // matcher names on waitpoints that are actionable (state in
+        // pending/active, non-empty token, total_matchers > 0). PipeSlot
+        // values are owning, so iterate all three ordered zip'd iters
+        // and consume them together.
+        struct Kept {
+            wp_id: WaitpointId,
+            wp_fields: Vec<Option<String>>,
+            total_matchers: usize,
+        }
+        let mut kept: Vec<Kept> = Vec::with_capacity(wp_ids.len());
+        for ((wp_id, wp_slot), cond_slot) in wp_ids
+            .iter()
+            .zip(wp_slots)
+            .zip(cond_slots)
+        {
+            let wp_fields: Vec<Option<String>> =
+                wp_slot.value().map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("pipeline slot HMGET waitpoint {wp_id}"),
+                })?;
+
+            // Waitpoint hash may have been GC'd between the SSCAN and
+            // this HMGET (rotation / cleanup race). Skip silently.
+            if wp_fields.iter().all(Option::is_none) {
+                // Still consume the cond_slot to free its buffer.
+                let _ = cond_slot.value();
+                continue;
+            }
+            let state_ref = wp_fields
+                .first()
+                .and_then(|v| v.as_deref())
+                .unwrap_or("");
+            if state_ref != "pending" && state_ref != "active" {
+                let _ = cond_slot.value();
+                continue;
+            }
+            let token_ref = wp_fields
+                .get(2)
+                .and_then(|v| v.as_deref())
+                .unwrap_or("");
+            if token_ref.is_empty() {
+                let _ = cond_slot.value();
+                tracing::warn!(
+                    waitpoint_id = %wp_id,
+                    execution_id = %execution_id,
+                    waitpoint_hash_key = %ctx.waitpoint(wp_id),
+                    state = %state_ref,
+                    "list_pending_waitpoints: waitpoint hash present but waitpoint_token \
+                     field is empty — likely storage corruption (half-populated write, \
+                     operator edit, or interrupted script). Skipping this entry in the \
+                     response. HGETALL the waitpoint_hash_key to inspect."
+                );
+                continue;
+            }
+
+            let total_matchers = cond_slot
+                .value()
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("pipeline slot HGET total_matchers {wp_id}"),
+                })?
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+
+            kept.push(Kept {
+                wp_id: wp_id.clone(),
+                wp_fields,
+                total_matchers,
+            });
+        }
+
+        if kept.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 2 pipeline: matcher-name HMGETs for every kept waitpoint
+        // with total_matchers > 0. Single round-trip regardless of
+        // per-waitpoint matcher count. Waitpoints with total_matchers==0
+        // (wildcard) skip the HMGET entirely.
+        let mut pass2 = self.client.pipeline();
+        let mut matcher_slots: Vec<Option<_>> = Vec::with_capacity(kept.len());
+        let mut pass2_needed = false;
+        for k in &kept {
+            if k.total_matchers == 0 {
+                matcher_slots.push(None);
+                continue;
+            }
+            pass2_needed = true;
+            let mut cmd = pass2.cmd::<Vec<Option<String>>>("HMGET");
+            cmd = cmd.arg(ctx.waitpoint_condition(&k.wp_id));
+            for i in 0..k.total_matchers {
+                cmd = cmd.arg(format!("matcher:{i}:name"));
+            }
+            matcher_slots.push(Some(cmd.finish()));
+        }
+        if pass2_needed {
+            pass2.execute().await.map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "pipeline HMGET wp_condition matchers".into(),
+            })?;
+        }
+
+        let parse_ts = |raw: &str| -> Option<TimestampMs> {
+            if raw.is_empty() {
+                None
+            } else {
+                raw.parse::<i64>().ok().map(TimestampMs)
+            }
+        };
+
+        let mut out: Vec<PendingWaitpointInfo> = Vec::with_capacity(kept.len());
+        for (k, slot) in kept.into_iter().zip(matcher_slots) {
+            let get = |i: usize| -> &str {
+                k.wp_fields.get(i).and_then(|v| v.as_deref()).unwrap_or("")
+            };
+
+            // Collect matcher names, eliding the empty-name wildcard
+            // sentinel (see lua/helpers.lua initialize_condition).
+            let required_signal_names: Vec<String> = match slot {
+                None => Vec::new(),
+                Some(s) => {
+                    let vals: Vec<Option<String>> =
+                        s.value().map_err(|e| ServerError::ValkeyContext {
+                            source: e,
+                            context: format!(
+                                "pipeline slot HMGET wp_condition matchers {}",
+                                k.wp_id
+                            ),
+                        })?;
+                    vals.into_iter()
+                        .flatten()
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                }
+            };
+
+            out.push(PendingWaitpointInfo {
+                waitpoint_id: k.wp_id,
+                waitpoint_key: get(1).to_owned(),
+                state: get(0).to_owned(),
+                waitpoint_token: WaitpointToken(get(2).to_owned()),
+                required_signal_names,
+                created_at: parse_ts(get(3)).unwrap_or(TimestampMs(0)),
+                activated_at: parse_ts(get(4)),
+                expires_at: parse_ts(get(5)),
+            });
+        }
+
+        Ok(out)
     }
 
     // ── Budget / Quota API ──
