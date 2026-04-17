@@ -56,41 +56,53 @@ impl Scanner for BudgetReconciler {
             }
         };
 
-        // Discover budgets via partition-level index SET (cluster-safe)
+        // Discover budgets via partition-level index SET (cluster-safe).
+        // Stream in SSCAN batches so partitions with many budgets do not
+        // materialise the entire id list into one allocation and do not
+        // hold Valkey's single-threaded SMEMBERS for a large set.
         let policies_key = keys::budget_policies_index(&tag);
-        let budget_ids: Vec<String> = match client
-            .cmd("SMEMBERS")
-            .arg(&policies_key)
-            .execute()
-            .await
-        {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!(partition, error = %e, "budget_reconciler: SMEMBERS failed");
-                return ScanResult { processed: 0, errors: 1 };
-            }
-        };
-
-        if budget_ids.is_empty() {
-            return ScanResult { processed: 0, errors: 0 };
-        }
-
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
+        let mut cursor = "0".to_string();
 
-        for bid in &budget_ids {
-            match reconcile_one_budget(client, &tag, &policies_key, bid, now_ms).await {
-                Ok(true) => processed += 1,
-                Ok(false) => {} // skipped (resetting budget or no drift)
+        loop {
+            let result: ferriskey::Value = match client
+                .cmd("SSCAN")
+                .arg(&policies_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await
+            {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(
-                        partition,
-                        budget_id = bid.as_str(),
-                        error = %e,
-                        "budget_reconciler: reconcile failed"
-                    );
-                    errors += 1;
+                    tracing::warn!(partition, error = %e, "budget_reconciler: SSCAN failed");
+                    return ScanResult { processed, errors: errors + 1 };
                 }
+            };
+
+            let (next_cursor, budget_ids) = parse_sscan_response(&result);
+
+            for bid in &budget_ids {
+                match reconcile_one_budget(client, &tag, &policies_key, bid, now_ms).await {
+                    Ok(true) => processed += 1,
+                    Ok(false) => {} // skipped (resetting budget or no drift)
+                    Err(e) => {
+                        tracing::warn!(
+                            partition,
+                            budget_id = bid.as_str(),
+                            error = %e,
+                            "budget_reconciler: reconcile failed"
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
             }
         }
 
@@ -230,5 +242,42 @@ fn pairs_to_map(flat: &[String]) -> std::collections::HashMap<&str, &str> {
         i += 2;
     }
     map
+}
+
+/// Parse an SSCAN reply `[cursor, [member1, member2, ...]]` into
+/// `(cursor, Vec<member>)`. Mirrors the helper in quota_reconciler /
+/// flow_projector so all three scanners agree on the wire shape.
+fn parse_sscan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                if let Ok(ferriskey::Value::BulkString(b)) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                if let ferriskey::Value::BulkString(b) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (cursor, members)
 }
 

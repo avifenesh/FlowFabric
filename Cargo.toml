@@ -43,3 +43,4 @@ thiserror = "2"
 crc16 = "0.4"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures = "0.3"
