@@ -96,14 +96,23 @@ async fn main() -> Result<()> {
 
     // Per-worker latency buffers (no Arc<Mutex> on the hot path —
     // same pattern the redis-rs baseline uses post-R1 fix).
+    //
+    // Each worker gets its OWN ferriskey Client. The redis-rs
+    // baseline does the equivalent by calling
+    // `client.get_multiplexed_async_connection()` per worker — that
+    // hands out a fresh logical connection each time. `Client::clone`
+    // on ferriskey shares underlying state, so reusing a single
+    // client across 16 workers serialises their BLMPOP commands on
+    // one connection and the drain hangs for minutes. Building
+    // per-worker puts the two bases on equal footing.
     let drain_start = Instant::now();
     let stop_at = Arc::new(std::sync::atomic::AtomicUsize::new(args.tasks));
     let mut handles = Vec::with_capacity(WORKER_COUNT);
     for wi in 0..WORKER_COUNT {
-        let client = client.clone();
+        let worker_client = build_client(&args.valkey_host, args.valkey_port).await?;
         let stop_at = stop_at.clone();
         handles.push(tokio::spawn(async move {
-            drive_worker(wi, client, stop_at).await
+            drive_worker(wi, worker_client, stop_at).await
         }));
     }
     let mut lat: Vec<u64> = Vec::with_capacity(args.tasks);
@@ -191,6 +200,9 @@ async fn drive_worker(
         // and drain-this-tick is `Value::Nil`. Typing against
         // `Option<Value>` collapses Nil to None cleanly; we don't
         // need to parse the key/elements — just whether the pop took.
+        // 1 s block (matches redis-rs baseline's `.arg(1_u64)`).
+        // Drained stragglers exit within ≤ 1 s of the last pop
+        // setting stop_at to 0.
         let popped: Option<Value> = client
             .cmd("BLMPOP")
             .arg(1_u64)
