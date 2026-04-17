@@ -1,0 +1,6 @@
+target/
+vendor/
+models/*.bin
+models/*.gguf
+samples/*.wav
+.fastembed_cache/

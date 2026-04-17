@@ -18,6 +18,19 @@ struct Args {
     #[arg(long)]
     waitpoint_id: String,
 
+    /// HMAC-SHA1 waitpoint token in `kid:hex` form. Minted by the
+    /// suspending worker and printed as `WAITPOINT_TOKEN=...`. Required
+    /// when `--approve`; the engine rejects signals without it (RFC-004
+    /// §Waitpoint Security).
+    ///
+    /// Alternative: a reviewer without access to the worker's stdout can
+    /// fetch the token from
+    /// `GET /v1/executions/{id}/pending-waitpoints` — the
+    /// `waitpoint_token` field on the matching waitpoint is the same
+    /// value.
+    #[arg(long)]
+    waitpoint_token: Option<String>,
+
     /// Approve the task output.
     #[arg(long)]
     approve: bool,
@@ -47,6 +60,21 @@ async fn main() {
         .as_millis() as i64;
 
     if args.approve {
+        // Approval requires the HMAC waitpoint token. An empty / missing
+        // token gets `invalid_token` from ff_deliver_signal — fail fast
+        // at the CLI instead of sending a doomed POST.
+        let waitpoint_token = match args.waitpoint_token {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "--waitpoint-token is required for --approve. The worker prints it as \
+                     `WAITPOINT_TOKEN=...` on suspend, and `GET /v1/executions/{{id}}/pending-waitpoints` \
+                     returns it on the matching waitpoint."
+                );
+                std::process::exit(1);
+            }
+        };
+
         // Deliver approval signal — resumes the suspended execution
         let review = ReviewPayload {
             approved: true,
@@ -66,6 +94,7 @@ async fn main() {
             "payload": payload_bytes,
             "payload_encoding": "json",
             "target_scope": "execution",
+            "waitpoint_token": waitpoint_token,
             "now": now_ms
         });
 

@@ -417,6 +417,16 @@ impl FlowFabricWorker {
         &self.config
     }
 
+    /// Get the server-published partition config this worker bound to at
+    /// `connect()`. Callers need this when computing partition hash-tags
+    /// for direct-client reads (e.g. ff-sdk::read_stream) to stay aligned
+    /// with the server's `num_execution_partitions` — using
+    /// `PartitionConfig::default()` assumes 256 partitions and silently
+    /// misses data on deployments with any other value.
+    pub fn partition_config(&self) -> &ff_core::partition::PartitionConfig {
+        &self.partition_config
+    }
+
     /// Attempt to claim the next eligible execution.
     ///
     /// Phase 1 simplified claim flow:

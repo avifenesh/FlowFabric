@@ -1138,6 +1138,14 @@ Per-partition `waitpoint_hmac_rotated` and `waitpoint_hmac_rotation_in_progress_
 
 Event names and structured field keys are a **stable public contract**. Breaking changes require a library-version bump and a deprecation window.
 
+### Reviewer token access
+
+The HMAC `waitpoint_token` is returned to the suspending worker in `SuspendOutcome`. A human-in-the-loop reviewer or other non-worker principal that must deliver a signal against the waitpoint has no direct path to that token — it is not echoed in stream frames (frames are observability, not credential carriers) and not written to `exec_core`'s public surface.
+
+`GET /v1/executions/{id}/pending-waitpoints` returns the actionable (`pending`/`active`) waitpoints for an execution, including `waitpoint_token`. It is subject to the same bearer-auth middleware (`FF_API_TOKEN`) as every other endpoint — no separate gate. Closed waitpoints are elided (history consumers should read the lease/stream record instead).
+
+Callers pass the returned token unchanged into `DeliverSignalArgs::waitpoint_token`; tampering surfaces at the Lua HMAC validation path as `invalid_token` (see §Waitpoint Security).
+
 ### Performance notes
 
 HMAC-SHA1 minting and validation cost scale with the input size, not the stream rate. The input is bounded: `waitpoint_id` (36 bytes UUID) + `|` + `waitpoint_key` (≤256 bytes per RFC-004's opaque-string ceiling) + `|` + `created_at_ms` (13 bytes) ≈ 310 bytes worst case. `redis.sha1hex` on a ~310-byte buffer runs in low hundreds of nanoseconds per call. In practice, throughput is dominated by the FCALL round-trip and XADD/HSET work, not the HMAC itself.
