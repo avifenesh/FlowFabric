@@ -74,13 +74,22 @@ impl FcallResult {
 
     /// If this is a failure result, convert the status string to a ScriptError.
     /// Returns Ok(self) if success.
+    ///
+    /// For variants carrying a detail payload (e.g. `CapabilityMismatch`,
+    /// `InvalidCapabilities`, `InvalidInput`) the first Lua-return field
+    /// is folded into the variant so callers can log the specifics of WHY
+    /// the call failed (which caps were missing, which bound was violated)
+    /// instead of an empty String placeholder.
     pub fn into_success(self) -> Result<Self, ScriptError> {
         if self.success {
             Ok(self)
         } else {
-            Err(ScriptError::from_code(&self.status).unwrap_or_else(|| {
-                ScriptError::Parse(format!("unknown error code: {}", self.status))
-            }))
+            let detail = value_to_string(self.fields.first());
+            let err = ScriptError::from_code_with_detail(&self.status, &detail)
+                .unwrap_or_else(|| {
+                    ScriptError::Parse(format!("unknown error code: {}", self.status))
+                });
+            Err(err)
         }
     }
 

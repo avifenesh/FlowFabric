@@ -12,17 +12,17 @@
 -- signal, evaluate resume condition, optionally close waitpoint +
 -- suspension + transition suspended -> runnable.
 --
--- KEYS (13): exec_core, wp_condition, wp_signals_stream,
+-- KEYS (14): exec_core, wp_condition, wp_signals_stream,
 --            exec_signals_zset, signal_hash, signal_payload,
 --            idem_key, waitpoint_hash, suspension_current,
 --            eligible_zset, suspended_zset, delayed_zset,
---            suspension_timeout_zset
--- ARGV (17): signal_id, execution_id, waitpoint_id, signal_name,
+--            suspension_timeout_zset, hmac_secrets
+-- ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
 --            signal_category, source_type, source_identity,
 --            payload, payload_encoding, idempotency_key,
 --            correlation_id, target_scope, created_at,
 --            dedup_ttl_ms, resume_delay_ms, signal_maxlen,
---            max_signals_per_execution
+--            max_signals_per_execution, waitpoint_token
 ---------------------------------------------------------------------------
 redis.register_function('ff_deliver_signal', function(keys, args)
   local K = {
@@ -39,6 +39,7 @@ redis.register_function('ff_deliver_signal', function(keys, args)
     suspended_zset        = keys[11],
     delayed_zset          = keys[12],
     suspension_timeout_zset = keys[13],
+    hmac_secrets          = keys[14],
   }
 
   local A = {
@@ -59,6 +60,7 @@ redis.register_function('ff_deliver_signal', function(keys, args)
     resume_delay_ms  = tonumber(args[15] or "0"),
     signal_maxlen    = tonumber(args[16] or "1000"),
     max_signals      = tonumber(args[17] or "10000"),
+    waitpoint_token  = args[18] or "",
   }
 
   local t = redis.call("TIME")
@@ -71,29 +73,58 @@ redis.register_function('ff_deliver_signal', function(keys, args)
   end
   local core = hgetall_to_table(raw)
 
-  -- 2. Validate execution is in a signalable state
+  -- 2. Validate HMAC token FIRST (RFC-004 §Waitpoint Security).
+  --
+  -- Order matters: lifecycle / waitpoint-state checks below would otherwise
+  -- form a state oracle — an attacker presenting ANY token (including an
+  -- invalid one) for an arbitrary (execution_id, waitpoint_id) pair could
+  -- distinguish "execution is terminal" vs "waitpoint is pending" vs
+  -- "waitpoint is closed" by the specific error code returned, without
+  -- having to produce a valid HMAC. Auth-first closes that oracle.
+  --
+  -- Missing-waitpoint is collapsed into `invalid_token` for the same
+  -- reason: an unauthenticated caller must not be able to probe which
+  -- (execution, waitpoint) tuples exist.
+  local wp_for_auth_raw = redis.call("HGETALL", K.waitpoint_hash)
+  if #wp_for_auth_raw == 0 then
+    return err("invalid_token")
+  end
+  local wp_for_auth = hgetall_to_table(wp_for_auth_raw)
+  if not wp_for_auth.created_at then
+    return err("invalid_token")
+  end
+  local token_err = validate_waitpoint_token(
+    K.hmac_secrets, A.waitpoint_token,
+    A.waitpoint_id, wp_for_auth.waitpoint_key or "",
+    tonumber(wp_for_auth.created_at) or 0, now_ms)
+  if token_err then
+    -- Operator-visible counter (RFC-004 §Waitpoint Security observability).
+    -- Single scalar HSET on exec_core — bounded, amortized-free. Gives
+    -- operators a "last time this execution saw an auth failure" field to
+    -- correlate with key-rotation drift, client bugs, or attack traffic
+    -- without needing to tail Lua slowlog or FCALL error logs.
+    redis.call("HSET", K.core_key, "last_hmac_validation_failed_at", tostring(now_ms))
+    return err(token_err)
+  end
+
+  -- 3. Validate execution is in a signalable state (post-auth).
   local lp = core.lifecycle_phase
   if lp == "terminal" then
     return err("target_not_signalable")
   end
 
   if lp == "active" or lp == "runnable" or lp == "submitted" then
-    -- Not suspended. Check for pending waitpoint.
-    local wp_raw = redis.call("HGETALL", K.waitpoint_hash)
-    if #wp_raw == 0 then
-      return err("target_not_signalable")
-    end
-    local wp = hgetall_to_table(wp_raw)
-    if wp.state == "pending" then
+    -- Not suspended. wp_for_auth was just loaded above; reuse it.
+    if wp_for_auth.state == "pending" then
       return err("waitpoint_pending_use_buffer_script")
     end
-    if wp.state ~= "active" then
+    if wp_for_auth.state ~= "active" then
       return err("target_not_signalable")
     end
     -- Active waitpoint on non-suspended execution — unusual but valid (race window)
   end
 
-  -- 3. Validate waitpoint condition is open
+  -- 4. Validate waitpoint condition is open (post-auth).
   local cond_raw = redis.call("HGETALL", K.wp_condition)
   if #cond_raw == 0 then
     return err("waitpoint_not_found")
@@ -303,10 +334,10 @@ end)
 -- When suspend_execution activates the waitpoint, buffered signals
 -- are replayed through the full evaluation path.
 --
--- KEYS (7): exec_core, wp_condition, wp_signals_stream,
+-- KEYS (9): exec_core, wp_condition, wp_signals_stream,
 --           exec_signals_zset, signal_hash, signal_payload,
---           idem_key
--- ARGV (17): same as ff_deliver_signal (unused fields ignored)
+--           idem_key, waitpoint_hash, hmac_secrets
+-- ARGV (18): same as ff_deliver_signal (17 + waitpoint_token)
 ---------------------------------------------------------------------------
 redis.register_function('ff_buffer_signal_for_pending_waitpoint', function(keys, args)
   local K = {
@@ -317,6 +348,8 @@ redis.register_function('ff_buffer_signal_for_pending_waitpoint', function(keys,
     signal_hash       = keys[5],
     signal_payload    = keys[6],
     idem_key          = keys[7],
+    waitpoint_hash    = keys[8],
+    hmac_secrets      = keys[9],
   }
 
   local A = {
@@ -336,6 +369,7 @@ redis.register_function('ff_buffer_signal_for_pending_waitpoint', function(keys,
     dedup_ttl_ms     = tonumber(args[14] or "86400000"),
     signal_maxlen    = tonumber(args[16] or "1000"),
     max_signals      = tonumber(args[17] or "10000"),
+    waitpoint_token  = args[18] or "",
   }
 
   local t = redis.call("TIME")
@@ -345,6 +379,32 @@ redis.register_function('ff_buffer_signal_for_pending_waitpoint', function(keys,
   local raw = redis.call("HGETALL", K.core_key)
   if #raw == 0 then
     return err("execution_not_found")
+  end
+
+  -- 1a. Validate HMAC token against the pending waitpoint's mint-time binding.
+  local wp_for_auth = hgetall_to_table(redis.call("HGETALL", K.waitpoint_hash))
+  if not wp_for_auth.created_at then
+    return err("waitpoint_not_found")
+  end
+  local token_err = validate_waitpoint_token(
+    K.hmac_secrets, A.waitpoint_token,
+    A.waitpoint_id, wp_for_auth.waitpoint_key or "",
+    tonumber(wp_for_auth.created_at) or 0, now_ms)
+  if token_err then
+    -- Operator-visible counter mirroring ff_deliver_signal. See comment
+    -- there for rationale.
+    redis.call("HSET", K.core_key, "last_hmac_validation_failed_at", tostring(now_ms))
+    return err(token_err)
+  end
+
+  -- 1b. Gate on waitpoint state. ff_deliver_signal blocks replay-after-close
+  -- via wp_condition.closed, but wp_condition is not initialized for pending
+  -- waitpoints — we must check wp.state directly. Without this, a caller
+  -- holding a valid token for a pending waitpoint that has since been
+  -- closed/expired can keep appending buffered signals that will replay
+  -- when suspend_execution(use_pending=1) later activates the waitpoint.
+  if wp_for_auth.state == "closed" or wp_for_auth.state == "expired" then
+    return err("waitpoint_closed")
   end
 
   -- 2. Signal count limit

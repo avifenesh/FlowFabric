@@ -20,11 +20,12 @@ pub struct SuspendOpKeys<'a> {
 
 // ─── ff_suspend_execution ─────────────────────────────────────────────
 //
-// Lua KEYS (16): exec_core, attempt_record, lease_current, lease_history,
+// Lua KEYS (17): exec_core, attempt_record, lease_current, lease_history,
 //                lease_expiry_zset, worker_leases, suspension_current,
 //                waitpoint_hash, waitpoint_signals, suspension_timeout_zset,
 //                pending_wp_expiry_zset, active_index, suspended_zset,
-//                waitpoint_history, wp_condition, attempt_timeout_zset
+//                waitpoint_history, wp_condition, attempt_timeout_zset,
+//                hmac_secrets
 // Lua ARGV (17): execution_id, attempt_index, attempt_id, lease_id,
 //                lease_epoch, suspension_id, waitpoint_id, waitpoint_key,
 //                reason_code, requested_by, timeout_at, resume_condition_json,
@@ -50,6 +51,7 @@ ff_function! {
             k.ctx.waitpoints(),                                        // 14
             k.ctx.waitpoint_condition(&args.waitpoint_id),             // 15
             k.idx.attempt_timeout(),                                   // 16
+            k.idx.waitpoint_hmac_secrets(),                            // 17
         }
         argv {
             args.execution_id.to_string(),                             // 1
@@ -76,30 +78,34 @@ ff_function! {
 impl FromFcallResult for SuspendExecutionResult {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let r = FcallResult::parse(raw)?;
-        // ALREADY_SATISFIED: {1, "ALREADY_SATISFIED", suspension_id, waitpoint_id, waitpoint_key}
+        // ALREADY_SATISFIED: {1, "ALREADY_SATISFIED", suspension_id, waitpoint_id, waitpoint_key, waitpoint_token}
         if r.status == "ALREADY_SATISFIED" {
             let sid = SuspensionId::parse(&r.field_str(0))
                 .map_err(|e| ScriptError::Parse(format!("bad suspension_id: {e}")))?;
             let wid = WaitpointId::parse(&r.field_str(1))
                 .map_err(|e| ScriptError::Parse(format!("bad waitpoint_id: {e}")))?;
             let wkey = r.field_str(2);
+            let token = WaitpointToken::new(r.field_str(3));
             return Ok(SuspendExecutionResult::AlreadySatisfied {
                 suspension_id: sid,
                 waitpoint_id: wid,
                 waitpoint_key: wkey,
+                waitpoint_token: token,
             });
         }
         let r = r.into_success()?;
-        // ok(suspension_id, waitpoint_id, waitpoint_key)
+        // ok(suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
         let sid = SuspensionId::parse(&r.field_str(0))
             .map_err(|e| ScriptError::Parse(format!("bad suspension_id: {e}")))?;
         let wid = WaitpointId::parse(&r.field_str(1))
             .map_err(|e| ScriptError::Parse(format!("bad waitpoint_id: {e}")))?;
         let wkey = r.field_str(2);
+        let token = WaitpointToken::new(r.field_str(3));
         Ok(SuspendExecutionResult::Suspended {
             suspension_id: sid,
             waitpoint_id: wid,
             waitpoint_key: wkey,
+            waitpoint_token: token,
         })
     }
 }
@@ -185,13 +191,15 @@ ff_function! {
 impl FromFcallResult for CreatePendingWaitpointResult {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let r = FcallResult::parse(raw)?.into_success()?;
-        // ok(waitpoint_id, waitpoint_key)
+        // ok(waitpoint_id, waitpoint_key, waitpoint_token)
         let wid = WaitpointId::parse(&r.field_str(0))
             .map_err(|e| ScriptError::Parse(format!("bad waitpoint_id: {e}")))?;
         let wkey = r.field_str(1);
+        let token = WaitpointToken::new(r.field_str(2));
         Ok(CreatePendingWaitpointResult::Created {
             waitpoint_id: wid,
             waitpoint_key: wkey,
+            waitpoint_token: token,
         })
     }
 }

@@ -13,20 +13,20 @@
 --
 -- Validate lease, release ownership, create suspension + waitpoint
 -- (or activate pending), init condition, transition active → suspended.
+-- Mints the waitpoint HMAC token (RFC-004 §Waitpoint Security) returned
+-- alongside the waitpoint_id for external signal delivery.
 --
--- KEYS (16): exec_core, attempt_record, lease_current, lease_history,
+-- KEYS (17): exec_core, attempt_record, lease_current, lease_history,
 --            lease_expiry_zset, worker_leases, suspension_current,
 --            waitpoint_hash, waitpoint_signals, suspension_timeout_zset,
 --            pending_wp_expiry_zset, active_index, suspended_zset,
---            waitpoint_history, wp_condition, attempt_timeout_zset
--- ARGV (13): execution_id, attempt_index, attempt_id, lease_id,
+--            waitpoint_history, wp_condition, attempt_timeout_zset,
+--            hmac_secrets
+-- ARGV (17): execution_id, attempt_index, attempt_id, lease_id,
 --            lease_epoch, suspension_id, waitpoint_id, waitpoint_key,
 --            reason_code, requested_by, timeout_at, resume_condition_json,
---            resume_policy_json
--- ARGV (14): continuation_metadata_pointer (optional)
--- ARGV (15): use_pending_waitpoint ("1" or "")
--- ARGV (16): timeout_behavior
--- ARGV (17): lease_history_maxlen
+--            resume_policy_json, continuation_metadata_pointer,
+--            use_pending_waitpoint, timeout_behavior, lease_history_maxlen
 ---------------------------------------------------------------------------
 redis.register_function('ff_suspend_execution', function(keys, args)
   local K = {
@@ -46,6 +46,7 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     waitpoint_history     = keys[14],
     wp_condition          = keys[15],
     attempt_timeout_key   = keys[16],
+    hmac_secrets          = keys[17],
   }
 
   local A = {
@@ -104,6 +105,7 @@ redis.register_function('ff_suspend_execution', function(keys, args)
   -- 5. Create or activate waitpoint
   local waitpoint_id = A.waitpoint_id
   local waitpoint_key = A.waitpoint_key
+  local waitpoint_token = ""
 
   if A.use_pending_waitpoint == "1" then
     -- Activate existing pending waitpoint
@@ -111,10 +113,23 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     local wp_err = validate_pending_waitpoint(wp_raw, A.execution_id, A.attempt_index, now_ms)
     if wp_err then return wp_err end
 
-    -- Read waitpoint_id and waitpoint_key from existing record
+    -- Read waitpoint_id, waitpoint_key, and existing token from pending record.
+    -- Token was minted at ff_create_pending_waitpoint time with that record's
+    -- created_at; we MUST keep using it so signals buffered before activation
+    -- validate against the same binding.
     local wp = hgetall_to_table(wp_raw)
     waitpoint_id = wp.waitpoint_id
     waitpoint_key = wp.waitpoint_key
+    -- A pending waitpoint without a minted token is either a pre-HMAC-upgrade
+    -- record or a corrupted write. Activating with an empty token would return
+    -- "" to the SDK, and every subsequent signal delivery would reject with
+    -- missing_token — fail-closed at the security boundary but silent about
+    -- the real degraded state. Surface the degradation AT the activation
+    -- point so operators see it immediately.
+    if not is_set(wp.waitpoint_token) then
+      return err("waitpoint_not_token_bound")
+    end
+    waitpoint_token = wp.waitpoint_token
 
     -- Activate the pending waitpoint
     redis.call("HSET", K.waitpoint_hash,
@@ -142,7 +157,7 @@ redis.register_function('ff_suspend_execution', function(keys, args)
           "closed_at", tostring(now_ms), "close_reason", "resumed")
         write_condition_hash(K.wp_condition, wp_cond, now_ms)
         -- Do NOT release lease, do NOT change execution state.
-        return ok_already_satisfied(A.suspension_id, waitpoint_id, waitpoint_key)
+        return ok_already_satisfied(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
       end
       -- Condition not yet satisfied — proceed with suspension.
       -- Write partial condition state (some matchers may be satisfied).
@@ -153,13 +168,21 @@ redis.register_function('ff_suspend_execution', function(keys, args)
       write_condition_hash(K.wp_condition, wp_cond, now_ms)
     end
   else
-    -- Create new waitpoint
+    -- Create new waitpoint — mint HMAC token bound to (waitpoint_id,
+    -- waitpoint_key, created_at). The created_at written here is what the
+    -- signal-delivery path reads back for HMAC validation.
+    local token, token_err = mint_waitpoint_token(
+      K.hmac_secrets, waitpoint_id, waitpoint_key, now_ms)
+    if not token then return err(token_err) end
+    waitpoint_token = token
+
     redis.call("HSET", K.waitpoint_hash,
       "waitpoint_id", waitpoint_id,
       "execution_id", A.execution_id,
       "attempt_index", A.attempt_index,
       "suspension_id", A.suspension_id,
       "waitpoint_key", waitpoint_key,
+      "waitpoint_token", waitpoint_token,
       "state", "active",
       "created_at", tostring(now_ms),
       "activated_at", tostring(now_ms),
@@ -252,7 +275,7 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     redis.call("ZADD", K.suspension_timeout_key, tonumber(A.timeout_at), A.execution_id)
   end
 
-  return ok(A.suspension_id, waitpoint_id, waitpoint_key)
+  return ok(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
 end)
 
 ---------------------------------------------------------------------------
@@ -370,8 +393,10 @@ end)
 -- Pre-create a waitpoint before suspension commits. The waitpoint is
 -- externally addressable by waitpoint_key so early signals can be buffered.
 -- Requires the caller to still hold the active lease.
+-- Mints the waitpoint HMAC token up front so early signals targeting the
+-- pending waitpoint can be authenticated via ff_buffer_signal_for_pending_waitpoint.
 --
--- KEYS (3): exec_core, waitpoint_hash, pending_wp_expiry_zset
+-- KEYS (4): exec_core, waitpoint_hash, pending_wp_expiry_zset, hmac_secrets
 -- ARGV (5): execution_id, attempt_index, waitpoint_id, waitpoint_key,
 --           expires_at
 ---------------------------------------------------------------------------
@@ -380,6 +405,7 @@ redis.register_function('ff_create_pending_waitpoint', function(keys, args)
     core_key              = keys[1],
     waitpoint_hash        = keys[2],
     pending_wp_expiry_key = keys[3],
+    hmac_secrets          = keys[4],
   }
 
   local A = {
@@ -419,13 +445,20 @@ redis.register_function('ff_create_pending_waitpoint', function(keys, args)
     -- Old closed/expired waitpoint — safe to overwrite
   end
 
-  -- 3. Create pending waitpoint
+  -- 3. Mint HMAC token bound to (waitpoint_id, waitpoint_key, now_ms).
+  -- The suspension activation path will reuse this token unchanged.
+  local waitpoint_token, token_err = mint_waitpoint_token(
+    K.hmac_secrets, A.waitpoint_id, A.waitpoint_key, now_ms)
+  if not waitpoint_token then return err(token_err) end
+
+  -- 4. Create pending waitpoint
   redis.call("HSET", K.waitpoint_hash,
     "waitpoint_id", A.waitpoint_id,
     "execution_id", A.execution_id,
     "attempt_index", A.attempt_index,
     "suspension_id", "",
     "waitpoint_key", A.waitpoint_key,
+    "waitpoint_token", waitpoint_token,
     "state", "pending",
     "created_at", tostring(now_ms),
     "activated_at", "",
@@ -437,11 +470,11 @@ redis.register_function('ff_create_pending_waitpoint', function(keys, args)
     "matched_signal_count", "0",
     "last_signal_at", "")
 
-  -- 4. Add to pending waitpoint expiry index
+  -- 5. Add to pending waitpoint expiry index
   redis.call("ZADD", K.pending_wp_expiry_key,
     tonumber(A.expires_at), A.waitpoint_id)
 
-  return ok(A.waitpoint_id, A.waitpoint_key)
+  return ok(A.waitpoint_id, A.waitpoint_key, waitpoint_token)
 end)
 
 ---------------------------------------------------------------------------

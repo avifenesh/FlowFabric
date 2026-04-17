@@ -51,6 +51,19 @@ pub struct FlowFabricWorker {
     client: Client,
     config: WorkerConfig,
     partition_config: PartitionConfig,
+    /// Sorted, deduplicated, comma-separated capabilities — computed once
+    /// from `config.capabilities` at connect time. Passed as ARGV[9] to
+    /// `ff_issue_claim_grant` on every claim. BTreeSet sorting is critical:
+    /// Lua's `ff_issue_claim_grant` relies on a stable CSV form for
+    /// reproducible logs and tests.
+    #[cfg(feature = "insecure-direct-claim")]
+    worker_capabilities_csv: String,
+    /// 8-hex FNV-1a digest of `worker_capabilities_csv`. Used in
+    /// per-mismatch logs so the 4KB CSV never echoes on every reject
+    /// during an incident. Full CSV logged once at connect-time WARN for
+    /// cross-reference. Mirrors `ff-scheduler::claim::worker_caps_digest`.
+    #[cfg(feature = "insecure-direct-claim")]
+    worker_capabilities_hash: String,
     #[cfg(feature = "insecure-direct-claim")]
     lane_index: AtomicUsize,
     #[cfg(feature = "insecure-direct-claim")]
@@ -202,10 +215,189 @@ impl FlowFabricWorker {
             partition_config.num_execution_partitions.max(1) as usize,
         );
 
+        // Sort + dedupe capabilities into a stable CSV. BTreeSet both sorts
+        // and deduplicates in one pass; string joining happens once here.
+        //
+        // Ingress validation mirrors Scheduler::claim_for_worker (ff-scheduler):
+        //   - `,` is the CSV delimiter; a token containing one would split
+        //     mid-parse and could let a {"gpu"} worker appear to satisfy
+        //     {"gpu,cuda"} (silent auth bypass).
+        //   - Empty strings would produce leading/adjacent commas on the
+        //     wire and inflate token count for no semantic reason.
+        //   - Non-printable / whitespace chars: `"gpu "` vs `"gpu"` or
+        //     `"gpu\n"` vs `"gpu"` produce silent mismatches that are
+        //     miserable to debug. Reject anything outside printable ASCII
+        //     excluding space (`'!'..='~'`) at ingress so a typo fails
+        //     loudly at connect instead of silently mis-routing forever.
+        // Reject at boot so operator misconfig is loud, symmetric with the
+        // scheduler path.
+        #[cfg(feature = "insecure-direct-claim")]
+        for cap in &config.capabilities {
+            if cap.is_empty() {
+                return Err(SdkError::Config(
+                    "capability token must not be empty".into(),
+                ));
+            }
+            if cap.contains(',') {
+                return Err(SdkError::Config(format!(
+                    "capability token may not contain ',' (CSV delimiter): {cap:?}"
+                )));
+            }
+            // Reject ASCII control bytes (0x00-0x1F, 0x7F) and any ASCII
+            // whitespace (space, tab, LF, CR, FF, VT). UTF-8 printable
+            // characters above 0x7F are ALLOWED so i18n caps like
+            // "东京-gpu" can be used. The CSV wire form is byte-safe for
+            // multibyte UTF-8 because `,` is always a single byte and
+            // never part of a multibyte continuation (only 0x80-0xBF are
+            // continuations, ',' is 0x2C).
+            if cap.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(SdkError::Config(format!(
+                    "capability token must not contain whitespace or control characters: {cap:?}"
+                )));
+            }
+        }
+        #[cfg(feature = "insecure-direct-claim")]
+        let worker_capabilities_csv: String = {
+            let set: std::collections::BTreeSet<&str> = config
+                .capabilities
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if set.len() > ff_core::policy::CAPS_MAX_TOKENS {
+                return Err(SdkError::Config(format!(
+                    "capability set exceeds CAPS_MAX_TOKENS ({}): {}",
+                    ff_core::policy::CAPS_MAX_TOKENS,
+                    set.len()
+                )));
+            }
+            let csv = set.into_iter().collect::<Vec<_>>().join(",");
+            if csv.len() > ff_core::policy::CAPS_MAX_BYTES {
+                return Err(SdkError::Config(format!(
+                    "capability CSV exceeds CAPS_MAX_BYTES ({}): {}",
+                    ff_core::policy::CAPS_MAX_BYTES,
+                    csv.len()
+                )));
+            }
+            csv
+        };
+
+        // Short stable digest of the sorted caps CSV, computed once so
+        // per-mismatch logs carry a stable identifier instead of the 4KB
+        // CSV. Shared helper — ff-scheduler uses the same one for its
+        // own per-mismatch logs, so cross-component log lines are
+        // diffable against each other.
+        #[cfg(feature = "insecure-direct-claim")]
+        let worker_capabilities_hash = ff_core::hash::fnv1a_xor8hex(&worker_capabilities_csv);
+
+        // Full CSV logged once at connect so per-mismatch logs (which
+        // carry only the 8-hex hash) can be cross-referenced by ops.
+        #[cfg(feature = "insecure-direct-claim")]
+        if !worker_capabilities_csv.is_empty() {
+            tracing::info!(
+                worker_instance_id = %config.worker_instance_id,
+                worker_caps_hash = %worker_capabilities_hash,
+                worker_caps = %worker_capabilities_csv,
+                "worker connected with capabilities (full CSV — mismatch logs use hash only)"
+            );
+        }
+
+        // Non-authoritative advertisement of caps for operator visibility
+        // (CLI introspection, dashboards). The AUTHORITATIVE source for
+        // scheduling decisions is ARGV[9] on each claim — Lua reads ONLY
+        // that, never this string. Lossy here is correctness-safe.
+        //
+        // Storage: a single STRING key holding the sorted CSV. Rationale:
+        //   * **Atomic overwrite.** `SET` is a single command — a concurrent
+        //     reader can never observe a transient empty value (the prior
+        //     DEL+SADD pair had that window).
+        //   * **Crash cleanup without refresh loop.** The alive-key SET NX
+        //     is startup-only (see §1 above); there's no periodic renew
+        //     to piggy-back on, so a TTL on caps would independently
+        //     expire mid-flight and hide a live worker's caps from ops
+        //     tools. Instead we drop the TTL: each reconnect overwrites;
+        //     a crashed worker leaves a stale CSV until a new process
+        //     with the same worker_instance_id boots (which triggers
+        //     `duplicate worker_instance_id` via alive-key guard anyway —
+        //     the orchestrator allocates a new id, and operators can DEL
+        //     the stale caps key if they care).
+        //   * **Empty caps = DEL.** A restart from {gpu} to {} clears the
+        //     advertisement rather than leaving stale data.
+        // Cluster-safe advertisement: the per-worker caps STRING lives at
+        // `ff:worker:{id}:caps` (lands on whatever slot CRC16 puts it on),
+        // and the INSTANCE ID is SADD'd to the global workers-index SET
+        // `ff:idx:workers` (single slot). The unblock scanner's cluster
+        // enumeration uses SMEMBERS on the index + per-member GET on each
+        // caps key, instead of `SCAN MATCH ff:worker:*:caps` (which in
+        // cluster mode only scans the shard the SCAN lands on and misses
+        // workers whose key hashes elsewhere). Pattern mirrors Batch A
+        // `budget_policies_index` / `flow_index` / `deps_all_edges`:
+        // operations stay atomic per command, the index is the
+        // cluster-wide enumeration surface.
+        #[cfg(feature = "insecure-direct-claim")]
+        {
+            let caps_key = ff_core::keys::worker_caps_key(&config.worker_instance_id);
+            let index_key = ff_core::keys::workers_index_key();
+            let instance_id = config.worker_instance_id.to_string();
+            if worker_capabilities_csv.is_empty() {
+                // No caps advertised. DEL the per-worker caps string AND
+                // SREM from the index so the scanner doesn't GET an empty
+                // string for a worker that never declares caps.
+                let _ = client
+                    .cmd("DEL")
+                    .arg(&caps_key)
+                    .execute::<Option<i64>>()
+                    .await;
+                if let Err(e) = client
+                    .cmd("SREM")
+                    .arg(&index_key)
+                    .arg(&instance_id)
+                    .execute::<Option<i64>>()
+                    .await
+                {
+                    tracing::warn!(error = %e, key = %index_key, instance = %instance_id,
+                        "SREM workers-index failed; continuing (non-authoritative)");
+                }
+            } else {
+                // Atomic overwrite of the caps STRING (one-command). Then
+                // SADD to the index (idempotent — re-running connect for
+                // the same id is a no-op at SADD level). The per-worker
+                // caps key is written BEFORE the index SADD so that when
+                // the scanner observes the id in the index, the caps key
+                // is guaranteed to resolve to a non-stale CSV (the reverse
+                // order would leak an index entry pointing at a stale or
+                // empty caps key during a narrow window).
+                if let Err(e) = client
+                    .cmd("SET")
+                    .arg(&caps_key)
+                    .arg(&worker_capabilities_csv)
+                    .execute::<Option<String>>()
+                    .await
+                {
+                    tracing::warn!(error = %e, key = %caps_key,
+                        "SET worker caps advertisement failed; continuing");
+                }
+                if let Err(e) = client
+                    .cmd("SADD")
+                    .arg(&index_key)
+                    .arg(&instance_id)
+                    .execute::<Option<i64>>()
+                    .await
+                {
+                    tracing::warn!(error = %e, key = %index_key, instance = %instance_id,
+                        "SADD workers-index failed; continuing");
+                }
+            }
+        }
+
         Ok(Self {
             client,
             config,
             partition_config,
+            #[cfg(feature = "insecure-direct-claim")]
+            worker_capabilities_csv,
+            #[cfg(feature = "insecure-direct-claim")]
+            worker_capabilities_hash,
             #[cfg(feature = "insecure-direct-claim")]
             lane_index: AtomicUsize::new(0),
             #[cfg(feature = "insecure-direct-claim")]
@@ -326,6 +518,27 @@ impl FlowFabricWorker {
 
             match grant_result {
                 Ok(()) => {}
+                Err(SdkError::Script(ff_script::error::ScriptError::CapabilityMismatch(
+                    ref missing,
+                ))) => {
+                    // Block-on-mismatch (RFC-009 §7.5) — parity with
+                    // ff-scheduler's Scheduler::claim_for_worker. Without
+                    // this, the inline-direct-claim path would hot-loop
+                    // on an unclaimable top-of-zset (every tick picks the
+                    // same execution, wastes an FCALL, logs, releases,
+                    // repeats). The scheduler-side unblock scanner
+                    // promotes blocked_route executions back to eligible
+                    // when a worker with matching caps registers.
+                    tracing::info!(
+                        execution_id = %execution_id,
+                        worker_id = %self.config.worker_id,
+                        worker_caps_hash = %self.worker_capabilities_hash,
+                        missing = %missing,
+                        "capability mismatch, blocking execution off eligible (SDK inline claim)"
+                    );
+                    self.block_route(&execution_id, &lane_id, &partition, &idx).await;
+                    continue;
+                }
                 Err(SdkError::Script(ref e)) if is_retryable_claim_error(e) => {
                     tracing::debug!(
                         execution_id = %execution_id,
@@ -409,8 +622,9 @@ impl FlowFabricWorker {
             idx.lane_eligible(lane_id),
         ];
 
-        // ARGV (8): eid, worker_id, worker_instance_id, lane_id,
-        //           capability_hash, grant_ttl_ms, route_snapshot_json, admission_summary
+        // ARGV (9): eid, worker_id, worker_instance_id, lane_id,
+        //           capability_hash, grant_ttl_ms, route_snapshot_json,
+        //           admission_summary, worker_capabilities_csv (sorted)
         let args: Vec<String> = vec![
             execution_id.to_string(),
             self.config.worker_id.to_string(),
@@ -420,6 +634,7 @@ impl FlowFabricWorker {
             "5000".to_owned(), // grant_ttl_ms (5 seconds)
             String::new(), // route_snapshot_json
             String::new(), // admission_summary
+            self.worker_capabilities_csv.clone(), // sorted CSV
         ];
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -432,6 +647,69 @@ impl FlowFabricWorker {
             .map_err(SdkError::Valkey)?;
 
         crate::task::parse_success_result(&raw, "ff_issue_claim_grant")
+    }
+
+    /// Move an execution from the lane's eligible ZSET into its
+    /// blocked_route ZSET via `ff_block_execution_for_admission`. Called
+    /// after a `CapabilityMismatch` reject — without this, the inline
+    /// direct-claim path would re-pick the same top-of-zset every tick
+    /// (same pattern the scheduler's block_candidate handles). The
+    /// engine's unblock scanner periodically promotes blocked_route
+    /// back to eligible once a worker with matching caps registers.
+    ///
+    /// Best-effort: transport or logical rejects (e.g. the execution
+    /// already went terminal between pick and block) are logged and the
+    /// outer loop simply `continue`s to the next partition. Parity with
+    /// ff-scheduler::Scheduler::block_candidate.
+    #[cfg(feature = "insecure-direct-claim")]
+    async fn block_route(
+        &self,
+        execution_id: &ExecutionId,
+        lane_id: &LaneId,
+        partition: &ff_core::partition::Partition,
+        idx: &IndexKeys,
+    ) {
+        let ctx = ExecKeyContext::new(partition, execution_id);
+        let core_key = ctx.core();
+        let eligible_key = idx.lane_eligible(lane_id);
+        let blocked_key = idx.lane_blocked_route(lane_id);
+        let eid_s = execution_id.to_string();
+        let now_ms = TimestampMs::now().0.to_string();
+
+        let keys: [&str; 3] = [&core_key, &eligible_key, &blocked_key];
+        let argv: [&str; 4] = [
+            &eid_s,
+            "waiting_for_capable_worker",
+            "no connected worker satisfies required_capabilities",
+            &now_ms,
+        ];
+
+        match self
+            .client
+            .fcall::<Value>("ff_block_execution_for_admission", &keys, &argv)
+            .await
+        {
+            Ok(v) => {
+                // Parse Lua result so a logical reject (e.g. execution
+                // went terminal mid-flight) is visible — same fix we
+                // applied to ff-scheduler's block_candidate.
+                if let Err(e) = crate::task::parse_success_result(&v, "ff_block_execution_for_admission") {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "SDK block_route: Lua rejected; eligible ZSET unchanged, next poll \
+                         will re-evaluate"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "SDK block_route: transport failure; eligible ZSET unchanged"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "insecure-direct-claim")]
@@ -530,21 +808,28 @@ impl FlowFabricWorker {
         };
 
         if status_code != 1 {
-            let error_code = arr
-                .get(1)
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::SimpleString(s)) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "unknown".to_owned());
+            let err_field_str = |idx: usize| -> String {
+                arr.get(idx)
+                    .and_then(|v| match v {
+                        Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                        Ok(Value::SimpleString(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            let error_code = {
+                let s = err_field_str(1);
+                if s.is_empty() { "unknown".to_owned() } else { s }
+            };
+            let detail = err_field_str(2);
 
             return Err(SdkError::Script(
-                ff_script::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
-                    ff_script::error::ScriptError::Parse(format!(
-                        "ff_claim_execution: {error_code}"
-                    ))
-                }),
+                ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
+                    .unwrap_or_else(|| {
+                        ff_script::error::ScriptError::Parse(format!(
+                            "ff_claim_execution: {error_code}"
+                        ))
+                    }),
             ));
         }
 
@@ -674,21 +959,28 @@ impl FlowFabricWorker {
         };
 
         if status_code != 1 {
-            let error_code = arr
-                .get(1)
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::SimpleString(s)) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "unknown".to_owned());
+            let err_field_str = |idx: usize| -> String {
+                arr.get(idx)
+                    .and_then(|v| match v {
+                        Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                        Ok(Value::SimpleString(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            let error_code = {
+                let s = err_field_str(1);
+                if s.is_empty() { "unknown".to_owned() } else { s }
+            };
+            let detail = err_field_str(2);
 
             return Err(SdkError::Script(
-                ff_script::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
-                    ff_script::error::ScriptError::Parse(format!(
-                        "ff_claim_resumed_execution: {error_code}"
-                    ))
-                }),
+                ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
+                    .unwrap_or_else(|| {
+                        ff_script::error::ScriptError::Parse(format!(
+                            "ff_claim_resumed_execution: {error_code}"
+                        ))
+                    }),
             ));
         }
 
@@ -793,11 +1085,11 @@ impl FlowFabricWorker {
             .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
         let lane_id = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
-        // KEYS (13): exec_core, wp_condition, wp_signals_stream,
+        // KEYS (14): exec_core, wp_condition, wp_signals_stream,
         //            exec_signals_zset, signal_hash, signal_payload,
         //            idem_key, waitpoint_hash, suspension_current,
         //            eligible_zset, suspended_zset, delayed_zset,
-        //            suspension_timeout_zset
+        //            suspension_timeout_zset, hmac_secrets
         let idem_key = if let Some(ref ik) = signal.idempotency_key {
             ctx.signal_dedup(waitpoint_id, ik)
         } else {
@@ -817,6 +1109,7 @@ impl FlowFabricWorker {
             idx.lane_suspended(&lane_id),                  // 11
             idx.lane_delayed(&lane_id),                    // 12
             idx.suspension_timeout(),                      // 13
+            idx.waitpoint_hmac_secrets(),                  // 14
         ];
 
         let payload_str = signal
@@ -825,12 +1118,12 @@ impl FlowFabricWorker {
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .unwrap_or_default();
 
-        // ARGV (17): signal_id, execution_id, waitpoint_id, signal_name,
+        // ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
         //            signal_category, source_type, source_identity,
         //            payload, payload_encoding, idempotency_key,
         //            correlation_id, target_scope, created_at,
         //            dedup_ttl_ms, resume_delay_ms, signal_maxlen,
-        //            max_signals_per_execution
+        //            max_signals_per_execution, waitpoint_token
         let args: Vec<String> = vec![
             signal_id.to_string(),                           // 1
             execution_id.to_string(),                        // 2
@@ -849,6 +1142,10 @@ impl FlowFabricWorker {
             "0".to_owned(),                                  // 15 resume_delay_ms
             "1000".to_owned(),                               // 16 signal_maxlen
             "10000".to_owned(),                              // 17 max_signals
+            // WIRE BOUNDARY — raw token must reach Lua unredacted. Do NOT
+            // use ToString/Display (those are redacted for log safety);
+            // .as_str() is the explicit opt-in that gets the secret bytes.
+            signal.waitpoint_token.as_str().to_owned(),      // 18 waitpoint_token
         ];
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -888,12 +1185,7 @@ fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
     if num_partitions == 0 {
         return 0;
     }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in worker_instance_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    (hash as usize) % num_partitions
+    (ff_core::hash::fnv1a_u64(worker_instance_id.as_bytes()) as usize) % num_partitions
 }
 
 #[cfg(feature = "insecure-direct-claim")]

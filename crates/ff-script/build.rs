@@ -44,7 +44,73 @@ fn main() {
         panic!("Failed to write {}: {}", output_path.display(), e);
     });
 
-    // Tell Cargo to re-run if any Lua file changes
+    // Single source of truth for LIBRARY_VERSION: extract the string
+    // literal from `lua/version.lua` and expose it to Rust via
+    // `cargo:rustc-env=FLOWFABRIC_LUA_VERSION=...`. `crates/ff-script/src/lib.rs`
+    // reads it through `env!("FLOWFABRIC_LUA_VERSION")`. Eliminates the
+    // two-place drift class (one bump updates both the Lua function and
+    // the Rust constant the loader compares against).
+    //
+    // Parse contract: `lua/version.lua` must contain exactly one
+    // `return 'X'` literal (the body of `ff_version`). String find+slice,
+    // no regex or Lua parser dependency. Break the contract → panic with
+    // a message that points at the file to fix.
+    let version_path = lua_dir.join("version.lua");
+    let version_source = fs::read_to_string(&version_path).unwrap_or_else(|e| {
+        panic!("Failed to read {}: {}", version_path.display(), e);
+    });
+    // Walk lines, skipping Lua comments ("--" at start after trimming).
+    // The version.lua docstring contains "return 'X'" as explanatory text;
+    // a naive `version_source.find("return '")` picks that up instead of
+    // the real function body. Line-based skip-comments parse keeps the
+    // extract string-based (no regex dep) while avoiding that trap.
+    //
+    // Strict "exactly one" contract: collect ALL non-comment matches, then
+    // panic if count != 1. Guards against a future edit that adds a second
+    // `register_function` returning a literal and silently takes the
+    // first match (or worse, the wrong match).
+    let matches: Vec<String> = version_source
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.trim_start();
+            if line.starts_with("--") {
+                return None;
+            }
+            let i = line.find("return '")?;
+            let rest = &line[i + "return '".len()..];
+            rest.find('\'').map(|j| rest[..j].to_owned())
+        })
+        .collect();
+    let version = match matches.len() {
+        1 => matches.into_iter().next().unwrap(),
+        0 => panic!(
+            "Failed to extract LIBRARY_VERSION from {}: expected exactly one \
+             non-commented `return 'X'` literal (the body of ff_version), found \
+             NONE. Do NOT maintain a separate copy in crates/ff-script/src/lib.rs \
+             — this extract is the single source of truth.",
+            version_path.display()
+        ),
+        n => panic!(
+            "Failed to extract LIBRARY_VERSION from {}: expected exactly one \
+             non-commented `return 'X'` literal, found {n} ({matches:?}). If \
+             version.lua grew a second register_function, move it elsewhere — \
+             the extract can't know which one is authoritative.",
+            version_path.display()
+        ),
+    };
+    // Sanity bounds: non-empty, no embedded quotes/newlines that would
+    // imply a broken parse, short enough to be a version string.
+    assert!(
+        !version.is_empty()
+            && version.len() < 64
+            && !version.contains('\n')
+            && !version.contains('\''),
+        "Invalid LIBRARY_VERSION extracted from lua/version.lua: {version:?}"
+    );
+    println!("cargo:rustc-env=FLOWFABRIC_LUA_VERSION={version}");
+
+    // Tell Cargo to re-run if any Lua file changes. `version.lua` is
+    // already in the list above, so changes to it trigger re-extract.
     for filename in lua_files {
         println!("cargo:rerun-if-changed=../../lua/{}", filename);
     }

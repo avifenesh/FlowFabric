@@ -674,6 +674,355 @@ Mitigations:
 
 ---
 
+## Implementation Notes (Batch B — RFC-006 #2, 2026-04-17)
+
+Read-side primitives landed on `feat/batch-b` to unblock cairn checkpoint
+recovery. Two endpoints, two different transports; the split is forced by
+Valkey's rule that blocking commands cannot run inside Functions.
+
+**`ff_read_attempt_stream` (XRANGE, inside a Lua Function)**
+- `XRANGE` is non-blocking and therefore safe in `redis.register_function`.
+- KEYS(2): `stream_data`, `stream_meta` (both share the `{p:N}` hash tag).
+- ARGV(3): `from_id`, `to_id`, `count_limit`.
+- `count_limit` MUST be in `1..=STREAM_READ_HARD_CAP` (10_000); `0`
+  returns `invalid_input` rather than silently reading the entire stream.
+- Returns an empty array when the stream key does not exist — a
+  never-written attempt is a legitimate state, not an error.
+- Also returns `closed_at` and `closed_reason` (read via `HMGET` on
+  `stream_meta`) so consumers get the **terminal signal** alongside the
+  frames in the same FCALL. A never-written attempt yields empty strings
+  for both fields, which the Rust layer maps to `None`/`None`
+  (indistinguishable from "still open" at this layer, which is the
+  intended semantics).
+
+**`xread_block` (XREAD / XREAD BLOCK, direct client command)**
+- Blocking inside a Function is rejected by Valkey, so this lives in
+  `crates/ff-script/src/stream_tail.rs` as a plain async helper that
+  invokes the client directly.
+- `block_ms == 0` → plain `XREAD` (no BLOCK). `XREAD BLOCK 0` blocks
+  *indefinitely*, which is never what a web handler wants.
+- `block_ms > 0` → `XREAD COUNT <limit> BLOCK <ms> STREAMS <key> <last_id>`.
+  Timeout returns `Value::Nil`, which we normalize to `Vec::new()`.
+- The REST layer rejects `block_ms > 30_000ms` with HTTP 400. Ceiling
+  chosen to sit below common LB idle timeouts (ALB 60s, nginx 60s,
+  Cloudflare 100s) so the response can't be cut mid-block.
+- After the XREAD settles we fire one follow-up `HMGET stream_meta
+  closed_at closed_reason` to attach the terminal signal to the return.
+  This is cheap (single RTT, same `{p:N}` slot) and avoids consumers
+  having to poll a separate endpoint to learn whether the stream is
+  closed. The follow-up HMGET is ALWAYS performed, even on timeout —
+  that's the common case where the signal matters most.
+
+**Routing by `(execution_id, attempt_index)` — not `attempt_id`**
+
+The stream key is `ff:stream:{p:N}:<eid>:<idx>`. There is no
+`attempt_id → (eid, idx)` reverse index, and the task consumer (cairn)
+already has both values at checkpoint time. We route by
+`(execution_id, attempt_index)` instead of building a new index.
+`attempt_id` remains an audit field inside each frame's write args, not a
+routing key. REST paths reflect this:
+
+- `GET /v1/executions/{eid}/attempts/{idx}/stream?from=-&to=+&limit=100`
+- `GET /v1/executions/{eid}/attempts/{idx}/stream/tail?after=<id>&block_ms=5000&limit=50`
+
+**REST transport: long-poll in v1**
+
+Tail is exposed as long-poll, not SSE. Rationale:
+- Simpler: no SSE framing, works through any HTTP stack, no client state
+  beyond "remember the last id I saw".
+- Bounded: `block_ms <= 30s` cap means a single request never outlives a
+  typical LB idle timeout.
+- SSE can be added later without changing the server-side shape — the
+  Server method `tail_attempt_stream` already returns `Vec<StreamFrame>`
+  suitable for either transport.
+
+**Transport timeout interaction (ferriskey)**
+
+The ferriskey client's default `request_timeout` (5s on ff-server) does
+NOT apply to blocking XREAD calls. `ferriskey::client::get_request_timeout`
+inspects outgoing commands; for `XREAD`/`XREADGROUP` with a `BLOCK`
+argument it returns `BlockingCommand(block_ms + 500ms)` via the
+`BLOCKING_CMD_TIMEOUT_EXTENSION` constant (0.5s), overriding the client's
+default for that single command.
+
+Practical consequence for **timeouts**: the REST `block_ms` ceiling of
+30s is the only knob that bounds tail latency from a transport
+perspective. The dedicated tail client (§"Dedicated tail connection"
+below) exists for a DIFFERENT reason — head-of-line isolation — not
+for request_timeout tuning. Two different concerns, two different
+fixes; don't conflate. The regression test
+`test_tail_stream_long_block_respects_ferriskey_timeout_extension`
+blocks for 7s (above the 5s default) to pin the timeout-extension
+behavior.
+
+**Input validation: both bounds reject, neither silently clamps**
+
+Both REST handlers reject out-of-range inputs with HTTP 400 rather than
+silently clamping:
+- `block_ms > MAX_TAIL_BLOCK_MS (30_000)` → 400.
+- `limit == 0` → 400 (`"limit must be >= 1"`).
+- `limit > REST_STREAM_LIMIT_CEILING (1_000)` → 400. Lower than the
+  internal `STREAM_READ_HARD_CAP (10_000)` because the REST layer
+  buffers the full JSON body in axum — a max-payload × max-limit
+  response is multi-hundred-MB per call and a clear DoS vector from a
+  single client. Internal callers via FCALL or the SDK directly retain
+  the 10_000 bound; REST clients paginate through `from`/`to`/`after`
+  for larger spans. Chunked-transfer / SSE deferred to v2.
+- Malformed `from` / `to` / `after` (anything outside `"-"`, `"+"`, or
+  `<ms>[-<seq>]`) → 400 at the REST boundary, never forwarded to Valkey.
+
+Explicit 400 responses surface client misconfiguration; silent clamps
+mask it. `STREAM_READ_HARD_CAP` is a single source of truth in
+`ff_core::contracts` and is mirrored in the Lua-side `HARD_CAP` literal
+in `lua/stream.lua`.
+
+**Dedicated stream-op connection (head-of-line isolation)**
+
+`Server::tail_attempt_stream` AND `Server::read_attempt_stream` both run
+on `Server.tail_client` — a dedicated `ferriskey::Client` built alongside
+the main client in `Server::start`. The main `Server.client` and the
+`Engine`'s scanner client are unaffected by stream-op latency.
+
+The split is about **head-of-line isolation**, not request_timeout
+(which ferriskey already handles; see §Transport timeout interaction
+above). Two separate classes of stream-op load would otherwise starve
+the main mux:
+
+- **Blocking**: `XREAD BLOCK 30_000` holds the socket read side for up
+  to 30 seconds.
+- **Large reads**: an XRANGE with `COUNT=STREAM_READ_HARD_CAP (10_000)`
+  returning ~64 KB-per-frame payloads is a multi-MB reply serialized
+  on one TCP socket.
+
+Either load on a shared client would stall every concurrent FCALL
+(claim, create, rotate-waitpoint-secret, budget/quota, admin) AND every
+engine scanner for the duration. Splitting both reads and tails out
+onto the dedicated `tail_client` makes foreground API and
+background-scanner cadence independent of stream-op latency.
+
+**Tail serialization on the dedicated client (v1)**
+
+The dedicated `tail_client` is still one multiplexed TCP connection:
+Valkey processes commands FIFO on it, and ferriskey's per-call
+`request_timeout` starts on the client side at future-poll. Two
+`XREAD BLOCK` calls pipelined down one mux therefore DO NOT run
+concurrently at the server — the second waits for the first to return
+— and the second call's `request_timeout` (auto-extended to
+`block_ms + 500ms`) expires BEFORE it ever reaches the server, producing
+spurious `timed_out` errors under concurrent tail load.
+
+V1 ships an explicit `tokio::sync::Mutex` (`Server.xread_block_lock`)
+that serializes `xread_block` calls against the tail client.
+Acquisition order is **semaphore permit first, Mutex second**. The
+`max_concurrent_stream_ops` ceiling becomes the queue depth; throughput
+on the tail client is 1 BLOCK at a time, but each call gets its full
+`block_ms` budget at Valkey instead of racing client-side timeouts.
+
+XRANGE reads (`read_attempt_stream`) are NOT gated by the Mutex. XRANGE
+is non-blocking at the server — pipelined XRANGEs on one mux complete
+in microseconds each — so they don't trigger the same client-side
+timeout race. Keeping reads unserialized preserves read throughput.
+
+**V2 upgrade path**: replace the single `tail_client` + Mutex pair with
+a pool of N dedicated `ferriskey::Client` connections. Each tail gets
+its own socket; BLOCKs run truly in parallel. Deferred from Batch B
+because it requires Server-state changes (pool lifecycle, shutdown
+draining of all N clients) that are scope-creep relative to the Mutex
+fix. The `xread_block_lock` is labeled with a pointer to this upgrade
+so the v2 removal is mechanical.
+
+**Backpressure on concurrent stream ops (`FF_MAX_CONCURRENT_STREAM_OPS`)**
+
+`Server.stream_semaphore` bounds concurrent stream-op calls — reads AND
+tails combined (default 64). Read and tail share the same pool because
+they share the same `tail_client`; a flood of one can starve the other
+unless fairness accounting is unified.
+
+Both `Server::read_attempt_stream` and `Server::tail_attempt_stream`
+acquire a permit via `try_acquire_owned` before their Valkey command;
+when the pool is exhausted, callers receive
+`ServerError::TailUnavailable` which the REST layer surfaces as
+**HTTP 429 Too Many Requests** (`retryable=true` in the error body).
+Non-blocking acquisition is deliberate: queueing would hold the caller's
+HTTP request open with no upper bound, which is exactly the exhaustion
+pattern the limit exists to prevent.
+
+Env var precedence: `FF_MAX_CONCURRENT_STREAM_OPS` is the preferred
+name; the older `FF_MAX_CONCURRENT_TAIL` is accepted for one release to
+keep existing deployments working while they update their config. If
+both are set, the new name wins.
+
+Operators tune this based on the server's overall request-concurrency
+budget. A single multiplexed tail connection handles arbitrary
+pipelining, so the ceiling is about fairness — how many stream ops can
+be in flight before new ones must back off — not about
+connection-count.
+
+**Permit-hold latency (closed via HSET while tail is blocking)**
+
+`XREAD BLOCK` wakes on `XADD` to the stream, not on `HSET` to
+`stream_meta`. When a producer closes a stream via one of the non-XADD
+terminal paths — `ff_cancel_execution` / `ff_complete_execution` /
+`ff_fail_execution` / `mark_expired` / reclaim, all of which HSET
+`closed_at` without appending a frame — any in-flight `tail_stream`
+will NOT wake early. It continues to hold its `stream_semaphore`
+permit until its configured `block_ms` expires OR a subsequent `XADD`
+happens to land (the close paths typically don't append further).
+
+Worst case: a tail with `block_ms=30_000` holds its permit for the
+full 30s even though the terminal signal is already on `stream_meta`.
+Under load this shrinks effective stream-op capacity for up to
+`block_ms` after a close cascade.
+
+V1 accepts this limitation. Operators who see stream-op 429s during
+cancellation storms can:
+- Tune `FF_MAX_CONCURRENT_STREAM_OPS` up (each permit is cheap — one
+  TCP-pipeline slot).
+- Recommend callers use smaller `block_ms` values (3–5s) and rely on
+  tail loops for responsiveness.
+
+**V2 upgrade path**: have the close paths emit a sentinel
+`XADD stream_key * frame_type stream_closed closed_reason=<reason>`
+entry. XREAD BLOCK wakes on the sentinel, consumers see a terminal
+frame (different from a normal frame via `frame_type`) and exit the
+loop immediately. Releases the permit as soon as the close happens,
+turning worst-case permit hold into ~RTT. Not done in v1 because it
+couples the close paths (execution.lua, signal.lua, reclaim) to the
+stream in a way that requires coordinated edits across 8+ Lua
+functions.
+
+**Terminal signal contract (closed_at / closed_reason)**
+
+Every read/tail call returns a `StreamFrames { frames, closed_at,
+closed_reason }` struct. `closed_at` is `Some` iff the writer has
+finalized the stream via one of the close paths below; `closed_reason`
+names the specific reason.
+
+**`closed_reason` enumeration (stable, public contract)**
+
+The full set of values `stream_meta.closed_reason` may take. New
+entries to this list are a breaking change to consumers and require a
+LIBRARY_VERSION bump:
+
+| value | write path | notes |
+|---|---|---|
+| `attempt_success` | `ff_complete_execution` (lua/execution.lua) | Worker called complete; most common case. |
+| `attempt_failure` | `ff_fail_execution` → terminal branch | Retry budget exhausted or unrecoverable fail. |
+| `attempt_cancelled` | `ff_cancel_execution` | External cancel while attempt active. |
+| `attempt_interrupted` | `ff_fail_execution` → retry-scheduled branch | Will retry; new attempt opens a new stream. |
+| `reclaimed` | reclaim path (lua/execution.lua reclaim branches) | Lease reclaimed by a different worker; stream of the reclaimed attempt is closed. |
+| `lease_expired` | `mark_expired` (lua/helpers.lua) | Worker died / lease expired without reclaim yet; surfaces the terminal signal so consumers don't wait for reclaim. Overwritten by `reclaimed` if reclaim runs later. |
+| `timed_out_auto_resume` | suspension auto-resume timeout path | Attempt's auto-resume suspension timed out. |
+| `timed_out_fail` | suspension fail-on-timeout path | Attempt's fail-on-timeout suspension tripped. |
+| `retention_trim` | retention trimmer scanner | Entire stream trimmed under a hard MAXLEN; very rare — normally XTRIM prunes entries, not closes streams. Reserved. |
+
+A never-written stream and an in-progress stream both present as
+`closed_at=None`; distinguishing them requires reading `exec_core`
+separately (out of scope here).
+
+Consumer polling pattern:
+```rust
+let mut last_id = "0-0".to_string();
+loop {
+    let page = ff_sdk::tail_stream(&client, &cfg, &eid, idx, &last_id, 5_000, 100).await?;
+    for frame in &page.frames {
+        handle(frame)?;
+        last_id = frame.id.clone();
+    }
+    if page.is_closed() {
+        break; // drained + terminal — exit cleanly, no timeout fallback needed
+    }
+}
+```
+
+The equivalent REST shape surfaces `closed_at` (i64 ms) and
+`closed_reason` (string) as optional top-level fields on both the
+`/stream` and `/stream/tail` JSON responses; fields are omitted when the
+stream is still open.
+
+**Terminal-signal drain pattern (XREAD / HMGET race)**
+
+`xread_block` issues the XREAD and the follow-up HMGET of `stream_meta`
+as separate round trips. A close can land between them — `frames`
+reflects the stream as of T1, `closed_at`/`closed_reason` reflect
+`stream_meta` as of T2. Correctness is preserved because
+`ff_append_frame` gates on `closed_at` before every XADD: a stream that
+is closed at T2 cannot have gained frames between T1 and T2, so anything
+XREAD returned was already the tail.
+
+The only consequence is that frames which landed between a previous
+tail's last read and the close may not appear in the tail call that
+*observes* the close. Consumers close the race with a final XRANGE
+drain:
+
+```rust
+let mut last_id = "0-0".to_string();
+loop {
+    let page = ff_sdk::tail_stream(&client, &cfg, &eid, idx, &last_id, 5_000, 100).await?;
+    for frame in &page.frames {
+        handle(frame)?;
+        last_id = frame.id.clone();
+    }
+    if page.is_closed() {
+        // Final drain: XRANGE from the cursor to '+' picks up any frames
+        // that were appended after our last tail read but before the
+        // writer called close. `read_stream` also reports closed_at, so
+        // the loop is self-terminating.
+        let trailing = ff_sdk::read_stream(
+            &client, &cfg, &eid, idx, &last_id, "+", 1_000,
+        ).await?;
+        for frame in trailing.frames.iter().filter(|f| f.id > last_id) {
+            handle(frame)?;
+        }
+        break;
+    }
+}
+```
+
+The SDK `tail_stream` rustdoc carries a short hint; this section is the
+normative reference. Implementations MAY skip the final drain when they
+can tolerate the edge case (e.g. log-shipping where late frames are
+best-effort), but correctness-sensitive consumers (cairn checkpoint
+recovery) MUST drain.
+
+**Authorization**
+
+Inherits the global Bearer middleware that protects every other
+`/v1/executions/…` route. Namespace-scoped ACLs are a cross-cutting
+concern (not stream-specific); when/if we add them, both endpoints pick
+them up for free. No per-stream authz is layered in at this time — it
+would be redundant until the surrounding ACL story exists.
+
+**Tests** (`crates/ff-test/tests/e2e_lifecycle.rs`, RFC-006 #2 section):
+- `test_read_stream_round_trips_append_frame_fields`
+- `test_read_stream_empty_returns_empty`
+- `test_read_stream_slice_and_resume`
+- `test_tail_stream_timeout_returns_empty`
+- `test_tail_stream_unblocks_on_write`
+- `test_tail_stream_no_block_returns_available`
+- `test_tail_stream_long_block_respects_ferriskey_timeout_extension`
+  (regression: 7s block does not spuriously transport-timeout at 5s)
+- `test_stream_closed_signal_propagates_to_read_and_tail`
+  (terminal signal: after complete, both read and tail report
+  `closed_at` + `closed_reason=attempt_success`)
+- `test_read_stream_rejects_zero_count_limit` (R3 BUG2 regression)
+- `test_tail_stream_rejects_zero_count_limit` (R3 BUG2 regression)
+- `test_lease_expired_closes_stream_meta` (R4 regression: tail
+  consumer observes terminal signal even if no reclaim ever runs)
+- `test_read_stream_rejects_over_hard_cap_at_lua` (PR#7 regression:
+  direct FCALL with count_limit > HARD_CAP must reject, not silently
+  clamp — closes the Lua-side gap that SDK + server already covered)
+
+**Library version** bumped to `"4"` — the initial read path landed at
+`"3"`; the R2 change that adds the terminal-signal fields to the return
+shape of `ff_read_attempt_stream` (positions 2 and 3:
+`closed_at`, `closed_reason`) is a return-arity change, so we bump again
+per the library-version policy. Older binaries will hit the version
+mismatch on boot and force a `FUNCTION LOAD REPLACE`, which matches the
+intent.
+
+---
+
 ## References
 
 - Pre-RFC: flowfabric_use_cases_and_primitives (2).md — Primitive 5, Finalization item 5

@@ -17,9 +17,10 @@ pub struct SchedOpKeys<'a> {
 // ─── ff_issue_claim_grant ──────────────────────────────────────────────
 //
 // Lua KEYS (3): exec_core, claim_grant_key, eligible_zset
-// Lua ARGV (8): execution_id, worker_id, worker_instance_id,
+// Lua ARGV (9): execution_id, worker_id, worker_instance_id,
 //               lane_id, capability_hash, grant_ttl_ms,
-//               route_snapshot_json, admission_summary
+//               route_snapshot_json, admission_summary,
+//               worker_capabilities_csv
 
 ff_function! {
     pub ff_issue_claim_grant(args: IssueClaimGrantArgs) -> IssueClaimGrantResult {
@@ -37,6 +38,8 @@ ff_function! {
             args.grant_ttl_ms.to_string(),
             args.route_snapshot_json.clone().unwrap_or_default(),
             args.admission_summary.clone().unwrap_or_default(),
+            // BTreeSet iterates in sorted order → stable CSV for Lua match
+            args.worker_capabilities.iter().cloned().collect::<Vec<_>>().join(","),
         }
     }
 }

@@ -345,6 +345,37 @@ pub enum ScriptError {
     #[error("invalid_input: {0}")]
     InvalidInput(String),
 
+    /// Worker caps do not satisfy execution's required_capabilities.
+    /// Payload is the sorted-CSV of missing tokens. RETRYABLE: execution
+    /// stays in the eligible ZSET for a worker with matching caps.
+    #[error("capability_mismatch: missing {0}")]
+    CapabilityMismatch(String),
+
+    /// Caller supplied a malformed or oversized capability list (defense
+    /// against 1MB-repeated-token payloads). TERMINAL from this call's
+    /// perspective: the caller must fix its config before retrying.
+    #[error("invalid_capabilities: {0}")]
+    InvalidCapabilities(String),
+
+    /// `ff_create_execution` received a `policy_json` that is not valid JSON
+    /// or whose `routing_requirements` is structurally wrong (not an object,
+    /// required_capabilities not an array). TERMINAL: the submitter must
+    /// send a well-formed policy. Kept distinct from `invalid_capabilities`
+    /// so tooling can distinguish "payload never parsed" from "payload
+    /// parsed but contents rejected".
+    #[error("invalid_policy_json: {0}")]
+    InvalidPolicyJson(String),
+
+    /// Pending waitpoint record is missing its HMAC token field. Returned by
+    /// `ff_suspend_execution` when activating a pending waitpoint whose
+    /// `waitpoint_token` field is absent or empty (pre-HMAC-upgrade record
+    /// or a corrupted write). Surfacing this at activation time instead of
+    /// letting every subsequent signal delivery silently reject with
+    /// `missing_token` makes the degraded state visible at the right step.
+    /// TERMINAL: the pending waitpoint is unrecoverable without a fresh one.
+    #[error("waitpoint_not_token_bound")]
+    WaitpointNotTokenBound,
+
     // ── Transport-level errors (not from Lua) ──
     /// Valkey connection or protocol error. Preserves `ferriskey::ErrorKind` so
     /// callers can distinguish transient/permanent/NOSCRIPT/MOVED/etc.
@@ -411,6 +442,9 @@ impl ScriptError {
             | Self::QuotaAttachConflict
             | Self::InvalidQuotaSpec
             | Self::InvalidInput(_)
+            | Self::InvalidCapabilities(_)
+            | Self::InvalidPolicyJson(_)
+            | Self::WaitpointNotTokenBound
             | Self::Parse(_) => ErrorClass::Terminal,
 
             // Transport errors classify by their ferriskey ErrorKind —
@@ -438,6 +472,7 @@ impl ScriptError {
             | Self::StaleGraphRevision
             | Self::RateLimitExceeded
             | Self::ConcurrencyLimitExceeded
+            | Self::CapabilityMismatch(_)
             | Self::InvalidOffset => ErrorClass::Retryable,
 
             // Cooperative
@@ -557,7 +592,29 @@ impl ScriptError {
             "quota_attach_conflict" => Self::QuotaAttachConflict,
             "invalid_quota_spec" => Self::InvalidQuotaSpec,
             "invalid_input" => Self::InvalidInput(String::new()),
+            "capability_mismatch" => Self::CapabilityMismatch(String::new()),
+            "invalid_capabilities" => Self::InvalidCapabilities(String::new()),
+            "invalid_policy_json" => Self::InvalidPolicyJson(String::new()),
+            "waitpoint_not_token_bound" => Self::WaitpointNotTokenBound,
             _ => return None,
+        })
+    }
+
+    /// Like `from_code`, but preserves the Lua-side detail payload for
+    /// variants that carry a String. Lua returns `{0, code, detail}` for
+    /// capability_mismatch (missing CSV), invalid_capabilities (bounds
+    /// reason), invalid_input (field name). The plain `from_code` discards
+    /// the detail; callers that log or surface the detail should use this
+    /// variant. Returns `None` only when the code is unknown — the detail
+    /// is always folded in when applicable.
+    pub fn from_code_with_detail(code: &str, detail: &str) -> Option<Self> {
+        let base = Self::from_code(code)?;
+        Some(match base {
+            Self::CapabilityMismatch(_) => Self::CapabilityMismatch(detail.to_owned()),
+            Self::InvalidCapabilities(_) => Self::InvalidCapabilities(detail.to_owned()),
+            Self::InvalidPolicyJson(_) => Self::InvalidPolicyJson(detail.to_owned()),
+            Self::InvalidInput(_) => Self::InvalidInput(detail.to_owned()),
+            other => other,
         })
     }
 }
