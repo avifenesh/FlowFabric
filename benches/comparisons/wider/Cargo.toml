@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "ff-bench-wider"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Wider-workload perf investigation — ferriskey vs redis-rs across 5
+# workloads (80/20 GET/SET, 50/50, 100% GET, 100-cmd pipeline, streams).
+# Sits alongside `baseline/` (redis-rs scenario 1) and
+# `ferriskey-baseline/` (ferriskey scenario 1) but broadens the
+# comparison so a single data point (BLMPOP-heavy scenario 1) doesn't
+# carry the headline. See benches/perf-invest/report-w2.md.
+#
+# Two bins per workload — one per client — trivially side-by-side so
+# a reviewer can eyeball both hot loops without an abstraction layer
+# in the way. Shared code (payload generation, percentiles, report
+# writer) lives in a small `shared` module imported by each bin.
+#
+# Scaffold-only at Cargo.toml commit time: only the 80/20 pair is in
+# src/bin now. 50/50, 100% GET, pipeline, and streams land in Phase 2.
+
+[[bin]]
+name = "wider-ferriskey-80-20"
+path = "src/bin/ferriskey_80_20.rs"
+
+[[bin]]
+name = "wider-redis-80-20"
+path = "src/bin/redis_80_20.rs"
+
+[dependencies]
+# Report-schema + metadata helpers stay consistent with baseline/ and
+# ferriskey-baseline/ — any aggregator that walks benches/results/
+# treats all three the same way.
+ff-bench = { path = "../../harness" }
+ferriskey = { path = "../../../ferriskey" }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hdrhistogram = "7"
+# Same PRNG the other bench bins use — a seeded StdRng gives
+# deterministic per-worker key draws across runs.
+rand = "0.9"
+
+[profile.release]
+# Match the other bench packages: debug symbols kept so perf/flame
+# reports resolve inline frames, lto off so rebuild time stays small
+# while the headline numbers are still on an optimised codegen path.
+debug = 1
+lto = "off"
