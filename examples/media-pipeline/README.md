@@ -42,8 +42,20 @@ submit CLI                   |                       |
 ## Prerequisites
 
 - Valkey running on `localhost:6379`
-- FlowFabric server running on `localhost:9090` (start with `cargo run -p ff-server` from the repo root)
+- FlowFabric server running on `localhost:9090` with `FF_WAITPOINT_HMAC_SECRET` set **and `FF_LANES=default,media`** — see [Server lane requirement](#server-lane-requirement) below.
 - `cmake`, `git`, `make`, `espeak-ng`, `ffmpeg` on `$PATH` (used by the setup and sample-generation scripts)
+
+### Server lane requirement
+
+The engine's unblock scanner only polls lane-scoped blocked-index sets for the lanes the server was started with. This pipeline uses the `media` lane exclusively, so a server started with the default `FF_LANES=default` will leave `media`-lane executions stuck in `blocked_by_route` forever even when a capable worker connects. Start the server with both lanes:
+
+```bash
+FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) \
+FF_LANES=default,media \
+    cargo run -p ff-server --release
+```
+
+(The HMAC secret is required for the suspend-and-resume path — the server refuses to boot without it.)
 
 ## First-time setup
 
@@ -83,6 +95,25 @@ cargo run --bin review -- --execution-id <uuid>
 ```
 
 The review CLI prints incoming `summary_token` frames while waiting for the suspend, then prompts `Approve? [y/n]:`.
+
+## Expected wall-time (CPU only)
+
+Qwen2.5-0.5B-Instruct Q4_K_M runs the full 200-token summary in about **10 minutes on a 16-core EPYC** — roughly 3.4 s per sampled token. Transcribe (whisper.cpp tiny.en-q5_1) and embed (MiniLM-L6-v2) each finish in under a second. A whole pipeline run on `samples/tech.wav` wall-clocks at ~12 minutes end-to-end.
+
+The bottleneck is the `llama-cpp-2 = "0.1", default-features = false` choice in `Cargo.toml`, which builds llama.cpp for stock CPU (no OpenMP, no offload). For realtime-feeling runs, flip on a hardware backend:
+
+```toml
+# GPU / accelerator options (pick one appropriate for your box)
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["cuda"] }     # Nvidia
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["metal"] }    # Apple Silicon
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["vulkan"] }   # portable
+```
+
+Each feature pulls the corresponding backend in `llama-cpp-sys-2`; see `cargo info llama-cpp-2` for the authoritative feature list.
+
+## Golden smoke output
+
+A trimmed reference run is checked in at [`docs/golden-smoke.txt`](docs/golden-smoke.txt). It captures the `[submit]` driver lines, the `[review]` auto-approve handshake, the first 20 streamed `summary_token` frames, the persisted `summary_final` frame, the 384-dim `EmbedResult` metadata, and the `WAITPOINT_TOKEN=...` disclosure line the review CLI parses.
 
 ## Validation scenarios
 
