@@ -686,6 +686,17 @@ pub struct PendingWaitpointInfo {
     /// HMAC-SHA1 token minted at create time; required by
     /// `ff_deliver_signal` and `ff_buffer_signal_for_pending_waitpoint`.
     pub waitpoint_token: WaitpointToken,
+    /// Signal names the resume condition is waiting for. Reviewers that
+    /// need to drive a specific waitpoint — particularly when multiple
+    /// concurrent waitpoints exist on one execution — filter on this to
+    /// pick the right target.
+    ///
+    /// An EMPTY vec means the condition matches any signal (wildcard, per
+    /// `lua/helpers.lua` `initialize_condition`). Callers must not infer
+    /// "no waitpoint" from empty; check `state` / length of the outer
+    /// list for that.
+    #[serde(default)]
+    pub required_signal_names: Vec<String>,
     /// Timestamp when the waitpoint record was first written.
     pub created_at: TimestampMs,
     /// Timestamp when the waitpoint was activated (suspension landed).

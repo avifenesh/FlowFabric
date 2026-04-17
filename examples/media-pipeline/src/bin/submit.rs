@@ -24,8 +24,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use media_pipeline::{
-    PipelineInput, SummarizeResult, TranscribeResult, KIND_EMBED, KIND_SUMMARIZE,
-    KIND_TRANSCRIBE, LABEL_EMBED, LABEL_SUMMARIZE, LABEL_TRANSCRIBE,
+    PipelineInput, SummarizeResult, TranscribeResult, FRAME_FIELD_PAYLOAD,
+    FRAME_FIELD_TYPE, KIND_EMBED, KIND_SUMMARIZE, KIND_TRANSCRIBE, LABEL_EMBED,
+    LABEL_SUMMARIZE, LABEL_TRANSCRIBE,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -107,6 +108,14 @@ async fn run_pipeline(client: &Client, args: &Args, stdout: &Arc<Mutex<Stdout>>)
     log(stdout, &format!("summarize={eid_summarize}")).await;
     log(stdout, &format!("embed={eid_embed}")).await;
 
+    // Shared flag the SIGINT branch reads to decide whether to POST
+    // /cancel. Once the pipeline has reached terminal completion we
+    // only need to finish draining the tails; cancelling an
+    // already-terminal flow is cosmetic (server returns
+    // flow_already_terminal) but adds a spurious "cancelling"
+    // log line that confuses operators doing post-hoc log reads.
+    let pipeline_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Install Ctrl-C handler for this run. Folding ctrl_c into the main
     // driver via tokio::select! ensures the handler is cancelled when the
     // pipeline finishes normally, avoiding the spawned-task race where a
@@ -120,12 +129,17 @@ async fn run_pipeline(client: &Client, args: &Args, stdout: &Arc<Mutex<Stdout>>)
         &eid_transcribe,
         &eid_summarize,
         &eid_embed,
+        pipeline_terminal.clone(),
     );
     tokio::pin!(pipeline);
 
     tokio::select! {
         res = &mut pipeline => res,
         _ = tokio::signal::ctrl_c() => {
+            if pipeline_terminal.load(std::sync::atomic::Ordering::Acquire) {
+                log(stdout, "SIGINT after embed completed — skipping cancel (flow already terminal)").await;
+                anyhow::bail!("interrupted by user (SIGINT) after completion");
+            }
             log(stdout, "SIGINT — cancelling flow").await;
             let body = serde_json::json!({
                 "flow_id": flow_id,
@@ -140,6 +154,7 @@ async fn run_pipeline(client: &Client, args: &Args, stdout: &Arc<Mutex<Stdout>>)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pipeline_inner(
     client: &Client,
     args: &Args,
@@ -148,6 +163,7 @@ async fn pipeline_inner(
     eid_transcribe: &str,
     eid_summarize: &str,
     eid_embed: &str,
+    pipeline_terminal: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     create_flow(client, args, flow_id).await?;
     log(stdout, "flow created").await;
@@ -187,7 +203,7 @@ async fn pipeline_inner(
 
     let t_state = wait_terminal(client, args, eid_transcribe).await?;
     if t_state != "completed" {
-        tail_transcribe.abort();
+        drain_and_stop(tail_transcribe).await;
         anyhow::bail!("transcribe ended in {t_state}");
     }
     let t_result: TranscribeResult = fetch_result(client, args, eid_transcribe).await?;
@@ -232,8 +248,8 @@ async fn pipeline_inner(
 
     let s_state = wait_terminal(client, args, eid_summarize).await?;
     if s_state != "completed" {
-        tail_transcribe.abort();
-        tail_summarize.abort();
+        drain_and_stop(tail_transcribe).await;
+        drain_and_stop(tail_summarize).await;
         anyhow::bail!("summarize ended in {s_state}");
     }
     let s_result: SummarizeResult = fetch_result(client, args, eid_summarize).await?;
@@ -279,11 +295,14 @@ async fn pipeline_inner(
 
     let e_state = wait_terminal(client, args, eid_embed).await?;
     if e_state != "completed" {
-        tail_transcribe.abort();
-        tail_summarize.abort();
-        tail_embed.abort();
+        drain_and_stop(tail_transcribe).await;
+        drain_and_stop(tail_summarize).await;
+        drain_and_stop(tail_embed).await;
         anyhow::bail!("embed ended in {e_state}");
     }
+    // Flag the SIGINT handler that the flow is terminal so a Ctrl-C
+    // during the remaining tail drain doesn't POST a redundant /cancel.
+    pipeline_terminal.store(true, std::sync::atomic::Ordering::Release);
     log(stdout, "embed done — pipeline complete").await;
 
     // Happy path: each tail exits on closed_at. join them so pending
@@ -426,20 +445,51 @@ async fn wire_edge(
 
 /// Poll execution state until it reaches a terminal value. Returns the
 /// terminal state name (`completed`, `failed`, `cancelled`, `expired`).
-/// Uses jittered backoff so concurrent submits don't synchronize their
-/// ZRANGEBYSCORE polls against one lane.
+///
+/// Transient server errors (5xx) and transport errors retry with
+/// exponential backoff (300ms base, 5s cap). 4xx bails loud — those are
+/// real client errors. After `MAX_TRANSIENT` consecutive transient
+/// failures we give up. Sized for ~2 minutes of outage tolerance at the
+/// 5s cap, long enough to ride through a typical Valkey failover without
+/// killing the pipeline.
 async fn wait_terminal(client: &Client, args: &Args, eid: &str) -> Result<String> {
+    const MAX_TRANSIENT: u32 = 30;
     let url = format!("{}/v1/executions/{eid}/state", args.server);
+    let mut transient_failures: u32 = 0;
     loop {
-        let resp = client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("state poll failed: {}", resp.status());
-        }
-        let v: serde_json::Value = resp.json().await?;
-        let state = v.as_str().unwrap_or("unknown").to_owned();
-        match state.as_str() {
-            "completed" | "failed" | "cancelled" | "expired" => return Ok(state),
-            _ => jittered_sleep(args.poll_ms).await,
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_client_error() {
+                    anyhow::bail!("state poll client error: {status}");
+                }
+                if !status.is_success() {
+                    transient_failures += 1;
+                    if transient_failures >= MAX_TRANSIENT {
+                        anyhow::bail!(
+                            "state poll: {transient_failures} consecutive transient failures (last: {status})"
+                        );
+                    }
+                    backoff_sleep(transient_failures).await;
+                    continue;
+                }
+                transient_failures = 0;
+                let v: serde_json::Value = resp.json().await?;
+                let state = v.as_str().unwrap_or("unknown").to_owned();
+                match state.as_str() {
+                    "completed" | "failed" | "cancelled" | "expired" => return Ok(state),
+                    _ => jittered_sleep(args.poll_ms).await,
+                }
+            }
+            Err(e) => {
+                transient_failures += 1;
+                if transient_failures >= MAX_TRANSIENT {
+                    anyhow::bail!(
+                        "state poll: {transient_failures} consecutive transport failures (last: {e})"
+                    );
+                }
+                backoff_sleep(transient_failures).await;
+            }
         }
     }
 }
@@ -450,14 +500,45 @@ async fn wait_terminal(client: &Client, args: &Args, eid: &str) -> Result<String
 /// WARNING: the endpoint returns bytes written by the most recent
 /// `ff_complete_execution` call. If retries are configured and an earlier
 /// attempt completed before being invalidated, those bytes would persist
-/// until a newer attempt overwrites them. The media-pipeline example
-/// configures no retries, so reading right after a success poll is
-/// unambiguous; adapt this pattern with care when retries are on.
+/// until a newer attempt overwrites them.
+///
+/// Defensive guard: this helper refuses to decode the result when the
+/// execution's `current_attempt_index > 0`, because in that case the
+/// stored bytes may be from a prior attempt that the completion-write
+/// of the current attempt has NOT yet overwritten. The media-pipeline
+/// example configures no retries so this is always 0 on the happy path;
+/// downstream adopters that enable retries must either use a different
+/// result-exchange channel or wait for Batch C's per-attempt result
+/// isolation.
 async fn fetch_result<T: for<'de> Deserialize<'de>>(
     client: &Client,
     args: &Args,
     eid: &str,
 ) -> Result<T> {
+    // Sanity-check the attempt index before reading the result key.
+    let info_url = format!("{}/v1/executions/{eid}", args.server);
+    let info_resp = client.get(&info_url).send().await?;
+    if !info_resp.status().is_success() {
+        anyhow::bail!(
+            "pre-fetch execution info failed: {} — cannot safely read /result",
+            info_resp.status()
+        );
+    }
+    #[derive(Deserialize)]
+    struct ExecInfoSubset {
+        current_attempt_index: u32,
+    }
+    let info: ExecInfoSubset = info_resp.json().await?;
+    if info.current_attempt_index > 0 {
+        anyhow::bail!(
+            "execution {eid} has current_attempt_index={} (retried). \
+             /result is not attempt-scoped in v1 — refusing to decode to \
+             avoid returning stale bytes. See Batch C for retry-safe \
+             result exchange.",
+            info.current_attempt_index
+        );
+    }
+
     let url = format!("{}/v1/executions/{eid}/result", args.server);
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
@@ -476,47 +557,73 @@ fn spawn_tail(
     eid: String,
     label: &'static str,
 ) -> JoinHandle<()> {
+    /// Tail failures are noisier on startup (stream not yet created) and
+    /// during concurrency caps (429). We warn loudly at this threshold so
+    /// operators see it but keep retrying — a tail giving up silently is
+    /// worse than a tail complaining.
+    const FATAL_THRESHOLD: u32 = 60;
+
     tokio::spawn(async move {
         let mut after = "0-0".to_owned();
+        let mut consecutive_failures: u32 = 0;
+        let mut warned_fatal = false;
         loop {
             let url = format!(
                 "{server}/v1/executions/{eid}/attempts/0/stream/tail?after={after}&block_ms=5000&limit=100"
             );
-            let resp = match client.get(&url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    log_raw(&stdout, &format!("[{label}] tail error: {e}")).await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
+            let step_result: Result<bool, String> = async {
+                let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    // 429 (concurrency cap) or 404 (stream not yet created)
+                    // or 5xx — all retryable. Burn one failure slot.
+                    return Err(format!("status {}", resp.status()));
                 }
-            };
-            if !resp.status().is_success() {
-                // 429 (concurrency cap) or 404 (stream not yet created) —
-                // back off and try again.
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
+                let body: StreamResponse = resp.json().await.map_err(|e| e.to_string())?;
+                for f in &body.frames {
+                    after = f.id.clone();
+                    let ft = f.fields.get(FRAME_FIELD_TYPE).cloned().unwrap_or_default();
+                    if ft == "result_payload" {
+                        continue;
+                    }
+                    let payload = f.fields.get(FRAME_FIELD_PAYLOAD).cloned().unwrap_or_default();
+                    log_raw(&stdout, &format!("[{label}] {ft}: {payload}")).await;
+                }
+                Ok(body.closed_at.is_some().then(|| {
+                    body.closed_reason.clone().unwrap_or_default()
+                }).is_some())
+                // Returning bool doesn't carry closed_reason; pass it through
+                // via a closure side-channel would overcomplicate — just
+                // re-read outside if needed. In practice closed_at => return.
             }
-            let body: StreamResponse = match resp.json().await {
-                Ok(b) => b,
+            .await;
+
+            match step_result {
+                Ok(true) => {
+                    log_raw(&stdout, &format!("[{label}] stream closed")).await;
+                    return;
+                }
+                Ok(false) => {
+                    consecutive_failures = 0;
+                }
                 Err(e) => {
-                    log_raw(&stdout, &format!("[{label}] tail decode: {e}")).await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
+                    consecutive_failures += 1;
+                    if consecutive_failures == FATAL_THRESHOLD && !warned_fatal {
+                        log_raw(
+                            &stdout,
+                            &format!(
+                                "[{label}] WARNING: {consecutive_failures} consecutive tail failures (last: {e}); continuing to retry"
+                            ),
+                        )
+                        .await;
+                        warned_fatal = true;
+                    } else if consecutive_failures <= 3 {
+                        // Avoid spamming: only log the first few transient
+                        // errors. Post-threshold we already fired the
+                        // WARNING once.
+                        log_raw(&stdout, &format!("[{label}] tail error: {e}")).await;
+                    }
+                    backoff_sleep(consecutive_failures).await;
                 }
-            };
-            for f in &body.frames {
-                after = f.id.clone();
-                let ft = f.fields.get("frame_type").cloned().unwrap_or_default();
-                if ft == "result_payload" {
-                    continue;
-                }
-                let payload = f.fields.get("payload").cloned().unwrap_or_default();
-                log_raw(&stdout, &format!("[{label}] {ft}: {payload}")).await;
-            }
-            if body.closed_at.is_some() {
-                let reason = body.closed_reason.unwrap_or_default();
-                log_raw(&stdout, &format!("[{label}] stream closed ({reason})")).await;
-                return;
             }
         }
     })
@@ -561,6 +668,28 @@ async fn jittered_sleep(base: u64) {
         0
     };
     tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+}
+
+/// Exponential backoff sleep. For `attempt = 1, 2, 3, …` this sleeps
+/// approximately `min(300 * 2^(attempt-1), 5000)` ms plus a small
+/// jitter. Caller tracks the attempt count.
+async fn backoff_sleep(attempt: u32) {
+    const BASE_MS: u64 = 300;
+    const CAP_MS: u64 = 5_000;
+    let shift = (attempt.saturating_sub(1)).min(6); // 2^6 = 64x base = 19_200 → capped
+    let ms = (BASE_MS.saturating_mul(1u64 << shift)).min(CAP_MS);
+    jittered_sleep(ms).await;
+}
+
+/// Let the tail drain any in-flight frames for ~300ms before aborting.
+/// Without the grace window, aborting immediately after a non-completed
+/// wait_terminal return discards the last block_ms of buffered frames —
+/// exactly the debug context an operator wants to see when something
+/// failed. Bounded by the 300ms sleep.
+async fn drain_and_stop(tail: JoinHandle<()>) {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tail.abort();
+    let _ = tail.await;
 }
 
 async fn check_ok(resp: reqwest::Response, op: &str) -> Result<()> {

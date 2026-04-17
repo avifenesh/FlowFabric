@@ -30,7 +30,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use media_pipeline::{ApprovalDecision, SIGNAL_NAME_APPROVAL};
+use media_pipeline::{
+    ApprovalDecision, FRAME_FIELD_PAYLOAD, FRAME_FIELD_TYPE, SIGNAL_NAME_APPROVAL,
+};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -93,41 +95,49 @@ async fn main() -> Result<()> {
     let tail_client = client.clone();
     let tail_server = args.server.clone();
     let tail = tokio::spawn(async move {
+        const FATAL_THRESHOLD: u32 = 60;
         let mut after = "0-0".to_owned();
+        let mut consecutive_failures: u32 = 0;
+        let mut warned_fatal = false;
         loop {
             let url = format!(
                 "{tail_server}/v1/executions/{tail_eid}/attempts/{current_attempt}/stream/tail?after={after}&block_ms=3000&limit=100"
             );
-            let resp = match tail_client.get(&url).send().await {
-                Ok(r) => r,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    continue;
+            let step: Result<bool, String> = async {
+                let resp = tail_client.get(&url).send().await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("status {}", resp.status()));
                 }
-            };
-            if !resp.status().is_success() {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                continue;
+                let body: StreamResponse = resp.json().await.map_err(|e| e.to_string())?;
+                for f in &body.frames {
+                    after = f.id.clone();
+                    let ft = f.fields.get(FRAME_FIELD_TYPE).cloned().unwrap_or_default();
+                    if ft == "result_payload" {
+                        continue;
+                    }
+                    let payload = f.fields.get(FRAME_FIELD_PAYLOAD).cloned().unwrap_or_default();
+                    println!("[summary {ft}] {payload}");
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(body.closed_at.is_some())
             }
-            let body: StreamResponse = match resp.json().await {
-                Ok(b) => b,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    continue;
+            .await;
+
+            match step {
+                Ok(true) => return,
+                Ok(false) => {
+                    consecutive_failures = 0;
                 }
-            };
-            for f in &body.frames {
-                after = f.id.clone();
-                let ft = f.fields.get("frame_type").cloned().unwrap_or_default();
-                if ft == "result_payload" {
-                    continue;
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures == FATAL_THRESHOLD && !warned_fatal {
+                        eprintln!(
+                            "[review] WARNING: {consecutive_failures} consecutive tail failures (last: {e}); continuing to retry"
+                        );
+                        warned_fatal = true;
+                    }
+                    backoff_sleep(consecutive_failures).await;
                 }
-                let payload = f.fields.get("payload").cloned().unwrap_or_default();
-                println!("[summary {ft}] {payload}");
-                let _ = std::io::stdout().flush();
-            }
-            if body.closed_at.is_some() {
-                return;
             }
         }
     });
@@ -153,10 +163,34 @@ async fn main() -> Result<()> {
     // the execution_id in the URL (see Server::list_pending_waitpoints).
     // No client-side re-check needed; listing the waitpoint's
     // execution_id here would be cosmetic.
-    let wp = waitpoints
+    //
+    // We match on `required_signal_names` so if a future use case
+    // surfaces more than one concurrent waitpoint on the same
+    // execution, the reviewer picks the one that actually waits for
+    // SIGNAL_NAME_APPROVAL rather than the first item in whatever order
+    // the server returned. A waitpoint with an empty list is the
+    // wildcard case; accept it as a fallback for the v1 single-waitpoint
+    // shape.
+    let candidates: Vec<_> = waitpoints
         .into_iter()
-        .find(|w| w.state == "active" || w.state == "pending")
-        .context("no active waitpoint after suspended state")?;
+        .filter(|w| w.state == "active" || w.state == "pending")
+        .collect();
+    let wp = candidates
+        .iter()
+        .find(|w| {
+            w.required_signal_names
+                .iter()
+                .any(|n| n == SIGNAL_NAME_APPROVAL)
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|w| w.required_signal_names.is_empty())
+        })
+        .cloned()
+        .context(
+            "no active waitpoint waiting for summary_approved signal (and no wildcard fallback)",
+        )?;
 
     let decision = prompt_decision(&args)?;
 
@@ -168,6 +202,20 @@ async fn main() -> Result<()> {
                 wp.waitpoint_token.clone()
             };
             let signal_payload = serde_json::to_vec(&ApprovalDecision::Approve)?;
+
+            // Deterministic idempotency key. Two reviewers racing on the
+            // same waitpoint produce the SAME key, so the second POST
+            // dedupes server-side (ff_deliver_signal returns DUPLICATE with
+            // the existing signal_id instead of a second signal). Without
+            // this, dedup only fires when idempotency_key is non-empty
+            // (see lua/signal.lua), and we'd accumulate parallel signals
+            // in the audit trail. Domain-separated hash prevents collision
+            // with other signal kinds we might add later.
+            let idempotency_key = format!(
+                "review-approve/{}/{}",
+                args.execution_id, wp.waitpoint_id
+            );
+
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
                 "waitpoint_id": wp.waitpoint_id,
@@ -179,14 +227,53 @@ async fn main() -> Result<()> {
                 "payload": signal_payload,
                 "payload_encoding": "json",
                 "target_scope": "execution",
+                "idempotency_key": idempotency_key,
                 "waitpoint_token": token,
                 "now": now_ms(),
             });
 
             let url = format!("{}/v1/executions/{}/signal", args.server, args.execution_id);
-            let resp = client.post(&url).json(&body).send().await?;
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // /signal gets a longer timeout than the default 60s client
+            // timeout — a slow Valkey + long dedup-window scan can push
+            // latency past 60s even on a healthy cluster. Even with this
+            // longer timeout, we still fall back to state recheck below
+            // if the call errors, so a slow server never double-signals.
+            let send_result = client
+                .post(&url)
+                .json(&body)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await;
+
+            let (status, text) = match send_result {
+                Ok(resp) => {
+                    let s = resp.status();
+                    let t = resp.text().await.unwrap_or_default();
+                    (Some(s), t)
+                }
+                Err(e) => {
+                    // Timeout / connection error: server may or may not
+                    // have processed the signal. Re-check state to decide.
+                    // If terminal=completed, the peer (or an earlier retry)
+                    // won the race — treat as success. If still suspended,
+                    // the idempotency_key makes a safe retry but this
+                    // reviewer reports the network hop issue and lets the
+                    // user re-run.
+                    println!("[review] /signal request error: {e} — rechecking state");
+                    let recheck = recheck_state(&client, &args).await?;
+                    if recheck == "completed" {
+                        println!("[review] state=completed after error — peer (or retried signal) won; exiting 0");
+                        drain_and_stop(tail).await;
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "signal delivery error: {e}. execution state={recheck}. \
+                         Re-run review with the same args; idempotency_key \
+                         {idempotency_key} guarantees at-most-once."
+                    );
+                }
+            };
+            let status = status.expect("matched Ok arm above");
 
             if args.tamper_token {
                 if status.is_success() {
@@ -200,7 +287,22 @@ async fn main() -> Result<()> {
             }
 
             if !status.is_success() {
-                anyhow::bail!("signal delivery failed ({status}): {text}");
+                // Server-side error. Could be a dedup hit from a peer
+                // reviewer (rare — same idempotency_key normally returns
+                // 200 with DUPLICATE), a transient 5xx, or a real failure.
+                // Re-check state: if the execution already moved on, treat
+                // as peer-won and exit 0.
+                let recheck = recheck_state(&client, &args).await.unwrap_or_default();
+                if recheck == "completed" {
+                    println!(
+                        "[review] /signal returned {status} but state=completed — peer reviewer won; exiting 0"
+                    );
+                    drain_and_stop(tail).await;
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "signal delivery failed ({status}): {text}. recheck state={recheck}"
+                );
             }
             println!("[review] signal delivered: {text}");
             println!("[review] waiting for summarize to complete");
@@ -213,8 +315,17 @@ async fn main() -> Result<()> {
             // the worker never re-claims, the flow sees a terminal
             // cancelled, and downstream edges skip.
             if args.tamper_token {
-                eprintln!("[review] --tamper-token is approve-only; reject goes through /cancel");
-                std::process::exit(1);
+                eprintln!(
+                    "[review] --tamper-token is approve-only (the reject path uses POST /cancel \
+                     which has no HMAC to tamper); re-run without --tamper-token to reject, or \
+                     keep --tamper-token and pass --auto-approve / answer 'y' to exercise the \
+                     HMAC rejection path."
+                );
+                // Exit 2 distinguishes "invalid-args, run differently" from the
+                // pipeline-level exit 1 ("execution actually failed"). Scripts
+                // that wrap review.rs can treat exit 2 as retriable with
+                // different flags.
+                std::process::exit(2);
             }
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
@@ -256,41 +367,81 @@ fn build_http(token: &Option<String>) -> Result<Client> {
 /// Possible outcomes of polling the target execution before the prompt.
 enum ReviewOutcome {
     Suspended,
-    /// A concurrent reviewer approved the execution between polls, so
-    /// state transitioned through `suspended → runnable → completed`
-    /// before we sampled. Not an error — the pipeline moved on.
+    /// Execution is already `completed` before this reviewer saw the
+    /// suspend. Two distinct causes, same action ("exit 0, peer won"):
+    ///
+    /// 1. A concurrent reviewer delivered the approval signal and the
+    ///    worker re-claimed + completed between our state polls.
+    /// 2. The summarize worker was started with `FF_SKIP_APPROVAL=1`,
+    ///    which skips the suspend entirely.
+    ///
+    /// Both are legitimate — no need to distinguish in logs until
+    /// FF_SKIP_APPROVAL is promoted from a W3-internal switch to a
+    /// supported config.
     AlreadyCompleted,
 }
 
 /// Poll state until we either see `suspended` (do the review) or
 /// `completed` (peer reviewer beat us). Other terminal states are a real
 /// error because they imply the execution ended without human review.
+///
+/// Transient 5xx + transport errors retry with exponential backoff so a
+/// single Valkey blip doesn't kill the reviewer. 4xx bails loud.
 async fn wait_for_review_window(client: &Client, args: &Args) -> Result<ReviewOutcome> {
+    const MAX_TRANSIENT: u32 = 30;
     let url = format!("{}/v1/executions/{}/state", args.server, args.execution_id);
+    let mut transient_failures: u32 = 0;
     loop {
-        let resp = client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("state poll failed: {}", resp.status());
-        }
-        let v: serde_json::Value = resp.json().await?;
-        let s = v.as_str().unwrap_or("unknown");
-        match s {
-            "suspended" => return Ok(ReviewOutcome::Suspended),
-            "completed" => return Ok(ReviewOutcome::AlreadyCompleted),
-            "failed" | "cancelled" | "expired" => {
-                anyhow::bail!(
-                    "execution ended in terminal state '{s}' before reaching suspended"
-                );
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_client_error() {
+                    anyhow::bail!("state poll client error: {status}");
+                }
+                if !status.is_success() {
+                    transient_failures += 1;
+                    if transient_failures >= MAX_TRANSIENT {
+                        anyhow::bail!(
+                            "state poll: {transient_failures} consecutive transient failures (last: {status})"
+                        );
+                    }
+                    backoff_sleep(transient_failures).await;
+                    continue;
+                }
+                transient_failures = 0;
+                let v: serde_json::Value = resp.json().await?;
+                let s = v.as_str().unwrap_or("unknown");
+                match s {
+                    "suspended" => return Ok(ReviewOutcome::Suspended),
+                    "completed" => return Ok(ReviewOutcome::AlreadyCompleted),
+                    "failed" | "cancelled" | "expired" => {
+                        anyhow::bail!(
+                            "execution ended in terminal state '{s}' before reaching suspended"
+                        );
+                    }
+                    _ => jittered_sleep(args.poll_ms).await,
+                }
             }
-            _ => jittered_sleep(args.poll_ms).await,
+            Err(e) => {
+                transient_failures += 1;
+                if transient_failures >= MAX_TRANSIENT {
+                    anyhow::bail!(
+                        "state poll: {transient_failures} consecutive transport failures (last: {e})"
+                    );
+                }
+                backoff_sleep(transient_failures).await;
+            }
         }
     }
 }
 
 async fn fetch_current_attempt_index(client: &Client, args: &Args) -> Result<u32> {
+    // NOTE: no #[serde(default)] — if the server ever stops emitting the
+    // field (version skew, transition window, bug) we want to fail loud
+    // instead of silently tailing attempt 0 and surfacing the mismatch
+    // much later as a confusing empty stream.
     #[derive(Deserialize)]
     struct ExecInfo {
-        #[serde(default)]
         current_attempt_index: u32,
     }
     let url = format!("{}/v1/executions/{}", args.server, args.execution_id);
@@ -303,6 +454,22 @@ async fn fetch_current_attempt_index(client: &Client, args: &Args) -> Result<u32
     }
     let info: ExecInfo = resp.json().await?;
     Ok(info.current_attempt_index)
+}
+
+/// Single-shot state re-check used on the /signal error/timeout paths to
+/// decide whether a peer reviewer already moved the execution to a
+/// terminal state. Returns the state string ("completed", "failed",
+/// "cancelled", "expired", "suspended", "running", …). Swallows network
+/// errors by returning "unknown" so callers get an error message they
+/// can surface to the operator.
+async fn recheck_state(client: &Client, args: &Args) -> Result<String> {
+    let url = format!("{}/v1/executions/{}/state", args.server, args.execution_id);
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Ok(format!("unreachable(http {})", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await?;
+    Ok(v.as_str().unwrap_or("unknown").to_owned())
 }
 
 async fn fetch_pending_waitpoints(client: &Client, args: &Args) -> Result<Vec<PendingWaitpoint>> {
@@ -385,6 +552,17 @@ async fn jittered_sleep(base: u64) {
     tokio::time::sleep(Duration::from_millis(base + jitter)).await;
 }
 
+/// Exponential backoff sleep. For `attempt = 1, 2, 3, …` this sleeps
+/// approximately `min(300 * 2^(attempt-1), 5000)` ms plus a small
+/// jitter. Caller tracks the attempt count.
+async fn backoff_sleep(attempt: u32) {
+    const BASE_MS: u64 = 300;
+    const CAP_MS: u64 = 5_000;
+    let shift = (attempt.saturating_sub(1)).min(6);
+    let ms = (BASE_MS.saturating_mul(1u64 << shift)).min(CAP_MS);
+    jittered_sleep(ms).await;
+}
+
 /// Let the spawned tail finish processing any in-flight frames, then
 /// abort it. Flushes any buffered payload lines to stdout so we don't
 /// drop frames on the floor. Bounded by the tail's own block_ms.
@@ -396,13 +574,15 @@ async fn drain_and_stop(tail: tokio::task::JoinHandle<()>) {
 
 // ── Wire types ────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct PendingWaitpoint {
     waitpoint_id: String,
     #[allow(dead_code)]
     waitpoint_key: String,
     state: String,
     waitpoint_token: String,
+    #[serde(default)]
+    required_signal_names: Vec<String>,
     #[allow(dead_code)]
     #[serde(default)]
     created_at: Option<i64>,

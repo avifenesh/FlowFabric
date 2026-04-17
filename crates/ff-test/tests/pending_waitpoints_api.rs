@@ -365,6 +365,15 @@ async fn test_list_pending_waitpoints_returns_token_after_suspend() {
     );
     assert!(entry.activated_at.is_some());
     assert!(!entry.waitpoint_token.as_str().is_empty());
+    // The fcall_suspend helper above passes
+    // required_signal_names=["pwp_signal"]; the endpoint should surface
+    // that so a reviewer with multiple waitpoints can pick the right
+    // one.
+    assert_eq!(
+        entry.required_signal_names,
+        vec!["pwp_signal".to_owned()],
+        "required_signal_names from the resume condition should round-trip"
+    );
 }
 
 /// An execution with no waitpoints returns an empty list.

@@ -159,6 +159,26 @@ FF_MAX_CONCURRENT_STREAM_OPS=2 cargo run -p ff-server &
 - **Client-side data passing.** The submit CLI waits for each upstream execution to complete, reads the raw result bytes from `GET /v1/executions/{id}/result`, and embeds them as the next execution's `input_payload`. The flow graph carries `data_passing_ref` on the dependency edges for inspectability, but the engine does not auto-inject the upstream payload into the downstream `input_payload` today. That's a Batch C task.
 - **`insecure-direct-claim` feature.** Workers use the direct Valkey claim path gated by the `insecure-direct-claim` feature on `ff-sdk`. Batch C will replace this with a proper scheduler-mediated claim API.
 
+## Submit crash recovery (v1)
+
+Because submit orchestrates the 3-stage sequence client-side, **a crash or Ctrl-C between stages leaves the flow stuck**: transcribe + summarize may exist as members with edges applied, but embed was never POSTed. The server has no way to drive the pipeline forward on its own until server-side `data_passing_ref` resolution lands.
+
+Recovery options:
+
+1. **Cancel the stuck flow.** Easiest. Find the flow_id in submit's log output and:
+
+   ```bash
+   curl -X POST http://localhost:9090/v1/flows/<flow-id>/cancel \
+       -H 'content-type: application/json' \
+       -d '{"flow_id":"<flow-id>","reason":"submit_crashed","cancellation_policy":"cancel_all","now":<ms>}'
+   ```
+
+   The pipeline is lost but downstream consumers see a terminal cancelled state.
+
+2. **Finish manually.** Read each staged execution's state and result, and POST the next stage yourself via the same REST calls submit uses. Non-trivial — recommend option 1 unless the transcribe / summarize result is expensive to rerun.
+
+3. **Batch C** will add a server-driven chaining path: submit posts all three executions up-front with `data_passing_ref` edges and the engine auto-injects upstream payloads into downstream `input_payload` as each stage completes. At that point submit becomes a tail multiplexer and a crash is a cosmetic tail-drop, not a stuck flow.
+
 ## File layout
 
 ```

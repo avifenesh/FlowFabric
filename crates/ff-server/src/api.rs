@@ -376,7 +376,27 @@ async fn list_pending_waitpoints(
 
 /// Returns the raw result payload bytes written by the worker's
 /// `ff_complete_execution` call. 404 when the execution has no stored
-/// result (missing entirely or still in-flight).
+/// result (missing entirely, still in-flight, or trimmed by retention —
+/// see below).
+///
+/// # Ordering (required)
+///
+/// Callers MUST poll `GET /v1/executions/{id}/state` until it returns
+/// `completed` before fetching `/result`. Early polls may return 404
+/// because completion writes `public_state = completed` and the result
+/// `SET` in the same atomic Lua; in the normal path the window is
+/// effectively zero, but network round-trip ordering between a state
+/// poll and a result fetch can make the result appear briefly absent
+/// during replay (`ff_replay_execution`).
+///
+/// # Retention / 404 after completed
+///
+/// `get_execution_state == completed` is authoritative for completion.
+/// This endpoint additionally depends on the result bytes not having
+/// been trimmed — v1 sets no retention policy, so
+/// `state = completed` should always pair with a 200 here. Any
+/// future retention-policy feature must call this contract out in its
+/// own docs.
 ///
 /// CONTENT-TYPE: `application/octet-stream`. The server is payload-format
 /// agnostic — workers choose the encoding via the SDK's `complete(bytes)`

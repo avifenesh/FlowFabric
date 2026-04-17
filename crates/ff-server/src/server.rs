@@ -589,7 +589,28 @@ impl Server {
     ///
     /// The Lua side stores the payload at `ctx.result()` via plain `SET`.
     /// No FCALL — this is a direct GET; returns `Ok(None)` when the
-    /// execution is missing or not yet complete.
+    /// execution is missing, not yet complete, or (in a future
+    /// retention-policy world) when the result was trimmed.
+    ///
+    /// # Contract vs `get_execution_state`
+    ///
+    /// `get_execution_state` is the authoritative completion signal. If
+    /// a caller observes `state == completed` but `get_execution_result`
+    /// returns `None`, the result bytes are unavailable — not a caller
+    /// bug and not a server bug, just the retention policy trimming the
+    /// blob. V1 sets no retention, so callers on v1 can treat
+    /// `state == completed` + `Ok(None)` as a server bug.
+    ///
+    /// # Ordering
+    ///
+    /// Callers MUST wait for `state == completed` before calling this
+    /// method; polls issued before the state transition may hit a
+    /// narrow window where the completion Lua has written
+    /// `public_state = completed` but the `result` key SET is still
+    /// on-wire. The current Lua `ff_complete_execution` writes both in
+    /// the same atomic script, so the window is effectively zero for
+    /// direct callers — but retries via `ff_replay_execution` open it
+    /// briefly.
     pub async fn get_execution_result(
         &self,
         execution_id: &ExecutionId,
@@ -618,12 +639,34 @@ impl Server {
     /// read the stream or lease history instead.
     ///
     /// Two-hop read: SMEMBERS on `ctx.waitpoints()` to get the waitpoint IDs,
-    /// then one HMGET per waitpoint hash for exactly the fields we return.
-    /// No FCALL — this is a read-only view built from already-persisted
-    /// state, so skipping Lua keeps the Valkey single-writer path
-    /// uncontended. HMGET (vs HGETALL) bounds the per-waitpoint read to
-    /// the documented field set and defends against a poisoned waitpoint
-    /// hash with unbounded extra fields accumulating response memory.
+    /// then one HMGET per waitpoint hash for exactly the fields we return,
+    /// plus one HMGET on the condition hash to surface
+    /// `required_signal_names`. No FCALL — this is a read-only view
+    /// built from already-persisted state, so skipping Lua keeps the
+    /// Valkey single-writer path uncontended. HMGET (vs HGETALL) bounds
+    /// the per-waitpoint read to the documented field set and defends
+    /// against a poisoned waitpoint hash with unbounded extra fields
+    /// accumulating response memory.
+    ///
+    /// # Empty result semantics (TOCTOU)
+    ///
+    /// An empty `Vec` is returned in three cases:
+    ///
+    /// 1. The execution exists but has never suspended.
+    /// 2. All existing waitpoints are `closed` (already resolved).
+    /// 3. A narrow teardown race: `SMEMBERS ctx.waitpoints()` read the set
+    ///    after a concurrent `ff_close_waitpoint` or execution-cleanup
+    ///    script deleted the waitpoint hashes but before it SREM'd the
+    ///    set members. Each HMGET returns all-None and we skip.
+    ///
+    /// Callers that get an unexpected empty list should cross-check
+    /// execution state (`get_execution_state`) to distinguish "pipeline
+    /// moved past suspended" from "nothing to review yet".
+    ///
+    /// A waitpoint hash that's present but missing its `waitpoint_token`
+    /// field is similarly elided and a server-side WARN is emitted —
+    /// this indicates storage corruption (a write that half-populated
+    /// the hash) and operators should investigate.
     pub async fn list_pending_waitpoints(
         &self,
         execution_id: &ExecutionId,
@@ -721,10 +764,22 @@ impl Server {
 
             let token_raw = get(2);
             if token_raw.is_empty() {
+                // This is storage corruption: a waitpoint hash in the
+                // active set MUST carry waitpoint_token (written by
+                // ff_suspend_execution / ff_create_pending_waitpoint).
+                // Missing token means either a half-populated write, a
+                // direct operator edit, or an interrupted script — all
+                // worth investigating. Include both IDs and the hash key
+                // so the operator can HGETALL the record directly.
                 tracing::warn!(
                     waitpoint_id = %wp_id,
                     execution_id = %execution_id,
-                    "list_pending_waitpoints: waitpoint hash missing waitpoint_token — skipping"
+                    waitpoint_hash_key = %ctx.waitpoint(&wp_id),
+                    state = %state,
+                    "list_pending_waitpoints: waitpoint hash present but waitpoint_token \
+                     field is empty — likely storage corruption (half-populated write, \
+                     operator edit, or interrupted script). Skipping this entry in the \
+                     response. HGETALL the waitpoint_hash_key to inspect."
                 );
                 continue;
             }
@@ -739,11 +794,62 @@ impl Server {
 
             let created_at = parse_ts(get(3)).unwrap_or(TimestampMs(0));
 
+            // Condition hash read — one extra HMGET per waitpoint to
+            // surface `required_signal_names`. The condition hash
+            // (ctx.waitpoint_condition(wp_id)) is written by
+            // `write_condition_hash` in lua/helpers.lua with fields:
+            //   total_matchers, matcher:0:name, matcher:1:name, …
+            // We first fetch total_matchers, then the matcher:N:name
+            // fields in a single HMGET. Total_matchers defaults to 0 on
+            // any parse failure so a cleanup race / missing hash
+            // degrades to an empty required_signal_names — callers can
+            // distinguish via the wildcard-vs-unknown comment in
+            // PendingWaitpointInfo.
+            let condition_key = ctx.waitpoint_condition(&wp_id);
+            let total_matchers_raw: Option<String> = self
+                .client
+                .hget(&condition_key, "total_matchers")
+                .await
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("HGET wp_condition total_matchers {wp_id}"),
+                })?;
+            let total_matchers: usize = total_matchers_raw
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let mut required_signal_names: Vec<String> = Vec::new();
+            if total_matchers > 0 {
+                let mut cmd = self.client.cmd("HMGET");
+                cmd = cmd.arg(condition_key);
+                for i in 0..total_matchers {
+                    cmd = cmd.arg(format!("matcher:{i}:name"));
+                }
+                let matcher_vals: Vec<Option<String>> =
+                    cmd.execute().await.map_err(|e| ServerError::ValkeyContext {
+                        source: e,
+                        context: format!("HMGET wp_condition matchers {wp_id}"),
+                    })?;
+                // The wildcard matcher uses an empty name sentinel; elide
+                // it from the public view so callers see "no required
+                // names" and can apply wildcard semantics without the
+                // server leaking the sentinel encoding. A `None` entry
+                // means the condition hash was concurrently cleaned up —
+                // same skip.
+                for name in matcher_vals.into_iter().flatten() {
+                    if !name.is_empty() {
+                        required_signal_names.push(name);
+                    }
+                }
+            }
+
             out.push(PendingWaitpointInfo {
                 waitpoint_id: wp_id,
                 waitpoint_key: get(1).to_owned(),
                 state,
                 waitpoint_token: WaitpointToken(token_raw.to_owned()),
+                required_signal_names,
                 created_at,
                 activated_at: parse_ts(get(4)),
                 expires_at: parse_ts(get(5)),
