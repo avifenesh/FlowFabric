@@ -3,6 +3,14 @@
 //! Claims executions with capability `asr`, spawns the `whisper-cli` binary,
 //! streams each output line as a `transcribe_line` frame, and completes with
 //! a `TranscribeResult` JSON payload.
+//!
+//! # Streaming cadence
+//!
+//! `whisper-cli --no-prints --no-timestamps` emits one stdout line per
+//! 30-second audio segment (one or two lines for the sample clips here),
+//! not one per token. The `transcribe_line` frame stream is therefore
+//! segment-scoped, not token-scoped — lower frequency than the
+//! summarize stage's `summary_token` stream.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -132,6 +140,12 @@ async fn process(
     tracing::info!(audio = %input.audio_path, "transcribing");
     let started = Instant::now();
 
+    // kill_on_drop(true) so that if this task is dropped (worker Ctrl-C
+    // mid-transcription, or claim_next future cancelled) the spawned
+    // whisper-cli receives SIGKILL instead of being orphaned as a
+    // grandchild of PID 1. Without this, a user interrupt leaves
+    // whisper-cli chewing CPU until it finishes or the host is
+    // rebooted.
     let mut child = Command::new(whisper_cli)
         .arg("-m").arg(model)
         .arg("-f").arg(&input.audio_path)
@@ -139,6 +153,7 @@ async fn process(
         .arg("--no-prints")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("spawn whisper-cli")?;
 

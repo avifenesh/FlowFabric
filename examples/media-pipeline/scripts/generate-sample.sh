@@ -6,7 +6,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 OUT="$ROOT/samples"
-TMP="/tmp/ff_mp_raw.wav"
+# Per-invocation temp file so two concurrent runs on the same host don't
+# clobber each other's intermediate espeak-ng output. Cleaned up via
+# trap so a Ctrl-C or failed ffmpeg invocation doesn't leak /tmp cruft.
+TMP="$(mktemp -t ff_mp_raw.XXXXXX.wav)"
+trap 'rm -f "$TMP"' EXIT
 
 mkdir -p "$OUT"
 
@@ -32,5 +36,4 @@ gen tech "Distributed consensus algorithms such as Raft and Paxos solve the prob
 
 gen conversation "Hey, did you finish reviewing the pull request? Yeah, I left a few comments about the error handling. I think we should retry on transient failures instead of bailing out immediately. Makes sense. I will push an update this afternoon."
 
-rm -f "$TMP"
 echo "[gen] done"
