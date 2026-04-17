@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["examples"]
+exclude = ["examples", "benches"]
 members = [
     "ferriskey",
     "crates/ff-core",

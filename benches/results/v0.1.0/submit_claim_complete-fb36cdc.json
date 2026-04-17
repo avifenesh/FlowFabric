@@ -1,0 +1,24 @@
+{
+  "scenario": "submit_claim_complete",
+  "system": "flowfabric",
+  "git_sha": "fb36cdc",
+  "valkey_version": "7.2.4",
+  "host": {
+    "cpu": "AMD EPYC 9R14",
+    "cores": 16,
+    "mem_gb": 30
+  },
+  "cluster": false,
+  "timestamp_utc": "2026-04-17T09:55:43Z",
+  "config": {
+    "payload_bytes": 4096,
+    "tasks": 10000,
+    "workers": 16
+  },
+  "throughput_ops_per_sec": 2896.085054904192,
+  "latency_ms": {
+    "p50": 0.405,
+    "p95": 0.708,
+    "p99": 0.85
+  }
+}
