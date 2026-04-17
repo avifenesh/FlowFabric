@@ -976,9 +976,28 @@ pub struct CancelFlowArgs {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancelFlowResult {
-    /// Flow cancelled. Member EIDs returned for cross-partition dispatch.
+    /// Flow cancelled and all member cancellations (if any) have completed
+    /// synchronously. Used when `cancellation_policy != "cancel_all"`, when
+    /// the flow has no members, when the caller opted into synchronous
+    /// dispatch (e.g. `?wait=true`), or when the flow was already in a
+    /// terminal state (idempotent retry).
+    ///
+    /// On the idempotent-retry path `member_execution_ids` may be *capped*
+    /// at the server (default 1000 entries) to bound response bandwidth on
+    /// flows with very large membership. The first (non-idempotent) call
+    /// always returns the full list, so clients that need every member id
+    /// should persist the initial response.
     Cancelled {
         cancellation_policy: String,
+        member_execution_ids: Vec<String>,
+    },
+    /// Flow state was flipped to cancelled atomically, but member
+    /// cancellations are dispatched asynchronously in the background.
+    /// Clients may poll `GET /v1/executions/{id}/state` for each member
+    /// execution id to track terminal state.
+    CancellationScheduled {
+        cancellation_policy: String,
+        member_count: u32,
         member_execution_ids: Vec<String>,
     },
 }

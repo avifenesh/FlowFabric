@@ -8,7 +8,7 @@ use ff_core::contracts::{
     MarkLeaseExpiredArgs, MarkLeaseExpiredResult, RenewLeaseArgs, RenewLeaseResult,
     RevokeLeaseArgs, RevokeLeaseResult,
 };
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::ExecKeyContext;
 use ff_core::types::TimestampMs;
 

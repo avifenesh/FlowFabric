@@ -2634,6 +2634,7 @@ async fn fcall_create_budget_full(
     let limits_key = format!("ff:budget:{{b:0}}:{budget_id}:limits");
     let usage_key = format!("ff:budget:{{b:0}}:{budget_id}:usage");
     let resets_key = "ff:idx:{b:0}:budget_resets".to_string();
+    let policies_index = "ff:idx:{b:0}:budget_policies".to_string();
 
     let now = TimestampMs::now();
 
@@ -2663,7 +2664,7 @@ async fn fcall_create_budget_full(
         args.push(soft.to_string());
     }
 
-    let keys: Vec<String> = vec![def_key, limits_key, usage_key, resets_key];
+    let keys: Vec<String> = vec![def_key, limits_key, usage_key, resets_key, policies_index];
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -3181,6 +3182,7 @@ async fn fcall_create_flow(tc: &TestCluster, flow_id: &str) -> String {
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3204,6 +3206,7 @@ async fn fcall_add_execution_to_flow(
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3227,6 +3230,7 @@ async fn fcall_cancel_flow(
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3276,6 +3280,7 @@ async fn fcall_apply_dependency(
         ctx.core(), ctx.deps_meta(), ctx.deps_unresolved(),
         ctx.dep_edge(&eid_p), idx.lane_eligible(&lane_id),
         idx.lane_blocked_dependencies(&lane_id),
+        ctx.deps_all_edges(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -5215,6 +5220,7 @@ async fn test_flow_create_idempotent() {
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -5233,6 +5239,101 @@ async fn test_flow_create_idempotent() {
         "second ff_create_flow should return ALREADY_SATISFIED");
     let fid_returned = field_str(arr, 2);
     assert_eq!(fid_returned, fid);
+}
+
+/// flow_index self-heal: if the projector SREMs a live flow (sampled
+/// all-terminal), a subsequent ff_add_execution_to_flow must re-register
+/// the flow in flow_index so future projector cycles see it again.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_index_self_heal_on_add() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let fid = "flow-heal-test";
+    let a = ExecutionId::new();
+    let b = ExecutionId::new();
+    let flow_index_key = "ff:idx:{fp:0}:flow_index";
+
+    // 1. Create flow + add one member
+    fcall_create_flow(&tc, fid).await;
+    fcall_add_execution_to_flow(&tc, fid, &a).await;
+
+    // Sanity: flow is registered in the index
+    let present: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(present, "flow_index should contain fid after create");
+
+    // 2. Simulate projector prune: SREM the flow_index entry
+    let _: u32 = tc.client()
+        .cmd("SREM").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    let after_rem: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(!after_rem, "flow_index SREM simulation failed");
+
+    // 3. Add a second member via ff_add_execution_to_flow
+    fcall_add_execution_to_flow(&tc, fid, &b).await;
+
+    // 4. Assert: flow_index now contains fid again (self-heal fired)
+    let healed: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(healed, "flow_index should be self-healed by ff_add_execution_to_flow");
+
+    // 5. Negative: self-heal must NOT resurrect a cancelled flow. Cancel,
+    //    then a subsequent add attempt must fail with flow_already_terminal.
+    //
+    //    NOTE on flow_index ownership: cancel_flow does NOT SREM flow_index
+    //    (the projector is the sole writer — it SREMs once it observes
+    //    sampled==true_total all-terminal members). So we assert the
+    //    negative invariant that matters for correctness: the *rejected*
+    //    add MUST NOT ADD the flow back to the index if a prior SREM had
+    //    dropped it. We pre-SREM the index here to simulate a projector
+    //    prune that ran between cancel and the retry, then confirm the
+    //    rejected add leaves it absent.
+    fcall_cancel_flow(&tc, fid, "test_heal_cancel", "cancel_all").await;
+
+    // Simulate the projector having already observed all-terminal and
+    // SREMd the flow (in real life this would take a projector cycle).
+    let _: u32 = tc.client()
+        .cmd("SREM").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+
+    // Direct FCALL so we can inspect the error result without panicking
+    let prefix = format!("ff:flow:{{fp:0}}:{fid}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+        flow_index_key.to_string(),
+    ];
+    let c = ExecutionId::new();
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        fid.to_owned(), c.to_string(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_add_execution_to_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_add_execution_to_flow after cancel");
+    let arr = match &raw {
+        Value::Array(a) => a,
+        _ => panic!("expected array"),
+    };
+    let status = match &arr[0] {
+        Ok(Value::Int(n)) => *n,
+        _ => panic!("expected Int status"),
+    };
+    assert_eq!(status, 0, "add-to-terminal-flow must fail");
+    assert_eq!(field_str(arr, 1), "flow_already_terminal");
+    let still_absent: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(!still_absent, "terminal flow must NOT be resurrected in flow_index");
 }
 
 /// ff_cancel_flow: create flow + add members → cancel → verify state + member list returned.
@@ -5279,6 +5380,7 @@ async fn test_flow_cancel() {
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
+        "ff:idx:{fp:0}:flow_index".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -5619,9 +5721,11 @@ async fn test_server_flow_lifecycle() {
 
     assert_in_eligible(&tc, &downstream, &LaneId::new(LANE)).await;
 
-    // 8. Cancel flow via Server API — should cancel downstream
+    // 8. Cancel flow via Server API — should cancel downstream.
+    // Use cancel_flow_wait so the assertion on downstream state directly
+    // below observes the synchronous dispatch outcome.
     let cancel_result = server
-        .cancel_flow(&CancelFlowArgs {
+        .cancel_flow_wait(&CancelFlowArgs {
             flow_id: flow_id.clone(),
             reason: "test_done".to_owned(),
             cancellation_policy: "cancel_all".to_owned(),
@@ -5630,10 +5734,13 @@ async fn test_server_flow_lifecycle() {
         .await
         .expect("cancel_flow failed");
 
-    let ff_core::contracts::CancelFlowResult::Cancelled {
-        ref cancellation_policy,
-        ref member_execution_ids,
-    } = cancel_result;
+    let (cancellation_policy, member_execution_ids) = match &cancel_result {
+        ff_core::contracts::CancelFlowResult::Cancelled {
+            cancellation_policy,
+            member_execution_ids,
+        } => (cancellation_policy, member_execution_ids),
+        other => panic!("expected Cancelled from cancel_flow_wait, got {other:?}"),
+    };
     assert_eq!(cancellation_policy, "cancel_all");
     assert_eq!(member_execution_ids.len(), 2);
 
@@ -6280,14 +6387,19 @@ async fn test_server_create_cancel_roundtrip() {
         flow_id: flow_id.clone(), execution_id: eid.clone(), now,
     }).await.expect("add member");
 
-    // Cancel flow via Server (cancel_all dispatches cancel_execution)
-    let result = server.cancel_flow(&CancelFlowArgs {
+    // Cancel flow via Server (cancel_all dispatches cancel_execution).
+    // Use the wait variant so the execution-state assertion below is
+    // deterministic without a polling loop.
+    let result = server.cancel_flow_wait(&CancelFlowArgs {
         flow_id: flow_id.clone(), reason: "roundtrip_test".to_owned(),
         cancellation_policy: "cancel_all".to_owned(), now: TimestampMs::now(),
     }).await.expect("cancel_flow");
-    let ff_core::contracts::CancelFlowResult::Cancelled {
-        ref member_execution_ids, ..
-    } = result;
+    let member_execution_ids = match &result {
+        ff_core::contracts::CancelFlowResult::Cancelled { member_execution_ids, .. } => {
+            member_execution_ids
+        }
+        other => panic!("expected Cancelled from cancel_flow_wait, got {other:?}"),
+    };
     assert_eq!(member_execution_ids.len(), 1);
 
     // Verify execution is cancelled via Server

@@ -179,14 +179,19 @@ async fn purge_execution(
     }
 
     // ── Cascading delete ──
-    // Collect all keys to delete in a single pipeline-style batch.
+    // Collect subordinate keys first. exec_core and the policy key are
+    // held out of this list and DELeted LAST, after every other chunk
+    // succeeds. Rationale: if an intermediate chunk fails with a
+    // transient error, the next retention pass needs to re-read
+    // `exec_core.total_attempt_count` and `policy.retention_ttl_ms` to
+    // rebuild the full del_keys list — so we must not destroy those two
+    // keys until the rest of the cascade has committed. ZREM on the
+    // terminal_zset entry also happens last (existing invariant).
     let mut del_keys: Vec<String> = Vec::with_capacity(16 + total_attempts as usize * 5);
 
-    // Execution-level keys
-    del_keys.push(exec_core_key);
+    // Execution-level keys (safe to delete before exec_core)
     del_keys.push(format!("ff:exec:{}:{}:payload", tag, eid_str));
     del_keys.push(format!("ff:exec:{}:{}:result", tag, eid_str));
-    del_keys.push(policy_key);
     del_keys.push(format!("ff:exec:{}:{}:tags", tag, eid_str));
 
     // Lease keys
@@ -208,26 +213,22 @@ async fn purge_execution(
     del_keys.push(format!("ff:exec:{}:{}:suspension:current", tag, eid_str));
 
     // Dependency keys (RFC-007)
-    // Read deps:unresolved to discover per-edge dep hashes BEFORE deleting the set
-    let deps_unresolved_key = format!("ff:exec:{}:{}:deps:unresolved", tag, eid_str);
+    // deps:all_edges holds every edge ID ever applied to this exec (never
+    // pruned on resolve), so SMEMBERS gives us the full set of dep hashes to
+    // drop — cluster-safe, no SCAN.
+    let deps_all_edges_key = format!("ff:exec:{}:{}:deps:all_edges", tag, eid_str);
     let dep_edge_ids: Vec<String> = client
         .cmd("SMEMBERS")
-        .arg(&deps_unresolved_key)
+        .arg(&deps_all_edges_key)
         .execute()
         .await
         .unwrap_or_default();
 
     del_keys.push(format!("ff:exec:{}:{}:deps:meta", tag, eid_str));
-    del_keys.push(deps_unresolved_key);
+    del_keys.push(format!("ff:exec:{}:{}:deps:unresolved", tag, eid_str));
+    del_keys.push(deps_all_edges_key);
     for edge_id in &dep_edge_ids {
         del_keys.push(format!("ff:exec:{}:{}:dep:{}", tag, eid_str, edge_id));
-    }
-    // Also scan for any satisfied/impossible edges that were removed from unresolved
-    // but still have hash keys. Use SCAN with pattern match.
-    let dep_pattern = format!("ff:exec:{}:{}:dep:*", tag, eid_str);
-    let extra_dep_keys = scan_keys_by_pattern(client, &dep_pattern).await;
-    for k in extra_dep_keys {
-        del_keys.push(k);
     }
 
     // Read waitpoints set to discover all waitpoint-related keys
@@ -266,7 +267,10 @@ async fn purge_execution(
     }
 
     // Batch DEL in chunks of 500 to avoid oversized commands on
-    // executions with many attempts/signals/waitpoints/deps.
+    // executions with many attempts/signals/waitpoints/deps. Subordinate
+    // keys go first; if any chunk errors with `?`, exec_core and
+    // policy_key remain untouched so the next retention pass can
+    // re-read them and rebuild the full del_keys list.
     for chunk in del_keys.chunks(500) {
         let key_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
         let _: u32 = client
@@ -276,7 +280,17 @@ async fn purge_execution(
             .await?;
     }
 
-    // Remove from terminal ZSET and all_executions SET
+    // Finalize: drop exec_core and policy together (both on {p:N}), then
+    // sweep the terminal-zset entry and the partition-wide all_executions
+    // index. Doing this after the subordinate chunks guarantees that a
+    // partial retention failure is idempotently retriable without
+    // orphaning keys that retention discovers by reading exec_core.
+    let _: u32 = client
+        .cmd("DEL")
+        .arg(&[exec_core_key.as_str(), policy_key.as_str()][..])
+        .execute()
+        .await?;
+
     let _: u32 = client.cmd("ZREM").arg(terminal_key).arg(eid_str).execute().await?;
     let all_exec_key = idx.all_executions();
     let _: u32 = client.cmd("SREM").arg(&all_exec_key).arg(eid_str).execute().await?;
@@ -327,66 +341,3 @@ async fn read_retention_ms(
         .unwrap_or(default_retention_ms)
 }
 
-/// Scan for keys matching a pattern. Used for discovering dep edge hashes
-/// that may have been removed from deps:unresolved (satisfied/impossible).
-async fn scan_keys_by_pattern(
-    client: &ferriskey::Client,
-    pattern: &str,
-) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = match client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-
-        let (next_cursor, found) = parse_scan_result(&result);
-        keys.extend(found);
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    keys
-}
-
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
-                }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
-        }
-        _ => ("0".to_string(), vec![]),
-    }
-}

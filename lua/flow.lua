@@ -58,21 +58,37 @@ end
 -- Create a new flow container. Idempotent: if flow_core already exists,
 -- returns ok_already_satisfied.
 --
--- KEYS (2): flow_core, members_set
--- ARGV (4): flow_id, flow_kind, namespace, now_ms
+-- KEYS (3): flow_core, members_set, flow_index
+-- ARGV (4): flow_id, flow_kind, namespace, now_ms (IGNORED — see note below)
+--
+-- NOTE: ARGV[4] (`now_ms`) is accepted for caller compatibility but NOT
+-- used for stored timestamps. We read server time via redis.call("TIME")
+-- so created_at / last_mutation_at agree with fields written by other
+-- Lua functions (ff_complete_execution etc.) under client clock skew.
 ---------------------------------------------------------------------------
 redis.register_function('ff_create_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
+    flow_index  = keys[3],
   }
 
   local A = {
     flow_id   = args[1],
     flow_kind = args[2],
     namespace = args[3],
-    now_ms    = args[4],
+    -- args[4] is client-provided now_ms; intentionally ignored.
   }
+
+  -- Server time (not client-provided) so created_at / last_mutation_at
+  -- agree with timestamps written by ff_complete_execution and peers.
+  local now_ms = server_time_ms()
+
+  -- Maintain flow_index BEFORE the idempotency guard. SADD is itself
+  -- idempotent (no-op on existing members), and hoisting it heals any
+  -- pre-existing flow_core that was created before this index was
+  -- introduced — no migration script required.
+  redis.call("SADD", K.flow_index, A.flow_id)
 
   -- Idempotency: if flow already exists, return already_satisfied
   if redis.call("EXISTS", K.flow_core) == 1 then
@@ -88,8 +104,8 @@ redis.register_function('ff_create_flow', function(keys, args)
     "node_count", 0,
     "edge_count", 0,
     "public_flow_state", "open",
-    "created_at", A.now_ms,
-    "last_mutation_at", A.now_ms)
+    "created_at", now_ms,
+    "last_mutation_at", now_ms)
 
   return ok(A.flow_id)
 end)
@@ -100,20 +116,25 @@ end)
 -- Add a member execution to a flow. Does NOT set flow_id on exec_core
 -- (that's on {p:N}, caller must do it separately).
 --
--- KEYS (2): flow_core, members_set
--- ARGV (3): flow_id, execution_id, now_ms
+-- KEYS (3): flow_core, members_set, flow_index
+-- ARGV (3): flow_id, execution_id, now_ms (IGNORED — server time used)
 ---------------------------------------------------------------------------
 redis.register_function('ff_add_execution_to_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
+    flow_index  = keys[3],
   }
 
   local A = {
     flow_id      = args[1],
     execution_id = args[2],
-    now_ms       = args[3],
+    -- args[3] is client-provided now_ms; intentionally ignored in favour
+    -- of redis.call("TIME") to keep last_mutation_at consistent with
+    -- timestamps stamped by ff_complete_execution and peers.
   }
+
+  local now_ms = server_time_ms()
 
   -- 1. Validate flow exists and is not terminal
   local raw = redis.call("HGETALL", K.flow_core)
@@ -123,6 +144,16 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
     return err("flow_already_terminal")
   end
+
+  -- Self-heal flow_index for LIVE flows only. The projector may have
+  -- SREMd this flow after observing an all-terminal sample, yet the
+  -- flow is still "open" per flow_core and can accept new members.
+  -- Re-add idempotently so the next projector cycle picks the flow
+  -- back up. Runs only after the terminal-state guard above so we do
+  -- not resurrect cancelled/completed/failed flows into the active
+  -- index. Same {fp:N} slot as the other KEYS, so atomic with the
+  -- membership mutation below.
+  redis.call("SADD", K.flow_index, A.flow_id)
 
   -- 2. Idempotency: already a member
   if redis.call("SISMEMBER", K.members_set, A.execution_id) == 1 then
@@ -136,7 +167,7 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   -- 4. Increment node_count and graph_revision
   local new_nc = redis.call("HINCRBY", K.flow_core, "node_count", 1)
   local new_rev = redis.call("HINCRBY", K.flow_core, "graph_revision", 1)
-  redis.call("HSET", K.flow_core, "last_mutation_at", A.now_ms)
+  redis.call("HSET", K.flow_core, "last_mutation_at", now_ms)
 
   return ok(A.execution_id, tostring(new_nc))
 end)
@@ -147,21 +178,31 @@ end)
 -- Cancel a flow. Returns the member list for the caller to dispatch
 -- individual cancellations cross-partition.
 --
--- KEYS (2): flow_core, members_set
--- ARGV (4): flow_id, reason, cancellation_policy, now_ms
+-- KEYS (3): flow_core, members_set, flow_index (RESERVED — see below)
+-- ARGV (4): flow_id, reason, cancellation_policy, now_ms (IGNORED —
+--   server time used so `cancelled_at` agrees with peer Lua fields)
+--
+-- KEYS[3] (flow_index) is accepted for caller-compatibility with the
+-- shared FlowStructOpKeys wrapper, but this function does NOT mutate
+-- flow_index. The projector is the sole SREM writer (see the "4b" note
+-- in the body below).
 ---------------------------------------------------------------------------
 redis.register_function('ff_cancel_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
+    -- keys[3] is flow_index; present in KEYS for wrapper symmetry but
+    -- unused in this function (see rationale near the end of the body).
   }
 
   local A = {
     flow_id              = args[1],
     reason               = args[2],
     cancellation_policy  = args[3],
-    now_ms               = args[4],
+    -- args[4] is client-provided now_ms; intentionally ignored.
   }
+
+  local now_ms = server_time_ms()
 
   -- 1. Validate flow exists
   local raw = redis.call("HGETALL", K.flow_core)
@@ -178,11 +219,32 @@ redis.register_function('ff_cancel_flow', function(keys, args)
   local members = redis.call("SMEMBERS", K.members_set)
 
   -- 4. Update flow state
+  -- cancellation_policy is persisted so an AlreadyTerminal retry can
+  -- return the authoritative stored policy instead of echoing the
+  -- caller's retry intent.
+  --
+  -- NOTE: this field is persisted from this library version onward.
+  -- Flows cancelled before this deploy reach public_flow_state='cancelled'
+  -- without a cancellation_policy value. The Rust caller detects the
+  -- empty field on HMGET and falls back to args.cancellation_policy, so
+  -- no backfill migration is needed.
   redis.call("HSET", K.flow_core,
     "public_flow_state", "cancelled",
-    "cancelled_at", A.now_ms,
+    "cancelled_at", now_ms,
     "cancel_reason", A.reason,
-    "last_mutation_at", A.now_ms)
+    "cancellation_policy", A.cancellation_policy,
+    "last_mutation_at", now_ms)
+
+  -- Do NOT SREM flow_index here. Member cancellations dispatch
+  -- asynchronously from ff-server; flow_projector needs to keep
+  -- projecting the flow while those cancels land so the summary
+  -- reflects the real progression (running/blocked → cancelled). The
+  -- projector owns the SREM once it observes sampled==true_total
+  -- all-terminal (see crates/ff-engine/src/scanner/flow_projector.rs).
+  -- A projector-owned SREM is also the right place because it is
+  -- the only writer that can prove every member has actually reached
+  -- terminal state. Removing the entry here would freeze the summary
+  -- at whatever snapshot was current when cancel_flow fired.
 
   -- 5. Return: ok(cancellation_policy, member1, member2, ...)
   -- Build array manually to include variable member list.
@@ -299,8 +361,8 @@ end)
 -- Create dep record on child execution partition, increment unsatisfied
 -- count. If child is runnable: set blocked_by_dependencies.
 --
--- KEYS (6): exec_core, deps_meta, unresolved_set, dep_hash,
---           eligible_zset, blocked_deps_zset
+-- KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
+--           eligible_zset, blocked_deps_zset, deps_all_edges
 -- ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
 --           dependency_kind, data_passing_ref, now_ms
 ---------------------------------------------------------------------------
@@ -312,6 +374,7 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
     dep_hash         = keys[4],
     eligible_zset    = keys[5],
     blocked_deps_zset = keys[6],
+    deps_all_edges   = keys[7],
   }
 
   local A = {
@@ -352,6 +415,10 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
 
   -- 5. Update deps:meta
   redis.call("SADD", K.unresolved_set, A.edge_id)
+  -- Register edge in the per-execution all-edges index (cluster-safe
+  -- retention discovery; retained across resolve, purged wholesale on
+  -- retention trim).
+  redis.call("SADD", K.deps_all_edges, A.edge_id)
   local unresolved = redis.call("HINCRBY", K.deps_meta, "unsatisfied_required_count", 1)
   redis.call("HSET", K.deps_meta,
     "flow_id", A.flow_id,

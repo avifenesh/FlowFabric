@@ -167,6 +167,14 @@ impl ExecKeyContext {
         format!("ff:exec:{}:{}:deps:unresolved", self.tag, self.eid)
     }
 
+    /// `ff:exec:{p:N}:<eid>:deps:all_edges` — Set of ALL applied edge IDs
+    /// on this execution (unresolved + satisfied + impossible). Populated by
+    /// ff_apply_dependency_to_child, never pruned on resolve. Used by the
+    /// retention trimmer to enumerate dep edge hashes without SCAN.
+    pub fn deps_all_edges(&self) -> String {
+        format!("ff:exec:{}:{}:deps:all_edges", self.tag, self.eid)
+    }
+
     // ── Accessor ──
 
     /// Dummy key on this partition, used as a placeholder for unused KEYS
@@ -363,9 +371,10 @@ impl FlowIndexKeys {
         }
     }
 
-    /// `ff:idx:{fp:N}:terminal_flows`
-    pub fn terminal_flows(&self) -> String {
-        format!("ff:idx:{}:terminal_flows", self.tag)
+    /// `ff:idx:{fp:N}:flow_index` — SET of flow IDs on this partition.
+    /// Used by the flow projector for cluster-safe discovery (replaces SCAN).
+    pub fn flow_index(&self) -> String {
+        format!("ff:idx:{}:flow_index", self.tag)
     }
 }
 
@@ -418,6 +427,12 @@ pub fn budget_attach_key(tag: &str, scope_type: &str, scope_id: &str) -> String 
 /// Budget reset schedule index.
 pub fn budget_resets_key(tag: &str) -> String {
     format!("ff:idx:{}:budget_resets", tag)
+}
+
+/// Budget policies index — SET of budget IDs on this partition.
+/// Used by the budget reconciler for cluster-safe discovery (replaces SCAN).
+pub fn budget_policies_index(tag: &str) -> String {
+    format!("ff:idx:{}:budget_policies", tag)
 }
 
 // ─── Quota Partition Keys ({q:K}) ───

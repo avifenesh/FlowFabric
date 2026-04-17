@@ -43,12 +43,10 @@ where
             Err(rejection) => {
                 let status = rejection.status();
                 tracing::debug!(detail = %rejection.body_text(), "JSON rejection");
-                let body = ErrorBody {
-                    error: format!(
-                        "invalid JSON: {}",
-                        status.canonical_reason().unwrap_or("bad request"),
-                    ),
-                };
+                let body = ErrorBody::plain(format!(
+                    "invalid JSON: {}",
+                    status.canonical_reason().unwrap_or("bad request"),
+                ));
                 Err((status, Json(body)).into_response())
             }
         }
@@ -65,20 +63,102 @@ impl From<ServerError> for ApiError {
     }
 }
 
+/// HTTP error body. `kind`/`retryable` are populated for 500s backed by a
+/// `ferriskey::Error` so HTTP clients (e.g. cairn-fabric) can make retry
+/// decisions without parsing the `error` string.
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+}
+
+impl ErrorBody {
+    fn plain(error: String) -> Self {
+        Self { error, kind: None, retryable: None }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self.0 {
-            ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-            ServerError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            ServerError::OperationFailed(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        use ff_script::retry::kind_to_stable_str;
+
+        let (status, body) = match &self.0 {
+            ServerError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, ErrorBody::plain(msg.clone()))
+            }
+            ServerError::InvalidInput(msg) => {
+                (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
+            }
+            ServerError::OperationFailed(msg) => {
+                (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
+            }
+            ServerError::Valkey(e) => {
+                let kind_str = kind_to_stable_str(e.kind());
+                tracing::error!(
+                    kind = kind_str,
+                    code = e.code().unwrap_or(""),
+                    detail = e.detail().unwrap_or(""),
+                    "valkey error"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorBody {
+                        error: self.0.to_string(),
+                        kind: Some(kind_str.to_owned()),
+                        retryable: Some(self.0.is_retryable()),
+                    },
+                )
+            }
+            ServerError::ValkeyContext { source, context } => {
+                let kind_str = kind_to_stable_str(source.kind());
+                tracing::error!(
+                    kind = kind_str,
+                    code = source.code().unwrap_or(""),
+                    detail = source.detail().unwrap_or(""),
+                    context = %context,
+                    "valkey error"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorBody {
+                        error: self.0.to_string(),
+                        kind: Some(kind_str.to_owned()),
+                        retryable: Some(self.0.is_retryable()),
+                    },
+                )
+            }
+            ServerError::LibraryLoad(load_err) => {
+                let kind_str = load_err.valkey_kind().map(kind_to_stable_str);
+                tracing::error!(
+                    kind = kind_str.unwrap_or(""),
+                    error = %load_err,
+                    "library load failure"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorBody {
+                        error: format!("library load: {load_err}"),
+                        kind: kind_str.map(str::to_owned),
+                        retryable: Some(self.0.is_retryable()),
+                    },
+                )
+            }
+            // Script / Config / PartitionMismatch — developer or deployment
+            // errors. No Valkey ErrorKind to surface, but retryable=false is
+            // informative: a client-side retry won't change the outcome.
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody {
+                    error: other.to_string(),
+                    kind: None,
+                    retryable: Some(false),
+                },
+            ),
         };
-        (status, Json(ErrorBody { error: message })).into_response()
+        (status, Json(body)).into_response()
     }
 }
 
@@ -149,9 +229,9 @@ async fn auth_middleware(
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(ErrorBody {
-                error: "missing or invalid Authorization header".to_owned(),
-            }),
+            Json(ErrorBody::plain(
+                "missing or invalid Authorization header".to_owned(),
+            )),
         )
             .into_response()
     }
@@ -330,15 +410,34 @@ async fn add_execution_to_flow(
     Ok((status, Json(result)))
 }
 
+/// Cancel a flow.
+///
+/// By default the handler returns immediately with
+/// [`CancelFlowResult::CancellationScheduled`] (or `Cancelled` for flows
+/// with no members / non-cancel_all policies), and the individual member
+/// execution cancellations run in a background task on the server.
+/// Clients can track per-member progress by polling
+/// `GET /v1/executions/{id}/state` for each id in `member_execution_ids`.
+///
+/// Pass `?wait=true` to run the dispatch loop inline; the handler will not
+/// return until every member has been cancelled. Useful for tests and
+/// callers that need synchronous completion.
 async fn cancel_flow(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     AppJson(mut args): AppJson<CancelFlowArgs>,
 ) -> Result<Json<CancelFlowResult>, ApiError> {
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    Ok(Json(server.cancel_flow(&args).await?))
+    let wait = params.get("wait").is_some_and(|v| v == "true" || v == "1");
+    let result = if wait {
+        server.cancel_flow_wait(&args).await?
+    } else {
+        server.cancel_flow(&args).await?
+    };
+    Ok(Json(result))
 }
 
 async fn stage_dependency_edge(
@@ -446,7 +545,7 @@ async fn healthz(
         .cmd("PING")
         .execute()
         .await
-        .map_err(|e| ApiError(ServerError::Valkey(e.to_string())))?;
+        .map_err(|e| ApiError(ServerError::ValkeyContext { source: e, context: "healthz PING".into() }))?;
     Ok(Json(HealthResponse { status: "ok" }))
 }
 

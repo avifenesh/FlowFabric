@@ -951,6 +951,8 @@ version = "0.1.0"
 dependencies = [
  "ferriskey",
  "ff-core",
+ "ff-script",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -961,6 +963,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -972,6 +975,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-engine",
+ "ff-script",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -991,6 +995,7 @@ dependencies = [
  "ff-scheduler",
  "ff-script",
  "ff-sdk",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

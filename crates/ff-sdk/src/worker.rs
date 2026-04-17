@@ -55,7 +55,26 @@ pub struct FlowFabricWorker {
     lane_index: AtomicUsize,
     #[cfg(feature = "insecure-direct-claim")]
     concurrency_semaphore: Arc<Semaphore>,
+    /// Rolling offset for chunked partition scans. Each poll advances the
+    /// cursor by `PARTITION_SCAN_CHUNK`, so over `ceil(num_partitions /
+    /// chunk)` polls every partition is covered. The initial value is
+    /// derived from `worker_instance_id` so idle workers spread their
+    /// scans across different partitions from the first poll onward.
+    ///
+    /// Overflow: on 64-bit targets `usize` is `u64` — overflow after
+    /// ~2^64 polls (billions of years at any realistic rate). On 32-bit
+    /// targets (wasm32, i686) `usize` is `u32` and wraps after ~4 years
+    /// at 1 poll/sec — acceptable; on wrap, the modulo preserves
+    /// correctness because the sequence simply restarts a new cycle.
+    #[cfg(feature = "insecure-direct-claim")]
+    scan_cursor: AtomicUsize,
 }
+
+/// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
+/// load at O(PARTITION_SCAN_CHUNK) per worker-second instead of
+/// O(num_execution_partitions).
+#[cfg(feature = "insecure-direct-claim")]
+const PARTITION_SCAN_CHUNK: usize = 32;
 
 impl FlowFabricWorker {
     /// Connect to Valkey and prepare the worker.
@@ -95,6 +114,65 @@ impl FlowFabricWorker {
             )));
         }
 
+        // Guard against two worker processes sharing the same
+        // `worker_instance_id`. A duplicate instance would clobber each
+        // other's lease_current/active_index entries and double-claim work.
+        // SET NX on a liveness key with 2× lease TTL; if the key already
+        // exists another process is live. The key auto-expires if this
+        // process crashes without renewal, so a restart after a hard crash
+        // just waits at most 2× lease_ttl_ms for the ghost entry to clear.
+        //
+        // Known limitations of this minimal scheme (documented for operators):
+        //   1. **Startup-only, not runtime.** There is no heartbeat renewal
+        //      path. After `2 × lease_ttl_ms` elapses the alive key expires
+        //      naturally even while this worker is still running, and a
+        //      second process with the same `worker_instance_id` launched
+        //      later will successfully SET NX alongside the first. The check
+        //      catches misconfiguration at boot; it does not fence duplicates
+        //      that appear mid-lifetime. Production deployments should rely
+        //      on the orchestrator (Kubernetes, systemd unit with
+        //      `Restart=on-failure`, etc.) as the authoritative single-
+        //      instance enforcer; this SET NX is belt-and-suspenders.
+        //
+        //   2. **Restart delay after a crash.** If a worker crashes
+        //      ungracefully (SIGKILL, container OOM) and is restarted within
+        //      `2 × lease_ttl_ms`, the alive key is still present and the
+        //      new process exits with `SdkError::Config("duplicate
+        //      worker_instance_id ...")`. Options for operators:
+        //        - Wait `2 × lease_ttl_ms` (default 60s with the 30s TTL)
+        //          before restarting.
+        //        - Manually `DEL ff:worker:<instance_id>:alive` in Valkey to
+        //          unblock the restart.
+        //        - Use a fresh `worker_instance_id` for the restart (the
+        //          orchestrator should already do this per-Pod).
+        //
+        //   3. **No graceful cleanup on shutdown.** There is no explicit
+        //      `disconnect()` call that DELs the alive key. On clean
+        //      `SIGTERM` the key lingers until its TTL expires. A follow-up
+        //      can add `FlowFabricWorker::disconnect(self)` for callers that
+        //      want to skip the restart-delay window.
+        let alive_key = format!("ff:worker:{}:alive", config.worker_instance_id);
+        let alive_ttl_ms = (config.lease_ttl_ms.saturating_mul(2)).max(1_000);
+        let set_result: Option<String> = client
+            .cmd("SET")
+            .arg(&alive_key)
+            .arg("1")
+            .arg("NX")
+            .arg("PX")
+            .arg(alive_ttl_ms.to_string().as_str())
+            .execute()
+            .await
+            .map_err(|e| SdkError::ValkeyContext {
+                source: e,
+                context: "SET NX worker alive key".into(),
+            })?;
+        if set_result.is_none() {
+            return Err(SdkError::Config(format!(
+                "duplicate worker_instance_id '{}': another process already holds {alive_key}",
+                config.worker_instance_id
+            )));
+        }
+
         // Read partition config from Valkey (set by ff-server on startup).
         // Falls back to defaults if key doesn't exist (e.g. SDK-only testing).
         let partition_config = read_partition_config(&client).await
@@ -118,6 +196,12 @@ impl FlowFabricWorker {
             "FlowFabricWorker connected"
         );
 
+        #[cfg(feature = "insecure-direct-claim")]
+        let scan_cursor_init = scan_cursor_seed(
+            config.worker_instance_id.as_str(),
+            partition_config.num_execution_partitions.max(1) as usize,
+        );
+
         Ok(Self {
             client,
             config,
@@ -126,6 +210,8 @@ impl FlowFabricWorker {
             lane_index: AtomicUsize::new(0),
             #[cfg(feature = "insecure-direct-claim")]
             concurrency_semaphore,
+            #[cfg(feature = "insecure-direct-claim")]
+            scan_cursor: AtomicUsize::new(scan_cursor_init),
         })
     }
 
@@ -152,7 +238,20 @@ impl FlowFabricWorker {
     /// (`ff-scheduler`) for production deployments. Enable with:
     /// `ff-sdk = { ..., features = ["insecure-direct-claim"] }`
     ///
-    /// Returns `Ok(None)` if no eligible execution is found.
+    /// # `None` semantics
+    ///
+    /// `Ok(None)` means **no work was found in the partition window this
+    /// poll covered**, not "the cluster is idle". Each call scans a chunk
+    /// of [`PARTITION_SCAN_CHUNK`] partitions starting at the rolling
+    /// `scan_cursor`; the cursor advances by that chunk size on every
+    /// invocation, so a worker covers every partition exactly once every
+    /// `ceil(num_execution_partitions / PARTITION_SCAN_CHUNK)` polls.
+    ///
+    /// Callers should treat `None` as "poll again soon" (typically after
+    /// `config.claim_poll_interval_ms`) rather than "sleep for a long
+    /// time". Backing off too aggressively on `None` can starve workers
+    /// when work lives on partitions outside the current window.
+    ///
     /// Returns `Err` on Valkey errors or script failures.
     #[cfg(feature = "insecure-direct-claim")]
     pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {
@@ -168,12 +267,24 @@ impl FlowFabricWorker {
         let now = TimestampMs::now();
 
         // Phase 1: We scan eligible executions directly by reading the eligible
-        // ZSET across all execution partitions. In production, the scheduler
+        // ZSET across execution partitions. In production the scheduler
         // (ff-scheduler) would handle this. For Phase 1, the SDK does a
         // simplified inline claim.
+        //
+        // Chunked scan: each poll covers at most PARTITION_SCAN_CHUNK
+        // partitions starting at a rolling offset. This keeps idle Valkey
+        // load at O(chunk) per worker-second instead of O(num_partitions),
+        // and the worker-instance-seeded initial cursor spreads concurrent
+        // workers across different partition windows.
+        let num_partitions = self.partition_config.num_execution_partitions as usize;
+        if num_partitions == 0 {
+            return Ok(None);
+        }
+        let chunk = PARTITION_SCAN_CHUNK.min(num_partitions);
+        let start = self.scan_cursor.fetch_add(chunk, Ordering::Relaxed) % num_partitions;
 
-        // Try each execution partition until we find eligible work.
-        for partition_idx in 0..self.partition_config.num_execution_partitions {
+        for step in 0..chunk {
+            let partition_idx = ((start + step) % num_partitions) as u16;
             let partition = ff_core::partition::Partition {
                 family: ff_core::partition::PartitionFamily::Execution,
                 index: partition_idx,
@@ -203,7 +314,7 @@ impl FlowFabricWorker {
             };
 
             let execution_id = ExecutionId::parse(&execution_id_str).map_err(|e| {
-                SdkError::Script(ff_core::error::ScriptError::Parse(format!(
+                SdkError::Script(ff_script::error::ScriptError::Parse(format!(
                     "bad execution_id in eligible set: {e}"
                 )))
             })?;
@@ -238,7 +349,7 @@ impl FlowFabricWorker {
                     task.set_concurrency_permit(permit);
                     return Ok(Some(task));
                 }
-                Err(SdkError::Script(ff_core::error::ScriptError::UseClaimResumedExecution)) => {
+                Err(SdkError::Script(ff_script::error::ScriptError::UseClaimResumedExecution)) => {
                     // Execution was resumed from suspension — attempt_interrupted.
                     // ff_claim_execution rejects this; use ff_claim_resumed_execution
                     // which reuses the existing attempt instead of creating a new one.
@@ -403,7 +514,7 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_execution: expected Array".into(),
                 )));
             }
@@ -412,7 +523,7 @@ impl FlowFabricWorker {
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_execution: bad status code".into(),
                 )));
             }
@@ -429,8 +540,8 @@ impl FlowFabricWorker {
                 .unwrap_or_else(|| "unknown".to_owned());
 
             return Err(SdkError::Script(
-                ff_core::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
-                    ff_core::error::ScriptError::Parse(format!(
+                ff_script::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                    ff_script::error::ScriptError::Parse(format!(
                         "ff_claim_execution: {error_code}"
                     ))
                 }),
@@ -547,7 +658,7 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_resumed_execution: expected Array".into(),
                 )));
             }
@@ -556,7 +667,7 @@ impl FlowFabricWorker {
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::Script(ff_core::error::ScriptError::Parse(
+                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
                     "ff_claim_resumed_execution: bad status code".into(),
                 )));
             }
@@ -573,8 +684,8 @@ impl FlowFabricWorker {
                 .unwrap_or_else(|| "unknown".to_owned());
 
             return Err(SdkError::Script(
-                ff_core::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
-                    ff_core::error::ScriptError::Parse(format!(
+                ff_script::error::ScriptError::from_code(&error_code).unwrap_or_else(|| {
+                    ff_script::error::ScriptError::Parse(format!(
                         "ff_claim_resumed_execution: {error_code}"
                     ))
                 }),
@@ -760,12 +871,29 @@ impl FlowFabricWorker {
 }
 
 #[cfg(feature = "insecure-direct-claim")]
-fn is_retryable_claim_error(err: &ff_core::error::ScriptError) -> bool {
+fn is_retryable_claim_error(err: &ff_script::error::ScriptError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
         err.class(),
         ErrorClass::Retryable | ErrorClass::Informational
     )
+}
+
+/// Initial offset for [`FlowFabricWorker::scan_cursor`]. Hashes the worker
+/// instance id with FNV-1a to place distinct worker processes on different
+/// partition windows from their first poll. Zero is valid for single-worker
+/// clusters but spreads work in multi-worker deployments.
+#[cfg(feature = "insecure-direct-claim")]
+fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
+    if num_partitions == 0 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in worker_instance_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    (hash as usize) % num_partitions
 }
 
 #[cfg(feature = "insecure-direct-claim")]
@@ -809,4 +937,31 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
         num_budget_partitions: parse("num_budget_partitions", 32),
         num_quota_partitions: parse("num_quota_partitions", 32),
     })
+}
+
+#[cfg(all(test, feature = "insecure-direct-claim"))]
+mod scan_cursor_tests {
+    use super::scan_cursor_seed;
+
+    #[test]
+    fn stable_for_same_input() {
+        assert_eq!(scan_cursor_seed("w1", 256), scan_cursor_seed("w1", 256));
+    }
+
+    #[test]
+    fn distinct_for_different_ids() {
+        assert_ne!(scan_cursor_seed("w1", 256), scan_cursor_seed("w2", 256));
+    }
+
+    #[test]
+    fn bounded_by_partition_count() {
+        for i in 0..100 {
+            assert!(scan_cursor_seed(&format!("w{i}"), 256) < 256);
+        }
+    }
+
+    #[test]
+    fn zero_partitions_returns_zero() {
+        assert_eq!(scan_cursor_seed("w1", 0), 0);
+    }
 }

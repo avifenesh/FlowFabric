@@ -7,11 +7,27 @@
 //!
 //! Interval: 15s (catchup mode — event-driven in production).
 //!
+//! Cluster-safe: uses SMEMBERS on a partition-level index SET instead of SCAN.
+//!
+//! # Two sources of `public_flow_state`
+//!
+//! This scanner writes a DERIVED `public_flow_state` field to the flow
+//! summary hash (`ff:flow:{fp:N}:<flow_id>:summary`). It does NOT touch
+//! `flow_core.public_flow_state` — that field is owned exclusively by
+//! `ff_create_flow` and `ff_cancel_flow` and is the authoritative
+//! state used for mutation guards (e.g. `ff_add_execution_to_flow`
+//! rejects adds when `flow_core.public_flow_state` is terminal).
+//!
+//! Consumer guidance:
+//! - Mutation-guard / authoritative state → read `flow_core.public_flow_state`.
+//! - Dashboards / projected rollups → read `:summary.public_flow_state`.
+//!
 //! Reference: RFC-007 §Flow Summary Projection, RFC-010 §6.7
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ff_core::keys::FlowIndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily};
 
 use super::{ScanResult, Scanner};
@@ -51,19 +67,8 @@ impl Scanner for FlowProjector {
             index: partition,
         };
         let tag = p.hash_tag();
-
-        // Discover flows on this partition via SCAN
-        let flow_ids = match scan_flow_ids(client, &tag).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!(partition, error = %e, "flow_projector: discovery failed");
-                return ScanResult { processed: 0, errors: 1 };
-            }
-        };
-
-        if flow_ids.is_empty() {
-            return ScanResult { processed: 0, errors: 0 };
-        }
+        let fidx = FlowIndexKeys::new(&p);
+        let flow_index_key = fidx.flow_index();
 
         let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
             Ok(t) => t,
@@ -75,22 +80,53 @@ impl Scanner for FlowProjector {
 
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
+        let mut cursor = "0".to_string();
 
-        for fid_str in &flow_ids {
-            match project_flow_summary(
-                client, &tag, fid_str, now_ms, &self.partition_config,
-            ).await {
-                Ok(true) => processed += 1,
-                Ok(false) => {} // no members or already up-to-date
+        // Stream flow_index in SSCAN batches (COUNT 100) instead of a
+        // single SMEMBERS. SMEMBERS on a partition with many flows would
+        // materialise every flow_id into one Vec<String> before we could
+        // project the first one; SSCAN bounds memory to one batch and
+        // keeps the Valkey command's server-side work bounded per call.
+        loop {
+            let result: ferriskey::Value = match client
+                .cmd("SSCAN")
+                .arg(&flow_index_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await
+            {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(
-                        partition,
-                        flow_id = fid_str.as_str(),
-                        error = %e,
-                        "flow_projector: projection failed"
-                    );
-                    errors += 1;
+                    tracing::warn!(partition, error = %e, "flow_projector: SSCAN failed");
+                    return ScanResult { processed, errors: errors + 1 };
                 }
+            };
+
+            let (next_cursor, flow_ids) = parse_sscan_response(&result);
+
+            for fid_str in &flow_ids {
+                match project_flow_summary(
+                    client, &tag, &flow_index_key, fid_str, now_ms, &self.partition_config,
+                ).await {
+                    Ok(true) => processed += 1,
+                    Ok(false) => {} // no members or already up-to-date
+                    Err(e) => {
+                        tracing::warn!(
+                            partition,
+                            flow_id = fid_str.as_str(),
+                            error = %e,
+                            "flow_projector: projection failed"
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
             }
         }
 
@@ -98,57 +134,32 @@ impl Scanner for FlowProjector {
     }
 }
 
-/// Discover flow IDs on a partition via SCAN.
-async fn scan_flow_ids(
-    client: &ferriskey::Client,
-    tag: &str,
-) -> Result<Vec<String>, ferriskey::Error> {
-    let mut flow_ids = Vec::new();
-    let pattern = format!("ff:flow:{}:*:core", tag);
-    let prefix = format!("ff:flow:{}:", tag);
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await?;
-
-        let (next_cursor, keys) = parse_scan_result(&result);
-
-        for key in keys {
-            // Key format: ff:flow:{fp:N}:<flow_id>:core
-            if let Some(rest) = key.strip_prefix(&prefix)
-                && let Some(fid) = rest.strip_suffix(":core")
-            {
-                flow_ids.push(fid.to_string());
-            }
-        }
-
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    Ok(flow_ids)
-}
-
 /// Project the summary for one flow. Returns Ok(true) if updated.
 async fn project_flow_summary(
     client: &ferriskey::Client,
     tag: &str,
+    flow_index_key: &str,
     fid_str: &str,
     now_ms: u64,
     config: &PartitionConfig,
 ) -> Result<bool, ferriskey::Error> {
+    let core_key = format!("ff:flow:{}:{}:core", tag, fid_str);
     let members_key = format!("ff:flow:{}:{}:members", tag, fid_str);
     let summary_key = format!("ff:flow:{}:{}:summary", tag, fid_str);
+
+    // Defensive prune: index entry for a flow whose core is gone (manual
+    // delete / retention purge) — drop it so SMEMBERS stays correct.
+    let core_exists: bool = client.exists(&core_key).await.unwrap_or(true);
+    if !core_exists {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(flow_index_key)
+            .arg(fid_str)
+            .execute()
+            .await
+            .unwrap_or(None);
+        return Ok(false);
+    }
 
     // Get true membership count for accurate total_members reporting.
     let true_total: u64 = client
@@ -255,34 +266,67 @@ async fn project_flow_summary(
         .execute()
         .await?;
 
+    // Prune the index entry only when we've observed EVERY member in this
+    // cycle and all of them are terminal. Gating on the full walk (not the
+    // sample) matters for two reasons:
+    //   1. For flows larger than BATCH_SIZE, a sample being "all terminal"
+    //      does not imply the flow is actually done; unsampled members
+    //      may still be running. Pruning on the sample would freeze the
+    //      summary mid-flight.
+    //   2. ff_replay_execution runs on {p:N}, so it cannot re-SADD the
+    //      {fp:N} flow_index when a terminal flow member is revived.
+    //      If we SREM while any revival path is reachable, the flow never
+    //      comes back into the projector's view.
+    // For large flows that never satisfy sampled == true_total, the
+    // defensive HGETALL-empty prune and retention deletion still clean up
+    // eventually. We accept a modest cardinality cost for correctness.
+    if all_terminal && (sampled as u64) == true_total {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(flow_index_key)
+            .arg(fid_str)
+            .execute()
+            .await
+            .unwrap_or(None);
+    }
+
     Ok(true)
 }
 
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
+/// Parse an SSCAN reply `[cursor, [member1, member2, ...]]` into
+/// `(cursor, Vec<member>)`. Mirrors the helper in quota_reconciler so
+/// both scanners agree on the wire shape.
+fn parse_sscan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                if let Ok(ferriskey::Value::BulkString(b)) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
                 }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
+            }
         }
-        _ => ("0".to_string(), vec![]),
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                if let ferriskey::Value::BulkString(b) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        _ => {}
     }
+
+    (cursor, members)
 }
+

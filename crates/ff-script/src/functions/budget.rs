@@ -1,7 +1,7 @@
 //! Typed FCALL wrappers for budget functions (lua/budget.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 
 use crate::result::{FcallResult, FromFcallResult};
@@ -22,7 +22,8 @@ pub struct BlockOpKeys<'a> {
 
 // ─── ff_create_budget ─────────────────────────────────────────────────
 //
-// Lua KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+// Lua KEYS (5): budget_def, budget_limits, budget_usage, budget_resets_zset,
+//               budget_policies_index
 // Lua ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
 //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
 //   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
@@ -33,6 +34,7 @@ pub async fn ff_create_budget(
     conn: &ferriskey::Client,
     k: &BudgetOpKeys<'_>,
     resets_zset: &str,
+    policies_index: &str,
     args: &CreateBudgetArgs,
 ) -> Result<CreateBudgetResult, ScriptError> {
     let keys: Vec<String> = vec![
@@ -40,6 +42,7 @@ pub async fn ff_create_budget(
         k.limits_key.to_string(),
         k.usage_key.to_string(),
         resets_zset.to_string(),
+        policies_index.to_string(),
     ];
 
     let dim_count = args.dimensions.len();
@@ -71,7 +74,7 @@ pub async fn ff_create_budget(
     let raw = conn
         .fcall::<ferriskey::Value>("ff_create_budget", &key_refs, &argv_refs)
         .await
-        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+        .map_err(ScriptError::Valkey)?;
     <CreateBudgetResult as FromFcallResult>::from_fcall_result(&raw)
 }
 
@@ -126,7 +129,7 @@ pub async fn ff_report_usage_and_check(
     let raw = conn
         .fcall::<ferriskey::Value>("ff_report_usage_and_check", &key_refs, &argv_refs)
         .await
-        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+        .map_err(ScriptError::Valkey)?;
     <ReportUsageResult as FromFcallResult>::from_fcall_result(&raw)
 }
 
@@ -185,7 +188,7 @@ pub async fn ff_reset_budget(
     let raw = conn
         .fcall::<ferriskey::Value>("ff_reset_budget", &key_refs, &argv_refs)
         .await
-        .map_err(|e| ScriptError::Valkey(e.to_string()))?;
+        .map_err(ScriptError::Valkey)?;
     <ResetBudgetResult as FromFcallResult>::from_fcall_result(&raw)
 }
 

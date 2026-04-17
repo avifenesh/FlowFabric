@@ -55,7 +55,7 @@ macro_rules! ff_function {
                 conn: &ferriskey::Client,
                 $ctx_name: &$ctx_type,
                 $args_name: &$args_type,
-            ) -> ::core::result::Result<$result_type, ff_core::error::ScriptError> {
+            ) -> ::core::result::Result<$result_type, $crate::error::ScriptError> {
                 let keys: ::std::vec::Vec<String> = vec![ $( $key_expr ),* ];
                 let argv: ::std::vec::Vec<String> = vec![ $( $argv_expr ),* ];
                 let key_refs: ::std::vec::Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -63,7 +63,7 @@ macro_rules! ff_function {
                 let raw = conn
                     .fcall::<ferriskey::Value>(stringify!($fn_name), &key_refs, &argv_refs)
                     .await
-                    .map_err(|e| ff_core::error::ScriptError::Valkey(e.to_string()))?;
+                    .map_err($crate::error::ScriptError::Valkey)?;
                 <$result_type as $crate::result::FromFcallResult>::from_fcall_result(&raw)
             }
         )*

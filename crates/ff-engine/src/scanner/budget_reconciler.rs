@@ -7,16 +7,16 @@
 //! Budgets with `reset_policy` set are SKIPPED — resetting budgets cannot
 //! be reconciled by summing all-time usage (the sum would undo the reset).
 //!
+//! Cluster-safe: uses SMEMBERS on a partition-level index SET instead of SCAN.
+//!
 //! Reference: RFC-008 §Budget Reconciliation, RFC-010 §6.5
 
 use std::time::Duration;
 
+use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
 
 use super::{ScanResult, Scanner};
-
-/// Max execution reads per budget per cycle to avoid cross-partition fan-out.
-const MAX_EXEC_READS_PER_BUDGET: usize = 100;
 
 pub struct BudgetReconciler {
     interval: Duration,
@@ -56,36 +56,53 @@ impl Scanner for BudgetReconciler {
             }
         };
 
-        // Discover budgets on this partition via SCAN for budget definition keys.
-        // Pattern: ff:budget:{b:M}:*  (but only definition keys, not :usage/:limits)
-        let budget_ids = match scan_budget_ids(client, &tag).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!(partition, error = %e, "budget_reconciler: budget discovery failed");
-                return ScanResult { processed: 0, errors: 1 };
-            }
-        };
-
-        if budget_ids.is_empty() {
-            return ScanResult { processed: 0, errors: 0 };
-        }
-
+        // Discover budgets via partition-level index SET (cluster-safe).
+        // Stream in SSCAN batches so partitions with many budgets do not
+        // materialise the entire id list into one allocation and do not
+        // hold Valkey's single-threaded SMEMBERS for a large set.
+        let policies_key = keys::budget_policies_index(&tag);
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
+        let mut cursor = "0".to_string();
 
-        for bid in &budget_ids {
-            match reconcile_one_budget(client, &tag, bid, now_ms).await {
-                Ok(true) => processed += 1,
-                Ok(false) => {} // skipped (resetting budget or no drift)
+        loop {
+            let result: ferriskey::Value = match client
+                .cmd("SSCAN")
+                .arg(&policies_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await
+            {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(
-                        partition,
-                        budget_id = bid.as_str(),
-                        error = %e,
-                        "budget_reconciler: reconcile failed"
-                    );
-                    errors += 1;
+                    tracing::warn!(partition, error = %e, "budget_reconciler: SSCAN failed");
+                    return ScanResult { processed, errors: errors + 1 };
                 }
+            };
+
+            let (next_cursor, budget_ids) = parse_sscan_response(&result);
+
+            for bid in &budget_ids {
+                match reconcile_one_budget(client, &tag, &policies_key, bid, now_ms).await {
+                    Ok(true) => processed += 1,
+                    Ok(false) => {} // skipped (resetting budget or no drift)
+                    Err(e) => {
+                        tracing::warn!(
+                            partition,
+                            budget_id = bid.as_str(),
+                            error = %e,
+                            "budget_reconciler: reconcile failed"
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
             }
         }
 
@@ -93,73 +110,45 @@ impl Scanner for BudgetReconciler {
     }
 }
 
-/// Discover budget IDs on a partition via SCAN.
-async fn scan_budget_ids(
-    client: &ferriskey::Client,
-    tag: &str,
-) -> Result<Vec<String>, ferriskey::Error> {
-    let mut budget_ids = Vec::new();
-    let pattern = format!("ff:budget:{}:*", tag);
-    let mut cursor = "0".to_string();
-
-    loop {
-        let result: ferriskey::Value = client
-            .cmd("SCAN")
-            .arg(&cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await?;
-
-        let (next_cursor, keys) = parse_scan_result(&result);
-
-        for key in keys {
-            // Only take definition keys (no :usage, :limits, :executions suffix)
-            // Definition key format: ff:budget:{b:M}:<budget_id>
-            if !key.contains(":usage")
-                && !key.contains(":limits")
-                && !key.contains(":executions")
-            {
-                // Extract budget_id from key
-                if let Some(bid) = key.strip_prefix(&format!("ff:budget:{}:", tag)) {
-                    budget_ids.push(bid.to_string());
-                }
-            }
-        }
-
-        cursor = next_cursor;
-        if cursor == "0" {
-            break;
-        }
-    }
-
-    Ok(budget_ids)
-}
-
 /// Reconcile one budget. Returns Ok(true) if corrected, Ok(false) if skipped.
 async fn reconcile_one_budget(
     client: &ferriskey::Client,
     tag: &str,
+    policies_key: &str,
     budget_id: &str,
     now_ms: u64,
 ) -> Result<bool, ferriskey::Error> {
     let def_key = format!("ff:budget:{}:{}", tag, budget_id);
     let usage_key = format!("ff:budget:{}:{}:usage", tag, budget_id);
     let limits_key = format!("ff:budget:{}:{}:limits", tag, budget_id);
-    let executions_key = format!("ff:budget:{}:{}:executions", tag, budget_id);
 
-    // Read budget definition to check for reset_interval_ms
-    let reset_interval: Option<String> = client
-        .cmd("HGET")
+    // Defensive prune: index entry for a budget whose definition is gone
+    // (manual delete / retention purge) — drop it so SMEMBERS stays correct.
+    let def_raw: Vec<String> = client
+        .cmd("HGETALL")
         .arg(&def_key)
-        .arg("reset_interval_ms")
         .execute()
-        .await?;
+        .await
+        .unwrap_or_default();
+    if def_raw.is_empty() {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(policies_key)
+            .arg(budget_id)
+            .execute()
+            .await
+            .unwrap_or(None);
+        return Ok(false);
+    }
+
+    let def_map = pairs_to_map(&def_raw);
+    let reset_interval = def_map.get("reset_interval_ms").copied();
 
     // Skip resetting budgets — cannot reconcile by summing all-time usage
-    if let Some(ref ri) = reset_interval && !ri.is_empty() && ri != "0" {
+    if let Some(ri) = reset_interval
+        && !ri.is_empty()
+        && ri != "0"
+    {
         return Ok(false);
     }
 
@@ -236,33 +225,11 @@ async fn reconcile_one_budget(
         tracing::info!(budget_id, "budget_reconciler: cleared budget breach");
     }
 
-    // Clean stale execution references (incremental — one batch per cycle)
-    let exec_ids: Vec<String> = client
-        .cmd("SRANDMEMBER")
-        .arg(&executions_key)
-        .arg(MAX_EXEC_READS_PER_BUDGET.to_string().as_str())
-        .execute()
-        .await
-        .unwrap_or_default();
-
-    for eid in &exec_ids {
-        // Check if the execution still exists (cross-partition read)
-        // We can't know the exact partition without the UUID bytes, so
-        // we check via the exec_core key existence using a hash-tag-less
-        // approach. Since we only need existence, use EXISTS.
-        // NOTE: In v1, stale cleanup is best-effort. The retention trimmer
-        // on {p:N} doesn't know about {b:M} reverse indexes. We clean here.
-        // For now, skip the cross-partition check and just verify the
-        // member is non-empty.
-        if eid.is_empty() {
-            let _: u32 = client
-                .cmd("SREM")
-                .arg(&executions_key)
-                .arg(eid.as_str())
-                .execute()
-                .await?;
-        }
-    }
+    // TODO: cross-partition stale-execution cleanup for ff:budget:{b:M}:<id>:executions.
+    // Retention on {p:N} can't reach this {b:M} reverse index, so entries
+    // accumulate after executions are purged. Needs a partition-aware EXISTS
+    // check (parse UUID → execution_partition(config) → core key) — deferred
+    // to a later pass since it requires PartitionConfig plumbing here.
 
     Ok(any_breached != currently_breached) // true if we corrected something
 }
@@ -277,31 +244,40 @@ fn pairs_to_map(flat: &[String]) -> std::collections::HashMap<&str, &str> {
     map
 }
 
-fn parse_scan_result(value: &ferriskey::Value) -> (String, Vec<String>) {
-    match value {
-        ferriskey::Value::Array(arr) if arr.len() == 2 => {
-            let cursor = match &arr[0] {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    String::from_utf8_lossy(b).to_string()
+/// Parse an SSCAN reply `[cursor, [member1, member2, ...]]` into
+/// `(cursor, Vec<member>)`. Mirrors the helper in quota_reconciler /
+/// flow_projector so all three scanners agree on the wire shape.
+fn parse_sscan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                if let Ok(ferriskey::Value::BulkString(b)) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
                 }
-                Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-                _ => "0".to_string(),
-            };
-            let keys = match &arr[1] {
-                Ok(ferriskey::Value::Array(keys)) => keys
-                    .iter()
-                    .filter_map(|v| match v {
-                        Ok(ferriskey::Value::BulkString(b)) => {
-                            Some(String::from_utf8_lossy(b).to_string())
-                        }
-                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
-            (cursor, keys)
+            }
         }
-        _ => ("0".to_string(), vec![]),
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                if let ferriskey::Value::BulkString(b) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        _ => {}
     }
+
+    (cursor, members)
 }
+
