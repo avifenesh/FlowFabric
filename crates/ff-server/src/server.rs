@@ -941,7 +941,7 @@ impl Server {
 
             let member_count = dispatch_members.len();
             let flow_id_for_log = flow_id.clone();
-            futures::stream::iter(dispatch_members.into_iter())
+            futures::stream::iter(dispatch_members)
                 .map(|eid_str| {
                     let client = client.clone();
                     let reason = reason.clone();
