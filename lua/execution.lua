@@ -220,6 +220,21 @@ end)
 --            capability_snapshot_hash, lease_id, lease_ttl_ms,
 --            renew_before_ms, attempt_id, attempt_policy_json,
 --            attempt_timeout_ms, execution_deadline_at
+--
+-- KNOWN LIMITATION (flow-cancel race): ff_claim_execution reads
+-- exec_core on {p:N} but cannot atomically read flow_core on {fp:N}
+-- (cross-slot). If ff_cancel_flow fired and its async member dispatch
+-- was dropped by a transient Valkey error, the member's exec_core has
+-- NOT yet been flipped to terminal — so a worker may still claim it and
+-- run it to completion inside a cancelled flow. The flow's own
+-- public_flow_state is correctly terminal; only this one member escapes.
+-- Mitigations already in place:
+--  * cancel_flow(wait=true) avoids the bg dispatch entirely.
+--  * ff_apply_dependency_to_child rejects additions to terminal flows,
+--    so children cannot be added mid-cancel.
+--  * retention eventually trims the stale member.
+-- Full fix (flag on exec_core maintained by a broadcast loop) is a
+-- deliberate design change deferred past Batch A.
 ---------------------------------------------------------------------------
 redis.register_function('ff_claim_execution', function(keys, args)
   local K = {

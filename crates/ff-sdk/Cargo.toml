@@ -16,6 +16,7 @@ insecure-direct-claim = []
 [dependencies]
 ff-core = { workspace = true }
 ff-engine = { workspace = true }
+ff-script = { workspace = true }
 ferriskey = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -12,6 +12,7 @@
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
 use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
+use ff_script::retry::is_retryable_kind;
 
 /// A claim grant issued by the scheduler for a specific execution.
 ///
@@ -634,31 +635,73 @@ async fn server_time_ms(client: &ferriskey::Client) -> Result<u64, ferriskey::Er
 }
 
 /// Errors from the scheduler.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
-    Valkey(ferriskey::Error),
+    /// Valkey connection or command error (preserves ErrorKind for caller inspection).
+    #[error("valkey: {0}")]
+    Valkey(#[from] ferriskey::Error),
+    /// Valkey error with additional context (preserves ErrorKind via #[source]).
+    #[error("valkey ({context}): {source}")]
+    ValkeyContext {
+        #[source]
+        source: ferriskey::Error,
+        context: String,
+    },
 }
 
-impl std::fmt::Display for SchedulerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl SchedulerError {
+    /// Returns the underlying ferriskey ErrorKind, if this is a Valkey error.
+    /// Matches `ServerError::valkey_kind` and `ScriptError::valkey_kind` so
+    /// callers can treat all three uniformly.
+    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
-            Self::Valkey(e) => write!(f, "valkey error: {e}"),
+            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
         }
     }
-}
 
-impl std::error::Error for SchedulerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Valkey(e) => Some(e),
-        }
+    /// Whether this error is safely retryable by a caller. Mirrors
+    /// `ServerError::is_retryable` semantics.
+    pub fn is_retryable(&self) -> bool {
+        self.valkey_kind()
+            .map(is_retryable_kind)
+            .unwrap_or(false)
     }
 }
 
-impl From<ferriskey::Error> for SchedulerError {
-    fn from(e: ferriskey::Error) -> Self {
-        Self::Valkey(e)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferriskey::ErrorKind;
+
+    fn mk_fk_err(kind: ErrorKind) -> ferriskey::Error {
+        ferriskey::Error::from((kind, "synthetic"))
+    }
+
+    #[test]
+    fn scheduler_is_retryable_matches_kind_table() {
+        assert!(SchedulerError::Valkey(mk_fk_err(ErrorKind::IoError)).is_retryable());
+        assert!(SchedulerError::Valkey(mk_fk_err(ErrorKind::ClusterDown)).is_retryable());
+
+        assert!(!SchedulerError::Valkey(mk_fk_err(ErrorKind::FatalReceiveError)).is_retryable());
+        assert!(!SchedulerError::Valkey(mk_fk_err(ErrorKind::NoScriptError)).is_retryable());
+        assert!(!SchedulerError::Valkey(mk_fk_err(ErrorKind::Moved)).is_retryable());
+    }
+
+    #[test]
+    fn scheduler_valkey_context_is_retryable() {
+        let err = SchedulerError::ValkeyContext {
+            source: mk_fk_err(ErrorKind::BusyLoadingError),
+            context: "HGET budget_ids".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn scheduler_valkey_kind_exposed() {
+        let err = SchedulerError::Valkey(mk_fk_err(ErrorKind::TryAgain));
+        assert_eq!(err.valkey_kind(), Some(ErrorKind::TryAgain));
     }
 }
+
 
 

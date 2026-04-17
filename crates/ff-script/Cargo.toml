@@ -14,5 +14,6 @@ description = "FlowFabric typed FCALL wrappers and Lua library loader"
 ff-core = { workspace = true }
 ferriskey = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["time"] }

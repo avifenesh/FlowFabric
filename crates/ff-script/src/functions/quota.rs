@@ -1,7 +1,7 @@
 //! Typed FCALL wrapper for quota admission function (lua/quota.lua).
 
 use ff_core::contracts::*;
-use ff_core::error::ScriptError;
+use crate::error::ScriptError;
 use ff_core::keys::QuotaKeyContext;
 
 use crate::result::{FcallResult, FromFcallResult};

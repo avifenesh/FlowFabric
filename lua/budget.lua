@@ -9,17 +9,19 @@
 -- Create a new budget policy with hard/soft limits on N dimensions.
 -- Idempotent: if EXISTS budget_def → return ok_already_satisfied.
 --
--- KEYS (4): budget_def, budget_limits, budget_usage, budget_resets_zset
+-- KEYS (5): budget_def, budget_limits, budget_usage, budget_resets_zset,
+--           budget_policies_index
 -- ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
 --   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
 --   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
 ---------------------------------------------------------------------------
 redis.register_function('ff_create_budget', function(keys, args)
   local K = {
-    def_key      = keys[1],
-    limits_key   = keys[2],
-    usage_key    = keys[3],
-    resets_zset  = keys[4],
+    def_key         = keys[1],
+    limits_key      = keys[2],
+    usage_key       = keys[3],
+    resets_zset     = keys[4],
+    policies_index  = keys[5],
   }
 
   local A = {
@@ -32,6 +34,12 @@ redis.register_function('ff_create_budget', function(keys, args)
     reset_interval_ms = args[7],
     now_ms            = args[8],
   }
+
+  -- Maintain budget_policies_index BEFORE the idempotency guard. SADD is
+  -- itself idempotent (no-op on existing members), and hoisting it heals
+  -- any pre-existing budget_def that was created before this index was
+  -- introduced — no migration script required.
+  redis.call("SADD", K.policies_index, A.budget_id)
 
   -- Idempotency: already exists → return immediately
   if redis.call("EXISTS", K.def_key) == 1 then

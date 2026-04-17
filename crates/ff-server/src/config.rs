@@ -56,7 +56,29 @@ impl ServerConfig {
         let tls = env_bool("FF_TLS");
         let cluster = env_bool("FF_CLUSTER");
         let listen_addr = env_or("FF_LISTEN_ADDR", "0.0.0.0:9090");
-        let cors_origins: Vec<String> = env_or("FF_CORS_ORIGINS", "*")
+        // FF_CORS_ORIGINS contract:
+        //   unset      → default "*" (permissive)
+        //   "*"        → permissive
+        //   "a,b,c"    → explicit allowlist
+        //   ""         → hard error. An empty explicit value almost always
+        //                means "I tried to unset it" which a blank env var
+        //                does not do. We refuse to guess and make the
+        //                operator's intent explicit.
+        let cors_raw = std::env::var("FF_CORS_ORIGINS");
+        let cors_source = match &cors_raw {
+            Ok(s) if s.is_empty() => {
+                return Err(ConfigError::InvalidValue {
+                    var: "FF_CORS_ORIGINS".to_owned(),
+                    message: "FF_CORS_ORIGINS is set but empty; \
+                              unset it to default to \"*\", or pass \"*\" explicitly, \
+                              or pass a non-empty comma-separated origin list"
+                        .to_owned(),
+                });
+            }
+            Ok(s) => s.clone(),
+            Err(_) => "*".to_owned(),
+        };
+        let cors_origins: Vec<String> = cors_source
             .split(',')
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())

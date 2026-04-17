@@ -12,5 +12,7 @@ description = "FlowFabric claim-grant scheduler"
 
 [dependencies]
 ff-core = { workspace = true }
+ff-script = { workspace = true }
 ferriskey = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
