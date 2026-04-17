@@ -39,7 +39,12 @@ use serde::Deserialize;
 
 const SCENARIO: &str = "suspend_signal_resume";
 const SIGNAL_NAME: &str = "bench_resume";
-const TIGHT_LOOP_POLL_MS: u64 = 0;
+/// Worker poll interval during the measured re-claim leg. 1 ms (not 0)
+/// so the tokio multi-thread runtime has a chance to schedule other
+/// tasks (e.g. the HTTP handler completing the /signal POST) between
+/// poll attempts — a strict 0 ms busy-spin starves peer tasks and
+/// adds microseconds of poll-wake overhead that isn't HMAC cost.
+const TIGHT_LOOP_POLL_MS: u64 = 1;
 /// The default ff-sdk claim_poll_interval. Surfaced only to compute the
 /// "production estimate" string in notes; the bench worker itself uses
 /// `TIGHT_LOOP_POLL_MS`.
@@ -115,8 +120,46 @@ fn scenario_2(c: &mut Criterion) {
 
 /// One measured cycle. The function owns the full envelope — setup
 /// outside the Instant::now window, measured roundtrip inside.
+///
+/// If the measured body returns an error partway through, the created
+/// execution would otherwise sit in Valkey until lease-TTL expiry,
+/// polluting state for the next iteration (and the next `cargo bench`
+/// run). `measure_one` wraps the body in an inner async so the outer
+/// shell can POST `/v1/executions/{eid}/cancel` on any failure —
+/// bounded cleanup, no TTL wait.
 async fn measure_one(env: &ff_bench::workload::BenchEnv) -> anyhow::Result<Duration> {
     let reviewer = ff_bench::workload::http_client()?;
+    let eid_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let eid_slot_inner = eid_slot.clone();
+    let reviewer_inner = reviewer.clone();
+    let res = measure_one_inner(env, &reviewer_inner, &eid_slot_inner).await;
+    if res.is_err() {
+        if let Some(eid) = eid_slot.lock().expect("poisoned").take() {
+            // Best-effort cleanup; ignore errors (execution may have
+            // already landed in a terminal state via the failed path).
+            let cancel_url = format!("{}/v1/executions/{}/cancel", env.server, eid);
+            let _ = reviewer
+                .post(&cancel_url)
+                .json(&serde_json::json!({
+                    "execution_id": eid,
+                    "reason": "bench iter failed",
+                    "now": ff_bench::workload::now_ms(),
+                }))
+                .send()
+                .await;
+        }
+    }
+    res
+}
+
+/// Body of one measured cycle. The `eid_slot` arg is a handoff so the
+/// outer [`measure_one`] wrapper can drive the cleanup path if this
+/// function returns an error.
+async fn measure_one_inner(
+    env: &ff_bench::workload::BenchEnv,
+    reviewer: &reqwest::Client,
+    eid_slot: &Arc<Mutex<Option<String>>>,
+) -> anyhow::Result<Duration> {
 
     // ── PRE-WORK — excluded from measurement ──────────────────────────
 
@@ -136,12 +179,14 @@ async fn measure_one(env: &ff_bench::workload::BenchEnv) -> anyhow::Result<Durat
     let worker = FlowFabricWorker::connect(config).await?;
 
     let eid = ff_bench::workload::create_execution(
-        &reviewer,
+        reviewer,
         env,
         "bench.scenario2",
         Vec::new(),
     )
     .await?;
+    // Record the eid so the outer wrapper can cancel on iter failure.
+    *eid_slot.lock().expect("poisoned") = Some(eid.clone());
 
     // Spin until this worker picks up the execution we just created.
     // Tight loop; no sleep.
@@ -156,6 +201,12 @@ async fn measure_one(env: &ff_bench::workload::BenchEnv) -> anyhow::Result<Durat
             t.fail("bench iter: not our execution", "bench_stale").await?;
         }
     };
+
+    // Yield once so any prior-iter cleanup (worker Drop, lease TTL
+    // bookkeeping) has been polled before we start the stopwatch.
+    // Belt-and-suspenders against iter-N-setup overlapping iter-(N-1)-
+    // quiesce on a contended runtime.
+    tokio::task::yield_now().await;
 
     // ── MEASURED WINDOW ───────────────────────────────────────────────
     let t0 = Instant::now();
@@ -237,6 +288,10 @@ async fn measure_one(env: &ff_bench::workload::BenchEnv) -> anyhow::Result<Durat
 
     resumed.complete(None).await?;
 
+    // Success path — clear the eid so the outer cleanup fallback
+    // doesn't try to cancel an already-completed execution.
+    *eid_slot.lock().expect("poisoned") = None;
+
     Ok(t0.elapsed())
 }
 
@@ -255,9 +310,10 @@ fn write_scenario_report(
     let production_projected_p50_ms =
         latency_ms.p50 + (DEFAULT_PROD_POLL_MS as f64 / 2.0);
     let notes = format!(
-        "tight-loop re-claim (claim_poll_interval_ms=0); production with \
+        "tight-loop re-claim (claim_poll_interval_ms={}); production with \
          default claim_poll_interval_ms={}ms adds ~{:.1}ms on the re-claim \
          leg, so production-projected p50 ≈ {:.2}ms.",
+        TIGHT_LOOP_POLL_MS,
         DEFAULT_PROD_POLL_MS,
         DEFAULT_PROD_POLL_MS as f64 / 2.0,
         production_projected_p50_ms,

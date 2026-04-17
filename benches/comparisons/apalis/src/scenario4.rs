@@ -39,6 +39,20 @@
 //! These deltas are why apalis's numbers on this scenario are a
 //! "what it feels like today", not "what a fair DAG engine would
 //! give you".
+//!
+//! # Polling-jitter floor
+//!
+//! The driver observes completion by polling `GET COMPLETED_KEY`
+//! every 50 ms (see the drain loop further down). Up to 50 ms of
+//! slack can sit between the Stage9 handler's INCR and the driver's
+//! next GET — wall is inflated by that slack. At `flows=10` the
+//! bias is ~5%; at `flows ≥ 100` it drops into noise. A tighter
+//! measurement would use Redis pub/sub (SUBSCRIBE on a completion
+//! channel the Stage9 handler PUBLISHes to) so the driver wakes
+//! exactly when the last completion lands. Tracked as a Batch C
+//! follow-up rather than fixed here — the current number is honest
+//! for the apalis-canonical "poll a counter" shape and consistent
+//! with how an apalis user would actually observe drain.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
