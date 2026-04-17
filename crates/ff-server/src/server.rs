@@ -672,10 +672,10 @@ impl Server {
     ///
     /// 1. The execution exists but has never suspended.
     /// 2. All existing waitpoints are `closed` (already resolved).
-    /// 3. A narrow teardown race: `SMEMBERS ctx.waitpoints()` read the set
-    ///    after a concurrent `ff_close_waitpoint` or execution-cleanup
-    ///    script deleted the waitpoint hashes but before it SREM'd the
-    ///    set members. Each HMGET returns all-None and we skip.
+    /// 3. A narrow teardown race: `SSCAN` read the waitpoint set after
+    ///    a concurrent `ff_close_waitpoint` or execution-cleanup script
+    ///    deleted the waitpoint hashes but before it SREM'd the set
+    ///    members. Each HMGET returns all-None and we skip.
     ///
     /// Callers that get an unexpected empty list should cross-check
     /// execution state (`get_execution_state`) to distinguish "pipeline
