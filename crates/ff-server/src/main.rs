@@ -10,7 +10,13 @@ async fn main() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| {
-                    "ff_server=info,ff_engine=info,ff_script=info,tower_http=debug".into()
+                    // `audit=info` is non-negotiable: rotation, security-kid
+                    // changes, and other compliance events use
+                    // `tracing::*!(target: "audit", ...)`. Without this
+                    // directive the default subscriber silently drops every
+                    // audit event (module-path directives like `ff_server=info`
+                    // do not match custom targets).
+                    "ff_server=info,ff_engine=info,ff_script=info,tower_http=debug,audit=info".into()
                 }),
         )
         .init();

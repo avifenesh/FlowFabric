@@ -159,7 +159,8 @@ async fn fcall_issue_claim_grant(
         idx.lane_eligible(&lane_id),
     ];
 
-    // ARGV (8): eid, worker_id, worker_instance_id, lane, cap_hash, grant_ttl, route_json, admission
+    // ARGV (9): eid, worker_id, worker_instance_id, lane, cap_hash, grant_ttl,
+    //           route_json, admission, worker_capabilities_csv
     let args: Vec<String> = vec![
         eid.to_string(),
         worker_id.to_owned(),
@@ -169,6 +170,7 @@ async fn fcall_issue_claim_grant(
         "5000".to_owned(),    // grant_ttl_ms
         String::new(),        // route_snapshot_json
         String::new(),        // admission_summary
+        String::new(),        // worker_capabilities_csv (empty: match-any path)
     ];
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -1014,6 +1016,7 @@ async fn fcall_issue_reclaim_grant(
     // KEYS (3): exec_core, claim_grant, lease_expiry
     let keys: Vec<String> = vec![ctx.core(), ctx.claim_grant(), idx.lease_expiry()];
 
+    // ARGV (9): …, worker_capabilities_csv (empty → match-any)
     let args: Vec<String> = vec![
         eid.to_string(),
         worker_id.to_owned(),
@@ -1021,6 +1024,7 @@ async fn fcall_issue_reclaim_grant(
         lane.to_owned(),
         String::new(),
         "5000".to_owned(),
+        String::new(),
         String::new(),
         String::new(),
     ];
@@ -1424,7 +1428,7 @@ async fn fcall_suspend_execution(
     resume_condition_json: &str,
     timeout_at: Option<i64>,
     timeout_behavior: &str,
-) -> (String, String, String, String) {
+) -> (String, String, String, String, String) {
     let config = test_config();
     let partition = execution_partition(eid, &config);
     let ctx = ExecKeyContext::new(&partition, eid);
@@ -1439,11 +1443,11 @@ async fn fcall_suspend_execution(
     let wp_id = WaitpointId::from_uuid(waitpoint_id_uuid);
     let waitpoint_key = format!("wpk:{waitpoint_id_str}");
 
-    // KEYS (16): exec_core, attempt_record, lease_current, lease_history,
+    // KEYS (17): exec_core, attempt_record, lease_current, lease_history,
     //            lease_expiry, worker_leases, suspension_current, waitpoint_hash,
     //            waitpoint_signals, suspension_timeout, pending_wp_expiry,
     //            active_index, suspended_index, waitpoint_history, wp_condition,
-    //            attempt_timeout
+    //            attempt_timeout, hmac_secrets
     let keys: Vec<String> = vec![
         ctx.core(),                              // 1
         ctx.attempt_hash(att_idx),               // 2
@@ -1461,6 +1465,7 @@ async fn fcall_suspend_execution(
         ctx.waitpoints(),                        // 14
         ctx.waitpoint_condition(&wp_id),         // 15
         idx.attempt_timeout(),                   // 16
+        idx.waitpoint_hmac_secrets(),            // 17
     ];
 
     // ARGV (17): execution_id, attempt_index, attempt_id, lease_id,
@@ -1499,7 +1504,10 @@ async fn fcall_suspend_execution(
 
     let arr = expect_success_array(&raw, "ff_suspend_execution");
     let sub_status = field_str(arr, 1); // "OK" or "ALREADY_SATISFIED"
-    (suspension_id, waitpoint_id_str, waitpoint_key, sub_status)
+    // Field index 5 in the response is the minted HMAC token (RFC-004
+    // §Waitpoint Security). Echoed for tests that will deliver signals.
+    let waitpoint_token = field_str(arr, 5);
+    (suspension_id, waitpoint_id_str, waitpoint_key, sub_status, waitpoint_token)
 }
 
 /// Call ff_deliver_signal.
@@ -1513,6 +1521,7 @@ async fn fcall_deliver_signal(
     signal_name: &str,
     signal_category: &str,
     idempotency_key: &str,
+    waitpoint_token: &str,
 ) -> (String, String) {
     let config = test_config();
     let partition = execution_partition(eid, &config);
@@ -1531,11 +1540,11 @@ async fn fcall_deliver_signal(
         ctx.signal_dedup(&wp_id, idempotency_key)
     };
 
-    // KEYS (13): exec_core, wp_condition, wp_signals_stream,
+    // KEYS (14): exec_core, wp_condition, wp_signals_stream,
     //            exec_signals_zset, signal_hash, signal_payload,
     //            idem_key, waitpoint_hash, suspension_current,
     //            eligible_zset, suspended_zset, delayed_zset,
-    //            suspension_timeout_zset
+    //            suspension_timeout_zset, hmac_secrets
     let keys: Vec<String> = vec![
         ctx.core(),                              // 1
         ctx.waitpoint_condition(&wp_id),         // 2
@@ -1550,14 +1559,15 @@ async fn fcall_deliver_signal(
         idx.lane_suspended(&lane_id),            // 11
         idx.lane_delayed(&lane_id),              // 12
         idx.suspension_timeout(),                // 13
+        idx.waitpoint_hmac_secrets(),            // 14
     ];
 
-    // ARGV (17): signal_id, execution_id, waitpoint_id, signal_name,
+    // ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
     //            signal_category, source_type, source_identity,
     //            payload, payload_encoding, idempotency_key,
     //            correlation_id, target_scope, created_at,
     //            dedup_ttl_ms, resume_delay_ms, signal_maxlen,
-    //            max_signals_per_execution
+    //            max_signals_per_execution, waitpoint_token
     let args: Vec<String> = vec![
         signal_id.clone(),                   // 1
         eid.to_string(),                     // 2
@@ -1576,6 +1586,7 @@ async fn fcall_deliver_signal(
         "0".to_owned(),                      // 15 resume_delay_ms
         "1000".to_owned(),                   // 16 signal_maxlen
         "10000".to_owned(),                  // 17 max_signals_per_execution
+        waitpoint_token.to_owned(),          // 18 waitpoint_token
     ];
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -1644,13 +1655,13 @@ async fn fcall_expire_suspension(
 }
 
 /// Call ff_create_pending_waitpoint.
-/// Returns (waitpoint_id, waitpoint_key).
+/// Returns (waitpoint_id, waitpoint_key, waitpoint_token).
 async fn fcall_create_pending_waitpoint(
     tc: &TestCluster,
     eid: &ExecutionId,
     attempt_index: &str,
     expires_in_ms: u64,
-) -> (String, String) {
+) -> (String, String, String) {
     let config = test_config();
     let partition = execution_partition(eid, &config);
     let ctx = ExecKeyContext::new(&partition, eid);
@@ -1663,11 +1674,12 @@ async fn fcall_create_pending_waitpoint(
 
     let expires_at = TimestampMs::now().0 + expires_in_ms as i64;
 
-    // KEYS (3): exec_core, waitpoint_hash, pending_wp_expiry_zset
+    // KEYS (4): exec_core, waitpoint_hash, pending_wp_expiry_zset, hmac_secrets
     let keys: Vec<String> = vec![
         ctx.core(),
         ctx.waitpoint(&wp_id),
         idx.pending_waitpoint_expiry(),
+        idx.waitpoint_hmac_secrets(),
     ];
 
     // ARGV (5): execution_id, attempt_index, waitpoint_id, waitpoint_key, expires_at
@@ -1688,8 +1700,10 @@ async fn fcall_create_pending_waitpoint(
         .await
         .expect("FCALL ff_create_pending_waitpoint failed");
 
-    assert_ok(&raw, "ff_create_pending_waitpoint");
-    (waitpoint_id_str, waitpoint_key)
+    let arr = expect_success_array(&raw, "ff_create_pending_waitpoint");
+    // Response: {1, "OK", waitpoint_id, waitpoint_key, waitpoint_token}
+    let waitpoint_token = field_str(arr, 4);
+    (waitpoint_id_str, waitpoint_key, waitpoint_token)
 }
 
 /// Call ff_buffer_signal_for_pending_waitpoint.
@@ -1700,10 +1714,12 @@ async fn fcall_buffer_signal(
     waitpoint_id_str: &str,
     signal_name: &str,
     idempotency_key: &str,
+    waitpoint_token: &str,
 ) -> (String, String) {
     let config = test_config();
     let partition = execution_partition(eid, &config);
     let ctx = ExecKeyContext::new(&partition, eid);
+    let idx = IndexKeys::new(&partition);
 
     let signal_id = uuid::Uuid::new_v4().to_string();
     let wp_id = WaitpointId::parse(waitpoint_id_str).unwrap();
@@ -1716,8 +1732,9 @@ async fn fcall_buffer_signal(
         ctx.signal_dedup(&wp_id, idempotency_key)
     };
 
-    // KEYS (7): exec_core, wp_condition, wp_signals_stream,
-    //           exec_signals_zset, signal_hash, signal_payload, idem_key
+    // KEYS (9): exec_core, wp_condition, wp_signals_stream,
+    //           exec_signals_zset, signal_hash, signal_payload, idem_key,
+    //           waitpoint_hash, hmac_secrets
     let keys: Vec<String> = vec![
         ctx.core(),
         ctx.waitpoint_condition(&wp_id),
@@ -1726,9 +1743,11 @@ async fn fcall_buffer_signal(
         ctx.signal(&sig_id),
         ctx.signal_payload(&sig_id),
         idem_key,
+        ctx.waitpoint(&wp_id),
+        idx.waitpoint_hmac_secrets(),
     ];
 
-    // ARGV (17): same layout as ff_deliver_signal
+    // ARGV (18): same layout as ff_deliver_signal + waitpoint_token
     let args: Vec<String> = vec![
         signal_id.clone(),                   // 1
         eid.to_string(),                     // 2
@@ -1747,6 +1766,7 @@ async fn fcall_buffer_signal(
         "0".to_owned(),                      // 15 resume_delay_ms (unused by buffer)
         "1000".to_owned(),                   // 16 signal_maxlen
         "10000".to_owned(),                  // 17 max_signals
+        waitpoint_token.to_owned(),          // 18 waitpoint_token
     ];
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -1920,7 +1940,7 @@ async fn test_suspend_and_signal_resume() {
 
     // 2. Suspend
     let resume_cond = build_resume_condition_json(&["approval_result"], "fail");
-    let (suspension_id, waitpoint_id, _waitpoint_key, sub_status) =
+    let (suspension_id, waitpoint_id, _waitpoint_key, sub_status, wp_token) =
         fcall_suspend_execution(
             &tc, &eid, LANE, WORKER_INST,
             &lease_id, &epoch, &att_idx, &attempt_id,
@@ -1963,7 +1983,7 @@ async fn test_suspend_and_signal_resume() {
     // 4. Deliver signal matching the condition
     let (signal_id, effect) = fcall_deliver_signal(
         &tc, &eid, LANE, &waitpoint_id,
-        "approval_result", "approval", "",
+        "approval_result", "approval", "", &wp_token,
     ).await;
     assert!(!signal_id.is_empty());
     assert_eq!(effect, "resume_condition_satisfied");
@@ -2018,7 +2038,7 @@ async fn test_suspend_timeout_fail() {
     // Suspend with timeout in the past (triggers immediate expiry)
     let past_timeout = TimestampMs::now().0 - 1000; // 1s ago
     let resume_cond = build_resume_condition_json(&["approval"], "fail");
-    let (_sid, waitpoint_id, _wpk, _sub) = fcall_suspend_execution(
+    let (_sid, waitpoint_id, _wpk, _sub, _wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST,
         &lease_id, &epoch, &att_idx, &attempt_id,
         "waiting_for_approval", &resume_cond, Some(past_timeout), "fail",
@@ -2057,7 +2077,7 @@ async fn test_suspend_timeout_auto_resume() {
     // Lua checks behavior == "auto_resume" (not the long form)
     let past_timeout = TimestampMs::now().0 - 1000;
     let resume_cond = build_resume_condition_json(&["approval"], "fail");
-    let (_sid, waitpoint_id, _wpk, _sub) = fcall_suspend_execution(
+    let (_sid, waitpoint_id, _wpk, _sub, _wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST,
         &lease_id, &epoch, &att_idx, &attempt_id,
         "waiting_for_approval", &resume_cond, Some(past_timeout), "auto_resume",
@@ -2094,13 +2114,13 @@ async fn test_pending_waitpoint_with_buffered_signal() {
         fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
 
     // 1. Create pending waitpoint while still active
-    let (waitpoint_id, _waitpoint_key) = fcall_create_pending_waitpoint(
+    let (waitpoint_id, _waitpoint_key, wp_token) = fcall_create_pending_waitpoint(
         &tc, &eid, &att_idx, 60_000,
     ).await;
 
     // 2. Buffer a signal against the pending waitpoint (before suspension)
     let (_sig_id, _effect) = fcall_buffer_signal(
-        &tc, &eid, &waitpoint_id, "callback_result", "",
+        &tc, &eid, &waitpoint_id, "callback_result", "", &wp_token,
     ).await;
 
     // 3. Now suspend with the pending waitpoint — condition matches buffered signal
@@ -2201,7 +2221,7 @@ async fn test_signal_idempotency() {
 
     // Use 2 matchers so first signal doesn't trigger resume
     let resume_cond = build_resume_condition_json(&["sig_a", "sig_b"], "fail");
-    let (_sid, waitpoint_id, _wpk, _sub) = fcall_suspend_execution(
+    let (_sid, waitpoint_id, _wpk, _sub, wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST,
         &lease_id, &epoch, &att_idx, &attempt_id,
         "waiting_for_signal", &resume_cond, None, "fail",
@@ -2210,7 +2230,7 @@ async fn test_signal_idempotency() {
     // First signal delivery
     let (sig_id_1, effect_1) = fcall_deliver_signal(
         &tc, &eid, LANE, &waitpoint_id,
-        "sig_a", "callback", "dedup-key-1",
+        "sig_a", "callback", "dedup-key-1", &wp_token,
     ).await;
     assert!(!sig_id_1.is_empty());
     assert_eq!(effect_1, "appended_to_waitpoint",
@@ -2243,6 +2263,7 @@ async fn test_signal_idempotency() {
         idx.lane_suspended(&lane_id),
         idx.lane_delayed(&lane_id),
         idx.suspension_timeout(),
+        idx.waitpoint_hmac_secrets(),
     ];
 
     let args: Vec<String> = vec![
@@ -2263,6 +2284,7 @@ async fn test_signal_idempotency() {
         "0".to_owned(),                      // 15 resume_delay_ms
         "1000".to_owned(),                   // 16 signal_maxlen
         "10000".to_owned(),                  // 17 max_signals
+        wp_token.clone(),                    // 18 waitpoint_token
     ];
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -2301,7 +2323,7 @@ async fn test_cancel_suspended_execution() {
         fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
 
     let resume_cond = build_resume_condition_json(&["approval"], "fail");
-    let (_sid, waitpoint_id, _wpk, _sub) = fcall_suspend_execution(
+    let (_sid, waitpoint_id, _wpk, _sub, _wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST,
         &lease_id, &epoch, &att_idx, &attempt_id,
         "waiting_for_approval", &resume_cond, None, "fail",
@@ -2642,16 +2664,17 @@ async fn fcall_create_budget_full(
     //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
     //   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
     let dim_count = hard_limits.len();
-    let mut args: Vec<String> = Vec::new();
-    args.push(budget_id.to_owned());
-    args.push("lane".to_owned());
-    args.push("test-lane".to_owned());
-    args.push("strict".to_owned());
-    args.push("fail".to_owned());
-    args.push("warn".to_owned());
-    args.push(reset_interval_ms.to_string());
-    args.push(now.to_string());
-    args.push(dim_count.to_string());
+    let mut args: Vec<String> = vec![
+        budget_id.to_owned(),
+        "lane".to_owned(),
+        "test-lane".to_owned(),
+        "strict".to_owned(),
+        "fail".to_owned(),
+        "warn".to_owned(),
+        reset_interval_ms.to_string(),
+        now.to_string(),
+        dim_count.to_string(),
+    ];
     for (dim, _) in hard_limits {
         args.push((*dim).to_owned());
     }
@@ -3172,7 +3195,7 @@ async fn set_flow_id_on_exec(tc: &TestCluster, eid: &ExecutionId, flow_id: &str)
     let config = test_config();
     let partition = execution_partition(eid, &config);
     let ctx = ExecKeyContext::new(&partition, eid);
-    tc.client().cmd("HSET").arg(&ctx.core()).arg("flow_id").arg(flow_id)
+    tc.client().cmd("HSET").arg(ctx.core()).arg("flow_id").arg(flow_id)
         .execute::<i64>().await.expect("HSET flow_id");
 }
 
@@ -3909,6 +3932,7 @@ async fn test_error_paths() {
         "5000".to_owned(),
         String::new(),
         String::new(),
+        String::new(), // worker_capabilities_csv
     ];
     let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -4022,7 +4046,7 @@ async fn test_error_paths() {
     let policy = r#"{"retry_policy":{"max_retries":0}}"#;
     let _: () = tc.client()
         .cmd("SET")
-        .arg(&ctx4.policy())
+        .arg(ctx4.policy())
         .arg(policy)
         .execute()
         .await
@@ -4133,10 +4157,11 @@ async fn test_scheduler_claim_priority_ordering() {
         tc.client().clone(),
         config,
     );
+    let no_caps = std::collections::BTreeSet::<String>::new();
 
     // First grant should go to highest priority (1000)
     let grant1 = scheduler
-        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &no_caps, 5000)
         .await
         .expect("scheduler claim 1 should not error");
     let grant1 = grant1.expect("should find an eligible execution");
@@ -4152,7 +4177,7 @@ async fn test_scheduler_claim_priority_ordering() {
 
     // Second grant should go to next highest priority (100)
     let grant2 = scheduler
-        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &no_caps, 5000)
         .await
         .expect("scheduler claim 2 should not error");
     let grant2 = grant2.expect("should find second eligible execution");
@@ -4168,7 +4193,7 @@ async fn test_scheduler_claim_priority_ordering() {
 
     // Third grant should go to lowest priority (10)
     let grant3 = scheduler
-        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &no_caps, 5000)
         .await
         .expect("scheduler claim 3 should not error");
     let grant3 = grant3.expect("should find third eligible execution");
@@ -4184,7 +4209,7 @@ async fn test_scheduler_claim_priority_ordering() {
 
     // Fourth claim: nothing left
     let grant4 = scheduler
-        .claim_for_worker(&lane_id, &worker_id, &wiid, 5000)
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &no_caps, 5000)
         .await
         .expect("scheduler claim 4 should not error");
     assert!(grant4.is_none(), "no more eligible executions");
@@ -4283,7 +4308,7 @@ async fn test_stream_payload_size_enforcement() {
     let ctx = ExecKeyContext::new(&partition, &eid);
     let att = AttemptIndex::new(att_idx.parse().unwrap());
     let frame_count: Option<String> = tc.client()
-        .cmd("HGET").arg(&ctx.stream_meta(att)).arg("frame_count")
+        .cmd("HGET").arg(ctx.stream_meta(att)).arg("frame_count")
         .execute().await.unwrap();
     assert_eq!(frame_count.as_deref(), Some("2"), "only 2 frames should exist");
 
@@ -4413,7 +4438,7 @@ async fn test_golden_path_all_methods() {
 
     // 6. Suspend
     let resume_cond = build_resume_condition_json(&["continue"], "fail");
-    let (_susp_id, wp_id_str, _wp_key, sub_status) = fcall_suspend_execution(
+    let (_susp_id, wp_id_str, _wp_key, sub_status, wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &att_idx, &attempt_id,
         "waiting_for_signal", &resume_cond, None, "fail",
     ).await;
@@ -4432,7 +4457,7 @@ async fn test_golden_path_all_methods() {
 
     // 7. Deliver signal → triggers resume
     let (sig_id, effect) = fcall_deliver_signal(
-        &tc, &eid, LANE, &wp_id_str, "continue", "api", "",
+        &tc, &eid, LANE, &wp_id_str, "continue", "api", "", &wp_token,
     ).await;
     assert!(!sig_id.is_empty());
     assert_eq!(effect, "resume_condition_satisfied");
@@ -4672,10 +4697,10 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
         ff_sdk::task::TimeoutBehavior::Fail,
     ).await.unwrap();
 
-    let (waitpoint_id, _waitpoint_key) = match outcome {
-        ff_sdk::task::SuspendOutcome::Suspended { waitpoint_id, waitpoint_key, .. } => {
-            (waitpoint_id, waitpoint_key)
-        }
+    let (waitpoint_id, _waitpoint_key, waitpoint_token) = match outcome {
+        ff_sdk::task::SuspendOutcome::Suspended {
+            waitpoint_id, waitpoint_key, waitpoint_token, ..
+        } => (waitpoint_id, waitpoint_key, waitpoint_token),
         ff_sdk::task::SuspendOutcome::AlreadySatisfied { .. } => {
             panic!("should not be already satisfied");
         }
@@ -4696,6 +4721,7 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
         source_type: "test".into(),
         source_identity: "test-runner".into(),
         idempotency_key: None,
+        waitpoint_token,
     };
     let sig_outcome = worker.deliver_signal(&eid, &waitpoint_id, signal).await.unwrap();
     match sig_outcome {
@@ -4950,7 +4976,7 @@ async fn test_sdk_claim_retry_attempt_index() {
     let ctx = ExecKeyContext::new(&partition, &eid);
     let _: () = tc.client()
         .cmd("SET")
-        .arg(&ctx.policy())
+        .arg(ctx.policy())
         .arg(r#"{"retry_policy":{"max_retries":3,"backoff":{"type":"fixed","delay_ms":10}}}"#)
         .execute()
         .await
@@ -5440,6 +5466,10 @@ async fn test_server() -> ff_server::server::Server {
         skip_library_load: true, // TestCluster::connect() already loaded it
         cors_origins: vec!["*".to_owned()],
         api_token: None,
+        waitpoint_hmac_secret:
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        waitpoint_hmac_grace_ms: 86_400_000,
+        max_concurrent_stream_ops: 64,
     };
     ff_server::server::Server::start(server_config)
         .await
@@ -5664,7 +5694,7 @@ async fn test_server_flow_lifecycle() {
     let config = test_config();
     let up_partition = execution_partition(&upstream, &config);
     let up_ctx = ExecKeyContext::new(&up_partition, &upstream);
-    let stored_fid: Option<String> = tc.client().cmd("HGET").arg(&up_ctx.core())
+    let stored_fid: Option<String> = tc.client().cmd("HGET").arg(up_ctx.core())
         .arg("flow_id").execute().await.unwrap();
     assert_eq!(stored_fid.as_deref(), Some(flow_id.to_string().as_str()),
         "flow_id should be set on upstream exec_core");
@@ -5751,7 +5781,7 @@ async fn test_server_flow_lifecycle() {
         "downstream should be cancelled after cancel_flow");
 
     // Verify flow core state is cancelled (reuse fctx from step 4)
-    let flow_state: Option<String> = tc.client().cmd("HGET").arg(&fctx.core())
+    let flow_state: Option<String> = tc.client().cmd("HGET").arg(fctx.core())
         .arg("public_flow_state").execute().await.unwrap();
     assert_eq!(flow_state.as_deref(), Some("cancelled"));
 
@@ -5779,7 +5809,7 @@ async fn test_server_deliver_signal() {
 
     // 2. Suspend with resume condition
     let cond_json = build_resume_condition_json(&["test_signal"], "fail");
-    let (_susp_id, wp_id_str, _wp_key, sub) = fcall_suspend_execution(
+    let (_susp_id, wp_id_str, _wp_key, sub, wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST, &lease_id, &lease_epoch,
         "0", &attempt_id, "waiting_signal", &cond_json, None, "fail",
     ).await;
@@ -5813,6 +5843,7 @@ async fn test_server_deliver_signal() {
         resume_delay_ms: None,
         max_signals_per_execution: None,
         signal_maxlen: None,
+        waitpoint_token: ff_core::types::WaitpointToken::new(wp_token),
         now: TimestampMs::now(),
     };
     let result = server.deliver_signal(&signal_args).await.unwrap();
@@ -5850,7 +5881,7 @@ async fn test_server_change_priority() {
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
     let prio: Option<String> = tc.client().cmd("HGET")
-        .arg(&ctx.core()).arg("priority").execute().await.unwrap();
+        .arg(ctx.core()).arg("priority").execute().await.unwrap();
     assert_eq!(prio.as_deref(), Some("100"));
 
     // Change priority via Server API
@@ -5860,7 +5891,7 @@ async fn test_server_change_priority() {
 
     // Verify new priority in exec_core
     let new_prio: Option<String> = tc.client().cmd("HGET")
-        .arg(&ctx.core()).arg("priority").execute().await.unwrap();
+        .arg(ctx.core()).arg("priority").execute().await.unwrap();
     assert_eq!(new_prio.as_deref(), Some("500"));
 
     server.shutdown().await;
@@ -5970,7 +6001,9 @@ async fn test_server_methods_wrong_execution_id() {
     let err = server.replay_execution(&bogus).await;
     assert!(err.is_err(), "replay_execution on bogus should fail");
 
-    // deliver_signal → script error
+    // deliver_signal → script error (bogus token, bogus execution).
+    // The bogus token is fine here — this test asserts the execution-not-found
+    // path fails, so any token shape is acceptable.
     let signal_args = ff_core::contracts::DeliverSignalArgs {
         execution_id: bogus.clone(),
         waitpoint_id: WaitpointId::new(),
@@ -5989,6 +6022,7 @@ async fn test_server_methods_wrong_execution_id() {
         resume_delay_ms: None,
         max_signals_per_execution: None,
         signal_maxlen: None,
+        waitpoint_token: ff_core::types::WaitpointToken::new("k1:0000000000000000000000000000000000000000"),
         now: TimestampMs::now(),
     };
     let err = server.deliver_signal(&signal_args).await;
@@ -6044,7 +6078,7 @@ async fn test_server_get_execution_all_phases() {
 
     // Phase 3: SUSPENDED
     let cond_json = build_resume_condition_json(&["resume_me"], "fail");
-    let (_susp_id, wp_id_str, _wp_key, _sub) = fcall_suspend_execution(
+    let (_susp_id, wp_id_str, _wp_key, _sub, wp_token) = fcall_suspend_execution(
         &tc, &eid, LANE, WORKER_INST, &lid, &lep, "0", &aid,
         "waiting_signal", &cond_json, None, "fail",
     ).await;
@@ -6057,7 +6091,7 @@ async fn test_server_get_execution_all_phases() {
     assert_eq!(info.public_state, ff_core::state::PublicState::Suspended);
 
     // Phase 4: Signal → back to RUNNABLE
-    fcall_deliver_signal(&tc, &eid, LANE, &wp_id_str, "resume_me", "test", "").await;
+    fcall_deliver_signal(&tc, &eid, LANE, &wp_id_str, "resume_me", "test", "", &wp_token).await;
     let info = server.get_execution(&eid).await.unwrap();
     assert_eq!(info.state_vector.lifecycle_phase, ff_core::state::LifecyclePhase::Runnable);
     assert_eq!(info.state_vector.attempt_state, ff_core::state::AttemptState::AttemptInterrupted);
@@ -6410,7 +6444,7 @@ async fn test_server_create_cancel_roundtrip() {
     // Verify flow is cancelled
     let fpart = ff_core::partition::flow_partition(&flow_id, &config);
     let fctx = ff_core::keys::FlowKeyContext::new(&fpart, &flow_id);
-    let pfs: Option<String> = tc.client().cmd("HGET").arg(&fctx.core())
+    let pfs: Option<String> = tc.client().cmd("HGET").arg(fctx.core())
         .arg("public_flow_state").execute().await.unwrap();
     assert_eq!(pfs.as_deref(), Some("cancelled"));
 
@@ -6469,6 +6503,10 @@ async fn test_system_engine_with_concurrent_scanners() {
             skip_library_load: true,
             cors_origins: vec!["*".to_owned()],
             api_token: None,
+            waitpoint_hmac_secret:
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            waitpoint_hmac_grace_ms: 86_400_000,
+            max_concurrent_stream_ops: 64,
         }
     };
     let server = ff_server::server::Server::start(server_config)
@@ -6537,4 +6575,1144 @@ async fn test_system_engine_with_concurrent_scanners() {
     }).await;
 
     server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Batch B: Capability routing (RFC-009)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Worker caps flow through ARGV[9] of ff_issue_claim_grant. Executions
+// declare required_capabilities in ExecutionPolicy.routing_requirements;
+// ff_create_execution extracts a sorted CSV onto exec_core. On mismatch
+// the Lua returns ("capability_mismatch", missing_csv) WITHOUT mutating
+// the eligible ZSET — the execution stays queued for a matching worker.
+
+async fn create_execution_with_caps(
+    tc: &TestCluster,
+    eid: &ExecutionId,
+    lane: &str,
+    required: &[&str],
+) {
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(lane);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.payload(),
+        ctx.policy(),
+        ctx.tags(),
+        idx.lane_eligible(&lane_id),
+        ctx.noop(),
+        idx.execution_deadline(),
+        idx.all_executions(),
+    ];
+
+    let policy_json = if required.is_empty() {
+        "{}".to_owned()
+    } else {
+        let caps_json = serde_json::to_string(required).unwrap();
+        format!(
+            r#"{{"routing_requirements":{{"required_capabilities":{caps_json}}}}}"#
+        )
+    };
+
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        NS.to_owned(),
+        lane.to_owned(),
+        "cap_test".to_owned(),
+        "0".to_owned(),
+        "cap-test".to_owned(),
+        policy_json,
+        r#"{"t":1}"#.to_owned(),
+        String::new(),
+        String::new(),
+        "{}".to_owned(),
+        String::new(),
+        partition.index.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc
+        .client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await
+        .expect("FCALL ff_create_execution failed");
+    parse_ok_fields(&raw, "ff_create_execution");
+}
+
+async fn fcall_claim_grant_with_caps(
+    tc: &TestCluster,
+    eid: &ExecutionId,
+    lane: &str,
+    worker_caps: &[&str],
+) -> Value {
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(lane);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.claim_grant(),
+        idx.lane_eligible(&lane_id),
+    ];
+
+    let caps_csv: String = worker_caps
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        WORKER.to_owned(),
+        WORKER_INST.to_owned(),
+        lane.to_owned(),
+        String::new(),
+        "5000".to_owned(),
+        String::new(),
+        String::new(),
+        caps_csv,
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    tc.client()
+        .fcall("ff_issue_claim_grant", &kr, &ar)
+        .await
+        .expect("FCALL ff_issue_claim_grant transport failure")
+}
+
+async fn assert_still_eligible(tc: &TestCluster, eid: &ExecutionId, lane: &str) {
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let idx = IndexKeys::new(&partition);
+    let eligible_key = idx.lane_eligible(&LaneId::new(lane));
+    let score: Option<String> = tc
+        .client()
+        .cmd("ZSCORE")
+        .arg(&eligible_key)
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("ZSCORE transport");
+    assert!(
+        score.is_some(),
+        "execution {eid} should still be in eligible ZSET after capability_mismatch"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_match_superset() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = ExecutionId::new();
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu", "cuda"]).await;
+    assert_ok(&raw, "capability_match_superset");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_exact_match() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = ExecutionId::new();
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    assert_ok(&raw, "capability_exact_match");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_empty_requirement() {
+    // Backwards compat: no required_capabilities → any worker matches,
+    // including a worker with NO caps declared.
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = ExecutionId::new();
+    create_execution_with_caps(&tc, &eid, LANE, &[]).await;
+    let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &[]).await;
+    assert_ok(&raw, "capability_empty_requirement");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_missing_one() {
+    // Worker satisfies some but not all required caps → capability_mismatch.
+    // Execution must stay in eligible ZSET.
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = ExecutionId::new();
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu", "torch>=2.3"]).await;
+    let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    assert_err(&raw, "capability_mismatch", "missing one required cap");
+    assert_still_eligible(&tc, &eid, LANE).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_no_overlap() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = ExecutionId::new();
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["cpu"]).await;
+    assert_err(&raw, "capability_mismatch", "no overlap");
+    assert_still_eligible(&tc, &eid, LANE).await;
+}
+
+/// Execution-side ingress: a required capability containing a comma must
+/// be rejected by `ff_create_execution`. Without this rejection the
+/// Lua-side CSV subset check would silently split the token at the comma
+/// and accept a worker that advertises only the prefix — a silent auth
+/// bypass. See lua/execution.lua's routing_requirements extraction.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_required_comma_rejected() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.payload(),
+        ctx.policy(),
+        ctx.tags(),
+        idx.lane_eligible(&lane_id),
+        ctx.noop(),
+        idx.execution_deadline(),
+        idx.all_executions(),
+    ];
+    // A token with an embedded comma. This MUST be rejected, otherwise
+    // the wire CSV would parse as two tokens on the Lua side.
+    let policy_json = r#"{"routing_requirements":{"required_capabilities":["gpu,cuda"]}}"#;
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        NS.to_owned(),
+        LANE.to_owned(),
+        "cap_comma_test".to_owned(),
+        "0".to_owned(),
+        "cap-test".to_owned(),
+        policy_json.to_owned(),
+        r#"{"t":1}"#.to_owned(),
+        String::new(),
+        String::new(),
+        "{}".to_owned(),
+        String::new(),
+        partition.index.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc
+        .client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await
+        .expect("transport");
+    assert_err(&raw, "invalid_capabilities", "comma in required token");
+}
+
+/// Execution-side ingress: required_capabilities over the 4096-byte CSV
+/// limit must be rejected by `ff_create_execution` rather than landing an
+/// unclaimable execution with a multi-kilobyte exec_core field. Limit is
+/// inclusive: exactly CAPS_MAX_BYTES accepts; CAPS_MAX_BYTES+1 rejects.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_required_csv_too_large() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Generate enough tokens that the resulting sorted CSV crosses
+    // CAPS_MAX_BYTES = 4096. Tokens "c000..c999" at 5 bytes + 1 comma each
+    // → worst case ~6KB; use 800 such tokens to safely exceed the limit
+    // while staying under CAPS_MAX_TOKENS (256) — wait, 800 > 256, so the
+    // too_many_tokens guard would fire first. To hit the bytes guard, use
+    // <=256 tokens with LONG strings. 32 * 200-byte tokens ≈ 6.4 KB.
+    let mut caps: Vec<String> = Vec::new();
+    for i in 0..32 {
+        caps.push(format!("{}{}", "c".repeat(200), i));
+    }
+    let caps_refs: Vec<&str> = caps.iter().map(String::as_str).collect();
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+
+    let policy_json = format!(
+        r#"{{"routing_requirements":{{"required_capabilities":{}}}}}"#,
+        serde_json::to_string(&caps_refs).unwrap()
+    );
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.payload(),
+        ctx.policy(),
+        ctx.tags(),
+        idx.lane_eligible(&lane_id),
+        ctx.noop(),
+        idx.execution_deadline(),
+        idx.all_executions(),
+    ];
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        NS.to_owned(),
+        LANE.to_owned(),
+        "cap_big_test".to_owned(),
+        "0".to_owned(),
+        "cap-test".to_owned(),
+        policy_json,
+        r#"{"t":1}"#.to_owned(),
+        String::new(),
+        String::new(),
+        "{}".to_owned(),
+        String::new(),
+        partition.index.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc
+        .client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await
+        .expect("transport");
+    assert_err(&raw, "invalid_capabilities", "CSV too large");
+}
+
+/// ff_issue_reclaim_grant applies the same capability check as the initial
+/// grant path: a reclaiming worker whose caps don't satisfy the execution's
+/// required set is rejected with capability_mismatch, execution stays in
+/// the lease_expiry ZSET for a different reclaimer to pick up.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_reclaim_grant_mismatch() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    // Create with required cap {gpu} and get the execution into
+    // lease_expired_reclaimable state.
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    // Initial worker matches so grant succeeds.
+    let grant = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    assert_ok(&grant, "initial grant should succeed for gpu worker");
+    // Claim with short lease TTL so we can time-expire it.
+    let (_lease_id, _epoch, _att_idx, _attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 100).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fcall_mark_lease_expired(&tc, &eid).await;
+
+    // Attempt reclaim with a worker that advertises {cpu} only. Must be
+    // rejected; execution remains lease_expired_reclaimable.
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+
+    let keys: Vec<String> = vec![ctx.core(), ctx.claim_grant(), idx.lease_expiry()];
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        WORKER.to_owned(),
+        "reclaim-cpu-worker".to_owned(),
+        LANE.to_owned(),
+        String::new(),
+        "5000".to_owned(),
+        String::new(),
+        String::new(),
+        "cpu".to_owned(), // worker_capabilities_csv — missing gpu
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc
+        .client()
+        .fcall("ff_issue_reclaim_grant", &kr, &ar)
+        .await
+        .expect("transport");
+    assert_err(
+        &raw,
+        "capability_mismatch",
+        "reclaim with non-matching caps",
+    );
+
+    // Execution should remain reclaimable for a different worker.
+    assert_execution_state(
+        &tc,
+        &eid,
+        &ExpectedState {
+            lifecycle_phase: Some(ff_core::state::LifecyclePhase::Active),
+            ownership_state: Some(ff_core::state::OwnershipState::LeaseExpiredReclaimable),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RFC-006 #2: STREAM READ + TAIL
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Read all frames on an attempt that wrote two frames. Verifies round-trip
+/// of every field written by `ff_append_frame`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_read_stream_round_trips_append_frame_fields() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_read_rt", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "log", "hello world", 0,
+    ).await;
+    fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "output", "final result", 0,
+    ).await;
+
+    let result = ff_sdk::read_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(att_idx.parse().unwrap()),
+        "-",
+        "+",
+        ff_sdk::STREAM_READ_HARD_CAP,
+    )
+    .await
+    .expect("read_stream");
+    let frames = &result.frames;
+
+    assert_eq!(frames.len(), 2, "expected 2 frames, got {}", frames.len());
+    let f0 = &frames[0];
+    assert_eq!(f0.fields.get("frame_type").map(String::as_str), Some("log"));
+    assert_eq!(f0.fields.get("payload").map(String::as_str), Some("hello world"));
+    assert_eq!(f0.fields.get("encoding").map(String::as_str), Some("utf8"));
+    assert_eq!(f0.fields.get("source").map(String::as_str), Some("worker"));
+    assert!(f0.fields.contains_key("ts"), "ts field missing");
+
+    let f1 = &frames[1];
+    assert_eq!(f1.fields.get("frame_type").map(String::as_str), Some("output"));
+    assert_eq!(f1.fields.get("payload").map(String::as_str), Some("final result"));
+
+    assert_ne!(f0.id, f1.id);
+}
+
+/// Empty / never-written stream → read returns [].
+#[tokio::test]
+#[serial_test::serial]
+async fn test_read_stream_empty_returns_empty() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    let result = ff_sdk::read_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(0),
+        "-",
+        "+",
+        100,
+    )
+    .await
+    .expect("read_stream on empty");
+    assert!(result.frames.is_empty(), "expected empty vec, got {}", result.frames.len());
+    assert!(!result.is_closed(), "never-written stream must present as open");
+}
+
+/// Write many frames, read a page with limit, then resume from the next id.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_read_stream_slice_and_resume() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_slice", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    const TOTAL: usize = 50;
+    for i in 0..TOTAL {
+        fcall_append_frame(
+            &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+            "log", &format!("msg-{i}"), 0,
+        ).await;
+    }
+
+    let att = AttemptIndex::new(att_idx.parse().unwrap());
+
+    let page1 = ff_sdk::read_stream(tc.client(), &config, &eid, att, "-", "+", 20)
+        .await
+        .expect("read page1");
+    assert_eq!(page1.frames.len(), 20);
+
+    let last_id = page1.frames.last().unwrap().id.clone();
+    // XRANGE start is inclusive. Bump the sequence to skip the cursor entry.
+    let (ms, seq) = last_id.split_once('-').expect("entry id has ms-seq form");
+    let next_seq: u64 = seq.parse::<u64>().unwrap() + 1;
+    let resume_from = format!("{ms}-{next_seq}");
+
+    let page2 = ff_sdk::read_stream(tc.client(), &config, &eid, att, &resume_from, "+", 100)
+        .await
+        .expect("read page2");
+    assert_eq!(page2.frames.len(), TOTAL - 20);
+    assert_ne!(page2.frames[0].id, last_id, "resume must skip cursor entry");
+}
+
+/// Tail on an empty stream with short block_ms returns [] near the timeout.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_tail_stream_timeout_returns_empty() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    let started = std::time::Instant::now();
+    let result = ff_sdk::tail_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(0),
+        "0-0",
+        200,
+        50,
+    )
+    .await
+    .expect("tail_stream");
+    let elapsed = started.elapsed();
+
+    assert!(result.frames.is_empty(), "expected timeout with empty vec");
+    assert!(!result.is_closed(), "never-written stream must not report closed");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "expected to block at least ~200ms, blocked {elapsed:?}"
+    );
+}
+
+/// Tail unblocks when a writer appends a frame while we're blocking.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_tail_stream_unblocks_on_write() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_tail", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    let eid_w = eid.clone();
+    let att_idx_w = att_idx.clone();
+    let lease_w = lease_id.clone();
+    let epoch_w = epoch.clone();
+    let att_id_w = attempt_id.clone();
+    let writer = tokio::spawn(async move {
+        let w = TestCluster::connect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        fcall_append_frame(
+            &w, &eid_w, &att_idx_w, &lease_w, &epoch_w, &att_id_w,
+            "log", "tail-unblock-payload", 0,
+        ).await;
+    });
+
+    let result = ff_sdk::tail_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(att_idx.parse().unwrap()),
+        "0-0",
+        2_000,
+        50,
+    )
+    .await
+    .expect("tail_stream");
+
+    writer.await.unwrap();
+
+    assert_eq!(result.frames.len(), 1, "expected 1 frame, got {}", result.frames.len());
+    assert_eq!(
+        result.frames[0].fields.get("payload").map(String::as_str),
+        Some("tail-unblock-payload")
+    );
+}
+
+/// Regression: ferriskey auto-extends request_timeout for XREAD BLOCK by
+/// `BLOCK_arg + 500ms`, so tail calls with block_ms > the client's default
+/// request_timeout (5s) do NOT spuriously time out. This test proves that
+/// by blocking for 7s (above 5s client request_timeout).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_tail_stream_long_block_respects_ferriskey_timeout_extension() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    let started = std::time::Instant::now();
+    let result = ff_sdk::tail_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(0),
+        "0-0",
+        7_000, // deliberately > default 5s request_timeout
+        50,
+    )
+    .await
+    .expect("tail_stream must not surface transport timeout when ferriskey extends BLOCK timeout");
+    let elapsed = started.elapsed();
+    let frames = &result.frames;
+
+    assert!(frames.is_empty(), "no writer → expected empty vec");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(6_500),
+        "expected to block ~7s, blocked {elapsed:?}"
+    );
+    assert!(
+        elapsed <= std::time::Duration::from_millis(9_000),
+        "expected to unblock near block_ms, blocked {elapsed:?}"
+    );
+}
+
+/// RFC-006 #2 terminal signal: after the attempt completes, both read_stream
+/// and a subsequent non-blocking tail_stream surface `closed_at` +
+/// `closed_reason` so consumers can exit their polling loop without a
+/// timeout fallback.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_stream_closed_signal_propagates_to_read_and_tail() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_closed", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // Write a frame, complete the attempt — completion closes the stream
+    // via lua/execution.lua with `closed_reason=attempt_success`.
+    fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "log", "final-frame", 0,
+    ).await;
+    fcall_complete_execution(&tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &attempt_id).await;
+
+    let att = AttemptIndex::new(att_idx.parse().unwrap());
+
+    // read_stream sees the frame AND the terminal markers.
+    let read = ff_sdk::read_stream(tc.client(), &config, &eid, att, "-", "+", 100)
+        .await
+        .expect("read_stream after complete");
+    assert_eq!(read.frames.len(), 1);
+    assert!(read.is_closed(), "read_stream must report closed after complete");
+    assert_eq!(read.closed_reason.as_deref(), Some("attempt_success"));
+    assert!(read.closed_at.is_some());
+
+    // tail_stream with block_ms=0 at the tip returns no new frames but
+    // still reports closed — this is the signal consumers poll on.
+    let tip = read.frames.last().unwrap().id.clone();
+    let tail = ff_sdk::tail_stream(tc.client(), &config, &eid, att, &tip, 0, 10)
+        .await
+        .expect("tail_stream at tip");
+    assert!(tail.frames.is_empty());
+    assert!(tail.is_closed(), "tail_stream must report closed after complete");
+    assert_eq!(tail.closed_reason.as_deref(), Some("attempt_success"));
+}
+
+/// R4 regression: lease expiry closes stream_meta so tail consumers observe
+/// the terminal signal even if no reclaim ever runs (worker OOM / node dead).
+/// closed_reason=lease_expired is set on the FIRST close; later reclaim can
+/// overwrite it to "reclaimed" via its own HSET.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_lease_expired_closes_stream_meta() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_lease_expire", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    // Short TTL so the lease expires while we wait.
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 200).await;
+
+    // Write a frame so stream_meta exists (the close path skips if meta
+    // was never created — a never-written attempt has no stream to close).
+    fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "log", "pre-expiry frame", 0,
+    ).await;
+
+    // Wait past TTL + a margin for Valkey's server-time resolution.
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+    fcall_mark_lease_expired(&tc, &eid).await;
+
+    let att = AttemptIndex::new(att_idx.parse().unwrap());
+    let result = ff_sdk::read_stream(
+        tc.client(), &config, &eid, att, "-", "+", 100,
+    )
+    .await
+    .expect("read_stream after lease expiry");
+
+    assert_eq!(result.frames.len(), 1);
+    assert!(
+        result.is_closed(),
+        "lease expiry must close stream_meta so tail consumers exit"
+    );
+    assert_eq!(result.closed_reason.as_deref(), Some("lease_expired"));
+    assert!(result.closed_at.is_some());
+}
+
+/// block_ms == 0 → non-blocking peek returns immediately with available entries.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_tail_stream_no_block_returns_available() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "stream_peek", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    fcall_append_frame(
+        &tc, &eid, &att_idx, &lease_id, &epoch, &attempt_id,
+        "log", "peek-1", 0,
+    ).await;
+
+    let started = std::time::Instant::now();
+    let result = ff_sdk::tail_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(att_idx.parse().unwrap()),
+        "0-0",
+        0,
+        50,
+    )
+    .await
+    .expect("tail_stream peek");
+    let elapsed = started.elapsed();
+    let frames = &result.frames;
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].fields.get("payload").map(String::as_str), Some("peek-1"));
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "non-blocking peek should return fast, took {elapsed:?}"
+    );
+}
+
+/// R3 regression (BUG2 `count_limit == 0` rejected at every layer).
+///
+/// Reject at the SDK boundary with `SdkError::Config` — never silently
+/// upgraded to `STREAM_READ_HARD_CAP`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_read_stream_rejects_zero_count_limit() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    let err = ff_sdk::read_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(0),
+        "-",
+        "+",
+        0,
+    )
+    .await
+    .expect_err("count_limit=0 must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("count_limit must be >= 1"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// R3 regression (BUG2 `count_limit == 0` rejected on tail path too).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_tail_stream_rejects_zero_count_limit() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+
+    let err = ff_sdk::tail_stream(
+        tc.client(),
+        &config,
+        &eid,
+        AttemptIndex::new(0),
+        "0-0",
+        0,
+        0,
+    )
+    .await
+    .expect_err("count_limit=0 must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("count_limit must be >= 1"),
+        "unexpected error: {msg}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// R2 regression tests (BUG1 + BUG2): fail-closed on malformed policy/caps
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Submit an arbitrary policy_json raw and return the FCALL response.
+/// Deliberately bypasses the well-formed cap helpers above so tests can
+/// exercise the fail-closed parse path in ff_create_execution.
+async fn fcall_create_execution_with_raw_policy(
+    tc: &TestCluster,
+    eid: &ExecutionId,
+    lane: &str,
+    policy_json: &str,
+) -> Value {
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(lane);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.payload(),
+        ctx.policy(),
+        ctx.tags(),
+        idx.lane_eligible(&lane_id),
+        ctx.noop(),
+        idx.execution_deadline(),
+        idx.all_executions(),
+    ];
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        NS.to_owned(),
+        lane.to_owned(),
+        "cap_regression".to_owned(),
+        "0".to_owned(),
+        "cap-test".to_owned(),
+        policy_json.to_owned(),
+        r#"{"t":1}"#.to_owned(),
+        String::new(),
+        String::new(),
+        "{}".to_owned(),
+        String::new(),
+        partition.index.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    tc.client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await
+        .expect("transport")
+}
+
+/// R2-BUG1 regression: a malformed policy_json (trailing comma here) used
+/// to slip through pcall(cjson.decode) as ok_decode=false, silently skip
+/// the routing_requirements extraction, and store an execution with NO
+/// required_capabilities — wildcard-claimable by anyone. Now it returns
+/// invalid_policy_json and writes nothing.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_malformed_policy_json_fails_closed() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let raw = fcall_create_execution_with_raw_policy(
+        &tc,
+        &eid,
+        LANE,
+        r#"{"routing_requirements":{"required_capabilities":["gpu",]}}"#,
+    )
+    .await;
+    assert_err(&raw, "invalid_policy_json", "malformed policy JSON");
+
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let exists: i64 = tc
+        .client()
+        .cmd("EXISTS")
+        .arg(ctx.core())
+        .execute()
+        .await
+        .expect("EXISTS transport");
+    assert_eq!(
+        exists, 0,
+        "exec_core must not exist after invalid_policy_json"
+    );
+}
+
+/// R2-BUG2 regression: a typed-config typo like ["gpu", null, 42] used to
+/// silent-drop the non-strings and store ["gpu"]. That silently erased a
+/// security-sensitive requirement. Now every non-string element aborts
+/// the create call with invalid_capabilities.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_non_string_token_fails_closed() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let cases = [
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu",null]}}"#,
+            "null token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu",42]}}"#,
+            "numeric token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu",{"x":1}]}}"#,
+            "object token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu",""]}}"#,
+            "empty token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":"gpu"}}"#,
+            "required not array",
+        ),
+    ];
+    for (policy_json, label) in cases {
+        let eid = ExecutionId::new();
+        let raw = fcall_create_execution_with_raw_policy(&tc, &eid, LANE, policy_json).await;
+        assert_err(&raw, "invalid_capabilities", label);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// R4: capability-mismatch block-to-route + periodic unblock
+// ═══════════════════════════════════════════════════════════════════════
+
+/// R4-BUG regression: after `ff_issue_claim_grant` returns capability_mismatch,
+/// the scheduler MUST move the execution from the lane's eligible ZSET
+/// into its blocked:route ZSET (eligibility_state=blocked_by_route,
+/// blocking_reason=waiting_for_capable_worker). Otherwise every tick
+/// re-picks the same top-of-zset and hot-loops.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_mismatch_blocks_to_route_zset() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+
+    let config = test_config();
+    let lane_id = LaneId::new(LANE);
+    let worker_id = ff_core::types::WorkerId::new(WORKER);
+    let wiid = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), config);
+
+    // Worker has only {cpu}; execution requires {gpu} → mismatch.
+    let cpu_only: std::collections::BTreeSet<String> =
+        ["cpu".to_owned()].into_iter().collect();
+    let grant = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &cpu_only, 5000)
+        .await
+        .expect("scheduler claim should not error");
+    assert!(grant.is_none(), "no matching worker → no grant returned");
+
+    // Invariant (a)+(b): execution was moved out of eligible into blocked:route
+    let partition = execution_partition(&eid, &config);
+    let idx = IndexKeys::new(&partition);
+    let eligible_score: Option<String> = tc
+        .client()
+        .cmd("ZSCORE")
+        .arg(idx.lane_eligible(&lane_id).as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("ZSCORE eligible");
+    assert!(
+        eligible_score.is_none(),
+        "execution must NOT be in eligible zset after mismatch"
+    );
+
+    let blocked_score: Option<String> = tc
+        .client()
+        .cmd("ZSCORE")
+        .arg(idx.lane_blocked_route(&lane_id).as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("ZSCORE blocked:route");
+    assert!(
+        blocked_score.is_some(),
+        "execution must be in blocked:route zset after mismatch"
+    );
+
+    // Invariant (c): exec_core fields reflect the block.
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let (eligibility_state, blocking_reason): (Option<String>, Option<String>) = {
+        let v: Vec<Option<String>> = tc
+            .client()
+            .cmd("HMGET")
+            .arg(ctx.core().as_str())
+            .arg("eligibility_state")
+            .arg("blocking_reason")
+            .execute()
+            .await
+            .expect("HMGET");
+        (v.first().cloned().flatten(), v.get(1).cloned().flatten())
+    };
+    assert_eq!(
+        eligibility_state.as_deref(),
+        Some("blocked_by_route"),
+        "eligibility_state must be blocked_by_route"
+    );
+    assert_eq!(
+        blocking_reason.as_deref(),
+        Some("waiting_for_capable_worker"),
+        "blocking_reason must be waiting_for_capable_worker"
+    );
+}
+
+/// R4-BUG regression: the engine's unblock scanner MUST promote
+/// `waiting_for_capable_worker`-blocked executions back to eligible once
+/// the union of connected workers' caps covers the required set. Without
+/// this, capability-blocked executions stay stuck forever — exactly the
+/// bug that W3 and W1 both flagged independently in R4.
+///
+/// Uses the unblock scanner directly (not via a running Engine) to keep
+/// the test deterministic.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capable_worker_unblocks_route_blocked() {
+    use ff_engine::scanner::Scanner;
+
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let config = test_config();
+    let lane_id = LaneId::new(LANE);
+    let eid = ExecutionId::new();
+
+    // 1. Create execution with required caps {gpu}; block it via a
+    //    mismatched scheduler claim.
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    let worker_id = ff_core::types::WorkerId::new(WORKER);
+    let wiid = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), config);
+    let cpu_only: std::collections::BTreeSet<String> =
+        ["cpu".to_owned()].into_iter().collect();
+    scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &cpu_only, 5000)
+        .await
+        .expect("scheduler claim should not error");
+
+    // 2. Simulate a capable worker registering by writing the SAME two
+    //    cluster-safe entries the SDK writes on connect: the per-worker
+    //    caps STRING at ff:worker:<id>:caps, AND a SADD into the global
+    //    workers-index SET `ff:idx:workers`. The scanner enumerates
+    //    through the index in cluster mode (a keyspace SCAN would miss
+    //    workers whose caps key hashes to other shards).
+    let instance_id = "capable-gpu-worker";
+    let caps_key = format!("ff:worker:{instance_id}:caps");
+    let _: Option<String> = tc
+        .client()
+        .cmd("SET")
+        .arg(caps_key.as_str())
+        .arg("cuda,gpu")
+        .execute()
+        .await
+        .expect("SET worker caps");
+    let _: Option<i64> = tc
+        .client()
+        .cmd("SADD")
+        .arg("ff:idx:workers")
+        .arg(instance_id)
+        .execute()
+        .await
+        .expect("SADD workers-index");
+
+    // 3. Run the unblock scanner for this execution's partition.
+    let partition_idx = execution_partition(&eid, &config).index;
+    let scanner = ff_engine::scanner::unblock::UnblockScanner::new(
+        std::time::Duration::from_secs(30),
+        vec![lane_id.clone()],
+        config,
+    );
+    let _ = scanner.scan_partition(tc.client(), partition_idx).await;
+
+    // 4. Execution should be back in eligible, off blocked:route.
+    let idx = IndexKeys::new(&execution_partition(&eid, &config));
+    let eligible_score: Option<String> = tc
+        .client()
+        .cmd("ZSCORE")
+        .arg(idx.lane_eligible(&lane_id).as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("ZSCORE eligible");
+    assert!(
+        eligible_score.is_some(),
+        "execution must be promoted back to eligible after capable worker appears"
+    );
+
+    let blocked_score: Option<String> = tc
+        .client()
+        .cmd("ZSCORE")
+        .arg(idx.lane_blocked_route(&lane_id).as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("ZSCORE blocked:route");
+    assert!(
+        blocked_score.is_none(),
+        "execution must NOT be in blocked:route after promotion"
+    );
 }

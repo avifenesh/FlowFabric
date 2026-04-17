@@ -1,17 +1,27 @@
-//! Unblock scanner for budget/quota-blocked executions.
+//! Unblock scanner for budget/quota/capability-blocked executions.
 //!
-//! Scans `ff:idx:{p:N}:lane:<lane>:blocked:budget` and `blocked:quota`
-//! per execution partition. For each blocked execution, re-evaluates the
+//! Scans `ff:idx:{p:N}:lane:<lane>:blocked:{budget,quota,route}` per
+//! execution partition. For each blocked execution, re-evaluates the
 //! blocking condition. If cleared, calls `FCALL ff_unblock_execution`.
 //!
 //! Cross-partition budget check is cached per scan cycle (MANDATORY —
 //! without it, 50K blocked executions = 50K budget reads).
 //!
+//! Capability sweep reads the union of non-authoritative worker cap sets
+//! (`ff:worker:*:caps` — written by `ff-sdk::FlowFabricWorker::connect`)
+//! ONCE per scan cycle and uses it to decide whether a `waiting_for_capable_worker`
+//! execution has a matching worker. This is best-effort: caps sets may
+//! be slightly stale (TTL-less STRING, overwrite on restart), but the
+//! promotion path is self-correcting — a promoted execution that still
+//! can't be claimed gets re-blocked on the next scheduler tick. RFC-009
+//! §7.5 documents the v1 sweep approach and defers connect-triggered
+//! sweeps to V2.
+//!
 //! MUST skip `paused_by_flow_cancel` — only cancel_flow clears that.
 //!
-//! Reference: RFC-008 §2.4, RFC-010 §6
+//! Reference: RFC-008 §2.4, RFC-009 §7.5, RFC-010 §6
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use ff_core::keys::IndexKeys;
@@ -61,12 +71,21 @@ impl Scanner for UnblockScanner {
         // Reset per partition scan (each partition scan is one "cycle").
         let mut budget_cache: HashMap<String, bool> = HashMap::new();
 
+        // Worker-caps union, read ONCE per partition scan.
+        // None = "not queried yet on this cycle"; Some(set) = cached result.
+        // Empty set means no online workers have any caps → nothing to promote.
+        // Partitions scanned later in a cycle reuse the same cached union;
+        // load is bounded by SCAN + GET per `ff:worker:*:caps` key per cycle.
+        let mut caps_union_cache: Option<BTreeSet<String>> = None;
+
         for lane in &self.lanes {
             // Scan blocked:budget
             let budget_key = idx.lane_blocked_budget(lane);
             let r = scan_blocked_set(
                 client, &p, &idx, lane, &budget_key,
-                "waiting_for_budget", &mut budget_cache, &self.partition_config,
+                "waiting_for_budget", &mut budget_cache,
+                &mut caps_union_cache,
+                &self.partition_config,
             ).await;
             total_processed += r.processed;
             total_errors += r.errors;
@@ -75,7 +94,22 @@ impl Scanner for UnblockScanner {
             let quota_key = idx.lane_blocked_quota(lane);
             let r = scan_blocked_set(
                 client, &p, &idx, lane, &quota_key,
-                "waiting_for_quota", &mut budget_cache, &self.partition_config,
+                "waiting_for_quota", &mut budget_cache,
+                &mut caps_union_cache,
+                &self.partition_config,
+            ).await;
+            total_processed += r.processed;
+            total_errors += r.errors;
+
+            // Scan blocked:route (capability-mismatch blocks). Promotion
+            // decision reads the union of connected workers' caps and
+            // checks subset coverage. See check_route_cleared below.
+            let route_key = idx.lane_blocked_route(lane);
+            let r = scan_blocked_set(
+                client, &p, &idx, lane, &route_key,
+                "waiting_for_capable_worker", &mut budget_cache,
+                &mut caps_union_cache,
+                &self.partition_config,
             ).await;
             total_processed += r.processed;
             total_errors += r.errors;
@@ -98,6 +132,7 @@ async fn scan_blocked_set(
     blocked_key: &str,
     expected_reason: &str,
     budget_cache: &mut HashMap<String, bool>,
+    caps_union_cache: &mut Option<BTreeSet<String>>,
     partition_config: &PartitionConfig,
 ) -> ScanResult {
     // Read all members from the blocked set (they're scored by block time)
@@ -167,6 +202,9 @@ async fn scan_blocked_set(
             }
             "waiting_for_quota" => {
                 check_quota_cleared(client, &core_key, eid_str, partition_config).await
+            }
+            "waiting_for_capable_worker" => {
+                check_route_cleared(client, &core_key, caps_union_cache).await
             }
             _ => false,
         };
@@ -467,4 +505,112 @@ async fn check_quota_cleared(
     }
 
     true // quota cleared
+}
+
+/// Check if the capability-block has cleared: some connected worker's
+/// caps now cover the execution's `required_capabilities`.
+///
+/// v1: compute the UNION of every connected worker's caps once per scan
+/// cycle (cached in `caps_union_cache`). If `required_capabilities ⊆ union`,
+/// unblock — the execution has at least one worker that *could* claim it
+/// on the next scheduling tick. If the worker is unavailable or the
+/// scheduler re-mismatches, the scheduler will block it again. That's
+/// the RFC-009 §7.5 "slow cycle" approximation; connect-triggered sweeps
+/// are V2.
+///
+/// Fail-OPEN on union-load failure: if `ff:worker:*:caps` read errors
+/// out, assume a worker might match and let the scheduler re-decide on
+/// the next tick. The caps set is non-authoritative (Lua never reads it);
+/// treating it as "unknown → maybe" preserves liveness. The alternative
+/// (fail-closed) would leave executions stuck whenever the caps-SCAN
+/// happens to hit a transient Valkey error.
+async fn check_route_cleared(
+    client: &ferriskey::Client,
+    core_key: &str,
+    caps_union_cache: &mut Option<BTreeSet<String>>,
+) -> bool {
+    let required_csv: Option<String> = client
+        .cmd("HGET")
+        .arg(core_key)
+        .arg("required_capabilities")
+        .execute()
+        .await
+        .unwrap_or(None);
+    let required_csv = match required_csv {
+        Some(s) if !s.is_empty() => s,
+        _ => return true, // no required caps → anyone can claim
+    };
+
+    if caps_union_cache.is_none() {
+        match load_worker_caps_union(client).await {
+            Ok(union) => *caps_union_cache = Some(union),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "unblock_scanner: failed to read worker caps union — \
+                     assuming match possible (fail-open to preserve liveness)"
+                );
+                return true;
+            }
+        }
+    }
+    let union = caps_union_cache.as_ref().expect("cache populated above");
+
+    // Subset check: every non-empty token in required_csv present in union.
+    required_csv
+        .split(',')
+        .filter(|t| !t.is_empty())
+        .all(|t| union.contains(t))
+}
+
+/// Union of every connected worker's advertised capabilities.
+///
+/// Cluster-safe enumeration: reads the members of
+/// `workers_index_key()` (a SET of worker_instance_ids maintained by
+/// `ff-sdk::FlowFabricWorker::connect`), then per-member `GET` on the
+/// `ff:worker:<id>:caps` STRING. A naive `SCAN MATCH ff:worker:*:caps`
+/// would silently miss workers whose keys hash to shards the `SCAN`
+/// command doesn't visit — Valkey cluster `SCAN` is per-node, not
+/// cluster-wide. This is the same class of bug Batch A fixed by
+/// promoting `budget_policies_index` / `flow_index` / `deps_all_edges`
+/// from keyspace SCAN to explicit index SETs.
+///
+/// Empty caps STRING, missing key, or per-worker GET error are treated
+/// as "no caps" for that worker — the scanner keeps going and the
+/// scheduler will re-evaluate on the next tick anyway (fail-open
+/// matches check_route_cleared's overall policy).
+async fn load_worker_caps_union(
+    client: &ferriskey::Client,
+) -> Result<BTreeSet<String>, ferriskey::Error> {
+    let mut union = BTreeSet::new();
+    let index_key = ff_core::keys::workers_index_key();
+
+    // Single-slot SMEMBERS: index key has no hash tag, so every node
+    // routes to the same slot. Bounded by the number of connected
+    // workers, which is the authoritative universe — unlike
+    // `SCAN MATCH ff:worker:*:caps` which in cluster mode only hits one
+    // shard's keyspace per call.
+    let worker_ids: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&index_key)
+        .execute()
+        .await?;
+
+    for id in &worker_ids {
+        let caps_key = format!("ff:worker:{}:caps", id);
+        let csv: Option<String> = client
+            .cmd("GET")
+            .arg(&caps_key)
+            .execute()
+            .await
+            .unwrap_or(None);
+        if let Some(csv) = csv {
+            for token in csv.split(',') {
+                if !token.is_empty() {
+                    union.insert(token.to_owned());
+                }
+            }
+        }
+    }
+    Ok(union)
 }

@@ -345,6 +345,61 @@ The scheduler prefers the highest-scoring eligible worker. Ties are broken by le
 | C3 | **Capability view is inspectable.** `explain_capability_mismatch` must show why no worker matches. | "Why is this stuck?" for routing. |
 | C4 | **Matching is deterministic enough to debug.** Same inputs → same match result. | Operators can reproduce routing decisions. |
 
+#### 7.5 V1 Implementation (Batch B, 2026-04)
+
+The design above is the target. V1 ships a deliberately simpler subset.
+
+**Model.** `required_capabilities` is a `BTreeSet<String>` of opaque string tokens (e.g. `"gpu"`, `"torch>=2.3"`, `"tools:playwright"`). Match is **exact-string subset**: a worker advertising capability set `W` may claim an execution requiring `R` iff `R ⊆ W`. Empty `R` matches any worker (backwards compatibility). Preferred/forbidden capabilities, isolation levels, locality, and scoring are **not implemented in V1**.
+
+**Token format restriction.** Tokens MUST be non-empty strings containing no comma, no whitespace, and no control characters. UTF-8 printable characters above 0x7F are allowed — i18n cap names like `"东京-gpu"` are valid. The CSV wire form is byte-safe for multibyte UTF-8 because `,` (0x2C) is single-byte and never a UTF-8 continuation (only 0x80-0xBF are). Three independent reasons for the restrictions:
+- `,` is reserved as the CSV delimiter for the wire-level representation between caller and Lua (`ff_issue_claim_grant` ARGV[9] on the worker side and `exec_core.required_capabilities` on the execution side). Embedding a comma would split a single token into two mid-parse: a worker with `{"gpu"}` would appear to satisfy a requirement of `{"gpu,cuda"}` — a silent auth bypass.
+- Empty tokens inflate the CSV with adjacent/leading commas and push the token count past CAPS_MAX_TOKENS for no semantic reason.
+- Whitespace and non-printable / control bytes (`"gpu "`, `"gpu\n"`, zero-width Unicode) produce silent mismatches that are painful to debug — reject at ingress so typos fail loud instead of forever-starving.
+
+Ingress validators reject on all three surfaces:
+- `ff-sdk` `FlowFabricWorker::connect` → `SdkError::Config`
+- `ff-scheduler` `Scheduler::claim_for_worker` → `SchedulerError::Config`
+- Lua `ff_create_execution` (required side) → `err("invalid_capabilities", "required:comma_in_token" | "required:empty_token" | "required:non_string_token")` and `err("invalid_policy_json", ...)` for malformed routing_requirements structure.
+
+Lua validation fails CLOSED: malformed policy_json or any non-string required_capabilities element aborts `ff_create_execution` before exec_core is written. Silent-drop would have let a typed-config typo erase a security-relevant requirement and leave the execution wildcard-claimable.
+
+The same wire form also bounds total size and token count (`CAPS_MAX_BYTES=4096`, `CAPS_MAX_TOKENS=256`), enforced symmetrically on both sides. V2 attestation (see deferred list) would replace CSV with a length-prefixed or JSON encoding, at which point these restrictions lift.
+
+**Starvation timestamp (observability).** On each `capability_mismatch` in `ff_issue_claim_grant` / `ff_issue_reclaim_grant`, the Lua stamps `last_capability_mismatch_at` on exec_core — a single idempotent scalar field. Operators identify permanently-unclaimable executions via `SCAN` + `HGET last_capability_mismatch_at` against a "stuck > 1h" threshold. An earlier design HINCRBY'd a `capability_mismatch_count` field alongside the timestamp; that was removed because under the "stay in eligible ZSET" failure mode (since fixed by block-on-mismatch) the counter grew unboundedly — 100 workers × 1 tick/s × one stuck exec = 8.6M increments/day. A single timestamp field is enough; recency, not rate, is the signal operators want. Full `explain_capability_mismatch` API remains V2.
+
+**Block-on-mismatch (starvation protection).** When `ff_issue_claim_grant` returns `capability_mismatch`, the scheduler MUST move the execution out of the eligible ZSET into a `blocked_route` (reason: `waiting_for_capability`) index on the same partition. Otherwise `ZRANGEBYSCORE eligible -inf +inf LIMIT 0 1` keeps returning the same top-of-zset every scheduling tick, and N workers × 1 tick/s per unmatchable execution = wasted FCALLs/quota-writes/log volume scaling linearly with the backlog. A periodic "blocked_route sweep" (v1: every 30 s) promotes blocked executions back to eligible for re-evaluation; workers that newly connected with matching caps then pick them up. Worker-registration-driven re-evaluation is the V2 target. The reclaim path (`ff_issue_reclaim_grant`) applies the same block-on-mismatch invariant — otherwise the reclaim scanner loops on the same lease-expired execution forever.
+
+**Authority: worker passes caps in ARGV (option a).**
+
+The worker ships its sorted CSV via `ff_issue_claim_grant` ARGV[9]. The Lua loads the execution's `required_capabilities` CSV from the exec_core hash and checks subset containment atomically. This is cluster-safe: both CSVs live in the FCALL scope; no cross-slot read is needed.
+
+The alternative — an authoritative `{c:worker}:{worker_id}:caps` hash that Lua reads — was rejected because (1) it would be cross-slot with `{p:N}` exec_core and require per-partition duplication, and (2) it does not add a real trust boundary. A malicious worker can lie about `worker_id` just as easily as about caps, and the claim/grant path already trusts `worker_id`. Authentication/attestation is the right tool for that threat model and is deferred.
+
+**On mismatch: block to `blocked_route` (scheduler-side).** `ff_issue_claim_grant` returns `err("capability_mismatch", missing_csv)` with a single exec_core HSET (`last_capability_mismatch_at`) and NO eligible-ZSET mutation of its own — Lua stays the authoritative atomic yes/no step. The scheduler caller (`ff-scheduler::Scheduler::claim_for_worker` AND `ff-sdk::FlowFabricWorker::claim_next` for the inline-direct-claim path) then invokes `ff_block_execution_for_admission(reason="waiting_for_capable_worker")` which moves the execution from the lane's eligible ZSET into its `blocked:route` ZSET (eligibility_state=`blocked_by_route`, blocking_reason=`waiting_for_capable_worker`, public_state=`rate_limited`).
+
+Earlier designs kept the execution in eligible. That invariant leaked into a hot-loop bug: 100 workers × 1 tick/s × one unclaimable top-of-zset = 100 wasted FCALLs/s plus quota-admission churn. Block-on-mismatch + periodic sweep is the stable shape.
+
+**Promotion back to eligible.** The engine's unblock scanner (`ff-engine::scanner::unblock`) scans `blocked:route` per lane per execution partition on its usual tick. For each member it reads the execution's `required_capabilities` CSV and checks subset coverage against the UNION of connected workers' `ff:worker:*:caps` STRING advertisements (loaded once per scan cycle, bounded by the number of online workers). If subset holds, `ff_unblock_execution(reason="waiting_for_capable_worker")` moves the execution back to eligible. Fail-open on the caps-union read: a transient Valkey error on SCAN / GET is treated as "match possible" so executions don't starve when the caps hash query transiently fails — the scheduler re-decides on the next tick anyway.
+
+`ff:worker:*:caps` is written non-authoritatively by `ff-sdk::FlowFabricWorker::connect` (atomic SET on connect, DEL on empty-caps restart). Lua never reads it; only the unblock scanner does. V2 target: worker-connect-triggered sweep so promotion latency is O(connect-time), not O(scanner interval).
+
+Starvation still surfaces in logs: the scheduler and SDK emit a single `tracing::info!` per mismatch with a `worker_caps_hash` (8-hex FNV-1a digest of the CSV) and the `missing` tokens — the full 4KB CSV is logged once at worker-connect WARN, so per-mismatch log volume is bounded by execution count, not caps length.
+
+**Bound checks.** The Lua rejects worker-or-required CSVs exceeding 4096 bytes or 256 tokens with `err("invalid_capabilities", detail)`. Defense-in-depth against misconfigured or buggy clients shipping large repeated payloads into the atomic section.
+
+**Non-authoritative visibility SET.** The SDK writes `SADD ff:worker:{instance_id}:caps` (with a TTL matching the alive key) on connect. This is **for operator introspection only**. The scheduler and Lua never read it. If a future version ditches option (a) in favor of option (b), this key becomes the source of truth — today it is not.
+
+**Deferred to V2 (explicitly):**
+- Worker attestation (HMAC signing of worker caps), enabling option (b) where Lua reads an authoritative cap store.
+- Semver predicates (`torch>=2.3` parsed as a range), not opaque strings.
+- Key-value capability attributes (`provider=anthropic`) — V1 is flat string tokens only.
+- Preferred/forbidden capabilities and scoring.
+- Secondary ZSET index per capability to avoid O(N) eligible scans when very few workers have a niche capability.
+- Operator `explain_capability_mismatch` API for C3.
+- Isolation level and locality matching.
+- Worker-connect-triggered `blocked_route` sweep (V1 uses the periodic unblock scanner — promotion latency is bounded by unblock scanner interval, not connect time).
+- Reclaim scanner integration for `ff_issue_reclaim_grant` — deferred to cairn Batch C (no production Rust caller today). When added, MUST apply the same block-on-capability-mismatch pattern as the claim path; the Lua helper already stamps `last_capability_mismatch_at` and documents the invariant inline.
+
 ---
 
 ### 8. Lane / Queue Facade

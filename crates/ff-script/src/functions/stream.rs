@@ -56,3 +56,235 @@ impl FromFcallResult for AppendFrameResult {
         })
     }
 }
+
+// ─── ff_read_attempt_stream ───────────────────────────────────────────
+//
+// Lua KEYS (2): stream_data, stream_meta
+// Lua ARGV (3): from_id, to_id, count_limit
+
+ff_function! {
+    pub ff_read_attempt_stream(args: ReadFramesArgs) -> ReadFramesResult {
+        keys(k: &StreamOpKeys<'_>) {
+            k.ctx.stream(args.attempt_index),              // 1
+            k.ctx.stream_meta(args.attempt_index),         // 2
+        }
+        argv {
+            args.from_id.clone(),                          // 1
+            args.to_id.clone(),                            // 2
+            args.count_limit.to_string(),                  // 3
+        }
+    }
+}
+
+impl FromFcallResult for ReadFramesResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        // Lua returns `ok(entries, closed_at, closed_reason)`.
+        // - entries: array of [entry_id, [f1, v1, ...]]
+        // - closed_at: string (ms timestamp) or "" if open
+        // - closed_reason: string or "" if open
+        let entries = r.fields.first().ok_or_else(|| {
+            ScriptError::Parse("ff_read_attempt_stream: missing entries field".into())
+        })?;
+        // XRANGE from a Valkey Function passes fields through as raw Lua
+        // arrays — no ArrayOfPairs conversion, so always Flat here.
+        let frames = parse_entries(entries, FieldShape::Flat)?;
+
+        let closed_at = r.field_str(1);
+        let closed_at = if closed_at.is_empty() {
+            None
+        } else {
+            closed_at
+                .parse::<i64>()
+                .ok()
+                .map(ff_core::types::TimestampMs::from_millis)
+        };
+
+        let closed_reason = r.field_str(2);
+        let closed_reason = if closed_reason.is_empty() {
+            None
+        } else {
+            Some(closed_reason)
+        };
+
+        Ok(ReadFramesResult::Frames(StreamFrames {
+            frames,
+            closed_at,
+            closed_reason,
+        }))
+    }
+}
+
+/// Explicit shape tag for stream-entry field payloads. Passed from the
+/// caller because each code path *knows* which shape ferriskey will emit —
+/// heuristic detection ("first entry looks like a 2-elem array") can
+/// mis-classify when field values happen to be arrays themselves.
+#[derive(Clone, Copy, Debug)]
+pub enum FieldShape {
+    /// Flat alternating `[k, v, k, v, ...]`. Emitted by raw Lua FCALL
+    /// replies and by RESP2 servers that bypass the ArrayOfPairs adapter.
+    Flat,
+    /// `[[k, v], [k, v], ...]` — ferriskey's `ArrayOfPairs` adapter for
+    /// XRANGE / XREAD direct commands.
+    Pairs,
+    /// RESP3 `{k: v, ...}` map.
+    Map,
+}
+
+/// Parse an XRANGE/XREAD-shaped `[entry_id, fields]` list.
+///
+/// Caller must tell us the field shape — see [`FieldShape`]. Inferring
+/// shape from data alone is unsound: any call site always knows whether
+/// it's reading a raw Lua payload (Flat), a ferriskey-adapted XRANGE/XREAD
+/// reply (Pairs), or a RESP3 Map.
+///
+/// Nil fields → an empty frame (no fields).
+pub(crate) fn parse_entries(
+    raw: &ferriskey::Value,
+    shape: FieldShape,
+) -> Result<Vec<StreamFrame>, ScriptError> {
+    let entries = match raw {
+        ferriskey::Value::Array(arr) => arr,
+        ferriskey::Value::Nil => return Ok(Vec::new()),
+        other => {
+            return Err(ScriptError::Parse(format!(
+                "XRANGE/XREAD entries: expected Array, got {other:?}"
+            )));
+        }
+    };
+
+    let mut frames = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let entry = entry.as_ref().map_err(|e| {
+            ScriptError::Parse(format!("XRANGE entry error: {e}"))
+        })?;
+        let parts = match entry {
+            ferriskey::Value::Array(a) => a,
+            other => {
+                return Err(ScriptError::Parse(format!(
+                    "XRANGE entry: expected Array, got {other:?}"
+                )));
+            }
+        };
+        if parts.len() != 2 {
+            return Err(ScriptError::Parse(format!(
+                "XRANGE entry: expected 2 elements, got {}",
+                parts.len()
+            )));
+        }
+        let id = value_to_string(parts[0].as_ref().ok()).ok_or_else(|| {
+            ScriptError::Parse("XRANGE entry: missing/invalid id".into())
+        })?;
+
+        let field_val = match parts[1].as_ref() {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(ScriptError::Parse(format!(
+                    "XRANGE entry fields error: {e}"
+                )));
+            }
+        };
+        let fields = parse_fields_kv(field_val, shape)?;
+        frames.push(StreamFrame { id, fields });
+    }
+    Ok(frames)
+}
+
+/// Parse a stream-entry field payload into a sorted map, using an explicit
+/// [`FieldShape`] tag supplied by the caller.
+///
+/// `Value::Nil` always yields an empty map (entry exists but has no
+/// fields) regardless of `shape` — both XRANGE and XREAD can produce this
+/// for empty writes.
+pub(crate) fn parse_fields_kv(
+    v: &ferriskey::Value,
+    shape: FieldShape,
+) -> Result<std::collections::BTreeMap<String, String>, ScriptError> {
+    let mut out = std::collections::BTreeMap::new();
+    if matches!(v, ferriskey::Value::Nil) {
+        return Ok(out);
+    }
+    match shape {
+        FieldShape::Flat => {
+            let arr = match v {
+                ferriskey::Value::Array(arr) => arr,
+                other => {
+                    return Err(ScriptError::Parse(format!(
+                        "stream fields (Flat): expected Array, got {other:?}"
+                    )));
+                }
+            };
+            if !arr.len().is_multiple_of(2) {
+                return Err(ScriptError::Parse(format!(
+                    "stream fields (Flat): odd element count {}",
+                    arr.len()
+                )));
+            }
+            let mut i = 0;
+            while i < arr.len() {
+                let k = value_to_string(arr[i].as_ref().ok())
+                    .ok_or_else(|| ScriptError::Parse("stream field: bad key".into()))?;
+                let val = value_to_string(arr[i + 1].as_ref().ok()).unwrap_or_default();
+                out.insert(k, val);
+                i += 2;
+            }
+        }
+        FieldShape::Pairs => {
+            let arr = match v {
+                ferriskey::Value::Array(arr) => arr,
+                other => {
+                    return Err(ScriptError::Parse(format!(
+                        "stream fields (Pairs): expected Array, got {other:?}"
+                    )));
+                }
+            };
+            for pair in arr.iter() {
+                let inner = match pair.as_ref() {
+                    Ok(ferriskey::Value::Array(inner)) => inner,
+                    _ => {
+                        return Err(ScriptError::Parse(
+                            "stream fields (Pairs): expected 2-element Array per entry".into(),
+                        ));
+                    }
+                };
+                if inner.len() != 2 {
+                    return Err(ScriptError::Parse(format!(
+                        "stream fields (Pairs): expected len=2, got {}",
+                        inner.len()
+                    )));
+                }
+                let k = value_to_string(inner[0].as_ref().ok())
+                    .ok_or_else(|| ScriptError::Parse("stream field: bad key".into()))?;
+                let val = value_to_string(inner[1].as_ref().ok()).unwrap_or_default();
+                out.insert(k, val);
+            }
+        }
+        FieldShape::Map => {
+            let pairs = match v {
+                ferriskey::Value::Map(pairs) => pairs,
+                other => {
+                    return Err(ScriptError::Parse(format!(
+                        "stream fields (Map): expected Map, got {other:?}"
+                    )));
+                }
+            };
+            for (k, vv) in pairs {
+                let key = value_to_string(Some(k))
+                    .ok_or_else(|| ScriptError::Parse("stream field: bad key".into()))?;
+                let val = value_to_string(Some(vv)).unwrap_or_default();
+                out.insert(key, val);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn value_to_string(v: Option<&ferriskey::Value>) -> Option<String> {
+    match v? {
+        ferriskey::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        ferriskey::Value::SimpleString(s) => Some(s.clone()),
+        ferriskey::Value::Int(n) => Some(n.to_string()),
+        ferriskey::Value::Okay => Some("OK".into()),
+        _ => None,
+    }
+}

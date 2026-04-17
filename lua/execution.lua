@@ -74,6 +74,66 @@ redis.register_function('ff_create_execution', function(keys, args)
     return {1, "DUPLICATE", A.execution_id}
   end
 
+  -- 2b. Policy JSON validation — extract required_capabilities CSV now, BEFORE
+  -- any write, so an error aborts without leaving a half-written exec_core.
+  -- Fail-CLOSED on any malformed/typed input rather than silently defaulting
+  -- to the empty-required wildcard — required_capabilities is security-
+  -- sensitive (an empty set matches any worker).
+  --
+  --   * An empty / "{}" policy_json → no required_capabilities field written
+  --     → wildcard match, intentional.
+  --   * A non-empty policy_json that fails cjson.decode → fail with
+  --     invalid_policy_json. An operator who MEANT "no policy" passes "".
+  --   * routing_requirements.required_capabilities present but not an array
+  --     → fail with invalid_capabilities:required_not_array.
+  --   * Any element that is not a non-empty string → fail with
+  --     invalid_capabilities:required:non_string_token. Silent-drop on
+  --     `["gpu", null, 42]` would erase real requirements.
+  --   * Comma in a token → fail (reserved delimiter, see ff_issue_claim_grant).
+  --   * Bounds: same 4096 bytes / 256 tokens ceiling as the worker CSV.
+  local required_caps_csv = nil
+  if is_set(A.policy_json) and A.policy_json ~= "{}" then
+    local ok_decode, policy = pcall(cjson.decode, A.policy_json)
+    if not ok_decode then
+      return err("invalid_policy_json", "malformed")
+    end
+    if type(policy) == "table" and policy.routing_requirements ~= nil then
+      if type(policy.routing_requirements) ~= "table" then
+        return err("invalid_policy_json", "routing_requirements:not_object")
+      end
+      local caps = policy.routing_requirements.required_capabilities
+      if caps ~= nil then
+        if type(caps) ~= "table" then
+          return err("invalid_capabilities", "required:not_array")
+        end
+        local list = {}
+        for _, cap in ipairs(caps) do
+          if type(cap) ~= "string" then
+            return err("invalid_capabilities", "required:non_string_token")
+          end
+          if #cap == 0 then
+            return err("invalid_capabilities", "required:empty_token")
+          end
+          if string.find(cap, ",", 1, true) then
+            return err("invalid_capabilities", "required:comma_in_token")
+          end
+          list[#list + 1] = cap
+        end
+        if #list > CAPS_MAX_TOKENS then
+          return err("invalid_capabilities", "required:too_many_tokens")
+        end
+        table.sort(list)
+        if #list > 0 then
+          local csv = table.concat(list, ",")
+          if #csv > CAPS_MAX_BYTES then
+            return err("invalid_capabilities", "required:too_many_bytes")
+          end
+          required_caps_csv = csv
+        end
+      end
+    end
+  end
+
   -- 3. Determine initial eligibility
   local lifecycle_phase = "runnable"
   local eligibility_state, blocking_reason, blocking_detail, public_state
@@ -157,9 +217,14 @@ redis.register_function('ff_create_execution', function(keys, args)
     redis.call("SET", K.payload_key, A.input_payload)
   end
 
-  -- 6. Store policy
+  -- 6. Store policy + required_capabilities. Validation already ran before
+  -- any write (step 2b); here we only persist the pre-validated CSV. See
+  -- step 2b for the fail-closed rationale on malformed / typed inputs.
   if is_set(A.policy_json) then
     redis.call("SET", K.policy_key, A.policy_json)
+  end
+  if required_caps_csv then
+    redis.call("HSET", K.core_key, "required_capabilities", required_caps_csv)
   end
 
   -- 7. Store tags

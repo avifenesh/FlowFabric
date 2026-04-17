@@ -40,7 +40,7 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 - **Budget and quota** -- per-dimension usage tracking, hard/soft limits, sliding-window rate limiting
 - **Streaming output** -- append-only frame streams scoped to each attempt
 - **Priority scheduling** -- score-based eligible sets with priority clamping
-- **REST API** -- 20 endpoints on axum with JSON error handling, CORS, health check
+- **REST API** -- 22 endpoints on axum with JSON error handling, CORS, health check
 - **Cluster-safe** -- all operations use hash-tag partitioning, no SCAN, no CrossSlot
 
 ## Quick start
@@ -96,6 +96,7 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 
 ## Production considerations
 
+- **Full env var reference** — see the `ServerConfig::from_env` rustdoc in `crates/ff-server/src/config.rs` for the complete table (FF_HOST, FF_PORT, FF_TLS, FF_CLUSTER, FF_LANES, FF_CORS_ORIGINS, FF_API_TOKEN, FF_WAITPOINT_HMAC_SECRET (required), FF_WAITPOINT_HMAC_GRACE_MS, FF_MAX_CONCURRENT_STREAM_OPS, scanner intervals, partition counts).
 - **Auth is opt-in** — if `FF_API_TOKEN` is unset, every endpoint except `GET /healthz` is reachable without authentication. Always set `FF_API_TOKEN` (and consider CORS via `FF_CORS_ORIGINS`) before exposing the server beyond localhost.
 - **No API rate limiting** — deploy behind a reverse proxy (nginx, Envoy) with rate limiting configured
 - **No HTTP connection limit** — axum accepts unbounded connections; configure limits at the load balancer
@@ -108,6 +109,8 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 ### Rolling upgrades
 
 KEYS-arity changes (and the `LIBRARY_VERSION` bump that paired with Batch A) require **blue-green or stop-then-start deployment**. Running old and new `ff-server` binaries against the same Valkey simultaneously can produce Lua errors on the old binary because the new binary loads a library whose KEYS arity differs from what the old binary expects — `redis.call(..., nil, ...)` surfaces as `ResponseError`, not silent corruption, but requests will fail until the old instances are drained.
+
+The version string lives in **`lua/version.lua`** (single source of truth). `crates/ff-script/build.rs` extracts it at compile time and exposes it to Rust via `env!("FLOWFABRIC_LUA_VERSION")`, so the Rust `LIBRARY_VERSION` constant tracks the Lua value automatically — do not maintain a separate Rust literal.
 
 Future: per-FCALL version negotiation. For now: drain old instances before starting new ones, or run a single writer at a time.
 

@@ -22,7 +22,8 @@ use ff_core::keys::{
     QuotaKeyContext,
 };
 use ff_core::partition::{
-    budget_partition, execution_partition, flow_partition, quota_partition, PartitionConfig,
+    budget_partition, execution_partition, flow_partition, quota_partition, Partition,
+    PartitionConfig, PartitionFamily,
 };
 use ff_core::state::{PublicState, StateVector};
 use ff_core::types::*;
@@ -43,6 +44,77 @@ const ALREADY_TERMINAL_MEMBER_CAP: usize = 1000;
 /// and provides a minimal API for Phase 1.
 pub struct Server {
     client: Client,
+    /// Dedicated Valkey connection used EXCLUSIVELY for stream-op calls:
+    /// `xread_block` tails AND `ff_read_attempt_stream` range reads.
+    /// `ferriskey::Client` is a pipelined multiplexed connection; Valkey
+    /// processes commands FIFO on it.
+    ///
+    /// Two head-of-line risks motivate the split from the main client:
+    ///
+    /// * **Blocking**: `XREAD BLOCK 30_000` holds the read side until a
+    ///   new entry arrives or `block_ms` elapses.
+    /// * **Large replies**: `XRANGE … COUNT 10_000` with ~64 KB per
+    ///   frame returns a multi-MB reply serialized on one connection.
+    ///
+    /// Sharing either load with the main client would starve every other
+    /// FCALL (create_execution, claim, rotate_waitpoint_secret,
+    /// budget/quota, admin endpoints) AND every engine scanner.
+    ///
+    /// Kept separate from `client` and from the `Engine` scanner client so
+    /// tail latency cannot couple to foreground API latency or background
+    /// scanner cadence. See RFC-006 Impl Notes for the cascading-failure
+    /// rationale.
+    tail_client: Client,
+    /// Bounds concurrent stream-op calls server-wide — read AND tail
+    /// combined. Each caller acquires one permit for the duration of its
+    /// Valkey round-trip(s); contention surfaces as HTTP 429 at the REST
+    /// boundary, not as a silent queue on the stream connection. Default
+    /// size is `FF_MAX_CONCURRENT_STREAM_OPS` (64; legacy env
+    /// `FF_MAX_CONCURRENT_TAIL` accepted for one release).
+    ///
+    /// Read and tail share the same pool deliberately: they share the
+    /// `tail_client`, so fairness accounting must be unified or a flood
+    /// of one can starve the other. The semaphore is also `close()`d on
+    /// shutdown so no new stream ops can start while existing ones drain
+    /// (see `Server::shutdown`).
+    stream_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Serializes `XREAD BLOCK` calls against `tail_client`.
+    ///
+    /// `ferriskey::Client` is a pipelined multiplexed connection — Valkey
+    /// processes commands FIFO on one socket. `XREAD BLOCK` holds the
+    /// connection's read side for the full `block_ms`, so two parallel
+    /// BLOCKs sent down the same mux serialize: the second waits for the
+    /// first to return before its own BLOCK even begins at the server.
+    /// Meanwhile ferriskey's per-call `request_timeout` (auto-extended to
+    /// `block_ms + 500ms`) starts at future-poll on the CLIENT side, so
+    /// the second call's timeout fires before its turn at the server —
+    /// spurious `timed_out` errors under concurrent tail load.
+    ///
+    /// Explicit serialization around `xread_block` removes the
+    /// silent-failure mode: concurrent tails queue on this Mutex (inside
+    /// an already-acquired semaphore permit), then dispatch one at a
+    /// time with their full `block_ms` budget intact. The semaphore
+    /// ceiling (`max_concurrent_stream_ops`) effectively becomes queue
+    /// depth; throughput on the tail client is 1 BLOCK at a time.
+    ///
+    /// V2 upgrade: a pool of N dedicated `ferriskey::Client` connections
+    /// replacing the single `tail_client` + this Mutex. Deferred; the
+    /// Mutex here is correct v1 behavior.
+    ///
+    /// XRANGE reads (`read_attempt_stream`) are NOT gated by this Mutex —
+    /// XRANGE is non-blocking at the server, so pipelined XRANGEs on one
+    /// mux complete in microseconds each and don't trigger the same
+    /// client-side timeout race. Keeping reads unserialized preserves
+    /// read throughput.
+    xread_block_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Server-wide Semaphore(1) gating admin rotate calls. Legitimate
+    /// operators rotate ~monthly and can afford to serialize; concurrent
+    /// rotate requests are an attack or misbehaving script. Holding the
+    /// permit also guards against interleaved partial rotations on the
+    /// Server side of the per-partition locks, surfacing contention as
+    /// HTTP 429 instead of silently queueing and blowing past the 120s
+    /// HTTP timeout. See `rotate_waitpoint_secret` handler.
+    admin_rotate_semaphore: Arc<tokio::sync::Semaphore>,
     engine: Engine,
     config: ServerConfig,
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
@@ -77,6 +149,12 @@ pub enum ServerError {
     OperationFailed(String),
     #[error("script: {0}")]
     Script(String),
+    /// Server-wide concurrent-tail limit reached. Surfaces as HTTP 429
+    /// at the REST boundary so load balancers and clients can retry with
+    /// backoff. Distinct from transport/script errors because the fault is
+    /// on the server side (too many in-flight tails), not the caller side.
+    #[error("too many concurrent tail calls (max: {0})")]
+    TailUnavailable(u32),
 }
 
 impl ServerError {
@@ -111,6 +189,9 @@ impl ServerError {
             | Self::InvalidInput(_)
             | Self::OperationFailed(_)
             | Self::Script(_) => false,
+            // Back off and retry — the server-side tail pool is the bound,
+            // so the retry will succeed once a permit frees up.
+            Self::TailUnavailable(_) => true,
         }
     }
 }
@@ -161,6 +242,17 @@ impl Server {
         // Step 2: Validate or create partition config
         validate_or_create_partition_config(&client, &config.partition_config).await?;
 
+        // Step 2b: Install waitpoint HMAC secret into every execution partition
+        // (RFC-004 §Waitpoint Security). Fail-fast: if any partition fails,
+        // the server refuses to start — a partial install would silently
+        // reject signal deliveries on half the partitions.
+        initialize_waitpoint_hmac_secret(
+            &client,
+            &config.partition_config,
+            &config.waitpoint_hmac_secret,
+        )
+        .await?;
+
         // Step 3: Load Lua library (skippable for tests where fixture already loaded)
         if !config.skip_library_load {
             tracing::info!("loading flowfabric Lua library");
@@ -191,7 +283,80 @@ impl Server {
             flow_projector_interval: config.engine_config.flow_projector_interval,
             execution_deadline_interval: config.engine_config.execution_deadline_interval,
         };
+        // Engine scanners keep running on the MAIN `client` mux — NOT on
+        // `tail_client`. Scanner cadence is foreground-latency-coupled by
+        // design (an incident that blocks all FCALLs should also visibly
+        // block scanners), and keeping scanners off the tail client means a
+        // long-poll tail can never starve lease-expiry, retention-trim,
+        // etc. Do not change this without revisiting RFC-006 Impl Notes.
         let engine = Engine::start(engine_cfg, client.clone());
+
+        // Dedicated tail client. Built AFTER library load + HMAC install
+        // because those steps use the main client; tail client only runs
+        // XREAD/XREAD BLOCK + HMGET on stream_meta, so it never needs the
+        // library loaded — but we build it on the same host/port/TLS
+        // options so network reachability is identical.
+        tracing::info!("opening dedicated tail connection");
+        let mut tail_builder = ClientBuilder::new()
+            .host(&config.host, config.port)
+            .connect_timeout(Duration::from_secs(10))
+            // `request_timeout` is ignored for XREAD BLOCK (ferriskey
+            // auto-extends to `block_ms + 500ms` for blocking commands),
+            // but is used for the companion HMGET — 5s matches main.
+            .request_timeout(Duration::from_millis(5000));
+        if config.tls {
+            tail_builder = tail_builder.tls();
+        }
+        if config.cluster {
+            tail_builder = tail_builder.cluster();
+        }
+        let tail_client = tail_builder
+            .build()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "connect (tail)".into(),
+            })?;
+        let tail_pong: String = tail_client
+            .cmd("PING")
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "PING (tail)".into(),
+            })?;
+        if tail_pong != "PONG" {
+            return Err(ServerError::OperationFailed(format!(
+                "tail client unexpected PING response: {tail_pong}"
+            )));
+        }
+
+        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_stream_ops as usize,
+        ));
+        let xread_block_lock = Arc::new(tokio::sync::Mutex::new(()));
+        tracing::info!(
+            max_concurrent_stream_ops = config.max_concurrent_stream_ops,
+            "stream-op client ready (read + tail share the semaphore; \
+             tails additionally serialize via xread_block_lock)"
+        );
+
+        // Admin surface warning. /v1/admin/* endpoints (waitpoint HMAC
+        // rotation, etc.) are only protected by the global Bearer
+        // middleware in api.rs — which is only installed when
+        // config.api_token is set. Without FF_API_TOKEN, a public
+        // deployment exposes secret rotation to anyone that can reach
+        // the listen_addr. Warn loudly so operators can't miss it; we
+        // don't fail-start because single-tenant dev uses this path.
+        if config.api_token.is_none() {
+            tracing::warn!(
+                listen_addr = %config.listen_addr,
+                "FF_API_TOKEN is unset — /v1/admin/* endpoints (including \
+                 rotate-waitpoint-secret) are UNAUTHENTICATED. Set \
+                 FF_API_TOKEN for any deployment reachable from untrusted \
+                 networks."
+            );
+        }
 
         tracing::info!(
             exec_partitions = config.partition_config.num_execution_partitions,
@@ -209,6 +374,14 @@ impl Server {
 
         Ok(Self {
             client,
+            tail_client,
+            stream_semaphore,
+            xread_block_lock,
+            // Single-permit semaphore: only one rotate-waitpoint-secret can
+            // be mid-flight server-wide. Attackers or misbehaving scripts
+            // firing parallel rotations fail fast with 429 instead of
+            // queueing HTTP handlers.
+            admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             engine,
             config,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
@@ -1118,11 +1291,11 @@ impl Server {
             .map(|k| ctx.signal_dedup(wp_id, k))
             .unwrap_or_else(|| ctx.noop());
 
-        // KEYS (13): exec_core, wp_condition, wp_signals_stream,
+        // KEYS (14): exec_core, wp_condition, wp_signals_stream,
         //            exec_signals_zset, signal_hash, signal_payload,
         //            idem_key, waitpoint_hash, suspension_current,
         //            eligible_zset, suspended_zset, delayed_zset,
-        //            suspension_timeout_zset
+        //            suspension_timeout_zset, hmac_secrets
         let fcall_keys: Vec<String> = vec![
             ctx.core(),                       // 1
             ctx.waitpoint_condition(wp_id),    // 2
@@ -1137,14 +1310,15 @@ impl Server {
             idx.lane_suspended(&lane),         // 11
             idx.lane_delayed(&lane),           // 12
             idx.suspension_timeout(),          // 13
+            idx.waitpoint_hmac_secrets(),      // 14
         ];
 
-        // ARGV (17): signal_id, execution_id, waitpoint_id, signal_name,
+        // ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
         //            signal_category, source_type, source_identity,
         //            payload, payload_encoding, idempotency_key,
         //            correlation_id, target_scope, created_at,
         //            dedup_ttl_ms, resume_delay_ms, signal_maxlen,
-        //            max_signals_per_execution
+        //            max_signals_per_execution, waitpoint_token
         let fcall_args: Vec<String> = vec![
             args.signal_id.to_string(),                          // 1
             args.execution_id.to_string(),                       // 2
@@ -1175,6 +1349,9 @@ impl Server {
             args.max_signals_per_execution
                 .unwrap_or(10_000)
                 .to_string(),                                    // 17
+            // WIRE BOUNDARY — raw token to Lua. Display is redacted
+            // for log safety; use .as_str() at the wire crossing.
+            args.waitpoint_token.as_str().to_owned(),            // 18
         ];
 
         let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
@@ -1570,15 +1747,206 @@ impl Server {
         parse_replay_result(&raw)
     }
 
+    /// Read frames from an attempt's stream (XRANGE wrapper) plus terminal
+    /// markers (`closed_at`, `closed_reason`) so consumers can stop polling
+    /// when the producer finalizes.
+    ///
+    /// `from_id` and `to_id` accept XRANGE special markers: `"-"` for
+    /// earliest, `"+"` for latest. `count_limit` MUST be `>= 1` —
+    /// `0` returns a `ServerError::InvalidInput` (matches the REST boundary
+    /// and the Lua-side reject).
+    ///
+    /// Cluster-safe: the attempt's `{p:N}` partition is derived from the
+    /// execution id, so all KEYS share the same slot.
+    pub async fn read_attempt_stream(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        from_id: &str,
+        to_id: &str,
+        count_limit: u64,
+    ) -> Result<ff_core::contracts::StreamFrames, ServerError> {
+        use ff_core::contracts::{ReadFramesArgs, ReadFramesResult};
+
+        if count_limit == 0 {
+            return Err(ServerError::InvalidInput(
+                "count_limit must be >= 1".to_owned(),
+            ));
+        }
+
+        // Share the same semaphore as tail. A large XRANGE reply (10_000
+        // frames × ~64KB) is just as capable of head-of-line-blocking the
+        // tail_client mux as a long BLOCK — fairness accounting must be
+        // unified. Non-blocking acquire → 429 on contention.
+        let permit = match self.stream_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(ServerError::TailUnavailable(
+                    self.config.max_concurrent_stream_ops,
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ServerError::OperationFailed(
+                    "stream semaphore closed (server shutting down)".into(),
+                ));
+            }
+        };
+
+        let args = ReadFramesArgs {
+            execution_id: execution_id.clone(),
+            attempt_index,
+            from_id: from_id.to_owned(),
+            to_id: to_id.to_owned(),
+            count_limit,
+        };
+
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let keys = ff_script::functions::stream::StreamOpKeys { ctx: &ctx };
+
+        // Route on the dedicated stream client, same as tail. A 10_000-
+        // frame XRANGE reply on the main mux would stall every other
+        // FCALL behind reply serialization.
+        let result = ff_script::functions::stream::ff_read_attempt_stream(
+            &self.tail_client, &keys, &args,
+        )
+        .await
+        .map_err(script_error_to_server);
+
+        drop(permit);
+
+        match result? {
+            ReadFramesResult::Frames(f) => Ok(f),
+        }
+    }
+
+    /// Tail a live attempt's stream (XREAD BLOCK wrapper). Returns frames
+    /// plus the terminal signal so a polling consumer can exit when the
+    /// producer closes the stream.
+    ///
+    /// `last_id` is exclusive — XREAD returns entries with id > last_id.
+    /// Pass `"0-0"` to read from the beginning.
+    ///
+    /// `block_ms == 0` → non-blocking peek (returns immediately).
+    /// `block_ms > 0`  → blocks up to that many ms. Empty `frames` +
+    /// `closed_at=None` → timeout, no new data, still open.
+    ///
+    /// `count_limit` MUST be `>= 1`; `0` returns `InvalidInput`.
+    ///
+    /// Implemented as a direct XREAD command (not FCALL) because blocking
+    /// commands are rejected inside Valkey Functions. The terminal
+    /// markers come from a companion HMGET on `stream_meta` — see
+    /// `ff_script::stream_tail` module docs.
+    pub async fn tail_attempt_stream(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        last_id: &str,
+        block_ms: u64,
+        count_limit: u64,
+    ) -> Result<ff_core::contracts::StreamFrames, ServerError> {
+        if count_limit == 0 {
+            return Err(ServerError::InvalidInput(
+                "count_limit must be >= 1".to_owned(),
+            ));
+        }
+
+        // Non-blocking permit acquisition on the shared stream_semaphore
+        // (read + tail split the same pool). If the server is already at
+        // the `max_concurrent_stream_ops` ceiling, return `TailUnavailable`
+        // (→ 429) rather than queueing — a queued tail holds the caller's
+        // HTTP request open with no upper bound, which is exactly the
+        // resource-exhaustion pattern this limit exists to prevent.
+        // Clients retry with backoff on 429.
+        //
+        // Worst-case permit hold: if the producer closes the stream via
+        // HSET on stream_meta (not an XADD), the XREAD BLOCK won't wake
+        // until `block_ms` elapses — so a permit can be held for up to
+        // the caller's block_ms even though the terminal signal is
+        // ready. This is a v1-accepted limitation; RFC-006 §Terminal-
+        // signal timing under active tail documents it and sketches the
+        // v2 sentinel-XADD upgrade path.
+        let permit = match self.stream_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(ServerError::TailUnavailable(
+                    self.config.max_concurrent_stream_ops,
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ServerError::OperationFailed(
+                    "stream semaphore closed (server shutting down)".into(),
+                ));
+            }
+        };
+
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let stream_key = ctx.stream(attempt_index);
+        let stream_meta_key = ctx.stream_meta(attempt_index);
+
+        // Acquire the XREAD BLOCK serializer AFTER the stream semaphore.
+        // Nesting order matters: the semaphore is the user-visible
+        // ceiling (surfaces as 429), the Mutex is an internal fairness
+        // gate. Holding the permit while waiting on the Mutex means the
+        // ceiling still bounds queue depth. See the field docstring for
+        // the full rationale (ferriskey pipeline FIFO + client-side
+        // per-call timeout race).
+        let _xread_guard = self.xread_block_lock.lock().await;
+
+        let result = ff_script::stream_tail::xread_block(
+            &self.tail_client,
+            &stream_key,
+            &stream_meta_key,
+            last_id,
+            block_ms,
+            count_limit,
+        )
+        .await
+        .map_err(script_error_to_server);
+
+        drop(_xread_guard);
+        drop(permit);
+        result
+    }
+
     /// Graceful shutdown — stops scanners, drains background handler tasks
     /// (e.g. cancel_flow member dispatch) with a bounded timeout, then waits
     /// for scanners to finish.
+    ///
+    /// Shutdown order is chosen so in-flight stream ops (read/tail) drain
+    /// cleanly without new arrivals piling up:
+    ///
+    /// 1. `stream_semaphore.close()` — new read/tail attempts fail fast
+    ///    with `ServerError::OperationFailed("stream semaphore closed …")`
+    ///    which the REST layer surfaces as a 500 with `retryable=false`
+    ///    (ops tooling may choose to wait + retry on 503-class responses;
+    ///    the body clearly names the shutdown reason).
+    /// 2. Drain handler-spawned background tasks with a 15s ceiling.
+    /// 3. `engine.shutdown()` stops scanners.
+    ///
+    /// Existing in-flight tails finish on their natural `block_ms`
+    /// boundary (up to ~30s); the `tail_client` is dropped when `Server`
+    /// is dropped after this function returns. We do NOT wait for tails
+    /// to drain explicitly — the semaphore-close + natural-timeout
+    /// combination bounds shutdown to roughly `block_ms + 15s` in the
+    /// worst case. Callers observing a dropped connection retry against
+    /// whatever replacement is coming up.
     pub async fn shutdown(self) {
         tracing::info!("shutting down FlowFabric server");
 
-        // Drain handler-spawned background tasks with the same ceiling as
-        // Engine::shutdown. If dispatch is still running at the deadline,
-        // drop the JoinSet to abort remaining tasks.
+        // Step 1: Close the stream semaphore FIRST so any in-flight
+        // read/tail calls that are between `try_acquire` and their
+        // Valkey command still hold a valid permit, but no NEW stream
+        // op can start. `Semaphore::close()` is idempotent.
+        self.stream_semaphore.close();
+        tracing::info!(
+            "stream semaphore closed; no new read/tail attempts will be accepted"
+        );
+
+        // Step 2: Drain handler-spawned background tasks with the same
+        // ceiling as Engine::shutdown. If dispatch is still running at
+        // the deadline, drop the JoinSet to abort remaining tasks.
         let drain_timeout = Duration::from_secs(15);
         let background = self.background_tasks.clone();
         let drain = async move {
@@ -1663,6 +2031,573 @@ async fn validate_or_create_partition_config(
 
     tracing::info!("partition config validated against stored {key}");
     Ok(())
+}
+
+// ── Waitpoint HMAC secret bootstrap (RFC-004 §Waitpoint Security) ──
+
+/// Stable initial kid written on first boot. Rotation promotes to k2, k3, ...
+/// The kid is stored alongside the secret in every partition's hash so each
+/// FCALL can self-identify which secret produced a given token.
+const WAITPOINT_HMAC_INITIAL_KID: &str = "k1";
+
+/// Per-partition outcome of the HMAC bootstrap step. Collected across the
+/// parallel scan so we can emit aggregated logs once at the end.
+enum PartitionBootOutcome {
+    /// Partition already had a matching (kid, secret) pair.
+    Match,
+    /// Stored secret diverges from env — likely operator rotation; kept.
+    Mismatch,
+    /// Torn write (current_kid present, secret:<kid> missing); repaired.
+    Repaired,
+    /// Fresh partition; atomically installed env secret under kid=k1.
+    Installed,
+}
+
+/// Bounded in-flight concurrency for the startup fan-out. Large enough to
+/// turn a 256-partition install from ~15s sequential into ~1s on cross-AZ
+/// Valkey, small enough to leave a cold cluster breathing room for other
+/// Server::start work (library load, engine scanner spawn).
+const BOOT_INIT_CONCURRENCY: usize = 16;
+
+async fn init_one_partition(
+    client: &Client,
+    partition: Partition,
+    secret_hex: &str,
+) -> Result<PartitionBootOutcome, ServerError> {
+    let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+
+    // Probe for an existing install. Fast path (fresh partition): HGET
+    // returns nil and we fall through to the atomic install below. Slow
+    // path: secret:<stored_kid> is then HGET'd once we know the kid name.
+    // (A previous version used a 2-field HMGET that included a fake
+    // `secret:probe` placeholder — vestigial from an abandoned
+    // optimization attempt, and confusing to read. Collapsed back to a
+    // single-field HGET.)
+    let stored_kid: Option<String> = client
+        .cmd("HGET")
+        .arg(&key)
+        .arg("current_kid")
+        .execute()
+        .await
+        .map_err(|e| ServerError::ValkeyContext {
+            source: e,
+            context: format!("HGET {key} current_kid (init probe)"),
+        })?;
+
+    if let Some(stored_kid) = stored_kid {
+        // We didn't know the stored kid up front, so now HGET the real
+        // secret:<stored_kid> field. Two round-trips in the slow path; the
+        // fast path (fresh partition) stays at one.
+        let field = format!("secret:{stored_kid}");
+        let stored_secret: Option<String> = client
+            .hget(&key, &field)
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: format!("HGET {key} secret:<kid> (init check)"),
+            })?;
+        if stored_secret.is_none() {
+            // Torn write from a previous boot: current_kid present but
+            // secret:<kid> missing. Without repair, mint returns
+            // "hmac_secret_not_initialized" on that partition forever.
+            // Repair in place with env secret. Not rotation — rotation
+            // always writes the secret first.
+            client
+                .hset(&key, &field, secret_hex)
+                .await
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("HSET {key} secret:<kid> (repair torn write)"),
+                })?;
+            return Ok(PartitionBootOutcome::Repaired);
+        }
+        if stored_secret.as_deref() != Some(secret_hex) {
+            return Ok(PartitionBootOutcome::Mismatch);
+        }
+        return Ok(PartitionBootOutcome::Match);
+    }
+
+    // Fresh partition — install current_kid + secret:<kid> atomically in
+    // one HSET. Multi-field HSET is single-command atomic, so a crash
+    // can't leave current_kid without its secret.
+    let secret_field = format!("secret:{WAITPOINT_HMAC_INITIAL_KID}");
+    let _: i64 = client
+        .cmd("HSET")
+        .arg(&key)
+        .arg("current_kid")
+        .arg(WAITPOINT_HMAC_INITIAL_KID)
+        .arg(&secret_field)
+        .arg(secret_hex)
+        .execute()
+        .await
+        .map_err(|e| ServerError::ValkeyContext {
+            source: e,
+            context: format!("HSET {key} (init waitpoint HMAC atomic)"),
+        })?;
+    Ok(PartitionBootOutcome::Installed)
+}
+
+/// Install the waitpoint HMAC secret on every execution partition.
+///
+/// Parallelized fan-out with bounded in-flight concurrency
+/// (`BOOT_INIT_CONCURRENCY`) so 256-partition boots finish in ~1s instead
+/// of ~15s sequential — the prior sequential loop was tight on K8s
+/// `initialDelaySeconds=30` defaults, especially cross-AZ. Fail-fast:
+/// the first per-partition error aborts boot.
+///
+/// Outcomes aggregate into mismatch/repaired counts (logged once at end)
+/// so operators see a single loud warning per fault class instead of 256
+/// per-partition lines.
+async fn initialize_waitpoint_hmac_secret(
+    client: &Client,
+    partition_config: &PartitionConfig,
+    secret_hex: &str,
+) -> Result<(), ServerError> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let n = partition_config.num_execution_partitions;
+    tracing::info!(
+        partitions = n,
+        concurrency = BOOT_INIT_CONCURRENCY,
+        "installing waitpoint HMAC secret across {n} execution partitions"
+    );
+
+    let mut mismatch_count: u16 = 0;
+    let mut repaired_count: u16 = 0;
+    let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut next_index: u16 = 0;
+
+    loop {
+        while pending.len() < BOOT_INIT_CONCURRENCY && next_index < n {
+            let partition = Partition {
+                family: PartitionFamily::Execution,
+                index: next_index,
+            };
+            let client = client.clone();
+            let secret_hex = secret_hex.to_owned();
+            pending.push(async move {
+                init_one_partition(&client, partition, &secret_hex).await
+            });
+            next_index += 1;
+        }
+        match pending.next().await {
+            Some(res) => match res? {
+                PartitionBootOutcome::Match | PartitionBootOutcome::Installed => {}
+                PartitionBootOutcome::Mismatch => mismatch_count += 1,
+                PartitionBootOutcome::Repaired => repaired_count += 1,
+            },
+            None => break,
+        }
+    }
+
+    if repaired_count > 0 {
+        tracing::warn!(
+            repaired_partitions = repaired_count,
+            total_partitions = n,
+            "repaired {repaired_count} partitions with torn waitpoint HMAC writes \
+             (current_kid present but secret:<kid> missing, likely crash during prior boot)"
+        );
+    }
+
+    if mismatch_count > 0 {
+        tracing::warn!(
+            mismatched_partitions = mismatch_count,
+            total_partitions = n,
+            "stored/env secret mismatch on {mismatch_count} partitions — \
+             env FF_WAITPOINT_HMAC_SECRET ignored in favor of stored values; \
+             run POST /v1/admin/rotate-waitpoint-secret to sync"
+        );
+    }
+
+    tracing::info!(partitions = n, "waitpoint HMAC secret install complete");
+    Ok(())
+}
+
+/// Result of a waitpoint HMAC secret rotation across all execution partitions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RotateWaitpointSecretResult {
+    /// Count of partitions that accepted the rotation.
+    pub rotated: u16,
+    /// Partition indices that failed — operator should investigate (Valkey
+    /// outage, auth failure, cluster split). Rotation is idempotent, so a
+    /// re-run after the underlying fault clears converges to the correct
+    /// state.
+    pub failed: Vec<u16>,
+    /// Partition indices where another rotation was already in progress
+    /// (SETNX lock held). These will be rotated by the concurrent request;
+    /// NOT a fault the operator should retry and NOT counted in `failed`.
+    /// Surfaced separately so dashboards distinguish "retry needed" from
+    /// "ignore, in-flight".
+    #[serde(default)]
+    pub in_progress: Vec<u16>,
+    /// New kid installed as current.
+    pub new_kid: String,
+}
+
+/// Per-partition rotation step outcome. `InProgress` means the SETNX lock
+/// was held by a concurrent rotation — not an error; the concurrent call
+/// will finish the work.
+enum RotationStepOutcome {
+    Rotated,
+    InProgress,
+}
+
+impl Server {
+    /// Rotate the waitpoint HMAC secret. Promotes the current kid to previous
+    /// (accepted within `FF_WAITPOINT_HMAC_GRACE_MS`), installs `new_secret_hex`
+    /// as the new current kid. Idempotent: re-running with the same `new_kid`
+    /// and `new_secret_hex` converges partitions to the same state.
+    ///
+    /// Returns a structured result so operators can see which partitions failed.
+    /// HTTP layer returns 200 if any partition succeeded, 500 only if all fail.
+    pub async fn rotate_waitpoint_secret(
+        &self,
+        new_kid: &str,
+        new_secret_hex: &str,
+    ) -> Result<RotateWaitpointSecretResult, ServerError> {
+        if new_kid.is_empty() || new_kid.contains(':') {
+            return Err(ServerError::OperationFailed(
+                "new_kid must be non-empty and must not contain ':'".into(),
+            ));
+        }
+        if new_secret_hex.is_empty()
+            || !new_secret_hex.len().is_multiple_of(2)
+            || !new_secret_hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(ServerError::OperationFailed(
+                "new_secret_hex must be a non-empty even-length hex string".into(),
+            ));
+        }
+
+        // Single-writer gate. Concurrent rotates against the SAME operator
+        // token are an attack pattern (or a retry-loop bug); legitimate
+        // operators rotate monthly and can afford to serialize. Contention
+        // returns TailUnavailable (→ HTTP 429) rather than queueing the
+        // HTTP handler past the 120s endpoint timeout. Permit is held for
+        // the full partition fan-out.
+        let _permit = match self.admin_rotate_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(ServerError::TailUnavailable(1));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ServerError::OperationFailed(
+                    "admin rotate semaphore closed (server shutting down)".into(),
+                ));
+            }
+        };
+
+        let n = self.config.partition_config.num_execution_partitions;
+        let grace_ms = self.config.waitpoint_hmac_grace_ms;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis() as i64;
+        let previous_expires_at = now_ms + grace_ms as i64;
+
+        let mut rotated = 0u16;
+        let mut failed = Vec::new();
+        let mut in_progress: Vec<u16> = Vec::new();
+        for index in 0..n {
+            let partition = Partition { family: PartitionFamily::Execution, index };
+            let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+
+            match self
+                .rotate_single_partition(&key, new_kid, new_secret_hex, previous_expires_at)
+                .await
+            {
+                Ok(RotationStepOutcome::Rotated) => {
+                    rotated += 1;
+                    // Per-partition event → DEBUG (not INFO). Rationale:
+                    // one rotate endpoint call produces 256 partition-level
+                    // events, which would blow up paid aggregator budgets
+                    // (Datadog/Splunk) at no operational value. The single
+                    // aggregated audit event below is the compliance
+                    // artifact. Failures stay at ERROR with per-partition
+                    // detail — that's where operators need it.
+                    tracing::debug!(
+                        partition = %partition,
+                        new_kid = %new_kid,
+                        "waitpoint_hmac_rotated"
+                    );
+                }
+                Ok(RotationStepOutcome::InProgress) => {
+                    // Another rotation is mid-flight on this partition. It
+                    // will finish (rotation is idempotent + per-partition
+                    // locked), so this is NOT a failure the operator needs
+                    // to retry. DO NOT push to `failed` — keeping `failed`
+                    // meaningful for actual Valkey/config errors the
+                    // operator must investigate. Per-partition detail at
+                    // DEBUG; summary emitted once at end.
+                    in_progress.push(index);
+                    tracing::debug!(
+                        partition = %partition,
+                        new_kid = %new_kid,
+                        "waitpoint_hmac_rotation_in_progress_skipped"
+                    );
+                }
+                Err(e) => {
+                    // Failures stay at ERROR (target=audit) per-partition —
+                    // operators need the partition index + error to debug
+                    // Valkey/config faults. Low cardinality in practice
+                    // (failures should be rare).
+                    tracing::error!(
+                        target: "audit",
+                        partition = %partition,
+                        err = %e,
+                        "waitpoint_hmac_rotation_failed"
+                    );
+                    failed.push(index);
+                }
+            }
+        }
+
+        // Single aggregated audit event for the whole rotation. This is
+        // the load-bearing compliance artifact — operators alert on
+        // target="audit" at INFO level and this is the stable schema.
+        tracing::info!(
+            target: "audit",
+            new_kid = %new_kid,
+            total_partitions = n,
+            rotated,
+            failed_count = failed.len(),
+            in_progress_count = in_progress.len(),
+            "waitpoint_hmac_rotation_complete"
+        );
+
+        Ok(RotateWaitpointSecretResult {
+            rotated,
+            failed,
+            in_progress,
+            new_kid: new_kid.to_owned(),
+        })
+    }
+
+    /// Rotate on a single partition. Reads current_kid, promotes it to
+    /// previous_kid with `previous_expires_at`, installs new_kid + new secret.
+    ///
+    /// Serialized per-partition via a SETNX lock (`ff:sec:rotate_lock:{p:N}`)
+    /// with a 10s TTL. Concurrent operator-triggered rotations against the
+    /// same partition would otherwise interleave the HGET/HDEL/HSET sequence
+    /// and lose writes — the loser's secret would end up partially stored
+    /// and its tokens would stop validating. The lock key shares the
+    /// partition hash tag so it stays in-slot under cluster mode.
+    ///
+    /// A single-partition rotation completes in a few ms on local Valkey,
+    /// so the 10s TTL is a generous safety margin.
+    async fn rotate_single_partition(
+        &self,
+        key: &str,
+        new_kid: &str,
+        new_secret_hex: &str,
+        previous_expires_at: i64,
+    ) -> Result<RotationStepOutcome, ServerError> {
+        // Derive the lock key from the secrets key: keep the `{p:N}` hash tag
+        // so the lock lives in the same cluster slot as the hash we're
+        // mutating. `ff:sec:{p:N}:waitpoint_hmac` → `ff:sec:{p:N}:rotate_lock`.
+        let lock_key = rotate_lock_key_for(key);
+        const LOCK_TTL_MS: u64 = 10_000;
+        let acquired: Option<String> = self
+            .client
+            .cmd("SET")
+            .arg(&lock_key)
+            .arg("1")
+            .arg("NX")
+            .arg("PX")
+            .arg(LOCK_TTL_MS.to_string().as_str())
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: format!("SET NX {lock_key}"),
+            })?;
+        if acquired.is_none() {
+            // Concurrent rotation holds the lock. Return InProgress (not
+            // Err) — the concurrent caller will finish the work, the
+            // outer loop buckets this partition into `in_progress`, and
+            // the operator does not get a spurious "failed" count.
+            return Ok(RotationStepOutcome::InProgress);
+        }
+
+        // Best-effort DEL of the lock on all exit paths. Valkey auto-expires
+        // via PX TTL anyway, so a dropped future only costs the remaining
+        // lock window, not correctness.
+        let result = self
+            .rotate_single_partition_locked(key, new_kid, new_secret_hex, previous_expires_at)
+            .await;
+        let _: Option<i64> = self
+            .client
+            .cmd("DEL")
+            .arg(&lock_key)
+            .execute()
+            .await
+            .ok()
+            .flatten();
+        result.map(|()| RotationStepOutcome::Rotated)
+    }
+
+    async fn rotate_single_partition_locked(
+        &self,
+        key: &str,
+        new_kid: &str,
+        new_secret_hex: &str,
+        previous_expires_at: i64,
+    ) -> Result<(), ServerError> {
+        let current_kid: Option<String> = self
+            .client
+            .hget(key, "current_kid")
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: format!("HGET {key} current_kid"),
+            })?;
+
+        if current_kid.as_deref() == Some(new_kid) {
+            // Already rotated to this kid. Retry-safety rule (RFC-004):
+            // - same kid + same secret → no-op (operator retry after HTTP
+            //   timeout or transient 5xx is SAFE).
+            // - same kid + DIFFERENT secret → REJECT with RotationConflict.
+            //   Silently overwriting would invalidate every token minted
+            //   under the stored secret since the first rotation to this
+            //   kid, an unbounded amount of in-flight state.
+            let field = format!("secret:{new_kid}");
+            let stored_secret: Option<String> = self
+                .client
+                .hget(key, &field)
+                .await
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("HGET {key} secret:<kid> (idempotency check)"),
+                })?;
+            match stored_secret.as_deref() {
+                Some(s) if s == new_secret_hex => {
+                    // Exact replay — idempotent no-op.
+                    return Ok(());
+                }
+                Some(_) => {
+                    // Same kid, different secret bytes. This is almost
+                    // certainly an operator mistake (typed wrong hex, or
+                    // forgot they rotated, or two simultaneous rotations
+                    // racing with distinct material). Refuse with a
+                    // dedicated error that the HTTP layer maps to 409
+                    // Conflict so the caller knows this isn't a retry
+                    // opportunity.
+                    return Err(ServerError::OperationFailed(format!(
+                        "rotation conflict: kid {new_kid} already installed with a \
+                         different secret. Either use a fresh kid or restore the \
+                         original secret for this kid before retrying."
+                    )));
+                }
+                None => {
+                    // Torn write: current_kid=new_kid but secret:<new_kid>
+                    // missing. Repair with the presented secret. Matches
+                    // boot-init repair semantics.
+                    self.client
+                        .hset(key, &field, new_secret_hex)
+                        .await
+                        .map_err(|e| ServerError::ValkeyContext {
+                            source: e,
+                            context: format!("HSET {key} secret:<kid> (torn-write repair)"),
+                        })?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Orphan GC: scan the entire expires_at:* namespace and HDEL both
+        // expires_at:<kid> and secret:<kid> for every kid whose grace has
+        // elapsed. Multi-kid validation (helpers.lua) accepts ANY kid
+        // present with a future expires_at, so GC by recency (just
+        // previous_kid) would leak historical kids forever AND — worse —
+        // restricting validation to a two-slot window would violate the
+        // grace contract on rapid rotation (A→B→C inside 24h kept A
+        // accepted under the prior model only via previous_kid, which B
+        // now claims).
+        //
+        // HGETALL the whole hash once (bounded: one entry per distinct
+        // kid ever installed, plus scalar fields). Build the reaper set
+        // in-memory, then one HDEL. Cheap.
+        let full_hash: std::collections::HashMap<String, String> = self
+            .client
+            .hgetall(key)
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: format!("HGETALL {key} (orphan scan)"),
+            })?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis() as i64;
+        let mut expired_kids: Vec<String> = Vec::new();
+        for (field, value) in &full_hash {
+            if let Some(kid) = field.strip_prefix("expires_at:") {
+                let exp = value.parse::<i64>().unwrap_or(0);
+                if exp <= 0 || exp <= now_ms {
+                    expired_kids.push(kid.to_owned());
+                }
+            }
+        }
+        if !expired_kids.is_empty() {
+            let mut hdel = self.client.cmd("HDEL").arg(key);
+            for kid in &expired_kids {
+                hdel = hdel.arg(format!("expires_at:{kid}")).arg(format!("secret:{kid}"));
+            }
+            let _: i64 = hdel.execute().await.map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: format!("HDEL {key} expired kids (orphan GC)"),
+            })?;
+        }
+
+        // Promote current → previous: stamp expires_at:<current_kid> with
+        // the new previous_expires_at. This is the per-kid grace window
+        // that validate_waitpoint_token reads. previous_kid +
+        // previous_expires_at scalars are kept in lockstep for audit log
+        // observability (aggregated rotation event shape) and for any
+        // downgrade path that still reads the two-slot scheme.
+        //
+        // INVARIANT: expires_at:<new_kid> is NEVER written — current_kid
+        // has no expiry (always valid). It only gets an expires_at entry
+        // when a FUTURE rotation promotes it out of current.
+        let mut hset = self.client.cmd("HSET").arg(key);
+        let prev_expires_str = previous_expires_at.to_string();
+        let cur_owned;
+        let outgoing_expires_field;
+        if let Some(cur) = current_kid {
+            cur_owned = cur;
+            outgoing_expires_field = format!("expires_at:{cur_owned}");
+            hset = hset
+                .arg("previous_kid")
+                .arg(cur_owned.as_str())
+                .arg("previous_expires_at")
+                .arg(prev_expires_str.as_str())
+                .arg(outgoing_expires_field.as_str())
+                .arg(prev_expires_str.as_str());
+        }
+        let secret_field = format!("secret:{new_kid}");
+        let _: i64 = hset
+            .arg("current_kid")
+            .arg(new_kid)
+            .arg(&secret_field)
+            .arg(new_secret_hex)
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: format!("HSET {key} (rotate atomic)"),
+            })?;
+        Ok(())
+    }
+}
+
+/// Derive a per-partition rotation lock key that shares the hash tag of the
+/// secrets key (so lock and hash live in the same cluster slot).
+/// `ff:sec:{p:N}:waitpoint_hmac` → `ff:sec:{p:N}:rotate_lock`.
+fn rotate_lock_key_for(secrets_key: &str) -> String {
+    match secrets_key.rsplit_once(':') {
+        Some((prefix, _last)) => format!("{prefix}:rotate_lock"),
+        None => format!("{secrets_key}:rotate_lock"),
+    }
 }
 
 // ── FCALL result parsing ──
@@ -2120,6 +3055,25 @@ fn parse_replay_result(raw: &Value) -> Result<ReplayExecutionResult, ServerError
 }
 
 /// Extract a string from an FCALL result array at the given index.
+/// Convert a `ScriptError` into a `ServerError` preserving `ferriskey::ErrorKind`
+/// for transport-level variants. Business-logic variants keep their code as
+/// `ServerError::Script(String)` so HTTP clients see a stable message.
+///
+/// Why this exists: before R2, the stream handlers did
+/// `ScriptError → format!() → ServerError::Script(String)`, which erased
+/// the ErrorKind and made `ServerError::is_retryable()` always return
+/// false. Retry-capable clients (cairn-fabric) would not retry a legit
+/// transient error like `IoError`.
+fn script_error_to_server(e: ff_script::error::ScriptError) -> ServerError {
+    match e {
+        ff_script::error::ScriptError::Valkey(valkey_err) => ServerError::ValkeyContext {
+            source: valkey_err,
+            context: "stream FCALL transport".into(),
+        },
+        other => ServerError::Script(other.to_string()),
+    }
+}
+
 fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> String {
     match arr.get(index) {
         Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),

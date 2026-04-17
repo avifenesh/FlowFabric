@@ -12,8 +12,10 @@
 //! - POST /v1/budgets/{id}/reset (reset_budget)
 //! - POST /v1/flows/{id}/edges (stage_dependency_edge)
 //! - POST /v1/flows/{id}/edges/apply (apply_dependency_to_child)
+//!
 //! TODO: Untested SDK methods (no test at any layer):
 //! - ClaimedTask::move_to_waiting_children()
+//!
 //! TODO: Untested Server methods (tested via FCALL but not typed Server API):
 //! - Server::revoke_lease()
 //! - Server::reset_budget()
@@ -114,6 +116,10 @@ fn test_server_config() -> ff_server::config::ServerConfig {
         skip_library_load: true,
         cors_origins: vec!["*".to_owned()],
         api_token: None,
+        waitpoint_hmac_secret:
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        waitpoint_hmac_grace_ms: 86_400_000,
+        max_concurrent_stream_ops: 64,
     }
 }
 
@@ -640,4 +646,100 @@ async fn test_api_cancel_flow() {
             assert_eq!(cancellation_policy, "cancel_all");
         }
     }
+}
+
+/// R5 smoke: concurrency ceiling for stream ops surfaces as HTTP 429
+/// Too Many Requests when a burst exceeds `max_concurrent_stream_ops`.
+/// Verifies the `stream_semaphore` + `TailUnavailable → 429` path in
+/// `api::tail_attempt_stream`.
+///
+/// We build a Server with `max_concurrent_stream_ops=2`, fire 5 tail
+/// calls with a long-ish block so they all stay in flight, and assert
+/// that at least 3 of them come back as 429.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_stream_semaphore_returns_429_on_burst() {
+    // Build a bespoke server with a tiny stream-op ceiling.
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let mut config = test_server_config();
+    config.max_concurrent_stream_ops = 2;
+    let server = ff_server::server::Server::start(config)
+        .await
+        .expect("Server::start failed");
+    let server = Arc::new(server);
+    let app = ff_server::api::router(server.clone(), &["*".to_owned()], None);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let _abort = handle.abort_handle();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    // Fire 5 concurrent tails on a never-written stream with block_ms=2000.
+    //
+    // Expected outcome under the `xread_block_lock` serializer:
+    //   * 2 calls acquire a stream_semaphore permit (ceiling=2) and
+    //     queue on the XREAD BLOCK Mutex. They serialize: first dispatches
+    //     immediately, second waits ~2s for the first to finish. Both
+    //     return 200 with empty frames + closed_at=None after ~2s and
+    //     ~4s respectively (full block_ms budget preserved on both).
+    //   * 3 calls fail the try_acquire_owned fast and return 429 in
+    //     microseconds.
+    //
+    // Before the serialization Mutex landed (R5-b), the second
+    // permit-holder would spuriously time out: ferriskey's per-call
+    // request_timeout (block_ms + 500ms) started client-side while
+    // Valkey was still servicing the first BLOCK on the pipelined mux,
+    // so the second call's timeout fired before its turn at the server.
+    // Observed as HTTP 500 `valkey: timed out`. The Mutex ensures each
+    // call's timeout doesn't start until it holds the lock.
+    let eid = ExecutionId::new();
+    let url = format!(
+        "{base_url}/v1/executions/{eid}/attempts/0/stream/tail?block_ms=2000&limit=10"
+    );
+
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let c = client.clone();
+        let u = url.clone();
+        handles.push(tokio::spawn(async move { c.get(&u).send().await }));
+    }
+
+    let mut ok_like = 0;
+    let mut too_many = 0;
+    for h in handles {
+        let resp = h.await.expect("join").expect("send");
+        let status = resp.status().as_u16();
+        match status {
+            200 => ok_like += 1,
+            429 => too_many += 1,
+            other => {
+                let body = resp.text().await.unwrap_or_default();
+                panic!("unexpected status {other}: {body}");
+            }
+        }
+    }
+
+    // At most 2 can have acquired permits; the remaining 3 must 429.
+    assert!(
+        too_many >= 3,
+        "expected >=3 429 responses, got too_many={too_many} ok_like={ok_like}"
+    );
+    assert!(
+        ok_like <= 2,
+        "expected <=2 200 responses (matches max_concurrent_stream_ops), got {ok_like}"
+    );
+
+    _abort.abort();
 }

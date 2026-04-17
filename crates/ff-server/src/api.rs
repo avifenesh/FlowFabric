@@ -95,6 +95,16 @@ impl IntoResponse for ApiError {
             ServerError::OperationFailed(msg) => {
                 (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
             }
+            ServerError::TailUnavailable(max) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorBody {
+                    error: format!(
+                        "too many concurrent tail calls (server max: {max}); retry with backoff"
+                    ),
+                    kind: None,
+                    retryable: Some(true),
+                },
+            ),
             ServerError::Valkey(e) => {
                 let kind_str = kind_to_stable_str(e.kind());
                 tracing::error!(
@@ -177,6 +187,15 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
         .route("/v1/executions/{id}/priority", put(change_priority))
         .route("/v1/executions/{id}/replay", post(replay_execution))
         .route("/v1/executions/{id}/revoke-lease", post(revoke_lease))
+        // Stream read + tail (RFC-006 #2)
+        .route(
+            "/v1/executions/{id}/attempts/{idx}/stream",
+            get(read_attempt_stream),
+        )
+        .route(
+            "/v1/executions/{id}/attempts/{idx}/stream/tail",
+            get(tail_attempt_stream),
+        )
         // Flows
         .route("/v1/flows", post(create_flow))
         .route("/v1/flows/{id}/members", post(add_execution_to_flow))
@@ -190,6 +209,8 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
         .route("/v1/budgets/{id}/reset", post(reset_budget))
         // Quotas
         .route("/v1/quotas", post(create_quota_policy))
+        // Admin: rotate waitpoint HMAC secret (RFC-004 §Waitpoint Security)
+        .route("/v1/admin/rotate-waitpoint-secret", post(rotate_waitpoint_secret))
         // Health (always unauthenticated)
         .route("/healthz", get(healthz));
 
@@ -350,6 +371,85 @@ async fn deliver_signal(
     Ok(Json(server.deliver_signal(&args).await?))
 }
 
+// ── Admin: rotate waitpoint HMAC secret (RFC-004 §Waitpoint Security) ──
+
+#[derive(Deserialize)]
+struct RotateWaitpointSecretBody {
+    new_kid: String,
+    /// Hex-encoded new secret. Even-length, 0-9a-fA-F.
+    new_secret_hex: String,
+}
+
+/// Hard ceiling on how long the rotate endpoint runs before the HTTP
+/// handler bails. Rotation touches every execution partition (up to 256)
+/// with HGET+HMGET+HDEL+HSET per partition; 6 round-trips × 30ms cross-AZ
+/// × 256 partitions ≈ 46s worst-case. The internal SETNX lock is 10s TTL
+/// per partition, so 120s gives ample margin for contention + slow RTTs
+/// while staying below common LB idle timeouts (ALB 60s default, but
+/// typically bumped to 120s+ for admin endpoints).
+///
+/// On timeout: returns HTTP 504 immediately. Valkey-side work may still
+/// finish (the per-partition locks and HSETs are already in flight). The
+/// operator observes a 504 and retries; retry is SAFE — rotation is
+/// idempotent per-partition (same new_kid + same secret → no-op on
+/// already-rotated partitions).
+const ROTATE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+async fn rotate_waitpoint_secret(
+    State(server): State<Arc<Server>>,
+    AppJson(body): AppJson<RotateWaitpointSecretBody>,
+) -> Result<Response, ApiError> {
+    // Cap the whole endpoint end-to-end. If this trips, the caller's
+    // retry is SAFE — per-partition rotation is idempotent on the same
+    // (new_kid, secret_hex) and the per-partition SETNX lock prevents
+    // double-rotation under concurrent retries.
+    let rotate_fut = server.rotate_waitpoint_secret(&body.new_kid, &body.new_secret_hex);
+    let result = match tokio::time::timeout(ROTATE_HTTP_TIMEOUT, rotate_fut).await {
+        Ok(r) => r?,
+        Err(_) => {
+            tracing::error!(
+                target: "audit",
+                new_kid = %body.new_kid,
+                timeout_s = ROTATE_HTTP_TIMEOUT.as_secs(),
+                "waitpoint_hmac_rotation_timeout_http_504"
+            );
+            let body = ErrorBody::plain(format!(
+                "rotation exceeded {}s server-side timeout; retry is safe \
+                 (per-partition rotation is idempotent on the same new_kid + secret_hex)",
+                ROTATE_HTTP_TIMEOUT.as_secs()
+            ));
+            return Ok((StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response());
+        }
+    };
+    // Operator action log at audit target (per-partition detail logged inside
+    // rotate_waitpoint_secret). Returns 200 if at least one partition rotated
+    // OR at least one partition was already in-flight under a concurrent
+    // rotation. Returns 400 only on actionable fault states.
+    //
+    // Three distinct rotated==0 cases:
+    //   - all in_progress → concurrent rotation handling it, NOT a failure.
+    //     200 OK with the structured result so operators see what's happening.
+    //   - failed.is_empty() && in_progress.is_empty() → no partitions at all
+    //     (num_execution_partitions == 0; env_u16_positive rejects this at
+    //     boot so this is mostly dead code for library/Default callers).
+    //   - !failed.is_empty() → every partition attempt raised a real error.
+    //     Operator investigates Valkey/auth/cluster health before retrying.
+    if result.rotated == 0 && result.failed.is_empty() && result.in_progress.is_empty() {
+        return Err(ApiError::from(ServerError::OperationFailed(
+            "rotation had no partitions to operate on \
+             (num_execution_partitions is 0 — server misconfigured)"
+                .to_owned(),
+        )));
+    }
+    if result.rotated == 0 && !result.failed.is_empty() {
+        return Err(ApiError::from(ServerError::OperationFailed(
+            "rotation failed on all partitions (check Valkey connectivity)".to_owned(),
+        )));
+    }
+    // rotated==0 but some in_progress → 200 OK; caller polls / re-runs.
+    Ok(Json(result).into_response())
+}
+
 #[derive(Deserialize)]
 struct ChangePriorityBody {
     new_priority: i32,
@@ -378,6 +478,170 @@ async fn revoke_lease(
 ) -> Result<Json<RevokeLeaseResult>, ApiError> {
     let eid = parse_execution_id(&id)?;
     Ok(Json(server.revoke_lease(&eid).await?))
+}
+
+// ── Stream read + tail ──
+
+#[derive(Deserialize)]
+struct ReadStreamParams {
+    #[serde(default = "default_from_id")]
+    from: String,
+    #[serde(default = "default_to_id")]
+    to: String,
+    #[serde(default = "default_read_limit")]
+    limit: u64,
+}
+
+fn default_from_id() -> String { "-".to_owned() }
+fn default_to_id() -> String { "+".to_owned() }
+fn default_read_limit() -> u64 { 100 }
+
+/// Reject malformed `from`/`to`/`after` stream IDs at the REST boundary so
+/// Valkey doesn't have to. Accepts `"-"`, `"+"`, and `<ms>` or `<ms>-<seq>`
+/// decimal IDs as Valkey XRANGE/XREAD does.
+///
+/// Without this, a request like `?from=abc` would round-trip to Valkey,
+/// surface as a script error, and return HTTP 500 — which is wrong for
+/// caller-input validation.
+fn validate_stream_id(s: &str, field: &str, allow_open_markers: bool) -> Result<(), ApiError> {
+    if allow_open_markers && (s == "-" || s == "+") {
+        return Ok(());
+    }
+    // Allowed: `<digits>` or `<digits>-<digits>`.
+    let (ms_part, seq_part) = match s.split_once('-') {
+        Some((ms, seq)) => (ms, Some(seq)),
+        None => (s, None),
+    };
+    let ms_valid = !ms_part.is_empty() && ms_part.chars().all(|c| c.is_ascii_digit());
+    let seq_valid = seq_part
+        .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(true);
+    if ms_valid && seq_valid {
+        Ok(())
+    } else {
+        Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: invalid stream ID '{s}' (expected '-', '+', '<ms>', or '<ms>-<seq>')"
+        ))))
+    }
+}
+
+#[derive(Serialize)]
+struct ReadStreamResponse {
+    frames: Vec<StreamFrame>,
+    count: usize,
+    /// When set, the producer has closed this stream — consumer should
+    /// stop polling. Absent when the stream is still open (or never
+    /// existed, which is indistinguishable from "still open" at this
+    /// layer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed_at: Option<i64>,
+    /// Reason from the closing writer: `attempt_success`, `attempt_failure`,
+    /// `attempt_cancelled`, `attempt_interrupted`. Absent iff still open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed_reason: Option<String>,
+}
+
+impl From<ff_core::contracts::StreamFrames> for ReadStreamResponse {
+    fn from(sf: ff_core::contracts::StreamFrames) -> Self {
+        let count = sf.frames.len();
+        Self {
+            frames: sf.frames,
+            count,
+            closed_at: sf.closed_at.map(|t| t.0),
+            closed_reason: sf.closed_reason,
+        }
+    }
+}
+
+/// REST-layer ceiling on `limit` for stream read/tail responses. Lower
+/// than the internal `STREAM_READ_HARD_CAP` (10_000) because an HTTP
+/// response buffers the whole JSON body in memory in axum — a
+/// `10_000 × max_payload_bytes (65_536)` body is ~640MB per call, which
+/// is a DoS vector from a single client. Internal callers using FCALL or
+/// the SDK directly still get the full 10_000 ceiling; REST clients must
+/// paginate through `from`/`to` for larger spans.
+///
+/// v2 candidate: chunked-transfer / SSE when the caller wants > this bound.
+const REST_STREAM_LIMIT_CEILING: u64 = 1_000;
+
+async fn read_attempt_stream(
+    State(server): State<Arc<Server>>,
+    Path((id, idx)): Path<(String, u32)>,
+    Query(params): Query<ReadStreamParams>,
+) -> Result<Json<ReadStreamResponse>, ApiError> {
+    if params.limit == 0 {
+        return Err(ApiError(ServerError::InvalidInput(
+            "limit must be >= 1".to_owned(),
+        )));
+    }
+    if params.limit > REST_STREAM_LIMIT_CEILING {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "limit exceeds REST ceiling {REST_STREAM_LIMIT_CEILING}; paginate via from/to for larger spans"
+        ))));
+    }
+    validate_stream_id(&params.from, "from", true)?;
+    validate_stream_id(&params.to, "to", true)?;
+
+    let eid = parse_execution_id(&id)?;
+    let attempt_index = AttemptIndex::new(idx);
+    let result = server
+        .read_attempt_stream(&eid, attempt_index, &params.from, &params.to, params.limit)
+        .await?;
+    Ok(Json(result.into()))
+}
+
+#[derive(Deserialize)]
+struct TailStreamParams {
+    #[serde(default = "default_tail_after")]
+    after: String,
+    #[serde(default)]
+    block_ms: u64,
+    #[serde(default = "default_tail_limit")]
+    limit: u64,
+}
+
+fn default_tail_after() -> String { "0-0".to_owned() }
+fn default_tail_limit() -> u64 { 50 }
+
+/// Ceiling on BLOCK duration for the tail endpoint. Kept below common LB
+/// idle timeouts (ALB 60s, nginx 60s, Cloudflare 100s) so the HTTP response
+/// can't be cut mid-block.
+///
+/// Note: ferriskey's client auto-extends its `request_timeout` for XREAD
+/// BLOCK to `block_ms + 500ms`, so a blocking call with the full ceiling
+/// never produces a spurious transport timeout. See
+/// `ff_script::stream_tail` module docs for the exact ferriskey code path.
+const MAX_TAIL_BLOCK_MS: u64 = 30_000;
+
+async fn tail_attempt_stream(
+    State(server): State<Arc<Server>>,
+    Path((id, idx)): Path<(String, u32)>,
+    Query(params): Query<TailStreamParams>,
+) -> Result<Json<ReadStreamResponse>, ApiError> {
+    if params.block_ms > MAX_TAIL_BLOCK_MS {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "block_ms exceeds {MAX_TAIL_BLOCK_MS}ms ceiling"
+        ))));
+    }
+    if params.limit == 0 {
+        return Err(ApiError(ServerError::InvalidInput(
+            "limit must be >= 1".to_owned(),
+        )));
+    }
+    if params.limit > REST_STREAM_LIMIT_CEILING {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "limit exceeds REST ceiling {REST_STREAM_LIMIT_CEILING}; paginate via after for larger spans"
+        ))));
+    }
+    // XREAD cursor must be a concrete ID — "-"/"+" are XRANGE-only.
+    validate_stream_id(&params.after, "after", false)?;
+
+    let eid = parse_execution_id(&id)?;
+    let attempt_index = AttemptIndex::new(idx);
+    let result = server
+        .tail_attempt_stream(&eid, attempt_index, &params.after, params.block_ms, params.limit)
+        .await?;
+    Ok(Json(result.into()))
 }
 
 // ── Flow handlers ──

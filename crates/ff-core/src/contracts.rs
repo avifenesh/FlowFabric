@@ -7,10 +7,10 @@ use crate::policy::ExecutionPolicy;
 use crate::state::{AttemptType, PublicState, StateVector};
 use crate::types::{
     AttemptId, AttemptIndex, CancelSource, ExecutionId, LaneId, LeaseEpoch, LeaseId, Namespace,
-    SignalId, SuspensionId, TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
+    SignalId, SuspensionId, TimestampMs, WaitpointId, WaitpointToken, WorkerId, WorkerInstanceId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 // ─── create_execution ───
 
@@ -68,6 +68,12 @@ pub struct IssueClaimGrantArgs {
     pub route_snapshot_json: Option<String>,
     #[serde(default)]
     pub admission_summary: Option<String>,
+    /// Capabilities this worker advertises. Serialized as a sorted,
+    /// comma-separated string to the Lua FCALL (see scheduling.lua
+    /// ff_issue_claim_grant). An empty set matches only executions whose
+    /// `required_capabilities` is also empty.
+    #[serde(default)]
+    pub worker_capabilities: BTreeSet<String>,
     pub grant_ttl_ms: u64,
     /// Caller-side timestamp for bookkeeping. NOT passed to the Lua FCALL —
     /// ff_issue_claim_grant uses `redis.call("TIME")` for grant_expires_at.
@@ -484,13 +490,18 @@ pub enum SuspendExecutionResult {
         suspension_id: SuspensionId,
         waitpoint_id: WaitpointId,
         waitpoint_key: String,
+        /// HMAC-SHA1 token bound to (waitpoint_id, waitpoint_key, created_at).
+        /// Required by signal-delivery callers to authenticate against this
+        /// waitpoint (RFC-004 §Waitpoint Security).
+        waitpoint_token: WaitpointToken,
     },
     /// Buffered signals already satisfied the condition — suspension skipped.
-    /// Lease is still held.
+    /// Lease is still held. Token comes from the pending waitpoint record.
     AlreadySatisfied {
         suspension_id: SuspensionId,
         waitpoint_id: WaitpointId,
         waitpoint_key: String,
+        waitpoint_token: WaitpointToken,
     },
 }
 
@@ -538,6 +549,10 @@ pub enum CreatePendingWaitpointResult {
     Created {
         waitpoint_id: WaitpointId,
         waitpoint_key: String,
+        /// HMAC-SHA1 token bound to the pending waitpoint. Required for
+        /// `buffer_signal_for_pending_waitpoint` and carried forward when
+        /// the waitpoint is activated by `suspend_execution`.
+        waitpoint_token: WaitpointToken,
     },
 }
 
@@ -589,6 +604,17 @@ pub struct DeliverSignalArgs {
     /// MAXLEN for the waitpoint signal stream.
     #[serde(default)]
     pub signal_maxlen: Option<u64>,
+    /// HMAC-SHA1 token issued when the waitpoint was created. Required for
+    /// signal delivery; missing/tampered/rotated-past-grace tokens are
+    /// rejected with `invalid_token` or `token_expired` (RFC-004).
+    ///
+    /// Defense-in-depth: `WaitpointToken` is a transparent string newtype,
+    /// so an empty string deserializes successfully from JSON. The
+    /// validation boundary is in Lua (`validate_waitpoint_token` returns
+    /// `missing_token` on empty input); this type intentionally does NOT
+    /// pre-reject at the Rust layer so callers get a consistent typed
+    /// error regardless of how they constructed the args.
+    pub waitpoint_token: WaitpointToken,
     pub now: TimestampMs,
 }
 
@@ -621,6 +647,9 @@ pub struct BufferSignalArgs {
     #[serde(default)]
     pub idempotency_key: Option<String>,
     pub target_scope: String,
+    /// HMAC-SHA1 token issued when `create_pending_waitpoint` ran. Required
+    /// to authenticate early signals targeting the pending waitpoint.
+    pub waitpoint_token: WaitpointToken,
     pub now: TimestampMs,
 }
 
@@ -723,6 +752,81 @@ pub enum AppendFrameResult {
         /// Total frame count after this append.
         frame_count: u64,
     },
+}
+
+// ─── read_attempt_stream / tail_attempt_stream ───
+
+/// Hard cap on the number of frames returned by a single read/tail call.
+///
+/// Single source of truth across the Rust layer (ff-script, ff-server,
+/// ff-sdk). The Lua side in `lua/stream.lua` keeps a matching literal with
+/// an inline reference back here; bump both together if you ever need to
+/// lift the cap.
+pub const STREAM_READ_HARD_CAP: u64 = 10_000;
+
+/// A single frame read from an attempt-scoped stream.
+///
+/// Field set mirrors what `ff_append_frame` writes: `frame_type`, `ts`,
+/// `payload`, `encoding`, `source`, and optionally `correlation_id`. Stored
+/// as an ordered map so field order is deterministic across read calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFrame {
+    /// Valkey Stream entry ID, e.g. "1713100800150-0".
+    pub id: String,
+    /// Frame fields in sorted order.
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+/// Inputs to `ff_read_attempt_stream` (XRANGE wrapper).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadFramesArgs {
+    pub execution_id: ExecutionId,
+    pub attempt_index: AttemptIndex,
+    /// XRANGE start ID. Use "-" for earliest.
+    pub from_id: String,
+    /// XRANGE end ID. Use "+" for latest.
+    pub to_id: String,
+    /// XRANGE COUNT limit. MUST be `>= 1`. The REST and SDK layers reject
+    /// `0` at the boundary; the Lua side rejects it too. `STREAM_READ_HARD_CAP`
+    /// is the upper bound.
+    pub count_limit: u64,
+}
+
+/// Result of reading frames from an attempt stream — frames plus terminal
+/// signal so consumers can stop polling without a timeout fallback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFrames {
+    /// Entries in the requested range (possibly empty).
+    pub frames: Vec<StreamFrame>,
+    /// Timestamp when the upstream writer closed the stream. `None` if the
+    /// stream is still open (or has never been written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<TimestampMs>,
+    /// Reason from the closing writer. Current values:
+    /// `attempt_success`, `attempt_failure`, `attempt_cancelled`,
+    /// `attempt_interrupted`. `None` iff the stream is still open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_reason: Option<String>,
+}
+
+impl StreamFrames {
+    /// Construct an empty open-stream result (no frames, no terminal
+    /// markers). Useful for fast-path peek helpers.
+    pub fn empty_open() -> Self {
+        Self { frames: Vec::new(), closed_at: None, closed_reason: None }
+    }
+
+    /// True iff the producer has closed this stream. Consumers should stop
+    /// polling and drain once this returns true.
+    pub fn is_closed(&self) -> bool {
+        self.closed_at.is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadFramesResult {
+    /// Frames returned (possibly empty) plus optional closed markers.
+    Frames(StreamFrames),
 }
 
 // ═══════════════════════════════════════════════════════════════════════

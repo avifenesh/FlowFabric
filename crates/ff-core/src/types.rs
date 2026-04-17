@@ -231,6 +231,78 @@ string_id! {
     WaitpointKey
 }
 
+/// Waitpoint HMAC token — authenticates signal delivery against the
+/// waitpoint's mint-time binding. Format `"kid:40hex"` (see RFC-004
+/// §Waitpoint Security). The `kid` prefix identifies which signing
+/// key produced the token, enabling zero-downtime rotation.
+///
+/// **Debug / Display REDACT the hex digest.** This is a bearer credential:
+/// anyone who captures the full token can mint signals against the waitpoint
+/// until it closes or rotation grace expires. A derive'd `Debug` would leak
+/// the digest into every `tracing::debug!(args = ?args)` call; a generic
+/// `Display` would leak it into error messages. Both impls print
+/// `"<kid>:<REDACTED:len>"` instead. If a test needs the raw value, use
+/// `as_str()` explicitly — that makes the leak intentional and searchable.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WaitpointToken(pub String);
+
+impl WaitpointToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Raw token value. Use ONLY at the wire boundary (FCALL ARGV,
+    /// HTTP header). Never feed this into a logger.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Split the token into `(kid, digest_len)` for redacted formatting.
+    /// Returns `(None, 0)` for malformed inputs so Debug/Display never
+    /// accidentally surface partial hex.
+    fn parts_for_redaction(&self) -> (Option<&str>, usize) {
+        match self.0.find(':') {
+            Some(i) if i > 0 && i < self.0.len() - 1 => {
+                (Some(&self.0[..i]), self.0.len() - i - 1)
+            }
+            _ => (None, 0),
+        }
+    }
+}
+
+impl fmt::Debug for WaitpointToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kid, digest_len) = self.parts_for_redaction();
+        match kid {
+            Some(k) => write!(f, "WaitpointToken({k}:<REDACTED:len={digest_len}>)"),
+            None => write!(f, "WaitpointToken(<REDACTED:malformed>)"),
+        }
+    }
+}
+
+impl fmt::Display for WaitpointToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kid, digest_len) = self.parts_for_redaction();
+        match kid {
+            Some(k) => write!(f, "{k}:<REDACTED:len={digest_len}>"),
+            None => write!(f, "<REDACTED:malformed>"),
+        }
+    }
+}
+
+impl From<&str> for WaitpointToken {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for WaitpointToken {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 /// Source of a cancel operation, determining authorization behavior.
 /// "operator_override" bypasses lease checks; "lease_holder" requires valid lease.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

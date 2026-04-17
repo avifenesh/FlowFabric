@@ -12,7 +12,40 @@
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
 use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
+use ff_script::error::ScriptError;
+use ff_script::result::FcallResult;
 use ff_script::retry::is_retryable_kind;
+use std::collections::BTreeSet;
+
+/// Short stable digest of a worker's capability CSV. Used in per-mismatch
+/// log lines so a worker-caps-CSV up to 4KB does not get echoed on every
+/// capability_mismatch event (would swamp aggregators during an incident).
+/// The full CSV is logged once at WARN when the worker connects; operators
+/// cross-reference this 8-hex prefix to the full set.
+/// Return true iff every non-empty comma-separated token in `required_csv`
+/// is present in `worker_caps`. Mirrors the authoritative Lua subset check
+/// in scheduling.lua (parse_capability_csv + missing_capabilities) — this
+/// is a fast-path Rust short-circuit so we can skip the quota-admission
+/// write for executions we already know the worker can't claim. Empty /
+/// all-separator CSV → subset holds trivially.
+fn caps_subset(required_csv: &str, worker_caps: &BTreeSet<String>) -> bool {
+    required_csv
+        .split(',')
+        .filter(|t| !t.is_empty())
+        .all(|t| worker_caps.contains(t))
+}
+
+fn worker_caps_digest(csv: &str) -> String {
+    // FNV-1a 64-bit — not security-sensitive; the point is cardinality
+    // reduction, not unforgeability. First 8 hex chars is enough for
+    // practical uniqueness at fleet scale.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in csv.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{:08x}", (h as u32) ^ ((h >> 32) as u32))
+}
 
 /// A claim grant issued by the scheduler for a specific execution.
 ///
@@ -190,6 +223,11 @@ impl Scheduler {
     /// Iterates all execution partitions looking for the first partition
     /// with an eligible execution. Issues a claim grant via FCALL.
     ///
+    /// `worker_capabilities` is sent to `ff_issue_claim_grant` as a sorted
+    /// CSV (BTreeSet guarantees deterministic order). Executions whose
+    /// `required_capabilities` are not a subset of this set are skipped
+    /// (stay queued) via `ScriptError::CapabilityMismatch`.
+    ///
     /// Returns `Ok(None)` if no eligible executions exist anywhere.
     /// Returns `Ok(Some(grant))` on success.
     /// Returns `Err` on Valkey errors.
@@ -198,12 +236,93 @@ impl Scheduler {
         lane: &LaneId,
         worker_id: &WorkerId,
         worker_instance_id: &WorkerInstanceId,
+        worker_capabilities: &BTreeSet<String>,
         grant_ttl_ms: u64,
     ) -> Result<Option<ClaimGrant>, SchedulerError> {
         let num_partitions = self.config.num_execution_partitions;
         let mut budget_checker = BudgetChecker::new(self.config);
 
-        for p_idx in 0..num_partitions {
+        // Jitter the partition scan start to avoid thundering-herd on
+        // partition 0 when 100 workers all tick simultaneously. Seeded
+        // from worker_instance_id so this worker hits a stable window
+        // within a single scheduling cycle (still covers every partition),
+        // and different workers naturally diverge. FNV-1a mix — same
+        // approach as ff-sdk's PARTITION_SCAN_CHUNK cursor seed.
+        let start_p: u16 = if num_partitions > 0 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in worker_instance_id.as_str().as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            (h as u16) % num_partitions
+        } else {
+            0
+        };
+        // BTreeSet iterates sorted → stable CSV for Lua subset match.
+        // Ingress validation mirrors FlowFabricWorker::connect (ff-sdk):
+        //   - `,` is the CSV delimiter — a token containing one would split
+        //     mid-parse and could let a {"gpu"} worker appear to satisfy
+        //     {"gpu,cuda"} (silent auth bypass).
+        //   - Empty strings would inflate the CSV with leading / adjacent
+        //     commas ("" → ",gpu" → [" "," gpu"]) and inflate the token
+        //     count past CAPS_MAX_TOKENS for no semantic reason.
+        //   - Non-printable / whitespace: "gpu " vs "gpu" or "gpu\n" vs
+        //     "gpu" silently mis-routes. Require printable ASCII excluding
+        //     space (0x21-0x7E) at ingress so typos fail loud.
+        // Enforce ALL here so operator misconfig at the scheduler entry
+        // point fails loud, symmetric with the SDK inline-claim path.
+        // Bounds (#csv, #tokens) are enforced by the Lua side.
+        for cap in worker_capabilities {
+            if cap.is_empty() {
+                return Err(SchedulerError::Config(
+                    "capability token must not be empty".to_owned(),
+                ));
+            }
+            if cap.contains(',') {
+                return Err(SchedulerError::Config(format!(
+                    "capability token may not contain ',' (CSV delimiter): {cap:?}"
+                )));
+            }
+            // Reject ASCII control + whitespace (incl. Unicode whitespace);
+            // allow non-ASCII printable UTF-8 so i18n cap names work. CSV
+            // delimiter `,` is single-byte and never a UTF-8 continuation,
+            // so multibyte UTF-8 is safe on the wire. Symmetric with
+            // ff-sdk::FlowFabricWorker::connect.
+            if cap.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(SchedulerError::Config(format!(
+                    "capability token must not contain whitespace or control characters: {cap:?}"
+                )));
+            }
+        }
+        if worker_capabilities.len() > ff_core::policy::CAPS_MAX_TOKENS {
+            return Err(SchedulerError::Config(format!(
+                "capability set exceeds CAPS_MAX_TOKENS ({}): {}",
+                ff_core::policy::CAPS_MAX_TOKENS,
+                worker_capabilities.len()
+            )));
+        }
+        let worker_caps_csv = worker_capabilities
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        // Stable digest used in per-mismatch logs so the full 4KB CSV
+        // doesn't get echoed on every mismatch. See worker_caps_digest.
+        let worker_caps_hash = worker_caps_digest(&worker_caps_csv);
+        if worker_caps_csv.len() > ff_core::policy::CAPS_MAX_BYTES {
+            return Err(SchedulerError::Config(format!(
+                "capability CSV exceeds CAPS_MAX_BYTES ({}): {}",
+                ff_core::policy::CAPS_MAX_BYTES,
+                worker_caps_csv.len()
+            )));
+        }
+
+        for offset in 0..num_partitions {
+            // Jittered iteration: start at start_p, wrap modulo num_partitions.
+            // Still covers every partition once per cycle; prevents all
+            // workers from hammering partition 0 first simultaneously.
+            let p_idx = (start_p + offset) % num_partitions;
             let partition = Partition {
                 family: PartitionFamily::Execution,
                 index: p_idx,
@@ -270,6 +389,65 @@ impl Scheduler {
                 }
             };
 
+            // ── Capability pre-check (in-slot HGET, cheap) ──
+            // Runs BEFORE quota admission so we never ZADD a quota slot
+            // for an execution this worker can't actually claim. Without
+            // this, on an unmatchable-top-of-zset, every scheduling tick
+            // would ZADD {q:K}:admitted_set then ZREM it via
+            // release_admission on the capability_mismatch reject — a
+            // cross-slot write storm amplifying the mismatch loop.
+            //
+            // Lua `ff_issue_claim_grant` still does the authoritative
+            // check; this is a fast-path short-circuit, not a substitute.
+            // A narrow race exists where `required_capabilities` is
+            // updated between our HGET and the FCALL — the FCALL is still
+            // atomic and correct.
+            let required_caps_csv: Option<String> = match self
+                .client
+                .cmd("HGET")
+                .arg(&core_key)
+                .arg("required_capabilities")
+                .execute::<Option<String>>()
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        partition = p_idx,
+                        execution_id = eid_s.as_str(),
+                        error = %e,
+                        "scheduler: HGET required_capabilities failed, skipping candidate"
+                    );
+                    continue;
+                }
+            };
+            if let Some(req) = required_caps_csv.as_deref()
+                && !req.is_empty()
+                && !caps_subset(req, worker_capabilities)
+            {
+                // Move this execution out of eligible into blocked_route
+                // so we don't hot-loop on it every tick (RFC-009 §564). A
+                // periodic sweep (scanner side) promotes blocked_route →
+                // eligible when a worker with matching caps registers.
+                // Logged with a hash digest, not the raw CSV, to keep
+                // per-mismatch log volume bounded.
+                tracing::info!(
+                    partition = p_idx,
+                    execution_id = eid_s.as_str(),
+                    worker_id = worker_id.as_str(),
+                    worker_caps_hash = worker_caps_hash.as_str(),
+                    required = req,
+                    "scheduler: capability mismatch, blocking execution off eligible"
+                );
+                self.block_candidate(
+                    &partition, &idx, lane, &eid, &eligible_key,
+                    "waiting_for_capable_worker",
+                    "no connected worker satisfies required_capabilities",
+                    now_ms,
+                ).await;
+                continue;
+            }
+
             // ── Budget pre-check (cross-partition, cached per cycle) ──
             if let Some(block_detail) = self
                 .check_budgets(&mut budget_checker, &exec_ctx, &core_key, &eid_s)
@@ -307,7 +485,7 @@ impl Scheduler {
             let wiid_s = worker_instance_id.to_string();
             let lane_s = lane.to_string();
 
-            let argv: [&str; 8] = [
+            let argv: [&str; 9] = [
                 &eid_s,
                 &wid_s,
                 &wiid_s,
@@ -316,13 +494,36 @@ impl Scheduler {
                 &ttl_str,
                 "",   // route_snapshot_json
                 "",   // admission_summary
+                &worker_caps_csv, // sorted CSV; empty → matches only empty-required execs
             ];
 
-            match self
+            let raw = match self
                 .client
                 .fcall::<ferriskey::Value>("ff_issue_claim_grant", &keys, &argv)
                 .await
             {
+                Ok(v) => v,
+                Err(e) => {
+                    // Transport failure on the FCALL — NOSCRIPT, IoError,
+                    // ClusterDown, etc. This is NOT a normal soft-reject;
+                    // persistent transport errors mean the scheduler is
+                    // effectively idle even though it looks like it's
+                    // running. WARN so ops dashboards (WARN+ aggregators)
+                    // fire instead of burying it at DEBUG.
+                    tracing::warn!(
+                        partition = p_idx,
+                        execution_id = eid_s.as_str(),
+                        error = %e,
+                        "scheduler: ff_issue_claim_grant transport error, trying next"
+                    );
+                    if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
+                        self.release_admission(tag, quota_id, eid).await;
+                    }
+                    continue;
+                }
+            };
+
+            match FcallResult::parse(&raw).and_then(|r| r.into_success()) {
                 Ok(_) => {
                     tracing::debug!(
                         partition = p_idx,
@@ -336,13 +537,50 @@ impl Scheduler {
                         expires_at_ms: now_ms + grant_ttl_ms,
                     }));
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        partition = p_idx,
-                        execution_id = eid_s.as_str(),
-                        error = %e,
-                        "scheduler: ff_issue_claim_grant rejected, trying next"
-                    );
+                Err(script_err) => {
+                    if matches!(script_err, ScriptError::CapabilityMismatch(_)) {
+                        // Should be rare: the Rust pre-check above
+                        // normally catches this and blocks the execution
+                        // off eligible. Reaching here means the
+                        // required_capabilities field mutated between our
+                        // HGET and the Lua atomic check (narrow race).
+                        // Block here too so the next tick doesn't loop.
+                        //
+                        // Log uses worker_caps_hash (8-hex digest), not
+                        // the full 4KB CSV, to keep per-mismatch log
+                        // volume bounded. Full CSV is logged once at
+                        // worker connect under "worker caps" WARN.
+                        tracing::info!(
+                            partition = p_idx,
+                            execution_id = eid_s.as_str(),
+                            worker_id = wid_s.as_str(),
+                            worker_caps_hash = worker_caps_hash.as_str(),
+                            error = %script_err,
+                            "scheduler: capability mismatch via Lua (race), blocking execution"
+                        );
+                        self.block_candidate(
+                            &partition, &idx, lane, &eid, &eligible_key,
+                            "waiting_for_capable_worker",
+                            "no connected worker satisfies required_capabilities",
+                            now_ms,
+                        ).await;
+                        if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
+                            self.release_admission(tag, quota_id, eid).await;
+                        }
+                        continue;
+                    } else {
+                        // Any other logical reject (grant_already_exists,
+                        // execution_not_in_eligible_set, execution_not_eligible,
+                        // invalid_capabilities, etc.). These are rare and each
+                        // indicates either a race or a config problem — in
+                        // either case ops need to see it, so WARN, not DEBUG.
+                        tracing::warn!(
+                            partition = p_idx,
+                            execution_id = eid_s.as_str(),
+                            error = %script_err,
+                            "scheduler: ff_issue_claim_grant rejected, trying next"
+                        );
+                    }
                     if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
                         self.release_admission(tag, quota_id, eid).await;
                     }
@@ -547,6 +785,7 @@ impl Scheduler {
         let blocked_key = match block_reason {
             "waiting_for_budget" => idx.lane_blocked_budget(lane),
             "waiting_for_quota" => idx.lane_blocked_quota(lane),
+            "waiting_for_capable_worker" => idx.lane_blocked_route(lane),
             _ => idx.lane_blocked_budget(lane),
         };
 
@@ -554,22 +793,45 @@ impl Scheduler {
         let now_s = now_ms.to_string();
         let argv: [&str; 4] = [&eid_s, block_reason, blocking_detail, &now_s];
 
+        // Parse FcallResult so we distinguish Lua-level rejections (e.g.
+        // execution_not_active because the execution went terminal between
+        // our HGET and the FCALL) from a real block. Previously `Ok(_)`
+        // treated an err-tuple as success → INFO log "candidate blocked"
+        // while nothing actually changed on exec_core, then the next tick
+        // re-picked the same candidate and looped. Mirrors the
+        // release_admission parse fix.
         match self.client
             .fcall::<ferriskey::Value>("ff_block_execution_for_admission", &keys, &argv)
             .await
         {
-            Ok(_) => {
-                tracing::info!(
-                    execution_id = eid_s,
-                    reason = block_reason,
-                    "scheduler: candidate blocked by admission check"
-                );
-            }
+            Ok(v) => match FcallResult::parse(&v).and_then(|r| r.into_success()) {
+                Ok(_) => {
+                    tracing::info!(
+                        execution_id = eid_s,
+                        reason = block_reason,
+                        "scheduler: candidate blocked by admission check"
+                    );
+                }
+                Err(script_err) => {
+                    // Logical reject from Lua (e.g. execution_not_active
+                    // — the execution went terminal between the scheduler
+                    // pick and the block FCALL; the candidate loop will
+                    // naturally move on). WARN so ops dashboards surface
+                    // actual block failures, but not so loud that a common
+                    // race spams alerts.
+                    tracing::warn!(
+                        execution_id = eid_s,
+                        reason = block_reason,
+                        error = %script_err,
+                        "scheduler: ff_block_execution_for_admission rejected by Lua"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::warn!(
                     execution_id = eid_s,
                     error = %e,
-                    "scheduler: ff_block_execution_for_admission failed"
+                    "scheduler: ff_block_execution_for_admission transport failed"
                 );
             }
         }
@@ -590,23 +852,42 @@ impl Scheduler {
         let keys: [&str; 3] = [&admitted_key, &admitted_set_key, &concurrency_key];
         let argv: [&str; 1] = [eid_s];
 
+        // Parse the Lua response properly: FCALL returns `Ok(Value)` for
+        // BOTH success and logical-error paths. Treating Ok(_) blindly as
+        // "released" logs a false positive when the Lua returns
+        // `{0, "quota_not_found"}` (or any other script-level err) — the
+        // slot in fact remains pinned until its TTL expires, which is
+        // minutes to hours. Surface the real outcome so on-call sees
+        // actual release failures instead of clean "released" events.
         match self.client
             .fcall::<ferriskey::Value>("ff_release_admission", &keys, &argv)
             .await
         {
-            Ok(_) => {
-                tracing::info!(
-                    execution_id = eid_s,
-                    quota_id,
-                    "scheduler: released admission after claim failure"
-                );
-            }
+            Ok(v) => match FcallResult::parse(&v).and_then(|r| r.into_success()) {
+                Ok(_) => {
+                    tracing::info!(
+                        execution_id = eid_s,
+                        quota_id,
+                        "scheduler: released admission after claim failure"
+                    );
+                }
+                Err(script_err) => {
+                    tracing::warn!(
+                        execution_id = eid_s,
+                        quota_id,
+                        error = %script_err,
+                        "scheduler: ff_release_admission rejected by Lua \
+                         (slot will expire via TTL)"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::warn!(
                     execution_id = eid_s,
                     quota_id,
                     error = %e,
-                    "scheduler: ff_release_admission failed (slot will expire via TTL)"
+                    "scheduler: ff_release_admission transport failed \
+                     (slot will expire via TTL)"
                 );
             }
         }
@@ -647,6 +928,10 @@ pub enum SchedulerError {
         source: ferriskey::Error,
         context: String,
     },
+    /// Caller-supplied value failed ingress validation. NOT retryable — the
+    /// caller must fix its input before retrying.
+    #[error("config: {0}")]
+    Config(String),
 }
 
 impl SchedulerError {
@@ -656,6 +941,7 @@ impl SchedulerError {
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
             Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
+            Self::Config(_) => None,
         }
     }
 
