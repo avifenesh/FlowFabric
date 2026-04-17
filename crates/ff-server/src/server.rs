@@ -819,8 +819,8 @@ impl Server {
         let mut kept: Vec<Kept> = Vec::with_capacity(wp_ids.len());
         for ((wp_id, wp_slot), cond_slot) in wp_ids
             .iter()
-            .zip(wp_slots.into_iter())
-            .zip(cond_slots.into_iter())
+            .zip(wp_slots)
+            .zip(cond_slots)
         {
             let wp_fields: Vec<Option<String>> =
                 wp_slot.value().map_err(|e| ServerError::ValkeyContext {
