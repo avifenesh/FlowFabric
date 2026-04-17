@@ -30,7 +30,7 @@ use anyhow::Context;
 use clap::Parser;
 use ff_sdk::{
     read_stream, ClaimedTask, ConditionMatcher, FlowFabricWorker, SuspendOutcome,
-    TimeoutBehavior, WorkerConfig,
+    TimeoutBehavior, WorkerConfig, STREAM_READ_HARD_CAP,
 };
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -40,15 +40,10 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
 };
 use media_pipeline::{
-    SummarizeResult, TranscribeResult, FRAME_FIELD_PAYLOAD, FRAME_FIELD_TYPE,
-    SIGNAL_NAME_APPROVAL, SUMMARY_CHAR_CAP,
+    find_last_summary_final, FrameView, SummarizeResult, TranscribeResult,
+    FRAME_FIELD_PAYLOAD, FRAME_FIELD_TYPE, FRAME_SUMMARY_FINAL, SIGNAL_NAME_APPROVAL,
+    SUMMARY_CHAR_CAP,
 };
-
-/// Frame type used to persist the final SummarizeResult across worker
-/// restarts / cross-worker resume (RFC-004 "any worker can resume" —
-/// avoids process-local HashMap stash that would leak across re-claims
-/// by a different worker process).
-const FRAME_SUMMARY_FINAL: &str = "summary_final";
 
 #[derive(Parser)]
 #[command(name = "summarize", about = "FlowFabric media-pipeline summarize worker")]
@@ -194,6 +189,20 @@ async fn handle(
 /// We use the SDK's `read_stream` directly with a dedicated accessor;
 /// worker's `client()` is shared with claims, but this read happens once
 /// per re-claim and is bounded, so head-of-line risk is negligible.
+///
+/// # Read window sizing
+///
+/// `summary_final` is appended AFTER every `summary_token` frame, so any
+/// read that truncates before the tail misses the frame and falsely
+/// reports "no persisted result" — triggering a full LLM re-run on
+/// resume and defeating the F1 invariant (caught by PR#8 Gemini review).
+///
+/// The ff-sdk's `append_frame` caps the Valkey stream at
+/// `retention_maxlen = 10_000` (`STREAM_READ_HARD_CAP`), so requesting
+/// that same cap reads the entire live stream by construction: no
+/// pagination needed, no risk of missing the tail entry. We still walk
+/// the frames in reverse so the first match wins, keeping the hot path
+/// O(tokens_generated_since_last_summary_final) for typical cases.
 async fn load_persisted_result(
     task: &ClaimedTask,
     client: &ferriskey::Client,
@@ -206,20 +215,51 @@ async fn load_persisted_result(
         task.attempt_index(),
         "-",
         "+",
-        500,
+        STREAM_READ_HARD_CAP,
     )
     .await
     .context("read_stream for resume check")?;
-    for frame in frames.frames.iter().rev() {
-        let ft = frame.fields.get(FRAME_FIELD_TYPE).map(|s| s.as_str()).unwrap_or("");
-        if ft == FRAME_SUMMARY_FINAL {
-            let payload = frame.fields.get(FRAME_FIELD_PAYLOAD).cloned().unwrap_or_default();
-            let result: SummarizeResult = serde_json::from_str(&payload)
-                .context("decode summary_final payload")?;
-            return Ok(Some(result));
+
+    let adapted: Vec<AdaptedFrame<'_>> = frames
+        .frames
+        .iter()
+        .map(AdaptedFrame::from)
+        .collect();
+    find_last_summary_final(&adapted).context("decode summary_final payload")
+}
+
+/// Borrowed adapter so the shared `find_last_summary_final` helper can
+/// walk `ff_core::contracts::StreamFrame` without pulling ff-core into
+/// `media_pipeline`'s public API.
+struct AdaptedFrame<'a> {
+    frame_type: &'a str,
+    payload: &'a str,
+}
+
+impl<'a> From<&'a ff_core::contracts::StreamFrame> for AdaptedFrame<'a> {
+    fn from(frame: &'a ff_core::contracts::StreamFrame) -> Self {
+        Self {
+            frame_type: frame
+                .fields
+                .get(FRAME_FIELD_TYPE)
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            payload: frame
+                .fields
+                .get(FRAME_FIELD_PAYLOAD)
+                .map(|s| s.as_str())
+                .unwrap_or(""),
         }
     }
-    Ok(None)
+}
+
+impl<'a> FrameView for AdaptedFrame<'a> {
+    fn frame_type(&self) -> &str {
+        self.frame_type
+    }
+    fn payload(&self) -> &str {
+        self.payload
+    }
 }
 
 async fn process(
