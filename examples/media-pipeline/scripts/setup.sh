@@ -40,8 +40,8 @@ warn_missing ffmpeg "generate-sample.sh"
 
 # Cap parallel compile jobs. cmake --build -j with no cap defaults to
 # (nproc) which OOMs 2GB-RAM VMs on whisper.cpp — each g++ worker peaks
-# around 700MB. Respect the user's MAKEFLAGS / CMAKE_BUILD_PARALLEL_LEVEL
-# if they've set one; otherwise fall back to min(nproc, 4).
+# around 700MB. Respect CMAKE_BUILD_PARALLEL_LEVEL if the user has set
+# it; otherwise fall back to min(nproc, 4).
 if [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
     JOBS="$CMAKE_BUILD_PARALLEL_LEVEL"
 else
