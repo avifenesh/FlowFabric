@@ -121,6 +121,36 @@ impl FlowFabricWorker {
         // exists another process is live. The key auto-expires if this
         // process crashes without renewal, so a restart after a hard crash
         // just waits at most 2× lease_ttl_ms for the ghost entry to clear.
+        //
+        // Known limitations of this minimal scheme (documented for operators):
+        //   1. **Startup-only, not runtime.** There is no heartbeat renewal
+        //      path. After `2 × lease_ttl_ms` elapses the alive key expires
+        //      naturally even while this worker is still running, and a
+        //      second process with the same `worker_instance_id` launched
+        //      later will successfully SET NX alongside the first. The check
+        //      catches misconfiguration at boot; it does not fence duplicates
+        //      that appear mid-lifetime. Production deployments should rely
+        //      on the orchestrator (Kubernetes, systemd unit with
+        //      `Restart=on-failure`, etc.) as the authoritative single-
+        //      instance enforcer; this SET NX is belt-and-suspenders.
+        //
+        //   2. **Restart delay after a crash.** If a worker crashes
+        //      ungracefully (SIGKILL, container OOM) and is restarted within
+        //      `2 × lease_ttl_ms`, the alive key is still present and the
+        //      new process exits with `SdkError::Config("duplicate
+        //      worker_instance_id ...")`. Options for operators:
+        //        - Wait `2 × lease_ttl_ms` (default 60s with the 30s TTL)
+        //          before restarting.
+        //        - Manually `DEL ff:worker:<instance_id>:alive` in Valkey to
+        //          unblock the restart.
+        //        - Use a fresh `worker_instance_id` for the restart (the
+        //          orchestrator should already do this per-Pod).
+        //
+        //   3. **No graceful cleanup on shutdown.** There is no explicit
+        //      `disconnect()` call that DELs the alive key. On clean
+        //      `SIGTERM` the key lingers until its TTL expires. A follow-up
+        //      can add `FlowFabricWorker::disconnect(self)` for callers that
+        //      want to skip the restart-delay window.
         let alive_key = format!("ff:worker:{}:alive", config.worker_instance_id);
         let alive_ttl_ms = (config.lease_ttl_ms.saturating_mul(2)).max(1_000);
         let set_result: Option<String> = client

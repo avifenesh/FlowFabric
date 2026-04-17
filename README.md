@@ -102,7 +102,14 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 - **cancel_flow** returns `CancellationScheduled` immediately for `cancel_all` policy and dispatches member cancellations asynchronously (see `POST /v1/flows/{id}/cancel`); append `?wait=true` for synchronous completion. Background dispatch is drained with a 15s timeout on shutdown and may be aborted for very large flows.
 - **detect_cycle BFS** can issue ~100K `redis.call` operations on large DAGs (up to 1000 nodes × edges per node), blocking the Valkey event loop; keep flow graph fan-out moderate
 - **Terminal operation ambiguity** — if the Valkey connection drops during `complete()`, `fail()`, or `cancel()`, the operation may have committed server-side; callers should verify execution state via `get_execution_state()` before retrying
+- **cancel_flow dispatch-drop race** — the async member-cancel loop can drop individual cancellations under a transient Valkey error. `ff_claim_execution` reads exec_core on `{p:N}` and cannot atomically consult `flow_core.public_flow_state` on `{fp:N}` (cross-slot), so a worker may still claim and complete a member of a cancelled flow. The flow itself is terminal; only the one member escapes. Use `?wait=true` when synchronous cancellation matters, or rely on retention to trim the stale member
 - **Lua library after failover** — the server auto-reloads the Lua library on first "function not found" error after a Valkey failover, but the first request in the new epoch will fail and be retried
+
+### Rolling upgrades
+
+KEYS-arity changes (and the `LIBRARY_VERSION` bump that paired with Batch A) require **blue-green or stop-then-start deployment**. Running old and new `ff-server` binaries against the same Valkey simultaneously can produce Lua errors on the old binary because the new binary loads a library whose KEYS arity differs from what the old binary expects — `redis.call(..., nil, ...)` surfaces as `ResponseError`, not silent corruption, but requests will fail until the old instances are drained.
+
+Future: per-FCALL version negotiation. For now: drain old instances before starting new ones, or run a single writer at a time.
 
 ## License
 
