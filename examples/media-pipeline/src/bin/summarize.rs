@@ -1,18 +1,26 @@
 //! Summarize worker — stage 2 of the media pipeline.
 //!
 //! Claims executions with capability `llm`, streams Qwen2.5-0.5B-Instruct
-//! Q4_K_M tokens as `summary_token` frames, then suspends for human review.
-//! The `suspend()` call mints an HMAC-bound `waitpoint_token` (RFC-004);
-//! it is printed on stdout so the review CLI can sign its signal.
+//! Q4_K_M tokens as `summary_token` frames, persists the final result as a
+//! `summary_final` frame (so any worker can resume), then suspends for
+//! human review. `suspend()` mints an HMAC-bound `waitpoint_token`
+//! (RFC-004); it is printed on stdout so the review CLI can sign its
+//! signal.
 //!
 //! Resume protocol:
-//!   * Approval → review CLI delivers the signed signal → engine re-queues →
-//!     this worker re-claims the same execution → we look up the stashed
-//!     `SummarizeResult` and `complete()`.
-//!   * Rejection → review CLI calls `/v1/executions/{id}/cancel` → the
-//!     execution is terminal-cancelled and never re-queues.
+//!   * Approval signal → engine re-queues → any worker re-claims (same or
+//!     different process); it reads the last `summary_final` frame via
+//!     `ff_sdk::read_stream` and calls `complete()`.
+//!   * Rejection → review CLI calls `/v1/executions/{id}/cancel`; the
+//!     execution never re-queues. The summarize worker has no re-claim
+//!     path for rejection.
+//!
+//! v1 limitation: ff-sdk does not surface the resume signal's payload to
+//! the re-claimed worker. We therefore encode reject-vs-approve in the
+//! control plane (approve → signal + re-claim; reject → cancel, no
+//! re-claim), not in the signal payload. See README §"Review decision
+//! protocol".
 
-use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,8 +29,8 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use ff_sdk::{
-    ClaimedTask, ConditionMatcher, FlowFabricWorker, SuspendOutcome, TimeoutBehavior,
-    WorkerConfig,
+    read_stream, ClaimedTask, ConditionMatcher, FlowFabricWorker, SuspendOutcome,
+    TimeoutBehavior, WorkerConfig,
 };
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -32,7 +40,17 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
 };
 use media_pipeline::{SummarizeResult, TranscribeResult, SIGNAL_NAME_APPROVAL};
-use tokio::sync::Mutex;
+
+/// Frame type used to persist the final SummarizeResult across worker
+/// restarts / cross-worker resume (RFC-004 "any worker can resume" —
+/// avoids process-local HashMap stash that would leak across re-claims
+/// by a different worker process).
+const FRAME_SUMMARY_FINAL: &str = "summary_final";
+
+/// Hard cap on summary chars before embed. MiniLM-L6-v2 truncates to 256
+/// tokens (~1000 chars) anyway; 4096 is a belt-and-suspenders guard on
+/// lease-healthy embed time. Aligns with embed.rs F5.
+const SUMMARY_CHAR_CAP: usize = 4096;
 
 #[derive(Parser)]
 #[command(name = "summarize", about = "FlowFabric media-pipeline summarize worker")]
@@ -105,9 +123,12 @@ async fn main() -> anyhow::Result<()> {
     config.capabilities = vec!["llm".into(), "qwen-500m-q4".into()];
 
     let worker = FlowFabricWorker::connect(config).await?;
-    tracing::info!(instance = %instance_id, model = %args.model.display(), "summarize worker connected");
+    tracing::info!(
+        instance = %instance_id,
+        model = %args.model.display(),
+        "summarize worker connected"
+    );
 
-    let pending: Arc<Mutex<HashMap<String, SummarizeResult>>> = Default::default();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -121,30 +142,11 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(Some(task)) => {
                         let eid = task.execution_id().to_string();
-
-                        // Re-claim after approval — complete with stashed result.
-                        if let Some(stashed) = pending.lock().await.remove(&eid) {
-                            tracing::info!(execution_id = %eid, "resumed after approval — completing");
-                            if let Err(e) = task
-                                .complete(Some(serde_json::to_vec(&stashed)?))
-                                .await
-                            {
-                                tracing::error!(execution_id = %eid, error = %e, "complete failed");
-                            }
-                            continue;
-                        }
-
-                        if let Err(e) = process(
-                            task,
-                            engine.clone(),
-                            args.max_new_tokens,
-                            args.skip_approval,
-                            pending.clone(),
-                        ).await {
+                        if let Err(e) = handle(task, engine.clone(), args.max_new_tokens, args.skip_approval, worker.client()).await {
                             tracing::error!(execution_id = %eid, error = %e, "task failed");
                         }
                     }
-                    Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Ok(None) => idle_sleep().await,
                     Err(e) => {
                         tracing::error!(error = %e, "claim_next failed");
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -157,12 +159,68 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Decide whether this claim is a fresh run or a resume-after-approval,
+/// then drive the appropriate path. A resume is identified by the
+/// presence of a persisted `summary_final` frame in the attempt stream.
+async fn handle(
+    task: ClaimedTask,
+    engine: Arc<Engine>,
+    max_new_tokens: usize,
+    skip_approval: bool,
+    client: &ferriskey::Client,
+) -> anyhow::Result<()> {
+    if let Some(result) = load_persisted_result(&task, client).await? {
+        tracing::info!(
+            execution_id = %task.execution_id(),
+            tokens = result.token_count,
+            "resume after approval — completing from persisted summary_final frame"
+        );
+        task.complete(Some(serde_json::to_vec(&result)?)).await?;
+        return Ok(());
+    }
+    process(task, engine, max_new_tokens, skip_approval).await
+}
+
+/// Scan the attempt stream for the most recent `summary_final` frame.
+/// Returns the decoded SummarizeResult if one is present. Absence means
+/// this is a fresh claim (pre-generation).
+///
+/// We use the SDK's `read_stream` directly with a dedicated accessor;
+/// worker's `client()` is shared with claims, but this read happens once
+/// per re-claim and is bounded, so head-of-line risk is negligible.
+async fn load_persisted_result(
+    task: &ClaimedTask,
+    client: &ferriskey::Client,
+) -> anyhow::Result<Option<SummarizeResult>> {
+    let partition_config = ff_core::partition::PartitionConfig::default();
+    let frames = read_stream(
+        client,
+        &partition_config,
+        task.execution_id(),
+        task.attempt_index(),
+        "-",
+        "+",
+        500,
+    )
+    .await
+    .context("read_stream for resume check")?;
+    for frame in frames.frames.iter().rev() {
+        let ft = frame.fields.get("frame_type").map(|s| s.as_str()).unwrap_or("");
+        if ft == FRAME_SUMMARY_FINAL {
+            let payload = frame.fields.get("payload").cloned().unwrap_or_default();
+            let result: SummarizeResult = serde_json::from_str(&payload)
+                .context("decode summary_final payload")?;
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
 async fn process(
     task: ClaimedTask,
     engine: Arc<Engine>,
     max_new_tokens: usize,
     skip_approval: bool,
-    pending: Arc<Mutex<HashMap<String, SummarizeResult>>>,
 ) -> anyhow::Result<()> {
     let eid = task.execution_id().to_string();
 
@@ -177,7 +235,7 @@ async fn process(
 
     tracing::info!(execution_id = %eid, transcript_chars = input.transcript.len(), "summarizing");
 
-    let result = match generate(&engine, &input.transcript, max_new_tokens, &task).await {
+    let mut result = match generate(&engine, &input.transcript, max_new_tokens, &task).await {
         Ok(r) => r,
         Err(e) => {
             task.fail(&format!("llama inference: {e}"), "inference_error")
@@ -186,15 +244,25 @@ async fn process(
         }
     };
 
-    tracing::info!(execution_id = %eid, tokens = result.token_count, "generation complete");
-
-    if skip_approval {
-        task.complete(Some(serde_json::to_vec(&result)?)).await?;
-        return Ok(());
+    // F5: cap summary length to keep downstream embed bounded.
+    if result.summary.len() > SUMMARY_CHAR_CAP {
+        result.summary = result.summary.chars().take(SUMMARY_CHAR_CAP).collect();
     }
 
-    // Stash before suspending — the task is consumed by suspend().
-    pending.lock().await.insert(eid.clone(), result);
+    tracing::info!(execution_id = %eid, tokens = result.token_count, "generation complete");
+
+    // F1: persist the final result BEFORE any control-plane action so any
+    // worker that re-claims after resume can find it. Emitted as a frame
+    // (stream is durable; append_frame is synchronously replicated).
+    let result_bytes = serde_json::to_vec(&result)?;
+    task.append_frame(FRAME_SUMMARY_FINAL, &result_bytes, None)
+        .await
+        .context("append summary_final frame")?;
+
+    if skip_approval {
+        task.complete(Some(result_bytes)).await?;
+        return Ok(());
+    }
 
     let outcome = task
         .suspend(
@@ -214,17 +282,34 @@ async fn process(
             ..
         }) => {
             println!("REVIEW_NEEDED eid={eid} wp={waitpoint_id}");
-            println!("WAITPOINT_TOKEN={waitpoint_token}");
+            // as_str() to bypass WaitpointToken's redacting Display impl —
+            // this stdout line is the intentional wire-boundary disclosure
+            // the review CLI reads. The redacted Display is the default to
+            // keep tracing and error-message paths safe (RFC-004 §Waitpoint
+            // Security); here we explicitly opt in to the raw value.
+            println!("WAITPOINT_TOKEN={}", waitpoint_token.as_str());
         }
         Ok(SuspendOutcome::AlreadySatisfied { .. }) => {
-            // No pending waitpoint was created, so this branch is unreachable
-            // in practice. Drop the stash to avoid leaking memory if it ever
-            // fires.
-            pending.lock().await.remove(&eid);
-            tracing::warn!(execution_id = %eid, "suspend returned AlreadySatisfied unexpectedly");
+            // Unreachable in this example's flow: AlreadySatisfied requires a
+            // pre-existing `create_pending_waitpoint` that buffered a signal
+            // before suspend. We never call create_pending_waitpoint, so the
+            // engine has no buffered signals and this arm cannot fire.
+            //
+            // If a future revision adds a pre-suspend buffer, lifting this
+            // into a working complete() call requires an ff-sdk change:
+            // `suspend()` consumes self, so when AlreadySatisfied fires the
+            // lease is retained but the ClaimedTask handle is gone. Tracked
+            // as a Batch C ff-sdk follow-up. Until then we log + rely on
+            // lease expiry -> scanner re-queue, which surfaces the bug
+            // loudly rather than silently dropping the work.
+            tracing::error!(
+                execution_id = %eid,
+                "SuspendOutcome::AlreadySatisfied fired unexpectedly — \
+                 lease will expire and scanner will re-queue. \
+                 Track as ff-sdk follow-up."
+            );
         }
         Err(e) => {
-            pending.lock().await.remove(&eid);
             return Err(e.into());
         }
     }
@@ -270,6 +355,7 @@ async fn generate(
     ]);
 
     let mut text = String::new();
+    let mut pending_bytes: Vec<u8> = Vec::new(); // F4: UTF-8 accumulation buffer.
     let mut cur_pos = prompt_len as i32;
     let mut generated: u32 = 0;
 
@@ -283,15 +369,26 @@ async fn generate(
             .model
             .token_to_piece_bytes(tok, 32, false, None)
             .unwrap_or_default();
-        if let Ok(piece) = std::str::from_utf8(&piece_bytes) {
-            text.push_str(piece);
+        pending_bytes.extend_from_slice(&piece_bytes);
+
+        // F4: Qwen BPE tokens can split multibyte codepoints. Only emit the
+        // bytes we can decode cleanly; carry the tail forward until the
+        // rest of the codepoint arrives.
+        let flushable = utf8_prefix_len(&pending_bytes);
+        if flushable > 0 {
+            let (good, rest) = pending_bytes.split_at(flushable);
+            if let Ok(s) = std::str::from_utf8(good) {
+                text.push_str(s);
+            }
+            if let Err(e) = task
+                .append_frame("summary_token", good, None)
+                .await
+            {
+                tracing::warn!(error = %e, "append_frame failed");
+            }
+            pending_bytes = rest.to_vec();
         }
-        if let Err(e) = task
-            .append_frame("summary_token", &piece_bytes, None)
-            .await
-        {
-            tracing::warn!(error = %e, "append_frame failed");
-        }
+
         batch.clear();
         batch.add(tok, cur_pos, &[0], true)?;
         ctx.decode(&mut batch).context("decode token")?;
@@ -299,10 +396,44 @@ async fn generate(
         generated += 1;
     }
 
+    // Flush any residual bytes that never formed a codepoint boundary —
+    // emit lossy so the on-stream reconstruction at least sees something.
+    if !pending_bytes.is_empty() {
+        let s = String::from_utf8_lossy(&pending_bytes).into_owned();
+        text.push_str(&s);
+        let _ = task
+            .append_frame("summary_token", s.as_bytes(), None)
+            .await;
+    }
+
     Ok(SummarizeResult {
         summary: text.trim().to_owned(),
         token_count: generated,
     })
+}
+
+/// Length of the longest prefix of `buf` that is valid UTF-8, in bytes.
+/// Returns a multiple of valid codepoints; never returns a value that
+/// lands mid-codepoint.
+fn utf8_prefix_len(buf: &[u8]) -> usize {
+    match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(e) => e.valid_up_to(),
+    }
+}
+
+/// Jittered idle sleep for `claim_next` -> `Ok(None)`. Burst-avoidance for
+/// worker fleets (F25): without jitter, N workers all poll at t=0, t=1s,
+/// t=2s on the same partition ZSETs. 200–1200ms random keeps aggregate
+/// claim QPS on the cluster similar to a 1Hz mean without the clock-
+/// aligned thundering herd.
+async fn idle_sleep() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let ms = 200 + (nanos % 1000) as u64;
+    tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
 async fn shutdown_signal() {
