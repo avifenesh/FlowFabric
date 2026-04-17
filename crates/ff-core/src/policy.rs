@@ -1,5 +1,14 @@
 use crate::types::{BudgetId, TimestampMs};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+/// Capability CSV ceilings (RFC-009 §7.5). Shared between `ff-sdk` (worker
+/// caps ingress) and `ff-scheduler` (worker caps ingress); mirrored in
+/// `lua/helpers.lua` and enforced by `lua/scheduling.lua`/`lua/execution.lua`
+/// as defense-in-depth. Inclusive: a CSV exactly CAPS_MAX_BYTES long is
+/// accepted; one byte more is rejected.
+pub const CAPS_MAX_BYTES: usize = 4096;
+pub const CAPS_MAX_TOKENS: usize = 256;
 
 /// Retry configuration for an execution.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -112,9 +121,13 @@ pub struct FallbackTier {
 /// Routing requirements for worker matching.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RoutingRequirements {
-    /// Required capabilities the worker must have.
+    /// Required capabilities the worker must advertise. An empty set means
+    /// any worker on the lane may claim (backwards-compatible default).
+    /// `BTreeSet` for deterministic ordering — critical for the sorted CSV
+    /// form that ff_issue_claim_grant receives in ARGV and for reproducible
+    /// test output / log correlation.
     #[serde(default)]
-    pub required_capabilities: Vec<String>,
+    pub required_capabilities: BTreeSet<String>,
     /// Preferred locality/region.
     #[serde(default)]
     pub preferred_locality: Option<String>,

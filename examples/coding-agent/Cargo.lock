@@ -934,6 +934,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -945,6 +946,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-engine",
+ "ff-script",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

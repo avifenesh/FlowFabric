@@ -7,6 +7,7 @@ pub mod result;
 pub mod loader;
 pub mod retry;
 pub mod functions;
+pub mod stream_tail;
 
 pub use error::ScriptError;
 pub use retry::{is_retryable_kind, kind_to_stable_str};
@@ -18,13 +19,15 @@ pub const LIBRARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/flowfab
 
 /// Expected library version. Must match `FCALL ff_version 0` return.
 ///
-/// Bump this (and the string returned by `lua/version.lua`'s `ff_version`)
-/// whenever any Lua function's KEYS or ARGV arity changes, or a new
-/// function is added. The loader compares this constant against the
-/// server's `ff_version` output; a mismatch triggers `FUNCTION LOAD
-/// REPLACE` so old binaries attached to a newly-upgraded Valkey don't
+/// **Single source of truth is `lua/version.lua`.** `build.rs` extracts the
+/// version string at compile time and injects it here via `env!()`. Do NOT
+/// hand-maintain a separate literal — the extract is the one knob. Bump
+/// `lua/version.lua` whenever any Lua function's KEYS or ARGV arity
+/// changes, or a new function is added. The loader compares this constant
+/// against the server's `ff_version` output; a mismatch triggers `FUNCTION
+/// LOAD REPLACE` so old binaries attached to a newly-upgraded Valkey don't
 /// call into a library whose key signatures they don't agree with.
-pub const LIBRARY_VERSION: &str = "2";
+pub const LIBRARY_VERSION: &str = env!("FLOWFABRIC_LUA_VERSION");
 
 // Re-export the trait so callers can use it without reaching into result.
 pub use result::FromFcallResult;

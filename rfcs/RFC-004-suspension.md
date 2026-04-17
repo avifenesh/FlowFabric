@@ -83,43 +83,11 @@ One active suspension owns one active waitpoint. A pending waitpoint may exist b
 
 #### Waitpoint key routing
 
-`waitpoint_key` must be externally opaque but internally routable to the correct partition in Valkey Cluster.
+`waitpoint_key` is an externally opaque, internally routable string. The V1 implementation uses the simple `wpk:<uuid>` format and is **NOT** a crypto token. Multi-tenant signal authentication is enforced separately by the HMAC waitpoint token — see §Waitpoint Security below, which is the authoritative specification for the token mechanism in this RFC.
 
-**Token format:** base64url-encoded binary blob. No padding.
+Routing to `{p:N}` is done by storing the partition number on the waitpoint hash at creation time, keyed by the waitpoint_id embedded in the `wpk:<uuid>` handle. No signature check on the handle itself; integrity is provided by the HMAC token the signal deliverer must present.
 
-**Token structure:**
-
-```
-[version: 1 byte] [partition_number: 2 bytes] [execution_id: 16 bytes]
-[waitpoint_id: 16 bytes] [nonce: 8 bytes] [HMAC: 32 bytes]
-```
-
-Total: 75 bytes raw → 100 characters base64url.
-
-**MAC algorithm:** HMAC-SHA256. Input: all fields preceding the HMAC (version + partition + execution_id + waitpoint_id + nonce). Key: system-level deployment secret (see below).
-
-**MAC secret:** A system-level secret configured at deployment. All engine instances share the same secret. The secret is NOT per-namespace or per-execution — it is a deployment-wide signing key.
-
-**Decoding on signal ingress:**
-1. base64url-decode the token.
-2. Extract version byte. If unsupported version → `invalid_waitpoint_key`.
-3. Verify HMAC-SHA256 against the **current** secret.
-4. If verification fails, retry with the **previous** secret (dual-key rotation — see below).
-5. If both fail → `invalid_waitpoint_key`.
-6. Extract `partition_number`, `execution_id`, `waitpoint_id`.
-7. Route to `{p:<partition_number>}` keys. No cross-partition lookup.
-
-**MAC secret rotation — dual-key verification:**
-
-The engine maintains two secrets: `current_secret` and `previous_secret`. On rotation:
-1. `previous_secret` ← `current_secret`
-2. `current_secret` ← new secret
-3. `previous_secret` is retained for a configurable grace period. Recommended: `max(suspension_timeout)` across all active suspensions, minimum 24 hours.
-4. During the grace period, signal ingress verifies against `current_secret` first, then `previous_secret` on failure.
-5. After the grace period, `previous_secret` is discarded. Outstanding tokens signed with the old secret become permanently invalid — their executions resume only via operator action or suspension timeout.
-6. New waitpoint_keys are always signed with `current_secret`.
-
-This ensures in-flight callbacks survive one secret rotation without disruption. Operators should drain active suspensions or extend the grace period before rotating a second time.
+(An earlier draft of this RFC described a versioned 75-byte base64url token with embedded partition bytes and HMAC-SHA256 dual-key verification. That design is **not** what shipped — it was superseded by the separate HMAC-SHA1 waitpoint token scheme in §Waitpoint Security. See that section for the shipped contract: algorithm choice, kid-ring rotation, grace window semantics, and KEYS/ARGV impact.)
 
 ### Pending Waitpoints
 
@@ -1055,6 +1023,147 @@ Scanner pattern:
    - DEL `ff:wp:{p:N}:<waitpoint_id>:condition` (condition hash, if created)
    - for each signal_id in the signal stream: DEL `ff:signal:{p:N}:<signal_id>` and `ff:signal:{p:N}:<signal_id>:payload` (clean up orphaned signal records)
 
+## Waitpoint Security (HMAC token authentication)
+
+Multi-tenant deployments require that external signal sources (approval gates, webhook callbacks, tool result delivery) cannot deliver signals to waitpoints they do not own. Waitpoint IDs are UUIDs and can be unguessable, but they leak through logs, URLs, and inter-service hops. Relying on ID secrecy alone is insufficient.
+
+Each waitpoint carries an **HMAC token** that the signal deliverer must present. The token is minted at waitpoint creation time, bound to the specific `(waitpoint_id, waitpoint_key, created_at)` tuple, and validated in Lua before any mutating signal-delivery work runs.
+
+### Token format
+
+`"kid:40hex"`, where:
+
+- `kid` — short key identifier (e.g. `k1`, `k2`), enabling zero-downtime rotation
+- `40hex` — HMAC-SHA1 digest, lowercase hex (SHA1 output = 20 bytes = 40 hex chars)
+
+### Algorithm: HMAC-SHA1
+
+The Valkey Lua sandbox exposes `redis.sha1hex` but no SHA-256 primitive. Rather than import a ~200 LOC pure-Lua SHA-256 (large attack surface, new crypto primitive shipped in scripts), we use **HMAC-SHA1 per RFC 2104**. The security property we need is MAC unforgeability, not hash collision resistance: HMAC-SHA1 remains unbroken as a MAC construction (NIST SP 800-107r1), and with a 32-byte random secret the forgery work factor is 2^160. The helper `hmac_sha1_hex` in `lua/helpers.lua` implements the standard ipad/opad construction with a 64-byte SHA1 block size.
+
+### HMAC input (binding)
+
+```
+HMAC_SHA1( secret, waitpoint_id || "|" || waitpoint_key || "|" || created_at_ms )
+```
+
+- The pipe delimiter prevents field-boundary collisions across distinct `(waitpoint_id, waitpoint_key)` pairs.
+- Binding `waitpoint_id` ensures a token for waitpoint A cannot authenticate against waitpoint B (even on the same execution).
+- Binding `created_at_ms` means a waitpoint that is closed and later re-created at the same `(id, key)` tuple would mint a new token — the old token does not authenticate the new waitpoint.
+
+### Constant-time comparison
+
+Token validation compares the computed HMAC against the presented digest using `constant_time_eq` (helpers.lua): XOR-accumulate every byte, return equal iff the accumulator is zero. This closes remote timing attacks on early-exit character comparison.
+
+### Secret storage and rotation
+
+Secrets live in a per-partition hash: `ff:sec:{p:N}:waitpoint_hmac`. Fields:
+
+| Field | Purpose |
+| --- | --- |
+| `current_kid` | The kid currently minting new tokens. |
+| `secret:<kid>` | Hex-encoded HMAC key for kid `<kid>`. |
+| `previous_kid` | The kid immediately preceding `current_kid`. |
+| `previous_expires_at` | Absolute ms timestamp after which `previous_kid` tokens are rejected. |
+
+**Per-partition replication is required** because Valkey cluster mode demands that all KEYS in a single FCALL hash to the same slot. A single global secret key (e.g. `{s:waitpoint}:hmac_secrets`) would produce CROSSSLOT errors in suspension.lua and signal.lua FCALLs, which already touch `{p:N}`-tagged keys. The secret value is **identical across partitions**; only the storage is replicated. Rotation fans out across partitions (`O(num_execution_partitions)` HSETs — 256 by default, bounded at deployment time via `FF_EXEC_PARTITIONS`).
+
+### Key rotation (2-kid ring)
+
+1. Operator POSTs new secret to `/v1/admin/rotate-waitpoint-secret` (FF_API_TOKEN-authenticated).
+2. Server promotes `current_kid` → `previous_kid`, writes `previous_expires_at = now + FF_WAITPOINT_HMAC_GRACE_MS` (default 24h), installs the new kid + secret as current.
+3. Both `current_kid` and `previous_kid` validate during the grace window. After `previous_expires_at`, `previous_kid` tokens return `token_expired`.
+4. Fanout uses plain HSET (not HSETNX) and is **idempotent**: a partial-failure retry converges to the same state. The rotation endpoint returns `{rotated: N_ok, failed: [partition_ids]}`; HTTP 200 if any partition succeeded, 500 only if all fail. Per-partition outcomes are audit-logged (`target: "audit"`).
+
+### Boot initialization (fail-fast)
+
+`ff-server`'s `initialize_waitpoint_hmac_secret` runs between partition-config validation and Lua library load. For each execution partition:
+
+1. HGET `current_kid`. If absent, HSET `current_kid=k1`, `secret:k1=<env hex>`.
+2. If present and the stored secret matches env, continue (restart-safe).
+3. If present and divergent, log a warning (operator rotation scenario) and preserve the stored secret.
+
+Any HSET failure aborts the boot. A server running with some partitions missing the secret would `hmac_secret_not_initialized` half of traffic — failing loud at boot is strictly safer.
+
+### Replay bounding via waitpoint state machine
+
+Tokens are not serial-numbered and do not carry a nonce. Replay resistance comes from the waitpoint's one-shot state machine, not the token itself:
+
+- `ff_deliver_signal` (see `lua/signal.lua` §3) checks `wp_cond.closed == "1"` and returns `waitpoint_closed` before any mutation.
+- Once the resume condition is satisfied, `ff_deliver_signal` writes `closed=1` atomically as part of the same FCALL that records the signal.
+- Therefore a leaked token cannot be replayed after the resume condition is met: even if the attacker controls the signal delivery endpoint, the next FCALL observes `closed=1` and rejects.
+
+### Error codes (Lua → typed `ScriptError`)
+
+| Code | Meaning |
+| --- | --- |
+| `missing_token` | ARGV token empty or non-string. |
+| `invalid_token` | Malformed, unknown kid, wrong length, or HMAC mismatch. |
+| `token_expired` | Previous kid accepted, but `previous_expires_at < now`. |
+| `hmac_secret_not_initialized` | Boot init skipped or partition secret hash missing. |
+| `invalid_keys_missing_hmac` | FCALL built without the hmac_secrets KEY (caller misuse). |
+
+### KEYS / ARGV impact (library version 3)
+
+| Function | KEYS | ARGV | Returns |
+| --- | --- | --- | --- |
+| `ff_create_pending_waitpoint` | +`hmac_secrets` | unchanged | +token |
+| `ff_suspend_execution` | +`hmac_secrets` | unchanged | +token |
+| `ff_deliver_signal` | +`hmac_secrets` | +`waitpoint_token` | unchanged |
+| `ff_buffer_signal_for_pending_waitpoint` | +`hmac_secrets`, +`waitpoint_hash` | +`waitpoint_token` | unchanged |
+| `ff_resume_execution`, `ff_expire_suspension`, `ff_close_waitpoint` | unchanged (internal, not externally triggered) | unchanged | unchanged |
+
+This is a **breaking library-version bump** (2 → 3). Old SDK clients building pre-HMAC FCALL shapes will fail with arity or `invalid_keys_missing_hmac` errors, which is the desired behavior for multi-tenant security: no silent degradation.
+
+### Required deployment configuration
+
+Every `ff-server` deployment MUST set these environment variables. The server refuses to boot without them so no deployment can silently ship without HMAC protection.
+
+| Env var | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `FF_WAITPOINT_HMAC_SECRET` | **yes** | — | Hex-encoded HMAC-SHA1 signing secret. Recommended 64 hex chars (32 bytes). Even-length `0-9a-fA-F` validated at boot; malformed value fails `Server::start`. Store in a secret manager; never commit. |
+| `FF_WAITPOINT_HMAC_GRACE_MS` | no | `86_400_000` (24h) | Window during which `previous_kid` tokens continue to validate after rotation. Tighten for high-sensitivity tenants, loosen for longer-running approval workflows. |
+| `FF_API_TOKEN` | strongly recommended | — | Bearer token gating the entire API surface **including `/v1/admin/rotate-waitpoint-secret`**. Without it, admin endpoints are unauthenticated and the server logs a loud warning at boot. |
+
+### Audit events
+
+Rotation and other security-sensitive paths emit structured log events at `tracing::target: "audit"`. Operators aggregating audit logs should consume this target explicitly — the subscriber's default `EnvFilter` includes an `audit=info` directive out of the box; custom subscribers must add it.
+
+| Event name (message) | Level | Emitted on | Structured fields |
+| --- | --- | --- | --- |
+| `waitpoint_hmac_rotation_complete` | INFO | Every rotate endpoint call (success or partial) | `new_kid`, `total_partitions`, `rotated`, `failed_count`, `in_progress_count` |
+| `waitpoint_hmac_rotation_failed` | ERROR | Per-partition actual failure (Valkey outage, cluster split) | `partition`, `err` |
+| `waitpoint_hmac_rotation_timeout_http_504` | ERROR | Rotate endpoint exceeds 120s server-side timeout | `new_kid`, `timeout_s` |
+
+Per-partition `waitpoint_hmac_rotated` and `waitpoint_hmac_rotation_in_progress_skipped` are logged at `DEBUG` (not audit) because emitting 256 events per rotation blows up paid log aggregator budgets with no additional compliance value over the single aggregated INFO summary.
+
+Event names and structured field keys are a **stable public contract**. Breaking changes require a library-version bump and a deprecation window.
+
+### Performance notes
+
+HMAC-SHA1 minting and validation cost scale with the input size, not the stream rate. The input is bounded: `waitpoint_id` (36 bytes UUID) + `|` + `waitpoint_key` (≤256 bytes per RFC-004's opaque-string ceiling) + `|` + `created_at_ms` (13 bytes) ≈ 310 bytes worst case. `redis.sha1hex` on a ~310-byte buffer runs in low hundreds of nanoseconds per call. In practice, throughput is dominated by the FCALL round-trip and XADD/HSET work, not the HMAC itself.
+
+### Operator observability
+
+Every `invalid_token`, `token_expired`, `missing_token`, or `invalid_keys_missing_hmac` rejection on the signal-delivery path (`ff_deliver_signal` or `ff_buffer_signal_for_pending_waitpoint`) writes `last_hmac_validation_failed_at = now_ms` on the target execution's `exec_core` hash. Bounded scalar — one write per rejection, no per-failure log volume.
+
+Operators correlate this field with key rotation windows, client deploys, or attack traffic without tailing Lua slowlog:
+
+```
+HGET ff:exec:{p:42}:<eid>:core last_hmac_validation_failed_at
+```
+
+Absent field → never failed. Present field → last timestamp of any auth failure. Pair with execution lifecycle telemetry to distinguish "aged token, benign" from "stuck waitpoint, needs rotation audit".
+
+Audit-log correlation: every rotation emits the `waitpoint_hmac_rotation_complete` event (see §Audit events); `last_hmac_validation_failed_at` timestamps falling shortly after a rotation suggest in-flight tokens that pre-dated the rotation. Outside rotation windows, concentrated timestamps on one execution suggest a client bug or a probe.
+
+### Rate-limit posture
+
+HMAC validation is cheap (see above) but the entire `ff_deliver_signal` FCALL runs inside Valkey's single-threaded Lua slot for one `{p:N}` partition. A flood of tampered-token signals against one partition (same `execution_id` or a tight cluster of IDs mapped to the same `{p:N}`) saturates that shard's Lua slot even though every call returns `invalid_token` fast.
+
+v1 posture: **defer to LB/WAF for coarse rate limits.** The HMAC check is cheap enough that a determined attacker's throughput is bounded by their own connection concurrency against the LB, which is where rate limits belong. Per-(execution_id, source) token-bucket admission at the REST boundary is a deferred v2 feature if operators see partition starvation from hostile signal traffic.
+
+No in-server backpressure is wired today. Operators should monitor Valkey slowlog on the signal-delivery script family for evidence of hot partitions and front the API with an LB-level rate limiter (e.g. Cloudflare, ALB, nginx `limit_req`) sized for expected legitimate signal volume plus headroom.
+
 ## Interactions with Other Primitives
 
 - **RFC-001 Execution**: suspension is a first-class lifecycle state and drives `public_state = suspended`.
@@ -1075,6 +1184,7 @@ In v1:
 - atomic suspend and atomic resume-to-runnable
 - durable per-waitpoint signal buffer
 - explicit signal vs control boundary
+- HMAC-SHA1 waitpoint tokens with 2-kid rotation (see §Waitpoint Security)
 
 Designed for later but not required in v1:
 
@@ -1102,7 +1212,7 @@ No unresolved questions remain.
 
 ## Implementation Notes (v1)
 
-- **`waitpoint_key` uses simple `wpk:<uuid>` format,** not the HMAC-SHA256 cryptographic token described in §Waitpoint key routing. The crypto token (75 bytes raw, MAC secret rotation, dual-key verification) is deferred to v2 when multi-tenant security requires unguessable tokens. Current tokens are guessable but sufficient for single-tenant deployment. The routing problem is solved by storing the partition number on the waitpoint hash and looking it up via the waitpoint_id embedded in the key.
+- **`waitpoint_key` uses simple `wpk:<uuid>` format** and is not itself a crypto token. Multi-tenant signal authentication is provided by the separate **waitpoint HMAC token** (§Waitpoint Security), returned alongside the waitpoint_id at creation and required on all signal-delivery FCALLs. The HMAC uses SHA1 (in-engine via `redis.sha1hex`) rather than SHA-256 (which is not exposed in the Valkey Lua sandbox). The routing problem is solved by storing the partition number on the waitpoint hash and looking it up via the waitpoint_id embedded in the key.
 - **`auto_resume_with_timeout_signal` does not append a synthetic timeout signal.** The timeout scanner triggers resume directly without injecting a signal into the waitpoint buffer. Synthetic signal injection is deferred to v2.
 - **Suspension timeout scanner and pending waitpoint expiry scanner are fully implemented** as Rust-only scanners in `ff-engine::scanner`. They use `ZRANGEBYSCORE` on the respective timeout indexes.
 - **OOM-safe write ordering is enforced.** `ff_suspend_execution` writes `exec_core` HSET first (lifecycle → suspended), then creates sub-objects. `ff_resume_execution` writes `exec_core` first (lifecycle → runnable), then closes sub-objects.

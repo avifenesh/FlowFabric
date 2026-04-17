@@ -940,6 +940,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-script",
+ "futures",
  "serde_json",
  "tokio",
  "tracing",

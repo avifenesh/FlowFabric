@@ -125,6 +125,88 @@ impl TestCluster {
     /// to be run per-shard.
     pub async fn cleanup(&self) {
         self.cleanup_ff_keys().await;
+        // FLUSHDB erased any previously-installed waitpoint HMAC secret,
+        // so re-install one across all test partitions. This keeps
+        // FCALL-only tests (no Server boot) able to mint + validate tokens.
+        self.install_waitpoint_hmac_secret(
+            "k1",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await;
+    }
+
+    /// Install a waitpoint HMAC secret across every execution partition.
+    /// Equivalent to what `Server::start` does on boot; useful for tests
+    /// that only exercise FCALLs (no Server instance). Overwrites.
+    pub async fn install_waitpoint_hmac_secret(&self, kid: &str, secret_hex: &str) {
+        for index in 0..self.config.num_execution_partitions {
+            let partition = ff_core::partition::Partition {
+                family: ff_core::partition::PartitionFamily::Execution,
+                index,
+            };
+            let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+            self.client
+                .hset(&key, "current_kid", kid)
+                .await
+                .expect("HSET current_kid");
+            self.client
+                .hset(&key, &format!("secret:{kid}"), secret_hex)
+                .await
+                .expect("HSET secret:<kid>");
+        }
+    }
+
+    /// Rotate the waitpoint HMAC secret across partitions — promotes current
+    /// kid to previous with `previous_expires_at`, installs new kid. Used by
+    /// rotation tests that want to simulate operator rotation via fixtures.
+    pub async fn rotate_waitpoint_hmac_secret(
+        &self,
+        new_kid: &str,
+        new_secret_hex: &str,
+        previous_expires_at_ms: i64,
+    ) {
+        for index in 0..self.config.num_execution_partitions {
+            let partition = ff_core::partition::Partition {
+                family: ff_core::partition::PartitionFamily::Execution,
+                index,
+            };
+            let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+            let current: Option<String> = self
+                .client
+                .hget(&key, "current_kid")
+                .await
+                .expect("HGET current_kid");
+            if let Some(cur) = current {
+                self.client
+                    .hset(&key, "previous_kid", &cur)
+                    .await
+                    .expect("HSET previous_kid");
+                self.client
+                    .hset(&key, "previous_expires_at", &previous_expires_at_ms.to_string())
+                    .await
+                    .expect("HSET previous_expires_at");
+                // Multi-kid validation (RFC-004 §Waitpoint Security): the
+                // per-kid expires_at:<kid> field is the authoritative
+                // grace signal. Mirror production Server::rotate_single_partition_locked
+                // which writes this alongside previous_kid / previous_expires_at.
+                self.client
+                    .hset(
+                        &key,
+                        &format!("expires_at:{cur}"),
+                        &previous_expires_at_ms.to_string(),
+                    )
+                    .await
+                    .expect("HSET expires_at:<outgoing_kid>");
+            }
+            self.client
+                .hset(&key, "current_kid", new_kid)
+                .await
+                .expect("HSET current_kid (rotate)");
+            self.client
+                .hset(&key, &format!("secret:{new_kid}"), new_secret_hex)
+                .await
+                .expect("HSET secret:<new_kid>");
+        }
     }
 
     /// Clear all data keys for a clean test slate.

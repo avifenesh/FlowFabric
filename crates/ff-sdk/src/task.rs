@@ -74,6 +74,8 @@ pub enum SuspendOutcome {
         suspension_id: SuspensionId,
         waitpoint_id: WaitpointId,
         waitpoint_key: String,
+        /// HMAC token that signal deliverers must supply to this waitpoint.
+        waitpoint_token: WaitpointToken,
     },
     /// Buffered signals already satisfied the condition — suspension skipped.
     /// The caller still holds the lease.
@@ -81,6 +83,7 @@ pub enum SuspendOutcome {
         suspension_id: SuspensionId,
         waitpoint_id: WaitpointId,
         waitpoint_key: String,
+        waitpoint_token: WaitpointToken,
     },
 }
 
@@ -93,6 +96,9 @@ pub struct Signal {
     pub source_type: String,
     pub source_identity: String,
     pub idempotency_key: Option<String>,
+    /// HMAC token issued when the waitpoint was created. Required for
+    /// authenticated signal delivery (RFC-004 §Waitpoint Security).
+    pub waitpoint_token: WaitpointToken,
 }
 
 /// Outcome of `deliver_signal()`.
@@ -714,11 +720,15 @@ impl ClaimedTask {
     /// waitpoint are buffered. When the worker later calls `suspend()` with
     /// `use_pending_waitpoint`, buffered signals may immediately satisfy the
     /// resume condition.
+    ///
+    /// Returns both the waitpoint_id AND the HMAC token required by external
+    /// callers to buffer signals against this pending waitpoint
+    /// (RFC-004 §Waitpoint Security).
     pub async fn create_pending_waitpoint(
         &self,
         waitpoint_key: &str,
         expires_in_ms: u64,
-    ) -> Result<WaitpointId, SdkError> {
+    ) -> Result<(WaitpointId, WaitpointToken), SdkError> {
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
         let idx = IndexKeys::new(&partition);
@@ -726,11 +736,12 @@ impl ClaimedTask {
         let waitpoint_id = WaitpointId::new();
         let expires_at = TimestampMs::from_millis(TimestampMs::now().0 + expires_in_ms as i64);
 
-        // KEYS (3): exec_core, waitpoint_hash, pending_wp_expiry_zset
+        // KEYS (4): exec_core, waitpoint_hash, pending_wp_expiry_zset, hmac_secrets
         let keys: Vec<String> = vec![
             ctx.core(),
             ctx.waitpoint(&waitpoint_id),
             idx.pending_waitpoint_expiry(),
+            idx.waitpoint_hmac_secrets(),
         ];
 
         // ARGV (5): execution_id, attempt_index, waitpoint_id, waitpoint_key, expires_at
@@ -751,8 +762,10 @@ impl ClaimedTask {
             .await
             .map_err(SdkError::Valkey)?;
 
-        parse_success_result(&raw, "ff_create_pending_waitpoint")?;
-        Ok(waitpoint_id)
+        // Response: {1, "OK", waitpoint_id, waitpoint_key, waitpoint_token}.
+        // Extract the token (the waitpoint_id is the one we generated locally).
+        let token = extract_pending_waitpoint_token(&raw)?;
+        Ok((waitpoint_id, token))
     }
 
     // ── Phase 4: Streaming ──
@@ -867,11 +880,11 @@ impl ClaimedTask {
             "retain_signal_buffer_until_closed": true,
         }).to_string();
 
-        // KEYS (16): exec_core, attempt_record, lease_current, lease_history,
+        // KEYS (17): exec_core, attempt_record, lease_current, lease_history,
         //            lease_expiry, worker_leases, suspension_current, waitpoint_hash,
         //            waitpoint_signals, suspension_timeout, pending_wp_expiry,
         //            active_index, suspended_index, waitpoint_history, wp_condition,
-        //            attempt_timeout
+        //            attempt_timeout, hmac_secrets
         let keys: Vec<String> = vec![
             ctx.core(),                                          // 1
             ctx.attempt_hash(self.attempt_index),                // 2
@@ -889,6 +902,7 @@ impl ClaimedTask {
             ctx.waitpoints(),                                    // 14
             ctx.waitpoint_condition(&waitpoint_id),              // 15
             idx.attempt_timeout(),                               // 16
+            idx.waitpoint_hmac_secrets(),                        // 17
         ];
 
         // ARGV (17): execution_id, attempt_index, attempt_id, lease_id,
@@ -1150,8 +1164,9 @@ fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError>
     };
     if status_code != 1 {
         let error_code = usage_field_str(arr, 1);
+        let detail = usage_field_str(arr, 2);
         return Err(SdkError::Script(
-            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_report_usage_and_check: {error_code}"))
             }),
         ));
@@ -1192,6 +1207,31 @@ fn usage_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
 }
 
 /// Parse a standard {1, "OK", ...} / {0, "error", ...} FCALL result.
+/// Extract the waitpoint_token (field index 4 in the 0-indexed response array)
+/// from an `ff_create_pending_waitpoint` reply. Runs `parse_success_result`
+/// first so error cases produce the usual typed error, not a parse failure.
+fn extract_pending_waitpoint_token(raw: &Value) -> Result<WaitpointToken, SdkError> {
+    parse_success_result(raw, "ff_create_pending_waitpoint")?;
+    let arr = match raw {
+        Value::Array(arr) => arr,
+        _ => unreachable!("parse_success_result would have rejected non-array"),
+    };
+    // Layout: [0]=1, [1]="OK", [2]=waitpoint_id, [3]=waitpoint_key, [4]=waitpoint_token
+    let token_str = arr
+        .get(4)
+        .and_then(|v| match v {
+            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+            Ok(Value::SimpleString(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            SdkError::Script(ScriptError::Parse(
+                "ff_create_pending_waitpoint: missing waitpoint_token in response".into(),
+            ))
+        })?;
+    Ok(WaitpointToken::new(token_str))
+}
+
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -1220,19 +1260,29 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
     if status_code == 1 {
         Ok(())
     } else {
-        // Extract error code from index 1
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+        // Extract error code from index 1 and optional detail from index 2
+        // (e.g. `capability_mismatch` ships missing tokens there). Variants
+        // that carry a String payload pick the detail up via
+        // `from_code_with_detail`; other variants ignore it.
+        let field_str = |idx: usize| -> String {
+            arr.get(idx)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let error_code = {
+            let s = field_str(1);
+            if s.is_empty() { "unknown".to_owned() } else { s }
+        };
+        let detail = field_str(2);
 
-        let script_err = ScriptError::from_code(&error_code).unwrap_or_else(|| {
-            ScriptError::Parse(format!("{function_name}: unknown error: {error_code}"))
-        });
+        let script_err = ScriptError::from_code_with_detail(&error_code, &detail)
+            .unwrap_or_else(|| {
+                ScriptError::Parse(format!("{function_name}: unknown error: {error_code}"))
+            });
 
         Err(SdkError::Script(script_err))
     }
@@ -1266,16 +1316,22 @@ fn parse_suspend_result(
     };
 
     if status_code != 1 {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+        let err_field_str = |idx: usize| -> String {
+            arr.get(idx)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let error_code = {
+            let s = err_field_str(1);
+            if s.is_empty() { "unknown".to_owned() } else { s }
+        };
+        let detail = err_field_str(2);
         return Err(SdkError::Script(
-            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_suspend_execution: {error_code}"))
             }),
         ));
@@ -1291,17 +1347,37 @@ fn parse_suspend_result(
         })
         .unwrap_or_default();
 
+    // Lua returns: {1, status, suspension_id, waitpoint_id, waitpoint_key, waitpoint_token}
+    // The suspension_id/waitpoint_id/waitpoint_key values the worker passed in are
+    // authoritative (Lua echoes them); waitpoint_token however is MINTED by Lua and
+    // must be read from the response.
+    let waitpoint_token = arr
+        .get(5)
+        .and_then(|v| match v {
+            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+            Ok(Value::SimpleString(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .map(WaitpointToken::new)
+        .ok_or_else(|| {
+            SdkError::Script(ScriptError::Parse(
+                "ff_suspend_execution: missing waitpoint_token in response".into(),
+            ))
+        })?;
+
     if sub_status == "ALREADY_SATISFIED" {
         Ok(SuspendOutcome::AlreadySatisfied {
             suspension_id,
             waitpoint_id,
             waitpoint_key,
+            waitpoint_token,
         })
     } else {
         Ok(SuspendOutcome::Suspended {
             suspension_id,
             waitpoint_id,
             waitpoint_key,
+            waitpoint_token,
         })
     }
 }
@@ -1329,16 +1405,22 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
     };
 
     if status_code != 1 {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+        let err_field_str = |idx: usize| -> String {
+            arr.get(idx)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let error_code = {
+            let s = err_field_str(1);
+            if s.is_empty() { "unknown".to_owned() } else { s }
+        };
+        let detail = err_field_str(2);
         return Err(SdkError::Script(
-            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_deliver_signal: {error_code}"))
             }),
         ));
@@ -1420,16 +1502,22 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
     };
 
     if status_code != 1 {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+        let err_field_str = |idx: usize| -> String {
+            arr.get(idx)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let error_code = {
+            let s = err_field_str(1);
+            if s.is_empty() { "unknown".to_owned() } else { s }
+        };
+        let detail = err_field_str(2);
         return Err(SdkError::Script(
-            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_append_frame: {error_code}"))
             }),
         ));
@@ -1484,16 +1572,22 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
     };
 
     if status_code != 1 {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+        let err_field_str = |idx: usize| -> String {
+            arr.get(idx)
+                .and_then(|v| match v {
+                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    Ok(Value::SimpleString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let error_code = {
+            let s = err_field_str(1);
+            if s.is_empty() { "unknown".to_owned() } else { s }
+        };
+        let detail = err_field_str(2);
         return Err(SdkError::Script(
-            ScriptError::from_code(&error_code).unwrap_or_else(|| {
+            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_fail_execution: {error_code}"))
             }),
         ));
@@ -1532,4 +1626,186 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
             "ff_fail_execution: unexpected sub-status: {sub_status}"
         )))),
     }
+}
+
+// ── Stream read / tail (consumer API, RFC-006 #2) ──
+
+/// Maximum tail block duration accepted by [`tail_stream`]. Mirrors the REST
+/// endpoint ceiling so SDK callers can't wedge a connection longer than the
+/// server would accept.
+pub const MAX_TAIL_BLOCK_MS: u64 = 30_000;
+
+/// Maximum frames per read/tail call. Mirrors
+/// `ff_core::contracts::STREAM_READ_HARD_CAP` — re-exported here so SDK
+/// callers don't need to import ff-core just to read the bound.
+pub use ff_core::contracts::STREAM_READ_HARD_CAP;
+
+/// Result of [`read_stream`] / [`tail_stream`] — frames plus the terminal
+/// signal so polling consumers can exit cleanly.
+///
+/// Re-export of `ff_core::contracts::StreamFrames` for SDK ergonomics.
+pub use ff_core::contracts::StreamFrames;
+
+fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
+    if count_limit == 0 {
+        return Err(SdkError::Config("count_limit must be >= 1".to_owned()));
+    }
+    if count_limit > STREAM_READ_HARD_CAP {
+        return Err(SdkError::Config(format!(
+            "count_limit exceeds STREAM_READ_HARD_CAP ({STREAM_READ_HARD_CAP})"
+        )));
+    }
+    Ok(())
+}
+
+/// Read frames from a completed or in-flight attempt's stream.
+///
+/// `from_id` / `to_id` accept XRANGE special markers (`"-"`, `"+"`) or
+/// entry IDs. `count_limit` MUST be in `1..=STREAM_READ_HARD_CAP` —
+/// `0` returns [`SdkError::Config`].
+///
+/// Returns a [`StreamFrames`] including `closed_at`/`closed_reason` so
+/// consumers know when the producer has finalized the stream. A
+/// never-written attempt and an in-progress stream are indistinguishable
+/// here — both present as `frames=[]`, `closed_at=None`.
+///
+/// Intended for consumers (audit, checkpoint replay) that hold a ferriskey
+/// client but are not the lease-holding worker — no lease check is
+/// performed.
+///
+/// # Head-of-line note
+///
+/// A max-limit XRANGE reply (10_000 frames × ~64 KB each) is a
+/// multi-MB reply serialized on one TCP socket. Like [`tail_stream`],
+/// calling this on a `client` that is also serving FCALLs stalls those
+/// FCALLs behind the reply. The REST server isolates reads on its
+/// `tail_client`; direct SDK callers should either use a dedicated
+/// client OR paginate through smaller `count_limit` slices.
+pub async fn read_stream(
+    client: &Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    from_id: &str,
+    to_id: &str,
+    count_limit: u64,
+) -> Result<StreamFrames, SdkError> {
+    use ff_core::contracts::{ReadFramesArgs, ReadFramesResult};
+    validate_stream_read_count(count_limit)?;
+
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let keys = ff_script::functions::stream::StreamOpKeys { ctx: &ctx };
+
+    let args = ReadFramesArgs {
+        execution_id: execution_id.clone(),
+        attempt_index,
+        from_id: from_id.to_owned(),
+        to_id: to_id.to_owned(),
+        count_limit,
+    };
+
+    let ReadFramesResult::Frames(f) =
+        ff_script::functions::stream::ff_read_attempt_stream(client, &keys, &args)
+            .await
+            .map_err(SdkError::Script)?;
+    Ok(f)
+}
+
+/// Tail a live attempt's stream.
+///
+/// `last_id` is exclusive — XREAD returns entries with id strictly greater
+/// than `last_id`. Pass `"0-0"` to start from the beginning.
+///
+/// `block_ms == 0` → non-blocking peek. `block_ms > 0` → blocks up to that
+/// many ms. Rejects `block_ms > MAX_TAIL_BLOCK_MS` and `count_limit`
+/// outside `1..=STREAM_READ_HARD_CAP` with [`SdkError::Config`] to keep
+/// SDK and REST ceilings aligned.
+///
+/// Returns a [`StreamFrames`] including `closed_at`/`closed_reason` —
+/// polling consumers should loop until `result.is_closed()` is true, then
+/// drain and exit. Timeout with no new frames presents as
+/// `frames=[], closed_at=None`.
+///
+/// # Head-of-line warning — use a dedicated client
+///
+/// `ferriskey::Client` is a pipelined multiplexed connection; Valkey
+/// processes commands FIFO on it. `XREAD BLOCK block_ms` does not yield
+/// the read side until a frame arrives or the block elapses. If the
+/// `client` you pass here is ALSO used for claims, completes, fails,
+/// appends, or any other FCALL, a 30-second tail will stall all those
+/// calls for up to 30 seconds.
+///
+/// **Strongly recommended**: build a separate `ferriskey::Client` for
+/// tail callers — mirrors the `Server::tail_client` split that the REST
+/// server uses internally (see `crates/ff-server/src/server.rs` and
+/// RFC-006 Impl Notes §"Dedicated stream-op connection").
+///
+/// # Tail parallelism caveat (same mux)
+///
+/// Even a dedicated tail client is still one multiplexed TCP connection.
+/// Valkey processes `XREAD BLOCK` calls FIFO on that one socket, and
+/// ferriskey's per-call `request_timeout` starts at future-poll — so
+/// two concurrent tails against the same client can time out spuriously:
+/// the second call's BLOCK budget elapses while it waits for the first
+/// BLOCK to return. The REST server handles this internally with a
+/// `tokio::sync::Mutex` that serializes `xread_block` calls, giving
+/// each call its full `block_ms` budget at the server.
+///
+/// **Direct SDK callers that need concurrent tails**: either
+///   (1) build ONE `ferriskey::Client` per concurrent tail call (a small
+///       pool of clients, rotated by the caller), OR
+///   (2) wrap `tail_stream` calls in your own `tokio::sync::Mutex` so
+///       only one BLOCK is in flight per client at a time.
+/// If you need the REST-side backpressure (429 on contention) and the
+/// built-in serializer, go through the
+/// `/v1/executions/{eid}/attempts/{idx}/stream/tail` endpoint rather
+/// than calling this directly.
+///
+/// This SDK does not enforce either pattern — the mutex belongs at the
+/// application layer, and the connection pool belongs at the SDK
+/// caller's DI layer; neither has a structured place inside this
+/// helper.
+///
+/// # Timeout handling
+///
+/// Blocking calls do not hit ferriskey's default `request_timeout` (5s on
+/// the server default). For `XREAD`/`XREADGROUP` with a `BLOCK` argument,
+/// ferriskey's `get_request_timeout` returns `BlockingCommand(block_ms +
+/// 500ms)`, overriding the client's default per-call. A tail with
+/// `block_ms = 30_000` gets a 30_500ms effective transport timeout even if
+/// the client was built with a shorter `request_timeout`. No custom client
+/// configuration is required for timeout reasons — only for head-of-line
+/// isolation above.
+pub async fn tail_stream(
+    client: &Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    last_id: &str,
+    block_ms: u64,
+    count_limit: u64,
+) -> Result<StreamFrames, SdkError> {
+    if block_ms > MAX_TAIL_BLOCK_MS {
+        return Err(SdkError::Config(format!(
+            "block_ms exceeds {MAX_TAIL_BLOCK_MS}ms ceiling"
+        )));
+    }
+    validate_stream_read_count(count_limit)?;
+
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let stream_key = ctx.stream(attempt_index);
+    let stream_meta_key = ctx.stream_meta(attempt_index);
+
+    ff_script::stream_tail::xread_block(
+        client,
+        &stream_key,
+        &stream_meta_key,
+        last_id,
+        block_ms,
+        count_limit,
+    )
+    .await
+    .map_err(SdkError::Script)
 }

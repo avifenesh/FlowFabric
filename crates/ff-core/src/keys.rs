@@ -257,6 +257,18 @@ impl IndexKeys {
         format!("ff:idx:{}:lane:{}:suspended", self.tag, lane_id)
     }
 
+    /// `ff:sec:{p:N}:waitpoint_hmac` — HMAC signing secrets replicated
+    /// across every execution partition (RFC-004 §Waitpoint Security).
+    /// Hash fields:
+    ///   `current_kid`, `previous_kid`, `secret:<kid>` (hex), `previous_expires_at`.
+    /// Replication is required for cluster mode: every FCALL that mints or
+    /// validates a token must hash-tag-collocate this key with the rest of
+    /// its execution-partition KEYS. The secret value is identical across
+    /// partitions; rotation fans out HSETs across them.
+    pub fn waitpoint_hmac_secrets(&self) -> String {
+        format!("ff:sec:{}:waitpoint_hmac", self.tag)
+    }
+
     /// `ff:idx:{p:N}:lease_expiry` — Cross-lane lease expiry scanner target.
     pub fn lease_expiry(&self) -> String {
         format!("ff:idx:{}:lease_expiry", self.tag)
@@ -510,7 +522,23 @@ pub fn worker_key(wid: &WorkerInstanceId) -> String {
     format!("ff:worker:{}", wid)
 }
 
-/// Global worker index.
+/// Non-authoritative capability advertisement STRING for a worker
+/// (sorted CSV). Written by `ff-sdk::FlowFabricWorker::connect`, read by
+/// the engine's unblock scanner to decide whether a `blocked_by_route`
+/// execution has a matching worker. Cluster mode: the key lands on
+/// whatever slot CRC16 hashes to — enumeration goes through
+/// `workers_index_key()` rather than a keyspace SCAN, which would only
+/// hit one shard in cluster mode.
+pub fn worker_caps_key(wid: &WorkerInstanceId) -> String {
+    format!("ff:worker:{}:caps", wid)
+}
+
+/// Global worker index — SET of connected worker_instance_ids. Single
+/// slot in cluster mode (no hash tag; CRC16 of the literal key). SADD on
+/// connect, SREM on empty-caps restart; SMEMBERS gives the enumerable
+/// universe the unblock scanner walks. Separate from `ff:worker:{id}`
+/// registration keys to keep the index membership cheap to read and
+/// independent of per-worker hash details.
 pub fn workers_index_key() -> String {
     "ff:idx:workers".to_owned()
 }

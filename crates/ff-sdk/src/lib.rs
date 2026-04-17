@@ -47,8 +47,9 @@ pub mod worker;
 // Re-exports for convenience
 pub use config::WorkerConfig;
 pub use task::{
-    AppendFrameOutcome, ClaimedTask, ConditionMatcher, FailOutcome, Signal, SignalOutcome,
-    SuspendOutcome, TimeoutBehavior,
+    read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, FailOutcome,
+    Signal, SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior, MAX_TAIL_BLOCK_MS,
+    STREAM_READ_HARD_CAP,
 };
 pub use worker::FlowFabricWorker;
 

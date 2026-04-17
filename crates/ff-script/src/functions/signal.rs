@@ -21,17 +21,17 @@ pub struct SignalOpKeys<'a> {
 
 // ─── ff_deliver_signal ────────────────────────────────────────────────
 //
-// Lua KEYS (13): exec_core, wp_condition, wp_signals_stream,
+// Lua KEYS (14): exec_core, wp_condition, wp_signals_stream,
 //                exec_signals_zset, signal_hash, signal_payload,
 //                idem_key, waitpoint_hash, suspension_current,
 //                eligible_zset, suspended_zset, delayed_zset,
-//                suspension_timeout_zset
-// Lua ARGV (17): signal_id, execution_id, waitpoint_id, signal_name,
+//                suspension_timeout_zset, hmac_secrets
+// Lua ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
 //                signal_category, source_type, source_identity,
 //                payload, payload_encoding, idempotency_key,
 //                correlation_id, target_scope, created_at,
 //                dedup_ttl_ms, resume_delay_ms, signal_maxlen,
-//                max_signals_per_execution
+//                max_signals_per_execution, waitpoint_token
 
 ff_function! {
     pub ff_deliver_signal(args: DeliverSignalArgs) -> DeliverSignalResult {
@@ -51,6 +51,7 @@ ff_function! {
             k.idx.lane_suspended(k.lane_id),                           // 11
             k.idx.lane_delayed(k.lane_id),                             // 12
             k.idx.suspension_timeout(),                                // 13
+            k.idx.waitpoint_hmac_secrets(),                            // 14
         }
         argv {
             args.signal_id.to_string(),                                // 1
@@ -72,6 +73,7 @@ ff_function! {
             args.resume_delay_ms.unwrap_or(0).to_string(),             // 15
             args.signal_maxlen.unwrap_or(1000).to_string(),            // 16
             args.max_signals_per_execution.unwrap_or(10_000).to_string(), // 17
+            args.waitpoint_token.as_str().to_owned(),                  // 18 (wire: raw, not redacted Display)
         }
     }
 }
@@ -103,10 +105,10 @@ impl FromFcallResult for DeliverSignalResult {
 
 // ─── ff_buffer_signal_for_pending_waitpoint ───────────────────────────
 //
-// Lua KEYS (7): exec_core, wp_condition, wp_signals_stream,
+// Lua KEYS (9): exec_core, wp_condition, wp_signals_stream,
 //               exec_signals_zset, signal_hash, signal_payload,
-//               idem_key
-// Lua ARGV (17): same as ff_deliver_signal (unused fields ignored)
+//               idem_key, waitpoint_hash, hmac_secrets
+// Lua ARGV (18): same as ff_deliver_signal (17 + waitpoint_token)
 
 ff_function! {
     pub ff_buffer_signal_for_pending_waitpoint(args: BufferSignalArgs) -> BufferSignalResult {
@@ -120,6 +122,8 @@ ff_function! {
             args.idempotency_key.as_ref().filter(|ik| !ik.is_empty()).map(|ik| {
                 k.ctx.signal_dedup(&args.waitpoint_id, ik)
             }).unwrap_or_else(|| k.ctx.noop()),                        // 7
+            k.ctx.waitpoint(&args.waitpoint_id),                       // 8
+            k.idx.waitpoint_hmac_secrets(),                            // 9
         }
         argv {
             args.signal_id.to_string(),                                // 1
@@ -141,6 +145,7 @@ ff_function! {
             String::new(),                                             // 15 resume_delay_ms (unused)
             String::new(),                                             // 16 signal_maxlen
             String::new(),                                             // 17 max_signals
+            args.waitpoint_token.as_str().to_owned(),                  // 18 (wire: raw, not redacted Display)
         }
     }
 }

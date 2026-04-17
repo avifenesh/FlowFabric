@@ -1,7 +1,302 @@
 -- FlowFabric shared library-local helpers
 -- These are local functions available to all registered functions in the
 -- flowfabric library. They are NOT independently FCALL-able.
--- Reference: RFC-010 §4.8
+-- Reference: RFC-010 §4.8, RFC-004 §Waitpoint Security (HMAC tokens)
+
+---------------------------------------------------------------------------
+-- Capability CSV bounds (RFC-009 §7.5)
+---------------------------------------------------------------------------
+-- Shared ceiling for BOTH the worker-side CSV (ff_issue_claim_grant ARGV[9])
+-- AND the execution-side CSV (exec_core.required_capabilities). Defense in
+-- depth against runaway field sizes: a 10k-token list turns into a multi-MB
+-- HSET value and a per-candidate O(N) atomic scan that blocks the shard.
+--
+-- Inclusivity: these are MAXIMUM accepted values. `#csv == CAPS_MAX_BYTES`
+-- and `n == CAPS_MAX_TOKENS` are accepted; one more rejects. Rust-side
+-- ingress (ff-sdk::FlowFabricWorker::connect, ff-scheduler::Scheduler::
+-- claim_for_worker, ff-core::policy::RoutingRequirements deserialization
+-- via lua/execution.lua) enforces the same ceilings so the Lua check is a
+-- defense-in-depth backstop, not the primary validator.
+local CAPS_MAX_BYTES  = 4096
+local CAPS_MAX_TOKENS = 256
+
+---------------------------------------------------------------------------
+-- Hex / binary helpers (for HMAC-SHA1 token derivation)
+---------------------------------------------------------------------------
+
+-- Convert a hex string to a binary (byte) string. Accepts mixed case.
+-- Returns nil on ANY malformed input: non-string, odd length, OR any
+-- non-hex char (including whitespace, unicode, control chars). Callers
+-- treat nil as invalid_secret.
+--
+-- Rust side (ServerConfig) already validates the env secret as even-length
+-- 0-9a-fA-F, but an operator writing directly to Valkey (or a torn write
+-- during rotation) could bypass that validator. We refuse the conversion
+-- here instead of silently coercing bad pairs to 0 bytes (which would
+-- produce a bogus but valid-looking MAC).
+local function hex_to_bytes(hex)
+  if type(hex) ~= "string" or #hex % 2 ~= 0 then
+    return nil
+  end
+  local out = {}
+  for i = 1, #hex - 1, 2 do
+    local byte = tonumber(hex:sub(i, i + 1), 16)
+    if not byte then
+      return nil
+    end
+    out[#out + 1] = string.char(byte)
+  end
+  return table.concat(out)
+end
+
+-- XOR two equal-length byte strings. Used for HMAC key-pad construction.
+local function xor_bytes(a, b)
+  local out = {}
+  for i = 1, #a do
+    out[i] = string.char(bit.bxor(a:byte(i), b:byte(i)))
+  end
+  return table.concat(out)
+end
+
+-- HMAC-SHA1(key_hex, message) → lowercase hex digest (40 chars), or nil on
+-- malformed key_hex (odd-length / non-string). Callers must treat nil as
+-- an invalid-secret error — never pass it to HSET / concat / return.
+-- Reference: RFC 2104. SHA1 block size = 64 bytes.
+local function hmac_sha1_hex(key_hex, message)
+  local key = hex_to_bytes(key_hex)
+  if not key then
+    return nil
+  end
+  local block_size = 64
+  if #key > block_size then
+    -- Reduce oversized key via SHA1 (per RFC 2104). sha1hex output is 40
+    -- lowercase hex chars, so the inner hex_to_bytes cannot fail.
+    key = hex_to_bytes(redis.sha1hex(key))
+  end
+  if #key < block_size then
+    key = key .. string.rep("\0", block_size - #key)
+  end
+  local ipad = string.rep(string.char(0x36), block_size)
+  local opad = string.rep(string.char(0x5c), block_size)
+  local inner = redis.sha1hex(xor_bytes(key, ipad) .. message)
+  return redis.sha1hex(xor_bytes(key, opad) .. hex_to_bytes(inner))
+end
+
+-- Constant-time string equality. Returns true iff strings are equal in
+-- both length and content. Uses XOR-accumulation to avoid early-exit
+-- timing leaks on byte mismatches during HMAC token validation.
+-- Reference: Remote timing attacks on authentication (e.g., CVE-2011-3389 class).
+--
+-- Safety note on the length check: a length-mismatch early return reveals
+-- whether the presented string matches the expected length, which is a
+-- timing side channel IF attacker-controlled length is used to probe the
+-- expected length. In this codebase the caller normalizes to a fixed shape
+-- BEFORE reaching here — validate_waitpoint_token already requires
+-- #presented == 40 (SHA1 hex digest length) at the parsing boundary, so
+-- any input reaching constant_time_eq has a length already known to be 40
+-- by the attacker. The only length variation here is on `expected`, which
+-- is server-computed and constant. Hence this early return does not leak
+-- secret-dependent timing.
+local function constant_time_eq(a, b)
+  if type(a) ~= "string" or type(b) ~= "string" then
+    return false
+  end
+  if #a ~= #b then
+    return false
+  end
+  local acc = 0
+  for i = 1, #a do
+    acc = bit.bor(acc, bit.bxor(a:byte(i), b:byte(i)))
+  end
+  return acc == 0
+end
+
+---------------------------------------------------------------------------
+-- Waitpoint HMAC tokens (RFC-004 §Waitpoint Security)
+---------------------------------------------------------------------------
+--
+-- Token format: "kid:40hex"  — kid identifies which key signed the token,
+-- enabling zero-downtime rotation. ANY kid present in the secrets hash
+-- with a future `expires_at:<kid>` (or the current kid, which has no
+-- expiry) accepts tokens. This supports rapid rotation: rotating A→B→C
+-- within a grace window keeps A's secret validatable as long as
+-- expires_at:A is still future.
+--
+-- HMAC input binds (waitpoint_id | waitpoint_key | created_at_ms) with a
+-- pipe delimiter so field-boundary confusion cannot produce collisions
+-- across waitpoints.
+--
+-- Secret storage: per-partition replicated hash at
+--   ff:sec:{p:N}:waitpoint_hmac
+-- Fields:
+--   current_kid               — the kid minting new tokens (no expiry)
+--   secret:<kid>              — hex-encoded HMAC key for each kid ever installed
+--   expires_at:<kid>          — unix ms; accept tokens under <kid> iff exp > now_ms
+--                               INVARIANT: expires_at:<current_kid> is NEVER written
+--   previous_kid              — observability/audit only: the kid immediately
+--                               preceding current_kid (NOT the only acceptable one)
+--   previous_expires_at       — observability/audit only: matches
+--                               expires_at:<previous_kid>
+--
+-- Replication is required for Valkey cluster mode (all FCALL KEYS must
+-- hash to the same slot); rotation fans out across partitions.
+---------------------------------------------------------------------------
+
+-- Read the hmac_secrets hash. Returns a table with:
+--   current_kid, current_secret — the minting kid (nil if not initialized)
+--   kid_secrets = { [kid] = { secret = <hex>, expires_at = <ms or nil> } }
+--     includes current_kid (expires_at = nil → no expiry)
+--     includes every secret:<kid> present in the hash
+--   previous_kid, previous_secret, previous_expires_at — kept for back-compat
+--     (audit log / observability); validate path does NOT depend on them.
+-- Returns nil if the hash is absent.
+local function load_waitpoint_secrets(secrets_key)
+  local raw = redis.call("HGETALL", secrets_key)
+  if #raw == 0 then
+    return nil
+  end
+  local t = {}
+  for i = 1, #raw, 2 do
+    t[raw[i]] = raw[i + 1]
+  end
+  local out = {
+    current_kid = t.current_kid,
+    previous_kid = t.previous_kid,
+    previous_expires_at = t.previous_expires_at,
+    kid_secrets = {},
+  }
+  if out.current_kid then
+    out.current_secret = t["secret:" .. out.current_kid]
+  end
+  if out.previous_kid then
+    out.previous_secret = t["secret:" .. out.previous_kid]
+  end
+  -- Multi-kid scan: every secret:<kid> becomes a validation candidate.
+  -- current_kid has no expiry entry (intentional — it's always valid).
+  -- Other kids are accepted iff expires_at:<kid> is set AND > now_ms; the
+  -- expiry check runs in validate_waitpoint_token so we simply carry the
+  -- raw expires_at string here.
+  for k, v in pairs(t) do
+    if k:sub(1, 7) == "secret:" then
+      local kid = k:sub(8)
+      if kid ~= "" then
+        out.kid_secrets[kid] = {
+          secret = v,
+          expires_at = t["expires_at:" .. kid],
+        }
+      end
+    end
+  end
+  return out
+end
+
+-- Build the HMAC input string. Pipe delimiter prevents concatenation
+-- collisions across distinct (waitpoint_id, waitpoint_key) pairs.
+local function waitpoint_hmac_input(waitpoint_id, waitpoint_key, created_at_ms)
+  return waitpoint_id .. "|" .. waitpoint_key .. "|" .. tostring(created_at_ms)
+end
+
+-- Mint a waitpoint token using the current kid.
+-- Returns (token, kid) on success or (nil, error_code) on failure.
+-- Defense-in-depth: returns a typed error for missing secrets_key / missing
+-- secrets hash so external callers that construct FCALL KEYS by hand cannot
+-- produce the "arguments must be strings or integers" Lua panic via nil.
+local function mint_waitpoint_token(secrets_key, waitpoint_id, waitpoint_key, created_at_ms)
+  if type(secrets_key) ~= "string" or secrets_key == "" then
+    return nil, "invalid_keys_missing_hmac"
+  end
+  local secrets = load_waitpoint_secrets(secrets_key)
+  if not secrets or not secrets.current_kid or not secrets.current_secret then
+    return nil, "hmac_secret_not_initialized"
+  end
+  local input = waitpoint_hmac_input(waitpoint_id, waitpoint_key, created_at_ms)
+  local digest = hmac_sha1_hex(secrets.current_secret, input)
+  if not digest then
+    return nil, "invalid_secret"
+  end
+  return secrets.current_kid .. ":" .. digest, secrets.current_kid
+end
+
+-- Validate a waitpoint token against the (waitpoint_id, waitpoint_key,
+-- created_at_ms) that were bound at mint time. Accepts tokens signed with
+-- current_kid, or previous_kid if previous_expires_at has not passed.
+-- Returns nil on success or an error code string on failure.
+local function validate_waitpoint_token(
+  secrets_key, token, waitpoint_id, waitpoint_key, created_at_ms, now_ms
+)
+  if type(secrets_key) ~= "string" or secrets_key == "" then
+    return "invalid_keys_missing_hmac"
+  end
+  if type(token) ~= "string" or token == "" then
+    return "missing_token"
+  end
+  local sep = token:find(":", 1, true)
+  if not sep or sep < 2 or sep >= #token then
+    return "invalid_token"
+  end
+  local kid = token:sub(1, sep - 1)
+  local presented = token:sub(sep + 1)
+  if #presented ~= 40 then
+    -- SHA1 hex digest is always 40 chars.
+    return "invalid_token"
+  end
+
+  local secrets = load_waitpoint_secrets(secrets_key)
+  if not secrets or not secrets.current_kid then
+    return "hmac_secret_not_initialized"
+  end
+
+  -- Multi-kid validation. ANY secret:<kid> present in the hash is a
+  -- candidate IF:
+  --   - kid == current_kid (no expiry, always valid), OR
+  --   - expires_at:<kid> is a positive integer AND > now_ms.
+  --
+  -- Rationale: rapid rotation (A→B→C inside a grace window) must keep
+  -- in-flight A-signed tokens valid. The previous 2-slot model
+  -- (current + previous) evicted A as soon as B became previous, even
+  -- though expires_at:A was still future. RFC-004 §Waitpoint Security
+  -- promises grace duration, not "grace until next rotation".
+  --
+  -- Fail-CLOSED on malformed expires_at: a corrupted/non-numeric value
+  -- means "no affirmative unexpired proof" — reject.
+  local secret = nil
+  local expiry_state = nil  -- "known_kid_expired" | "unknown_kid"
+  if kid == secrets.current_kid then
+    secret = secrets.current_secret
+  else
+    local entry = secrets.kid_secrets and secrets.kid_secrets[kid]
+    if entry then
+      local exp = tonumber(entry.expires_at)
+      if not exp or exp <= 0 or exp < now_ms then
+        -- secret:<kid> is present but its grace has elapsed (or was
+        -- never recorded). Distinguishable from unknown_kid so the
+        -- caller can log the more-actionable "token_expired".
+        expiry_state = "known_kid_expired"
+      else
+        secret = entry.secret
+      end
+    else
+      expiry_state = "unknown_kid"
+    end
+  end
+
+  if not secret then
+    if expiry_state == "known_kid_expired" then
+      return "token_expired"
+    end
+    return "invalid_token"
+  end
+
+  local input = waitpoint_hmac_input(waitpoint_id, waitpoint_key, created_at_ms)
+  local expected = hmac_sha1_hex(secret, input)
+  if not expected then
+    return "invalid_secret"
+  end
+  if not constant_time_eq(expected, presented) then
+    return "invalid_token"
+  end
+  return nil
+end
 
 ---------------------------------------------------------------------------
 -- Time
@@ -105,6 +400,26 @@ local function validate_lease(core, argv, now_ms)
 end
 
 -- Sets ownership_state to lease_expired_reclaimable. Idempotent.
+--
+-- Also writes `closed_at`/`closed_reason="lease_expired"` on the attempt's
+-- `stream_meta` hash when that stream exists, so `tail_stream` consumers
+-- observe the terminal signal without having to fall back to polling
+-- `execution_state`. This matters for the permanent-failure case (worker
+-- OOM or node dead, no replacement reclaims): the reclaim path that
+-- normally writes `closed_reason="reclaimed"` may never run, and without
+-- this signal the tail poll loop waits forever.
+--
+-- Write order: we only write stream_meta if its existing `closed_at` is
+-- empty. A later `ff_reclaim_execution` that overwrites `closed_reason`
+-- to "reclaimed" still wins because it unconditionally HSETs the field;
+-- this function intentionally does NOT overwrite a pre-existing close.
+--
+-- Key construction: the stream_meta key is derived from core_key's
+-- `{p:N}` hash tag + current_attempt_index. All three keys share the
+-- same hash tag, so this stays single-slot in cluster mode despite not
+-- being declared in KEYS upfront — mirrors the dynamic attempt/lane key
+-- construction in `ff_create_execution`.
+--
 -- @param keys   table with core_key, lease_history_key
 -- @param core   table from hgetall_to_table
 -- @param now_ms current timestamp in milliseconds
@@ -134,6 +449,36 @@ local function mark_expired(keys, core, now_ms, maxlen)
     "worker_id", core.current_worker_id or "",
     "worker_instance_id", core.current_worker_instance_id or "",
     "ts", now_ms)
+
+  -- Close stream_meta (if the stream was lazily created) so tail_stream
+  -- consumers receive the terminal signal. Core key format:
+  --   ff:exec:{p:N}:<eid>:core
+  -- Stream meta key format:
+  --   ff:stream:{p:N}:<eid>:<attempt_index>:meta
+  local att_idx = core.current_attempt_index
+  if att_idx ~= nil and att_idx ~= "" then
+    local tag_open  = string.find(keys.core_key, "{", 1, true)
+    local tag_close = tag_open and string.find(keys.core_key, "}", tag_open, true)
+    if tag_open and tag_close then
+      local tag = string.sub(keys.core_key, tag_open, tag_close)
+      -- After `}:` comes `<eid>:core`. Walk past the `}:` delimiter.
+      local after_tag = string.sub(keys.core_key, tag_close + 2)
+      local eid_end = string.find(after_tag, ":core", 1, true)
+      if eid_end then
+        local eid = string.sub(after_tag, 1, eid_end - 1)
+        local stream_meta_key = "ff:stream:" .. tag .. ":" .. eid
+                                .. ":" .. tostring(att_idx) .. ":meta"
+        if redis.call("EXISTS", stream_meta_key) == 1 then
+          local existing_closed_at = redis.call("HGET", stream_meta_key, "closed_at")
+          if not is_set(existing_closed_at) then
+            redis.call("HSET", stream_meta_key,
+              "closed_at", tostring(now_ms),
+              "closed_reason", "lease_expired")
+          end
+        end
+      end
+    end
+  end
 end
 
 -- Validates lease AND atomically marks expired if lease has lapsed.

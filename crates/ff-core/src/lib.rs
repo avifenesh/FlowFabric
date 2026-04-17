@@ -2,6 +2,7 @@
 
 pub mod contracts;
 pub mod error;
+pub mod hash;
 pub mod keys;
 pub mod partition;
 pub mod policy;

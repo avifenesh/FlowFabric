@@ -28,6 +28,31 @@ pub struct ServerConfig {
     /// Shared-secret API token. If set, all requests except GET /healthz must
     /// include `Authorization: Bearer <token>`. If unset, auth is disabled.
     pub api_token: Option<String>,
+    /// Hex-encoded secret used to sign waitpoint HMAC tokens (RFC-004
+    /// §Waitpoint Security). Required on boot; the server refuses to start
+    /// without it so multi-tenant signal authentication is never silently
+    /// disabled. Recommended length: 64 hex chars (32 bytes).
+    pub waitpoint_hmac_secret: String,
+    /// Grace window during which tokens signed by the previous kid remain
+    /// accepted after rotation. Tokens already in flight survive operator
+    /// rotation; operators tighten this for sensitive tenants. Default 24h.
+    pub waitpoint_hmac_grace_ms: u64,
+    /// Maximum concurrent stream-op callers (`read_attempt_stream` +
+    /// `tail_attempt_stream` combined). Each caller holds one semaphore
+    /// permit for the duration of its Valkey round-trip(s); contention
+    /// surfaces as HTTP 429 at the REST boundary.
+    ///
+    /// Shared bound for both read and tail because both run on the same
+    /// dedicated `tail_client` (see `Server.tail_client`) — a big
+    /// 10_000-frame XRANGE reply can head-of-line the mux just as badly
+    /// as a long `XREAD BLOCK`, so they should share fairness accounting.
+    ///
+    /// Default `64`. Set below the server's request-concurrency budget
+    /// so stream ops cannot starve other routes. Env var:
+    /// `FF_MAX_CONCURRENT_STREAM_OPS` (preferred) or legacy
+    /// `FF_MAX_CONCURRENT_TAIL` (accepted during the R4 rename; both
+    /// valid for at least one release).
+    pub max_concurrent_stream_ops: u32,
 }
 
 impl ServerConfig {
@@ -85,6 +110,43 @@ impl ServerConfig {
             .collect();
 
         let api_token = std::env::var("FF_API_TOKEN").ok().filter(|s| !s.is_empty());
+
+        // Waitpoint HMAC secret. Required on boot — refuse to start without
+        // it so multi-tenant signal authentication can never be silently
+        // disabled. Validate hex shape eagerly; empty strings and bad hex
+        // produce a configuration error, not a runtime crash later.
+        let waitpoint_hmac_secret = std::env::var("FF_WAITPOINT_HMAC_SECRET")
+            .map_err(|_| ConfigError::InvalidValue {
+                var: "FF_WAITPOINT_HMAC_SECRET".to_owned(),
+                message:
+                    "required: hex-encoded HMAC signing secret for waitpoint tokens \
+                     (RFC-004 §Waitpoint Security); suggested 64 hex chars (32 bytes)"
+                        .to_owned(),
+            })?;
+        if waitpoint_hmac_secret.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                var: "FF_WAITPOINT_HMAC_SECRET".to_owned(),
+                message: "must not be empty".to_owned(),
+            });
+        }
+        if waitpoint_hmac_secret.len() % 2 != 0
+            || !waitpoint_hmac_secret.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(ConfigError::InvalidValue {
+                var: "FF_WAITPOINT_HMAC_SECRET".to_owned(),
+                message: "must be an even-length hex string (0-9a-fA-F)".to_owned(),
+            });
+        }
+        let waitpoint_hmac_grace_ms = env_u64("FF_WAITPOINT_HMAC_GRACE_MS", 86_400_000)?;
+        // Preferred env var: FF_MAX_CONCURRENT_STREAM_OPS. Legacy
+        // FF_MAX_CONCURRENT_TAIL is accepted for one release to avoid
+        // breaking existing deployments mid-rename (R4 unified the two
+        // stream-op clients on one permit pool). If both are set, the
+        // new name wins.
+        let max_concurrent_stream_ops = match std::env::var("FF_MAX_CONCURRENT_STREAM_OPS") {
+            Ok(_) => env_u32_positive("FF_MAX_CONCURRENT_STREAM_OPS", 64)?,
+            Err(_) => env_u32_positive("FF_MAX_CONCURRENT_TAIL", 64)?,
+        };
 
         let lanes: Vec<LaneId> = env_or("FF_LANES", "default")
             .split(',')
@@ -165,6 +227,9 @@ impl ServerConfig {
             skip_library_load: false,
             cors_origins,
             api_token,
+            waitpoint_hmac_secret,
+            waitpoint_hmac_grace_ms,
+            max_concurrent_stream_ops,
         })
     }
 }
@@ -189,6 +254,15 @@ impl Default for ServerConfig {
             skip_library_load: false,
             cors_origins: vec!["*".to_owned()],
             api_token: None,
+            // Deterministic dev/test secret. Production deployments MUST
+            // override via FF_WAITPOINT_HMAC_SECRET (ServerConfig::from_env
+            // requires it), so this default only applies to unit tests and
+            // TestCluster fixtures that skip env validation.
+            waitpoint_hmac_secret:
+                "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+            waitpoint_hmac_grace_ms: 86_400_000,
+            max_concurrent_stream_ops: 64,
         }
     }
 }
@@ -240,4 +314,21 @@ fn env_u64(key: &str, default: u64) -> Result<u64, ConfigError> {
         }),
         Err(_) => Ok(default),
     }
+}
+
+fn env_u32_positive(key: &str, default: u32) -> Result<u32, ConfigError> {
+    let val = match std::env::var(key) {
+        Ok(v) => v.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+            var: key.to_owned(),
+            message: format!("expected u32, got '{v}'"),
+        })?,
+        Err(_) => default,
+    };
+    if val == 0 {
+        return Err(ConfigError::InvalidValue {
+            var: key.to_owned(),
+            message: "must be > 0 (semaphore size)".to_owned(),
+        });
+    }
+    Ok(val)
 }
