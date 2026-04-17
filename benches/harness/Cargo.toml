@@ -13,6 +13,38 @@ name = "submit_claim_complete"
 harness = false
 path = "benches/submit_claim_complete.rs"
 
+# Scenario 2 — suspend → signal → resume latency (HMAC roundtrip).
+# Criterion per-iter = one full roundtrip (Shape A). See the bench's
+# module comment for the exact timing envelope.
+[[bench]]
+name = "suspend_signal_resume"
+harness = false
+path = "benches/suspend_signal_resume.rs"
+
+# Scenario 3 — long-running steady-state (100 workers × 5 min).
+# Criterion's iteration model doesn't fit a 5-minute run; custom
+# tokio harness instead. Invoked via:
+#   cargo run -p ff-bench --release --bin long_running -- --duration 300
+[[bin]]
+name = "long_running"
+path = "src/bin/long_running.rs"
+
+# Scenario 4 — linear flow DAG. 100 concurrent 10-node chains.
+# Custom harness (criterion's iter model doesn't fit N-parallel-flow
+# drains). Invoked via:
+#   cargo run -p ff-bench --release --bin flow_dag -- --flows 100 --nodes 10
+[[bin]]
+name = "flow_dag"
+path = "src/bin/flow_dag.rs"
+
+# Scenario 5 — capability-routed claim under 3 distributions.
+# Custom harness: 100 workers × 10 cap sets × 1000 tasks doesn't fit
+# a criterion iter. Invoked via:
+#   cargo run -p ff-bench --release --bin cap_routed -- --mode happy
+[[bin]]
+name = "cap_routed"
+path = "src/bin/cap_routed.rs"
+
 [dependencies]
 ff-core = { path = "../../crates/ff-core" }
 ff-sdk = { path = "../../crates/ff-sdk", features = ["insecure-direct-claim"] }
@@ -23,6 +55,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 

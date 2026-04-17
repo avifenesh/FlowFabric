@@ -8,9 +8,14 @@
 //! Phase A ships scenario 1 (submit → claim → complete throughput) only;
 //! scenarios 2–5 land in Batch C follow-up issues.
 
+pub mod comparison;
 pub mod report;
+pub mod runners;
 pub mod workload;
 
+pub use comparison::{
+    run_scenario, ComparisonRunner, RunConfig, RunResult, Scenario, SystemSupport,
+};
 pub use report::{
     git_sha, host_info, iso8601_utc, valkey_version, write_report, HostInfo, LatencyMs,
     Percentiles, Report, SYSTEM_FLOWFABRIC,
