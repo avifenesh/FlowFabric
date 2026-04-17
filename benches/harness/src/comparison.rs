@@ -170,11 +170,19 @@ pub async fn run_scenario<R: ComparisonRunner>(
     env: &BenchEnv,
 ) -> anyhow::Result<Report> {
     let support = runner.supports(scenario);
+    // Suffix the system name by support level so the emitted filename
+    // (system-<scenario>-<sha>.json) can't silently clobber a prior
+    // run at a different support level. Approximation and Unsupported
+    // both carry suffixes; Native keeps the bare runner name so
+    // existing baselines don't renumber on upgrade.
     let system = match &support {
         SystemSupport::Approximation { .. } => {
             format!("{}-approx", runner.system_name())
         }
-        _ => runner.system_name().to_owned(),
+        SystemSupport::Unsupported { .. } => {
+            format!("{}-unsupported", runner.system_name())
+        }
+        SystemSupport::Native => runner.system_name().to_owned(),
     };
 
     let (throughput, latency_ms, notes) = match &support {
@@ -307,7 +315,9 @@ mod tests {
             run_scenario(&mut r, Scenario::FlowDagLinear, &RunConfig::small(), &env)
                 .await
                 .unwrap();
-        assert_eq!(report.system, "fake");
+        // Suffixed so Unsupported reports can't overwrite a prior
+        // Native baseline file for the same (system, scenario) pair.
+        assert_eq!(report.system, "fake-unsupported");
         assert_eq!(report.throughput_ops_per_sec, 0.0);
         assert_eq!(report.notes.as_deref(), Some("Unsupported: no DAG"));
     }

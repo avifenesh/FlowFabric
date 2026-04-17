@@ -423,9 +423,17 @@ async fn wait_state(
     }
 }
 
-/// Fetch started_at + completed_at timestamps for an execution. Returns
-/// the pair in ms since epoch. Returns (0, 0) if either field is
-/// missing — callers treat that as the clamp-to-zero case.
+/// Fetch started_at + completed_at timestamps (ms since epoch) for an
+/// execution we've already observed in terminal state. Bails loudly on
+/// missing/unparseable fields: at call time the caller has confirmed
+/// `state == "completed"` via `wait_state`, so both timestamps must be
+/// populated. Silently returning 0 (the prior behavior) zeroed every
+/// stage_latency sample in the scenario 4 report — R1 HIGH finding F1.
+///
+/// ExecutionInfo now serialises these as `Option<String>` (matching
+/// the existing `created_at: String` pattern); both are elided when
+/// empty on the wire, populated once Lua's HSET writes them to
+/// exec_core.
 async fn fetch_exec_timestamps(
     client: &Client,
     env: &BenchEnv,
@@ -439,14 +447,17 @@ async fn fetch_exec_timestamps(
         anyhow::bail!("get_execution({eid}) failed ({status}): {text}");
     }
     let v: JsonValue = resp.json().await?;
-    let started = v
-        .pointer("/started_at")
-        .and_then(|n| n.as_i64())
-        .unwrap_or(0);
-    let completed = v
-        .pointer("/completed_at")
-        .and_then(|n| n.as_i64())
-        .unwrap_or(0);
+
+    let parse_ts = |field: &str| -> Result<i64> {
+        let raw = v
+            .pointer(&format!("/{field}"))
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| anyhow::anyhow!("exec {eid} missing field {field} post-completion"))?;
+        raw.parse::<i64>()
+            .map_err(|e| anyhow::anyhow!("exec {eid} field {field}={raw:?}: {e}"))
+    };
+    let started = parse_ts("started_at")?;
+    let completed = parse_ts("completed_at")?;
     Ok((started, completed))
 }
 
@@ -485,6 +496,14 @@ async fn spawn_echo_workers(env: BenchEnv, count: usize) -> Result<WorkerPool> {
     })
 }
 
+/// Minimal worker that claims and immediately completes.
+///
+/// Zero work in the hot path is deliberate: scenario 4 measures flow
+/// overhead (scheduler propagation + dependency resolution), not
+/// worker runtime. A realistic workload would add its own duration on
+/// top of every stage_latency sample the bench reports; the reported
+/// numbers are therefore a *floor* — real pipelines run slower, by
+/// the cost of whatever the workers actually do.
 async fn echo_worker_loop(
     wi: usize,
     env: BenchEnv,

@@ -1280,6 +1280,17 @@ pub struct ExecutionInfo {
     pub state_vector: StateVector,
     pub public_state: PublicState,
     pub created_at: String,
+    /// TimestampMs (ms since epoch) when the execution's first attempt
+    /// was started by a worker claim. Empty string until the first
+    /// claim lands. Serialised as `Option<String>` so pre-claim reads
+    /// deserialise cleanly even if the field is absent from the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// TimestampMs when the execution reached a terminal
+    /// `completed`/`failed`/`cancelled`/`expired` state. Empty /
+    /// absent while still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
     pub current_attempt_index: u32,
     pub flow_id: Option<String>,
     pub blocking_detail: String,

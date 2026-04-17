@@ -13,6 +13,36 @@
 //! using the shared `ff_bench::comparison::run_scenario` envelope.
 //! Report `notes` contains the scenario-4-specific metrics as a
 //! `key=value,…` string (see `runners::flowfabric::format_notes`).
+//!
+//! # What this bench measures (and what it doesn't)
+//!
+//! * **Flow-DAG cost at the server's HTTP ceiling.** The default
+//!   configuration is 100 concurrent flows × 39 HTTP calls per flow
+//!   (1 flow-create + 10 exec + 10 member + 9 edge-stage + 9
+//!   edge-apply). That's 3 900 HTTP round-trips driven through
+//!   reqwest's default connection pool; the reported throughput is the
+//!   *flow-primitive cost as seen from a contending HTTP client*, not
+//!   the pure scheduler cost of running a DAG. If the server's axum
+//!   layer saturates before the Lua path does, the number tracks the
+//!   axum layer, not the primitive. Drop `--flows` and `--workers`
+//!   together to isolate the scheduler-only cost.
+//!
+//! * **Pure scheduler propagation + dependency resolution.** The
+//!   per-node worker (`runners::flowfabric::echo_worker_loop`) calls
+//!   `task.complete(None)` immediately on claim — zero work in the
+//!   hot path, deliberate. The stage-latency numbers therefore
+//!   measure scheduler propagation (dependency_reconciler →
+//!   `blocked_by_upstream` cleared → eligible → claim), *not* worker
+//!   runtime. Any real worker would add its own duration on top.
+//!
+//! * **Flow-setup wall vs. server apply-ack.** `flow_setup_ms` stops
+//!   at the *client-observed* HTTP response of the final
+//!   `/edges/apply` call. The server finished applying the edge
+//!   slightly earlier — the slack is one HTTP round-trip + a little
+//!   axum ack overhead, on the order of a millisecond per edge. The
+//!   `setup_exec_ratio` number inherits that bias; it's consistent
+//!   across runs, so cross-release comparisons still work, but the
+//!   absolute value is an upper bound on the true flow-graph work.
 
 use std::path::PathBuf;
 
