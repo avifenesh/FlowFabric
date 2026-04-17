@@ -740,6 +740,16 @@ impl Server {
             }
         }
 
+        // SSCAN may observe a member more than once across iterations —
+        // that is documented Valkey behavior, not a bug (see
+        // https://valkey.io/commands/sscan/). Dedup in-place before
+        // building the typed id list so the HTTP response and the
+        // downstream pipelined HMGETs don't duplicate work. Sort +
+        // dedup keeps this O(n log n) without a BTreeSet allocation;
+        // typical n is 1 (the single waitpoint on a suspended exec).
+        wp_ids_raw.sort_unstable();
+        wp_ids_raw.dedup();
+
         if wp_ids_raw.is_empty() {
             return Ok(Vec::new());
         }
