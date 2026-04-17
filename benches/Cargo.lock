@@ -976,6 +976,7 @@ dependencies = [
  "anyhow",
  "clap",
  "criterion",
+ "ferriskey",
  "ff-core",
  "ff-sdk",
  "rand 0.9.4",

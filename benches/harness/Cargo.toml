@@ -48,6 +48,7 @@ path = "src/bin/cap_routed.rs"
 [dependencies]
 ff-core = { path = "../../crates/ff-core" }
 ff-sdk = { path = "../../crates/ff-sdk", features = ["insecure-direct-claim"] }
+ferriskey = { path = "../../ferriskey" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

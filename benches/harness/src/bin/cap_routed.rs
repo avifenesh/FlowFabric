@@ -63,7 +63,7 @@
 //! task seeding) dwarfs the measured work. Running a long custom
 //! harness per-mode and aggregating is the right shape.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,6 +71,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use ff_bench::{write_report, LatencyMs, Report, SYSTEM_FLOWFABRIC};
+use ff_core::keys::IndexKeys;
+use ff_core::partition::{Partition, PartitionConfig, PartitionFamily};
+use ff_core::types::LaneId;
 use ff_sdk::{FlowFabricWorker, WorkerConfig};
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -152,6 +155,9 @@ async fn main() -> Result<()> {
     let mut total_scheduler_fcalls: u64 = 0;
     let mut total_blocked: u64 = 0;
     let mut total_wall = Duration::ZERO;
+    let mut block_cycles_all: Vec<u32> = Vec::new();
+    let mut block_cycles_stranded: Vec<u32> = Vec::new();
+    let mut stranded_states: Vec<StrandedState> = Vec::new();
 
     for it in 0..args.iterations {
         let run = run_once(&env, args.mode, &args).await?;
@@ -162,6 +168,9 @@ async fn main() -> Result<()> {
         first_latencies_us.extend(&run.first_claim_us);
         correct_latencies_us.extend(&run.correct_claim_us);
         retry_gap_latencies_us.extend(&run.retry_gap_us);
+        block_cycles_all.extend(&run.block_cycles_all);
+        block_cycles_stranded.extend(&run.block_cycles_stranded);
+        stranded_states.extend(run.stranded_states.iter().cloned());
         eprintln!(
             "[cap_routed] iter {}/{} mode={} correct={}/{} blocked={} wall={}ms",
             it + 1,
@@ -217,6 +226,9 @@ async fn main() -> Result<()> {
         correct_latency.clone(),
         retry_gap_latency,
         throughput,
+        &block_cycles_all,
+        &block_cycles_stranded,
+        &stranded_states,
     );
 
     if (correct_routing_rate - 1.0).abs() > 1e-9 {
@@ -245,6 +257,49 @@ struct RunResult {
     /// Per-task `correct - first` retry-gap in microseconds. Not a
     /// true blocked-route dwell (see module comment).
     retry_gap_us: Vec<u64>,
+    /// Final block_cycles for every task (correct + stranded). Triage
+    /// signal for the promote/reblock thrash hypothesis (H1+H3).
+    block_cycles_all: Vec<u32>,
+    /// Final block_cycles for tasks that NEVER reached Correct.
+    /// Distinguishes design-limit thrash (high cycles) from scanner
+    /// bug (0 or 1 cycle, never promoted).
+    block_cycles_stranded: Vec<u32>,
+    /// Post-shutdown classification of every stranded task. Authoritative
+    /// signal from Valkey state — bench-side Rejected counter misses
+    /// SDK-internal block_route dispatch, so we read the ZSETs directly.
+    stranded_states: Vec<StrandedState>,
+}
+
+#[derive(Debug, Clone)]
+struct StrandedState {
+    eid: String,
+    state: StrandedStateKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrandedStateKind {
+    /// Currently in `lane_blocked_route` somewhere. Thrash/design-limit
+    /// evidence — unblock scanner hadn't promoted this task yet at
+    /// shutdown (or re-blocked it just before).
+    BlockedRoute,
+    /// In `lane_terminal` — reached a terminal state but NOT via a
+    /// Correct claim observation. Shouldn't happen in a clean run; flag
+    /// as a measurement anomaly.
+    Terminal,
+    /// Not found in any monitored ZSET. Scheduler lost track OR the
+    /// task landed in an unmonitored state (eligible, active, delayed,
+    /// suspended, etc.). Treat as "nowhere" for triage.
+    Nowhere,
+}
+
+impl StrandedStateKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BlockedRoute => "blocked_route",
+            Self::Terminal => "terminal",
+            Self::Nowhere => "nowhere",
+        }
+    }
 }
 
 async fn run_once(
@@ -363,6 +418,7 @@ async fn run_once(
                         let mut guard = tracker.lock().await;
                         if let Some(entry) = guard.get_mut(&eid) {
                             entry.blocked = true;
+                            entry.block_cycles = entry.block_cycles.saturating_add(1);
                         }
                     }
                 }
@@ -396,6 +452,37 @@ async fn run_once(
         );
     }
 
+    // Drain final per-task block_cycles from the tracker. A task
+    // reached Correct iff correct_claim_us is Some; everything else
+    // is stranded (never converged within deadline or shutdown took
+    // over). Done after shutdown so no observation is in-flight.
+    let (block_cycles_all, block_cycles_stranded, stranded_eids) = {
+        let guard = tracker.lock().await;
+        let mut all = Vec::with_capacity(guard.len());
+        let mut stranded = Vec::new();
+        let mut stranded_eids = Vec::new();
+        for (eid, entry) in guard.iter() {
+            all.push(entry.block_cycles);
+            if entry.correct_claim_us.is_none() {
+                stranded.push(entry.block_cycles);
+                stranded_eids.push(eid.clone());
+            }
+        }
+        (all, stranded, stranded_eids)
+    };
+
+    // Option 1 — bench-side ZSET reader. The bench's Rejected counter
+    // never fires because SDK `claim_next` dispatches block_route
+    // internally before returning Some(task). Sweep every execution
+    // partition's lane_blocked_route + lane_terminal ZSETs to classify
+    // each stranded eid authoritatively from Valkey state. Best-effort:
+    // a connection failure yields an empty classification — surfaced
+    // so the operator knows to distrust the zeros.
+    let stranded_states = classify_stranded(env, &stranded_eids).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "stranded-state sweep failed; classifications unavailable");
+        Vec::new()
+    });
+
     Ok(RunResult {
         wall,
         correct_claims,
@@ -404,7 +491,90 @@ async fn run_once(
         first_claim_us,
         correct_claim_us,
         retry_gap_us,
+        block_cycles_all,
+        block_cycles_stranded,
+        stranded_states,
     })
+}
+
+/// Open a ferriskey client, scan every execution-partition's
+/// `lane_blocked_route` and `lane_terminal` ZSETs into hash sets, then
+/// classify each stranded eid. O(num_partitions × 2) ZRANGEBYSCORE
+/// calls regardless of how many eids we're classifying — the bench's
+/// cost model for a 256-partition sweep is ~512 round-trips, bounded
+/// and predictable.
+async fn classify_stranded(
+    env: &ff_bench::workload::BenchEnv,
+    stranded_eids: &[String],
+) -> Result<Vec<StrandedState>> {
+    if stranded_eids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let client = ferriskey::ClientBuilder::new()
+        .host(&env.valkey_host, env.valkey_port)
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .await
+        .context("open ferriskey client for stranded-state sweep")?;
+
+    let lane = LaneId::new(env.lane.clone());
+    let config = PartitionConfig::default();
+    let n = config.num_execution_partitions;
+
+    let mut blocked_route: HashSet<String> = HashSet::new();
+    let mut terminal: HashSet<String> = HashSet::new();
+
+    for p in 0..n {
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: p,
+        };
+        let idx = IndexKeys::new(&partition);
+
+        let br_key = idx.lane_blocked_route(&lane);
+        match client
+            .cmd("ZRANGEBYSCORE")
+            .arg(&br_key)
+            .arg("-inf")
+            .arg("+inf")
+            .execute::<Vec<String>>()
+            .await
+        {
+            Ok(members) => blocked_route.extend(members),
+            Err(e) => tracing::warn!(error = %e, key = %br_key, "ZRANGEBYSCORE blocked_route failed"),
+        }
+
+        let term_key = idx.lane_terminal(&lane);
+        match client
+            .cmd("ZRANGEBYSCORE")
+            .arg(&term_key)
+            .arg("-inf")
+            .arg("+inf")
+            .execute::<Vec<String>>()
+            .await
+        {
+            Ok(members) => terminal.extend(members),
+            Err(e) => tracing::warn!(error = %e, key = %term_key, "ZRANGEBYSCORE terminal failed"),
+        }
+    }
+
+    Ok(stranded_eids
+        .iter()
+        .map(|eid| {
+            let state = if blocked_route.contains(eid) {
+                StrandedStateKind::BlockedRoute
+            } else if terminal.contains(eid) {
+                StrandedStateKind::Terminal
+            } else {
+                StrandedStateKind::Nowhere
+            };
+            StrandedState {
+                eid: eid.clone(),
+                state,
+            }
+        })
+        .collect())
 }
 
 #[derive(Debug)]
@@ -413,6 +583,13 @@ struct TaskEntry {
     first_claim_us: Option<u64>,
     correct_claim_us: Option<u64>,
     blocked: bool,
+    /// How many times THIS task was claimed by an incapable worker and
+    /// routed to blocked_by_route. Incremented on each Rejected
+    /// observation. Triage signal for H1+H3 — promote/reblock thrash
+    /// from the 90:10 regular:power worker poll-ratio race. A stranded
+    /// task's final value distinguishes design-limit (high cycles) from
+    /// scanner bug (low cycles, 0 or 1).
+    block_cycles: u32,
 }
 
 #[derive(Debug)]
@@ -460,6 +637,7 @@ async fn seed_tasks(
                         first_claim_us: None,
                         correct_claim_us: None,
                         blocked: false,
+                        block_cycles: 0,
                     },
                 );
             }
@@ -712,6 +890,43 @@ fn percentiles_ms(samples_us: &[u64]) -> LatencyMs {
     ff_bench::report::Percentiles::from_micros(samples_us)
 }
 
+struct ReblockBuckets {
+    zero: usize,
+    one_two: usize,
+    three_five: usize,
+    six_ten: usize,
+    eleven_plus: usize,
+}
+
+fn reblock_histogram(cycles: &[u32]) -> ReblockBuckets {
+    let mut b = ReblockBuckets {
+        zero: 0,
+        one_two: 0,
+        three_five: 0,
+        six_ten: 0,
+        eleven_plus: 0,
+    };
+    for &c in cycles {
+        match c {
+            0 => b.zero += 1,
+            1..=2 => b.one_two += 1,
+            3..=5 => b.three_five += 1,
+            6..=10 => b.six_ten += 1,
+            _ => b.eleven_plus += 1,
+        }
+    }
+    b
+}
+
+fn median_u32(cycles: &[u32]) -> u32 {
+    if cycles.is_empty() {
+        return 0;
+    }
+    let mut v = cycles.to_vec();
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_scenario_report(
     env: &ff_bench::workload::BenchEnv,
@@ -726,7 +941,39 @@ fn write_scenario_report(
     correct_latency: LatencyMs,
     retry_gap_latency: LatencyMs,
     throughput: f64,
+    block_cycles_all: &[u32],
+    block_cycles_stranded: &[u32],
+    stranded_states: &[StrandedState],
 ) {
+    // Reblock histogram: bucket counts across all tasks, plus the raw
+    // per-stranded-task final cycle value. Triage view for the
+    // promote/reblock thrash hypothesis (H1+H3). Buckets chosen to
+    // separate "never blocked" (0), "mildly thrashed" (1-5),
+    // "significantly thrashed" (6-10), and "pathological" (11+).
+    let histogram = reblock_histogram(block_cycles_all);
+    let max_all = block_cycles_all.iter().copied().max().unwrap_or(0);
+    let max_stranded = block_cycles_stranded.iter().copied().max().unwrap_or(0);
+    let median_all = median_u32(block_cycles_all);
+    let median_stranded = median_u32(block_cycles_stranded);
+
+    // Stranded-state classification from the post-shutdown Valkey
+    // sweep. Authoritative — supersedes the bench-side Rejected
+    // counter, which misses SDK-internal block_route dispatch.
+    let mut in_blocked_route = 0usize;
+    let mut in_terminal = 0usize;
+    let mut nowhere = 0usize;
+    for s in stranded_states {
+        match s.state {
+            StrandedStateKind::BlockedRoute => in_blocked_route += 1,
+            StrandedStateKind::Terminal => in_terminal += 1,
+            StrandedStateKind::Nowhere => nowhere += 1,
+        }
+    }
+    let stranded_sample: Vec<serde_json::Value> = stranded_states
+        .iter()
+        .take(20)
+        .map(|s| serde_json::json!({ "eid": s.eid, "state": s.state.label() }))
+        .collect();
     let config = serde_json::json!({
         "mode": mode.label(),
         "workers": workers,
@@ -758,6 +1005,43 @@ fn write_scenario_report(
             "p99": retry_gap_latency.p99,
         },
         "delta_p99_ms": (correct_latency.p99 - first_latency.p99).max(0.0),
+        // Triage for cap-routing thrash (H1+H3). `reblock_histogram`
+        // is the per-task count of Rejected observations bucketed by
+        // severity; `stranded_final_block_cycles` lists the final
+        // cycle count for EACH stranded task (same data as histogram,
+        // but per-task rather than aggregate). Separation lets the
+        // operator distinguish:
+        //   • stranded with cycles==0 → never got blocked, never
+        //     promoted — pure starvation (block_candidate / caps
+        //     publish race bug).
+        //   • stranded with cycles==1 → blocked once, scanner never
+        //     promoted back — unblock scanner bug.
+        //   • stranded with cycles>=6 → repeatedly promoted and
+        //     re-blocked — design-limit thrash (90:10 regular:power
+        //     poll ratio loses the race).
+        "reblock_histogram": {
+            "0":     histogram.zero,
+            "1_2":   histogram.one_two,
+            "3_5":   histogram.three_five,
+            "6_10":  histogram.six_ten,
+            "11_plus": histogram.eleven_plus,
+        },
+        "max_block_cycles_all":      max_all,
+        "max_block_cycles_stranded": max_stranded,
+        "median_block_cycles_all":      median_all,
+        "median_block_cycles_stranded": median_stranded,
+        "stranded_count":                block_cycles_stranded.len(),
+        "stranded_final_block_cycles":   block_cycles_stranded,
+        // Authoritative post-shutdown Valkey classification of stranded
+        // tasks. Bench-side Rejected counter sees zero observations
+        // because SDK dispatches block_route internally; these counts
+        // come from sweeping lane_blocked_route + lane_terminal ZSETs
+        // across all 256 execution partitions.
+        "final_in_blocked_route_count": in_blocked_route,
+        "final_terminal_count":         in_terminal,
+        "final_nowhere_count":          nowhere,
+        "stranded_states_classified":   stranded_states.len(),
+        "stranded_state_sample":        stranded_sample,
     });
 
     let notes = format!(
@@ -765,7 +1049,13 @@ fn write_scenario_report(
          first_claim_latency is diagnostic; correct_claim_latency is \
          the real routing cost. route_retry_gap_ms = correct - first \
          per task (client-observed retry gap, not a direct dwell \
-         reading of waitpoint blocked_by_route state).",
+         reading of waitpoint blocked_by_route state). \
+         partial mode is worst-case adversarial design: 90 workers \
+         mismatched, 10 correct. Production deployments typically \
+         invert this ratio. reblock_histogram + \
+         stranded_final_block_cycles are RFC-009 §7.5 triage: \
+         stranded@0 = starvation, stranded@1 = scanner-miss, \
+         stranded>=6 = promote/reblock thrash (design limit).",
         mode.label(),
         correct_routing_rate,
     );
