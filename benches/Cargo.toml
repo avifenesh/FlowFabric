@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["harness"]
+exclude = ["comparisons"]
+
+# Isolated from the top-level FlowFabric workspace (which excludes this
+# directory) so benchmark dependencies — criterion, histogram crates,
+# and later apalis + faktory + redis-rs — never leak into the product
+# crates.
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,121 @@
+# cargo-deny policy for FlowFabric.
+#
+# Runs in security-and-quality.yml on every PR. Enforces:
+#   * allow-list of licenses (deny GPL/AGPL and anything outside the list)
+#   * no wildcard version constraints
+#   * ban deprecated / known-unmaintained crates (RUSTSEC-curated)
+#   * only crates.io as a registry source (no unpinned git deps)
+#
+# Update with a one-line justification in the commit when adding an
+# entry to `deny` / `ignore` — no silent drift.
+
+[graph]
+all-features = false
+no-default-features = false
+# Check all Cargo.lock targets by default; no per-target filters.
+targets = []
+
+[output]
+feature-depth = 1
+
+# ──────────────────────────────────────────────────────────────────────
+# Licenses
+# ──────────────────────────────────────────────────────────────────────
+#
+# SPDX identifiers from the Rust ecosystem that are compatible with
+# Apache-2.0 (FlowFabric's own license). Anything not in this list
+# fails the check — add with a paper trail when a new transitive dep
+# introduces a novel license.
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    "0BSD",
+    # Permissive; covers webpki-root-certs and its peers.
+    "CDLA-Permissive-2.0",
+]
+exceptions = []
+
+# ──────────────────────────────────────────────────────────────────────
+# Bans — duplicates, wildcards, deprecated
+# ──────────────────────────────────────────────────────────────────────
+
+[bans]
+# Deny wildcard version constraints outright. A PR that adds a wildcard
+# either doesn't know the version it's pinning against or is reaching
+# for an unreleased API — both cases warrant an explicit version pin.
+wildcards = "deny"
+
+# Multiple versions of the same crate happen when transitives pull
+# different majors (e.g. tokio-util 0.7 + hyper-util pulling 0.6).
+# We warn rather than deny because the churn to force a single version
+# often requires upstream bumps we don't control. Revisit per release.
+multiple-versions = "warn"
+highlight = "all"
+
+# Deprecated / known-unmaintained crates. Extend with justification.
+# Reference: https://github.com/rustsec/advisory-db
+deny = []
+
+# Workspace-internal crates (path deps without an explicit `version =`)
+# register as wildcards to deny. They are never published independently
+# of the workspace, so the "what version will be pulled from crates.io"
+# concern wildcards guard against does not apply here. Bypass the check
+# for this internal set only. W1's release tooling work will eventually
+# add `version = ...` alongside `path = ...` on these; this allow-list
+# shrinks when that lands.
+allow-wildcard-paths = true
+
+# Explicit skip list for known benign duplicate majors. Empty on first
+# land; add here when a `multiple-versions` warning fires but the
+# ecosystem hasn't aligned yet.
+skip = []
+skip-tree = []
+
+# ──────────────────────────────────────────────────────────────────────
+# Sources — crates.io only
+# ──────────────────────────────────────────────────────────────────────
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Allow no unpinned git deps. A PR that needs a git dep must explicitly
+# list it here AND pin to a commit, documented in the same PR.
+allow-git = []
+
+# ──────────────────────────────────────────────────────────────────────
+# Advisories — mirror cargo-audit behavior through deny
+# ──────────────────────────────────────────────────────────────────────
+#
+# This section duplicates `cargo audit`'s coverage; keeping both gates
+# is intentional — audit is focused and fast, deny catches advisory
+# changes alongside license/ban drift in one CI step.
+
+[advisories]
+version = 2
+# Each entry MUST carry a justification comment. Review on every
+# release; if the fix has shipped upstream, remove the entry.
+ignore = [
+    # rand 0.8.5 unsoundness when a custom logger calls `rand::rng()`.
+    # We reach rand 0.8 only transitively via
+    # tower 0.4.13 → tonic 0.12.3 → opentelemetry-proto 0.27.0 →
+    # opentelemetry-otlp 0.27.0 → telemetrylib 0.1.0 → ferriskey.
+    # FlowFabric does not install a custom tracing logger (we use the
+    # default EnvFilter subscriber), so the trigger condition does not
+    # apply. Remove when opentelemetry-otlp upgrades to tonic >=0.13
+    # which pulls a patched tower.
+    "RUSTSEC-2026-0097",
+]
