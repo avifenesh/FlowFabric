@@ -95,11 +95,11 @@ impl IntoResponse for ApiError {
             ServerError::OperationFailed(msg) => {
                 (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
             }
-            ServerError::TailUnavailable(max) => (
+            ServerError::ConcurrencyLimitExceeded(source, max) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorBody {
                     error: format!(
-                        "too many concurrent tail calls (server max: {max}); retry with backoff"
+                        "too many concurrent {source} calls (server max: {max}); retry with backoff"
                     ),
                     kind: None,
                     retryable: Some(true),

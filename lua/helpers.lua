@@ -25,17 +25,26 @@ local CAPS_MAX_TOKENS = 256
 ---------------------------------------------------------------------------
 
 -- Convert a hex string to a binary (byte) string. Accepts mixed case.
--- Returns nil on odd-length input; callers treat nil as invalid_secret.
--- Rust side (ServerConfig) already rejects odd-length hex, but an operator
--- writing directly to Valkey would bypass that validator — we refuse the
--- conversion here rather than silently drop the trailing nibble.
+-- Returns nil on ANY malformed input: non-string, odd length, OR any
+-- non-hex char (including whitespace, unicode, control chars). Callers
+-- treat nil as invalid_secret.
+--
+-- Rust side (ServerConfig) already validates the env secret as even-length
+-- 0-9a-fA-F, but an operator writing directly to Valkey (or a torn write
+-- during rotation) could bypass that validator. We refuse the conversion
+-- here instead of silently coercing bad pairs to 0 bytes (which would
+-- produce a bogus but valid-looking MAC).
 local function hex_to_bytes(hex)
   if type(hex) ~= "string" or #hex % 2 ~= 0 then
     return nil
   end
   local out = {}
   for i = 1, #hex - 1, 2 do
-    out[#out + 1] = string.char(tonumber(hex:sub(i, i + 1), 16) or 0)
+    local byte = tonumber(hex:sub(i, i + 1), 16)
+    if not byte then
+      return nil
+    end
+    out[#out + 1] = string.char(byte)
   end
   return table.concat(out)
 end

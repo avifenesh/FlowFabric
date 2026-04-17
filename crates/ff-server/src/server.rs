@@ -149,12 +149,16 @@ pub enum ServerError {
     OperationFailed(String),
     #[error("script: {0}")]
     Script(String),
-    /// Server-wide concurrent-tail limit reached. Surfaces as HTTP 429
-    /// at the REST boundary so load balancers and clients can retry with
-    /// backoff. Distinct from transport/script errors because the fault is
-    /// on the server side (too many in-flight tails), not the caller side.
-    #[error("too many concurrent tail calls (max: {0})")]
-    TailUnavailable(u32),
+    /// Server-wide concurrency limit reached on a labelled pool. Surfaces
+    /// as HTTP 429 at the REST boundary so load balancers and clients can
+    /// retry with backoff. The `source` label ("stream_ops", "admin_rotate",
+    /// etc.) identifies WHICH pool is exhausted so operators aren't
+    /// misled by a single "tail unavailable" string when the real fault
+    /// is rotation contention.
+    ///
+    /// Fields: (source_label, max_permits).
+    #[error("too many concurrent {0} calls (max: {1})")]
+    ConcurrencyLimitExceeded(&'static str, u32),
 }
 
 impl ServerError {
@@ -189,9 +193,10 @@ impl ServerError {
             | Self::InvalidInput(_)
             | Self::OperationFailed(_)
             | Self::Script(_) => false,
-            // Back off and retry — the server-side tail pool is the bound,
-            // so the retry will succeed once a permit frees up.
-            Self::TailUnavailable(_) => true,
+            // Back off and retry — the bound is a server-side permit pool,
+            // so the retry will succeed once a permit frees up. Applies
+            // equally to stream ops, admin rotate, etc.
+            Self::ConcurrencyLimitExceeded(_, _) => true,
         }
     }
 }
@@ -1781,7 +1786,8 @@ impl Server {
         let permit = match self.stream_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(ServerError::TailUnavailable(
+                return Err(ServerError::ConcurrencyLimitExceeded(
+                    "stream_ops",
                     self.config.max_concurrent_stream_ops,
                 ));
             }
@@ -1869,7 +1875,8 @@ impl Server {
         let permit = match self.stream_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(ServerError::TailUnavailable(
+                return Err(ServerError::ConcurrencyLimitExceeded(
+                    "stream_ops",
                     self.config.max_concurrent_stream_ops,
                 ));
             }
@@ -2272,13 +2279,14 @@ impl Server {
         // Single-writer gate. Concurrent rotates against the SAME operator
         // token are an attack pattern (or a retry-loop bug); legitimate
         // operators rotate monthly and can afford to serialize. Contention
-        // returns TailUnavailable (→ HTTP 429) rather than queueing the
-        // HTTP handler past the 120s endpoint timeout. Permit is held for
+        // returns ConcurrencyLimitExceeded("admin_rotate", 1) (→ HTTP 429
+        // with a labelled error body) rather than queueing the HTTP
+        // handler past the 120s endpoint timeout. Permit is held for
         // the full partition fan-out.
         let _permit = match self.admin_rotate_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(ServerError::TailUnavailable(1));
+                return Err(ServerError::ConcurrencyLimitExceeded("admin_rotate", 1));
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 return Err(ServerError::OperationFailed(
@@ -2295,60 +2303,98 @@ impl Server {
             .as_millis() as i64;
         let previous_expires_at = now_ms + grace_ms as i64;
 
+        // Parallelize the rotation fan-out with the same bounded
+        // concurrency as boot init (BOOT_INIT_CONCURRENCY = 16). A 256-
+        // partition sequential rotation takes ~7.7s at 30ms cross-AZ RTT,
+        // uncomfortably close to the 120s HTTP endpoint timeout under
+        // contention. The per-partition SETNX lock in
+        // `rotate_single_partition` prevents interleaved writes against
+        // the same partition; parallelism across DIFFERENT partitions is
+        // safe. The outer `admin_rotate_semaphore(1)` already bounds
+        // server-wide concurrent rotations, so this fan-out only affects
+        // a single in-flight rotate call at a time.
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         let mut rotated = 0u16;
         let mut failed = Vec::new();
         let mut in_progress: Vec<u16> = Vec::new();
-        for index in 0..n {
-            let partition = Partition { family: PartitionFamily::Execution, index };
-            let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut next_index: u16 = 0;
 
-            match self
-                .rotate_single_partition(&key, new_kid, new_secret_hex, previous_expires_at)
-                .await
-            {
-                Ok(RotationStepOutcome::Rotated) => {
-                    rotated += 1;
-                    // Per-partition event → DEBUG (not INFO). Rationale:
-                    // one rotate endpoint call produces 256 partition-level
-                    // events, which would blow up paid aggregator budgets
-                    // (Datadog/Splunk) at no operational value. The single
-                    // aggregated audit event below is the compliance
-                    // artifact. Failures stay at ERROR with per-partition
-                    // detail — that's where operators need it.
-                    tracing::debug!(
-                        partition = %partition,
-                        new_kid = %new_kid,
-                        "waitpoint_hmac_rotated"
-                    );
-                }
-                Ok(RotationStepOutcome::InProgress) => {
-                    // Another rotation is mid-flight on this partition. It
-                    // will finish (rotation is idempotent + per-partition
-                    // locked), so this is NOT a failure the operator needs
-                    // to retry. DO NOT push to `failed` — keeping `failed`
-                    // meaningful for actual Valkey/config errors the
-                    // operator must investigate. Per-partition detail at
-                    // DEBUG; summary emitted once at end.
-                    in_progress.push(index);
-                    tracing::debug!(
-                        partition = %partition,
-                        new_kid = %new_kid,
-                        "waitpoint_hmac_rotation_in_progress_skipped"
-                    );
-                }
-                Err(e) => {
-                    // Failures stay at ERROR (target=audit) per-partition —
-                    // operators need the partition index + error to debug
-                    // Valkey/config faults. Low cardinality in practice
-                    // (failures should be rare).
-                    tracing::error!(
-                        target: "audit",
-                        partition = %partition,
-                        err = %e,
-                        "waitpoint_hmac_rotation_failed"
-                    );
-                    failed.push(index);
-                }
+        loop {
+            while pending.len() < BOOT_INIT_CONCURRENCY && next_index < n {
+                let partition = Partition {
+                    family: PartitionFamily::Execution,
+                    index: next_index,
+                };
+                let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+                let idx = next_index;
+                // Clone only what the per-partition future needs. The
+                // new_kid / new_secret_hex references outlive the loop
+                // (they come from the enclosing function args), but
+                // FuturesUnordered needs 'static futures. Own the strings.
+                let new_kid_owned = new_kid.to_owned();
+                let new_secret_owned = new_secret_hex.to_owned();
+                // Borrow-free call into rotate_single_partition: it only
+                // needs &self (Arc is fine; we already have &self here),
+                // &str (owned locals above), and i64 (Copy).
+                let fut = async move {
+                    let outcome = self
+                        .rotate_single_partition(
+                            &key,
+                            &new_kid_owned,
+                            &new_secret_owned,
+                            previous_expires_at,
+                        )
+                        .await;
+                    (idx, partition, outcome)
+                };
+                pending.push(fut);
+                next_index += 1;
+            }
+            match pending.next().await {
+                Some((idx, partition, outcome)) => match outcome {
+                    Ok(RotationStepOutcome::Rotated) => {
+                        rotated += 1;
+                        // Per-partition event → DEBUG (not INFO). Rationale:
+                        // one rotate endpoint call produces 256 partition-level
+                        // events, which would blow up paid aggregator budgets
+                        // (Datadog/Splunk) at no operational value. The single
+                        // aggregated audit event below is the compliance
+                        // artifact. Failures stay at ERROR with per-partition
+                        // detail — that's where operators need it.
+                        tracing::debug!(
+                            partition = %partition,
+                            new_kid = %new_kid,
+                            "waitpoint_hmac_rotated"
+                        );
+                    }
+                    Ok(RotationStepOutcome::InProgress) => {
+                        // Another rotation is mid-flight on this partition.
+                        // Idempotent + per-partition locked; NOT a failure
+                        // the operator needs to retry. Kept out of `failed`
+                        // so that list stays actionable.
+                        in_progress.push(idx);
+                        tracing::debug!(
+                            partition = %partition,
+                            new_kid = %new_kid,
+                            "waitpoint_hmac_rotation_in_progress_skipped"
+                        );
+                    }
+                    Err(e) => {
+                        // Failures stay at ERROR (target=audit) per-partition —
+                        // operators need the partition index + error to debug
+                        // Valkey/config faults. Low cardinality in practice.
+                        tracing::error!(
+                            target: "audit",
+                            partition = %partition,
+                            err = %e,
+                            "waitpoint_hmac_rotation_failed"
+                        );
+                        failed.push(idx);
+                    }
+                },
+                None => break,
             }
         }
 

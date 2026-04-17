@@ -35,16 +35,11 @@ fn caps_subset(required_csv: &str, worker_caps: &BTreeSet<String>) -> bool {
         .all(|t| worker_caps.contains(t))
 }
 
+/// Short, stable digest of a worker's caps CSV for per-event log lines.
+/// Thin wrapper around the shared helper so call sites read as
+/// "worker_caps_digest" locally while the algorithm lives in one place.
 fn worker_caps_digest(csv: &str) -> String {
-    // FNV-1a 64-bit — not security-sensitive; the point is cardinality
-    // reduction, not unforgeability. First 8 hex chars is enough for
-    // practical uniqueness at fleet scale.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in csv.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    format!("{:08x}", (h as u32) ^ ((h >> 32) as u32))
+    ff_core::hash::fnv1a_xor8hex(csv)
 }
 
 /// A claim grant issued by the scheduler for a specific execution.
@@ -246,18 +241,13 @@ impl Scheduler {
         // partition 0 when 100 workers all tick simultaneously. Seeded
         // from worker_instance_id so this worker hits a stable window
         // within a single scheduling cycle (still covers every partition),
-        // and different workers naturally diverge. FNV-1a mix — same
-        // approach as ff-sdk's PARTITION_SCAN_CHUNK cursor seed.
-        let start_p: u16 = if num_partitions > 0 {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in worker_instance_id.as_str().as_bytes() {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(0x100_0000_01b3);
-            }
-            (h as u16) % num_partitions
-        } else {
-            0
-        };
+        // and different workers naturally diverge. Uses the shared
+        // ff_core::hash FNV-1a reducer — same helper powering ff-sdk's
+        // PARTITION_SCAN_CHUNK cursor seed. Zero-modulus safe.
+        let start_p: u16 = ff_core::hash::fnv1a_u16_mod(
+            worker_instance_id.as_str(),
+            num_partitions,
+        );
         // BTreeSet iterates sorted → stable CSV for Lua subset match.
         // Ingress validation mirrors FlowFabricWorker::connect (ff-sdk):
         //   - `,` is the CSV delimiter — a token containing one would split

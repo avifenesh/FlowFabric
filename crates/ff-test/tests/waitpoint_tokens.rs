@@ -859,3 +859,108 @@ async fn test_rapid_rotation_past_grace_rejects_expired() {
     let resp = try_deliver_signal(&tc, &eid_b, &wp_b, "wpt_signal", &k1_token).await;
     assert_err_code(&resp, "token_expired");
 }
+
+/// 13. Malformed hex in the stored secret is rejected with `invalid_secret`.
+///
+/// Defense-in-depth: ServerConfig::from_env validates the env secret as
+/// even-length `0-9a-fA-F`, but an operator (or a buggy tool) writing
+/// directly to Valkey could plant a torn or non-hex value. The Lua
+/// `hex_to_bytes` helper rejects ANY non-hex pair — no silent coercion
+/// to 0 bytes, which would produce a bogus-but-valid-looking MAC.
+///
+/// This test installs a non-hex secret for the current kid, then attempts
+/// to deliver a signal and expects `invalid_secret` to bubble up through
+/// mint (at suspend) and/or validate (at deliver).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_malformed_hex_secret_rejects_cleanly() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Install a deliberately malformed secret under a fresh kid on every
+    // partition. "zzzzzz..." is ascii-printable but not hex, and even-
+    // length so it doesn't trip the length guard. The real guard is the
+    // per-pair tonumber(...) check.
+    let bad_hex = "z".repeat(64);
+    tc.install_waitpoint_hmac_secret("k1", &bad_hex).await;
+
+    // Try to suspend an execution. mint_waitpoint_token will call
+    // hmac_sha1_hex → hex_to_bytes(secret) → nil → "invalid_secret".
+    let eid = ExecutionId::new();
+    let (lease_id, epoch, _, attempt_id) = create_and_claim(&tc, &eid).await;
+
+    // Suspend with a fresh wp_id/wp_key. We can't use `suspend_and_get_token`
+    // here because it asserts success; we want to observe the failure.
+    let partition = execution_partition(&eid, &config());
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+    let wid = WorkerInstanceId::new(WORKER_INST);
+    let wp_uuid = uuid::Uuid::new_v4();
+    let wp_id_str = wp_uuid.to_string();
+    let wp_id = WaitpointId::from_uuid(wp_uuid);
+    let wp_key = format!("wpk:{wp_id_str}");
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(AttemptIndex::new(0)),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lease_expiry(),
+        idx.worker_leases(&wid),
+        ctx.suspension_current(),
+        ctx.waitpoint(&wp_id),
+        ctx.waitpoint_signals(&wp_id),
+        idx.suspension_timeout(),
+        idx.pending_waitpoint_expiry(),
+        idx.lane_active(&lane_id),
+        idx.lane_suspended(&lane_id),
+        ctx.waitpoints(),
+        ctx.waitpoint_condition(&wp_id),
+        idx.attempt_timeout(),
+        idx.waitpoint_hmac_secrets(),
+    ];
+    let resume_condition_json = serde_json::json!({
+        "condition_type": "signal_set",
+        "required_signal_names": ["wpt_signal"],
+        "signal_match_mode": "any",
+        "minimum_signal_count": 1,
+        "timeout_behavior": "fail",
+        "allow_operator_override": true,
+    })
+    .to_string();
+    let resume_policy_json = serde_json::json!({
+        "resume_target": "runnable",
+        "close_waitpoint_on_resume": true,
+        "consume_matched_signals": true,
+        "retain_signal_buffer_until_closed": true,
+    })
+    .to_string();
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        "0".to_owned(),
+        attempt_id,
+        lease_id,
+        epoch,
+        uuid::Uuid::new_v4().to_string(),
+        wp_id_str.clone(),
+        wp_key.clone(),
+        "waiting_for_signal".to_owned(),
+        "worker".to_owned(),
+        String::new(),
+        resume_condition_json,
+        resume_policy_json,
+        String::new(),
+        "0".to_owned(),
+        "fail".to_owned(),
+        "1000".to_owned(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let ar: Vec<&str> = args.iter().map(String::as_str).collect();
+    let raw: Value = tc
+        .client()
+        .fcall("ff_suspend_execution", &kr, &ar)
+        .await
+        .expect("ff_suspend_execution");
+    // Mint path rejects with invalid_secret — the token never reaches the wire.
+    assert_err_code(&raw, "invalid_secret");
+}

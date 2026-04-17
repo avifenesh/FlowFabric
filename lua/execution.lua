@@ -90,7 +90,21 @@ redis.register_function('ff_create_execution', function(keys, args)
   --     invalid_capabilities:required:non_string_token. Silent-drop on
   --     `["gpu", null, 42]` would erase real requirements.
   --   * Comma in a token → fail (reserved delimiter, see ff_issue_claim_grant).
+  --   * ASCII control byte (0x00-0x1F, 0x7F) or space (0x20) → fail
+  --     (invalid_capabilities:required:control_or_whitespace). Mirrors the
+  --     Rust ingress in ff-sdk::FlowFabricWorker::connect and
+  --     ff-scheduler::Scheduler::claim_for_worker (R3 relaxed printable-ASCII
+  --     check to allow UTF-8 printable above 0x7F while still rejecting
+  --     whitespace/control). This is the "last line of defense" for admin
+  --     direct-HSET bypass: a required cap containing "\n" or "\0" is
+  --     impossible to type, impossible to debug, and would silently pin an
+  --     execution as unclaimable forever.
   --   * Bounds: same 4096 bytes / 256 tokens ceiling as the worker CSV.
+  --
+  -- Note on UTF-8: the byte-range test rejects ASCII control + space but
+  -- accepts every byte ≥ 0x21 except 0x7F (DEL). UTF-8 multibyte sequences
+  -- use only bytes 0x80-0xBF (continuation) or 0xC0-0xFD (lead), all above
+  -- 0x7F, so i18n caps like "东京-gpu" pass through intact. See RFC-009 §7.5.
   local required_caps_csv = nil
   if is_set(A.policy_json) and A.policy_json ~= "{}" then
     local ok_decode, policy = pcall(cjson.decode, A.policy_json)
@@ -116,6 +130,14 @@ redis.register_function('ff_create_execution', function(keys, args)
           end
           if string.find(cap, ",", 1, true) then
             return err("invalid_capabilities", "required:comma_in_token")
+          end
+          -- Reject ASCII control (0x00-0x1F), DEL (0x7F), and space (0x20).
+          -- Iterating byte-by-byte: any byte in 0x00..=0x20 or == 0x7F fails.
+          for i = 1, #cap do
+            local b = cap:byte(i)
+            if b <= 0x20 or b == 0x7F then
+              return err("invalid_capabilities", "required:control_or_whitespace")
+            end
           end
           list[#list + 1] = cap
         end

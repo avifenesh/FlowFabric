@@ -7405,6 +7405,71 @@ async fn test_tail_stream_rejects_zero_count_limit() {
     );
 }
 
+/// PR#7 regression (Copilot): direct FCALL with `count_limit > HARD_CAP`
+/// must return `err("invalid_input", "count_limit_exceeds_hard_cap")` —
+/// NOT a silent clamp to HARD_CAP. The SDK and server layers already
+/// reject at their boundary, but a caller bypassing those (direct
+/// `FCALL ff_read_attempt_stream`) still hit the silent-clamp path in
+/// lua/stream.lua before this fix. RFC-006 §Input validation promises
+/// symmetric rejection at both edges.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_read_stream_rejects_over_hard_cap_at_lua() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = ExecutionId::new();
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+
+    // HARD_CAP in lua/stream.lua is 10_000 (mirrors STREAM_READ_HARD_CAP).
+    // 10_001 must be rejected loud, not silently clamped.
+    let keys: Vec<String> = vec![
+        ctx.stream(AttemptIndex::new(0)),
+        ctx.stream_meta(AttemptIndex::new(0)),
+    ];
+    let args: Vec<String> = vec![
+        "-".to_owned(),
+        "+".to_owned(),
+        "10001".to_owned(),
+    ];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw: Value = tc
+        .client()
+        .fcall("ff_read_attempt_stream", &key_refs, &arg_refs)
+        .await
+        .expect("FCALL transport failed");
+
+    // Expect failure tuple: {0, "invalid_input", "count_limit_exceeds_hard_cap"}
+    let arr = match &raw {
+        Value::Array(a) => a,
+        other => panic!("expected Array, got {other:?}"),
+    };
+    let status = match arr.first() {
+        Some(Ok(Value::Int(n))) => *n,
+        other => panic!("expected Int status, got {other:?}"),
+    };
+    assert_eq!(status, 0, "expected failure status, got {status}: {arr:?}");
+    let code = match arr.get(1) {
+        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
+        Some(Ok(Value::SimpleString(s))) => s.clone(),
+        other => panic!("expected error code string, got {other:?}"),
+    };
+    assert_eq!(code, "invalid_input", "unexpected error code: {code}");
+    let detail = match arr.get(2) {
+        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
+        Some(Ok(Value::SimpleString(s))) => s.clone(),
+        other => panic!("expected detail string, got {other:?}"),
+    };
+    assert_eq!(
+        detail, "count_limit_exceeds_hard_cap",
+        "unexpected detail: {detail}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // R2 regression tests (BUG1 + BUG2): fail-closed on malformed policy/caps
 // ═══════════════════════════════════════════════════════════════════════
@@ -7715,4 +7780,47 @@ async fn test_capable_worker_unblocks_route_blocked() {
         blocked_score.is_none(),
         "execution must NOT be in blocked:route after promotion"
     );
+}
+
+/// PR#7-BUG4 regression: required_capabilities tokens must be rejected by
+/// ff_create_execution when they contain ASCII control bytes (0x00-0x1F,
+/// 0x7F) or whitespace (0x20). Rust ingress in ff-sdk/ff-scheduler
+/// already rejects these, but an admin direct-HSET or a path that
+/// bypasses Rust ingress should STILL fail on the Lua side — the Lua
+/// write-path validation is the last line of defense. Silent-accept of
+/// "gpu\ncuda" would pin an execution as unclaimable forever.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capability_required_control_or_whitespace_rejected() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let cases = [
+        // Raw JSON escape of \n inside the cap string.
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu\ncuda"]}}"#,
+            "newline in token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu\tcuda"]}}"#,
+            "tab in token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu cuda"]}}"#,
+            "space in token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu\u0000cuda"]}}"#,
+            "NUL byte in token",
+        ),
+        (
+            r#"{"routing_requirements":{"required_capabilities":["gpu\u007fcuda"]}}"#,
+            "DEL byte in token",
+        ),
+    ];
+    for (policy_json, label) in cases {
+        let eid = ExecutionId::new();
+        let raw = fcall_create_execution_with_raw_policy(&tc, &eid, LANE, policy_json).await;
+        assert_err(&raw, "invalid_capabilities", label);
+    }
 }

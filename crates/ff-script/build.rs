@@ -64,7 +64,12 @@ fn main() {
     // a naive `version_source.find("return '")` picks that up instead of
     // the real function body. Line-based skip-comments parse keeps the
     // extract string-based (no regex dep) while avoiding that trap.
-    let version = version_source
+    //
+    // Strict "exactly one" contract: collect ALL non-comment matches, then
+    // panic if count != 1. Guards against a future edit that adds a second
+    // `register_function` returning a literal and silently takes the
+    // first match (or worse, the wrong match).
+    let matches: Vec<String> = version_source
         .lines()
         .filter_map(|raw| {
             let line = raw.trim_start();
@@ -75,16 +80,24 @@ fn main() {
             let rest = &line[i + "return '".len()..];
             rest.find('\'').map(|j| rest[..j].to_owned())
         })
-        .next()
-        .unwrap_or_else(|| {
-            panic!(
-                "Failed to extract LIBRARY_VERSION from {}: expected exactly one \
-                 non-commented `return 'X'` literal (the body of ff_version). Do NOT \
-                 maintain a separate copy in crates/ff-script/src/lib.rs — this \
-                 extract is the single source of truth.",
-                version_path.display()
-            )
-        });
+        .collect();
+    let version = match matches.len() {
+        1 => matches.into_iter().next().unwrap(),
+        0 => panic!(
+            "Failed to extract LIBRARY_VERSION from {}: expected exactly one \
+             non-commented `return 'X'` literal (the body of ff_version), found \
+             NONE. Do NOT maintain a separate copy in crates/ff-script/src/lib.rs \
+             — this extract is the single source of truth.",
+            version_path.display()
+        ),
+        n => panic!(
+            "Failed to extract LIBRARY_VERSION from {}: expected exactly one \
+             non-commented `return 'X'` literal, found {n} ({matches:?}). If \
+             version.lua grew a second register_function, move it elsewhere — \
+             the extract can't know which one is authoritative.",
+            version_path.display()
+        ),
+    };
     // Sanity bounds: non-empty, no embedded quotes/newlines that would
     // imply a broken parse, short enough to be a version string.
     assert!(

@@ -282,18 +282,13 @@ impl FlowFabricWorker {
             csv
         };
 
-        // FNV-1a 8-hex digest of the sorted caps CSV, computed once so
-        // per-mismatch logs carry a stable short identifier instead of the
-        // 4KB CSV. Matches ff-scheduler::claim::worker_caps_digest.
+        // Short stable digest of the sorted caps CSV, computed once so
+        // per-mismatch logs carry a stable identifier instead of the 4KB
+        // CSV. Shared helper — ff-scheduler uses the same one for its
+        // own per-mismatch logs, so cross-component log lines are
+        // diffable against each other.
         #[cfg(feature = "insecure-direct-claim")]
-        let worker_capabilities_hash = {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in worker_capabilities_csv.as_bytes() {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(0x100_0000_01b3);
-            }
-            format!("{:08x}", (h as u32) ^ ((h >> 32) as u32))
-        };
+        let worker_capabilities_hash = ff_core::hash::fnv1a_xor8hex(&worker_capabilities_csv);
 
         // Full CSV logged once at connect so per-mismatch logs (which
         // carry only the 8-hex hash) can be cross-referenced by ops.
@@ -1190,12 +1185,7 @@ fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
     if num_partitions == 0 {
         return 0;
     }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in worker_instance_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    (hash as usize) % num_partitions
+    (ff_core::hash::fnv1a_u64(worker_instance_id.as_bytes()) as usize) % num_partitions
 }
 
 #[cfg(feature = "insecure-direct-claim")]

@@ -185,10 +185,16 @@ redis.register_function('ff_read_attempt_stream', function(keys, args)
   local to_id   = args[2] or "+"
   local count_limit = tonumber(args[3] or "0")
 
-  -- Explicit reject on zero/negative — the REST and SDK layers also reject
-  -- at their boundary but we keep this as belt-and-suspenders so direct
-  -- FCALL callers (tests, future consumers) get a clear error instead of
-  -- a silently-clamped whole-stream read.
+  -- Explicit reject on zero/negative AND on over-cap. The REST and SDK
+  -- layers reject both at their boundary (R2/R3); the Lua check is the
+  -- last line of defense for direct FCALL callers (tests, future
+  -- consumers) so they get a clear error instead of a silently-clamped
+  -- whole-stream read or reply-size blowup.
+  --
+  -- Before PR#7 this was asymmetric: < 1 rejected with invalid_input,
+  -- but > HARD_CAP was silently clamped. That contradicted RFC-006
+  -- §Input validation ("both bounds reject, neither silently clamps").
+  -- Now both edges reject symmetrically.
   --
   -- HARD_CAP mirrors ff_core::contracts::STREAM_READ_HARD_CAP — keep in sync.
   local HARD_CAP = 10000
@@ -196,7 +202,7 @@ redis.register_function('ff_read_attempt_stream', function(keys, args)
     return err("invalid_input", "count_limit must be >= 1")
   end
   if count_limit > HARD_CAP then
-    count_limit = HARD_CAP
+    return err("invalid_input", "count_limit_exceeds_hard_cap")
   end
 
   -- Stream may legitimately not exist (never-written attempt). XRANGE on a

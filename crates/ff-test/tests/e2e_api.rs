@@ -650,8 +650,8 @@ async fn test_api_cancel_flow() {
 
 /// R5 smoke: concurrency ceiling for stream ops surfaces as HTTP 429
 /// Too Many Requests when a burst exceeds `max_concurrent_stream_ops`.
-/// Verifies the `stream_semaphore` + `TailUnavailable → 429` path in
-/// `api::tail_attempt_stream`.
+/// Verifies the `stream_semaphore` + `ConcurrencyLimitExceeded("stream_ops", N)
+/// → 429` path in `api::tail_attempt_stream`.
 ///
 /// We build a Server with `max_concurrent_stream_ops=2`, fire 5 tail
 /// calls with a long-ish block so they all stay in flight, and assert

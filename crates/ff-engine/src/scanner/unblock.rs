@@ -22,7 +22,11 @@
 //! Reference: RFC-008 §2.4, RFC-009 §7.5, RFC-010 §6
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition};
@@ -32,15 +36,60 @@ use super::{ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 100;
 
+/// SSCAN page size for the workers-index SET. Same COUNT the other
+/// index-SET scanners use (budget_reconciler, flow_projector). Bounds
+/// per-cursor round-trip response size; total iteration is still the
+/// full SET size across cursor=0 wrap.
+const WORKERS_SSCAN_COUNT: usize = 100;
+
+/// Per-worker caps GET fan-out concurrency cap. Mirrors the bounded
+/// parallelism W1 used in initialize_waitpoint_hmac_secret. Too low and
+/// large fleets (1000+ workers) pay serial round-trip latency; too high
+/// and we head-of-line the scanner client with a pipeline burst. 16 is
+/// a pragmatic middle for the current fleet scales.
+const CAPS_GET_CONCURRENCY: usize = 16;
+
 pub struct UnblockScanner {
     interval: Duration,
     lanes: Vec<LaneId>,
     partition_config: PartitionConfig,
+    /// Shared worker-caps union cache across ALL partitions in one scan
+    /// pass. Previously this cache was declared inside `scan_partition`
+    /// which runs once PER PARTITION — at 256 partitions that meant up
+    /// to 256 redundant SSCAN + fan-out GET sequences per scan interval.
+    /// Now: one load per TTL window (= `interval`), shared across every
+    /// partition visited in that window. `TTL == interval` is natural:
+    /// a worker connecting "now" propagates into the caps union on the
+    /// next scan cycle, not faster or slower than the cycle itself.
+    ///
+    /// `Arc<AsyncMutex<_>>` because the Scanner trait's `scan_partition`
+    /// takes `&self`. Contention is bounded by the partition iteration
+    /// cadence (one partition at a time per scanner task), so the mutex
+    /// is effectively uncontended in steady state.
+    caps_cache: Arc<AsyncMutex<CapsUnionCache>>,
+}
+
+/// Worker-caps union snapshot with a monotonic freshness timestamp.
+/// `None` on first scan; filled by `get_or_load`. Invalidated when
+/// `Instant::now() - fetched_at >= ttl`.
+struct CapsUnionCache {
+    snapshot: Option<BTreeSet<String>>,
+    fetched_at: Option<Instant>,
+    ttl: Duration,
 }
 
 impl UnblockScanner {
     pub fn new(interval: Duration, lanes: Vec<LaneId>, partition_config: PartitionConfig) -> Self {
-        Self { interval, lanes, partition_config }
+        Self {
+            interval,
+            lanes,
+            partition_config,
+            caps_cache: Arc::new(AsyncMutex::new(CapsUnionCache {
+                snapshot: None,
+                fetched_at: None,
+                ttl: interval,
+            })),
+        }
     }
 }
 
@@ -71,12 +120,14 @@ impl Scanner for UnblockScanner {
         // Reset per partition scan (each partition scan is one "cycle").
         let mut budget_cache: HashMap<String, bool> = HashMap::new();
 
-        // Worker-caps union, read ONCE per partition scan.
-        // None = "not queried yet on this cycle"; Some(set) = cached result.
-        // Empty set means no online workers have any caps → nothing to promote.
-        // Partitions scanned later in a cycle reuse the same cached union;
-        // load is bounded by SCAN + GET per `ff:worker:*:caps` key per cycle.
-        let mut caps_union_cache: Option<BTreeSet<String>> = None;
+        // Worker-caps union cache is shared across ALL partitions via
+        // the scanner struct (Arc<AsyncMutex<CapsUnionCache>>). `get_or_load`
+        // returns the cached snapshot if its fetched_at is within
+        // `interval` (TTL == scan interval), otherwise loads fresh via
+        // SSCAN + concurrent GET fan-out. Without this, at 256 partitions
+        // the old per-partition-local cache re-ran load_worker_caps_union
+        // up to 256× per cycle.
+        let caps_cache = self.caps_cache.clone();
 
         for lane in &self.lanes {
             // Scan blocked:budget
@@ -84,7 +135,7 @@ impl Scanner for UnblockScanner {
             let r = scan_blocked_set(
                 client, &p, &idx, lane, &budget_key,
                 "waiting_for_budget", &mut budget_cache,
-                &mut caps_union_cache,
+                &caps_cache,
                 &self.partition_config,
             ).await;
             total_processed += r.processed;
@@ -95,7 +146,7 @@ impl Scanner for UnblockScanner {
             let r = scan_blocked_set(
                 client, &p, &idx, lane, &quota_key,
                 "waiting_for_quota", &mut budget_cache,
-                &mut caps_union_cache,
+                &caps_cache,
                 &self.partition_config,
             ).await;
             total_processed += r.processed;
@@ -108,7 +159,7 @@ impl Scanner for UnblockScanner {
             let r = scan_blocked_set(
                 client, &p, &idx, lane, &route_key,
                 "waiting_for_capable_worker", &mut budget_cache,
-                &mut caps_union_cache,
+                &caps_cache,
                 &self.partition_config,
             ).await;
             total_processed += r.processed;
@@ -132,7 +183,7 @@ async fn scan_blocked_set(
     blocked_key: &str,
     expected_reason: &str,
     budget_cache: &mut HashMap<String, bool>,
-    caps_union_cache: &mut Option<BTreeSet<String>>,
+    caps_cache: &Arc<AsyncMutex<CapsUnionCache>>,
     partition_config: &PartitionConfig,
 ) -> ScanResult {
     // Read all members from the blocked set (they're scored by block time)
@@ -204,7 +255,7 @@ async fn scan_blocked_set(
                 check_quota_cleared(client, &core_key, eid_str, partition_config).await
             }
             "waiting_for_capable_worker" => {
-                check_route_cleared(client, &core_key, caps_union_cache).await
+                check_route_cleared(client, &core_key, caps_cache).await
             }
             _ => false,
         };
@@ -510,24 +561,21 @@ async fn check_quota_cleared(
 /// Check if the capability-block has cleared: some connected worker's
 /// caps now cover the execution's `required_capabilities`.
 ///
-/// v1: compute the UNION of every connected worker's caps once per scan
-/// cycle (cached in `caps_union_cache`). If `required_capabilities ⊆ union`,
-/// unblock — the execution has at least one worker that *could* claim it
-/// on the next scheduling tick. If the worker is unavailable or the
-/// scheduler re-mismatches, the scheduler will block it again. That's
-/// the RFC-009 §7.5 "slow cycle" approximation; connect-triggered sweeps
-/// are V2.
+/// The UNION of every connected worker's caps is cached on the scanner
+/// struct with a TTL equal to `interval`; so within one scan cycle every
+/// partition reuses the same snapshot, and between cycles a stale
+/// snapshot is automatically refreshed.
 ///
-/// Fail-OPEN on union-load failure: if `ff:worker:*:caps` read errors
+/// Fail-OPEN on union-load failure: if the SSCAN or fan-out GET errors
 /// out, assume a worker might match and let the scheduler re-decide on
 /// the next tick. The caps set is non-authoritative (Lua never reads it);
-/// treating it as "unknown → maybe" preserves liveness. The alternative
-/// (fail-closed) would leave executions stuck whenever the caps-SCAN
-/// happens to hit a transient Valkey error.
+/// treating it as "unknown → maybe" preserves liveness. Fail-closed
+/// would leave executions stuck whenever the caps read hits a transient
+/// Valkey error.
 async fn check_route_cleared(
     client: &ferriskey::Client,
     core_key: &str,
-    caps_union_cache: &mut Option<BTreeSet<String>>,
+    caps_cache: &Arc<AsyncMutex<CapsUnionCache>>,
 ) -> bool {
     let required_csv: Option<String> = client
         .cmd("HGET")
@@ -541,75 +589,123 @@ async fn check_route_cleared(
         _ => return true, // no required caps → anyone can claim
     };
 
-    if caps_union_cache.is_none() {
-        match load_worker_caps_union(client).await {
-            Ok(union) => *caps_union_cache = Some(union),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "unblock_scanner: failed to read worker caps union — \
-                     assuming match possible (fail-open to preserve liveness)"
-                );
-                return true;
+    // Acquire the cache, return a cheap clone of the snapshot so the
+    // subset check runs OUTSIDE the mutex (BTreeSet clone is O(n) but
+    // n is bounded by total caps across the fleet — typically tens).
+    // Holding the mutex across the subset loop would serialize every
+    // partition's capability-block decision behind this one mutex.
+    let snapshot: BTreeSet<String> = {
+        let mut guard = caps_cache.lock().await;
+        let stale = guard
+            .fetched_at
+            .map(|t| t.elapsed() >= guard.ttl)
+            .unwrap_or(true);
+        if stale {
+            match load_worker_caps_union(client).await {
+                Ok(union) => {
+                    guard.snapshot = Some(union);
+                    guard.fetched_at = Some(Instant::now());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "unblock_scanner: failed to read worker caps union — \
+                         assuming match possible (fail-open to preserve liveness)"
+                    );
+                    return true;
+                }
             }
         }
-    }
-    let union = caps_union_cache.as_ref().expect("cache populated above");
+        guard.snapshot.clone().unwrap_or_default()
+    };
 
     // Subset check: every non-empty token in required_csv present in union.
     required_csv
         .split(',')
         .filter(|t| !t.is_empty())
-        .all(|t| union.contains(t))
+        .all(|t| snapshot.contains(t))
 }
 
 /// Union of every connected worker's advertised capabilities.
 ///
-/// Cluster-safe enumeration: reads the members of
-/// `workers_index_key()` (a SET of worker_instance_ids maintained by
-/// `ff-sdk::FlowFabricWorker::connect`), then per-member `GET` on the
-/// `ff:worker:<id>:caps` STRING. A naive `SCAN MATCH ff:worker:*:caps`
-/// would silently miss workers whose keys hash to shards the `SCAN`
-/// command doesn't visit — Valkey cluster `SCAN` is per-node, not
-/// cluster-wide. This is the same class of bug Batch A fixed by
-/// promoting `budget_policies_index` / `flow_index` / `deps_all_edges`
-/// from keyspace SCAN to explicit index SETs.
+/// Cluster-safe enumeration pattern (matches Batch A's index SETs for
+/// budget/flow/deps): SSCAN the `workers_index_key()` SET (single-slot,
+/// no hash tag needed — the key name literally hashes to one slot), then
+/// fan-out concurrent `GET ff:worker:<id>:caps` with a bounded concurrency
+/// cap. A keyspace `SCAN MATCH ff:worker:*:caps` in cluster mode visits
+/// only one shard per call and silently drops workers on other shards —
+/// exactly the class of bug Batch A Issue #11 fixed.
+///
+/// SSCAN is used instead of SMEMBERS so a fleet of thousands of workers
+/// doesn't round-trip the entire member list in one reply. `COUNT = 100`
+/// matches the convention in budget_reconciler / flow_projector.
 ///
 /// Empty caps STRING, missing key, or per-worker GET error are treated
-/// as "no caps" for that worker — the scanner keeps going and the
-/// scheduler will re-evaluate on the next tick anyway (fail-open
-/// matches check_route_cleared's overall policy).
+/// as "no caps" for that worker — scanner keeps going, the scheduler
+/// re-evaluates on the next tick (fail-open).
 async fn load_worker_caps_union(
     client: &ferriskey::Client,
 ) -> Result<BTreeSet<String>, ferriskey::Error> {
     let mut union = BTreeSet::new();
     let index_key = ff_core::keys::workers_index_key();
 
-    // Single-slot SMEMBERS: index key has no hash tag, so every node
-    // routes to the same slot. Bounded by the number of connected
-    // workers, which is the authoritative universe — unlike
-    // `SCAN MATCH ff:worker:*:caps` which in cluster mode only hits one
-    // shard's keyspace per call.
-    let worker_ids: Vec<String> = client
-        .cmd("SMEMBERS")
-        .arg(&index_key)
-        .execute()
-        .await?;
-
-    for id in &worker_ids {
-        let caps_key = format!("ff:worker:{}:caps", id);
-        let csv: Option<String> = client
-            .cmd("GET")
-            .arg(&caps_key)
+    // SSCAN loop — bounded per-page response size. Cursor starts at "0"
+    // and wraps back to "0" when iteration completes.
+    let mut cursor: String = "0".to_owned();
+    loop {
+        let reply: (String, Vec<String>) = client
+            .cmd("SSCAN")
+            .arg(&index_key)
+            .arg(&cursor)
+            .arg("COUNT")
+            .arg(WORKERS_SSCAN_COUNT.to_string().as_str())
             .execute()
-            .await
-            .unwrap_or(None);
-        if let Some(csv) = csv {
-            for token in csv.split(',') {
-                if !token.is_empty() {
-                    union.insert(token.to_owned());
+            .await?;
+        cursor = reply.0;
+        let worker_ids = reply.1;
+
+        // Bounded concurrent GETs per SSCAN page. FuturesUnordered with
+        // a buffered stream caps in-flight work at CAPS_GET_CONCURRENCY —
+        // enough parallelism to amortize round-trip latency, bounded so
+        // one scanner tick can't flood the shared Valkey client.
+        let mut pending = FuturesUnordered::new();
+        for id in worker_ids {
+            let client = client.clone();
+            pending.push(async move {
+                let caps_key = format!("ff:worker:{}:caps", id);
+                let csv: Option<String> = client
+                    .cmd("GET")
+                    .arg(&caps_key)
+                    .execute()
+                    .await
+                    .unwrap_or(None);
+                csv
+            });
+            if pending.len() >= CAPS_GET_CONCURRENCY
+                && let Some(csv) = pending.next().await.flatten()
+            {
+                for token in csv.split(',') {
+                    if !token.is_empty() {
+                        union.insert(token.to_owned());
+                    }
                 }
             }
+        }
+        // Drain remaining pending GETs from this page before advancing
+        // the SSCAN cursor. Keeps the pipeline window bounded and the
+        // union observation consistent with "all workers visible so far".
+        while let Some(result) = pending.next().await {
+            if let Some(csv) = result {
+                for token in csv.split(',') {
+                    if !token.is_empty() {
+                        union.insert(token.to_owned());
+                    }
+                }
+            }
+        }
+
+        if cursor == "0" {
+            break;
         }
     }
     Ok(union)

@@ -1009,6 +1009,9 @@ would be redundant until the surrounding ACL story exists.
 - `test_tail_stream_rejects_zero_count_limit` (R3 BUG2 regression)
 - `test_lease_expired_closes_stream_meta` (R4 regression: tail
   consumer observes terminal signal even if no reclaim ever runs)
+- `test_read_stream_rejects_over_hard_cap_at_lua` (PR#7 regression:
+  direct FCALL with count_limit > HARD_CAP must reject, not silently
+  clamp — closes the Lua-side gap that SDK + server already covered)
 
 **Library version** bumped to `"4"` — the initial read path landed at
 `"3"`; the R2 change that adds the terminal-signal fields to the return
