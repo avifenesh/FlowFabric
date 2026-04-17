@@ -1,0 +1,27 @@
+{
+  "scenario": "flow_dag_linear",
+  "system": "flowfabric",
+  "git_sha": "b4ec2c2",
+  "valkey_version": "7.2.4",
+  "host": {
+    "cpu": "AMD EPYC 9R14",
+    "cores": 16,
+    "mem_gb": 30
+  },
+  "cluster": false,
+  "timestamp_utc": "2026-04-17T22:49:44Z",
+  "config": {
+    "flows": 100,
+    "nodes": 10,
+    "payload_bytes": 0,
+    "tasks": 1000,
+    "workers": 16
+  },
+  "throughput_ops_per_sec": 5.958978110235566,
+  "latency_ms": {
+    "p50": 7348.786,
+    "p95": 8555.876,
+    "p99": 9350.297
+  },
+  "notes": "flow_setup_p50_ms=161.89,exec_p50_ms=7187.98,exec_p95_ms=8394.74,exec_p99_ms=9190.13,stage_latency_p50_ms=938.00,stage_latency_p95_ms=1092.00,stage_latency_p99_ms=2656.00,setup_exec_ratio=0.02"
+}

@@ -190,7 +190,7 @@ impl ServerConfig {
         let unblock_interval =
             Duration::from_secs(env_u64("FF_UNBLOCK_INTERVAL_S", 5)?);
         let dependency_reconciler_interval =
-            Duration::from_secs(env_u64("FF_DEPENDENCY_RECONCILER_INTERVAL_S", 15)?);
+            Duration::from_secs(env_u64("FF_DEPENDENCY_RECONCILER_INTERVAL_S", 1)?);
 
         let engine_config = EngineConfig {
             partition_config,
