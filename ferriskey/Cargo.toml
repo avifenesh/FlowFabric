@@ -10,6 +10,12 @@ repository = "https://github.com/avifenesh/FlowFabric"
 keywords = ["valkey", "redis", "client", "async"]
 categories = ["database"]
 
+# Skip cargo-release version bumps — ferriskey's publishability is tracked
+# separately (issue #9 item 5). Once resolved, remove this and include the
+# crate in workspace version bumps.
+[package.metadata.release]
+release = false
+
 [dependencies]
 # Allocator — mimalloc on supported platforms, system allocator elsewhere
 mimalloc = { version = "0.1", default-features = false }

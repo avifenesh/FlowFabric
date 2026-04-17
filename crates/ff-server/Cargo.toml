@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "FlowFabric server binary"
+description = "FlowFabric server library and HTTP binary"
 
 [dependencies]
 ff-core = { workspace = true }

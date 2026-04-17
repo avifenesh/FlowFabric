@@ -1,0 +1,59 @@
+# cargo-release config for FlowFabric workspace.
+#
+# This config drives `cargo release <level>` to perform a consolidated,
+# workspace-wide version bump across the publishable crates:
+#   ff-core, ff-script, ff-engine, ff-scheduler, ff-sdk, ff-server
+#
+# Intentionally excluded from the bump (via [package.metadata.release]
+# release = false in each crate's Cargo.toml):
+#   ferriskey   — vendored fork, publishability unresolved (see issue #9 item 5)
+#   ff-test     — dev-only integration harness (publish = false)
+#
+# cargo-release only prepares the release locally. It does NOT push and does
+# NOT publish to crates.io — the tag-triggered `.github/workflows/release.yml`
+# workflow runs the actual publish after CI green-gates.
+#
+# Typical release flow:
+#   1. `cargo release <patch|minor|major> --execute`  (on a release branch)
+#   2. Review the bump commit + tag locally.
+#   3. `git push` the branch and the tag.
+#   4. GHA workflow runs on the tag → verify → publish → create GH Release.
+
+# ── Workspace coordination ─────────────────────────────────────────────────
+
+# All publishable crates bump to the same version together. Without this,
+# cargo-release treats each member independently.
+shared-version      = true
+
+# One commit for the workspace bump + one tag for the workspace. Avoids N
+# separate commits/tags per crate. (Push consolidation is implicit — we
+# disable `push` entirely below, so nothing to consolidate.)
+consolidate-commits = true
+
+# ── Tag ────────────────────────────────────────────────────────────────────
+
+# Root-level tag `v0.1.0` — no per-crate prefix. Matches the workflow's
+# `tags: [v*.*.*]` trigger glob.
+tag-name     = "v{{version}}"
+tag-message  = "Release v{{version}}"
+tag-prefix   = ""
+
+# ── Commit ─────────────────────────────────────────────────────────────────
+
+pre-release-commit-message = "chore(release): v{{version}}"
+
+# ── What cargo-release must NOT do ─────────────────────────────────────────
+
+# Publishing is the workflow's job. cargo-release must stop after the local
+# bump + commit + tag so the operator can inspect before pushing.
+publish = false
+
+# Never push automatically. Operator reviews then pushes the branch + tag.
+push = false
+
+# ── Safety ─────────────────────────────────────────────────────────────────
+
+# Refuse to run if the working tree has uncommitted changes or if the branch
+# isn't up to date with its upstream. Both default to true; kept explicit for
+# the reader.
+allow-branch    = ["main", "release/*"]
