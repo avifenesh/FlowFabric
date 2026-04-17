@@ -107,6 +107,13 @@ jobs:
     # Keep some slack under the job timeout so polling can report the
     # timeout with a useful message before the job is hard-killed.
     timeout-minutes: 35
+    # gh run list queries the Actions API; workflow-level permissions
+    # only grant contents:read, which would 403. actions:read is the
+    # minimum scope needed to list runs (GitHub docs: "Workflow runs"
+    # REST endpoints require the actions scope).
+    permissions:
+      contents: read
+      actions: read
     # This job exists so branch protection can gate merges on CodeQL's
     # status without changing codeql.yml's schedule triggers. It polls
     # the companion CodeQL workflow run for the same SHA and waits for
@@ -200,8 +207,10 @@ jobs:
         with:
           key: semver-checks
       - name: Install cargo-semver-checks
-        # Pin to a version that supports our current toolchain (stable
-        # 1.90). Bump in lockstep with rust-toolchain.toml.
+        # Version pin avoids a surprise upstream MSRV bump breaking CI
+        # on a green branch. `rust-toolchain.toml` tracks `stable` (no
+        # explicit version), so if cargo-semver-checks raises its MSRV
+        # past whatever stable becomes, bump this pin in lockstep.
         run: cargo install cargo-semver-checks --locked --version 0.46.0
       - name: Run semver-checks on publish-bound crates
         # On a repo with no v*.*.* tag yet (pre-first-release), skip
