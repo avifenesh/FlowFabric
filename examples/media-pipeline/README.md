@@ -64,7 +64,7 @@ FF_LANES=default,media \
 
 scripts/setup.sh               # clones + builds whisper.cpp, fetches ggml-tiny.en
 scripts/download-models.sh     # pulls qwen2.5-0.5b-instruct + pre-warms minilm
-scripts/generate-sample.sh     # writes samples/sample-{01,02,03}.wav
+scripts/generate-sample.sh     # writes samples/{story,tech,conversation}.wav
 ```
 
 Each script is idempotent — re-running only does missing work.
@@ -86,8 +86,8 @@ cargo run --bin transcribe &
 cargo run --bin summarize &
 cargo run --bin embed &
 
-# Terminal B — submit
-cargo run --bin submit -- --audio samples/sample-01.wav --title demo
+# Terminal B — submit (samples: story.wav, tech.wav, or conversation.wav)
+cargo run --bin submit -- --audio samples/story.wav --title demo
 
 # Terminal C — as soon as submit prints "[submit] summarize=<uuid>",
 # start the reviewer against that UUID:
@@ -123,7 +123,7 @@ Kill the embed worker before submitting, watch the pipeline block at the embed s
 
 ```bash
 # With only transcribe + summarize running:
-cargo run --bin submit -- --audio samples/sample-01.wav &
+cargo run --bin submit -- --audio samples/story.wav &
 cargo run --bin review -- --execution-id <uuid> --auto-approve
 
 # submit output stalls after "summarize done" because embed has no claimer.
