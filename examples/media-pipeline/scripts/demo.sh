@@ -17,7 +17,10 @@ ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT"
 
 SERVER="${FF_SERVER:-http://localhost:9090}"
-SAMPLE="${SAMPLE:-samples/sample-01.wav}"
+# generate-sample.sh writes samples/{story,tech,conversation}.wav.
+# story.wav is the shortest clip (~16s of audio → ~3 whisper segments)
+# and keeps demo wall time under a minute on CPU-only boxes.
+SAMPLE="${SAMPLE:-samples/story.wav}"
 LOGDIR="${LOGDIR:-target/demo-logs}"
 
 if [ ! -f "$SAMPLE" ]; then
