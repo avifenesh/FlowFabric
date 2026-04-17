@@ -1,0 +1,4 @@
+target/
+vendor/
+models/*.bin
+samples/*.wav
