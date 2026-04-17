@@ -100,22 +100,20 @@ pub const FRAME_SUMMARY_FINAL: &str = "summary_final";
 ///
 /// Returns `Ok(None)` when no matching frame is present — the caller
 /// should treat this as "fresh claim" and drive generation.
-pub fn find_last_summary_final<'a, F>(
-    frames: impl IntoIterator<Item = &'a F>,
+pub fn find_last_summary_final<'a, F, I>(
+    frames: I,
 ) -> Result<Option<SummarizeResult>, serde_json::Error>
 where
     F: FrameView + 'a,
+    I: IntoIterator<Item = &'a F>,
+    I::IntoIter: DoubleEndedIterator,
 {
-    let mut last: Option<&'a F> = None;
-    for f in frames {
+    for f in frames.into_iter().rev() {
         if f.frame_type() == FRAME_SUMMARY_FINAL {
-            last = Some(f);
+            return Ok(Some(serde_json::from_str(f.payload())?));
         }
     }
-    match last {
-        Some(f) => Ok(Some(serde_json::from_str(f.payload())?)),
-        None => Ok(None),
-    }
+    Ok(None)
 }
 
 /// Minimal view of a stream frame used by [`find_last_summary_final`].
