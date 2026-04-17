@@ -13,12 +13,10 @@
 #     `publish-new` + `publish-update`.
 #   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
 #
-# Open blocker -- issue #9 item 5:
-#   ferriskey is `publish = false` but is a path dependency of all six
-#   publishable crates. The first real tag push will fail at
-#   `cargo publish -p ff-script` (or whichever crate is tried first)
-#   because crates.io rejects path deps. Resolve ferriskey publishability
-#   before tagging a real release.
+# Publish set (8 crates, topologically ordered):
+#   telemetrylib -> ferriskey -> ff-core -> ff-script -> ff-engine
+#     -> ff-scheduler -> ff-sdk -> ff-server
+# ff-test is dev-only (publish = false) and not in the set.
 #
 # Partial-publish recovery:
 #   If publish succeeds for crate N but fails for crate N+1, the workflow
@@ -95,26 +93,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Ordering respects path->version deps (ff-core is a leaf, ff-server
-      # is last). `--no-verify` is safe because `verify` already built +
-      # clippied + tested the same ref. Without it every `cargo publish`
-      # re-builds from scratch.
+      # Ordering respects path->version deps. telemetrylib is the root of
+      # the ferriskey subtree; ferriskey depends on it. ff-script, ff-sdk,
+      # ff-server, ff-engine, ff-scheduler, ff-test all depend on
+      # ferriskey. ff-core is a leaf. ff-server closes the chain.
+      # `--no-verify` is safe because `verify` already built + clippied +
+      # tested the same ref. Without it every `cargo publish` re-builds
+      # from scratch.
+      - name: publish telemetrylib
+        run: |
+          cargo publish -p telemetrylib --no-verify || {
+            echo "::error::cargo publish telemetrylib failed -- no crates published yet, safe to re-tag"
+            exit 1
+          }
+      - name: wait for index propagation
+        run: sleep 30
+      - name: publish ferriskey
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ferriskey --no-verify || {
+            echo "::error::cargo publish ferriskey failed -- yank telemetrylib@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
       - name: publish ff-core
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           cargo publish -p ff-core --no-verify || {
-            echo "::error::cargo publish ff-core failed -- no crates published yet, safe to re-tag"
+            echo "::error::cargo publish ff-core failed -- yank telemetrylib,ferriskey@${TAG_VERSION#v} before re-tagging"
             exit 1
           }
-      - name: wait for index propagation
-        run: sleep 30
+      - run: sleep 30
       - name: publish ff-script
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           cargo publish -p ff-script --no-verify || {
-            echo "::error::cargo publish ff-script failed -- yank ff-core@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-script failed -- yank telemetrylib,ferriskey,ff-core@${TAG_VERSION#v} before re-tagging"
             exit 1
           }
       - run: sleep 30
@@ -123,7 +140,7 @@ jobs:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           cargo publish -p ff-engine --no-verify || {
-            echo "::error::cargo publish ff-engine failed -- yank ff-core,ff-script@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-engine failed -- yank telemetrylib,ferriskey,ff-core,ff-script@${TAG_VERSION#v} before re-tagging"
             exit 1
           }
       - run: sleep 30
@@ -132,7 +149,7 @@ jobs:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           cargo publish -p ff-scheduler --no-verify || {
-            echo "::error::cargo publish ff-scheduler failed -- yank ff-core,ff-script,ff-engine@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-scheduler failed -- yank telemetrylib,ferriskey,ff-core,ff-script,ff-engine@${TAG_VERSION#v} before re-tagging"
             exit 1
           }
       - run: sleep 30
@@ -141,7 +158,7 @@ jobs:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           cargo publish -p ff-sdk --no-verify || {
-            echo "::error::cargo publish ff-sdk failed -- yank ff-core,ff-script,ff-engine,ff-scheduler@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-sdk failed -- yank telemetrylib,ferriskey,ff-core,ff-script,ff-engine,ff-scheduler@${TAG_VERSION#v} before re-tagging"
             exit 1
           }
       - run: sleep 30
@@ -150,7 +167,7 @@ jobs:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           cargo publish -p ff-server --no-verify || {
-            echo "::error::cargo publish ff-server failed -- yank ff-core,ff-script,ff-engine,ff-scheduler,ff-sdk@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-server failed -- yank telemetrylib,ferriskey,ff-core,ff-script,ff-engine,ff-scheduler,ff-sdk@${TAG_VERSION#v} before re-tagging"
             exit 1
           }
 

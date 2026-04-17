@@ -6,35 +6,33 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Six crates, all pinned to the same version:
+Eight crates, all pinned to the same version, published in topological order:
 
-1. `ff-core`
-2. `ff-script`
-3. `ff-engine`
-4. `ff-scheduler`
-5. `ff-sdk`
-6. `ff-server`
+1. `telemetrylib`    — root of the ferriskey subtree
+2. `ferriskey`       — Valkey client (reparented fork of glide-core)
+3. `ff-core`         — types, keys, errors
+4. `ff-script`       — typed FCALL wrappers + Lua library loader
+5. `ff-engine`       — cross-partition dispatch + scanners
+6. `ff-scheduler`    — claim-grant scheduler
+7. `ff-sdk`          — worker SDK
+8. `ff-server`       — HTTP server library + binary
 
 Excluded from publish:
 
-- `ferriskey` — vendored fork, publishability pending (issue #9 item 5).
-- `ff-test` — dev-only integration harness.
+- `ff-test` — dev-only integration harness (`publish = false`).
 
 ## Pre-flight checklist
 
 Before cutting a release, verify:
 
-- [ ] All Batch C release blockers (issue #9 item 5, `release-blocker` label)
-      are resolved. Specifically: `ferriskey` is publishable — either
-      `publish = true` with proper NOTICE/attribution, or path dep replaced
-      with a published version.
 - [ ] W3's benchmark numbers for the target version exist at
       `benches/results/<new_version>/`. The release workflow does not
       enforce this; it is an operator-level gate.
 - [ ] `CARGO_REGISTRY_TOKEN` is configured in repo settings (Settings →
       Secrets and variables → Actions). Generate at
       <https://crates.io/me> → API Tokens with scope `publish-new` +
-      `publish-update`.
+      `publish-update`. The token must have upload rights to all eight
+      crate names — claim them on crates.io first if they are new.
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.
 
@@ -104,20 +102,3 @@ To recover:
    version under the same number, so you must bump the patch.
 
 4. Push the new tag; the workflow re-runs from the start.
-
-## Why `ferriskey` blocks the first release
-
-`ferriskey` is a vendored fork of glide-core (valkey-glide) currently
-set to `publish = false`. Six of our publishable crates depend on it
-via a workspace path dep. `cargo publish` rejects path deps at the
-index-upload step, so the first real tag push will fail on the first
-crate that has a `ferriskey` dep.
-
-Resolution options (tracked in issue #9 item 5):
-
-- Publish `ferriskey` as-is with Apache-2.0 NOTICE + attribution.
-- Rename before publishing to avoid any glide-core namespace overlap.
-- Retire the fork — upstream changes to valkey-glide and depend on
-  the published crate.
-
-Pick one before tagging a real release.

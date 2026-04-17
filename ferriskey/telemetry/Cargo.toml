@@ -4,12 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Valkey GLIDE Maintainers"]
-publish = false
-
-# Skip cargo-release version bumps — sub-crate of the ferriskey vendored
-# fork, not part of the FlowFabric publish set. See issue #9 item 5.
-[package.metadata.release]
-release = false
+description = "OpenTelemetry hooks for ferriskey — FlowFabric's reparented fork of glide-core."
+repository = "https://github.com/avifenesh/FlowFabric"
 
 [dependencies]
 lazy_static = "1"

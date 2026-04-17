@@ -2,12 +2,12 @@
 #
 # This config drives `cargo release <level>` to perform a consolidated,
 # workspace-wide version bump across the publishable crates:
-#   ff-core, ff-script, ff-engine, ff-scheduler, ff-sdk, ff-server
+#   telemetrylib, ferriskey, ff-core, ff-script, ff-engine, ff-scheduler,
+#   ff-sdk, ff-server
 #
 # Intentionally excluded from the bump (via [package.metadata.release]
 # release = false in each crate's Cargo.toml):
-#   ferriskey   — vendored fork, publishability unresolved (see issue #9 item 5)
-#   ff-test     — dev-only integration harness (publish = false)
+#   ff-test — dev-only integration harness (publish = false)
 #
 # cargo-release only prepares the release locally. It does NOT push and does
 # NOT publish to crates.io — the tag-triggered `.github/workflows/release.yml`
