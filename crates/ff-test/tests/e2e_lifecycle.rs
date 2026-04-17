@@ -5241,6 +5241,91 @@ async fn test_flow_create_idempotent() {
     assert_eq!(fid_returned, fid);
 }
 
+/// flow_index self-heal: if the projector SREMs a live flow (sampled
+/// all-terminal), a subsequent ff_add_execution_to_flow must re-register
+/// the flow in flow_index so future projector cycles see it again.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_index_self_heal_on_add() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let fid = "flow-heal-test";
+    let a = ExecutionId::new();
+    let b = ExecutionId::new();
+    let flow_index_key = "ff:idx:{fp:0}:flow_index";
+
+    // 1. Create flow + add one member
+    fcall_create_flow(&tc, fid).await;
+    fcall_add_execution_to_flow(&tc, fid, &a).await;
+
+    // Sanity: flow is registered in the index
+    let present: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(present, "flow_index should contain fid after create");
+
+    // 2. Simulate projector prune: SREM the flow_index entry
+    let _: u32 = tc.client()
+        .cmd("SREM").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    let after_rem: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(!after_rem, "flow_index SREM simulation failed");
+
+    // 3. Add a second member via ff_add_execution_to_flow
+    fcall_add_execution_to_flow(&tc, fid, &b).await;
+
+    // 4. Assert: flow_index now contains fid again (self-heal fired)
+    let healed: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(healed, "flow_index should be self-healed by ff_add_execution_to_flow");
+
+    // 5. Negative: self-heal must NOT resurrect a cancelled flow. Cancel,
+    //    then a subsequent add attempt must fail with flow_already_terminal
+    //    AND leave the index empty.
+    fcall_cancel_flow(&tc, fid, "test_heal_cancel", "cancel_all").await;
+    let after_cancel: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(!after_cancel, "cancel should remove flow from flow_index");
+
+    // Direct FCALL so we can inspect the error result without panicking
+    let prefix = format!("ff:flow:{{fp:0}}:{fid}");
+    let keys: Vec<String> = vec![
+        format!("{prefix}:core"),
+        format!("{prefix}:members"),
+        flow_index_key.to_string(),
+    ];
+    let c = ExecutionId::new();
+    let now = TimestampMs::now();
+    let args: Vec<String> = vec![
+        fid.to_owned(), c.to_string(), now.to_string(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_add_execution_to_flow", &kr, &ar)
+        .await
+        .expect("FCALL ff_add_execution_to_flow after cancel");
+    let arr = match &raw {
+        Value::Array(a) => a,
+        _ => panic!("expected array"),
+    };
+    let status = match &arr[0] {
+        Ok(Value::Int(n)) => *n,
+        _ => panic!("expected Int status"),
+    };
+    assert_eq!(status, 0, "add-to-terminal-flow must fail");
+    assert_eq!(field_str(arr, 1), "flow_already_terminal");
+    let still_absent: bool = tc.client()
+        .cmd("SISMEMBER").arg(flow_index_key).arg(fid)
+        .execute().await.unwrap();
+    assert!(!still_absent, "terminal flow must NOT be resurrected in flow_index");
+}
+
 /// ff_cancel_flow: create flow + add members → cancel → verify state + member list returned.
 #[tokio::test]
 #[serial_test::serial]

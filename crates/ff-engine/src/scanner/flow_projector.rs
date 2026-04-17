@@ -9,6 +9,19 @@
 //!
 //! Cluster-safe: uses SMEMBERS on a partition-level index SET instead of SCAN.
 //!
+//! # Two sources of `public_flow_state`
+//!
+//! This scanner writes a DERIVED `public_flow_state` field to the flow
+//! summary hash (`ff:flow:{fp:N}:<flow_id>:summary`). It does NOT touch
+//! `flow_core.public_flow_state` — that field is owned exclusively by
+//! `ff_create_flow` and `ff_cancel_flow` and is the authoritative
+//! state used for mutation guards (e.g. `ff_add_execution_to_flow`
+//! rejects adds when `flow_core.public_flow_state` is terminal).
+//!
+//! Consumer guidance:
+//! - Mutation-guard / authoritative state → read `flow_core.public_flow_state`.
+//! - Dashboards / projected rollups → read `:summary.public_flow_state`.
+//!
 //! Reference: RFC-007 §Flow Summary Projection, RFC-010 §6.7
 
 use std::collections::HashMap;

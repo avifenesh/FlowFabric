@@ -83,6 +83,8 @@ impl ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        use ff_script::retry::kind_to_stable_str;
+
         let (status, body) = match &self.0 {
             ServerError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, ErrorBody::plain(msg.clone()))
@@ -94,8 +96,9 @@ impl IntoResponse for ApiError {
                 (StatusCode::BAD_REQUEST, ErrorBody::plain(msg.clone()))
             }
             ServerError::Valkey(e) => {
+                let kind_str = kind_to_stable_str(e.kind());
                 tracing::error!(
-                    kind = ?e.kind(),
+                    kind = kind_str,
                     code = e.code().unwrap_or(""),
                     detail = e.detail().unwrap_or(""),
                     "valkey error"
@@ -104,14 +107,15 @@ impl IntoResponse for ApiError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorBody {
                         error: self.0.to_string(),
-                        kind: Some(format!("{:?}", e.kind())),
+                        kind: Some(kind_str.to_owned()),
                         retryable: Some(self.0.is_retryable()),
                     },
                 )
             }
             ServerError::ValkeyContext { source, context } => {
+                let kind_str = kind_to_stable_str(source.kind());
                 tracing::error!(
-                    kind = ?source.kind(),
+                    kind = kind_str,
                     code = source.code().unwrap_or(""),
                     detail = source.detail().unwrap_or(""),
                     context = %context,
@@ -121,15 +125,15 @@ impl IntoResponse for ApiError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorBody {
                         error: self.0.to_string(),
-                        kind: Some(format!("{:?}", source.kind())),
+                        kind: Some(kind_str.to_owned()),
                         retryable: Some(self.0.is_retryable()),
                     },
                 )
             }
             ServerError::LibraryLoad(load_err) => {
-                let kind = load_err.valkey_kind();
+                let kind_str = load_err.valkey_kind().map(kind_to_stable_str);
                 tracing::error!(
-                    kind = ?kind,
+                    kind = kind_str.unwrap_or(""),
                     error = %load_err,
                     "library load failure"
                 );
@@ -137,14 +141,21 @@ impl IntoResponse for ApiError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorBody {
                         error: format!("library load: {load_err}"),
-                        kind: kind.map(|k| format!("{k:?}")),
+                        kind: kind_str.map(str::to_owned),
                         retryable: Some(self.0.is_retryable()),
                     },
                 )
             }
+            // Script / Config / PartitionMismatch — developer or deployment
+            // errors. No Valkey ErrorKind to surface, but retryable=false is
+            // informative: a client-side retry won't change the outcome.
             other => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorBody::plain(other.to_string()),
+                ErrorBody {
+                    error: other.to_string(),
+                    kind: None,
+                    retryable: Some(false),
+                },
             ),
         };
         (status, Json(body)).into_response()

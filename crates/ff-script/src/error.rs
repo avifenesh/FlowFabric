@@ -6,6 +6,8 @@
 
 use ff_core::error::ErrorClass;
 
+use crate::retry::is_retryable_kind;
+
 /// All error codes returned by FlowFabric Valkey Functions.
 /// Matches RFC-010 §10.7 exactly.
 ///
@@ -409,8 +411,19 @@ impl ScriptError {
             | Self::QuotaAttachConflict
             | Self::InvalidQuotaSpec
             | Self::InvalidInput(_)
-            | Self::Valkey(_)
             | Self::Parse(_) => ErrorClass::Terminal,
+
+            // Transport errors classify by their ferriskey ErrorKind —
+            // IoError / FatalSend / TryAgain / BusyLoading / ClusterDown are
+            // genuinely retryable even though all other Valkey errors are
+            // terminal from the caller's perspective.
+            Self::Valkey(e) => {
+                if is_retryable_kind(e.kind()) {
+                    ErrorClass::Retryable
+                } else {
+                    ErrorClass::Terminal
+                }
+            }
 
             // Retryable
             Self::UseClaimResumedExecution
@@ -583,6 +596,34 @@ mod tests {
     #[test]
     fn error_classification_cooperative() {
         assert_eq!(ScriptError::BudgetExceeded.class(), ErrorClass::Cooperative);
+    }
+
+    #[test]
+    fn error_classification_valkey_transient_is_retryable() {
+        use ferriskey::ErrorKind;
+        let transient = ScriptError::Valkey(ferriskey::Error::from((
+            ErrorKind::IoError,
+            "connection dropped",
+        )));
+        assert_eq!(transient.class(), ErrorClass::Retryable);
+    }
+
+    #[test]
+    fn error_classification_valkey_permanent_is_terminal() {
+        use ferriskey::ErrorKind;
+        let permanent = ScriptError::Valkey(ferriskey::Error::from((
+            ErrorKind::AuthenticationFailed,
+            "bad creds",
+        )));
+        assert_eq!(permanent.class(), ErrorClass::Terminal);
+
+        // FatalReceiveError: request may have been applied, conservatively
+        // terminal.
+        let fatal_recv = ScriptError::Valkey(ferriskey::Error::from((
+            ErrorKind::FatalReceiveError,
+            "response lost",
+        )));
+        assert_eq!(fatal_recv.class(), ErrorClass::Terminal);
     }
 
     #[test]

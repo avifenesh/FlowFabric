@@ -12,6 +12,7 @@
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
 use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
+use ff_script::retry::is_retryable_kind;
 
 /// A claim grant issued by the scheduler for a specific execution.
 ///
@@ -667,15 +668,40 @@ impl SchedulerError {
     }
 }
 
-/// Classify a ferriskey `ErrorKind` as retryable. Conservative: only kinds
-/// that are known-safe to retry return true. `FatalReceiveError` is NOT
-/// retryable because the request may have been processed.
-fn is_retryable_kind(kind: ferriskey::ErrorKind) -> bool {
-    use ferriskey::ErrorKind::*;
-    matches!(
-        kind,
-        IoError | FatalSendError | TryAgain | BusyLoadingError | ClusterDown | Moved | Ask
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferriskey::ErrorKind;
+
+    fn mk_fk_err(kind: ErrorKind) -> ferriskey::Error {
+        ferriskey::Error::from((kind, "synthetic"))
+    }
+
+    #[test]
+    fn scheduler_is_retryable_matches_kind_table() {
+        assert!(SchedulerError::Valkey(mk_fk_err(ErrorKind::IoError)).is_retryable());
+        assert!(SchedulerError::Valkey(mk_fk_err(ErrorKind::ClusterDown)).is_retryable());
+
+        assert!(!SchedulerError::Valkey(mk_fk_err(ErrorKind::FatalReceiveError)).is_retryable());
+        assert!(!SchedulerError::Valkey(mk_fk_err(ErrorKind::NoScriptError)).is_retryable());
+        assert!(!SchedulerError::Valkey(mk_fk_err(ErrorKind::Moved)).is_retryable());
+    }
+
+    #[test]
+    fn scheduler_valkey_context_is_retryable() {
+        let err = SchedulerError::ValkeyContext {
+            source: mk_fk_err(ErrorKind::BusyLoadingError),
+            context: "HGET budget_ids".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn scheduler_valkey_kind_exposed() {
+        let err = SchedulerError::Valkey(mk_fk_err(ErrorKind::TryAgain));
+        assert_eq!(err.valkey_kind(), Some(ErrorKind::TryAgain));
+    }
 }
+
 
 
