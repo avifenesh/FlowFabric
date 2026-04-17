@@ -77,9 +77,18 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
       - name: cargo clippy
-        run: cargo clippy -p ff-core -p ff-script -p ff-engine -p ff-scheduler -p ff-sdk --features insecure-direct-claim -p ff-server -p ff-test -- -D warnings
+        run: |
+          cargo clippy \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server -p ff-test \
+            --features ff-sdk/insecure-direct-claim \
+            -- -D warnings
       - name: unit tests
-        run: cargo test -p ff-core -p ff-script -p ff-engine -p ff-scheduler -p ff-sdk --features insecure-direct-claim -p ff-server
+        run: |
+          cargo test \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server \
+            --features ff-sdk/insecure-direct-claim
       - name: e2e tests (serial)
         run: cargo test -p ff-test -- --test-threads=1
 
