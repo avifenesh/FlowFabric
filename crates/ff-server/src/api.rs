@@ -182,6 +182,10 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
         .route("/v1/executions", get(list_executions).post(create_execution))
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/state", get(get_execution_state))
+        .route(
+            "/v1/executions/{id}/pending-waitpoints",
+            get(list_pending_waitpoints),
+        )
         .route("/v1/executions/{id}/cancel", post(cancel_execution))
         .route("/v1/executions/{id}/signal", post(deliver_signal))
         .route("/v1/executions/{id}/priority", put(change_priority))
@@ -347,6 +351,18 @@ async fn get_execution_state(
 ) -> Result<Json<PublicState>, ApiError> {
     let eid = parse_execution_id(&id)?;
     Ok(Json(server.get_execution_state(&eid).await?))
+}
+
+/// Returns the actionable (pending or active) waitpoints for an execution,
+/// including the HMAC token required to deliver signals. Human reviewers
+/// use this to look up the token that was originally returned to the
+/// suspending worker.
+async fn list_pending_waitpoints(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<PendingWaitpointInfo>>, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    Ok(Json(server.list_pending_waitpoints(&eid).await?))
 }
 
 async fn cancel_execution(

@@ -661,6 +661,42 @@ pub enum BufferSignalResult {
     Duplicate { existing_signal_id: SignalId },
 }
 
+// ─── list_pending_waitpoints ───
+
+/// One entry in the read-only view of an execution's active waitpoints.
+///
+/// Returned by `Server::list_pending_waitpoints` (and the
+/// `GET /v1/executions/{id}/pending-waitpoints` REST endpoint). The
+/// `waitpoint_token` is the same HMAC-SHA1 credential a suspending worker
+/// receives in `SuspendOutcome::Suspended` — a reviewer that needs to
+/// deliver a signal against this waitpoint must present it in
+/// `DeliverSignalArgs::waitpoint_token`.
+///
+/// Exposing the token here is a deliberate API gap closure: a
+/// human-in-the-loop reviewer has no other path to the token, since only
+/// the suspending worker sees the `SuspendOutcome`. Access is gated by
+/// the same bearer-auth middleware as every other REST endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingWaitpointInfo {
+    pub waitpoint_id: WaitpointId,
+    pub waitpoint_key: String,
+    /// Current waitpoint state: `pending`, `active`, `closed`. Callers
+    /// typically filter to `pending` or `active`.
+    pub state: String,
+    /// HMAC-SHA1 token minted at create time; required by
+    /// `ff_deliver_signal` and `ff_buffer_signal_for_pending_waitpoint`.
+    pub waitpoint_token: WaitpointToken,
+    /// Timestamp when the waitpoint record was first written.
+    pub created_at: TimestampMs,
+    /// Timestamp when the waitpoint was activated (suspension landed).
+    /// `None` while the waitpoint is still `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_at: Option<TimestampMs>,
+    /// Scheduled expiration timestamp. `None` if no timeout configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<TimestampMs>,
+}
+
 // ─── expire_suspension ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

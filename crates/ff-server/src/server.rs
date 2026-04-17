@@ -12,7 +12,7 @@ use ff_core::contracts::{
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     ApplyDependencyToChildArgs, ApplyDependencyToChildResult,
     DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ExecutionSummary,
-    ListExecutionsResult, ReplayExecutionResult,
+    ListExecutionsResult, PendingWaitpointInfo, ReplayExecutionResult,
     ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
     RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
@@ -570,6 +570,132 @@ impl Server {
                 "execution not found: {execution_id}"
             ))),
         }
+    }
+
+    /// List the active (`pending` or `active`) waitpoints for an execution.
+    ///
+    /// Returns one [`PendingWaitpointInfo`] per open waitpoint, including the
+    /// HMAC-SHA1 `waitpoint_token` needed to deliver authenticated signals.
+    /// `closed` waitpoints are elided — callers looking at history should
+    /// read the stream or lease history instead.
+    ///
+    /// Two-hop read: SMEMBERS on `ctx.waitpoints()` to get the waitpoint IDs,
+    /// then one HGETALL per waitpoint hash. No FCALL — this is a read-only
+    /// view built from already-persisted state, so skipping Lua keeps the
+    /// Valkey single-writer path uncontended.
+    pub async fn list_pending_waitpoints(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<PendingWaitpointInfo>, ServerError> {
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+
+        let core_exists: bool = self
+            .client
+            .cmd("EXISTS")
+            .arg(ctx.core())
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "EXISTS exec_core (pending waitpoints)".into(),
+            })?;
+        if !core_exists {
+            return Err(ServerError::NotFound(format!(
+                "execution not found: {execution_id}"
+            )));
+        }
+
+        let wp_ids: Vec<String> = self
+            .client
+            .cmd("SMEMBERS")
+            .arg(ctx.waitpoints())
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "SMEMBERS waitpoints".into(),
+            })?;
+
+        if wp_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out: Vec<PendingWaitpointInfo> = Vec::with_capacity(wp_ids.len());
+        for wp_id_str in &wp_ids {
+            let wp_id = match WaitpointId::parse(wp_id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        raw_id = %wp_id_str,
+                        error = %e,
+                        execution_id = %execution_id,
+                        "list_pending_waitpoints: skipping unparseable waitpoint_id"
+                    );
+                    continue;
+                }
+            };
+
+            let fields: HashMap<String, String> = self
+                .client
+                .hgetall(&ctx.waitpoint(&wp_id))
+                .await
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("HGETALL waitpoint {wp_id}"),
+                })?;
+
+            // Waitpoint hash may have been GC'd between the SMEMBERS read
+            // and this HGETALL. That is normal (rotation / cleanup), not a
+            // server error — just skip.
+            if fields.is_empty() {
+                continue;
+            }
+
+            let state = fields.get("state").cloned().unwrap_or_default();
+            // Elide closed waitpoints — callers only care about actionable
+            // ones. `pending` (pre-suspension early-signal buffer) and
+            // `active` (post-suspend, awaiting resume) are both actionable
+            // by a reviewer.
+            if state != "pending" && state != "active" {
+                continue;
+            }
+
+            let token_raw = fields
+                .get("waitpoint_token")
+                .cloned()
+                .unwrap_or_default();
+            if token_raw.is_empty() {
+                tracing::warn!(
+                    waitpoint_id = %wp_id,
+                    execution_id = %execution_id,
+                    "list_pending_waitpoints: waitpoint hash missing waitpoint_token — skipping"
+                );
+                continue;
+            }
+
+            let parse_ts = |field: &str| -> Option<TimestampMs> {
+                fields
+                    .get(field)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(TimestampMs)
+            };
+
+            let created_at = parse_ts("created_at").unwrap_or(TimestampMs(0));
+
+            out.push(PendingWaitpointInfo {
+                waitpoint_id: wp_id,
+                waitpoint_key: fields.get("waitpoint_key").cloned().unwrap_or_default(),
+                state,
+                waitpoint_token: WaitpointToken(token_raw),
+                created_at,
+                activated_at: parse_ts("activated_at"),
+                expires_at: parse_ts("expires_at"),
+            });
+        }
+
+        Ok(out)
     }
 
     // ── Budget / Quota API ──
