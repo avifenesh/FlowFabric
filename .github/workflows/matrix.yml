@@ -2,7 +2,7 @@ name: Matrix CI
 
 # Cross-host + cross-Valkey-version + cross-mode verification.
 #
-# Matrix coverage (10 jobs):
+# Matrix coverage (9 jobs):
 #
 #   linux x86_64  × valkey 7.2    × standalone   → ubuntu-latest
 #   linux x86_64  × valkey 7.2    × cluster      → ubuntu-latest
@@ -13,18 +13,42 @@ name: Matrix CI
 #   linux arm64   × valkey latest × standalone   → ubuntu-24.04-arm
 #   linux arm64   × valkey latest × cluster      → ubuntu-24.04-arm
 #   macos arm64   × valkey latest × standalone   → macos-latest
-#   macos x86_64  × valkey latest × standalone   → macos-13
 #
-# Mac runners validate cross-arch Rust correctness on the latest Valkey
-# release; the 7.2 × mac combination is intentionally skipped because
-# Homebrew does not package 7.2 and docker-on-mac on GitHub runners is
-# flaky under privileged-mode requirements. Linux covers the full
-# version matrix where we actually deploy.
+# Mac arm64 validates Apple Silicon Rust correctness on the latest
+# Valkey release; the 7.2 × mac combination is intentionally skipped
+# because Homebrew does not package 7.2 and docker-on-mac on GitHub
+# runners is flaky under privileged-mode requirements. x86_64 mac is
+# NOT in the matrix: GitHub's Intel runner (macos-13) is EOL December
+# 2025, and x86_64 Rust correctness is already validated through
+# ubuntu-latest. Linux covers the full Valkey version matrix where we
+# actually deploy.
 
 on:
+  # `paths-ignore` drops doc-only PRs from CI entirely (the matrix
+  # never schedules). The sentinel `matrix-tests-complete` job below
+  # always reports success so branch protection — which must list the
+  # sentinel (NOT the matrix job directly) as required — still
+  # accepts the PR. Duplicated across push + pull_request because
+  # GitHub Actions does not support YAML anchors in workflow files.
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,7 +71,6 @@ jobs:
           - { os: ubuntu-latest,    kind: linux, arch: x86_64 }
           - { os: ubuntu-24.04-arm, kind: linux, arch: arm64 }
           - { os: macos-latest,     kind: mac,   arch: arm64 }
-          - { os: macos-13,         kind: mac,   arch: x86_64 }
         valkey:
           - { version: "7.2",    image: "valkey/valkey:7.2" }
           - { version: "latest", image: "valkey/valkey:latest" }
@@ -55,14 +78,12 @@ jobs:
         exclude:
           # Mac: latest Valkey only, standalone only. Homebrew has no
           # 7.2 formula + docker-on-mac cluster setup is unsupported on
-          # GitHub hosted runners.
+          # GitHub hosted runners. x86_64 mac coverage is intentionally
+          # omitted — GitHub's Intel runner (macos-13) is EOL December
+          # 2025; x86_64 correctness is validated through ubuntu-latest.
           - host: { os: macos-latest, kind: mac, arch: arm64 }
             valkey: { version: "7.2", image: "valkey/valkey:7.2" }
-          - host: { os: macos-13, kind: mac, arch: x86_64 }
-            valkey: { version: "7.2", image: "valkey/valkey:7.2" }
           - host: { os: macos-latest, kind: mac, arch: arm64 }
-            mode: cluster
-          - host: { os: macos-13, kind: mac, arch: x86_64 }
             mode: cluster
 
     steps:
@@ -161,3 +182,26 @@ jobs:
         if: failure() && matrix.host.kind == 'linux' && matrix.mode == 'cluster'
         run: |
           docker compose -f .github/cluster/docker-compose.cluster.yml logs --tail=80 2>&1 || true
+
+  # Always-runs sentinel. Branch protection should list
+  # `matrix-tests-complete` as the required status check — NOT the
+  # per-matrix-job name — so a doc-only PR (which skips the matrix via
+  # paths-ignore) still reports a green required check and can merge.
+  # `needs.matrix.result` is `skipped` when the matrix was filtered out
+  # by paths-ignore, `success` on a clean run, `failure` / `cancelled`
+  # otherwise. `if: always()` keeps the job on the run graph even when
+  # the matrix is skipped.
+  matrix-tests-complete:
+    name: matrix-tests-complete
+    needs: matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate matrix result
+        env:
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+        run: |
+          case "$MATRIX_RESULT" in
+            success|skipped) echo "matrix: $MATRIX_RESULT — ok"; exit 0 ;;
+            *) echo "matrix: $MATRIX_RESULT — blocking merge" >&2; exit 1 ;;
+          esac

@@ -12,9 +12,29 @@ name: Security & Quality
 #                   (skips gracefully until the first git tag lands)
 
 on:
+  # paths-ignore skips doc-only PRs entirely. Branch protection
+  # should require `quality-gates-complete` (the sentinel at the bottom
+  # of this file) rather than any individual gate job, so skipped
+  # runs still report a passing required check.
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
 
 concurrency:
   group: security-quality-${{ github.ref }}
@@ -197,3 +217,41 @@ jobs:
             --baseline-rev "$latest_tag" \
             -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
             -p ff-sdk -p ff-server
+
+  # Always-runs sentinel. Branch protection should list
+  # `quality-gates-complete` as the required check — NOT the six
+  # gates individually — so doc-only PRs (matched by paths-ignore)
+  # still report green here and can merge. A gate that actually
+  # fails will flip this job to `failure` via the `needs.*.result`
+  # aggregate below.
+  quality-gates-complete:
+    name: quality-gates-complete
+    needs: [audit, deny, geiger, codeql-gate, machete, semver-checks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate gate results
+        env:
+          R_AUDIT: ${{ needs.audit.result }}
+          R_DENY: ${{ needs.deny.result }}
+          R_GEIGER: ${{ needs.geiger.result }}
+          R_CODEQL: ${{ needs.codeql-gate.result }}
+          R_MACHETE: ${{ needs.machete.result }}
+          R_SEMVER: ${{ needs.semver-checks.result }}
+        run: |
+          fail=0
+          for pair in \
+              "audit:$R_AUDIT" \
+              "deny:$R_DENY" \
+              "geiger:$R_GEIGER" \
+              "codeql-gate:$R_CODEQL" \
+              "machete:$R_MACHETE" \
+              "semver-checks:$R_SEMVER"; do
+            name="${pair%%:*}"
+            result="${pair#*:}"
+            case "$result" in
+              success|skipped) echo "$name: $result — ok" ;;
+              *)               echo "$name: $result — blocking merge" >&2; fail=1 ;;
+            esac
+          done
+          exit "$fail"

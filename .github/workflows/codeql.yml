@@ -1,9 +1,30 @@
 name: CodeQL
 
 on:
+  # paths-ignore skips CodeQL on doc-only changes. The scheduled
+  # weekly run (cron below) continues to cover main regardless, so
+  # there is no security-analysis blind spot for doc-heavy weeks.
+  # Branch protection should require `codeql-complete` (the sentinel
+  # at the bottom) rather than the individual Analyze jobs.
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
   schedule:
     - cron: "0 6 * * 1"
 
@@ -37,3 +58,23 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"
+
+  # Always-runs sentinel. Branch protection should require
+  # `codeql-complete` — not the per-language Analyze jobs — so
+  # paths-ignore skips and scheduled runs both report a single
+  # stable required check. `needs.analyze.result` is `skipped` when
+  # the path filter matches and `success` on a clean analysis.
+  codeql-complete:
+    name: codeql-complete
+    needs: analyze
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate analysis result
+        env:
+          ANALYZE_RESULT: ${{ needs.analyze.result }}
+        run: |
+          case "$ANALYZE_RESULT" in
+            success|skipped) echo "analyze: $ANALYZE_RESULT — ok"; exit 0 ;;
+            *) echo "analyze: $ANALYZE_RESULT — blocking merge" >&2; exit 1 ;;
+          esac
