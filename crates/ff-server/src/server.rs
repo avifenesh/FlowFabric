@@ -618,7 +618,16 @@ impl Server {
         let partition = execution_partition(execution_id, &self.config.partition_config);
         let ctx = ExecKeyContext::new(&partition, execution_id);
 
-        let payload: Option<String> = self
+        // Binary-safe read. Decoding into `String` would reject any
+        // non-UTF-8 payload (bincode-encoded f32 vectors, compressed
+        // artifacts, arbitrary binary stages) with a ferriskey decode
+        // error that surfaces as HTTP 500. The endpoint response is
+        // already `application/octet-stream`; `Vec<u8>` has a
+        // ferriskey-specialized `FromValue` impl that preserves raw
+        // bytes without UTF-8 validation (see ferriskey/src/value.rs:
+        // `from_byte_vec`). Nil → None via the blanket
+        // `Option<T: FromValue>` wrapper.
+        let payload: Option<Vec<u8>> = self
             .client
             .cmd("GET")
             .arg(ctx.result())
@@ -628,7 +637,7 @@ impl Server {
                 source: e,
                 context: "GET exec result".into(),
             })?;
-        Ok(payload.map(|s| s.into_bytes()))
+        Ok(payload)
     }
 
     /// List the active (`pending` or `active`) waitpoints for an execution.
@@ -638,13 +647,22 @@ impl Server {
     /// `closed` waitpoints are elided — callers looking at history should
     /// read the stream or lease history instead.
     ///
-    /// Two-hop read: SMEMBERS on `ctx.waitpoints()` to get the waitpoint IDs,
-    /// then one HMGET per waitpoint hash for exactly the fields we return,
-    /// plus one HMGET on the condition hash to surface
-    /// `required_signal_names`. No FCALL — this is a read-only view
-    /// built from already-persisted state, so skipping Lua keeps the
-    /// Valkey single-writer path uncontended. HMGET (vs HGETALL) bounds
-    /// the per-waitpoint read to the documented field set and defends
+    /// Read plan: SSCAN `ctx.waitpoints()` with `COUNT 100` (bounded
+    /// page size, matching the unblock / flow-projector / budget-
+    /// reconciler convention) to enumerate waitpoint IDs, then TWO
+    /// pipelines:
+    ///
+    /// * Pass 1 — single round-trip containing, per waitpoint, one
+    ///   HMGET over the documented field set + one HGET for
+    ///   `total_matchers` on the condition hash.
+    /// * Pass 2 (conditional) — single round-trip containing an
+    ///   HMGET per waitpoint with `total_matchers > 0` to read the
+    ///   `matcher:N:name` fields.
+    ///
+    /// No FCALL — this is a read-only view built from already-
+    /// persisted state, so skipping Lua keeps the Valkey single-
+    /// writer path uncontended. HMGET (vs HGETALL) bounds the per-
+    /// waitpoint read to the documented field set and defends
     /// against a poisoned waitpoint hash with unbounded extra fields
     /// accumulating response memory.
     ///
@@ -690,25 +708,64 @@ impl Server {
             )));
         }
 
-        let wp_ids: Vec<String> = self
-            .client
-            .cmd("SMEMBERS")
-            .arg(ctx.waitpoints())
-            .execute()
-            .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "SMEMBERS waitpoints".into(),
-            })?;
+        // SSCAN the waitpoints set in bounded pages. SMEMBERS would
+        // load the entire set in one reply — fine for today's
+        // single-waitpoint executions, but the codebase convention
+        // (budget_reconciler, flow_projector, unblock scanner) is SSCAN
+        // COUNT 100 so response size per round-trip is bounded as the
+        // set grows. Match the precedent instead of carving a new
+        // pattern here.
+        const WAITPOINTS_SSCAN_COUNT: usize = 100;
+        let waitpoints_key = ctx.waitpoints();
+        let mut wp_ids_raw: Vec<String> = Vec::new();
+        let mut cursor: String = "0".to_owned();
+        loop {
+            let reply: (String, Vec<String>) = self
+                .client
+                .cmd("SSCAN")
+                .arg(&waitpoints_key)
+                .arg(&cursor)
+                .arg("COUNT")
+                .arg(WAITPOINTS_SSCAN_COUNT.to_string().as_str())
+                .execute()
+                .await
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: "SSCAN waitpoints".into(),
+                })?;
+            cursor = reply.0;
+            wp_ids_raw.extend(reply.1);
+            if cursor == "0" {
+                break;
+            }
+        }
 
+        if wp_ids_raw.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Parse + filter out malformed waitpoint_ids up-front so the
+        // downstream pipeline indexes stay aligned to the Vec of
+        // typed ids.
+        let mut wp_ids: Vec<WaitpointId> = Vec::with_capacity(wp_ids_raw.len());
+        for raw in &wp_ids_raw {
+            match WaitpointId::parse(raw) {
+                Ok(id) => wp_ids.push(id),
+                Err(e) => tracing::warn!(
+                    raw_id = %raw,
+                    error = %e,
+                    execution_id = %execution_id,
+                    "list_pending_waitpoints: skipping unparseable waitpoint_id"
+                ),
+            }
+        }
         if wp_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         // Bounded HMGET field set — these are the six hash fields that
-        // surface in `PendingWaitpointInfo` plus `waitpoint_id` for
-        // sanity checking. Fixed-size indexing into the response below
-        // tracks this order.
+        // surface in `PendingWaitpointInfo`. Fixed-size indexing into
+        // the response below tracks this order.
         const WP_FIELDS: [&str; 6] = [
             "state",
             "waitpoint_key",
@@ -718,64 +775,85 @@ impl Server {
             "expires_at",
         ];
 
-        let mut out: Vec<PendingWaitpointInfo> = Vec::with_capacity(wp_ids.len());
-        for wp_id_str in &wp_ids {
-            let wp_id = match WaitpointId::parse(wp_id_str) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(
-                        raw_id = %wp_id_str,
-                        error = %e,
-                        execution_id = %execution_id,
-                        "list_pending_waitpoints: skipping unparseable waitpoint_id"
-                    );
-                    continue;
-                }
-            };
-
-            let mut cmd = self.client.cmd("HMGET");
-            cmd = cmd.arg(ctx.waitpoint(&wp_id));
+        // Pass 1 pipeline: waitpoint HMGET + condition HGET
+        // total_matchers, one of each per waitpoint, in a SINGLE
+        // round-trip. Sequential HMGETs were an N-round-trip latency
+        // floor on flows with fan-out waitpoints.
+        let mut pass1 = self.client.pipeline();
+        let mut wp_slots = Vec::with_capacity(wp_ids.len());
+        let mut cond_slots = Vec::with_capacity(wp_ids.len());
+        for wp_id in &wp_ids {
+            let mut cmd = pass1.cmd::<Vec<Option<String>>>("HMGET");
+            cmd = cmd.arg(ctx.waitpoint(wp_id));
             for f in WP_FIELDS {
                 cmd = cmd.arg(f);
             }
-            let vals: Vec<Option<String>> = cmd.execute().await.map_err(|e| {
-                ServerError::ValkeyContext {
-                    source: e,
-                    context: format!("HMGET waitpoint {wp_id}"),
-                }
+            wp_slots.push(cmd.finish());
+
+            cond_slots.push(
+                pass1
+                    .cmd::<Option<String>>("HGET")
+                    .arg(ctx.waitpoint_condition(wp_id))
+                    .arg("total_matchers")
+                    .finish(),
+            );
+        }
+        pass1
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "pipeline HMGET waitpoints + HGET total_matchers".into(),
             })?;
 
-            // Waitpoint hash may have been GC'd between the SMEMBERS read
-            // and this HMGET. That is normal (rotation / cleanup), not a
-            // server error — skip when every field is None.
-            if vals.iter().all(Option::is_none) {
+        // Collect pass-1 results + queue pass-2 HMGETs for condition
+        // matcher names on waitpoints that are actionable (state in
+        // pending/active, non-empty token, total_matchers > 0). PipeSlot
+        // values are owning, so iterate all three ordered zip'd iters
+        // and consume them together.
+        struct Kept {
+            wp_id: WaitpointId,
+            wp_fields: Vec<Option<String>>,
+            total_matchers: usize,
+        }
+        let mut kept: Vec<Kept> = Vec::with_capacity(wp_ids.len());
+        for ((wp_id, wp_slot), cond_slot) in wp_ids
+            .iter()
+            .zip(wp_slots.into_iter())
+            .zip(cond_slots.into_iter())
+        {
+            let wp_fields: Vec<Option<String>> =
+                wp_slot.value().map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("pipeline slot HMGET waitpoint {wp_id}"),
+                })?;
+
+            // Waitpoint hash may have been GC'd between the SSCAN and
+            // this HMGET (rotation / cleanup race). Skip silently.
+            if wp_fields.iter().all(Option::is_none) {
+                // Still consume the cond_slot to free its buffer.
+                let _ = cond_slot.value();
                 continue;
             }
-
-            let get = |i: usize| vals.get(i).and_then(|v| v.as_deref()).unwrap_or("");
-            let state = get(0).to_owned();
-            // Elide closed waitpoints — callers only care about actionable
-            // ones. `pending` (pre-suspension early-signal buffer) and
-            // `active` (post-suspend, awaiting resume) are both actionable
-            // by a reviewer.
-            if state != "pending" && state != "active" {
+            let state_ref = wp_fields
+                .first()
+                .and_then(|v| v.as_deref())
+                .unwrap_or("");
+            if state_ref != "pending" && state_ref != "active" {
+                let _ = cond_slot.value();
                 continue;
             }
-
-            let token_raw = get(2);
-            if token_raw.is_empty() {
-                // This is storage corruption: a waitpoint hash in the
-                // active set MUST carry waitpoint_token (written by
-                // ff_suspend_execution / ff_create_pending_waitpoint).
-                // Missing token means either a half-populated write, a
-                // direct operator edit, or an interrupted script — all
-                // worth investigating. Include both IDs and the hash key
-                // so the operator can HGETALL the record directly.
+            let token_ref = wp_fields
+                .get(2)
+                .and_then(|v| v.as_deref())
+                .unwrap_or("");
+            if token_ref.is_empty() {
+                let _ = cond_slot.value();
                 tracing::warn!(
                     waitpoint_id = %wp_id,
                     execution_id = %execution_id,
-                    waitpoint_hash_key = %ctx.waitpoint(&wp_id),
-                    state = %state,
+                    waitpoint_hash_key = %ctx.waitpoint(wp_id),
+                    state = %state_ref,
                     "list_pending_waitpoints: waitpoint hash present but waitpoint_token \
                      field is empty — likely storage corruption (half-populated write, \
                      operator edit, or interrupted script). Skipping this entry in the \
@@ -784,73 +862,94 @@ impl Server {
                 continue;
             }
 
-            let parse_ts = |raw: &str| -> Option<TimestampMs> {
-                if raw.is_empty() {
-                    None
-                } else {
-                    raw.parse::<i64>().ok().map(TimestampMs)
+            let total_matchers = cond_slot
+                .value()
+                .map_err(|e| ServerError::ValkeyContext {
+                    source: e,
+                    context: format!("pipeline slot HGET total_matchers {wp_id}"),
+                })?
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+
+            kept.push(Kept {
+                wp_id: wp_id.clone(),
+                wp_fields,
+                total_matchers,
+            });
+        }
+
+        if kept.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 2 pipeline: matcher-name HMGETs for every kept waitpoint
+        // with total_matchers > 0. Single round-trip regardless of
+        // per-waitpoint matcher count. Waitpoints with total_matchers==0
+        // (wildcard) skip the HMGET entirely.
+        let mut pass2 = self.client.pipeline();
+        let mut matcher_slots: Vec<Option<_>> = Vec::with_capacity(kept.len());
+        let mut pass2_needed = false;
+        for k in &kept {
+            if k.total_matchers == 0 {
+                matcher_slots.push(None);
+                continue;
+            }
+            pass2_needed = true;
+            let mut cmd = pass2.cmd::<Vec<Option<String>>>("HMGET");
+            cmd = cmd.arg(ctx.waitpoint_condition(&k.wp_id));
+            for i in 0..k.total_matchers {
+                cmd = cmd.arg(format!("matcher:{i}:name"));
+            }
+            matcher_slots.push(Some(cmd.finish()));
+        }
+        if pass2_needed {
+            pass2.execute().await.map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "pipeline HMGET wp_condition matchers".into(),
+            })?;
+        }
+
+        let parse_ts = |raw: &str| -> Option<TimestampMs> {
+            if raw.is_empty() {
+                None
+            } else {
+                raw.parse::<i64>().ok().map(TimestampMs)
+            }
+        };
+
+        let mut out: Vec<PendingWaitpointInfo> = Vec::with_capacity(kept.len());
+        for (k, slot) in kept.into_iter().zip(matcher_slots) {
+            let get = |i: usize| -> &str {
+                k.wp_fields.get(i).and_then(|v| v.as_deref()).unwrap_or("")
+            };
+
+            // Collect matcher names, eliding the empty-name wildcard
+            // sentinel (see lua/helpers.lua initialize_condition).
+            let required_signal_names: Vec<String> = match slot {
+                None => Vec::new(),
+                Some(s) => {
+                    let vals: Vec<Option<String>> =
+                        s.value().map_err(|e| ServerError::ValkeyContext {
+                            source: e,
+                            context: format!(
+                                "pipeline slot HMGET wp_condition matchers {}",
+                                k.wp_id
+                            ),
+                        })?;
+                    vals.into_iter()
+                        .flatten()
+                        .filter(|name| !name.is_empty())
+                        .collect()
                 }
             };
 
-            let created_at = parse_ts(get(3)).unwrap_or(TimestampMs(0));
-
-            // Condition hash read — one extra HMGET per waitpoint to
-            // surface `required_signal_names`. The condition hash
-            // (ctx.waitpoint_condition(wp_id)) is written by
-            // `write_condition_hash` in lua/helpers.lua with fields:
-            //   total_matchers, matcher:0:name, matcher:1:name, …
-            // We first fetch total_matchers, then the matcher:N:name
-            // fields in a single HMGET. Total_matchers defaults to 0 on
-            // any parse failure so a cleanup race / missing hash
-            // degrades to an empty required_signal_names — callers can
-            // distinguish via the wildcard-vs-unknown comment in
-            // PendingWaitpointInfo.
-            let condition_key = ctx.waitpoint_condition(&wp_id);
-            let total_matchers_raw: Option<String> = self
-                .client
-                .hget(&condition_key, "total_matchers")
-                .await
-                .map_err(|e| ServerError::ValkeyContext {
-                    source: e,
-                    context: format!("HGET wp_condition total_matchers {wp_id}"),
-                })?;
-            let total_matchers: usize = total_matchers_raw
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            let mut required_signal_names: Vec<String> = Vec::new();
-            if total_matchers > 0 {
-                let mut cmd = self.client.cmd("HMGET");
-                cmd = cmd.arg(condition_key);
-                for i in 0..total_matchers {
-                    cmd = cmd.arg(format!("matcher:{i}:name"));
-                }
-                let matcher_vals: Vec<Option<String>> =
-                    cmd.execute().await.map_err(|e| ServerError::ValkeyContext {
-                        source: e,
-                        context: format!("HMGET wp_condition matchers {wp_id}"),
-                    })?;
-                // The wildcard matcher uses an empty name sentinel; elide
-                // it from the public view so callers see "no required
-                // names" and can apply wildcard semantics without the
-                // server leaking the sentinel encoding. A `None` entry
-                // means the condition hash was concurrently cleaned up —
-                // same skip.
-                for name in matcher_vals.into_iter().flatten() {
-                    if !name.is_empty() {
-                        required_signal_names.push(name);
-                    }
-                }
-            }
-
             out.push(PendingWaitpointInfo {
-                waitpoint_id: wp_id,
+                waitpoint_id: k.wp_id,
                 waitpoint_key: get(1).to_owned(),
-                state,
-                waitpoint_token: WaitpointToken(token_raw.to_owned()),
+                state: get(0).to_owned(),
+                waitpoint_token: WaitpointToken(get(2).to_owned()),
                 required_signal_names,
-                created_at,
+                created_at: parse_ts(get(3)).unwrap_or(TimestampMs(0)),
                 activated_at: parse_ts(get(4)),
                 expires_at: parse_ts(get(5)),
             });
