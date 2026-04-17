@@ -186,6 +186,7 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
             "/v1/executions/{id}/pending-waitpoints",
             get(list_pending_waitpoints),
         )
+        .route("/v1/executions/{id}/result", get(get_execution_result))
         .route("/v1/executions/{id}/cancel", post(cancel_execution))
         .route("/v1/executions/{id}/signal", post(deliver_signal))
         .route("/v1/executions/{id}/priority", put(change_priority))
@@ -363,6 +364,27 @@ async fn list_pending_waitpoints(
 ) -> Result<Json<Vec<PendingWaitpointInfo>>, ApiError> {
     let eid = parse_execution_id(&id)?;
     Ok(Json(server.list_pending_waitpoints(&eid).await?))
+}
+
+/// Returns the raw result payload bytes written by
+/// `ff_complete_execution`. 404 when the execution has no stored result
+/// (missing entirely or still in-flight).
+async fn get_execution_result(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    match server.get_execution_result(&eid).await? {
+        Some(bytes) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response()),
+        None => Err(ApiError(ServerError::NotFound(format!(
+            "execution result not found: {eid}"
+        )))),
+    }
 }
 
 async fn cancel_execution(

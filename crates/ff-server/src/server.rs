@@ -572,6 +572,31 @@ impl Server {
         }
     }
 
+    /// Read the raw result payload written by `ff_complete_execution`.
+    ///
+    /// The Lua side stores the payload at `ctx.result()` via plain `SET`.
+    /// No FCALL — this is a direct GET; returns `Ok(None)` when the
+    /// execution is missing or not yet complete.
+    pub async fn get_execution_result(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
+        let partition = execution_partition(execution_id, &self.config.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+
+        let payload: Option<String> = self
+            .client
+            .cmd("GET")
+            .arg(ctx.result())
+            .execute()
+            .await
+            .map_err(|e| ServerError::ValkeyContext {
+                source: e,
+                context: "GET exec result".into(),
+            })?;
+        Ok(payload.map(|s| s.into_bytes()))
+    }
+
     /// List the active (`pending` or `active`) waitpoints for an execution.
     ///
     /// Returns one [`PendingWaitpointInfo`] per open waitpoint, including the

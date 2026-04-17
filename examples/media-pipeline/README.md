@@ -1,0 +1,150 @@
+# Media Pipeline
+
+A three-stage audio processing pipeline on FlowFabric: **transcribe → summarize → embed**, with a human-in-the-loop approval gate between summarize and embed.
+
+This example exercises three mechanisms shipped in Batch B:
+
+- **Capability routing** (RFC-009): each execution declares `required_capabilities`; each worker advertises its `capabilities`. The scheduler subset-matches so transcribe tasks never reach the embed worker, etc. Executions that cannot be matched to any capable worker block in `lane_blocked_route` and are promoted by the unblock scanner when a capable worker appears.
+- **Stream tail with terminal signal** (RFC-006): workers stream incremental output (transcribe lines, LLM tokens, embed completion) as frames; the submit and review CLIs tail concurrently and stop cleanly on the stream's `closed_at` / `closed_reason` terminal markers instead of timeout fallbacks.
+- **HMAC-signed waitpoint signals** (RFC-004): the summarize worker suspends and receives a `waitpoint_token`. The review CLI fetches that token from `GET /v1/executions/{id}/pending-waitpoints` and must include it in the resume signal. Tampering with the token (via `--tamper-token`) surfaces as a server-side `invalid_token` rejection.
+
+## Architecture
+
+```
+submit CLI             FlowFabric Server          Workers
+    |                        |                       |
+    |-- POST /flows -------->|                       |
+    |-- POST /executions --->|                       |
+    |   (caps=asr)           |<-- claim (caps=asr) --| transcribe-worker
+    |                        |<-- append_frame ------|   (whisper.cpp stdout)
+    |<-- tail_stream --------|<-- complete ----------|
+    |-- GET  /result ------->|                       |
+    |-- POST /executions --->|                       |
+    |   (caps=llm, payload=T)|<-- claim (caps=llm) --| summarize-worker
+    |                        |<-- append_frame ------|   (qwen2.5-0.5b tokens)
+    |                        |<-- suspend + wpt ----|
+    |<-- tail_stream --------|                       |
+    |                        |                       |
+  review CLI                 |                       |
+    |-- GET  /state -------->|                       |
+    |-- GET  /pending-wp --->|                       |
+    |-- POST /signal+token ->|                       |
+    |                        |-- resume ------------>| (same worker re-claims)
+    |                        |<-- complete ----------|
+submit CLI                   |                       |
+    |-- POST /executions --->|                       |
+    |   (caps=embed)         |<-- claim (caps=embed)-| embed-worker
+    |                        |<-- complete ----------|
+    |<-- tail_stream --------|   all three streams closed_at set
+    |  exit 0
+```
+
+## Prerequisites
+
+- Valkey running on `localhost:6379`
+- FlowFabric server running on `localhost:9090` (start with `cargo run -p ff-server` from the repo root)
+- `cmake`, `git`, `make`, `espeak-ng`, `ffmpeg` on `$PATH` (used by the setup and sample-generation scripts)
+
+## First-time setup
+
+```bash
+# From examples/media-pipeline/
+
+scripts/setup.sh               # clones + builds whisper.cpp, fetches ggml-tiny.en
+scripts/download-models.sh     # pulls qwen2.5-0.5b-instruct + pre-warms minilm
+scripts/generate-sample.sh     # writes samples/sample-{01,02,03}.wav
+```
+
+Each script is idempotent — re-running only does missing work.
+
+## Running the demo
+
+```bash
+# From examples/media-pipeline/
+scripts/demo.sh
+```
+
+That spawns the three workers in the background, runs `submit`, runs `review --auto-approve`, and exits 0 on success. Per-worker logs land in `target/demo-logs/`.
+
+For an interactive walkthrough, run the pieces by hand:
+
+```bash
+# Terminal A — start the three workers
+cargo run --bin transcribe &
+cargo run --bin summarize &
+cargo run --bin embed &
+
+# Terminal B — submit
+cargo run --bin submit -- --audio samples/sample-01.wav --title demo
+
+# Terminal C — as soon as submit prints "[submit] summarize=<uuid>",
+# start the reviewer against that UUID:
+cargo run --bin review -- --execution-id <uuid>
+```
+
+The review CLI prints incoming `summary_token` frames while waiting for the suspend, then prompts `Approve? [y/n]:`.
+
+## Validation scenarios
+
+### 1. Capability routing — block + unblock
+
+Kill the embed worker before submitting, watch the pipeline block at the embed stage, then restart it and watch the unblock scanner promote the execution.
+
+```bash
+# With only transcribe + summarize running:
+cargo run --bin submit -- --audio samples/sample-01.wav &
+cargo run --bin review -- --execution-id <uuid> --auto-approve
+
+# submit output stalls after "summarize done" because embed has no claimer.
+# Start the embed worker now:
+cargo run --bin embed
+
+# Within seconds, submit prints "embed done" and exits 0.
+```
+
+### 2. HMAC enforcement — tampered token
+
+```bash
+cargo run --bin review -- \
+    --execution-id <summarize-uuid> \
+    --tamper-token \
+    --auto-approve
+```
+
+The review CLI flips one hex char of the token before sending. The server rejects with `400 Bad Request: ff_deliver_signal failed: invalid_token` and the review CLI exits 0 (the rejection is the expected behavior). The summarize execution remains suspended; a second clean `review` call can approve it.
+
+### 3. Concurrent tail cap
+
+```bash
+# Set the server's max concurrent stream ops low, then fire several tails.
+FF_MAX_CONCURRENT_STREAM_OPS=2 cargo run -p ff-server &
+
+# In another shell, tail the same stream five times in parallel.
+# Three of the five get HTTP 429 while the cap is saturated.
+```
+
+## V1 shortcuts (documented)
+
+- **Client-side data passing.** The submit CLI waits for each upstream execution to complete, reads the raw result bytes from `GET /v1/executions/{id}/result`, and embeds them as the next execution's `input_payload`. The flow graph carries `data_passing_ref` on the dependency edges for inspectability, but the engine does not auto-inject the upstream payload into the downstream `input_payload` today. That's a Batch C task.
+- **`insecure-direct-claim` feature.** Workers use the direct Valkey claim path gated by the `insecure-direct-claim` feature on `ff-sdk`. Batch C will replace this with a proper scheduler-mediated claim API.
+
+## File layout
+
+```
+examples/media-pipeline/
+    Cargo.toml                 # workspace = []; one crate, five bins, one lib
+    src/lib.rs                 # canonical shared types (PipelineInput,
+                               # TranscribeResult, SummarizeResult,
+                               # EmbedResult, ApprovalDecision)
+    src/bin/
+        transcribe.rs          # W1 — whisper.cpp, caps=asr
+        summarize.rs           # W3 — qwen2.5, caps=llm, suspends for review
+        embed.rs               # W3 — minilm, caps=embed
+        submit.rs              # W2 — flow orchestrator + tail multiplexer
+        review.rs              # W2 — approval signal with HMAC token
+    scripts/
+        setup.sh               # whisper.cpp + ggml model
+        download-models.sh     # qwen GGUF + minilm warmup
+        generate-sample.sh     # three canned WAVs via espeak-ng + ffmpeg
+        demo.sh                # one-liner end-to-end demo
+```
