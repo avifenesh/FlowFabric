@@ -361,6 +361,19 @@ impl Server {
                  FF_API_TOKEN for any deployment reachable from untrusted \
                  networks."
             );
+            // Explicit callout for the credential-bearing read endpoints.
+            // Auditors grep for these on a per-endpoint basis; lumping
+            // into the admin warning alone hides the fact that
+            // /pending-waitpoints returns HMAC tokens and /result
+            // returns completion payload bytes.
+            tracing::warn!(
+                listen_addr = %config.listen_addr,
+                "FF_API_TOKEN is unset — GET /v1/executions/{{id}}/pending-waitpoints \
+                 returns HMAC waitpoint_tokens (bearer credentials for signal delivery) \
+                 and GET /v1/executions/{{id}}/result returns raw completion payload \
+                 bytes (may contain PII). Both are UNAUTHENTICATED in this \
+                 configuration."
+            );
         }
 
         tracing::info!(
@@ -605,9 +618,12 @@ impl Server {
     /// read the stream or lease history instead.
     ///
     /// Two-hop read: SMEMBERS on `ctx.waitpoints()` to get the waitpoint IDs,
-    /// then one HGETALL per waitpoint hash. No FCALL — this is a read-only
-    /// view built from already-persisted state, so skipping Lua keeps the
-    /// Valkey single-writer path uncontended.
+    /// then one HMGET per waitpoint hash for exactly the fields we return.
+    /// No FCALL — this is a read-only view built from already-persisted
+    /// state, so skipping Lua keeps the Valkey single-writer path
+    /// uncontended. HMGET (vs HGETALL) bounds the per-waitpoint read to
+    /// the documented field set and defends against a poisoned waitpoint
+    /// hash with unbounded extra fields accumulating response memory.
     pub async fn list_pending_waitpoints(
         &self,
         execution_id: &ExecutionId,
@@ -646,6 +662,19 @@ impl Server {
             return Ok(Vec::new());
         }
 
+        // Bounded HMGET field set — these are the six hash fields that
+        // surface in `PendingWaitpointInfo` plus `waitpoint_id` for
+        // sanity checking. Fixed-size indexing into the response below
+        // tracks this order.
+        const WP_FIELDS: [&str; 6] = [
+            "state",
+            "waitpoint_key",
+            "waitpoint_token",
+            "created_at",
+            "activated_at",
+            "expires_at",
+        ];
+
         let mut out: Vec<PendingWaitpointInfo> = Vec::with_capacity(wp_ids.len());
         for wp_id_str in &wp_ids {
             let wp_id = match WaitpointId::parse(wp_id_str) {
@@ -661,23 +690,27 @@ impl Server {
                 }
             };
 
-            let fields: HashMap<String, String> = self
-                .client
-                .hgetall(&ctx.waitpoint(&wp_id))
-                .await
-                .map_err(|e| ServerError::ValkeyContext {
+            let mut cmd = self.client.cmd("HMGET");
+            cmd = cmd.arg(ctx.waitpoint(&wp_id));
+            for f in WP_FIELDS {
+                cmd = cmd.arg(f);
+            }
+            let vals: Vec<Option<String>> = cmd.execute().await.map_err(|e| {
+                ServerError::ValkeyContext {
                     source: e,
-                    context: format!("HGETALL waitpoint {wp_id}"),
-                })?;
+                    context: format!("HMGET waitpoint {wp_id}"),
+                }
+            })?;
 
             // Waitpoint hash may have been GC'd between the SMEMBERS read
-            // and this HGETALL. That is normal (rotation / cleanup), not a
-            // server error — just skip.
-            if fields.is_empty() {
+            // and this HMGET. That is normal (rotation / cleanup), not a
+            // server error — skip when every field is None.
+            if vals.iter().all(Option::is_none) {
                 continue;
             }
 
-            let state = fields.get("state").cloned().unwrap_or_default();
+            let get = |i: usize| vals.get(i).and_then(|v| v.as_deref()).unwrap_or("");
+            let state = get(0).to_owned();
             // Elide closed waitpoints — callers only care about actionable
             // ones. `pending` (pre-suspension early-signal buffer) and
             // `active` (post-suspend, awaiting resume) are both actionable
@@ -686,10 +719,7 @@ impl Server {
                 continue;
             }
 
-            let token_raw = fields
-                .get("waitpoint_token")
-                .cloned()
-                .unwrap_or_default();
+            let token_raw = get(2);
             if token_raw.is_empty() {
                 tracing::warn!(
                     waitpoint_id = %wp_id,
@@ -699,24 +729,24 @@ impl Server {
                 continue;
             }
 
-            let parse_ts = |field: &str| -> Option<TimestampMs> {
-                fields
-                    .get(field)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .map(TimestampMs)
+            let parse_ts = |raw: &str| -> Option<TimestampMs> {
+                if raw.is_empty() {
+                    None
+                } else {
+                    raw.parse::<i64>().ok().map(TimestampMs)
+                }
             };
 
-            let created_at = parse_ts("created_at").unwrap_or(TimestampMs(0));
+            let created_at = parse_ts(get(3)).unwrap_or(TimestampMs(0));
 
             out.push(PendingWaitpointInfo {
                 waitpoint_id: wp_id,
-                waitpoint_key: fields.get("waitpoint_key").cloned().unwrap_or_default(),
+                waitpoint_key: get(1).to_owned(),
                 state,
-                waitpoint_token: WaitpointToken(token_raw),
+                waitpoint_token: WaitpointToken(token_raw.to_owned()),
                 created_at,
-                activated_at: parse_ts("activated_at"),
-                expires_at: parse_ts("expires_at"),
+                activated_at: parse_ts(get(4)),
+                expires_at: parse_ts(get(5)),
             });
         }
 

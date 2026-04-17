@@ -15,10 +15,9 @@
 //!     we gate sequencing ourselves
 //!   * Tail each execution's stream concurrently, prefix-labeled, through
 //!     a shared stdout mutex
-//!   * Handle Ctrl-C by cancelling the flow
+//!   * Handle Ctrl-C by cancelling the flow (inline in the main select)
 //!   * Return exit 0 only if all three completed successfully
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +31,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 // ── CLI ──
 
@@ -63,7 +63,9 @@ struct Args {
     #[arg(long, default_value = "default")]
     namespace: String,
 
-    /// Poll interval for state checks.
+    /// Base poll interval for state polling. Actual sleep is
+    /// `poll_ms` plus a uniform 0..=poll_ms/2 jitter so multiple CLIs
+    /// don't synchronize ZRANGEBYSCORE hits on an idle lane.
     #[arg(long, default_value_t = 2000)]
     poll_ms: u64,
 }
@@ -81,6 +83,18 @@ async fn main() -> Result<()> {
     let client = build_http(&args.api_token)?;
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
 
+    match run_pipeline(&client, &args, &stdout).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log(&stdout, &format!("pipeline failed: {e:#}")).await;
+            Err(e)
+        }
+    }
+}
+
+/// Full-pipeline driver. Wrapped so Ctrl-C in the main select can cancel
+/// the whole future and also POST /cancel before exit.
+async fn run_pipeline(client: &Client, args: &Args, stdout: &Arc<Mutex<Stdout>>) -> Result<()> {
     // Flow + execution IDs up-front — we need them for dependency edges
     // before each execution is created.
     let flow_id = uuid::Uuid::new_v4().to_string();
@@ -88,13 +102,55 @@ async fn main() -> Result<()> {
     let eid_summarize = uuid::Uuid::new_v4().to_string();
     let eid_embed = uuid::Uuid::new_v4().to_string();
 
-    log(&stdout, &format!("flow_id={flow_id}")).await;
-    log(&stdout, &format!("transcribe={eid_transcribe}")).await;
-    log(&stdout, &format!("summarize={eid_summarize}")).await;
-    log(&stdout, &format!("embed={eid_embed}")).await;
+    log(stdout, &format!("flow_id={flow_id}")).await;
+    log(stdout, &format!("transcribe={eid_transcribe}")).await;
+    log(stdout, &format!("summarize={eid_summarize}")).await;
+    log(stdout, &format!("embed={eid_embed}")).await;
 
-    create_flow(&client, &args, &flow_id).await?;
-    log(&stdout, "flow created").await;
+    // Install Ctrl-C handler for this run. Folding ctrl_c into the main
+    // driver via tokio::select! ensures the handler is cancelled when the
+    // pipeline finishes normally, avoiding the spawned-task race where a
+    // Ctrl-C during tail-drain would trigger a spurious cancel on an
+    // already-completed flow.
+    let pipeline = pipeline_inner(
+        client,
+        args,
+        stdout,
+        &flow_id,
+        &eid_transcribe,
+        &eid_summarize,
+        &eid_embed,
+    );
+    tokio::pin!(pipeline);
+
+    tokio::select! {
+        res = &mut pipeline => res,
+        _ = tokio::signal::ctrl_c() => {
+            log(stdout, "SIGINT — cancelling flow").await;
+            let body = serde_json::json!({
+                "flow_id": flow_id,
+                "reason": "user_cancelled",
+                "cancellation_policy": "cancel_all",
+                "now": now_ms(),
+            });
+            let url = format!("{}/v1/flows/{flow_id}/cancel", args.server);
+            let _ = client.post(&url).json(&body).send().await;
+            anyhow::bail!("interrupted by user (SIGINT)");
+        }
+    }
+}
+
+async fn pipeline_inner(
+    client: &Client,
+    args: &Args,
+    stdout: &Arc<Mutex<Stdout>>,
+    flow_id: &str,
+    eid_transcribe: &str,
+    eid_summarize: &str,
+    eid_embed: &str,
+) -> Result<()> {
+    create_flow(client, args, flow_id).await?;
+    log(stdout, "flow created").await;
 
     // graph_revision is incremented atomically by the server on every
     // add_member and every stage_edge. Track locally so the next mutation
@@ -107,56 +163,36 @@ async fn main() -> Result<()> {
         title: args.title.clone(),
     };
     create_execution(
-        &client,
-        &args,
-        &eid_transcribe,
+        client,
+        args,
+        eid_transcribe,
         KIND_TRANSCRIBE,
-        ["asr", "whisper-tiny-en"].iter().copied().collect(),
+        &["asr", "whisper-tiny-en"],
         serde_json::to_vec(&pipeline_input)?,
     )
     .await?;
-    add_to_flow(&client, &args, &flow_id, &eid_transcribe).await?;
+    add_to_flow(client, args, flow_id, eid_transcribe).await?;
     graph_rev += 1;
-    log(&stdout, "transcribe execution created").await;
+    log(stdout, "transcribe execution created").await;
 
-    // Ctrl-C handler: cancel the flow.
-    let cancel_flow_id = flow_id.clone();
-    let cancel_client = client.clone();
-    let cancel_server = args.server.clone();
-    let cancel_stdout = stdout.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = log(&cancel_stdout, "SIGINT — cancelling flow").await;
-            let body = serde_json::json!({
-                "flow_id": cancel_flow_id,
-                "reason": "user_cancelled",
-                "cancellation_policy": "cancel_all",
-                "now": now_ms(),
-            });
-            let url = format!("{cancel_server}/v1/flows/{cancel_flow_id}/cancel");
-            let _ = cancel_client.post(&url).json(&body).send().await;
-            std::process::exit(130);
-        }
-    });
-
-    // Start tailing transcribe immediately (worker may already be running).
+    // Tail transcribe immediately — if we waited until we see the worker
+    // claim it, we'd miss the opening frames on fast transcriptions.
     let tail_transcribe = spawn_tail(
         client.clone(),
         args.server.clone(),
         stdout.clone(),
-        eid_transcribe.clone(),
+        eid_transcribe.to_owned(),
         LABEL_TRANSCRIBE,
     );
 
-    // Wait for transcribe to reach terminal state; read its result and wire
-    // the next stage.
-    let t_state = wait_terminal(&client, &args, &eid_transcribe).await?;
+    let t_state = wait_terminal(client, args, eid_transcribe).await?;
     if t_state != "completed" {
+        tail_transcribe.abort();
         anyhow::bail!("transcribe ended in {t_state}");
     }
-    let t_result: TranscribeResult = fetch_result(&client, &args, &eid_transcribe).await?;
+    let t_result: TranscribeResult = fetch_result(client, args, eid_transcribe).await?;
     log(
-        &stdout,
+        stdout,
         &format!(
             "transcribe done ({} chars, {} ms)",
             t_result.transcript.len(),
@@ -166,22 +202,22 @@ async fn main() -> Result<()> {
     .await;
 
     create_execution(
-        &client,
-        &args,
-        &eid_summarize,
+        client,
+        args,
+        eid_summarize,
         KIND_SUMMARIZE,
-        ["llm", "qwen-500m-q4"].iter().copied().collect(),
+        &["llm", "qwen-500m-q4"],
         serde_json::to_vec(&t_result)?,
     )
     .await?;
-    add_to_flow(&client, &args, &flow_id, &eid_summarize).await?;
+    add_to_flow(client, args, flow_id, eid_summarize).await?;
     graph_rev += 1;
     graph_rev = wire_edge(
-        &client,
-        &args,
-        &flow_id,
-        &eid_transcribe,
-        &eid_summarize,
+        client,
+        args,
+        flow_id,
+        eid_transcribe,
+        eid_summarize,
         graph_rev,
     )
     .await?;
@@ -190,17 +226,19 @@ async fn main() -> Result<()> {
         client.clone(),
         args.server.clone(),
         stdout.clone(),
-        eid_summarize.clone(),
+        eid_summarize.to_owned(),
         LABEL_SUMMARIZE,
     );
 
-    let s_state = wait_terminal(&client, &args, &eid_summarize).await?;
+    let s_state = wait_terminal(client, args, eid_summarize).await?;
     if s_state != "completed" {
+        tail_transcribe.abort();
+        tail_summarize.abort();
         anyhow::bail!("summarize ended in {s_state}");
     }
-    let s_result: SummarizeResult = fetch_result(&client, &args, &eid_summarize).await?;
+    let s_result: SummarizeResult = fetch_result(client, args, eid_summarize).await?;
     log(
-        &stdout,
+        stdout,
         &format!(
             "summarize done ({} tokens, {} chars)",
             s_result.token_count,
@@ -210,42 +248,46 @@ async fn main() -> Result<()> {
     .await;
 
     create_execution(
-        &client,
-        &args,
-        &eid_embed,
+        client,
+        args,
+        eid_embed,
         KIND_EMBED,
-        ["embed", "minilm-l6"].iter().copied().collect(),
+        &["embed", "minilm-l6"],
         serde_json::to_vec(&s_result)?,
     )
     .await?;
-    add_to_flow(&client, &args, &flow_id, &eid_embed).await?;
+    add_to_flow(client, args, flow_id, eid_embed).await?;
     graph_rev += 1;
     graph_rev = wire_edge(
-        &client,
-        &args,
-        &flow_id,
-        &eid_summarize,
-        &eid_embed,
+        client,
+        args,
+        flow_id,
+        eid_summarize,
+        eid_embed,
         graph_rev,
     )
     .await?;
-    let _ = graph_rev; // silence unused on trailing assignment
+    let _ = graph_rev;
 
     let tail_embed = spawn_tail(
         client.clone(),
         args.server.clone(),
         stdout.clone(),
-        eid_embed.clone(),
+        eid_embed.to_owned(),
         LABEL_EMBED,
     );
 
-    let e_state = wait_terminal(&client, &args, &eid_embed).await?;
+    let e_state = wait_terminal(client, args, eid_embed).await?;
     if e_state != "completed" {
+        tail_transcribe.abort();
+        tail_summarize.abort();
+        tail_embed.abort();
         anyhow::bail!("embed ended in {e_state}");
     }
-    log(&stdout, "embed done — pipeline complete").await;
+    log(stdout, "embed done — pipeline complete").await;
 
-    // Drain tails (each exits on closed_at).
+    // Happy path: each tail exits on closed_at. join them so pending
+    // frames flush before we return.
     let _ = tokio::join!(tail_transcribe, tail_summarize, tail_embed);
     Ok(())
 }
@@ -281,13 +323,15 @@ async fn create_execution(
     args: &Args,
     eid: &str,
     kind: &str,
-    capabilities: BTreeSet<&str>,
+    capabilities: &[&str],
     input_payload: Vec<u8>,
 ) -> Result<()> {
-    let caps: Vec<String> = capabilities.iter().map(|s| (*s).to_string()).collect();
+    // Caller supplies a small, already-deduped capability list. Pass it
+    // through directly — no BTreeSet allocation needed; the routing
+    // layer sorts and dedups on its own side.
     let policy = serde_json::json!({
         "routing_requirements": {
-            "required_capabilities": caps,
+            "required_capabilities": capabilities,
         },
     });
     let body = serde_json::json!({
@@ -358,7 +402,6 @@ async fn wire_edge(
     if !status.is_success() {
         anyhow::bail!("stage_edge failed ({status}): {body}");
     }
-    // StageDependencyEdgeResult::Staged { edge_id, new_graph_revision }
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("stage_edge: decode body {body}"))?;
     let new_rev = v
@@ -383,9 +426,10 @@ async fn wire_edge(
 
 /// Poll execution state until it reaches a terminal value. Returns the
 /// terminal state name (`completed`, `failed`, `cancelled`, `expired`).
+/// Uses jittered backoff so concurrent submits don't synchronize their
+/// ZRANGEBYSCORE polls against one lane.
 async fn wait_terminal(client: &Client, args: &Args, eid: &str) -> Result<String> {
     let url = format!("{}/v1/executions/{eid}/state", args.server);
-    let mut last = String::new();
     loop {
         let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
@@ -393,19 +437,22 @@ async fn wait_terminal(client: &Client, args: &Args, eid: &str) -> Result<String
         }
         let v: serde_json::Value = resp.json().await?;
         let state = v.as_str().unwrap_or("unknown").to_owned();
-        if state != last {
-            last = state.clone();
-        }
         match state.as_str() {
             "completed" | "failed" | "cancelled" | "expired" => return Ok(state),
-            _ => tokio::time::sleep(Duration::from_millis(args.poll_ms)).await,
+            _ => jittered_sleep(args.poll_ms).await,
         }
     }
 }
 
 /// Fetch the JSON-decoded completion result through
-/// `GET /v1/executions/{id}/result`. The endpoint returns the raw bytes
-/// written by the worker's `complete(Some(...))` call.
+/// `GET /v1/executions/{id}/result`.
+///
+/// WARNING: the endpoint returns bytes written by the most recent
+/// `ff_complete_execution` call. If retries are configured and an earlier
+/// attempt completed before being invalidated, those bytes would persist
+/// until a newer attempt overwrites them. The media-pipeline example
+/// configures no retries, so reading right after a success poll is
+/// unambiguous; adapt this pattern with care when retries are on.
 async fn fetch_result<T: for<'de> Deserialize<'de>>(
     client: &Client,
     args: &Args,
@@ -428,7 +475,7 @@ fn spawn_tail(
     stdout: Arc<Mutex<Stdout>>,
     eid: String,
     label: &'static str,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut after = "0-0".to_owned();
         loop {
@@ -461,8 +508,6 @@ fn spawn_tail(
                 after = f.id.clone();
                 let ft = f.fields.get("frame_type").cloned().unwrap_or_default();
                 if ft == "result_payload" {
-                    // Don't dump large result blobs into stdout; the CLI
-                    // reports completion elsewhere.
                     continue;
                 }
                 let payload = f.fields.get("payload").cloned().unwrap_or_default();
@@ -501,6 +546,21 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis() as i64
+}
+
+/// Sleep `base` ms plus a uniform 0..=base/2 jitter. Cheap uniform draw
+/// from nanos-of-system-time avoids pulling in a rand dep for this.
+async fn jittered_sleep(base: u64) {
+    let jitter = if base > 1 {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        now_nanos % (base / 2 + 1)
+    } else {
+        0
+    };
+    tokio::time::sleep(Duration::from_millis(base + jitter)).await;
 }
 
 async fn check_ok(resp: reqwest::Response, op: &str) -> Result<()> {

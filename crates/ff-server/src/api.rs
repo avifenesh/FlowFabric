@@ -354,10 +354,18 @@ async fn get_execution_state(
     Ok(Json(server.get_execution_state(&eid).await?))
 }
 
-/// Returns the actionable (pending or active) waitpoints for an execution,
-/// including the HMAC token required to deliver signals. Human reviewers
-/// use this to look up the token that was originally returned to the
-/// suspending worker.
+/// Returns the actionable (`pending`/`active`) waitpoints for an
+/// execution, including the HMAC `waitpoint_token` required to deliver
+/// signals. Human reviewers use this to look up the token originally
+/// returned only to the suspending worker's `SuspendOutcome`.
+///
+/// SECURITY: `waitpoint_token` is a bearer credential for signal
+/// delivery; leaking it lets a third party forge authority to resume or
+/// influence the execution. Gate the endpoint behind `FF_API_TOKEN` in
+/// any deployment reachable from untrusted networks. The auth middleware
+/// only mounts when `FF_API_TOKEN` is set; this endpoint is
+/// unauthenticated without it, and the server logs a loud warning at
+/// startup so operators notice.
 async fn list_pending_waitpoints(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
@@ -366,9 +374,20 @@ async fn list_pending_waitpoints(
     Ok(Json(server.list_pending_waitpoints(&eid).await?))
 }
 
-/// Returns the raw result payload bytes written by
-/// `ff_complete_execution`. 404 when the execution has no stored result
-/// (missing entirely or still in-flight).
+/// Returns the raw result payload bytes written by the worker's
+/// `ff_complete_execution` call. 404 when the execution has no stored
+/// result (missing entirely or still in-flight).
+///
+/// CONTENT-TYPE: `application/octet-stream`. The server is payload-format
+/// agnostic — workers choose the encoding via the SDK's `complete(bytes)`
+/// call, and callers must know the contract. The media-pipeline example
+/// uses JSON by convention (`serde_json::to_vec(&Result)`); adapters can
+/// pick any binary format.
+///
+/// SECURITY: completion payloads can contain PII (e.g. LLM summaries of
+/// user audio). Treat this endpoint like any other read — gate behind
+/// `FF_API_TOKEN` in any deployment reachable from untrusted networks.
+/// The auth middleware only mounts when `FF_API_TOKEN` is set.
 async fn get_execution_result(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,

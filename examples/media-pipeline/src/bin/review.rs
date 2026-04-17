@@ -1,11 +1,29 @@
 //! Review CLI — tail the summarize execution, deliver an HMAC-signed
-//! approval signal when it suspends.
+//! approval signal when it suspends, OR cancel on rejection.
 //!
 //! Demonstrates two Batch B primitives:
 //!   * `GET /v1/executions/{id}/pending-waitpoints` to fetch the token.
 //!   * `POST /v1/executions/{id}/signal` with the HMAC-bound token. The
 //!     `--tamper-token` flag mutates the token before send so the user
 //!     can watch the server reject it with `invalid_token`.
+//!
+//! # v1 decision protocol: approve = signal, reject = cancel
+//!
+//! ff-sdk does not surface the resume signal's payload to the re-claimed
+//! worker, so the summarize worker cannot distinguish approve vs reject
+//! by inspecting the signal on resume. Instead this CLI uses the control
+//! plane to differentiate:
+//!
+//!   * `--approve` (or interactive `y`) → POST /signal (HMAC-authenticated).
+//!     Engine fulfils the waitpoint → summarize worker re-claims → reads
+//!     the persisted `summary_final` frame → `complete()`.
+//!
+//!   * `--reject <reason>` (or interactive `n`) → POST /cancel. The
+//!     execution transitions to terminal cancelled; no signal is sent
+//!     and no re-claim occurs.
+//!
+//! Tracked as a Batch C follow-up: "Expose resume signal payload on
+//! ClaimedTask so workers can route approve vs reject in-band".
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -43,6 +61,9 @@ struct Args {
     #[arg(long)]
     tamper_token: bool,
 
+    /// Base poll interval for state polling. Actual sleep is
+    /// `poll_ms` plus a uniform 0..=poll_ms/2 jitter so multiple
+    /// reviewers don't synchronize ZRANGEBYSCORE hits.
     #[arg(long, default_value_t = 1000)]
     poll_ms: u64,
 }
@@ -61,6 +82,11 @@ async fn main() -> Result<()> {
 
     println!("[review] tailing {} — waiting for suspend", args.execution_id);
 
+    // Look up the current attempt so the tail hits the right stream key.
+    // Summarize has no retry policy in this example so attempt_index = 0,
+    // but the pattern is correct for downstream adopters that do retry.
+    let current_attempt = fetch_current_attempt_index(&client, &args).await?;
+
     // Tail summary tokens while polling state. Both run concurrently so
     // the reviewer sees the incremental summary before the prompt fires.
     let tail_eid = args.execution_id.clone();
@@ -70,7 +96,7 @@ async fn main() -> Result<()> {
         let mut after = "0-0".to_owned();
         loop {
             let url = format!(
-                "{tail_server}/v1/executions/{tail_eid}/attempts/0/stream/tail?after={after}&block_ms=3000&limit=100"
+                "{tail_server}/v1/executions/{tail_eid}/attempts/{current_attempt}/stream/tail?after={after}&block_ms=3000&limit=100"
             );
             let resp = match tail_client.get(&url).send().await {
                 Ok(r) => r,
@@ -106,67 +132,106 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Poll for suspend.
-    wait_for_state(&client, &args, "suspended").await?;
-    println!("[review] execution suspended — fetching waitpoint token");
+    // Wait for either the suspend we expect, or (rare) an already-completed
+    // execution because a peer reviewer beat us to the approval. Terminal
+    // "completed" is an OK outcome — the pipeline moved on without us.
+    match wait_for_review_window(&client, &args).await? {
+        ReviewOutcome::Suspended => {
+            println!("[review] execution suspended — fetching waitpoint token");
+        }
+        ReviewOutcome::AlreadyCompleted => {
+            println!(
+                "[review] execution already completed — another reviewer beat us; exiting 0"
+            );
+            drain_and_stop(tail).await;
+            return Ok(());
+        }
+    }
 
     let waitpoints = fetch_pending_waitpoints(&client, &args).await?;
+    // NOTE: the server already scopes the /pending-waitpoints response to
+    // the execution_id in the URL (see Server::list_pending_waitpoints).
+    // No client-side re-check needed; listing the waitpoint's
+    // execution_id here would be cosmetic.
     let wp = waitpoints
         .into_iter()
         .find(|w| w.state == "active" || w.state == "pending")
         .context("no active waitpoint after suspended state")?;
 
-    let token = if args.tamper_token {
-        tamper(&wp.waitpoint_token)
-    } else {
-        wp.waitpoint_token.clone()
-    };
-
     let decision = prompt_decision(&args)?;
-    let signal_payload = serde_json::to_vec(&decision)?;
-
-    let body = serde_json::json!({
-        "execution_id": args.execution_id,
-        "waitpoint_id": wp.waitpoint_id,
-        "signal_id": uuid::Uuid::new_v4().to_string(),
-        "signal_name": SIGNAL_NAME_APPROVAL,
-        "signal_category": "human_review",
-        "source_type": "human",
-        "source_identity": "reviewer",
-        "payload": signal_payload,
-        "payload_encoding": "json",
-        "target_scope": "execution",
-        "waitpoint_token": token,
-        "now": now_ms(),
-    });
-
-    let url = format!("{}/v1/executions/{}/signal", args.server, args.execution_id);
-    let resp = client.post(&url).json(&body).send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
-    if args.tamper_token {
-        if status.is_success() {
-            eprintln!("[review] FAIL — tampered token was accepted: {text}");
-            std::process::exit(1);
-        }
-        println!("[review] tampered token rejected ({status}): {text}");
-        // Expected path — stop tailing since no resume will happen.
-        tail.abort();
-        return Ok(());
-    }
-
-    if !status.is_success() {
-        anyhow::bail!("signal delivery failed ({status}): {text}");
-    }
-    println!("[review] signal delivered: {text}");
 
     match decision {
         ApprovalDecision::Approve => {
+            let token = if args.tamper_token {
+                tamper(&wp.waitpoint_token)
+            } else {
+                wp.waitpoint_token.clone()
+            };
+            let signal_payload = serde_json::to_vec(&ApprovalDecision::Approve)?;
+            let body = serde_json::json!({
+                "execution_id": args.execution_id,
+                "waitpoint_id": wp.waitpoint_id,
+                "signal_id": uuid::Uuid::new_v4().to_string(),
+                "signal_name": SIGNAL_NAME_APPROVAL,
+                "signal_category": "human_review",
+                "source_type": "human",
+                "source_identity": "reviewer",
+                "payload": signal_payload,
+                "payload_encoding": "json",
+                "target_scope": "execution",
+                "waitpoint_token": token,
+                "now": now_ms(),
+            });
+
+            let url = format!("{}/v1/executions/{}/signal", args.server, args.execution_id);
+            let resp = client.post(&url).json(&body).send().await?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+
+            if args.tamper_token {
+                if status.is_success() {
+                    eprintln!("[review] FAIL — tampered token was accepted: {text}");
+                    std::process::exit(1);
+                }
+                println!("[review] tampered token rejected ({status}): {text}");
+                println!("[review] ── tail aborted: tamper-reject path ──");
+                drain_and_stop(tail).await;
+                return Ok(());
+            }
+
+            if !status.is_success() {
+                anyhow::bail!("signal delivery failed ({status}): {text}");
+            }
+            println!("[review] signal delivered: {text}");
             println!("[review] waiting for summarize to complete");
         }
-        ApprovalDecision::Reject { .. } => {
-            println!("[review] rejected — summarize will not resume");
+        ApprovalDecision::Reject { reason } => {
+            // v1 protocol: reject → /cancel, not /signal. ff-sdk does not
+            // surface the resume signal's payload to the summarize worker
+            // on re-claim, so approve vs reject cannot be disambiguated
+            // via the signal. Cancelling the execution is unambiguous:
+            // the worker never re-claims, the flow sees a terminal
+            // cancelled, and downstream edges skip.
+            if args.tamper_token {
+                eprintln!("[review] --tamper-token is approve-only; reject goes through /cancel");
+                std::process::exit(1);
+            }
+            let body = serde_json::json!({
+                "execution_id": args.execution_id,
+                "reason": reason,
+                "source": "reviewer",
+                "now": now_ms(),
+            });
+            let url = format!("{}/v1/executions/{}/cancel", args.server, args.execution_id);
+            let resp = client.post(&url).json(&body).send().await?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("cancel failed ({status}): {text}");
+            }
+            println!("[review] rejected — execution cancelled: {text}");
+            drain_and_stop(tail).await;
+            return Ok(());
         }
     }
 
@@ -188,7 +253,19 @@ fn build_http(token: &Option<String>) -> Result<Client> {
     Ok(builder.build()?)
 }
 
-async fn wait_for_state(client: &Client, args: &Args, want: &str) -> Result<()> {
+/// Possible outcomes of polling the target execution before the prompt.
+enum ReviewOutcome {
+    Suspended,
+    /// A concurrent reviewer approved the execution between polls, so
+    /// state transitioned through `suspended → runnable → completed`
+    /// before we sampled. Not an error — the pipeline moved on.
+    AlreadyCompleted,
+}
+
+/// Poll state until we either see `suspended` (do the review) or
+/// `completed` (peer reviewer beat us). Other terminal states are a real
+/// error because they imply the execution ended without human review.
+async fn wait_for_review_window(client: &Client, args: &Args) -> Result<ReviewOutcome> {
     let url = format!("{}/v1/executions/{}/state", args.server, args.execution_id);
     loop {
         let resp = client.get(&url).send().await?;
@@ -197,14 +274,35 @@ async fn wait_for_state(client: &Client, args: &Args, want: &str) -> Result<()> 
         }
         let v: serde_json::Value = resp.json().await?;
         let s = v.as_str().unwrap_or("unknown");
-        if s == want {
-            return Ok(());
+        match s {
+            "suspended" => return Ok(ReviewOutcome::Suspended),
+            "completed" => return Ok(ReviewOutcome::AlreadyCompleted),
+            "failed" | "cancelled" | "expired" => {
+                anyhow::bail!(
+                    "execution ended in terminal state '{s}' before reaching suspended"
+                );
+            }
+            _ => jittered_sleep(args.poll_ms).await,
         }
-        if matches!(s, "completed" | "failed" | "cancelled" | "expired") {
-            anyhow::bail!("execution ended in terminal state '{s}' before reaching '{want}'");
-        }
-        tokio::time::sleep(Duration::from_millis(args.poll_ms)).await;
     }
+}
+
+async fn fetch_current_attempt_index(client: &Client, args: &Args) -> Result<u32> {
+    #[derive(Deserialize)]
+    struct ExecInfo {
+        #[serde(default)]
+        current_attempt_index: u32,
+    }
+    let url = format!("{}/v1/executions/{}", args.server, args.execution_id);
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "get execution failed: {} — review needs the current attempt index",
+            resp.status()
+        );
+    }
+    let info: ExecInfo = resp.json().await?;
+    Ok(info.current_attempt_index)
 }
 
 async fn fetch_pending_waitpoints(client: &Client, args: &Args) -> Result<Vec<PendingWaitpoint>> {
@@ -250,18 +348,19 @@ fn prompt_decision(args: &Args) -> Result<ApprovalDecision> {
     }
 }
 
-/// Flip the last hex char of the token so the HMAC fails validation.
+/// Guaranteed-different tamper: XOR the lowest bit of the last byte.
+///
+/// `waitpoint_token` is HMAC-SHA1 output (40 ASCII hex chars). Flipping
+/// the low bit of a hex char always produces a different hex char in the
+/// same charset (`0`↔`1`, `2`↔`3`, …, `a`↔`b`, …), so the resulting
+/// token is both distinct and valid hex — the server rejects on HMAC
+/// comparison, not on format parsing.
 fn tamper(token: &str) -> String {
-    let mut chars: Vec<char> = token.chars().collect();
-    if let Some(last) = chars.last_mut() {
-        *last = match *last {
-            'a' => 'b',
-            'A' => 'B',
-            '0' => '1',
-            _ => '0',
-        };
+    let mut bytes = token.as_bytes().to_vec();
+    if let Some(last) = bytes.last_mut() {
+        *last ^= 0x01;
     }
-    chars.into_iter().collect()
+    String::from_utf8(bytes).unwrap_or_else(|_| token.to_owned())
 }
 
 fn now_ms() -> i64 {
@@ -269,6 +368,30 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis() as i64
+}
+
+/// Base + uniform 0..=base/2 jitter. Shares the cheap-uniform-from-nanos
+/// trick from submit.rs to avoid pulling in a rand dep.
+async fn jittered_sleep(base: u64) {
+    let jitter = if base > 1 {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        now_nanos % (base / 2 + 1)
+    } else {
+        0
+    };
+    tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+}
+
+/// Let the spawned tail finish processing any in-flight frames, then
+/// abort it. Flushes any buffered payload lines to stdout so we don't
+/// drop frames on the floor. Bounded by the tail's own block_ms.
+async fn drain_and_stop(tail: tokio::task::JoinHandle<()>) {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tail.abort();
+    let _ = tail.await;
 }
 
 // ── Wire types ────────────────────────────────────────────────────────
