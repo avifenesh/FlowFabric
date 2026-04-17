@@ -28,8 +28,9 @@ submit CLI                FlowFabric Server            Worker
     |    [suspended]             |                         |
     |                            |                         |
 approve CLI                      |                         |
-    |--- POST signal ----------->|                         |
-    |    (approved: true)        |---- resume ------------>|
+    |--- POST signal+hmac ------>|                         |
+    |    (approved: true,        |                         |
+    |     waitpoint_token=k1:..) |---- resume ------------>|
     |                            |<--- claim_next() ------|
     |                            |<--- complete() --------|
     |    [completed]             |                         |
@@ -95,28 +96,47 @@ Created execution: a1b2c3d4-...
 [state] waiting
 [state] running
 [state] suspended
-Awaiting review. Use:
-  cargo run --bin approve -- --execution-id a1b2c3d4-... --waitpoint-id e5f6g7h8-... --approve
+```
+
+Meanwhile the worker's stdout prints the review prompt along with the HMAC
+waitpoint token that the approval signal must carry (RFC-004 §Waitpoint
+Security):
+
+```
+REVIEW NEEDED: execution_id=a1b2c3d4-... waitpoint_id=e5f6g7h8-...
+WAITPOINT_TOKEN=k1:9a7b3e...
+  cargo run --bin approve -- --execution-id a1b2c3d4-... --waitpoint-id e5f6g7h8-... --waitpoint-token k1:9a7b3e... --approve
 ```
 
 ### Approve or reject
 
-Approve the patch:
+Approve the patch (the `--waitpoint-token` value is the string printed by
+the worker on suspend):
 
 ```bash
 cargo run --bin approve -- \
   --execution-id a1b2c3d4-... \
   --waitpoint-id e5f6g7h8-... \
+  --waitpoint-token k1:9a7b3e... \
   --approve
 ```
 
-Or reject with feedback:
+Or reject with feedback — no token needed, reject goes through
+`/v1/executions/{id}/cancel` and does not deliver a signal:
 
 ```bash
 cargo run --bin approve -- \
   --execution-id a1b2c3d4-... \
   --waitpoint-id e5f6g7h8-... \
   --reject --feedback "needs edge case handling for empty strings"
+```
+
+A reviewer who doesn't see the worker's stdout can fetch the token from
+the server instead:
+
+```bash
+curl http://localhost:9090/v1/executions/a1b2c3d4-.../pending-waitpoints
+# [{"waitpoint_id":"e5f6g7h8-...","waitpoint_token":"k1:9a7b3e...",...}]
 ```
 
 After approval, the worker re-claims the execution and completes it. The submit CLI shows:
@@ -141,6 +161,6 @@ Task completed!
 
 **worker**: `--host`, `--port`, `--api-key`, `--model`, `--namespace`, `--lane`
 
-**approve**: `--server`, `--execution-id`, `--waitpoint-id`, `--approve`, `--reject`, `--feedback`
+**approve**: `--server`, `--execution-id`, `--waitpoint-id`, `--waitpoint-token`, `--approve`, `--reject`, `--feedback`
 
 Run any binary with `--help` for full details.

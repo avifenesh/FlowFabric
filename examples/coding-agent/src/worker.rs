@@ -281,12 +281,23 @@ async fn process_task(
             )
             .await
         {
-            Ok(SuspendOutcome::Suspended { waitpoint_id, .. }) => {
+            Ok(SuspendOutcome::Suspended {
+                waitpoint_id,
+                waitpoint_token,
+                ..
+            }) => {
                 println!(
                     "REVIEW NEEDED: execution_id={eid} waitpoint_id={waitpoint_id}"
                 );
+                // Use .as_str() — `WaitpointToken`'s Display impl is
+                // redacted for log safety (RFC-004 §Waitpoint Security),
+                // which would print `<redacted>` here. The approve CLI
+                // needs the raw kid:hex so it can re-submit the HMAC.
+                // Matches the media-pipeline convention.
+                println!("WAITPOINT_TOKEN={}", waitpoint_token.as_str());
                 println!(
-                    "  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --approve"
+                    "  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --waitpoint-token {} --approve",
+                    waitpoint_token.as_str()
                 );
             }
             Ok(SuspendOutcome::AlreadySatisfied { .. }) => {
