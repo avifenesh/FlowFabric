@@ -1,0 +1,16 @@
+# cargo-audit ignore list.
+#
+# Mirrors the `[advisories] ignore` list in deny.toml so a single PR
+# can land an ignore in both places. Each entry MUST carry a
+# justification comment matching deny.toml's.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0097 — rand 0.8 unsoundness via custom logger +
+    # `rand::rng()`. Reached transitively through
+    # tower 0.4.13 → tonic 0.12.3 → opentelemetry-otlp → telemetrylib
+    # → ferriskey. FlowFabric uses the default tracing subscriber
+    # (no custom logger), so the trigger condition does not apply.
+    # Remove when opentelemetry-otlp upgrades to tonic ≥0.13.
+    "RUSTSEC-2026-0097",
+]

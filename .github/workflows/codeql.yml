@@ -1,11 +1,38 @@
 name: CodeQL
 
 on:
+  # paths-ignore skips CodeQL on doc-only changes. The scheduled
+  # weekly run (cron below) continues to cover main regardless, so
+  # there is no security-analysis blind spot for doc-heavy weeks.
+  # Branch protection should require `codeql-complete` (the sentinel
+  # at the bottom) rather than the individual Analyze jobs.
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
   schedule:
     - cron: "0 6 * * 1"
+
+# Workflow-level default matches the sentinel job. The `analyze` job
+# widens to `actions: read` + `security-events: write` as it needs
+# both (read the workflow run metadata + upload the SARIF).
+permissions:
+  contents: read
 
 jobs:
   analyze:
@@ -22,18 +49,42 @@ jobs:
         language: [actions, rust]
 
     steps:
-      - uses: actions/checkout@v4
+      # Action pins track supply-chain hardening (CodeQL's own
+      # security-and-quality rule). Tag comments name the version each
+      # SHA resolves to — refresh via `gh api repos/<owner>/<repo>/
+      # git/ref/tags/<tag>` and dereference annotated tags.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a  # v3.35.2
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a  # v3.35.2
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a  # v3.35.2
         with:
           category: "/language:${{ matrix.language }}"
+
+  # Always-runs sentinel. Branch protection should require
+  # `codeql-complete` — not the per-language Analyze jobs — so
+  # paths-ignore skips and scheduled runs both report a single
+  # stable required check. `needs.analyze.result` is `skipped` when
+  # the path filter matches and `success` on a clean analysis.
+  codeql-complete:
+    name: codeql-complete
+    needs: analyze
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate analysis result
+        env:
+          ANALYZE_RESULT: ${{ needs.analyze.result }}
+        run: |
+          case "$ANALYZE_RESULT" in
+            success|skipped) echo "analyze: $ANALYZE_RESULT — ok"; exit 0 ;;
+            *) echo "analyze: $ANALYZE_RESULT — blocking merge" >&2; exit 1 ;;
+          esac

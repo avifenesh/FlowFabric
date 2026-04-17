@@ -1,0 +1,9 @@
+# Keep the directory tracked; drop in-flight + editor junk. Committed
+# reports live under per-release subdirectories (v0.1.0/, v0.1.1/, ...).
+# The top-level *.json files are transient: each `cargo bench` invocation
+# rewrites the one for the current sha, and check-release.sh copies the
+# approved run into the version subdir. Ignoring them here prevents
+# accidental commits of CI-workstation transients.
+*.tmp
+*.swp
+/*.json

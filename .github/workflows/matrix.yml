@@ -1,0 +1,217 @@
+name: Matrix CI
+
+# Cross-host + cross-Valkey-version + cross-mode verification.
+#
+# Matrix coverage (9 jobs):
+#
+#   linux x86_64  × valkey 7.2    × standalone   → ubuntu-latest
+#   linux x86_64  × valkey 7.2    × cluster      → ubuntu-latest
+#   linux x86_64  × valkey latest × standalone   → ubuntu-latest
+#   linux x86_64  × valkey latest × cluster      → ubuntu-latest
+#   linux arm64   × valkey 7.2    × standalone   → ubuntu-24.04-arm
+#   linux arm64   × valkey 7.2    × cluster      → ubuntu-24.04-arm
+#   linux arm64   × valkey latest × standalone   → ubuntu-24.04-arm
+#   linux arm64   × valkey latest × cluster      → ubuntu-24.04-arm
+#   macos arm64   × valkey latest × standalone   → macos-latest
+#
+# Mac arm64 validates Apple Silicon Rust correctness on the latest
+# Valkey release; the 7.2 × mac combination is intentionally skipped
+# because Homebrew does not package 7.2 and docker-on-mac on GitHub
+# runners is flaky under privileged-mode requirements. x86_64 mac is
+# NOT in the matrix: GitHub's Intel runner (macos-13) is EOL December
+# 2025, and x86_64 Rust correctness is already validated through
+# ubuntu-latest. Linux covers the full Valkey version matrix where we
+# actually deploy.
+
+on:
+  # `paths-ignore` drops doc-only PRs from CI entirely (the matrix
+  # never schedules). The sentinel `matrix-tests-complete` job below
+  # always reports success so branch protection — which must list the
+  # sentinel (NOT the matrix job directly) as required — still
+  # accepts the PR. Duplicated across push + pull_request because
+  # GitHub Actions does not support YAML anchors in workflow files.
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rfcs/**'
+      - 'LICENSE*'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+# Least-privilege default. The matrix jobs only read the repo for
+# build/test; nothing here mutates status, comments, or artifacts.
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: ${{ matrix.host.os }} · valkey ${{ matrix.valkey.version }} · ${{ matrix.mode }}
+    runs-on: ${{ matrix.host.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          - { os: ubuntu-latest,    kind: linux, arch: x86_64 }
+          - { os: ubuntu-24.04-arm, kind: linux, arch: arm64 }
+          - { os: macos-latest,     kind: mac,   arch: arm64 }
+        valkey:
+          - { version: "7.2",    image: "valkey/valkey:7.2" }
+          - { version: "latest", image: "valkey/valkey:latest" }
+        mode: [standalone, cluster]
+        exclude:
+          # Mac: latest Valkey only, standalone only. Homebrew has no
+          # 7.2 formula + docker-on-mac cluster setup is unsupported on
+          # GitHub hosted runners. x86_64 mac coverage is intentionally
+          # omitted — GitHub's Intel runner (macos-13) is EOL December
+          # 2025; x86_64 correctness is validated through ubuntu-latest.
+          - host: { os: macos-latest, kind: mac, arch: arm64 }
+            valkey: { version: "7.2", image: "valkey/valkey:7.2" }
+          - host: { os: macos-latest, kind: mac, arch: arm64 }
+            mode: cluster
+
+    steps:
+      # Third-party actions pinned to commit SHAs (CodeQL
+      # security-and-quality rule + supply-chain hardening). Tag
+      # comments name the version each SHA points at; refresh by
+      # running `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` and
+      # dereferencing annotated tags to commit type. If the pin lands
+      # on a lightweight tag, ref/tags returns the commit directly.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+        with:
+          key: ${{ matrix.host.os }}-${{ matrix.valkey.version }}-${{ matrix.mode }}
+
+      # ── Valkey setup ──────────────────────────────────────────────
+
+      - name: Start Valkey (linux · standalone)
+        if: matrix.host.kind == 'linux' && matrix.mode == 'standalone'
+        env:
+          VALKEY_IMAGE: ${{ matrix.valkey.image }}
+        run: |
+          docker run -d --name valkey \
+            -p 6379:6379 \
+            --health-cmd 'valkey-cli ping' --health-interval 3s --health-retries 10 \
+            "$VALKEY_IMAGE" \
+            valkey-server --save "" --appendonly no
+          for _ in $(seq 1 30); do
+            if docker exec valkey valkey-cli ping 2>/dev/null | grep -q PONG; then
+              echo "valkey ready"; break
+            fi
+            sleep 1
+          done
+
+      - name: Start Valkey cluster (linux)
+        if: matrix.host.kind == 'linux' && matrix.mode == 'cluster'
+        env:
+          VALKEY_IMAGE: ${{ matrix.valkey.image }}
+        # docker compose v2 auto-discovers compose.yaml / compose.yml /
+        # docker-compose.yml only; our descriptive filename needs `-f`.
+        run: |
+          docker compose -f .github/cluster/docker-compose.cluster.yml up -d
+          sudo apt-get update -qq && sudo apt-get install -yqq redis-tools
+          bash .github/cluster/bootstrap.sh
+
+      - name: Start Valkey (mac · standalone)
+        if: matrix.host.kind == 'mac'
+        run: |
+          brew update
+          brew install valkey
+          valkey-server --daemonize yes --port 6379 --save "" --appendonly no
+          for _ in $(seq 1 30); do
+            if valkey-cli ping 2>/dev/null | grep -q PONG; then
+              echo "valkey ready"; break
+            fi
+            sleep 1
+          done
+
+      # ── Verification steps ────────────────────────────────────────
+
+      - name: cargo check
+        run: cargo check --workspace --all-features
+
+      - name: cargo clippy
+        run: |
+          cargo clippy \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server -p ff-test \
+            --features ff-sdk/insecure-direct-claim \
+            -- -D warnings
+
+      - name: Unit tests
+        env:
+          FF_HOST: 127.0.0.1
+          FF_PORT: ${{ matrix.mode == 'cluster' && '7000' || '6379' }}
+          FF_CLUSTER: ${{ matrix.mode == 'cluster' && '1' || '0' }}
+        run: |
+          cargo test \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server \
+            --features ff-sdk/insecure-direct-claim
+
+      - name: Integration tests (serial)
+        env:
+          FF_HOST: 127.0.0.1
+          FF_PORT: ${{ matrix.mode == 'cluster' && '7000' || '6379' }}
+          FF_CLUSTER: ${{ matrix.mode == 'cluster' && '1' || '0' }}
+        run: |
+          cargo test -p ff-test -- --test-threads=1
+
+      # ── Diagnostics on failure ────────────────────────────────────
+
+      - name: Dump Valkey logs (linux · standalone)
+        if: failure() && matrix.host.kind == 'linux' && matrix.mode == 'standalone'
+        run: docker logs valkey 2>&1 | tail -200 || true
+
+      - name: Dump Valkey cluster logs (linux · cluster)
+        if: failure() && matrix.host.kind == 'linux' && matrix.mode == 'cluster'
+        run: |
+          docker compose -f .github/cluster/docker-compose.cluster.yml logs --tail=80 2>&1 || true
+
+  # Always-runs sentinel. Branch protection should list
+  # `matrix-tests-complete` as the required status check — NOT the
+  # per-matrix-job name — so a doc-only PR (which skips the matrix via
+  # paths-ignore) still reports a green required check and can merge.
+  # `needs.matrix.result` is `skipped` when the matrix was filtered out
+  # by paths-ignore, `success` on a clean run, `failure` / `cancelled`
+  # otherwise. `if: always()` keeps the job on the run graph even when
+  # the matrix is skipped.
+  matrix-tests-complete:
+    name: matrix-tests-complete
+    needs: matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate matrix result
+        env:
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+        run: |
+          case "$MATRIX_RESULT" in
+            success|skipped) echo "matrix: $MATRIX_RESULT — ok"; exit 0 ;;
+            *) echo "matrix: $MATRIX_RESULT — blocking merge" >&2; exit 1 ;;
+          esac

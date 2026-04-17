@@ -1,0 +1,31 @@
+[package]
+name = "ff-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "submit_claim_complete"
+harness = false
+path = "benches/submit_claim_complete.rs"
+
+[dependencies]
+ff-core = { path = "../../crates/ff-core" }
+ff-sdk = { path = "../../crates/ff-sdk", features = ["insecure-direct-claim"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["async_tokio", "html_reports"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

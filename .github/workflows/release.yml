@@ -1,0 +1,208 @@
+# Tag-triggered release: verify -> publish -> GitHub Release.
+#
+# Trigger:
+#   - push of a tag matching `v*.*.*` (produced by `cargo release`).
+#   - manual `workflow_dispatch` with `dry_run: true` for safe rehearsal.
+#     When dry_run is true, the workflow runs the verify gate but SKIPS
+#     the actual publish + GH release steps, so an operator can walk
+#     through the flow on any branch without touching crates.io.
+#
+# Pre-requisites that MUST be configured before the first real tag push:
+#   - Secret CARGO_REGISTRY_TOKEN (Settings -> Secrets -> Actions).
+#     Generate at https://crates.io/me -> API Tokens with scope
+#     `publish-new` + `publish-update`.
+#   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
+#
+# Publish set (8 crates, topologically ordered):
+#   telemetrylib -> ferriskey -> ff-core -> ff-script -> ff-engine
+#     -> ff-scheduler -> ff-sdk -> ff-server
+# ff-test is dev-only (publish = false) and not in the set.
+#
+# Partial-publish recovery:
+#   If publish succeeds for crate N but fails for crate N+1, the workflow
+#   fails the job and logs an explicit recovery message. Operator must:
+#     1. `cargo yank --version <X.Y.Z> <crate>` for every crate that got
+#        published.
+#     2. Fix the root cause on a hotfix branch.
+#     3. Re-tag as <X.Y.(Z+1)> -- crates.io rejects re-publishing a
+#        yanked version under the same number.
+#   See docs/RELEASING.md for step-by-step.
+#
+# Security note:
+#   Every GHA expression that references a branch/tag/input is read into
+#   an env var first and then the shell reads the env var. This avoids
+#   the `${{ github.* }}` shell-injection class (see
+#   https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run verify only; skip publish + GH release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least-privilege default. `verify` + `publish` only need read; the
+# `release` job overrides with `contents: write` so `gh release create`
+# can push the release and upload notes.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (check + clippy + tests)
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:7.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      FF_HOST: localhost
+      FF_PORT: "6379"
+    steps:
+      # Third-party action pins — see matrix.yml for the resolve-and-
+      # update procedure. Tag comments name the version each SHA
+      # dereferences to.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+      - name: cargo check
+        run: cargo check --workspace
+      - name: cargo clippy
+        run: |
+          cargo clippy \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server -p ff-test \
+            --features ff-sdk/insecure-direct-claim \
+            -- -D warnings
+      - name: unit tests
+        run: |
+          cargo test \
+            -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
+            -p ff-sdk -p ff-server \
+            --features ff-sdk/insecure-direct-claim
+      - name: e2e tests (serial)
+        run: cargo test -p ff-test -- --test-threads=1
+
+  publish:
+    name: Publish crates
+    needs: verify
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      # Ordering respects path->version deps. telemetrylib is the root of
+      # the ferriskey subtree; ferriskey depends on it. ff-script, ff-sdk,
+      # ff-server, ff-engine, ff-scheduler, ff-test all depend on
+      # ferriskey. ff-core is a leaf. ff-server closes the chain.
+      # `--no-verify` is safe because `verify` already built + clippied +
+      # tested the same ref. Without it every `cargo publish` re-builds
+      # from scratch.
+      - name: publish telemetrylib
+        run: |
+          cargo publish -p telemetrylib --no-verify || {
+            echo "::error::cargo publish telemetrylib failed -- no crates published yet, safe to re-tag"
+            exit 1
+          }
+      - name: wait for index propagation
+        run: sleep 30
+      - name: publish ferriskey
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ferriskey --no-verify || {
+            echo "::error::cargo publish ferriskey failed -- yank telemetrylib@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
+      - name: publish ff-core
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ff-core --no-verify || {
+            echo "::error::cargo publish ff-core failed -- yank telemetrylib,ferriskey@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
+      - name: publish ff-script
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ff-script --no-verify || {
+            echo "::error::cargo publish ff-script failed -- yank telemetrylib,ferriskey,ff-core@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
+      - name: publish ff-engine
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ff-engine --no-verify || {
+            echo "::error::cargo publish ff-engine failed -- yank telemetrylib,ferriskey,ff-core,ff-script@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
+      - name: publish ff-scheduler
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ff-scheduler --no-verify || {
+            echo "::error::cargo publish ff-scheduler failed -- yank telemetrylib,ferriskey,ff-core,ff-script,ff-engine@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
+      - name: publish ff-sdk
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ff-sdk --no-verify || {
+            echo "::error::cargo publish ff-sdk failed -- yank telemetrylib,ferriskey,ff-core,ff-script,ff-engine,ff-scheduler@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+      - run: sleep 30
+      - name: publish ff-server
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo publish -p ff-server --no-verify || {
+            echo "::error::cargo publish ff-server failed -- yank telemetrylib,ferriskey,ff-core,ff-script,ff-engine,ff-scheduler,ff-sdk@${TAG_VERSION#v} before re-tagging"
+            exit 1
+          }
+
+  release:
+    name: Create GitHub Release
+    needs: publish
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: gh release create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --generate-notes

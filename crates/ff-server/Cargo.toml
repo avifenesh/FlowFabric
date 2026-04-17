@@ -8,14 +8,12 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "FlowFabric server binary"
+description = "FlowFabric server library and HTTP binary"
 
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }
 ff-engine = { workspace = true }
-ff-scheduler = { workspace = true }
-ff-sdk = { workspace = true }
 ferriskey = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 tracing = { workspace = true }
