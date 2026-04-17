@@ -82,11 +82,15 @@ jobs:
   codeql-gate:
     name: CodeQL gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Big enough to cover the slow side of CodeQL's Rust autobuild
+    # (~15–25 min cold, under 5 min hot cache) plus startup overhead.
+    # Keep some slack under the job timeout so polling can report the
+    # timeout with a useful message before the job is hard-killed.
+    timeout-minutes: 35
     # This job exists so branch protection can gate merges on CodeQL's
     # status without changing codeql.yml's schedule triggers. It polls
     # the companion CodeQL workflow run for the same SHA and waits for
-    # success. If codeql is still running past the timeout, this job
+    # success. If codeql is still running past the deadline, this job
     # fails — PR author re-runs when codeql finishes.
     steps:
       - uses: actions/checkout@v4
@@ -97,28 +101,52 @@ jobs:
           # SHA-1 hex strings, not user-controlled text.
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          deadline=$(( $(date +%s) + 480 ))
+          # Total deadline for CodeQL to finish: 30 min. Rust autobuild
+          # in CodeQL can take 10–20 min cold and ~3 min hot; the first
+          # failed run we saw capped out at 8m22s which was below the
+          # steady-state runtime. Poll every 20s so we react quickly
+          # without pounding the gh API — 90 polls over 30 min.
+          #
+          # First 2 min are an additional "scheduler grace" bucket: if
+          # codeql.yml hasn't even picked up the SHA yet (race between
+          # push-event scheduling and this job starting), we log it as
+          # "pending scheduler" and keep waiting. Only after the main
+          # deadline elapses do we fail.
+          start=$(date +%s)
+          deadline=$(( start + 1800 ))
+
           while :; do
             runs_json=$(gh run list \
               --workflow=codeql.yml \
               --commit="$HEAD_SHA" \
               --limit 1 \
               --json status,conclusion)
-            status=$(echo "$runs_json" | jq -r '.[0].status // "queued"')
-            conclusion=$(echo "$runs_json" | jq -r '.[0].conclusion // ""')
-            echo "codeql @ $HEAD_SHA: status=$status conclusion=$conclusion"
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "CodeQL passed"; exit 0
+
+            # `gh run list` with no matches returns `[]`. Distinguish
+            # "no run yet" from "queued/in_progress run" so the log is
+            # readable when something is stuck.
+            count=$(echo "$runs_json" | jq 'length')
+            if [ "$count" -eq 0 ]; then
+              echo "codeql @ $HEAD_SHA: no run scheduled yet (waiting for dispatcher)"
+            else
+              status=$(echo "$runs_json" | jq -r '.[0].status')
+              conclusion=$(echo "$runs_json" | jq -r '.[0].conclusion // ""')
+              echo "codeql @ $HEAD_SHA: status=$status conclusion=$conclusion"
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" = "success" ]; then
+                  echo "CodeQL passed"
+                  exit 0
+                fi
+                echo "CodeQL finished with conclusion=$conclusion" >&2
+                exit 1
               fi
-              echo "CodeQL finished with conclusion=$conclusion" >&2
-              exit 1
             fi
+
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "timeout waiting for CodeQL" >&2
+              echo "timeout waiting for CodeQL after ~30 min" >&2
               exit 1
             fi
-            sleep 15
+            sleep 20
           done
 
   machete:

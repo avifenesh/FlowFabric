@@ -99,11 +99,12 @@ jobs:
         if: matrix.host.kind == 'linux' && matrix.mode == 'cluster'
         env:
           VALKEY_IMAGE: ${{ matrix.valkey.image }}
+        # docker compose v2 auto-discovers compose.yaml / compose.yml /
+        # docker-compose.yml only; our descriptive filename needs `-f`.
         run: |
-          cd .github/cluster
-          docker compose up -d
+          docker compose -f .github/cluster/docker-compose.cluster.yml up -d
           sudo apt-get update -qq && sudo apt-get install -yqq redis-tools
-          bash bootstrap.sh
+          bash .github/cluster/bootstrap.sh
 
       - name: Start Valkey (mac · standalone)
         if: matrix.host.kind == 'mac'
@@ -159,5 +160,4 @@ jobs:
       - name: Dump Valkey cluster logs (linux · cluster)
         if: failure() && matrix.host.kind == 'linux' && matrix.mode == 'cluster'
         run: |
-          cd .github/cluster
-          docker compose logs --tail=80 2>&1 || true
+          docker compose -f .github/cluster/docker-compose.cluster.yml logs --tail=80 2>&1 || true
