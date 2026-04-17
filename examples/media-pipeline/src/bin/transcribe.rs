@@ -171,8 +171,8 @@ async fn process(
                     stderr_tail.push_str(&l);
                     stderr_tail.push('\n');
                     if stderr_tail.len() > 4096 {
-                        let start = stderr_tail.len() - 2048;
-                        stderr_tail = stderr_tail.split_off(start);
+                        let rev: String = stderr_tail.chars().rev().take(2048).collect();
+                        stderr_tail = rev.chars().rev().collect();
                     }
                 }
             }
