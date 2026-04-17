@@ -7824,3 +7824,96 @@ async fn test_capability_required_control_or_whitespace_rejected() {
         assert_err(&raw, "invalid_capabilities", label);
     }
 }
+
+/// PR#7 follow-up regression (Copilot): if a per-worker GET errors out
+/// inside `load_worker_caps_union` (transport blip, WRONGTYPE, etc.) the
+/// union must NOT silently treat that worker as capless. Previously
+/// `.unwrap_or(None)` merged error and empty into the same branch,
+/// producing a false-negative union and keeping executions blocked even
+/// though a matching worker existed.
+///
+/// Now the error propagates up; `check_route_cleared` treats `Err` as
+/// fail-open ("we don't know → let the scheduler re-decide next tick")
+/// and returns true, which promotes the blocked execution back to
+/// eligible. Test shapes the failure with HSET so the subsequent GET
+/// returns WRONGTYPE — a deterministic per-worker GET error we can
+/// exercise without mocking Valkey.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_capable_worker_unblocks_on_get_error_failopen() {
+    use ff_engine::scanner::Scanner;
+
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let config = test_config();
+    let lane_id = LaneId::new(LANE);
+    let eid = ExecutionId::new();
+
+    // 1. Create execution with required caps {gpu}; block it via a
+    //    mismatched scheduler claim.
+    create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
+    let worker_id = ff_core::types::WorkerId::new(WORKER);
+    let wiid = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), config);
+    let cpu_only: std::collections::BTreeSet<String> =
+        ["cpu".to_owned()].into_iter().collect();
+    scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &cpu_only, 5000)
+        .await
+        .expect("scheduler claim should not error");
+
+    // 2. Register a worker in the index but corrupt its caps key with a
+    //    HSET instead of SET. A subsequent GET on that key returns
+    //    WRONGTYPE — the concrete shape of "per-worker GET error" this
+    //    test is guarding against.
+    let instance_id = "wrongtype-gpu-worker";
+    let caps_key = format!("ff:worker:{instance_id}:caps");
+    let _: i64 = tc
+        .client()
+        .cmd("HSET")
+        .arg(caps_key.as_str())
+        .arg("corrupted")
+        .arg("by-test")
+        .execute()
+        .await
+        .expect("HSET plant WRONGTYPE");
+    let _: Option<i64> = tc
+        .client()
+        .cmd("SADD")
+        .arg("ff:idx:workers")
+        .arg(instance_id)
+        .execute()
+        .await
+        .expect("SADD workers-index");
+
+    // 3. Run the unblock scanner. The GET on the corrupted caps key will
+    //    error out inside load_worker_caps_union; that should bubble up
+    //    through check_route_cleared which fails OPEN and promotes.
+    let partition_idx = execution_partition(&eid, &config).index;
+    let scanner = ff_engine::scanner::unblock::UnblockScanner::new(
+        std::time::Duration::from_secs(30),
+        vec![lane_id.clone()],
+        config,
+    );
+    let _ = scanner.scan_partition(tc.client(), partition_idx).await;
+
+    // 4. Execution MUST be promoted back to eligible. With the old
+    //    `.unwrap_or(None)` swallow, the union would have been empty,
+    //    the subset check would have failed, and the execution would
+    //    still be in blocked:route.
+    let idx = IndexKeys::new(&execution_partition(&eid, &config));
+    let eligible_score: Option<String> = tc
+        .client()
+        .cmd("ZSCORE")
+        .arg(idx.lane_eligible(&lane_id).as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("ZSCORE eligible");
+    assert!(
+        eligible_score.is_some(),
+        "execution must be promoted back to eligible when caps GET errors \
+         (fail-open on transient errors preserves liveness)"
+    );
+}

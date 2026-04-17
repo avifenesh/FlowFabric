@@ -640,14 +640,42 @@ async fn check_route_cleared(
 /// doesn't round-trip the entire member list in one reply. `COUNT = 100`
 /// matches the convention in budget_reconciler / flow_projector.
 ///
-/// Empty caps STRING, missing key, or per-worker GET error are treated
-/// as "no caps" for that worker — scanner keeps going, the scheduler
-/// re-evaluates on the next tick (fail-open).
+/// Empty caps STRING or missing key = "no caps for that worker"; scanner
+/// keeps accumulating. Per-worker GET error, in contrast, PROPAGATES — a
+/// previous version used `.unwrap_or(None)` which silently merged error
+/// and empty into the same branch, making a transient error look like
+/// "this worker has no caps". In a single-capable-worker fleet that
+/// produced false-negative unions and left executions blocked even
+/// though a matching worker existed, contradicting the scanner's
+/// documented fail-open behavior. Now an error bubbles up; the only
+/// caller (`check_route_cleared`) treats `Err` by returning `true`
+/// (unblock — "we don't know, let the scheduler re-decide next tick"),
+/// which preserves liveness uniformly whether the fault is SSCAN, GET,
+/// or deeper transport.
 async fn load_worker_caps_union(
     client: &ferriskey::Client,
 ) -> Result<BTreeSet<String>, ferriskey::Error> {
     let mut union = BTreeSet::new();
     let index_key = ff_core::keys::workers_index_key();
+
+    // Helper: drain one completed future and fold its caps into the
+    // union, or propagate its error. Centralizing keeps the in-loop +
+    // drain paths symmetric (both must behave the same — a missed error
+    // at either point re-introduces the false-negative-union bug).
+    fn absorb(
+        union: &mut BTreeSet<String>,
+        res: Result<Option<String>, ferriskey::Error>,
+    ) -> Result<(), ferriskey::Error> {
+        let csv = res?;
+        if let Some(csv) = csv {
+            for token in csv.split(',') {
+                if !token.is_empty() {
+                    union.insert(token.to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
 
     // SSCAN loop — bounded per-page response size. Cursor starts at "0"
     // and wraps back to "0" when iteration completes.
@@ -667,8 +695,11 @@ async fn load_worker_caps_union(
         // Bounded concurrent GETs per SSCAN page. FuturesUnordered with
         // a buffered stream caps in-flight work at CAPS_GET_CONCURRENCY —
         // enough parallelism to amortize round-trip latency, bounded so
-        // one scanner tick can't flood the shared Valkey client.
-        let mut pending = FuturesUnordered::new();
+        // one scanner tick can't flood the shared Valkey client. Each
+        // spawned future returns `Result<Option<String>, Error>` so
+        // transient Valkey errors propagate up (no .unwrap_or(None)
+        // swallowing) — see the fn-level doc for why.
+        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
         for id in worker_ids {
             let client = client.clone();
             pending.push(async move {
@@ -677,31 +708,20 @@ async fn load_worker_caps_union(
                     .cmd("GET")
                     .arg(&caps_key)
                     .execute()
-                    .await
-                    .unwrap_or(None);
-                csv
+                    .await?;
+                Ok::<Option<String>, ferriskey::Error>(csv)
             });
             if pending.len() >= CAPS_GET_CONCURRENCY
-                && let Some(csv) = pending.next().await.flatten()
+                && let Some(res) = pending.next().await
             {
-                for token in csv.split(',') {
-                    if !token.is_empty() {
-                        union.insert(token.to_owned());
-                    }
-                }
+                absorb(&mut union, res)?;
             }
         }
         // Drain remaining pending GETs from this page before advancing
         // the SSCAN cursor. Keeps the pipeline window bounded and the
         // union observation consistent with "all workers visible so far".
-        while let Some(result) = pending.next().await {
-            if let Some(csv) = result {
-                for token in csv.split(',') {
-                    if !token.is_empty() {
-                        union.insert(token.to_owned());
-                    }
-                }
-            }
+        while let Some(res) = pending.next().await {
+            absorb(&mut union, res)?;
         }
 
         if cursor == "0" {
