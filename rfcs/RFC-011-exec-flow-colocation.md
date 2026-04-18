@@ -165,6 +165,46 @@ let result = match partial {
 
 The 5 `ExecutionId::parse(&eid_str)` production sites — where the FCALL return carries a real exec_id string — are forward-compatible with §2.3's new parse rules. The new shape (`{fp:N}:<uuid>`) still parses through the same `ExecutionId::parse` entry point; as long as the Lua side is returning the new shape on phase-3 merge, these parsers succeed. Phase 1 just changes the parse validator; phase 3 changes what Lua emits. No placeholder issue on these 5.
 
+**Multi-variant enum pattern (addendum 2026-04-18 after W1 YELLOW round 2).** The `ClaimExecutionResultPartial` example above is a single-variant enum. Multi-variant result types (`ExpireExecutionResult { AlreadyTerminal, Expired { execution_id } }`, `CreateExecutionResult { Created { execution_id, public_state }, Duplicate { execution_id } }`, etc.) follow a variant-mirror pattern where only variants actually carrying an `execution_id` need the Partial lift:
+
+```rust
+// Before:
+pub enum ExpireExecutionResult {
+    AlreadyTerminal,
+    Expired { execution_id: ExecutionId },
+}
+
+// After:
+pub enum ExpireExecutionResultPartial {
+    AlreadyTerminal,
+    Expired {},  // empty variant — exec_id supplied by caller
+}
+
+impl ExpireExecutionResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> ExpireExecutionResult {
+        match self {
+            Self::AlreadyTerminal => ExpireExecutionResult::AlreadyTerminal,
+            Self::Expired {} => ExpireExecutionResult::Expired { execution_id },
+        }
+    }
+}
+```
+
+`complete(exec_id)` attaches the caller-supplied `execution_id` only to the variants that carry one; variants without an exec_id (`AlreadyTerminal`, `Duplicate`'s no-id form if any) pass through unchanged. The `complete` combinator is a total match over the Partial variants, so adding a new variant to the Partial forces a compile error in `complete` — which is the point: future maintainers can't forget to wire a new exec_id-bearing variant into the caller-supplies path.
+
+For `CreateExecutionResult { Created { execution_id, public_state }, Duplicate { execution_id } }` — both variants carry exec_id — the Partial form is:
+
+```rust
+pub enum CreateExecutionResultPartial {
+    Created { public_state: PublicState },  // exec_id lifted to caller
+    Duplicate {},                             // exec_id lifted to caller
+}
+```
+
+Both variants still get an exec_id in `complete`; the Partial just strips the field from the parsed shape so the parser never has a placeholder in scope.
+
+**Scope impact:** zero. The 10 refactored impls in §3.1b already implicitly follow this pattern — each variant's fields minus `execution_id` form the Partial variant, and the caller supplies the exec_id back via `.complete(args.execution_id.clone())`. This addendum just makes the multi-variant shape explicit so phase-1 implementation has a reference pattern for the non-trivial cases (Expire + Create have 2 variants each; Complete + Cancel + Delay + MoveToWaitingChildren + Fail have single-variant shapes matching the original §2.4 example).
+
 ### §2.4 Rationale for the id-shape choice
 
 **Why `{fp:N}:<uuid>` and not `{fp:N}-<uuid>` or `fp:N:<uuid>`?**
@@ -241,15 +281,17 @@ Every call site of `ExecutionId::new()` migrates to `for_flow` or `solo`. Compil
   - `crates/ff-test/tests/pending_waitpoints_api.rs`: 4 sites. All solo.
   - `crates/ff-test/tests/result_api.rs`: 3 sites. All solo.
   - `crates/ff-test/src/fixtures.rs`: 1 site. Solo (fixture helper).
-* **Authoritative attribution for the `for_flow` vs `solo` selection at each site:**
-  - **ff-server side** (phase 2, W1): ONE site — the `create_execution` handler in `crates/ff-server/src/server.rs`. This is the runtime id-minting path; decision: `args.flow_id.as_ref().map(|fid| ExecutionId::for_flow(fid, config)).unwrap_or_else(|| ExecutionId::solo(&args.lane, config))`.
-  - **cairn-fabric side** (phase 4): cairn's `RunService::create_run` + `TaskService::create_task`. Cairn's choice between `for_flow` and `solo` depends on whether the task's parent run has a flow context; cairn-fabric-side decision, not ff-server-side. This is W3's YELLOW catch: I previously put this under phase 2 ff-server scope.
+* **Authoritative attribution for the `for_flow` vs `solo` selection at each site (REVISED round 2 after W3 YELLOW):**
+  - **ff-server side: ZERO sites.** Current code does not mint `ExecutionId` in `ff-server`. `CreateExecutionArgs.execution_id` is a required non-`Option<ExecutionId>` field (`crates/ff-core/src/contracts.rs`), so every caller supplies a pre-minted id to the server. There is no `flow_id` field on `CreateExecutionArgs` today either, so even hypothetically the server couldn't decide `for_flow` vs `solo` without an ingress schema change. The original draft's "ONE site in ff-server" was wrong — there is no such site, because there is no ff-server mint path. Striking the ff-server bullet entirely.
+  - **cairn-fabric side** (phase 4): cairn's `RunService::create_run` + `TaskService::create_task`. Cairn is the mint site today and stays the mint site post-RFC. Cairn's choice between `for_flow` and `solo` depends on whether the task's parent run has a flow context; cairn-fabric-side decision, full stop.
   - **ff-test side** (phase 2, W2): 166 test sites. Each test picks the variant matching what the test is checking — solo-path tests use `ExecutionId::solo(&fixture_lane, &config)`, flow-member tests use `ExecutionId::for_flow(&shared_fid, &config)`. The test helper `crates/ff-test/src/fixtures.rs` gains a `fixture_lane()` function returning a single test-wide `LaneId` so every solo site can share one helper call.
 
-**Mechanical vs judgement split:**
+  **Why not option B** (spec a wire-API change where `CreateExecutionArgs.execution_id: Option<ExecutionId>` + new `flow_id: Option<FlowId>` field + server-side mint)? It's scope creep. The RFC's target is §5.5 atomicity. Server-side minting would only serve a hypothetical client that bypasses the SDK, not a real consumer today. A future client needing it files a follow-up RFC with its own review; silently expanding the wire contract here would dilute the RFC's focus without unblocking any current work.
+
+**Mechanical vs judgement split (REVISED):**
 * ~160 of 166 ff-test sites are "solo with fixture_lane" — mechanical, 30s each after the first.
 * ~6 sites are flow-member tests; each needs semantic judgement about which flow context the exec belongs to. ~5min each.
-* The 1 ff-server site needs design-fidelity judgement about the `args.flow_id.is_some()` branch. ~15-30min to write + test.
+* No ff-server id-minting site exists today, so W1's phase-2 scope drops by ~30min (previously budgeted for the now-non-existent `create_execution` mint decision). Revised hours reflected in §7.2 round-2 update below.
 
 ### §3.5 Scheduler / claim routing (REVISED — W3 YELLOW)
 
@@ -374,7 +416,7 @@ Solo-execution routing via `crc16(lane_id) % num_flow_partitions` (§4.1) shares
 
 **Three-part mitigation:**
 
-1. **CLI diagnostic.** `ff-admin partition-collisions` prints the current crc16-hash mapping for every lane + flow in the cluster and flags collisions. Operators run this during deployment sizing.
+1. **CLI diagnostic.** `ff-server admin partition-collisions` — a new admin subcommand on the existing `ff-server` binary (NOT a separate crate). Prints the current crc16-hash mapping for every lane + flow in the cluster and flags collisions. Operators run this during deployment sizing. Shape: `ff-server admin partition-collisions --config <path>` reads the standard `ServerConfig`, connects to the configured Valkey cluster, iterates `flow_index` members across partitions + `LaneId` registry, computes `crc16 % num_flow_partitions` for each entity, emits a collision table to stdout. Subcommand placement reuses the existing config-loading path + ferriskey client setup — no duplicated plumbing. Cost: ~1h (subcommand handler + unit test). Matches §5.6 cost claim; matches §8 phase-5 budget.
 2. **Runbook.** `docs/runbooks/partition-amplification.md` (phase 5) explains: how to read the CLI, what a collision means for p99 latency, how to mitigate (rename a lane, adopt a custom `SoloPartitioner`).
 3. **Pluggable `SoloPartitioner` trait.** `crates/ff-core/src/partition.rs` exposes a trait:
    ```rust
@@ -455,7 +497,7 @@ Each phase has (a) touch-file list, (b) landing criteria, (c) acceptance gate, (
 
 ### §7.2 Phase 2 — Call-site migration (REVISED 14-18h, W1 + W2 parallel)
 
-**Touch:** `crates/ff-server/src/server.rs` (create_execution id minting + ~15 `execution_partition` sites + 7-10 Partial-consumer call sites per §3.1b), `crates/ff-scheduler/src/claim.rs` (per §3.5; no partition_scan.rs), `crates/ff-sdk/src/task.rs` + `worker.rs` (~13 sites, rustdoc on `ClaimGrant.partition`), **`crates/ff-test` (166 sites across 5 test files + `fixtures.rs`)**.
+**Touch:** `crates/ff-server/src/server.rs` (~15 `execution_partition` sites + 7-10 Partial-consumer call sites per §3.1b — NO id-minting; see §3.4 round-2 revision), `crates/ff-scheduler/src/claim.rs` (per §3.5; no partition_scan.rs), `crates/ff-sdk/src/task.rs` + `worker.rs` (~13 sites, rustdoc on `ClaimGrant.partition`), **`crates/ff-test` (166 sites across 5 test files + `fixtures.rs`)**.
 
 **Landing:**
 * Every `ExecutionId::new()` migrated to `for_flow` or `solo`. 175 total call sites: 10 ff-core (phase 1) + 1 ff-server + 166 ff-test + 0 cairn-fabric-in-phase-2 (cairn is phase 4).
@@ -471,7 +513,7 @@ Each phase has (a) touch-file list, (b) landing criteria, (c) acceptance gate, (
 * `cargo test -p ff-test --tests` green against a real Valkey — the two-phase `add_execution_to_flow` is unchanged, only its input id shape differs.
 
 **Hour breakdown (REVISED — grounded in independent-grep counts from §3.4):**
-* **W1 (6-8h):** ff-server `create_execution` id-minting decision (~30min) + ~15 `execution_partition` routing-through sites at ~2min each (30min, compile-check only) + 7-10 Partial-consumer `.complete()` call-site updates at ~10min each (1-2h) + ff-scheduler bounds + `ClaimGrant.partition` rustdoc (~1h). Plus 2-3h buffer for unforeseen judgement calls and build-break fixes.
+* **W1 (5.5-7.5h):** ~15 `execution_partition` routing-through sites at ~2min each (30min, compile-check only) + 7-10 Partial-consumer `.complete()` call-site updates at ~10min each (1-2h) + ff-scheduler bounds + `ClaimGrant.partition` rustdoc (~1h). Plus 2-3h buffer for unforeseen judgement calls and build-break fixes. (Previous round-1 estimate included ~30min for an ff-server id-minting decision that §3.4 round-2 strike removed; W1's phase-2 budget drops by ~30min.)
 * **W2 (8-10h):** ff-sdk (~13 `execution_partition` routing-through sites, 30min) + **166 ff-test `ExecutionId::new` migrations**. Breakdown: ~160 solo-path sites × ~30s (80min) + ~6 flow-member sites × ~5min (30min) + `fixture_lane()` helper in `fixtures.rs` + test-file-level `use` import additions (~1h) + per-test-file validation runs (~2h) + buffer for compile-error chains (3-4h). The bulk of this work is mechanical; the critical path is waiting for `cargo test` runs, not writing code.
 
 **Cross-review:** W3 reviews both W1's and W2's diffs before phase 3 starts.
@@ -595,15 +637,15 @@ No crash-injection test — the scanner-ticket-motivated "kill process between p
 | Phase | Owner        | Hours (revised) | Critical path |
 |-------|--------------|-----------------|----------------|
 | 1     | W3           | 10 (was 6)      | yes (blocks 2, 3) — scope added: ff-script Partial refactor per §3.1b |
-| 2     | W1 + W2      | 14-18 (8-10 W2 + 6-8 W1, parallel; was 8) | yes (blocks 3) — counts corrected from ~90 to 175 sites per §3.4 |
+| 2     | W1 + W2      | 13.5-17.5 (8-10 W2 + 5.5-7.5 W1, parallel; was 8) | yes (blocks 3) — counts corrected from ~90 to 175 sites per §3.4; §3.4 round-2 struck the ff-server id-mint sub-item (-30min W1) |
 | 3     | W2           | 8               | yes (blocks 4, 5) — unchanged |
 | 4     | cairn team   | 6               | parallel-with-5 — cairn-side `for_flow`/`solo` decision + re-align |
 | 5     | W2 / harness | 4               | parallel-with-4 — unchanged |
-| **Total** | **3 workers** | **42-46h serialised, 36-40h wall-clock** (was 32h/28h) | |
+| **Total** | **3 workers** | **41.5-45.5h serialised, 35.5-39.5h wall-clock** (was 32h/28h) | |
 
 At 6h/day per worker: **~7 working days end-to-end** assuming no rework and one cross-review debate round per phase. With debate rounds: 8-10 days realistic.
 
-Revised estimate is 2x the original for phase 2 (because of the site-count undercount) and 1.67x for phase 1 (because of the added ff-script scope). Total revision: ~32h → ~44h (1.38x). Still within the "3-7 days" range the user's decision was based on — now 7 days at the upper end rather than 5 at the upper end. Not a scope-change trigger.
+Revised estimate is ~1.7-1.9x the original for phase 2 (because of the site-count undercount, offset slightly by the round-2 id-mint strike) and 1.67x for phase 1 (because of the added ff-script scope). Total revision: ~32h → ~43h (~1.35x). Still within the "3-7 days" range the user's decision was based on — now 7 days at the upper end rather than 5 at the upper end. Not a scope-change trigger.
 
 ---
 
@@ -652,7 +694,7 @@ Response: see §6.1. We have no production consumers that need a soft landing. A
 **New concern (W3 YELLOW): traffic amplification.** Conceded. A lane and a flow that happen to hash to the same partition pile their traffic on the same Valkey slot. Under the birthday paradox, with ~15 lanes and 256 partitions, the probability of at least one lane colliding with at least one flow is non-negligible (~30-40% for a deployment with ~15 active lanes × ~15 active flows). The collision isn't a correctness issue, but it is an operational hot-spot axis that operators need to be able to diagnose and mitigate.
 
 **Mitigation** (added in §5.5 — new subsection):
-* `ff-server` adds a `ff-admin partition-collisions` CLI command that reports, for the current Valkey cluster state, which lane-hashes collide with which flow-hashes. Operators run this during deployment sizing to spot amplification before it becomes a runtime hot-spot.
+* `ff-server` adds a `ff-server admin partition-collisions` CLI command that reports, for the current Valkey cluster state, which lane-hashes collide with which flow-hashes. Operators run this during deployment sizing to spot amplification before it becomes a runtime hot-spot.
 * Documentation in `docs/runbooks/partition-amplification.md` (added in phase 5 alongside the cutover runbook) explains: (a) how the collision arises, (b) how to read the CLI output, (c) what to do about it (rename the lane, or adopt a deterministic-but-different solo-partition scheme; see §12.3 for the decision-protocol for the latter).
 * `ExecutionId::solo(lane_id, config)` is decoupled from "which Valkey slot" via a pluggable `SoloPartitioner` trait (default: `crc16 % n`), so a deployment that hits amplification can override to a custom mapping without re-building ff-server.
 
@@ -722,7 +764,7 @@ Today `PartitionConfig::num_execution_partitions` is settable via `ServerConfig`
 * Default value (256).
 * Override mechanism (`ServerConfig::partition_config.num_flow_partitions`).
 * Trade-off guidance (lower for small clusters, higher for bigger clusters, observable slot balance).
-* Link to `ff-admin partition-collisions` (§5.6).
+* Link to `ff-server admin partition-collisions` (§5.6).
 
 ### §9.17 "Boot-time Valkey version check at phase-3 merge timing — what if the cluster is mid-rolling-upgrade and one node reports < 8.0?" (W1 YELLOW)
 
@@ -887,7 +929,7 @@ Kept to the minimum. Each has a decision protocol for when data arrives; nothing
 **Current pick:** `Crc16SoloPartitioner` (default, `crc16 % num_flow_partitions`).
 **Data we don't have yet:** which deployments hit traffic-amplification collision hotspots in practice, and what non-default partitioning schemes mitigate them.
 **Decision protocol:**
-1. Deployments run `ff-admin partition-collisions` pre-go-live (documented in phase 5 runbook).
+1. Deployments run `ff-server admin partition-collisions` pre-go-live (documented in phase 5 runbook).
 2. If the report flags a collision between a hot lane and a hot flow, the operator either renames the lane (cheapest fix) or installs a custom `SoloPartitioner`.
 3. If three or more operators independently report collisions that lane-renaming doesn't fix, the default partitioner's algorithm is up for revision in a follow-up RFC (e.g. switching to a keyed hash that varies per-deployment).
 **Fallback:** `crc16 % N` is a standard hashing choice matching Valkey's own slot-assignment; a deployment that hits systematic collisions has either a lane-naming problem (fixable by rename) or a scale-and-configuration problem (fixable by `num_flow_partitions` bump).
