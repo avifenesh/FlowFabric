@@ -824,10 +824,11 @@ impl Client {
                     tokio::select! {
                         result = &mut execute => result?,
                         _ = tokio::time::sleep(duration) => {
-                            // User timeout — execute future is dropped. The Cmd
-                            // was already moved into the event loop's PendingRequest,
-                            // so its tracker clone keeps the inflight slot held until
-                            // all sub-commands complete naturally.
+                            // User timeout — execute future is dropped. A clone
+                            // of the InflightRequestTracker was already attached
+                            // to cmd via set_inflight_tracker, so the tracker
+                            // (and its slot guard) lives until the caller drops
+                            // their Cmd — independent of this future's drop.
                             tracing::warn!(
                                 target: "ferriskey",
                                 event = "timeout",

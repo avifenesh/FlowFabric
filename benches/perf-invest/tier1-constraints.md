@@ -9,6 +9,13 @@ read-only constraint capture — what MUST still hold after the
 collapse. Written against the pre-collapse baseline so a reviewer can
 diff against it.
 
+> **Note — post-merge reader**: line numbers and the `execute_command_owned`
+> name refer to the pre-collapse tree (`main` @ `fcfb98c`). After this PR
+> merges, `execute_command_owned` no longer exists as a separate function —
+> its body is inlined into `Client::send_command`. Treat the citations in
+> this doc as a historical reference for what invariants the collapse had
+> to preserve, not as a current map of the code.
+
 ## §2 — Public signature invariants
 
 ```rust
