@@ -1,8 +1,8 @@
 {
-  "commit": "fb36cdc2c426645704c8ae0502b653e48aaea255",
+  "commit": "8cb546aaa384f49e5c859cf87175d23006e5ffae",
   "crates": {
     "ferriskey": {
-      "unsafe_expressions": 30
+      "unsafe_expressions": 0
     },
     "ff-core": {
       "unsafe_expressions": 0
@@ -26,5 +26,5 @@
       "unsafe_expressions": 0
     }
   },
-  "generated_at": "2026-04-17T09:46:24Z"
+  "generated_at": "2026-04-18T07:22:52Z"
 }
