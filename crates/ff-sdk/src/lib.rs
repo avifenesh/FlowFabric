@@ -208,12 +208,14 @@ impl SdkError {
             Self::Http { source, .. } => source.is_timeout() || source.is_connect(),
             // Admin API errors: trust the server's `retryable` hint
             // when present; otherwise fall back to the HTTP-standard
-            // retryable-status set (429, 503, 504). 5xxs without a
-            // hint are conservatively non-retryable — the caller can
+            // retryable-status set (429, 502, 503, 504). 5xxs without
+            // a hint are conservatively non-retryable — the caller can
             // override with `AdminApi.status`-based logic if needed.
+            // 502 covers reverse-proxy transients (ALB/nginx returning
+            // Bad Gateway when ff-server restarts mid-request).
             Self::AdminApi {
                 status, retryable, ..
-            } => retryable.unwrap_or(matches!(*status, 429 | 503 | 504)),
+            } => retryable.unwrap_or(matches!(*status, 429 | 502 | 503 | 504)),
             Self::Config(_) => false,
         }
     }
@@ -307,7 +309,10 @@ mod tests {
 
     #[test]
     fn is_retryable_admin_api_falls_back_to_standard_retryable_statuses() {
-        for s in [429u16, 503, 504] {
+        // 502 covers ALB/nginx Bad Gateway transients on ff-server
+        // restart — same retry-is-safe as 503/504 because rotation
+        // is idempotent server-side.
+        for s in [429u16, 502, 503, 504] {
             let err = SdkError::AdminApi {
                 status: s,
                 message: "x".into(),

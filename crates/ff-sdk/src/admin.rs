@@ -61,13 +61,36 @@ impl FlowFabricAdminClient {
     /// every request. The token is passed by value so the caller
     /// retains ownership policy (e.g. zeroize on drop at the
     /// caller side); the SDK only reads it.
+    ///
+    /// # Empty-token guard
+    ///
+    /// An empty or all-whitespace `token` returns
+    /// [`SdkError::Config`] instead of silently constructing
+    /// `Authorization: Bearer ` (which the server rejects with
+    /// 401, leaving the operator chasing a "why is auth broken"
+    /// ghost). Common source: `FF_ADMIN_TOKEN=""` in a shell
+    /// where the var was meant to be set; the unset-expansion is
+    /// the empty string. Prefer an obvious error at construction
+    /// over a silent 401 at first request.
+    ///
+    /// If the caller genuinely wants an unauthenticated client
+    /// (dev ff-server without `api_token` configured), use
+    /// [`FlowFabricAdminClient::new`] instead.
     pub fn with_token(
         base_url: impl Into<String>,
         token: impl AsRef<str>,
     ) -> Result<Self, SdkError> {
+        let token_str = token.as_ref();
+        if token_str.trim().is_empty() {
+            return Err(SdkError::Config(
+                "bearer token is empty or all-whitespace; use \
+                 FlowFabricAdminClient::new for unauthenticated access"
+                    .into(),
+            ));
+        }
         let mut headers = reqwest::header::HeaderMap::new();
         let mut auth_value =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.as_ref())).map_err(
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token_str)).map_err(
                 |_| {
                     SdkError::Config(
                         "bearer token contains characters not valid in an HTTP header".into(),
@@ -240,6 +263,21 @@ mod tests {
         // header — must fail loudly at construction.
         let err = FlowFabricAdminClient::with_token("http://x", "tok\nevil").unwrap_err();
         assert!(matches!(err, SdkError::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn with_token_rejects_empty_or_whitespace() {
+        // Exact shell footgun: FF_ADMIN_TOKEN="" expands to "".
+        // Fail loudly at construction instead of shipping a client
+        // that silently 401s on first request.
+        for s in ["", " ", "\t\n ", "   "] {
+            let err = FlowFabricAdminClient::with_token("http://x", s)
+                .unwrap_err();
+            assert!(
+                matches!(&err, SdkError::Config(msg) if msg.contains("empty")),
+                "token {s:?} should return Config(empty/whitespace); got: {err:?}"
+            );
+        }
     }
 
     #[test]
