@@ -7,12 +7,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASELINE="$ROOT/.github/geiger-baseline.json"
-PATTERN='\bunsafe\s+(fn\b|impl\b|trait\b|\{)'
+PATTERN='(^|[[:space:]])unsafe[[:space:]]+(fn[[:space:]]|impl[[:space:]]|trait[[:space:]]|\{)'
 
 count_crate() {
     local path="$1"
     local raw
-    raw=$(rg --count-matches --no-heading "$PATTERN" "$path" 2>/dev/null || true)
+    raw=$(grep -rEc --include='*.rs' "$PATTERN" "$path" 2>/dev/null || true)
     echo "$raw" | awk -F: '{s+=$NF} END {print s+0}'
 }
 

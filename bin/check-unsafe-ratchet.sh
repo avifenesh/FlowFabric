@@ -16,25 +16,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASELINE="$ROOT/.github/geiger-baseline.json"
 
-command -v rg >/dev/null 2>&1 || {
-    echo "ripgrep (rg) missing" >&2
-    exit 2
-}
 [ -f "$BASELINE" ] || {
     echo "baseline missing at $BASELINE" >&2
     exit 2
 }
 
-# Matches a real `unsafe` keyword followed by a block opener or a
-# function/impl/trait signature. Skips matches in strings/doc comments
-# by requiring word boundary.
-PATTERN='\bunsafe\s+(fn\b|impl\b|trait\b|\{)'
+# Matches `unsafe` followed by a block opener or fn/impl/trait keyword.
+# Uses grep -E (POSIX ERE) for runner portability (no ripgrep dep).
+# \b -> [[:<:]] / [[:>:]] is non-portable; substitute a [[:space:]]-or-BOL
+# prefix + [[:space:]] suffix, which catches real use sites and rejects
+# identifiers like `unsafer` or `foo_unsafe`.
+PATTERN='(^|[[:space:]])unsafe[[:space:]]+(fn[[:space:]]|impl[[:space:]]|trait[[:space:]]|\{)'
 
 count_crate() {
     local path="$1"
     local raw
-    # rg exits 1 when there are no matches. Capture output + ignore exit.
-    raw=$(rg --count-matches --no-heading "$PATTERN" "$path" 2>/dev/null || true)
+    # grep -c counts per file; sum. grep exits 1 when no matches — ignore.
+    raw=$(grep -rEc --include='*.rs' "$PATTERN" "$path" 2>/dev/null || true)
     echo "$raw" | awk -F: '{s+=$NF} END {print s+0}'
 }
 
