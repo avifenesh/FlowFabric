@@ -1239,9 +1239,65 @@ impl Server {
 
     /// Add an execution to a flow.
     ///
-    /// Two-phase cross-partition operation:
-    /// 1. FCALL ff_add_execution_to_flow on {fp:N} — add to membership set
-    /// 2. HSET flow_id on exec_core on {p:N} — link execution to flow
+    /// # Two-phase cross-partition operation (cairn P3.6 §5.5)
+    ///
+    /// Membership lives on `{fp:N}` (flow-partition); the exec's
+    /// back-pointer to the flow lives on `{p:N}` (execution-partition).
+    /// Valkey functions are single-slot, so we cannot touch both in one
+    /// FCALL — a clustered deploy would return `CROSSSLOT`. The method
+    /// therefore issues two commands in sequence:
+    ///
+    /// 1. **Phase 1 — FCALL `ff_add_execution_to_flow` on `{fp:N}`**.
+    ///    Atomically adds the execution to `members_set`, bumps
+    ///    `node_count` + `graph_revision` on `flow_core`, and re-adds
+    ///    the flow to `flow_index` (self-healing idempotent SADD).
+    /// 2. **Phase 2 — `HSET exec_core flow_id <flow_id>` on `{p:N}`**.
+    ///    Stamps the back-pointer on the execution's core hash so
+    ///    exec-scoped reads (`describe_execution`, `replay_execution`)
+    ///    know which flow the exec belongs to.
+    ///
+    /// # Orphan window
+    ///
+    /// If the server crashes after phase 1 commits but before phase 2
+    /// runs — or phase 2's Valkey round-trip fails at the transport —
+    /// the flow believes the exec is a member while the exec's
+    /// `exec_core.flow_id` field is still empty. The orphan is
+    /// asymmetric: the "flow side says yes, exec side says nothing"
+    /// direction. Retry is idempotent on both phases, but a retry
+    /// requires the caller to notice the failure; a crashed caller
+    /// does not retry.
+    ///
+    /// # Reader safety during the orphan window
+    ///
+    /// * `flow_core → members_set → exec_core` joins (flow projector
+    ///   at `crates/ff-engine/src/scanner/flow_projector.rs`; cancel-
+    ///   flow member dispatch): **safe**. Flow-side is authoritative
+    ///   for membership; readers iterate `members_set` without
+    ///   consulting `exec_core.flow_id`.
+    /// * `exec_core.flow_id → flow_core` joins (`describe_execution`
+    ///   at `server.rs:1895-1910`, `replay_execution` at
+    ///   `server.rs:2080-2115`): **safe**. Empty `flow_id` is filtered
+    ///   via `.filter(|s| !s.is_empty())` and surfaced as "no flow
+    ///   affinity"; a re-read after phase 2 commits returns the link.
+    /// * Joint-consistency readers ("list all members of flow X AND
+    ///   confirm each exec's `exec_core.flow_id == X`"): **unsafe**.
+    ///   No reader in this repo does that today. New code adding such
+    ///   a join must either tolerate empty `flow_id` for newly-added
+    ///   members or rely on the reconciliation scanner below.
+    ///
+    /// # Crash-recovery plan
+    ///
+    /// Tracked as issue #21 (see also the §4 amendment of
+    /// `benches/perf-invest/bridge-event-gap-report.md`). The scanner
+    /// walks `flow_index → members_set → exec_core`, re-stamping
+    /// `flow_id` on any `exec_core` where it's empty or mismatched.
+    /// Rotation-idempotent (same `flow_id` + same `exec_core` → no-op).
+    ///
+    /// Current error propagation (do **not** change without reviewing
+    /// the scanner plan): if phase 2's `HSET` fails, the method
+    /// returns `Err(ServerError::ValkeyContext)` so the caller knows
+    /// phase 1 landed but phase 2 didn't. A silent `Ok(())` would
+    /// hide the need for a retry or scanner sweep.
     pub async fn add_execution_to_flow(
         &self,
         args: &AddExecutionToFlowArgs,
@@ -1270,8 +1326,16 @@ impl Server {
 
         let result = parse_add_execution_to_flow_result(&raw)?;
 
-        // Phase 2: HSET flow_id on exec_core on {p:N}
-        // This is idempotent — safe to retry if phase 1 succeeded but phase 2 failed.
+        // Phase 2: HSET flow_id on exec_core on {p:N}.
+        //
+        // Cross-slot: this write CANNOT be folded into phase 1's FCALL.
+        // See the method-level docstring ("Two-phase cross-partition
+        // operation") for the orphan-window shape + reader safety, and
+        // `lua/flow.lua:114` for the matching note on the FCALL side.
+        //
+        // Idempotent on retry (same flow_id → no-op). If phase 1 landed
+        // but this HSET fails, the Err is propagated so the caller knows
+        // to retry or rely on the reconciliation scanner (issue #21).
         let exec_partition =
             execution_partition(&args.execution_id, &self.config.partition_config);
         let ectx = ExecKeyContext::new(&exec_partition, &args.execution_id);
@@ -1902,6 +1966,16 @@ impl Server {
             public_state: deserialize("public_state", &ps_str)?,
         };
 
+        // Reader invariant (cairn P3.6 §5.5): `flow_id` on exec_core is
+        // populated by `add_execution_to_flow`'s phase 2 HSET, which
+        // runs AFTER the `ff_add_execution_to_flow` FCALL commits on
+        // the flow-partition. During the orphan window (crash between
+        // phases), this field can be empty on an exec that flow_core
+        // already lists as a member. Treat empty as "no flow affinity
+        // known at read time" — safe for this reader (`describe_execution`
+        // surfaces exec state; flow linkage is descriptive, not an
+        // invariant). See `add_execution_to_flow` rustdoc for the
+        // orphan-direction and reader-safety catalogue.
         let flow_id_val = fields.get("flow_id").filter(|s| !s.is_empty()).cloned();
 
         // started_at / completed_at come from the exec_core hash —
@@ -2083,7 +2157,23 @@ impl Server {
         let ctx = ExecKeyContext::new(&partition, execution_id);
         let idx = IndexKeys::new(&partition);
 
-        // Pre-read lane_id, flow_id, terminal_outcome
+        // Pre-read lane_id, flow_id, terminal_outcome.
+        //
+        // Reader invariant (cairn P3.6 §5.5): `flow_id` on exec_core is
+        // populated by `add_execution_to_flow`'s phase-2 HSET. During
+        // the orphan window (crash between the phase-1 FCALL and the
+        // phase-2 HSET), this field can be empty on an exec that the
+        // flow partition already lists as a member. This reader treats
+        // that case correctly — `flow_id_str.unwrap_or_default()`
+        // yields `""`, and the `is_skipped_flow_member` branch below
+        // gates on `!flow_id_str.is_empty()`, so replay falls back to
+        // the non-flow-member path. The only consequence is that a
+        // `skipped` terminal landed during the orphan window replays
+        // without its inbound-edge adjacency reset; the next
+        // reconciliation-scanner pass (see `add_execution_to_flow`
+        // rustdoc) stamps `flow_id` and a subsequent replay is
+        // correct. See `add_execution_to_flow` rustdoc for the
+        // full orphan-direction + reader-safety catalogue.
         let dyn_fields: Vec<Option<String>> = self
             .client
             .cmd("HMGET")
