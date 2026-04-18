@@ -221,9 +221,99 @@ string_id! {
     Namespace
 }
 
-string_id! {
-    /// Submission lane (queue-compatible ingress).
-    LaneId
+// ── LaneId — bespoke impl (RFC-011 §9.15) ──
+//
+// Specialised out of the string_id! macro so ingress (HTTP query params,
+// request-body deserialisation) can reject malformed lane strings at the
+// system boundary instead of silently hashing them via the SoloPartitioner.
+
+/// Submission lane (queue-compatible ingress).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct LaneId(pub String);
+
+/// Max byte length for a LaneId. Matches the common runtime-label ceiling
+/// (e.g. Kubernetes label value 63 bytes; we go 64 for round-number reasons).
+pub const LANE_ID_MAX_BYTES: usize = 64;
+
+/// Error returned when a LaneId fails validation.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LaneIdError {
+    #[error("lane_id is empty")]
+    Empty,
+    #[error("lane_id exceeds {LANE_ID_MAX_BYTES} bytes (got {0})")]
+    TooLong(usize),
+    #[error("lane_id contains non-ASCII-printable byte at index {0}")]
+    NonPrintable(usize),
+}
+
+impl LaneId {
+    /// Infallible constructor. Accepts any `Into<String>` and does NOT validate.
+    /// Use for hardcoded lane names ("default", test fixtures). For runtime-
+    /// bounded input (HTTP, env, config file), use [`LaneId::try_new`].
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Fallible constructor. Validates:
+    ///  - non-empty
+    ///  - <= [`LANE_ID_MAX_BYTES`] bytes
+    ///  - every byte is ASCII-printable (`0x20..=0x7e`)
+    ///
+    /// Use at system boundaries where the lane string could be anything.
+    pub fn try_new(value: impl Into<String>) -> Result<Self, LaneIdError> {
+        let s = value.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
+    }
+
+    fn validate(s: &str) -> Result<(), LaneIdError> {
+        if s.is_empty() {
+            return Err(LaneIdError::Empty);
+        }
+        if s.len() > LANE_ID_MAX_BYTES {
+            return Err(LaneIdError::TooLong(s.len()));
+        }
+        if let Some((idx, _)) = s.bytes().enumerate().find(|(_, b)| !(0x20..=0x7e).contains(b)) {
+            return Err(LaneIdError::NonPrintable(idx));
+        }
+        Ok(())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LaneId {
+    /// Deserialises from a JSON string; validates via [`LaneId::try_new`]
+    /// so malformed ingress lanes fail at the parse boundary instead of
+    /// downstream in the partitioner.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::try_new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl From<&str> for LaneId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for LaneId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
 }
 
 string_id! {
@@ -398,5 +488,88 @@ mod tests {
         let json = serde_json::to_string(&lane).unwrap();
         let parsed: LaneId = serde_json::from_str(&json).unwrap();
         assert_eq!(lane, parsed);
+    }
+
+    // ── LaneId validation (RFC-011 §9.15) ──
+
+    #[test]
+    fn lane_id_try_new_accepts_valid() {
+        assert!(LaneId::try_new("default").is_ok());
+        assert!(LaneId::try_new("worker-pool-1").is_ok());
+        assert!(LaneId::try_new("a").is_ok());
+        // Exactly max length
+        let max = "a".repeat(LANE_ID_MAX_BYTES);
+        assert!(LaneId::try_new(max).is_ok());
+    }
+
+    #[test]
+    fn lane_id_try_new_rejects_empty() {
+        assert_eq!(LaneId::try_new(""), Err(LaneIdError::Empty));
+    }
+
+    #[test]
+    fn lane_id_try_new_rejects_too_long() {
+        let over = "a".repeat(LANE_ID_MAX_BYTES + 1);
+        match LaneId::try_new(over) {
+            Err(LaneIdError::TooLong(n)) => assert_eq!(n, LANE_ID_MAX_BYTES + 1),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_id_try_new_rejects_non_ascii_printable() {
+        // Control character
+        match LaneId::try_new("bad\nlane") {
+            Err(LaneIdError::NonPrintable(3)) => {}
+            other => panic!("expected NonPrintable(3), got {other:?}"),
+        }
+        // Non-ASCII (multi-byte UTF-8)
+        match LaneId::try_new("lane\u{00e9}") {
+            Err(LaneIdError::NonPrintable(_)) => {}
+            other => panic!("expected NonPrintable, got {other:?}"),
+        }
+        // NUL byte
+        match LaneId::try_new("lane\0x") {
+            Err(LaneIdError::NonPrintable(4)) => {}
+            other => panic!("expected NonPrintable(4), got {other:?}"),
+        }
+        // Tab (below printable range)
+        match LaneId::try_new("\tlane") {
+            Err(LaneIdError::NonPrintable(0)) => {}
+            other => panic!("expected NonPrintable(0), got {other:?}"),
+        }
+        // DEL (0x7f, just above printable range)
+        match LaneId::try_new("la\u{007f}ne") {
+            Err(LaneIdError::NonPrintable(2)) => {}
+            other => panic!("expected NonPrintable(2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_id_new_is_infallible_for_hardcoded_names() {
+        // Hardcoded internal names use ::new (no validation).
+        // This test documents the contract that ::new does NOT validate.
+        let _ = LaneId::new("default");
+        let _ = LaneId::new("test-fixture");
+    }
+
+    #[test]
+    fn lane_id_deserialize_rejects_malformed() {
+        // Empty string via JSON
+        let e: Result<LaneId, _> = serde_json::from_str(r#""""#);
+        assert!(e.is_err(), "empty string must fail Deserialize");
+        // Over-length via JSON
+        let over = format!(r#""{}""#, "a".repeat(LANE_ID_MAX_BYTES + 1));
+        let e: Result<LaneId, _> = serde_json::from_str(&over);
+        assert!(e.is_err(), "over-length must fail Deserialize");
+        // Control char via JSON
+        let e: Result<LaneId, _> = serde_json::from_str(r#""bad\nlane""#);
+        assert!(e.is_err(), "newline must fail Deserialize");
+    }
+
+    #[test]
+    fn lane_id_deserialize_accepts_valid() {
+        let parsed: LaneId = serde_json::from_str(r#""default""#).unwrap();
+        assert_eq!(parsed, LaneId::new("default"));
     }
 }

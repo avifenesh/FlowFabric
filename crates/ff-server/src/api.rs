@@ -318,7 +318,8 @@ async fn list_executions(
     State(server): State<Arc<Server>>,
     Query(params): Query<ListExecutionsParams>,
 ) -> Result<Json<ListExecutionsResult>, ApiError> {
-    let lane = ff_core::types::LaneId::new(&params.lane);
+    let lane = ff_core::types::LaneId::try_new(params.lane.clone())
+        .map_err(|e| ApiError::from(ServerError::InvalidInput(format!("invalid lane: {e}"))))?;
     let limit = params.limit.min(1000);
     let result = server
         .list_executions(params.partition, &lane, &params.state, params.offset, limit)
