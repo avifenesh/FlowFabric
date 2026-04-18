@@ -4407,10 +4407,62 @@ async fn test_claim_from_grant_rejects_at_capacity() {
         .expect("EXISTS on grant_key");
     assert_eq!(exists, 1, "grant_key must still exist after capacity reject");
 
-    // Release the first task — normally the scheduler or a different
-    // worker would now be able to consume g2. Here we just want the
-    // test to leave the cluster clean.
+    // Stronger proof that the grant is not just present but still
+    // live: spin up a second FlowFabricWorker with available
+    // capacity and have it consume the same grant. If
+    // claim_from_grant had leaked the FCALL through on the first
+    // worker, ff_claim_execution would have atomically consumed
+    // the grant key and this second claim would return
+    // `InvalidClaimGrant`. Ok here is proof of liveness.
+    //
+    // Same worker_id / worker_instance_id so Lua's worker match
+    // on the grant passes — we're modelling a retry from a fresh
+    // worker process with free capacity, not a different identity.
+    let second_worker_config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(WORKER),
+        // Distinct instance id so the alive-key SET NX guard in
+        // `FlowFabricWorker::connect` doesn't reject us as a
+        // duplicate — same worker_id, new process identity.
+        worker_instance_id: ff_core::types::WorkerInstanceId::new("cap-second-inst"),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 16,
+    };
+    let second_worker = ff_sdk::FlowFabricWorker::connect(second_worker_config)
+        .await
+        .expect("second worker should connect");
+
+    // Reconstruct the grant struct by hand — the original `g2` was
+    // moved into the saturated call. The grant values are
+    // unchanged; we just rebuild the Rust wrapper around the same
+    // Valkey key.
+    let rebuilt_g2 = ff_core::contracts::ClaimGrant {
+        execution_id: eid_b.clone(),
+        partition: ff_core::partition::execution_partition(&eid_b, &test_config()),
+        grant_key: g2_key.clone(),
+        // expires_at_ms is advisory on the consumer side; Lua
+        // enforces the real expiry via its own TIME read, so
+        // copying any value from the pre-rejection grant is fine.
+        expires_at_ms: u64::MAX,
+    };
+
+    let task2 = second_worker
+        .claim_from_grant(lane_id.clone(), rebuilt_g2)
+        .await
+        .expect("second worker with free capacity must consume the still-live grant");
+    assert_eq!(*task2.execution_id(), eid_b);
+
+    // Cleanup both tasks so the test leaves the cluster in a
+    // serial-safe state.
     task1.complete(None).await.unwrap();
+    task2.complete(None).await.unwrap();
 }
 
 // ─── Phase 7: Integration tests ───

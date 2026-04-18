@@ -39,6 +39,26 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Migration: `insecure-direct-claim` → scheduler-issued grants
+//!
+//! The `insecure-direct-claim` cargo feature — which gates
+//! [`FlowFabricWorker::claim_next`] — is **deprecated** in favour of
+//! the pair of scheduler-issued grant entry points:
+//!
+//! * [`FlowFabricWorker::claim_from_grant`] — fresh claims. Use
+//!   `ff_scheduler::Scheduler::claim_for_worker` to obtain the
+//!   [`ClaimGrant`], then hand it to the SDK.
+//! * [`FlowFabricWorker::claim_from_reclaim_grant`] — resumed claims
+//!   for an `attempt_interrupted` execution. Wraps a
+//!   [`ReclaimGrant`].
+//!
+//! `claim_next` bypasses budget and quota admission control; the
+//! grant-based path does not. See each method's rustdoc for the
+//! exact migration recipe.
+//!
+//! [`ClaimGrant`]: ff_core::contracts::ClaimGrant
+//! [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
 
 pub mod config;
 pub mod task;
@@ -78,14 +98,30 @@ pub enum SdkError {
 
     /// Worker is at its configured `max_concurrent_tasks` capacity —
     /// the caller should retry later. Returned by
-    /// [`FlowFabricWorker::claim_from_grant`] when the concurrency
-    /// semaphore is saturated. Distinct from `Ok(None)`: a
-    /// `ClaimGrant` represents real work already selected by the
-    /// scheduler, so silently dropping it would waste the grant and
-    /// let the grant TTL elapse. Surfacing the saturation lets the
-    /// caller release the grant (or wait + retry).
+    /// [`FlowFabricWorker::claim_from_grant`] and
+    /// [`FlowFabricWorker::claim_from_reclaim_grant`] when the
+    /// concurrency semaphore is saturated. Distinct from `Ok(None)`:
+    /// a `ClaimGrant`/`ReclaimGrant` represents real work already
+    /// selected by the scheduler, so silently dropping it would waste
+    /// the grant and let the grant TTL elapse. Surfacing the
+    /// saturation lets the caller release the grant (or wait +
+    /// retry).
+    ///
+    /// # Classification
+    ///
+    /// * [`SdkError::is_retryable`] returns `true` — saturation is
+    ///   transient: any in-flight task's
+    ///   complete/fail/cancel/drop releases a permit. Retry after
+    ///   milliseconds, not a retry loop with backoff for a Valkey
+    ///   transport failure.
+    /// * [`SdkError::valkey_kind`] returns `None` — this is not a
+    ///   Valkey transport or Lua error, so there is no
+    ///   `ferriskey::ErrorKind` to inspect. Callers that fan out
+    ///   on `valkey_kind()` should match `WorkerAtCapacity`
+    ///   explicitly (or use `is_retryable()`).
     ///
     /// [`FlowFabricWorker::claim_from_grant`]: crate::FlowFabricWorker::claim_from_grant
+    /// [`FlowFabricWorker::claim_from_reclaim_grant`]: crate::FlowFabricWorker::claim_from_reclaim_grant
     #[error("worker at capacity: max_concurrent_tasks reached")]
     WorkerAtCapacity,
 }
