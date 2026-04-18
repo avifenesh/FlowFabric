@@ -593,6 +593,21 @@ pub fn waitpoint_key_resolution(tag: &str, wp_key: &WaitpointKey) -> String {
     format!("ff:wpkey:{}:{}", tag, wp_key)
 }
 
+/// Shared prefix for the usage-dedup keyspace. Must match the
+/// `ff:usagededup:` literal referenced in `lua/**.lua` (notably
+/// `lua/ff_report_usage_and_check.lua`). Grep `ff:usagededup:` to
+/// find all producers, consumers, and test fixtures in one search.
+pub const USAGE_DEDUP_KEY_PREFIX: &str = "ff:usagededup:";
+
+/// Build a usage-dedup key: `ff:usagededup:<hash_tag>:<dedup_id>`.
+///
+/// `hash_tag` must ALREADY include the Valkey hash-tag braces
+/// (e.g. `"{bp:7}"`) — typically obtained from
+/// [`BudgetKeyContext::hash_tag`]. Do not double-wrap.
+pub fn usage_dedup_key(hash_tag: &str, dedup_id: &str) -> String {
+    format!("{USAGE_DEDUP_KEY_PREFIX}{hash_tag}:{dedup_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,5 +701,16 @@ mod tests {
         let key = lane_config_key(&lane);
         assert_eq!(key, "ff:lane:default:config");
         assert!(!key.contains('{'));
+    }
+
+    #[test]
+    fn usage_dedup_key_format() {
+        // hash_tag already includes braces — helper must not double-wrap.
+        let key = usage_dedup_key("{bp:7}", "dedup-123");
+        assert_eq!(key, "ff:usagededup:{bp:7}:dedup-123");
+        assert!(key.starts_with(USAGE_DEDUP_KEY_PREFIX));
+        // Exactly one `{…}` hash-tag region.
+        assert_eq!(key.matches('{').count(), 1);
+        assert_eq!(key.matches('}').count(), 1);
     }
 }

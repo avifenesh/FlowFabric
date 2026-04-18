@@ -6,7 +6,7 @@ use std::time::Duration;
 use ferriskey::{Client, Value};
 use ff_core::contracts::ReportUsageResult;
 use ff_script::error::ScriptError;
-use ff_core::keys::{BudgetKeyContext, ExecKeyContext, IndexKeys};
+use ff_core::keys::{usage_dedup_key, BudgetKeyContext, ExecKeyContext, IndexKeys};
 use ff_core::partition::{budget_partition, execution_partition, PartitionConfig};
 use ff_core::types::*;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
@@ -698,7 +698,7 @@ impl ClaimedTask {
         argv.push(now.to_string());
         let dedup_key_val = dedup_key
             .filter(|k| !k.is_empty())
-            .map(|k| format!("ff:usagededup:{}:{}", bctx.hash_tag(), k))
+            .map(|k| usage_dedup_key(bctx.hash_tag(), k))
             .unwrap_or_default();
         argv.push(dedup_key_val);
 
@@ -1153,10 +1153,21 @@ fn is_terminal_renewal_error(err: &ScriptError) -> bool {
 
 // ── FCALL result parsing ──
 
-/// Parse ff_report_usage_and_check result.
-/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
-///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
-fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
+/// Parse the wire-format result of the `ff_report_usage_and_check` Lua
+/// function into a typed [`ReportUsageResult`].
+///
+/// Standard format: `{1, "OK"}`, `{1, "SOFT_BREACH", dim, current, limit}`,
+///                  `{1, "HARD_BREACH", dim, current, limit}`, `{1, "ALREADY_APPLIED"}`.
+/// Status code `!= 1` is parsed as a [`ScriptError`] via
+/// [`ScriptError::from_code_with_detail`].
+///
+/// Exposed as `pub` so downstream SDKs that speak the same wire format
+/// — notably cairn-fabric's `budget_service::parse_spend_result` — can
+/// call this directly instead of re-implementing the parse. Keeping one
+/// parser paired with the producer (the Lua function in
+/// `lua/ff_report_usage_and_check.lua`) is the defence against silent
+/// format drift between producer and consumer.
+pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
@@ -1819,4 +1830,96 @@ pub async fn tail_stream(
     )
     .await
     .map_err(SdkError::Script)
+}
+
+#[cfg(test)]
+mod parse_report_usage_result_tests {
+    use super::*;
+
+    /// `Value::SimpleString` from a `&str`. `usage_field_str` handles
+    /// BulkString and SimpleString uniformly (see
+    /// `usage_field_str` — `Value::BulkString(b)` → `String::from_utf8_lossy`,
+    /// `Value::SimpleString(s)` → clone). SimpleString avoids a
+    /// dev-dependency on `bytes` just for test construction.
+    fn s(v: &str) -> Result<Value, ferriskey::Error> {
+        Ok(Value::SimpleString(v.to_owned()))
+    }
+
+    fn int(n: i64) -> Result<Value, ferriskey::Error> {
+        Ok(Value::Int(n))
+    }
+
+    fn arr(items: Vec<Result<Value, ferriskey::Error>>) -> Value {
+        Value::Array(items)
+    }
+
+    #[test]
+    fn ok_status() {
+        let raw = arr(vec![int(1), s("OK")]);
+        assert_eq!(parse_report_usage_result(&raw).unwrap(), ReportUsageResult::Ok);
+    }
+
+    #[test]
+    fn already_applied_status() {
+        let raw = arr(vec![int(1), s("ALREADY_APPLIED")]);
+        assert_eq!(
+            parse_report_usage_result(&raw).unwrap(),
+            ReportUsageResult::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn soft_breach_status() {
+        let raw = arr(vec![int(1), s("SOFT_BREACH"), s("tokens"), s("150"), s("100")]);
+        match parse_report_usage_result(&raw).unwrap() {
+            ReportUsageResult::SoftBreach { dimension, current_usage, soft_limit } => {
+                assert_eq!(dimension, "tokens");
+                assert_eq!(current_usage, 150);
+                assert_eq!(soft_limit, 100);
+            }
+            other => panic!("expected SoftBreach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_breach_status() {
+        let raw = arr(vec![int(1), s("HARD_BREACH"), s("requests"), s("10001"), s("10000")]);
+        match parse_report_usage_result(&raw).unwrap() {
+            ReportUsageResult::HardBreach { dimension, current_usage, hard_limit } => {
+                assert_eq!(dimension, "requests");
+                assert_eq!(current_usage, 10001);
+                assert_eq!(hard_limit, 10000);
+            }
+            other => panic!("expected HardBreach, got {other:?}"),
+        }
+    }
+
+    /// Negative case: non-Array input. Guards against a future Lua refactor
+    /// that accidentally returns a bare string/int — the parser must fail
+    /// loudly rather than silently succeed or panic.
+    #[test]
+    fn non_array_input_is_parse_error() {
+        let raw = Value::SimpleString("OK".to_owned());
+        let err = parse_report_usage_result(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("expected array"),
+            "error should mention expected shape, got: {msg}"
+        );
+    }
+
+    /// Negative case: Array whose first element isn't an Int status code.
+    /// The Lua function's first return slot is always `status_code` (1 on
+    /// success, an error code otherwise); a non-Int there is a wire-format
+    /// break that must surface as a parse error.
+    #[test]
+    fn first_element_non_int_is_parse_error() {
+        let raw = arr(vec![s("not_an_int"), s("OK")]);
+        let err = parse_report_usage_result(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("int"),
+            "error should mention Int status code, got: {msg}"
+        );
+    }
 }
