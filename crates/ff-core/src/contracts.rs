@@ -95,7 +95,15 @@ pub enum IssueClaimGrantResult {
 /// Shared wire-level type between `ff-scheduler` (issuer) and
 /// `ff-sdk` (consumer, via `FlowFabricWorker::claim_from_grant`).
 /// Lives in `ff-core` so neither crate needs a dep on the other.
-#[derive(Clone, Debug)]
+///
+/// **Lane asymmetry with [`ReclaimGrant`]:** `ClaimGrant` does NOT
+/// carry `lane_id`. The issuing scheduler's caller already picked
+/// a lane (that's how admission reached this grant) and passes it
+/// through to `claim_from_grant` as a separate argument. The grant
+/// handle stays narrow to what uniquely identifies the admission
+/// decision. The matching field on [`ReclaimGrant`] is an
+/// intentional divergence — see the note on that type.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimGrant {
     /// The execution that was granted.
     pub execution_id: ExecutionId,
@@ -110,11 +118,12 @@ pub struct ClaimGrant {
 
 /// A reclaim grant issued for a resumed (attempt_interrupted) execution.
 ///
-/// Produced when a suspended or signalled execution is ready to
-/// resume on a named worker. The worker consumes the grant via
-/// `FlowFabricWorker::claim_from_reclaim_grant`, which calls
-/// `ff_claim_resumed_execution` atomically: that FCALL validates
-/// the grant, consumes it, and transitions `attempt_interrupted` →
+/// Issued by a producer (typically `ff-scheduler` once a Batch-C
+/// reclaim scanner is in place; test fixtures in the interim — no
+/// production Rust caller exists in-tree today). Consumed by
+/// [`FlowFabricWorker::claim_from_reclaim_grant`], which calls
+/// `ff_claim_resumed_execution` atomically: that FCALL validates the
+/// grant, consumes it, and transitions `attempt_interrupted` →
 /// `started` while preserving the existing `attempt_index` +
 /// `attempt_id` (a resumed execution re-uses its attempt; it does
 /// not start a new one).
@@ -132,15 +141,19 @@ pub struct ClaimGrant {
 /// consumes it (`ff_claim_execution` for new attempts,
 /// `ff_claim_resumed_execution` for resumes).
 ///
-/// `lane_id` is carried explicitly (unlike [`ClaimGrant`], where
-/// lane is implicit from the admission side) so the consumer
-/// doesn't pay a `HGET exec_core lane_id` round trip on the hot
-/// claim path — the producer already knows the lane at grant issue
-/// time.
+/// **Lane asymmetry with [`ClaimGrant`]:** `ReclaimGrant` CARRIES
+/// `lane_id` as a field. The issuing path already knows the lane
+/// (it's read from `exec_core` at grant time); carrying it here
+/// spares the consumer a `HGET exec_core lane_id` round trip on
+/// the hot claim path. The asymmetry is intentional — prefer
+/// one-fewer-HGET on a type that already lives with the resumer's
+/// lifecycle over strict handle symmetry with `ClaimGrant`.
 ///
 /// Shared wire-level type between `ff-scheduler` (issuer) and
 /// `ff-sdk` (consumer, via `FlowFabricWorker::claim_from_reclaim_grant`).
 /// Lives in `ff-core` so neither crate needs a dep on the other.
+///
+/// [`FlowFabricWorker::claim_from_reclaim_grant`]: https://docs.rs/ff-sdk
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReclaimGrant {
     /// The execution granted for resumption.
