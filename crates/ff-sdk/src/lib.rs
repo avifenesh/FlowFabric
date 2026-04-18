@@ -133,7 +133,7 @@ pub enum SdkError {
     /// the underlying `reqwest::Error` via `#[source]` so callers
     /// can inspect `is_timeout()` / `is_connect()` / etc. for
     /// finer-grained retry logic. Distinct from
-    /// [`SdkError::Valkey`]: this fires on the HTTP/JSON surface,
+    /// [`SdkError::Valkey`] — this fires on the HTTP/JSON surface,
     /// not on the Lua/Valkey hot path.
     #[error("http: {context}: {source}")]
     Http {

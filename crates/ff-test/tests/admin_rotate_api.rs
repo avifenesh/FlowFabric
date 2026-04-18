@@ -19,7 +19,6 @@
 //! Run with: `cargo test -p ff-test --test admin_rotate_api -- --test-threads=1`
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use ff_core::keys::IndexKeys;
 use ff_core::partition::Partition;
@@ -168,75 +167,122 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
     let resp = client.rotate_waitpoint_secret(req).await.expect("rotate");
     assert!(resp.rotated > 0, "need at least one rotated partition to verify state");
 
-    // Pick partition 0 and read its waitpoint_hmac hash directly.
-    let partition = Partition {
-        family: ff_core::partition::PartitionFamily::Execution,
-        index: 0,
-    };
-    let idx = IndexKeys::new(&partition);
-    let hmac_key = idx.waitpoint_hmac_secrets();
-
-    // current_kid should now be our new_kid.
-    let current_kid: Option<String> = tc.client()
-        .cmd("HGET")
-        .arg(&hmac_key)
-        .arg("current_kid")
-        .execute()
-        .await
-        .expect("HGET current_kid");
-    assert_eq!(
-        current_kid.as_deref(),
-        Some(new_kid.as_str()),
-        "current_kid must be promoted to our new_kid"
-    );
-
-    // previous_kid should be set.
-    let previous_kid: Option<String> = tc.client()
-        .cmd("HGET")
-        .arg(&hmac_key)
-        .arg("previous_kid")
-        .execute()
-        .await
-        .expect("HGET previous_kid");
-    assert!(
-        previous_kid.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
-        "previous_kid must be set after a rotate; got {previous_kid:?}"
-    );
-
-    // previous_expires_at must be populated and in the future.
-    let previous_expires_at: Option<String> = tc.client()
-        .cmd("HGET")
-        .arg(&hmac_key)
-        .arg("previous_expires_at")
-        .execute()
-        .await
-        .expect("HGET previous_expires_at");
-    let expires_ms: i64 = previous_expires_at
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .expect("previous_expires_at should be numeric");
+    // Loop over every partition the response reported as `rotated`.
+    // Partition 0 succeeding doesn't prove partitions 1..N rotated —
+    // a server-side bug that skipped the fan-out after the first
+    // partition would still pass a single-partition check. This
+    // asserts per-partition state for the full rotated set.
+    //
+    // `failed` partitions are intentionally NOT asserted against
+    // (the rotation didn't touch them so their state is unchanged)
+    // but the happy-path test already guarantees failed.is_empty()
+    // on a healthy cluster; here we'd just skip them defensively.
+    //
+    // `in_progress` partitions are ALSO skipped — their state is
+    // transient (the concurrent rotation may be mid-fanout) and
+    // the server contract only promises eventual convergence for
+    // that set, not a post-call snapshot.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    assert!(
-        expires_ms > now_ms,
-        "previous_expires_at ({expires_ms}) must be in the future (now={now_ms})"
-    );
+    let expected_secret_hex =
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
 
-    // The new_kid's secret should be present in the hash.
-    let secret_field = format!("secret:{new_kid}");
-    let secret: Option<String> = tc.client()
-        .cmd("HGET")
-        .arg(&hmac_key)
-        .arg(&secret_field)
-        .execute()
-        .await
-        .expect("HGET secret:<new_kid>");
+    // Collect the partition indices we expect to have fully rotated.
+    // The server returns `rotated: u16` as a COUNT, not a list, so
+    // we iterate `0..num_execution_partitions` and assert on every
+    // partition NOT in the `failed` or `in_progress` sets.
+    let pc = ff_test::fixtures::TEST_PARTITION_CONFIG;
+    let skip: std::collections::HashSet<u16> = resp
+        .failed
+        .iter()
+        .copied()
+        .chain(resp.in_progress.iter().copied())
+        .collect();
+
+    let mut checked = 0u16;
+    for p_idx in 0..pc.num_execution_partitions {
+        if skip.contains(&p_idx) {
+            continue;
+        }
+        let partition = Partition {
+            family: ff_core::partition::PartitionFamily::Execution,
+            index: p_idx,
+        };
+        let idx = IndexKeys::new(&partition);
+        let hmac_key = idx.waitpoint_hmac_secrets();
+
+        // current_kid promoted.
+        let current_kid: Option<String> = tc.client()
+            .cmd("HGET")
+            .arg(&hmac_key)
+            .arg("current_kid")
+            .execute()
+            .await
+            .expect("HGET current_kid");
+        assert_eq!(
+            current_kid.as_deref(),
+            Some(new_kid.as_str()),
+            "partition {p_idx}: current_kid must be promoted to new_kid"
+        );
+
+        // previous_kid set (non-empty).
+        let previous_kid: Option<String> = tc.client()
+            .cmd("HGET")
+            .arg(&hmac_key)
+            .arg("previous_kid")
+            .execute()
+            .await
+            .expect("HGET previous_kid");
+        assert!(
+            previous_kid.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+            "partition {p_idx}: previous_kid must be set; got {previous_kid:?}"
+        );
+
+        // previous_expires_at populated and in the future.
+        let previous_expires_at: Option<String> = tc.client()
+            .cmd("HGET")
+            .arg(&hmac_key)
+            .arg("previous_expires_at")
+            .execute()
+            .await
+            .expect("HGET previous_expires_at");
+        let expires_ms: i64 = previous_expires_at
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "partition {p_idx}: previous_expires_at should be numeric; got {previous_expires_at:?}"
+                )
+            });
+        assert!(
+            expires_ms > now_ms,
+            "partition {p_idx}: previous_expires_at ({expires_ms}) must be in the future (now={now_ms})"
+        );
+
+        // new_kid's secret field carries the hex we sent.
+        let secret_field = format!("secret:{new_kid}");
+        let secret: Option<String> = tc.client()
+            .cmd("HGET")
+            .arg(&hmac_key)
+            .arg(&secret_field)
+            .execute()
+            .await
+            .expect("HGET secret:<new_kid>");
+        assert_eq!(
+            secret.as_deref(),
+            Some(expected_secret_hex),
+            "partition {p_idx}: secret:<new_kid> must carry the new hex"
+        );
+
+        checked += 1;
+    }
+
     assert_eq!(
-        secret.as_deref(),
-        Some("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"),
-        "secret:<new_kid> must carry the new hex we sent"
+        checked, resp.rotated,
+        "number of partitions verified ({checked}) must equal resp.rotated ({})",
+        resp.rotated
     );
 }
 
@@ -312,6 +358,4 @@ async fn test_rotate_waitpoint_secret_enforces_bearer_token() {
         .await
         .expect("bearer-configured client must be able to rotate");
     assert_eq!(resp.new_kid, new_kid);
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }

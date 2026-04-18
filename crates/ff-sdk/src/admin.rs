@@ -10,8 +10,9 @@
 //! Authentication is Bearer token. Callers pick up the token from
 //! wherever they hold it (`FF_API_TOKEN` env var is the common
 //! pattern, but the SDK does not read env vars on the caller's
-//! behalf — [`FlowFabricAdminClient::with_token`] takes an owned
-//! `String`).
+//! behalf — [`FlowFabricAdminClient::with_token`] accepts a
+//! string-like token value (`&str` or `String`) via
+//! `impl AsRef<str>`).
 
 use std::time::Duration;
 
@@ -171,9 +172,19 @@ impl FlowFabricAdminClient {
         }
 
         // Non-2xx: parse the server's ErrorBody if we can, fall
-        // back to a raw body otherwise.
+        // back to a raw body otherwise. Propagate body-read
+        // transport errors as Http rather than silently flattening
+        // them into `AdminApi { raw_body: "" }` — a connection drop
+        // mid-body-read is a transport fault, not an API-layer
+        // reject, and misclassifying it strips `is_retryable`'s
+        // timeout/connect signal from the caller.
         let status_u16 = status.as_u16();
-        let raw = resp.text().await.unwrap_or_default();
+        let raw = resp.text().await.map_err(|e| SdkError::Http {
+            source: e,
+            context: format!(
+                "read rotate-waitpoint-secret error response body (status {status_u16})"
+            ),
+        })?;
         let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
         Err(SdkError::AdminApi {
             status: status_u16,
