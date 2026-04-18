@@ -153,7 +153,7 @@ async fn test_rotate_waitpoint_secret_happy_path() {
 
     let client = FlowFabricAdminClient::new(&api.base_url)
         .expect("build admin client");
-    let new_kid = format!("kid-{}", ff_core::types::ExecutionId::new());
+    let new_kid = format!("kid-{}", uuid::Uuid::new_v4());
     let req = RotateWaitpointSecretRequest {
         new_kid: new_kid.clone(),
         new_secret_hex: FIXTURE_HEX_A.to_owned(),
@@ -188,7 +188,7 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
 
     let client = FlowFabricAdminClient::new(&api.base_url)
         .expect("build admin client");
-    let new_kid = format!("kid-{}", ff_core::types::ExecutionId::new());
+    let new_kid = format!("kid-{}", uuid::Uuid::new_v4());
     let req = RotateWaitpointSecretRequest {
         new_kid: new_kid.clone(),
         new_secret_hex: FIXTURE_HEX_B.to_owned(),
@@ -222,8 +222,10 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
 
     // Collect the partition indices we expect to have fully rotated.
     // The server returns `rotated: u16` as a COUNT, not a list, so
-    // we iterate `0..num_execution_partitions` and assert on every
-    // partition NOT in the `failed` or `in_progress` sets.
+    // we iterate `0..num_flow_partitions` and assert on every
+    // partition NOT in the `failed` or `in_progress` sets. RFC-011
+    // co-locates exec keys onto flow partitions, so
+    // `num_flow_partitions` is now the authoritative count.
     let pc = ff_test::fixtures::TEST_PARTITION_CONFIG;
     let skip: std::collections::HashSet<u16> = resp
         .failed
@@ -233,7 +235,7 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
         .collect();
 
     let mut checked = 0u16;
-    for p_idx in 0..pc.num_execution_partitions {
+    for p_idx in 0..pc.num_flow_partitions {
         if skip.contains(&p_idx) {
             continue;
         }
@@ -366,7 +368,7 @@ async fn test_rotate_waitpoint_secret_enforces_bearer_token() {
     let unauthed = FlowFabricAdminClient::new(&api.base_url)
         .expect("build no-auth client");
     let req_for_unauth = RotateWaitpointSecretRequest {
-        new_kid: format!("kid-unauth-{}", ff_core::types::ExecutionId::new()),
+        new_kid: format!("kid-unauth-{}", uuid::Uuid::new_v4()),
         new_secret_hex: FIXTURE_HEX_C.to_owned(),
     };
     match unauthed.rotate_waitpoint_secret(req_for_unauth).await {
@@ -379,7 +381,7 @@ async fn test_rotate_waitpoint_secret_enforces_bearer_token() {
     // 2. Bearer-configured client → 200.
     let authed = FlowFabricAdminClient::with_token(&api.base_url, token)
         .expect("build auth client");
-    let new_kid = format!("kid-auth-{}", ff_core::types::ExecutionId::new());
+    let new_kid = format!("kid-auth-{}", uuid::Uuid::new_v4());
     let req_for_auth = RotateWaitpointSecretRequest {
         new_kid: new_kid.clone(),
         new_secret_hex: FIXTURE_HEX_D.to_owned(),

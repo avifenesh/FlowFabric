@@ -485,8 +485,10 @@ mod tests {
 
     #[test]
     fn test_partition_config_is_small() {
+        // RFC-011: num_execution_partitions retired; exec + flow
+        // co-locate on {fp:N}. num_flow_partitions is the single
+        // authoritative count that governs exec routing too.
         assert_eq!(TEST_PARTITION_CONFIG.num_flow_partitions, 4);
-        assert_eq!(TEST_PARTITION_CONFIG.num_flow_partitions, 2);
         assert_eq!(TEST_PARTITION_CONFIG.num_budget_partitions, 2);
         assert_eq!(TEST_PARTITION_CONFIG.num_quota_partitions, 2);
     }
