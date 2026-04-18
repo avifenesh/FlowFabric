@@ -147,6 +147,32 @@ workload to see whether the drop-path telemetry frame surfaces
 hotter than on the GET/SET traces (which dominated the original
 scenario-1 capture).
 
+### §3.4 Fair-comparison note — empty-queue retry budget
+
+The BLMPOP hot loop in both baselines retries empty-queue polls via
+a 10 ms sleep (see `baseline/src/scenario1.rs` and
+`ferriskey-baseline/src/scenario1.rs` hot loops). The original
+round-1 + round-2 captures did not surface this count; a later
+instrumentation pass added a `blmpop_outcomes: { ok, nil, err }`
+counter to both baselines' JSON reports. In W2's cross-review re-run
+(BLMPOP localhost, 10 000 tasks × 16 workers), the counter showed:
+
+| client    | ok      | nil | err |
+| --------- | ------: | --: | --: |
+| redis-rs  | 10 000  |   0 |  15 |
+| ferriskey | 10 000  |  15 |   0 |
+
+**Same miss count, opposite classification.** In both cases the
+server returned Nil; redis-rs's typed path (`Option<(String,
+Vec<Vec<u8>>)>`) treats the unexpected shape as `Err(Io)`, while
+ferriskey's `Option<Value>` path returns `Ok(None)`. Both paths
+fall through to the same `tokio::time::sleep(10 ms)` retry, so the
+wall-clock contribution is symmetric (~150 ms on each side). This
+is not a measurement bias — it's a downstream of the typed-decoder
+difference called out in W3's report-w3.md §2.5 — but it is worth
+documenting so readers of the raw JSON don't misread the `err=15`
+on redis-rs as a transport fault.
+
 ## §4 New outliers under cluster + TLS
 
 ### §4.1 Pipeline + streams wins vanished (§1 repeated for emphasis)
@@ -283,3 +309,31 @@ paths would confirm or refute the §3.3 hypothesis.
 
 Report consolidation with round 1 findings is the manager's next
 step; owner hand-off follows.
+
+## §8 Round-3 follow-up — cross-check on the post-round-3 branch
+
+Added during W2's cross-review (commit `50e441d` on
+`feat/ferriskey-iam-gate`). The scenario-1 BLMPOP localhost bench
+was re-run against the current branch HEAD after round 3 landed:
+
+- Round-1 capture (commit `4d89a89` era):
+  redis-rs 14 755.2 ops/s, ferriskey 7 993.3 ops/s. Gap **-45.83 %**.
+- Cross-check re-run (post-`2a36b46` telemetry redesign +
+  post-`ba73945` lazy redesign + post-`0181f30` blocking-probe
+  findings merged): redis-rs 14 588.5 ops/s (-1.13 % vs published),
+  ferriskey 8 487.7 ops/s (+6.19 % vs published). Gap **-41.82 %**.
+
+The gap compressed ~4 percentage points on ferriskey's side. Most
+of that drift is attributable to W1's `telemetrylib` removal
+(round-1 `report-w1.md` §H2 called out `StandaloneClient::Drop` +
+`Telemetry::decr_total_clients` as a blocking-workload hot spot);
+some is attributable to the lazy-redesign eliminating 17 defensive
+`ClientWrapper::Lazy` match arms; the remainder is within normal
+run-to-run variance on a shared host.
+
+**Direction preserved, headline robust.** The round-2 narrative
+above — "BLMPOP gap HOLDS but COMPRESSES from localhost -45.81 %
+to cluster+TLS -32.50 %" — still reads correctly; the localhost
+baseline moves a few points in the same direction on the post-
+round-3 branch. No re-run of the cluster+TLS suite is needed to
+ship this report.

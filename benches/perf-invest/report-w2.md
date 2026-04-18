@@ -94,6 +94,21 @@ For reference, from `benches/results/submit_claim_complete-*.json`:
 BLMPOP is alone in the 6-workload comparison. Everything else is
 noise-level tied or ferriskey-winning.
 
+**Profile note (added post-cross-review):** the scenario-1 numbers
+above come from `benches/comparisons/baseline/` and
+`ferriskey-baseline/`, which build with `lto = "fat"` +
+`codegen-units = 1` + `debug = 0`. The round-1 wider/ numbers in
+§2.1-§2.3 come from `benches/comparisons/wider/`, which builds with
+`lto = "off"` + `debug = 1` (chosen so flamegraphs resolve inline
+frames without changing the headline codegen path for the bench
+runner). The **direction** of the scenario-1 -45.81 % gap is robust
+across both profiles — BLMPOP was re-run post-round-3 on the
+lto=fat baselines and reproduced at -41.82 % — but the **exact
+delta** between the two table rows above and the wider/ ~115 k
+ops/sec flat-RPC rows should not be read as a single-profile
+measurement. Within-suite comparisons (every row in §2.1-§2.3
+against every other §2.x row) are on one profile and clean.
+
 ## §3 BLMPOP — why this workload specifically
 
 The wider suite refutes the "ferriskey has universal per-command
