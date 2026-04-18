@@ -86,6 +86,94 @@ pub enum IssueClaimGrantResult {
     Granted { execution_id: ExecutionId },
 }
 
+/// A claim grant issued by the scheduler for a specific execution.
+///
+/// The worker uses this to call `ff_claim_execution` (or
+/// `ff_acquire_lease`), which atomically consumes the grant and
+/// creates the lease.
+///
+/// Shared wire-level type between `ff-scheduler` (issuer) and
+/// `ff-sdk` (consumer, via `FlowFabricWorker::claim_from_grant`).
+/// Lives in `ff-core` so neither crate needs a dep on the other.
+///
+/// **Lane asymmetry with [`ReclaimGrant`]:** `ClaimGrant` does NOT
+/// carry `lane_id`. The issuing scheduler's caller already picked
+/// a lane (that's how admission reached this grant) and passes it
+/// through to `claim_from_grant` as a separate argument. The grant
+/// handle stays narrow to what uniquely identifies the admission
+/// decision. The matching field on [`ReclaimGrant`] is an
+/// intentional divergence — see the note on that type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimGrant {
+    /// The execution that was granted.
+    pub execution_id: ExecutionId,
+    /// The partition where this execution lives.
+    pub partition: crate::partition::Partition,
+    /// The Valkey key holding the grant hash (for the worker to
+    /// reference).
+    pub grant_key: String,
+    /// When the grant expires if not consumed.
+    pub expires_at_ms: u64,
+}
+
+/// A reclaim grant issued for a resumed (attempt_interrupted) execution.
+///
+/// Issued by a producer (typically `ff-scheduler` once a Batch-C
+/// reclaim scanner is in place; test fixtures in the interim — no
+/// production Rust caller exists in-tree today). Consumed by
+/// [`FlowFabricWorker::claim_from_reclaim_grant`], which calls
+/// `ff_claim_resumed_execution` atomically: that FCALL validates the
+/// grant, consumes it, and transitions `attempt_interrupted` →
+/// `started` while preserving the existing `attempt_index` +
+/// `attempt_id` (a resumed execution re-uses its attempt; it does
+/// not start a new one).
+///
+/// Mirrors [`ClaimGrant`] for the resume path. Differences:
+///
+///   * [`ClaimGrant`] is issued against a freshly-eligible
+///     execution and `ff_claim_execution` creates a new attempt.
+///   * [`ReclaimGrant`] is issued against an `attempt_interrupted`
+///     execution; `ff_claim_resumed_execution` re-uses the existing
+///     attempt and bumps the lease epoch.
+///
+/// The grant itself is written to the same `claim_grant` Valkey key
+/// that [`ClaimGrant`] uses; the distinction is which Lua FCALL
+/// consumes it (`ff_claim_execution` for new attempts,
+/// `ff_claim_resumed_execution` for resumes).
+///
+/// **Lane asymmetry with [`ClaimGrant`]:** `ReclaimGrant` CARRIES
+/// `lane_id` as a field. The issuing path already knows the lane
+/// (it's read from `exec_core` at grant time); carrying it here
+/// spares the consumer a `HGET exec_core lane_id` round trip on
+/// the hot claim path. The asymmetry is intentional — prefer
+/// one-fewer-HGET on a type that already lives with the resumer's
+/// lifecycle over strict handle symmetry with `ClaimGrant`.
+///
+/// Shared wire-level type between the eventual `ff-scheduler`
+/// producer (Batch-C reclaim scanner — not yet in-tree; test
+/// fixtures construct this type today) and `ff-sdk` (consumer, via
+/// `FlowFabricWorker::claim_from_reclaim_grant`). Lives in
+/// `ff-core` so neither crate needs a dep on the other.
+///
+/// [`FlowFabricWorker::claim_from_reclaim_grant`]: https://docs.rs/ff-sdk
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimGrant {
+    /// The execution granted for resumption.
+    pub execution_id: ExecutionId,
+    /// The partition the execution lives on.
+    pub partition: crate::partition::Partition,
+    /// Valkey key of the grant hash — same key shape as
+    /// [`ClaimGrant`].
+    pub grant_key: String,
+    /// Monotonic ms when the grant expires; unconsumed grants
+    /// vanish.
+    pub expires_at_ms: u64,
+    /// Lane the execution belongs to. Needed by
+    /// `ff_claim_resumed_execution` for `KEYS[3]` (eligible_zset)
+    /// and `KEYS[9]` (active_index).
+    pub lane_id: LaneId,
+}
+
 // ─── claim_execution ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -18,8 +18,8 @@ use ff_core::contracts::{
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
-    self, BudgetKeyContext, ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys,
-    QuotaKeyContext,
+    self, usage_dedup_key, BudgetKeyContext, ExecKeyContext, FlowIndexKeys, FlowKeyContext,
+    IndexKeys, QuotaKeyContext,
 };
 use ff_core::partition::{
     budget_partition, execution_partition, flow_partition, quota_partition, Partition,
@@ -1165,7 +1165,7 @@ impl Server {
             .dedup_key
             .as_ref()
             .filter(|k| !k.is_empty())
-            .map(|k| format!("ff:usagededup:{}:{}", bctx.hash_tag(), k))
+            .map(|k| usage_dedup_key(bctx.hash_tag(), k))
             .unwrap_or_default();
         fcall_args.push(dedup_key_val);
 

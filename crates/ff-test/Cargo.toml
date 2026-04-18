@@ -19,6 +19,7 @@ release = false
 ff-core = { workspace = true }
 ff-engine = { workspace = true }
 ff-scheduler = { workspace = true }
+ff-script = { workspace = true }
 ff-sdk = { workspace = true, features = ["insecure-direct-claim"] }
 ferriskey = { workspace = true }
 tokio = { workspace = true }
