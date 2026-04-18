@@ -118,6 +118,49 @@ end)
 --
 -- KEYS (3): flow_core, members_set, flow_index
 -- ARGV (3): flow_id, execution_id, now_ms (IGNORED — server time used)
+--
+-- ── TWO-PHASE CONTRACT (cairn P3.6 §5.5) ────────────────────────────────
+-- exec_core lives on {p:N} (execution-partition), this FCALL runs on
+-- {fp:N} (flow-partition). Valkey functions are single-slot; we CANNOT
+-- touch exec_core from here without a CROSSSLOT failure on a clustered
+-- deploy. The caller (ff-server `add_execution_to_flow`, crates/ff-server
+-- /src/server.rs:1240-1320) therefore runs this FCALL first and then
+-- issues an `HSET exec_core flow_id = <flow_id>` as a separate command.
+--
+-- Orphan window:
+--   Phase 1 (this FCALL) succeeds → flow_core/members_set/flow_index on
+--   {fp:N} all reflect the new membership and the exec_core on {p:N}
+--   does NOT yet carry flow_id.
+--   If the server crashes before phase 2 (HSET), exec_core.flow_id stays
+--   empty while the flow lists the exec as a member. The orphan is in
+--   the "flow says yes, exec says nothing" direction only.
+--
+-- Reader safety:
+--   * flow_core → members_set → exec_core readers (projector,
+--     cancel_flow member dispatch): SAFE. They iterate members_set and
+--     operate on each exec regardless of whether exec_core.flow_id is
+--     stamped — the flow side is the authoritative direction for
+--     membership.
+--   * exec_core.flow_id → flow_core readers
+--     (`describe_execution` at server.rs:1895-1910, `replay_execution`
+--     at server.rs:2080-2115): SAFE against the orphan. An empty
+--     flow_id is treated as "no flow affinity known at read time" and
+--     filtered via `.filter(|s| !s.is_empty())` — the read returns the
+--     exec's intrinsic fields and omits the flow link; a subsequent
+--     read after phase 2 completes returns the link.
+--   * Joint-consistency readers ("list all members of flow X AND
+--     confirm each exec's exec_core.flow_id == X"): UNSAFE during the
+--     orphan window. No reader in this repo does that today; if one is
+--     added, it must either (a) tolerate empty flow_id on the exec
+--     side for newly-added members, or (b) wait on the reconciliation
+--     scanner (see below).
+--
+-- Crash-recovery plan: a reconciliation scanner is tracked as issue
+-- #21 (see also the §4 amendment of
+-- `benches/perf-invest/bridge-event-gap-report.md`). The scanner walks
+-- flow_index → members_set → exec_core, re-stamping flow_id on any
+-- exec_core hash where it's empty or mismatched. Rotation-idempotent
+-- (same flow_id + same exec_core → no-op).
 ---------------------------------------------------------------------------
 redis.register_function('ff_add_execution_to_flow', function(keys, args)
   local K = {
