@@ -369,17 +369,12 @@ impl CompressionManager {
         if let Some(backend_id) = extract_backend_id(value) {
             // If the data was compressed with our configured backend, use it
             // This respects the client's compression configuration
-            let result = if backend_id == self.backend.backend_id() {
+            if backend_id == self.backend.backend_id() {
                 self.backend.decompress(value)
             } else {
-                // Otherwise, use a static backend for decompression
-                // Static backends are shared and don't allocate on each call
-                // Return error if backend is not supported
                 let backend = get_backend_for_decompression(backend_id)?;
                 backend.decompress(value)
-            };
-
-            result
+            }
         } else {
             Ok(value.to_vec())
         }

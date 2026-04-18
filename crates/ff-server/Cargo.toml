@@ -15,8 +15,6 @@ description = "FlowFabric server library and HTTP binary"
 # and the flag propagates to the underlying ferriskey crate. OFF by
 # default.
 iam = ["ferriskey/iam"]
-otel = ["ferriskey/otel"]
-metrics = ["ferriskey/metrics"]
 
 [dependencies]
 ff-core = { workspace = true }

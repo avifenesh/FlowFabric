@@ -18,8 +18,6 @@ insecure-direct-claim = []
 # — the ~40-crate AWS dep graph does not land in builds that don't need
 # it.
 iam = ["ferriskey/iam"]
-otel = ["ferriskey/otel"]
-metrics = ["ferriskey/metrics"]
 
 [dependencies]
 ff-core = { workspace = true }
