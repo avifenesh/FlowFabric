@@ -1,4 +1,18 @@
 //! Typed FCALL wrappers for execution lifecycle functions (lua/execution.lua).
+//!
+//! ## Partial-type pattern (RFC-011 §2.4)
+//!
+//! Post-RFC-011, `ExecutionId` no longer has `Default`, so parsers cannot
+//! construct result structs with a placeholder `execution_id` to be
+//! overwritten by the caller. Instead, each `ff_function!` wrapper whose
+//! result carries an `execution_id` returns a `*Partial` type that omits
+//! the field, with a `.complete(execution_id)` combinator the caller
+//! invokes after the FCALL returns (the caller always knows the
+//! `execution_id` — it supplied the id as ARGV).
+//!
+//! `complete` is a total match over the Partial variants, so future
+//! result variants that carry an `execution_id` force a compile error
+//! in `complete` until the new variant is wired through.
 
 use ff_core::contracts::*;
 use crate::error::ScriptError;
@@ -7,6 +21,131 @@ use ff_core::state::{AttemptType, PublicState};
 use ff_core::types::*;
 
 use crate::result::{FcallResult, FromFcallResult};
+
+// ─── Partial types (RFC-011 §2.4) ──────────────────────────────────────
+
+/// Partial form of [`ClaimedExecution`] used by the parser path;
+/// caller-supplied `execution_id` is attached via [`ClaimExecutionResultPartial::complete`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedExecutionPartial {
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub attempt_index: AttemptIndex,
+    pub attempt_id: AttemptId,
+    pub attempt_type: AttemptType,
+    pub lease_expires_at: TimestampMs,
+}
+
+/// Partial form of [`ClaimExecutionResult`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimExecutionResultPartial {
+    Claimed(ClaimedExecutionPartial),
+}
+
+impl ClaimExecutionResultPartial {
+    /// Attach the caller-supplied `execution_id` and lift to the full
+    /// [`ClaimExecutionResult`]. Total match over Partial variants.
+    pub fn complete(self, execution_id: ExecutionId) -> ClaimExecutionResult {
+        match self {
+            Self::Claimed(p) => ClaimExecutionResult::Claimed(ClaimedExecution {
+                execution_id,
+                lease_id: p.lease_id,
+                lease_epoch: p.lease_epoch,
+                attempt_index: p.attempt_index,
+                attempt_id: p.attempt_id,
+                attempt_type: p.attempt_type,
+                lease_expires_at: p.lease_expires_at,
+            }),
+        }
+    }
+}
+
+/// Partial form of [`CompleteExecutionResult`] (omits `execution_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompleteExecutionResultPartial {
+    Completed { public_state: PublicState },
+}
+
+impl CompleteExecutionResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> CompleteExecutionResult {
+        match self {
+            Self::Completed { public_state } => CompleteExecutionResult::Completed {
+                execution_id,
+                public_state,
+            },
+        }
+    }
+}
+
+/// Partial form of [`CancelExecutionResult`] (omits `execution_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancelExecutionResultPartial {
+    Cancelled { public_state: PublicState },
+}
+
+impl CancelExecutionResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> CancelExecutionResult {
+        match self {
+            Self::Cancelled { public_state } => CancelExecutionResult::Cancelled {
+                execution_id,
+                public_state,
+            },
+        }
+    }
+}
+
+/// Partial form of [`DelayExecutionResult`] (omits `execution_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DelayExecutionResultPartial {
+    Delayed { public_state: PublicState },
+}
+
+impl DelayExecutionResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> DelayExecutionResult {
+        match self {
+            Self::Delayed { public_state } => DelayExecutionResult::Delayed {
+                execution_id,
+                public_state,
+            },
+        }
+    }
+}
+
+/// Partial form of [`MoveToWaitingChildrenResult`] (omits `execution_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MoveToWaitingChildrenResultPartial {
+    Moved { public_state: PublicState },
+}
+
+impl MoveToWaitingChildrenResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> MoveToWaitingChildrenResult {
+        match self {
+            Self::Moved { public_state } => MoveToWaitingChildrenResult::Moved {
+                execution_id,
+                public_state,
+            },
+        }
+    }
+}
+
+/// Partial form of [`ExpireExecutionResult`].
+///
+/// Multi-variant: `Expired` carries `execution_id` (lifted); `AlreadyTerminal`
+/// does not. `complete` attaches the id only on `Expired`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpireExecutionResultPartial {
+    Expired,
+    AlreadyTerminal,
+}
+
+impl ExpireExecutionResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> ExpireExecutionResult {
+        match self {
+            Self::Expired => ExpireExecutionResult::Expired { execution_id },
+            Self::AlreadyTerminal => ExpireExecutionResult::AlreadyTerminal,
+        }
+    }
+}
 
 /// Bundles ExecKeyContext + IndexKeys + lane-scoped index resolution.
 /// Passed as the key context to all execution ff_function! invocations.
@@ -100,7 +239,7 @@ impl FromFcallResult for CreateExecutionResult {
 //                attempt_timeout_ms, execution_deadline_at
 
 ff_function! {
-    pub ff_claim_execution(args: ClaimExecutionArgs) -> ClaimExecutionResult {
+    pub ff_claim_execution(args: ClaimExecutionArgs) -> ClaimExecutionResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),
             k.ctx.claim_grant(),
@@ -134,7 +273,7 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for ClaimExecutionResult {
+impl FromFcallResult for ClaimExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let r = FcallResult::parse(raw)?.into_success()?;
         // ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)
@@ -150,8 +289,7 @@ impl FromFcallResult for ClaimExecutionResult {
             .map_err(|e| ScriptError::Parse(format!("bad attempt_index: {e}")))?;
         let attempt_type = parse_attempt_type(&r.field_str(5))?;
 
-        Ok(ClaimExecutionResult::Claimed(ClaimedExecution {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
+        Ok(Self::Claimed(ClaimedExecutionPartial {
             lease_id,
             lease_epoch: LeaseEpoch::new(epoch),
             attempt_index: AttemptIndex::new(attempt_index),
@@ -171,7 +309,7 @@ impl FromFcallResult for ClaimExecutionResult {
 // Lua ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, result_payload
 
 ff_function! {
-    pub ff_complete_execution(args: CompleteExecutionArgs) -> CompleteExecutionResult {
+    pub ff_complete_execution(args: CompleteExecutionArgs) -> CompleteExecutionResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),
             k.ctx.attempt_hash(args.attempt_index),
@@ -198,14 +336,11 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for CompleteExecutionResult {
+impl FromFcallResult for CompleteExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok("completed")
-        Ok(CompleteExecutionResult::Completed {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
-            public_state: PublicState::Completed,
-        })
+        Ok(Self::Completed { public_state: PublicState::Completed })
     }
 }
 
@@ -231,7 +366,7 @@ impl FromFcallResult for CompleteExecutionResult {
 // already closed/deleted). Phase 3 must pre-read the waitpoint_id and
 // pass the real keys.
 ff_function! {
-    pub ff_cancel_execution(args: CancelExecutionArgs) -> CancelExecutionResult {
+    pub ff_cancel_execution(args: CancelExecutionArgs) -> CancelExecutionResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),                                       // 1
             k.ctx.attempt_hash(AttemptIndex::new(0)),           // 2 placeholder
@@ -265,14 +400,11 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for CancelExecutionResult {
+impl FromFcallResult for CancelExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok("cancelled", cancelled_from_state)
-        Ok(CancelExecutionResult::Cancelled {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
-            public_state: PublicState::Cancelled,
-        })
+        Ok(Self::Cancelled { public_state: PublicState::Cancelled })
     }
 }
 
@@ -284,7 +416,7 @@ impl FromFcallResult for CancelExecutionResult {
 // Lua ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, delay_until
 
 ff_function! {
-    pub ff_delay_execution(args: DelayExecutionArgs) -> DelayExecutionResult {
+    pub ff_delay_execution(args: DelayExecutionArgs) -> DelayExecutionResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),
             k.ctx.attempt_hash(args.attempt_index),
@@ -306,14 +438,11 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for DelayExecutionResult {
+impl FromFcallResult for DelayExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok(delay_until)
-        Ok(DelayExecutionResult::Delayed {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
-            public_state: PublicState::Delayed,
-        })
+        Ok(Self::Delayed { public_state: PublicState::Delayed })
     }
 }
 
@@ -325,7 +454,7 @@ impl FromFcallResult for DelayExecutionResult {
 // Lua ARGV (4): execution_id, lease_id, lease_epoch, attempt_id
 
 ff_function! {
-    pub ff_move_to_waiting_children(args: MoveToWaitingChildrenArgs) -> MoveToWaitingChildrenResult {
+    pub ff_move_to_waiting_children(args: MoveToWaitingChildrenArgs) -> MoveToWaitingChildrenResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),
             k.ctx.attempt_hash(args.attempt_index),
@@ -346,14 +475,11 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for MoveToWaitingChildrenResult {
+impl FromFcallResult for MoveToWaitingChildrenResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok()
-        Ok(MoveToWaitingChildrenResult::Moved {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
-            public_state: PublicState::WaitingChildren,
-        })
+        Ok(Self::Moved { public_state: PublicState::WaitingChildren })
     }
 }
 
@@ -428,7 +554,7 @@ impl FromFcallResult for FailExecutionResult {
 // Lua ARGV (2): execution_id, expire_reason
 
 ff_function! {
-    pub ff_expire_execution(args: ExpireExecutionArgs) -> ExpireExecutionResult {
+    pub ff_expire_execution(args: ExpireExecutionArgs) -> ExpireExecutionResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),
             k.ctx.attempt_hash(AttemptIndex::new(0)),   // placeholder
@@ -452,19 +578,15 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for ExpireExecutionResult {
+impl FromFcallResult for ExpireExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let r = FcallResult::parse(raw)?.into_success()?;
         // ok("expired", from_phase) or ok("already_terminal") or ok("not_found_cleaned")
         let sub = r.field_str(0);
         match sub.as_str() {
-            "already_terminal" | "not_found_cleaned" => Ok(ExpireExecutionResult::AlreadyTerminal),
-            "expired" => Ok(ExpireExecutionResult::Expired {
-                execution_id: ExecutionId::parse("").unwrap_or_default(),
-            }),
-            _ => Ok(ExpireExecutionResult::Expired {
-                execution_id: ExecutionId::parse("").unwrap_or_default(),
-            }),
+            "already_terminal" | "not_found_cleaned" => Ok(Self::AlreadyTerminal),
+            "expired" => Ok(Self::Expired),
+            _ => Ok(Self::Expired),
         }
     }
 }
@@ -496,5 +618,103 @@ fn parse_attempt_type(s: &str) -> Result<AttemptType, ScriptError> {
         "replay" => Ok(AttemptType::Replay),
         "fallback" => Ok(AttemptType::Fallback),
         _ => Err(ScriptError::Parse(format!("unknown attempt_type: {s}"))),
+    }
+}
+
+// ─── Partial-type tests (RFC-011 §2.4 acceptance) ──────────────────────
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+    use ff_core::partition::PartitionConfig;
+
+    fn test_eid() -> ExecutionId {
+        ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default())
+    }
+
+    #[test]
+    fn claim_partial_complete_attaches_execution_id() {
+        let partial = ClaimExecutionResultPartial::Claimed(ClaimedExecutionPartial {
+            lease_id: LeaseId::new(),
+            lease_epoch: LeaseEpoch::new(1),
+            attempt_index: AttemptIndex::new(0),
+            attempt_id: AttemptId::new(),
+            attempt_type: AttemptType::Initial,
+            lease_expires_at: TimestampMs::from_millis(1000),
+        });
+        let eid = test_eid();
+        let full = partial.complete(eid.clone());
+        match full {
+            ClaimExecutionResult::Claimed(c) => assert_eq!(c.execution_id, eid),
+        }
+    }
+
+    #[test]
+    fn complete_partial_complete_attaches_execution_id() {
+        let partial = CompleteExecutionResultPartial::Completed {
+            public_state: PublicState::Completed,
+        };
+        let eid = test_eid();
+        let full = partial.complete(eid.clone());
+        match full {
+            CompleteExecutionResult::Completed { execution_id, .. } => assert_eq!(execution_id, eid),
+        }
+    }
+
+    #[test]
+    fn cancel_partial_complete_attaches_execution_id() {
+        let partial = CancelExecutionResultPartial::Cancelled {
+            public_state: PublicState::Cancelled,
+        };
+        let eid = test_eid();
+        let full = partial.complete(eid.clone());
+        match full {
+            CancelExecutionResult::Cancelled { execution_id, .. } => assert_eq!(execution_id, eid),
+        }
+    }
+
+    #[test]
+    fn delay_partial_complete_attaches_execution_id() {
+        let partial = DelayExecutionResultPartial::Delayed {
+            public_state: PublicState::Delayed,
+        };
+        let eid = test_eid();
+        let full = partial.complete(eid.clone());
+        match full {
+            DelayExecutionResult::Delayed { execution_id, .. } => assert_eq!(execution_id, eid),
+        }
+    }
+
+    #[test]
+    fn move_to_waiting_children_partial_complete_attaches_execution_id() {
+        let partial = MoveToWaitingChildrenResultPartial::Moved {
+            public_state: PublicState::WaitingChildren,
+        };
+        let eid = test_eid();
+        let full = partial.complete(eid.clone());
+        match full {
+            MoveToWaitingChildrenResult::Moved { execution_id, .. } => assert_eq!(execution_id, eid),
+        }
+    }
+
+    #[test]
+    fn expire_partial_expired_variant_attaches_execution_id() {
+        let partial = ExpireExecutionResultPartial::Expired;
+        let eid = test_eid();
+        let full = partial.complete(eid.clone());
+        match full {
+            ExpireExecutionResult::Expired { execution_id } => assert_eq!(execution_id, eid),
+            _ => panic!("expected Expired variant"),
+        }
+    }
+
+    #[test]
+    fn expire_partial_already_terminal_variant_ignores_execution_id() {
+        // Multi-variant exhaustiveness test: AlreadyTerminal has no
+        // execution_id field, so complete() passes it through without
+        // attaching. Verifies the variant-mirror pattern.
+        let partial = ExpireExecutionResultPartial::AlreadyTerminal;
+        let eid = test_eid();
+        let full = partial.complete(eid);
+        assert!(matches!(full, ExpireExecutionResult::AlreadyTerminal));
     }
 }

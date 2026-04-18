@@ -161,8 +161,9 @@ impl ServerConfig {
         }
 
         let partition_config = PartitionConfig {
-            num_execution_partitions: env_u16_positive("FF_EXEC_PARTITIONS", 256)?,
-            num_flow_partitions: env_u16_positive("FF_FLOW_PARTITIONS", 64)?,
+            // RFC-011: num_execution_partitions retired; exec keys co-locate on
+            // {fp:N}. FF_FLOW_PARTITIONS is the canonical env var.
+            num_flow_partitions: env_u16_positive("FF_FLOW_PARTITIONS", 256)?,
             num_budget_partitions: env_u16_positive("FF_BUDGET_PARTITIONS", 32)?,
             num_quota_partitions: env_u16_positive("FF_QUOTA_PARTITIONS", 32)?,
         };

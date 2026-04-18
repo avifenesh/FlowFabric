@@ -234,7 +234,7 @@ impl Scheduler {
         worker_capabilities: &BTreeSet<String>,
         grant_ttl_ms: u64,
     ) -> Result<Option<ClaimGrant>, SchedulerError> {
-        let num_partitions = self.config.num_execution_partitions;
+        let num_partitions = self.config.num_flow_partitions;
         let mut budget_checker = BudgetChecker::new(self.config);
 
         // Jitter the partition scan start to avoid thundering-herd on
@@ -314,7 +314,7 @@ impl Scheduler {
             // workers from hammering partition 0 first simultaneously.
             let p_idx = (start_p + offset) % num_partitions;
             let partition = Partition {
-                family: PartitionFamily::Execution,
+                family: PartitionFamily::Flow,
                 index: p_idx,
             };
             let idx = IndexKeys::new(&partition);

@@ -593,14 +593,14 @@ async fn classify_stranded(
 
     let lane = LaneId::new(env.lane.clone());
     let config = PartitionConfig::default();
-    let n = config.num_execution_partitions;
+    let n = config.num_flow_partitions;
 
     let mut blocked_route: HashSet<String> = HashSet::new();
     let mut terminal: HashSet<String> = HashSet::new();
 
     for p in 0..n {
         let partition = Partition {
-            family: PartitionFamily::Execution,
+            family: PartitionFamily::Flow,
             index: p,
         };
         let idx = IndexKeys::new(&partition);

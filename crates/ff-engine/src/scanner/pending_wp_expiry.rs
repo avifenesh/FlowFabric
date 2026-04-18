@@ -41,7 +41,7 @@ impl Scanner for PendingWaitpointExpiryScanner {
         partition: u16,
     ) -> ScanResult {
         let p = Partition {
-            family: PartitionFamily::Execution,
+            family: PartitionFamily::Flow,
             index: partition,
         };
         let idx = IndexKeys::new(&p);

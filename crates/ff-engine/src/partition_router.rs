@@ -40,7 +40,7 @@ impl PartitionRouter {
     /// Build IndexKeys for a given partition index.
     pub fn index_keys(&self, partition_index: u16) -> IndexKeys {
         let partition = Partition {
-            family: PartitionFamily::Execution,
+            family: PartitionFamily::Flow,
             index: partition_index,
         };
         IndexKeys::new(&partition)
@@ -52,8 +52,8 @@ impl PartitionRouter {
     }
 
     /// Total number of execution partitions.
-    pub fn num_execution_partitions(&self) -> u16 {
-        self.config.num_execution_partitions
+    pub fn num_flow_partitions(&self) -> u16 {
+        self.config.num_flow_partitions
     }
 }
 
