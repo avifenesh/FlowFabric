@@ -26,6 +26,11 @@ benches/benches/
 benches/comparisons/*/benches/
 benches/perf-invest/redis-rs-src/
 
+# Flame graph + folded stack artifacts from probe runs — regenerable.
+benches/perf-invest/**/*.folded
+benches/perf-invest/**/*.svg
+benches/perf-invest/envelope-probe/20*/
+
 # ── Team coordination (internal, not public) ──
 TEAM.md
 .remember/
