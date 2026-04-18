@@ -1,0 +1,37 @@
+{
+  "cluster": false,
+  "config": {
+    "cluster_mode": true,
+    "duration_s": 30,
+    "endpoint": "clustercfg.glide-perf-test-cache-2026.nra7gl.use1.cache.amazonaws.com",
+    "key_count": 10000,
+    "mix": "100% GET",
+    "payload_bytes": 4096,
+    "port": 6379,
+    "tls": true,
+    "warmup_s": 5,
+    "workers": 16
+  },
+  "duration_s": 30.002053963,
+  "git_sha": "4636dde",
+  "hdr_samples": 753296,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 3.535,
+    "p50": 0.636,
+    "p95": 0.688,
+    "p99": 0.726
+  },
+  "notes": "ferriskey cluster+TLS = 100% GET on 4 KiB pre-seeded, {wider} single-slot.",
+  "scenario": "cluster_wider_get_only",
+  "system": "ferriskey-cluster",
+  "throughput_ops_per_sec": 25108.147626459224,
+  "timestamp_utc": "2026-04-18T00:46:48Z",
+  "total_errors": 0,
+  "total_ops": 753296,
+  "valkey_version": "7.2.4"
+}

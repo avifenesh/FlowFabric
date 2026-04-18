@@ -10,6 +10,12 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric server library and HTTP binary"
 
+[features]
+# Re-exports of ferriskey feature flags. Consumers opt in on ff-server
+# and the flag propagates to the underlying ferriskey crate. OFF by
+# default.
+iam = ["ferriskey/iam"]
+
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }

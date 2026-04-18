@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "ff-bench-faktory"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Comparison package for the Faktory work server (contribsys/faktory).
+# Runs against a separately-hosted Faktory instance — see
+# `scripts/start-faktory.sh`. NOT wired into the matrix CI because
+# the Faktory daemon needs its own docker container and the CI host
+# pool doesn't keep one around.
+
+[[bin]]
+name = "faktory-scenario1"
+path = "src/scenario1.rs"
+
+[[bin]]
+name = "faktory-scenario3"
+path = "src/scenario3.rs"
+
+[dependencies]
+# ff-bench path dep reuses the shared report-metadata helpers
+# (host_info, valkey_version, git_sha, iso8601_utc) so the Faktory
+# report schema matches the FlowFabric / baseline / apalis reports.
+# Brings in ff-sdk / reqwest as a transitive cost that doesn't touch
+# the measured workload — the Faktory hot path is faktory-crate-only.
+ff-bench = { path = "../../harness" }
+faktory = { version = "0.13", default-features = false, features = ["rustls"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

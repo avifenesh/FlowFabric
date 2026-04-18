@@ -21,7 +21,6 @@ use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
-use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{mpsc, Notify, RwLock as TokioRwLock};
 
 /// Subscription kinds for cluster mode
@@ -252,10 +251,18 @@ impl EventDrivenSynchronizer {
         });
 
         if is_synced {
-            let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
+            tracing::debug!(
+                target: "ferriskey",
+                event = "pubsub_synced",
+                "ferriskey: pubsub subscription state synced"
+            );
             self.sync_notify.notify_waiters();
         } else {
-            let _ = FerrisKeyOtel::record_subscription_out_of_sync();
+            tracing::warn!(
+                target: "ferriskey",
+                event = "pubsub_out_of_sync",
+                "ferriskey: pubsub subscription state drift detected"
+            );
         }
     }
 

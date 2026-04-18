@@ -1,7 +1,5 @@
 #![macro_use]
 
-use telemetrylib::FerrisKeySpan;
-
 use crate::cmd::{Cmd, cmd, cmd_len};
 use crate::value::{
     ErrorKind, FromValue, HashSet, Result, ToArgs, Value, from_owned_value,
@@ -14,8 +12,6 @@ pub struct Pipeline {
     commands: Vec<Arc<Cmd>>,
     transaction_mode: bool,
     ignored_commands: HashSet<usize>,
-    /// The OpenTelemtry span command, to measure the lifetime of the pipeline.
-    otel_command_span: Option<FerrisKeySpan>,
 }
 
 /// A pipeline allows you to send multiple commands in one go to the
@@ -52,14 +48,7 @@ impl Pipeline {
             commands: Vec::with_capacity(capacity),
             transaction_mode: false,
             ignored_commands: HashSet::new(),
-            otel_command_span: None,
         }
-    }
-
-    /// Return this command span
-    #[inline]
-    pub(crate) fn span(&self) -> Option<FerrisKeySpan> {
-        self.otel_command_span.clone()
     }
 
     /// This enables atomic mode.  In atomic mode the whole pipeline is

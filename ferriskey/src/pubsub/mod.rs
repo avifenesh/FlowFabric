@@ -68,3 +68,35 @@ pub async fn create_pubsub_synchronizer(
         sync
     }
 }
+
+/// Attach a `Weak<Arc<RwLock<ClientWrapper>>>` to an already-created
+/// synchronizer.
+///
+/// The direct `create_pubsub_synchronizer` call takes the weak
+/// handle at construction time because historically the shared
+/// client `Arc` was built before connect — initialised with a
+/// `ClientWrapper::Lazy` placeholder. The Lazy placeholder is gone;
+/// `Client::new` now builds the real wrapper, then the `Arc`, then
+/// calls this helper to wire the synchronizer's Weak reference.
+/// Separating "create" from "attach" keeps the ordering legal
+/// without changing the trait surface.
+pub fn attach_internal_client(
+    sync: &Arc<dyn PubSubSynchronizer>,
+    internal_client: Weak<RwLock<ClientWrapper>>,
+) {
+    if internal_client.upgrade().is_none() {
+        return;
+    }
+    #[cfg(feature = "test-util")]
+    if let Some(concrete) = sync.as_any().downcast_ref::<mock::MockPubSubSynchronizer>() {
+        concrete.set_internal_client(internal_client);
+        return;
+    }
+    #[cfg(not(feature = "test-util"))]
+    if let Some(concrete) = sync
+        .as_any()
+        .downcast_ref::<synchronizer::EventDrivenSynchronizer>()
+    {
+        concrete.set_internal_client(internal_client);
+    }
+}

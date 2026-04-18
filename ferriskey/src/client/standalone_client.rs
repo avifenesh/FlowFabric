@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use telemetrylib::Telemetry;
 use tokio::sync::mpsc;
 use tokio::task;
 
@@ -59,16 +58,13 @@ pub struct StandaloneClient {
     inner: Arc<DropWrapper>,
 }
 
-impl Drop for StandaloneClient {
-    fn drop(&mut self) {
-        // Client was dropped, reduce the number of clients.
-        // NOTE: mark_as_dropped() is intentionally NOT called here.
-        // StandaloneClient is Clone (shares Arc<DropWrapper>), so this Drop fires
-        // on every clone drop, not just the final one. The DropWrapper::drop()
-        // handles mark_as_dropped() correctly when the LAST Arc reference is dropped.
-        Telemetry::decr_total_clients(1);
-    }
-}
+// No `impl Drop for StandaloneClient` — the previous drop body called
+// a global `Telemetry::decr_total_clients(1)` that took a
+// lazy_static::RwLock::write on every cloned wrapper drop (~30k per 10k
+// task bench). Connection-lifecycle observability now lives on the
+// connect/disconnect events (tracing at `create_client`) and the
+// `DropWrapper::drop` above; a cloned `StandaloneClient` is an Arc bump,
+// not a connection change.
 
 fn format_connection_errors(errors: Vec<(Option<String>, Error)>) -> Error {
     if errors.len() == 1 {
@@ -92,7 +88,7 @@ impl StandaloneClient {
     pub async fn create_client(
         connection_request: ConnectionRequest,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+        #[cfg(feature = "iam")] iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     ) -> std::result::Result<Self, Error> {
         if connection_request.addresses.is_empty() {
@@ -116,8 +112,11 @@ impl StandaloneClient {
             )));
         }
 
+        #[cfg(feature = "iam")]
         let valkey_connection_info =
             get_valkey_connection_info(&connection_request, iam_token_manager).await;
+        #[cfg(not(feature = "iam"))]
+        let valkey_connection_info = get_valkey_connection_info(&connection_request).await;
         let retry_strategy = match connection_request.connection_retry_strategy {
             Some(strategy) => RetryStrategy::new(
                 strategy.exponent_base,
@@ -192,6 +191,7 @@ impl StandaloneClient {
         let addresses = connection_request.addresses.clone();
         let read_from_option = connection_request.read_from.clone();
 
+        #[cfg(feature = "iam")]
         let iam_token_handle = iam_token_manager.map(|m| m.get_token_handle());
 
         let mut stream = stream::iter(addresses)
@@ -206,6 +206,7 @@ impl StandaloneClient {
                 let nodelay = tcp_nodelay;
                 let sync = pubsub_synchronizer.clone();
                 let skip_replication = read_only;
+                #[cfg(feature = "iam")]
                 let iam_handle = iam_token_handle.clone();
                 async move {
                     get_connection_and_replication_info(
@@ -220,6 +221,7 @@ impl StandaloneClient {
                         nodelay,
                         &sync,
                         skip_replication,
+                        #[cfg(feature = "iam")]
                         iam_handle,
                     )
                     .await
@@ -320,8 +322,13 @@ impl StandaloneClient {
             Self::start_periodic_connection_check(node.clone());
         }
 
-        // Successfully created new client. Update the telemetry
-        Telemetry::incr_total_clients(1);
+        // Successfully created new client. Emit a connect event.
+        tracing::info!(
+            target: "ferriskey",
+            event = "client_created",
+            nodes = nodes.len(),
+            "ferriskey: standalone client connected"
+        );
 
         Ok(Self {
             inner: Arc::new(DropWrapper {
@@ -785,7 +792,7 @@ async fn get_connection_and_replication_info(
     tcp_nodelay: bool,
     pubsub_synchronizer: &Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     skip_replication_check: bool,
-    iam_token_handle: Option<super::IAMTokenHandle>,
+    #[cfg(feature = "iam")] iam_token_handle: Option<super::IAMTokenHandle>,
 ) -> std::result::Result<(ReconnectingConnection, Option<Value>), (ReconnectingConnection, Error)> {
     let reconnecting_connection = ReconnectingConnection::new(
         address,
@@ -798,6 +805,7 @@ async fn get_connection_and_replication_info(
         tls_params,
         tcp_nodelay,
         pubsub_synchronizer.clone(),
+        #[cfg(feature = "iam")]
         iam_token_handle,
     )
     .await?;

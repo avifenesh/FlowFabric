@@ -10,7 +10,6 @@ use crate::pipeline::Pipeline;
 use crate::value::{
     FromValue, Result, ToArgs, Write, from_owned_value,
 };
-use telemetrylib::FerrisKeySpan;
 
 /// An argument to a valkey command
 #[derive(Clone)]
@@ -30,8 +29,6 @@ pub struct Cmd {
     // Arg::Simple contains the offset that marks the end of the argument
     args: Vec<Arg<usize>>,
     cursor: Option<u64>,
-    /// The span associated with this command
-    span: Option<FerrisKeySpan>,
     //  A flag indicating whether this is a fenced command  (will have PING appended to ensure ordering)
     is_fenced: bool,
     /// Inflight slot tracker. When set, the slot is released when the last
@@ -303,7 +300,6 @@ impl Cmd {
             data: vec![],
             args: vec![],
             cursor: None,
-            span: None,
             is_fenced: false,
             inflight_tracker: None,
             pre_packed: false,
@@ -322,7 +318,6 @@ impl Cmd {
             data: packed.into(),
             args: vec![],
             cursor: None,
-            span: None,
             is_fenced: false,
             inflight_tracker: None,
             pre_packed: true,
@@ -451,12 +446,6 @@ impl Cmd {
         };
 
         Some(&self.data[start..end])
-    }
-
-    /// Return this command span
-    #[inline]
-    pub(crate) fn span(&self) -> Option<FerrisKeySpan> {
-        self.span.clone()
     }
 
     /// Mark this command as fenced. A PING command will be appended after it

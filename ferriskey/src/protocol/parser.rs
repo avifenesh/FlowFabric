@@ -6,7 +6,6 @@ use crate::value::{
 
 use bytes::{Buf, BytesMut};
 use num_bigint::BigInt;
-use telemetrylib::FerrisKeyOtel;
 
 const MAX_RECURSE_DEPTH: usize = 100;
 const MAX_BULK_STRING_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
@@ -25,9 +24,11 @@ fn err_parser(line: &str) -> Error {
         "LOADING" => ErrorKind::BusyLoadingError,
         "NOSCRIPT" => ErrorKind::NoScriptError,
         "MOVED" => {
-            if let Err(e) = FerrisKeyOtel::record_moved_error() {
-                tracing::error!("OpenTelemetry:moved_error - Failed to record moved error: {e}");
-            }
+            tracing::debug!(
+                target: "ferriskey",
+                event = "moved_redirect",
+                "ferriskey: MOVED redirect from server"
+            );
             ErrorKind::Moved
         }
         "ASK" => ErrorKind::Ask,

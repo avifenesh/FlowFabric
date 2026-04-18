@@ -1,7 +1,9 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{NodeAddress, TlsMode};
-use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
+use crate::connection::factory::FerrisKeyConnectionOptions;
+#[cfg(feature = "iam")]
+use crate::connection::factory::IAMTokenProvider;
 use crate::connection::info::ValkeyConnectionInfo;
 use crate::connection::{DisconnectNotifier, MultiplexedConnection};
 use crate::pubsub::push_manager::PushInfo;
@@ -15,7 +17,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 use std::time::Duration;
-use telemetrylib::Telemetry;
 use tokio::sync::{Notify, mpsc};
 use tokio::task;
 use tokio::time::timeout;
@@ -41,6 +42,9 @@ pub enum ReconnectReason {
 /// it via SigV4 signing when the current one has expired — so the AUTH command
 /// always uses valid credentials without requiring a reference back to the full
 /// `IAMTokenManager`.
+///
+/// Only available when built with `feature = "iam"`.
+#[cfg(feature = "iam")]
 #[derive(Clone)]
 pub struct IAMTokenHandle {
     /// Shared cached IAM token (same `Arc` owned by `IAMTokenManager`).
@@ -51,6 +55,7 @@ pub struct IAMTokenHandle {
     pub(crate) iam_token_state: crate::iam::IamTokenState,
 }
 
+#[cfg(feature = "iam")]
 impl IAMTokenHandle {
     /// Returns the best available token, refreshing it first if expired.
     ///
@@ -95,6 +100,7 @@ impl IAMTokenHandle {
     }
 }
 
+#[cfg(feature = "iam")]
 #[async_trait::async_trait]
 impl IAMTokenProvider for IAMTokenHandle {
     async fn get_valid_token(&self) -> Option<String> {
@@ -111,6 +117,7 @@ struct ConnectionBackend {
     /// Once this flag is set, the internal connection needs no longer try to reconnect to the server, because all the outer clients were dropped.
     client_dropped_flagged: AtomicBool,
     /// Optional handle to the IAM token cache for refreshing the password before reconnection.
+    #[cfg(feature = "iam")]
     iam_token_handle: Option<IAMTokenHandle>,
 }
 
@@ -254,7 +261,11 @@ async fn create_connection(
                 let addr = &client.get_connection_info().addr;
                 tracing::debug!("connection creation - Connection to {addr} created");
             }
-            Telemetry::incr_total_connections(1);
+            tracing::info!(
+                target: "ferriskey",
+                event = "connection_opened",
+                "ferriskey: connection opened"
+            );
             Ok(ReconnectingConnection {
                 inner: Arc::new(InnerReconnectingConnection {
                     state: Mutex::new(ConnectionState::Connected(connection)),
@@ -320,7 +331,7 @@ impl ReconnectingConnection {
         tls_params: Option<crate::connection::tls::TlsConnParams>,
         tcp_nodelay: bool,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-        iam_token_handle: Option<IAMTokenHandle>,
+        #[cfg(feature = "iam")] iam_token_handle: Option<IAMTokenHandle>,
     ) -> std::result::Result<ReconnectingConnection, (ReconnectingConnection, Error)> {
         tracing::debug!("connection creation - Attempting connection to {address}");
 
@@ -329,6 +340,7 @@ impl ReconnectingConnection {
             connection_info: RwLock::new(connection_info),
             connection_available_signal: ManualResetEvent::new(true),
             client_dropped_flagged: AtomicBool::new(false),
+            #[cfg(feature = "iam")]
             iam_token_handle,
         };
         create_connection(
@@ -360,9 +372,14 @@ impl ReconnectingConnection {
     }
 
     pub(super) fn mark_as_dropped(&self) {
-        // Update the telemetry for each connection that is dropped. A dropped connection
-        // will not be re-connected, so update the telemetry here
-        Telemetry::decr_total_connections(1);
+        // A dropped connection will not be re-connected; emit a close
+        // event so subscribers can track connection-lifecycle metrics.
+        tracing::info!(
+            target: "ferriskey",
+            event = "connection_closed",
+            reason = "mark_as_dropped",
+            "ferriskey: connection closed"
+        );
         self.inner
             .backend
             .client_dropped_flagged
@@ -406,15 +423,24 @@ impl ReconnectingConnection {
         let connection_clone = self.clone();
 
         if reason.eq(&ReconnectReason::ConnectionDropped) {
-            // Attempting to reconnect a connection that was dropped (for any reason) - update the telemetry by reducing
-            // the number of opened connections by 1, it will be incremented by 1 after a successful re-connect
-            Telemetry::decr_total_connections(1);
+            // Emit a close event for the dropped connection; the new
+            // connection will emit its own open event after a
+            // successful reconnect attempt.
+            tracing::warn!(
+                target: "ferriskey",
+                event = "connection_closed",
+                reason = "connection_dropped",
+                "ferriskey: connection dropped, reconnecting"
+            );
         }
 
         // The reconnect task is spawned instead of awaited here, so that the reconnect attempt will continue in the
         // background, regardless of whether the calling task is dropped or not.
         task::spawn(async move {
+            #[cfg(feature = "iam")]
             let has_iam = connection_clone.inner.backend.iam_token_handle.is_some();
+            #[cfg(not(feature = "iam"))]
+            let has_iam = false;
 
             // For non-IAM connections, clone the client once before the loop to preserve
             // the original reconnection behavior (password is fixed at reconnect start).
@@ -444,6 +470,7 @@ impl ReconnectingConnection {
                 // If IAM authentication is configured, ensure the connection uses a
                 // valid token before attempting to reconnect.  If the cached token has
                 // expired, a fresh one is generated on demand via SigV4 signing.
+                #[cfg(feature = "iam")]
                 if let Some(handle) = &connection_clone.inner.backend.iam_token_handle
                     && let Some(valid_token) = handle.get_valid_token_inner().await
                 {
@@ -488,7 +515,12 @@ impl ReconnectingConnection {
                             *guard = ConnectionState::Connected(connection);
                         }
 
-                        Telemetry::incr_total_connections(1);
+                        tracing::info!(
+                            target: "ferriskey",
+                            event = "connection_opened",
+                            reason = "reconnect",
+                            "ferriskey: reconnect completed"
+                        );
                         return;
                     }
                     Err(_) => tokio::time::sleep(sleep_duration).await,

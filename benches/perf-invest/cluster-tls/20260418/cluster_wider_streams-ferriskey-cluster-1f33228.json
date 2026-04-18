@@ -1,0 +1,37 @@
+{
+  "cluster": false,
+  "config": {
+    "cluster_mode": true,
+    "duration_s": 30,
+    "endpoint": "clustercfg.glide-perf-test-cache-2026.nra7gl.use1.cache.amazonaws.com",
+    "mix": "20% XADD / 80% XRANGE-10",
+    "payload_bytes": 4096,
+    "port": 6379,
+    "tls": true,
+    "warmup_s": 5,
+    "workers": 16,
+    "xrange_count": 10
+  },
+  "duration_s": 30.002305818,
+  "git_sha": "1f33228",
+  "hdr_samples": 562780,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 4.335,
+    "p50": 0.834,
+    "p95": 1.072,
+    "p99": 1.247
+  },
+  "notes": "ferriskey cluster+TLS = 20% XADD + 80% XRANGE-10, per-worker {wider} stream keys.",
+  "scenario": "cluster_wider_streams",
+  "system": "ferriskey-cluster",
+  "throughput_ops_per_sec": 18757.89159053095,
+  "timestamp_utc": "2026-04-18T00:50:53Z",
+  "total_errors": 0,
+  "total_ops": 562780,
+  "valkey_version": "7.2.4"
+}

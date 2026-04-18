@@ -99,7 +99,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 use strum_macros::Display;
-use telemetrylib::{FerrisKeyOtel, FerrisKeySpan, Telemetry};
 use tokio::{
     sync::{
         Notify, mpsc,
@@ -174,12 +173,19 @@ type SharedConnFuture<C> = futures::future::Shared<BoxFuture<'static, C>>;
 type DirectPipelineGroup<C> = (Arc<str>, crate::pipeline::Pipeline, Vec<usize>, SharedConnFuture<C>);
 type NodeResponseReceiver = (Option<Arc<str>>, oneshot::Receiver<Result<Response>>);
 
-/// Sets the routed node's address on the command span for OTel reporting.
-/// Called after cluster routing resolves the actual target node.
-fn set_routed_node_on_span(span: &FerrisKeySpan, address: &str) {
+/// Emits a tracing event identifying the routed node for this
+/// command. Replaces the previous OTel-span-attribute path; subscribers
+/// that want span-attached attributes can open a `ferriskey.route` span
+/// and correlate via the event.
+fn emit_routed_node(address: &str) {
     if let Some((host, port)) = parse_node_address(address) {
-        span.set_attribute("server.address", host.to_string());
-        span.set_attribute_i64("server.port", port);
+        tracing::debug!(
+            target: "ferriskey",
+            event = "routed",
+            server.address = %host,
+            server.port = port,
+            "ferriskey: cluster routing resolved node"
+        );
     }
 }
 
@@ -498,7 +504,6 @@ where
             _ => CmdArg::Cmd {
                 packed: cmd.get_packed_command(),
                 is_fenced: cmd.is_fenced(),
-                span: cmd.span(),
                 routing: routing.into(),
             },
         };
@@ -832,8 +837,11 @@ impl<C> Dispose for ClusterConnInner<C> {
             handle.abort()
         }
 
-        // Reduce the number of clients
-        Telemetry::decr_total_clients(1);
+        tracing::info!(
+            target: "ferriskey",
+            event = "client_dropped",
+            "ferriskey: cluster client dropped"
+        );
     }
 }
 
@@ -931,7 +939,6 @@ enum CmdArg<C> {
     Cmd {
         packed: bytes::Bytes,
         is_fenced: bool,
-        span: Option<FerrisKeySpan>,
         routing: InternalRoutingInfo<C>,
     },
     /// Multi-node command: needs the full Cmd for fan-out splitting.
@@ -1401,10 +1408,12 @@ impl<C> Future for Request<C> {
                     return next;
                 }
                 request.retry = request.retry.saturating_add(1);
-                // Record retry attempts metric if telemetry is initialized
-                if let Err(e) = FerrisKeyOtel::record_retry_attempt() {
-                    tracing::error!("OpenTelemetry:retry_error - Failed to record retry attempt: {e}");
-                }
+                tracing::warn!(
+                    target: "ferriskey",
+                    event = "retry",
+                    attempt = request.retry,
+                    "ferriskey: cluster command retry"
+                );
 
                 if err.kind() == ErrorKind::AllConnectionsUnavailable {
                     return Next::ReconnectToInitialNodes {
@@ -1627,8 +1636,12 @@ where
             }
         }
 
-        // New client added
-        Telemetry::incr_total_clients(1);
+        tracing::info!(
+            target: "ferriskey",
+            event = "client_created",
+            kind = "cluster",
+            "ferriskey: cluster client connected"
+        );
         Ok(Disposable::new(connection))
     }
 
@@ -2914,7 +2927,6 @@ where
     async fn try_packed_request(
         packed: bytes::Bytes,
         is_fenced: bool,
-        span: Option<FerrisKeySpan>,
         routing: InternalRoutingInfo<C>,
         core: Core<C>,
     ) -> OperationResult {
@@ -2935,9 +2947,7 @@ where
         let (address, mut conn, needs_asking) = Self::get_connection(routing, core, None)
             .await
             .map_err(|err| (OperationTarget::NotFound, err))?;
-        if let Some(span) = span {
-            set_routed_node_on_span(&span, &address);
-        }
+        emit_routed_node(&address);
 
         if needs_asking {
             // Send ASKING + real command atomically via a 2-command pipeline
@@ -3011,9 +3021,7 @@ where
             Self::get_connection(routing, core, Some(cmd.clone()))
                 .await
                 .map_err(|err| (OperationTarget::NotFound, err))?;
-        if let Some(span) = cmd.span() {
-            set_routed_node_on_span(&span, &address);
-        }
+        emit_routed_node(&address);
 
         if needs_asking {
             // Send ASKING + real command atomically via a 2-command pipeline.
@@ -3070,9 +3078,7 @@ where
         trace!("try_pipeline_request");
         let (address, mut conn, needs_asking) =
             conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
-        if let Some(span) = pipeline.span() {
-            set_routed_node_on_span(&span, &address);
-        }
+        emit_routed_node(&address);
 
         // When needs_asking is true, prepend ASKING to the pipeline so
         // it is sent atomically in a single write.  Adjust offset/count
@@ -3115,9 +3121,8 @@ where
             CmdArg::Cmd {
                 packed,
                 is_fenced,
-                span,
                 routing,
-            } => Self::try_packed_request(packed, is_fenced, span, routing, core).await,
+            } => Self::try_packed_request(packed, is_fenced, routing, core).await,
             CmdArg::MultiCmd { cmd, routing } => Self::try_cmd_request(cmd, routing, core).await,
             CmdArg::Pipeline {
                 pipeline,

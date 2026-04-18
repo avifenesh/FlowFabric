@@ -1,0 +1,33 @@
+{
+  "cluster": false,
+  "config": {
+    "duration_s": 30,
+    "mix": "20% XADD / 80% XRANGE-10",
+    "payload_bytes": 4096,
+    "warmup_s": 5,
+    "workers": 16,
+    "xrange_count": 10
+  },
+  "duration_s": 30.000294884,
+  "git_sha": "8cb6dff",
+  "hdr_samples": 1503634,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 4.595,
+    "p50": 0.309,
+    "p95": 0.481,
+    "p99": 0.633
+  },
+  "notes": "redis-rs wider = streams = 20% XADD + 80% XRANGE-10 per worker. Same per-worker stream key under {wider}; pre-seeded 50-entry backlog.",
+  "scenario": "wider_streams",
+  "system": "redis-rs-wider",
+  "throughput_ops_per_sec": 50120.64067416652,
+  "timestamp_utc": "2026-04-18T00:08:19Z",
+  "total_errors": 0,
+  "total_ops": 1503634,
+  "valkey_version": "7.2.4"
+}

@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use telemetrylib::Telemetry;
 
 use tracing::debug;
 
@@ -301,7 +300,7 @@ pub(crate) struct ConnectionsContainer<Connection> {
 impl<Connection> Drop for ConnectionsContainer<Connection> {
     fn drop(&mut self) {
         let count = count_connections!(&self.connection_map);
-        Telemetry::decr_total_connections(count);
+        tracing::debug!(target: "ferriskey", event = "connections_removed", count = count as u64, "ferriskey: cluster connections removed");
     }
 }
 
@@ -333,7 +332,7 @@ where
 
         // Update the telemetry with the number of connections
         let count = count_connections!(&connection_map);
-        Telemetry::incr_total_connections(count);
+        tracing::debug!(target: "ferriskey", event = "connections_added", count = count as u64, "ferriskey: cluster connections added");
 
         Self {
             connection_map,
@@ -364,7 +363,13 @@ where
         self.connection_map.extend(other_connection_map.0);
         let conn_count_after = count_connections!(&self.connection_map);
         // Update the number of connections by the difference
-        Telemetry::incr_total_connections(conn_count_after.saturating_sub(conn_count_before));
+        let added = conn_count_after.saturating_sub(conn_count_before);
+        tracing::debug!(
+            target: "ferriskey",
+            event = "connections_added",
+            count = added as u64,
+            "ferriskey: cluster connections added"
+        );
     }
 
     /// Returns the availability zone associated with the connection in address
@@ -668,20 +673,35 @@ where
     ) -> Arc<str> {
         let address: Arc<str> = address.into();
 
-        // Increase the total number of connections by the number of connections managed by `node`
-        Telemetry::incr_total_connections(node.connections_count());
+        let added = node.connections_count() as u64;
+        tracing::debug!(
+            target: "ferriskey",
+            event = "connections_added",
+            count = added,
+            "ferriskey: cluster connections added"
+        );
 
         if let Some(old_conn) = self.connection_map.insert(Arc::clone(&address), node) {
-            // We are replacing a node. Reduce the counter by the number of connections managed by
-            // the old connection
-            Telemetry::decr_total_connections(old_conn.connections_count());
+            let removed = old_conn.connections_count() as u64;
+            tracing::debug!(
+                target: "ferriskey",
+                event = "connections_removed",
+                count = removed,
+                "ferriskey: cluster connections removed"
+            );
         };
         address
     }
 
     pub(crate) fn remove_node(&self, address: &str) -> Option<ClusterNode<Connection>> {
         if let Some((_key, old_conn)) = self.connection_map.remove(address) {
-            Telemetry::decr_total_connections(old_conn.connections_count());
+            let removed = old_conn.connections_count() as u64;
+            tracing::debug!(
+                target: "ferriskey",
+                event = "connections_removed",
+                count = removed,
+                "ferriskey: cluster connections removed"
+            );
             Some(old_conn)
         } else {
             None

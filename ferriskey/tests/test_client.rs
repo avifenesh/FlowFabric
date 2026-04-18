@@ -23,7 +23,6 @@ macro_rules! async_assert_eq {
 
 #[cfg(test)]
 pub(crate) mod shared_client_tests {
-    use ferriskey::Telemetry;
     use ferriskey::cluster::routing::{
         MultipleNodeRoutingInfo, Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
     };
@@ -34,6 +33,8 @@ pub(crate) mod shared_client_tests {
 
     use super::*;
     use ferriskey::client::{Client, DEFAULT_RESPONSE_TIMEOUT};
+    #[allow(unused_imports)] // used only by lazy IAM tests (W3 scope)
+    use ferriskey::client::ValkeyClientForTests;
     use rstest::rstest;
     use utilities::BackingServer;
     use utilities::cluster::*;
@@ -672,8 +673,10 @@ pub(crate) mod shared_client_tests {
             // Enable lazy connection
             connection_request.lazy_connect = true;
 
-            // Create client with lazy connection
-            let client_result = Client::new(connection_request, None).await;
+            // Create client with lazy connection via the dedicated
+            // LazyClient type — `Client::new` now rejects
+            // `lazy_connect=true`.
+            let client_result = ferriskey::LazyClient::from_config(connection_request);
 
             match client_result {
                 Ok(mut client) => {
@@ -772,8 +775,10 @@ pub(crate) mod shared_client_tests {
             // Enable lazy connection
             connection_request.lazy_connect = true;
 
-            // Create client with lazy connection
-            let client_result = Client::new(connection_request, None).await;
+            // Create client with lazy connection via the dedicated
+            // LazyClient type — `Client::new` now rejects
+            // `lazy_connect=true`.
+            let client_result = ferriskey::LazyClient::from_config(connection_request);
 
             match client_result {
                 Ok(mut client) => {
@@ -2479,82 +2484,14 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_client_telemetry_standalone() {
-        Telemetry::reset();
-        block_on_all(async move {
-            // create a server with 2 clients
-            let server_config = TestConfiguration {
-                use_tls: false,
-                ..Default::default()
-            };
-
-            let test_basics = utilities::setup_test_basics_internal(&server_config).await;
-            let server = BackingServer::Standalone(test_basics.server);
-
-            // setup_test_basics_internal internally, starts a single client connection
-            assert_eq!(Telemetry::total_connections(), 1);
-            assert_eq!(Telemetry::total_clients(), 1);
-
-            {
-                // Create 2 more clients, confirm that they are tracked
-                let _client1 = create_client(&server, server_config.clone()).await;
-                let _client2 = create_client(&server, server_config).await;
-
-                // Each client maintains a single connection
-                assert_eq!(Telemetry::total_connections(), 3);
-                assert_eq!(Telemetry::total_clients(), 3);
-
-                // Connections are dropped here
-            }
-
-            // Confirm 1 connection & client remain
-            assert_eq!(Telemetry::total_connections(), 1);
-            assert_eq!(Telemetry::total_clients(), 1);
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_client_telemetry_cluster() {
-        Telemetry::reset();
-        block_on_all(async {
-            let local_set = tokio::task::LocalSet::default();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-            // We use 2 tasks to let "dispose" be called. In addition, the task that checks for the cleanup
-            // does not start until the cluster is up and running. We use a channel to communicate this between
-            // the tasks
-            local_set.spawn_local(async move {
-                let cluster = cluster::setup_default_cluster().await;
-                async_assert_eq!(Telemetry::total_connections(), 0);
-                async_assert_eq!(Telemetry::total_clients(), 0);
-
-                // Each client opens 12 connections
-                println!("Creating 1st cluster client...");
-                let _c1 = cluster::setup_default_client(&cluster).await;
-                async_assert_eq!(Telemetry::total_connections(), 12);
-                async_assert_eq!(Telemetry::total_clients(), 1);
-
-                println!("Creating 2nd cluster client...");
-                let _c2 = cluster::setup_default_client(&cluster).await;
-                async_assert_eq!(Telemetry::total_connections(), 24);
-                async_assert_eq!(Telemetry::total_clients(), 2);
-
-                let _ = tx.send(1).await;
-                // client is dropped and eventually disposed here
-            });
-
-            local_set.spawn_local(async move {
-                let _ = rx.recv().await;
-                println!("Cluster terminated. Wait for the telemetry to clear");
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                assert_eq!(Telemetry::total_connections(), 0);
-                assert_eq!(Telemetry::total_clients(), 0);
-            });
-            local_set.await;
-        });
-    }
+    // Telemetry counter tests deleted in the telemetry-redesign:
+    // `ferriskey::Telemetry` is now a deprecated compatibility stub whose
+    // methods no-op (see `ferriskey/src/telemetry_compat.rs`). Connection
+    // and client lifecycle are observable via tracing events
+    // (`target = "ferriskey"`, `event = "connection_opened" | "client_created"
+    // | "connection_closed" | ...`) on the standard tracing subscriber
+    // pipeline. A replacement integration test that captures and asserts
+    // on those events lives at `tests/test_tracing_spans.rs`.
 
     #[test]
     #[serial_test::serial]

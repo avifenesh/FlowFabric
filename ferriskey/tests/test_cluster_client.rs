@@ -18,6 +18,7 @@ mod cluster_client_tests {
         *,
     };
     use ferriskey::client::Client;
+    use ferriskey::client::ValkeyClientForTests;
     use ferriskey::client::types::ReadFrom;
     use ferriskey::{
         InfoDict, ProtocolVersion, PubSubSubscriptionInfo, PubSubSubscriptionKind,
@@ -512,6 +513,9 @@ mod cluster_client_tests {
             //    pointing to the DEDICATED Cluster A.
             //    We use the `base_config_for_dedicated_cluster` for other settings.
             let mut lazy_client_config = base_config_for_dedicated_cluster;
+            // `lazy_connect` is recorded on the config for intent but
+            // `Client::new` rejects it now; use `LazyClient::from_config`
+            // for deferred-connect semantics.
             lazy_client_config.lazy_connect = true;
             lazy_client_config.client_name = Some("lazy_config".to_string());
 
@@ -521,10 +525,10 @@ mod cluster_client_tests {
                 &lazy_client_config, // Uses the same config but with lazy_connect=true
             );
 
-            // 5. Create the client
-            let mut lazy_ferriskey_client = Client::new(lazy_connection_request, None)
-                .await
-                .expect("Failed to create lazy client for Cluster A");
+            // 5. Create the lazy client via the new LazyClient type.
+            let mut lazy_ferriskey_client =
+                ferriskey::LazyClient::from_config(lazy_connection_request)
+                    .expect("Failed to construct lazy client for Cluster A");
 
             // 6. Assert that no new connections were made yet by the lazy client on Cluster A.
             let clients_after_lazy_init =

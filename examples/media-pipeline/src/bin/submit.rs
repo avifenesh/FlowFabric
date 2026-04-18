@@ -103,10 +103,14 @@ async fn run_pipeline(client: &Client, args: &Args, stdout: &Arc<Mutex<Stdout>>)
     let eid_summarize = uuid::Uuid::new_v4().to_string();
     let eid_embed = uuid::Uuid::new_v4().to_string();
 
+    // Print the flow ID + transcribe EID up-front so diagnostics can
+    // correlate early failures. The summarize and embed EIDs are
+    // emitted AFTER their executions are actually created — otherwise
+    // `demo.sh` races, grepping the EID out of the submit log and
+    // launching `review --execution-id <summarize>` against an
+    // execution the server has not heard of yet (404, no retry).
     log(stdout, &format!("flow_id={flow_id}")).await;
     log(stdout, &format!("transcribe={eid_transcribe}")).await;
-    log(stdout, &format!("summarize={eid_summarize}")).await;
-    log(stdout, &format!("embed={eid_embed}")).await;
 
     // Shared flag the SIGINT branch reads to decide whether to POST
     // /cancel. Once the pipeline has reached terminal completion we
@@ -237,6 +241,10 @@ async fn pipeline_inner(
         graph_rev,
     )
     .await?;
+    // Emit summarize EID now that the server knows about the execution.
+    // `demo.sh` greps this line to launch `review --execution-id ...`;
+    // emitting it earlier races the review bin against the create.
+    log(stdout, &format!("summarize={eid_summarize}")).await;
 
     let tail_summarize = spawn_tail(
         client.clone(),
@@ -284,6 +292,10 @@ async fn pipeline_inner(
     )
     .await?;
     let _ = graph_rev;
+    // Emit embed EID after the execution exists on the server — same
+    // reasoning as summarize above. Keeps `demo.sh`-style consumers
+    // grep-driven and race-free.
+    log(stdout, &format!("embed={eid_embed}")).await;
 
     let tail_embed = spawn_tail(
         client.clone(),
@@ -305,9 +317,18 @@ async fn pipeline_inner(
     pipeline_terminal.store(true, std::sync::atomic::Ordering::Release);
     log(stdout, "embed done — pipeline complete").await;
 
-    // Happy path: each tail exits on closed_at. join them so pending
-    // frames flush before we return.
-    let _ = tokio::join!(tail_transcribe, tail_summarize, tail_embed);
+    // Happy path: give each tail a 300ms grace to flush buffered
+    // frames, then abort. `tokio::join!`-ing them (as an earlier
+    // version did) hangs indefinitely on executions that complete
+    // without ever writing a stream frame — embed in this pipeline
+    // produces a result payload only (no streamed output), so its
+    // attempt stream is never created and therefore never carries a
+    // `closed_at` marker for the tail loop to observe. 300ms per tail
+    // is the same grace we give on the error path via
+    // `drain_and_stop` above.
+    drain_and_stop(tail_transcribe).await;
+    drain_and_stop(tail_summarize).await;
+    drain_and_stop(tail_embed).await;
     Ok(())
 }
 

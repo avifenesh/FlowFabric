@@ -1,0 +1,17 @@
+{
+  "ext_ms": 10000,
+  "server_timeout_s": 5,
+  "n_tasks": 5,
+  "n_array": 0,
+  "n_nil": 2,
+  "n_err": 1,
+  "min_wall_ms": 0,
+  "max_wall_ms": 15001,
+  "tasks": [
+    { "task": 0, "elapsed_ms": 0, "wall_ms": 0, "result": "other-ok" },
+    { "task": 1, "elapsed_ms": 0, "wall_ms": 0, "result": "other-ok" },
+    { "task": 2, "elapsed_ms": 5070, "wall_ms": 5070, "result": "nil" },
+    { "task": 3, "elapsed_ms": 15001, "wall_ms": 15001, "result": "err", "err": "timed out" },
+    { "task": 4, "elapsed_ms": 10088, "wall_ms": 10088, "result": "nil" }
+  ]
+}

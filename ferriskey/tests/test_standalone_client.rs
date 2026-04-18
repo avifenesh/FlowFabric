@@ -571,6 +571,11 @@ mod standalone_client_tests {
 
             // 4. Configuration for the lazy client, targeting the SAME dedicated server.
             let mut lazy_client_config = base_config_for_dedicated_server.clone();
+            // `lazy_connect` on the configuration no longer drives
+            // `Client::new` — that path errors on this flag. We keep
+            // the flag on the config to document intent and route
+            // through `ferriskey::LazyClient::from_config`, which
+            // owns deferred-connect semantics.
             lazy_client_config.lazy_connect = true;
 
             let mut lazy_client_connection_request_pb = utilities::create_connection_request(
@@ -579,16 +584,13 @@ mod standalone_client_tests {
             );
             lazy_client_connection_request_pb.cluster_mode_enabled = false;
 
-            // 5. Create the "lazy" client.
-            // For standalone lazy client, we'd expect to create a ferriskey::client::Client
-            // that internally holds a LazyClient configured for standalone.
+            // 5. Create the "lazy" client via the new LazyClient type.
             let core_connection_request: ferriskey::client::types::ConnectionRequest =
                 lazy_client_connection_request_pb;
 
-            // We need to use the generic Client::new for lazy loading behavior
-            let mut lazy_ferriskey_client_enum = FerrisKeyClient::new(core_connection_request, None)
-                .await
-                .expect("Failed to create lazy FerrisKeyClient for dedicated server");
+            let mut lazy_ferriskey_client_enum =
+                ferriskey::LazyClient::from_config(core_connection_request)
+                    .expect("Failed to construct lazy FerrisKeyClient for dedicated server");
 
             // 6. Assert that no new connection was made yet by the lazy client
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
