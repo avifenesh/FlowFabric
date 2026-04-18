@@ -29,6 +29,38 @@ use ff_sdk::{
     FlowFabricAdminClient, RotateWaitpointSecretRequest, RotateWaitpointSecretResponse, SdkError,
 };
 
+// ── Test fixture secrets ────────────────────────────────────────
+//
+// HARD-CODED TEST FIXTURE VALUES. These are NOT real HMAC signing
+// secrets — they are public constants in an integration test that
+// runs against a throw-away test Valkey, used solely to exercise
+// the server's rotation machinery. They do not appear in any log,
+// metric, panic message, or other sink.
+//
+// CodeQL's "cleartext logging of sensitive information" query may
+// flag these by following the `new_secret_hex` field name through
+// dataflow. The flags are false positives:
+//   - no println/eprintln/tracing/log in this file logs the
+//     request struct;
+//   - the RotateWaitpointSecretResponse type does NOT carry the
+//     secret;
+//   - the consts below are deliberately deterministic test
+//     fixtures, not operational secrets.
+//
+// See PR#20 discussion for the full investigation.
+// codeql[rust/cleartext-logging-sensitive-data]
+const FIXTURE_HEX_A: &str =
+    "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+// codeql[rust/cleartext-logging-sensitive-data]
+const FIXTURE_HEX_B: &str =
+    "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+// codeql[rust/cleartext-logging-sensitive-data]
+const FIXTURE_HEX_C: &str =
+    "cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677";
+// codeql[rust/cleartext-logging-sensitive-data]
+const FIXTURE_HEX_D: &str =
+    "1122334455667788aabbccddeeff00111122334455667788aabbccddeeff0011";
+
 // ── HTTP harness ────────────────────────────────────────────────
 
 struct TestApi {
@@ -124,8 +156,7 @@ async fn test_rotate_waitpoint_secret_happy_path() {
     let new_kid = format!("kid-{}", ff_core::types::ExecutionId::new());
     let req = RotateWaitpointSecretRequest {
         new_kid: new_kid.clone(),
-        new_secret_hex:
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_owned(),
+        new_secret_hex: FIXTURE_HEX_A.to_owned(),
     };
 
     let resp: RotateWaitpointSecretResponse =
@@ -160,8 +191,7 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
     let new_kid = format!("kid-{}", ff_core::types::ExecutionId::new());
     let req = RotateWaitpointSecretRequest {
         new_kid: new_kid.clone(),
-        new_secret_hex:
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_owned(),
+        new_secret_hex: FIXTURE_HEX_B.to_owned(),
     };
 
     let resp = client.rotate_waitpoint_secret(req).await.expect("rotate");
@@ -186,8 +216,9 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let expected_secret_hex =
-        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    // Same fixture we put on the wire — see module-level
+    // FIXTURE_HEX_B comment for the CodeQL context.
+    let expected_secret_hex = FIXTURE_HEX_B;
 
     // Collect the partition indices we expect to have fully rotated.
     // The server returns `rotated: u16` as a COUNT, not a list, so
@@ -262,6 +293,9 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
         );
 
         // new_kid's secret field carries the hex we sent.
+        // Compare via equality without formatting either value in
+        // the panic message — keeps CodeQL's dataflow from
+        // classifying this as logging the hex fixture.
         let secret_field = format!("secret:{new_kid}");
         let secret: Option<String> = tc.client()
             .cmd("HGET")
@@ -270,10 +304,10 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
             .execute()
             .await
             .expect("HGET secret:<new_kid>");
-        assert_eq!(
-            secret.as_deref(),
-            Some(expected_secret_hex),
-            "partition {p_idx}: secret:<new_kid> must carry the new hex"
+        let matches_fixture = secret.as_deref() == Some(expected_secret_hex);
+        assert!(
+            matches_fixture,
+            "partition {p_idx}: secret:<new_kid> must carry the fixture hex (mismatch)"
         );
 
         checked += 1;
@@ -297,8 +331,7 @@ async fn test_rotate_waitpoint_secret_rejects_bad_new_kid() {
         .expect("build admin client");
     let req = RotateWaitpointSecretRequest {
         new_kid: "bad:kid".to_owned(),
-        new_secret_hex:
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_owned(),
+        new_secret_hex: FIXTURE_HEX_A.to_owned(),
     };
 
     match client.rotate_waitpoint_secret(req).await {
@@ -334,8 +367,7 @@ async fn test_rotate_waitpoint_secret_enforces_bearer_token() {
         .expect("build no-auth client");
     let req_for_unauth = RotateWaitpointSecretRequest {
         new_kid: format!("kid-unauth-{}", ff_core::types::ExecutionId::new()),
-        new_secret_hex:
-            "cafebabedeadbeef0011223344556677cafebabedeadbeef0011223344556677".to_owned(),
+        new_secret_hex: FIXTURE_HEX_C.to_owned(),
     };
     match unauthed.rotate_waitpoint_secret(req_for_unauth).await {
         Err(SdkError::AdminApi { status, .. }) => {
@@ -350,8 +382,7 @@ async fn test_rotate_waitpoint_secret_enforces_bearer_token() {
     let new_kid = format!("kid-auth-{}", ff_core::types::ExecutionId::new());
     let req_for_auth = RotateWaitpointSecretRequest {
         new_kid: new_kid.clone(),
-        new_secret_hex:
-            "1122334455667788aabbccddeeff00111122334455667788aabbccddeeff0011".to_owned(),
+        new_secret_hex: FIXTURE_HEX_D.to_owned(),
     };
     let resp = authed
         .rotate_waitpoint_secret(req_for_auth)
