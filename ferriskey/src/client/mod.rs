@@ -791,6 +791,21 @@ impl Client {
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
     ) -> BoxFuture<'a, Result<Value>> {
+        // The per-command span is the primary public observation point.
+        // Stable name = "ferriskey.send_command", target = "ferriskey".
+        // Zero-cost when no subscriber is installed (tracing short-
+        // circuits via the global dispatcher's `would_enabled` check).
+        use tracing::Instrument;
+        let command_name = cmd
+            .command()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let span = tracing::debug_span!(
+            target: "ferriskey",
+            "ferriskey.send_command",
+            command = %command_name,
+            has_routing = routing.is_some(),
+        );
         Box::pin(async move {
             // Check for IAM token changes and update the password without authentication if needed (pull model)
             if let Some(iam_manager) = &self.iam_token_manager
@@ -887,7 +902,8 @@ impl Client {
                 }
                 None => execute.await,
             }
-        })
+        }
+        .instrument(span))
     }
 
     // Cluster scan is not passed to ferriskey as a regular command, so we need to handle it separately.
