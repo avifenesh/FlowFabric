@@ -661,79 +661,6 @@ impl Client {
         Ok(guard.clone())
     }
 
-    /// Internal command execution logic. Takes owned data so the returned future
-    /// is `Send + 'static`.
-    async fn execute_command_owned(
-        mut self_clone: Client,
-        cmd: Arc<Cmd>,
-        routing: Option<RoutingInfo>,
-        client: ClientWrapper,
-        compression_manager: Option<Arc<CompressionManager>>,
-    ) -> Result<Value> {
-        let raw_value = match client {
-            ClientWrapper::Standalone(mut client) => client.send_command(&cmd).await,
-            ClientWrapper::Cluster { mut client } => {
-                let final_routing = if let Some(RoutingInfo::SingleNode(
-                    SingleNodeRoutingInfo::Random,
-                )) = routing
-                {
-                    let cmd_name = cmd.command().unwrap_or_default();
-                    let cmd_name = String::from_utf8_lossy(&cmd_name);
-                    if crate::cluster::routing::is_readonly_cmd(cmd_name.as_bytes()) {
-                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
-                    } else {
-                        tracing::warn!("send_command - User provided 'Random' routing which is not suitable for the writeable command '{cmd_name}'. Changing it to 'RandomPrimary'");
-                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::RandomPrimary)
-                    }
-                } else {
-                    routing
-                        .or_else(|| RoutingInfo::for_routable(cmd.as_ref()))
-                        .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
-                };
-                client.route_command(&cmd, final_routing).await
-            }
-        }?;
-
-        // Post-process: decompress and convert to expected type.
-        // Done after the mutable borrow on cmd is released.
-        let processed_value = if let Some(ref compression_manager) = compression_manager {
-            if let Some(request_type) = extract_request_type_from_cmd(&cmd) {
-                match crate::compression::process_response_for_decompression(
-                    raw_value.clone(),
-                    request_type,
-                    Some(compression_manager.as_ref()),
-                ) {
-                    Ok(decompressed_value) => decompressed_value,
-                    Err(e) => {
-                        tracing::warn!("send_command_decompression - Failed to decompress response: {e}");
-                        raw_value
-                    }
-                }
-            } else {
-                raw_value
-            }
-        } else {
-            raw_value
-        };
-
-        let expected_type = expected_type_for_cmd(&cmd);
-        let value = convert_to_expected_type(processed_value, expected_type)?;
-
-        if Self::is_client_set_name_command(&cmd) {
-            self_clone.handle_client_set_name_command(&cmd).await?;
-        }
-        if Self::is_select_command(&cmd) {
-            self_clone.handle_select_command(&cmd).await?;
-        }
-        if Self::is_auth_command(&cmd) {
-            self_clone.handle_auth_command(&cmd).await?;
-        }
-        if Self::is_hello_command(&cmd) {
-            self_clone.handle_hello_command(&cmd).await?;
-        }
-        Ok(value)
-    }
-
     pub fn send_command<'a>(
         &'a mut self,
         cmd: &'a mut Cmd,
@@ -825,22 +752,77 @@ impl Client {
             } else {
                 None
             };
-            let self_clone = self.clone();
-            let owned_cmd = Arc::new(cmd.clone());
 
-            let execute = Self::execute_command_owned(
-                self_clone,
-                owned_cmd,
-                routing,
-                client,
-                compression_manager,
-            );
+            // Inlined dispatch + post-processing. The execute future borrows
+            // `&*cmd` and owns `client`/`routing`/`compression_manager`; `self`
+            // is reborrowed after the await for handle_* post-calls. Holding
+            // the future as an async block lets the timeout branch still drop
+            // it on elapse without changing user-facing semantics.
+            //
+            // Lifetime shift: pre-collapse, `Self::execute_command_owned(...)`
+            // was deliberately `Send + 'static` so the outer `tokio::select!`
+            // could pin it across the sleep, paying for `self.clone()` +
+            // `Arc::new(cmd.clone())` per call. Post-collapse, `execute` is
+            // `Send + 'a` (borrows `&mut cmd`). That is sufficient because the
+            // surrounding `Box::pin(async move { ... })` is already `'a`-bound,
+            // so the select runs inside a single `'a`-scoped future. No caller
+            // requires the inner future to be `'static`; reintroducing that
+            // bound would also reintroduce the two allocations this commit
+            // removed.
+            let execute = async {
+                let raw_value = match client {
+                    ClientWrapper::Standalone(mut client) => client.send_command(cmd).await,
+                    ClientWrapper::Cluster { mut client } => {
+                        let final_routing = if let Some(RoutingInfo::SingleNode(
+                            SingleNodeRoutingInfo::Random,
+                        )) = routing
+                        {
+                            let cmd_name = cmd.command().unwrap_or_default();
+                            let cmd_name = String::from_utf8_lossy(&cmd_name);
+                            if crate::cluster::routing::is_readonly_cmd(cmd_name.as_bytes()) {
+                                RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
+                            } else {
+                                tracing::warn!("send_command - User provided 'Random' routing which is not suitable for the writeable command '{cmd_name}'. Changing it to 'RandomPrimary'");
+                                RoutingInfo::SingleNode(SingleNodeRoutingInfo::RandomPrimary)
+                            }
+                        } else {
+                            routing
+                                .or_else(|| RoutingInfo::for_routable(cmd as &Cmd))
+                                .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
+                        };
+                        client.route_command(cmd, final_routing).await
+                    }
+                }?;
 
-            match request_timeout {
+                let processed_value = if let Some(ref compression_manager) = compression_manager {
+                    if let Some(request_type) = extract_request_type_from_cmd(cmd) {
+                        match crate::compression::process_response_for_decompression(
+                            raw_value.clone(),
+                            request_type,
+                            Some(compression_manager.as_ref()),
+                        ) {
+                            Ok(decompressed_value) => decompressed_value,
+                            Err(e) => {
+                                tracing::warn!("send_command_decompression - Failed to decompress response: {e}");
+                                raw_value
+                            }
+                        }
+                    } else {
+                        raw_value
+                    }
+                } else {
+                    raw_value
+                };
+
+                let expected_type = expected_type_for_cmd(cmd);
+                convert_to_expected_type(processed_value, expected_type)
+            };
+
+            let value = match request_timeout {
                 Some(duration) => {
                     tokio::pin!(execute);
                     tokio::select! {
-                        result = &mut execute => result,
+                        result = &mut execute => result?,
                         _ = tokio::time::sleep(duration) => {
                             // User timeout — execute future is dropped. The Cmd
                             // was already moved into the event loop's PendingRequest,
@@ -852,12 +834,26 @@ impl Client {
                                 duration_ms = duration.as_millis() as u64,
                                 "ferriskey: command timed out"
                             );
-                            Err(io::Error::from(io::ErrorKind::TimedOut).into())
+                            return Err(io::Error::from(io::ErrorKind::TimedOut).into());
                         }
                     }
                 }
-                None => execute.await,
+                None => execute.await?,
+            };
+
+            if Self::is_client_set_name_command(cmd) {
+                self.handle_client_set_name_command(cmd).await?;
             }
+            if Self::is_select_command(cmd) {
+                self.handle_select_command(cmd).await?;
+            }
+            if Self::is_auth_command(cmd) {
+                self.handle_auth_command(cmd).await?;
+            }
+            if Self::is_hello_command(cmd) {
+                self.handle_hello_command(cmd).await?;
+            }
+            Ok(value)
         }
         .instrument(span))
     }
