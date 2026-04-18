@@ -117,8 +117,13 @@ impl TestCluster {
     /// scheduler's natural co-location. Callers exercising flow
     /// membership should construct ids directly via
     /// `ExecutionId::for_flow(&fid, &config)` instead.
+    ///
+    /// Uses `self.config` (the cluster's active config, honouring any
+    /// `FF_TEST_PARTITION_CONFIG` env override) rather than the compile-
+    /// time `TEST_PARTITION_CONFIG` constant — matches the partition
+    /// count every other `&self.config` consumer on `TestCluster` sees.
     pub fn new_execution_id(&self) -> ExecutionId {
-        ExecutionId::solo(&self.test_lane(), &TEST_PARTITION_CONFIG)
+        ExecutionId::solo(&self.test_lane(), &self.config)
     }
 
     /// Current timestamp.

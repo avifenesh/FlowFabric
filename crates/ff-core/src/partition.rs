@@ -128,8 +128,12 @@ fn partition_for_uuid(uuid_bytes: &[u8; 16], num_partitions: u16) -> u16 {
 /// is retained for API symmetry with the other partition functions, but is
 /// unused — the exec id carries its partition intrinsically.
 pub fn execution_partition(eid: &ExecutionId, _config: &PartitionConfig) -> Partition {
+    // `Execution` family preserves exec-scoped semantics at the metadata
+    // layer (logs, tracing spans, metric labels) even though routing is
+    // aliased to `Flow`'s hash-tag prefix under RFC-011 co-location.
+    // See PartitionFamily enum rustdoc for the alias contract.
     Partition {
-        family: PartitionFamily::Flow,
+        family: PartitionFamily::Execution,
         index: eid.partition(),
     }
 }
@@ -205,8 +209,12 @@ pub fn solo_partition_with(
     config: &PartitionConfig,
     partitioner: &dyn SoloPartitioner,
 ) -> Partition {
+    // Solo execs are execution-scoped — preserve `Execution` family at
+    // the metadata layer. Routing is aliased to `Flow`'s `{fp:N}` tag
+    // under RFC-011 co-location; see PartitionFamily rustdoc for the
+    // alias contract.
     Partition {
-        family: PartitionFamily::Flow,
+        family: PartitionFamily::Execution,
         index: partitioner.partition_for_lane(lane, config),
     }
 }
@@ -357,8 +365,12 @@ mod tests {
         let fp = flow_partition(&fid, &config);
         assert_eq!(eid.partition(), fp.index);
         let ep = execution_partition(&eid, &config);
+        // Indices match (RFC-011 co-location) but family is Execution —
+        // preserves exec-scoped semantics at the metadata layer.
         assert_eq!(ep.index, fp.index);
-        assert_eq!(ep.family, PartitionFamily::Flow);
+        assert_eq!(ep.family, PartitionFamily::Execution);
+        // Alias contract: Execution and Flow produce identical hash-tags.
+        assert_eq!(ep.hash_tag(), fp.hash_tag());
     }
 
     #[test]
@@ -440,7 +452,9 @@ mod tests {
         let p1 = solo_partition(&lane, &config);
         let p2 = solo_partition(&lane, &config);
         assert_eq!(p1, p2);
-        assert_eq!(p1.family, PartitionFamily::Flow);
+        // Solo execs are execution-scoped — family is Execution, routing
+        // is aliased to Flow's `{fp:N}` via PartitionFamily's prefix map.
+        assert_eq!(p1.family, PartitionFamily::Execution);
         assert!(p1.index < config.num_flow_partitions);
     }
 
@@ -493,7 +507,8 @@ mod tests {
         let lane = LaneId::new("pick-me");
         let p = solo_partition_with(&lane, &config, &AlwaysZero);
         assert_eq!(p.index, 0);
-        assert_eq!(p.family, PartitionFamily::Flow);
+        // Solo execs → Execution family (aliases Flow for routing).
+        assert_eq!(p.family, PartitionFamily::Execution);
     }
 
     #[test]
