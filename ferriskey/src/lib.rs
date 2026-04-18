@@ -50,6 +50,13 @@ pub use value::{
     from_owned_value, from_value,
 };
 
+/// Glide-era alias for [`Result`]. Pre-existing consumers (including
+/// `benches/connections_benchmark.rs`) typed results against
+/// `ValkeyResult<T>`; keeping the alias preserves the external
+/// vocabulary without growing a second error shape. Prefer `Result`
+/// in new code.
+pub use value::Result as ValkeyResult;
+
 pub mod client;
 pub mod compression;
 pub(crate) mod ferriskey_client;
