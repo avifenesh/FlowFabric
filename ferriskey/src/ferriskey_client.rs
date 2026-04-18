@@ -445,6 +445,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Extra time added to a blocking command's server-side timeout
+    /// when computing the client-side request deadline.
+    ///
+    /// Blocking commands (BLPOP, BLMPOP, XREAD BLOCK, etc.) pass a
+    /// server-side timeout as part of the command payload. To prevent
+    /// the client from failing a request that the server is
+    /// legitimately about to answer, the client waits
+    /// `server_timeout + extension` before treating the command as
+    /// timed out. The extension is a safety margin over slow links or
+    /// loaded servers.
+    ///
+    /// Defaults to 500ms. Under concurrent blocking pressure (many
+    /// clients waking at the same server timeout), 500ms can be
+    /// insufficient — consider 1s or 2s if you observe late responders
+    /// losing their replies.
+    pub fn blocking_cmd_timeout_extension(mut self, extension: Duration) -> Self {
+        self.request.blocking_cmd_timeout_extension = Some(extension);
+        self
+    }
+
     /// Set the maximum number of in-flight requests.
     pub fn max_inflight(mut self, max_inflight: u32) -> Self {
         self.request.inflight_requests_limit = Some(max_inflight);

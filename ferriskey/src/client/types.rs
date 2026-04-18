@@ -38,6 +38,13 @@ pub struct ConnectionRequest {
     pub tcp_nodelay: bool,
     pub pubsub_reconciliation_interval_ms: Option<u32>,
     pub read_only: bool,
+    /// Extra time added to a blocking command's server-side timeout when
+    /// setting the client-side request deadline. The client waits for
+    /// `server_timeout + extension` before treating the command as
+    /// timed out — the extension is a safety margin so the client
+    /// doesn't fail a request that the server is legitimately about to
+    /// answer. `None` uses [`DEFAULT_BLOCKING_CMD_TIMEOUT_EXTENSION`].
+    pub blocking_cmd_timeout_extension: Option<Duration>,
 }
 
 /// Default connection timeout used when not specified in the request.

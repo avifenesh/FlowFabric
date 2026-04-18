@@ -202,6 +202,10 @@ pub enum ClientWrapper {
 pub struct Client {
     internal_client: Arc<RwLock<ClientWrapper>>,
     request_timeout: Duration,
+    /// Extra time added to a blocking command's server-side timeout
+    /// when computing the client-side request deadline. Defaults to
+    /// [`DEFAULT_DEFAULT_EXT_SECS`] (500ms).
+    blocking_cmd_timeout_extension: Duration,
     inflight_requests_allowed: Arc<AtomicIsize>,
     inflight_requests_limit: isize,
     inflight_log_interval: isize,
@@ -238,8 +242,15 @@ async fn run_with_timeout<T>(
     }
 }
 
-/// Extension to the request timeout for blocking commands to ensure we won't return with timeout error before the server responded
-const BLOCKING_CMD_TIMEOUT_EXTENSION: f64 = 0.5; // seconds
+/// Default extension to the request timeout for blocking commands.
+///
+/// When a blocking command (BLPOP, BLMPOP, XREAD BLOCK, etc.) is dispatched,
+/// the client-side request deadline is set to `server_timeout + extension`.
+/// The extension is a safety margin so the client doesn't fail a request
+/// that the server is legitimately about to answer over a slow link.
+///
+/// Override per-client via [`crate::ClientBuilder::blocking_cmd_timeout_extension`].
+pub const DEFAULT_DEFAULT_EXT_SECS: Duration = Duration::from_millis(500);
 
 enum TimeUnit {
     Milliseconds = 1000,
@@ -285,10 +296,13 @@ fn parse_timeout_to_f64(cmd: &Cmd, timeout_idx: usize) -> Result<f64> {
 /// Attempts to get the timeout duration from the command argument at `timeout_idx`.
 /// If the argument can be parsed into a duration, it returns the duration in seconds with BlockingCmdTimeout.
 /// If the timeout argument value is zero, NoTimeout will be returned. Otherwise, ClientConfigTimeout is returned.
+///
+/// `extension` is the per-client safety margin added to the server-side timeout.
 fn get_timeout_from_cmd_arg(
     cmd: &Cmd,
     timeout_idx: usize,
     time_unit: TimeUnit,
+    extension: Duration,
 ) -> Result<RequestTimeoutOption> {
     let timeout_secs = parse_timeout_to_f64(cmd, timeout_idx)? / ((time_unit as i32) as f64);
     if timeout_secs < 0.0 {
@@ -313,23 +327,27 @@ fn get_timeout_from_cmd_arg(
             // Extend the request timeout to ensure we don't timeout before receiving a response from the server.
             Ok(RequestTimeoutOption::BlockingCommand(
                 Duration::from_secs_f64(
-                    (timeout_secs + BLOCKING_CMD_TIMEOUT_EXTENSION).min(u32::MAX as f64),
+                    (timeout_secs + extension.as_secs_f64()).min(u32::MAX as f64),
                 ),
             ))
         }
     }
 }
 
-fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Duration>> {
+fn get_request_timeout(
+    cmd: &Cmd,
+    default_timeout: Duration,
+    extension: Duration,
+) -> Result<Option<Duration>> {
     let command = cmd.command().unwrap_or_default();
     let timeout = match command.as_slice() {
         b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BZPOPMAX" | b"BZPOPMIN" | b"BRPOPLPUSH" => {
-            get_timeout_from_cmd_arg(cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds)
+            get_timeout_from_cmd_arg(cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds, extension)
         }
-        b"BLMPOP" | b"BZMPOP" => get_timeout_from_cmd_arg(cmd, 1, TimeUnit::Seconds),
+        b"BLMPOP" | b"BZMPOP" => get_timeout_from_cmd_arg(cmd, 1, TimeUnit::Seconds, extension),
         b"XREAD" | b"XREADGROUP" => cmd
             .position(b"BLOCK")
-            .map(|idx| get_timeout_from_cmd_arg(cmd, idx + 1, TimeUnit::Milliseconds))
+            .map(|idx| get_timeout_from_cmd_arg(cmd, idx + 1, TimeUnit::Milliseconds, extension))
             .unwrap_or(Ok(RequestTimeoutOption::ClientConfig)),
         b"WAIT" | b"WAITAOF" => {
             let idx = if command.as_slice() == b"WAITAOF" {
@@ -337,7 +355,7 @@ fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Du
             } else {
                 2
             };
-            get_timeout_from_cmd_arg(cmd, idx, TimeUnit::Milliseconds)
+            get_timeout_from_cmd_arg(cmd, idx, TimeUnit::Milliseconds, extension)
         }
         _ => Ok(RequestTimeoutOption::ClientConfig),
     }?;
@@ -764,7 +782,11 @@ impl Client {
                 return result;
             }
 
-            let request_timeout = get_request_timeout(cmd, self.request_timeout)?;
+            let request_timeout = get_request_timeout(
+                cmd,
+                self.request_timeout,
+                self.blocking_cmd_timeout_extension,
+            )?;
 
             // Reserve an inflight slot. The tracker holds the slot until the
             // last clone of the Cmd is dropped (i.e. all sub-commands in the
@@ -1731,6 +1753,9 @@ impl Client {
 
         tracing::info!("Connection configuration - {}", sanitized_request_string(&request));
         let request_timeout = to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT);
+        let blocking_cmd_timeout_extension = request
+            .blocking_cmd_timeout_extension
+            .unwrap_or(DEFAULT_DEFAULT_EXT_SECS);
         let inflight_requests_limit = request
             .inflight_requests_limit
             .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
@@ -1853,6 +1878,7 @@ impl Client {
             let client = Self {
                 internal_client: internal_client_arc,
                 request_timeout,
+                blocking_cmd_timeout_extension,
                 inflight_requests_allowed,
                 inflight_requests_limit: inflight_limit,
                 inflight_log_interval,
@@ -1954,21 +1980,31 @@ mod tests {
     use crate::cmd::Cmd;
 
     use crate::client::{
-        BLOCKING_CMD_TIMEOUT_EXTENSION, RequestTimeoutOption, TimeUnit, get_request_timeout,
+        DEFAULT_DEFAULT_EXT_SECS, RequestTimeoutOption, TimeUnit, get_request_timeout,
     };
 
     use super::{Client, get_timeout_from_cmd_arg};
+
+    /// Default extension as seconds (f64) — tests compare against
+    /// `Duration::from_secs_f64` expressions.
+    const DEFAULT_EXT_SECS: f64 = 0.5;
+    const DEFAULT_EXT: Duration = DEFAULT_DEFAULT_EXT_SECS;
 
     #[test]
     fn test_get_timeout_from_cmd_returns_correct_duration_int() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg("5");
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             RequestTimeoutOption::BlockingCommand(Duration::from_secs_f64(
-                5.0 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                5.0 + DEFAULT_EXT_SECS
             ))
         );
     }
@@ -1977,12 +2013,17 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_correct_duration_float() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg(0.5);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             RequestTimeoutOption::BlockingCommand(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
     }
@@ -1991,12 +2032,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_correct_duration_milliseconds() {
         let mut cmd = Cmd::new();
         cmd.arg("XREAD").arg("BLOCK").arg("500").arg("key");
-        let result = get_timeout_from_cmd_arg(&cmd, 2, TimeUnit::Milliseconds);
+        let result = get_timeout_from_cmd_arg(&cmd, 2, TimeUnit::Milliseconds, DEFAULT_EXT);
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             RequestTimeoutOption::BlockingCommand(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
     }
@@ -2005,7 +2046,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_err_when_timeout_isnt_passed() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg("key3");
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         println!("{err:?}");
@@ -2019,7 +2065,12 @@ mod tests {
             .arg("key1")
             .arg("key2")
             .arg(u32::MAX as u64 + 1);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         println!("{err:?}");
@@ -2030,7 +2081,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_err_when_timeout_is_negative() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg(-1);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().to_lowercase().contains("negative"), "{err}");
@@ -2040,7 +2096,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_no_timeout_when_zero_is_passed() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg(0);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RequestTimeoutOption::NoTimeout,);
     }
@@ -2049,59 +2110,59 @@ mod tests {
     fn test_get_request_timeout_with_blocking_command_returns_cmd_arg_timeout() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                500.0 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                500.0 + DEFAULT_EXT_SECS
             ))
         );
 
         let mut cmd = Cmd::new();
         cmd.arg("XREADGROUP").arg("BLOCK").arg("500").arg("key");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
 
         let mut cmd = Cmd::new();
         cmd.arg("BLMPOP").arg("0.857").arg("key");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.857 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.857 + DEFAULT_EXT_SECS
             ))
         );
 
         let mut cmd = Cmd::new();
         cmd.arg("WAIT").arg(1).arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(500)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(500), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
 
         // WAITAOF
         let mut cmd = Cmd::new();
         cmd.arg("WAITAOF").arg(1).arg(1).arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(500)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(500), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
 
         // Infinite block (0) — returns None (no client timeout)
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key").arg("0");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(result, None);
     }
 
@@ -2109,12 +2170,12 @@ mod tests {
     fn test_get_request_timeout_non_blocking_command_returns_default_timeout() {
         let mut cmd = Cmd::new();
         cmd.arg("SET").arg("key").arg("value").arg("PX").arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(result, Some(Duration::from_millis(100)));
 
         let mut cmd = Cmd::new();
         cmd.arg("XREADGROUP").arg("key");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(result, Some(Duration::from_millis(100)));
     }
 
@@ -2361,7 +2422,7 @@ mod tests {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key").arg("0");
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             None
         );
 
@@ -2374,7 +2435,7 @@ mod tests {
             .arg("s1")
             .arg("$");
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             None
         );
     }
@@ -2384,8 +2445,8 @@ mod tests {
         // BLPOP key 5 — blocks 5s, timeout should be 5s + extension
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key").arg("5");
-        let result = get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap();
-        let expected = Duration::from_secs_f64(5.0 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let result = get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap();
+        let expected = Duration::from_secs_f64(5.0 + DEFAULT_EXT_SECS);
         assert_eq!(result, Some(expected));
         assert!(expected > Duration::from_secs(5));
     }
@@ -2395,7 +2456,7 @@ mod tests {
         for cmd_name in &["SET", "GET", "DEL", "HGET", "LPUSH", "SADD", "PING"] {
             let mut cmd = Cmd::new();
             cmd.arg(*cmd_name).arg("key");
-            let result = get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap();
+            let result = get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap();
             assert_eq!(
                 result,
                 Some(Duration::from_millis(1000)),
@@ -2408,9 +2469,9 @@ mod tests {
     fn test_waitaof_detected_as_blocking() {
         let mut cmd = Cmd::new();
         cmd.arg("WAITAOF").arg(1).arg(1).arg("3000");
-        let expected = Duration::from_secs_f64(3.0 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let expected = Duration::from_secs_f64(3.0 + DEFAULT_EXT_SECS);
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             Some(expected)
         );
     }
@@ -2419,9 +2480,9 @@ mod tests {
     fn test_wait_detected_as_blocking() {
         let mut cmd = Cmd::new();
         cmd.arg("WAIT").arg(1).arg("5000");
-        let expected = Duration::from_secs_f64(5.0 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let expected = Duration::from_secs_f64(5.0 + DEFAULT_EXT_SECS);
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             Some(expected)
         );
     }
@@ -2436,7 +2497,7 @@ mod tests {
             .arg("s1")
             .arg("$");
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             Some(Duration::from_millis(1000))
         );
     }
@@ -2445,9 +2506,9 @@ mod tests {
     fn test_blocking_fractional_seconds() {
         let mut cmd = Cmd::new();
         cmd.arg("BLMPOP").arg("0.857").arg("key");
-        let expected = Duration::from_secs_f64(0.857 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let expected = Duration::from_secs_f64(0.857 + DEFAULT_EXT_SECS);
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(100)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap(),
             Some(expected)
         );
     }
@@ -2473,11 +2534,26 @@ mod tests {
             for a in &args {
                 cmd.arg(*a);
             }
-            let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+            let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
             assert!(
                 result.is_some(),
                 "{cmd_name} should be detected as blocking"
             );
+        }
+    }
+
+    #[test]
+    fn test_blocking_extension_configurable() {
+        // Same BLMPOP 5s command, three different extensions — the
+        // client-side deadline tracks `server_timeout + extension`.
+        let mut cmd = Cmd::new();
+        cmd.arg("BLMPOP").arg("5").arg("1").arg("key");
+
+        for ext_ms in [500u64, 1_000, 2_000] {
+            let ext = Duration::from_millis(ext_ms);
+            let result = get_request_timeout(&cmd, Duration::from_millis(100), ext).unwrap();
+            let expected = Duration::from_secs_f64(5.0 + ext.as_secs_f64());
+            assert_eq!(result, Some(expected), "ext={ext_ms}ms");
         }
     }
 }
