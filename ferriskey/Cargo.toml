@@ -49,9 +49,15 @@ dashmap = "6"
 parking_lot = "0.12"
 socket2 = { version = "0.6", features = ["all"] }
 
-# Telemetry
-telemetrylib = { version = "0.1.0", path = "./telemetry" }
+# Telemetry — `tracing` for spans + events (always on, zero-cost when no
+# subscriber is installed). Optional OpenTelemetry + metrics crate
+# integrations live behind the [features] gates at the bottom of this
+# manifest.
 tracing = "0.1"
+opentelemetry = { version = "0.27", features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+metrics = { version = "0.24", optional = true }
 
 # AWS IAM
 aws-config = "1"
@@ -74,6 +80,18 @@ lz4 = { version = "1.28" }
 [features]
 default = []
 test-util = []
+
+# Wire `tracing` spans through to an OpenTelemetry tracer. Consumers
+# install a `tracing_opentelemetry` layer on their subscriber; spans
+# emitted from ferriskey flow through. Spans are STILL emitted without
+# this feature — they just go to whatever tracing_subscriber the
+# consumer installed. This feature only adds the OTel bridge.
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk"]
+
+# Emit OTel-backed metrics at specific sites (connect count, reconnects,
+# timeouts) via the `metrics` crate façade. Other metrics backends
+# (prometheus, statsd) work through the same façade.
+metrics = ["dep:metrics"]
 
 [dev-dependencies]
 socket2 = "0.6"

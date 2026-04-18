@@ -15,7 +15,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 use std::time::Duration;
-use telemetrylib::Telemetry;
 use tokio::sync::{Notify, mpsc};
 use tokio::task;
 use tokio::time::timeout;
@@ -254,7 +253,11 @@ async fn create_connection(
                 let addr = &client.get_connection_info().addr;
                 tracing::debug!("connection creation - Connection to {addr} created");
             }
-            Telemetry::incr_total_connections(1);
+            tracing::info!(
+                target: "ferriskey",
+                event = "connection_opened",
+                "ferriskey: connection opened"
+            );
             Ok(ReconnectingConnection {
                 inner: Arc::new(InnerReconnectingConnection {
                     state: Mutex::new(ConnectionState::Connected(connection)),
@@ -360,9 +363,14 @@ impl ReconnectingConnection {
     }
 
     pub(super) fn mark_as_dropped(&self) {
-        // Update the telemetry for each connection that is dropped. A dropped connection
-        // will not be re-connected, so update the telemetry here
-        Telemetry::decr_total_connections(1);
+        // A dropped connection will not be re-connected; emit a close
+        // event so subscribers can track connection-lifecycle metrics.
+        tracing::info!(
+            target: "ferriskey",
+            event = "connection_closed",
+            reason = "mark_as_dropped",
+            "ferriskey: connection closed"
+        );
         self.inner
             .backend
             .client_dropped_flagged
@@ -406,9 +414,15 @@ impl ReconnectingConnection {
         let connection_clone = self.clone();
 
         if reason.eq(&ReconnectReason::ConnectionDropped) {
-            // Attempting to reconnect a connection that was dropped (for any reason) - update the telemetry by reducing
-            // the number of opened connections by 1, it will be incremented by 1 after a successful re-connect
-            Telemetry::decr_total_connections(1);
+            // Emit a close event for the dropped connection; the new
+            // connection will emit its own open event after a
+            // successful reconnect attempt.
+            tracing::warn!(
+                target: "ferriskey",
+                event = "connection_closed",
+                reason = "connection_dropped",
+                "ferriskey: connection dropped, reconnecting"
+            );
         }
 
         // The reconnect task is spawned instead of awaited here, so that the reconnect attempt will continue in the
@@ -488,7 +502,12 @@ impl ReconnectingConnection {
                             *guard = ConnectionState::Connected(connection);
                         }
 
-                        Telemetry::incr_total_connections(1);
+                        tracing::info!(
+                            target: "ferriskey",
+                            event = "connection_opened",
+                            reason = "reconnect",
+                            "ferriskey: reconnect completed"
+                        );
                         return;
                     }
                     Err(_) => tokio::time::sleep(sleep_duration).await,

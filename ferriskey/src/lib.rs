@@ -87,4 +87,8 @@ pub(crate) mod cluster_scan_container;
 pub(crate) mod iam;
 pub mod pubsub;
 pub mod request_type;
-pub use telemetrylib::Telemetry;
+
+#[allow(deprecated)]
+mod telemetry_compat;
+#[allow(deprecated)]
+pub use telemetry_compat::Telemetry;

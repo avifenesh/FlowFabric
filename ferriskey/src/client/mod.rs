@@ -41,7 +41,6 @@ use crate::request_type::RequestType;
 use crate::value::InfoDict;
 use std::future::Future;
 use std::pin::Pin;
-use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{RwLock, mpsc};
 use versions::Versioning;
 
@@ -211,10 +210,12 @@ async fn run_with_timeout<T>(
         Some(duration) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
             Err(_) => {
-                // Record timeout error metric if telemetry is initialized
-                if let Err(e) = FerrisKeyOtel::record_timeout_error() {
-                    tracing::error!("OpenTelemetry:timeout_error - Failed to record timeout error: {e}");
-                }
+                tracing::warn!(
+                    target: "ferriskey",
+                    event = "timeout",
+                    duration_ms = duration.as_millis() as u64,
+                    "ferriskey: request timed out"
+                );
                 Err(io::Error::from(io::ErrorKind::TimedOut).into())
             }
         },
@@ -874,9 +875,12 @@ impl Client {
                             // was already moved into the event loop's PendingRequest,
                             // so its tracker clone keeps the inflight slot held until
                             // all sub-commands complete naturally.
-                            if let Err(e) = FerrisKeyOtel::record_timeout_error() {
-                                tracing::error!("OpenTelemetry:timeout_error - Failed to record timeout error: {e}");
-                            }
+                            tracing::warn!(
+                                target: "ferriskey",
+                                event = "timeout",
+                                duration_ms = duration.as_millis() as u64,
+                                "ferriskey: command timed out"
+                            );
                             Err(io::Error::from(io::ErrorKind::TimedOut).into())
                         }
                     }

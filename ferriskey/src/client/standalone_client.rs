@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use telemetrylib::Telemetry;
 use tokio::sync::mpsc;
 use tokio::task;
 
@@ -59,16 +58,13 @@ pub struct StandaloneClient {
     inner: Arc<DropWrapper>,
 }
 
-impl Drop for StandaloneClient {
-    fn drop(&mut self) {
-        // Client was dropped, reduce the number of clients.
-        // NOTE: mark_as_dropped() is intentionally NOT called here.
-        // StandaloneClient is Clone (shares Arc<DropWrapper>), so this Drop fires
-        // on every clone drop, not just the final one. The DropWrapper::drop()
-        // handles mark_as_dropped() correctly when the LAST Arc reference is dropped.
-        Telemetry::decr_total_clients(1);
-    }
-}
+// No `impl Drop for StandaloneClient` — the previous drop body called
+// a global `Telemetry::decr_total_clients(1)` that took a
+// lazy_static::RwLock::write on every cloned wrapper drop (~30k per 10k
+// task bench). Connection-lifecycle observability now lives on the
+// connect/disconnect events (tracing at `create_client`) and the
+// `DropWrapper::drop` above; a cloned `StandaloneClient` is an Arc bump,
+// not a connection change.
 
 fn format_connection_errors(errors: Vec<(Option<String>, Error)>) -> Error {
     if errors.len() == 1 {
@@ -320,8 +316,13 @@ impl StandaloneClient {
             Self::start_periodic_connection_check(node.clone());
         }
 
-        // Successfully created new client. Update the telemetry
-        Telemetry::incr_total_clients(1);
+        // Successfully created new client. Emit a connect event.
+        tracing::info!(
+            target: "ferriskey",
+            event = "client_created",
+            nodes = nodes.len(),
+            "ferriskey: standalone client connected"
+        );
 
         Ok(Self {
             inner: Arc::new(DropWrapper {
