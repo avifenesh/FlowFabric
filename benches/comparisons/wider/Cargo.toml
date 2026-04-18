@@ -32,6 +32,38 @@ path = "src/bin/ferriskey_80_20.rs"
 name = "wider-redis-80-20"
 path = "src/bin/redis_80_20.rs"
 
+[[bin]]
+name = "wider-ferriskey-50-50"
+path = "src/bin/ferriskey_50_50.rs"
+
+[[bin]]
+name = "wider-redis-50-50"
+path = "src/bin/redis_50_50.rs"
+
+[[bin]]
+name = "wider-ferriskey-get"
+path = "src/bin/ferriskey_get.rs"
+
+[[bin]]
+name = "wider-redis-get"
+path = "src/bin/redis_get.rs"
+
+[[bin]]
+name = "wider-ferriskey-pipeline"
+path = "src/bin/ferriskey_pipeline.rs"
+
+[[bin]]
+name = "wider-redis-pipeline"
+path = "src/bin/redis_pipeline.rs"
+
+[[bin]]
+name = "wider-ferriskey-streams"
+path = "src/bin/ferriskey_streams.rs"
+
+[[bin]]
+name = "wider-redis-streams"
+path = "src/bin/redis_streams.rs"
+
 [dependencies]
 # Report-schema + metadata helpers stay consistent with baseline/ and
 # ferriskey-baseline/ — any aggregator that walks benches/results/

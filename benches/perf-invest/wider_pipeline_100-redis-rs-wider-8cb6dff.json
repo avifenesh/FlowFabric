@@ -1,0 +1,35 @@
+{
+  "cluster": false,
+  "config": {
+    "duration_s": 30,
+    "key_count": 10000,
+    "mix": "100-cmd pipeline (GET)",
+    "payload_bytes": 4096,
+    "pipeline_size": 100,
+    "pipelines_executed": 89840,
+    "warmup_s": 5,
+    "workers": 16
+  },
+  "duration_s": 30.004378153,
+  "git_sha": "8cb6dff",
+  "hdr_samples": 89840,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 19.311,
+    "p50": 5.267,
+    "p95": 6.899,
+    "p99": 7.107
+  },
+  "notes": "redis-rs wider = redis::pipe() of 100 GETs per iteration, same {wider} hash tag. Throughput counts per-GET (pipelines × 100). Latency = per-pipeline = per-100-ops-amortised.",
+  "scenario": "wider_pipeline_100",
+  "system": "redis-rs-wider",
+  "throughput_ops_per_sec": 299422.9693476161,
+  "timestamp_utc": "2026-04-18T00:07:02Z",
+  "total_errors": 0,
+  "total_ops": 8984000,
+  "valkey_version": "7.2.4"
+}

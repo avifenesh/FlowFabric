@@ -39,6 +39,7 @@ pub fn filler_payload(size: usize) -> Vec<u8> {
 /// hit the same key (avoiding intra-connection contention / hot-key
 /// effects) but small enough that the whole ring stays in Valkey's
 /// working set.
+#[allow(dead_code)] // streams bins don't use a keyring
 pub fn key_ring(count: usize) -> Vec<String> {
     (0..count)
         .map(|i| format!("{{wider}}:k{i:08}"))
