@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::compression::CompressionConfig;
+#[cfg(feature = "iam")]
 use crate::iam::ServiceType;
 
 #[derive(Default, Clone, Debug)]
@@ -55,8 +56,10 @@ impl ConnectionRequest {
 
 /// Authentication information for connecting to Valkey servers
 ///
-/// Supports traditional username/password authentication and AWS IAM authentication.
-/// IAM authentication takes priority when both are configured.
+/// Supports traditional username/password authentication and (when built
+/// with `feature = "iam"`) AWS IAM authentication. IAM authentication
+/// takes priority when both are configured; the `iam_config` field is
+/// only present on builds that enable the `iam` feature.
 #[derive(PartialEq, Eq, Clone, Default, Debug)]
 pub struct AuthenticationInfo {
     /// Username for authentication (required for IAM)
@@ -65,14 +68,19 @@ pub struct AuthenticationInfo {
     /// Password for traditional authentication (fallback when IAM unavailable)
     pub password: Option<String>,
 
-    /// IAM authentication configuration (takes precedence over password)
+    /// IAM authentication configuration (takes precedence over password).
+    /// Only available when built with `feature = "iam"`.
+    #[cfg(feature = "iam")]
     pub iam_config: Option<IamAuthenticationConfig>,
 }
 
-/// AWS IAM authentication configuration for ElastiCache and MemoryDB
+/// AWS IAM authentication configuration for ElastiCache and MemoryDB.
 ///
-/// Handles AWS credential resolution, SigV4 token signing, and automatic token refresh.
-/// Tokens are valid for 15 minutes and refreshed every 14 minutes by default.
+/// Handles AWS credential resolution, SigV4 token signing, and automatic
+/// token refresh. Tokens are valid for 15 minutes and refreshed every
+/// 14 minutes by default. Only available when built with
+/// `feature = "iam"`.
+#[cfg(feature = "iam")]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct IamAuthenticationConfig {
     /// AWS ElastiCache or MemoryDB cluster name

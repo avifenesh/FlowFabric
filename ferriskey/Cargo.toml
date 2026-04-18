@@ -59,12 +59,15 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics"], opti
 tracing-opentelemetry = { version = "0.28", optional = true }
 metrics = { version = "0.24", optional = true }
 
-# AWS IAM
-aws-config = "1"
-aws-credential-types = "1"
-aws-sigv4 = "1"
-http = "1"
-urlencoding = "2"
+# AWS IAM — all optional, gated by the `iam` feature at the bottom of
+# this manifest. Without the feature, none of these (nor their ~40
+# transitive aws-* / smithy / hyper / rustls-platform-verifier crates)
+# land in the dep graph.
+aws-config = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-sigv4 = { version = "1", optional = true }
+http = { version = "1", optional = true }
+urlencoding = { version = "2", optional = true }
 
 # Serialization / misc
 serde_json = "1"
@@ -92,6 +95,14 @@ otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk
 # timeouts) via the `metrics` crate façade. Other metrics backends
 # (prometheus, statsd) work through the same façade.
 metrics = ["dep:metrics"]
+
+# Enable AWS IAM authentication for ElastiCache / MemoryDB. Pulls in
+# aws-config + aws-sigv4 + their transitive aws-smithy / hyper /
+# rustls-platform-verifier graph (~40 crates). OFF BY DEFAULT — users
+# who don't auth against AWS-managed Valkey don't pay the build-time
+# cost. `iam_config` on AuthenticationInfo and the `IAMTokenManager`
+# type exist only when this feature is enabled.
+iam = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:http", "dep:urlencoding"]
 
 [dev-dependencies]
 socket2 = "0.6"

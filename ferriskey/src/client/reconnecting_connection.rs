@@ -1,7 +1,9 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use super::{NodeAddress, TlsMode};
-use crate::connection::factory::{FerrisKeyConnectionOptions, IAMTokenProvider};
+use crate::connection::factory::FerrisKeyConnectionOptions;
+#[cfg(feature = "iam")]
+use crate::connection::factory::IAMTokenProvider;
 use crate::connection::info::ValkeyConnectionInfo;
 use crate::connection::{DisconnectNotifier, MultiplexedConnection};
 use crate::pubsub::push_manager::PushInfo;
@@ -40,6 +42,9 @@ pub enum ReconnectReason {
 /// it via SigV4 signing when the current one has expired — so the AUTH command
 /// always uses valid credentials without requiring a reference back to the full
 /// `IAMTokenManager`.
+///
+/// Only available when built with `feature = "iam"`.
+#[cfg(feature = "iam")]
 #[derive(Clone)]
 pub struct IAMTokenHandle {
     /// Shared cached IAM token (same `Arc` owned by `IAMTokenManager`).
@@ -50,6 +55,7 @@ pub struct IAMTokenHandle {
     pub(crate) iam_token_state: crate::iam::IamTokenState,
 }
 
+#[cfg(feature = "iam")]
 impl IAMTokenHandle {
     /// Returns the best available token, refreshing it first if expired.
     ///
@@ -94,6 +100,7 @@ impl IAMTokenHandle {
     }
 }
 
+#[cfg(feature = "iam")]
 #[async_trait::async_trait]
 impl IAMTokenProvider for IAMTokenHandle {
     async fn get_valid_token(&self) -> Option<String> {
@@ -110,6 +117,7 @@ struct ConnectionBackend {
     /// Once this flag is set, the internal connection needs no longer try to reconnect to the server, because all the outer clients were dropped.
     client_dropped_flagged: AtomicBool,
     /// Optional handle to the IAM token cache for refreshing the password before reconnection.
+    #[cfg(feature = "iam")]
     iam_token_handle: Option<IAMTokenHandle>,
 }
 
@@ -323,7 +331,7 @@ impl ReconnectingConnection {
         tls_params: Option<crate::connection::tls::TlsConnParams>,
         tcp_nodelay: bool,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
-        iam_token_handle: Option<IAMTokenHandle>,
+        #[cfg(feature = "iam")] iam_token_handle: Option<IAMTokenHandle>,
     ) -> std::result::Result<ReconnectingConnection, (ReconnectingConnection, Error)> {
         tracing::debug!("connection creation - Attempting connection to {address}");
 
@@ -332,6 +340,7 @@ impl ReconnectingConnection {
             connection_info: RwLock::new(connection_info),
             connection_available_signal: ManualResetEvent::new(true),
             client_dropped_flagged: AtomicBool::new(false),
+            #[cfg(feature = "iam")]
             iam_token_handle,
         };
         create_connection(
@@ -428,7 +437,10 @@ impl ReconnectingConnection {
         // The reconnect task is spawned instead of awaited here, so that the reconnect attempt will continue in the
         // background, regardless of whether the calling task is dropped or not.
         task::spawn(async move {
+            #[cfg(feature = "iam")]
             let has_iam = connection_clone.inner.backend.iam_token_handle.is_some();
+            #[cfg(not(feature = "iam"))]
+            let has_iam = false;
 
             // For non-IAM connections, clone the client once before the loop to preserve
             // the original reconnection behavior (password is fixed at reconnect start).
@@ -458,6 +470,7 @@ impl ReconnectingConnection {
                 // If IAM authentication is configured, ensure the connection uses a
                 // valid token before attempting to reconnect.  If the cached token has
                 // expired, a fresh one is generated on demand via SigV4 signing.
+                #[cfg(feature = "iam")]
                 if let Some(handle) = &connection_clone.inner.backend.iam_token_handle
                     && let Some(valid_token) = handle.get_valid_token_inner().await
                 {

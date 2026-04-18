@@ -88,7 +88,7 @@ impl StandaloneClient {
     pub async fn create_client(
         connection_request: ConnectionRequest,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+        #[cfg(feature = "iam")] iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
         pubsub_synchronizer: Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     ) -> std::result::Result<Self, Error> {
         if connection_request.addresses.is_empty() {
@@ -112,8 +112,11 @@ impl StandaloneClient {
             )));
         }
 
+        #[cfg(feature = "iam")]
         let valkey_connection_info =
             get_valkey_connection_info(&connection_request, iam_token_manager).await;
+        #[cfg(not(feature = "iam"))]
+        let valkey_connection_info = get_valkey_connection_info(&connection_request).await;
         let retry_strategy = match connection_request.connection_retry_strategy {
             Some(strategy) => RetryStrategy::new(
                 strategy.exponent_base,
@@ -188,6 +191,7 @@ impl StandaloneClient {
         let addresses = connection_request.addresses.clone();
         let read_from_option = connection_request.read_from.clone();
 
+        #[cfg(feature = "iam")]
         let iam_token_handle = iam_token_manager.map(|m| m.get_token_handle());
 
         let mut stream = stream::iter(addresses)
@@ -202,6 +206,7 @@ impl StandaloneClient {
                 let nodelay = tcp_nodelay;
                 let sync = pubsub_synchronizer.clone();
                 let skip_replication = read_only;
+                #[cfg(feature = "iam")]
                 let iam_handle = iam_token_handle.clone();
                 async move {
                     get_connection_and_replication_info(
@@ -216,6 +221,7 @@ impl StandaloneClient {
                         nodelay,
                         &sync,
                         skip_replication,
+                        #[cfg(feature = "iam")]
                         iam_handle,
                     )
                     .await
@@ -786,7 +792,7 @@ async fn get_connection_and_replication_info(
     tcp_nodelay: bool,
     pubsub_synchronizer: &Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     skip_replication_check: bool,
-    iam_token_handle: Option<super::IAMTokenHandle>,
+    #[cfg(feature = "iam")] iam_token_handle: Option<super::IAMTokenHandle>,
 ) -> std::result::Result<(ReconnectingConnection, Option<Value>), (ReconnectingConnection, Error)> {
     let reconnecting_connection = ReconnectingConnection::new(
         address,
@@ -799,6 +805,7 @@ async fn get_connection_and_replication_info(
         tls_params,
         tcp_nodelay,
         pubsub_synchronizer.clone(),
+        #[cfg(feature = "iam")]
         iam_token_handle,
     )
     .await?;

@@ -996,6 +996,7 @@ fn authentication_from_parts(
         Some(AuthenticationInfo {
             username: username.clone(),
             password: password.clone(),
+            #[cfg(feature = "iam")]
             iam_config: None,
         })
     }

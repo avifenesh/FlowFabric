@@ -33,6 +33,7 @@ pub use types::*;
 
 use self::value_conversion::{convert_to_expected_type, expected_type_for_cmd, get_value_type};
 mod reconnecting_connection;
+#[cfg(feature = "iam")]
 pub use reconnecting_connection::IAMTokenHandle;
 mod standalone_client;
 mod value_conversion;
@@ -98,15 +99,20 @@ pub(super) fn get_port(address: &NodeAddress) -> u16 {
     }
 }
 
-/// Get Valkey connection info with IAM token integration
+/// Get Valkey connection info with IAM token integration (when built
+/// with `feature = "iam"`).
 ///
-/// If IAM config + token manager exist, use the IAM token as the password; otherwise use the provided password.
+/// If IAM config + token manager exist, use the IAM token as the
+/// password; otherwise use the provided password. The
+/// `iam_token_manager` parameter is cfg-gated so non-IAM builds have
+/// a smaller signature with no dependency on the IAM module.
 ///
-/// `iam_token_manager: Option<&Arc<IAMTokenManager>>`
-/// — `Option` because IAM is optional; `&Arc` gives shared, non-owning, cheap access to a shared manager (we only read a token).
+/// With `feature = "iam"` off, this function only ever uses the
+/// static password path — the match on `iam_config` vanishes at
+/// compile time.
 pub async fn get_valkey_connection_info(
     connection_request: &ConnectionRequest,
-    iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+    #[cfg(feature = "iam")] iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
 ) -> crate::connection::info::ValkeyConnectionInfo {
     let protocol = connection_request.protocol.unwrap_or_default();
     let db = connection_request.database_id;
@@ -115,28 +121,32 @@ pub async fn get_valkey_connection_info(
 
     match &connection_request.authentication_info {
         Some(info) => {
-            // If we have IAM configuration and a token manager, use the IAM token as password
+            // If we have IAM configuration and a token manager, use the IAM token as password.
+            // The entire branch is cfg-gated so non-IAM builds compile it out.
+            #[cfg(feature = "iam")]
             if let (Some(_), Some(manager)) = (&info.iam_config, iam_token_manager) {
                 let token = manager.get_token().await;
 
-                crate::connection::info::ValkeyConnectionInfo {
+                return crate::connection::info::ValkeyConnectionInfo {
                     db,
                     username: info.username.clone(),
                     password: Some(token),
                     protocol,
                     client_name,
                     lib_name,
-                }
-            } else {
-                // Regular password-based authentication
-                crate::connection::info::ValkeyConnectionInfo {
-                    db,
-                    username: info.username.clone(),
-                    password: info.password.clone(),
-                    protocol,
-                    client_name,
-                    lib_name,
-                }
+                };
+            }
+
+            // Regular password-based authentication (always taken when
+            // feature = "iam" is off; taken when no iam_config present
+            // or no manager provided when the feature is on).
+            crate::connection::info::ValkeyConnectionInfo {
+                db,
+                username: info.username.clone(),
+                password: info.password.clone(),
+                protocol,
+                client_name,
+                lib_name,
             }
         }
         None => crate::connection::info::ValkeyConnectionInfo {
@@ -195,7 +205,11 @@ pub struct Client {
     inflight_requests_allowed: Arc<AtomicIsize>,
     inflight_requests_limit: isize,
     inflight_log_interval: isize,
-    // IAM token manager for automatic credential refresh
+    // IAM token manager for automatic credential refresh.
+    // Only present when built with `feature = "iam"`; non-IAM builds
+    // don't carry the field and don't pay the `Option<Arc<_>>` clone
+    // cost on the per-command Client::clone hot path.
+    #[cfg(feature = "iam")]
     iam_token_manager: Option<Arc<crate::iam::IAMTokenManager>>,
     // Optional compression manager for automatic compression/decompression
     compression_manager: Option<Arc<CompressionManager>>,
@@ -723,7 +737,11 @@ impl Client {
             has_routing = routing.is_some(),
         );
         Box::pin(async move {
-            // Check for IAM token changes and update the password without authentication if needed (pull model)
+            // Check for IAM token changes and update the password without
+            // authentication if needed (pull model). Entirely cfg-gated:
+            // non-IAM builds do not carry the `iam_token_manager` field
+            // and do not compile this check.
+            #[cfg(feature = "iam")]
             if let Some(iam_manager) = &self.iam_token_manager
                 && iam_manager.token_changed()
             {
@@ -1231,6 +1249,8 @@ impl Client {
     /// Create an `IAMTokenManager` when IAM auth is configured.
     ///
     /// Client retrieves tokens on-demand during command execution.
+    /// Only compiled when built with `feature = "iam"`.
+    #[cfg(feature = "iam")]
     async fn create_iam_token_manager(
         auth_info: &crate::client::types::AuthenticationInfo,
     ) -> Option<std::sync::Arc<crate::iam::IAMTokenManager>> {
@@ -1263,15 +1283,18 @@ impl Client {
         }
     }
 
-    /// Manually refresh the IAM token and update connection authentication
+    /// Manually refresh the IAM token and update connection authentication.
     ///
-    /// This method generates a new IAM token using the configured IAM token manager
-    /// and immediately authenticates all connections with the new token.
+    /// This method generates a new IAM token using the configured IAM
+    /// token manager and immediately authenticates all connections
+    /// with the new token. Only available when built with
+    /// `feature = "iam"`.
     ///
     /// # Returns
     /// - `Ok(())` if the token was successfully refreshed and authentication succeeded
     /// - `Err(Error)` if no IAM token manager is configured, token generation fails,
     ///   or authentication with the new token fails.
+    #[cfg(feature = "iam")]
     pub async fn refresh_iam_token(&mut self) -> Result<()> {
         // Check if IAM token manager is available
         let iam_manager = self.iam_token_manager.as_ref().ok_or_else(|| {
@@ -1365,12 +1388,15 @@ pub(crate) fn to_duration(time_in_millis: Option<u32>, default: Duration) -> Dur
 async fn create_cluster_client(
     request: ConnectionRequest,
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+    #[cfg(feature = "iam")] iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
     pubsub_synchronizer: Arc<dyn crate::pubsub::PubSubSynchronizer>,
 ) -> Result<crate::cluster::ClusterConnection> {
     let tls_mode = request.tls_mode.unwrap_or_default();
 
+    #[cfg(feature = "iam")]
     let valkey_connection_info = get_valkey_connection_info(&request, iam_token_manager).await;
+    #[cfg(not(feature = "iam"))]
+    let valkey_connection_info = get_valkey_connection_info(&request).await;
 
     let has_root_certs = !request.root_certs.is_empty();
     let has_client_cert = !request.client_cert.is_empty();
@@ -1499,11 +1525,14 @@ async fn create_cluster_client(
     builder = builder.periodic_connections_checks(Some(CONNECTION_CHECKS_INTERVAL));
 
     let client = builder.build()?;
+    #[cfg(feature = "iam")]
     let iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>> =
         iam_token_manager.map(|manager| {
             Arc::new(manager.get_token_handle())
                 as Arc<dyn crate::connection::factory::IAMTokenProvider>
         });
+    #[cfg(not(feature = "iam"))]
+    let iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>> = None;
 
     let mut con = client
         .get_async_connection(push_sender, Some(pubsub_synchronizer), iam_token_provider)
@@ -1771,6 +1800,8 @@ impl Client {
             // Create IAM token manager if needed — must happen
             // before `create_cluster_client` / `create_client` so
             // the token is available to the connect handshake.
+            // Only compiled when built with `feature = "iam"`.
+            #[cfg(feature = "iam")]
             let iam_token_manager = if let Some(auth_info) = &request.authentication_info {
                 Self::create_iam_token_manager(auth_info).await
             } else {
@@ -1785,6 +1816,7 @@ impl Client {
                 let client = create_cluster_client(
                     request,
                     push_sender,
+                    #[cfg(feature = "iam")]
                     iam_token_manager.as_ref(),
                     pubsub_synchronizer.clone(),
                 )
@@ -1795,6 +1827,7 @@ impl Client {
                     StandaloneClient::create_client(
                         request,
                         push_sender,
+                        #[cfg(feature = "iam")]
                         iam_token_manager.as_ref(),
                         Some(pubsub_synchronizer.clone()),
                     )
@@ -1824,6 +1857,7 @@ impl Client {
                 inflight_requests_limit: inflight_limit,
                 inflight_log_interval,
                 compression_manager,
+                #[cfg(feature = "iam")]
                 iam_token_manager,
                 pubsub_synchronizer: pubsub_synchronizer.clone(),
                 otel_metadata,

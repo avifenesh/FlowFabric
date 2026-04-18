@@ -92,6 +92,7 @@ pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
 }
 #[allow(dead_code)]
 pub(crate) mod cluster_scan_container;
+#[cfg(feature = "iam")]
 pub(crate) mod iam;
 pub mod pubsub;
 pub mod request_type;
