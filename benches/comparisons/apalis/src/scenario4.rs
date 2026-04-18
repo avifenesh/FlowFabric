@@ -285,16 +285,16 @@ async fn main() -> Result<()> {
             }
         });
 
-    // Stage9 handler: INCR the completion counter. Redis connection
-    // reused across calls via a shared ConnectionManager.
-    let counter_client = raw_client.clone();
+    // Stage9 handler: INCR the completion counter. MultiplexedConnection
+    // is cloneable and shares the underlying TCP socket across calls —
+    // clone it once out here, not per-invocation.
+    let counter_conn = raw_client.get_multiplexed_async_connection().await?;
     let w9 = WorkerBuilder::new("s9")
         .backend(storage_9)
         .concurrency(CONCURRENCY)
         .build(move |_j: Stage9| {
-            let client = counter_client.clone();
+            let mut c = counter_conn.clone();
             async move {
-                let mut c = client.get_multiplexed_async_connection().await?;
                 let _: () = c.incr(COMPLETED_KEY, 1).await?;
                 Ok::<(), BoxDynError>(())
             }

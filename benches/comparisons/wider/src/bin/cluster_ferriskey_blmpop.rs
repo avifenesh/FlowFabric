@@ -117,21 +117,28 @@ async fn drive_worker(_wi: usize, client: Client, stop_at: Arc<AtomicUsize>) -> 
             return Ok(WorkerResult { ops, errors, hdr });
         }
         let t0 = Instant::now();
-        let popped: Option<Value> = client
+        let popped: Result<Option<Value>, _> = client
             .cmd("BLMPOP")
             .arg(1_u64).arg(1_u64).arg(QUEUE_KEY).arg("LEFT").arg("COUNT").arg(1_u64)
-            .execute().await.unwrap_or(None);
-        if popped.is_some() {
-            match client.incr(COMPLETED_KEY).await {
-                Ok(_) => {
-                    hdr.record((t0.elapsed().as_micros() as u64).clamp(1, 60_000_000)).ok();
-                    ops += 1;
-                    stop_at.fetch_sub(1, Ordering::Relaxed);
+            .execute().await;
+        match popped {
+            Ok(Some(_)) => {
+                match client.incr(COMPLETED_KEY).await {
+                    Ok(_) => {
+                        hdr.record((t0.elapsed().as_micros() as u64).clamp(1, 60_000_000)).ok();
+                        ops += 1;
+                        stop_at.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    Err(_) => errors += 1,
                 }
-                Err(_) => errors += 1,
             }
-        } else {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                errors += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 }

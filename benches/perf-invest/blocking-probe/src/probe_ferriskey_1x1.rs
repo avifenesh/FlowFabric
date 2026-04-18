@@ -19,7 +19,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use ferriskey::{ClientBuilder, Cmd};
+use ferriskey::ClientBuilder;
 
 const KEY: &str = "bench:blocking-list";
 const ITERATIONS: usize = 100;
@@ -34,8 +34,6 @@ async fn main() -> Result<()> {
 
     // Preflight: warm the client (lazy init path) so the first iter
     // isn't dominated by connection setup.
-    let mut warmup = Cmd::new();
-    warmup.arg("PING");
     let _: ferriskey::Value = client.cmd("PING").execute().await.context("PING warmup")?;
 
     // Seed: need one item per iter so the BLMPOP returns fast.

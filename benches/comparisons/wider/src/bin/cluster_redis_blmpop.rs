@@ -108,20 +108,27 @@ async fn drive_worker(_wi: usize, mut conn: ClusterConnection, stop_at: Arc<Atom
             return Ok(WorkerResult { ops, errors, hdr });
         }
         let t0 = Instant::now();
-        let popped: Option<redis::Value> = redis::cmd("BLMPOP")
+        let popped: Result<Option<redis::Value>, _> = redis::cmd("BLMPOP")
             .arg(1_u64).arg(1_u64).arg(QUEUE_KEY).arg("LEFT").arg("COUNT").arg(1_u64)
-            .query_async(&mut conn).await.unwrap_or(None);
-        if popped.is_some() {
-            match redis::cmd("INCR").arg(COMPLETED_KEY).query_async::<i64>(&mut conn).await {
-                Ok(_) => {
-                    hdr.record((t0.elapsed().as_micros() as u64).clamp(1, 60_000_000)).ok();
-                    ops += 1;
-                    stop_at.fetch_sub(1, Ordering::Relaxed);
+            .query_async(&mut conn).await;
+        match popped {
+            Ok(Some(_)) => {
+                match redis::cmd("INCR").arg(COMPLETED_KEY).query_async::<i64>(&mut conn).await {
+                    Ok(_) => {
+                        hdr.record((t0.elapsed().as_micros() as u64).clamp(1, 60_000_000)).ok();
+                        ops += 1;
+                        stop_at.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    Err(_) => errors += 1,
                 }
-                Err(_) => errors += 1,
             }
-        } else {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                errors += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 }

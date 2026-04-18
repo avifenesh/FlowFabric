@@ -63,7 +63,10 @@ pub struct HdrSnapshot {
 pub fn hdr_snapshot(histos: &[Histogram<u64>]) -> HdrSnapshot {
     let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
     for h in histos {
-        merged.add(h).ok();
+        debug_assert!(
+            merged.add(h).is_ok(),
+            "worker histogram failed to merge into aggregate snapshot"
+        );
     }
     if merged.len() == 0 {
         return HdrSnapshot {

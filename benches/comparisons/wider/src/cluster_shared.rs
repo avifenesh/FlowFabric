@@ -35,7 +35,9 @@ use ferriskey::{Client as FkClient, ClientBuilder as FkBuilder};
 pub fn init_rustls_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("install rustls aws-lc-rs CryptoProvider");
     });
 }
 

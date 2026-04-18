@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
             let latencies = latencies_clone.clone();
             async move {
                 let t0 = Instant::now();
-                let _ = noop_handler(job).await?;
+                noop_handler(job).await?;
                 let lat = t0.elapsed().as_micros() as u64;
                 latencies.lock().await.push(lat);
                 drained.fetch_add(1, Ordering::Relaxed);
