@@ -319,6 +319,18 @@ Defect class unchanged: still a crash-recovery atomicity gap. But
 the fix shape is "documented two-phase contract + reconciliation
 scanner ticket," not a single-FCALL transformation.
 
+**UPDATE (2026-04-18, W2):** RFC-011 (`rfcs/RFC-011-exec-flow-colocation.md`,
+**Accepted**) lands the actual atomic-by-construction fix via
+`execution_id = "{fp:N}:<uuid>"` hash-tag co-location. When RFC-011's
+phase 3 merges, `ff_add_execution_to_flow` becomes a single atomic
+FCALL that takes both `flow_core` and `exec_core` as KEYS (same slot
+under co-location), the two-phase contract documented here ceases to
+apply, and issue #21 is closed as superseded. This commit's
+documentation (commit 8df40fc) is the interim safety net that carries
+the repo from today through RFC-011 phase 3. Readers auditing the
+atomicity story should treat RFC-011 as the load-bearing artifact and
+this §4 amendment as its transitional prelude.
+
 **Not bridge-event related. No cairn-side work.**
 
 ## §5 Recommendations
