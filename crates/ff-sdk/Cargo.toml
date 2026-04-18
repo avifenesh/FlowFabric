@@ -13,6 +13,14 @@ description = "FlowFabric worker SDK — public API for worker authors"
 [features]
 insecure-direct-claim = []
 
+# Re-exports of ferriskey feature flags. Consumers opt in on ff-sdk and
+# the flag propagates to the underlying ferriskey crate. OFF by default
+# — the ~40-crate AWS dep graph does not land in builds that don't need
+# it.
+iam = ["ferriskey/iam"]
+otel = ["ferriskey/otel"]
+metrics = ["ferriskey/metrics"]
+
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }
