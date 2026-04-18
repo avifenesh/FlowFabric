@@ -1065,7 +1065,7 @@ Secrets live in a per-partition hash: `ff:sec:{p:N}:waitpoint_hmac`. Fields:
 | `previous_kid` | The kid immediately preceding `current_kid`. |
 | `previous_expires_at` | Absolute ms timestamp after which `previous_kid` tokens are rejected. |
 
-**Per-partition replication is required** because Valkey cluster mode demands that all KEYS in a single FCALL hash to the same slot. A single global secret key (e.g. `{s:waitpoint}:hmac_secrets`) would produce CROSSSLOT errors in suspension.lua and signal.lua FCALLs, which already touch `{p:N}`-tagged keys. The secret value is **identical across partitions**; only the storage is replicated. Rotation fans out across partitions (`O(num_execution_partitions)` HSETs — 256 by default, bounded at deployment time via `FF_EXEC_PARTITIONS`).
+**Per-partition replication is required** because Valkey cluster mode demands that all KEYS in a single FCALL hash to the same slot. A single global secret key (e.g. `{s:waitpoint}:hmac_secrets`) would produce CROSSSLOT errors in suspension.lua and signal.lua FCALLs, which already touch execution-partition-tagged keys (pre-RFC-011: `{p:N}`; post-RFC-011: `{fp:N}` under hash-tag co-location — see RFC-011 §2). The secret value is **identical across partitions**; only the storage is replicated. Rotation fans out across partitions (`O(num_flow_partitions)` HSETs — 256 by default, bounded at deployment time via `FF_FLOW_PARTITIONS`; `num_execution_partitions` / `FF_EXEC_PARTITIONS` retired by RFC-011).
 
 ### Key rotation (2-kid ring)
 
