@@ -1,0 +1,33 @@
+{
+  "cluster": false,
+  "config": {
+    "duration_s": 30,
+    "key_count": 10000,
+    "mix": "80/20 GET/SET",
+    "payload_bytes": 4096,
+    "warmup_s": 5,
+    "workers": 16
+  },
+  "duration_s": 30.000274885,
+  "git_sha": "8cb6dff",
+  "hdr_samples": 3463044,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 4.077,
+    "p50": 0.133,
+    "p95": 0.183,
+    "p99": 0.219
+  },
+  "notes": "redis-rs wider = MultiplexedConnection per worker + 80% GET / 20% SET on 4 KiB values, {wider} hash-tagged ring. No blocking commands. Paired with ferriskey_80_20 for apples-to-apples; any delta is client overhead under non-blocking RESP2 traffic.",
+  "scenario": "wider_80_20",
+  "system": "redis-rs-wider",
+  "throughput_ops_per_sec": 115433.74229985826,
+  "timestamp_utc": "2026-04-17T23:58:54Z",
+  "total_errors": 0,
+  "total_ops": 3463044,
+  "valkey_version": "7.2.4"
+}

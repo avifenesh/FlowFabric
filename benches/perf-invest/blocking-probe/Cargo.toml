@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "blocking-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Minimal probes to verify the theoretical blocking-command trace in
+# report-w1-round2.md. Three bins per client (one per scenario):
+#   * probe-ferriskey-1x1  — 1 client × 1 BLMPOP, no concurrency
+#   * probe-ferriskey-5x1  — 5 cloned clients × 1 concurrent BLMPOP each
+#   * probe-redis-rs-1x1   — same, redis-rs
+#   * probe-redis-rs-5x1   — same, redis-rs
+#
+# All four bins drive the same workload shape against the same pre-
+# seeded list. See src/lib.rs (if any) + per-bin README in
+# benches/perf-invest/blocking-probe/README.md.
+
+[[bin]]
+name = "probe-ferriskey-1x1"
+path = "src/probe_ferriskey_1x1.rs"
+
+[[bin]]
+name = "probe-ferriskey-5x1"
+path = "src/probe_ferriskey_5x1.rs"
+
+[[bin]]
+name = "probe-ferriskey-5x1-configurable"
+path = "src/probe_ferriskey_5x1_configurable.rs"
+
+[[bin]]
+name = "probe-redis-rs-1x1"
+path = "src/probe_redis_rs_1x1.rs"
+
+[[bin]]
+name = "probe-redis-rs-5x1"
+path = "src/probe_redis_rs_5x1.rs"
+
+[dependencies]
+ferriskey = { path = "../../../ferriskey" }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

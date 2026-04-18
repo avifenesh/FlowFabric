@@ -1,0 +1,1 @@
+redis-rs n=100000 ok=100000 nil=0 err=0 p50=0.031ms p95=0.039ms p99=0.045ms p999=0.069ms min=0.025ms max=0.410ms mean=0.032ms

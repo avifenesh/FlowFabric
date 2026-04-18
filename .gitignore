@@ -18,6 +18,14 @@ ferriskey/flamegraph.svg
 *.perf.data
 perf.data
 
+# ── Internal bench result JSONs (regenerable, hardware-specific) ──
+# Keep benches/results/baseline.md as the tracked summary; raw JSONs are local.
+benches/results/*.json
+benches/results/*/*.json
+benches/benches/
+benches/comparisons/*/benches/
+benches/perf-invest/redis-rs-src/
+
 # ── Team coordination (internal, not public) ──
 TEAM.md
 .remember/

@@ -1904,6 +1904,21 @@ impl Server {
 
         let flow_id_val = fields.get("flow_id").filter(|s| !s.is_empty()).cloned();
 
+        // started_at / completed_at come from the exec_core hash —
+        // lua/execution.lua writes them alongside the rest of the state
+        // vector. `created_at` is required; the other two are optional
+        // (pre-claim / pre-terminal reads) and elided when empty so the
+        // wire payload for in-flight executions stays the shape existing
+        // callers expect.
+        let started_at_opt = fields
+            .get("started_at")
+            .filter(|s| !s.is_empty())
+            .cloned();
+        let completed_at_opt = fields
+            .get("completed_at")
+            .filter(|s| !s.is_empty())
+            .cloned();
+
         Ok(ExecutionInfo {
             execution_id: execution_id.clone(),
             namespace: parse_enum("namespace"),
@@ -1916,6 +1931,8 @@ impl Server {
             state_vector,
             public_state: deserialize("public_state", &ps_str)?,
             created_at: parse_enum("created_at"),
+            started_at: started_at_opt,
+            completed_at: completed_at_opt,
             current_attempt_index: fields
                 .get("current_attempt_index")
                 .and_then(|v| v.parse().ok())

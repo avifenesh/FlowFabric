@@ -1,0 +1,1 @@
+redis-rs-1x1 n=100 p50=0.032ms p95=0.040ms p99=0.055ms min=0.031ms max=0.062ms mean=0.033ms

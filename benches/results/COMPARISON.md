@@ -19,15 +19,49 @@ remaining cells.
 
 ## Scenario 2 — suspend → signal → resume latency
 
-_Phase B_.
+| system          | p50 (ms)           | p95 (ms)           | p99 (ms)           | throughput (ops/s) |
+| --------------- | ------------------ | ------------------ | ------------------ | ------------------ |
+| flowfabric      | _Phase B (W2)_     | _Phase B (W2)_     | _Phase B (W2)_     | _Phase B (W2)_     |
+| apalis 🚫       | _no native suspend_| —                  | —                  | —                  |
+| faktory 🚫      | _no native suspend_| —                  | —                  | —                  |
+| baseline 🚫     | _no primitive_     | —                  | —                  | —                  |
+
+**Why apalis / faktory / baseline have no number here.** FlowFabric's
+`task.suspend()` releases the lease and mints an HMAC-bound waitpoint
+token in a single Lua call; the execution sits in `suspended` state
+and resumes when the signed signal arrives (RFC-004). Apalis has no
+equivalent: the closest shape is a retry-middleware workaround (job
+errors with a backoff, polls Redis for a signal key on each retry
+tick). Investigated during Phase B/C but NOT shipped — the retry-poll
+floor (~100 ms × retry interval) measures a fundamentally different
+primitive (polled retries, unauthenticated signal keys), not a
+suspend/resume comparison. Implementing it would publish a number
+that misleads readers into treating the systems as comparable here.
+Faktory has no middleware story for this at all; baseline (raw
+redis-rs) has no lease semantics.
+
+Recorded as a differentiator: the cell is structurally "FlowFabric
+only".
 
 ## Scenario 3 — 5-minute steady-state, 100 workers, 10 000 tasks
 
-_Phase B_.
+_Phase B (W2)._
 
 ## Scenario 4 — linear 10-node flow DAG
 
-_Phase B_.
+| system     | throughput (flows/s) | p50 total (ms) | p99 total (ms) |
+| ---------- | -------------------- | -------------- | -------------- |
+| flowfabric | _fill from flow_dag_linear-<sha>.json_ | _…_ | _…_ |
+| apalis 🚫  | _no DAG primitive_   | —              | —              |
+| faktory 🚫 | _no DAG primitive_   | —              | —              |
+| baseline 🚫| _no primitive_       | —              | —              |
+
+The flow_dag report's `notes` field carries the breakdown:
+`flow_setup_p50_ms`, `exec_p50_ms`, `exec_p95_ms`, `exec_p99_ms`,
+`stage_latency_p50_ms`, `stage_latency_p99_ms`, `setup_exec_ratio`.
+Copy the three headline numbers from
+`benches/results/flow_dag_linear-<sha>.json` into the flowfabric row;
+paste the notes line immediately below the table.
 
 ## Scenario 5 — capability-routed claim
 
@@ -38,15 +72,15 @@ the gap)._
 ## How to regenerate
 
 ```
-cd benches
-cargo bench --bench submit_claim_complete
+# From benches/
+cargo bench --bench submit_claim_complete          # scenario 1
+cargo run --release --bin flow_dag -- --flows 100 --nodes 10   # scenario 4
 cd comparisons/baseline && cargo run --release --bin baseline-scenario1
 ```
 
-Then copy the two `throughput_ops_per_sec` and `latency_ms` triples
-from `benches/results/submit_claim_complete-<sha>.json` and
-`benches/results/submit_claim_complete-baseline-<sha>.json` into the
-scenario-1 table above.
+Then copy the `throughput_ops_per_sec` and `latency_ms` triples from
+each scenario's JSON in `benches/results/` into the tables above.
 
-Automation for this will land with Phase B once we have >1 scenario to
-aggregate; hand-written for now.
+Automation for this will land with a subsequent PR once ≥ 4 scenarios
+have FlowFabric-side numbers; hand-written for now to keep the schema
+work focused on the bench runners themselves.

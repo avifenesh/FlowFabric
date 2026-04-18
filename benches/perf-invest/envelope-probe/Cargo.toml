@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "envelope-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Track-A envelope probes. Single-client, single-worker, tight loop of
+# INCR bench:envelope-counter × 100_000. INCR is a scalar-reply non-
+# blocking command: no head-of-line mux effects, no nested
+# value_conversion, no Lua-wire parse branching. Everything in the
+# per-call cost is envelope.
+#
+# Two bins (one per client under test). Both emit a per-iter latency
+# sanity snapshot; the headline is the flame graph captured via
+# cargo flamegraph --profile perf against each binary.
+
+[[bin]]
+name = "probe-ferriskey"
+path = "src/probe_ferriskey.rs"
+
+[[bin]]
+name = "probe-redis-rs"
+path = "src/probe_redis_rs.rs"
+
+[dependencies]
+ferriskey = { path = "../../../ferriskey" }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 0
+
+# Perf capture profile — same codegen as release, plus line-table debug
+# info so flamegraph can resolve Rust function names. Used only for the
+# timestamped capture runs under this directory.
+[profile.perf]
+inherits = "release"
+debug = 1

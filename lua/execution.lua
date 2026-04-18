@@ -497,7 +497,14 @@ redis.register_function('ff_claim_execution', function(keys, args)
     "lease_expires_at", tostring(expires_at),
     "lease_last_renewed_at", tostring(now_ms),
     "lease_renewal_deadline", tostring(renewal_deadline),
-    "started_at", core.started_at or tostring(now_ms),
+    -- Preserve the first-claim timestamp across retries; only fall
+    -- back to `now_ms` when the stored value is empty (initial state
+    -- written at HSET, line 208, or after a reset). In Lua the empty
+    -- string is truthy, so `core.started_at or now_ms` would wedge at
+    -- "" forever on the first claim — explicit emptiness check fixes
+    -- the scenario 4 stage_latency bench (exec_core surfaced this via
+    -- the new ExecutionInfo.started_at REST field).
+    "started_at", (core.started_at ~= nil and core.started_at ~= "") and core.started_at or tostring(now_ms),
     -- Clear pending lineage fields (consumed above)
     "pending_retry_reason", "",
     "pending_replay_reason", "",

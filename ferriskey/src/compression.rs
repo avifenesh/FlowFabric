@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::request_type::RequestType;
-use telemetrylib::Telemetry;
 
 /// Detailed compression error with context for debugging
 #[derive(Debug, Clone, PartialEq)]
@@ -330,32 +329,28 @@ impl CompressionManager {
     /// Attempts to compress the value with graceful fallback to original data
     pub fn compress_value<'a>(&self, value: &'a [u8]) -> Cow<'a, [u8]> {
         if !self.config.enabled || !self.should_compress(value) {
-            Telemetry::incr_compression_skipped_count(1);
             return Cow::Borrowed(value);
         }
 
         if self.backend.is_compressed(value) {
-            Telemetry::incr_compression_skipped_count(1);
             return Cow::Borrowed(value);
         }
 
         match self.backend.compress(value, self.config.compression_level) {
             Ok(compressed) => {
                 if compressed.len() < value.len() {
-                    // Successfully compressed and reduced size
-                    Telemetry::incr_total_values_compressed(1);
-                    Telemetry::incr_total_original_bytes(value.len());
-                    Telemetry::incr_total_bytes_compressed(compressed.len());
                     Cow::Owned(compressed)
                 } else {
-                    // Compression didn't reduce size, skip it
-                    Telemetry::incr_compression_skipped_count(1);
                     Cow::Borrowed(value)
                 }
             }
             Err(err) => {
-                tracing::warn!("compression - Compression failed: {err:?}");
-                Telemetry::incr_compression_skipped_count(1);
+                tracing::warn!(
+                    target: "ferriskey",
+                    event = "compression_failed",
+                    error = %err,
+                    "ferriskey: compression failed, passing through"
+                );
                 Cow::Borrowed(value)
             }
         }
@@ -374,23 +369,12 @@ impl CompressionManager {
         if let Some(backend_id) = extract_backend_id(value) {
             // If the data was compressed with our configured backend, use it
             // This respects the client's compression configuration
-            let result = if backend_id == self.backend.backend_id() {
+            if backend_id == self.backend.backend_id() {
                 self.backend.decompress(value)
             } else {
-                // Otherwise, use a static backend for decompression
-                // Static backends are shared and don't allocate on each call
-                // Return error if backend is not supported
                 let backend = get_backend_for_decompression(backend_id)?;
                 backend.decompress(value)
-            };
-
-            // Update telemetry on successful decompression
-            if let Ok(ref decompressed) = result {
-                Telemetry::incr_total_values_decompressed(1);
-                Telemetry::incr_total_bytes_decompressed(decompressed.len());
             }
-
-            result
         } else {
             Ok(value.to_vec())
         }

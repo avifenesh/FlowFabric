@@ -1,0 +1,7 @@
+redis-rs-5x1 per-task:
+  task=0 elapsed_ms=    0 wall_from_spawn_ms=    0 result=array
+  task=1 elapsed_ms=  500 wall_from_spawn_ms=  500 result=err
+  task=2 elapsed_ms=    0 wall_from_spawn_ms=    0 result=array
+  task=3 elapsed_ms=  500 wall_from_spawn_ms=  500 result=err
+  task=4 elapsed_ms=  500 wall_from_spawn_ms=  500 result=err
+redis-rs-5x1 spread: min_wall=0ms max_wall=500ms

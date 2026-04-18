@@ -1,0 +1,37 @@
+{
+  "cluster": false,
+  "config": {
+    "cluster_mode": true,
+    "duration_s": 30,
+    "endpoint": "clustercfg.glide-perf-test-cache-2026.nra7gl.use1.cache.amazonaws.com",
+    "key_count": 10000,
+    "mix": "80/20 GET/SET",
+    "payload_bytes": 4096,
+    "port": 6379,
+    "tls": true,
+    "warmup_s": 5,
+    "workers": 16
+  },
+  "duration_s": 30.000918146,
+  "git_sha": "2fb00c6",
+  "hdr_samples": 770372,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 2.649,
+    "p50": 0.619,
+    "p95": 0.679,
+    "p99": 0.724
+  },
+  "notes": "redis-rs cluster+TLS = ClusterClient + get_async_connection per worker + 80/20 GET/SET on 4 KiB, {wider} single-slot. Measures client-in-cluster-mode + TLS.",
+  "scenario": "cluster_wider_80_20",
+  "system": "redis-rs-cluster",
+  "throughput_ops_per_sec": 25678.280786306972,
+  "timestamp_utc": "2026-04-18T00:42:59Z",
+  "total_errors": 0,
+  "total_ops": 770372,
+  "valkey_version": "7.2.4"
+}

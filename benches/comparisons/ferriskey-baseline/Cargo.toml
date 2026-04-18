@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "ff-bench-ferriskey-baseline"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "ferriskey-baseline-scenario1"
+path = "src/scenario1.rs"
+
+[dependencies]
+# Same ff-bench path dep the redis-rs baseline uses — picks up the
+# shared report-metadata helpers (host_info, valkey_version, git_sha,
+# iso8601_utc). Keeps the emitted JSON schema identical across
+# baselines so a 3-way compare is mechanical.
+ff-bench = { path = "../../harness" }
+# DELIBERATELY path-only to ferriskey. Not ff-sdk — the whole point of
+# this package is to isolate ferriskey's client overhead from ff-sdk
+# + ff-server + Lua. If you find yourself reaching for ff-sdk here,
+# you're in the wrong package.
+ferriskey = { path = "../../../ferriskey" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 0
+
+# Perf capture profile — same codegen as release, plus line-table debug
+# info so flamegraph can resolve Rust function names. Used only for
+# benches/perf-invest/ captures; production builds keep using release.
+[profile.perf]
+inherits = "release"
+debug = 1

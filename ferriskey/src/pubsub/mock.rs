@@ -17,7 +17,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
-use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{Notify, RwLock as TokioRwLock, mpsc};
 use tokio::time::sleep;
 
@@ -229,18 +228,24 @@ impl MockPubSubSynchronizer {
     pub(crate) fn check_and_record_sync_state(&self) {
         let is_synced = self.is_synchronized();
         if is_synced {
-            let _ = FerrisKeyOtel::update_subscription_last_sync_timestamp();
-            {
-                let client_id = &self.client_id;
-                tracing::debug!("mock_pubsub - Client {client_id} subscriptions in sync");
-            }
+            let client_id = &self.client_id;
+            tracing::debug!(
+                target: "ferriskey",
+                event = "pubsub_synced",
+                %client_id,
+                "ferriskey: mock pubsub subscriptions in sync"
+            );
         } else {
-            let _ = FerrisKeyOtel::record_subscription_out_of_sync();
             let (desired, actual) = self.get_subscription_state();
-            {
-                let client_id = &self.client_id;
-                tracing::debug!("mock_pubsub - Client {client_id} subscriptions out of sync - desired: {desired:?}, actual: {actual:?}");
-            }
+            let client_id = &self.client_id;
+            tracing::debug!(
+                target: "ferriskey",
+                event = "pubsub_out_of_sync",
+                %client_id,
+                desired = ?desired,
+                actual = ?actual,
+                "ferriskey: mock pubsub subscriptions out of sync"
+            );
         }
     }
 }

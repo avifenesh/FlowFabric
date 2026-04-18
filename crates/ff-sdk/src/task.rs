@@ -999,7 +999,18 @@ impl Drop for ClaimedTask {
 // ── Lease renewal ──
 
 /// Perform a single lease renewal via FCALL ff_renew_lease.
+///
+/// The span is named `renew_lease` with target `ff_sdk::task` so bench
+/// harnesses can attach a `tracing_subscriber::Layer` and measure
+/// renewal count + per-call duration via `on_enter` / `on_exit`
+/// without polluting the hot path with additional instrumentation.
+/// See `benches/harness/src/bin/long_running.rs` for the consumer.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "renew_lease",
+    skip_all,
+    fields(execution_id = %execution_id)
+)]
 async fn renew_lease_inner(
     client: &Client,
     partition_config: &PartitionConfig,

@@ -445,6 +445,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Extra time added to a blocking command's server-side timeout
+    /// when computing the client-side request deadline.
+    ///
+    /// Blocking commands (BLPOP, BLMPOP, XREAD BLOCK, etc.) pass a
+    /// server-side timeout as part of the command payload. To prevent
+    /// the client from failing a request that the server is
+    /// legitimately about to answer, the client waits
+    /// `server_timeout + extension` before treating the command as
+    /// timed out. The extension is a safety margin over slow links or
+    /// loaded servers.
+    ///
+    /// Defaults to 500ms. Under concurrent blocking pressure (many
+    /// clients waking at the same server timeout), 500ms can be
+    /// insufficient — consider 1s or 2s if you observe late responders
+    /// losing their replies.
+    pub fn blocking_cmd_timeout_extension(mut self, extension: Duration) -> Self {
+        self.request.blocking_cmd_timeout_extension = Some(extension);
+        self
+    }
+
     /// Set the maximum number of in-flight requests.
     pub fn max_inflight(mut self, max_inflight: u32) -> Self {
         self.request.inflight_requests_limit = Some(max_inflight);
@@ -470,6 +490,24 @@ impl ClientBuilder {
     }
 
     /// Enable lazy connection (connect on first command, not on build).
+    ///
+    /// **Deprecated.** The `lazy_connect` flag on `ConnectionRequest`
+    /// no longer alters `Client::new` / `build()` behaviour — those
+    /// entry points always return a connected `Client` or an error.
+    /// The connect-on-first-use path moved to a dedicated type:
+    /// construct a [`LazyClient`] via [`ClientBuilder::build_lazy`]
+    /// or [`LazyClient::from_config`].
+    ///
+    /// Callers still chaining `.lazy_connect().build()` will see
+    /// `build()` return `InvalidClientConfig` at runtime — the
+    /// deprecation warning here surfaces the migration at compile
+    /// time.
+    #[deprecated(
+        since = "0.1.1",
+        note = "Use ClientBuilder::build_lazy() -> LazyClient instead. \
+                lazy_connect() sets a flag that Client::new now rejects; \
+                the connect-on-first-use path lives on LazyClient."
+    )]
     pub fn lazy_connect(mut self) -> Self {
         self.request.lazy_connect = true;
         self
@@ -498,6 +536,144 @@ impl ClientBuilder {
 
         let inner = ClientInner::new(self.request, None).await?;
         Ok(Client(Arc::new(inner)))
+    }
+
+    /// Build a client that defers TCP connection until the first
+    /// command is executed.
+    ///
+    /// Unlike [`build`](Self::build), this does NOT attempt to reach
+    /// the server — it validates the address list and returns a
+    /// [`LazyClient`] synchronously. The underlying connection is
+    /// established on the first [`LazyClient::connect`] call (or
+    /// implicitly on the first command issued through the
+    /// returned `&Client`). Subsequent calls reuse the already-
+    /// established connection; a `OnceCell` guarantees connect runs
+    /// exactly once.
+    ///
+    /// Use this when you want a client handle you can construct
+    /// synchronously and thread through app startup, but where
+    /// the Valkey endpoint may not be reachable yet (e.g. the
+    /// server is part of the same deployment and comes up later).
+    pub fn build_lazy(self) -> Result<LazyClient> {
+        if self.request.addresses.is_empty() {
+            return Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "ClientBuilder requires at least one address",
+            )));
+        }
+        Ok(LazyClient {
+            config: self.request,
+            inner: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+}
+
+/// A client handle whose underlying TCP connection is established on
+/// first use, not at construction.
+///
+/// Construct via [`ClientBuilder::build_lazy`]. Call
+/// [`connect`](LazyClient::connect) to force connection establishment
+/// (and to get back the resolved [`Client`] for direct command
+/// dispatch). The resolved client is cached via a
+/// [`tokio::sync::OnceCell`]; first-call races are safe — only one
+/// connection attempt runs, and all callers observe the same result.
+///
+/// ```no_run
+/// # use ferriskey::{ClientBuilder, Result};
+/// # async fn example() -> Result<()> {
+/// let lazy = ClientBuilder::new()
+///     .host("localhost", 6379)
+///     .build_lazy()?;
+///
+/// // No connection has been made yet.
+///
+/// // First use triggers connect + runs the command.
+/// let _: String = lazy.connect().await?.cmd("PING").execute().await?;
+///
+/// // Subsequent calls reuse the established connection.
+/// let _: String = lazy.connect().await?.cmd("PING").execute().await?;
+/// # Ok(()) }
+/// ```
+#[derive(Clone)]
+pub struct LazyClient {
+    config: ConnectionRequest,
+    // OnceCell holds the resolved Client — once connected, every
+    // caller gets the same Arc-backed handle. Clone is cheap.
+    // `tokio::sync::OnceCell` (not `std::sync`) because init runs
+    // an `async` connect and may yield under heavy concurrency.
+    inner: Arc<tokio::sync::OnceCell<Client>>,
+}
+
+impl crate::client::ValkeyClientForTests for LazyClient {
+    fn send_command<'a>(
+        &'a mut self,
+        cmd: &'a mut crate::cmd::Cmd,
+        routing: Option<crate::cluster::routing::RoutingInfo>,
+    ) -> futures::future::BoxFuture<'a, Result<crate::value::Value>> {
+        // Integration-test adapter: resolve the inner Client (connect
+        // on first call) then delegate `send_command`. Mirrors the
+        // old lazy Client behaviour — external tests that used
+        // `Client::new(req_with_lazy, None)` now pass a `LazyClient`
+        // through the same `ValkeyClientForTests` harness without
+        // needing to touch connect() themselves.
+        use futures::FutureExt;
+        async move {
+            let client = self.connect().await?.clone();
+            let mut inner = (*client.0).clone();
+            inner.send_command(cmd, routing).await
+        }
+        .boxed()
+    }
+}
+
+impl LazyClient {
+    /// Construct a `LazyClient` directly from a raw
+    /// [`ConnectionRequest`]. Parallel to the escape-hatch
+    /// `Client::new(request, ...)` API — same shape, deferred
+    /// connect. Escape hatch for tests + advanced consumers that
+    /// already own a built `ConnectionRequest`; ordinary code should
+    /// prefer [`ClientBuilder::build_lazy`].
+    ///
+    /// The `lazy_connect` flag on the request is ignored (the
+    /// lazy semantics come from this type, not the flag).
+    pub fn from_config(config: ConnectionRequest) -> Result<Self> {
+        if config.addresses.is_empty() {
+            return Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "LazyClient requires at least one address",
+            )));
+        }
+        Ok(Self {
+            config,
+            inner: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+
+    /// Resolve the underlying [`Client`], performing the connect on
+    /// first call. Idempotent: subsequent calls return the cached
+    /// handle without re-dialling.
+    ///
+    /// Returns the resolved `&Client`. Call command methods on the
+    /// returned reference (`lazy.connect().await?.cmd(...).execute()`).
+    pub async fn connect(&self) -> Result<&Client> {
+        self.inner
+            .get_or_try_init(|| async {
+                // Clear `lazy_connect` so the inner eager ctor accepts
+                // the config — LazyClient's own OnceCell already
+                // provides the deferral.
+                let mut config = self.config.clone();
+                config.lazy_connect = false;
+                let inner = ClientInner::new(config, None).await?;
+                Ok::<Client, Error>(Client(Arc::new(inner)))
+            })
+            .await
+    }
+
+    /// Return a reference to the resolved [`Client`] if connect has
+    /// already succeeded, or `None` otherwise. Useful when a caller
+    /// wants to avoid awaiting if the connection is already warm.
+    pub fn get(&self) -> Option<&Client> {
+        self.inner.get()
     }
 }
 
@@ -840,6 +1016,7 @@ fn authentication_from_parts(
         Some(AuthenticationInfo {
             username: username.clone(),
             password: password.clone(),
+            #[cfg(feature = "iam")]
             iam_config: None,
         })
     }

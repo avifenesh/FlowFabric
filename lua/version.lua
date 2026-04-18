@@ -16,5 +16,5 @@
 -- with a pointer to this file.
 
 redis.register_function('ff_version', function(keys, args)
-  return '4'
+  return '5'
 end)

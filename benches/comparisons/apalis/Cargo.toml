@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "ff-bench-apalis"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# apalis 1.0 is still in pre-release; pinned EXACTLY so rc→rc API drift
+# doesn't silently break a bench review mid-flight. When rc graduates
+# to stable, update explicitly with a diff + re-verify.
+
+[[bin]]
+name = "apalis-scenario1"
+path = "src/scenario1.rs"
+
+[[bin]]
+name = "apalis-scenario4"
+path = "src/scenario4.rs"
+
+[dependencies]
+ff-bench = { path = "../../harness" }
+apalis = { version = "=1.0.0-rc.7", features = ["tracing", "limit"] }
+apalis-redis = { version = "=1.0.0-rc.7", features = ["tokio-comp"] }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

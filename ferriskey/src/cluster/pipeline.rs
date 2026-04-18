@@ -18,7 +18,6 @@ use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use telemetrylib::FerrisKeyOtel;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 
@@ -94,8 +93,13 @@ fn add_command_to_node_pipeline_map<C>(
 ) where
     C: Clone,
 {
-    if is_retrying && let Err(e) = FerrisKeyOtel::record_retry_attempt() {
-        tracing::error!("OpenTelemetry:retry_error - Failed to record retry attempt: {e}");
+    if is_retrying {
+        tracing::warn!(
+            target: "ferriskey",
+            event = "retry",
+            kind = "pipeline",
+            "ferriskey: cluster pipeline retry"
+        );
     }
     if add_asking {
         let asking_cmd = Arc::new(crate::cmd::cmd("ASKING"));

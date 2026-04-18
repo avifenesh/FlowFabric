@@ -1,0 +1,1 @@
+ferriskey-1x1 n=100 p50=0.042ms p95=0.054ms p99=0.091ms min=0.036ms max=0.141ms mean=0.044ms

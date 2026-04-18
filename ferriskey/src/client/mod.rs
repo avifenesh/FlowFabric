@@ -26,13 +26,14 @@ use futures_util::future::BoxFuture;
 use futures::FutureExt;
 pub use standalone_client::StandaloneClient;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Duration;
 pub use types::*;
 
 use self::value_conversion::{convert_to_expected_type, expected_type_for_cmd, get_value_type};
 mod reconnecting_connection;
+#[cfg(feature = "iam")]
 pub use reconnecting_connection::IAMTokenHandle;
 mod standalone_client;
 mod value_conversion;
@@ -41,7 +42,6 @@ use crate::request_type::RequestType;
 use crate::value::InfoDict;
 use std::future::Future;
 use std::pin::Pin;
-use telemetrylib::FerrisKeyOtel;
 use tokio::sync::{RwLock, mpsc};
 use versions::Versioning;
 
@@ -99,15 +99,20 @@ pub(super) fn get_port(address: &NodeAddress) -> u16 {
     }
 }
 
-/// Get Valkey connection info with IAM token integration
+/// Get Valkey connection info with IAM token integration (when built
+/// with `feature = "iam"`).
 ///
-/// If IAM config + token manager exist, use the IAM token as the password; otherwise use the provided password.
+/// If IAM config + token manager exist, use the IAM token as the
+/// password; otherwise use the provided password. The
+/// `iam_token_manager` parameter is cfg-gated so non-IAM builds have
+/// a smaller signature with no dependency on the IAM module.
 ///
-/// `iam_token_manager: Option<&Arc<IAMTokenManager>>`
-/// — `Option` because IAM is optional; `&Arc` gives shared, non-owning, cheap access to a shared manager (we only read a token).
+/// With `feature = "iam"` off, this function only ever uses the
+/// static password path — the match on `iam_config` vanishes at
+/// compile time.
 pub async fn get_valkey_connection_info(
     connection_request: &ConnectionRequest,
-    iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+    #[cfg(feature = "iam")] iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
 ) -> crate::connection::info::ValkeyConnectionInfo {
     let protocol = connection_request.protocol.unwrap_or_default();
     let db = connection_request.database_id;
@@ -116,28 +121,32 @@ pub async fn get_valkey_connection_info(
 
     match &connection_request.authentication_info {
         Some(info) => {
-            // If we have IAM configuration and a token manager, use the IAM token as password
+            // If we have IAM configuration and a token manager, use the IAM token as password.
+            // The entire branch is cfg-gated so non-IAM builds compile it out.
+            #[cfg(feature = "iam")]
             if let (Some(_), Some(manager)) = (&info.iam_config, iam_token_manager) {
                 let token = manager.get_token().await;
 
-                crate::connection::info::ValkeyConnectionInfo {
+                return crate::connection::info::ValkeyConnectionInfo {
                     db,
                     username: info.username.clone(),
                     password: Some(token),
                     protocol,
                     client_name,
                     lib_name,
-                }
-            } else {
-                // Regular password-based authentication
-                crate::connection::info::ValkeyConnectionInfo {
-                    db,
-                    username: info.username.clone(),
-                    password: info.password.clone(),
-                    protocol,
-                    client_name,
-                    lib_name,
-                }
+                };
+            }
+
+            // Regular password-based authentication (always taken when
+            // feature = "iam" is off; taken when no iam_config present
+            // or no manager provided when the feature is on).
+            crate::connection::info::ValkeyConnectionInfo {
+                db,
+                username: info.username.clone(),
+                password: info.password.clone(),
+                protocol,
+                client_name,
+                lib_name,
             }
         }
         None => crate::connection::info::ValkeyConnectionInfo {
@@ -174,28 +183,37 @@ pub(super) fn get_connection_info(
     }
 }
 
+/// The underlying connected client held by a [`Client`].
+///
+/// By construction this is ALWAYS connected — [`Client::new`] and
+/// [`ClientBuilder::build`] only return after
+/// [`StandaloneClient::create_client`] or [`create_cluster_client`]
+/// succeeds. There is no transient "not yet connected" state; code
+/// that needs connection-on-first-use constructs a
+/// [`crate::LazyClient`] via [`crate::ClientBuilder::build_lazy`]
+/// instead.
 #[derive(Clone)]
 pub enum ClientWrapper {
     Standalone(StandaloneClient),
     Cluster { client: ClusterConnection },
-    Lazy(Box<LazyClient>),
-}
-
-/// A client wrapper that defers connection until the first command is executed.
-#[derive(Clone)]
-pub struct LazyClient {
-    config: ConnectionRequest,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
 }
 
 #[derive(Clone)]
 pub struct Client {
     internal_client: Arc<RwLock<ClientWrapper>>,
     request_timeout: Duration,
+    /// Extra time added to a blocking command's server-side timeout
+    /// when computing the client-side request deadline. Defaults to
+    /// [`DEFAULT_DEFAULT_EXT_SECS`] (500ms).
+    blocking_cmd_timeout_extension: Duration,
     inflight_requests_allowed: Arc<AtomicIsize>,
     inflight_requests_limit: isize,
     inflight_log_interval: isize,
-    // IAM token manager for automatic credential refresh
+    // IAM token manager for automatic credential refresh.
+    // Only present when built with `feature = "iam"`; non-IAM builds
+    // don't carry the field and don't pay the `Option<Arc<_>>` clone
+    // cost on the per-command Client::clone hot path.
+    #[cfg(feature = "iam")]
     iam_token_manager: Option<Arc<crate::iam::IAMTokenManager>>,
     // Optional compression manager for automatic compression/decompression
     compression_manager: Option<Arc<CompressionManager>>,
@@ -211,10 +229,12 @@ async fn run_with_timeout<T>(
         Some(duration) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
             Err(_) => {
-                // Record timeout error metric if telemetry is initialized
-                if let Err(e) = FerrisKeyOtel::record_timeout_error() {
-                    tracing::error!("OpenTelemetry:timeout_error - Failed to record timeout error: {e}");
-                }
+                tracing::warn!(
+                    target: "ferriskey",
+                    event = "timeout",
+                    duration_ms = duration.as_millis() as u64,
+                    "ferriskey: request timed out"
+                );
                 Err(io::Error::from(io::ErrorKind::TimedOut).into())
             }
         },
@@ -222,8 +242,15 @@ async fn run_with_timeout<T>(
     }
 }
 
-/// Extension to the request timeout for blocking commands to ensure we won't return with timeout error before the server responded
-const BLOCKING_CMD_TIMEOUT_EXTENSION: f64 = 0.5; // seconds
+/// Default extension to the request timeout for blocking commands.
+///
+/// When a blocking command (BLPOP, BLMPOP, XREAD BLOCK, etc.) is dispatched,
+/// the client-side request deadline is set to `server_timeout + extension`.
+/// The extension is a safety margin so the client doesn't fail a request
+/// that the server is legitimately about to answer over a slow link.
+///
+/// Override per-client via [`crate::ClientBuilder::blocking_cmd_timeout_extension`].
+pub const DEFAULT_DEFAULT_EXT_SECS: Duration = Duration::from_millis(500);
 
 enum TimeUnit {
     Milliseconds = 1000,
@@ -269,10 +296,13 @@ fn parse_timeout_to_f64(cmd: &Cmd, timeout_idx: usize) -> Result<f64> {
 /// Attempts to get the timeout duration from the command argument at `timeout_idx`.
 /// If the argument can be parsed into a duration, it returns the duration in seconds with BlockingCmdTimeout.
 /// If the timeout argument value is zero, NoTimeout will be returned. Otherwise, ClientConfigTimeout is returned.
+///
+/// `extension` is the per-client safety margin added to the server-side timeout.
 fn get_timeout_from_cmd_arg(
     cmd: &Cmd,
     timeout_idx: usize,
     time_unit: TimeUnit,
+    extension: Duration,
 ) -> Result<RequestTimeoutOption> {
     let timeout_secs = parse_timeout_to_f64(cmd, timeout_idx)? / ((time_unit as i32) as f64);
     if timeout_secs < 0.0 {
@@ -297,23 +327,27 @@ fn get_timeout_from_cmd_arg(
             // Extend the request timeout to ensure we don't timeout before receiving a response from the server.
             Ok(RequestTimeoutOption::BlockingCommand(
                 Duration::from_secs_f64(
-                    (timeout_secs + BLOCKING_CMD_TIMEOUT_EXTENSION).min(u32::MAX as f64),
+                    (timeout_secs + extension.as_secs_f64()).min(u32::MAX as f64),
                 ),
             ))
         }
     }
 }
 
-fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Duration>> {
+fn get_request_timeout(
+    cmd: &Cmd,
+    default_timeout: Duration,
+    extension: Duration,
+) -> Result<Option<Duration>> {
     let command = cmd.command().unwrap_or_default();
     let timeout = match command.as_slice() {
         b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BZPOPMAX" | b"BZPOPMIN" | b"BRPOPLPUSH" => {
-            get_timeout_from_cmd_arg(cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds)
+            get_timeout_from_cmd_arg(cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds, extension)
         }
-        b"BLMPOP" | b"BZMPOP" => get_timeout_from_cmd_arg(cmd, 1, TimeUnit::Seconds),
+        b"BLMPOP" | b"BZMPOP" => get_timeout_from_cmd_arg(cmd, 1, TimeUnit::Seconds, extension),
         b"XREAD" | b"XREADGROUP" => cmd
             .position(b"BLOCK")
-            .map(|idx| get_timeout_from_cmd_arg(cmd, idx + 1, TimeUnit::Milliseconds))
+            .map(|idx| get_timeout_from_cmd_arg(cmd, idx + 1, TimeUnit::Milliseconds, extension))
             .unwrap_or(Ok(RequestTimeoutOption::ClientConfig)),
         b"WAIT" | b"WAITAOF" => {
             let idx = if command.as_slice() == b"WAITAOF" {
@@ -321,7 +355,7 @@ fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Du
             } else {
                 2
             };
-            get_timeout_from_cmd_arg(cmd, idx, TimeUnit::Milliseconds)
+            get_timeout_from_cmd_arg(cmd, idx, TimeUnit::Milliseconds, extension)
         }
         _ => Ok(RequestTimeoutOption::ClientConfig),
     }?;
@@ -336,12 +370,18 @@ fn get_request_timeout(cmd: &Cmd, default_timeout: Duration) -> Result<Option<Du
 }
 
 impl Client {
-    fn is_select_command(&self, cmd: &Cmd) -> bool {
+    // Command-shape inspectors below take no `&self` — they're pure
+    // functions over a `&Cmd`. Associated-fn syntax lets the unit
+    // tests call them without constructing a `Client` (which now
+    // requires a connected wrapper and can't be stubbed without a
+    // real TCP connection).
+
+    fn is_select_command(cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"SELECT")
     }
 
     /// Extract the database ID from a SELECT command's first argument.
-    fn extract_database_id_from_select(&self, cmd: &Cmd) -> Result<i64> {
+    fn extract_database_id_from_select(cmd: &Cmd) -> Result<i64> {
         // For both crate::cmd::cmd("SELECT").arg("5") and crate::cmd::Cmd::new().arg("SELECT").arg("5")
         // the database ID is at arg_idx(1)
         cmd.arg_idx(1)
@@ -374,7 +414,7 @@ impl Client {
     /// Client may report a stale `db_namespace` in OTel spans. This is an
     /// acceptable trade-off since concurrent SELECTs are rare in practice.
     async fn handle_select_command(&mut self, cmd: &Cmd) -> Result<()> {
-        let database_id = self.extract_database_id_from_select(cmd)?;
+        let database_id = Self::extract_database_id_from_select(cmd)?;
 
         self.update_stored_database_id(database_id).await?;
         // Keep OTel db.namespace in sync
@@ -394,19 +434,15 @@ impl Client {
                 client.update_connection_database(database_id).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
-    fn is_client_set_name_command(&self, cmd: &Cmd) -> bool {
+    fn is_client_set_name_command(cmd: &Cmd) -> bool {
         cmd.command()
             .is_some_and(|bytes| bytes == b"CLIENT SETNAME")
     }
 
-    fn extract_client_name_from_client_set_name(&self, cmd: &Cmd) -> Option<String> {
+    fn extract_client_name_from_client_set_name(cmd: &Cmd) -> Option<String> {
         // For crate::cmd::cmd("CLIENT").arg("SETNAME").arg("name")
         // the client name is at arg_idx(2) (after "SETNAME")
         cmd.arg_idx(2).and_then(|name_bytes| {
@@ -417,7 +453,7 @@ impl Client {
     }
 
     async fn handle_client_set_name_command(&mut self, cmd: &Cmd) -> Result<()> {
-        let client_name = self.extract_client_name_from_client_set_name(cmd);
+        let client_name = Self::extract_client_name_from_client_set_name(cmd);
         self.update_stored_client_name(client_name).await?;
         Ok(())
     }
@@ -434,19 +470,15 @@ impl Client {
                 client.update_connection_client_name(client_name).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
-    fn is_auth_command(&self, cmd: &Cmd) -> bool {
+    fn is_auth_command(cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"AUTH")
     }
 
     /// Extract (username, password) from an AUTH command.
-    fn extract_auth_info(&self, cmd: &Cmd) -> (Option<String>, Option<String>) {
+    fn extract_auth_info(cmd: &Cmd) -> (Option<String>, Option<String>) {
         // Get the first argument
         let first_arg = cmd
             .arg_idx(1)
@@ -468,7 +500,7 @@ impl Client {
     }
 
     async fn handle_auth_command(&mut self, cmd: &Cmd) -> Result<()> {
-        let (username, password) = self.extract_auth_info(cmd);
+        let (username, password) = Self::extract_auth_info(cmd);
         if username.is_some() {
             self.update_stored_username(username).await?;
         }
@@ -490,10 +522,6 @@ impl Client {
                 client.update_connection_username(username).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
@@ -508,14 +536,10 @@ impl Client {
                 client.update_connection_password(password).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
-    fn is_hello_command(&self, cmd: &Cmd) -> bool {
+    fn is_hello_command(cmd: &Cmd) -> bool {
         cmd.command().is_some_and(|bytes| bytes == b"HELLO")
     }
 
@@ -527,7 +551,6 @@ impl Client {
     /// - HELLO 3 SETNAME clientname
     /// - HELLO 3 AUTH username password SETNAME clientname
     fn extract_hello_info(
-        &self,
         cmd: &Cmd,
     ) -> (
         Option<crate::value::ProtocolVersion>,
@@ -583,7 +606,7 @@ impl Client {
     }
 
     async fn handle_hello_command(&mut self, cmd: &Cmd) -> Result<()> {
-        let (protocol, username, password, client_name) = self.extract_hello_info(cmd);
+        let (protocol, username, password, client_name) = Self::extract_hello_info(cmd);
 
         // Update protocol version if provided
         if let Some(protocol) = protocol {
@@ -622,90 +645,20 @@ impl Client {
                 client.update_connection_protocol(protocol).await?;
                 Ok(())
             }
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
+    /// Return a clone of the underlying [`ClientWrapper`].
+    ///
+    /// Post-construction the wrapper is guaranteed to be
+    /// [`ClientWrapper::Standalone`] or [`ClientWrapper::Cluster`] —
+    /// there is no lazy state here anymore. The lazy connect-on-first-
+    /// use path lives on [`crate::LazyClient`] instead. This method
+    /// keeps its historical name so internal callers don't churn,
+    /// but it is now a simple read-clone.
     async fn get_or_initialize_client(&self) -> Result<ClientWrapper> {
-        {
-            let guard = self.internal_client.read().await;
-            if !matches!(&*guard, ClientWrapper::Lazy(_)) {
-                return Ok(guard.clone()); // ✅ Already initialized, return clone
-            }
-        }
-
-        // Handle lazy client initialization
-        let (config, push_sender) = {
-            let mut guard = self.internal_client.write().await;
-            if let ClientWrapper::Lazy(lazy_client) = &mut *guard {
-                let config = lazy_client.config.clone();
-                let push_sender = lazy_client.push_sender.clone();
-                (config, push_sender)
-            } else {
-                // Another thread initialized it while we were waiting
-                return Ok(guard.clone());
-            }
-        };
-
-        // Continue with client initialization
-        let mut config = config;
-        config.lazy_connect = false;
-
-        let mut guard = self.internal_client.write().await;
-        let iam_manager_ref = self.iam_token_manager.as_ref();
-        if let ClientWrapper::Lazy(_) = &*guard {
-            // Create the appropriate client based on configuration
-            let real_client = if config.cluster_mode_enabled {
-                // Create cluster client
-                let client = create_cluster_client(
-                    config,
-                    push_sender,
-                    iam_manager_ref,
-                    self.pubsub_synchronizer.clone(),
-                )
-                .await?;
-                ClientWrapper::Cluster { client }
-            } else {
-                // Create standalone client
-                let client = StandaloneClient::create_client(
-                    config,
-                    push_sender,
-                    iam_manager_ref,
-                    Some(self.pubsub_synchronizer.clone()),
-                )
-                .await
-                .map_err(|e| {
-                    Error::from((
-                        ErrorKind::IoError,
-                        "Standalone connect failed",
-                        format!("{e:?}"),
-                    ))
-                })?;
-                ClientWrapper::Standalone(client)
-            };
-
-            // Replace the lazy client with the real client
-            *guard = real_client;
-        }
-
-        // We must drop the guard so the pubsub synchronizer can acquire it when subscribing
-        // to channels provided via config. Keeping the guard would cause a deadlock. We wait
-        // for the subscription here to ensure the lazy client is subscribed immediately upon creation.
-        drop(guard);
-        if let Err(e) = self
-            .pubsub_synchronizer
-            .wait_for_sync(0, None, None, None)
-            .await
-        {
-            tracing::warn!("Client::new - Failed to establish initial subscriptions within timeout: {e:?}");
-        }
-
-        // Re-acquire for the return
         let guard = self.internal_client.read().await;
-        Ok(guard.clone()) // ✅ Return clone of the now-initialized wrapper
+        Ok(guard.clone())
     }
 
     /// Internal command execution logic. Takes owned data so the returned future
@@ -739,10 +692,6 @@ impl Client {
                 };
                 client.route_command(&cmd, final_routing).await
             }
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }?;
 
         // Post-process: decompress and convert to expected type.
@@ -770,16 +719,16 @@ impl Client {
         let expected_type = expected_type_for_cmd(&cmd);
         let value = convert_to_expected_type(processed_value, expected_type)?;
 
-        if self_clone.is_client_set_name_command(&cmd) {
+        if Self::is_client_set_name_command(&cmd) {
             self_clone.handle_client_set_name_command(&cmd).await?;
         }
-        if self_clone.is_select_command(&cmd) {
+        if Self::is_select_command(&cmd) {
             self_clone.handle_select_command(&cmd).await?;
         }
-        if self_clone.is_auth_command(&cmd) {
+        if Self::is_auth_command(&cmd) {
             self_clone.handle_auth_command(&cmd).await?;
         }
-        if self_clone.is_hello_command(&cmd) {
+        if Self::is_hello_command(&cmd) {
             self_clone.handle_hello_command(&cmd).await?;
         }
         Ok(value)
@@ -790,8 +739,27 @@ impl Client {
         cmd: &'a mut Cmd,
         routing: Option<RoutingInfo>,
     ) -> BoxFuture<'a, Result<Value>> {
+        // The per-command span is the primary public observation point.
+        // Stable name = "ferriskey.send_command", target = "ferriskey".
+        // Zero-cost when no subscriber is installed (tracing short-
+        // circuits via the global dispatcher's `would_enabled` check).
+        use tracing::Instrument;
+        let command_name = cmd
+            .command()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let span = tracing::debug_span!(
+            target: "ferriskey",
+            "ferriskey.send_command",
+            command = %command_name,
+            has_routing = routing.is_some(),
+        );
         Box::pin(async move {
-            // Check for IAM token changes and update the password without authentication if needed (pull model)
+            // Check for IAM token changes and update the password without
+            // authentication if needed (pull model). Entirely cfg-gated:
+            // non-IAM builds do not carry the `iam_token_manager` field
+            // and do not compile this check.
+            #[cfg(feature = "iam")]
             if let Some(iam_manager) = &self.iam_token_manager
                 && iam_manager.token_changed()
             {
@@ -814,7 +782,11 @@ impl Client {
                 return result;
             }
 
-            let request_timeout = get_request_timeout(cmd, self.request_timeout)?;
+            let request_timeout = get_request_timeout(
+                cmd,
+                self.request_timeout,
+                self.blocking_cmd_timeout_extension,
+            )?;
 
             // Reserve an inflight slot. The tracker holds the slot until the
             // last clone of the Cmd is dropped (i.e. all sub-commands in the
@@ -874,16 +846,20 @@ impl Client {
                             // was already moved into the event loop's PendingRequest,
                             // so its tracker clone keeps the inflight slot held until
                             // all sub-commands complete naturally.
-                            if let Err(e) = FerrisKeyOtel::record_timeout_error() {
-                                tracing::error!("OpenTelemetry:timeout_error - Failed to record timeout error: {e}");
-                            }
+                            tracing::warn!(
+                                target: "ferriskey",
+                                event = "timeout",
+                                duration_ms = duration.as_millis() as u64,
+                                "ferriskey: command timed out"
+                            );
                             Err(io::Error::from(io::ErrorKind::TimedOut).into())
                         }
                     }
                 }
                 None => execute.await,
             }
-        })
+        }
+        .instrument(span))
     }
 
     // Cluster scan is not passed to ferriskey as a regular command, so we need to handle it separately.
@@ -930,10 +906,6 @@ impl Client {
                 Ok(Value::Array(vec![Ok(cluster_cursor_id), Ok(Value::Array(keys.into_iter().map(Ok).collect()))]))
             }
             // Lazy case is now handled by the initial check
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
@@ -1074,10 +1046,6 @@ impl Client {
                                 raise_on_error,
                             )
                         }
-                        ClientWrapper::Lazy(_) => Err(Error::from((
-                            ErrorKind::ClientError,
-                            "Client not yet initialized",
-                        ))),
                     }
                 },
             )
@@ -1148,10 +1116,6 @@ impl Client {
                                     .await
                             }
                         },
-                        ClientWrapper::Lazy(_) => Err(Error::from((
-                            ErrorKind::ClientError,
-                            "Client not yet initialized",
-                        ))),
                     }?;
 
                     Client::convert_pipeline_values_to_expected_types(
@@ -1229,10 +1193,6 @@ impl Client {
                 ClientWrapper::Cluster { ref mut client } => {
                     client.update_connection_password(password.clone()).await
                 }
-                ClientWrapper::Lazy(_) => Err(Error::from((
-                    ErrorKind::ClientError,
-                    "Client not yet initialized",
-                ))),
             }
         })
         .await
@@ -1305,16 +1265,14 @@ impl Client {
                 ))),
             },
             ClientWrapper::Standalone(client) => Ok(client.get_username()),
-            ClientWrapper::Lazy(_) => Err(Error::from((
-                ErrorKind::ClientError,
-                "Client not yet initialized",
-            ))),
         }
     }
 
     /// Create an `IAMTokenManager` when IAM auth is configured.
     ///
     /// Client retrieves tokens on-demand during command execution.
+    /// Only compiled when built with `feature = "iam"`.
+    #[cfg(feature = "iam")]
     async fn create_iam_token_manager(
         auth_info: &crate::client::types::AuthenticationInfo,
     ) -> Option<std::sync::Arc<crate::iam::IAMTokenManager>> {
@@ -1347,15 +1305,18 @@ impl Client {
         }
     }
 
-    /// Manually refresh the IAM token and update connection authentication
+    /// Manually refresh the IAM token and update connection authentication.
     ///
-    /// This method generates a new IAM token using the configured IAM token manager
-    /// and immediately authenticates all connections with the new token.
+    /// This method generates a new IAM token using the configured IAM
+    /// token manager and immediately authenticates all connections
+    /// with the new token. Only available when built with
+    /// `feature = "iam"`.
     ///
     /// # Returns
     /// - `Ok(())` if the token was successfully refreshed and authentication succeeded
     /// - `Err(Error)` if no IAM token manager is configured, token generation fails,
     ///   or authentication with the new token fails.
+    #[cfg(feature = "iam")]
     pub async fn refresh_iam_token(&mut self) -> Result<()> {
         // Check if IAM token manager is available
         let iam_manager = self.iam_token_manager.as_ref().ok_or_else(|| {
@@ -1417,10 +1378,6 @@ impl PubSubCommandApplier for ClientWrapper {
                         .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random));
                     client.route_command(cmd, final_routing).await
                 }
-                ClientWrapper::Lazy(_) => Err(Error::from((
-                    ErrorKind::ClientError,
-                    "Client not initialized",
-                ))),
             }
         })
     }
@@ -1453,12 +1410,15 @@ pub(crate) fn to_duration(time_in_millis: Option<u32>, default: Duration) -> Dur
 async fn create_cluster_client(
     request: ConnectionRequest,
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
+    #[cfg(feature = "iam")] iam_token_manager: Option<&Arc<crate::iam::IAMTokenManager>>,
     pubsub_synchronizer: Arc<dyn crate::pubsub::PubSubSynchronizer>,
 ) -> Result<crate::cluster::ClusterConnection> {
     let tls_mode = request.tls_mode.unwrap_or_default();
 
+    #[cfg(feature = "iam")]
     let valkey_connection_info = get_valkey_connection_info(&request, iam_token_manager).await;
+    #[cfg(not(feature = "iam"))]
+    let valkey_connection_info = get_valkey_connection_info(&request).await;
 
     let has_root_certs = !request.root_certs.is_empty();
     let has_client_cert = !request.client_cert.is_empty();
@@ -1587,11 +1547,14 @@ async fn create_cluster_client(
     builder = builder.periodic_connections_checks(Some(CONNECTION_CHECKS_INTERVAL));
 
     let client = builder.build()?;
+    #[cfg(feature = "iam")]
     let iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>> =
         iam_token_manager.map(|manager| {
             Arc::new(manager.get_token_handle())
                 as Arc<dyn crate::connection::factory::IAMTokenProvider>
         });
+    #[cfg(not(feature = "iam"))]
+    let iam_token_provider: Option<Arc<dyn crate::connection::factory::IAMTokenProvider>> = None;
 
     let mut con = client
         .get_async_connection(push_sender, Some(pubsub_synchronizer), iam_token_provider)
@@ -1790,6 +1753,9 @@ impl Client {
 
         tracing::info!("Connection configuration - {}", sanitized_request_string(&request));
         let request_timeout = to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT);
+        let blocking_cmd_timeout_extension = request
+            .blocking_cmd_timeout_extension
+            .unwrap_or(DEFAULT_DEFAULT_EXT_SECS);
         let inflight_requests_limit = request
             .inflight_requests_limit
             .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
@@ -1807,22 +1773,33 @@ impl Client {
             _ => None,
         };
 
-        tokio::time::timeout(client_creation_timeout, async move {
-            // Create shared, thread-safe wrapper for the internal client that starts as lazy
-            // Arc<RwLock<T>> enables multiple async tasks to safely share and modify the client state
-            let internal_client_arc =
-                Arc::new(RwLock::new(ClientWrapper::Lazy(Box::new(LazyClient {
-                    config: request.clone(),
-                    push_sender: push_sender.clone(),
-                }))));
+        // Lazy-connect is no longer supported through `Client::new`.
+        // The dedicated `LazyClient` type (built via
+        // `ClientBuilder::build_lazy`) owns the connect-on-first-use
+        // path. Failing loud here ensures callers who still set the
+        // flag migrate explicitly rather than picking up a silent
+        // behaviour change.
+        if request.lazy_connect {
+            return Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "lazy_connect is no longer supported on Client::new",
+                "Use ClientBuilder::build_lazy() -> LazyClient to defer connection.".to_string(),
+            )));
+        }
 
+        tokio::time::timeout(client_creation_timeout, async move {
             let initial_subscriptions = request.pubsub_subscriptions.clone();
 
+            // Build the synchronizer up front with an EMPTY weak
+            // handle — we'll wire it to the real `internal_client_arc`
+            // once the wrapper has been constructed. The placeholder
+            // is safe because synchronizer code only `upgrade()`s the
+            // weak when reconciling; startup callers don't.
             let pubsub_synchronizer = create_pubsub_synchronizer(
                 push_sender.clone(),
                 initial_subscriptions,
                 request.cluster_mode_enabled,
-                Arc::downgrade(&internal_client_arc),
+                Weak::new(),
                 reconciliation_interval,
                 request_timeout,
             )
@@ -1845,48 +1822,26 @@ impl Client {
                 db_namespace: request.database_id.to_string(),
             };
 
-            // Create the Client first without IAM token manager
-            let inflight_limit: isize = inflight_requests_limit
-                .try_into()
-                .expect("inflight limit exceeds isize::MAX");
-            let inflight_log_interval = (inflight_limit / 10).max(1);
-            let client = Self {
-                internal_client: internal_client_arc.clone(),
-                request_timeout,
-                inflight_requests_allowed,
-                inflight_requests_limit: inflight_limit,
-                inflight_log_interval,
-                compression_manager: compression_manager.clone(),
-                iam_token_manager: None,
-                pubsub_synchronizer: pubsub_synchronizer.clone(),
-                otel_metadata,
-            };
-
-            let client_arc = Arc::new(RwLock::new(client));
-
-            // Create IAM token manager if needed
+            // Create IAM token manager if needed — must happen
+            // before `create_cluster_client` / `create_client` so
+            // the token is available to the connect handshake.
+            // Only compiled when built with `feature = "iam"`.
+            #[cfg(feature = "iam")]
             let iam_token_manager = if let Some(auth_info) = &request.authentication_info {
                 Self::create_iam_token_manager(auth_info).await
             } else {
                 None
             };
 
-            // Update the client with the IAM token manager
-            {
-                let mut client_guard = client_arc.write().await;
-                client_guard.iam_token_manager = iam_token_manager.clone();
-            }
-
-            let is_lazy = request.lazy_connect;
-            let internal_client = if is_lazy {
-                ClientWrapper::Lazy(Box::new(LazyClient {
-                    config: request,
-                    push_sender,
-                }))
-            } else if request.cluster_mode_enabled {
+            // Build the real wrapper — NO transient Lazy state.
+            // This is the only place the wrapper is constructed
+            // now; `Client::new` never returns a disconnected
+            // handle.
+            let internal_client = if request.cluster_mode_enabled {
                 let client = create_cluster_client(
                     request,
                     push_sender,
+                    #[cfg(feature = "iam")]
                     iam_token_manager.as_ref(),
                     pubsub_synchronizer.clone(),
                 )
@@ -1897,6 +1852,7 @@ impl Client {
                     StandaloneClient::create_client(
                         request,
                         push_sender,
+                        #[cfg(feature = "iam")]
                         iam_token_manager.as_ref(),
                         Some(pubsub_synchronizer.clone()),
                     )
@@ -1904,24 +1860,41 @@ impl Client {
                 )
             };
 
-            // Update the internal client with the actual client
-            {
-                let mut guard = internal_client_arc.write().await;
-                *guard = internal_client;
-            }
+            let internal_client_arc = Arc::new(RwLock::new(internal_client));
 
-            if !is_lazy {
-                pubsub_synchronizer.trigger_reconciliation();
-                if let Err(e) = pubsub_synchronizer.wait_for_sync(0, None, None, None).await {
-                    tracing::error!("Client::new - Failed to establish initial subscriptions within timeout: {e:?}");
-                }
-            }
+            // Now that the Arc exists and holds a connected wrapper,
+            // wire the synchronizer's Weak handle so reconciliation
+            // can reach the client.
+            crate::pubsub::attach_internal_client(
+                &pubsub_synchronizer,
+                Arc::downgrade(&internal_client_arc),
+            );
 
-            // Return the client from the Arc
-            let client = {
-                let client_guard = client_arc.read().await;
-                client_guard.clone()
+            let inflight_limit: isize = inflight_requests_limit
+                .try_into()
+                .expect("inflight limit exceeds isize::MAX");
+            let inflight_log_interval = (inflight_limit / 10).max(1);
+
+            let client = Self {
+                internal_client: internal_client_arc,
+                request_timeout,
+                blocking_cmd_timeout_extension,
+                inflight_requests_allowed,
+                inflight_requests_limit: inflight_limit,
+                inflight_log_interval,
+                compression_manager,
+                #[cfg(feature = "iam")]
+                iam_token_manager,
+                pubsub_synchronizer: pubsub_synchronizer.clone(),
+                otel_metadata,
             };
+
+            pubsub_synchronizer.trigger_reconciliation();
+            if let Err(e) = pubsub_synchronizer.wait_for_sync(0, None, None, None).await {
+                tracing::error!(
+                    "Client::new - Failed to establish initial subscriptions within timeout: {e:?}"
+                );
+            }
 
             Ok(client)
         })
@@ -2006,24 +1979,32 @@ mod tests {
 
     use crate::cmd::Cmd;
 
-    use crate::client::types::{ConnectionRequest, NodeAddress, OTelMetadata};
     use crate::client::{
-        BLOCKING_CMD_TIMEOUT_EXTENSION, RequestTimeoutOption, TimeUnit, get_request_timeout,
+        DEFAULT_DEFAULT_EXT_SECS, RequestTimeoutOption, TimeUnit, get_request_timeout,
     };
 
-    use super::{Client, ClientWrapper, LazyClient, get_timeout_from_cmd_arg};
-    use std::sync::Weak;
+    use super::{Client, get_timeout_from_cmd_arg};
+
+    /// Default extension as seconds (f64) — tests compare against
+    /// `Duration::from_secs_f64` expressions.
+    const DEFAULT_EXT_SECS: f64 = 0.5;
+    const DEFAULT_EXT: Duration = DEFAULT_DEFAULT_EXT_SECS;
 
     #[test]
     fn test_get_timeout_from_cmd_returns_correct_duration_int() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg("5");
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             RequestTimeoutOption::BlockingCommand(Duration::from_secs_f64(
-                5.0 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                5.0 + DEFAULT_EXT_SECS
             ))
         );
     }
@@ -2032,12 +2013,17 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_correct_duration_float() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg(0.5);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             RequestTimeoutOption::BlockingCommand(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
     }
@@ -2046,12 +2032,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_correct_duration_milliseconds() {
         let mut cmd = Cmd::new();
         cmd.arg("XREAD").arg("BLOCK").arg("500").arg("key");
-        let result = get_timeout_from_cmd_arg(&cmd, 2, TimeUnit::Milliseconds);
+        let result = get_timeout_from_cmd_arg(&cmd, 2, TimeUnit::Milliseconds, DEFAULT_EXT);
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
             RequestTimeoutOption::BlockingCommand(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
     }
@@ -2060,7 +2046,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_err_when_timeout_isnt_passed() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg("key3");
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         println!("{err:?}");
@@ -2074,7 +2065,12 @@ mod tests {
             .arg("key1")
             .arg("key2")
             .arg(u32::MAX as u64 + 1);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         println!("{err:?}");
@@ -2085,7 +2081,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_err_when_timeout_is_negative() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg(-1);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().to_lowercase().contains("negative"), "{err}");
@@ -2095,7 +2096,12 @@ mod tests {
     fn test_get_timeout_from_cmd_returns_no_timeout_when_zero_is_passed() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg(0);
-        let result = get_timeout_from_cmd_arg(&cmd, cmd.args_iter().len() - 1, TimeUnit::Seconds);
+        let result = get_timeout_from_cmd_arg(
+            &cmd,
+            cmd.args_iter().len() - 1,
+            TimeUnit::Seconds,
+            DEFAULT_EXT,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RequestTimeoutOption::NoTimeout,);
     }
@@ -2104,59 +2110,59 @@ mod tests {
     fn test_get_request_timeout_with_blocking_command_returns_cmd_arg_timeout() {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key1").arg("key2").arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                500.0 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                500.0 + DEFAULT_EXT_SECS
             ))
         );
 
         let mut cmd = Cmd::new();
         cmd.arg("XREADGROUP").arg("BLOCK").arg("500").arg("key");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
 
         let mut cmd = Cmd::new();
         cmd.arg("BLMPOP").arg("0.857").arg("key");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.857 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.857 + DEFAULT_EXT_SECS
             ))
         );
 
         let mut cmd = Cmd::new();
         cmd.arg("WAIT").arg(1).arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(500)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(500), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
 
         // WAITAOF
         let mut cmd = Cmd::new();
         cmd.arg("WAITAOF").arg(1).arg(1).arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(500)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(500), DEFAULT_EXT).unwrap();
         assert_eq!(
             result,
             Some(Duration::from_secs_f64(
-                0.5 + BLOCKING_CMD_TIMEOUT_EXTENSION
+                0.5 + DEFAULT_EXT_SECS
             ))
         );
 
         // Infinite block (0) — returns None (no client timeout)
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key").arg("0");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(result, None);
     }
 
@@ -2164,241 +2170,167 @@ mod tests {
     fn test_get_request_timeout_non_blocking_command_returns_default_timeout() {
         let mut cmd = Cmd::new();
         cmd.arg("SET").arg("key").arg("value").arg("PX").arg("500");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(result, Some(Duration::from_millis(100)));
 
         let mut cmd = Cmd::new();
         cmd.arg("XREADGROUP").arg("key");
-        let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+        let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
         assert_eq!(result, Some(Duration::from_millis(100)));
     }
 
     #[test]
     fn test_is_select_command_detects_valid_select_commands() {
         // Test detection of valid SELECT commands
-        let client = create_test_client();
-
         // Test uppercase SELECT command
         let mut cmd = Cmd::new();
         cmd.arg("SELECT").arg("1");
-        assert!(client.is_select_command(&cmd));
+        assert!(Client::is_select_command(&cmd));
 
         // Test SELECT with different database IDs
         let mut cmd = Cmd::new();
         cmd.arg("SELECT").arg("0");
-        assert!(client.is_select_command(&cmd));
+        assert!(Client::is_select_command(&cmd));
     }
 
     #[test]
     fn test_extract_database_id_from_select() {
         // Test detection of valid SELECT commands
-        let client = create_test_client();
-
         // Test uppercase SELECT command
         let mut cmd = Cmd::new();
         cmd.arg("SELECT").arg("1");
-        assert_eq!(client.extract_database_id_from_select(&cmd), Ok(1));
+        assert_eq!(Client::extract_database_id_from_select(&cmd), Ok(1));
 
         // Test SELECT with different database IDs
         let mut cmd = Cmd::new();
         cmd.arg("SELECT").arg("0");
-        assert_eq!(client.extract_database_id_from_select(&cmd), Ok(0));
+        assert_eq!(Client::extract_database_id_from_select(&cmd), Ok(0));
     }
 
     #[test]
     fn test_is_select_command_rejects_non_select_commands() {
         // Test rejection of non-SELECT commands
-        let client = create_test_client();
-
         // Test common Valkey commands
         let mut cmd = Cmd::new();
         cmd.arg("GET").arg("key");
-        assert!(!client.is_select_command(&cmd));
+        assert!(!Client::is_select_command(&cmd));
 
         let mut cmd = Cmd::new();
         cmd.arg("SET").arg("key").arg("value");
-        assert!(!client.is_select_command(&cmd));
+        assert!(!Client::is_select_command(&cmd));
     }
 
     #[test]
     fn test_is_select_command_case_normalization() {
         // Test that ferriskey normalizes commands to uppercase
-        let client = create_test_client();
-
         // Test lowercase select (ferriskey normalizes to uppercase, so this works too)
         let mut cmd = Cmd::new();
         cmd.arg("select").arg("1");
-        assert!(client.is_select_command(&cmd));
+        assert!(Client::is_select_command(&cmd));
     }
 
     #[test]
     fn test_is_select_command_handles_empty_command() {
         // Test handling of empty or malformed commands
-        let client = create_test_client();
-
         // Test empty command
         let cmd = Cmd::new();
-        assert!(!client.is_select_command(&cmd));
-    }
-
-    /// Helper function to create a test client for unit tests
-    fn create_test_client() -> Client {
-        use crate::pubsub::create_pubsub_synchronizer;
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicIsize;
-        use tokio::sync::RwLock;
-
-        let config = ConnectionRequest {
-            database_id: 0,
-            cluster_mode_enabled: false,
-            addresses: vec![NodeAddress {
-                host: "127.0.0.1".to_string(),
-                port: 6379,
-            }],
-            lazy_connect: true,
-            ..Default::default()
-        };
-
-        let lazy_client = LazyClient {
-            config,
-            push_sender: None,
-        };
-
-        // Create runtime to initialize a stub pubsub synchronizer
-        // We do this in order to keep the pubsub_synchronizer in the client struct non-optional.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let pubsub_synchronizer = rt.block_on(create_pubsub_synchronizer(
-            None,
-            None,
-            false,
-            Weak::new(),
-            None,
-            Duration::from_millis(250),
-        ));
-
-        Client {
-            internal_client: Arc::new(RwLock::new(ClientWrapper::Lazy(Box::new(lazy_client)))),
-            request_timeout: Duration::from_millis(250),
-            inflight_requests_allowed: Arc::new(AtomicIsize::new(1000)),
-            inflight_requests_limit: 1000,
-            inflight_log_interval: 100,
-            iam_token_manager: None,
-            compression_manager: None,
-            pubsub_synchronizer,
-            otel_metadata: OTelMetadata {
-                address: NodeAddress {
-                    host: "localhost".to_string(),
-                    port: 6379,
-                },
-                db_namespace: "0".to_string(),
-            },
-        }
+        assert!(!Client::is_select_command(&cmd));
     }
 
     #[test]
     fn test_is_client_set_name_command() {
         // Create a mock client for testing
-        let client = create_test_client();
-
         // Test valid CLIENT SETNAME command
         let mut cmd = Cmd::new();
         cmd.arg("CLIENT").arg("SETNAME").arg("test_client");
-        assert!(client.is_client_set_name_command(&cmd));
+        assert!(Client::is_client_set_name_command(&cmd));
 
         // Test CLIENT SETNAME with different case (should work due to case-insensitive comparison)
         let mut cmd = Cmd::new();
         cmd.arg("client").arg("setname").arg("test_client");
-        assert!(client.is_client_set_name_command(&cmd));
+        assert!(Client::is_client_set_name_command(&cmd));
 
         // Test CLIENT command without SETNAME
         let mut cmd = Cmd::new();
         cmd.arg("CLIENT").arg("INFO");
-        assert!(!client.is_client_set_name_command(&cmd));
+        assert!(!Client::is_client_set_name_command(&cmd));
 
         // Test non-CLIENT command
         let mut cmd = Cmd::new();
         cmd.arg("SET").arg("key").arg("value");
-        assert!(!client.is_client_set_name_command(&cmd));
+        assert!(!Client::is_client_set_name_command(&cmd));
 
         // Test CLIENT SETNAME without client name argument
         let mut cmd = Cmd::new();
         cmd.arg("CLIENT").arg("SETNAME");
-        assert!(client.is_client_set_name_command(&cmd));
+        assert!(Client::is_client_set_name_command(&cmd));
 
         // Test CLIENT only
         let mut cmd = Cmd::new();
         cmd.arg("CLIENT");
-        assert!(!client.is_client_set_name_command(&cmd));
+        assert!(!Client::is_client_set_name_command(&cmd));
     }
 
     #[test]
     fn test_extract_client_name_from_client_set_name() {
         // Test detection of valid CLIENT SETNAME commands
-        let client = create_test_client();
-
         // Test uppercase CLIENT SETNAME command
         let mut cmd = Cmd::new();
         cmd.arg("CLIENT").arg("SETNAME").arg("test_name");
         assert_eq!(
-            client.extract_client_name_from_client_set_name(&cmd),
+            Client::extract_client_name_from_client_set_name(&cmd),
             Some("test_name".to_string())
         );
     }
 
     #[test]
     fn test_is_auth_command() {
-        let client = create_test_client();
-
         // Test valid AUTH command with password
         let mut cmd = Cmd::new();
         cmd.arg("AUTH").arg("password123");
-        assert!(client.is_auth_command(&cmd));
+        assert!(Client::is_auth_command(&cmd));
 
         // Test AUTH command with username and password
         let mut cmd = Cmd::new();
         cmd.arg("AUTH").arg("myuser").arg("password123");
-        assert!(client.is_auth_command(&cmd));
+        assert!(Client::is_auth_command(&cmd));
 
         // Test non-AUTH command
         let mut cmd = Cmd::new();
         cmd.arg("SET").arg("key").arg("value");
-        assert!(!client.is_auth_command(&cmd));
+        assert!(!Client::is_auth_command(&cmd));
     }
 
     #[test]
     fn test_extract_auth_info() {
-        let client = create_test_client();
-
         // Test AUTH with password only
         let mut cmd = Cmd::new();
         cmd.arg("AUTH").arg("password123");
-        let (username, password) = client.extract_auth_info(&cmd);
+        let (username, password) = Client::extract_auth_info(&cmd);
         assert_eq!(username, None);
         assert_eq!(password, Some("password123".to_string()));
 
         // Test AUTH with username and password
         let mut cmd = Cmd::new();
         cmd.arg("AUTH").arg("myuser").arg("password123");
-        let (username, password) = client.extract_auth_info(&cmd);
+        let (username, password) = Client::extract_auth_info(&cmd);
         assert_eq!(username, Some("myuser".to_string()));
         assert_eq!(password, Some("password123".to_string()));
 
         // Test AUTH with no arguments (invalid)
         let mut cmd = Cmd::new();
         cmd.arg("AUTH");
-        let (username, password) = client.extract_auth_info(&cmd);
+        let (username, password) = Client::extract_auth_info(&cmd);
         assert_eq!(username, None);
         assert_eq!(password, None);
     }
 
     #[test]
     fn test_is_hello_command() {
-        let client = create_test_client();
-
         // Test valid HELLO command
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("3");
-        assert!(client.is_hello_command(&cmd));
+        assert!(Client::is_hello_command(&cmd));
 
         // Test HELLO with AUTH
         let mut cmd = Cmd::new();
@@ -2407,22 +2339,20 @@ mod tests {
             .arg("AUTH")
             .arg("user")
             .arg("pass");
-        assert!(client.is_hello_command(&cmd));
+        assert!(Client::is_hello_command(&cmd));
 
         // Test non-HELLO command
         let mut cmd = Cmd::new();
         cmd.arg("PING");
-        assert!(!client.is_hello_command(&cmd));
+        assert!(!Client::is_hello_command(&cmd));
     }
 
     #[test]
     fn test_extract_hello_info() {
-        let client = create_test_client();
-
         // Test HELLO 3
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("3");
-        let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
+        let (protocol, username, password, client_name) = Client::extract_hello_info(&cmd);
         assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, None);
         assert_eq!(password, None);
@@ -2431,7 +2361,7 @@ mod tests {
         // Test HELLO 2
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("2");
-        let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
+        let (protocol, username, password, client_name) = Client::extract_hello_info(&cmd);
         assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP2));
         assert_eq!(username, None);
         assert_eq!(password, None);
@@ -2444,7 +2374,7 @@ mod tests {
             .arg("AUTH")
             .arg("myuser")
             .arg("mypass");
-        let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
+        let (protocol, username, password, client_name) = Client::extract_hello_info(&cmd);
         assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, Some("myuser".to_string()));
         assert_eq!(password, Some("mypass".to_string()));
@@ -2453,7 +2383,7 @@ mod tests {
         // Test HELLO 3 SETNAME myclient
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("3").arg("SETNAME").arg("myclient");
-        let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
+        let (protocol, username, password, client_name) = Client::extract_hello_info(&cmd);
         assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, None);
         assert_eq!(password, None);
@@ -2468,7 +2398,7 @@ mod tests {
             .arg("mypass")
             .arg("SETNAME")
             .arg("myclient");
-        let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
+        let (protocol, username, password, client_name) = Client::extract_hello_info(&cmd);
         assert_eq!(protocol, Some(crate::value::ProtocolVersion::RESP3));
         assert_eq!(username, Some("myuser".to_string()));
         assert_eq!(password, Some("mypass".to_string()));
@@ -2477,7 +2407,7 @@ mod tests {
         // Test HELLO with invalid protocol version
         let mut cmd = Cmd::new();
         cmd.arg("HELLO").arg("99");
-        let (protocol, username, password, client_name) = client.extract_hello_info(&cmd);
+        let (protocol, username, password, client_name) = Client::extract_hello_info(&cmd);
         assert_eq!(protocol, None);
         assert_eq!(username, None);
         assert_eq!(password, None);
@@ -2492,7 +2422,7 @@ mod tests {
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key").arg("0");
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             None
         );
 
@@ -2505,7 +2435,7 @@ mod tests {
             .arg("s1")
             .arg("$");
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             None
         );
     }
@@ -2515,8 +2445,8 @@ mod tests {
         // BLPOP key 5 — blocks 5s, timeout should be 5s + extension
         let mut cmd = Cmd::new();
         cmd.arg("BLPOP").arg("key").arg("5");
-        let result = get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap();
-        let expected = Duration::from_secs_f64(5.0 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let result = get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap();
+        let expected = Duration::from_secs_f64(5.0 + DEFAULT_EXT_SECS);
         assert_eq!(result, Some(expected));
         assert!(expected > Duration::from_secs(5));
     }
@@ -2526,7 +2456,7 @@ mod tests {
         for cmd_name in &["SET", "GET", "DEL", "HGET", "LPUSH", "SADD", "PING"] {
             let mut cmd = Cmd::new();
             cmd.arg(*cmd_name).arg("key");
-            let result = get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap();
+            let result = get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap();
             assert_eq!(
                 result,
                 Some(Duration::from_millis(1000)),
@@ -2539,9 +2469,9 @@ mod tests {
     fn test_waitaof_detected_as_blocking() {
         let mut cmd = Cmd::new();
         cmd.arg("WAITAOF").arg(1).arg(1).arg("3000");
-        let expected = Duration::from_secs_f64(3.0 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let expected = Duration::from_secs_f64(3.0 + DEFAULT_EXT_SECS);
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             Some(expected)
         );
     }
@@ -2550,9 +2480,9 @@ mod tests {
     fn test_wait_detected_as_blocking() {
         let mut cmd = Cmd::new();
         cmd.arg("WAIT").arg(1).arg("5000");
-        let expected = Duration::from_secs_f64(5.0 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let expected = Duration::from_secs_f64(5.0 + DEFAULT_EXT_SECS);
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             Some(expected)
         );
     }
@@ -2567,7 +2497,7 @@ mod tests {
             .arg("s1")
             .arg("$");
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(1000)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(1000), DEFAULT_EXT).unwrap(),
             Some(Duration::from_millis(1000))
         );
     }
@@ -2576,9 +2506,9 @@ mod tests {
     fn test_blocking_fractional_seconds() {
         let mut cmd = Cmd::new();
         cmd.arg("BLMPOP").arg("0.857").arg("key");
-        let expected = Duration::from_secs_f64(0.857 + BLOCKING_CMD_TIMEOUT_EXTENSION);
+        let expected = Duration::from_secs_f64(0.857 + DEFAULT_EXT_SECS);
         assert_eq!(
-            get_request_timeout(&cmd, Duration::from_millis(100)).unwrap(),
+            get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap(),
             Some(expected)
         );
     }
@@ -2604,11 +2534,26 @@ mod tests {
             for a in &args {
                 cmd.arg(*a);
             }
-            let result = get_request_timeout(&cmd, Duration::from_millis(100)).unwrap();
+            let result = get_request_timeout(&cmd, Duration::from_millis(100), DEFAULT_EXT).unwrap();
             assert!(
                 result.is_some(),
                 "{cmd_name} should be detected as blocking"
             );
+        }
+    }
+
+    #[test]
+    fn test_blocking_extension_configurable() {
+        // Same BLMPOP 5s command, three different extensions — the
+        // client-side deadline tracks `server_timeout + extension`.
+        let mut cmd = Cmd::new();
+        cmd.arg("BLMPOP").arg("5").arg("1").arg("key");
+
+        for ext_ms in [500u64, 1_000, 2_000] {
+            let ext = Duration::from_millis(ext_ms);
+            let result = get_request_timeout(&cmd, Duration::from_millis(100), ext).unwrap();
+            let expected = Duration::from_secs_f64(5.0 + ext.as_secs_f64());
+            assert_eq!(result, Some(expected), "ext={ext_ms}ms");
         }
     }
 }

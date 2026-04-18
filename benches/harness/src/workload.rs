@@ -66,8 +66,23 @@ pub async fn create_execution(
     kind: &str,
     payload_bytes: Vec<u8>,
 ) -> Result<String> {
+    create_execution_with_deadline(client, env, kind, payload_bytes, None).await
+}
+
+/// Variant that optionally supplies `execution_deadline_at`.
+/// `deadline_at_ms` is an absolute Unix-ms timestamp — same type the
+/// server's `CreateExecutionArgs.execution_deadline_at` field expects.
+/// Scenario 3 uses this to seed jobs with a 60-second deadline so it
+/// can report a back-pressure-sensitive missed-deadline rate.
+pub async fn create_execution_with_deadline(
+    client: &Client,
+    env: &BenchEnv,
+    kind: &str,
+    payload_bytes: Vec<u8>,
+    deadline_at_ms: Option<i64>,
+) -> Result<String> {
     let eid = uuid::Uuid::new_v4().to_string();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "execution_id": eid,
         "namespace": env.namespace,
         "lane_id": env.lane,
@@ -80,6 +95,9 @@ pub async fn create_execution(
         "partition_id": 0,
         "now": now_ms(),
     });
+    if let Some(deadline) = deadline_at_ms {
+        body["execution_deadline_at"] = serde_json::json!(deadline);
+    }
     let url = format!("{}/v1/executions", env.server);
     let resp = client.post(&url).json(&body).send().await?;
     let status = resp.status();

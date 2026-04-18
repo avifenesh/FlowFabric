@@ -50,6 +50,13 @@ pub use value::{
     from_owned_value, from_value,
 };
 
+/// Glide-era alias for [`Result`]. Pre-existing consumers (including
+/// `benches/connections_benchmark.rs`) typed results against
+/// `ValkeyResult<T>`; keeping the alias preserves the external
+/// vocabulary without growing a second error shape. Prefer `Result`
+/// in new code.
+pub use value::Result as ValkeyResult;
+
 pub mod client;
 pub mod compression;
 pub(crate) mod ferriskey_client;
@@ -58,7 +65,8 @@ pub(crate) mod scripts_container;
 
 // High-level public API — the entry point for library users.
 pub use ferriskey_client::{
-    Client, ClientBuilder, CommandBuilder, PipeCmdBuilder, PipeSlot, ReadFrom, TypedPipeline,
+    Client, ClientBuilder, CommandBuilder, LazyClient, PipeCmdBuilder, PipeSlot, ReadFrom,
+    TypedPipeline,
 };
 
 /// Connect to a standalone Valkey server.
@@ -84,7 +92,12 @@ pub async fn connect_cluster(urls: &[&str]) -> Result<Client> {
 }
 #[allow(dead_code)]
 pub(crate) mod cluster_scan_container;
+#[cfg(feature = "iam")]
 pub(crate) mod iam;
 pub mod pubsub;
 pub mod request_type;
-pub use telemetrylib::Telemetry;
+
+#[allow(deprecated)]
+mod telemetry_compat;
+#[allow(deprecated)]
+pub use telemetry_compat::Telemetry;

@@ -57,9 +57,29 @@ pub struct EngineConfig {
     pub quota_reconciler_interval: Duration,
     /// Unblock scanner interval. Default: 5s.
     pub unblock_interval: Duration,
-    /// Dependency reconciler interval. Default: 15s.
+    /// Dependency reconciler interval. Default: 1s.
+    ///
+    /// This scanner is the only promotion path for downstream
+    /// executions blocked on a dependency edge — `dispatch_dependency_
+    /// resolution` in partition_router.rs exists as a push-based
+    /// alternative but has no completion-time call site today (see
+    /// Batch C issue for the push-based wiring). Until that lands,
+    /// this interval is the per-stage floor for DAG latency: a
+    /// 10-node linear chain runs in ~interval × nodes + work.
+    ///
+    /// 1s is the right default for most deployments; the cost is ~256–
+    /// 512 empty-ZRANGEBYSCORE ops per second (one per partition per
+    /// lane), well under 1% of Valkey capacity. Operators running
+    /// huge numbers of partitions or lanes where the idle-scan cost
+    /// matters can raise this knob — it's a public field for that
+    /// purpose.
     pub dependency_reconciler_interval: Duration,
     /// Flow summary projector interval. Default: 15s.
+    ///
+    /// Separate observability projection path — maintains the flow
+    /// summary view, NOT on the DAG-completion latency path. Kept at
+    /// 15s in this config; a change to that cadence is unrelated to
+    /// dependency resolution.
     pub flow_projector_interval: Duration,
     /// Execution deadline scanner interval. Default: 5s.
     pub execution_deadline_interval: Duration,
@@ -81,7 +101,7 @@ impl Default for EngineConfig {
             budget_reconciler_interval: Duration::from_secs(30),
             quota_reconciler_interval: Duration::from_secs(30),
             unblock_interval: Duration::from_secs(5),
-            dependency_reconciler_interval: Duration::from_secs(15),
+            dependency_reconciler_interval: Duration::from_secs(1),
             flow_projector_interval: Duration::from_secs(15),
             execution_deadline_interval: Duration::from_secs(5),
         }

@@ -1,0 +1,7 @@
+ferriskey-5x1 per-task:
+  task=0 elapsed_ms=    0 wall_from_spawn_ms=    0 result=other-ok
+  task=1 elapsed_ms= 5021 wall_from_spawn_ms= 5021 result=nil
+  task=2 elapsed_ms=    0 wall_from_spawn_ms=    0 result=other-ok
+  task=3 elapsed_ms= 5500 wall_from_spawn_ms= 5500 result=err
+  task=4 elapsed_ms= 5500 wall_from_spawn_ms= 5500 result=err
+ferriskey-5x1 spread: min_wall=0ms max_wall=5500ms
