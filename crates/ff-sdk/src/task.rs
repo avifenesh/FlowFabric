@@ -187,8 +187,8 @@ pub struct ClaimedTask {
 }
 
 impl ClaimedTask {
-    #[allow(clippy::too_many_arguments, dead_code)]
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         client: Client,
         partition_config: PartitionConfig,
         execution_id: ExecutionId,
