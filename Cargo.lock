@@ -916,6 +916,7 @@ dependencies = [
  "ff-core",
  "ff-engine",
  "ff-scheduler",
+ "ff-script",
  "ff-sdk",
  "ff-server",
  "reqwest",

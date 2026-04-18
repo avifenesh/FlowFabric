@@ -4215,6 +4215,256 @@ async fn test_scheduler_claim_priority_ordering() {
     assert!(grant4.is_none(), "no more eligible executions");
 }
 
+/// End-to-end: `Scheduler::claim_for_worker` → `FlowFabricWorker::
+/// claim_from_grant` → live `ClaimedTask`. This is the production
+/// entry path for consumers that cannot enable the
+/// `insecure-direct-claim` feature (cairn, in particular) — the
+/// scheduler does admission control and hands off a grant; the SDK
+/// consumes the grant without touching the eligible ZSET directly.
+///
+/// Asserts:
+///  1. the grant issued by the scheduler is consumable by
+///     `claim_from_grant` (no shape mismatch between the two layers).
+///  2. the returned `ClaimedTask` carries the correct attempt_index
+///     (0 for a fresh claim), execution_id, and kind/tags.
+///  3. `complete()` drops the lease cleanly — proving the concurrency
+///     permit was acquired + transferred properly (otherwise the task
+///     drop would panic on a non-transferred renewal handle).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_grant_via_scheduler() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "claim_from_grant_test", 500).await;
+
+    // Issue grant via the Scheduler — not via raw FCALL — so the
+    // test exercises the scheduler-to-SDK handoff shape.
+    let scheduler = ff_scheduler::claim::Scheduler::new(
+        tc.client().clone(),
+        test_config(),
+    );
+    let lane_id = LaneId::new(LANE);
+    let worker_id = ff_core::types::WorkerId::new(WORKER);
+    let wiid = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let no_caps = std::collections::BTreeSet::<String>::new();
+
+    let grant = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &no_caps, 30_000)
+        .await
+        .expect("scheduler should not error")
+        .expect("the created execution should be eligible");
+    assert_eq!(grant.execution_id, eid, "grant should point at our execution");
+
+    // Hand the grant to the SDK worker. `build_reclaim_test_worker`
+    // configures lanes=[LANE] and max_concurrent_tasks=16 — enough
+    // headroom that the semaphore is never the gating factor here.
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+    let claimed = worker
+        .claim_from_grant(lane_id.clone(), grant)
+        .await
+        .expect("claim_from_grant should succeed on a fresh grant");
+
+    assert_eq!(*claimed.execution_id(), eid, "claimed task should carry our eid");
+    assert_eq!(
+        claimed.attempt_index().0, 0,
+        "fresh claim should have attempt_index 0"
+    );
+    assert_eq!(claimed.execution_kind(), "claim_from_grant_test");
+
+    // Drop-clean contract: complete() releases the lease, renewal
+    // task, and concurrency permit.
+    claimed.complete(Some(b"ok".to_vec())).await
+        .expect("complete should succeed");
+
+    // State sanity: execution terminal + no active lease.
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        public_state: Some(ff_core::state::PublicState::Completed),
+        ..Default::default()
+    }).await;
+}
+
+/// Saturation guard: when the worker's `max_concurrent_tasks` is
+/// fully committed, `claim_from_grant` must return
+/// `SdkError::WorkerAtCapacity` WITHOUT calling
+/// `ff_claim_execution` — otherwise the grant would be atomically
+/// consumed by the Lua FCALL even though the SDK can't run the
+/// work, and the next scheduler tick would see a stuck execution.
+///
+/// Asserts:
+///   1. A worker with `max_concurrent_tasks=1` plus one permit in
+///      flight refuses the second grant with
+///      `SdkError::WorkerAtCapacity`.
+///   2. The grant stays valid — a different worker can consume it.
+///   3. `SdkError::WorkerAtCapacity.is_retryable()` is `true`
+///      (sanity).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_grant_rejects_at_capacity() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    // Two separate executions so that if the first claim somehow
+    // releases, we still catch the saturation on the second one.
+    // Generate UUIDs until both hash to the SAME execution partition —
+    // otherwise the scheduler's jittered partition scan may pick them
+    // up in a different order than priority dictates (the scheduler
+    // visits partitions linearly, priority-ordering is only guaranteed
+    // within a single partition).
+    let (eid_a, eid_b) = {
+        let config = test_config();
+        loop {
+            let a = ExecutionId::new();
+            let b = ExecutionId::new();
+            let pa = ff_core::partition::execution_partition(&a, &config);
+            let pb = ff_core::partition::execution_partition(&b, &config);
+            if pa.index == pb.index {
+                break (a, b);
+            }
+        }
+    };
+    fcall_create_execution(&tc, &eid_a, NS, LANE, "cap_test", 100).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    fcall_create_execution(&tc, &eid_b, NS, LANE, "cap_test", 50).await;
+
+    // Build a worker with max_concurrent_tasks=1 so the second claim
+    // is guaranteed to saturate. Use the standard worker identity
+    // so both grants are issued to this worker_id.
+    let worker_config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(WORKER),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(WORKER_INST),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 1,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    let scheduler = ff_scheduler::claim::Scheduler::new(
+        tc.client().clone(),
+        test_config(),
+    );
+    let lane_id = LaneId::new(LANE);
+    let worker_id_t = ff_core::types::WorkerId::new(WORKER);
+    let wiid_t = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let no_caps = std::collections::BTreeSet::<String>::new();
+
+    // 1st grant (highest priority on the shared partition = eid_a).
+    // Succeeds and holds the sole permit.
+    let g1 = scheduler
+        .claim_for_worker(&lane_id, &worker_id_t, &wiid_t, &no_caps, 30_000)
+        .await
+        .unwrap()
+        .expect("eligible execution present");
+    assert_eq!(
+        g1.execution_id, eid_a,
+        "same-partition priority: eid_a (100) comes before eid_b (50)"
+    );
+
+    let task1 = worker
+        .claim_from_grant(lane_id.clone(), g1)
+        .await
+        .expect("first claim should take the permit");
+
+    // 2nd grant (eid_b). Semaphore is drained — claim_from_grant
+    // must refuse without consuming the grant.
+    let g2 = scheduler
+        .claim_for_worker(&lane_id, &worker_id_t, &wiid_t, &no_caps, 30_000)
+        .await
+        .unwrap()
+        .expect("second eligible execution present");
+    assert_eq!(g2.execution_id, eid_b);
+    let g2_key = g2.grant_key.clone();
+
+    match worker.claim_from_grant(lane_id.clone(), g2).await {
+        Err(ff_sdk::SdkError::WorkerAtCapacity) => {}
+        Err(other) => panic!("expected WorkerAtCapacity, got {other:?}"),
+        Ok(_) => panic!("saturated worker should not claim"),
+    }
+
+    // Retryability sanity check.
+    assert!(
+        ff_sdk::SdkError::WorkerAtCapacity.is_retryable(),
+        "capacity saturation is transient"
+    );
+
+    // Grant unharmed: the grant key still exists in Valkey (FCALL
+    // was not called, so the grant hash was not atomically deleted).
+    let exists: i64 = tc.client()
+        .cmd("EXISTS")
+        .arg(&g2_key)
+        .execute()
+        .await
+        .expect("EXISTS on grant_key");
+    assert_eq!(exists, 1, "grant_key must still exist after capacity reject");
+
+    // Stronger proof that the grant is not just present but still
+    // live: spin up a second FlowFabricWorker with available
+    // capacity and have it consume the same grant. If
+    // claim_from_grant had leaked the FCALL through on the first
+    // worker, ff_claim_execution would have atomically consumed
+    // the grant key and this second claim would return
+    // `InvalidClaimGrant`. Ok here is proof of liveness.
+    //
+    // Same worker_id / worker_instance_id so Lua's worker match
+    // on the grant passes — we're modelling a retry from a fresh
+    // worker process with free capacity, not a different identity.
+    let second_worker_config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(WORKER),
+        // Distinct instance id so the alive-key SET NX guard in
+        // `FlowFabricWorker::connect` doesn't reject us as a
+        // duplicate — same worker_id, new process identity.
+        worker_instance_id: ff_core::types::WorkerInstanceId::new("cap-second-inst"),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 16,
+    };
+    let second_worker = ff_sdk::FlowFabricWorker::connect(second_worker_config)
+        .await
+        .expect("second worker should connect");
+
+    // Reconstruct the grant struct by hand — the original `g2` was
+    // moved into the saturated call. The grant values are
+    // unchanged; we just rebuild the Rust wrapper around the same
+    // Valkey key.
+    let rebuilt_g2 = ff_core::contracts::ClaimGrant {
+        execution_id: eid_b.clone(),
+        partition: ff_core::partition::execution_partition(&eid_b, &test_config()),
+        grant_key: g2_key.clone(),
+        // expires_at_ms is advisory on the consumer side; Lua
+        // enforces the real expiry via its own TIME read, so
+        // copying any value from the pre-rejection grant is fine.
+        expires_at_ms: u64::MAX,
+    };
+
+    let task2 = second_worker
+        .claim_from_grant(lane_id.clone(), rebuilt_g2)
+        .await
+        .expect("second worker with free capacity must consume the still-live grant");
+    assert_eq!(*task2.execution_id(), eid_b);
+
+    // Cleanup both tasks so the test leaves the cluster in a
+    // serial-safe state.
+    task1.complete(None).await.unwrap();
+    task2.complete(None).await.unwrap();
+}
+
 // ─── Phase 7: Integration tests ───
 
 /// Budget enforcement e2e: report 5 tokens (OK), report 6 more (HARD_BREACH),
@@ -7916,4 +8166,458 @@ async fn test_capable_worker_unblocks_on_get_error_failopen() {
         "execution must be promoted back to eligible when caps GET errors \
          (fail-open on transient errors preserves liveness)"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FlowFabricWorker::claim_from_reclaim_grant (cairn-fabric P1B)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Write the test partition config into Valkey so the SDK's worker
+/// reads the same 4-partition layout as `fcall_create_execution`.
+/// Without this, `FlowFabricWorker` picks up whatever config was
+/// already there (often the 256-partition default from a prior
+/// server run), and the `ReclaimGrant.partition` computed from
+/// `test_config()` points at a core-key that doesn't exist.
+async fn write_test_partition_config(tc: &TestCluster) {
+    let config = test_config();
+    let _: () = tc.client().cmd("HSET")
+        .arg("ff:config:partitions")
+        .arg("num_execution_partitions")
+        .arg(config.num_execution_partitions.to_string().as_str())
+        .arg("num_flow_partitions")
+        .arg(config.num_flow_partitions.to_string().as_str())
+        .arg("num_budget_partitions")
+        .arg(config.num_budget_partitions.to_string().as_str())
+        .arg("num_quota_partitions")
+        .arg(config.num_quota_partitions.to_string().as_str())
+        .execute()
+        .await
+        .unwrap();
+}
+
+/// Build a `FlowFabricWorker` configured for the suspend→signal→resume
+/// flow using the standard e2e worker identity.
+async fn build_reclaim_test_worker(
+    worker_id: &str,
+    worker_instance_id: &str,
+) -> ff_sdk::FlowFabricWorker {
+    let config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(worker_id),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(worker_instance_id),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 16,
+    };
+    ff_sdk::FlowFabricWorker::connect(config).await.unwrap()
+}
+
+/// Drive an execution through create → claim → suspend → deliver-signal,
+/// leaving it in `attempt_interrupted` with the suspended/runnable
+/// transition already completed. Returns the eid plus the `ReclaimGrant`
+/// a caller can pass to `claim_from_reclaim_grant`.
+///
+/// `grant_ttl_ms` is the TTL for the claim-grant the resumed-path
+/// consumer reads. Short TTL = fast expiry test; long TTL = happy path.
+async fn suspend_resume_setup_with_grant(
+    tc: &TestCluster,
+    eid: &ExecutionId,
+    grant_ttl_ms: u64,
+    grant_worker_id: &str,
+    grant_worker_instance_id: &str,
+) -> ff_core::contracts::ReclaimGrant {
+    // 1. create + claim the initial attempt
+    fcall_create_execution(tc, eid, NS, LANE, "reclaim_grant_test", 0).await;
+    fcall_issue_claim_grant(tc, eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(tc, eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // 2. suspend (fail-on-timeout path to avoid timer noise)
+    let resume_cond = build_resume_condition_json(&["approval_result"], "fail");
+    let (_susp_id, waitpoint_id, _wp_key, _sub_status, wp_token) =
+        fcall_suspend_execution(
+            tc, eid, LANE, WORKER_INST,
+            &lease_id, &epoch, &att_idx, &attempt_id,
+            "waiting_for_approval", &resume_cond, None, "fail",
+        ).await;
+
+    // 3. deliver signal so the execution transitions to runnable +
+    //    attempt_interrupted
+    let (_sig_id, effect) = fcall_deliver_signal(
+        tc, eid, LANE, &waitpoint_id,
+        "approval_result", "approval", "", &wp_token,
+    ).await;
+    assert_eq!(effect, "resume_condition_satisfied");
+
+    // 4. issue the reclaim grant — for the resumed flow, the grant is
+    //    written by ff_issue_claim_grant (same key). We want a
+    //    configurable TTL so expiry tests can dial it down; the existing
+    //    fcall_issue_claim_grant helper uses a hardcoded 5 s TTL, so
+    //    inline the FCALL here to parameterise grant_ttl_ms.
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.claim_grant(),
+        idx.lane_eligible(&lane_id),
+    ];
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        grant_worker_id.to_owned(),
+        grant_worker_instance_id.to_owned(),
+        LANE.to_owned(),
+        String::new(),               // capability_hash
+        grant_ttl_ms.to_string(),    // grant_ttl_ms (parameterised)
+        String::new(),               // route_snapshot_json
+        String::new(),               // admission_summary
+        String::new(),               // worker_capabilities_csv
+    ];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc
+        .client()
+        .fcall("ff_issue_claim_grant", &key_refs, &arg_refs)
+        .await
+        .expect("FCALL ff_issue_claim_grant failed");
+    assert_ok(&raw, "ff_issue_claim_grant");
+
+    // 5. read grant_expires_at from the claim_grant hash
+    let grant_key = ctx.claim_grant();
+    let expires_at_str: Option<String> = tc.hget(&grant_key, "grant_expires_at").await;
+    let expires_at_ms: u64 = expires_at_str
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .expect("grant_expires_at should be numeric");
+
+    ff_core::contracts::ReclaimGrant {
+        execution_id: eid.clone(),
+        partition,
+        grant_key,
+        expires_at_ms,
+        lane_id,
+    }
+}
+
+/// Happy path + control: `claim_from_reclaim_grant` resumes the
+/// suspended execution cleanly. Paired with the expiry test — both use
+/// the same setup; this one consumes the grant immediately to prove
+/// the flow works, the other waits out the TTL to prove the expiry
+/// check fires.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_happy_path() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    // Long TTL so there's no race with the HGET / FlowFabricWorker
+    // construction below.
+    let grant = suspend_resume_setup_with_grant(
+        &tc, &eid, 30_000, WORKER, WORKER_INST,
+    ).await;
+
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+    let claimed = worker
+        .claim_from_reclaim_grant(grant)
+        .await
+        .expect("happy path should succeed");
+
+    // Resumed execution preserves attempt_index 0 — a resume re-uses
+    // the existing attempt.
+    assert_eq!(claimed.attempt_index().0, 0,
+        "resumed execution should keep attempt_index 0");
+
+    // Verify active state after consumption.
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        lifecycle_phase: Some(ff_core::state::LifecyclePhase::Active),
+        ownership_state: Some(ff_core::state::OwnershipState::Leased),
+        attempt_state: Some(ff_core::state::AttemptState::RunningAttempt),
+        public_state: Some(ff_core::state::PublicState::Active),
+        ..Default::default()
+    }).await;
+
+    // Complete to release the lease.
+    claimed.complete(Some(b"reclaim-done".to_vec())).await.unwrap();
+}
+
+/// Control companion to the expired-grant test: at the SAME setup
+/// (short TTL) with NO sleep, the claim should succeed. Guards against
+/// the expiry test passing due to a stuck-clock Lua bug rather than a
+/// real TTL check.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_immediate_control() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    // Short TTL — same knob the expiry test uses. No sleep here, so
+    // the grant is still fresh when claimed.
+    let grant = suspend_resume_setup_with_grant(
+        &tc, &eid, 500, WORKER, WORKER_INST,
+    ).await;
+
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+    let claimed = worker
+        .claim_from_reclaim_grant(grant)
+        .await
+        .expect("control: short-TTL grant claimed immediately should still succeed");
+
+    claimed.complete(None).await.unwrap();
+}
+
+/// Expired grant → `ScriptError::ClaimGrantExpired`. Run AFTER the
+/// control test above so the exit condition isn't confused with
+/// "short TTL always fails" flakiness.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_expired() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    // 200 ms TTL — small enough to wait out cheaply, large enough that
+    // the setup FCALLs finish well inside it.
+    let grant = suspend_resume_setup_with_grant(
+        &tc, &eid, 200, WORKER, WORKER_INST,
+    ).await;
+
+    // Let the grant expire.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+    match worker.claim_from_reclaim_grant(grant).await {
+        // Either error is acceptable:
+        //   * `ClaimGrantExpired` fires when the FCALL observes the
+        //     grant key still present but `grant_expires_at < now_ms`
+        //     (Lua deletes the key and returns this code).
+        //   * `InvalidClaimGrant` fires when Valkey's PEXPIREAT has
+        //     already evicted the key before the FCALL reaches
+        //     HGETALL (#grant_raw == 0).
+        // Both signal the same root cause — the grant's TTL elapsed.
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::ClaimGrantExpired)) => {}
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::InvalidClaimGrant)) => {}
+        Err(other) => panic!("expected ClaimGrantExpired or InvalidClaimGrant, got {other:?}"),
+        Ok(_) => panic!("expired grant should not succeed"),
+    }
+}
+
+/// Grant issued to worker A → worker B calls `claim_from_reclaim_grant`
+/// → `ScriptError::InvalidClaimGrant`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_wrong_worker() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    // Grant issued for "worker-a".
+    let grant = suspend_resume_setup_with_grant(
+        &tc, &eid, 30_000, "worker-a", "worker-a-inst",
+    ).await;
+
+    // Build a FlowFabricWorker with a DIFFERENT worker_id.
+    let worker = build_reclaim_test_worker("worker-b", "worker-b-inst").await;
+    match worker.claim_from_reclaim_grant(grant).await {
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::InvalidClaimGrant)) => {}
+        Err(other) => panic!("expected InvalidClaimGrant, got {other:?}"),
+        Ok(_) => panic!("worker-id mismatch should not succeed"),
+    }
+}
+
+/// Execution that was never suspended (attempt_state != attempt_interrupted)
+/// → `ScriptError::NotAResumedExecution`. Builds a plain create+claim
+/// execution, issues a grant, then tries to consume it via the RESUME
+/// path instead of the normal claim path.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_not_resumed() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "not_resumed_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    // DO NOT suspend + deliver_signal. Execution is in ClaimGrant state
+    // but attempt_state = NotAttempted (the initial claim hasn't fired
+    // yet) — not attempt_interrupted.
+
+    // Build the ReclaimGrant manually from the just-issued grant key.
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let grant_key = ctx.claim_grant();
+    let expires_at_str: Option<String> = tc.hget(&grant_key, "grant_expires_at").await;
+    let expires_at_ms: u64 = expires_at_str.as_deref().and_then(|s| s.parse().ok()).unwrap();
+
+    let grant = ff_core::contracts::ReclaimGrant {
+        execution_id: eid.clone(),
+        partition,
+        grant_key,
+        expires_at_ms,
+        lane_id: LaneId::new(LANE),
+    };
+
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+    match worker.claim_from_reclaim_grant(grant).await {
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::NotAResumedExecution)) => {}
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::ExecutionNotLeaseable)) => {
+            // Acceptable alternate: some Lua orderings check
+            // lifecycle_phase (runnable) before attempt_state. Either
+            // error signals the same root cause — this is a non-
+            // resumed execution, reject.
+        }
+        Err(other) => panic!("expected NotAResumedExecution or ExecutionNotLeaseable, got {other:?}"),
+        Ok(_) => panic!("non-resumed execution should not succeed"),
+    }
+}
+
+/// Grant is consumed atomically — a second call with the same grant
+/// fails with `InvalidClaimGrant`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_double_consume() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    let grant = suspend_resume_setup_with_grant(
+        &tc, &eid, 30_000, WORKER, WORKER_INST,
+    ).await;
+
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+
+    // First consumption succeeds.
+    let claimed = worker
+        .claim_from_reclaim_grant(grant.clone())
+        .await
+        .expect("first consume should succeed");
+
+    // Second consume with the same grant handle must fail. The
+    // underlying Valkey `claim_grant` key was DEL'd by the first
+    // consume, AND the execution's `lifecycle_phase` transitioned
+    // from `runnable` to `active`. The Lua FCALL checks
+    // `lifecycle_phase == runnable` (line 524 of signal.lua) BEFORE
+    // grant validation, so the error surfaced first is
+    // `ExecutionNotLeaseable`. If an attacker/race ordered calls
+    // differently we'd also see `InvalidClaimGrant` — accept either
+    // as proof the second consume was rejected.
+    match worker.claim_from_reclaim_grant(grant).await {
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::ExecutionNotLeaseable)) => {}
+        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::InvalidClaimGrant)) => {}
+        Err(other) => panic!("expected ExecutionNotLeaseable or InvalidClaimGrant on second consume, got {other:?}"),
+        Ok(_) => panic!("second consume should not succeed"),
+    }
+
+    // Cleanup: complete the still-live claim so the lease doesn't
+    // linger into other serial tests.
+    claimed.complete(None).await.unwrap();
+}
+
+/// Saturation guard for `claim_from_reclaim_grant` — mirrors
+/// `test_claim_from_grant_rejects_at_capacity`. A worker at
+/// `max_concurrent_tasks=1` with its single permit in flight must
+/// refuse a second reclaim grant with `SdkError::WorkerAtCapacity`
+/// WITHOUT invoking `ff_claim_resumed_execution` (so the grant key
+/// is not atomically consumed).
+///
+/// Caught during cross-review round 2: the original
+/// `claim_from_reclaim_grant` did NOT acquire a concurrency permit,
+/// which on a saturated worker silently exceeded
+/// `max_concurrent_tasks` and handed back a `ClaimedTask` without a
+/// permit to release — violating the concurrency contract the user
+/// configured. Fix mirrors W1's `claim_from_grant` saturation
+/// pattern exactly.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_rejects_at_capacity() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    // Set up two independently-suspended executions so we have two
+    // reclaim grants to try against the same worker. Both use the
+    // standard e2e worker identity so both grants are targeted at
+    // the same worker_id.
+    let eid_a = ExecutionId::new();
+    let grant_a = suspend_resume_setup_with_grant(
+        &tc, &eid_a, 30_000, WORKER, WORKER_INST,
+    ).await;
+    let eid_b = ExecutionId::new();
+    let grant_b = suspend_resume_setup_with_grant(
+        &tc, &eid_b, 30_000, WORKER, WORKER_INST,
+    ).await;
+    let grant_b_key = grant_b.grant_key.clone();
+
+    // Build a worker with max_concurrent_tasks=1 so the second
+    // reclaim is guaranteed to saturate.
+    let worker_config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(WORKER),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(WORKER_INST),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 1,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    // 1st reclaim takes the sole permit.
+    let task_a = worker
+        .claim_from_reclaim_grant(grant_a)
+        .await
+        .expect("first reclaim should take the permit");
+
+    // 2nd reclaim must refuse at capacity, BEFORE invoking the Lua
+    // FCALL that would atomically consume the grant key.
+    match worker.claim_from_reclaim_grant(grant_b).await {
+        Err(ff_sdk::SdkError::WorkerAtCapacity) => {}
+        Err(other) => panic!("expected WorkerAtCapacity, got {other:?}"),
+        Ok(_) => panic!("saturated worker should not claim"),
+    }
+
+    // Retryability sanity check — same contract as claim_from_grant.
+    assert!(
+        ff_sdk::SdkError::WorkerAtCapacity.is_retryable(),
+        "capacity saturation is transient"
+    );
+
+    // Grant unharmed: grant_b's claim_grant key is still present in
+    // Valkey. If the FCALL had fired on a saturated worker we'd see
+    // EXISTS=0 here (the Lua DELs the key on consume).
+    let exists: i64 = tc.client()
+        .cmd("EXISTS")
+        .arg(&grant_b_key)
+        .execute()
+        .await
+        .expect("EXISTS on grant_key");
+    assert_eq!(exists, 1,
+        "reclaim grant_key must still exist after capacity reject — \
+         claim_from_reclaim_grant must not fire ff_claim_resumed_execution \
+         when the semaphore is drained");
+
+    // Cleanup so the lease from task_a doesn't linger into the next
+    // serial test.
+    task_a.complete(None).await.unwrap();
 }

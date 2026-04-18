@@ -44,19 +44,19 @@ fn worker_caps_digest(csv: &str) -> String {
 
 /// A claim grant issued by the scheduler for a specific execution.
 ///
-/// The worker uses this to call `ff_claim_execution` (or `ff_acquire_lease`)
-/// which atomically consumes the grant and creates the lease.
-#[derive(Debug)]
-pub struct ClaimGrant {
-    /// The execution that was granted.
-    pub execution_id: ExecutionId,
-    /// The partition where this execution lives.
-    pub partition: Partition,
-    /// The Valkey key holding the grant hash (for the worker to reference).
-    pub grant_key: String,
-    /// When the grant expires if not consumed.
-    pub expires_at_ms: u64,
-}
+/// Re-exported from [`ff_core::contracts::ClaimGrant`]. Lives in
+/// `ff-core` so `ff-scheduler` (issuer) and `ff-sdk` (consumer)
+/// share one wire-level type without a cross-dep between them.
+pub use ff_core::contracts::ClaimGrant;
+
+/// A reclaim grant for a resumed (attempt_interrupted) execution.
+///
+/// Re-export of [`ff_core::contracts::ReclaimGrant`] for symmetry
+/// with [`ClaimGrant`]. `ff-scheduler` will be the canonical
+/// producer once the Batch-C reclaim scanner lands; today only
+/// test fixtures construct this type. Consumed by
+/// `FlowFabricWorker::claim_from_reclaim_grant`.
+pub use ff_core::contracts::ReclaimGrant;
 
 /// Budget check result from a cross-partition budget read.
 #[derive(Debug)]
