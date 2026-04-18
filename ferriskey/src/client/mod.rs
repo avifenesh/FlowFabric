@@ -782,12 +782,12 @@ impl Client {
                             if crate::cluster::routing::is_readonly_cmd(cmd_name.as_bytes()) {
                                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)
                             } else {
-                                tracing::warn!("send_command - User provided 'Random' routing which is not suitable for the writeable command '{cmd_name}'. Changing it to 'RandomPrimary'");
+                                tracing::warn!("send_command - User provided 'Random' routing which is not suitable for the writable command '{cmd_name}'. Changing it to 'RandomPrimary'");
                                 RoutingInfo::SingleNode(SingleNodeRoutingInfo::RandomPrimary)
                             }
                         } else {
                             routing
-                                .or_else(|| RoutingInfo::for_routable(cmd as &Cmd))
+                                .or_else(|| RoutingInfo::for_routable(cmd))
                                 .unwrap_or(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
                         };
                         client.route_command(cmd, final_routing).await
@@ -815,7 +815,25 @@ impl Client {
                 };
 
                 let expected_type = expected_type_for_cmd(cmd);
-                convert_to_expected_type(processed_value, expected_type)
+                let value = convert_to_expected_type(processed_value, expected_type)?;
+
+                // Post-dispatch handlers run INSIDE the timeout scope to match
+                // pre-collapse semantics: in the old execute_command_owned these
+                // ran after the ClientWrapper dispatch but before the function
+                // returned, so the outer select!'s timeout bounded them too.
+                if Self::is_client_set_name_command(cmd) {
+                    self.handle_client_set_name_command(cmd).await?;
+                }
+                if Self::is_select_command(cmd) {
+                    self.handle_select_command(cmd).await?;
+                }
+                if Self::is_auth_command(cmd) {
+                    self.handle_auth_command(cmd).await?;
+                }
+                if Self::is_hello_command(cmd) {
+                    self.handle_hello_command(cmd).await?;
+                }
+                Ok::<_, Error>(value)
             };
 
             let value = match request_timeout {
@@ -842,18 +860,6 @@ impl Client {
                 None => execute.await?,
             };
 
-            if Self::is_client_set_name_command(cmd) {
-                self.handle_client_set_name_command(cmd).await?;
-            }
-            if Self::is_select_command(cmd) {
-                self.handle_select_command(cmd).await?;
-            }
-            if Self::is_auth_command(cmd) {
-                self.handle_auth_command(cmd).await?;
-            }
-            if Self::is_hello_command(cmd) {
-                self.handle_hello_command(cmd).await?;
-            }
             Ok(value)
         }
         .instrument(span))
