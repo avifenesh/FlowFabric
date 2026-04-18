@@ -66,8 +66,7 @@ impl ServerConfig {
     /// | `FF_CLUSTER` | `false` | Enable cluster mode (`1` or `true`) |
     /// | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
     /// | `FF_LANES` | `default` | Comma-separated lane names |
-    /// | `FF_EXEC_PARTITIONS` | `256` | Execution partition count |
-    /// | `FF_FLOW_PARTITIONS` | `64` | Flow partition count |
+    /// | `FF_FLOW_PARTITIONS` | `256` | Flow partition count — authoritative; under RFC-011 hash-tag co-location, exec keys also route here |
     /// | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
     /// | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
     /// | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins (`*` = permissive) |
