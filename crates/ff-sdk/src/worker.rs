@@ -970,8 +970,8 @@ impl FlowFabricWorker {
 
     /// Consume a [`ReclaimGrant`] and transition the granted
     /// `attempt_interrupted` execution into a `started` state on this
-    /// worker. Symmetric partner to `claim_from_grant` for the resume
-    /// path.
+    /// worker. Symmetric partner to [`claim_from_grant`] for the
+    /// resume path.
     ///
     /// The grant must have been issued to THIS worker (matching
     /// `worker_id` at grant time). A mismatch returns
@@ -979,8 +979,26 @@ impl FlowFabricWorker {
     /// atomically by `ff_claim_resumed_execution`; a second call with
     /// the same grant also returns `InvalidClaimGrant`.
     ///
+    /// # Concurrency
+    ///
+    /// The worker's concurrency semaphore is checked BEFORE the FCALL
+    /// (same contract as [`claim_from_grant`]). Reclaim does NOT
+    /// assume pre-existing capacity on this worker — a reclaim can
+    /// land on a fresh worker instance that just came up after a
+    /// crash/restart and is picking up a previously-interrupted
+    /// execution. If the worker is saturated, the grant stays valid
+    /// for its remaining TTL and the caller can release it or retry.
+    ///
+    /// On success the returned [`ClaimedTask`] holds a concurrency
+    /// permit that releases automatically on
+    /// `complete`/`fail`/`cancel`/drop.
+    ///
     /// # Errors
     ///
+    /// * [`SdkError::WorkerAtCapacity`] — `max_concurrent_tasks`
+    ///   permits all held. Retryable; the grant is untouched (no
+    ///   FCALL was issued, so `ff_claim_resumed_execution` did not
+    ///   atomically consume the grant key).
     /// * `ScriptError::InvalidClaimGrant` — grant missing, consumed,
     ///   or `worker_id` mismatch.
     /// * `ScriptError::ClaimGrantExpired` — grant TTL elapsed.
@@ -989,21 +1007,38 @@ impl FlowFabricWorker {
     /// * `ScriptError::ExecutionNotLeaseable` — `lifecycle_phase` is
     ///   not `runnable`.
     /// * `ScriptError::ExecutionNotFound` — core key missing.
-    /// * `SdkError::Valkey` / `SdkError::ValkeyContext` — transport.
+    /// * [`SdkError::Valkey`] / [`SdkError::ValkeyContext`] —
+    ///   transport.
     ///
     /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+    /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     pub async fn claim_from_reclaim_grant(
         &self,
         grant: ff_core::contracts::ReclaimGrant,
     ) -> Result<ClaimedTask, SdkError> {
+        // Semaphore check FIRST — same load-bearing ordering as
+        // `claim_from_grant`. If the worker is saturated, surface
+        // WorkerAtCapacity without firing the FCALL; the FCALL is an
+        // atomic consume on the grant key, so calling it past-
+        // saturation would destroy the grant while leaving no
+        // permit to attach to the returned `ClaimedTask`.
+        let permit = self
+            .concurrency_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SdkError::WorkerAtCapacity)?;
+
         // Grant carries partition + lane_id so no round-trip is needed
         // to resolve them before the FCALL.
-        self.claim_resumed_execution(
-            &grant.execution_id,
-            &grant.lane_id,
-            &grant.partition,
-        )
-        .await
+        let mut task = self
+            .claim_resumed_execution(
+                &grant.execution_id,
+                &grant.lane_id,
+                &grant.partition,
+            )
+            .await?;
+        task.set_concurrency_permit(permit);
+        Ok(task)
     }
 
     /// Low-level resume claim. Invokes `ff_claim_resumed_execution`

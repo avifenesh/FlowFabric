@@ -8477,3 +8477,95 @@ async fn test_claim_from_reclaim_grant_double_consume() {
     // linger into other serial tests.
     claimed.complete(None).await.unwrap();
 }
+
+/// Saturation guard for `claim_from_reclaim_grant` — mirrors
+/// `test_claim_from_grant_rejects_at_capacity`. A worker at
+/// `max_concurrent_tasks=1` with its single permit in flight must
+/// refuse a second reclaim grant with `SdkError::WorkerAtCapacity`
+/// WITHOUT invoking `ff_claim_resumed_execution` (so the grant key
+/// is not atomically consumed).
+///
+/// Caught during cross-review round 2: the original
+/// `claim_from_reclaim_grant` did NOT acquire a concurrency permit,
+/// which on a saturated worker silently exceeded
+/// `max_concurrent_tasks` and handed back a `ClaimedTask` without a
+/// permit to release — violating the concurrency contract the user
+/// configured. Fix mirrors W1's `claim_from_grant` saturation
+/// pattern exactly.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_reclaim_grant_rejects_at_capacity() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    // Set up two independently-suspended executions so we have two
+    // reclaim grants to try against the same worker. Both use the
+    // standard e2e worker identity so both grants are targeted at
+    // the same worker_id.
+    let eid_a = ExecutionId::new();
+    let grant_a = suspend_resume_setup_with_grant(
+        &tc, &eid_a, 30_000, WORKER, WORKER_INST,
+    ).await;
+    let eid_b = ExecutionId::new();
+    let grant_b = suspend_resume_setup_with_grant(
+        &tc, &eid_b, 30_000, WORKER, WORKER_INST,
+    ).await;
+    let grant_b_key = grant_b.grant_key.clone();
+
+    // Build a worker with max_concurrent_tasks=1 so the second
+    // reclaim is guaranteed to saturate.
+    let worker_config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(WORKER),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(WORKER_INST),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 1,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    // 1st reclaim takes the sole permit.
+    let task_a = worker
+        .claim_from_reclaim_grant(grant_a)
+        .await
+        .expect("first reclaim should take the permit");
+
+    // 2nd reclaim must refuse at capacity, BEFORE invoking the Lua
+    // FCALL that would atomically consume the grant key.
+    match worker.claim_from_reclaim_grant(grant_b).await {
+        Err(ff_sdk::SdkError::WorkerAtCapacity) => {}
+        Err(other) => panic!("expected WorkerAtCapacity, got {other:?}"),
+        Ok(_) => panic!("saturated worker should not claim"),
+    }
+
+    // Retryability sanity check — same contract as claim_from_grant.
+    assert!(
+        ff_sdk::SdkError::WorkerAtCapacity.is_retryable(),
+        "capacity saturation is transient"
+    );
+
+    // Grant unharmed: grant_b's claim_grant key is still present in
+    // Valkey. If the FCALL had fired on a saturated worker we'd see
+    // EXISTS=0 here (the Lua DELs the key on consume).
+    let exists: i64 = tc.client()
+        .cmd("EXISTS")
+        .arg(&grant_b_key)
+        .execute()
+        .await
+        .expect("EXISTS on grant_key");
+    assert_eq!(exists, 1,
+        "reclaim grant_key must still exist after capacity reject — \
+         claim_from_reclaim_grant must not fire ff_claim_resumed_execution \
+         when the semaphore is drained");
+
+    // Cleanup so the lease from task_a doesn't linger into the next
+    // serial test.
+    task_a.complete(None).await.unwrap();
+}
