@@ -51,7 +51,11 @@ impl PartitionRouter {
         &self.config
     }
 
-    /// Total number of execution partitions.
+    /// Total number of flow partitions.
+    ///
+    /// Post-RFC-011: exec keys co-locate with their parent flow's partition
+    /// under hash-tag routing, so this count governs exec routing too.
+    /// There is no separate `num_execution_partitions`.
     pub fn num_flow_partitions(&self) -> u16 {
         self.config.num_flow_partitions
     }
