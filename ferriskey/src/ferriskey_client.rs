@@ -470,6 +470,24 @@ impl ClientBuilder {
     }
 
     /// Enable lazy connection (connect on first command, not on build).
+    ///
+    /// **Deprecated.** The `lazy_connect` flag on `ConnectionRequest`
+    /// no longer alters `Client::new` / `build()` behaviour — those
+    /// entry points always return a connected `Client` or an error.
+    /// The connect-on-first-use path moved to a dedicated type:
+    /// construct a [`LazyClient`] via [`ClientBuilder::build_lazy`]
+    /// or [`LazyClient::from_config`].
+    ///
+    /// Callers still chaining `.lazy_connect().build()` will see
+    /// `build()` return `InvalidClientConfig` at runtime — the
+    /// deprecation warning here surfaces the migration at compile
+    /// time.
+    #[deprecated(
+        since = "0.1.1",
+        note = "Use ClientBuilder::build_lazy() -> LazyClient instead. \
+                lazy_connect() sets a flag that Client::new now rejects; \
+                the connect-on-first-use path lives on LazyClient."
+    )]
     pub fn lazy_connect(mut self) -> Self {
         self.request.lazy_connect = true;
         self
