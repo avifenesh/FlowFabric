@@ -107,12 +107,18 @@ async fn main() -> Result<()> {
     // per-worker puts the two bases on equal footing.
     let drain_start = Instant::now();
     let stop_at = Arc::new(std::sync::atomic::AtomicUsize::new(args.tasks));
+    let ok_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let nil_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let err_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::with_capacity(WORKER_COUNT);
     for wi in 0..WORKER_COUNT {
         let worker_client = build_client(&args.valkey_host, args.valkey_port).await?;
         let stop_at = stop_at.clone();
+        let ok_c = ok_count.clone();
+        let nil_c = nil_count.clone();
+        let err_c = err_count.clone();
         handles.push(tokio::spawn(async move {
-            drive_worker(wi, worker_client, stop_at).await
+            drive_worker(wi, worker_client, stop_at, ok_c, nil_c, err_c).await
         }));
     }
     let mut lat: Vec<u64> = Vec::with_capacity(args.tasks);
@@ -121,6 +127,9 @@ async fn main() -> Result<()> {
         lat.append(&mut per_worker);
     }
     let wall = drain_start.elapsed();
+    let ok = ok_count.load(std::sync::atomic::Ordering::Relaxed);
+    let nil = nil_count.load(std::sync::atomic::Ordering::Relaxed);
+    let err = err_count.load(std::sync::atomic::Ordering::Relaxed);
 
     let throughput = args.tasks as f64 / wall.as_secs_f64();
     let (p50, p95, p99) = percentiles(&lat);
@@ -139,7 +148,8 @@ async fn main() -> Result<()> {
         "config": { "tasks": args.tasks, "workers": WORKER_COUNT, "payload_bytes": PAYLOAD_BYTES },
         "throughput_ops_per_sec": throughput,
         "latency_ms": { "p50": p50, "p95": p95, "p99": p99 },
-        "notes": "ferriskey-baseline = ClientBuilder + RPUSH / BLMPOP / INCR, no ff-sdk no ff-server no Lua",
+        "blmpop_outcomes": { "ok": ok, "nil": nil, "err": err },
+        "notes": "ferriskey-baseline = ClientBuilder + RPUSH / BLMPOP / INCR, no ff-sdk no ff-server no Lua. blmpop_outcomes counts per-poll results across all workers: ok=popped-a-value, nil=server returned Nil (queue empty), err=transport/timeout error. All three paths currently sleep 10ms and retry.",
     });
 
     let results_dir = std::path::Path::new(&args.results_dir);
@@ -152,10 +162,13 @@ async fn main() -> Result<()> {
     ));
     std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
     eprintln!(
-        "[ferriskey-baseline] wrote {} — {:.1} ops/sec p99={:.2}ms",
+        "[ferriskey-baseline] wrote {} — {:.1} ops/sec p99={:.2}ms ok={} nil={} err={}",
         path.display(),
         throughput,
-        p99
+        p99,
+        ok,
+        nil,
+        err
     );
     Ok(())
 }
@@ -182,6 +195,9 @@ async fn drive_worker(
     _wi: usize,
     client: Client,
     stop_at: Arc<std::sync::atomic::AtomicUsize>,
+    ok_count: Arc<std::sync::atomic::AtomicU64>,
+    nil_count: Arc<std::sync::atomic::AtomicU64>,
+    err_count: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u64>> {
     use std::sync::atomic::Ordering;
     let mut local: Vec<u64> = Vec::new();
@@ -203,7 +219,7 @@ async fn drive_worker(
         // 1 s block (matches redis-rs baseline's `.arg(1_u64)`).
         // Drained stragglers exit within ≤ 1 s of the last pop
         // setting stop_at to 0.
-        let popped: Option<Value> = client
+        let popped: Result<Option<Value>, _> = client
             .cmd("BLMPOP")
             .arg(1_u64)
             .arg(1_u64)
@@ -212,24 +228,29 @@ async fn drive_worker(
             .arg("COUNT")
             .arg(1_u64)
             .execute()
-            .await
-            .unwrap_or(None);
+            .await;
 
-        if popped.is_some() {
-            // Record latency BEFORE the INCR so the sample matches
-            // the redis-rs baseline's (INCR-included) definition.
-            // Need the INCR RTT in the sample for apples-to-apples.
-            let _: i64 = client
-                .incr(COMPLETED_KEY)
-                .await
-                .context("INCR completed")?;
-            local.push(t0.elapsed().as_micros() as u64);
-            stop_at.fetch_sub(1, Ordering::Relaxed);
-        } else {
-            // Queue drained from BLMPOP's perspective; check stop
-            // counter and loop. Matches the redis-rs baseline's 10ms
-            // backoff.
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        match popped {
+            Ok(Some(_)) => {
+                ok_count.fetch_add(1, Ordering::Relaxed);
+                // Record latency BEFORE the INCR so the sample matches
+                // the redis-rs baseline's (INCR-included) definition.
+                // Need the INCR RTT in the sample for apples-to-apples.
+                let _: i64 = client
+                    .incr(COMPLETED_KEY)
+                    .await
+                    .context("INCR completed")?;
+                local.push(t0.elapsed().as_micros() as u64);
+                stop_at.fetch_sub(1, Ordering::Relaxed);
+            }
+            Ok(None) => {
+                nil_count.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                err_count.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 }

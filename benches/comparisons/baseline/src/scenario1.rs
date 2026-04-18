@@ -74,12 +74,18 @@ async fn main() -> Result<()> {
     // concurrency (PR#10 bot review).
     let drain_start = Instant::now();
     let stop_at = Arc::new(std::sync::atomic::AtomicUsize::new(args.tasks));
+    let ok_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let nil_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let err_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::with_capacity(WORKER_COUNT);
     for wi in 0..WORKER_COUNT {
         let client = client.clone();
         let stop_at = stop_at.clone();
+        let ok_c = ok_count.clone();
+        let nil_c = nil_count.clone();
+        let err_c = err_count.clone();
         handles.push(tokio::spawn(async move {
-            drive_worker(wi, client, stop_at).await
+            drive_worker(wi, client, stop_at, ok_c, nil_c, err_c).await
         }));
     }
     let mut lat: Vec<u64> = Vec::with_capacity(args.tasks);
@@ -88,6 +94,9 @@ async fn main() -> Result<()> {
         lat.append(&mut per_worker);
     }
     let wall = drain_start.elapsed();
+    let ok = ok_count.load(std::sync::atomic::Ordering::Relaxed);
+    let nil = nil_count.load(std::sync::atomic::Ordering::Relaxed);
+    let err = err_count.load(std::sync::atomic::Ordering::Relaxed);
 
     let throughput = args.tasks as f64 / wall.as_secs_f64();
     let (p50, p95, p99) = percentiles(&lat);
@@ -107,7 +116,8 @@ async fn main() -> Result<()> {
         "config": { "tasks": args.tasks, "workers": WORKER_COUNT, "payload_bytes": PAYLOAD_BYTES },
         "throughput_ops_per_sec": throughput,
         "latency_ms": { "p50": p50, "p95": p95, "p99": p99 },
-        "notes": "baseline = RPUSH / BLMPOP / INCR, no retries no leases no flows",
+        "blmpop_outcomes": { "ok": ok, "nil": nil, "err": err },
+        "notes": "baseline = RPUSH / BLMPOP / INCR, no retries no leases no flows. blmpop_outcomes counts per-poll results across all workers: ok=popped-a-value, nil=server returned Nil (queue empty), err=transport/timeout error. All three paths currently sleep 10ms and retry.",
     });
 
     // Write using the same path convention the harness uses so
@@ -122,10 +132,13 @@ async fn main() -> Result<()> {
     ));
     std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
     eprintln!(
-        "[baseline] wrote {} — {:.1} ops/sec p99={:.2}ms",
+        "[baseline] wrote {} — {:.1} ops/sec p99={:.2}ms ok={} nil={} err={}",
         path.display(),
         throughput,
-        p99
+        p99,
+        ok,
+        nil,
+        err
     );
     Ok(())
 }
@@ -149,6 +162,9 @@ async fn drive_worker(
     _wi: usize,
     client: redis::Client,
     stop_at: Arc<std::sync::atomic::AtomicUsize>,
+    ok_count: Arc<std::sync::atomic::AtomicU64>,
+    nil_count: Arc<std::sync::atomic::AtomicU64>,
+    err_count: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u64>> {
     use std::sync::atomic::Ordering;
     let mut con = client.get_multiplexed_async_connection().await?;
@@ -158,7 +174,7 @@ async fn drive_worker(
             return Ok(local);
         }
         let t0 = Instant::now();
-        let popped: Option<(String, Vec<Vec<u8>>)> =
+        let popped: Result<Option<(String, Vec<Vec<u8>>)>, _> =
             redis::cmd("BLMPOP")
                 .arg(1_u64) // 1-second block
                 .arg(1_u64) // 1 key
@@ -167,21 +183,29 @@ async fn drive_worker(
                 .arg("COUNT")
                 .arg(1_u64)
                 .query_async(&mut con)
-                .await
-                .ok()
-                .flatten();
-        match popped {
-            Some((_, values)) if !values.is_empty() => {
+                .await;
+        let popped_something = match popped {
+            Ok(Some((_, values))) if !values.is_empty() => {
+                ok_count.fetch_add(1, Ordering::Relaxed);
                 let _: () = con.incr(COMPLETED_KEY, 1).await?;
                 local.push(t0.elapsed().as_micros() as u64);
                 stop_at.fetch_sub(1, Ordering::Relaxed);
+                true
             }
-            _ => {
-                // Queue drained from BLMPOP's perspective; check stop
-                // counter and loop. Avoids tight-spinning an empty
-                // queue during stragglers.
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(_) => {
+                nil_count.fetch_add(1, Ordering::Relaxed);
+                false
             }
+            Err(_) => {
+                err_count.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        };
+        if !popped_something {
+            // Queue drained from BLMPOP's perspective; check stop
+            // counter and loop. Avoids tight-spinning an empty
+            // queue during stragglers.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

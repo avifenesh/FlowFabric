@@ -32,8 +32,9 @@ clap = { version = "4", features = ["derive", "env"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+debug = 0
 
 # Perf capture profile — same codegen as release, plus line-table debug
 # info so flamegraph can resolve Rust function names. Used only for
