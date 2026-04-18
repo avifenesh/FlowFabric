@@ -376,15 +376,17 @@ impl Server {
             );
         }
 
+        // Partition counts — post-RFC-011 there are three physical families.
+        // Execution keys co-locate with their parent flow's partition (§2 of
+        // the RFC), so `num_flow_partitions` governs both exec and flow
+        // routing; no separate `num_execution_partitions` count exists.
         tracing::info!(
-            exec_partitions = config.partition_config.num_flow_partitions,
             flow_partitions = config.partition_config.num_flow_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,
             quota_partitions = config.partition_config.num_quota_partitions,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
             listen_addr = %config.listen_addr,
-            "FlowFabric server started. Partitions: {}/{}/{}/{}. Scanners: 14 active.",
-            config.partition_config.num_flow_partitions,
+            "FlowFabric server started. Partitions (flow/budget/quota): {}/{}/{}. Scanners: 14 active.",
             config.partition_config.num_flow_partitions,
             config.partition_config.num_budget_partitions,
             config.partition_config.num_quota_partitions,
@@ -2504,10 +2506,6 @@ async fn validate_or_create_partition_config(
             .await
             .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_flow_partitions".into() })?;
         client
-            .hset(&key, "num_flow_partitions", &config.num_flow_partitions.to_string())
-            .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_flow_partitions".into() })?;
-        client
             .hset(&key, "num_budget_partitions", &config.num_budget_partitions.to_string())
             .await
             .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_budget_partitions".into() })?;
@@ -2534,7 +2532,6 @@ async fn validate_or_create_partition_config(
         Ok(())
     };
 
-    check("num_flow_partitions", config.num_flow_partitions)?;
     check("num_flow_partitions", config.num_flow_partitions)?;
     check("num_budget_partitions", config.num_budget_partitions)?;
     check("num_quota_partitions", config.num_quota_partitions)?;
