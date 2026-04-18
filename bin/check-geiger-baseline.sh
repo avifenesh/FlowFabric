@@ -45,13 +45,26 @@ for pair in "${CRATES[@]}"; do
     manifest="${pair#*:}"
     names+=("$name")
     printf '  - %-15s' "$name"
+    # cargo-geiger 0.13.0 sometimes exits non-zero after emitting valid
+    # JSON (tool-side package-matching warnings on resolver v3). We care
+    # about usable JSON, not the exit code — verify the target crate is
+    # present in the output before giving up.
     cargo geiger --output-format Json --all-targets --manifest-path "$ROOT/$manifest" \
-        > "$TMPDIR/$name.json" 2>"$TMPDIR/$name.err" || {
+        > "$TMPDIR/$name.json" 2>"$TMPDIR/$name.err" || true
+    if ! python3 -c "
+import json, sys
+try:
+    data = json.load(open('$TMPDIR/$name.json'))
+except Exception as e:
+    print(f'JSON parse failed: {e}', file=sys.stderr); sys.exit(1)
+if not any(p.get('package', {}).get('id', {}).get('name') == '$name' for p in data.get('packages', [])):
+    print('target crate $name missing from geiger output', file=sys.stderr); sys.exit(1)
+" 2>>"$TMPDIR/$name.err"; then
         echo
         echo "cargo geiger failed for $name:" >&2
         tail -40 "$TMPDIR/$name.err" >&2
         exit 2
-    }
+    fi
     echo " ok"
 done
 
