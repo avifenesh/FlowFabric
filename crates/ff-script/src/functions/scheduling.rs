@@ -1,4 +1,7 @@
 //! Typed FCALL wrappers for scheduling functions (lua/scheduling.lua).
+//!
+//! See `execution.rs` module-level rustdoc for the Partial-type pattern
+//! rationale (RFC-011 §2.4).
 
 use ff_core::contracts::*;
 use crate::error::ScriptError;
@@ -6,6 +9,20 @@ use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::types::*;
 
 use crate::result::{FcallResult, FromFcallResult};
+
+/// Partial form of [`ChangePriorityResult`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChangePriorityResultPartial {
+    Changed,
+}
+
+impl ChangePriorityResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> ChangePriorityResult {
+        match self {
+            Self::Changed => ChangePriorityResult::Changed { execution_id },
+        }
+    }
+}
 
 /// Key context for scheduling operations that need exec_core + index keys.
 pub struct SchedOpKeys<'a> {
@@ -61,7 +78,7 @@ impl FromFcallResult for IssueClaimGrantResult {
 // Lua ARGV (2): execution_id, new_priority
 
 ff_function! {
-    pub ff_change_priority(args: ChangePriorityArgs) -> ChangePriorityResult {
+    pub ff_change_priority(args: ChangePriorityArgs) -> ChangePriorityResultPartial {
         keys(k: &SchedOpKeys<'_>) {
             k.ctx.core(),
             k.idx.lane_eligible(k.lane_id),
@@ -73,13 +90,11 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for ChangePriorityResult {
+impl FromFcallResult for ChangePriorityResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok(old_priority, new_priority)
-        Ok(ChangePriorityResult::Changed {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
-        })
+        Ok(Self::Changed)
     }
 }
 
@@ -108,5 +123,22 @@ impl FromFcallResult for UpdateProgressResult {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok()
         Ok(UpdateProgressResult::Updated)
+    }
+}
+
+// ─── Partial-type tests (RFC-011 §2.4 acceptance) ──────────────────────
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+    use ff_core::partition::PartitionConfig;
+
+    #[test]
+    fn change_priority_partial_complete_attaches_execution_id() {
+        let partial = ChangePriorityResultPartial::Changed;
+        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
+        let full = partial.complete(eid.clone());
+        match full {
+            ChangePriorityResult::Changed { execution_id } => assert_eq!(execution_id, eid),
+        }
     }
 }

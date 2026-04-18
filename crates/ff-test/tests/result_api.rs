@@ -312,7 +312,7 @@ async fn test_result_404_before_completion() {
     let api = TestApi::setup().await;
     let tc = TestCluster::connect().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let _ = fcall_create_and_claim(&tc, &eid).await;
 
     let resp = api
@@ -332,7 +332,7 @@ async fn test_result_200_json_payload_byte_exact() {
     let api = TestApi::setup().await;
     let tc = TestCluster::connect().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
     let payload = br#"{"status":"ok","value":42}"#;
     fcall_complete_with_payload(&tc, &eid, &lease_id, &epoch, &attempt_id, payload).await;
@@ -372,7 +372,7 @@ async fn test_result_binary_payload_roundtrips() {
     let api = TestApi::setup().await;
     let tc = TestCluster::connect().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
 
     // Deliberately include bytes that are not valid UTF-8:

@@ -377,14 +377,14 @@ impl Server {
         }
 
         tracing::info!(
-            exec_partitions = config.partition_config.num_execution_partitions,
+            exec_partitions = config.partition_config.num_flow_partitions,
             flow_partitions = config.partition_config.num_flow_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,
             quota_partitions = config.partition_config.num_quota_partitions,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
             listen_addr = %config.listen_addr,
             "FlowFabric server started. Partitions: {}/{}/{}/{}. Scanners: 14 active.",
-            config.partition_config.num_execution_partitions,
+            config.partition_config.num_flow_partitions,
             config.partition_config.num_flow_partitions,
             config.partition_config.num_budget_partitions,
             config.partition_config.num_quota_partitions,
@@ -2500,9 +2500,9 @@ async fn validate_or_create_partition_config(
         // First boot — create the config
         tracing::info!("first boot: creating {key}");
         client
-            .hset(&key, "num_execution_partitions", &config.num_execution_partitions.to_string())
+            .hset(&key, "num_flow_partitions", &config.num_flow_partitions.to_string())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_execution_partitions".into() })?;
+            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_flow_partitions".into() })?;
         client
             .hset(&key, "num_flow_partitions", &config.num_flow_partitions.to_string())
             .await
@@ -2534,7 +2534,7 @@ async fn validate_or_create_partition_config(
         Ok(())
     };
 
-    check("num_execution_partitions", config.num_execution_partitions)?;
+    check("num_flow_partitions", config.num_flow_partitions)?;
     check("num_flow_partitions", config.num_flow_partitions)?;
     check("num_budget_partitions", config.num_budget_partitions)?;
     check("num_quota_partitions", config.num_quota_partitions)?;
@@ -2665,7 +2665,7 @@ async fn initialize_waitpoint_hmac_secret(
 ) -> Result<(), ServerError> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    let n = partition_config.num_execution_partitions;
+    let n = partition_config.num_flow_partitions;
     tracing::info!(
         partitions = n,
         concurrency = BOOT_INIT_CONCURRENCY,
@@ -2798,7 +2798,7 @@ impl Server {
             }
         };
 
-        let n = self.config.partition_config.num_execution_partitions;
+        let n = self.config.partition_config.num_flow_partitions;
         let grace_ms = self.config.waitpoint_hmac_grace_ms;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

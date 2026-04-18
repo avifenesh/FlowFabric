@@ -1396,11 +1396,13 @@ pub struct StateSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::FlowId;
 
     #[test]
     fn create_execution_args_serde() {
+        let config = crate::partition::PartitionConfig::default();
         let args = CreateExecutionArgs {
-            execution_id: ExecutionId::new(),
+            execution_id: ExecutionId::for_flow(&FlowId::new(), &config),
             namespace: Namespace::new("test"),
             lane_id: LaneId::new("default"),
             execution_kind: "llm_call".to_owned(),
@@ -1423,8 +1425,9 @@ mod tests {
 
     #[test]
     fn claim_result_serde() {
+        let config = crate::partition::PartitionConfig::default();
         let result = ClaimExecutionResult::Claimed(ClaimedExecution {
-            execution_id: ExecutionId::new(),
+            execution_id: ExecutionId::for_flow(&FlowId::new(), &config),
             lease_id: LeaseId::new(),
             lease_epoch: LeaseEpoch::new(1),
             attempt_index: AttemptIndex::new(0),

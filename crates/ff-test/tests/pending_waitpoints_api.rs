@@ -337,7 +337,7 @@ async fn test_list_pending_waitpoints_returns_token_after_suspend() {
     let api = TestApi::setup().await;
     let tc = TestCluster::connect().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
     let (wp_id, wp_key, expected_token) =
         fcall_suspend(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -383,7 +383,7 @@ async fn test_list_pending_waitpoints_empty_for_unsuspended() {
     let api = TestApi::setup().await;
     let tc = TestCluster::connect().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let _ = fcall_create_and_claim(&tc, &eid).await;
 
     let resp = api
@@ -409,7 +409,7 @@ async fn test_signal_delivery_with_tampered_token_rejected() {
     let api = TestApi::setup().await;
     let tc = TestCluster::connect().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, token) =
         fcall_suspend(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -467,7 +467,7 @@ async fn test_list_pending_waitpoints_not_found() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let resp = api
         .client
         .get(api.url(&format!("/v1/executions/{eid}/pending-waitpoints")))

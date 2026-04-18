@@ -91,7 +91,7 @@ pub struct FlowFabricWorker {
 
 /// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
 /// load at O(PARTITION_SCAN_CHUNK) per worker-second instead of
-/// O(num_execution_partitions).
+/// O(num_flow_partitions).
 #[cfg(feature = "insecure-direct-claim")]
 const PARTITION_SCAN_CHUNK: usize = 32;
 
@@ -216,7 +216,7 @@ impl FlowFabricWorker {
         #[cfg(feature = "insecure-direct-claim")]
         let scan_cursor_init = scan_cursor_seed(
             config.worker_instance_id.as_str(),
-            partition_config.num_execution_partitions.max(1) as usize,
+            partition_config.num_flow_partitions.max(1) as usize,
         );
 
         // Sort + dedupe capabilities into a stable CSV. BTreeSet both sorts
@@ -423,7 +423,7 @@ impl FlowFabricWorker {
     /// Get the server-published partition config this worker bound to at
     /// `connect()`. Callers need this when computing partition hash-tags
     /// for direct-client reads (e.g. ff-sdk::read_stream) to stay aligned
-    /// with the server's `num_execution_partitions` — using
+    /// with the server's `num_flow_partitions` — using
     /// `PartitionConfig::default()` assumes 256 partitions and silently
     /// misses data on deployments with any other value.
     pub fn partition_config(&self) -> &ff_core::partition::PartitionConfig {
@@ -450,7 +450,7 @@ impl FlowFabricWorker {
     /// of [`PARTITION_SCAN_CHUNK`] partitions starting at the rolling
     /// `scan_cursor`; the cursor advances by that chunk size on every
     /// invocation, so a worker covers every partition exactly once every
-    /// `ceil(num_execution_partitions / PARTITION_SCAN_CHUNK)` polls.
+    /// `ceil(num_flow_partitions / PARTITION_SCAN_CHUNK)` polls.
     ///
     /// Callers should treat `None` as "poll again soon" (typically after
     /// `config.claim_poll_interval_ms`) rather than "sleep for a long
@@ -481,7 +481,7 @@ impl FlowFabricWorker {
         // load at O(chunk) per worker-second instead of O(num_partitions),
         // and the worker-instance-seeded initial cursor spreads concurrent
         // workers across different partition windows.
-        let num_partitions = self.partition_config.num_execution_partitions as usize;
+        let num_partitions = self.partition_config.num_flow_partitions as usize;
         if num_partitions == 0 {
             return Ok(None);
         }
@@ -1400,8 +1400,7 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
     };
 
     Ok(PartitionConfig {
-        num_execution_partitions: parse("num_execution_partitions", 256),
-        num_flow_partitions: parse("num_flow_partitions", 64),
+        num_flow_partitions: parse("num_flow_partitions", 256),
         num_budget_partitions: parse("num_budget_partitions", 32),
         num_quota_partitions: parse("num_quota_partitions", 32),
     })

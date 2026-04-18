@@ -121,7 +121,7 @@ impl Engine {
     /// Spawns background scanner tasks. Returns immediately.
     pub fn start(config: EngineConfig, client: ferriskey::Client) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let num_partitions = config.partition_config.num_execution_partitions;
+        let num_partitions = config.partition_config.num_flow_partitions;
         let router = Arc::new(PartitionRouter::new(config.partition_config));
 
         let mut handles = Vec::new();

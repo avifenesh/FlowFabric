@@ -180,7 +180,7 @@ async fn test_api_healthz() {
 async fn test_api_create_and_get_execution() {
     let api = TestApi::setup().await;
 
-    let eid = ExecutionId::new();
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     let now = TimestampMs::now();
     let args = CreateExecutionArgs {
         execution_id: eid.clone(),
@@ -244,7 +244,7 @@ async fn test_api_cancel_execution() {
     let api = TestApi::setup().await;
 
     // Create first
-    let eid = ExecutionId::new();
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     let now = TimestampMs::now();
     let create_args = CreateExecutionArgs {
         execution_id: eid.clone(),
@@ -353,7 +353,7 @@ async fn test_api_create_flow() {
 async fn test_api_not_found() {
     let api = TestApi::setup().await;
 
-    let fake_id = ExecutionId::new();
+    let fake_id = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     let resp = api
         .client
         .get(api.url(&format!("/v1/executions/{fake_id}")))
@@ -483,7 +483,7 @@ async fn test_api_create_quota_policy() {
 async fn test_api_change_priority() {
     let api = TestApi::setup().await;
 
-    let eid = ExecutionId::new();
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     api_create_execution(&api, &eid, 0).await;
 
     // Change priority
@@ -513,7 +513,7 @@ async fn test_api_change_priority() {
 async fn test_api_replay_execution() {
     let api = TestApi::setup().await;
 
-    let eid = ExecutionId::new();
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     api_create_execution(&api, &eid, 0).await;
 
     // Cancel to make terminal
@@ -578,7 +578,7 @@ async fn test_api_add_execution_to_flow() {
     assert!(resp.status().is_success());
 
     // Create execution
-    let eid = ExecutionId::new();
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     api_create_execution(&api, &eid, 0).await;
 
     // Add to flow
@@ -704,7 +704,7 @@ async fn test_stream_semaphore_returns_429_on_burst() {
     // so the second call's timeout fired before its turn at the server.
     // Observed as HTTP 500 `valkey: timed out`. The Mutex ensures each
     // call's timeout doesn't start until it holds the lock.
-    let eid = ExecutionId::new();
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
     let url = format!(
         "{base_url}/v1/executions/{eid}/attempts/0/stream/tail?block_ms=2000&limit=10"
     );

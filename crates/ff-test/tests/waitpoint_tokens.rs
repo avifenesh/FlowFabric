@@ -348,7 +348,7 @@ async fn test_valid_token_accepted() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _att_idx, attempt_id) = create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -364,7 +364,7 @@ async fn test_missing_token_rejected() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _att_idx, attempt_id) = create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, _token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -380,7 +380,7 @@ async fn test_tampered_token_rejected() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _att_idx, attempt_id) = create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -403,7 +403,7 @@ async fn test_wrong_kid_rejected() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _att_idx, attempt_id) = create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, _token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -422,7 +422,7 @@ async fn test_rotation_grace_allows_previous_kid() {
     tc.cleanup().await;
 
     // Fresh secret — TestCluster::cleanup already installed k1.
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _att_idx, attempt_id) = create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, k1_token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -450,7 +450,7 @@ async fn test_rotation_past_grace_rejects_previous_kid() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _att_idx, attempt_id) = create_and_claim(&tc, &eid).await;
     let (wp_id, _wp_key, k1_token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
@@ -479,7 +479,7 @@ async fn test_pending_waitpoint_token_flow() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (_lease_id, _epoch, _att_idx, _attempt_id) = create_and_claim(&tc, &eid).await;
 
     // Create pending waitpoint with its own minted token.
@@ -614,8 +614,8 @@ async fn test_cross_waitpoint_token_rejected() {
     // Two separate executions each get their own waitpoint + token. Using
     // two executions avoids the single-open-suspension invariant; the
     // security property we're checking is the token→waitpoint binding.
-    let eid_a = ExecutionId::new();
-    let eid_b = ExecutionId::new();
+    let eid_a = tc.new_execution_id();
+    let eid_b = tc.new_execution_id();
     let (lid_a, ep_a, _, aid_a) = create_and_claim(&tc, &eid_a).await;
     let (lid_b, ep_b, _, aid_b) = create_and_claim(&tc, &eid_b).await;
     let (_wp_a, _wk_a, token_a) =
@@ -642,7 +642,7 @@ async fn test_deliver_signal_no_state_oracle_on_bad_token() {
     tc.cleanup().await;
 
     // Create an execution in active/leased state (NOT suspended, NO waitpoint).
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (_lease_id, _epoch, _att_idx, _attempt_id) = create_and_claim(&tc, &eid).await;
 
     // Present an invented waitpoint_id and a bogus token. Pre-fix: caller
@@ -669,7 +669,7 @@ async fn test_buffer_signal_rejected_after_waitpoint_closed() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (_lease_id, _epoch, _att_idx, _attempt_id) = create_and_claim(&tc, &eid).await;
 
     // Create pending waitpoint, capture token.
@@ -779,7 +779,7 @@ async fn test_rapid_rotation_preserves_in_grace_tokens() {
     tc.cleanup().await;
 
     // Mint a token under k1 (installed by cleanup()).
-    let eid_a = ExecutionId::new();
+    let eid_a = tc.new_execution_id();
     let (lid_a, ep_a, _, aid_a) = create_and_claim(&tc, &eid_a).await;
     let (wp_a, _wk_a, k1_token) =
         suspend_and_get_token(&tc, &eid_a, &lid_a, &ep_a, &aid_a).await;
@@ -821,7 +821,7 @@ async fn test_rapid_rotation_past_grace_rejects_expired() {
     tc.cleanup().await;
 
     // Mint a k1 token, rotate to k2 with a grace window ALREADY in the past.
-    let eid_b = ExecutionId::new();
+    let eid_b = tc.new_execution_id();
     let (lid_b, ep_b, _, aid_b) = create_and_claim(&tc, &eid_b).await;
     let (wp_b, _wk_b, k1_token) =
         suspend_and_get_token(&tc, &eid_b, &lid_b, &ep_b, &aid_b).await;
@@ -886,7 +886,7 @@ async fn test_malformed_hex_secret_rejects_cleanly() {
 
     // Try to suspend an execution. mint_waitpoint_token will call
     // hmac_sha1_hex → hex_to_bytes(secret) → nil → "invalid_secret".
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let (lease_id, epoch, _, attempt_id) = create_and_claim(&tc, &eid).await;
 
     // Suspend with a fresh wp_id/wp_key. We can't use `suspend_and_get_token`

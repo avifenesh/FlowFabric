@@ -84,9 +84,128 @@ macro_rules! string_id {
 
 // ── UUID-backed identity types ──
 
-uuid_id! {
-    /// Stable identity for a logical execution. Never changes across retries/reclaims/replays.
-    ExecutionId
+// ── ExecutionId — bespoke impl (RFC-011 §2.3) ──
+//
+// Not uuid_id!-generated because the hash-tagged `{fp:N}:<uuid>` shape
+// requires a flow/lane context at construction time (co-locating exec keys
+// with their parent flow's Valkey slot). Removes new()/Default/from_uuid
+// variants that would produce a bare UUID with no hash-tag.
+
+/// Stable identity for a logical execution. Never changes across
+/// retries/reclaims/replays.
+///
+/// String-backed shape `{fp:N}:<uuid>` where `fp:N` is the Valkey
+/// hash-tag for the flow partition this execution co-locates with, and
+/// `<uuid>` is a UUIDv4 for intra-partition uniqueness. Construct via
+/// [`ExecutionId::for_flow`] (known parent flow) or [`ExecutionId::solo`]
+/// (no parent flow; per-lane synthetic shard).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExecutionId(String);
+
+/// Error returned when parsing a malformed [`ExecutionId`] string.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ExecutionIdParseError {
+    #[error("execution_id is missing the `{{fp:N}}:` hash-tag prefix: {0}")]
+    MissingTag(String),
+    #[error("execution_id partition index is not a valid u16: {0}")]
+    InvalidPartitionIndex(String),
+    #[error("execution_id UUID suffix is not a valid UUID: {0}")]
+    InvalidUuid(String),
+}
+
+impl ExecutionId {
+    /// Mint an execution id co-located with the given flow's partition.
+    /// Use when the flow is known at creation time (the common case).
+    ///
+    /// Partition index = `crc16(flow_id.bytes) % num_flow_partitions`,
+    /// matching [`crate::partition::flow_partition`].
+    pub fn for_flow(flow_id: &FlowId, config: &crate::partition::PartitionConfig) -> Self {
+        let partition = crate::partition::flow_partition(flow_id, config).index;
+        Self::with_partition(partition)
+    }
+
+    /// Mint an execution id co-located with the given lane's solo shard.
+    /// Use when the exec has no parent flow (standalone `create_execution`).
+    ///
+    /// Partition index = `crc16(lane_id.as_str().bytes) % num_flow_partitions`
+    /// via the default [`crate::partition::SoloPartitioner`].
+    pub fn solo(lane_id: &LaneId, config: &crate::partition::PartitionConfig) -> Self {
+        let partition = crate::partition::solo_partition(lane_id, config).index;
+        Self::with_partition(partition)
+    }
+
+    fn with_partition(partition: u16) -> Self {
+        let uuid = Uuid::new_v4();
+        Self(format!("{{fp:{partition}}}:{uuid}"))
+    }
+
+    /// Parse a hash-tagged execution-id string.
+    ///
+    /// Rejects:
+    ///
+    /// - strings missing the `{fp:N}:` prefix (returns [`ExecutionIdParseError::MissingTag`]);
+    /// - non-integer partition index, or one that does not fit in `u16` (returns [`ExecutionIdParseError::InvalidPartitionIndex`]);
+    /// - malformed UUID suffix (returns [`ExecutionIdParseError::InvalidUuid`]).
+    ///
+    /// **Parse does NOT check `N < num_flow_partitions`** — the function takes only `&str` and has no [`crate::partition::PartitionConfig`] handle. Range validation against the live deployment's partition count is the caller's responsibility via [`ExecutionId::partition`] + config comparison.
+    ///
+    /// See RFC-011 §2.3.1 for the architectural rationale: exec ids are durable identifiers that legitimately cross deployment boundaries with different configs, so parse-time config-coupling would mis-reject otherwise-valid historical ids. The natural validation point is at ingress boundaries (e.g. `ff-server`'s request handlers, scheduler claim-grant receipt) against the current deployment's config.
+    ///
+    /// Callers reading [`ExecutionId`] strings from Lua FCALL results use this entry point.
+    pub fn parse(s: &str) -> Result<Self, ExecutionIdParseError> {
+        // Expected: "{fp:<N>}:<uuid>"
+        let rest = s
+            .strip_prefix("{fp:")
+            .ok_or_else(|| ExecutionIdParseError::MissingTag(s.to_owned()))?;
+        let close = rest
+            .find("}:")
+            .ok_or_else(|| ExecutionIdParseError::MissingTag(s.to_owned()))?;
+        let partition_str = &rest[..close];
+        let uuid_str = &rest[close + 2..];
+        partition_str
+            .parse::<u16>()
+            .map_err(|_| ExecutionIdParseError::InvalidPartitionIndex(partition_str.to_owned()))?;
+        Uuid::parse_str(uuid_str)
+            .map_err(|_| ExecutionIdParseError::InvalidUuid(uuid_str.to_owned()))?;
+        Ok(Self(s.to_owned()))
+    }
+
+    /// Decode the partition index from the hash-tag prefix. Infallible on a
+    /// validated `ExecutionId` (construction paths guarantee a well-formed tag).
+    pub fn partition(&self) -> u16 {
+        // Safe: the only ways to construct an ExecutionId are for_flow/solo/parse,
+        // all of which enforce the `{fp:N}:<uuid>` shape.
+        let rest = &self.0["{fp:".len()..];
+        let close = rest.find("}:").expect("invariant: valid ExecutionId");
+        rest[..close]
+            .parse::<u16>()
+            .expect("invariant: valid partition index")
+    }
+
+    /// Raw string form; always `{fp:N}:<uuid>`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionId {
+    /// Deserialises from a JSON string; validates via [`ExecutionId::parse`]
+    /// so malformed wire payloads (e.g. legacy bare UUIDs) fail loudly at the
+    /// parse boundary rather than routing to the wrong partition downstream.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 uuid_id! {
@@ -221,9 +340,99 @@ string_id! {
     Namespace
 }
 
-string_id! {
-    /// Submission lane (queue-compatible ingress).
-    LaneId
+// ── LaneId — bespoke impl (RFC-011 §9.15) ──
+//
+// Specialised out of the string_id! macro so ingress (HTTP query params,
+// request-body deserialisation) can reject malformed lane strings at the
+// system boundary instead of silently hashing them via the SoloPartitioner.
+
+/// Submission lane (queue-compatible ingress).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct LaneId(pub String);
+
+/// Max byte length for a LaneId. Matches the common runtime-label ceiling
+/// (e.g. Kubernetes label value 63 bytes; we go 64 for round-number reasons).
+pub const LANE_ID_MAX_BYTES: usize = 64;
+
+/// Error returned when a LaneId fails validation.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LaneIdError {
+    #[error("lane_id is empty")]
+    Empty,
+    #[error("lane_id exceeds {LANE_ID_MAX_BYTES} bytes (got {0})")]
+    TooLong(usize),
+    #[error("lane_id contains non-ASCII-printable byte at index {0}")]
+    NonPrintable(usize),
+}
+
+impl LaneId {
+    /// Infallible constructor. Accepts any `Into<String>` and does NOT validate.
+    /// Use for hardcoded lane names ("default", test fixtures). For runtime-
+    /// bounded input (HTTP, env, config file), use [`LaneId::try_new`].
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Fallible constructor. Validates:
+    ///  - non-empty
+    ///  - <= [`LANE_ID_MAX_BYTES`] bytes
+    ///  - every byte is ASCII-printable (`0x20..=0x7e`)
+    ///
+    /// Use at system boundaries where the lane string could be anything.
+    pub fn try_new(value: impl Into<String>) -> Result<Self, LaneIdError> {
+        let s = value.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
+    }
+
+    fn validate(s: &str) -> Result<(), LaneIdError> {
+        if s.is_empty() {
+            return Err(LaneIdError::Empty);
+        }
+        if s.len() > LANE_ID_MAX_BYTES {
+            return Err(LaneIdError::TooLong(s.len()));
+        }
+        if let Some((idx, _)) = s.bytes().enumerate().find(|(_, b)| !(0x20..=0x7e).contains(b)) {
+            return Err(LaneIdError::NonPrintable(idx));
+        }
+        Ok(())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LaneId {
+    /// Deserialises from a JSON string; validates via [`LaneId::try_new`]
+    /// so malformed ingress lanes fail at the parse boundary instead of
+    /// downstream in the partitioner.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::try_new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl From<&str> for LaneId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for LaneId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
 }
 
 string_id! {
@@ -354,11 +563,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uuid_id_display_roundtrip() {
-        let eid = ExecutionId::new();
+    fn execution_id_display_roundtrip() {
+        // Post-RFC-011: ExecutionId has no ::new(); round-trip via for_flow.
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let s = eid.to_string();
         let parsed = ExecutionId::parse(&s).unwrap();
         assert_eq!(eid, parsed);
+    }
+
+    #[test]
+    fn uuid_id_display_roundtrip() {
+        // Non-ExecutionId uuid_id! types still round-trip via ::new().
+        let fid = FlowId::new();
+        let s = fid.to_string();
+        let parsed = FlowId::parse(&s).unwrap();
+        assert_eq!(fid, parsed);
     }
 
     #[test]
@@ -385,11 +605,20 @@ mod tests {
     }
 
     #[test]
-    fn uuid_id_serde_roundtrip() {
-        let eid = ExecutionId::new();
+    fn execution_id_serde_roundtrip() {
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let json = serde_json::to_string(&eid).unwrap();
         let parsed: ExecutionId = serde_json::from_str(&json).unwrap();
         assert_eq!(eid, parsed);
+    }
+
+    #[test]
+    fn uuid_id_serde_roundtrip() {
+        let fid = FlowId::new();
+        let json = serde_json::to_string(&fid).unwrap();
+        let parsed: FlowId = serde_json::from_str(&json).unwrap();
+        assert_eq!(fid, parsed);
     }
 
     #[test]
@@ -398,5 +627,88 @@ mod tests {
         let json = serde_json::to_string(&lane).unwrap();
         let parsed: LaneId = serde_json::from_str(&json).unwrap();
         assert_eq!(lane, parsed);
+    }
+
+    // ── LaneId validation (RFC-011 §9.15) ──
+
+    #[test]
+    fn lane_id_try_new_accepts_valid() {
+        assert!(LaneId::try_new("default").is_ok());
+        assert!(LaneId::try_new("worker-pool-1").is_ok());
+        assert!(LaneId::try_new("a").is_ok());
+        // Exactly max length
+        let max = "a".repeat(LANE_ID_MAX_BYTES);
+        assert!(LaneId::try_new(max).is_ok());
+    }
+
+    #[test]
+    fn lane_id_try_new_rejects_empty() {
+        assert_eq!(LaneId::try_new(""), Err(LaneIdError::Empty));
+    }
+
+    #[test]
+    fn lane_id_try_new_rejects_too_long() {
+        let over = "a".repeat(LANE_ID_MAX_BYTES + 1);
+        match LaneId::try_new(over) {
+            Err(LaneIdError::TooLong(n)) => assert_eq!(n, LANE_ID_MAX_BYTES + 1),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_id_try_new_rejects_non_ascii_printable() {
+        // Control character
+        match LaneId::try_new("bad\nlane") {
+            Err(LaneIdError::NonPrintable(3)) => {}
+            other => panic!("expected NonPrintable(3), got {other:?}"),
+        }
+        // Non-ASCII (multi-byte UTF-8)
+        match LaneId::try_new("lane\u{00e9}") {
+            Err(LaneIdError::NonPrintable(_)) => {}
+            other => panic!("expected NonPrintable, got {other:?}"),
+        }
+        // NUL byte
+        match LaneId::try_new("lane\0x") {
+            Err(LaneIdError::NonPrintable(4)) => {}
+            other => panic!("expected NonPrintable(4), got {other:?}"),
+        }
+        // Tab (below printable range)
+        match LaneId::try_new("\tlane") {
+            Err(LaneIdError::NonPrintable(0)) => {}
+            other => panic!("expected NonPrintable(0), got {other:?}"),
+        }
+        // DEL (0x7f, just above printable range)
+        match LaneId::try_new("la\u{007f}ne") {
+            Err(LaneIdError::NonPrintable(2)) => {}
+            other => panic!("expected NonPrintable(2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_id_new_is_infallible_for_hardcoded_names() {
+        // Hardcoded internal names use ::new (no validation).
+        // This test documents the contract that ::new does NOT validate.
+        let _ = LaneId::new("default");
+        let _ = LaneId::new("test-fixture");
+    }
+
+    #[test]
+    fn lane_id_deserialize_rejects_malformed() {
+        // Empty string via JSON
+        let e: Result<LaneId, _> = serde_json::from_str(r#""""#);
+        assert!(e.is_err(), "empty string must fail Deserialize");
+        // Over-length via JSON
+        let over = format!(r#""{}""#, "a".repeat(LANE_ID_MAX_BYTES + 1));
+        let e: Result<LaneId, _> = serde_json::from_str(&over);
+        assert!(e.is_err(), "over-length must fail Deserialize");
+        // Control char via JSON
+        let e: Result<LaneId, _> = serde_json::from_str(r#""bad\nlane""#);
+        assert!(e.is_err(), "newline must fail Deserialize");
+    }
+
+    #[test]
+    fn lane_id_deserialize_accepts_valid() {
+        let parsed: LaneId = serde_json::from_str(r#""default""#).unwrap();
+        assert_eq!(parsed, LaneId::new("default"));
     }
 }

@@ -612,7 +612,7 @@ async fn test_create_claim_complete_lifecycle() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     // 1. Create execution
@@ -712,7 +712,7 @@ async fn test_create_cancel_from_waiting() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create
     fcall_create_execution(&tc, &eid, NS, LANE, "cancel_test", 0).await;
@@ -748,7 +748,7 @@ async fn test_create_claim_cancel_from_active() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "active_cancel", 0).await;
@@ -787,7 +787,7 @@ async fn test_delay_execution() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "delay_test", 0).await;
@@ -837,7 +837,7 @@ async fn test_change_priority() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     // Create with priority 0
@@ -1162,7 +1162,7 @@ async fn test_fail_with_retry() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create with a retry policy (max_retries=3, fixed 10ms backoff for fast test)
     let policy_json = r#"{"retry_policy":{"max_retries":3,"backoff":{"type":"fixed","delay_ms":10},"retryable_categories":[]}}"#;
@@ -1252,7 +1252,7 @@ async fn test_fail_terminal() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim (no retry policy)
     fcall_create_execution(&tc, &eid, NS, LANE, "terminal_fail", 0).await;
@@ -1290,7 +1290,7 @@ async fn test_reclaim_expired_lease() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim with very short TTL (100ms)
     fcall_create_execution(&tc, &eid, NS, LANE, "reclaim_test", 0).await;
@@ -1353,7 +1353,7 @@ async fn test_expire_execution() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "expire_test", 0).await;
@@ -1929,7 +1929,7 @@ async fn test_suspend_and_signal_resume() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // 1. Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "suspend_test", 0).await;
@@ -2027,7 +2027,7 @@ async fn test_suspend_timeout_fail() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "timeout_fail", 0).await;
@@ -2065,7 +2065,7 @@ async fn test_suspend_timeout_auto_resume() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "timeout_resume", 0).await;
@@ -2105,7 +2105,7 @@ async fn test_pending_waitpoint_with_buffered_signal() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim
     fcall_create_execution(&tc, &eid, NS, LANE, "pending_wp_test", 0).await;
@@ -2211,7 +2211,7 @@ async fn test_signal_idempotency() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim + suspend
     fcall_create_execution(&tc, &eid, NS, LANE, "idem_test", 0).await;
@@ -2314,7 +2314,7 @@ async fn test_cancel_suspended_execution() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim + suspend
     fcall_create_execution(&tc, &eid, NS, LANE, "cancel_susp", 0).await;
@@ -2491,7 +2491,7 @@ async fn test_append_frame_during_execution() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     // Create + claim
@@ -2549,7 +2549,7 @@ async fn test_append_frame_after_complete() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // Create + claim + complete
     fcall_create_execution(&tc, &eid, NS, LANE, "closed_stream", 0).await;
@@ -2587,7 +2587,7 @@ async fn test_stream_maxlen_trimming() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     // Create + claim
@@ -2953,7 +2953,7 @@ async fn test_block_and_unblock() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     // Create execution (eligible)
@@ -3030,7 +3030,7 @@ async fn test_block_and_unblock() {
 
     // ── Stale unblock rejection: wrong expected_blocking_reason ──
     // Create another execution and block it for quota
-    let eid2 = ExecutionId::new();
+    let eid2 = tc.new_execution_id();
     fcall_create_execution(&tc, &eid2, NS, LANE, "stale_unblock", 0).await;
 
     let partition2 = execution_partition(&eid2, &config);
@@ -3106,7 +3106,7 @@ async fn test_quota_admission() {
     fcall_create_quota_policy(&tc, policy_id, 1, 2, 0).await;
 
     // Admit execution 1 → ADMITTED
-    let eid1 = ExecutionId::new();
+    let eid1 = tc.new_execution_id();
     let guard1 = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid1);
     let now1 = TimestampMs::now();
     let keys1: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard1, admitted_set_key.clone()];
@@ -3123,7 +3123,7 @@ async fn test_quota_admission() {
     assert_eq!(result1, "ADMITTED");
 
     // Admit execution 2 → ADMITTED
-    let eid2 = ExecutionId::new();
+    let eid2 = tc.new_execution_id();
     let guard2 = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid2);
     let now2 = TimestampMs::now();
     let keys2: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard2, admitted_set_key.clone()];
@@ -3139,7 +3139,7 @@ async fn test_quota_admission() {
     assert_eq!(parse_admission_result(&raw2), "ADMITTED");
 
     // Admit execution 3 → RATE_EXCEEDED (limit=2 per 1s window)
-    let eid3 = ExecutionId::new();
+    let eid3 = tc.new_execution_id();
     let guard3 = format!("ff:quota:{{q:0}}:{policy_id}:admitted:{}", eid3);
     let now3 = TimestampMs::now();
     let keys3: Vec<String> = vec![window_key.clone(), concurrency_key.clone(), def_key.clone(), guard3, admitted_set_key.clone()];
@@ -3355,9 +3355,9 @@ async fn test_flow_linear_chain() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-chain";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_bc = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "chain_a", 0).await;
@@ -3405,9 +3405,9 @@ async fn test_flow_fan_out() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-fanout";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_ac = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fo_a", 0).await;
@@ -3432,9 +3432,9 @@ async fn test_flow_dependency_failure_propagation() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-fail";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_bc = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fp_a", 0).await;
@@ -3471,8 +3471,8 @@ async fn test_flow_resolve_idempotency() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-idem";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "ri_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "ri_b", 0).await;
@@ -3495,8 +3495,8 @@ async fn test_flow_with_execution_lifecycle() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-full";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fl_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "fl_b", 0).await;
@@ -3532,8 +3532,8 @@ async fn test_flow_replay_after_skip() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-replay";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     let config = test_config();
 
@@ -3623,7 +3623,7 @@ async fn test_priority_clamp_and_ordering() {
     tc.cleanup().await;
 
     // Create execution with priority=10000 (should be clamped to 9000)
-    let high = ExecutionId::new();
+    let high = tc.new_execution_id();
     let (_, _) = fcall_create_execution(
         &tc, &high, "ns_prio", "default", "clamp_test", 10000,
     ).await;
@@ -3641,7 +3641,7 @@ async fn test_priority_clamp_and_ordering() {
     );
 
     // Create execution with priority=-5 (should be clamped to 0)
-    let neg = ExecutionId::new();
+    let neg = tc.new_execution_id();
     let (_, _) = fcall_create_execution(
         &tc, &neg, "ns_prio", "default", "clamp_test", -5,
     ).await;
@@ -3657,7 +3657,7 @@ async fn test_priority_clamp_and_ordering() {
     );
 
     // Create execution with priority=50 (should be stored as-is)
-    let low = ExecutionId::new();
+    let low = tc.new_execution_id();
     let (_, _) = fcall_create_execution(
         &tc, &low, "ns_prio", "default", "clamp_test", 50,
     ).await;
@@ -3726,8 +3726,6 @@ async fn test_max_concurrent_tasks_enforcement() {
     let config_key = "ff:config:partitions";
     let _: () = tc.client().cmd("HSET")
         .arg(config_key)
-        .arg("num_execution_partitions")
-        .arg(config.num_execution_partitions.to_string().as_str())
         .arg("num_flow_partitions")
         .arg(config.num_flow_partitions.to_string().as_str())
         .arg("num_budget_partitions")
@@ -3739,7 +3737,7 @@ async fn test_max_concurrent_tasks_enforcement() {
         .unwrap();
 
     // Create 3 eligible executions via raw FCALL
-    let eids: Vec<ExecutionId> = (0..3).map(|_| ExecutionId::new()).collect();
+    let eids: Vec<ExecutionId> = (0..3).map(|_| tc.new_execution_id()).collect();
     for eid in &eids {
         fcall_create_execution(&tc, eid, NS, LANE, "concurrency_test", 0).await;
     }
@@ -3802,7 +3800,7 @@ async fn test_execution_deadline_expire_runnable() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
@@ -3912,7 +3910,7 @@ async fn test_error_paths() {
     let config = test_config();
 
     // ── 1. Claim grant on nonexistent execution → execution_not_found ──
-    let fake_eid = ExecutionId::new();
+    let fake_eid = tc.new_execution_id();
     let partition = execution_partition(&fake_eid, &config);
     let ctx = ExecKeyContext::new(&partition, &fake_eid);
     let idx = IndexKeys::new(&partition);
@@ -3943,7 +3941,7 @@ async fn test_error_paths() {
     assert_err(&raw, "execution_not_found", "ff_issue_claim_grant on nonexistent");
 
     // ── 2. Complete with wrong lease_id → stale_lease ──
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "error_test", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
     let (lease_id, epoch, _att_idx, attempt_id) =
@@ -3986,7 +3984,7 @@ async fn test_error_paths() {
     fcall_complete_execution(&tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &attempt_id).await;
 
     // ── 3. Create with duplicate dedup key → DUPLICATE ──
-    let eid3 = ExecutionId::new();
+    let eid3 = tc.new_execution_id();
     let partition3 = execution_partition(&eid3, &config);
     let ctx3 = ExecKeyContext::new(&partition3, &eid3);
     let idx3 = IndexKeys::new(&partition3);
@@ -4036,7 +4034,7 @@ async fn test_error_paths() {
     assert_eq!(dup_status, "DUPLICATE", "second create should return DUPLICATE");
 
     // ── 4. Fail with max retries exhausted → terminal_failed ──
-    let eid4 = ExecutionId::new();
+    let eid4 = tc.new_execution_id();
     // Create with a retry policy that has max_retries=0
     fcall_create_execution(&tc, &eid4, NS, LANE, "retry_test", 0).await;
 
@@ -4132,9 +4130,9 @@ async fn test_scheduler_claim_priority_ordering() {
         let mut mid;
         let mut high;
         loop {
-            low = ExecutionId::new();
-            mid = ExecutionId::new();
-            high = ExecutionId::new();
+            low = tc.new_execution_id();
+            mid = tc.new_execution_id();
+            high = tc.new_execution_id();
             let p_low = ff_core::partition::execution_partition(&low, &config);
             let p_mid = ff_core::partition::execution_partition(&mid, &config);
             let p_high = ff_core::partition::execution_partition(&high, &config);
@@ -4237,7 +4235,7 @@ async fn test_claim_from_grant_via_scheduler() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "claim_from_grant_test", 500).await;
 
     // Issue grant via the Scheduler — not via raw FCALL — so the
@@ -4317,8 +4315,8 @@ async fn test_claim_from_grant_rejects_at_capacity() {
     let (eid_a, eid_b) = {
         let config = test_config();
         loop {
-            let a = ExecutionId::new();
-            let b = ExecutionId::new();
+            let a = tc.new_execution_id();
+            let b = tc.new_execution_id();
             let pa = ff_core::partition::execution_partition(&a, &config);
             let pb = ff_core::partition::execution_partition(&b, &config);
             if pa.index == pb.index {
@@ -4522,7 +4520,7 @@ async fn test_stream_payload_size_enforcement() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_size_test", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
     let (lease_id, epoch, att_idx, attempt_id) =
@@ -4582,17 +4580,17 @@ async fn test_quota_concurrency_enforcement() {
     fcall_create_quota_policy(&tc, policy_id, 60, 0, 2).await;
 
     // Admit E1 → ADMITTED (concurrency_cap=2, no rate limit)
-    let e1 = ExecutionId::new();
+    let e1 = tc.new_execution_id();
     let r1 = fcall_admit(&tc, policy_id, &e1, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r1, "ADMITTED");
 
     // Admit E2 → ADMITTED
-    let e2 = ExecutionId::new();
+    let e2 = tc.new_execution_id();
     let r2 = fcall_admit(&tc, policy_id, &e2, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r2, "ADMITTED");
 
     // Admit E3 → CONCURRENCY_EXCEEDED
-    let e3 = ExecutionId::new();
+    let e3 = tc.new_execution_id();
     let r3 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r3, "CONCURRENCY_EXCEEDED", "3rd admission should be rejected (cap=2)");
 
@@ -4642,7 +4640,7 @@ async fn test_golden_path_all_methods() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
@@ -4821,9 +4819,9 @@ async fn test_flow_full_lifecycle_with_staging() {
     tc.cleanup().await;
 
     let fid = "flow-r7";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_bc = uuid::Uuid::new_v4().to_string();
     let lane_id = LaneId::new(LANE);
@@ -4905,14 +4903,13 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
     let config_key = "ff:config:partitions";
     let _: () = tc.client().cmd("HSET")
         .arg(config_key)
-        .arg("num_execution_partitions").arg(config.num_execution_partitions.to_string().as_str())
         .arg("num_flow_partitions").arg(config.num_flow_partitions.to_string().as_str())
         .arg("num_budget_partitions").arg(config.num_budget_partitions.to_string().as_str())
         .arg("num_quota_partitions").arg(config.num_quota_partitions.to_string().as_str())
         .execute().await.unwrap();
 
     // Create an execution via raw FCALL
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "sdk_suspend_test", 0).await;
 
     // Build SDK worker
@@ -5036,8 +5033,8 @@ async fn test_quota_reconciler_self_healing() {
     fcall_create_quota_policy(&tc, policy_id, 60, 0, 2).await;
 
     // Admit E1 and E2
-    let e1 = ExecutionId::new();
-    let e2 = ExecutionId::new();
+    let e1 = tc.new_execution_id();
+    let e2 = tc.new_execution_id();
     let r1 = fcall_admit(&tc, policy_id, &e1, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r1, "ADMITTED");
     let r2 = fcall_admit(&tc, policy_id, &e2, &window_key, &concurrency_key, &def_key).await;
@@ -5059,7 +5056,7 @@ async fn test_quota_reconciler_self_healing() {
     assert_eq!(corrupted.as_deref(), Some("5"), "counter should be corrupted to 5");
 
     // Verify 3rd admission is rejected (counter=5 >= cap=2)
-    let e3 = ExecutionId::new();
+    let e3 = tc.new_execution_id();
     let r3 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r3, "CONCURRENCY_EXCEEDED", "should be rejected with corrupted counter");
 
@@ -5097,8 +5094,6 @@ async fn test_sdk_all_methods_smoke() {
     let config_key = "ff:config:partitions";
     let _: () = tc.client().cmd("HSET")
         .arg(config_key)
-        .arg("num_execution_partitions")
-        .arg(config.num_execution_partitions.to_string().as_str())
         .arg("num_flow_partitions")
         .arg(config.num_flow_partitions.to_string().as_str())
         .arg("num_budget_partitions")
@@ -5126,7 +5121,7 @@ async fn test_sdk_all_methods_smoke() {
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
     // ── Test 1: update_progress + append_frame + complete (happy path) ──
-    let eid1 = ExecutionId::new();
+    let eid1 = tc.new_execution_id();
     fcall_create_execution(&tc, &eid1, NS, LANE, "sdk_smoke_1", 0).await;
     let task1 = worker.claim_next().await.unwrap().expect("should claim eid1");
 
@@ -5153,7 +5148,7 @@ async fn test_sdk_all_methods_smoke() {
     }).await;
 
     // ── Test 2: fail() via SDK → terminal ──
-    let eid2 = ExecutionId::new();
+    let eid2 = tc.new_execution_id();
     fcall_create_execution(&tc, &eid2, NS, LANE, "sdk_smoke_2", 0).await;
     let task2 = worker.claim_next().await.unwrap().expect("should claim eid2");
 
@@ -5167,7 +5162,7 @@ async fn test_sdk_all_methods_smoke() {
     }).await;
 
     // ── Test 3: cancel() via SDK ──
-    let eid3 = ExecutionId::new();
+    let eid3 = tc.new_execution_id();
     fcall_create_execution(&tc, &eid3, NS, LANE, "sdk_smoke_3", 0).await;
     let task3 = worker.claim_next().await.unwrap().expect("should claim eid3");
 
@@ -5191,8 +5186,6 @@ async fn test_sdk_claim_retry_attempt_index() {
     let config = test_config();
     let _: () = tc.client().cmd("HSET")
         .arg("ff:config:partitions")
-        .arg("num_execution_partitions")
-        .arg(config.num_execution_partitions.to_string().as_str())
         .arg("num_flow_partitions")
         .arg(config.num_flow_partitions.to_string().as_str())
         .arg("num_budget_partitions")
@@ -5220,7 +5213,7 @@ async fn test_sdk_claim_retry_attempt_index() {
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
     // Create execution with retry policy
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "retry_idx_test", 0).await;
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
@@ -5383,17 +5376,17 @@ async fn test_quota_create_and_enforce() {
 
     // Admit E1 → ADMITTED
     let window_key = format!("ff:quota:{{q:0}}:{policy_id}:window:requests");
-    let e1 = ExecutionId::new();
+    let e1 = tc.new_execution_id();
     let r1 = fcall_admit(&tc, policy_id, &e1, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r1, "ADMITTED");
 
     // Admit E2 → ADMITTED
-    let e2 = ExecutionId::new();
+    let e2 = tc.new_execution_id();
     let r2 = fcall_admit(&tc, policy_id, &e2, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r2, "ADMITTED");
 
     // Admit E3 → CONCURRENCY_EXCEEDED
-    let e3 = ExecutionId::new();
+    let e3 = tc.new_execution_id();
     let r3 = fcall_admit(&tc, policy_id, &e3, &window_key, &concurrency_key, &def_key).await;
     assert_eq!(r3, "CONCURRENCY_EXCEEDED", "3rd should be rejected (cap=2)");
 }
@@ -5434,9 +5427,9 @@ async fn test_flow_create_and_membership() {
     tc.cleanup().await;
 
     let fid = "flow-create-test";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
 
     // Create flow
     let result = fcall_create_flow(&tc, fid).await;
@@ -5527,8 +5520,8 @@ async fn test_flow_index_self_heal_on_add() {
     tc.cleanup().await;
 
     let fid = "flow-heal-test";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
     let flow_index_key = "ff:idx:{fp:0}:flow_index";
 
     // 1. Create flow + add one member
@@ -5585,7 +5578,7 @@ async fn test_flow_index_self_heal_on_add() {
         format!("{prefix}:members"),
         flow_index_key.to_string(),
     ];
-    let c = ExecutionId::new();
+    let c = tc.new_execution_id();
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
         fid.to_owned(), c.to_string(), now.to_string(),
@@ -5620,9 +5613,9 @@ async fn test_flow_cancel() {
     tc.cleanup().await;
 
     let fid = "flow-cancel-test";
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
 
     // Create flow and add 3 members
     fcall_create_flow(&tc, fid).await;
@@ -5809,7 +5802,7 @@ async fn test_server_create_quota() {
     assert_eq!(stored_window.as_deref(), Some("60"), "window should be 60s");
 
     // Verify admission works against the policy we created
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let guard_key = qctx.admitted(&eid);
     let admit_keys: Vec<String> = vec![
         qctx.window("requests_per_window"),
@@ -5908,8 +5901,8 @@ async fn test_server_flow_lifecycle() {
     );
 
     // 2. Create 2 executions
-    let upstream = ExecutionId::new();
-    let downstream = ExecutionId::new();
+    let upstream = tc.new_execution_id();
+    let downstream = tc.new_execution_id();
     fcall_create_execution(&tc, &upstream, NS, LANE, "upstream_task", 0).await;
     fcall_create_execution(&tc, &downstream, NS, LANE, "downstream_task", 0).await;
 
@@ -6051,7 +6044,7 @@ async fn test_server_deliver_signal() {
     let server = test_server().await;
 
     // 1. Create and claim
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "signal_test", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
     let (lease_id, lease_epoch, _, attempt_id) =
@@ -6123,7 +6116,7 @@ async fn test_server_change_priority() {
     tc.cleanup().await;
     let server = test_server().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "prio_test", 100).await;
 
     // Verify initial priority
@@ -6155,7 +6148,7 @@ async fn test_server_get_execution() {
     tc.cleanup().await;
     let server = test_server().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "get_test", 42).await;
 
     let info = server.get_execution(&eid).await.unwrap();
@@ -6177,7 +6170,7 @@ async fn test_server_get_execution() {
     assert!(!info.created_at.is_empty(), "created_at should be set");
 
     // Verify not-found
-    let missing = ExecutionId::new();
+    let missing = tc.new_execution_id();
     let err = server.get_execution(&missing).await;
     assert!(err.is_err(), "non-existent execution should error");
 
@@ -6193,7 +6186,7 @@ async fn test_server_replay() {
     let server = test_server().await;
 
     // Create, claim, complete
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "replay_test", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
     let (lid, lep, _, aid) =
@@ -6235,7 +6228,7 @@ async fn test_server_methods_wrong_execution_id() {
     tc.cleanup().await;
     let server = test_server().await;
 
-    let bogus = ExecutionId::new(); // never created
+    let bogus = tc.new_execution_id(); // never created
 
     // get_execution → execution not found
     let err = server.get_execution(&bogus).await;
@@ -6302,7 +6295,7 @@ async fn test_server_get_execution_all_phases() {
     tc.cleanup().await;
     let server = test_server().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "phase_test", 50).await;
 
     // Phase 1: RUNNABLE
@@ -6433,12 +6426,12 @@ async fn test_quota_create_admit_reconcile_cycle() {
     let window_key = format!("ff:quota:{{q:0}}:{pid}:window:requests");
     let def_key = format!("ff:quota:{{q:0}}:{pid}");
 
-    let e1 = ExecutionId::new();
-    let e2 = ExecutionId::new();
+    let e1 = tc.new_execution_id();
+    let e2 = tc.new_execution_id();
     assert_eq!(fcall_admit(&tc, pid, &e1, &window_key, &conc_key, &def_key).await, "ADMITTED");
     assert_eq!(fcall_admit(&tc, pid, &e2, &window_key, &conc_key, &def_key).await, "ADMITTED");
 
-    let e3 = ExecutionId::new();
+    let e3 = tc.new_execution_id();
     assert_eq!(fcall_admit(&tc, pid, &e3, &window_key, &conc_key, &def_key).await, "CONCURRENCY_EXCEEDED");
 
     let _: () = tc.client().cmd("SET").arg(&conc_key).arg("5").execute().await.unwrap();
@@ -6529,9 +6522,9 @@ async fn test_server_full_flow_lifecycle() {
     let config = test_config();
     let now = TimestampMs::now();
 
-    let a = ExecutionId::new();
-    let b = ExecutionId::new();
-    let c = ExecutionId::new();
+    let a = tc.new_execution_id();
+    let b = tc.new_execution_id();
+    let c = tc.new_execution_id();
     for (eid, kind) in [(&a, "step_a"), (&b, "step_b"), (&c, "step_c")] {
         server.create_execution(&CreateExecutionArgs {
             execution_id: eid.clone(), namespace: Namespace::new(NS),
@@ -6620,7 +6613,7 @@ async fn test_cancel_empty_flow_then_add_member() {
         cancellation_policy: "cancel_all".to_owned(), now,
     }).await.expect("cancel empty flow");
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "late_add", 0).await;
     let add_result = server.add_execution_to_flow(&AddExecutionToFlowArgs {
         flow_id: flow_id.clone(), execution_id: eid.clone(), now,
@@ -6646,7 +6639,7 @@ async fn test_server_create_cancel_roundtrip() {
     let now = TimestampMs::now();
 
     // Create execution via Server
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     server.create_execution(&CreateExecutionArgs {
         execution_id: eid.clone(), namespace: Namespace::new(NS),
         lane_id: LaneId::new(LANE), execution_kind: "roundtrip_task".to_owned(),
@@ -6764,7 +6757,7 @@ async fn test_system_engine_with_concurrent_scanners() {
         .expect("Server::start with 14 scanners");
 
     // 1. Create a DELAYED execution (delay_until = 50ms from now)
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
     let idx = IndexKeys::new(&partition);
@@ -6963,7 +6956,7 @@ async fn assert_still_eligible(tc: &TestCluster, eid: &ExecutionId, lane: &str) 
 async fn test_capability_match_superset() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
     let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu", "cuda"]).await;
     assert_ok(&raw, "capability_match_superset");
@@ -6974,7 +6967,7 @@ async fn test_capability_match_superset() {
 async fn test_capability_exact_match() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
     let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu"]).await;
     assert_ok(&raw, "capability_exact_match");
@@ -6987,7 +6980,7 @@ async fn test_capability_empty_requirement() {
     // including a worker with NO caps declared.
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     create_execution_with_caps(&tc, &eid, LANE, &[]).await;
     let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &[]).await;
     assert_ok(&raw, "capability_empty_requirement");
@@ -7000,7 +6993,7 @@ async fn test_capability_missing_one() {
     // Execution must stay in eligible ZSET.
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     create_execution_with_caps(&tc, &eid, LANE, &["gpu", "torch>=2.3"]).await;
     let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["gpu"]).await;
     assert_err(&raw, "capability_mismatch", "missing one required cap");
@@ -7012,7 +7005,7 @@ async fn test_capability_missing_one() {
 async fn test_capability_no_overlap() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
     let raw = fcall_claim_grant_with_caps(&tc, &eid, LANE, &["cpu"]).await;
     assert_err(&raw, "capability_mismatch", "no overlap");
@@ -7030,7 +7023,7 @@ async fn test_capability_required_comma_rejected() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
@@ -7097,7 +7090,7 @@ async fn test_capability_required_csv_too_large() {
     }
     let caps_refs: Vec<&str> = caps.iter().map(String::as_str).collect();
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
@@ -7154,7 +7147,7 @@ async fn test_capability_reclaim_grant_mismatch() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     // Create with required cap {gpu} and get the execution into
     // lease_expired_reclaimable state.
     create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
@@ -7224,7 +7217,7 @@ async fn test_read_stream_round_trips_append_frame_fields() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_read_rt", 0).await;
@@ -7276,7 +7269,7 @@ async fn test_read_stream_empty_returns_empty() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     let result = ff_sdk::read_stream(
@@ -7301,7 +7294,7 @@ async fn test_read_stream_slice_and_resume() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_slice", 0).await;
@@ -7344,7 +7337,7 @@ async fn test_tail_stream_timeout_returns_empty() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     let started = std::time::Instant::now();
@@ -7376,7 +7369,7 @@ async fn test_tail_stream_unblocks_on_write() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_tail", 0).await;
@@ -7429,7 +7422,7 @@ async fn test_tail_stream_long_block_respects_ferriskey_timeout_extension() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     let started = std::time::Instant::now();
@@ -7468,7 +7461,7 @@ async fn test_stream_closed_signal_propagates_to_read_and_tail() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_closed", 0).await;
@@ -7516,7 +7509,7 @@ async fn test_lease_expired_closes_stream_meta() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_lease_expire", 0).await;
@@ -7560,7 +7553,7 @@ async fn test_tail_stream_no_block_returns_available() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_peek", 0).await;
@@ -7606,7 +7599,7 @@ async fn test_read_stream_rejects_zero_count_limit() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     let err = ff_sdk::read_stream(
@@ -7634,7 +7627,7 @@ async fn test_tail_stream_rejects_zero_count_limit() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
 
     let err = ff_sdk::tail_stream(
@@ -7668,7 +7661,7 @@ async fn test_read_stream_rejects_over_hard_cap_at_lua() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let config = test_config();
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
@@ -7783,7 +7776,7 @@ async fn test_capability_malformed_policy_json_fails_closed() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let raw = fcall_create_execution_with_raw_policy(
         &tc,
         &eid,
@@ -7842,7 +7835,7 @@ async fn test_capability_non_string_token_fails_closed() {
         ),
     ];
     for (policy_json, label) in cases {
-        let eid = ExecutionId::new();
+        let eid = tc.new_execution_id();
         let raw = fcall_create_execution_with_raw_policy(&tc, &eid, LANE, policy_json).await;
         assert_err(&raw, "invalid_capabilities", label);
     }
@@ -7863,7 +7856,7 @@ async fn test_capability_mismatch_blocks_to_route_zset() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     create_execution_with_caps(&tc, &eid, LANE, &["gpu"]).await;
 
     let config = test_config();
@@ -7954,7 +7947,7 @@ async fn test_capable_worker_unblocks_route_blocked() {
 
     let config = test_config();
     let lane_id = LaneId::new(LANE);
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // 1. Create execution with required caps {gpu}; block it via a
     //    mismatched scheduler claim.
@@ -8069,7 +8062,7 @@ async fn test_capability_required_control_or_whitespace_rejected() {
         ),
     ];
     for (policy_json, label) in cases {
-        let eid = ExecutionId::new();
+        let eid = tc.new_execution_id();
         let raw = fcall_create_execution_with_raw_policy(&tc, &eid, LANE, policy_json).await;
         assert_err(&raw, "invalid_capabilities", label);
     }
@@ -8098,7 +8091,7 @@ async fn test_capable_worker_unblocks_on_get_error_failopen() {
 
     let config = test_config();
     let lane_id = LaneId::new(LANE);
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
 
     // 1. Create execution with required caps {gpu}; block it via a
     //    mismatched scheduler claim.
@@ -8182,8 +8175,6 @@ async fn write_test_partition_config(tc: &TestCluster) {
     let config = test_config();
     let _: () = tc.client().cmd("HSET")
         .arg("ff:config:partitions")
-        .arg("num_execution_partitions")
-        .arg(config.num_execution_partitions.to_string().as_str())
         .arg("num_flow_partitions")
         .arg(config.num_flow_partitions.to_string().as_str())
         .arg("num_budget_partitions")
@@ -8320,7 +8311,7 @@ async fn test_claim_from_reclaim_grant_happy_path() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     // Long TTL so there's no race with the HGET / FlowFabricWorker
     // construction below.
     let grant = suspend_resume_setup_with_grant(
@@ -8362,7 +8353,7 @@ async fn test_claim_from_reclaim_grant_immediate_control() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     // Short TTL — same knob the expiry test uses. No sleep here, so
     // the grant is still fresh when claimed.
     let grant = suspend_resume_setup_with_grant(
@@ -8388,7 +8379,7 @@ async fn test_claim_from_reclaim_grant_expired() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     // 200 ms TTL — small enough to wait out cheaply, large enough that
     // the setup FCALLs finish well inside it.
     let grant = suspend_resume_setup_with_grant(
@@ -8424,7 +8415,7 @@ async fn test_claim_from_reclaim_grant_wrong_worker() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     // Grant issued for "worker-a".
     let grant = suspend_resume_setup_with_grant(
         &tc, &eid, 30_000, "worker-a", "worker-a-inst",
@@ -8450,7 +8441,7 @@ async fn test_claim_from_reclaim_grant_not_resumed() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     fcall_create_execution(&tc, &eid, NS, LANE, "not_resumed_test", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
     // DO NOT suspend + deliver_signal. Execution is in ClaimGrant state
@@ -8496,7 +8487,7 @@ async fn test_claim_from_reclaim_grant_double_consume() {
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
 
-    let eid = ExecutionId::new();
+    let eid = tc.new_execution_id();
     let grant = suspend_resume_setup_with_grant(
         &tc, &eid, 30_000, WORKER, WORKER_INST,
     ).await;
@@ -8555,11 +8546,11 @@ async fn test_claim_from_reclaim_grant_rejects_at_capacity() {
     // reclaim grants to try against the same worker. Both use the
     // standard e2e worker identity so both grants are targeted at
     // the same worker_id.
-    let eid_a = ExecutionId::new();
+    let eid_a = tc.new_execution_id();
     let grant_a = suspend_resume_setup_with_grant(
         &tc, &eid_a, 30_000, WORKER, WORKER_INST,
     ).await;
-    let eid_b = ExecutionId::new();
+    let eid_b = tc.new_execution_id();
     let grant_b = suspend_resume_setup_with_grant(
         &tc, &eid_b, 30_000, WORKER, WORKER_INST,
     ).await;

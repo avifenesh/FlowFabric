@@ -66,8 +66,7 @@ impl ServerConfig {
     /// | `FF_CLUSTER` | `false` | Enable cluster mode (`1` or `true`) |
     /// | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
     /// | `FF_LANES` | `default` | Comma-separated lane names |
-    /// | `FF_EXEC_PARTITIONS` | `256` | Execution partition count |
-    /// | `FF_FLOW_PARTITIONS` | `64` | Flow partition count |
+    /// | `FF_FLOW_PARTITIONS` | `256` | Flow partition count — authoritative; under RFC-011 hash-tag co-location, exec keys also route here |
     /// | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
     /// | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
     /// | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins (`*` = permissive) |
@@ -161,8 +160,9 @@ impl ServerConfig {
         }
 
         let partition_config = PartitionConfig {
-            num_execution_partitions: env_u16_positive("FF_EXEC_PARTITIONS", 256)?,
-            num_flow_partitions: env_u16_positive("FF_FLOW_PARTITIONS", 64)?,
+            // RFC-011: num_execution_partitions retired; exec keys co-locate on
+            // {fp:N}. FF_FLOW_PARTITIONS is the canonical env var.
+            num_flow_partitions: env_u16_positive("FF_FLOW_PARTITIONS", 256)?,
             num_budget_partitions: env_u16_positive("FF_BUDGET_PARTITIONS", 32)?,
             num_quota_partitions: env_u16_positive("FF_QUOTA_PARTITIONS", 32)?,
         };

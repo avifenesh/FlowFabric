@@ -2679,7 +2679,7 @@ The scheduler is embedded in ff-server for v1. The `ff-scheduler` crate boundary
 
 **No leader election required for v1.** Duplicate scheduling work is wasted but not incorrect.
 
-**Partition configuration:** Partition counts (`num_execution_partitions`, `num_flow_partitions`, `num_budget_partitions`, `num_quota_partitions`) are stored in `ff:config:partitions` on Valkey. All processes (ff-server, workers) read this key on startup and reject if it mismatches local config. This prevents silent partition misconfiguration across restarts or deployments.
+**Partition configuration:** Partition counts (`num_flow_partitions`, `num_budget_partitions`, `num_quota_partitions`) are stored in `ff:config:partitions` on Valkey. All processes (ff-server, workers) read this key on startup and reject if it mismatches local config. This prevents silent partition misconfiguration across restarts or deployments. (`num_execution_partitions` was retired by RFC-011 §2 — execution keys co-locate with their parent flow's partition under hash-tag routing, so they share `num_flow_partitions` and do not need a separate count.)
 
 ### 8.4 Background Scanner Distribution
 

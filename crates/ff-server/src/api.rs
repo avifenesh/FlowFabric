@@ -318,7 +318,8 @@ async fn list_executions(
     State(server): State<Arc<Server>>,
     Query(params): Query<ListExecutionsParams>,
 ) -> Result<Json<ListExecutionsResult>, ApiError> {
-    let lane = ff_core::types::LaneId::new(&params.lane);
+    let lane = ff_core::types::LaneId::try_new(params.lane.clone())
+        .map_err(|e| ApiError::from(ServerError::InvalidInput(format!("invalid lane: {e}"))))?;
     let limit = params.limit.min(1000);
     let result = server
         .list_executions(params.partition, &lane, &params.state, params.offset, limit)
@@ -507,14 +508,14 @@ async fn rotate_waitpoint_secret(
     //   - all in_progress → concurrent rotation handling it, NOT a failure.
     //     200 OK with the structured result so operators see what's happening.
     //   - failed.is_empty() && in_progress.is_empty() → no partitions at all
-    //     (num_execution_partitions == 0; env_u16_positive rejects this at
+    //     (num_flow_partitions == 0; env_u16_positive rejects this at
     //     boot so this is mostly dead code for library/Default callers).
     //   - !failed.is_empty() → every partition attempt raised a real error.
     //     Operator investigates Valkey/auth/cluster health before retrying.
     if result.rotated == 0 && result.failed.is_empty() && result.in_progress.is_empty() {
         return Err(ApiError::from(ServerError::OperationFailed(
             "rotation had no partitions to operate on \
-             (num_execution_partitions is 0 — server misconfigured)"
+             (num_flow_partitions is 0 — server misconfigured)"
                 .to_owned(),
         )));
     }

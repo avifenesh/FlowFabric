@@ -837,6 +837,7 @@ dependencies = [
  "crc16",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 

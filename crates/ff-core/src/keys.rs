@@ -4,7 +4,14 @@ use crate::types::{
     WaitpointId, WaitpointKey, WorkerInstanceId,
 };
 
-// ─── Execution Partition Keys ({p:N}) ───
+// ─── Execution Partition Keys ({fp:N} post-RFC-011) ───
+//
+// NOTE: docstrings below still reference `{p:N}` as a historical shorthand.
+// Post-RFC-011 all exec-scoped keys hash-tag to `{fp:N}` (the parent flow's
+// partition), enabling atomic multi-key FCALLs across exec_core + flow_core.
+// The `Partition` type's `hash_tag()` method produces the correct `{fp:N}`
+// prefix; the docstring example paths are indicative of structure, not the
+// literal runtime hash-tag.
 
 /// Pre-computed key context for all keys on an execution's partition.
 /// Created once per operation and reused for all key construction.
@@ -617,12 +624,13 @@ mod tests {
     #[test]
     fn exec_key_context_core_format() {
         let config = PartitionConfig::default();
-        let eid = ExecutionId::parse("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let eid = ExecutionId::parse("{fp:0}:550e8400-e29b-41d4-a716-446655440000").unwrap();
         let partition = execution_partition(&eid, &config);
         let ctx = ExecKeyContext::new(&partition, &eid);
 
         let core_key = ctx.core();
-        assert!(core_key.starts_with("ff:exec:{p:"));
+        // Post-RFC-011: exec keys co-locate on flow partitions ({fp:*}).
+        assert!(core_key.starts_with("ff:exec:{fp:"));
         assert!(core_key.ends_with(":core"));
         assert!(core_key.contains("550e8400-e29b-41d4-a716-446655440000"));
     }
@@ -630,7 +638,7 @@ mod tests {
     #[test]
     fn exec_key_all_keys_share_hash_tag() {
         let config = PartitionConfig::default();
-        let eid = ExecutionId::new();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let partition = execution_partition(&eid, &config);
         let ctx = ExecKeyContext::new(&partition, &eid);
         let tag = ctx.hash_tag();
@@ -650,7 +658,7 @@ mod tests {
     #[test]
     fn attempt_key_includes_index() {
         let config = PartitionConfig::default();
-        let eid = ExecutionId::new();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let partition = execution_partition(&eid, &config);
         let ctx = ExecKeyContext::new(&partition, &eid);
 
@@ -661,19 +669,19 @@ mod tests {
     #[test]
     fn stream_key_format() {
         let config = PartitionConfig::default();
-        let eid = ExecutionId::new();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let partition = execution_partition(&eid, &config);
         let ctx = ExecKeyContext::new(&partition, &eid);
 
         let key = ctx.stream(AttemptIndex::new(0));
-        assert!(key.starts_with("ff:stream:{p:"));
+        assert!(key.starts_with("ff:stream:{fp:"));
         assert!(key.ends_with(":0"));
     }
 
     #[test]
     fn index_keys_format() {
         let config = PartitionConfig::default();
-        let eid = ExecutionId::new();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let partition = execution_partition(&eid, &config);
         let idx = IndexKeys::new(&partition);
         let lane = LaneId::new("default");
