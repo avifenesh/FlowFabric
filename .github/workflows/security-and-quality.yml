@@ -83,10 +83,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      # Pin to 1.92 — cargo-geiger 0.13.0 (latest release on crates.io,
+      # unmaintained) crashes on the newer-cargo resolver-v3 metadata
+      # walk, emitting "Failed to match (ignoring source) package: …"
+      # and no JSON. 1.92 is the last toolchain where the tool produces
+      # usable output against our workspace. When cargo-geiger ships a
+      # fix or we replace the ratchet with a grep-based check, bump.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+        with:
+          toolchain: "1.92"
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
         with:
-          key: geiger-v2
+          key: geiger-v3
       - name: Install cargo-geiger
         run: cargo install cargo-geiger --locked
       - name: Verify no crate's unsafe count exceeds the committed baseline
