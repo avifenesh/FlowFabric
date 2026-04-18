@@ -187,6 +187,58 @@ pub struct ClaimedTask {
 }
 
 impl ClaimedTask {
+    /// Construct a `ClaimedTask` from the results of a successful
+    /// `ff_claim_execution` or `ff_claim_resumed_execution` FCALL.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` — shared Valkey client used for subsequent lease
+    ///   renewals, signal delivery, and the final
+    ///   complete/fail/cancel FCALL.
+    /// * `partition_config` — partition topology snapshot read at
+    ///   `FlowFabricWorker::connect`. Used for key construction on
+    ///   the lifetime of this task.
+    /// * `execution_id` — the claimed execution's UUID.
+    /// * `attempt_index` / `attempt_id` — current attempt identity.
+    ///   `attempt_index` is 0 on a fresh claim, preserved on a
+    ///   resumed claim.
+    /// * `lease_id` / `lease_epoch` — lease identity. `lease_epoch`
+    ///   is returned by the Lua FCALL and bumped on each resumed
+    ///   claim.
+    /// * `lease_ttl_ms` — lease TTL used to schedule the background
+    ///   renewal task (renews at `lease_ttl_ms / 3`).
+    /// * `lane_id` — the lane the task was claimed on. Used for
+    ///   index key construction (`lane_active`, `lease_expiry`,
+    ///   etc.).
+    /// * `worker_instance_id` — this worker's identity. Used to
+    ///   resolve `worker_leases` index entries during renewal and
+    ///   completion.
+    /// * `input_payload` / `execution_kind` / `tags` — pre-read
+    ///   execution metadata, exposed via getters so the worker
+    ///   doesn't round-trip to Valkey to inspect what it just
+    ///   claimed.
+    ///
+    /// # Invariant: constructor is `pub(crate)` on purpose
+    ///
+    /// **External callers cannot construct a `ClaimedTask`** — only
+    /// the in-crate claim entry points (`claim_next`,
+    /// `claim_from_grant`, `claim_from_reclaim_grant`) may. This is
+    /// load-bearing: those entry points are the ONLY sites that
+    /// acquire a permit from the worker's concurrency semaphore
+    /// (via `FlowFabricWorker::concurrency_semaphore`) and attach
+    /// it through `ClaimedTask::set_concurrency_permit` before
+    /// returning the task. Promoting `new` to `pub` would let
+    /// consumers build tasks that bypass the concurrency contract
+    /// the worker's `max_concurrent_tasks` config advertises — the
+    /// returned task would run alongside other in-flight work
+    /// without debiting the permit bank, and the
+    /// complete/fail/cancel/drop path would have nothing to
+    /// release.
+    ///
+    /// If an external callsite genuinely needs to rehydrate a
+    /// task from saved FCALL results, the right answer is a new
+    /// `FlowFabricWorker` entry point that wraps `new` + acquires a
+    /// permit — not promoting this constructor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client: Client,
@@ -1164,9 +1216,9 @@ fn is_terminal_renewal_error(err: &ScriptError) -> bool {
 /// Exposed as `pub` so downstream SDKs that speak the same wire format
 /// — notably cairn-fabric's `budget_service::parse_spend_result` — can
 /// call this directly instead of re-implementing the parse. Keeping one
-/// parser paired with the producer (the Lua function in
-/// `lua/ff_report_usage_and_check.lua`) is the defence against silent
-/// format drift between producer and consumer.
+/// parser paired with the producer (the Lua function registered at
+/// `lua/budget.lua:99`, `ff_report_usage_and_check`) is the defence
+/// against silent format drift between producer and consumer.
 pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -1199,14 +1251,14 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
         "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
         "SOFT_BREACH" => {
             let dim = usage_field_str(arr, 2);
-            let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
-            let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
+            let current = parse_usage_u64(arr, 3, "SOFT_BREACH", "current_usage")?;
+            let limit = parse_usage_u64(arr, 4, "SOFT_BREACH", "soft_limit")?;
             Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
         }
         "HARD_BREACH" => {
             let dim = usage_field_str(arr, 2);
-            let current: u64 = usage_field_str(arr, 3).parse().unwrap_or(0);
-            let limit: u64 = usage_field_str(arr, 4).parse().unwrap_or(0);
+            let current = parse_usage_u64(arr, 3, "HARD_BREACH", "current_usage")?;
+            let limit = parse_usage_u64(arr, 4, "HARD_BREACH", "hard_limit")?;
             Ok(ReportUsageResult::HardBreach {
                 dimension: dim,
                 current_usage: current,
@@ -1225,6 +1277,60 @@ fn usage_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
         Some(Ok(Value::SimpleString(s))) => s.clone(),
         Some(Ok(Value::Int(n))) => n.to_string(),
         _ => String::new(),
+    }
+}
+
+/// Parse a required numeric usage field (u64) from the wire array at
+/// `index`. Returns `Err(ScriptError::Parse)` if the slot is missing,
+/// holds a non-string/non-int value, or contains a string that does
+/// not parse as u64.
+///
+/// Rationale: the Lua producer (`lua/budget.lua:99`,
+/// `ff_report_usage_and_check`) always emits
+/// `tostring(current_usage)` / `tostring(soft_or_hard_limit)` for
+/// SOFT_BREACH/HARD_BREACH, never an empty slot. A missing or
+/// non-numeric value here means the Lua and Rust sides drifted;
+/// silently coercing to `0` would surface drift as "zero-usage breach"
+/// — arithmetically correct but semantically nonsense. Fail loudly
+/// instead so drift shows up as a parse error at the first call site.
+fn parse_usage_u64(
+    arr: &[Result<Value, ferriskey::Error>],
+    index: usize,
+    sub_status: &str,
+    field_name: &str,
+) -> Result<u64, SdkError> {
+    match arr.get(index) {
+        Some(Ok(Value::Int(n))) => {
+            u64::try_from(*n).map_err(|_| {
+                SdkError::Script(ScriptError::Parse(format!(
+                    "ff_report_usage_and_check {sub_status}: {field_name} \
+                     (index {index}) negative int {n} cannot be u64"
+                )))
+            })
+        }
+        Some(Ok(Value::BulkString(b))) => {
+            let s = String::from_utf8_lossy(b);
+            s.parse::<u64>().map_err(|_| {
+                SdkError::Script(ScriptError::Parse(format!(
+                    "ff_report_usage_and_check {sub_status}: {field_name} \
+                     (index {index}) not a u64 string: {s:?}"
+                )))
+            })
+        }
+        Some(Ok(Value::SimpleString(s))) => s.parse::<u64>().map_err(|_| {
+            SdkError::Script(ScriptError::Parse(format!(
+                "ff_report_usage_and_check {sub_status}: {field_name} \
+                 (index {index}) not a u64 string: {s:?}"
+            )))
+        }),
+        Some(_) => Err(SdkError::Script(ScriptError::Parse(format!(
+            "ff_report_usage_and_check {sub_status}: {field_name} \
+             (index {index}) wrong wire type (expected Int or String)"
+        )))),
+        None => Err(SdkError::Script(ScriptError::Parse(format!(
+            "ff_report_usage_and_check {sub_status}: {field_name} \
+             (index {index}) missing from response"
+        )))),
     }
 }
 
@@ -1920,6 +2026,58 @@ mod parse_report_usage_result_tests {
         assert!(
             msg.to_lowercase().contains("int"),
             "error should mention Int status code, got: {msg}"
+        );
+    }
+
+    /// Negative case: SOFT_BREACH with a non-numeric `current_usage`
+    /// field. Guards against the silent-coercion defect cross-review
+    /// caught: the old parser used `.unwrap_or(0)` on numeric fields,
+    /// which would have surfaced Lua-side wire-format drift as a
+    /// `SoftBreach { current_usage: 0, ... }` — arithmetically valid
+    /// but semantically wrong (a "breach with zero usage" is nonsense
+    /// and masks the real error).
+    #[test]
+    fn soft_breach_non_numeric_current_is_parse_error() {
+        let raw = arr(vec![
+            int(1),
+            s("SOFT_BREACH"),
+            s("tokens"),
+            s("not_a_number"), // current_usage — must fail, not coerce to 0
+            s("100"),
+        ]);
+        let err = parse_report_usage_result(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SOFT_BREACH") && msg.contains("current_usage"),
+            "error should identify sub-status + field, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("u64"),
+            "error should mention the expected type (u64), got: {msg}"
+        );
+    }
+
+    /// Negative case: HARD_BREACH with the limit slot missing
+    /// entirely. Same defence as the non-numeric test above: a
+    /// truncated response must fail loudly rather than coerce to 0.
+    #[test]
+    fn hard_breach_missing_limit_is_parse_error() {
+        let raw = arr(vec![
+            int(1),
+            s("HARD_BREACH"),
+            s("requests"),
+            s("10001"),
+            // no index 4 — hard_limit missing
+        ]);
+        let err = parse_report_usage_result(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HARD_BREACH") && msg.contains("hard_limit"),
+            "error should identify sub-status + field, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("missing"),
+            "error should say 'missing', got: {msg}"
         );
     }
 }

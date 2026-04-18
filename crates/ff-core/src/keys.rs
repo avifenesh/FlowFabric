@@ -595,8 +595,9 @@ pub fn waitpoint_key_resolution(tag: &str, wp_key: &WaitpointKey) -> String {
 
 /// Shared prefix for the usage-dedup keyspace. Must match the
 /// `ff:usagededup:` literal referenced in `lua/**.lua` (notably
-/// `lua/ff_report_usage_and_check.lua`). Grep `ff:usagededup:` to
-/// find all producers, consumers, and test fixtures in one search.
+/// `lua/budget.lua:99`, the `ff_report_usage_and_check` function).
+/// Grep `ff:usagededup:` to find all producers, consumers, and test
+/// fixtures in one search.
 pub const USAGE_DEDUP_KEY_PREFIX: &str = "ff:usagededup:";
 
 /// Build a usage-dedup key: `ff:usagededup:<hash_tag>:<dedup_id>`.
