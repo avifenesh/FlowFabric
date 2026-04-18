@@ -2028,7 +2028,7 @@ impl Server {
         limit: u64,
     ) -> Result<ListExecutionsResult, ServerError> {
         let partition = ff_core::partition::Partition {
-            family: ff_core::partition::PartitionFamily::Flow,
+            family: ff_core::partition::PartitionFamily::Execution,
             index: partition_id,
         };
         let idx = IndexKeys::new(&partition);
@@ -2680,7 +2680,7 @@ async fn initialize_waitpoint_hmac_secret(
     loop {
         while pending.len() < BOOT_INIT_CONCURRENCY && next_index < n {
             let partition = Partition {
-                family: PartitionFamily::Flow,
+                family: PartitionFamily::Execution,
                 index: next_index,
             };
             let client = client.clone();
@@ -2827,7 +2827,7 @@ impl Server {
         loop {
             while pending.len() < BOOT_INIT_CONCURRENCY && next_index < n {
                 let partition = Partition {
-                    family: PartitionFamily::Flow,
+                    family: PartitionFamily::Execution,
                     index: next_index,
                 };
                 let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();

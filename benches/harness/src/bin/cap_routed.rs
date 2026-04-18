@@ -600,7 +600,7 @@ async fn classify_stranded(
 
     for p in 0..n {
         let partition = Partition {
-            family: PartitionFamily::Flow,
+            family: PartitionFamily::Execution,
             index: p,
         };
         let idx = IndexKeys::new(&partition);

@@ -149,7 +149,7 @@ impl TestCluster {
     pub async fn install_waitpoint_hmac_secret(&self, kid: &str, secret_hex: &str) {
         for index in 0..self.config.num_flow_partitions {
             let partition = ff_core::partition::Partition {
-                family: ff_core::partition::PartitionFamily::Flow,
+                family: ff_core::partition::PartitionFamily::Execution,
                 index,
             };
             let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
@@ -175,7 +175,7 @@ impl TestCluster {
     ) {
         for index in 0..self.config.num_flow_partitions {
             let partition = ff_core::partition::Partition {
-                family: ff_core::partition::PartitionFamily::Flow,
+                family: ff_core::partition::PartitionFamily::Execution,
                 index,
             };
             let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();

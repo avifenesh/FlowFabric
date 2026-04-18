@@ -238,7 +238,7 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
             continue;
         }
         let partition = Partition {
-            family: ff_core::partition::PartitionFamily::Flow,
+            family: ff_core::partition::PartitionFamily::Execution,
             index: p_idx,
         };
         let idx = IndexKeys::new(&partition);

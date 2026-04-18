@@ -56,7 +56,7 @@ impl Scanner for RetentionTrimmer {
         partition: u16,
     ) -> ScanResult {
         let p = Partition {
-            family: PartitionFamily::Flow,
+            family: PartitionFamily::Execution,
             index: partition,
         };
         let idx = IndexKeys::new(&p);

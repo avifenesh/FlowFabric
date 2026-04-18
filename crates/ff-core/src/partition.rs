@@ -3,16 +3,34 @@ use serde::{Deserialize, Serialize};
 
 /// The partition families in FlowFabric.
 ///
-/// Post-RFC-011: `Execution` is retired as a separate family. Execution
-/// keys co-locate with their parent flow's partition (same `{fp:N}`
-/// hash-tag), so they route through [`PartitionFamily::Flow`] physically
-/// while keeping the logical `ff:exec:*` vs `ff:flow:*` key-name prefix.
+/// Post-RFC-011: `Execution` and `Flow` are now routing **aliases** —
+/// both produce the same `{fp:N}` hash-tag, because execution keys
+/// co-locate with their parent flow's partition under hash-tag
+/// co-location. The `Execution` variant is **deliberately retained**
+/// per RFC-011 §11 Non-goals ("Deleting `PartitionFamily::Execution`
+/// from the public API. The variant stays for API compatibility; only
+/// its routing behaviour changes."), so downstream crates like
+/// cairn-fabric that construct `Partition { family: Execution, .. }`
+/// continue to compile and route correctly without source changes.
+///
+/// New FF-internal code should prefer `PartitionFamily::Flow` for
+/// clarity — the `Execution` alias exists solely to preserve the
+/// public-API contract promised by RFC-011. The logical distinction
+/// between exec-scoped and flow-scoped keys continues to live in the
+/// key-name prefix (`ff:exec:*` vs `ff:flow:*`), not in the
+/// `PartitionFamily` discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitionFamily {
     /// Flow-structural + execution partition: `{fp:N}` — flow topology
     /// and all per-execution keys co-located with their parent flow.
     Flow,
+    /// Execution partition — **routing alias for [`PartitionFamily::Flow`]**
+    /// under RFC-011 co-location. Produces `{fp:N}` hash-tags identical to
+    /// `Flow` and indexes into `num_flow_partitions`. Kept as a distinct
+    /// variant per RFC-011 §11 for downstream-API compatibility (cairn-
+    /// fabric and other consumers that construct this variant directly).
+    Execution,
     /// Budget partition: `{b:M}` — budget definitions and usage.
     Budget,
     /// Quota partition: `{q:K}` — quota policies and sliding windows.
@@ -21,9 +39,12 @@ pub enum PartitionFamily {
 
 impl PartitionFamily {
     /// Hash tag prefix for this family.
+    ///
+    /// `Flow` and `Execution` are aliases and both return `"fp"` — see
+    /// the enum-level rustdoc for the RFC-011 §11 compatibility rationale.
     fn prefix(self) -> &'static str {
         match self {
-            Self::Flow => "fp",
+            Self::Flow | Self::Execution => "fp",
             Self::Budget => "b",
             Self::Quota => "q",
         }
@@ -55,9 +76,12 @@ impl Default for PartitionConfig {
 
 impl PartitionConfig {
     /// Get the partition count for a given family.
+    ///
+    /// `Flow` and `Execution` return the same value (`num_flow_partitions`)
+    /// — they are routing aliases under RFC-011 co-location.
     pub fn count_for(&self, family: PartitionFamily) -> u16 {
         match family {
-            PartitionFamily::Flow => self.num_flow_partitions,
+            PartitionFamily::Flow | PartitionFamily::Execution => self.num_flow_partitions,
             PartitionFamily::Budget => self.num_budget_partitions,
             PartitionFamily::Quota => self.num_quota_partitions,
         }
@@ -118,19 +142,72 @@ pub fn flow_partition(fid: &FlowId, config: &PartitionConfig) -> Partition {
     }
 }
 
+/// Strategy for picking a solo execution's partition from its lane id.
+///
+/// RFC-011 §5.6 defines the birthday-paradox traffic-amplification
+/// mitigation: solo execs hash their lane id to a flow partition with
+/// crc16, which can collide with a flow's own partition. Operators
+/// that hit a persistent collision install a custom strategy at boot
+/// time via [`solo_partition_with`] instead of rebuilding `ff-server`.
+///
+/// The default impl [`Crc16SoloPartitioner`] matches the algorithm
+/// used by every other partition family. Replace only when a real
+/// collision surfaces via `ff-server admin partition-collisions`.
+pub trait SoloPartitioner: Send + Sync {
+    /// Return the partition index for a solo execution on the given lane.
+    ///
+    /// Must return a value in `0..config.num_flow_partitions`.
+    /// Must be deterministic — the same `(lane, config)` always produces
+    /// the same index (violated determinism → exec keys would route
+    /// differently on each mint, breaking all cross-lookup invariants).
+    fn partition_for_lane(&self, lane: &LaneId, config: &PartitionConfig) -> u16;
+}
+
+/// Default [`SoloPartitioner`]: `crc16_ccitt(lane_utf8) % num_flow_partitions`.
+///
+/// Matches the hashing used by [`flow_partition`], [`budget_partition`],
+/// [`quota_partition`] — same crc16-CCITT algorithm Valkey Cluster uses
+/// for slot assignment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Crc16SoloPartitioner;
+
+impl SoloPartitioner for Crc16SoloPartitioner {
+    fn partition_for_lane(&self, lane: &LaneId, config: &PartitionConfig) -> u16 {
+        assert!(
+            config.num_flow_partitions > 0,
+            "num_flow_partitions must be > 0 (division by zero)"
+        );
+        crc16_ccitt(lane.as_str().as_bytes()) % config.num_flow_partitions
+    }
+}
+
 /// Compute the partition for a solo (flow-less) execution's lane shard.
 ///
-/// Solo execs (bare `create_execution`, no parent flow) derive their
-/// partition from the lane id instead of a flow id. Ensures per-lane
-/// co-location (RFC-011 §4).
+/// Uses the default [`Crc16SoloPartitioner`]. Deployments that hit a
+/// traffic-amplification hotspot (per RFC-011 §5.6) should call
+/// [`solo_partition_with`] with a custom partitioner instead.
 pub fn solo_partition(lane: &LaneId, config: &PartitionConfig) -> Partition {
-    assert!(
-        config.num_flow_partitions > 0,
-        "num_flow_partitions must be > 0 (division by zero)"
-    );
+    solo_partition_with(lane, config, &Crc16SoloPartitioner)
+}
+
+/// Compute the partition for a solo execution using a custom
+/// [`SoloPartitioner`] strategy.
+///
+/// The operator-facing escape hatch for RFC-011 §5.6 traffic-amplification
+/// collisions. A deployment that observes a collision via
+/// `ff-server admin partition-collisions` instantiates an alternate
+/// [`SoloPartitioner`] impl and routes solo mint paths through this
+/// function. The default [`Crc16SoloPartitioner`] is used by
+/// [`solo_partition`] and [`ExecutionId::solo`] — neither signature
+/// changes under this extension point.
+pub fn solo_partition_with(
+    lane: &LaneId,
+    config: &PartitionConfig,
+    partitioner: &dyn SoloPartitioner,
+) -> Partition {
     Partition {
         family: PartitionFamily::Flow,
-        index: crc16_ccitt(lane.as_str().as_bytes()) % config.num_flow_partitions,
+        index: partitioner.partition_for_lane(lane, config),
     }
 }
 
@@ -159,6 +236,9 @@ mod tests {
         let p = Partition { family: PartitionFamily::Flow, index: 7 };
         assert_eq!(p.hash_tag(), "{fp:7}");
 
+        let p = Partition { family: PartitionFamily::Execution, index: 7 };
+        assert_eq!(p.hash_tag(), "{fp:7}", "Execution must alias Flow (RFC-011 §11)");
+
         let p = Partition { family: PartitionFamily::Budget, index: 0 };
         assert_eq!(p.hash_tag(), "{b:0}");
 
@@ -166,8 +246,45 @@ mod tests {
         assert_eq!(p.hash_tag(), "{q:31}");
     }
 
+    /// Execution and Flow are deliberate routing aliases post-RFC-011 §11.
+    /// This test pins the alias contract so a future edit that diverges the
+    /// two routes fails loudly rather than silently breaking co-location.
+    #[test]
+    fn execution_family_aliases_flow() {
+        // Same hash-tag at every index.
+        for index in [0u16, 1, 7, 42, 255, 65535] {
+            let flow = Partition { family: PartitionFamily::Flow, index };
+            let exec = Partition { family: PartitionFamily::Execution, index };
+            assert_eq!(
+                flow.hash_tag(),
+                exec.hash_tag(),
+                "Flow and Execution must produce identical hash-tags at index {index}"
+            );
+        }
+
+        // count_for returns the same value.
+        let config = PartitionConfig::default();
+        assert_eq!(
+            config.count_for(PartitionFamily::Flow),
+            config.count_for(PartitionFamily::Execution),
+            "count_for(Flow) == count_for(Execution) — both route via num_flow_partitions"
+        );
+
+        // A Partition minted with family=Execution produces the same
+        // hash-tag as one minted with family=Flow, given the same index.
+        // This is the key property cairn-fabric (and any other consumer
+        // that constructs `Partition { family: Execution, .. }`) depends on.
+        let p_exec = Partition { family: PartitionFamily::Execution, index: 42 };
+        let p_flow = Partition { family: PartitionFamily::Flow, index: 42 };
+        assert_eq!(p_exec.hash_tag(), p_flow.hash_tag());
+        assert_eq!(p_exec.hash_tag(), "{fp:42}");
+    }
+
     #[test]
     fn all_families_produce_distinct_tags() {
+        // Post-RFC-011: Flow and Execution deliberately share `{fp:N}` — see
+        // `execution_family_aliases_flow`. The three *distinct* tag spaces are
+        // {fp:N}, {b:N}, {q:N}. This test asserts that alias-after-collapse.
         let tags: Vec<String> = [
             PartitionFamily::Flow,
             PartitionFamily::Budget,
@@ -177,7 +294,7 @@ mod tests {
         .map(|f| Partition { family: *f, index: 0 }.hash_tag())
         .collect();
         let unique: std::collections::HashSet<&String> = tags.iter().collect();
-        assert_eq!(unique.len(), 3, "all families must produce distinct hash tags");
+        assert_eq!(unique.len(), 3, "flow/budget/quota must produce distinct hash tags");
     }
 
     #[test]
@@ -344,6 +461,51 @@ mod tests {
             "solo_partition distribution too narrow: only {} distinct of 100",
             seen.len()
         );
+    }
+
+    // ── SoloPartitioner trait (RFC-011 §5.6 mitigation #3) ──
+
+    #[test]
+    fn crc16_solo_partitioner_matches_legacy_behavior() {
+        // The default Crc16SoloPartitioner must produce the same index as
+        // the pre-trait solo_partition() function — otherwise installing
+        // the trait under an existing deployment would silently re-route
+        // every solo exec.
+        let config = PartitionConfig::default();
+        let lane = LaneId::new("workers-a");
+        let default_idx = Crc16SoloPartitioner.partition_for_lane(&lane, &config);
+        let expected = crc16::State::<crc16::XMODEM>::calculate(lane.as_str().as_bytes())
+            % config.num_flow_partitions;
+        assert_eq!(default_idx, expected);
+    }
+
+    #[test]
+    fn solo_partition_with_custom_partitioner_routes_through_trait() {
+        // Stub partitioner always returns index 0; a custom impl must
+        // override the default routing.
+        struct AlwaysZero;
+        impl SoloPartitioner for AlwaysZero {
+            fn partition_for_lane(&self, _lane: &LaneId, _config: &PartitionConfig) -> u16 {
+                0
+            }
+        }
+        let config = PartitionConfig::default();
+        let lane = LaneId::new("pick-me");
+        let p = solo_partition_with(&lane, &config, &AlwaysZero);
+        assert_eq!(p.index, 0);
+        assert_eq!(p.family, PartitionFamily::Flow);
+    }
+
+    #[test]
+    fn solo_partition_default_matches_solo_partition_with_crc16() {
+        // solo_partition() and solo_partition_with(Crc16SoloPartitioner)
+        // must produce identical Partitions — this pins the default impl
+        // as the identity override.
+        let config = PartitionConfig::default();
+        let lane = LaneId::new("workers-b");
+        let default = solo_partition(&lane, &config);
+        let explicit = solo_partition_with(&lane, &config, &Crc16SoloPartitioner);
+        assert_eq!(default, explicit);
     }
 
     #[test]

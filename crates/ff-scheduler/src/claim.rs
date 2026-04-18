@@ -314,7 +314,7 @@ impl Scheduler {
             // workers from hammering partition 0 first simultaneously.
             let p_idx = (start_p + offset) % num_partitions;
             let partition = Partition {
-                family: PartitionFamily::Flow,
+                family: PartitionFamily::Execution,
                 index: p_idx,
             };
             let idx = IndexKeys::new(&partition);

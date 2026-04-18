@@ -491,7 +491,7 @@ impl FlowFabricWorker {
         for step in 0..chunk {
             let partition_idx = ((start + step) % num_partitions) as u16;
             let partition = ff_core::partition::Partition {
-                family: ff_core::partition::PartitionFamily::Flow,
+                family: ff_core::partition::PartitionFamily::Execution,
                 index: partition_idx,
             };
             let idx = IndexKeys::new(&partition);
