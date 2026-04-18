@@ -52,8 +52,8 @@ impl PartitionRouter {
     }
 
     /// Total number of execution partitions.
-    pub fn num_execution_partitions(&self) -> u16 {
-        self.config.num_execution_partitions
+    pub fn num_flow_partitions(&self) -> u16 {
+        self.config.num_flow_partitions
     }
 }
 

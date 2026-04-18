@@ -1,5 +1,8 @@
 //! Typed FCALL wrappers for signal delivery and resume-claim functions
 //! (lua/signal.lua).
+//!
+//! See `execution.rs` module-level rustdoc for the Partial-type pattern
+//! rationale (RFC-011 §2.4).
 
 use ff_core::contracts::*;
 use crate::error::ScriptError;
@@ -10,6 +13,37 @@ use crate::result::{FcallResult, FromFcallResult};
 
 // Re-export ExecOpKeys from execution.rs for ff_claim_resumed_execution.
 use super::execution::ExecOpKeys;
+
+/// Partial form of [`ClaimedResumedExecution`] (omits `execution_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedResumedExecutionPartial {
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub attempt_index: AttemptIndex,
+    pub attempt_id: AttemptId,
+    pub lease_expires_at: TimestampMs,
+}
+
+/// Partial form of [`ClaimResumedExecutionResult`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimResumedExecutionResultPartial {
+    Claimed(ClaimedResumedExecutionPartial),
+}
+
+impl ClaimResumedExecutionResultPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> ClaimResumedExecutionResult {
+        match self {
+            Self::Claimed(p) => ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution {
+                execution_id,
+                lease_id: p.lease_id,
+                lease_epoch: p.lease_epoch,
+                attempt_index: p.attempt_index,
+                attempt_id: p.attempt_id,
+                lease_expires_at: p.lease_expires_at,
+            }),
+        }
+    }
+}
 
 /// Key context for signal delivery operations.
 /// Needs exec keys + index keys + lane (for eligible/suspended/delayed).
@@ -182,7 +216,7 @@ impl FromFcallResult for BufferSignalResult {
 //               remaining_attempt_timeout_ms
 
 ff_function! {
-    pub ff_claim_resumed_execution(args: ClaimResumedExecutionArgs) -> ClaimResumedExecutionResult {
+    pub ff_claim_resumed_execution(args: ClaimResumedExecutionArgs) -> ClaimResumedExecutionResultPartial {
         keys(k: &ExecOpKeys<'_>) {
             k.ctx.core(),                                              // 1
             k.ctx.claim_grant(),                                       // 2
@@ -211,7 +245,7 @@ ff_function! {
     }
 }
 
-impl FromFcallResult for ClaimResumedExecutionResult {
+impl FromFcallResult for ClaimResumedExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let r = FcallResult::parse(raw)?.into_success()?;
         // ok(lease_id, epoch, expires_at, attempt_id, attempt_index, "resumed")
@@ -226,13 +260,35 @@ impl FromFcallResult for ClaimResumedExecutionResult {
         let attempt_index = r.field_str(4).parse::<u32>()
             .map_err(|e| ScriptError::Parse(format!("bad attempt_index: {e}")))?;
 
-        Ok(ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution {
-            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
+        Ok(Self::Claimed(ClaimedResumedExecutionPartial {
             lease_id,
             lease_epoch: LeaseEpoch::new(epoch),
             attempt_index: AttemptIndex::new(attempt_index),
             attempt_id,
             lease_expires_at: TimestampMs::from_millis(expires_at),
         }))
+    }
+}
+
+// ─── Partial-type tests (RFC-011 §2.4 acceptance) ──────────────────────
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+    use ff_core::partition::PartitionConfig;
+
+    #[test]
+    fn claim_resumed_partial_complete_attaches_execution_id() {
+        let partial = ClaimResumedExecutionResultPartial::Claimed(ClaimedResumedExecutionPartial {
+            lease_id: LeaseId::new(),
+            lease_epoch: LeaseEpoch::new(2),
+            attempt_index: AttemptIndex::new(1),
+            attempt_id: AttemptId::new(),
+            lease_expires_at: TimestampMs::from_millis(2000),
+        });
+        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
+        let full = partial.complete(eid.clone());
+        match full {
+            ClaimResumedExecutionResult::Claimed(c) => assert_eq!(c.execution_id, eid),
+        }
     }
 }
