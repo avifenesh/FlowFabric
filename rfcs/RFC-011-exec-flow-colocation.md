@@ -52,8 +52,8 @@ execution_id = "{fp:N}:<uuid>"
 ```
 
 * `fp:N` is the hash-tag prefix identifying the flow-partition the exec's parent flow lives on.
-* `<uuid>` is a v4 UUID for uniqueness within that partition.
-* `N` is an integer in `0..num_flow_partitions`.
+* `<uuid>` is a UUID for uniqueness within that partition. Parsing is version-agnostic — `ExecutionId::parse` accepts any valid UUID (v4 in practice from `Uuid::new_v4()`-backed mint paths; other versions if a caller chooses them). Version enforcement lives at the caller if it matters.
+* `N` is an integer that fits in `u16`. Writers by convention mint only `N < num_flow_partitions` for the current deployment's config (see `ExecutionId::for_flow` / `solo` constructors), but **the `u16` range is the only parse-time invariant**. Range-against-config is caller-enforced at ingress — see §2.3.1. This allows exec ids to traverse deployment boundaries (replay, audit export, cross-env migration) without parse-time rejection.
 
 Solo execs (no parent flow) use the same shape but with a deterministic synthetic lane-derived partition index (§4).
 
@@ -84,7 +84,7 @@ impl ExecutionId {
     /// Parse the hash-tagged shape. Returns Err on:
     ///  - missing `{fp:N}:` prefix
     ///  - non-integer N (or N that does not fit in `u16`)
-    ///  - UUID suffix fails v4 parse
+    ///  - UUID suffix fails `Uuid::parse_str` (syntax check only; version-agnostic — callers that require v4 specifically enforce post-parse)
     ///
     /// **Parse does NOT check `N < num_flow_partitions`** — the function
     /// takes only `&str` and has no `PartitionConfig` handle. Range
@@ -107,9 +107,9 @@ impl ExecutionId {
 
 #### §2.3.1 Parse-range delegation note (revision 3, 2026-04-18)
 
-The original §2.3 text (revision 1) described `ExecutionId::parse` as rejecting ids where "N >= num_flow_partitions." That phrasing implied parse had access to a `PartitionConfig`. It does not — parse takes `&str` only. W1 probed during phase-1 review: `ExecutionId::parse("{fp:50000}:<uuid>")` on a 256-partition config succeeds and produces an id that routes to a nonexistent slot.
+The original §2.3 text (revision 1) described `ExecutionId::parse` as rejecting ids where "N >= num_flow_partitions." That phrasing implied parse had access to a `PartitionConfig`. It does not — parse takes `&str` only. W1 probed during phase-1 review: `ExecutionId::parse("{fp:50000}:550e8400-e29b-41d4-a716-446655440000")` on a 256-partition config succeeds and produces an id that routes to a nonexistent slot.
 
-**The implementation ships the correct behaviour: parse validates shape only (hash-tag prefix, integer-that-fits-in-u16, v4 UUID). Range validation is the caller's responsibility.**
+**The implementation ships the correct behaviour: parse validates shape only (hash-tag prefix, integer-that-fits-in-u16, valid UUID via `Uuid::parse_str` — syntax-only, version-agnostic). Range validation + UUID-version enforcement are the caller's responsibility.**
 
 Architectural rationale:
 
@@ -459,7 +459,7 @@ Solo-execution routing via `crc16(lane_id) % num_flow_partitions` (§4.1) shares
    }
    pub struct Crc16SoloPartitioner;  // default
    ```
-   `ExecutionId::solo` delegates to the default [`Crc16SoloPartitioner`] — callers with a known-good lane-name layout get correct routing with zero ceremony. A deployment hitting amplification installs a custom partitioner by calling `ff_core::partition::solo_partition_with(lane, config, &custom_impl)` from deployment-owned id-minting code. Operators who take this path fork `ff-core`'s default `ExecutionId::solo` minting logic into their own code; the pluggable trait is the stable contract, not the mint function. Defer a `PartitionConfig::with_solo_partitioner` ergonomic wrapper to a follow-up RFC if operator demand emerges post-phase-5 benchmarks (revision 3, 2026-04-18 — names the shape that actually landed in phase-1 per W1's post-implementation review).
+   `ExecutionId::solo` delegates to the default `Crc16SoloPartitioner` — callers with a known-good lane-name layout get correct routing with zero ceremony. A deployment hitting amplification installs a custom partitioner by calling `ff_core::partition::solo_partition_with(lane, config, &custom_impl)` from deployment-owned id-minting code. Operators who take this path fork `ff-core`'s default `ExecutionId::solo` minting logic into their own code; the pluggable trait is the stable contract, not the mint function. Defer a `PartitionConfig::with_solo_partitioner` ergonomic wrapper to a follow-up RFC if operator demand emerges post-phase-5 benchmarks (revision 3, 2026-04-18 — names the shape that actually landed in phase-1 per W1's post-implementation review).
 
 **Cost absorbed in revised §8:** ~30min phase 1 (trait + default impl) + ~1h phase 5 (CLI + runbook). Already in the totals.
 
@@ -537,10 +537,13 @@ Two distinct counts are cited in this RFC and they measure different things — 
 |---|---|---|
 | Pre-phase-1 `ExecutionId::new()` source sites (§3.4) | **175** | Total source-level call sites grepped across the workspace *before* phase-1 edits. Of these, 10 live in ff-core and 166 in ff-test (with a 1-site rounding overlap from a paired macro-roundtrip test; see §3.4). |
 | Post-phase-1 `cargo check -p ff-test --tests` errors | **172** | Compile errors emitted by ff-test after phase-1 lands. Sum = 166 class-(a) `ExecutionId::new()` + 6 class-(b) `num_execution_partitions` + 1 class-(c) cascade. |
+| **Post-phase-1+2 merge (main @ `d614ae5`) `ExecutionId::new(` occurrences, workspace-wide** | **0 live references** (1 doc-comment mention of the retired API inside `fixtures.rs:113`, which is historical prose, not a call site) | Confirmation that phase-2 closed the full migration. `grep -rn "ExecutionId::new(" crates/ benches/ examples/ --include="*.rs"` returns exactly one line — a docstring in `crates/ff-test/src/fixtures.rs` documenting that the API was removed. Zero production or test call sites remain. |
 
 Pre-phase-1 counts *source sites* across the whole workspace; post-phase-1 counts *still-to-migrate compile errors scoped to ff-test*. The 10 ff-core sites do not appear in the 172 because phase-1 fixed them; the 6 class-(b) errors do appear even though they are not `ExecutionId::new()` sites, because they are phase-2 work of the same migration shape. The 1 class-(c) cascade rounds out the compile output.
 
 A reviewer running `cargo check` on ff-test post-phase-1 and seeing ~172 errors should verify every error falls under (a), (b), or (c) before flagging a RED.
+
+**Closure confirmation.** After phase-2's merge (commit `d614ae5`), the workspace-wide grep returns zero live call sites — the migration is complete. Future additions to ff-test must use `TestCluster::new_execution_id()` (routes to `ExecutionId::solo(&test_lane, &self.config)`) or `ExecutionId::for_flow` / `solo` directly; `ExecutionId::new()` does not exist in the post-phase-1 API surface.
 
 **Hour breakdown (REVISED):**
 * 1h types.rs: bespoke ExecutionId impl + parse + for_flow/solo
