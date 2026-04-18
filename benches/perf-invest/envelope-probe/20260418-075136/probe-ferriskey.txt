@@ -1,0 +1,1 @@
+ferriskey n=100000 ok=100000 nil=0 err=0 p50=0.031ms p95=0.038ms p99=0.045ms p999=0.073ms min=0.025ms max=0.471ms mean=0.032ms
