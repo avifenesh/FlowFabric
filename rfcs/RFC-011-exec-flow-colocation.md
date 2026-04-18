@@ -83,8 +83,18 @@ impl ExecutionId {
 
     /// Parse the hash-tagged shape. Returns Err on:
     ///  - missing `{fp:N}:` prefix
-    ///  - non-integer N, or N >= num_flow_partitions
+    ///  - non-integer N (or N that does not fit in `u16`)
     ///  - UUID suffix fails v4 parse
+    ///
+    /// **Parse does NOT check `N < num_flow_partitions`** — the function
+    /// takes only `&str` and has no `PartitionConfig` handle. Range
+    /// validation against the live deployment's partition count is the
+    /// caller's responsibility via `.partition()` + config comparison.
+    /// See the §2.3.1 parse-range-delegation note (revision 3) for the
+    /// architectural rationale — exec ids are durable identifiers that
+    /// can legitimately cross deployment boundaries with different
+    /// configs, so parse-time config-coupling would mis-reject
+    /// otherwise-valid historical ids.
     pub fn parse(s: &str) -> Result<Self, ExecutionIdParseError>;
 
     /// Raw string form; always `{fp:N}:<uuid>`.
@@ -94,6 +104,30 @@ impl ExecutionId {
     pub fn partition(&self) -> u16;
 }
 ```
+
+#### §2.3.1 Parse-range delegation note (revision 3, 2026-04-18)
+
+The original §2.3 text (revision 1) described `ExecutionId::parse` as rejecting ids where "N >= num_flow_partitions." That phrasing implied parse had access to a `PartitionConfig`. It does not — parse takes `&str` only. W1 probed during phase-1 review: `ExecutionId::parse("{fp:50000}:<uuid>")` on a 256-partition config succeeds and produces an id that routes to a nonexistent slot.
+
+**The implementation ships the correct behaviour: parse validates shape only (hash-tag prefix, integer-that-fits-in-u16, v4 UUID). Range validation is the caller's responsibility.**
+
+Architectural rationale:
+
+1. **Exec ids are durable identifiers.** They outlive the Valkey deployment they were minted against. An id minted on a 256-partition cluster can legitimately surface on a 1024-partition cluster (stream replay, audit export, cross-environment migration). Parse-time config-coupling would mis-reject otherwise-valid historical ids under legitimate lookup flows.
+2. **Parse has no `PartitionConfig` handle.** Adding one would either make parse infallible-but-trivial (no config check) or force every caller that currently calls `ExecutionId::parse(s)` to plumb a config through — invasive change for a boundary-validation concern.
+3. **The right place for range validation is at the system boundary against the current deployment's config** — `ff-server` at ingress, the scheduler when it receives an id from a claim-grant payload, etc. Callers use `eid.partition()` (O(1) hash-tag decode) + compare against `config.num_flow_partitions` at the exact moment range matters.
+
+Phase-1 tests encode this architectural boundary: `execution_partition_ignores_config_value` verifies that an id minted in a 4-partition config decodes to the same partition index when read via a 1024-partition config. That test would fail if parse coupled to the config value — the deliberate pass is the invariant we're protecting.
+
+Callers that want range validation write it explicitly:
+```rust
+let eid = ExecutionId::parse(s)?;
+if eid.partition() >= config.num_flow_partitions {
+    return Err(SomeKind::OutOfRangePartition);
+}
+```
+
+This amendment closes W1's YELLOW-3 by updating the RFC prose to match the implementation's (correct) shape, rather than the other way around.
 
 ### §2.4 ff-script FCALL-result parsing (CONVERGED-RED-1 resolution)
 
@@ -425,7 +459,7 @@ Solo-execution routing via `crc16(lane_id) % num_flow_partitions` (§4.1) shares
    }
    pub struct Crc16SoloPartitioner;  // default
    ```
-   `ExecutionId::solo` delegates to the configured partitioner. A deployment hitting amplification installs a custom partitioner via `PartitionConfig::with_solo_partitioner(Arc<dyn SoloPartitioner>)` without rebuilding.
+   `ExecutionId::solo` delegates to the default [`Crc16SoloPartitioner`] — callers with a known-good lane-name layout get correct routing with zero ceremony. A deployment hitting amplification installs a custom partitioner by calling `ff_core::partition::solo_partition_with(lane, config, &custom_impl)` from deployment-owned id-minting code. Operators who take this path fork `ff-core`'s default `ExecutionId::solo` minting logic into their own code; the pluggable trait is the stable contract, not the mint function. Defer a `PartitionConfig::with_solo_partitioner` ergonomic wrapper to a follow-up RFC if operator demand emerges post-phase-5 benchmarks (revision 3, 2026-04-18 — names the shape that actually landed in phase-1 per W1's post-implementation review).
 
 **Cost absorbed in revised §8:** ~30min phase 1 (trait + default impl) + ~1h phase 5 (CLI + runbook). Already in the totals.
 
@@ -483,7 +517,30 @@ Each phase has (a) touch-file list, (b) landing criteria, (c) acceptance gate, (
 **Acceptance (REVISED — ff-script added after RED-1):**
 * `cargo test -p ff-core` green (partition tests regenerated).
 * **`cargo check -p ff-script` green** (the Partial refactor must compile clean in the same phase — without this, phase 1 appears to pass while ff-script has silent compile errors waiting for the first dependent build).
-* `cargo check -p ff-server -p ff-scheduler -p ff-sdk -p ff-test` produces compile errors at `ExecutionId::new()` call sites + at Partial-type consumer sites only. Clean on every other crate.
+* `cargo check -p ff-server -p ff-scheduler -p ff-sdk -p ff-test` produces compile errors that are all phase-2 migration work. Clean on every other crate.
+
+**Scope of expected phase-2 compile errors (clarification — revision 3, 2026-04-18):** the original "only at ExecutionId::new() call sites + at Partial-type consumer sites" wording was too tight. Phase-1 implementation surfaces three distinct error classes, all legitimately deferred to phase 2:
+
+  (a) `ExecutionId::new()` call sites — **pre-phase-1 total: 175** across the workspace (see §3.4 for the authoritative file-by-file breakdown — 10 ff-core + 166 ff-test, with 1 deduplication in the ff-core partition.rs test macro-roundtrip pair). Phase-1 migrates the 10 ff-core sites to `ExecutionId::for_flow` / `solo` as part of the ff-core primitives landing. Phase-2 migrates the remaining **166 ff-test sites**.
+  (b) `num_execution_partitions` field references — **6 in ff-test tests** after `PartitionConfig` retired the field in phase 1.B. Migrated to `num_flow_partitions` in phase 2.
+  (c) Downstream cascades from (a) and (b) — type-inference failures, mismatched-type errors, and Partial-consumer call sites that need `.complete(exec_id)` wiring. Count scales with the above; mechanical once the root-cause sites in (a)/(b) are fixed. Typical: 1 cascade error per cluster of 10-20 root-cause sites.
+
+Class (c) is NOT a separate category of work — it is the compiler's natural propagation from (a) and (b). Phase-1 acceptance is considered met when:
+  - every error across ff-server/ff-scheduler/ff-sdk/ff-test resolves to one of (a), (b), or (c);
+  - no error is a surprise class (e.g. an API-shape break the RFC did not anticipate).
+
+**Worked numbers (for reviewer cross-checking against actual phase-1 push output):**
+
+Two distinct counts are cited in this RFC and they measure different things — not inconsistent:
+
+| Metric | Value | What it counts |
+|---|---|---|
+| Pre-phase-1 `ExecutionId::new()` source sites (§3.4) | **175** | Total source-level call sites grepped across the workspace *before* phase-1 edits. Of these, 10 live in ff-core and 166 in ff-test (with a 1-site rounding overlap from a paired macro-roundtrip test; see §3.4). |
+| Post-phase-1 `cargo check -p ff-test --tests` errors | **172** | Compile errors emitted by ff-test after phase-1 lands. Sum = 166 class-(a) `ExecutionId::new()` + 6 class-(b) `num_execution_partitions` + 1 class-(c) cascade. |
+
+Pre-phase-1 counts *source sites* across the whole workspace; post-phase-1 counts *still-to-migrate compile errors scoped to ff-test*. The 10 ff-core sites do not appear in the 172 because phase-1 fixed them; the 6 class-(b) errors do appear even though they are not `ExecutionId::new()` sites, because they are phase-2 work of the same migration shape. The 1 class-(c) cascade rounds out the compile output.
+
+A reviewer running `cargo check` on ff-test post-phase-1 and seeing ~172 errors should verify every error falls under (a), (b), or (c) before flagging a RED.
 
 **Hour breakdown (REVISED):**
 * 1h types.rs: bespoke ExecutionId impl + parse + for_flow/solo
