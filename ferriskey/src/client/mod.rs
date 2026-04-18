@@ -177,12 +177,16 @@ pub(super) fn get_connection_info(
 pub enum ClientWrapper {
     Standalone(StandaloneClient),
     Cluster { client: ClusterConnection },
-    Lazy(Box<LazyClient>),
+    Lazy(Box<LazyWrapperState>),
 }
 
-/// A client wrapper that defers connection until the first command is executed.
+/// Deprecated internal state used by [`ClientWrapper::Lazy`] for
+/// connection-on-first-command behaviour. The public-facing lazy API
+/// is now [`crate::LazyClient`] constructed via
+/// [`ClientBuilder::build_lazy`]; this struct lingers only until the
+/// `ClientWrapper::Lazy` variant is removed in the next commit.
 #[derive(Clone)]
-pub struct LazyClient {
+pub struct LazyWrapperState {
     config: ConnectionRequest,
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
 }
@@ -1831,7 +1835,7 @@ impl Client {
             // Create shared, thread-safe wrapper for the internal client that starts as lazy
             // Arc<RwLock<T>> enables multiple async tasks to safely share and modify the client state
             let internal_client_arc =
-                Arc::new(RwLock::new(ClientWrapper::Lazy(Box::new(LazyClient {
+                Arc::new(RwLock::new(ClientWrapper::Lazy(Box::new(LazyWrapperState {
                     config: request.clone(),
                     push_sender: push_sender.clone(),
                 }))));
@@ -1899,7 +1903,7 @@ impl Client {
 
             let is_lazy = request.lazy_connect;
             let internal_client = if is_lazy {
-                ClientWrapper::Lazy(Box::new(LazyClient {
+                ClientWrapper::Lazy(Box::new(LazyWrapperState {
                     config: request,
                     push_sender,
                 }))
@@ -2031,7 +2035,7 @@ mod tests {
         BLOCKING_CMD_TIMEOUT_EXTENSION, RequestTimeoutOption, TimeUnit, get_request_timeout,
     };
 
-    use super::{Client, ClientWrapper, LazyClient, get_timeout_from_cmd_arg};
+    use super::{Client, ClientWrapper, LazyWrapperState, get_timeout_from_cmd_arg};
     use std::sync::Weak;
 
     #[test]
@@ -2279,7 +2283,7 @@ mod tests {
             ..Default::default()
         };
 
-        let lazy_client = LazyClient {
+        let lazy_client = LazyWrapperState {
             config,
             push_sender: None,
         };

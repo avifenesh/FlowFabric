@@ -499,6 +499,95 @@ impl ClientBuilder {
         let inner = ClientInner::new(self.request, None).await?;
         Ok(Client(Arc::new(inner)))
     }
+
+    /// Build a client that defers TCP connection until the first
+    /// command is executed.
+    ///
+    /// Unlike [`build`](Self::build), this does NOT attempt to reach
+    /// the server — it validates the address list and returns a
+    /// [`LazyClient`] synchronously. The underlying connection is
+    /// established on the first [`LazyClient::connect`] call (or
+    /// implicitly on the first command issued through the
+    /// returned `&Client`). Subsequent calls reuse the already-
+    /// established connection; a `OnceCell` guarantees connect runs
+    /// exactly once.
+    ///
+    /// Use this when you want a client handle you can construct
+    /// synchronously and thread through app startup, but where
+    /// the Valkey endpoint may not be reachable yet (e.g. the
+    /// server is part of the same deployment and comes up later).
+    pub fn build_lazy(self) -> Result<LazyClient> {
+        if self.request.addresses.is_empty() {
+            return Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "ClientBuilder requires at least one address",
+            )));
+        }
+        Ok(LazyClient {
+            config: self.request,
+            inner: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+}
+
+/// A client handle whose underlying TCP connection is established on
+/// first use, not at construction.
+///
+/// Construct via [`ClientBuilder::build_lazy`]. Call
+/// [`connect`](LazyClient::connect) to force connection establishment
+/// (and to get back the resolved [`Client`] for direct command
+/// dispatch). The resolved client is cached via a
+/// [`tokio::sync::OnceCell`]; first-call races are safe — only one
+/// connection attempt runs, and all callers observe the same result.
+///
+/// ```no_run
+/// # use ferriskey::{ClientBuilder, Result};
+/// # async fn example() -> Result<()> {
+/// let lazy = ClientBuilder::new()
+///     .host("localhost", 6379)
+///     .build_lazy()?;
+///
+/// // No connection has been made yet.
+///
+/// // First use triggers connect + runs the command.
+/// let _: String = lazy.connect().await?.cmd("PING").execute().await?;
+///
+/// // Subsequent calls reuse the established connection.
+/// let _: String = lazy.connect().await?.cmd("PING").execute().await?;
+/// # Ok(()) }
+/// ```
+#[derive(Clone)]
+pub struct LazyClient {
+    config: ConnectionRequest,
+    // OnceCell holds the resolved Client — once connected, every
+    // caller gets the same Arc-backed handle. Clone is cheap.
+    // `tokio::sync::OnceCell` (not `std::sync`) because init runs
+    // an `async` connect and may yield under heavy concurrency.
+    inner: Arc<tokio::sync::OnceCell<Client>>,
+}
+
+impl LazyClient {
+    /// Resolve the underlying [`Client`], performing the connect on
+    /// first call. Idempotent: subsequent calls return the cached
+    /// handle without re-dialling.
+    ///
+    /// Returns the resolved `&Client`. Call command methods on the
+    /// returned reference (`lazy.connect().await?.cmd(...).execute()`).
+    pub async fn connect(&self) -> Result<&Client> {
+        self.inner
+            .get_or_try_init(|| async {
+                let inner = ClientInner::new(self.config.clone(), None).await?;
+                Ok::<Client, Error>(Client(Arc::new(inner)))
+            })
+            .await
+    }
+
+    /// Return a reference to the resolved [`Client`] if connect has
+    /// already succeeded, or `None` otherwise. Useful when a caller
+    /// wants to avoid awaiting if the connection is already warm.
+    pub fn get(&self) -> Option<&Client> {
+        self.inner.get()
+    }
 }
 
 impl Default for ClientBuilder {

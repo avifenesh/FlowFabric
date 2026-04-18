@@ -65,7 +65,8 @@ pub(crate) mod scripts_container;
 
 // High-level public API — the entry point for library users.
 pub use ferriskey_client::{
-    Client, ClientBuilder, CommandBuilder, PipeCmdBuilder, PipeSlot, ReadFrom, TypedPipeline,
+    Client, ClientBuilder, CommandBuilder, LazyClient, PipeCmdBuilder, PipeSlot, ReadFrom,
+    TypedPipeline,
 };
 
 /// Connect to a standalone Valkey server.
