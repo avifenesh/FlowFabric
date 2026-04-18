@@ -13,7 +13,6 @@ use ff_core::types::*;
 use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
-#[cfg(feature = "insecure-direct-claim")]
 use crate::task::ClaimedTask;
 use crate::SdkError;
 
@@ -887,7 +886,53 @@ impl FlowFabricWorker {
         ))
     }
 
-    #[cfg(feature = "insecure-direct-claim")]
+    /// Consume a [`ReclaimGrant`] and transition the granted
+    /// `attempt_interrupted` execution into a `started` state on this
+    /// worker. Symmetric partner to `claim_from_grant` for the resume
+    /// path.
+    ///
+    /// The grant must have been issued to THIS worker (matching
+    /// `worker_id` at grant time). A mismatch returns
+    /// `Err(Script(InvalidClaimGrant))`. The grant is consumed
+    /// atomically by `ff_claim_resumed_execution`; a second call with
+    /// the same grant also returns `InvalidClaimGrant`.
+    ///
+    /// # Errors
+    ///
+    /// * `ScriptError::InvalidClaimGrant` — grant missing, consumed,
+    ///   or `worker_id` mismatch.
+    /// * `ScriptError::ClaimGrantExpired` — grant TTL elapsed.
+    /// * `ScriptError::NotAResumedExecution` — `attempt_state` is not
+    ///   `attempt_interrupted`.
+    /// * `ScriptError::ExecutionNotLeaseable` — `lifecycle_phase` is
+    ///   not `runnable`.
+    /// * `ScriptError::ExecutionNotFound` — core key missing.
+    /// * `SdkError::Valkey` / `SdkError::ValkeyContext` — transport.
+    ///
+    /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+    pub async fn claim_from_reclaim_grant(
+        &self,
+        grant: ff_core::contracts::ReclaimGrant,
+    ) -> Result<ClaimedTask, SdkError> {
+        // Grant carries partition + lane_id so no round-trip is needed
+        // to resolve them before the FCALL.
+        self.claim_resumed_execution(
+            &grant.execution_id,
+            &grant.lane_id,
+            &grant.partition,
+        )
+        .await
+    }
+
+    /// Low-level resume claim. Invokes `ff_claim_resumed_execution`
+    /// and returns a `ClaimedTask` bound to the resumed attempt.
+    ///
+    /// Previously gated behind `insecure-direct-claim`; ungated so the
+    /// public [`claim_from_reclaim_grant`] entry point can reuse it.
+    /// The method stays private — external callers use
+    /// `claim_from_reclaim_grant`.
+    ///
+    /// [`claim_from_reclaim_grant`]: FlowFabricWorker::claim_from_reclaim_grant
     async fn claim_resumed_execution(
         &self,
         execution_id: &ExecutionId,
@@ -1033,7 +1078,10 @@ impl FlowFabricWorker {
         ))
     }
 
-    #[cfg(feature = "insecure-direct-claim")]
+    /// Read payload + execution_kind + tags from exec_core. Previously
+    /// gated behind `insecure-direct-claim`; now shared by the
+    /// feature-gated inline claim path and the public
+    /// `claim_from_reclaim_grant` entry point.
     async fn read_execution_context(
         &self,
         execution_id: &ExecutionId,
