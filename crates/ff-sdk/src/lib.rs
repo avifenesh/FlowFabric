@@ -75,6 +75,19 @@ pub enum SdkError {
     /// Configuration error.
     #[error("config: {0}")]
     Config(String),
+
+    /// Worker is at its configured `max_concurrent_tasks` capacity —
+    /// the caller should retry later. Returned by
+    /// [`FlowFabricWorker::claim_from_grant`] when the concurrency
+    /// semaphore is saturated. Distinct from `Ok(None)`: a
+    /// `ClaimGrant` represents real work already selected by the
+    /// scheduler, so silently dropping it would waste the grant and
+    /// let the grant TTL elapse. Surfacing the saturation lets the
+    /// caller release the grant (or wait + retry).
+    ///
+    /// [`FlowFabricWorker::claim_from_grant`]: crate::FlowFabricWorker::claim_from_grant
+    #[error("worker at capacity: max_concurrent_tasks reached")]
+    WorkerAtCapacity,
 }
 
 impl SdkError {
@@ -86,7 +99,7 @@ impl SdkError {
             Self::Valkey(e) => Some(e.kind()),
             Self::ValkeyContext { source, .. } => Some(source.kind()),
             Self::Script(e) => e.valkey_kind(),
-            Self::Config(_) => None,
+            Self::Config(_) | Self::WorkerAtCapacity => None,
         }
     }
 
@@ -102,6 +115,9 @@ impl SdkError {
             Self::Script(e) => {
                 matches!(e.class(), ff_core::error::ErrorClass::Retryable)
             }
+            // WorkerAtCapacity is retryable: the saturation is transient
+            // and clears as soon as a concurrent task completes.
+            Self::WorkerAtCapacity => true,
             Self::Config(_) => false,
         }
     }

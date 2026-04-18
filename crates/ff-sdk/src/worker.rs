@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 #[cfg(feature = "insecure-direct-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "insecure-direct-claim")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +8,6 @@ use ferriskey::{Client, ClientBuilder, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::*;
-#[cfg(feature = "insecure-direct-claim")]
 use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
@@ -65,7 +63,15 @@ pub struct FlowFabricWorker {
     worker_capabilities_hash: String,
     #[cfg(feature = "insecure-direct-claim")]
     lane_index: AtomicUsize,
-    #[cfg(feature = "insecure-direct-claim")]
+    /// Concurrency cap for in-flight tasks. Permits are acquired by
+    /// [`claim_next`] (feature-gated) and
+    /// [`claim_from_grant`] (always available), transferred to the
+    /// returned [`ClaimedTask`], and released on task
+    /// complete/fail/cancel/drop. Holds `max_concurrent_tasks` permits
+    /// total.
+    ///
+    /// [`claim_next`]: FlowFabricWorker::claim_next
+    /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     concurrency_semaphore: Arc<Semaphore>,
     /// Rolling offset for chunked partition scans. Each poll advances the
     /// cursor by `PARTITION_SCAN_CHUNK`, so over `ceil(num_partitions /
@@ -196,9 +202,7 @@ impl FlowFabricWorker {
                 PartitionConfig::default()
             });
 
-        #[cfg(feature = "insecure-direct-claim")]
         let max_tasks = config.max_concurrent_tasks.max(1);
-        #[cfg(feature = "insecure-direct-claim")]
         let concurrency_semaphore = Arc::new(Semaphore::new(max_tasks));
 
         tracing::info!(
@@ -399,7 +403,6 @@ impl FlowFabricWorker {
             worker_capabilities_hash,
             #[cfg(feature = "insecure-direct-claim")]
             lane_index: AtomicUsize::new(0),
-            #[cfg(feature = "insecure-direct-claim")]
             concurrency_semaphore,
             #[cfg(feature = "insecure-direct-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
@@ -721,7 +724,16 @@ impl FlowFabricWorker {
         }
     }
 
-    #[cfg(feature = "insecure-direct-claim")]
+    /// Low-level claim of a granted execution. Invokes
+    /// `ff_claim_execution` and returns a `ClaimedTask` with auto
+    /// lease renewal.
+    ///
+    /// Previously gated behind `insecure-direct-claim`; ungated so
+    /// the public [`claim_from_grant`] entry point can reuse the
+    /// same FCALL plumbing. The method stays private — external
+    /// callers use `claim_from_grant`.
+    ///
+    /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     async fn claim_execution(
         &self,
         execution_id: &ExecutionId,
@@ -884,6 +896,76 @@ impl FlowFabricWorker {
             execution_kind,
             tags,
         ))
+    }
+
+    /// Consume a [`ClaimGrant`] and claim the granted execution on
+    /// this worker. The intended production entry point: pair with
+    /// [`ff_scheduler::Scheduler::claim_for_worker`] to flow
+    /// scheduler-issued grants into the SDK without enabling the
+    /// `insecure-direct-claim` feature (which bypasses budget/quota
+    /// admission control).
+    ///
+    /// The worker's concurrency semaphore is checked BEFORE the FCALL
+    /// so a saturated worker does not consume the grant: the grant
+    /// stays valid for its remaining TTL and the caller can either
+    /// release it back to the scheduler or retry after some other
+    /// in-flight task completes.
+    ///
+    /// On success the returned [`ClaimedTask`] holds a concurrency
+    /// permit that releases automatically on
+    /// `complete`/`fail`/`cancel`/drop — same contract as
+    /// `claim_next`.
+    ///
+    /// # Arguments
+    ///
+    /// * `lane` — the lane the grant was issued for. Must match what
+    ///   was passed to `Scheduler::claim_for_worker`; the Lua FCALL
+    ///   uses it to look up `lane_eligible`, `lane_active`, and the
+    ///   `worker_leases` index slot.
+    /// * `grant` — the [`ClaimGrant`] returned by the scheduler.
+    ///
+    /// # Errors
+    ///
+    /// * [`SdkError::WorkerAtCapacity`] — `max_concurrent_tasks`
+    ///   permits all held. Retryable; the grant is untouched.
+    /// * `ScriptError::InvalidClaimGrant` — grant missing, consumed,
+    ///   or `worker_id` mismatch (wrapped in [`SdkError::Script`]).
+    /// * `ScriptError::ClaimGrantExpired` — grant TTL elapsed
+    ///   (wrapped in [`SdkError::Script`]).
+    /// * `ScriptError::CapabilityMismatch` — execution's required
+    ///   capabilities not a subset of this worker's caps (wrapped in
+    ///   [`SdkError::Script`]). Surfaced post-grant if a race
+    ///   between grant issuance and caps change allows it.
+    /// * `ScriptError::Parse` — `ff_claim_execution` returned an
+    ///   unexpected shape (wrapped in [`SdkError::Script`]).
+    /// * [`SdkError::Valkey`] / [`SdkError::ValkeyContext`] —
+    ///   transport error during the FCALL or the
+    ///   `read_execution_context` follow-up.
+    ///
+    /// [`ClaimGrant`]: ff_core::contracts::ClaimGrant
+    /// [`ff_scheduler::Scheduler::claim_for_worker`]: https://docs.rs/ff-scheduler
+    pub async fn claim_from_grant(
+        &self,
+        lane: LaneId,
+        grant: ff_core::contracts::ClaimGrant,
+    ) -> Result<ClaimedTask, SdkError> {
+        // Semaphore check FIRST. If the worker is saturated we must
+        // surface the condition to the caller without touching the
+        // grant — silently returning Ok(None) (as claim_next does)
+        // would drop a grant the scheduler has already committed work
+        // to issuing, wasting the slot until its TTL elapses.
+        let permit = self
+            .concurrency_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SdkError::WorkerAtCapacity)?;
+
+        let now = TimestampMs::now();
+        let mut task = self
+            .claim_execution(&grant.execution_id, &lane, &grant.partition, now)
+            .await?;
+        task.set_concurrency_permit(permit);
+        Ok(task)
     }
 
     /// Consume a [`ReclaimGrant`] and transition the granted

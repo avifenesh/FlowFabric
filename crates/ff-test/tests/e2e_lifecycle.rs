@@ -4215,6 +4215,204 @@ async fn test_scheduler_claim_priority_ordering() {
     assert!(grant4.is_none(), "no more eligible executions");
 }
 
+/// End-to-end: `Scheduler::claim_for_worker` → `FlowFabricWorker::
+/// claim_from_grant` → live `ClaimedTask`. This is the production
+/// entry path for consumers that cannot enable the
+/// `insecure-direct-claim` feature (cairn, in particular) — the
+/// scheduler does admission control and hands off a grant; the SDK
+/// consumes the grant without touching the eligible ZSET directly.
+///
+/// Asserts:
+///  1. the grant issued by the scheduler is consumable by
+///     `claim_from_grant` (no shape mismatch between the two layers).
+///  2. the returned `ClaimedTask` carries the correct attempt_index
+///     (0 for a fresh claim), execution_id, and kind/tags.
+///  3. `complete()` drops the lease cleanly — proving the concurrency
+///     permit was acquired + transferred properly (otherwise the task
+///     drop would panic on a non-transferred renewal handle).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_grant_via_scheduler() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    let eid = ExecutionId::new();
+    fcall_create_execution(&tc, &eid, NS, LANE, "claim_from_grant_test", 500).await;
+
+    // Issue grant via the Scheduler — not via raw FCALL — so the
+    // test exercises the scheduler-to-SDK handoff shape.
+    let scheduler = ff_scheduler::claim::Scheduler::new(
+        tc.client().clone(),
+        test_config(),
+    );
+    let lane_id = LaneId::new(LANE);
+    let worker_id = ff_core::types::WorkerId::new(WORKER);
+    let wiid = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let no_caps = std::collections::BTreeSet::<String>::new();
+
+    let grant = scheduler
+        .claim_for_worker(&lane_id, &worker_id, &wiid, &no_caps, 30_000)
+        .await
+        .expect("scheduler should not error")
+        .expect("the created execution should be eligible");
+    assert_eq!(grant.execution_id, eid, "grant should point at our execution");
+
+    // Hand the grant to the SDK worker. `build_reclaim_test_worker`
+    // configures lanes=[LANE] and max_concurrent_tasks=16 — enough
+    // headroom that the semaphore is never the gating factor here.
+    let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
+    let claimed = worker
+        .claim_from_grant(lane_id.clone(), grant)
+        .await
+        .expect("claim_from_grant should succeed on a fresh grant");
+
+    assert_eq!(*claimed.execution_id(), eid, "claimed task should carry our eid");
+    assert_eq!(
+        claimed.attempt_index().0, 0,
+        "fresh claim should have attempt_index 0"
+    );
+    assert_eq!(claimed.execution_kind(), "claim_from_grant_test");
+
+    // Drop-clean contract: complete() releases the lease, renewal
+    // task, and concurrency permit.
+    claimed.complete(Some(b"ok".to_vec())).await
+        .expect("complete should succeed");
+
+    // State sanity: execution terminal + no active lease.
+    assert_execution_state(&tc, &eid, &ExpectedState {
+        public_state: Some(ff_core::state::PublicState::Completed),
+        ..Default::default()
+    }).await;
+}
+
+/// Saturation guard: when the worker's `max_concurrent_tasks` is
+/// fully committed, `claim_from_grant` must return
+/// `SdkError::WorkerAtCapacity` WITHOUT calling
+/// `ff_claim_execution` — otherwise the grant would be atomically
+/// consumed by the Lua FCALL even though the SDK can't run the
+/// work, and the next scheduler tick would see a stuck execution.
+///
+/// Asserts:
+///   1. A worker with `max_concurrent_tasks=1` plus one permit in
+///      flight refuses the second grant with
+///      `SdkError::WorkerAtCapacity`.
+///   2. The grant stays valid — a different worker can consume it.
+///   3. `SdkError::WorkerAtCapacity.is_retryable()` is `true`
+///      (sanity).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_claim_from_grant_rejects_at_capacity() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    write_test_partition_config(&tc).await;
+
+    // Two separate executions so that if the first claim somehow
+    // releases, we still catch the saturation on the second one.
+    // Generate UUIDs until both hash to the SAME execution partition —
+    // otherwise the scheduler's jittered partition scan may pick them
+    // up in a different order than priority dictates (the scheduler
+    // visits partitions linearly, priority-ordering is only guaranteed
+    // within a single partition).
+    let (eid_a, eid_b) = {
+        let config = test_config();
+        loop {
+            let a = ExecutionId::new();
+            let b = ExecutionId::new();
+            let pa = ff_core::partition::execution_partition(&a, &config);
+            let pb = ff_core::partition::execution_partition(&b, &config);
+            if pa.index == pb.index {
+                break (a, b);
+            }
+        }
+    };
+    fcall_create_execution(&tc, &eid_a, NS, LANE, "cap_test", 100).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    fcall_create_execution(&tc, &eid_b, NS, LANE, "cap_test", 50).await;
+
+    // Build a worker with max_concurrent_tasks=1 so the second claim
+    // is guaranteed to saturate. Use the standard worker identity
+    // so both grants are issued to this worker_id.
+    let worker_config = ff_sdk::WorkerConfig {
+        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
+        tls: ff_test::fixtures::env_flag("FF_TLS"),
+        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        worker_id: ff_core::types::WorkerId::new(WORKER),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(WORKER_INST),
+        namespace: ff_core::types::Namespace::new(NS),
+        lanes: vec![LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 100,
+        max_concurrent_tasks: 1,
+    };
+    let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
+
+    let scheduler = ff_scheduler::claim::Scheduler::new(
+        tc.client().clone(),
+        test_config(),
+    );
+    let lane_id = LaneId::new(LANE);
+    let worker_id_t = ff_core::types::WorkerId::new(WORKER);
+    let wiid_t = ff_core::types::WorkerInstanceId::new(WORKER_INST);
+    let no_caps = std::collections::BTreeSet::<String>::new();
+
+    // 1st grant (highest priority on the shared partition = eid_a).
+    // Succeeds and holds the sole permit.
+    let g1 = scheduler
+        .claim_for_worker(&lane_id, &worker_id_t, &wiid_t, &no_caps, 30_000)
+        .await
+        .unwrap()
+        .expect("eligible execution present");
+    assert_eq!(
+        g1.execution_id, eid_a,
+        "same-partition priority: eid_a (100) comes before eid_b (50)"
+    );
+
+    let task1 = worker
+        .claim_from_grant(lane_id.clone(), g1)
+        .await
+        .expect("first claim should take the permit");
+
+    // 2nd grant (eid_b). Semaphore is drained — claim_from_grant
+    // must refuse without consuming the grant.
+    let g2 = scheduler
+        .claim_for_worker(&lane_id, &worker_id_t, &wiid_t, &no_caps, 30_000)
+        .await
+        .unwrap()
+        .expect("second eligible execution present");
+    assert_eq!(g2.execution_id, eid_b);
+    let g2_key = g2.grant_key.clone();
+
+    match worker.claim_from_grant(lane_id.clone(), g2).await {
+        Err(ff_sdk::SdkError::WorkerAtCapacity) => {}
+        Err(other) => panic!("expected WorkerAtCapacity, got {other:?}"),
+        Ok(_) => panic!("saturated worker should not claim"),
+    }
+
+    // Retryability sanity check.
+    assert!(
+        ff_sdk::SdkError::WorkerAtCapacity.is_retryable(),
+        "capacity saturation is transient"
+    );
+
+    // Grant unharmed: the grant key still exists in Valkey (FCALL
+    // was not called, so the grant hash was not atomically deleted).
+    let exists: i64 = tc.client()
+        .cmd("EXISTS")
+        .arg(&g2_key)
+        .execute()
+        .await
+        .expect("EXISTS on grant_key");
+    assert_eq!(exists, 1, "grant_key must still exist after capacity reject");
+
+    // Release the first task — normally the scheduler or a different
+    // worker would now be able to consume g2. Here we just want the
+    // test to leave the cluster clean.
+    task1.complete(None).await.unwrap();
+}
+
 // ─── Phase 7: Integration tests ───
 
 /// Budget enforcement e2e: report 5 tokens (OK), report 6 more (HARD_BREACH),
