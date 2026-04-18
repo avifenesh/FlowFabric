@@ -63,15 +63,16 @@ pub struct FlowFabricWorker {
     worker_capabilities_hash: String,
     #[cfg(feature = "insecure-direct-claim")]
     lane_index: AtomicUsize,
-    /// Concurrency cap for in-flight tasks. Permits are acquired by
-    /// [`claim_next`] (feature-gated) and
-    /// [`claim_from_grant`] (always available), transferred to the
-    /// returned [`ClaimedTask`], and released on task
-    /// complete/fail/cancel/drop. Holds `max_concurrent_tasks` permits
-    /// total.
+    /// Concurrency cap for in-flight tasks. Permits are acquired or
+    /// transferred by [`claim_next`] (feature-gated),
+    /// [`claim_from_grant`] (always available), and
+    /// [`claim_from_reclaim_grant`], transferred to the returned
+    /// [`ClaimedTask`], and released on task complete/fail/cancel/drop.
+    /// Holds `max_concurrent_tasks` permits total.
     ///
     /// [`claim_next`]: FlowFabricWorker::claim_next
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
+    /// [`claim_from_reclaim_grant`]: FlowFabricWorker::claim_from_reclaim_grant
     concurrency_semaphore: Arc<Semaphore>,
     /// Rolling offset for chunked partition scans. Each poll advances the
     /// cursor by `PARTITION_SCAN_CHUNK`, so over `ceil(num_partitions /
