@@ -60,11 +60,15 @@
 //! [`ClaimGrant`]: ff_core::contracts::ClaimGrant
 //! [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
 
+pub mod admin;
 pub mod config;
 pub mod task;
 pub mod worker;
 
 // Re-exports for convenience
+pub use admin::{
+    FlowFabricAdminClient, RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
+};
 pub use config::WorkerConfig;
 pub use task::{
     read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, FailOutcome,
@@ -124,6 +128,43 @@ pub enum SdkError {
     /// [`FlowFabricWorker::claim_from_reclaim_grant`]: crate::FlowFabricWorker::claim_from_reclaim_grant
     #[error("worker at capacity: max_concurrent_tasks reached")]
     WorkerAtCapacity,
+
+    /// HTTP transport error from the admin REST surface. Carries
+    /// the underlying `reqwest::Error` via `#[source]` so callers
+    /// can inspect `is_timeout()` / `is_connect()` / etc. for
+    /// finer-grained retry logic. Distinct from
+    /// [`SdkError::Valkey`]: this fires on the HTTP/JSON surface,
+    /// not on the Lua/Valkey hot path.
+    #[error("http: {context}: {source}")]
+    Http {
+        #[source]
+        source: reqwest::Error,
+        context: String,
+    },
+
+    /// The admin REST endpoint returned a non-2xx response.
+    ///
+    /// Fields surface the server-side `ErrorBody` JSON shape
+    /// (`{ error, kind?, retryable? }`) as structured values so
+    /// cairn-fabric and other consumers can match without
+    /// re-parsing the body:
+    ///
+    /// * `status` — HTTP status code.
+    /// * `message` — the `error` string from the JSON body (or
+    ///   the raw body if it didn't parse as JSON).
+    /// * `kind` — server-supplied Valkey `ErrorKind` label for 5xxs
+    ///   backed by a transport error; `None` for 4xxs.
+    /// * `retryable` — server-supplied hint; `None` for 4xxs.
+    /// * `raw_body` — the full response body, preserved for logging
+    ///   when the JSON shape doesn't match.
+    #[error("admin api: {status}: {message}")]
+    AdminApi {
+        status: u16,
+        message: String,
+        kind: Option<String>,
+        retryable: Option<bool>,
+        raw_body: String,
+    },
 }
 
 impl SdkError {
@@ -135,7 +176,13 @@ impl SdkError {
             Self::Valkey(e) => Some(e.kind()),
             Self::ValkeyContext { source, .. } => Some(source.kind()),
             Self::Script(e) => e.valkey_kind(),
-            Self::Config(_) | Self::WorkerAtCapacity => None,
+            // HTTP/admin-surface errors carry no ferriskey::ErrorKind;
+            // the admin path never touches Valkey directly from the
+            // SDK side. Use `AdminApi.kind` for the server-supplied
+            // label when present.
+            Self::Config(_) | Self::WorkerAtCapacity | Self::Http { .. } | Self::AdminApi { .. } => {
+                None
+            }
         }
     }
 
@@ -154,6 +201,19 @@ impl SdkError {
             // WorkerAtCapacity is retryable: the saturation is transient
             // and clears as soon as a concurrent task completes.
             Self::WorkerAtCapacity => true,
+            // HTTP transport: timeouts and connect failures are
+            // retryable (transient network state); body-decode or
+            // request-build errors are terminal (caller must fix
+            // the code). `reqwest::Error` exposes both predicates.
+            Self::Http { source, .. } => source.is_timeout() || source.is_connect(),
+            // Admin API errors: trust the server's `retryable` hint
+            // when present; otherwise fall back to the HTTP-standard
+            // retryable-status set (429, 503, 504). 5xxs without a
+            // hint are conservatively non-retryable — the caller can
+            // override with `AdminApi.status`-based logic if needed.
+            Self::AdminApi {
+                status, retryable, ..
+            } => retryable.unwrap_or(matches!(*status, 429 | 503 | 504)),
             Self::Config(_) => false,
         }
     }
@@ -222,5 +282,62 @@ mod tests {
     #[test]
     fn is_retryable_config_false() {
         assert!(!SdkError::Config("at least one lane is required".into()).is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_admin_api_uses_server_hint_when_present() {
+        let err = SdkError::AdminApi {
+            status: 429,
+            message: "throttled".into(),
+            kind: None,
+            retryable: Some(false),
+            raw_body: String::new(),
+        };
+        assert!(!err.is_retryable());
+
+        let err = SdkError::AdminApi {
+            status: 500,
+            message: "valkey timeout".into(),
+            kind: Some("IoError".into()),
+            retryable: Some(true),
+            raw_body: String::new(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_admin_api_falls_back_to_standard_retryable_statuses() {
+        for s in [429u16, 503, 504] {
+            let err = SdkError::AdminApi {
+                status: s,
+                message: "x".into(),
+                kind: None,
+                retryable: None,
+                raw_body: String::new(),
+            };
+            assert!(err.is_retryable(), "status {s} should be retryable");
+        }
+        for s in [400u16, 401, 403, 404, 500] {
+            let err = SdkError::AdminApi {
+                status: s,
+                message: "x".into(),
+                kind: None,
+                retryable: None,
+                raw_body: String::new(),
+            };
+            assert!(!err.is_retryable(), "status {s} should NOT be retryable without hint");
+        }
+    }
+
+    #[test]
+    fn valkey_kind_none_for_admin_surface() {
+        let err = SdkError::AdminApi {
+            status: 500,
+            message: "x".into(),
+            kind: Some("IoError".into()),
+            retryable: Some(true),
+            raw_body: String::new(),
+        };
+        assert_eq!(err.valkey_kind(), None);
     }
 }
