@@ -95,6 +95,76 @@ impl ExecutionId {
 }
 ```
 
+### §2.4 ff-script FCALL-result parsing (CONVERGED-RED-1 resolution)
+
+`crates/ff-script` parses Lua FCALL return values into Rust typed results (`ClaimExecutionResult::Claimed`, `CompleteExecutionResult::Completed`, etc.). 9 of those parse paths today construct their result struct with `execution_id: ExecutionId::parse("").unwrap_or_default()` as a placeholder — the comment reads "filled by caller" — and rely on the Rust server-side caller overwriting the field in-place after the parse returns. Removing `impl Default for ExecutionId` in phase 1 breaks `unwrap_or_default()`, removing the placeholder escape hatch.
+
+**Decision: Option (c) refactor the parse API to eliminate the placeholder pattern entirely.** Each `FromFcallResult` impl whose current return type carries an `execution_id` field is refactored to return a "partial" variant that omits that field; the server-side caller combines the partial with the `ExecutionId` it already holds (the caller supplied it as ARGV in the first place, so this is always available at the call site).
+
+Concrete shape:
+
+```rust
+// Before (today, in crates/ff-script/src/functions/execution.rs):
+impl FromFcallResult for ClaimExecutionResult {
+    fn from_fcall_result(raw: &Value) -> Result<Self, ScriptError> {
+        // ... parse epoch, expires_at, attempt_id, attempt_index, attempt_type ...
+        Ok(ClaimExecutionResult::Claimed(ClaimedExecution {
+            execution_id: ExecutionId::parse("").unwrap_or_default(), // filled by caller
+            lease_id, lease_epoch, attempt_index, attempt_id, attempt_type,
+            lease_expires_at,
+        }))
+    }
+}
+
+// After (phase 1):
+pub struct ClaimedExecutionPartial {
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub attempt_index: AttemptIndex,
+    pub attempt_id: AttemptId,
+    pub attempt_type: AttemptType,
+    pub lease_expires_at: TimestampMs,
+}
+
+impl ClaimedExecutionPartial {
+    pub fn complete(self, execution_id: ExecutionId) -> ClaimedExecution {
+        ClaimedExecution { execution_id, ..self.into_claimed() }
+    }
+}
+
+pub enum ClaimExecutionResultPartial { Claimed(ClaimedExecutionPartial) }
+
+impl FromFcallResult for ClaimExecutionResultPartial {
+    fn from_fcall_result(raw: &Value) -> Result<Self, ScriptError> {
+        // same parsing logic, no placeholder
+        Ok(Self::Claimed(ClaimedExecutionPartial { lease_id, ... }))
+    }
+}
+```
+
+Server caller updates (`crates/ff-server/src/server.rs`):
+```rust
+let partial: ClaimExecutionResultPartial = fcall_parse(...)?;
+let result = match partial {
+    ClaimExecutionResultPartial::Claimed(p) =>
+        ClaimExecutionResult::Claimed(p.complete(args.execution_id.clone())),
+};
+```
+
+**Why Option (c), not (a) or (b):**
+
+* **Option (a) — wrap `execution_id: Option<ExecutionId>` on the public struct.** Violates the "a `ClaimedExecution` always has an `execution_id`" type invariant that `ff-sdk` callers (and cairn-fabric) rely on. Every downstream reader would need an unwrap() or `.expect()`; introduces runtime panics where today's code has compile-time guarantees. Explicitly weakens the type system relative to today.
+* **Option (b) — `pub const ExecutionId::PLACEHOLDER`.** Re-introduces `Default` under a different name. Any caller path that forgets to overwrite the field silently corrupts state with the placeholder value — the exact failure mode removing `Default` in §2.3 is aiming to prevent. Silent corruption worse than today.
+* **Option (c) — refactor to Partial.** Type-system-enforced: the compiler forbids a ClaimedExecution from being constructed without an `execution_id`, because there is no constructor path that produces one. Eliminates the "filled by caller" pattern, which today is a load-bearing convention with no compiler enforcement. Aligns with the §2.3 goal of removing `Default` to make "exec_id is always populated" a type-level invariant.
+
+  **Architectural fit:** this pattern already exists in the ff-script ↔ ff-core boundary. The "what the FCALL returns" types (`FcallResult`, `from_fcall_result`) are distinct from the "what the typed API exposes" types (`ClaimExecutionResult`, `CreateExecutionResult`) — the parsers deliberately do not speak the wire-protocol input types. Adding `ClaimedExecutionPartial` etc. extends that existing boundary one layer deeper; the refactor matches an architectural split the code already has, rather than inventing a new one.
+
+**Cost:** ~10 `FromFcallResult` impls across `crates/ff-script/src/functions/execution.rs` (8 impls), `signal.rs` (1), `scheduling.rs` (1). Each is a `Partial` type + `complete(execution_id)` combinator + server-side `.complete(args.execution_id.clone())` at the caller. Scoped into phase 1 (§7.1) alongside the ff-core primitives.
+
+**ff-script files touched:** `crates/ff-script/src/functions/execution.rs` (9 placeholder sites at L154, L206, L273, L314, L354, L463, L466 + 2 `ExecutionId::parse(&eid_str)` at L74, L81), `scheduling.rs` (1 placeholder L81 + 1 parse L52), `signal.rs` (1 placeholder L230), `flow.rs` (2 `ExecutionId::parse(&eid_str)` at L83, L92 — these stay as parsers of FCALL-returned strings, not placeholders). Total: 4 files, 16 call sites, 9 placeholders.
+
+The 5 `ExecutionId::parse(&eid_str)` production sites — where the FCALL return carries a real exec_id string — are forward-compatible with §2.3's new parse rules. The new shape (`{fp:N}:<uuid>`) still parses through the same `ExecutionId::parse` entry point; as long as the Lua side is returning the new shape on phase-3 merge, these parsers succeed. Phase 1 just changes the parse validator; phase 3 changes what Lua emits. No placeholder issue on these 5.
+
 ### §2.4 Rationale for the id-shape choice
 
 **Why `{fp:N}:<uuid>` and not `{fp:N}-<uuid>` or `fp:N:<uuid>`?**
@@ -118,6 +188,29 @@ All call sites grepped on commit `8df40fc`. Line numbers are inventory-accurate 
 * `crates/ff-core/src/partition.rs:95-100` — rewrite `execution_partition` to decode the hash-tag prefix instead of hashing UUID bytes. Keep `partition_for_uuid` for `flow_partition` / `budget_partition` / `quota_partition` (those stay UUID-hashed).
 * `crates/ff-core/src/partition.rs:134-192` — regenerate partition tests against the new constructor shape.
 
+### §3.1b ff-script Partial-type refactor (added 2026-04-18 after RED-1 convergence)
+
+**New scope item, scoped into phase 1.** `crates/ff-script` has 4 files + 9 `ExecutionId::parse("").unwrap_or_default()` placeholder sites + 5 production `ExecutionId::parse(&eid_str)` sites. The placeholder pattern breaks the moment §2.3's `impl Default for ExecutionId` removal lands. §2.4 designs the Partial-type refactor; this punch-list entry is the concrete file map.
+
+* `crates/ff-script/src/functions/execution.rs:68-88` — `FromFcallResult for CreateExecutionResult`. No placeholder; 2 production `parse(&eid_str)` sites (L74, L81) that read the real exec_id from the FCALL return. Forward-compat with §2.3 parse rules. **No refactor needed.**
+* `crates/ff-script/src/functions/execution.rs:137-162` — `FromFcallResult for ClaimExecutionResult`. 1 placeholder (L154). **Refactor to `ClaimExecutionResultPartial`** per §2.4. Add `ClaimedExecutionPartial` struct in the same file.
+* `crates/ff-script/src/functions/execution.rs:201-240` — `FromFcallResult for CompleteExecutionResult`. 1 placeholder (L206). **Refactor.**
+* `crates/ff-script/src/functions/execution.rs:268-300` — `FromFcallResult for CancelExecutionResult`. 1 placeholder (L273). **Refactor.**
+* `crates/ff-script/src/functions/execution.rs:309-340` — `FromFcallResult for DelayExecutionResult`. 1 placeholder (L314). **Refactor.**
+* `crates/ff-script/src/functions/execution.rs:349-390` — `FromFcallResult for MoveToWaitingChildrenResult`. 1 placeholder (L354). **Refactor.**
+* `crates/ff-script/src/functions/execution.rs:455-470` — `FromFcallResult for ExpireExecutionResult`. 2 placeholders (L463, L466). **Refactor.**
+* `crates/ff-script/src/functions/scheduling.rs:45-95` — `FromFcallResult` impl. 1 production `parse(&eid_str)` (L52) + 1 placeholder (L81). **Refactor** (placeholder only; production parse site is forward-compat).
+* `crates/ff-script/src/functions/signal.rs:215-240` — `FromFcallResult` impl. 1 placeholder (L230). **Refactor.**
+* `crates/ff-script/src/functions/flow.rs:80-100` — 2 production `parse(&eid_str)` sites (L83, L92). No placeholder. Forward-compat.
+
+**Server-side updates** (required at every Partial-type consumer site; enumerated as subset of §3.3):
+* `crates/ff-server/src/server.rs` — every `fcall_with_reload("ff_claim_execution", ...)` call site and friends; each unwraps the Partial + calls `.complete(args.execution_id.clone())`. Compiler forces the update because the result type name changed. Approximately 7 call sites (one per refactored `FromFcallResult` impl), mechanical per site.
+
+**Test updates:**
+* `crates/ff-script/tests/*.rs` (if any) — regenerate against Partial types. No test file currently constructs a placeholder; spot-check in phase 1.
+
+**Phase 1 acceptance gate** (§7.1) is extended: `cargo check -p ff-script` must compile clean after the ff-core + ff-script changes land together. Without ff-script in the gate, phase 1 appears to pass while ff-script silently has compile errors waiting for the first dependent build.
+
 ### §3.2 Lua: `ff_add_execution_to_flow` becomes atomic
 
 * `lua/flow.lua:122-173` — add `exec_core` as KEYS[4]; append `redis.call("HSET", K.exec_core, "flow_id", A.flow_id)` after the membership SADD (step 3). Remove the two-phase-contract preamble in the docstring; replace with a co-location note pointing at this RFC. Update the `ok(...)` return to confirm the atomic commit.
@@ -133,18 +226,37 @@ All call sites below keep the same API signature; the change in §3.1 makes them
 * ff-core keys tests: `crates/ff-core/src/keys.rs:621, 634, 654, 665, 677`.
 * Tests: `crates/ff-test/src/helpers.rs:106, 237, 276, 304, 315`; `crates/ff-test/src/assertions.rs:38, 74, 107, 189, 201, 213, 225, 233, 248, 267, 283, 299, 310, 325, 349, 366`; ~90 sites across `crates/ff-test/tests/*.rs` (grep-bounded).
 
-### §3.4 `ExecutionId::new()` removal
+### §3.4 `ExecutionId::new()` removal (REVISED after RED-2 convergence)
 
 Every call site of `ExecutionId::new()` migrates to `for_flow` or `solo`. Compiler enforces this — after phase 1, `ExecutionId::new` doesn't exist and every caller fails to compile until migrated.
 
-* ff-server: `crates/ff-server/src/server.rs` `create_execution` handler — picks `for_flow` when `args.flow_id.is_some()`, else `solo(&args.lane, config)`.
-* ff-test: ~50 sites across `tests/e2e_lifecycle.rs`, `tests/e2e_api.rs`, `tests/pending_waitpoints_api.rs`, `tests/result_api.rs`, `tests/waitpoint_tokens.rs`, `tests/admin_rotate_api.rs`. Solo-path tests take `ExecutionId::solo(&fixture_lane, &config)`; multi-exec flow tests take `for_flow(&shared_fid, &config)`.
-* cairn-fabric: phase 4 (§8).
+**Independent-grep count (2026-04-18): 175 call sites** across 12 files. Original draft claimed "~50 sites" / "~90 sites"; both were 2-3x undercounts. Revised distribution:
 
-### §3.5 Scheduler / claim routing
+* **ff-core (10 sites)** — `crates/ff-core/src/partition.rs` (2, tests), `crates/ff-core/src/keys.rs` (4, tests), `crates/ff-core/src/types.rs` (2, tests for the macro-generated constructor), `crates/ff-core/src/contracts.rs` (2, doctests). All in ff-core's own test paths; **scoped into phase 1** alongside §3.1.
+* **ff-test (166 sites)**:
+  - `crates/ff-test/tests/e2e_lifecycle.rs`: 134 sites — the bulk of the migration work. Each site is a test fixture minting an exec_id for a scenario; most are solo-path (no parent flow), a minority are flow-tests.
+  - `crates/ff-test/tests/waitpoint_tokens.rs`: 14 sites. Solo-path tests.
+  - `crates/ff-test/tests/e2e_api.rs`: 7 sites. Mixed.
+  - `crates/ff-test/tests/admin_rotate_api.rs`: 4 sites. All solo (admin tests have no flow context).
+  - `crates/ff-test/tests/pending_waitpoints_api.rs`: 4 sites. All solo.
+  - `crates/ff-test/tests/result_api.rs`: 3 sites. All solo.
+  - `crates/ff-test/src/fixtures.rs`: 1 site. Solo (fixture helper).
+* **Authoritative attribution for the `for_flow` vs `solo` selection at each site:**
+  - **ff-server side** (phase 2, W1): ONE site — the `create_execution` handler in `crates/ff-server/src/server.rs`. This is the runtime id-minting path; decision: `args.flow_id.as_ref().map(|fid| ExecutionId::for_flow(fid, config)).unwrap_or_else(|| ExecutionId::solo(&args.lane, config))`.
+  - **cairn-fabric side** (phase 4): cairn's `RunService::create_run` + `TaskService::create_task`. Cairn's choice between `for_flow` and `solo` depends on whether the task's parent run has a flow context; cairn-fabric-side decision, not ff-server-side. This is W3's YELLOW catch: I previously put this under phase 2 ff-server scope.
+  - **ff-test side** (phase 2, W2): 166 test sites. Each test picks the variant matching what the test is checking — solo-path tests use `ExecutionId::solo(&fixture_lane, &config)`, flow-member tests use `ExecutionId::for_flow(&shared_fid, &config)`. The test helper `crates/ff-test/src/fixtures.rs` gains a `fixture_lane()` function returning a single test-wide `LaneId` so every solo site can share one helper call.
 
-* `crates/ff-scheduler/src/partition_scan.rs` — outer loop iterates `0..num_flow_partitions` (not `num_execution_partitions`). The per-partition scan body is unchanged — it reads `{fp:N}`-slotted eligible-zsets and routes FCALLs to the same slot, which is exactly what we want post-co-location.
-* `crates/ff-scheduler/src/claim.rs` — `ClaimGrant.partition` holds `{fp:N}` instead of `{p:N}`. One field-value change; consumers use it opaquely as a routing hint, not for logic branching.
+**Mechanical vs judgement split:**
+* ~160 of 166 ff-test sites are "solo with fixture_lane" — mechanical, 30s each after the first.
+* ~6 sites are flow-member tests; each needs semantic judgement about which flow context the exec belongs to. ~5min each.
+* The 1 ff-server site needs design-fidelity judgement about the `args.flow_id.is_some()` branch. ~15-30min to write + test.
+
+### §3.5 Scheduler / claim routing (REVISED — W3 YELLOW)
+
+Corrected file map. `crates/ff-scheduler/src` contains only `claim.rs` + `lib.rs`; there is no `partition_scan.rs` (original draft was wrong). Verified: `ls crates/ff-scheduler/src` → `claim.rs lib.rs`.
+
+* `crates/ff-scheduler/src/claim.rs` — the full scheduler scope in one file. Changes: (a) `ClaimGrant.partition` field-value tag shifts from `{p:N}` to `{fp:N}` (consumers use it opaquely; no logic branching). (b) Any partition-iteration the scheduler does (currently over `num_execution_partitions`) migrates to `num_flow_partitions`. (c) The scheduler's `Scheduler::claim_for_worker` path picks grant keys via `execution_partition(eid)`; the call is unchanged but the decoded partition now routes via the hash-tag (§3.1).
+* `crates/ff-scheduler/src/lib.rs` — re-export surface only; no functional changes.
 
 ### §3.6 Lease / heartbeat / stream reads
 
@@ -254,6 +366,29 @@ Today: `num_execution_partitions = 256`, `num_flow_partitions = 64`. Post-RFC: a
 
 Decision: 256. Deferrable to phase 5 benchmarks if the number turns out wrong; a default bump is a one-line change + release-note entry.
 
+### §5.6 Traffic-amplification mitigation (added 2026-04-18 after W3 YELLOW §9.7)
+
+Solo-execution routing via `crc16(lane_id) % num_flow_partitions` (§4.1) shares the partition index space with flow routing via `crc16(flow_id.as_bytes()) % num_flow_partitions`. A lane and a flow that hash to the same partition pile traffic on the same Valkey slot. This is not a correctness issue — keys are namespaced by entity type (`ff:exec:*` vs `ff:flow:*`) — but it is a hot-spot axis.
+
+**Birthday-paradox arithmetic:** with ~15 lanes and ~15 active flows on a 256-partition cluster, P(at least one collision) ≈ 1 − (256 choose 30) / 256^30 ≈ 30-40%. For deployments with more active entities, the probability climbs.
+
+**Three-part mitigation:**
+
+1. **CLI diagnostic.** `ff-admin partition-collisions` prints the current crc16-hash mapping for every lane + flow in the cluster and flags collisions. Operators run this during deployment sizing.
+2. **Runbook.** `docs/runbooks/partition-amplification.md` (phase 5) explains: how to read the CLI, what a collision means for p99 latency, how to mitigate (rename a lane, adopt a custom `SoloPartitioner`).
+3. **Pluggable `SoloPartitioner` trait.** `crates/ff-core/src/partition.rs` exposes a trait:
+   ```rust
+   pub trait SoloPartitioner: Send + Sync {
+       fn partition_for_lane(&self, lane_id: &LaneId, config: &PartitionConfig) -> u16;
+   }
+   pub struct Crc16SoloPartitioner;  // default
+   ```
+   `ExecutionId::solo` delegates to the configured partitioner. A deployment hitting amplification installs a custom partitioner via `PartitionConfig::with_solo_partitioner(Arc<dyn SoloPartitioner>)` without rebuilding.
+
+**Cost absorbed in revised §8:** ~30min phase 1 (trait + default impl) + ~1h phase 5 (CLI + runbook). Already in the totals.
+
+**Residual risk:** a deployment that doesn't run the CLI pre-deployment and happens to hit a collision sees a hot-spot without diagnosis tooling at hand. We're giving operators the tool, not forcing them to use it. Acceptable.
+
 ---
 
 ## §6 Migration
@@ -292,36 +427,41 @@ If phase 3 ships and an unforeseen regression appears:
 
 Each phase has (a) touch-file list, (b) landing criteria, (c) acceptance gate, (d) cross-review protocol.
 
-### §7.1 Phase 1 — ff-core primitives (6h, W3)
+### §7.1 Phase 1 — ff-core primitives + ff-script Partial refactor (REVISED 10h, W3)
 
-**Touch:** `crates/ff-core/src/types.rs`, `crates/ff-core/src/partition.rs`, `crates/ff-core/src/keys.rs` (tests only).
+**Touch:** `crates/ff-core/src/types.rs`, `crates/ff-core/src/partition.rs`, `crates/ff-core/src/keys.rs` (tests only), `crates/ff-core/src/contracts.rs` (doctests), **`crates/ff-script/src/functions/execution.rs`, `scheduling.rs`, `signal.rs`** (Partial refactor per §2.4 + §3.1b).
 
 **Landing:**
 * `ExecutionId::for_flow`, `ExecutionId::solo` constructors.
 * `ExecutionId::parse` validates `{fp:N}:<uuid>`; rejects bare UUIDs.
 * `execution_partition` decodes the hash-tag prefix.
 * `ExecutionId::new`, `ExecutionId::from_uuid`, `Default` impl removed.
+* ff-script `FromFcallResult` impls refactored to emit `*Partial` types; `complete(execution_id)` combinator on each Partial.
 
-**Acceptance:**
+**Acceptance (REVISED — ff-script added after RED-1):**
 * `cargo test -p ff-core` green (partition tests regenerated).
-* `cargo check -p ff-server -p ff-scheduler -p ff-sdk` produces compile errors at `ExecutionId::new()` call sites only. Clean on every other crate.
+* **`cargo check -p ff-script` green** (the Partial refactor must compile clean in the same phase — without this, phase 1 appears to pass while ff-script has silent compile errors waiting for the first dependent build).
+* `cargo check -p ff-server -p ff-scheduler -p ff-sdk -p ff-test` produces compile errors at `ExecutionId::new()` call sites + at Partial-type consumer sites only. Clean on every other crate.
 
-**Hour breakdown:**
+**Hour breakdown (REVISED):**
 * 1h types.rs: bespoke ExecutionId impl + parse + for_flow/solo
 * 1h partition.rs: execution_partition rewrite + tests
 * 3h compile-error audit across workspace (grep → enumerate → verify compiler agrees)
+* **3h ff-script Partial refactor** (10 FromFcallResult impls × ~15min each = 2.5h + 30min for cross-crate type reshuffle)
+* **1h ff-script unit tests** regenerate
 * 1h cross-review write-up + commit
 
 **Cross-review:** W1 and W2 review before phase 2 starts. Debate round if either dissents.
 
-### §7.2 Phase 2 — Call-site migration (8h, W1 + W2 parallel)
+### §7.2 Phase 2 — Call-site migration (REVISED 14-18h, W1 + W2 parallel)
 
-**Touch:** `crates/ff-server/src/server.rs` (create_execution id minting), `crates/ff-scheduler/src/claim.rs` + `partition_scan.rs`, `crates/ff-sdk/src/task.rs` + `worker.rs`, ~50 ff-test sites, ~90 ExecutionId::new() call sites.
+**Touch:** `crates/ff-server/src/server.rs` (create_execution id minting + ~15 `execution_partition` sites + 7-10 Partial-consumer call sites per §3.1b), `crates/ff-scheduler/src/claim.rs` (per §3.5; no partition_scan.rs), `crates/ff-sdk/src/task.rs` + `worker.rs` (~13 sites, rustdoc on `ClaimGrant.partition`), **`crates/ff-test` (166 sites across 5 test files + `fixtures.rs`)**.
 
 **Landing:**
-* Every `ExecutionId::new()` migrated to `for_flow` or `solo`.
+* Every `ExecutionId::new()` migrated to `for_flow` or `solo`. 175 total call sites: 10 ff-core (phase 1) + 1 ff-server + 166 ff-test + 0 cairn-fabric-in-phase-2 (cairn is phase 4).
 * Scheduler iteration bounds become `num_flow_partitions`.
 * `ClaimGrant.partition` rustdoc updated.
+* Partial-type consumer sites call `.complete(args.execution_id.clone())` (§3.1b).
 * No Lua changes; `add_execution_to_flow` still two-phase.
 
 **Acceptance:**
@@ -330,9 +470,9 @@ Each phase has (a) touch-file list, (b) landing criteria, (c) acceptance gate, (
 * `cargo test -p ff-server --tests` green.
 * `cargo test -p ff-test --tests` green against a real Valkey — the two-phase `add_execution_to_flow` is unchanged, only its input id shape differs.
 
-**Hour breakdown:**
-* W1: 4h — ff-server create_execution + scheduler + ClaimGrant rustdoc (~25 sites)
-* W2: 4h — ff-sdk + ff-test migration (~75 sites)
+**Hour breakdown (REVISED — grounded in independent-grep counts from §3.4):**
+* **W1 (6-8h):** ff-server `create_execution` id-minting decision (~30min) + ~15 `execution_partition` routing-through sites at ~2min each (30min, compile-check only) + 7-10 Partial-consumer `.complete()` call-site updates at ~10min each (1-2h) + ff-scheduler bounds + `ClaimGrant.partition` rustdoc (~1h). Plus 2-3h buffer for unforeseen judgement calls and build-break fixes.
+* **W2 (8-10h):** ff-sdk (~13 `execution_partition` routing-through sites, 30min) + **166 ff-test `ExecutionId::new` migrations**. Breakdown: ~160 solo-path sites × ~30s (80min) + ~6 flow-member sites × ~5min (30min) + `fixture_lane()` helper in `fixtures.rs` + test-file-level `use` import additions (~1h) + per-test-file validation runs (~2h) + buffer for compile-error chains (3-4h). The bulk of this work is mechanical; the critical path is waiting for `cargo test` runs, not writing code.
 
 **Cross-review:** W3 reviews both W1's and W2's diffs before phase 3 starts.
 
@@ -380,7 +520,7 @@ Each phase has (a) touch-file list, (b) landing criteria, (c) acceptance gate, (
 
 **Test 2 — Lua error rollback (commits neither write).**
 
-Exploits the fact that `redis.error_reply(...)` inside a Lua function aborts the whole FCALL atomically — Valkey's scripting contract guarantees no commands executed before the error remain visible. Concrete mechanism:
+Exploits the fact that `ff_add_execution_to_flow`'s early-return paths (`flow_not_found`, `flow_already_terminal`) fire BEFORE any write. Valkey does NOT transactionally roll back a Lua function mid-body (see §9.5 and §10.6 probe 2 — writes before a mid-body error are visible). The test works because the function is structured to validate-before-writing: if validation fails, zero writes have happened yet. Concrete mechanism:
 
 ```
 1. Inject an invalid argument that triggers the "flow_not_found" early return path
@@ -450,18 +590,20 @@ No crash-injection test — the scanner-ticket-motivated "kill process between p
 
 ---
 
-## §8 Cost totals
+## §8 Cost totals (REVISED — grounded in §3.1b + §3.4 counts)
 
-| Phase | Owner        | Hours | Critical path |
-|-------|--------------|-------|----------------|
-| 1     | W3           | 6     | yes (blocks 2, 3) |
-| 2     | W1 + W2      | 8 (4+4 parallel) | yes (blocks 3) |
-| 3     | W2           | 8     | yes (blocks 4, 5) |
-| 4     | cairn team   | 6     | parallel-with-5 |
-| 5     | W2 / harness | 4     | parallel-with-4 |
-| **Total** | **3 workers** | **32h serialised, 28h wall-clock** | |
+| Phase | Owner        | Hours (revised) | Critical path |
+|-------|--------------|-----------------|----------------|
+| 1     | W3           | 10 (was 6)      | yes (blocks 2, 3) — scope added: ff-script Partial refactor per §3.1b |
+| 2     | W1 + W2      | 14-18 (8-10 W2 + 6-8 W1, parallel; was 8) | yes (blocks 3) — counts corrected from ~90 to 175 sites per §3.4 |
+| 3     | W2           | 8               | yes (blocks 4, 5) — unchanged |
+| 4     | cairn team   | 6               | parallel-with-5 — cairn-side `for_flow`/`solo` decision + re-align |
+| 5     | W2 / harness | 4               | parallel-with-4 — unchanged |
+| **Total** | **3 workers** | **42-46h serialised, 36-40h wall-clock** (was 32h/28h) | |
 
-At 6h/day per worker: ~5 working days end-to-end assuming no rework and one cross-review debate round per phase. With debate rounds: 6-8 days realistic.
+At 6h/day per worker: **~7 working days end-to-end** assuming no rework and one cross-review debate round per phase. With debate rounds: 8-10 days realistic.
+
+Revised estimate is 2x the original for phase 2 (because of the site-count undercount) and 1.67x for phase 1 (because of the added ff-script scope). Total revision: ~32h → ~44h (1.38x). Still within the "3-7 days" range the user's decision was based on — now 7 days at the upper end rather than 5 at the upper end. Not a scope-change trigger.
 
 ---
 
@@ -487,15 +629,38 @@ Response: conceded. It's 7-9 characters longer per id. Traded for: the partition
 
 ### §9.5 "Phase 3's atomicity test can't actually prove atomicity under a real crash — only under a Lua-error rollback."
 
-Response: Correct, and the test is named accordingly. The point of the test is to verify the **Lua function's declared rollback semantics**, which Valkey's scripting contract extends to real crashes. `redis.error_reply()` mid-function triggers the same transactional rollback path as "process died mid-function" — both paths discard intermediate writes because the function executes inside an atomic Lua callback. Testing the error-reply path is the testable proxy for the crash path; the Valkey contract makes them equivalent for commit visibility.
+Response (REVISED 2026-04-18 after W3 YELLOW): conceding a language tightening without conceding the test design.
+
+The original phrasing ("the Valkey contract makes them equivalent for commit visibility") was looser than what Valkey actually guarantees. Empirical §10.6 probe 2 showed that **writes executed before a mid-function error_reply do commit and become visible** — Valkey's atomicity unit is the single `redis.call`, not the function body. The function doesn't transactionally roll back. So a mid-function error does NOT trigger the same commit-visibility outcome as "process died mid-function."
+
+What the test actually verifies: the *structure* of `ff_add_execution_to_flow` as rewritten in phase 3 is "validate → SADD → HSET → return ok". The error_reply path we test (`flow_not_found`) returns BEFORE any writes. So the test confirms that the rewritten function's error path commits zero writes, which is the behaviour we care about. It does not claim that all mid-function errors in all Lua functions trigger transactional rollback — they don't.
+
+**Corrected language for the RFC:** the atomicity test is a structural test, not a transactional-rollback test. It verifies: (a) the happy path atomically commits both writes (§7.3.1 test 1), (b) the early-return error path commits zero writes (§7.3.1 test 2), (c) idempotent retries are no-ops (test 3). It does NOT test crash-mid-function semantics, because Valkey does not guarantee those semantics — the function can leave partial state visible if it fails after a redis.call but before return.
+
+**Why this is fine for §5.5's purposes:** the orphan window we're closing is not "Lua function crashes mid-body" (Lua functions don't crash mid-body in normal operation) — it's "Rust caller's two-phase control flow has a gap between phase 1 and phase 2." By collapsing to a single FCALL, we eliminate the Rust-level gap. The Lua-level "mid-function partial commit" concern is a different failure mode that requires a different analysis (FF's error-emitting Lua paths deliberately validate before any write, so no writes happen before an error can fire — this is the load-bearing discipline on the Lua side).
+
+**Concession:** language in §7.3 is updated to remove the "equivalent to crash rollback" claim. §9.5 above replaces the original phrasing. §10.6 probe 2's commit-visibility finding is the source of truth.
 
 ### §9.6 "Migration is new-execs-only; but can't we have a legacy-UUID shim for one release cycle to give consumers a soft landing?"
 
 Response: see §6.1. We have no production consumers that need a soft landing. A shim is dead weight the moment it ships — code that exists to support a state we've never been in. If this RFC lands after the first external consumer deploys, we'd need the shim; it doesn't.
 
-### §9.7 "The `{fp:<crc16(lane_id)>}` solo scheme collides with `{fp:<flow_id_hash>}` — a lane and a flow could share a partition."
+### §9.7 "The `{fp:<crc16(lane_id)>}` solo scheme collides with `{fp:<flow_id_hash>}` — a lane and a flow could share a partition." (REVISED — key collision addressed; traffic amplification CONCEDED 2026-04-18)
 
-Response: Correct, and that's **intended**. Two entities sharing a partition is the co-location story; they route to the same slot and can participate in atomic multi-key FCALLs. The uniqueness guarantee is on the UUID suffix, not the partition prefix. No key collision possible: `ff:exec:{fp:N}:<uuid>:core` and `ff:flow:{fp:N}:<flow_id>:core` have distinct entity-type prefixes (`exec:` vs `flow:`) before the hash-tag.
+**Original concern (key collision):** two entities sharing a partition is **intended**. They route to the same slot and can participate in atomic multi-key FCALLs. No key collision is possible: `ff:exec:{fp:N}:<uuid>:core` and `ff:flow:{fp:N}:<flow_id>:core` have distinct entity-type prefixes (`exec:` vs `flow:`) before the hash-tag.
+
+**New concern (W3 YELLOW): traffic amplification.** Conceded. A lane and a flow that happen to hash to the same partition pile their traffic on the same Valkey slot. Under the birthday paradox, with ~15 lanes and 256 partitions, the probability of at least one lane colliding with at least one flow is non-negligible (~30-40% for a deployment with ~15 active lanes × ~15 active flows). The collision isn't a correctness issue, but it is an operational hot-spot axis that operators need to be able to diagnose and mitigate.
+
+**Mitigation** (added in §5.5 — new subsection):
+* `ff-server` adds a `ff-admin partition-collisions` CLI command that reports, for the current Valkey cluster state, which lane-hashes collide with which flow-hashes. Operators run this during deployment sizing to spot amplification before it becomes a runtime hot-spot.
+* Documentation in `docs/runbooks/partition-amplification.md` (added in phase 5 alongside the cutover runbook) explains: (a) how the collision arises, (b) how to read the CLI output, (c) what to do about it (rename the lane, or adopt a deterministic-but-different solo-partition scheme; see §12.3 for the decision-protocol for the latter).
+* `ExecutionId::solo(lane_id, config)` is decoupled from "which Valkey slot" via a pluggable `SoloPartitioner` trait (default: `crc16 % n`), so a deployment that hits amplification can override to a custom mapping without re-building ff-server.
+
+**Scope impact:** CLI command + docs + trait-based extension point = ~1h of phase-5 work + ~30min of phase-1 work (define the trait + default impl). Already absorbed into the revised §8 totals.
+
+**Residual risk:** a deployment that doesn't run the CLI pre-deployment and happens to hit a collision will see a hot-spot without diagnosis tooling handy. This is true for any hash-partitioning scheme; we're giving operators the tool but not forcing them to use it. Acceptable trade-off at our scale; revisit if a second consumer reports operational pain from traffic amplification specifically.
+
+**See §5.5** for the mitigation spec and §12.3 for the "replace the default SoloPartitioner" decision protocol.
 
 ### §9.8 "You kept `num_flow_partitions` configurable but the default is 256 — why not make the wider default 1024 for future-proofing?"
 
@@ -526,6 +691,50 @@ Response: because §10.3-a's empirical finding shows Module API has the **same c
 ### §9.13 "Valkey 8.0+ floor — what about Redis-consumer compatibility?"
 
 Response: we already ship a Valkey-native architecture (Valkey Functions, RESP3, ferriskey client). There is no Redis consumer to be compatible with. cairn-fabric (our only production-adjacent consumer) pins to `valkey/valkey:8-alpine` explicitly (`/tmp/cairn-rs/scripts/run-fabric-integration-tests.sh`, `/tmp/cairn-rs/crates/cairn-fabric/README.md`). Our interim Valkey floor was effectively 7.2 (where Functions stabilised); moving to 8.0 aligns us with cairn and unblocks future Valkey-8-specific work (see Non-goals §11). See §13 for the explicit version-compatibility commitment.
+
+### §9.14 "§4.4 throughput derivation comes from wider_80_20 bench (SET/GET mix), not from FCALL workload. Is 115k ops/sec realistic for our per-slot ceiling claim?" (W1 YELLOW)
+
+Response: CONCEDE the derivation is indirect; TIGHTEN the language.
+
+The `wider_80_20-ferriskey-wider-8cb6dff.json` measurement is raw SET/GET throughput, not FCALL. FCALL has Lua-script overhead (registration lookup, argument marshalling, Lua bytecode execution, reply serialisation) that a raw SET does not. Our FCALL-heavy workload is slower than raw GET/SET by a factor we haven't measured independently.
+
+**Corrected phrasing for §4.4** (will land in a follow-up revision commit after this response): "Per-slot GET/SET throughput from the existing bench: 115k ops/sec. FlowFabric's per-op cost is 3-5 Valkey round-trips (claim → attempt commands → complete/fail), each of which is an FCALL; FCALL throughput is empirically 30-60% of raw SET/GET on comparable hardware per the ferriskey round-3 bench results in `benches/perf-invest/report-envelope.md`. A conservative envelope for per-slot FCALL throughput is **30-40k FCALLs/sec**; for a 4-5 FCALL/exec workload, that's **~7-10k execs/sec per lane per slot**."
+
+That tightening preserves the §5.2 "10k-member soft limit" rationale — 10k members at 7-10k execs/sec saturates the slot for ~1-1.4 seconds end-to-end, which is still the sub-second p99 budget concern. The number is lower than the original (~20-40k/sec), but the shape of the argument survives.
+
+**Phase 5 benchmark commitment:** run an FCALL-specific benchmark during phase 5 and update the RFC's §4.4 + §5.2 numbers with real data. Defer the precise number; ship the structural argument now.
+
+### §9.15 "`lane_id` isn't validated at ingress. Could malformed lane strings break the SoloPartitioner hashing?" (W1 YELLOW, indirect — was a concern about lane string handling)
+
+Response: The `LaneId` type (`crates/ff-core/src/types.rs`) is a `string_id!` macro invocation — a newtype over `String` with no validation on `::new()`. Any UTF-8 bytes are accepted. The `SoloPartitioner` trait (§5.6) hashes `lane_id.as_str().as_bytes()` via crc16, which is byte-safe and length-independent. Malformed lane strings produce valid (if unexpected) hash outputs; they do not crash or misroute.
+
+**Defense-in-depth mitigation** (added in phase 1 alongside the `ExecutionId` validators): `LaneId::new` gains a length-bound check (max 64 bytes, matching the common runtime-label ceiling) and an ASCII-printable validator. Non-conformant lanes fail loudly at construction, not at routing time. One-line additive validation; no existing caller pattern breaks (all current lane names are ASCII-printable).
+
+**Why this is a phase-1 item, not a phase-5 item:** if a deployment's lane strings pass validation today under a new `LaneId::new`, they'll pass forever. If they don't, we want to know at phase-1 compile-time-of-tests, not phase-3 runtime.
+
+### §9.16 "`num_flow_partitions` environment variable / config override — is it documented?" (W1 YELLOW)
+
+Response: CONCEDE, fix in phase 5 doc pass.
+
+Today `PartitionConfig::num_execution_partitions` is settable via `ServerConfig` (struct field), not an env var. Post-RFC `num_flow_partitions` inherits the same configurability shape. Phase 5's release-note and `docs/runbooks/rfc-011-cutover.md` document the config key and default. No behaviour change — just making the doc visible.
+
+**Explicit commitment added in phase 5 punch-list:** `docs/runbooks/rfc-011-cutover.md` contains a "Partition count" section with:
+* Default value (256).
+* Override mechanism (`ServerConfig::partition_config.num_flow_partitions`).
+* Trade-off guidance (lower for small clusters, higher for bigger clusters, observable slot balance).
+* Link to `ff-admin partition-collisions` (§5.6).
+
+### §9.17 "Boot-time Valkey version check at phase-3 merge timing — what if the cluster is mid-rolling-upgrade and one node reports < 8.0?" (W1 YELLOW)
+
+Response: CONCEDE, tighten the §13 commitment.
+
+The boot-time check as drafted reads `INFO server` and refuses to start against Valkey < 8.0. During a rolling upgrade, the node we happen to connect to might be pre-upgrade while others are post-upgrade — transient failure.
+
+**Revised semantics:** the check runs at startup and on first connection. If it fails, `ff-server` logs a structured error and **retries with exponential backoff up to 60 seconds** before giving up. This tolerates a ~1-minute rolling-upgrade window where one replica is temporarily stale. After 60s, the server exits with the structured error — at that point the cluster is not just mid-upgrade, it's mis-configured and needs operator attention.
+
+**Added to phase 3 punch-list:** `Server::start` boot-path in `crates/ff-server/src/server.rs` gains a `verify_valkey_version()` async call with the 60s retry budget. Single additional commit in phase 3; ~30min to write + test.
+
+§13 updated to name the retry budget.
 
 ---
 
@@ -673,6 +882,16 @@ Kept to the minimum. Each has a decision protocol for when data arrives; nothing
 **Decision protocol:** phase 1 ships with these three; phase 4 (cairn side) may request a fourth variant if they hit a concrete case; adjusted via a non-breaking enum addition before the vX.Y.0 tag.
 **Fallback:** three variants cover every failure mode we've grepped; expansion is additive.
 
+### §12.3 Custom `SoloPartitioner` adoption trigger (added 2026-04-18 after W3 §9.7 concession)
+
+**Current pick:** `Crc16SoloPartitioner` (default, `crc16 % num_flow_partitions`).
+**Data we don't have yet:** which deployments hit traffic-amplification collision hotspots in practice, and what non-default partitioning schemes mitigate them.
+**Decision protocol:**
+1. Deployments run `ff-admin partition-collisions` pre-go-live (documented in phase 5 runbook).
+2. If the report flags a collision between a hot lane and a hot flow, the operator either renames the lane (cheapest fix) or installs a custom `SoloPartitioner`.
+3. If three or more operators independently report collisions that lane-renaming doesn't fix, the default partitioner's algorithm is up for revision in a follow-up RFC (e.g. switching to a keyed hash that varies per-deployment).
+**Fallback:** `crc16 % N` is a standard hashing choice matching Valkey's own slot-assignment; a deployment that hits systematic collisions has either a lane-naming problem (fixable by rename) or a scale-and-configuration problem (fixable by `num_flow_partitions` bump).
+
 ---
 
 ## §13 Valkey version compatibility
@@ -686,7 +905,7 @@ Rationale:
 
 **Explicit compatibility commitment:** `ff-server` post-RFC-011 targets Valkey 8.0+. Valkey 7.x is not supported. Redis (any version) is not supported and never was — FlowFabric is a Valkey-native engine.
 
-**Version assertion:** `ff-server` boot-time version check (added in phase 3) reads `INFO server` and refuses to start against Valkey < 8.0 with a structured error message. Single CI matrix entry: `VALKEY_IMAGE=valkey/valkey:8-alpine`.
+**Version assertion:** `ff-server` boot-time version check (added in phase 3) reads `INFO server` and refuses to start against Valkey < 8.0 with a structured error message. **Retry budget: 60s with exponential backoff** to tolerate rolling-upgrade transients where a replica is temporarily stale (see §9.17). After 60s the server exits; that's a misconfiguration signal, not a transient. Single CI matrix entry: `VALKEY_IMAGE=valkey/valkey:8-alpine`.
 
 ## §14 References
 
