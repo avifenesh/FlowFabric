@@ -149,9 +149,11 @@ pub struct ClaimGrant {
 /// one-fewer-HGET on a type that already lives with the resumer's
 /// lifecycle over strict handle symmetry with `ClaimGrant`.
 ///
-/// Shared wire-level type between `ff-scheduler` (issuer) and
-/// `ff-sdk` (consumer, via `FlowFabricWorker::claim_from_reclaim_grant`).
-/// Lives in `ff-core` so neither crate needs a dep on the other.
+/// Shared wire-level type between the eventual `ff-scheduler`
+/// producer (Batch-C reclaim scanner — not yet in-tree; test
+/// fixtures construct this type today) and `ff-sdk` (consumer, via
+/// `FlowFabricWorker::claim_from_reclaim_grant`). Lives in
+/// `ff-core` so neither crate needs a dep on the other.
 ///
 /// [`FlowFabricWorker::claim_from_reclaim_grant`]: https://docs.rs/ff-sdk
 #[derive(Clone, Debug, PartialEq, Eq)]

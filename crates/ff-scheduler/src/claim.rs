@@ -49,10 +49,12 @@ fn worker_caps_digest(csv: &str) -> String {
 /// share one wire-level type without a cross-dep between them.
 pub use ff_core::contracts::ClaimGrant;
 
-/// A reclaim grant issued for a resumed (attempt_interrupted) execution.
+/// A reclaim grant for a resumed (attempt_interrupted) execution.
 ///
-/// Re-exported from [`ff_core::contracts::ReclaimGrant`] for
-/// symmetry with [`ClaimGrant`]. Consumed by
+/// Re-export of [`ff_core::contracts::ReclaimGrant`] for symmetry
+/// with [`ClaimGrant`]. `ff-scheduler` will be the canonical
+/// producer once the Batch-C reclaim scanner lands; today only
+/// test fixtures construct this type. Consumed by
 /// `FlowFabricWorker::claim_from_reclaim_grant`.
 pub use ff_core::contracts::ReclaimGrant;
 
