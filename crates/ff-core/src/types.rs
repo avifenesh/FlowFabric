@@ -142,8 +142,21 @@ impl ExecutionId {
 
     /// Parse a hash-tagged execution-id string. Rejects:
     ///  - strings missing the `{fp:N}:` prefix (returns [`ExecutionIdParseError::MissingTag`]);
-    ///  - non-integer partition index (returns [`ExecutionIdParseError::InvalidPartitionIndex`]);
+    ///  - non-integer partition index, or one that does not fit in `u16`
+    ///    (returns [`ExecutionIdParseError::InvalidPartitionIndex`]);
     ///  - malformed UUID suffix (returns [`ExecutionIdParseError::InvalidUuid`]).
+    ///
+    /// **Parse does NOT check `N < num_flow_partitions`** — the function
+    /// takes only `&str` and has no [`crate::partition::PartitionConfig`]
+    /// handle. Range validation against the live deployment's partition
+    /// count is the caller's responsibility via [`ExecutionId::partition`]
+    /// + config comparison. See RFC-011 §2.3.1 for the architectural
+    /// rationale: exec ids are durable identifiers that legitimately cross
+    /// deployment boundaries with different configs, so parse-time
+    /// config-coupling would mis-reject otherwise-valid historical ids.
+    /// The natural validation point is at ingress boundaries (e.g.
+    /// `ff-server`'s request handlers, scheduler claim-grant receipt)
+    /// against the current deployment's config.
     ///
     /// Callers reading [`ExecutionId`] strings from Lua FCALL results use this entry point.
     pub fn parse(s: &str) -> Result<Self, ExecutionIdParseError> {
