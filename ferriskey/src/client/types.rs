@@ -22,6 +22,12 @@ pub struct ConnectionRequest {
     pub periodic_checks: Option<PeriodicCheck>,
     pub pubsub_subscriptions: Option<crate::connection::info::PubSubSubscriptionInfo>,
     pub inflight_requests_limit: Option<u32>,
+    /// Deprecated glide-era flag. The connect-on-first-use path now
+    /// lives on [`crate::LazyClient`] constructed via
+    /// [`crate::ClientBuilder::build_lazy`]. If this flag is set on
+    /// a request handed to [`crate::Client::new`], the call returns
+    /// `InvalidClientConfig` with an actionable migration message —
+    /// see that error for guidance.
     pub lazy_connect: bool,
     pub refresh_topology_from_initial_nodes: bool,
     pub root_certs: Vec<Vec<u8>>,

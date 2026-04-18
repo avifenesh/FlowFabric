@@ -33,6 +33,8 @@ pub(crate) mod shared_client_tests {
 
     use super::*;
     use ferriskey::client::{Client, DEFAULT_RESPONSE_TIMEOUT};
+    #[allow(unused_imports)] // used only by lazy IAM tests (W3 scope)
+    use ferriskey::client::ValkeyClientForTests;
     use rstest::rstest;
     use utilities::BackingServer;
     use utilities::cluster::*;
@@ -671,8 +673,10 @@ pub(crate) mod shared_client_tests {
             // Enable lazy connection
             connection_request.lazy_connect = true;
 
-            // Create client with lazy connection
-            let client_result = Client::new(connection_request, None).await;
+            // Create client with lazy connection via the dedicated
+            // LazyClient type — `Client::new` now rejects
+            // `lazy_connect=true`.
+            let client_result = ferriskey::LazyClient::from_config(connection_request);
 
             match client_result {
                 Ok(mut client) => {
@@ -771,8 +775,10 @@ pub(crate) mod shared_client_tests {
             // Enable lazy connection
             connection_request.lazy_connect = true;
 
-            // Create client with lazy connection
-            let client_result = Client::new(connection_request, None).await;
+            // Create client with lazy connection via the dedicated
+            // LazyClient type — `Client::new` now rejects
+            // `lazy_connect=true`.
+            let client_result = ferriskey::LazyClient::from_config(connection_request);
 
             match client_result {
                 Ok(mut client) => {

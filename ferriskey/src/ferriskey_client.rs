@@ -566,7 +566,51 @@ pub struct LazyClient {
     inner: Arc<tokio::sync::OnceCell<Client>>,
 }
 
+impl crate::client::ValkeyClientForTests for LazyClient {
+    fn send_command<'a>(
+        &'a mut self,
+        cmd: &'a mut crate::cmd::Cmd,
+        routing: Option<crate::cluster::routing::RoutingInfo>,
+    ) -> futures::future::BoxFuture<'a, Result<crate::value::Value>> {
+        // Integration-test adapter: resolve the inner Client (connect
+        // on first call) then delegate `send_command`. Mirrors the
+        // old lazy Client behaviour — external tests that used
+        // `Client::new(req_with_lazy, None)` now pass a `LazyClient`
+        // through the same `ValkeyClientForTests` harness without
+        // needing to touch connect() themselves.
+        use futures::FutureExt;
+        async move {
+            let client = self.connect().await?.clone();
+            let mut inner = (*client.0).clone();
+            inner.send_command(cmd, routing).await
+        }
+        .boxed()
+    }
+}
+
 impl LazyClient {
+    /// Construct a `LazyClient` directly from a raw
+    /// [`ConnectionRequest`]. Parallel to the escape-hatch
+    /// `Client::new(request, ...)` API — same shape, deferred
+    /// connect. Escape hatch for tests + advanced consumers that
+    /// already own a built `ConnectionRequest`; ordinary code should
+    /// prefer [`ClientBuilder::build_lazy`].
+    ///
+    /// The `lazy_connect` flag on the request is ignored (the
+    /// lazy semantics come from this type, not the flag).
+    pub fn from_config(config: ConnectionRequest) -> Result<Self> {
+        if config.addresses.is_empty() {
+            return Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "LazyClient requires at least one address",
+            )));
+        }
+        Ok(Self {
+            config,
+            inner: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+
     /// Resolve the underlying [`Client`], performing the connect on
     /// first call. Idempotent: subsequent calls return the cached
     /// handle without re-dialling.
@@ -576,7 +620,12 @@ impl LazyClient {
     pub async fn connect(&self) -> Result<&Client> {
         self.inner
             .get_or_try_init(|| async {
-                let inner = ClientInner::new(self.config.clone(), None).await?;
+                // Clear `lazy_connect` so the inner eager ctor accepts
+                // the config — LazyClient's own OnceCell already
+                // provides the deferral.
+                let mut config = self.config.clone();
+                config.lazy_connect = false;
+                let inner = ClientInner::new(config, None).await?;
                 Ok::<Client, Error>(Client(Arc::new(inner)))
             })
             .await
