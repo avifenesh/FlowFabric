@@ -1005,6 +1005,7 @@ dependencies = [
  "hdrhistogram",
  "rand 0.9.4",
  "redis",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

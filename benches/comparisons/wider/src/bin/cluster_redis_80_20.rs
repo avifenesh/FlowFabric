@@ -41,6 +41,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    cluster_shared::init_rustls_provider();
     let env = ClusterEnv::from_env();
     eprintln!("[cluster-redis-80-20] {}", env.describe());
 

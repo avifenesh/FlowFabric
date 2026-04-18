@@ -152,6 +152,15 @@ hdrhistogram = "7"
 # Same PRNG the other bench bins use — a seeded StdRng gives
 # deterministic per-worker key draws across runs.
 rand = "0.9"
+# Round 2 cluster+TLS requires a process-wide rustls CryptoProvider
+# to be installed before any TLS connection. `aws-lc-rs` matches
+# ferriskey's own rustls config (ferriskey/Cargo.toml pins
+# rustls = { features = ["aws-lc-rs"] }) so both clients share one
+# provider and the comparison is apples-to-apples on TLS primitives.
+# Without this, redis-rs's get_async_connection panics inside rustls
+# with "Could not automatically determine the process-level
+# CryptoProvider from Rustls crate features."
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 
 [profile.release]
 # Match the other bench packages: debug symbols kept so perf/flame

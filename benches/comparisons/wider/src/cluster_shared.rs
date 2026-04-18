@@ -14,10 +14,30 @@
 //! `{wider}` or `{benchq}` tag is a measurement bug; a post-run
 //! DBSIZE check flags leakage.
 
+use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ferriskey::{Client as FkClient, ClientBuilder as FkBuilder};
+
+/// Install the process-wide rustls `CryptoProvider` exactly once.
+///
+/// rustls 0.23 refuses to hand out a default provider unless exactly
+/// one feature is enabled. Ferriskey pins `aws-lc-rs` internally; the
+/// redis crate's `tls-rustls` feature set does NOT pick a provider,
+/// so without this call `redis::ClusterClient::get_async_connection`
+/// panics at first TLS handshake. Matching ferriskey's choice keeps
+/// the TLS primitives identical across both clients in round-2
+/// benches — a fair A/B.
+///
+/// `Once` guards the install so calling this from every bin's main
+/// (and from every worker that might initialise TLS later) is safe.
+pub fn init_rustls_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 /// Connection config read from env — matches
 /// `crates/ff-test/src/fixtures.rs::build_client_from_env` so a
