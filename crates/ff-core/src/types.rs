@@ -84,9 +84,121 @@ macro_rules! string_id {
 
 // ── UUID-backed identity types ──
 
-uuid_id! {
-    /// Stable identity for a logical execution. Never changes across retries/reclaims/replays.
-    ExecutionId
+// ── ExecutionId — bespoke impl (RFC-011 §2.3) ──
+//
+// Not uuid_id!-generated because the hash-tagged `{fp:N}:<uuid>` shape
+// requires a flow/lane context at construction time (co-locating exec keys
+// with their parent flow's Valkey slot). Removes new()/Default/from_uuid
+// variants that would produce a bare UUID with no hash-tag.
+
+/// Stable identity for a logical execution. Never changes across
+/// retries/reclaims/replays.
+///
+/// String-backed shape `{fp:N}:<uuid>` where `fp:N` is the Valkey
+/// hash-tag for the flow partition this execution co-locates with, and
+/// `<uuid>` is a UUIDv4 for intra-partition uniqueness. Construct via
+/// [`ExecutionId::for_flow`] (known parent flow) or [`ExecutionId::solo`]
+/// (no parent flow; per-lane synthetic shard).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExecutionId(String);
+
+/// Error returned when parsing a malformed [`ExecutionId`] string.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ExecutionIdParseError {
+    #[error("execution_id is missing the `{{fp:N}}:` hash-tag prefix: {0}")]
+    MissingTag(String),
+    #[error("execution_id partition index is not a valid u16: {0}")]
+    InvalidPartitionIndex(String),
+    #[error("execution_id UUID suffix is not a valid UUID: {0}")]
+    InvalidUuid(String),
+}
+
+impl ExecutionId {
+    /// Mint an execution id co-located with the given flow's partition.
+    /// Use when the flow is known at creation time (the common case).
+    ///
+    /// Partition index = `crc16(flow_id.bytes) % num_flow_partitions`,
+    /// matching [`crate::partition::flow_partition`].
+    pub fn for_flow(flow_id: &FlowId, config: &crate::partition::PartitionConfig) -> Self {
+        let partition = crate::partition::flow_partition(flow_id, config).index;
+        Self::with_partition(partition)
+    }
+
+    /// Mint an execution id co-located with the given lane's solo shard.
+    /// Use when the exec has no parent flow (standalone `create_execution`).
+    ///
+    /// Partition index = `crc16(lane_id.as_str().bytes) % num_flow_partitions`
+    /// via the default [`crate::partition::SoloPartitioner`].
+    pub fn solo(lane_id: &LaneId, config: &crate::partition::PartitionConfig) -> Self {
+        let partition = crate::partition::solo_partition(lane_id, config).index;
+        Self::with_partition(partition)
+    }
+
+    fn with_partition(partition: u16) -> Self {
+        let uuid = Uuid::new_v4();
+        Self(format!("{{fp:{partition}}}:{uuid}"))
+    }
+
+    /// Parse a hash-tagged execution-id string. Rejects:
+    ///  - strings missing the `{fp:N}:` prefix (returns [`ExecutionIdParseError::MissingTag`]);
+    ///  - non-integer partition index (returns [`ExecutionIdParseError::InvalidPartitionIndex`]);
+    ///  - malformed UUID suffix (returns [`ExecutionIdParseError::InvalidUuid`]).
+    ///
+    /// Callers reading [`ExecutionId`] strings from Lua FCALL results use this entry point.
+    pub fn parse(s: &str) -> Result<Self, ExecutionIdParseError> {
+        // Expected: "{fp:<N>}:<uuid>"
+        let rest = s
+            .strip_prefix("{fp:")
+            .ok_or_else(|| ExecutionIdParseError::MissingTag(s.to_owned()))?;
+        let close = rest
+            .find("}:")
+            .ok_or_else(|| ExecutionIdParseError::MissingTag(s.to_owned()))?;
+        let partition_str = &rest[..close];
+        let uuid_str = &rest[close + 2..];
+        partition_str
+            .parse::<u16>()
+            .map_err(|_| ExecutionIdParseError::InvalidPartitionIndex(partition_str.to_owned()))?;
+        Uuid::parse_str(uuid_str)
+            .map_err(|_| ExecutionIdParseError::InvalidUuid(uuid_str.to_owned()))?;
+        Ok(Self(s.to_owned()))
+    }
+
+    /// Decode the partition index from the hash-tag prefix. Infallible on a
+    /// validated `ExecutionId` (construction paths guarantee a well-formed tag).
+    pub fn partition(&self) -> u16 {
+        // Safe: the only ways to construct an ExecutionId are for_flow/solo/parse,
+        // all of which enforce the `{fp:N}:<uuid>` shape.
+        let rest = &self.0["{fp:".len()..];
+        let close = rest.find("}:").expect("invariant: valid ExecutionId");
+        rest[..close]
+            .parse::<u16>()
+            .expect("invariant: valid partition index")
+    }
+
+    /// Raw string form; always `{fp:N}:<uuid>`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionId {
+    /// Deserialises from a JSON string; validates via [`ExecutionId::parse`]
+    /// so malformed wire payloads (e.g. legacy bare UUIDs) fail loudly at the
+    /// parse boundary rather than routing to the wrong partition downstream.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 uuid_id! {
@@ -444,11 +556,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uuid_id_display_roundtrip() {
-        let eid = ExecutionId::new();
+    fn execution_id_display_roundtrip() {
+        // Post-RFC-011: ExecutionId has no ::new(); round-trip via for_flow.
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let s = eid.to_string();
         let parsed = ExecutionId::parse(&s).unwrap();
         assert_eq!(eid, parsed);
+    }
+
+    #[test]
+    fn uuid_id_display_roundtrip() {
+        // Non-ExecutionId uuid_id! types still round-trip via ::new().
+        let fid = FlowId::new();
+        let s = fid.to_string();
+        let parsed = FlowId::parse(&s).unwrap();
+        assert_eq!(fid, parsed);
     }
 
     #[test]
@@ -475,11 +598,20 @@ mod tests {
     }
 
     #[test]
-    fn uuid_id_serde_roundtrip() {
-        let eid = ExecutionId::new();
+    fn execution_id_serde_roundtrip() {
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
         let json = serde_json::to_string(&eid).unwrap();
         let parsed: ExecutionId = serde_json::from_str(&json).unwrap();
         assert_eq!(eid, parsed);
+    }
+
+    #[test]
+    fn uuid_id_serde_roundtrip() {
+        let fid = FlowId::new();
+        let json = serde_json::to_string(&fid).unwrap();
+        let parsed: FlowId = serde_json::from_str(&json).unwrap();
+        assert_eq!(fid, parsed);
     }
 
     #[test]
