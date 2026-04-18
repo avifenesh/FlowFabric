@@ -29,6 +29,10 @@ name = "probe-ferriskey-5x1"
 path = "src/probe_ferriskey_5x1.rs"
 
 [[bin]]
+name = "probe-ferriskey-5x1-configurable"
+path = "src/probe_ferriskey_5x1_configurable.rs"
+
+[[bin]]
 name = "probe-redis-rs-1x1"
 path = "src/probe_redis_rs_1x1.rs"
 
