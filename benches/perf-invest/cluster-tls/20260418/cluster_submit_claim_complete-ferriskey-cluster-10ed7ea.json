@@ -1,0 +1,36 @@
+{
+  "cluster": false,
+  "config": {
+    "cluster_mode": true,
+    "endpoint": "clustercfg.glide-perf-test-cache-2026.nra7gl.use1.cache.amazonaws.com",
+    "mix": "RPUSH/BLMPOP/INCR (scenario 1 shape)",
+    "payload_bytes": 4096,
+    "port": 6379,
+    "queue_key": "{benchq}:q",
+    "tasks": 10000,
+    "tls": true,
+    "workers": 16
+  },
+  "duration_s": 3.035430157,
+  "git_sha": "10ed7ea",
+  "hdr_samples": 10000,
+  "host": {
+    "cores": 16,
+    "cpu": "AMD EPYC 9R14",
+    "mem_gb": 30
+  },
+  "latency_ms": {
+    "max": 4.175,
+    "p50": 1.203,
+    "p95": 1.301,
+    "p99": 2.685
+  },
+  "notes": "ferriskey cluster+TLS = ClientBuilder per worker + RPUSH/BLMPOP/INCR, {benchq} single-slot. Scenario 1 shape re-run over cluster+TLS — round 1 localhost showed -46% ferriskey vs redis-rs.",
+  "scenario": "cluster_submit_claim_complete",
+  "system": "ferriskey-cluster",
+  "throughput_ops_per_sec": 3294.425989983337,
+  "timestamp_utc": "2026-04-18T00:52:17Z",
+  "total_errors": 0,
+  "total_ops": 10000,
+  "valkey_version": "7.2.4"
+}
