@@ -159,6 +159,17 @@ pub enum ServerError {
     /// Fields: (source_label, max_permits).
     #[error("too many concurrent {0} calls (max: {1})")]
     ConcurrencyLimitExceeded(&'static str, u32),
+    /// Detected Valkey version is below the RFC-011 §13 minimum. The hash-slot
+    /// co-location design and Valkey Functions API behavior the engine depends
+    /// on were introduced/stabilized in 8.0; older versions silently behave
+    /// differently on some cluster edge cases. Operator action: upgrade Valkey.
+    #[error(
+        "valkey version too low: detected {detected}, required >= {required} (RFC-011 §13)"
+    )]
+    ValkeyVersionTooLow {
+        detected: String,
+        required: String,
+    },
 }
 
 impl ServerError {
@@ -197,6 +208,8 @@ impl ServerError {
             // so the retry will succeed once a permit frees up. Applies
             // equally to stream ops, admin rotate, etc.
             Self::ConcurrencyLimitExceeded(_, _) => true,
+            // Operator must upgrade Valkey; a retry at the caller won't help.
+            Self::ValkeyVersionTooLow { .. } => false,
         }
     }
 }
@@ -243,6 +256,12 @@ impl Server {
             )));
         }
         tracing::info!("Valkey connection established");
+
+        // Step 1b: Verify Valkey version meets the RFC-011 §13 minimum (8.0).
+        // Tolerates a rolling upgrade via a 60s exponential-backoff budget
+        // per RFC-011 §9.17 — transient INFO errors during a node restart
+        // don't trip the check until the whole budget is exhausted.
+        verify_valkey_version(&client).await?;
 
         // Step 2: Validate or create partition config
         validate_or_create_partition_config(&client, &config.partition_config).await?;
@@ -2456,6 +2475,101 @@ impl Server {
     }
 }
 
+// ── Valkey version check (RFC-011 §13) ──
+
+/// Minimum Valkey version the engine requires (see RFC-011 §13). 8.0 ships the
+/// hash-slot and Functions behavior the co-location design relies on.
+const REQUIRED_VALKEY_MAJOR: u32 = 8;
+
+/// Upper bound on the rolling-upgrade retry window (RFC-011 §9.17). A Valkey
+/// node cycling through SIGTERM → restart typically completes in well under
+/// 60s; this budget is generous without letting a truly-stuck cluster hang
+/// boot indefinitely.
+const VERSION_CHECK_RETRY_BUDGET: Duration = Duration::from_secs(60);
+
+/// Verify the connected Valkey reports `redis_version` ≥ 8.0.
+///
+/// Sends `INFO server`, parses the `redis_version` field, and compares the
+/// major component. Retries on transient errors (connection refused mid-
+/// upgrade, parse-below-threshold) with exponential backoff capped at the
+/// rolling-upgrade budget. On exhaustion of the budget, returns the last
+/// typed error (either `ValkeyVersionTooLow` for a low-version response, or
+/// `ValkeyContext` for a transport error).
+async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
+    let deadline = tokio::time::Instant::now() + VERSION_CHECK_RETRY_BUDGET;
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        let transient_err = match query_valkey_version(client).await {
+            Ok(detected_major) if detected_major >= REQUIRED_VALKEY_MAJOR => {
+                tracing::info!(
+                    detected_major,
+                    required = REQUIRED_VALKEY_MAJOR,
+                    "Valkey version accepted"
+                );
+                return Ok(());
+            }
+            Ok(detected_major) => {
+                // Low version — not transient, don't retry. The cluster
+                // can't "grow" past this without operator action. Return
+                // immediately with a typed error.
+                return Err(ServerError::ValkeyVersionTooLow {
+                    detected: detected_major.to_string(),
+                    required: format!("{REQUIRED_VALKEY_MAJOR}.0"),
+                });
+            }
+            Err(e) => e,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(transient_err);
+        }
+        tracing::warn!(
+            backoff_ms = backoff.as_millis() as u64,
+            "valkey version check transient error; retrying"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+/// Run `INFO server` and extract the major component of `redis_version`.
+/// Returns `Err` on transport errors, missing field, or unparsable version.
+async fn query_valkey_version(client: &Client) -> Result<u32, ServerError> {
+    let info: String = client
+        .cmd("INFO")
+        .arg("server")
+        .execute()
+        .await
+        .map_err(|e| ServerError::ValkeyContext {
+            source: e,
+            context: "INFO server".into(),
+        })?;
+    parse_valkey_major_version(&info)
+}
+
+/// Extract the major component of `redis_version` from an `INFO server`
+/// response body. Pure parser — pulled out of [`query_valkey_version`] so it
+/// is unit-testable without a live Valkey.
+fn parse_valkey_major_version(info: &str) -> Result<u32, ServerError> {
+    let version_line = info
+        .lines()
+        .find_map(|line| line.strip_prefix("redis_version:"))
+        .ok_or_else(|| {
+            ServerError::OperationFailed(
+                "valkey version check: INFO missing redis_version".into(),
+            )
+        })?;
+    let major_str = version_line.split('.').next().ok_or_else(|| {
+        ServerError::OperationFailed(format!(
+            "valkey version check: unparsable version '{version_line}'"
+        ))
+    })?;
+    major_str.trim().parse::<u32>().map_err(|_| {
+        ServerError::OperationFailed(format!(
+            "valkey version check: non-numeric major in '{version_line}'"
+        ))
+    })
+}
+
 // ── Partition config validation ──
 
 /// Validate or create the `ff:config:partitions` key on first boot.
@@ -4000,5 +4114,66 @@ mod tests {
             got: "2".into(),
         });
         assert_eq!(err.valkey_kind(), None);
+    }
+
+    // ── Valkey version check (RFC-011 §13) ──
+
+    #[test]
+    fn parse_valkey_major_extracts_8_from_real_info_body() {
+        // Sample INFO server output from Valkey 8.0.
+        let info = "\
+# Server\r\n\
+redis_version:8.0.1\r\n\
+redis_git_sha1:00000000\r\n\
+redis_git_dirty:0\r\n\
+redis_build_id:abc\r\n\
+redis_mode:standalone\r\n\
+os:Linux\r\n\
+arch_bits:64\r\n";
+        assert_eq!(parse_valkey_major_version(info).unwrap(), 8);
+    }
+
+    #[test]
+    fn parse_valkey_major_extracts_7_from_low_version() {
+        let info = "# Server\r\nredis_version:7.2.4\r\nfoo:bar\r\n";
+        assert_eq!(parse_valkey_major_version(info).unwrap(), 7);
+    }
+
+    #[test]
+    fn parse_valkey_major_errors_when_field_missing() {
+        let info = "# Server\r\nfoo:bar\r\n";
+        let err = parse_valkey_major_version(info).unwrap_err();
+        assert!(matches!(err, ServerError::OperationFailed(_)));
+        assert!(err.to_string().contains("missing redis_version"));
+    }
+
+    #[test]
+    fn parse_valkey_major_errors_on_non_numeric() {
+        let info = "redis_version:invalid.x.y\n";
+        let err = parse_valkey_major_version(info).unwrap_err();
+        assert!(matches!(err, ServerError::OperationFailed(_)));
+        assert!(err.to_string().contains("non-numeric major"));
+    }
+
+    #[test]
+    fn valkey_version_too_low_is_not_retryable() {
+        let err = ServerError::ValkeyVersionTooLow {
+            detected: "7".into(),
+            required: "8.0".into(),
+        };
+        assert!(!err.is_retryable());
+        assert_eq!(err.valkey_kind(), None);
+    }
+
+    #[test]
+    fn valkey_version_too_low_error_message_includes_both_versions() {
+        let err = ServerError::ValkeyVersionTooLow {
+            detected: "7".into(),
+            required: "8.0".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("7"), "detected version in message: {msg}");
+        assert!(msg.contains("8.0"), "required version in message: {msg}");
+        assert!(msg.contains("RFC-011"), "RFC pointer in message: {msg}");
     }
 }
