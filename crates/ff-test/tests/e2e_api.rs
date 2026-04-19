@@ -577,8 +577,11 @@ async fn test_api_add_execution_to_flow() {
         .expect("create flow failed");
     assert!(resp.status().is_success());
 
-    // Create execution
-    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
+    // Create execution co-located with the flow's partition.
+    // Post-RFC-011 phase 3: ff_add_execution_to_flow is an atomic
+    // single-FCALL that takes exec_core as KEYS[4] and requires the
+    // exec's hash-tag to match the flow's. Mint via for_flow.
+    let eid = ExecutionId::for_flow(&flow_id, &ff_test::fixtures::TEST_PARTITION_CONFIG);
     api_create_execution(&api, &eid, 0).await;
 
     // Add to flow
