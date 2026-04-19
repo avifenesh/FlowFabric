@@ -181,12 +181,21 @@ pub struct ClaimedTask {
     /// task. Reset to 0 on each successful renewal. Workers should check
     /// `is_lease_healthy()` before committing expensive side effects.
     renewal_failures: Arc<AtomicU32>,
-    /// Set to `true` by `stop_renewal()` before a terminal op's FCALL
-    /// completes. `Drop` reads this instead of `renewal_handle.is_finished()`
-    /// to suppress the false-positive "dropped without terminal operation"
+    /// Set to `true` by `stop_renewal()` after a terminal op's FCALL
+    /// response is received, just before `self` is consumed into `Drop`.
+    /// `Drop` reads this instead of `renewal_handle.is_finished()` to
+    /// suppress the false-positive "dropped without terminal operation"
     /// warning: after `notify_one`, the renewal task has not yet been
     /// polled by the runtime, so `is_finished()` is still `false` on the
     /// happy path when self is being consumed.
+    ///
+    /// Note: the flag is set for any terminal-op path that reaches
+    /// `stop_renewal()`, which includes Lua-level script errors (the
+    /// FCALL returned a `{0, "error", ...}` payload). That is intentional:
+    /// the caller already receives the `Err` via the op's return value,
+    /// so an additional `Drop` warning would be noise. The warning is
+    /// reserved for genuine drop-without-terminal-op cases (panic, early
+    /// return, transport failure before stop_renewal ran).
     terminal_op_called: AtomicBool,
     /// Concurrency permit from the worker's semaphore. Held for the lifetime
     /// of the task; released on complete/fail/cancel/drop.
@@ -1058,7 +1067,10 @@ impl Drop for ClaimedTask {
         // has not yet been polled by the runtime, so `is_finished()` is still
         // `false` here — which previously fired the warning on every
         // complete/fail/cancel/suspend call. `terminal_op_called` is the
-        // authoritative signal: if stop_renewal ran, this was a clean exit.
+        // authoritative signal that a terminal-op path ran to the point of
+        // stopping renewal; it does not by itself certify the Lua side
+        // succeeded (see the field doc). The caller surfaces any error via
+        // the op's return value, so a `Drop` warning is unneeded there.
         if !self.terminal_op_called.load(Ordering::Acquire) {
             tracing::warn!(
                 execution_id = %self.execution_id,
