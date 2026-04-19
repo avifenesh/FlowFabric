@@ -18,11 +18,23 @@ pub struct DepOpKeys<'a> {
     pub ctx: &'a ExecKeyContext,
     pub idx: &'a IndexKeys,
     pub lane_id: &'a ff_core::types::LaneId,
-    /// Upstream's [`ExecKeyContext`] for building `upstream_result` when
-    /// `ff_resolve_dependency` is called with a `data_passing_ref` edge.
-    /// Upstream and downstream are co-located on the same `{fp:N}` slot
-    /// via flow membership (RFC-011 §7.3), so this shares the ctx's
-    /// partition — only the `<eid>` segment differs.
+}
+
+/// Extended key context for [`ff_resolve_dependency`], which needs
+/// access to the upstream execution's result key for server-side
+/// `data_passing_ref` resolution (Batch C item 3). Separate from
+/// [`DepOpKeys`] so the other dependency wrappers —
+/// `ff_apply_dependency_to_child`, `ff_evaluate_flow_eligibility`,
+/// `ff_promote_blocked_to_eligible`, `ff_replay_execution` — don't
+/// have to carry an upstream context they never use.
+///
+/// Upstream and downstream are co-located on the same `{fp:N}` slot
+/// via flow membership (RFC-011 §7.3), so `upstream_ctx` builds the
+/// upstream key on the child's partition.
+pub struct ResolveDependencyKeys<'a> {
+    pub ctx: &'a ExecKeyContext,
+    pub idx: &'a IndexKeys,
+    pub lane_id: &'a ff_core::types::LaneId,
     pub upstream_ctx: &'a ExecKeyContext,
 }
 
@@ -232,7 +244,7 @@ impl FromFcallResult for ApplyDependencyToChildResult {
 
 ff_function! {
     pub ff_resolve_dependency(args: ResolveDependencyArgs) -> ResolveDependencyResult {
-        keys(k: &DepOpKeys<'_>) {
+        keys(k: &ResolveDependencyKeys<'_>) {
             k.ctx.core(),
             k.ctx.deps_meta(),
             k.ctx.deps_unresolved(),

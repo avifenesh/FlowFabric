@@ -563,32 +563,41 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
       "unsatisfied_required_count", -1)
     redis.call("HSET", K.deps_meta, "last_dependency_update_at", A.now_ms)
 
-    -- Server-side data_passing_ref resolution (Batch C item 3). When the
-    -- edge was staged with a non-empty `data_passing_ref`, replace the
-    -- downstream's input_payload with the upstream's result. COPY is a
-    -- single-slot server-internal op (no round-trip to Lua memory) so
-    -- large result payloads don't inflate the FCALL's working set.
+    -- Check if all deps now satisfied
+    local raw = redis.call("HGETALL", K.core_key)
+    if #raw == 0 then return ok("satisfied", "") end
+    local core = hgetall_to_table(raw)
+
+    -- Server-side data_passing_ref resolution (Batch C item 3). When
+    -- the edge was staged with a non-empty `data_passing_ref`, replace
+    -- the downstream's input_payload with the upstream's result. COPY
+    -- is a single-slot server-internal op (no round-trip to Lua
+    -- memory) so large result payloads don't inflate the FCALL's
+    -- working set.
     --
-    -- Write-ordering note (RFC-010 §4.8b): this runs BEFORE the
+    -- Terminal-child guard: a late satisfaction can race with the
+    -- child being cancelled or skipped. Don't overwrite the payload
+    -- of a child that has already reached a terminal state — it's at
+    -- best pointless (the worker will never read it) and at worst
+    -- noisy for post-mortem debugging.
+    --
+    -- Write-ordering note (RFC-010 §4.8b): COPY runs BEFORE the
     -- eligibility transition below so a crash between the two leaves
     -- the child blocked (or late-satisfied on reconciler retry) with
     -- the correct payload rather than eligible with a stale one.
     --
     -- Void-completion path: if the upstream called complete(None), the
-    -- result key does not exist — skip silently and leave the child's
-    -- original input_payload intact.
+    -- result key does not exist — COPY returns 0 and data_injected
+    -- stays empty, leaving the child's original input_payload intact.
     local data_injected = ""
-    if is_set(dep.data_passing_ref) then
-      if redis.call("EXISTS", K.upstream_result) == 1 then
-        redis.call("COPY", K.upstream_result, K.downstream_payload, "REPLACE")
+    if is_set(dep.data_passing_ref)
+       and core.terminal_outcome == "none" then
+      local copied = redis.call(
+        "COPY", K.upstream_result, K.downstream_payload, "REPLACE")
+      if copied == 1 then
         data_injected = "data_injected"
       end
     end
-
-    -- Check if all deps now satisfied
-    local raw = redis.call("HGETALL", K.core_key)
-    if #raw == 0 then return ok("satisfied") end
-    local core = hgetall_to_table(raw)
 
     if remaining == 0
        and core.lifecycle_phase == "runnable"

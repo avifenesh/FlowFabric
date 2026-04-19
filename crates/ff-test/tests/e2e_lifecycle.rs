@@ -3553,6 +3553,70 @@ async fn test_flow_data_passing_ref_empty_no_copy() {
     );
 }
 
+/// Data-passing guard: a late satisfy against an ALREADY-terminal
+/// child must not overwrite the child's payload. Simulates a cancel
+/// racing with ff_resolve_dependency.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_data_passing_ref_skips_terminal_child() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let fid = "flow-terminal-child";
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let e_ab = uuid::Uuid::new_v4().to_string();
+    fcall_create_execution(&tc, &a, NS, LANE, "t_a", 0).await;
+    fcall_create_execution(&tc, &b, NS, LANE, "t_b", 0).await;
+
+    // Write a sentinel payload on B up front.
+    let config = test_config();
+    let p = execution_partition(&b, &config);
+    let ctx = ExecKeyContext::new(&p, &b);
+    let _: () = tc.client()
+        .cmd("SET")
+        .arg(ctx.payload())
+        .arg("b_sentinel")
+        .execute()
+        .await
+        .expect("SET b.payload");
+
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
+    fcall_apply_dependency_with_data_passing(
+        &tc, &b, fid, &e_ab, &a, "result",
+    ).await;
+
+    // Force B into a terminal state BEFORE A resolves — direct exec_core
+    // patch is the minimal test hook (skips the cancel flow dispatcher).
+    let _: () = tc.client()
+        .cmd("HSET")
+        .arg(ctx.core())
+        .arg("lifecycle_phase").arg("terminal")
+        .arg("terminal_outcome").arg("cancelled")
+        .execute()
+        .await
+        .expect("HSET b.core terminal");
+
+    // Now complete A and resolve. COPY should be skipped by the
+    // terminal-child guard.
+    fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
+    let (la, ea, _, aa) =
+        fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
+    fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await;
+
+    let payload: Option<String> = tc.client()
+        .cmd("GET")
+        .arg(ctx.payload())
+        .execute()
+        .await
+        .expect("GET b.payload");
+    assert_eq!(
+        payload.as_deref(),
+        Some("b_sentinel"),
+        "terminal child's payload must not be overwritten by late satisfy"
+    );
+}
+
 /// Fan-out: A->B, A->C. Complete A, both B and C unblocked.
 #[tokio::test]
 #[serial_test::serial]

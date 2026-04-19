@@ -322,17 +322,21 @@ async fn dispatch_dependency_resolution_inner(
     }
 }
 
-/// Check if an ff_resolve_dependency result indicates the child was skipped.
-/// Result shapes after Batch C item 3:
-///   [1, "OK", "already_resolved"]           (2 payload fields)
-///   [1, "OK", "satisfied", ""|"data_injected"]
-///   [1, "OK", "impossible", ""|"child_skipped"]
+/// Check if an ff_resolve_dependency result indicates the child was
+/// skipped. Result shapes after Batch C item 3:
+///   `[1, "OK", "already_resolved"]`            — 3 elements total
+///   `[1, "OK", "satisfied", ""|"data_injected"]` — 4 elements total
+///   `[1, "OK", "impossible", ""|"child_skipped"]` — 4 elements total
+///
+/// "Child skipped" lives in slot 3 (0-indexed) on the impossible path
+/// only; the satisfied path's fourth slot is the unrelated
+/// data_injected marker.
 fn is_child_skipped_result(value: &ferriskey::Value) -> bool {
     match value {
         ferriskey::Value::Array(arr) => {
             if arr.len() < 4 {
-                // 2- and 3-element responses are normal paths
-                // (already_resolved, etc.). No warning.
+                // 3-element responses are normal (already_resolved).
+                // No warning.
                 return false;
             }
             arr.get(3)
