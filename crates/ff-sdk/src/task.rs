@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -181,6 +181,13 @@ pub struct ClaimedTask {
     /// task. Reset to 0 on each successful renewal. Workers should check
     /// `is_lease_healthy()` before committing expensive side effects.
     renewal_failures: Arc<AtomicU32>,
+    /// Set to `true` by `stop_renewal()` before a terminal op's FCALL
+    /// completes. `Drop` reads this instead of `renewal_handle.is_finished()`
+    /// to suppress the false-positive "dropped without terminal operation"
+    /// warning: after `notify_one`, the renewal task has not yet been
+    /// polled by the runtime, so `is_finished()` is still `false` on the
+    /// happy path when self is being consumed.
+    terminal_op_called: AtomicBool,
     /// Concurrency permit from the worker's semaphore. Held for the lifetime
     /// of the task; released on complete/fail/cancel/drop.
     _concurrency_permit: Option<OwnedSemaphorePermit>,
@@ -288,6 +295,7 @@ impl ClaimedTask {
             renewal_handle,
             renewal_stop,
             renewal_failures,
+            terminal_op_called: AtomicBool::new(false),
             _concurrency_permit: None,
         }
     }
@@ -995,8 +1003,13 @@ impl ClaimedTask {
         parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
     }
 
-    /// Signal the renewal task to stop.
+    /// Signal the renewal task to stop. Called by every terminal op
+    /// (`complete`/`fail`/`cancel`/`suspend`/`delay_execution`/
+    /// `move_to_waiting_children`) after the FCALL returns. Also marks
+    /// `terminal_op_called` so the `Drop` impl can distinguish happy-path
+    /// consumption from a genuine drop-without-terminal-op.
     fn stop_renewal(&self) {
+        self.terminal_op_called.store(true, Ordering::Release);
         self.renewal_stop.notify_one();
     }
 
@@ -1038,7 +1051,15 @@ impl Drop for ClaimedTask {
         // This is a safety net — complete/fail/cancel already stop renewal
         // via notify before consuming self. But if the task is dropped
         // without being consumed (e.g., panic), abort prevents leaked renewals.
-        if !self.renewal_handle.is_finished() {
+        //
+        // Why check `terminal_op_called` instead of `renewal_handle.is_finished()`:
+        // on the happy path, `stop_renewal()` fires `notify_one` synchronously
+        // and then self is consumed into Drop immediately. The renewal task
+        // has not yet been polled by the runtime, so `is_finished()` is still
+        // `false` here — which previously fired the warning on every
+        // complete/fail/cancel/suspend call. `terminal_op_called` is the
+        // authoritative signal: if stop_renewal ran, this was a clean exit.
+        if !self.terminal_op_called.load(Ordering::Acquire) {
             tracing::warn!(
                 execution_id = %self.execution_id,
                 "ClaimedTask dropped without terminal operation — lease will expire"
