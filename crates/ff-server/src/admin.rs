@@ -28,13 +28,27 @@ use ff_core::types::LaneId;
 /// Returns `Err(String)` with an operator-actionable message on invalid
 /// values (empty `FF_LANES`, non-positive partition count, etc.).
 pub fn load_probe_inputs() -> Result<(Vec<LaneId>, PartitionConfig), String> {
-    let lanes: Vec<LaneId> = std::env::var("FF_LANES")
-        .unwrap_or_else(|_| "default".to_string())
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(LaneId::new)
-        .collect();
+    // Parse + validate each lane name via try_new (length, ASCII-printable
+    // shape per types.rs LANE_ID_MAX_BYTES). Reject duplicates so the
+    // collision table is not polluted by a miscounted total.
+    let raw = std::env::var("FF_LANES").unwrap_or_else(|_| "default".to_string());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut lanes: Vec<LaneId> = Vec::new();
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lane = LaneId::try_new(trimmed).map_err(|e| {
+            format!("FF_LANES: invalid lane name '{trimmed}': {e}")
+        })?;
+        if !seen.insert(lane.as_str().to_string()) {
+            return Err(format!(
+                "FF_LANES: duplicate lane name '{trimmed}' — remove one of the entries"
+            ));
+        }
+        lanes.push(lane);
+    }
     if lanes.is_empty() {
         return Err(
             "FF_LANES: at least one non-empty lane name is required".to_string(),
@@ -128,17 +142,26 @@ impl PartitionCollisionsReport {
             by_partition.entry(p.index).or_default().push(lane.clone());
         }
 
-        // Build per-lane entries with the collides_with set populated.
+        // Build per-lane entries. Sort each partition's siblings ONCE
+        // up-front (O(M log M) per partition), then derive the
+        // collides_with set by filtering the already-sorted slice — an
+        // O(M) walk per lane. Previous shape re-sorted the siblings slice
+        // for every lane in the partition, hitting O(M² log M) when a
+        // partition holds many lanes. For normal deployments where most
+        // partitions have at most 1 lane, both shapes are fast; the fix
+        // matters only under severe collision density, but the cheaper
+        // shape is also clearer to read.
         let mut entries: Vec<LanePartition> = Vec::with_capacity(lanes.len());
         let mut colliding_lanes = 0usize;
         for (index, siblings) in &by_partition {
+            let mut sorted_siblings: Vec<LaneId> = siblings.clone();
+            sorted_siblings.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             for lane in siblings {
-                let mut others: Vec<LaneId> = siblings
+                let others: Vec<LaneId> = sorted_siblings
                     .iter()
                     .filter(|sib| sib.as_str() != lane.as_str())
                     .cloned()
                     .collect();
-                others.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 if !others.is_empty() {
                     colliding_lanes += 1;
                 }
@@ -192,8 +215,29 @@ impl PartitionCollisionsReport {
             severity = self.severity,
         ));
 
-        out.push_str("partition | lane                               | collides_with\n");
-        out.push_str("----------+------------------------------------+----------------------------------------\n");
+        // Lane column width adapts to the longest configured lane name
+        // so tables stay aligned even with long names (LaneId::try_new
+        // permits up to 64 bytes). Minimum width 16 keeps the table
+        // readable on deployments with very short names.
+        let lane_width = self
+            .entries
+            .iter()
+            .map(|e| e.lane.as_str().len())
+            .max()
+            .unwrap_or(0)
+            .max(16);
+        out.push_str(&format!(
+            "{:>9} | {:<width$} | collides_with\n",
+            "partition",
+            "lane",
+            width = lane_width,
+        ));
+        out.push_str(&format!(
+            "{} | {} | {}\n",
+            "-".repeat(9),
+            "-".repeat(lane_width),
+            "-".repeat(40),
+        ));
         for entry in &self.entries {
             let collides = if entry.collides_with.is_empty() {
                 "—".to_string()
@@ -206,10 +250,11 @@ impl PartitionCollisionsReport {
                     .join(", ")
             };
             out.push_str(&format!(
-                "{:>9} | {:<34} | {}\n",
+                "{:>9} | {:<width$} | {}\n",
                 entry.index,
                 entry.lane.as_str(),
                 collides,
+                width = lane_width,
             ));
         }
 
@@ -336,6 +381,33 @@ mod tests {
         assert!(out.contains("default"));
         // Clean deployments get NO remediation section.
         assert!(!out.contains("Remediation"));
+    }
+
+    #[test]
+    fn format_plain_adapts_width_to_long_lane_name() {
+        // LaneId permits up to 64 bytes. A 40-byte name should NOT
+        // produce a broken-looking table — column width must adapt.
+        let long = "x".repeat(40);
+        let lanes = vec![lane(&long), lane("short")];
+        let r = PartitionCollisionsReport::compute(&lanes, &cfg(256));
+        let out = r.format_plain();
+        // Each data row should have the lane section padded to the long
+        // name's length. Split on '|' and confirm the middle column is
+        // at least 40 chars wide (plus potential surrounding space).
+        for line in out.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit() || c == ' ')) {
+            if let Some(middle) = line.split('|').nth(1) {
+                let middle_trim_right = middle.trim_end();
+                // At minimum the longest name must fit without truncation.
+                if middle_trim_right.contains(&long) {
+                    assert!(
+                        middle.len() > long.len(),
+                        "row middle too narrow for long lane: {middle:?}"
+                    );
+                }
+            }
+        }
+        // And crucially: the long lane name appears intact.
+        assert!(out.contains(&long));
     }
 
     #[test]
