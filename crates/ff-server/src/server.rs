@@ -1291,6 +1291,24 @@ impl Server {
             execution_partition(&args.execution_id, &self.config.partition_config);
         let ectx = ExecKeyContext::new(&exec_partition, &args.execution_id);
 
+        // Pre-flight: exec_partition must match flow_partition under
+        // RFC-011 §7.3 co-location contract. If the caller hands us a
+        // `solo`-minted exec whose hash-tag ≠ flow_partition, the FCALL
+        // would fail with raw `CROSSSLOT` on a clustered deploy — a
+        // typed `ServerError::PartitionMismatch` is a clearer signal
+        // that the consumer-contract invariant was violated at mint
+        // time (caller should have used `ExecutionId::for_flow(...)`).
+        // See the Consumer contract section of this method's rustdoc.
+        if exec_partition.index != partition.index {
+            return Err(ServerError::PartitionMismatch(format!(
+                "add_execution_to_flow: execution_id's partition {exec_p} != flow_id's partition {flow_p}. \
+                 Post-RFC-011 §7.3 co-location requires mint via `ExecutionId::for_flow(&flow_id, config)` \
+                 so the exec's hash-tag matches the flow's `{{fp:N}}`.",
+                exec_p = exec_partition.index,
+                flow_p = partition.index,
+            )));
+        }
+
         // KEYS (4): flow_core, members_set, flow_index, exec_core
         let fcall_keys: Vec<String> = vec![
             fctx.core(),

@@ -184,15 +184,24 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
     return ok_already_satisfied(A.execution_id, nc)
   end
 
-  -- 3. Add to membership set
+  -- 3. Cross-flow guard: if exec_core.flow_id is already set to a
+  --    DIFFERENT flow, refuse — silently re-stamping would orphan
+  --    the other flow's accounting. An exec belongs to at most one
+  --    flow at a time per RFC-007.
+  local existing_flow_id = redis.call("HGET", K.exec_core, "flow_id")
+  if existing_flow_id and existing_flow_id ~= "" and existing_flow_id ~= A.flow_id then
+    return err("already_member_of_different_flow:" .. existing_flow_id)
+  end
+
+  -- 4. Add to membership set
   redis.call("SADD", K.members_set, A.execution_id)
 
-  -- 4. Stamp the flow_id back-pointer on exec_core. Co-located with
+  -- 5. Stamp the flow_id back-pointer on exec_core. Co-located with
   --    the flow's partition under RFC-011 §7.3 hash-tag routing; this
   --    HSET is part of the same atomic FCALL as the SADD above.
   redis.call("HSET", K.exec_core, "flow_id", A.flow_id)
 
-  -- 5. Increment node_count and graph_revision
+  -- 6. Increment node_count and graph_revision
   local new_nc = redis.call("HINCRBY", K.flow_core, "node_count", 1)
   local new_rev = redis.call("HINCRBY", K.flow_core, "graph_revision", 1)
   redis.call("HSET", K.flow_core, "last_mutation_at", now_ms)

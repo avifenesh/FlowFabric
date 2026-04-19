@@ -368,3 +368,63 @@ async fn test_atomicity_flow_id_visible_to_subsequent_reads() {
         );
     }
 }
+
+/// Cross-review YELLOW 2 (W1 + W3 convergent): pre-flight
+/// partition-mismatch check — a wrong-partition caller must see a
+/// typed `ServerError::PartitionMismatch` instead of a raw Valkey
+/// CROSSSLOT / Lua-lib error.
+///
+/// Deliberately mints exec on a DIFFERENT partition than the flow.
+/// Under the post-RFC-011 §7.3 co-location contract this is a
+/// caller-side mint error; `add_execution_to_flow` catches it at
+/// the API boundary before the FCALL runs.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_atomicity_partition_mismatch_pre_flight_check() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    // Pick a FlowId whose partition index we can compute, then mint
+    // the exec on a DIFFERENT partition.
+    let flow_id = FlowId::new();
+    let fp = flow_partition(&flow_id, tc.partition_config());
+    let wrong_partition = (fp.index + 1) % tc.partition_config().num_flow_partitions;
+    let eid = tc.new_execution_id_on_partition(wrong_partition);
+
+    let server = start_server(&tc).await;
+    create_flow(&server, &flow_id).await;
+    fcall_create_execution(&tc, &eid).await;
+
+    let err = server
+        .add_execution_to_flow(&AddExecutionToFlowArgs {
+            flow_id: flow_id.clone(),
+            execution_id: eid.clone(),
+            now: TimestampMs::now(),
+        })
+        .await
+        .expect_err("wrong-partition exec must fail at pre-flight");
+
+    // Typed PartitionMismatch — not CROSSSLOT / Lua-lib / other raw
+    // downstream error.
+    assert!(
+        matches!(err, ff_server::server::ServerError::PartitionMismatch(_)),
+        "expected ServerError::PartitionMismatch, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("partition"),
+        "error message must mention partition: {msg}"
+    );
+
+    // Neither write should have happened (pre-flight guards run
+    // before the FCALL).
+    assert_eq!(
+        hget_flow_id(&tc, &eid).await,
+        None,
+        "pre-flight rejection must not mutate exec_core"
+    );
+    assert!(
+        !sismember_flow(&tc, &flow_id, &eid).await,
+        "pre-flight rejection must not add to members_set"
+    );
+}

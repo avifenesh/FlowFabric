@@ -5917,9 +5917,10 @@ async fn test_server_flow_lifecycle() {
         "expected Created, got {create_flow_result:?}"
     );
 
-    // 2. Create 2 executions
-    let upstream = tc.new_execution_id();
-    let downstream = tc.new_execution_id();
+    // 2. Create 2 executions co-located with the flow (RFC-011 §7.3).
+    let config = test_config();
+    let upstream = ExecutionId::for_flow(&flow_id, &config);
+    let downstream = ExecutionId::for_flow(&flow_id, &config);
     fcall_create_execution(&tc, &upstream, NS, LANE, "upstream_task", 0).await;
     fcall_create_execution(&tc, &downstream, NS, LANE, "downstream_task", 0).await;
 
@@ -6539,9 +6540,12 @@ async fn test_server_full_flow_lifecycle() {
     let config = test_config();
     let now = TimestampMs::now();
 
-    let a = tc.new_execution_id_on_partition(0);
-    let b = tc.new_execution_id_on_partition(0);
-    let c = tc.new_execution_id_on_partition(0);
+    // Mint flow FIRST so execs can co-locate with it (RFC-011 §7.3
+    // consumer contract enforced by add_execution_to_flow pre-flight).
+    let flow_id = FlowId::new();
+    let a = ExecutionId::for_flow(&flow_id, &config);
+    let b = ExecutionId::for_flow(&flow_id, &config);
+    let c = ExecutionId::for_flow(&flow_id, &config);
     for (eid, kind) in [(&a, "step_a"), (&b, "step_b"), (&c, "step_c")] {
         server.create_execution(&CreateExecutionArgs {
             execution_id: eid.clone(), namespace: Namespace::new(NS),
@@ -6554,7 +6558,6 @@ async fn test_server_full_flow_lifecycle() {
         }).await.expect("create_execution");
     }
 
-    let flow_id = FlowId::new();
     server.create_flow(&CreateFlowArgs {
         flow_id: flow_id.clone(), flow_kind: "chain".to_owned(),
         namespace: Namespace::new(NS), now,
@@ -6630,7 +6633,8 @@ async fn test_cancel_empty_flow_then_add_member() {
         cancellation_policy: "cancel_all".to_owned(), now,
     }).await.expect("cancel empty flow");
 
-    let eid = tc.new_execution_id_on_partition(0);
+    let config = test_config();
+    let eid = ExecutionId::for_flow(&flow_id, &config);
     fcall_create_execution(&tc, &eid, NS, LANE, "late_add", 0).await;
     let add_result = server.add_execution_to_flow(&AddExecutionToFlowArgs {
         flow_id: flow_id.clone(), execution_id: eid.clone(), now,
@@ -6655,8 +6659,11 @@ async fn test_server_create_cancel_roundtrip() {
     let config = test_config();
     let now = TimestampMs::now();
 
-    // Create execution via Server
-    let eid = tc.new_execution_id_on_partition(0);
+    // Mint the flow FIRST so the exec can co-locate with it —
+    // RFC-011 §7.3 co-location contract, enforced by the pre-flight
+    // partition check in `add_execution_to_flow`.
+    let flow_id = FlowId::new();
+    let eid = ExecutionId::for_flow(&flow_id, &config);
     server.create_execution(&CreateExecutionArgs {
         execution_id: eid.clone(), namespace: Namespace::new(NS),
         lane_id: LaneId::new(LANE), execution_kind: "roundtrip_task".to_owned(),
@@ -6672,7 +6679,6 @@ async fn test_server_create_cancel_roundtrip() {
         ff_core::state::PublicState::Waiting);
 
     // Create flow + add member via Server
-    let flow_id = FlowId::new();
     server.create_flow(&CreateFlowArgs {
         flow_id: flow_id.clone(), flow_kind: "roundtrip".to_owned(),
         namespace: Namespace::new(NS), now,
