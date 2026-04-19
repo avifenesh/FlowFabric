@@ -648,6 +648,23 @@ redis.register_function('ff_complete_execution', function(keys, args)
     "reason", "completed",
     "ts", tostring(now_ms))
 
+  -- Push-based DAG promotion (Batch C item 6). Only publish when the
+  -- execution actually belongs to a flow — standalone executions never
+  -- have downstream edges for the engine to resolve. The engine's
+  -- CompletionListener scanner SUBSCRIBEs to ff:dag:completions and
+  -- calls dispatch_dependency_resolution per message. The
+  -- dependency_reconciler interval scan is retained as a safety net
+  -- for: missed messages during listener restart, ungated state
+  -- (flow_id empty on older executions), and cluster broadcast gaps.
+  if is_set(core.flow_id) then
+    local payload = cjson.encode({
+      execution_id = A.execution_id,
+      flow_id = core.flow_id,
+      outcome = "success",
+    })
+    redis.call("PUBLISH", "ff:dag:completions", payload)
+  end
+
   return ok("completed")
 end)
 
@@ -835,6 +852,21 @@ redis.register_function('ff_cancel_execution', function(keys, args)
 
   -- ZADD terminal (unconditional)
   redis.call("ZADD", K.terminal_key, now_ms, A.execution_id)
+
+  -- Push-based DAG promotion (Batch C item 6). Skip the publish when
+  -- the cancel came from `flow_cascade` — that source means a parent
+  -- already propagated and the engine is walking the edge graph; an
+  -- additional publish here would trigger redundant dispatch work.
+  -- (Not a correctness issue since dispatch is idempotent, but it
+  -- avoids unnecessary load under wide fan-out cancellations.)
+  if is_set(core.flow_id) and A.source ~= "flow_cascade" then
+    local payload = cjson.encode({
+      execution_id = A.execution_id,
+      flow_id = core.flow_id,
+      outcome = "cancelled",
+    })
+    redis.call("PUBLISH", "ff:dag:completions", payload)
+  end
 
   return ok("cancelled", cancelled_from)
 end)
@@ -1209,6 +1241,18 @@ redis.register_function('ff_fail_execution', function(keys, args)
       "attempt_index", core.current_attempt_index or "",
       "reason", "failed_terminal",
       "ts", tostring(now_ms))
+
+    -- Push-based DAG promotion (Batch C item 6). See ff_complete_execution
+    -- for rationale. A terminal-failed upstream triggers
+    -- child-skip cascades via ff_resolve_dependency on the receiver side.
+    if is_set(core.flow_id) then
+      local payload = cjson.encode({
+        execution_id = A.execution_id,
+        flow_id = core.flow_id,
+        outcome = "failed",
+      })
+      redis.call("PUBLISH", "ff:dag:completions", payload)
+    end
 
     return ok("terminal_failed")
   end

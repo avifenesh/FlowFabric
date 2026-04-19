@@ -304,6 +304,14 @@ impl Server {
             quota_reconciler_interval: config.engine_config.quota_reconciler_interval,
             unblock_interval: config.engine_config.unblock_interval,
             dependency_reconciler_interval: config.engine_config.dependency_reconciler_interval,
+            // Push-based DAG promotion (Batch C item 6). Enabled by
+            // default with the server's Valkey endpoint; the engine
+            // spawns a dedicated RESP3 client for SUBSCRIBE.
+            completion_listener: Some(ff_engine::CompletionListenerConfig {
+                addresses: vec![(config.host.clone(), config.port)],
+                tls: config.tls,
+                cluster: config.cluster,
+            }),
             flow_projector_interval: config.engine_config.flow_projector_interval,
             execution_deadline_interval: config.engine_config.execution_deadline_interval,
         };

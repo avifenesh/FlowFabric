@@ -1,6 +1,7 @@
 //! ff-engine: cross-partition dispatch and background scanners.
 
 pub mod budget;
+pub mod completion_listener;
 pub mod partition_router;
 pub mod scanner;
 pub mod supervisor;
@@ -30,6 +31,22 @@ use scanner::suspension_timeout::SuspensionTimeoutScanner;
 use scanner::flow_projector::FlowProjector;
 use scanner::unblock::UnblockScanner;
 
+/// Connection parameters for the completion listener's dedicated RESP3
+/// client. Must match the deployment the dispatcher client connects to.
+#[derive(Clone, Debug)]
+pub struct CompletionListenerConfig {
+    /// Seed addresses — `(host, port)` pairs. For standalone, one entry.
+    /// For cluster, pass all configured seed nodes.
+    pub addresses: Vec<(String, u16)>,
+    /// Enable TLS (matches `ClientBuilder::tls_insecure` — the listener
+    /// uses insecure TLS because it only handles completion metadata,
+    /// never user payloads; if strict TLS is required, plumb a
+    /// custom flag).
+    pub tls: bool,
+    /// Enable cluster mode.
+    pub cluster: bool,
+}
+
 /// Engine configuration.
 pub struct EngineConfig {
     pub partition_config: PartitionConfig,
@@ -57,23 +74,38 @@ pub struct EngineConfig {
     pub quota_reconciler_interval: Duration,
     /// Unblock scanner interval. Default: 5s.
     pub unblock_interval: Duration,
-    /// Dependency reconciler interval. Default: 1s.
+    /// Dependency reconciler interval. Default: 15s.
     ///
-    /// This scanner is the only promotion path for downstream
-    /// executions blocked on a dependency edge — `dispatch_dependency_
-    /// resolution` in partition_router.rs exists as a push-based
-    /// alternative but has no completion-time call site today (see
-    /// Batch C issue for the push-based wiring). Until that lands,
-    /// this interval is the per-stage floor for DAG latency: a
-    /// 10-node linear chain runs in ~interval × nodes + work.
+    /// Post-Batch-C this scanner is a **safety net**, not the primary
+    /// promotion path. The [`completion_listener`] SUBSCRIBEs to
+    /// `ff:dag:completions` and dispatches dependency resolution
+    /// synchronously with each completion — under normal operation,
+    /// DAG latency is `~RTT × levels`, not `interval × levels`.
     ///
-    /// 1s is the right default for most deployments; the cost is ~256–
-    /// 512 empty-ZRANGEBYSCORE ops per second (one per partition per
-    /// lane), well under 1% of Valkey capacity. Operators running
-    /// huge numbers of partitions or lanes where the idle-scan cost
-    /// matters can raise this knob — it's a public field for that
-    /// purpose.
+    /// The reconciler still runs as a catch-all for:
+    ///   - messages missed during listener restart or reconnect;
+    ///   - pre-Batch-C executions without `core.flow_id` stamped;
+    ///   - operator-driven edge mutation that doesn't pass through
+    ///     the terminal-transition publish path.
+    ///
+    /// 15s idle-scan cost is minimal. If the listener is disabled
+    /// (`completion_listener` = None), drop this to 1s to preserve
+    /// pre-Batch-C DAG latency behavior.
+    ///
+    /// [`completion_listener`]: Self::completion_listener
     pub dependency_reconciler_interval: Duration,
+
+    /// Optional push-based DAG promotion listener (Batch C item 6).
+    /// When `Some`, the engine spawns a [`completion_listener`] task
+    /// that SUBSCRIBEs to `ff:dag:completions` on a dedicated RESP3
+    /// client and dispatches dependency resolution per completion.
+    ///
+    /// `None` disables the listener entirely — the reconciler alone
+    /// promotes. Useful for lightweight single-node deployments or
+    /// test harnesses that don't care about DAG latency.
+    ///
+    /// [`completion_listener`]: crate::completion_listener
+    pub completion_listener: Option<CompletionListenerConfig>,
     /// Flow summary projector interval. Default: 15s.
     ///
     /// Separate observability projection path — maintains the flow
@@ -101,7 +133,8 @@ impl Default for EngineConfig {
             budget_reconciler_interval: Duration::from_secs(30),
             quota_reconciler_interval: Duration::from_secs(30),
             unblock_interval: Duration::from_secs(5),
-            dependency_reconciler_interval: Duration::from_secs(1),
+            dependency_reconciler_interval: Duration::from_secs(15),
+            completion_listener: None,
             flow_projector_interval: Duration::from_secs(15),
             execution_deadline_interval: Duration::from_secs(5),
         }
@@ -283,17 +316,35 @@ impl Engine {
         ));
         handles.push(supervised_spawn(
             deadline_scanner,
-            client,
+            client.clone(),
             num_partitions,
-            shutdown_rx,
+            shutdown_rx.clone(),
         ));
 
+        // Completion listener (Batch C item 6 — push-based DAG promotion).
+        // Optional: when Some, spawns a dedicated RESP3 client that
+        // SUBSCRIBEs to ff:dag:completions and dispatches dependency
+        // resolution per completion. See `completion_listener` module
+        // docs for the design rationale.
+        let listener_enabled = config.completion_listener.is_some();
+        if let Some(listener_cfg) = config.completion_listener {
+            handles.push(completion_listener::spawn_completion_listener(
+                router.clone(),
+                client,
+                listener_cfg.addresses,
+                listener_cfg.tls,
+                listener_cfg.cluster,
+                shutdown_rx,
+            ));
+        }
+
+        let scanner_count = if listener_enabled { "14 scanners + completion listener" } else { "14 scanners" };
         tracing::info!(
             num_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,
             quota_partitions = config.partition_config.num_quota_partitions,
             flow_partitions = config.partition_config.num_flow_partitions,
-            "engine started with 14 scanners"
+            "engine started with {scanner_count}"
         );
 
         Self {
