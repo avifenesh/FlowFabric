@@ -1,11 +1,22 @@
 use std::sync::Arc;
 
+use ff_server::admin::{load_probe_inputs, PartitionCollisionsReport};
 use ff_server::api;
 use ff_server::config::ServerConfig;
 use ff_server::server::Server;
 
 #[tokio::main]
 async fn main() {
+    // Admin subcommands are parsed before tracing init because
+    // `partition-collisions` prints a plain-text table to stdout and
+    // should not be interleaved with structured tracing output. Other
+    // subcommands can opt into tracing individually.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "admin" {
+        run_admin_subcommand(&args[2..]);
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -64,6 +75,54 @@ async fn main() {
     match Arc::try_unwrap(server) {
         Ok(s) => s.shutdown().await,
         Err(_) => tracing::warn!("could not take exclusive server ownership for shutdown"),
+    }
+}
+
+/// Dispatch an `admin` subcommand. Reads `ServerConfig::from_env()` but
+/// does NOT connect to Valkey or start any long-lived task — probes are
+/// pure computations over the configured state.
+///
+/// Exit codes:
+/// - `0` — probe succeeded
+/// - `2` — unknown subcommand or invalid config
+fn run_admin_subcommand(args: &[String]) {
+    let subcommand = args.first().map(String::as_str).unwrap_or("");
+    match subcommand {
+        "partition-collisions" => {
+            // Use the probe-specific loader — the collisions probe is a
+            // pure computation over lanes + partition_config and does not
+            // need the prod-boot requirements (HMAC secret, CORS, etc.).
+            let (lanes, partition_config) = match load_probe_inputs() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("ff-server admin partition-collisions: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let report =
+                PartitionCollisionsReport::compute(&lanes, &partition_config);
+            print!("{}", report.format_plain());
+        }
+        "" => {
+            eprintln!(
+                "ff-server admin: no subcommand given\n\
+                 \n\
+                 USAGE:\n    \
+                 ff-server admin <subcommand>\n\
+                 \n\
+                 SUBCOMMANDS:\n    \
+                 partition-collisions    Report RFC-011 §5.6 partition collisions across configured lanes\n"
+            );
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!(
+                "ff-server admin: unknown subcommand '{other}'\n\
+                 \n\
+                 Available subcommands: partition-collisions\n"
+            );
+            std::process::exit(2);
+        }
     }
 }
 

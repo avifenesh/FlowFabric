@@ -107,9 +107,33 @@ colliding on the same partition. A collision is not a correctness bug —
 routing still works — but it concentrates write traffic on one Valkey master,
 which can hot-spot under load.
 
-> The `ff-server admin partition-collisions` subcommand documented here lands
-> in phase-5B. Until it ships, operators who want to check can compute
-> `crc16(lane_id) % num_flow_partitions` manually or use any crc16 CLI.
+### Running the probe
+
+```sh
+# Reads FF_LANES + FF_FLOW_PARTITIONS from env, same as ff-server boot.
+# Does NOT connect to Valkey or start any server; pure computation.
+FF_LANES="default,high,low,bulk" \
+  ff-server admin partition-collisions
+```
+
+Output columns:
+
+- `partition` — the partition index the lane hashes to (crc16 % num_flow_partitions)
+- `lane` — the configured lane id
+- `collides_with` — other lanes sharing the same partition (empty `—` if none)
+
+Severity field summarizes the whole deployment:
+
+| Severity | Ratio of colliding lanes | Operator action |
+|---|---|---|
+| `Clean` | 0% | No action |
+| `Watch` | <5% | Monitor; remediate if throughput asymmetry surfaces |
+| `Elevated` | 5-15% | Worth remediating preventively |
+| `Remediate` | >15% | Hot-spot risk under load; apply one of the three options below |
+
+The tool exits `0` regardless of severity — it's an observability probe,
+not a gate. Integrate it into deployment pipelines as a reporting step if
+you want severity thresholds to fail CI.
 
 ### When to investigate
 
