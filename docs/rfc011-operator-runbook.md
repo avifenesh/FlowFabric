@@ -110,7 +110,11 @@ which can hot-spot under load.
 ### Running the probe
 
 ```sh
-# Reads FF_LANES + FF_FLOW_PARTITIONS from env, same as ff-server boot.
+# Reads FF_LANES + FF_FLOW_PARTITIONS from env. Validates lane names
+# (length + ASCII-printable per LaneId::try_new) and rejects duplicate
+# entries — note ff-server boot itself currently uses LaneId::new
+# without duplicate detection, so the probe may catch misconfigurations
+# that a prod boot silently accepts.
 # Does NOT connect to Valkey or start any server; pure computation.
 FF_LANES="default,high,low,bulk" \
   ff-server admin partition-collisions

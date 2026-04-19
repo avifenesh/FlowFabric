@@ -131,10 +131,11 @@ impl PartitionCollisionsReport {
     ///
     /// Pure function — no Valkey connection, no IO. Uses
     /// [`ff_core::partition::solo_partition`] (and therefore
-    /// [`ff_core::partition::Crc16SoloPartitioner`]). Deployments that have
-    /// installed a custom [`SoloPartitioner`] at boot time need to feed the
-    /// alternate partitioner in explicitly — not yet wired through this
-    /// subcommand; current probe assumes the default.
+    /// `ff_core::partition::Crc16SoloPartitioner`). Deployments that have
+    /// installed a custom `ff_core::partition::SoloPartitioner` at boot
+    /// time need to feed the alternate partitioner in explicitly — not
+    /// yet wired through this subcommand; the current probe assumes the
+    /// default.
     pub fn compute(lanes: &[LaneId], config: &PartitionConfig) -> Self {
         // Group lane indices by the partition they hash to.
         let mut by_partition: std::collections::BTreeMap<u16, Vec<LaneId>> =
@@ -153,31 +154,25 @@ impl PartitionCollisionsReport {
         // partitions have at most 1 lane, both shapes are fast; the fix
         // matters only under severe collision density, but the cheaper
         // shape is also clearer to read.
-        //
-        // `by_identity` guards against a caller passing a lane list that
-        // contains duplicate names. The CLI path already rejects dupes in
-        // [`load_probe_inputs`], but `compute` is reachable from library
-        // callers too — harden against self-filter-by-name producing an
-        // empty-collides-with-but-actually-colliding row. Dedupe by
-        // position: filter out only the entry at the lane's own position
-        // in the original `lanes` slice, not every entry with the same
-        // name.
+        // Guard against a caller passing a lane list with duplicate names.
+        // The CLI path already rejects duplicates in [`load_probe_inputs`],
+        // but `compute` is reachable from library callers too. For each
+        // lane, build `collides_with` by filtering the sorted sibling
+        // slice but skipping exactly ONE occurrence of the same name —
+        // via a `seen_self` guard. Any remaining matching entries are
+        // real duplicates and correctly appear in collides_with.
         let mut entries: Vec<LanePartition> = Vec::with_capacity(lanes.len());
         let mut colliding_lanes = 0usize;
         for (index, siblings) in &by_partition {
             let mut sorted_siblings: Vec<LaneId> = siblings.clone();
             sorted_siblings.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            for (position_in_partition, lane) in siblings.iter().enumerate() {
-                // Exclude exactly one occurrence of self (by position) —
-                // if the caller passed duplicate names, the remaining
-                // occurrences correctly appear in collides_with.
+            for lane in siblings {
                 let mut seen_self = false;
                 let others: Vec<LaneId> = sorted_siblings
                     .iter()
                     .filter(|sib| {
                         if sib.as_str() == lane.as_str() && !seen_self {
-                            // Only skip the first occurrence; any further
-                            // matching entries are real duplicates.
+                            // Skip the first occurrence only.
                             seen_self = true;
                             false
                         } else {
@@ -186,10 +181,6 @@ impl PartitionCollisionsReport {
                     })
                     .cloned()
                     .collect();
-                // Suppress the unused-variable warning without renaming:
-                // position_in_partition documents our iteration intent
-                // but the filter uses seen_self for the dedup itself.
-                let _ = position_in_partition;
                 if !others.is_empty() {
                     colliding_lanes += 1;
                 }
@@ -307,10 +298,19 @@ fn classify_severity(colliding: usize, total: usize) -> CollisionSeverity {
     if total == 0 {
         return CollisionSeverity::Clean;
     }
-    let ratio = colliding as f64 / total as f64;
-    if ratio < 0.05 {
+    // Integer arithmetic to avoid floating-point boundary surprises
+    // (exactly 5% and exactly 15% previously landed on the stricter
+    // bucket due to float comparison with `ratio < 0.05` / `< 0.15`).
+    // Runbook contract:
+    //   <5%    → Watch       (colliding * 100 < 5 * total)
+    //   5-15%  → Elevated    (5 * total <= colliding * 100 <= 15 * total)
+    //   >15%   → Remediate   (colliding * 100 > 15 * total)
+    let colliding_bp = colliding.saturating_mul(100); // basis points ×100 (not bp proper)
+    let five_pct = total.saturating_mul(5);
+    let fifteen_pct = total.saturating_mul(15);
+    if colliding_bp < five_pct {
         CollisionSeverity::Watch
-    } else if ratio < 0.15 {
+    } else if colliding_bp <= fifteen_pct {
         CollisionSeverity::Elevated
     } else {
         CollisionSeverity::Remediate
@@ -376,9 +376,11 @@ mod tests {
         assert_eq!(classify_severity(10, 100), CollisionSeverity::Elevated);
         // 20% → Remediate
         assert_eq!(classify_severity(20, 100), CollisionSeverity::Remediate);
-        // Boundary cases
+        // Boundary cases per runbook: 5% → Elevated (inclusive),
+        // 15% → Elevated (inclusive), 16% → Remediate.
         assert_eq!(classify_severity(5, 100), CollisionSeverity::Elevated);
-        assert_eq!(classify_severity(15, 100), CollisionSeverity::Remediate);
+        assert_eq!(classify_severity(15, 100), CollisionSeverity::Elevated);
+        assert_eq!(classify_severity(16, 100), CollisionSeverity::Remediate);
     }
 
     #[test]
