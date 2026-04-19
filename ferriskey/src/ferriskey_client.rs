@@ -27,6 +27,7 @@ pub struct Client(Arc<ClientInner>);
 /// Builder for constructing a [`Client`] with custom connection options.
 pub struct ClientBuilder {
     request: ConnectionRequest,
+    push_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::pubsub::push_manager::PushInfo>>,
 }
 
 /// Builder for executing an arbitrary command through a [`Client`].
@@ -372,6 +373,7 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             request: ConnectionRequest::default(),
+            push_sender: None,
         }
     }
 
@@ -525,6 +527,55 @@ impl ClientBuilder {
         self
     }
 
+    /// Receive RESP3 push frames (pub/sub messages, invalidation notices,
+    /// keyspace notifications) on a caller-provided channel.
+    ///
+    /// The sender half is wired into every connection this client owns;
+    /// push frames that the connection receives are forwarded to it
+    /// verbatim as [`crate::PushInfo`] values.
+    ///
+    /// Push delivery requires RESP3 — build the client with
+    /// [`ClientBuilder::protocol`] set to
+    /// [`crate::value::ProtocolVersion::RESP3`]. Subscribing to channels
+    /// is performed separately via:
+    ///
+    /// - build-time: [`ClientBuilder::pubsub_subscriptions`] (replayed on
+    ///   reconnect);
+    /// - runtime: `client.cmd("SUBSCRIBE").arg("chan").execute::<()>()`
+    ///   (intercepted by the pubsub synchronizer and reconciled in the
+    ///   background; the call returns as soon as the desired state is
+    ///   recorded).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use ferriskey::{ClientBuilder, Result, value::ProtocolVersion};
+    /// # async fn example() -> Result<()> {
+    /// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let client = ClientBuilder::new()
+    ///     .host("127.0.0.1", 6379)
+    ///     .protocol(ProtocolVersion::RESP3)
+    ///     .push_sender(tx)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// // Request a subscription. The reconciler issues SUBSCRIBE in the
+    /// // background; push frames arrive on `rx` once the server confirms.
+    /// let _: () = client.cmd("SUBSCRIBE").arg("events").execute().await?;
+    /// while let Some(push) = rx.recv().await {
+    ///     // handle push frame
+    ///     let _ = push;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn push_sender(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::pubsub::push_manager::PushInfo>,
+    ) -> Self {
+        self.push_sender = Some(tx);
+        self
+    }
+
     /// Build and connect the client.
     pub async fn build(self) -> Result<Client> {
         if self.request.addresses.is_empty() {
@@ -534,7 +585,7 @@ impl ClientBuilder {
             )));
         }
 
-        let inner = ClientInner::new(self.request, None).await?;
+        let inner = ClientInner::new(self.request, self.push_sender).await?;
         Ok(Client(Arc::new(inner)))
     }
 
@@ -564,6 +615,7 @@ impl ClientBuilder {
         Ok(LazyClient {
             config: self.request,
             inner: Arc::new(tokio::sync::OnceCell::new()),
+            push_sender: self.push_sender,
         })
     }
 }
@@ -602,6 +654,10 @@ pub struct LazyClient {
     // `tokio::sync::OnceCell` (not `std::sync`) because init runs
     // an `async` connect and may yield under heavy concurrency.
     inner: Arc<tokio::sync::OnceCell<Client>>,
+    // Forwarded to `ClientInner::new` on first `connect()` so RESP3
+    // push frames reach the caller-supplied channel. `None` when the
+    // builder never called `push_sender`.
+    push_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::pubsub::push_manager::PushInfo>>,
 }
 
 impl crate::client::ValkeyClientForTests for LazyClient {
@@ -646,6 +702,7 @@ impl LazyClient {
         Ok(Self {
             config,
             inner: Arc::new(tokio::sync::OnceCell::new()),
+            push_sender: None,
         })
     }
 
@@ -663,7 +720,7 @@ impl LazyClient {
                 // provides the deferral.
                 let mut config = self.config.clone();
                 config.lazy_connect = false;
-                let inner = ClientInner::new(config, None).await?;
+                let inner = ClientInner::new(config, self.push_sender.clone()).await?;
                 Ok::<Client, Error>(Client(Arc::new(inner)))
             })
             .await
