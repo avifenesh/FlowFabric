@@ -61,10 +61,10 @@ macro_rules! require_cluster {
 #[ignore] // Requires live cluster
 async fn test_basic_get_set() {
     let mut conn = require_cluster!();
-    let _ = conn.req_packed_command(&cmd("SET").arg("itest:basic").arg("hello")).await.unwrap();
-    let val = conn.req_packed_command(&cmd("GET").arg("itest:basic")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg("itest:basic").arg("hello")).await.unwrap();
+    let val = conn.req_packed_command(cmd("GET").arg("itest:basic")).await.unwrap();
     assert_eq!(val, Value::BulkString(bytes::Bytes::from_static(b"hello")));
-    let _ = conn.req_packed_command(&cmd("DEL").arg("itest:basic")).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg("itest:basic")).await;
 }
 
 #[tokio::test]
@@ -73,21 +73,21 @@ async fn test_list_operations_rpop_lpush() {
     // Same pattern as rusty-celery's broker
     let mut conn = require_cluster!();
     let key = "itest:queue";
-    let _ = conn.req_packed_command(&cmd("DEL").arg(key)).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg(key)).await;
 
     // LPUSH 3 items
-    let _ = conn.req_packed_command(&cmd("LPUSH").arg(key).arg("task1")).await.unwrap();
-    let _ = conn.req_packed_command(&cmd("LPUSH").arg(key).arg("task2")).await.unwrap();
-    let _ = conn.req_packed_command(&cmd("LPUSH").arg(key).arg("task3")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("LPUSH").arg(key).arg("task1")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("LPUSH").arg(key).arg("task2")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("LPUSH").arg(key).arg("task3")).await.unwrap();
 
     // RPOP should return in FIFO order (task1 first)
-    let val = conn.req_packed_command(&cmd("RPOP").arg(key)).await.unwrap();
+    let val = conn.req_packed_command(cmd("RPOP").arg(key)).await.unwrap();
     assert_eq!(val, Value::BulkString(bytes::Bytes::from_static(b"task1")));
 
-    let val = conn.req_packed_command(&cmd("RPOP").arg(key)).await.unwrap();
+    let val = conn.req_packed_command(cmd("RPOP").arg(key)).await.unwrap();
     assert_eq!(val, Value::BulkString(bytes::Bytes::from_static(b"task2")));
 
-    let _ = conn.req_packed_command(&cmd("DEL").arg(key)).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg(key)).await;
 }
 
 #[tokio::test]
@@ -96,22 +96,22 @@ async fn test_hash_operations_hset_hdel() {
     // Same pattern as rusty-celery's task result tracking
     let mut conn = require_cluster!();
     let key = "itest:results";
-    let _ = conn.req_packed_command(&cmd("DEL").arg(key)).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg(key)).await;
 
     // HSET
-    let _ = conn.req_packed_command(&cmd("HSET").arg(key).arg("task-123").arg("SUCCESS")).await.unwrap();
-    let _ = conn.req_packed_command(&cmd("HSET").arg(key).arg("task-456").arg("FAILURE")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("HSET").arg(key).arg("task-123").arg("SUCCESS")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("HSET").arg(key).arg("task-456").arg("FAILURE")).await.unwrap();
 
     // HGET
-    let val = conn.req_packed_command(&cmd("HGET").arg(key).arg("task-123")).await.unwrap();
+    let val = conn.req_packed_command(cmd("HGET").arg(key).arg("task-123")).await.unwrap();
     assert_eq!(val, Value::BulkString(bytes::Bytes::from_static(b"SUCCESS")));
 
     // HDEL
-    let _ = conn.req_packed_command(&cmd("HDEL").arg(key).arg("task-123")).await.unwrap();
-    let val = conn.req_packed_command(&cmd("HGET").arg(key).arg("task-123")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("HDEL").arg(key).arg("task-123")).await.unwrap();
+    let val = conn.req_packed_command(cmd("HGET").arg(key).arg("task-123")).await.unwrap();
     assert_eq!(val, Value::Nil);
 
-    let _ = conn.req_packed_command(&cmd("DEL").arg(key)).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg(key)).await;
 }
 
 #[tokio::test]
@@ -119,12 +119,12 @@ async fn test_hash_operations_hset_hdel() {
 async fn test_mget_multi_key() {
     let mut conn = require_cluster!();
     // Use hash tags to ensure same slot
-    let _ = conn.req_packed_command(&cmd("SET").arg("{itest}:k1").arg("v1")).await.unwrap();
-    let _ = conn.req_packed_command(&cmd("SET").arg("{itest}:k2").arg("v2")).await.unwrap();
-    let _ = conn.req_packed_command(&cmd("SET").arg("{itest}:k3").arg("v3")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg("{itest}:k1").arg("v1")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg("{itest}:k2").arg("v2")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg("{itest}:k3").arg("v3")).await.unwrap();
 
     let val = conn.req_packed_command(
-        &cmd("MGET").arg("{itest}:k1").arg("{itest}:k2").arg("{itest}:k3")
+        cmd("MGET").arg("{itest}:k1").arg("{itest}:k2").arg("{itest}:k3")
     ).await.unwrap();
 
     if let Value::Array(items) = val {
@@ -136,7 +136,7 @@ async fn test_mget_multi_key() {
         panic!("Expected Array, got {:?}", val);
     }
 
-    let _ = conn.req_packed_command(&cmd("DEL").arg("{itest}:k1").arg("{itest}:k2").arg("{itest}:k3")).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg("{itest}:k1").arg("{itest}:k2").arg("{itest}:k3")).await;
 }
 
 #[tokio::test]
@@ -144,7 +144,7 @@ async fn test_mget_multi_key() {
 async fn test_pipeline_atomic() {
     let mut conn = require_cluster!();
     let key = "{itest:pipe}:counter";
-    let _ = conn.req_packed_command(&cmd("SET").arg(key).arg("0")).await;
+    let _ = conn.req_packed_command(cmd("SET").arg(key).arg("0")).await;
 
     // Pipeline: INCR 3 times atomically
     let mut pipe = Pipeline::new();
@@ -159,7 +159,7 @@ async fn test_pipeline_atomic() {
     assert_eq!(results[1], Value::Int(2));
     assert_eq!(results[2], Value::Int(3));
 
-    let _ = conn.req_packed_command(&cmd("DEL").arg(key)).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg(key)).await;
 }
 
 #[tokio::test]
@@ -182,16 +182,16 @@ async fn test_expiry_and_ttl() {
     let mut conn = require_cluster!();
     let key = "itest:expiry";
 
-    let _ = conn.req_packed_command(&cmd("SET").arg(key).arg("temp").arg("EX").arg("10")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg(key).arg("temp").arg("EX").arg("10")).await.unwrap();
 
-    let ttl = conn.req_packed_command(&cmd("TTL").arg(key)).await.unwrap();
+    let ttl = conn.req_packed_command(cmd("TTL").arg(key)).await.unwrap();
     if let Value::Int(t) = ttl {
         assert!(t > 0 && t <= 10, "TTL should be between 1-10, got {t}");
     } else {
         panic!("Expected Int, got {:?}", ttl);
     }
 
-    let _ = conn.req_packed_command(&cmd("DEL").arg(key)).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg(key)).await;
 }
 
 #[tokio::test]
@@ -199,8 +199,8 @@ async fn test_expiry_and_ttl() {
 async fn test_cross_slot_pipeline_non_atomic() {
     let mut conn = require_cluster!();
     // Keys WITHOUT hash tags → likely different slots
-    let _ = conn.req_packed_command(&cmd("SET").arg("itest:xslot:a").arg("1")).await.unwrap();
-    let _ = conn.req_packed_command(&cmd("SET").arg("itest:xslot:b").arg("2")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg("itest:xslot:a").arg("1")).await.unwrap();
+    let _ = conn.req_packed_command(cmd("SET").arg("itest:xslot:b").arg("2")).await.unwrap();
 
     // Non-atomic pipeline across slots — exercises our direct dispatch splitting
     let mut pipe = Pipeline::new();
@@ -212,6 +212,6 @@ async fn test_cross_slot_pipeline_non_atomic() {
     assert_eq!(results[0], Value::BulkString(bytes::Bytes::from_static(b"1")));
     assert_eq!(results[1], Value::BulkString(bytes::Bytes::from_static(b"2")));
 
-    let _ = conn.req_packed_command(&cmd("DEL").arg("itest:xslot:a")).await;
-    let _ = conn.req_packed_command(&cmd("DEL").arg("itest:xslot:b")).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg("itest:xslot:a")).await;
+    let _ = conn.req_packed_command(cmd("DEL").arg("itest:xslot:b")).await;
 }

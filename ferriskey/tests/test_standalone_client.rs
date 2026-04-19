@@ -9,7 +9,7 @@ mod standalone_client_tests {
     use crate::constants::{IP_ADDRESS_V4, IP_ADDRESS_V6};
     use crate::utilities::mocks::{Mock, ServerMock};
     use ferriskey::{
-        client::{Client as FerrisKeyClient, StandaloneClient},
+        client::StandaloneClient,
         client::types::ReadFrom,
     };
     use ferriskey::{FromValue, Value};
@@ -261,7 +261,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .unwrap();
             tracing::info!(
@@ -404,7 +404,7 @@ mod standalone_client_tests {
             create_connection_request(addresses.as_slice(), &Default::default());
         block_on_all(async {
             let client_res =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(client_res.is_err());
             let error = client_res.unwrap_err();
             let primary_1_addr = addresses.first().unwrap().to_string();
@@ -441,7 +441,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .unwrap();
 
@@ -647,11 +647,11 @@ mod standalone_client_tests {
                 },
             );
             connection_request.tls_mode = Some(ferriskey::client::types::TlsMode::SecureTls);
-            connection_request.root_certs = vec![ca_cert_bytes.into()];
+            connection_request.root_certs = vec![ca_cert_bytes];
 
             // Test that connection works with custom root cert
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .expect("Failed to create client with custom root cert");
 
@@ -688,7 +688,7 @@ mod standalone_client_tests {
                 },
             );
             connection_request.tls_mode = ferriskey::client::types::TlsMode::SecureTls.into();
-            connection_request.root_certs = vec![wrong_ca_cert_bytes.into()];
+            connection_request.root_certs = vec![wrong_ca_cert_bytes];
             // Use minimal retries to fail fast
             connection_request.connection_retry_strategy =
                 Some(ferriskey::client::types::ConnectionRetryStrategy {
@@ -696,12 +696,11 @@ mod standalone_client_tests {
                     factor: 1,
                     exponent_base: 1,
                     ..Default::default()
-                })
-                .into();
+                });
 
             // Connection should fail due to certificate mismatch
             let client_result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 client_result.is_err(),
                 "Expected connection to fail with wrong root certificate"
@@ -734,13 +733,12 @@ mod standalone_client_tests {
             // Using a PEM-like structure but with invalid base64 content
             connection_request.root_certs = vec![
                 b"-----BEGIN CERTIFICATE-----\n!!!invalid base64!!!\n-----END CERTIFICATE-----"
-                    .to_vec()
-                    .into(),
+                    .to_vec(),
             ];
 
             // Client creation should fail during certificate parsing
             let client_result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 client_result.is_err(),
                 "Expected client creation to fail with invalid certificate bytes"
@@ -766,11 +764,11 @@ mod standalone_client_tests {
             );
             connection_request.tls_mode = ferriskey::client::types::TlsMode::NoTls.into();
             // Provide custom root certs but with NoTls mode
-            connection_request.root_certs = vec![b"some certificate".to_vec().into()];
+            connection_request.root_certs = vec![b"some certificate".to_vec()];
 
             // Client creation should fail due to invalid configuration
             let client_result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 client_result.is_err(),
                 "Expected client creation to fail when custom certs provided with NoTls mode"
@@ -816,11 +814,11 @@ mod standalone_client_tests {
             );
             connection_request.tls_mode = ferriskey::client::types::TlsMode::SecureTls.into();
             connection_request.root_certs =
-                vec![invalid_ca_cert_bytes.into(), valid_ca_cert_bytes.into()];
+                vec![invalid_ca_cert_bytes, valid_ca_cert_bytes];
 
             // Connection should succeed using the second (valid) certificate
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .expect("Failed to create client with multiple root certs");
 
@@ -868,13 +866,13 @@ mod standalone_client_tests {
                 },
             );
             connection_request.tls_mode = ferriskey::client::types::TlsMode::SecureTls.into();
-            connection_request.root_certs = vec![ca_cert_bytes.into()];
-            connection_request.client_cert = client_cert_bytes.into();
-            connection_request.client_key = client_key_bytes.into();
+            connection_request.root_certs = vec![ca_cert_bytes];
+            connection_request.client_cert = client_cert_bytes;
+            connection_request.client_key = client_key_bytes;
 
             // Test that connection works with custom root cert and client TLS auth
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .expect("Failed to create client with custom root cert");
 
@@ -920,10 +918,10 @@ mod standalone_client_tests {
                 },
             );
             connection_request.tls_mode = ferriskey::client::types::TlsMode::SecureTls.into();
-            connection_request.root_certs = vec![ca_cert_bytes.into()];
+            connection_request.root_certs = vec![ca_cert_bytes];
 
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .expect("Failed to create client with IP address");
 
@@ -954,7 +952,7 @@ mod standalone_client_tests {
             );
 
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .expect("Failed to create client with IP address");
 
@@ -1004,7 +1002,7 @@ mod standalone_client_tests {
         block_on_all(async {
             // This should succeed because read_only mode doesn't require a primary
             let client_result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 client_result.is_ok(),
                 "read_only mode should connect without requiring a primary node"
@@ -1031,7 +1029,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .unwrap();
 
@@ -1069,7 +1067,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let mut client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .unwrap();
 
@@ -1097,7 +1095,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 result.is_err(),
                 "AZAffinity should be rejected with read_only mode"
@@ -1125,7 +1123,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 result.is_err(),
                 "AZAffinityReplicasAndPrimary should be rejected with read_only mode"
@@ -1153,7 +1151,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 result.is_ok(),
                 "PreferReplica should be accepted with read_only mode"
@@ -1175,7 +1173,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             assert!(
                 result.is_ok(),
                 "Primary ReadFrom should be accepted with read_only mode (reads go to connected nodes)"
@@ -1197,7 +1195,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let _client =
-                StandaloneClient::create_client(connection_request, None, None, None)
+                create_test_standalone_client(connection_request, None)
                     .await
                     .unwrap();
 
@@ -1222,7 +1220,7 @@ mod standalone_client_tests {
 
         block_on_all(async {
             let result =
-                StandaloneClient::create_client(connection_request, None, None, None).await;
+                create_test_standalone_client(connection_request, None).await;
             // Normal mode should fail because no primary is found
             assert!(
                 result.is_err(),
@@ -1258,27 +1256,19 @@ mod standalone_client_tests {
             // Create a normal client connected to the primary for writes
             let primary_connection_request =
                 create_connection_request(primary_address.as_slice(), &Default::default());
-            let mut primary_client = StandaloneClient::create_client(
-                primary_connection_request,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("Primary client should connect successfully");
+            let mut primary_client =
+                create_test_standalone_client(primary_connection_request, None)
+                    .await
+                    .expect("Primary client should connect successfully");
 
             // Create a read-only client connected to the replica for reads
             let mut replica_connection_request =
                 create_connection_request(replica_address.as_slice(), &Default::default());
             replica_connection_request.read_only = true;
-            let mut replica_client = StandaloneClient::create_client(
-                replica_connection_request,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("Read-only replica client should connect successfully");
+            let mut replica_client =
+                create_test_standalone_client(replica_connection_request, None)
+                    .await
+                    .expect("Read-only replica client should connect successfully");
 
             // Write to primary using normal client
             let write_result = primary_client.send_command(&set_cmd).await;

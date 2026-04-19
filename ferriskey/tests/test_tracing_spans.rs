@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 /// A `MakeWriter` backed by an `Arc<Mutex<Vec<u8>>>` so tests can
 /// install a subscriber, run ferriskey code, then inspect the output.
@@ -50,6 +49,7 @@ impl Write for BufferedWriterGuard {
     }
 }
 
+#[allow(dead_code)]
 fn buffer_contains(buf: &Arc<Mutex<Vec<u8>>>, needle: &str) -> bool {
     let guard = buf.lock().expect("poisoned test buffer");
     std::str::from_utf8(&guard)

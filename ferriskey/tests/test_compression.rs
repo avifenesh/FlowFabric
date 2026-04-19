@@ -244,21 +244,9 @@ mod compression_tests {
 
     #[test]
     fn test_command_compression_behavior() {
-        // Test description()
-        assert_eq!(
-            CommandCompressionBehavior::CompressValues.description(),
-            "Compress values before sending to server"
-        );
-        assert_eq!(
-            CommandCompressionBehavior::DecompressValues.description(),
-            "Decompress values after receiving from server"
-        );
-        assert_eq!(
-            CommandCompressionBehavior::NoCompression.description(),
-            "No compression processing required"
-        );
-
-        // Test Display
+        // CommandCompressionBehavior used to expose a standalone description()
+        // method alongside Display; that method was removed and Display is
+        // the single source of truth for the human-readable form.
         assert_eq!(
             CommandCompressionBehavior::CompressValues.to_string(),
             "CompressValues"

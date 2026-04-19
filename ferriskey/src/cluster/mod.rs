@@ -4911,6 +4911,7 @@ mod direct_dispatch_tests {
         }
 
         /// Returns a copy of the nth received payload, panicking if absent.
+        #[allow(dead_code)]
         fn received_nth(&self, n: usize) -> Vec<u8> {
             self.received.lock().unwrap()[n].clone()
         }

@@ -839,13 +839,12 @@ pub async fn wait_for_node_to_become_primary(
             tokio::time::timeout(per_query_timeout, ClusterTopology::from_connection(connection))
                 .await;
 
-        if let Ok(topology) = query_result {
-            if let Some(node) = topology.nodes.iter().find(|n| n.node_id == node_id)
+        if let Ok(topology) = query_result
+            && let Some(node) = topology.nodes.iter().find(|n| n.node_id == node_id)
                 && node.is_primary
             {
                 return true;
             }
-        }
         // On timeout or wrong state, wait briefly and retry
 
         tokio::time::sleep(Duration::from_millis(200)).await;
