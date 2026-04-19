@@ -44,10 +44,13 @@ pub const COMPLETION_CHANNEL: &str = "ff:dag:completions";
 
 /// Wire format of a completion message. JSON-encoded by the Lua
 /// producers; parsed with serde here so field drift surfaces as a
-/// typed error rather than silent skip.
+/// typed error rather than silent skip. `execution_id` uses
+/// `ExecutionId`'s Deserialize impl, which validates the
+/// `{fp:N}:<uuid>` shape at parse time — a malformed id fails loudly
+/// here instead of routing to the wrong partition downstream.
 #[derive(Debug, Deserialize)]
 struct CompletionPayload {
-    execution_id: String,
+    execution_id: ExecutionId,
     flow_id: String,
     #[serde(default)]
     #[allow(dead_code)]
@@ -70,7 +73,12 @@ async fn build_listener_client(
         builder = builder.cluster();
     }
     if tls {
-        builder = builder.tls_insecure();
+        // Match the main client's TLS stance (`ClientBuilder::tls()` —
+        // certificate verification enabled). Downgrading to
+        // `tls_insecure` on the listener alone would silently weaken
+        // transport guarantees even though completion payloads are
+        // metadata, not user data — consistency matters.
+        builder = builder.tls();
     }
     for (host, port) in addresses {
         builder = builder.host(host, *port);
@@ -115,7 +123,15 @@ pub fn spawn_completion_listener(
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                        _ = shutdown.changed() => return,
+                        changed = shutdown.changed() => {
+                            // `changed()` errors only when every sender
+                            // has been dropped — treat that as a hard
+                            // shutdown signal (the engine owner is
+                            // gone). Otherwise check the latest value.
+                            if changed.is_err() || *shutdown.borrow() {
+                                return;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -138,7 +154,11 @@ pub fn spawn_completion_listener(
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                    _ = shutdown.changed() => return,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    }
                 }
                 continue;
             }
@@ -152,8 +172,8 @@ pub fn spawn_completion_listener(
             // (push_rx closes) or shutdown fires.
             loop {
                 tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
                             return;
                         }
                     }
@@ -164,7 +184,16 @@ pub fn spawn_completion_listener(
                             );
                             break;
                         };
-                        handle_push(&router, &dispatch_client, push).await;
+                        // Spawn per-dispatch so slow ff_resolve_dependency
+                        // calls (multi-partition FCALLs, cascade recursion)
+                        // don't head-of-line-block subsequent completions.
+                        // dispatch is idempotent; redundant re-entry on the
+                        // same eid is harmless.
+                        let router = router.clone();
+                        let client = dispatch_client.clone();
+                        tokio::spawn(async move {
+                            handle_push(&router, &client, push).await;
+                        });
                     }
                 }
             }
@@ -187,6 +216,24 @@ async fn handle_push(
 
     // RESP3 Message frame layout (per Valkey docs):
     //   data = [ channel, message_payload ]
+    // Verify the channel name so an unexpected fan-in (e.g. a future
+    // second SUBSCRIBE on the same client) can't feed unrelated
+    // payloads into the dispatcher.
+    let channel_match = matches!(
+        push.data.first(),
+        Some(Value::BulkString(b)) if b.as_ref() == COMPLETION_CHANNEL.as_bytes()
+    ) || matches!(
+        push.data.first(),
+        Some(Value::SimpleString(s)) if s == COMPLETION_CHANNEL
+    );
+    if !channel_match {
+        tracing::debug!(
+            data = ?push.data.first(),
+            "completion_listener: Message on unexpected channel, ignoring"
+        );
+        return;
+    }
+
     let payload_str = match push.data.get(1) {
         Some(Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
         Some(Value::SimpleString(s)) => s.clone(),
@@ -199,32 +246,23 @@ async fn handle_push(
         }
     };
 
+    // ExecutionId is validated by its Deserialize impl; a malformed
+    // id fails here and we drop the message with a log. Reconciler
+    // picks up the completion on its next scan.
     let parsed: CompletionPayload = match serde_json::from_str(&payload_str) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 payload = %payload_str,
-                "completion_listener: cjson decode failed, skipping"
-            );
-            return;
-        }
-    };
-
-    let eid = match ExecutionId::parse(&parsed.execution_id) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                raw = %parsed.execution_id,
-                "completion_listener: invalid execution_id in payload"
+                "completion_listener: json decode failed, skipping"
             );
             return;
         }
     };
 
     tracing::debug!(
-        execution_id = %eid,
+        execution_id = %parsed.execution_id,
         flow_id = %parsed.flow_id,
         outcome = %parsed.outcome,
         "completion_listener: dispatching dependency resolution"
@@ -233,7 +271,7 @@ async fn handle_push(
     dispatch_dependency_resolution(
         dispatch_client,
         router,
-        &eid,
+        &parsed.execution_id,
         Some(parsed.flow_id.as_str()),
     )
     .await;
@@ -247,6 +285,7 @@ mod tests {
     fn parses_canonical_payload() {
         let raw = r#"{"execution_id":"{fp:5}:11111111-1111-1111-1111-111111111111","flow_id":"22222222-2222-2222-2222-222222222222","outcome":"success"}"#;
         let p: CompletionPayload = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.execution_id.partition(), 5);
         assert_eq!(p.flow_id, "22222222-2222-2222-2222-222222222222");
         assert_eq!(p.outcome, "success");
     }
@@ -263,5 +302,19 @@ mod tests {
     fn malformed_payload_is_error() {
         let raw = r#"{"not":"valid"}"#;
         assert!(serde_json::from_str::<CompletionPayload>(raw).is_err());
+    }
+
+    /// Malformed execution_id (missing hash-tag) must fail parse —
+    /// ExecutionId's Deserialize impl validates the shape, so a
+    /// bare-UUID producer (legacy, wire-format drift) surfaces as
+    /// a parse error rather than silently routing to partition 0.
+    #[test]
+    fn malformed_execution_id_rejected_at_parse() {
+        let raw = r#"{"execution_id":"11111111-1111-1111-1111-111111111111","flow_id":"22222222-2222-2222-2222-222222222222"}"#;
+        let err = serde_json::from_str::<CompletionPayload>(raw).unwrap_err();
+        assert!(
+            err.to_string().contains("hash-tag") || err.to_string().contains("{fp:"),
+            "error should mention hash-tag shape: {err}"
+        );
     }
 }
