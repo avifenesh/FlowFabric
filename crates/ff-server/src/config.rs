@@ -189,8 +189,12 @@ impl ServerConfig {
             Duration::from_secs(env_u64("FF_QUOTA_RECONCILER_INTERVAL_S", 30)?);
         let unblock_interval =
             Duration::from_secs(env_u64("FF_UNBLOCK_INTERVAL_S", 5)?);
+        // Raised from 1s (pre-Batch-C) to 15s now that push-based DAG
+        // promotion is primary. The reconciler is a safety net post-
+        // completion-listener; see ff-engine docs on
+        // `dependency_reconciler_interval`.
         let dependency_reconciler_interval =
-            Duration::from_secs(env_u64("FF_DEPENDENCY_RECONCILER_INTERVAL_S", 1)?);
+            Duration::from_secs(env_u64("FF_DEPENDENCY_RECONCILER_INTERVAL_S", 15)?);
 
         let engine_config = EngineConfig {
             partition_config,
@@ -207,6 +211,10 @@ impl ServerConfig {
             quota_reconciler_interval,
             unblock_interval,
             dependency_reconciler_interval,
+            // Listener is owned by `Server::start`, which has the
+            // Valkey endpoint info. Left None here; populated when
+            // the ServerConfig gets consumed by the server.
+            completion_listener: None,
             flow_projector_interval: Duration::from_secs(
                 env_u64("FF_FLOW_PROJECTOR_INTERVAL_S", 15)?
             ),

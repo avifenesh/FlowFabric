@@ -166,6 +166,55 @@ In increasing order of operator cost:
    config, &custom_impl)` is the public escape hatch. Defer to a follow-up
    RFC if this becomes common demand.
 
+## DAG promotion: push listener + safety-net reconciler
+
+Post-Batch-C item 6, FlowFabric uses two paths to promote downstream
+executions when an upstream reaches a terminal state:
+
+1. **Push (primary).** `ff_complete_execution` /
+   `ff_fail_execution` / `ff_cancel_execution` `PUBLISH` a JSON
+   completion payload to the `ff:dag:completions` channel. The engine
+   runs a `CompletionListener` on a dedicated RESP3 client that
+   `SUBSCRIBE`s to that channel and dispatches
+   `ff_resolve_dependency` for each downstream edge.
+2. **Reconciler (safety net).** The `dependency_reconciler` scanner
+   still runs — default interval raised from 1s to 15s now that
+   push is primary — and picks up any completion the listener
+   missed (restart window, unstamped legacy `core.flow_id`,
+   cross-node sharded-pubsub gaps).
+
+Under normal operation DAG latency is `~RTT × levels`, not
+`interval × levels`.
+
+### When to tune `FF_DEPENDENCY_RECONCILER_INTERVAL_S`
+
+- **Default (15s)**: listener is primary; the scanner is belt-and-
+  suspenders. Correct for every deployment the server runs in by
+  itself.
+- **Listener disabled** (custom deployments only, via the
+  `ff_engine::EngineConfig::completion_listener = None` escape hatch):
+  drop this back to `1` so DAG latency doesn't regress to the
+  pre-Batch-C floor.
+
+### Cluster mode
+
+Plain `PUBLISH` broadcasts across cluster nodes. Every ff-server
+instance that runs an engine will receive every completion;
+duplicate dispatches are harmless (idempotent) but redundant. If
+contention surfaces under very wide fan-out, a follow-up can shard
+the channel via `SPUBLISH` keyed by flow partition — not required
+at current scale.
+
+### Observability
+
+- `tracing::info!` at subscribe time:
+  `completion_listener: subscribed, awaiting push frames`.
+- `tracing::debug!` per dispatched completion:
+  `completion_listener: dispatching dependency resolution`.
+- `tracing::warn!` on reconnect, malformed payload, or invalid
+  `execution_id` — rare; a non-zero sustained rate means the Lua
+  producers and engine parser have drifted.
+
 ## Superseded artifacts
 
 ### Issue #21 (crash-recovery scanner)
