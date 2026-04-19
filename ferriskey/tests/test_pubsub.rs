@@ -731,6 +731,42 @@ mod standalone_pubsub_tests {
         Some((sub_client, push_rx, pub_client))
     }
 
+    /// Build sub+pub via the public [`ferriskey::ClientBuilder::push_sender`]
+    /// surface (distinct from the internal `Client::new` path used by
+    /// the other tests in this module). Returns `ferriskey::Client`
+    /// — the top-level facade type, not `ferriskey::client::Client`.
+    #[allow(clippy::type_complexity)]
+    async fn create_sub_pub_clients_via_builder() -> Option<(
+        ferriskey::Client,
+        mpsc::UnboundedReceiver<PushInfo>,
+        ferriskey::Client,
+    )> {
+        use ferriskey::ClientBuilder;
+        use ferriskey::value::ProtocolVersion;
+
+        let host = std::env::var("VALKEY_STANDALONE_HOST").ok()?;
+        let port: u16 = std::env::var("VALKEY_STANDALONE_PORT")
+            .unwrap_or_else(|_| "6379".into())
+            .parse()
+            .unwrap_or(6379);
+
+        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let sub_client = ClientBuilder::new()
+            .host(&host, port)
+            .protocol(ProtocolVersion::RESP3)
+            .push_sender(push_tx)
+            .build()
+            .await
+            .ok()?;
+        let pub_client = ClientBuilder::new()
+            .host(&host, port)
+            .protocol(ProtocolVersion::RESP3)
+            .build()
+            .await
+            .ok()?;
+        Some((sub_client, push_rx, pub_client))
+    }
+
     /// Create a single client (for subscribe/unsubscribe only tests).
     async fn create_single_client() -> Option<Client> {
         let request = standalone_request()?;
@@ -814,6 +850,58 @@ mod standalone_pubsub_tests {
             unsub_cmd.arg(*ch);
         }
         sub_client.send_command(&mut unsub_cmd, None).await.unwrap();
+    }
+
+    /// Verify the public `ClientBuilder::push_sender` setter actually
+    /// delivers RESP3 push frames to the caller-supplied channel
+    /// end-to-end against a live Valkey. Mirrors the shape of
+    /// `test_standalone_exact_subscribe_and_publish` but builds the
+    /// subscriber via the builder instead of the internal
+    /// `Client::new(request, Some(tx))` escape hatch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_standalone_builder_push_sender_delivers() {
+        let (sub_client, mut push_rx, pub_client) =
+            match create_sub_pub_clients_via_builder().await {
+                Some(c) => c,
+                None => {
+                    eprintln!(
+                        "Skipping: VALKEY_STANDALONE_HOST not set or unreachable"
+                    );
+                    return;
+                }
+            };
+
+        // SUBSCRIBE via the facade's runtime-intercepted path. The pubsub
+        // synchronizer returns as soon as the desired state is recorded;
+        // the reconciler then issues the real SUBSCRIBE in the background.
+        let _: () = sub_client
+            .cmd("SUBSCRIBE")
+            .arg("builder:ch1")
+            .execute()
+            .await
+            .unwrap();
+        drain_push(&mut push_rx, ferriskey::PushKind::Subscribe, 1).await;
+
+        let _: () = pub_client
+            .cmd("PUBLISH")
+            .arg("builder:ch1")
+            .arg("hello-from-builder")
+            .execute()
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+            .await
+            .expect("Timed out waiting for message")
+            .expect("Push channel closed");
+        assert_eq!(msg.kind, ferriskey::PushKind::Message);
+
+        let _: () = sub_client
+            .cmd("UNSUBSCRIBE")
+            .arg("builder:ch1")
+            .execute()
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
