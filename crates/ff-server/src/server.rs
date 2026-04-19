@@ -2500,8 +2500,10 @@ const VERSION_CHECK_RETRY_BUDGET: Duration = Duration::from_secs(60);
 /// - Retryable ferriskey transport errors — connection refused,
 ///   `BusyLoadingError`, `ClusterDown`, etc., classified via
 ///   `ff_script::retry::is_retryable_kind`.
-/// - Missing/unparsable `redis_version` — treated as transient (fresh-boot
-///   server may not have the field populated yet).
+/// - Missing/unparsable version field — treated as transient (fresh-boot
+///   server may not have the INFO fields populated yet). Reads
+///   `valkey_version` when present (authoritative on Valkey 8.0+), falls
+///   back to `redis_version` for Valkey 7.x.
 ///
 /// **Does NOT retry on:**
 /// - Non-retryable transport errors (auth failures, permission denied,

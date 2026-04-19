@@ -64,8 +64,10 @@ jobs:
     services:
       valkey:
         # Valkey >= 8.0 required by RFC-011 §13 (ff-server refuses to
-        # boot against 7.x). `valkey:latest` tracks current stable.
-        image: valkey/valkey:latest
+        # boot against 7.x). Major-version pin — tracks 8.x patches
+        # without drift risk from a moving `:latest`. Matches the
+        # matrix-ci and cairn-fabric pins for reproducibility.
+        image: valkey/valkey:8-alpine
         ports:
           - 6379:6379
         options: >-

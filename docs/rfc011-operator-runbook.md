@@ -30,10 +30,21 @@ operator responsible for the Valkey backend + FlowFabric server deployment.
 ## Valkey version requirement
 
 FlowFabric requires **Valkey ≥ 8.0** (see RFC-011 §13). The server verifies
-this at boot by issuing `INFO server`, parsing `redis_version`, and comparing
-the major component to the required floor. If the detected version is below
-8.0, the server refuses to start with a typed `ServerError::ValkeyVersionTooLow
-{ detected, required }` and exits.
+this at boot by issuing `INFO server` and parsing the authoritative version
+field:
+
+- Prefers `valkey_version:` (present on Valkey 8.0+; this is the real
+  server version).
+- Falls back to `redis_version:` for Valkey 7.x, which doesn't emit
+  `valkey_version:`.
+
+**Note:** Valkey 8.x/9.x keeps `redis_version:7.2.4` pinned for Redis-client
+compat and exposes the true version in `valkey_version:`. Operators
+inspecting the INFO response manually should read `valkey_version:`, not
+`redis_version:`, to see the real server version.
+
+If the major component is below 8, the server refuses to start with a typed
+`ServerError::ValkeyVersionTooLow { detected, required }` and exits.
 
 ### Why 8.0
 

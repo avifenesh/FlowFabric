@@ -1,20 +1,22 @@
 name: Matrix CI
 
-# Cross-host + cross-mode verification against Valkey latest.
+# Cross-host + cross-mode verification against Valkey 8.
 #
 # Matrix coverage (5 jobs):
 #
-#   linux x86_64  × valkey latest × standalone   → ubuntu-latest
-#   linux x86_64  × valkey latest × cluster      → ubuntu-latest
-#   linux arm64   × valkey latest × standalone   → ubuntu-24.04-arm
-#   linux arm64   × valkey latest × cluster      → ubuntu-24.04-arm
-#   macos arm64   × valkey latest × standalone   → macos-latest
+#   linux x86_64  × valkey 8 × standalone   → ubuntu-latest
+#   linux x86_64  × valkey 8 × cluster      → ubuntu-latest
+#   linux arm64   × valkey 8 × standalone   → ubuntu-24.04-arm
+#   linux arm64   × valkey 8 × cluster      → ubuntu-24.04-arm
+#   macos arm64   × valkey 8 × standalone   → macos-latest
 #
-# **Valkey version:** `latest` only. RFC-011 §13 requires Valkey >= 8.0
-# (enforced at ff-server boot via `verify_valkey_version`). The Valkey
-# 7.2 rows from pre-RFC-011 matrix coverage are retired — the server
-# refuses to start against 7.x, so running tests there only validates
-# "the refusal works," not engine behavior.
+# **Valkey version:** `valkey/valkey:8-alpine` (major-version pin).
+# RFC-011 §13 requires Valkey >= 8.0 (enforced at ff-server boot via
+# `verify_valkey_version`). Pinning to major 8 tracks patch releases
+# automatically without the drift risk of `:latest` rolling to 9.x with
+# breaking behavior changes. Matches cairn-fabric's integration-test pin.
+# The Valkey 7.2 rows from pre-RFC-011 coverage are retired — the server
+# refuses to start against 7.x.
 #
 # Mac arm64 validates Apple Silicon Rust correctness on the latest
 # Valkey release; the 7.2 × mac combination is intentionally skipped
@@ -79,7 +81,12 @@ jobs:
           - { os: ubuntu-24.04-arm, kind: linux, arch: arm64 }
           - { os: macos-latest,     kind: mac,   arch: arm64 }
         valkey:
-          - { version: "latest", image: "valkey/valkey:latest" }
+          # Pin to major 8 (alpine variant) — matches cairn-fabric's
+          # integration-test pin and RFC-011 §13's required floor. Using
+          # a major-version tag tracks patch releases automatically without
+          # the drift risk of `:latest` (which could roll to 9.x with
+          # breaking behavior changes).
+          - { version: "8", image: "valkey/valkey:8-alpine" }
         mode: [standalone, cluster]
         exclude:
           # Mac: standalone only. docker-on-mac cluster setup is
