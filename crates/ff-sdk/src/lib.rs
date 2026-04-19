@@ -72,8 +72,8 @@ pub use admin::{
 pub use config::WorkerConfig;
 pub use task::{
     read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, FailOutcome,
-    Signal, SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior, MAX_TAIL_BLOCK_MS,
-    STREAM_READ_HARD_CAP,
+    ResumeSignal, Signal, SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior,
+    MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
 };
 pub use worker::FlowFabricWorker;
 
