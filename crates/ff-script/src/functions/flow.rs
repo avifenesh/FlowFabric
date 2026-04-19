@@ -20,6 +20,24 @@ pub struct DepOpKeys<'a> {
     pub lane_id: &'a ff_core::types::LaneId,
 }
 
+/// Extended key context for [`ff_resolve_dependency`], which needs
+/// access to the upstream execution's result key for server-side
+/// `data_passing_ref` resolution (Batch C item 3). Separate from
+/// [`DepOpKeys`] so the other dependency wrappers —
+/// `ff_apply_dependency_to_child`, `ff_evaluate_flow_eligibility`,
+/// `ff_promote_blocked_to_eligible`, `ff_replay_execution` — don't
+/// have to carry an upstream context they never use.
+///
+/// Upstream and downstream are co-located on the same `{fp:N}` slot
+/// via flow membership (RFC-011 §7.3), so `upstream_ctx` builds the
+/// upstream key on the child's partition.
+pub struct ResolveDependencyKeys<'a> {
+    pub ctx: &'a ExecKeyContext,
+    pub idx: &'a IndexKeys,
+    pub lane_id: &'a ff_core::types::LaneId,
+    pub upstream_ctx: &'a ExecKeyContext,
+}
+
 // ─── ff_create_flow ──────────────────────────────────────────────────
 // KEYS (3): flow_core, members_set, flow_index
 // ARGV (4): flow_id, flow_kind, namespace, now_ms
@@ -213,14 +231,20 @@ impl FromFcallResult for ApplyDependencyToChildResult {
 }
 
 // ─── ff_resolve_dependency ────────────────────────────────────────────
-// KEYS (9): exec_core, deps_meta, unresolved_set, dep_hash,
-//           eligible_zset, terminal_zset, blocked_deps_zset,
-//           attempt_hash, stream_meta
+// KEYS (11): exec_core, deps_meta, unresolved_set, dep_hash,
+//            eligible_zset, terminal_zset, blocked_deps_zset,
+//            attempt_hash, stream_meta, downstream_payload,
+//            upstream_result
 // ARGV (3): edge_id, upstream_outcome, now_ms
+//
+// KEYS[10]/[11] added in Batch C item 3 for server-side
+// data_passing_ref resolution. Upstream and downstream are co-located
+// on the same {fp:N} slot via flow membership — the `upstream_ctx`
+// field on DepOpKeys builds the upstream key on that shared partition.
 
 ff_function! {
     pub ff_resolve_dependency(args: ResolveDependencyArgs) -> ResolveDependencyResult {
-        keys(k: &DepOpKeys<'_>) {
+        keys(k: &ResolveDependencyKeys<'_>) {
             k.ctx.core(),
             k.ctx.deps_meta(),
             k.ctx.deps_unresolved(),
@@ -230,6 +254,8 @@ ff_function! {
             k.idx.lane_blocked_dependencies(k.lane_id),
             k.ctx.attempt_hash(ff_core::types::AttemptIndex::new(0)), // placeholder
             k.ctx.stream_meta(ff_core::types::AttemptIndex::new(0)),  // placeholder
+            k.ctx.payload(),
+            k.upstream_ctx.result(),
         }
         argv {
             args.edge_id.to_string(),

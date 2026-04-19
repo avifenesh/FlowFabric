@@ -156,12 +156,12 @@ FF_MAX_CONCURRENT_STREAM_OPS=2 cargo run -p ff-server &
 
 ## V1 shortcuts (documented)
 
-- **Client-side data passing.** The submit CLI waits for each upstream execution to complete, reads the raw result bytes from `GET /v1/executions/{id}/result`, and embeds them as the next execution's `input_payload`. The flow graph carries `data_passing_ref` on the dependency edges for inspectability, but the engine does not auto-inject the upstream payload into the downstream `input_payload` today. That's a Batch C task.
+- **Client-side data passing (legacy, to be migrated).** The submit CLI currently waits for each upstream execution to complete, reads the raw result bytes from `GET /v1/executions/{id}/result`, and embeds them as the next execution's `input_payload`. Batch C item 3 has landed server-side auto-injection: when the flow edge is staged with a non-empty `data_passing_ref`, the engine atomically copies the upstream's `result` into the downstream's `input_payload` at satisfaction time inside `ff_resolve_dependency`. The submit CLI has not yet been migrated to the server-side path — tracked as a follow-up. See `docs/rfc011-operator-runbook.md` §"Data passing between flow nodes".
 - **`insecure-direct-claim` feature.** Workers use the direct Valkey claim path gated by the `insecure-direct-claim` feature on `ff-sdk`. Batch C will replace this with a proper scheduler-mediated claim API.
 
 ## Submit crash recovery (v1)
 
-Because submit orchestrates the 3-stage sequence client-side, **a crash or Ctrl-C between stages leaves the flow stuck**: transcribe + summarize may exist as members with edges applied, but embed was never POSTed. The server has no way to drive the pipeline forward on its own until server-side `data_passing_ref` resolution lands.
+Because submit in its current form orchestrates the 3-stage sequence client-side, **a crash or Ctrl-C between stages leaves the flow stuck**: transcribe + summarize may exist as members with edges applied, but embed was never POSTed. Once the submit CLI is migrated to stage all 3 executions up-front with `data_passing_ref` edges (follow-up to Batch C item 3), the server drives the pipeline forward autonomously and a crash becomes cosmetic tail-drop instead of a stuck flow.
 
 Recovery options:
 
@@ -177,7 +177,7 @@ Recovery options:
 
 2. **Finish manually.** Read each staged execution's state and result, and POST the next stage yourself via the same REST calls submit uses. Non-trivial — recommend option 1 unless the transcribe / summarize result is expensive to rerun.
 
-3. **Batch C** will add a server-driven chaining path: submit posts all three executions up-front with `data_passing_ref` edges and the engine auto-injects upstream payloads into downstream `input_payload` as each stage completes. At that point submit becomes a tail multiplexer and a crash is a cosmetic tail-drop, not a stuck flow.
+3. **Migrate submit to the server-driven chain** (Batch C item 3 has landed the engine side). Post all three executions up-front with `data_passing_ref` set on the edges; the engine auto-injects upstream payloads into downstream `input_payload` as each stage completes. Submit becomes a tail multiplexer and a crash is cosmetic tail-drop, not a stuck flow.
 
 ## File layout
 
