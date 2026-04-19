@@ -199,8 +199,14 @@ async fn reconcile_one_execution(
         // KEYS must match Lua positional order:
         // [1] exec_core, [2] deps_meta, [3] unresolved_set, [4] dep_hash,
         // [5] eligible_zset, [6] terminal_zset, [7] blocked_deps_zset,
-        // [8] attempt_hash, [9] stream_meta
-        let keys: [&str; 9] = [
+        // [8] attempt_hash, [9] stream_meta, [10] downstream_payload,
+        // [11] upstream_result
+        // [10]/[11] added for Batch C item 3. Upstream + downstream are
+        // co-located on the same {fp:N} slot via flow membership;
+        // build both keys with the same partition tag.
+        let downstream_payload = format!("ff:exec:{}:{}:payload", tag, eid_str);
+        let upstream_result = format!("ff:exec:{}:{}:result", tag, upstream_id);
+        let keys: [&str; 11] = [
             &exec_core,           // 1
             &deps_meta,           // 2
             &deps_unresolved_key, // 3
@@ -210,6 +216,8 @@ async fn reconcile_one_execution(
             &blocked_deps_key,    // 7
             &attempt_hash,        // 8
             &stream_meta,         // 9
+            &downstream_payload,  // 10
+            &upstream_result,     // 11
         ];
         let now_s = now_ms.to_string();
         let argv: [&str; 3] = [edge_id.as_str(), resolution, &now_s];

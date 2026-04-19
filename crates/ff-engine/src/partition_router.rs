@@ -233,9 +233,15 @@ async fn dispatch_dependency_resolution_inner(
             &ff_core::types::EdgeId::parse(edge_id).unwrap_or_default(),
         );
 
-        // KEYS (9): exec_core, deps_meta, unresolved_set, dep_hash,
-        //           eligible_zset, terminal_zset, blocked_deps_zset,
-        //           attempt_hash, stream_meta
+        // KEYS (11): exec_core, deps_meta, unresolved_set, dep_hash,
+        //            eligible_zset, terminal_zset, blocked_deps_zset,
+        //            attempt_hash, stream_meta, downstream_payload,
+        //            upstream_result
+        // KEYS[10]/[11] added for Batch C item 3: server-side
+        // data_passing_ref resolution. Upstream and downstream are
+        // co-located via flow membership (RFC-011 §7.3), so we build
+        // the upstream key on the child's partition using the same
+        // ExecKeyContext shape.
         let deps_meta = child_ctx.deps_meta();
         let unresolved = child_ctx.deps_unresolved();
         let eligible = child_idx.lane_eligible(&lane_id);
@@ -243,17 +249,22 @@ async fn dispatch_dependency_resolution_inner(
         let blocked_deps = child_idx.lane_blocked_dependencies(&lane_id);
         let attempt_hash = child_ctx.attempt_hash(att_idx);
         let stream_meta = child_ctx.stream_meta(att_idx);
+        let downstream_payload = child_ctx.payload();
+        let upstream_ctx = ExecKeyContext::new(&child_partition, eid);
+        let upstream_result = upstream_ctx.result();
 
-        let keys: [&str; 9] = [
-            &child_core_key,  // 1
-            &deps_meta,       // 2
-            &unresolved,      // 3
-            &dep_hash,        // 4
-            &eligible,        // 5
-            &terminal,        // 6
-            &blocked_deps,    // 7
-            &attempt_hash,    // 8
-            &stream_meta,     // 9
+        let keys: [&str; 11] = [
+            &child_core_key,       // 1
+            &deps_meta,            // 2
+            &unresolved,           // 3
+            &dep_hash,             // 4
+            &eligible,             // 5
+            &terminal,             // 6
+            &blocked_deps,         // 7
+            &attempt_hash,         // 8
+            &stream_meta,          // 9
+            &downstream_payload,   // 10
+            &upstream_result,      // 11
         ];
         let argv: [&str; 3] = [edge_id, upstream_outcome, &now_ms];
 
@@ -312,17 +323,16 @@ async fn dispatch_dependency_resolution_inner(
 }
 
 /// Check if an ff_resolve_dependency result indicates the child was skipped.
-/// Result format: [1, "OK", "impossible", "child_skipped"]
+/// Result shapes after Batch C item 3:
+///   [1, "OK", "already_resolved"]           (2 payload fields)
+///   [1, "OK", "satisfied", ""|"data_injected"]
+///   [1, "OK", "impossible", ""|"child_skipped"]
 fn is_child_skipped_result(value: &ferriskey::Value) -> bool {
     match value {
         ferriskey::Value::Array(arr) => {
             if arr.len() < 4 {
-                if arr.len() != 2 {
-                    tracing::warn!(
-                        arr_len = arr.len(),
-                        "is_child_skipped_result: unexpected array length (expected 2 or 4)"
-                    );
-                }
+                // 2- and 3-element responses are normal paths
+                // (already_resolved, etc.). No warning.
                 return false;
             }
             arr.get(3)
