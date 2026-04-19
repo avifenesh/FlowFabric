@@ -61,8 +61,7 @@ Two concrete harms from the unnecessary promotion:
 
 **Status:** fixed at `4a7a149`. `pub(crate) fn new` restored; `dead_code`
 allow dropped (call sites are live). Clippy + ff-sdk + ff-test green
-across `--no-default-features`, default, and `--features
-insecure-direct-claim`.
+across `--no-default-features`, default, and `--features direct-valkey-claim`.
 
 ## §3 c545664 — `pub claim_from_grant`
 

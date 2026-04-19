@@ -76,7 +76,7 @@ cargo run --bin submit -- --issue "Write a Rust function that checks if a string
 The SDK's `claim_next()` method bypasses budget/quota admission control and is gated behind a feature flag. Enable it explicitly:
 
 ```toml
-ff-sdk = { path = "crates/ff-sdk", features = ["insecure-direct-claim"] }
+ff-sdk = { path = "crates/ff-sdk", features = ["direct-valkey-claim"] }
 ```
 
 For production deployments, use the Scheduler (`ff-scheduler`) which enforces admission control before issuing claim grants. The direct claim path is intended for development, testing, and trusted single-worker setups.

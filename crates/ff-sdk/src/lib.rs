@@ -40,9 +40,9 @@
 //! }
 //! ```
 //!
-//! # Migration: `insecure-direct-claim` → scheduler-issued grants
+//! # Migration: `direct-valkey-claim` → scheduler-issued grants
 //!
-//! The `insecure-direct-claim` cargo feature — which gates
+//! The `direct-valkey-claim` cargo feature — which gates
 //! [`FlowFabricWorker::claim_next`] — is **deprecated** in favour of
 //! the pair of scheduler-issued grant entry points:
 //!

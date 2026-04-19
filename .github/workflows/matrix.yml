@@ -165,7 +165,7 @@ jobs:
           cargo clippy \
             -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
             -p ff-sdk -p ff-server -p ff-test \
-            --features ff-sdk/insecure-direct-claim \
+            --features ff-sdk/direct-valkey-claim \
             -- -D warnings
 
       - name: cargo clippy (ferriskey, all targets, no features)
@@ -191,7 +191,7 @@ jobs:
           cargo test \
             -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
             -p ff-sdk -p ff-server \
-            --features ff-sdk/insecure-direct-claim
+            --features ff-sdk/direct-valkey-claim
 
       - name: Integration tests (serial)
         env:

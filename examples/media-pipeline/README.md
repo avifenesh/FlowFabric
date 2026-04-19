@@ -157,7 +157,7 @@ FF_MAX_CONCURRENT_STREAM_OPS=2 cargo run -p ff-server &
 ## V1 shortcuts (documented)
 
 - **Client-side data passing (legacy, to be migrated).** The submit CLI currently waits for each upstream execution to complete, reads the raw result bytes from `GET /v1/executions/{id}/result`, and embeds them as the next execution's `input_payload`. Batch C item 3 has landed server-side auto-injection: when the flow edge is staged with a non-empty `data_passing_ref`, the engine atomically copies the upstream's `result` into the downstream's `input_payload` at satisfaction time inside `ff_resolve_dependency`. The submit CLI has not yet been migrated to the server-side path — tracked as a follow-up. See `docs/rfc011-operator-runbook.md` §"Data passing between flow nodes".
-- **`insecure-direct-claim` feature.** Workers use the direct Valkey claim path gated by the `insecure-direct-claim` feature on `ff-sdk`. Batch C will replace this with a proper scheduler-mediated claim API.
+- **`direct-valkey-claim` feature.** Workers use the direct Valkey claim path gated by the `direct-valkey-claim` feature on `ff-sdk`. Batch C will replace this with a proper scheduler-mediated claim API.
 
 ## Submit crash recovery (v1)
 

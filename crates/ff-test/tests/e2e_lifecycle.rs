@@ -4435,7 +4435,7 @@ async fn test_scheduler_claim_priority_ordering() {
 /// End-to-end: `Scheduler::claim_for_worker` → `FlowFabricWorker::
 /// claim_from_grant` → live `ClaimedTask`. This is the production
 /// entry path for consumers that cannot enable the
-/// `insecure-direct-claim` feature (cairn, in particular) — the
+/// `direct-valkey-claim` feature (cairn, in particular) — the
 /// scheduler does admission control and hands off a grant; the SDK
 /// consumes the grant without touching the eligible ZSET directly.
 ///
