@@ -122,6 +122,39 @@ impl SignalOutcome {
     }
 }
 
+/// A signal that triggered a resume, readable by a worker after re-claim.
+///
+/// Returned by [`ClaimedTask::resume_signals`] when a suspended execution
+/// is resumed because one or more matched signals satisfied its waitpoint's
+/// resume condition. The worker can then inspect `signal_name` to branch
+/// behavior (approve / reject / etc.) and use `payload` for richer decision
+/// data instead of inferring intent from stream frames.
+///
+/// Returned only for signals whose matcher slot in the waitpoint's resume
+/// condition is marked satisfied. Pre-buffered-but-unmatched signals are
+/// not included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeSignal {
+    pub signal_id: SignalId,
+    pub signal_name: String,
+    pub signal_category: String,
+    pub source_type: String,
+    pub source_identity: String,
+    pub correlation_id: String,
+    /// Valkey-server `now_ms` timestamp at which `ff_deliver_signal`
+    /// accepted this signal. `0` if the stored `accepted_at` field is
+    /// missing or non-numeric (a Lua-side defect — not expected at
+    /// runtime).
+    pub accepted_at: TimestampMs,
+    /// Raw payload bytes, if the signal was delivered with one. `None`
+    /// for signals delivered without a payload. Note: the SDK's current
+    /// signal-delivery path (`FlowFabricWorker::deliver_signal`) writes
+    /// payloads as UTF-8 (lossy) with `payload_encoding="json"`; callers
+    /// that invoke `ff_deliver_signal` directly via FCALL with non-UTF-8
+    /// bytes will receive those bytes verbatim here.
+    pub payload: Option<Vec<u8>>,
+}
+
 /// Outcome of `append_frame()`.
 #[derive(Clone, Debug)]
 pub struct AppendFrameOutcome {
@@ -1012,6 +1045,155 @@ impl ClaimedTask {
         parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
     }
 
+    /// Read the signals that satisfied the waitpoint and triggered this
+    /// resume.
+    ///
+    /// Non-consuming. Intended to be called immediately after re-claim via
+    /// [`crate::FlowFabricWorker::claim_from_reclaim_grant`], before any
+    /// subsequent `suspend()` (which replaces `suspension:current`).
+    ///
+    /// Returns `Ok(vec![])` when this claim is NOT a signal-resume:
+    ///
+    /// - No prior suspension on this execution.
+    /// - The prior suspension belonged to an earlier attempt (e.g. the
+    ///   attempt was cancelled/failed and a retry is now claiming).
+    /// - The prior suspension was closed by timeout / cancel / operator
+    ///   override rather than by a matched signal.
+    ///
+    /// Reads `suspension:current` once, filters by `attempt_index` to
+    /// guard against stale prior-attempt records, then fetches the matched
+    /// `signal_id` set from `waitpoint_condition`'s `matcher:N:signal_id`
+    /// fields and reads each signal's metadata + payload directly.
+    pub async fn resume_signals(&self) -> Result<Vec<ResumeSignal>, SdkError> {
+        let partition = execution_partition(&self.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
+
+        let susp: HashMap<String, String> = self
+            .client
+            .hgetall(&ctx.suspension_current())
+            .await
+            .map_err(|e| SdkError::ValkeyContext {
+                source: e,
+                context: "HGETALL suspension_current".into(),
+            })?;
+
+        let Some(waitpoint_id) =
+            resume_waitpoint_id_from_suspension(&susp, self.attempt_index)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        // Bounded read of waitpoint_condition: HGET total_matchers first,
+        // then HMGET exactly the fields we need per matcher slot. Avoids an
+        // unbounded HGETALL (matcher:N:* fields grow with condition size).
+        let wp_cond_key = ctx.waitpoint_condition(&waitpoint_id);
+        let total_str: Option<String> = self
+            .client
+            .hget(&wp_cond_key, "total_matchers")
+            .await
+            .map_err(|e| SdkError::ValkeyContext {
+                source: e,
+                context: "HGET total_matchers".into(),
+            })?;
+        let total: usize = total_str
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let mut signal_ids: Vec<SignalId> = Vec::new();
+        for i in 0..total {
+            let fields: Vec<Option<String>> = self
+                .client
+                .cmd("HMGET")
+                .arg(&wp_cond_key)
+                .arg(format!("matcher:{i}:satisfied"))
+                .arg(format!("matcher:{i}:signal_id"))
+                .execute()
+                .await
+                .map_err(|e| SdkError::ValkeyContext {
+                    source: e,
+                    context: "HMGET matcher slot".into(),
+                })?;
+            let satisfied = fields.first().and_then(|o| o.as_deref());
+            if satisfied != Some("1") {
+                continue;
+            }
+            let Some(raw) = fields.get(1).and_then(|o| o.as_deref()).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            match SignalId::parse(raw) {
+                Ok(sid) => signal_ids.push(sid),
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %self.execution_id,
+                        waitpoint_id = %waitpoint_id,
+                        raw = %raw,
+                        error = %e,
+                        "resume_signals: matcher signal_id failed to parse, skipping"
+                    );
+                }
+            }
+        }
+
+        let mut out: Vec<ResumeSignal> = Vec::with_capacity(signal_ids.len());
+        for signal_id in signal_ids {
+            let sig: HashMap<String, String> = self
+                .client
+                .hgetall(&ctx.signal(&signal_id))
+                .await
+                .map_err(|e| SdkError::ValkeyContext {
+                    source: e,
+                    context: "HGETALL signal_hash".into(),
+                })?;
+            if sig.is_empty() {
+                // Signal hash was GC'd (not currently a code path, but
+                // defensive against future cleanup scanners). Skip.
+                continue;
+            }
+
+            // Read payload as raw Value so non-UTF-8 bytes survive intact.
+            // Previously this was `get::<Option<String>>` + `into_bytes`,
+            // which would panic/error on any non-UTF-8 payload (reachable
+            // via direct-FCALL callers that bypass the SDK's lossy
+            // UTF-8 encode path in deliver_signal).
+            let payload_raw: Option<Value> = self
+                .client
+                .cmd("GET")
+                .arg(ctx.signal_payload(&signal_id))
+                .execute()
+                .await
+                .map_err(|e| SdkError::ValkeyContext {
+                    source: e,
+                    context: "GET signal_payload".into(),
+                })?;
+            let payload: Option<Vec<u8>> = match payload_raw {
+                Some(Value::BulkString(b)) => Some(b.to_vec()),
+                Some(Value::SimpleString(s)) => Some(s.into_bytes()),
+                _ => None,
+            };
+
+            let accepted_at = sig
+                .get("accepted_at")
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(TimestampMs::from_millis)
+                .unwrap_or_else(|| TimestampMs::from_millis(0));
+
+            out.push(ResumeSignal {
+                signal_id,
+                signal_name: sig.get("signal_name").cloned().unwrap_or_default(),
+                signal_category: sig.get("signal_category").cloned().unwrap_or_default(),
+                source_type: sig.get("source_type").cloned().unwrap_or_default(),
+                source_identity: sig.get("source_identity").cloned().unwrap_or_default(),
+                correlation_id: sig.get("correlation_id").cloned().unwrap_or_default(),
+                accepted_at,
+                payload,
+            });
+        }
+
+        Ok(out)
+    }
+
     /// Signal the renewal task to stop. Called by every terminal op
     /// (`complete`/`fail`/`cancel`/`suspend`/`delay_execution`/
     /// `move_to_waiting_children`) after the FCALL returns. Also marks
@@ -1391,6 +1573,45 @@ fn extract_pending_waitpoint_token(raw: &Value) -> Result<WaitpointToken, SdkErr
             ))
         })?;
     Ok(WaitpointToken::new(token_str))
+}
+
+/// Pure helper: decide whether `suspension:current` represents a
+/// signal-driven resume for the currently-claimed attempt, and extract
+/// the waitpoint_id if so. Returns `Ok(None)` for every non-match case
+/// (no record, stale prior-attempt, non-resumed close). Returns an error
+/// only for a present-but-malformed waitpoint_id, which indicates a Lua
+/// bug rather than a missing-data case.
+fn resume_waitpoint_id_from_suspension(
+    susp: &HashMap<String, String>,
+    claimed_attempt: AttemptIndex,
+) -> Result<Option<WaitpointId>, SdkError> {
+    if susp.is_empty() {
+        return Ok(None);
+    }
+    let susp_att: u32 = susp
+        .get("attempt_index")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
+    if susp_att != claimed_attempt.0 {
+        return Ok(None);
+    }
+    let close_reason = susp.get("close_reason").map(String::as_str).unwrap_or("");
+    if close_reason != "resumed" {
+        return Ok(None);
+    }
+    let wp_id_str = susp
+        .get("waitpoint_id")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if wp_id_str.is_empty() {
+        return Ok(None);
+    }
+    let waitpoint_id = WaitpointId::parse(wp_id_str).map_err(|e| {
+        SdkError::Script(ScriptError::Parse(format!(
+            "resume_signals: suspension_current.waitpoint_id is not a valid UUID: {e}"
+        )))
+    })?;
+    Ok(Some(waitpoint_id))
 }
 
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {
@@ -2113,4 +2334,93 @@ mod parse_report_usage_result_tests {
             "error should say 'missing', got: {msg}"
         );
     }
+}
+
+
+#[cfg(test)]
+mod resume_signals_tests {
+    use super::*;
+
+    fn m(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn empty_suspension_returns_none() {
+        let susp = m(&[]);
+        let out = resume_waitpoint_id_from_suspension(&susp, AttemptIndex::new(0)).unwrap();
+        assert!(out.is_none(), "no suspension record → None");
+    }
+
+    #[test]
+    fn stale_prior_attempt_returns_none() {
+        let wp = WaitpointId::new();
+        let susp = m(&[
+            ("attempt_index", "0"),
+            ("close_reason", "resumed"),
+            ("waitpoint_id", &wp.to_string()),
+        ]);
+        // Claimed attempt is 1; suspension belongs to 0 → stale.
+        let out = resume_waitpoint_id_from_suspension(&susp, AttemptIndex::new(1)).unwrap();
+        assert!(out.is_none(), "attempt_index mismatch → None");
+    }
+
+    #[test]
+    fn non_resumed_close_returns_none() {
+        let wp = WaitpointId::new();
+        for reason in ["timeout", "cancelled", "", "expired"] {
+            let susp = m(&[
+                ("attempt_index", "0"),
+                ("close_reason", reason),
+                ("waitpoint_id", &wp.to_string()),
+            ]);
+            let out = resume_waitpoint_id_from_suspension(&susp, AttemptIndex::new(0)).unwrap();
+            assert!(out.is_none(), "close_reason={reason:?} must not return signals");
+        }
+    }
+
+    #[test]
+    fn resumed_same_attempt_returns_waitpoint() {
+        let wp = WaitpointId::new();
+        let susp = m(&[
+            ("attempt_index", "2"),
+            ("close_reason", "resumed"),
+            ("waitpoint_id", &wp.to_string()),
+        ]);
+        let out = resume_waitpoint_id_from_suspension(&susp, AttemptIndex::new(2)).unwrap();
+        assert_eq!(out, Some(wp));
+    }
+
+    #[test]
+    fn malformed_waitpoint_id_is_error() {
+        let susp = m(&[
+            ("attempt_index", "0"),
+            ("close_reason", "resumed"),
+            ("waitpoint_id", "not-a-uuid"),
+        ]);
+        let err = resume_waitpoint_id_from_suspension(&susp, AttemptIndex::new(0)).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a valid UUID"),
+            "error should mention invalid UUID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_waitpoint_id_returns_none() {
+        // Defensive: an empty waitpoint_id field (shouldn't happen on
+        // resumed records, but guard against partial writes) is None, not an error.
+        let susp = m(&[
+            ("attempt_index", "0"),
+            ("close_reason", "resumed"),
+            ("waitpoint_id", ""),
+        ]);
+        let out = resume_waitpoint_id_from_suspension(&susp, AttemptIndex::new(0)).unwrap();
+        assert!(out.is_none());
+    }
+
+    // The previous `matched_signal_ids_from_condition` helper was
+    // removed when the production path switched from unbounded
+    // HGETALL to a bounded HGET + per-matcher HMGET loop (review
+    // feedback on unbounded condition-hash reply size). That loop
+    // is exercised by the integration tests in `ff-test`.
 }
