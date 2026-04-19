@@ -57,16 +57,33 @@ correct node without a routing round-trip.
 **How to audit your code:**
 
 ```bash
-grep -rn 'ExecutionId::new\|ExecutionId::from_uuid\|ExecutionId::default' src/
+# Constructor calls
+grep -rn 'ExecutionId::new\|ExecutionId::from_uuid' src/
+
+# Default::default() calls that resolve to ExecutionId — the type-annotated
+# form and the explicit path form. Also catches #[derive(Default)] on structs
+# that included ExecutionId before RFC-011 (they'll fail to derive now).
+grep -rn 'ExecutionId::default\|: ExecutionId = Default::default\|#\[derive.*Default' src/
 ```
 
 Every hit is a migration site. If the context has a flow_id → `for_flow`.
 Otherwise → `solo`.
 
-**Parsing unchanged:** `ExecutionId::parse(s: &str)` still exists and is
-backward-compatible for wire-format reads (FCALL return values, HTTP bodies).
-Validation rejects bare UUID strings; see RFC-011 §2.3.1 for the range-check
-delegation contract.
+**Parse signature:** `ExecutionId::parse(s: &str)` entry point is unchanged,
+but the return error type changed post-RFC-011. The old `uuid::Error` is now
+`ExecutionIdParseError` (defined at `ff_core::types`). Consumers that match on
+the error type need the rename:
+
+```rust
+// Before
+fn parse(s: &str) -> Result<ExecutionId, uuid::Error>;
+
+// After
+fn parse(s: &str) -> Result<ExecutionId, ExecutionIdParseError>;
+```
+
+Validation is stricter: bare UUID strings are now rejected (shape must be
+`{fp:N}:<uuid>`). See RFC-011 §2.3.1 for the range-check delegation contract.
 
 ## Step 2 — `PartitionConfig` field rename
 
@@ -160,7 +177,7 @@ let grant = scheduler.claim_for_worker(&lane, &worker_caps).await?;
 match worker.claim_from_grant(lane.clone(), grant).await {
     Ok(task) => { /* process, eventually call task.complete/fail */ }
     Err(SdkError::WorkerAtCapacity) => {
-        // Retryable; re-try after a task completes.
+        // Retryable; retry after a task completes.
     }
     Err(SdkError::Script(ScriptError::ClaimGrantExpired)) => {
         // Grant TTL elapsed — request a new grant.
@@ -207,7 +224,7 @@ Prevents format drift between your copy and the producer.
 
 ```rust
 use ff_sdk::task::parse_report_usage_result;
-use ff_sdk::task::ReportUsageResult;
+use ff_core::contracts::ReportUsageResult;  // defined in ff-core, not ff-sdk
 
 match parse_report_usage_result(&raw_fcall_result)? {
     ReportUsageResult::Ok => { /* ... */ }
@@ -225,9 +242,10 @@ match parse_report_usage_result(&raw_fcall_result)? {
 pub const USAGE_DEDUP_KEY_PREFIX: &str = "ff:usagededup:";
 
 pub fn usage_dedup_key(hash_tag: &str, dedup_id: &str) -> String;
-// Returns "ff:usagededup:{hash_tag}:{dedup_id}"
-// IMPORTANT: hash_tag must already include braces (e.g. "{bp:7}").
-// Don't pre-wrap; the helper does not add braces.
+// Returns "ff:usagededup:<hash_tag>:<dedup_id>" where <hash_tag> is inserted
+// VERBATIM (the literal braces in "{bp:7}" become part of the key — the
+// helper does NOT wrap the input in additional braces).
+// Example: usage_dedup_key("{bp:7}", "abc") → "ff:usagededup:{bp:7}:abc"
 ```
 
 **Before:**
