@@ -140,6 +140,63 @@ impl ExecutionId {
         Self(format!("{{fp:{partition}}}:{uuid}"))
     }
 
+    fn with_partition_and_uuid(partition: u16, uuid: Uuid) -> Self {
+        Self(format!("{{fp:{partition}}}:{uuid}"))
+    }
+
+    /// Deterministic mint: same `(flow_id, uuid)` inputs always produce the
+    /// same `ExecutionId`. Intended for consumers that derive a stable UUID
+    /// externally (e.g. `Uuid::new_v5` from application-scoped keys) and
+    /// need idempotent execution identity on retry without coordinating
+    /// through FlowFabric.
+    ///
+    /// Any `Uuid` value is accepted — no version or shape strictness. The
+    /// caller owns the derivation scheme; FlowFabric treats the UUID as an
+    /// opaque 128-bit identifier.
+    ///
+    /// # Partition-count stability
+    ///
+    /// The returned id's hash-tag embeds
+    /// `crc16(flow_id.bytes) % num_flow_partitions`. **Determinism holds
+    /// only while `num_flow_partitions` is stable** across the caller's
+    /// usage window. Resizing the deployment's partition count invalidates
+    /// previously-minted ids: the same inputs will produce a different
+    /// hash-tag, and lookups against the old id will miss. Consumers relying
+    /// on cross-run determinism should pin `num_flow_partitions` or embed a
+    /// namespace-version in their UUID derivation so a resize surfaces as a
+    /// namespace rollover rather than silent drift.
+    pub fn deterministic_for_flow(
+        flow_id: &FlowId,
+        config: &crate::partition::PartitionConfig,
+        uuid: Uuid,
+    ) -> Self {
+        let partition = crate::partition::flow_partition(flow_id, config).index;
+        Self::with_partition_and_uuid(partition, uuid)
+    }
+
+    /// Deterministic mint for solo (no-parent-flow) executions. Same
+    /// `(lane_id, uuid)` always yields the same `ExecutionId`. Mirrors
+    /// [`ExecutionId::solo`] but with a caller-supplied UUID.
+    ///
+    /// Partition routing uses the default
+    /// [`crate::partition::Crc16SoloPartitioner`]. Deployments that
+    /// installed a custom [`crate::partition::SoloPartitioner`] must mint
+    /// via their own path — this constructor hard-codes the default and
+    /// will diverge from a custom partitioner's routing.
+    ///
+    /// # Partition-count stability
+    ///
+    /// Same stability contract as [`ExecutionId::deterministic_for_flow`]:
+    /// determinism holds only while `num_flow_partitions` is stable.
+    pub fn deterministic_solo(
+        lane_id: &LaneId,
+        config: &crate::partition::PartitionConfig,
+        uuid: Uuid,
+    ) -> Self {
+        let partition = crate::partition::solo_partition(lane_id, config).index;
+        Self::with_partition_and_uuid(partition, uuid)
+    }
+
     /// Parse a hash-tagged execution-id string.
     ///
     /// Rejects:
@@ -627,6 +684,116 @@ mod tests {
         let json = serde_json::to_string(&lane).unwrap();
         let parsed: LaneId = serde_json::from_str(&json).unwrap();
         assert_eq!(lane, parsed);
+    }
+
+    // ── Deterministic mint (RFC-011 — cairn-fabric idempotency) ──
+
+    #[test]
+    fn deterministic_for_flow_is_stable() {
+        let config = crate::partition::PartitionConfig::default();
+        let fid = FlowId::new();
+        let u = Uuid::new_v4();
+        let a = ExecutionId::deterministic_for_flow(&fid, &config, u);
+        let b = ExecutionId::deterministic_for_flow(&fid, &config, u);
+        assert_eq!(a, b);
+        assert_eq!(a.as_str(), b.as_str());
+    }
+
+    #[test]
+    fn deterministic_for_flow_partition_matches_for_flow() {
+        let config = crate::partition::PartitionConfig::default();
+        let fid = FlowId::new();
+        let u = Uuid::new_v4();
+        let det = ExecutionId::deterministic_for_flow(&fid, &config, u);
+        let rnd = ExecutionId::for_flow(&fid, &config);
+        assert_eq!(det.partition(), rnd.partition());
+    }
+
+    #[test]
+    fn deterministic_for_flow_uuid_embedded_verbatim() {
+        let config = crate::partition::PartitionConfig::default();
+        let fid = FlowId::new();
+        let u = Uuid::new_v4();
+        let eid = ExecutionId::deterministic_for_flow(&fid, &config, u);
+        assert!(eid.as_str().ends_with(&u.to_string()));
+    }
+
+    #[test]
+    fn deterministic_for_flow_accepts_any_uuid_version() {
+        // No strictness — v5 (cairn's case), v4, and nil all accepted.
+        let config = crate::partition::PartitionConfig::default();
+        let fid = FlowId::new();
+        // Include nil, v4, and a synthetic from_bytes (stand-in for v5/v7
+        // which aren't enabled as uuid features in this crate).
+        for u in [
+            Uuid::nil(),
+            Uuid::new_v4(),
+            Uuid::from_bytes([0xab; 16]),
+        ] {
+            let eid = ExecutionId::deterministic_for_flow(&fid, &config, u);
+            assert!(ExecutionId::parse(eid.as_str()).is_ok());
+        }
+    }
+
+    #[test]
+    fn deterministic_for_flow_resize_changes_partition() {
+        // Documents the stability contract: different num_flow_partitions
+        // generally yields a different partition (i.e. a different id).
+        let small = crate::partition::PartitionConfig {
+            num_flow_partitions: 4,
+            num_budget_partitions: 32,
+            num_quota_partitions: 32,
+        };
+        let big = crate::partition::PartitionConfig {
+            num_flow_partitions: 256,
+            num_budget_partitions: 32,
+            num_quota_partitions: 32,
+        };
+        let u = Uuid::new_v4();
+        // Try several flow ids — at least one must differ. Using the same
+        // fid under the two configs could collide (4 divides 256), but
+        // across distinct fids the hash-tags must not be uniformly equal.
+        let mut any_diff = false;
+        for _ in 0..16 {
+            let fid = FlowId::new();
+            let a = ExecutionId::deterministic_for_flow(&fid, &small, u);
+            let b = ExecutionId::deterministic_for_flow(&fid, &big, u);
+            if a.partition() != b.partition() {
+                any_diff = true;
+                break;
+            }
+        }
+        assert!(any_diff, "partition resize should change at least one id");
+    }
+
+    #[test]
+    fn deterministic_solo_is_stable() {
+        let config = crate::partition::PartitionConfig::default();
+        let lane = LaneId::new("default");
+        let u = Uuid::new_v4();
+        let a = ExecutionId::deterministic_solo(&lane, &config, u);
+        let b = ExecutionId::deterministic_solo(&lane, &config, u);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn deterministic_solo_partition_matches_solo() {
+        let config = crate::partition::PartitionConfig::default();
+        let lane = LaneId::new("default");
+        let u = Uuid::new_v4();
+        let det = ExecutionId::deterministic_solo(&lane, &config, u);
+        let rnd = ExecutionId::solo(&lane, &config);
+        assert_eq!(det.partition(), rnd.partition());
+    }
+
+    #[test]
+    fn deterministic_mint_parse_roundtrip() {
+        let config = crate::partition::PartitionConfig::default();
+        let fid = FlowId::new();
+        let u = Uuid::new_v4();
+        let eid = ExecutionId::deterministic_for_flow(&fid, &config, u);
+        let parsed = ExecutionId::parse(eid.as_str()).unwrap();
+        assert_eq!(eid, parsed);
     }
 
     // ── LaneId validation (RFC-011 §9.15) ──
