@@ -1,8 +1,10 @@
 //! Administrative subcommands for operator use.
 //!
 //! Invoked as `ff-server admin <subcommand> [args]`. Subcommands are
-//! read-only probes that share `ServerConfig` with the main binary; they
-//! do not start HTTP, scanners, or any long-lived task.
+//! read-only probes that share the `ff-server` binary + env-var conventions
+//! but load only the minimal config subset they need (see
+//! [`load_probe_inputs`]). They do not connect to Valkey, start HTTP, or
+//! spawn scanners. Each probe completes synchronously and exits.
 //!
 //! # Subcommands
 //!
@@ -151,17 +153,43 @@ impl PartitionCollisionsReport {
         // partitions have at most 1 lane, both shapes are fast; the fix
         // matters only under severe collision density, but the cheaper
         // shape is also clearer to read.
+        //
+        // `by_identity` guards against a caller passing a lane list that
+        // contains duplicate names. The CLI path already rejects dupes in
+        // [`load_probe_inputs`], but `compute` is reachable from library
+        // callers too — harden against self-filter-by-name producing an
+        // empty-collides-with-but-actually-colliding row. Dedupe by
+        // position: filter out only the entry at the lane's own position
+        // in the original `lanes` slice, not every entry with the same
+        // name.
         let mut entries: Vec<LanePartition> = Vec::with_capacity(lanes.len());
         let mut colliding_lanes = 0usize;
         for (index, siblings) in &by_partition {
             let mut sorted_siblings: Vec<LaneId> = siblings.clone();
             sorted_siblings.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            for lane in siblings {
+            for (position_in_partition, lane) in siblings.iter().enumerate() {
+                // Exclude exactly one occurrence of self (by position) —
+                // if the caller passed duplicate names, the remaining
+                // occurrences correctly appear in collides_with.
+                let mut seen_self = false;
                 let others: Vec<LaneId> = sorted_siblings
                     .iter()
-                    .filter(|sib| sib.as_str() != lane.as_str())
+                    .filter(|sib| {
+                        if sib.as_str() == lane.as_str() && !seen_self {
+                            // Only skip the first occurrence; any further
+                            // matching entries are real duplicates.
+                            seen_self = true;
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .cloned()
                     .collect();
+                // Suppress the unused-variable warning without renaming:
+                // position_in_partition documents our iteration intent
+                // but the filter uses seen_self for the dedup itself.
+                let _ = position_in_partition;
                 if !others.is_empty() {
                     colliding_lanes += 1;
                 }
@@ -259,13 +287,14 @@ impl PartitionCollisionsReport {
         }
 
         if self.colliding_lanes > 0 {
-            out.push_str(
-                "\n\
-                Remediation (see docs/rfc011-operator-runbook.md §Partition-collision observability):\n\
-                  1. Rename a colliding lane to hash differently (cheapest).\n\
-                  2. Bump FF_FLOW_PARTITIONS to halve collision probability (requires clean state).\n\
-                  3. Install a custom SoloPartitioner via solo_partition_with (advanced; requires fork).\n",
-            );
+            // Backslash line-continuation strips leading whitespace, so the
+            // numbered list is spelled as explicit "\n  1. ..." entries
+            // (NOT multi-line raw strings with visually-indented lines).
+            out.push('\n');
+            out.push_str("Remediation (see docs/rfc011-operator-runbook.md §Partition-collision observability):\n");
+            out.push_str("  1. Rename a colliding lane to hash differently (cheapest).\n");
+            out.push_str("  2. Bump FF_FLOW_PARTITIONS to halve collision probability (requires clean state).\n");
+            out.push_str("  3. Install a custom SoloPartitioner via solo_partition_with (advanced; requires fork).\n");
         }
         out
     }
@@ -421,5 +450,21 @@ mod tests {
         assert!(out.contains("SoloPartitioner"));
         // Each lane's row lists the other as collides_with.
         assert!(out.contains("a") && out.contains("b"));
+        // Numbered list items retain the intended two-space indent. The
+        // backslash line-continuation Rust string idiom strips leading
+        // whitespace, so we explicitly push each numbered line; this test
+        // pins that we didn't regress back to the continuation shape.
+        assert!(
+            out.contains("\n  1. Rename"),
+            "remediation step 1 missing two-space indent in: {out:?}"
+        );
+        assert!(
+            out.contains("\n  2. Bump FF_FLOW_PARTITIONS"),
+            "remediation step 2 missing two-space indent in: {out:?}"
+        );
+        assert!(
+            out.contains("\n  3. Install a custom SoloPartitioner"),
+            "remediation step 3 missing two-space indent in: {out:?}"
+        );
     }
 }

@@ -78,9 +78,11 @@ async fn main() {
     }
 }
 
-/// Dispatch an `admin` subcommand. Reads `ServerConfig::from_env()` but
-/// does NOT connect to Valkey or start any long-lived task — probes are
-/// pure computations over the configured state.
+/// Dispatch an `admin` subcommand. Reads only the minimal env subset each
+/// probe needs (via `ff_server::admin::load_probe_inputs` and similar);
+/// does NOT call `ServerConfig::from_env()` and does NOT connect to Valkey
+/// or start any long-lived task — probes are pure computations over the
+/// configured state.
 ///
 /// Exit codes:
 /// - `0` — probe succeeded
