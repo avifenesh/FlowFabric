@@ -511,9 +511,16 @@ end)
 -- Resolve one dependency edge: satisfied (upstream success) or impossible
 -- (upstream failed/cancelled/expired). Updates child eligibility.
 --
--- KEYS (9): exec_core, deps_meta, unresolved_set, dep_hash,
---           eligible_zset, terminal_zset, blocked_deps_zset,
---           attempt_hash, stream_meta
+-- On satisfaction, if the edge was staged with a non-empty
+-- `data_passing_ref`, atomically COPYs the upstream's result key into
+-- the downstream's input_payload key before flipping the child to
+-- eligible. Upstream + downstream are guaranteed co-located on the
+-- same {fp:N} slot by flow membership (RFC-011 §7.3).
+--
+-- KEYS (11): exec_core, deps_meta, unresolved_set, dep_hash,
+--            eligible_zset, terminal_zset, blocked_deps_zset,
+--            attempt_hash, stream_meta, downstream_payload,
+--            upstream_result
 -- ARGV (3): edge_id, upstream_outcome, now_ms
 ---------------------------------------------------------------------------
 redis.register_function('ff_resolve_dependency', function(keys, args)
@@ -527,6 +534,8 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     blocked_deps_zset = keys[7],
     attempt_hash      = keys[8],
     stream_meta       = keys[9],
+    downstream_payload = keys[10],
+    upstream_result    = keys[11],
   }
 
   local A = {
@@ -556,8 +565,39 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
 
     -- Check if all deps now satisfied
     local raw = redis.call("HGETALL", K.core_key)
-    if #raw == 0 then return ok("satisfied") end
+    if #raw == 0 then return ok("satisfied", "") end
     local core = hgetall_to_table(raw)
+
+    -- Server-side data_passing_ref resolution (Batch C item 3). When
+    -- the edge was staged with a non-empty `data_passing_ref`, replace
+    -- the downstream's input_payload with the upstream's result. COPY
+    -- is a single-slot server-internal op (no round-trip to Lua
+    -- memory) so large result payloads don't inflate the FCALL's
+    -- working set.
+    --
+    -- Terminal-child guard: a late satisfaction can race with the
+    -- child being cancelled or skipped. Don't overwrite the payload
+    -- of a child that has already reached a terminal state — it's at
+    -- best pointless (the worker will never read it) and at worst
+    -- noisy for post-mortem debugging.
+    --
+    -- Write-ordering note (RFC-010 §4.8b): COPY runs BEFORE the
+    -- eligibility transition below so a crash between the two leaves
+    -- the child blocked (or late-satisfied on reconciler retry) with
+    -- the correct payload rather than eligible with a stale one.
+    --
+    -- Void-completion path: if the upstream called complete(None), the
+    -- result key does not exist — COPY returns 0 and data_injected
+    -- stays empty, leaving the child's original input_payload intact.
+    local data_injected = ""
+    if is_set(dep.data_passing_ref)
+       and core.terminal_outcome == "none" then
+      local copied = redis.call(
+        "COPY", K.upstream_result, K.downstream_payload, "REPLACE")
+      if copied == 1 then
+        data_injected = "data_injected"
+      end
+    end
 
     if remaining == 0
        and core.lifecycle_phase == "runnable"
@@ -588,7 +628,7 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
       redis.call("ZADD", K.eligible_zset, score, core.execution_id or "")
     end
 
-    return ok("satisfied")
+    return ok("satisfied", data_injected)
   end
 
   -- 4. Impossible path (upstream failed/cancelled/expired/skipped)

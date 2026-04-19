@@ -3333,6 +3333,15 @@ async fn fcall_apply_dependency(
     tc: &TestCluster, downstream: &ExecutionId, flow_id: &str,
     edge_id: &str, upstream: &ExecutionId,
 ) {
+    fcall_apply_dependency_with_data_passing(
+        tc, downstream, flow_id, edge_id, upstream, "",
+    ).await;
+}
+
+async fn fcall_apply_dependency_with_data_passing(
+    tc: &TestCluster, downstream: &ExecutionId, flow_id: &str,
+    edge_id: &str, upstream: &ExecutionId, data_passing_ref: &str,
+) {
     let config = test_config();
     let p = execution_partition(downstream, &config);
     let ctx = ExecKeyContext::new(&p, downstream);
@@ -3348,7 +3357,8 @@ async fn fcall_apply_dependency(
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
         flow_id.to_owned(), edge_id.to_owned(), upstream.to_string(),
-        "1".to_owned(), "success_only".to_owned(), String::new(), now.to_string(),
+        "1".to_owned(), "success_only".to_owned(),
+        data_passing_ref.to_owned(), now.to_string(),
     ];
     let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -3359,12 +3369,13 @@ async fn fcall_apply_dependency(
 }
 
 async fn fcall_resolve_dependency(
-    tc: &TestCluster, downstream: &ExecutionId,
+    tc: &TestCluster, downstream: &ExecutionId, upstream: &ExecutionId,
     edge_id: &str, outcome: &str,
 ) -> String {
     let config = test_config();
     let p = execution_partition(downstream, &config);
     let ctx = ExecKeyContext::new(&p, downstream);
+    let upstream_ctx = ExecKeyContext::new(&p, upstream);
     let idx = IndexKeys::new(&p);
     let lane_id = LaneId::new(LANE);
     let eid_p = ff_core::types::EdgeId::parse(edge_id).unwrap();
@@ -3374,6 +3385,7 @@ async fn fcall_resolve_dependency(
         ctx.dep_edge(&eid_p), idx.lane_eligible(&lane_id),
         idx.lane_terminal(&lane_id), idx.lane_blocked_dependencies(&lane_id),
         ctx.attempt_hash(att), ctx.stream_meta(att),
+        ctx.payload(), upstream_ctx.result(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3417,13 +3429,13 @@ async fn test_flow_linear_chain() {
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
     let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "success").await, "satisfied");
+    assert_eq!(fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await, "satisfied");
     assert_in_eligible(&tc, &b, &LaneId::new(LANE)).await;
     // Complete B, resolve B->C
     fcall_issue_claim_grant(&tc, &b, LANE, WORKER, WORKER_INST).await;
     let (lb, eb, _, ab) = fcall_claim_execution(&tc, &b, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &b, LANE, WORKER_INST, &lb, &eb, &ab).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &c, &e_bc, "success").await, "satisfied");
+    assert_eq!(fcall_resolve_dependency(&tc, &c, &b, &e_bc, "success").await, "satisfied");
     assert_in_eligible(&tc, &c, &LaneId::new(LANE)).await;
     // Complete C
     fcall_issue_claim_grant(&tc, &c, LANE, WORKER, WORKER_INST).await;
@@ -3436,6 +3448,173 @@ async fn test_flow_linear_chain() {
             ..Default::default()
         }).await;
     }
+}
+
+/// Server-side data_passing_ref resolution (Batch C item 3).
+/// Chain A->B with data_passing_ref on the edge. After A completes,
+/// B's input_payload should equal A's result (the canned
+/// `{"status":"ok"}` string that fcall_complete_execution writes).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_data_passing_ref_injects_on_satisfy() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let fid = "flow-dataref";
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let e_ab = uuid::Uuid::new_v4().to_string();
+    fcall_create_execution(&tc, &a, NS, LANE, "dp_a", 0).await;
+    fcall_create_execution(&tc, &b, NS, LANE, "dp_b", 0).await;
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
+    // Stage the edge with a non-empty data_passing_ref to enable copy.
+    fcall_apply_dependency_with_data_passing(
+        &tc, &b, fid, &e_ab, &a, "result",
+    ).await;
+
+    // Complete A with the canned {"status":"ok"} result_payload baked
+    // into fcall_complete_execution.
+    fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
+    let (la, ea, _, aa) =
+        fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
+    assert_eq!(
+        fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await,
+        "satisfied"
+    );
+
+    // Verify B's payload now holds A's result bytes (not the original
+    // create_execution payload).
+    let config = test_config();
+    let p = execution_partition(&b, &config);
+    let ctx = ExecKeyContext::new(&p, &b);
+    let payload: Option<String> = tc.client()
+        .cmd("GET")
+        .arg(ctx.payload())
+        .execute()
+        .await
+        .expect("GET b.payload");
+    assert_eq!(
+        payload.as_deref(),
+        Some(r#"{"status":"ok"}"#),
+        "data_passing_ref should have copied A's result into B's payload"
+    );
+}
+
+/// Control test for data_passing_ref: when the edge is staged with an
+/// EMPTY data_passing_ref, B's payload must NOT be overwritten by A's
+/// result. Guards against an accidental copy on every satisfy.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_data_passing_ref_empty_no_copy() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let fid = "flow-nodataref";
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let e_ab = uuid::Uuid::new_v4().to_string();
+    fcall_create_execution(&tc, &a, NS, LANE, "np_a", 0).await;
+    fcall_create_execution(&tc, &b, NS, LANE, "np_b", 0).await;
+
+    // Write a known payload on B up-front so we can assert it survives.
+    let config = test_config();
+    let p = execution_partition(&b, &config);
+    let ctx = ExecKeyContext::new(&p, &b);
+    let _: () = tc.client()
+        .cmd("SET")
+        .arg(ctx.payload())
+        .arg("b_original_payload")
+        .execute()
+        .await
+        .expect("SET b.payload");
+
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
+    // Edge has NO data_passing_ref — injection must be skipped.
+    fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
+
+    fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
+    let (la, ea, _, aa) =
+        fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
+    assert_eq!(
+        fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await,
+        "satisfied"
+    );
+
+    let payload: Option<String> = tc.client()
+        .cmd("GET")
+        .arg(ctx.payload())
+        .execute()
+        .await
+        .expect("GET b.payload");
+    assert_eq!(
+        payload.as_deref(),
+        Some("b_original_payload"),
+        "empty data_passing_ref must preserve B's original payload"
+    );
+}
+
+/// Data-passing guard: a late satisfy against an ALREADY-terminal
+/// child must not overwrite the child's payload. Simulates a cancel
+/// racing with ff_resolve_dependency.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_flow_data_passing_ref_skips_terminal_child() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let fid = "flow-terminal-child";
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let e_ab = uuid::Uuid::new_v4().to_string();
+    fcall_create_execution(&tc, &a, NS, LANE, "t_a", 0).await;
+    fcall_create_execution(&tc, &b, NS, LANE, "t_b", 0).await;
+
+    // Write a sentinel payload on B up front.
+    let config = test_config();
+    let p = execution_partition(&b, &config);
+    let ctx = ExecKeyContext::new(&p, &b);
+    let _: () = tc.client()
+        .cmd("SET")
+        .arg(ctx.payload())
+        .arg("b_sentinel")
+        .execute()
+        .await
+        .expect("SET b.payload");
+
+    setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
+    fcall_apply_dependency_with_data_passing(
+        &tc, &b, fid, &e_ab, &a, "result",
+    ).await;
+
+    // Force B into a terminal state BEFORE A resolves — direct exec_core
+    // patch is the minimal test hook (skips the cancel flow dispatcher).
+    let _: () = tc.client()
+        .cmd("HSET")
+        .arg(ctx.core())
+        .arg("lifecycle_phase").arg("terminal")
+        .arg("terminal_outcome").arg("cancelled")
+        .execute()
+        .await
+        .expect("HSET b.core terminal");
+
+    // Now complete A and resolve. COPY should be skipped by the
+    // terminal-child guard.
+    fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
+    let (la, ea, _, aa) =
+        fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
+    fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
+    fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await;
+
+    let payload: Option<String> = tc.client()
+        .cmd("GET")
+        .arg(ctx.payload())
+        .execute()
+        .await
+        .expect("GET b.payload");
+    assert_eq!(
+        payload.as_deref(),
+        Some("b_sentinel"),
+        "terminal child's payload must not be overwritten by late satisfy"
+    );
 }
 
 /// Fan-out: A->B, A->C. Complete A, both B and C unblocked.
@@ -3459,8 +3638,8 @@ async fn test_flow_fan_out() {
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
     let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
-    fcall_resolve_dependency(&tc, &b, &e_ab, "success").await;
-    fcall_resolve_dependency(&tc, &c, &e_ac, "success").await;
+    fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await;
+    fcall_resolve_dependency(&tc, &c, &a, &e_ac, "success").await;
     assert_in_eligible(&tc, &b, &LaneId::new(LANE)).await;
     assert_in_eligible(&tc, &c, &LaneId::new(LANE)).await;
 }
@@ -3487,13 +3666,13 @@ async fn test_flow_dependency_failure_propagation() {
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
     let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
-    fcall_resolve_dependency(&tc, &b, &e_ab, "success").await;
+    fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await;
     // Fail B
     fcall_issue_claim_grant(&tc, &b, LANE, WORKER, WORKER_INST).await;
     let (lb, eb, _, ab) = fcall_claim_execution(&tc, &b, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_fail_execution(&tc, &b, LANE, WORKER_INST, &lb, &eb, &ab, "err", "worker_error", "").await;
     // Resolve B->C as "failed" -> C becomes skipped
-    assert_eq!(fcall_resolve_dependency(&tc, &c, &e_bc, "failed").await, "impossible");
+    assert_eq!(fcall_resolve_dependency(&tc, &c, &b, &e_bc, "failed").await, "impossible");
     assert_execution_state(&tc, &c, &ExpectedState {
         lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
         terminal_outcome: Some(ff_core::state::TerminalOutcome::Skipped),
@@ -3518,9 +3697,9 @@ async fn test_flow_resolve_idempotency() {
     fcall_create_execution(&tc, &b, NS, LANE, "ri_b", 0).await;
     setup_flow_via_fcall(&tc, fid, &[&a, &b]).await;
     fcall_apply_dependency(&tc, &b, fid, &e_ab, &a).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "failed").await, "impossible");
+    assert_eq!(fcall_resolve_dependency(&tc, &b, &a, &e_ab, "failed").await, "impossible");
     // Second resolve -> already_resolved
-    assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "success").await, "already_resolved");
+    assert_eq!(fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await, "already_resolved");
     // B still skipped
     assert_execution_state(&tc, &b, &ExpectedState {
         terminal_outcome: Some(ff_core::state::TerminalOutcome::Skipped),
@@ -3551,7 +3730,7 @@ async fn test_flow_with_execution_lifecycle() {
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
     let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
-    fcall_resolve_dependency(&tc, &b, &e_ab, "success").await;
+    fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await;
     assert_in_eligible(&tc, &b, &LaneId::new(LANE)).await;
     fcall_issue_claim_grant(&tc, &b, LANE, WORKER, WORKER_INST).await;
     let (lb, eb, _, ab) = fcall_claim_execution(&tc, &b, LANE, WORKER, WORKER_INST, 30_000).await;
@@ -3588,7 +3767,7 @@ async fn test_flow_replay_after_skip() {
     fcall_fail_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa, "err", "worker_error", "").await;
 
     // Resolve A->B as "failed" -> B becomes skipped
-    fcall_resolve_dependency(&tc, &b, &e_ab, "failed").await;
+    fcall_resolve_dependency(&tc, &b, &a, &e_ab, "failed").await;
     assert_execution_state(&tc, &b, &ExpectedState {
         lifecycle_phase: Some(ff_core::state::LifecyclePhase::Terminal),
         terminal_outcome: Some(ff_core::state::TerminalOutcome::Skipped),
@@ -4897,7 +5076,7 @@ async fn test_flow_full_lifecycle_with_staging() {
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
     let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "success").await, "satisfied");
+    assert_eq!(fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await, "satisfied");
     assert_in_eligible(&tc, &b, &lane_id).await;
     assert_not_in_eligible(&tc, &c, &lane_id).await;
 
@@ -4905,7 +5084,7 @@ async fn test_flow_full_lifecycle_with_staging() {
     fcall_issue_claim_grant(&tc, &b, LANE, WORKER, WORKER_INST).await;
     let (lb, eb, _, ab) = fcall_claim_execution(&tc, &b, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &b, LANE, WORKER_INST, &lb, &eb, &ab).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &c, &e_bc, "success").await, "satisfied");
+    assert_eq!(fcall_resolve_dependency(&tc, &c, &b, &e_bc, "success").await, "satisfied");
     assert_in_eligible(&tc, &c, &lane_id).await;
 
     // 8. Complete C
@@ -6051,7 +6230,7 @@ async fn test_server_flow_lifecycle() {
     fcall_complete_execution(&tc, &upstream, LANE, WORKER_INST, &la, &ea, &aa).await;
 
     // 7. Resolve dependency → downstream becomes eligible
-    let resolve_result = fcall_resolve_dependency(&tc, &downstream, &edge_id, "success").await;
+    let resolve_result = fcall_resolve_dependency(&tc, &downstream, &upstream, &edge_id, "success").await;
     assert_eq!(resolve_result, "satisfied");
 
     assert_in_eligible(&tc, &downstream, &LaneId::new(LANE)).await;
@@ -6641,11 +6820,11 @@ async fn test_server_full_flow_lifecycle() {
     fcall_issue_claim_grant(&tc, &a, LANE, WORKER, WORKER_INST).await;
     let (la, ea, _, aa) = fcall_claim_execution(&tc, &a, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &a, LANE, WORKER_INST, &la, &ea, &aa).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &b, &e_ab, "success").await, "satisfied");
+    assert_eq!(fcall_resolve_dependency(&tc, &b, &a, &e_ab, "success").await, "satisfied");
     fcall_issue_claim_grant(&tc, &b, LANE, WORKER, WORKER_INST).await;
     let (lb, eb, _, ab) = fcall_claim_execution(&tc, &b, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &b, LANE, WORKER_INST, &lb, &eb, &ab).await;
-    assert_eq!(fcall_resolve_dependency(&tc, &c, &e_bc, "success").await, "satisfied");
+    assert_eq!(fcall_resolve_dependency(&tc, &c, &b, &e_bc, "success").await, "satisfied");
     fcall_issue_claim_grant(&tc, &c, LANE, WORKER, WORKER_INST).await;
     let (lc, ec, _, ac) = fcall_claim_execution(&tc, &c, LANE, WORKER, WORKER_INST, 30_000).await;
     fcall_complete_execution(&tc, &c, LANE, WORKER_INST, &lc, &ec, &ac).await;

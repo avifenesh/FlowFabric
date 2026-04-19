@@ -166,6 +166,36 @@ In increasing order of operator cost:
    config, &custom_impl)` is the public escape hatch. Defer to a follow-up
    RFC if this becomes common demand.
 
+## Data passing between flow nodes
+
+When a flow edge is staged via `ff_stage_dependency_edge` with a
+non-empty `data_passing_ref`, the engine copies the upstream's
+`result` bytes into the downstream's `input_payload` atomically at
+satisfaction time (inside `ff_resolve_dependency`). No separate
+client-side chain is required — submit posts all nodes up-front,
+the worker's subsequent `claim_next` reads the already-injected
+payload.
+
+Semantics:
+
+- Any non-empty `data_passing_ref` triggers injection. The string
+  content is currently opaque to the engine (reserved for a future
+  field-path or schema-ref extension).
+- Copy runs **before** the downstream's eligibility transition so
+  a crash mid-FCALL can't leave the child eligible with a stale
+  payload (RFC-010 §4.8b write-ordering rule).
+- If the upstream called `complete(None)` (no result written), the
+  copy is a no-op — the downstream's original `input_payload` (set
+  at `create_execution` time) is preserved.
+- Multi-upstream children with `data_passing_ref` on multiple edges
+  experience last-writer-wins semantics. Configure the flow with at
+  most one data-passing edge per child if this matters.
+- Uses Valkey `COPY src dst REPLACE` server-side, not round-trip
+  `GET`/`SET` — large payloads don't inflate the FCALL memory budget.
+- Upstream/downstream co-location is guaranteed by flow membership
+  (RFC-011 §7.3 hash-tag routing), so the copy is a single-slot op
+  even on cluster.
+
 ## DAG promotion: push listener + safety-net reconciler
 
 Post-Batch-C item 6, FlowFabric uses two paths to promote downstream
