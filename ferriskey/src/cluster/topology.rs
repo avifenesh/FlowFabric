@@ -460,10 +460,13 @@ mod tests {
         Map,
     }
 
+    // (address, port, optional metadata pairs)
+    type NodeWithMetadata<'a> = (&'a str, u16, Option<Vec<(&'a str, &'a str)>>);
+
     fn slot_value_with_metadata(
         start: u16,
         end: u16,
-        nodes: Vec<(&str, u16, Option<Vec<(&str, &str)>>)>, // (address, port, metadata)
+        nodes: Vec<NodeWithMetadata<'_>>,
         format: MetadataFormat,
     ) -> Value {
         let node_values: Vec<Result<Value>> = nodes

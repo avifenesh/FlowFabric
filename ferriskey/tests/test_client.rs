@@ -77,8 +77,7 @@ pub(crate) mod shared_client_tests {
                         create_connection_request(
                             std::slice::from_ref(&connection_addr),
                             &configuration,
-                        )
-                        .into(),
+                        ),
                         None,
                     )
                     .await

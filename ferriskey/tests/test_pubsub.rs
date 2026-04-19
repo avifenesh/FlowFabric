@@ -675,10 +675,11 @@ mod standalone_pubsub_tests {
     use ferriskey::client::types::{ConnectionRetryStrategy, NodeAddress};
     use ferriskey::client::Client;
     use ferriskey::value::Value;
-    use ferriskey::{ConnectionAddr, PushInfo};
+    use ferriskey::PushInfo;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    #[allow(dead_code)]
     fn standalone_url() -> Option<String> {
         let host = std::env::var("VALKEY_STANDALONE_HOST").ok()?;
         let port = std::env::var("VALKEY_STANDALONE_PORT").unwrap_or_else(|_| "6379".into());
