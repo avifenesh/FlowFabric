@@ -1628,12 +1628,10 @@ mod tests_routing {
             )))
         );
 
-        for cmd in vec![
-            cmd("SCAN"),
+        for cmd in [cmd("SCAN"),
             cmd("SHUTDOWN"),
             cmd("SLAVEOF"),
-            cmd("REPLICAOF"),
-        ] {
+            cmd("REPLICAOF")] {
             assert_eq!(
                 RoutingInfo::for_routable(&cmd),
                 None,

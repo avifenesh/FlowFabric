@@ -232,6 +232,7 @@ fn parse_cpu_count(cpu_str: &str) -> usize {
     num_cpus::get()
 }
 
+#[cfg(target_os = "linux")]
 fn set_cpu_affinity(cpu_str: &str) -> Result<(), String> {
     // Use libc sched_setaffinity to pin this process
     if let Some((start, end)) = cpu_str.split_once('-') {
@@ -250,6 +251,15 @@ fn set_cpu_affinity(cpu_str: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// CPU pinning stub for non-Linux platforms. macOS and Windows lack
+/// `sched_setaffinity` (macOS had `thread_policy_set` affinity hints
+/// which Apple now silently ignores). Benchmarks on those platforms
+/// skip pinning entirely; the caller logs a warning and continues.
+#[cfg(not(target_os = "linux"))]
+fn set_cpu_affinity(_cpu_str: &str) -> Result<(), String> {
+    Err("CPU affinity is only supported on Linux".to_owned())
 }
 
 // ---------------------------------------------------------------------------

@@ -749,13 +749,17 @@ pub fn create_connection_request(
     };
     let connection_info = configuration.connection_info.clone().unwrap_or_default();
     let auth = if connection_info.password.is_some() || connection_info.username.is_some() {
+        // Use `..Default::default()` so feature-gated fields (e.g. the
+        // iam-only `iam_config` added under `#[cfg(feature = "iam")]`)
+        // are populated without needing their own cfg-gated init line
+        // here. Tests don't exercise IAM, so the default is always None.
+        // The lint fires on no-feature builds where all fields ARE
+        // specified — allowed since the IAM build needs the rest.
+        #[allow(clippy::needless_update)]
         Some(AuthenticationInfo {
             password: connection_info.password,
             username: connection_info.username,
-            // iam_config is only present on `feature = "iam"` builds.
-            // Tests don't exercise IAM, so always default when the field exists.
-            #[cfg(feature = "iam")]
-            iam_config: None,
+            ..Default::default()
         })
     } else {
         None

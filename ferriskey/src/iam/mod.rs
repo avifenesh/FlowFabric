@@ -501,7 +501,6 @@ fn strip_scheme(full: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
     use serial_test::serial;
     use std::env;
     use std::fs;

@@ -96,8 +96,10 @@ jobs:
             -p ff-sdk -p ff-server -p ff-test \
             --features ff-sdk/insecure-direct-claim \
             -- -D warnings
-      - name: cargo clippy (ferriskey all targets)
+      - name: cargo clippy (ferriskey all targets, no features)
         run: cargo clippy -p ferriskey --all-targets -- -D warnings
+      - name: cargo clippy (ferriskey all targets, +iam)
+        run: cargo clippy -p ferriskey --all-targets --features iam -- -D warnings
       - name: unit tests
         run: |
           cargo test \
