@@ -141,11 +141,17 @@ pub struct ResumeSignal {
     pub source_type: String,
     pub source_identity: String,
     pub correlation_id: String,
-    /// Valkey-server `now_ms` timestamp at which ff_deliver_signal accepted
-    /// this signal (string form of an i64; parse if you need arithmetic).
-    pub accepted_at: String,
-    /// Opaque payload bytes, if the signal was delivered with one. `None`
-    /// for signals delivered without a payload.
+    /// Valkey-server `now_ms` timestamp at which `ff_deliver_signal`
+    /// accepted this signal. `0` if the stored `accepted_at` field is
+    /// missing or non-numeric (a Lua-side defect — not expected at
+    /// runtime).
+    pub accepted_at: TimestampMs,
+    /// Raw payload bytes, if the signal was delivered with one. `None`
+    /// for signals delivered without a payload. Note: the SDK's current
+    /// signal-delivery path (`FlowFabricWorker::deliver_signal`) writes
+    /// payloads as UTF-8 (lossy) with `payload_encoding="json"`; callers
+    /// that invoke `ff_deliver_signal` directly via FCALL with non-UTF-8
+    /// bytes will receive those bytes verbatim here.
     pub payload: Option<Vec<u8>>,
 }
 
@@ -1077,20 +1083,58 @@ impl ClaimedTask {
             return Ok(Vec::new());
         };
 
-        let cond: HashMap<String, String> = self
+        // Bounded read of waitpoint_condition: HGET total_matchers first,
+        // then HMGET exactly the fields we need per matcher slot. Avoids an
+        // unbounded HGETALL (matcher:N:* fields grow with condition size).
+        let wp_cond_key = ctx.waitpoint_condition(&waitpoint_id);
+        let total_str: Option<String> = self
             .client
-            .hgetall(&ctx.waitpoint_condition(&waitpoint_id))
+            .hget(&wp_cond_key, "total_matchers")
             .await
             .map_err(|e| SdkError::ValkeyContext {
                 source: e,
-                context: "HGETALL waitpoint_condition".into(),
+                context: "HGET total_matchers".into(),
             })?;
+        let total: usize = total_str
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
-        let signal_ids = matched_signal_ids_from_condition(
-            &cond,
-            &self.execution_id,
-            &waitpoint_id,
-        );
+        let mut signal_ids: Vec<SignalId> = Vec::new();
+        for i in 0..total {
+            let fields: Vec<Option<String>> = self
+                .client
+                .cmd("HMGET")
+                .arg(&wp_cond_key)
+                .arg(format!("matcher:{i}:satisfied"))
+                .arg(format!("matcher:{i}:signal_id"))
+                .execute()
+                .await
+                .map_err(|e| SdkError::ValkeyContext {
+                    source: e,
+                    context: "HMGET matcher slot".into(),
+                })?;
+            let satisfied = fields.first().and_then(|o| o.as_deref());
+            if satisfied != Some("1") {
+                continue;
+            }
+            let Some(raw) = fields.get(1).and_then(|o| o.as_deref()).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            match SignalId::parse(raw) {
+                Ok(sid) => signal_ids.push(sid),
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %self.execution_id,
+                        waitpoint_id = %waitpoint_id,
+                        raw = %raw,
+                        error = %e,
+                        "resume_signals: matcher signal_id failed to parse, skipping"
+                    );
+                }
+            }
+        }
 
         let mut out: Vec<ResumeSignal> = Vec::with_capacity(signal_ids.len());
         for signal_id in signal_ids {
@@ -1108,15 +1152,32 @@ impl ClaimedTask {
                 continue;
             }
 
-            let payload_str: Option<String> = self
+            // Read payload as raw Value so non-UTF-8 bytes survive intact.
+            // Previously this was `get::<Option<String>>` + `into_bytes`,
+            // which would panic/error on any non-UTF-8 payload (reachable
+            // via direct-FCALL callers that bypass the SDK's lossy
+            // UTF-8 encode path in deliver_signal).
+            let payload_raw: Option<Value> = self
                 .client
-                .get(&ctx.signal_payload(&signal_id))
+                .cmd("GET")
+                .arg(ctx.signal_payload(&signal_id))
+                .execute()
                 .await
                 .map_err(|e| SdkError::ValkeyContext {
                     source: e,
                     context: "GET signal_payload".into(),
                 })?;
-            let payload = payload_str.map(String::into_bytes);
+            let payload: Option<Vec<u8>> = match payload_raw {
+                Some(Value::BulkString(b)) => Some(b.to_vec()),
+                Some(Value::SimpleString(s)) => Some(s.into_bytes()),
+                _ => None,
+            };
+
+            let accepted_at = sig
+                .get("accepted_at")
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(TimestampMs::from_millis)
+                .unwrap_or_else(|| TimestampMs::from_millis(0));
 
             out.push(ResumeSignal {
                 signal_id,
@@ -1125,7 +1186,7 @@ impl ClaimedTask {
                 source_type: sig.get("source_type").cloned().unwrap_or_default(),
                 source_identity: sig.get("source_identity").cloned().unwrap_or_default(),
                 correlation_id: sig.get("correlation_id").cloned().unwrap_or_default(),
-                accepted_at: sig.get("accepted_at").cloned().unwrap_or_default(),
+                accepted_at,
                 payload,
             });
         }
@@ -1527,8 +1588,11 @@ fn resume_waitpoint_id_from_suspension(
     if susp.is_empty() {
         return Ok(None);
     }
-    let susp_att = susp.get("attempt_index").map(String::as_str).unwrap_or("");
-    if susp_att != claimed_attempt.to_string() {
+    let susp_att: u32 = susp
+        .get("attempt_index")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
+    if susp_att != claimed_attempt.0 {
         return Ok(None);
     }
     let close_reason = susp.get("close_reason").map(String::as_str).unwrap_or("");
@@ -1548,47 +1612,6 @@ fn resume_waitpoint_id_from_suspension(
         )))
     })?;
     Ok(Some(waitpoint_id))
-}
-
-/// Pure helper: extract the signal_ids from the waitpoint_condition's
-/// `matcher:N:signal_id` fields where `matcher:N:satisfied == "1"`.
-/// `total_matchers` bounds the iteration. Malformed signal_ids are
-/// logged-and-skipped (not an error): a present-but-unparseable slot
-/// is a defect in a single matcher's record, not a reason to blind the
-/// worker to the remaining satisfied matchers.
-fn matched_signal_ids_from_condition(
-    cond: &HashMap<String, String>,
-    execution_id: &ExecutionId,
-    waitpoint_id: &WaitpointId,
-) -> Vec<SignalId> {
-    let total: usize = cond
-        .get("total_matchers")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut out: Vec<SignalId> = Vec::new();
-    for i in 0..total {
-        let sat_key = format!("matcher:{i}:satisfied");
-        if cond.get(&sat_key).map(String::as_str) != Some("1") {
-            continue;
-        }
-        let id_key = format!("matcher:{i}:signal_id");
-        let Some(raw) = cond.get(&id_key).filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        match SignalId::parse(raw) {
-            Ok(sid) => out.push(sid),
-            Err(e) => {
-                tracing::warn!(
-                    execution_id = %execution_id,
-                    waitpoint_id = %waitpoint_id,
-                    raw = %raw,
-                    error = %e,
-                    "resume_signals: matcher signal_id failed to parse, skipping"
-                );
-            }
-        }
-    }
-    out
 }
 
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {
@@ -2395,79 +2418,9 @@ mod resume_signals_tests {
         assert!(out.is_none());
     }
 
-    #[test]
-    fn matched_signals_any_mode_single_matcher() {
-        let sid = SignalId::new();
-        let cond = m(&[
-            ("total_matchers", "1"),
-            ("matcher:0:satisfied", "1"),
-            ("matcher:0:signal_id", &sid.to_string()),
-        ]);
-        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
-        let wp = WaitpointId::new();
-        let out = matched_signal_ids_from_condition(&cond, &eid, &wp);
-        assert_eq!(out, vec![sid]);
-    }
-
-    #[test]
-    fn matched_signals_all_mode_multiple_matchers() {
-        let s0 = SignalId::new();
-        let s1 = SignalId::new();
-        let cond = m(&[
-            ("total_matchers", "2"),
-            ("matcher:0:satisfied", "1"),
-            ("matcher:0:signal_id", &s0.to_string()),
-            ("matcher:1:satisfied", "1"),
-            ("matcher:1:signal_id", &s1.to_string()),
-        ]);
-        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
-        let wp = WaitpointId::new();
-        let out = matched_signal_ids_from_condition(&cond, &eid, &wp);
-        assert_eq!(out, vec![s0, s1]);
-    }
-
-    #[test]
-    fn matched_signals_skips_unsatisfied_matchers() {
-        // total_matchers=3, only matcher 1 satisfied. 0 and 2 are
-        // partially-satisfied "all" matchers (shouldnt happen on a
-        // resumed condition but defensive against partial state).
-        let s1 = SignalId::new();
-        let cond = m(&[
-            ("total_matchers", "3"),
-            ("matcher:0:satisfied", "0"),
-            ("matcher:1:satisfied", "1"),
-            ("matcher:1:signal_id", &s1.to_string()),
-            ("matcher:2:satisfied", "0"),
-        ]);
-        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
-        let wp = WaitpointId::new();
-        let out = matched_signal_ids_from_condition(&cond, &eid, &wp);
-        assert_eq!(out, vec![s1]);
-    }
-
-    #[test]
-    fn matched_signals_missing_total_returns_empty() {
-        let cond = m(&[]);
-        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
-        let wp = WaitpointId::new();
-        let out = matched_signal_ids_from_condition(&cond, &eid, &wp);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn matched_signals_malformed_signal_id_is_skipped_not_fatal() {
-        let s1 = SignalId::new();
-        let cond = m(&[
-            ("total_matchers", "2"),
-            ("matcher:0:satisfied", "1"),
-            ("matcher:0:signal_id", "not-a-uuid"),
-            ("matcher:1:satisfied", "1"),
-            ("matcher:1:signal_id", &s1.to_string()),
-        ]);
-        let eid = ExecutionId::for_flow(&FlowId::new(), &PartitionConfig::default());
-        let wp = WaitpointId::new();
-        let out = matched_signal_ids_from_condition(&cond, &eid, &wp);
-        // Malformed matcher:0 is skipped with a warn log; matcher:1 surfaces.
-        assert_eq!(out, vec![s1]);
-    }
+    // The previous `matched_signal_ids_from_condition` helper was
+    // removed when the production path switched from unbounded
+    // HGETALL to a bounded HGET + per-matcher HMGET loop (review
+    // feedback on unbounded condition-hash reply size). That loop
+    // is exercised by the integration tests in `ff-test`.
 }
