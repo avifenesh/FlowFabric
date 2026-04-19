@@ -8,7 +8,7 @@
 //!
 //! Run: `cargo test -p ff-test --test e2e_flow_atomicity -- --test-threads=1`
 
-use ff_core::contracts::{AddExecutionToFlowArgs, CreateFlowArgs};
+use ff_core::contracts::{AddExecutionToFlowArgs, CreateExecutionArgs, CreateFlowArgs};
 use ff_core::keys::ExecKeyContext;
 use ff_core::partition::{execution_partition, flow_partition};
 use ff_core::types::*;
@@ -74,45 +74,35 @@ async fn create_flow(
         .expect("create_flow");
 }
 
-async fn fcall_create_execution(
+/// Create an exec via `Server::create_execution` — production path.
+/// Uses the caller-supplied `eid` so tests can pin exec partition
+/// via `mint_flow_and_exec` for co-location.
+async fn create_execution(
+    server: &ff_server::server::Server,
     tc: &TestCluster,
     eid: &ExecutionId,
 ) {
-    let partition = execution_partition(eid, tc.partition_config());
-    let ctx = ExecKeyContext::new(&partition, eid);
-    let idx = ff_core::keys::IndexKeys::new(&partition);
-    let now = TimestampMs::now();
-    let keys: Vec<String> = vec![
-        ctx.core(),
-        ctx.payload(),
-        ctx.policy(),
-        ctx.tags(),
-        idx.lane_eligible(&LaneId::new("atomicity-lane")),
-        idx.all_executions(),
-        idx.execution_deadline(),
-    ];
-    let args: Vec<String> = vec![
-        eid.to_string(),
-        NS.to_owned(),
-        "atomicity-lane".to_owned(),
-        "test".to_owned(),
-        "{}".to_owned(),
-        "{}".to_owned(),
-        String::new(),
-        String::new(),
-        "0".to_owned(),
-        "tester".to_owned(),
-        String::new(),
-        String::new(),
-        String::new(),
-        now.to_string(),
-    ];
-    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    tc.client()
-        .fcall::<ferriskey::Value>("ff_create_execution", &kr, &ar)
+    let partition_id = execution_partition(eid, tc.partition_config()).index;
+    server
+        .create_execution(&CreateExecutionArgs {
+            execution_id: eid.clone(),
+            namespace: Namespace::new(NS),
+            lane_id: LaneId::new("atomicity-lane"),
+            execution_kind: "test".to_owned(),
+            input_payload: b"{}".to_vec(),
+            payload_encoding: Some("json".to_owned()),
+            priority: 0,
+            creator_identity: "tester".to_owned(),
+            idempotency_key: None,
+            tags: std::collections::HashMap::new(),
+            policy: None,
+            delay_until: None,
+            execution_deadline_at: None,
+            partition_id,
+            now: TimestampMs::now(),
+        })
         .await
-        .expect("fcall ff_create_execution");
+        .expect("create_execution");
 }
 
 async fn hget_flow_id(tc: &TestCluster, eid: &ExecutionId) -> Option<String> {
@@ -161,7 +151,7 @@ async fn test_atomicity_happy_path_commits_both_writes() {
     let server = start_server(&tc).await;
 
     create_flow(&server, &flow_id).await;
-    fcall_create_execution(&tc, &eid).await;
+    create_execution(&server, &tc, &eid).await;
 
     assert_eq!(hget_flow_id(&tc, &eid).await, None);
     assert!(!sismember_flow(&tc, &flow_id, &eid).await);
@@ -195,7 +185,7 @@ async fn test_atomicity_flow_not_found_commits_nothing() {
     let (flow_id, eid) = mint_flow_and_exec(&tc);
     let server = start_server(&tc).await;
 
-    fcall_create_execution(&tc, &eid).await;
+    create_execution(&server, &tc, &eid).await;
 
     let err = server
         .add_execution_to_flow(&AddExecutionToFlowArgs {
@@ -232,7 +222,7 @@ async fn test_atomicity_repeat_call_is_idempotent() {
     let server = start_server(&tc).await;
 
     create_flow(&server, &flow_id).await;
-    fcall_create_execution(&tc, &eid).await;
+    create_execution(&server, &tc, &eid).await;
 
     server
         .add_execution_to_flow(&AddExecutionToFlowArgs {
@@ -284,8 +274,8 @@ async fn test_atomicity_concurrent_distinct_execs() {
 
     let server = start_server(&tc).await;
     create_flow(&server, &flow_id).await;
-    fcall_create_execution(&tc, &eid_a).await;
-    fcall_create_execution(&tc, &eid_b).await;
+    create_execution(&server, &tc, &eid_a).await;
+    create_execution(&server, &tc, &eid_b).await;
 
     let fa = flow_id.clone();
     let fb = flow_id.clone();
@@ -349,7 +339,7 @@ async fn test_atomicity_flow_id_visible_to_subsequent_reads() {
     let server = start_server(&tc).await;
 
     create_flow(&server, &flow_id).await;
-    fcall_create_execution(&tc, &eid).await;
+    create_execution(&server, &tc, &eid).await;
 
     server
         .add_execution_to_flow(&AddExecutionToFlowArgs {
@@ -367,6 +357,51 @@ async fn test_atomicity_flow_id_visible_to_subsequent_reads() {
             "HGET attempt {attempt} must see the flow_id stamp immediately"
         );
     }
+}
+
+/// Post-review YELLOW (Gemini PR #28): complement to test 2's
+/// flow_not_found rollback — assert execution_not_found similarly
+/// commits zero state.
+///
+/// Deliberately skips the `create_execution` step so exec_core
+/// hash does not exist when `add_execution_to_flow` runs. The Lua
+/// step-1 guard (EXISTS K.exec_core) fires before any write.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_atomicity_execution_not_found_commits_nothing() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let (flow_id, eid) = mint_flow_and_exec(&tc);
+    let server = start_server(&tc).await;
+
+    create_flow(&server, &flow_id).await;
+    // DO NOT create the execution — exec_core hash is absent.
+
+    let err = server
+        .add_execution_to_flow(&AddExecutionToFlowArgs {
+            flow_id: flow_id.clone(),
+            execution_id: eid.clone(),
+            now: TimestampMs::now(),
+        })
+        .await
+        .expect_err("add_execution_to_flow must error when exec does not exist");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("execution_not_found") || msg.contains("execution not found"),
+        "error must name execution_not_found path; got {msg}"
+    );
+
+    // Neither flow_index / members_set / exec_core mutated.
+    assert!(
+        !sismember_flow(&tc, &flow_id, &eid).await,
+        "exec must NOT be in members_set when exec guard fires"
+    );
+    assert_eq!(
+        hget_flow_id(&tc, &eid).await,
+        None,
+        "exec_core.flow_id must be untouched (in fact exec_core should not exist at all)"
+    );
 }
 
 /// Cross-review YELLOW 2 (W1 + W3 convergent): pre-flight
@@ -393,7 +428,7 @@ async fn test_atomicity_partition_mismatch_pre_flight_check() {
 
     let server = start_server(&tc).await;
     create_flow(&server, &flow_id).await;
-    fcall_create_execution(&tc, &eid).await;
+    create_execution(&server, &tc, &eid).await;
 
     let err = server
         .add_execution_to_flow(&AddExecutionToFlowArgs {

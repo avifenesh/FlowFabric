@@ -3298,12 +3298,35 @@ async fn fcall_cancel_flow(
 }
 
 /// Higher-level helper: create flow + add members + set flow_id on exec_core.
+///
+/// Post-RFC-011 phase-3: `ff_add_execution_to_flow`'s step-1 guard
+/// requires exec_core to exist (`EXISTS K.exec_core`). Pre-seed a
+/// minimal exec_core hash before calling the FCALL.
 async fn setup_flow_via_fcall(tc: &TestCluster, flow_id: &str, members: &[&ExecutionId]) {
     fcall_create_flow(tc, flow_id).await;
     for eid in members {
+        ensure_exec_core_exists(tc, eid).await;
         fcall_add_execution_to_flow(tc, flow_id, eid).await;
         set_flow_id_on_exec(tc, eid, flow_id).await;
     }
+}
+
+/// Minimal exec_core row creator for tests that skip the full
+/// `ff_create_execution` FCALL surface. HSETs a single field so
+/// `EXISTS` returns true; sufficient for the post-phase-3
+/// `ff_add_execution_to_flow` exec-existence guard. Idempotent.
+async fn ensure_exec_core_exists(tc: &TestCluster, eid: &ExecutionId) {
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    tc.client()
+        .cmd("HSET")
+        .arg(ctx.core())
+        .arg("execution_id")
+        .arg(eid.to_string())
+        .execute::<i64>()
+        .await
+        .expect("HSET minimal exec_core");
 }
 
 async fn fcall_apply_dependency(
@@ -5458,6 +5481,11 @@ async fn test_flow_create_and_membership() {
         .arg("public_flow_state").execute().await.unwrap();
     assert_eq!(pfs.as_deref(), Some("open"));
 
+    // Pre-seed exec_core rows (RFC-011 phase-3 guard requires EXISTS).
+    ensure_exec_core_exists(&tc, &a).await;
+    ensure_exec_core_exists(&tc, &b).await;
+    ensure_exec_core_exists(&tc, &c).await;
+
     // Add 3 members
     let (eid1, nc1) = fcall_add_execution_to_flow(&tc, fid, &a).await;
     assert_eq!(eid1, a.to_string());
@@ -5541,8 +5569,11 @@ async fn test_flow_index_self_heal_on_add() {
     let b = tc.new_execution_id_on_partition(0);
     let flow_index_key = "ff:idx:{fp:0}:flow_index";
 
-    // 1. Create flow + add one member
+    // 1. Create flow + add one member (pre-seed exec_core for the
+    //    RFC-011 phase-3 EXISTS guard).
     fcall_create_flow(&tc, fid).await;
+    ensure_exec_core_exists(&tc, &a).await;
+    ensure_exec_core_exists(&tc, &b).await;
     fcall_add_execution_to_flow(&tc, fid, &a).await;
 
     // Sanity: flow is registered in the index
@@ -5588,14 +5619,23 @@ async fn test_flow_index_self_heal_on_add() {
         .cmd("SREM").arg(flow_index_key).arg(fid)
         .execute().await.unwrap();
 
-    // Direct FCALL so we can inspect the error result without panicking
+    // Direct FCALL so we can inspect the error result without panicking.
+    // Post-RFC-011 phase-3 the FCALL requires KEYS[4]=exec_core on the
+    // same {fp:0} slot — pin the exec via on_partition(0). Test happens
+    // to pass even with only 3 KEYS today because flow_already_terminal
+    // returns before step 4 touches exec_core, but relying on Lua
+    // validation order is brittle; pass all 4 KEYS as the contract
+    // dictates.
     let prefix = format!("ff:flow:{{fp:0}}:{fid}");
+    let c = tc.new_execution_id_on_partition(0);
+    let exec_partition = ff_core::partition::execution_partition(&c, tc.partition_config());
+    let ectx = ff_core::keys::ExecKeyContext::new(&exec_partition, &c);
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
         flow_index_key.to_string(),
+        ectx.core(),
     ];
-    let c = tc.new_execution_id_on_partition(0);
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
         fid.to_owned(), c.to_string(), now.to_string(),
@@ -5634,8 +5674,12 @@ async fn test_flow_cancel() {
     let b = tc.new_execution_id_on_partition(0);
     let c = tc.new_execution_id_on_partition(0);
 
-    // Create flow and add 3 members
+    // Create flow and add 3 members (pre-seed exec_core for the
+    // RFC-011 phase-3 EXISTS guard).
     fcall_create_flow(&tc, fid).await;
+    ensure_exec_core_exists(&tc, &a).await;
+    ensure_exec_core_exists(&tc, &b).await;
+    ensure_exec_core_exists(&tc, &c).await;
     fcall_add_execution_to_flow(&tc, fid, &a).await;
     fcall_add_execution_to_flow(&tc, fid, &b).await;
     fcall_add_execution_to_flow(&tc, fid, &c).await;

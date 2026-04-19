@@ -153,14 +153,23 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
 
   local now_ms = server_time_ms()
 
-  -- 1. Validate flow exists and is not terminal. Validates-before-
-  --    writing: no redis.call() writes happen before these guards.
+  -- 1. Validate flow exists and is not terminal, and execution exists.
+  --    Validates-before-writing: no redis.call() writes happen before
+  --    these guards, so the error paths commit zero state (symmetric
+  --    with step 2's cross-flow guard on AlreadyMember).
   local raw = redis.call("HGETALL", K.flow_core)
   if #raw == 0 then return err("flow_not_found") end
   local flow = hgetall_to_table(raw)
   local pfs = flow.public_flow_state or ""
   if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
     return err("flow_already_terminal")
+  end
+  -- Execution must exist — otherwise step 5's HSET exec_core would
+  -- silently create a hash for a non-existent exec, leading to an
+  -- inconsistent members_set ↔ exec_core state. Symmetric with the
+  -- flow_not_found guard above.
+  if redis.call("EXISTS", K.exec_core) == 0 then
+    return err("execution_not_found")
   end
 
   -- Self-heal flow_index for LIVE flows only. The projector may have
@@ -173,12 +182,25 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   -- membership mutation below.
   redis.call("SADD", K.flow_index, A.flow_id)
 
-  -- 2. Idempotency: already a member. Still stamp exec_core.flow_id
-  --    defensively — an earlier call may have committed members_set
-  --    but crashed before exec_core HSET under the legacy two-phase
-  --    shape. Stamping here is a no-op if flow_id already matches;
-  --    heals any pre-RFC-011 orphans encountered on a rolling upgrade.
+  -- 2. Idempotency: already a member of THIS flow's members_set.
+  --    Still stamp exec_core.flow_id defensively — an earlier call
+  --    may have committed members_set but crashed before exec_core
+  --    HSET under the legacy two-phase shape. Stamping here is a
+  --    no-op if flow_id already matches; heals any pre-RFC-011
+  --    orphans encountered on a rolling upgrade.
+  --
+  --    Cross-flow guard on the orphan case: if exec_core.flow_id is
+  --    already set to a DIFFERENT flow (corrupted-state orphan that
+  --    IS in this flow's members_set but stamped wrong), refuse
+  --    instead of silently re-stamping. Symmetric with step 3's
+  --    guard on the not-yet-a-member branch — catches the same
+  --    invariant violation earlier in the path. Empty existing
+  --    flow_id goes through the heal path normally.
   if redis.call("SISMEMBER", K.members_set, A.execution_id) == 1 then
+    local existing = redis.call("HGET", K.exec_core, "flow_id")
+    if existing and existing ~= "" and existing ~= A.flow_id then
+      return err("already_member_of_different_flow:" .. existing)
+    end
     redis.call("HSET", K.exec_core, "flow_id", A.flow_id)
     local nc = redis.call("HGET", K.flow_core, "node_count") or "0"
     return ok_already_satisfied(A.execution_id, nc)
