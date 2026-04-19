@@ -407,6 +407,7 @@ dependencies = [
  "crc16",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -429,6 +430,8 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-script",
+ "reqwest",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

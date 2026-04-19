@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use ff_sdk::{ClaimedTask, FlowFabricWorker, WorkerConfig};
+use ff_sdk::{ClaimedTask, FlowFabricAdminClient, FlowFabricWorker, WorkerConfig};
 use media_pipeline::{EmbedResult, SummarizeResult, SUMMARY_CHAR_CAP};
 use tokio::sync::Mutex;
 
@@ -23,6 +23,14 @@ struct Args {
 
     #[arg(long, env = "FF_PORT", default_value_t = 6379)]
     port: u16,
+
+    /// ff-server base URL for the scheduler-routed claim path.
+    #[arg(long, env = "FF_SERVER_URL", default_value = "http://localhost:9090")]
+    server_url: String,
+
+    /// Optional bearer token for ff-server.
+    #[arg(long, env = "FF_API_TOKEN")]
+    api_token: Option<String>,
 
     #[arg(long, default_value = "default")]
     namespace: String,
@@ -83,6 +91,11 @@ async fn main() -> anyhow::Result<()> {
     config.capabilities = vec!["embed".into(), "minilm-l6".into()];
 
     let worker = FlowFabricWorker::connect(config).await?;
+    let admin = match args.api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(tok) => FlowFabricAdminClient::with_token(&args.server_url, tok)?,
+        None => FlowFabricAdminClient::new(&args.server_url)?,
+    };
+    let lane = ff_core::types::LaneId::new(&args.lane);
     tracing::info!(instance = %instance_id, "embed worker connected");
 
     let shutdown = shutdown_signal();
@@ -94,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("shutdown signal received");
                 break;
             }
-            result = worker.claim_next() => {
+            result = worker.claim_via_server(&admin, &lane, 10_000) => {
                 match result {
                     Ok(Some(task)) => {
                         let eid = task.execution_id().to_string();
@@ -104,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(None) => idle_sleep().await,
                     Err(e) => {
-                        tracing::error!(error = %e, "claim_next failed");
+                        tracing::error!(error = %e, "claim_via_server failed");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
