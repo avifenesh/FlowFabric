@@ -63,7 +63,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       valkey:
-        image: valkey/valkey:7.2
+        # Valkey >= 8.0 required by RFC-011 §13 (ff-server refuses to
+        # boot against 7.x). `valkey:latest` tracks current stable.
+        image: valkey/valkey:latest
         ports:
           - 6379:6379
         options: >-

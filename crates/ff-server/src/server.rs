@@ -2489,42 +2489,78 @@ const VERSION_CHECK_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
 /// Verify the connected Valkey reports `redis_version` ≥ 8.0.
 ///
-/// Sends `INFO server`, parses the `redis_version` field, and compares the
-/// major component. Retries on transient errors (connection refused mid-
-/// upgrade, parse-below-threshold) with exponential backoff capped at the
-/// rolling-upgrade budget. On exhaustion of the budget, returns the last
-/// typed error (either `ValkeyVersionTooLow` for a low-version response, or
-/// `ValkeyContext` for a transport error).
+/// Per RFC-011 §9.17, during a rolling upgrade the node we happen to connect
+/// to may temporarily be pre-upgrade while others are post-upgrade. The check
+/// tolerates this by retrying the whole verification (including low-version
+/// responses) with exponential backoff, capped at a 60s budget.
+///
+/// **Retries on:**
+/// - Low-version responses (`detected_major < REQUIRED_VALKEY_MAJOR`) — may
+///   resolve as the rolling upgrade progresses onto the connected node.
+/// - Retryable ferriskey transport errors — connection refused,
+///   `BusyLoadingError`, `ClusterDown`, etc., classified via
+///   `ff_script::retry::is_retryable_kind`.
+/// - Missing/unparsable `redis_version` — treated as transient (fresh-boot
+///   server may not have the field populated yet).
+///
+/// **Does NOT retry on:**
+/// - Non-retryable transport errors (auth failures, permission denied,
+///   invalid client config) — these are operator misconfiguration, not
+///   transient cluster state; fast-fail preserves a clear signal.
+///
+/// On budget exhaustion, returns the last observed error.
 async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
     let deadline = tokio::time::Instant::now() + VERSION_CHECK_RETRY_BUDGET;
     let mut backoff = Duration::from_millis(200);
     loop {
-        let transient_err = match query_valkey_version(client).await {
-            Ok(detected_major) if detected_major >= REQUIRED_VALKEY_MAJOR => {
-                tracing::info!(
-                    detected_major,
-                    required = REQUIRED_VALKEY_MAJOR,
-                    "Valkey version accepted"
-                );
-                return Ok(());
-            }
-            Ok(detected_major) => {
-                // Low version — not transient, don't retry. The cluster
-                // can't "grow" past this without operator action. Return
-                // immediately with a typed error.
-                return Err(ServerError::ValkeyVersionTooLow {
-                    detected: detected_major.to_string(),
-                    required: format!("{REQUIRED_VALKEY_MAJOR}.0"),
-                });
-            }
-            Err(e) => e,
-        };
+        let (should_retry, err_for_budget_exhaust, log_detail): (bool, ServerError, String) =
+            match query_valkey_version(client).await {
+                Ok(detected_major) if detected_major >= REQUIRED_VALKEY_MAJOR => {
+                    tracing::info!(
+                        detected_major,
+                        required = REQUIRED_VALKEY_MAJOR,
+                        "Valkey version accepted"
+                    );
+                    return Ok(());
+                }
+                Ok(detected_major) => (
+                    // Low version — may be a rolling-upgrade stale node.
+                    // Retry within budget; after exhaustion, the cluster
+                    // is misconfigured and fast-fail is the correct signal.
+                    true,
+                    ServerError::ValkeyVersionTooLow {
+                        detected: detected_major.to_string(),
+                        required: format!("{REQUIRED_VALKEY_MAJOR}.0"),
+                    },
+                    format!("detected_major={detected_major} < required={REQUIRED_VALKEY_MAJOR}"),
+                ),
+                Err(e) => {
+                    // Only retry if the underlying Valkey error is retryable
+                    // by kind. Auth / permission / invalid-config should fast-
+                    // fail so operators see the true root cause immediately,
+                    // not a 60s hang followed by a generic "transient" error.
+                    let retryable = e
+                        .valkey_kind()
+                        .map(ff_script::retry::is_retryable_kind)
+                        // Non-Valkey errors (parse, missing field, operation
+                        // failures) are treated as transient — a fresh-boot
+                        // Valkey may not have redis_version populated yet.
+                        .unwrap_or(true);
+                    let detail = e.to_string();
+                    (retryable, e, detail)
+                }
+            };
+
+        if !should_retry {
+            return Err(err_for_budget_exhaust);
+        }
         if tokio::time::Instant::now() >= deadline {
-            return Err(transient_err);
+            return Err(err_for_budget_exhaust);
         }
         tracing::warn!(
             backoff_ms = backoff.as_millis() as u64,
-            "valkey version check transient error; retrying"
+            detail = %log_detail,
+            "valkey version check transient failure; retrying"
         );
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -2557,13 +2593,17 @@ fn parse_valkey_major_version(info: &str) -> Result<u32, ServerError> {
             ServerError::OperationFailed(
                 "valkey version check: INFO missing redis_version".into(),
             )
-        })?;
-    let major_str = version_line.split('.').next().ok_or_else(|| {
-        ServerError::OperationFailed(format!(
-            "valkey version check: unparsable version '{version_line}'"
-        ))
-    })?;
-    major_str.trim().parse::<u32>().map_err(|_| {
+        })?
+        .trim();
+    // `split('.').next()` always returns Some; the real empty-input case
+    // surfaces as an empty major segment rather than None.
+    let major_str = version_line.split('.').next().unwrap_or("").trim();
+    if major_str.is_empty() {
+        return Err(ServerError::OperationFailed(format!(
+            "valkey version check: empty version field in '{version_line}'"
+        )));
+    }
+    major_str.parse::<u32>().map_err(|_| {
         ServerError::OperationFailed(format!(
             "valkey version check: non-numeric major in '{version_line}'"
         ))

@@ -16,7 +16,7 @@ operator responsible for the Valkey backend + FlowFabric server deployment.
 | `FF_PORT` | `6379` | Valkey port |
 | `FF_TLS` | unset | Set any value to enable TLS |
 | `FF_CLUSTER` | unset | Set any value to enable cluster mode |
-| `FF_FLOW_PARTITIONS` | `256` | **Was `FF_EXEC_PARTITIONS` pre-RFC-011**. Authoritative partition count for both flow and execution routing (hash-slot co-located). Must be a power of 2 in `[1, 16384]`. |
+| `FF_FLOW_PARTITIONS` | `256` | **Was `FF_EXEC_PARTITIONS` pre-RFC-011**. Authoritative partition count for both flow and execution routing (hash-slot co-located). Any positive `u16` value (1–65535); powers of 2 are not required by the implementation but are recommended for even hash-slot distribution. |
 | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
 | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
 
@@ -45,14 +45,24 @@ deployment, and it's what FlowFabric's integration tests pin.
 ### Rolling upgrade tolerance
 
 The version check includes a **60-second exponential-backoff retry budget**
-(RFC-011 §9.17). If the Valkey node is restarting mid-upgrade, transient
-connection-refused or network errors during the window are treated as
-retryable, not as a low-version signal. Backoff starts at 200ms and doubles up
-to a 5-second cap per attempt.
+(RFC-011 §9.17). During that window both error classes retry:
 
-**A low version response (7.x on the first successful INFO) is NOT retried** —
-the cluster can't grow past this without operator action, so the boot fails
-fast with the typed error.
+- **Transport transients** — connection refused, `BusyLoadingError`,
+  `ClusterDown`, etc. (Valkey error kinds classified as retryable).
+- **Low-version responses** — if the connected node happens to be a
+  pre-upgrade replica during a rolling upgrade, the 7.x response is treated
+  as a rolling-state transient and retried. After 60s of consistent low
+  responses, the server exits with `ServerError::ValkeyVersionTooLow` —
+  that's the misconfiguration signal, not a transient.
+
+Backoff starts at 200ms and doubles up to a 5-second cap per attempt.
+
+**Exception — fast-fail classes:** auth failures, permission denied, and
+invalid client config are **not** retried. These are operator
+misconfiguration (wrong credentials, wrong ACL, bad TLS config) and
+retrying them just hides the true cause under a 60s hang. Server boot fails
+immediately with the structured error and the underlying Valkey error kind
+preserved.
 
 ## Rolling upgrade procedure (Valkey 7.x → 8.0+)
 
@@ -63,9 +73,12 @@ fast with the typed error.
 2. **Upgrade Valkey node-by-node:**
    - If single-node standalone: stop ff-server briefly, upgrade Valkey, start
      ff-server. The 60s retry budget tolerates restart windows under that.
-   - If cluster: roll node-by-node. At any point during the roll, if ff-server
-     restarts and hits a 7.x node, it retries until that node upgrades or the
-     budget is exhausted. Keep the rolling window under 60s per node.
+   - If cluster: roll node-by-node. If ff-server restarts and connects to a
+     pre-upgrade (7.x) node while the roll is in progress, the version check
+     retries within the 60s budget; once the connected node completes its
+     upgrade (or a reconnect lands on a post-upgrade node), the check
+     succeeds. Keep the rolling window under 60s per node so the check
+     doesn't exhaust before the node ahead finishes.
 
 3. **Verify:** after the upgrade, ff-server boot log should emit
    `Valkey version accepted detected_major=8 required=8` at INFO level.
