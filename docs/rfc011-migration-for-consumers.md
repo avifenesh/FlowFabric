@@ -17,7 +17,7 @@ version floor, operator runbook, partition-collisions probe) is in flight.
 |---|---|---|
 | 1 | `ExecutionId` construction | 1 line per mint site |
 | 2 | `PartitionConfig` field rename | 1 line per field reference + env var rename |
-| 3 | Worker claim flow (replace `insecure-direct-claim`) | Rewrite `claim_next`-based code to grant-based path |
+| 3 | Worker claim flow (replace `direct-valkey-claim`) | Rewrite `claim_next`-based code to grant-based path |
 | 4 | `parse_report_usage_result` | Delete parallel parser, import FF's |
 | 5 | `usage_dedup_key` helper | Replace hardcoded `format!` sites |
 | 6 | Valkey 8.0 minimum (future, phase 5) | Upgrade Valkey if on 7.x |
@@ -122,10 +122,10 @@ constructs `Partition { family: PartitionFamily::Execution, ... }` continues
 to work; both variants produce the `{fp:N}` hash tag and route via
 `num_flow_partitions`.
 
-## Step 3 — Worker claim flow (replace `insecure-direct-claim`)
+## Step 3 — Worker claim flow (replace `direct-valkey-claim`)
 
 **FF change:** two new public entry points on `FlowFabricWorker` replace the
-`insecure-direct-claim` feature-gated direct-FCALL path. They acquire the
+`direct-valkey-claim` feature-gated direct-FCALL path. They acquire the
 worker's concurrency permit before the FCALL so a saturated worker never
 consumes a grant.
 
@@ -190,14 +190,14 @@ match worker.claim_from_grant(lane.clone(), grant).await {
 `use_claim_resumed_execution`. The reclaim grant flow is symmetric.
 
 **New error variant:** `SdkError::WorkerAtCapacity` is retryable. The old
-`insecure-direct-claim` path returned `Ok(None)` on saturation; the new path
+`direct-valkey-claim` path returned `Ok(None)` on saturation; the new path
 returns `Err(WorkerAtCapacity)` with `is_retryable() == true` so callers can
 opt into structured retry. Both `claim_from_grant` and
 `claim_from_reclaim_grant` return this variant under saturation.
 
 **Retiring the feature flag:** after this step, your crate can drop
-`insecure-direct-claim` from its `ff-sdk` feature list and the associated
-`#[cfg(feature = "insecure-direct-claim")]` branches. The ungated grant path
+`direct-valkey-claim` from its `ff-sdk` feature list and the associated
+`#[cfg(feature = "direct-valkey-claim")]` branches. The ungated grant path
 is always available.
 
 ## Step 4 — `parse_report_usage_result` (drop your parallel parser)
@@ -294,7 +294,7 @@ grep -rn 'num_execution_partitions\|FF_EXEC_PARTITIONS' src/
 grep -rn 'ff:usagededup:' src/
 # expect: zero raw format! sites (helper uses are fine)
 
-grep -rn '"insecure-direct-claim"' Cargo.toml
+grep -rn '"direct-valkey-claim"' Cargo.toml
 # expect: feature flag removed from your ff-sdk dep
 
 # 2. Build + test

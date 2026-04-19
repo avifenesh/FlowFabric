@@ -20,7 +20,7 @@ ff-core = { workspace = true }
 ff-engine = { workspace = true }
 ff-scheduler = { workspace = true }
 ff-script = { workspace = true }
-ff-sdk = { workspace = true, features = ["insecure-direct-claim"] }
+ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
 ferriskey = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

@@ -11,7 +11,7 @@ categories.workspace = true
 description = "FlowFabric worker SDK — public API for worker authors"
 
 [features]
-insecure-direct-claim = []
+direct-valkey-claim = []
 
 # Re-exports of ferriskey feature flags. Consumers opt in on ff-sdk and
 # the flag propagates to the underlying ferriskey crate. OFF by default

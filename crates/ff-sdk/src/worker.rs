@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-#[cfg(feature = "insecure-direct-claim")]
+#[cfg(feature = "direct-valkey-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,15 +17,20 @@ use crate::SdkError;
 /// FlowFabric worker — connects to Valkey, claims executions, and provides
 /// the worker-facing API.
 ///
-/// # Admission Control
+/// # Admission control
 ///
-/// **`claim_next()` bypasses budget and quota admission checks.** The SDK's
-/// inline claim path reads the eligible ZSET directly and issues claim grants
-/// without consulting budget (`{b:M}`) or quota (`{q:K}`) policies. In
-/// production deployments, use the Scheduler (`ff-scheduler`) which enforces
-/// admission control (budget breach check, quota sliding-window check,
-/// concurrency cap) before issuing claim grants. The SDK's inline claim is
-/// suitable for trusted workers, development, and testing.
+/// `claim_next()` lives behind the `direct-valkey-claim` feature flag and
+/// **bypasses the scheduler's admission controls**: it reads the eligible
+/// ZSET directly and mints its own claim grant without consulting budget
+/// (`{b:M}`) or quota (`{q:K}`) policies. Default-off. Intended for
+/// benchmarks, tests, and single-tenant development where the scheduler
+/// hop is measurement noise, not for production.
+///
+/// For production deployments, go through the scheduler's HTTP claim
+/// endpoint instead (see [`FlowFabricWorker::claim_via_server`] in the
+/// follow-up PR). The scheduler enforces budget breach, quota
+/// sliding-window, concurrency cap, and capability-match checks before
+/// issuing grants.
 ///
 /// # Usage
 ///
@@ -53,15 +58,15 @@ pub struct FlowFabricWorker {
     /// `ff_issue_claim_grant` on every claim. BTreeSet sorting is critical:
     /// Lua's `ff_issue_claim_grant` relies on a stable CSV form for
     /// reproducible logs and tests.
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     worker_capabilities_csv: String,
     /// 8-hex FNV-1a digest of `worker_capabilities_csv`. Used in
     /// per-mismatch logs so the 4KB CSV never echoes on every reject
     /// during an incident. Full CSV logged once at connect-time WARN for
     /// cross-reference. Mirrors `ff-scheduler::claim::worker_caps_digest`.
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     worker_capabilities_hash: String,
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     lane_index: AtomicUsize,
     /// Concurrency cap for in-flight tasks. Permits are acquired or
     /// transferred by [`claim_next`] (feature-gated),
@@ -85,14 +90,14 @@ pub struct FlowFabricWorker {
     /// targets (wasm32, i686) `usize` is `u32` and wraps after ~4 years
     /// at 1 poll/sec — acceptable; on wrap, the modulo preserves
     /// correctness because the sequence simply restarts a new cycle.
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     scan_cursor: AtomicUsize,
 }
 
 /// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
 /// load at O(PARTITION_SCAN_CHUNK) per worker-second instead of
 /// O(num_flow_partitions).
-#[cfg(feature = "insecure-direct-claim")]
+#[cfg(feature = "direct-valkey-claim")]
 const PARTITION_SCAN_CHUNK: usize = 32;
 
 impl FlowFabricWorker {
@@ -213,7 +218,7 @@ impl FlowFabricWorker {
             "FlowFabricWorker connected"
         );
 
-        #[cfg(feature = "insecure-direct-claim")]
+        #[cfg(feature = "direct-valkey-claim")]
         let scan_cursor_init = scan_cursor_seed(
             config.worker_instance_id.as_str(),
             partition_config.num_flow_partitions.max(1) as usize,
@@ -235,7 +240,7 @@ impl FlowFabricWorker {
         //     loudly at connect instead of silently mis-routing forever.
         // Reject at boot so operator misconfig is loud, symmetric with the
         // scheduler path.
-        #[cfg(feature = "insecure-direct-claim")]
+        #[cfg(feature = "direct-valkey-claim")]
         for cap in &config.capabilities {
             if cap.is_empty() {
                 return Err(SdkError::Config(
@@ -260,7 +265,7 @@ impl FlowFabricWorker {
                 )));
             }
         }
-        #[cfg(feature = "insecure-direct-claim")]
+        #[cfg(feature = "direct-valkey-claim")]
         let worker_capabilities_csv: String = {
             let set: std::collections::BTreeSet<&str> = config
                 .capabilities
@@ -291,12 +296,12 @@ impl FlowFabricWorker {
         // CSV. Shared helper — ff-scheduler uses the same one for its
         // own per-mismatch logs, so cross-component log lines are
         // diffable against each other.
-        #[cfg(feature = "insecure-direct-claim")]
+        #[cfg(feature = "direct-valkey-claim")]
         let worker_capabilities_hash = ff_core::hash::fnv1a_xor8hex(&worker_capabilities_csv);
 
         // Full CSV logged once at connect so per-mismatch logs (which
         // carry only the 8-hex hash) can be cross-referenced by ops.
-        #[cfg(feature = "insecure-direct-claim")]
+        #[cfg(feature = "direct-valkey-claim")]
         if !worker_capabilities_csv.is_empty() {
             tracing::info!(
                 worker_instance_id = %config.worker_instance_id,
@@ -338,7 +343,7 @@ impl FlowFabricWorker {
         // `budget_policies_index` / `flow_index` / `deps_all_edges`:
         // operations stay atomic per command, the index is the
         // cluster-wide enumeration surface.
-        #[cfg(feature = "insecure-direct-claim")]
+        #[cfg(feature = "direct-valkey-claim")]
         {
             let caps_key = ff_core::keys::worker_caps_key(&config.worker_instance_id);
             let index_key = ff_core::keys::workers_index_key();
@@ -398,14 +403,14 @@ impl FlowFabricWorker {
             client,
             config,
             partition_config,
-            #[cfg(feature = "insecure-direct-claim")]
+            #[cfg(feature = "direct-valkey-claim")]
             worker_capabilities_csv,
-            #[cfg(feature = "insecure-direct-claim")]
+            #[cfg(feature = "direct-valkey-claim")]
             worker_capabilities_hash,
-            #[cfg(feature = "insecure-direct-claim")]
+            #[cfg(feature = "direct-valkey-claim")]
             lane_index: AtomicUsize::new(0),
             concurrency_semaphore,
-            #[cfg(feature = "insecure-direct-claim")]
+            #[cfg(feature = "direct-valkey-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
         })
     }
@@ -439,9 +444,12 @@ impl FlowFabricWorker {
     /// 4. Read execution payload + tags
     /// 5. Return a [`ClaimedTask`] with auto lease renewal
     ///
-    /// **This bypasses budget/quota admission control.** Use the Scheduler
-    /// (`ff-scheduler`) for production deployments. Enable with:
-    /// `ff-sdk = { ..., features = ["insecure-direct-claim"] }`
+    /// Gated behind the `direct-valkey-claim` feature — bypasses the
+    /// scheduler's budget / quota / capability admission checks. Enable
+    /// with `ff-sdk = { ..., features = ["direct-valkey-claim"] }` when
+    /// the scheduler hop would be measurement noise (benches) or when
+    /// the test harness needs a deterministic worker-local path. Prefer
+    /// the scheduler-routed HTTP claim path in production.
     ///
     /// # `None` semantics
     ///
@@ -458,7 +466,7 @@ impl FlowFabricWorker {
     /// when work lives on partitions outside the current window.
     ///
     /// Returns `Err` on Valkey errors or script failures.
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {
         // Enforce max_concurrent_tasks: try to acquire a semaphore permit.
         // try_acquire returns immediately — if no permits available, the worker
@@ -618,7 +626,7 @@ impl FlowFabricWorker {
         Ok(None)
     }
 
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     async fn issue_claim_grant(
         &self,
         execution_id: &ExecutionId,
@@ -674,7 +682,7 @@ impl FlowFabricWorker {
     /// already went terminal between pick and block) are logged and the
     /// outer loop simply `continue`s to the next partition. Parity with
     /// ff-scheduler::Scheduler::block_candidate.
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     async fn block_route(
         &self,
         execution_id: &ExecutionId,
@@ -729,7 +737,7 @@ impl FlowFabricWorker {
     /// `ff_claim_execution` and returns a `ClaimedTask` with auto
     /// lease renewal.
     ///
-    /// Previously gated behind `insecure-direct-claim`; ungated so
+    /// Previously gated behind `direct-valkey-claim`; ungated so
     /// the public [`claim_from_grant`] entry point can reuse the
     /// same FCALL plumbing. The method stays private — external
     /// callers use `claim_from_grant`.
@@ -903,7 +911,7 @@ impl FlowFabricWorker {
     /// this worker. The intended production entry point: pair with
     /// [`ff_scheduler::Scheduler::claim_for_worker`] to flow
     /// scheduler-issued grants into the SDK without enabling the
-    /// `insecure-direct-claim` feature (which bypasses budget/quota
+    /// `direct-valkey-claim` feature (which bypasses budget/quota
     /// admission control).
     ///
     /// The worker's concurrency semaphore is checked BEFORE the FCALL
@@ -1045,7 +1053,7 @@ impl FlowFabricWorker {
     /// Low-level resume claim. Invokes `ff_claim_resumed_execution`
     /// and returns a `ClaimedTask` bound to the resumed attempt.
     ///
-    /// Previously gated behind `insecure-direct-claim`; ungated so the
+    /// Previously gated behind `direct-valkey-claim`; ungated so the
     /// public [`claim_from_reclaim_grant`] entry point can reuse it.
     /// The method stays private — external callers use
     /// `claim_from_reclaim_grant`.
@@ -1197,7 +1205,7 @@ impl FlowFabricWorker {
     }
 
     /// Read payload + execution_kind + tags from exec_core. Previously
-    /// gated behind `insecure-direct-claim`; now shared by the
+    /// gated behind `direct-valkey-claim`; now shared by the
     /// feature-gated inline claim path and the public
     /// `claim_from_reclaim_grant` entry point.
     async fn read_execution_context(
@@ -1336,14 +1344,14 @@ impl FlowFabricWorker {
         crate::task::parse_signal_result(&raw)
     }
 
-    #[cfg(feature = "insecure-direct-claim")]
+    #[cfg(feature = "direct-valkey-claim")]
     fn next_lane(&self) -> LaneId {
         let idx = self.lane_index.fetch_add(1, Ordering::Relaxed) % self.config.lanes.len();
         self.config.lanes[idx].clone()
     }
 }
 
-#[cfg(feature = "insecure-direct-claim")]
+#[cfg(feature = "direct-valkey-claim")]
 fn is_retryable_claim_error(err: &ff_script::error::ScriptError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
@@ -1356,7 +1364,7 @@ fn is_retryable_claim_error(err: &ff_script::error::ScriptError) -> bool {
 /// instance id with FNV-1a to place distinct worker processes on different
 /// partition windows from their first poll. Zero is valid for single-worker
 /// clusters but spreads work in multi-worker deployments.
-#[cfg(feature = "insecure-direct-claim")]
+#[cfg(feature = "direct-valkey-claim")]
 fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
     if num_partitions == 0 {
         return 0;
@@ -1364,7 +1372,7 @@ fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
     (ff_core::hash::fnv1a_u64(worker_instance_id.as_bytes()) as usize) % num_partitions
 }
 
-#[cfg(feature = "insecure-direct-claim")]
+#[cfg(feature = "direct-valkey-claim")]
 fn extract_first_array_string(value: &Value) -> Option<String> {
     match value {
         Value::Array(arr) if !arr.is_empty() => match &arr[0] {
@@ -1406,7 +1414,7 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
     })
 }
 
-#[cfg(all(test, feature = "insecure-direct-claim"))]
+#[cfg(all(test, feature = "direct-valkey-claim"))]
 mod scan_cursor_tests {
     use super::scan_cursor_seed;
 
