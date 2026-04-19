@@ -124,6 +124,12 @@ to work; both variants produce the `{fp:N}` hash tag and route via
 
 ## Step 3 — Worker claim flow (replace `direct-valkey-claim`)
 
+> **Rename note:** the feature flag previously named
+> `insecure-direct-claim` was hard-renamed to `direct-valkey-claim`
+> (see Batch C PR-A). If your `Cargo.toml` or source still references
+> `insecure-direct-claim`, update to `direct-valkey-claim` before
+> following the rest of this step.
+
 **FF change:** two new public entry points on `FlowFabricWorker` replace the
 `direct-valkey-claim` feature-gated direct-FCALL path. They acquire the
 worker's concurrency permit before the FCALL so a saturated worker never
@@ -294,8 +300,10 @@ grep -rn 'num_execution_partitions\|FF_EXEC_PARTITIONS' src/
 grep -rn 'ff:usagededup:' src/
 # expect: zero raw format! sites (helper uses are fine)
 
-grep -rn '"direct-valkey-claim"' Cargo.toml
-# expect: feature flag removed from your ff-sdk dep
+grep -rnE '"(direct-valkey-claim|insecure-direct-claim)"' Cargo.toml
+# expect: both names removed from your ff-sdk dep
+# (insecure-direct-claim was the pre-Batch-C name; direct-valkey-claim
+#  is its post-rename form — neither should survive this migration.)
 
 # 2. Build + test
 cargo check --workspace

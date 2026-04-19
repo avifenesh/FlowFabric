@@ -26,11 +26,10 @@ use crate::SdkError;
 /// benchmarks, tests, and single-tenant development where the scheduler
 /// hop is measurement noise, not for production.
 ///
-/// For production deployments, go through the scheduler's HTTP claim
-/// endpoint instead (see [`FlowFabricWorker::claim_via_server`] in the
-/// follow-up PR). The scheduler enforces budget breach, quota
-/// sliding-window, concurrency cap, and capability-match checks before
-/// issuing grants.
+/// For production deployments, consume scheduler-issued grants via
+/// [`FlowFabricWorker::claim_from_grant`] — the scheduler enforces
+/// budget breach, quota sliding-window, concurrency cap, and
+/// capability-match checks before issuing grants.
 ///
 /// # Usage
 ///
