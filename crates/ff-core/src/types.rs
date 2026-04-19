@@ -96,9 +96,12 @@ macro_rules! string_id {
 ///
 /// String-backed shape `{fp:N}:<uuid>` where `fp:N` is the Valkey
 /// hash-tag for the flow partition this execution co-locates with, and
-/// `<uuid>` is a UUIDv4 for intra-partition uniqueness. Construct via
-/// [`ExecutionId::for_flow`] (known parent flow) or [`ExecutionId::solo`]
-/// (no parent flow; per-lane synthetic shard).
+/// `<uuid>` is an opaque 128-bit identifier for intra-partition
+/// uniqueness. [`ExecutionId::for_flow`] / [`ExecutionId::solo`] mint a
+/// UUIDv4; [`ExecutionId::deterministic_for_flow`] /
+/// [`ExecutionId::deterministic_solo`] accept any caller-supplied
+/// `Uuid` without version or shape strictness — the caller owns the
+/// derivation scheme.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ExecutionId(String);
@@ -749,20 +752,20 @@ mod tests {
             num_budget_partitions: 32,
             num_quota_partitions: 32,
         };
-        let u = Uuid::new_v4();
-        // Try several flow ids — at least one must differ. Using the same
-        // fid under the two configs could collide (4 divides 256), but
-        // across distinct fids the hash-tags must not be uniformly equal.
-        let mut any_diff = false;
-        for _ in 0..16 {
-            let fid = FlowId::new();
+        // Deterministic search across a fixed byte-pattern set of flow ids
+        // so the test outcome does not depend on RNG. 4 divides 256 so the
+        // same fid *could* collide across configs; across 256 varied fids
+        // the hash-tags cannot be uniformly equal.
+        let u = Uuid::from_bytes([0x5a; 16]);
+        let any_diff = (0u8..=u8::MAX).any(|i| {
+            let mut bytes = [0u8; 16];
+            bytes[0] = i;
+            bytes[15] = i.wrapping_mul(31).wrapping_add(17);
+            let fid = FlowId::from_uuid(Uuid::from_bytes(bytes));
             let a = ExecutionId::deterministic_for_flow(&fid, &small, u);
             let b = ExecutionId::deterministic_for_flow(&fid, &big, u);
-            if a.partition() != b.partition() {
-                any_diff = true;
-                break;
-            }
-        }
+            a.partition() != b.partition()
+        });
         assert!(any_diff, "partition resize should change at least one id");
     }
 
