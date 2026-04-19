@@ -126,6 +126,27 @@ impl TestCluster {
         ExecutionId::solo(&self.test_lane(), &self.config)
     }
 
+    /// Generate a fresh ExecutionId pinned to a specific partition index.
+    ///
+    /// Test-only escape hatch for fixtures that hard-code a flow partition
+    /// (e.g. `fcall_create_flow` + `fcall_add_execution_to_flow` in
+    /// `e2e_lifecycle.rs` write to the `{fp:0}` slot regardless of
+    /// `flow_partition(fid)` routing). Post-RFC-011 phase-3 the atomic
+    /// `ff_add_execution_to_flow` FCALL takes `exec_core` as KEYS[4] and
+    /// requires the exec's hash-tag to match the flow's — so these tests
+    /// need a way to pin the exec to a chosen partition index rather
+    /// than routing it via the lane-solo partitioner.
+    ///
+    /// This is NOT a general mint path. Production code must use
+    /// `ExecutionId::for_flow` (flow-co-location) or `ExecutionId::solo`
+    /// (lane-solo). The `{fp:N}:<uuid>` escape hatch stays inside
+    /// `crates/ff-test` per RFC-011 §5.6 ("pluggable trait is the stable
+    /// contract, not the mint function").
+    pub fn new_execution_id_on_partition(&self, index: u16) -> ExecutionId {
+        let raw = format!("{{fp:{index}}}:{}", uuid::Uuid::new_v4());
+        ExecutionId::parse(&raw).expect("synthetic exec id must parse")
+    }
+
     /// Current timestamp.
     pub fn now(&self) -> TimestampMs {
         TimestampMs::now()

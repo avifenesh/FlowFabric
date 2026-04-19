@@ -331,6 +331,21 @@ the repo from today through RFC-011 phase 3. Readers auditing the
 atomicity story should treat RFC-011 as the load-bearing artifact and
 this §4 amendment as its transitional prelude.
 
+**LANDED (2026-04-18, W2, phase 3):** `ff_add_execution_to_flow` is
+now atomic. Single FCALL with KEYS[4]=exec_core co-located on the
+same `{fp:N}` slot as flow_core/members_set/flow_index. Both the
+membership SADD and the `exec_core.flow_id` HSET commit atomically
+or neither does (validates-before-writing Lua discipline). The two-
+phase contract documented above is retired; the post-FCALL Rust HSET
+at `crates/ff-server/src/server.rs` is deleted. Interim safety-net
+prose on the Lua function docstring, the Rust method rustdoc, and
+the reader-invariant comments at `describe_execution` +
+`replay_execution` are rewritten to reference the atomic invariant
+via RFC-011 §7.3 instead of the superseded two-phase reader-safety
+catalogue. Issue #21 is closed as superseded. See phase-3 merge
+commit for the full diff; see `crates/ff-test/tests/e2e_flow_atomicity.rs`
+for the 5 atomicity tests pinning the invariants.
+
 **Not bridge-event related. No cairn-side work.**
 
 ## §5 Recommendations
@@ -344,7 +359,7 @@ Per-gap summary, owner assignment, and rationale.
 | §1.3 FF-initiated timeout expiry runnable-branch (`ff_expire_execution` L1464) | YES   | **FF + cairn** | FF: add symmetric `lease_history` `expired` XADD in the runnable branch (matches active/suspended branches already doing it). Cairn: same subscription as §1.1, additional mapping for `expired` frames without a prior `lease_acquired`. |
 | §1.4 Scanner promotions (delayed/blocked → eligible)       | NO          | —         | Intentional silence. Scheduling-tick transitions; cairn sees the eventual claim.                                                 |
 | §1.5 Admission block (`ff_block_execution_for_admission`)  | NO          | —         | Intentional silence (at time of writing). Cairn has no `ExecutionRateLimited` variant.                                           |
-| §5.5 Non-FCALL `flow_id` HSET (server.rs:1279)             | YES (atomicity, not emit) | **FF** | Cross-slot constraint rules out single-FCALL fix. Document two-phase contract in `lua/flow.lua` + `server.rs:1240-1320` + reader-side invariants at `server.rs:1895-1910` and `server.rs:2080-2115`; file reconciliation-scanner ticket. **See §4 amendment.** |
+| §5.5 Non-FCALL `flow_id` HSET (server.rs:1279)             | **CLOSED** (landed phase 3) | **FF** | RFC-011 §7.3 landed the atomic single-FCALL shape. exec_core co-locates with flow_core on `{fp:N}`; `ff_add_execution_to_flow` now writes both atomically in one FCALL body. Two-phase contract retired; issue #21 closed as superseded. See §4 LANDED block + `crates/ff-test/tests/e2e_flow_atomicity.rs`. |
 
 ### Summary
 

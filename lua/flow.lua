@@ -111,62 +111,36 @@ redis.register_function('ff_create_flow', function(keys, args)
 end)
 
 ---------------------------------------------------------------------------
--- ff_add_execution_to_flow  (on {fp:N} ONLY)
+-- ff_add_execution_to_flow  (on {fp:N} — single atomic FCALL)
 --
--- Add a member execution to a flow. Does NOT set flow_id on exec_core
--- (that's on {p:N}, caller must do it separately).
+-- Add a member execution to a flow AND stamp the flow_id back-pointer
+-- on exec_core in one atomic commit. Per RFC-011 §7.3, exec keys
+-- co-locate with their parent flow's partition under hash-tag routing,
+-- so exec_core shares the `{fp:N}` hash-tag with flow_core / members_set
+-- / flow_index. All four KEYS hash to the same slot; no CROSSSLOT.
 --
--- KEYS (3): flow_core, members_set, flow_index
+-- KEYS (4): flow_core, members_set, flow_index, exec_core
 -- ARGV (3): flow_id, execution_id, now_ms (IGNORED — server time used)
 --
--- ── TWO-PHASE CONTRACT (cairn P3.6 §5.5) ────────────────────────────────
--- exec_core lives on {p:N} (execution-partition), this FCALL runs on
--- {fp:N} (flow-partition). Valkey functions are single-slot; we CANNOT
--- touch exec_core from here without a CROSSSLOT failure on a clustered
--- deploy. The caller (ff-server `add_execution_to_flow`, crates/ff-server
--- /src/server.rs:1240-1320) therefore runs this FCALL first and then
--- issues an `HSET exec_core flow_id = <flow_id>` as a separate command.
+-- Validates-before-writing: flow_not_found / flow_already_terminal
+-- early-returns fire BEFORE any write (step 1 below). On those error
+-- paths, zero state mutates — atomicity by construction at the Lua
+-- level (Valkey scripting contract: no redis.call() before error_reply
+-- means nothing to roll back). See RFC-011 §7.3.1 tests for the
+-- structural pin.
 --
--- Orphan window:
---   Phase 1 (this FCALL) succeeds → flow_core/members_set/flow_index on
---   {fp:N} all reflect the new membership and the exec_core on {p:N}
---   does NOT yet carry flow_id.
---   If the server crashes before phase 2 (HSET), exec_core.flow_id stays
---   empty while the flow lists the exec as a member. The orphan is in
---   the "flow says yes, exec says nothing" direction only.
---
--- Reader safety:
---   * flow_core → members_set → exec_core readers (projector,
---     cancel_flow member dispatch): SAFE. They iterate members_set and
---     operate on each exec regardless of whether exec_core.flow_id is
---     stamped — the flow side is the authoritative direction for
---     membership.
---   * exec_core.flow_id → flow_core readers
---     (`describe_execution` at server.rs:1895-1910, `replay_execution`
---     at server.rs:2080-2115): SAFE against the orphan. An empty
---     flow_id is treated as "no flow affinity known at read time" and
---     filtered via `.filter(|s| !s.is_empty())` — the read returns the
---     exec's intrinsic fields and omits the flow link; a subsequent
---     read after phase 2 completes returns the link.
---   * Joint-consistency readers ("list all members of flow X AND
---     confirm each exec's exec_core.flow_id == X"): UNSAFE during the
---     orphan window. No reader in this repo does that today; if one is
---     added, it must either (a) tolerate empty flow_id on the exec
---     side for newly-added members, or (b) wait on the reconciliation
---     scanner (see below).
---
--- Crash-recovery plan: a reconciliation scanner is tracked as issue
--- #21 (see also the §4 amendment of
--- `benches/perf-invest/bridge-event-gap-report.md`). The scanner walks
--- flow_index → members_set → exec_core, re-stamping flow_id on any
--- exec_core hash where it's empty or mismatched. Rotation-idempotent
--- (same flow_id + same exec_core → no-op).
+-- Invariant (post-RFC-011): a successful call commits BOTH the flow-
+-- index updates AND the exec_core.flow_id stamp in one atomic unit.
+-- Readers can assume exec_core.flow_id == flow_id iff the exec is in
+-- members_set. The pre-RFC-011 two-phase contract + §5.5 orphan-window
+-- + issue #21 reconciliation-scanner plan are all superseded.
 ---------------------------------------------------------------------------
 redis.register_function('ff_add_execution_to_flow', function(keys, args)
   local K = {
     flow_core   = keys[1],
     members_set = keys[2],
     flow_index  = keys[3],
+    exec_core   = keys[4],
   }
 
   local A = {
@@ -179,13 +153,23 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
 
   local now_ms = server_time_ms()
 
-  -- 1. Validate flow exists and is not terminal
+  -- 1. Validate flow exists and is not terminal, and execution exists.
+  --    Validates-before-writing: no redis.call() writes happen before
+  --    these guards, so the error paths commit zero state (symmetric
+  --    with step 2's cross-flow guard on AlreadyMember).
   local raw = redis.call("HGETALL", K.flow_core)
   if #raw == 0 then return err("flow_not_found") end
   local flow = hgetall_to_table(raw)
   local pfs = flow.public_flow_state or ""
   if pfs == "cancelled" or pfs == "completed" or pfs == "failed" then
     return err("flow_already_terminal")
+  end
+  -- Execution must exist — otherwise step 5's HSET exec_core would
+  -- silently create a hash for a non-existent exec, leading to an
+  -- inconsistent members_set ↔ exec_core state. Symmetric with the
+  -- flow_not_found guard above.
+  if redis.call("EXISTS", K.exec_core) == 0 then
+    return err("execution_not_found")
   end
 
   -- Self-heal flow_index for LIVE flows only. The projector may have
@@ -198,16 +182,48 @@ redis.register_function('ff_add_execution_to_flow', function(keys, args)
   -- membership mutation below.
   redis.call("SADD", K.flow_index, A.flow_id)
 
-  -- 2. Idempotency: already a member
+  -- 2. Idempotency: already a member of THIS flow's members_set.
+  --    Still stamp exec_core.flow_id defensively — an earlier call
+  --    may have committed members_set but crashed before exec_core
+  --    HSET under the legacy two-phase shape. Stamping here is a
+  --    no-op if flow_id already matches; heals any pre-RFC-011
+  --    orphans encountered on a rolling upgrade.
+  --
+  --    Cross-flow guard on the orphan case: if exec_core.flow_id is
+  --    already set to a DIFFERENT flow (corrupted-state orphan that
+  --    IS in this flow's members_set but stamped wrong), refuse
+  --    instead of silently re-stamping. Symmetric with step 3's
+  --    guard on the not-yet-a-member branch — catches the same
+  --    invariant violation earlier in the path. Empty existing
+  --    flow_id goes through the heal path normally.
   if redis.call("SISMEMBER", K.members_set, A.execution_id) == 1 then
+    local existing = redis.call("HGET", K.exec_core, "flow_id")
+    if existing and existing ~= "" and existing ~= A.flow_id then
+      return err("already_member_of_different_flow:" .. existing)
+    end
+    redis.call("HSET", K.exec_core, "flow_id", A.flow_id)
     local nc = redis.call("HGET", K.flow_core, "node_count") or "0"
     return ok_already_satisfied(A.execution_id, nc)
   end
 
-  -- 3. Add to membership set
+  -- 3. Cross-flow guard: if exec_core.flow_id is already set to a
+  --    DIFFERENT flow, refuse — silently re-stamping would orphan
+  --    the other flow's accounting. An exec belongs to at most one
+  --    flow at a time per RFC-007.
+  local existing_flow_id = redis.call("HGET", K.exec_core, "flow_id")
+  if existing_flow_id and existing_flow_id ~= "" and existing_flow_id ~= A.flow_id then
+    return err("already_member_of_different_flow:" .. existing_flow_id)
+  end
+
+  -- 4. Add to membership set
   redis.call("SADD", K.members_set, A.execution_id)
 
-  -- 4. Increment node_count and graph_revision
+  -- 5. Stamp the flow_id back-pointer on exec_core. Co-located with
+  --    the flow's partition under RFC-011 §7.3 hash-tag routing; this
+  --    HSET is part of the same atomic FCALL as the SADD above.
+  redis.call("HSET", K.exec_core, "flow_id", A.flow_id)
+
+  -- 6. Increment node_count and graph_revision
   local new_nc = redis.call("HINCRBY", K.flow_core, "node_count", 1)
   local new_rev = redis.call("HINCRBY", K.flow_core, "graph_revision", 1)
   redis.call("HSET", K.flow_core, "last_mutation_at", now_ms)

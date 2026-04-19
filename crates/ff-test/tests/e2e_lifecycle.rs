@@ -3222,14 +3222,31 @@ async fn fcall_create_flow(tc: &TestCluster, flow_id: &str) -> String {
 }
 
 /// FCALL ff_add_execution_to_flow — returns (eid_or_status, node_count).
+///
+/// Post-RFC-011 phase-3: FCALL is an atomic single-commit and takes
+/// exec_core as KEYS[4]. `execution_id` MUST be pinned to the same
+/// partition as this helper's hardcoded `{fp:0}` flow partition —
+/// mint via `tc.new_execution_id_on_partition(0)`. Passing a solo-
+/// routed exec whose hash-tag ≠ `{fp:0}` fails (cross-slot on cluster,
+/// Lua-lib error on standalone when the exec_core key lives in a
+/// different logical partition index).
 async fn fcall_add_execution_to_flow(
     tc: &TestCluster, flow_id: &str, execution_id: &ExecutionId,
 ) -> (String, String) {
     let prefix = format!("ff:flow:{{fp:0}}:{flow_id}");
+    // exec_core co-located with {fp:0} per the mint-side contract
+    // above. Construct via ExecKeyContext so the key format matches
+    // production (ff:exec:{fp:N}:<eid>:core).
+    let exec_partition = ff_core::partition::execution_partition(
+        execution_id,
+        tc.partition_config(),
+    );
+    let ectx = ff_core::keys::ExecKeyContext::new(&exec_partition, execution_id);
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
         "ff:idx:{fp:0}:flow_index".to_string(),
+        ectx.core(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3281,12 +3298,35 @@ async fn fcall_cancel_flow(
 }
 
 /// Higher-level helper: create flow + add members + set flow_id on exec_core.
+///
+/// Post-RFC-011 phase-3: `ff_add_execution_to_flow`'s step-1 guard
+/// requires exec_core to exist (`EXISTS K.exec_core`). Pre-seed a
+/// minimal exec_core hash before calling the FCALL.
 async fn setup_flow_via_fcall(tc: &TestCluster, flow_id: &str, members: &[&ExecutionId]) {
     fcall_create_flow(tc, flow_id).await;
     for eid in members {
+        ensure_exec_core_exists(tc, eid).await;
         fcall_add_execution_to_flow(tc, flow_id, eid).await;
         set_flow_id_on_exec(tc, eid, flow_id).await;
     }
+}
+
+/// Minimal exec_core row creator for tests that skip the full
+/// `ff_create_execution` FCALL surface. HSETs a single field so
+/// `EXISTS` returns true; sufficient for the post-phase-3
+/// `ff_add_execution_to_flow` exec-existence guard. Idempotent.
+async fn ensure_exec_core_exists(tc: &TestCluster, eid: &ExecutionId) {
+    let config = test_config();
+    let partition = execution_partition(eid, &config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    tc.client()
+        .cmd("HSET")
+        .arg(ctx.core())
+        .arg("execution_id")
+        .arg(eid.to_string())
+        .execute::<i64>()
+        .await
+        .expect("HSET minimal exec_core");
 }
 
 async fn fcall_apply_dependency(
@@ -3355,9 +3395,9 @@ async fn test_flow_linear_chain() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-chain";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let c = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_bc = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "chain_a", 0).await;
@@ -3405,9 +3445,9 @@ async fn test_flow_fan_out() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-fanout";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let c = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_ac = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fo_a", 0).await;
@@ -3432,9 +3472,9 @@ async fn test_flow_dependency_failure_propagation() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-fail";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let c = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_bc = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fp_a", 0).await;
@@ -3471,8 +3511,8 @@ async fn test_flow_resolve_idempotency() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-idem";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "ri_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "ri_b", 0).await;
@@ -3495,8 +3535,8 @@ async fn test_flow_with_execution_lifecycle() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-full";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     fcall_create_execution(&tc, &a, NS, LANE, "fl_a", 0).await;
     fcall_create_execution(&tc, &b, NS, LANE, "fl_b", 0).await;
@@ -3532,8 +3572,8 @@ async fn test_flow_replay_after_skip() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     let fid = "flow-replay";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     let config = test_config();
 
@@ -4819,9 +4859,9 @@ async fn test_flow_full_lifecycle_with_staging() {
     tc.cleanup().await;
 
     let fid = "flow-r7";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let c = tc.new_execution_id_on_partition(0);
     let e_ab = uuid::Uuid::new_v4().to_string();
     let e_bc = uuid::Uuid::new_v4().to_string();
     let lane_id = LaneId::new(LANE);
@@ -5427,9 +5467,9 @@ async fn test_flow_create_and_membership() {
     tc.cleanup().await;
 
     let fid = "flow-create-test";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let c = tc.new_execution_id_on_partition(0);
 
     // Create flow
     let result = fcall_create_flow(&tc, fid).await;
@@ -5440,6 +5480,11 @@ async fn test_flow_create_and_membership() {
     let pfs: Option<String> = tc.client().cmd("HGET").arg(&flow_core_key)
         .arg("public_flow_state").execute().await.unwrap();
     assert_eq!(pfs.as_deref(), Some("open"));
+
+    // Pre-seed exec_core rows (RFC-011 phase-3 guard requires EXISTS).
+    ensure_exec_core_exists(&tc, &a).await;
+    ensure_exec_core_exists(&tc, &b).await;
+    ensure_exec_core_exists(&tc, &c).await;
 
     // Add 3 members
     let (eid1, nc1) = fcall_add_execution_to_flow(&tc, fid, &a).await;
@@ -5520,12 +5565,15 @@ async fn test_flow_index_self_heal_on_add() {
     tc.cleanup().await;
 
     let fid = "flow-heal-test";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
     let flow_index_key = "ff:idx:{fp:0}:flow_index";
 
-    // 1. Create flow + add one member
+    // 1. Create flow + add one member (pre-seed exec_core for the
+    //    RFC-011 phase-3 EXISTS guard).
     fcall_create_flow(&tc, fid).await;
+    ensure_exec_core_exists(&tc, &a).await;
+    ensure_exec_core_exists(&tc, &b).await;
     fcall_add_execution_to_flow(&tc, fid, &a).await;
 
     // Sanity: flow is registered in the index
@@ -5571,14 +5619,23 @@ async fn test_flow_index_self_heal_on_add() {
         .cmd("SREM").arg(flow_index_key).arg(fid)
         .execute().await.unwrap();
 
-    // Direct FCALL so we can inspect the error result without panicking
+    // Direct FCALL so we can inspect the error result without panicking.
+    // Post-RFC-011 phase-3 the FCALL requires KEYS[4]=exec_core on the
+    // same {fp:0} slot — pin the exec via on_partition(0). Test happens
+    // to pass even with only 3 KEYS today because flow_already_terminal
+    // returns before step 4 touches exec_core, but relying on Lua
+    // validation order is brittle; pass all 4 KEYS as the contract
+    // dictates.
     let prefix = format!("ff:flow:{{fp:0}}:{fid}");
+    let c = tc.new_execution_id_on_partition(0);
+    let exec_partition = ff_core::partition::execution_partition(&c, tc.partition_config());
+    let ectx = ff_core::keys::ExecKeyContext::new(&exec_partition, &c);
     let keys: Vec<String> = vec![
         format!("{prefix}:core"),
         format!("{prefix}:members"),
         flow_index_key.to_string(),
+        ectx.core(),
     ];
-    let c = tc.new_execution_id();
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
         fid.to_owned(), c.to_string(), now.to_string(),
@@ -5613,12 +5670,16 @@ async fn test_flow_cancel() {
     tc.cleanup().await;
 
     let fid = "flow-cancel-test";
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    let a = tc.new_execution_id_on_partition(0);
+    let b = tc.new_execution_id_on_partition(0);
+    let c = tc.new_execution_id_on_partition(0);
 
-    // Create flow and add 3 members
+    // Create flow and add 3 members (pre-seed exec_core for the
+    // RFC-011 phase-3 EXISTS guard).
     fcall_create_flow(&tc, fid).await;
+    ensure_exec_core_exists(&tc, &a).await;
+    ensure_exec_core_exists(&tc, &b).await;
+    ensure_exec_core_exists(&tc, &c).await;
     fcall_add_execution_to_flow(&tc, fid, &a).await;
     fcall_add_execution_to_flow(&tc, fid, &b).await;
     fcall_add_execution_to_flow(&tc, fid, &c).await;
@@ -5900,9 +5961,10 @@ async fn test_server_flow_lifecycle() {
         "expected Created, got {create_flow_result:?}"
     );
 
-    // 2. Create 2 executions
-    let upstream = tc.new_execution_id();
-    let downstream = tc.new_execution_id();
+    // 2. Create 2 executions co-located with the flow (RFC-011 §7.3).
+    let config = test_config();
+    let upstream = ExecutionId::for_flow(&flow_id, &config);
+    let downstream = ExecutionId::for_flow(&flow_id, &config);
     fcall_create_execution(&tc, &upstream, NS, LANE, "upstream_task", 0).await;
     fcall_create_execution(&tc, &downstream, NS, LANE, "downstream_task", 0).await;
 
@@ -6522,9 +6584,12 @@ async fn test_server_full_flow_lifecycle() {
     let config = test_config();
     let now = TimestampMs::now();
 
-    let a = tc.new_execution_id();
-    let b = tc.new_execution_id();
-    let c = tc.new_execution_id();
+    // Mint flow FIRST so execs can co-locate with it (RFC-011 §7.3
+    // consumer contract enforced by add_execution_to_flow pre-flight).
+    let flow_id = FlowId::new();
+    let a = ExecutionId::for_flow(&flow_id, &config);
+    let b = ExecutionId::for_flow(&flow_id, &config);
+    let c = ExecutionId::for_flow(&flow_id, &config);
     for (eid, kind) in [(&a, "step_a"), (&b, "step_b"), (&c, "step_c")] {
         server.create_execution(&CreateExecutionArgs {
             execution_id: eid.clone(), namespace: Namespace::new(NS),
@@ -6537,7 +6602,6 @@ async fn test_server_full_flow_lifecycle() {
         }).await.expect("create_execution");
     }
 
-    let flow_id = FlowId::new();
     server.create_flow(&CreateFlowArgs {
         flow_id: flow_id.clone(), flow_kind: "chain".to_owned(),
         namespace: Namespace::new(NS), now,
@@ -6613,7 +6677,8 @@ async fn test_cancel_empty_flow_then_add_member() {
         cancellation_policy: "cancel_all".to_owned(), now,
     }).await.expect("cancel empty flow");
 
-    let eid = tc.new_execution_id();
+    let config = test_config();
+    let eid = ExecutionId::for_flow(&flow_id, &config);
     fcall_create_execution(&tc, &eid, NS, LANE, "late_add", 0).await;
     let add_result = server.add_execution_to_flow(&AddExecutionToFlowArgs {
         flow_id: flow_id.clone(), execution_id: eid.clone(), now,
@@ -6638,8 +6703,11 @@ async fn test_server_create_cancel_roundtrip() {
     let config = test_config();
     let now = TimestampMs::now();
 
-    // Create execution via Server
-    let eid = tc.new_execution_id();
+    // Mint the flow FIRST so the exec can co-locate with it —
+    // RFC-011 §7.3 co-location contract, enforced by the pre-flight
+    // partition check in `add_execution_to_flow`.
+    let flow_id = FlowId::new();
+    let eid = ExecutionId::for_flow(&flow_id, &config);
     server.create_execution(&CreateExecutionArgs {
         execution_id: eid.clone(), namespace: Namespace::new(NS),
         lane_id: LaneId::new(LANE), execution_kind: "roundtrip_task".to_owned(),
@@ -6655,7 +6723,6 @@ async fn test_server_create_cancel_roundtrip() {
         ff_core::state::PublicState::Waiting);
 
     // Create flow + add member via Server
-    let flow_id = FlowId::new();
     server.create_flow(&CreateFlowArgs {
         flow_id: flow_id.clone(), flow_kind: "roundtrip".to_owned(),
         namespace: Namespace::new(NS), now,
