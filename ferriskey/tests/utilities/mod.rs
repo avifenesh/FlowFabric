@@ -29,6 +29,29 @@ use versions::Versioning;
 pub mod cluster;
 pub mod mocks;
 
+/// Feature-aware shim around [`StandaloneClient::create_client`] for tests.
+///
+/// The real function takes an extra `iam_token_manager` argument under
+/// `#[cfg(feature = "iam")]`. Tests don't exercise IAM but still need to
+/// compile in both configurations, so this wrapper absorbs the variance
+/// and presents a 2-arg surface (`request`, `push_sender`). The remaining
+/// `iam_token_manager` / `pubsub_synchronizer` args are always `None` for
+/// test harnesses.
+#[allow(dead_code)]
+pub async fn create_test_standalone_client(
+    connection_request: ConnectionRequest,
+    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+) -> std::result::Result<StandaloneClient, ferriskey::value::Error> {
+    #[cfg(feature = "iam")]
+    {
+        StandaloneClient::create_client(connection_request, push_sender, None, None).await
+    }
+    #[cfg(not(feature = "iam"))]
+    {
+        StandaloneClient::create_client(connection_request, push_sender, None).await
+    }
+}
+
 pub(crate) const SHORT_STANDALONE_TEST_TIMEOUT: Duration = Duration::from_millis(20_000);
 pub(crate) const LONG_STANDALONE_TEST_TIMEOUT: Duration = Duration::from_millis(40_000);
 
@@ -134,7 +157,7 @@ pub fn get_listener_on_available_port() -> TcpListener {
     socket.bind(&socket2::SockAddr::from(*addr)).unwrap();
     socket.listen(1).unwrap();
 
-    TcpListener::from(std::net::TcpListener::from(socket))
+    std::net::TcpListener::from(socket)
 }
 
 impl ValkeyServer {
@@ -726,10 +749,17 @@ pub fn create_connection_request(
     };
     let connection_info = configuration.connection_info.clone().unwrap_or_default();
     let auth = if connection_info.password.is_some() || connection_info.username.is_some() {
+        // Use `..Default::default()` so feature-gated fields (e.g. the
+        // iam-only `iam_config` added under `#[cfg(feature = "iam")]`)
+        // are populated without needing their own cfg-gated init line
+        // here. Tests don't exercise IAM, so the default is always None.
+        // The lint fires on no-feature builds where all fields ARE
+        // specified — allowed since the IAM build needs the rest.
+        #[allow(clippy::needless_update)]
         Some(AuthenticationInfo {
             password: connection_info.password,
             username: connection_info.username,
-            iam_config: None,
+            ..Default::default()
         })
     } else {
         None
@@ -827,7 +857,7 @@ pub(crate) async fn setup_test_basics_internal(configuration: &TestConfiguration
     connection_request.cluster_mode_enabled = false;
     connection_request.protocol = Some(configuration.protocol);
     let (push_sender, push_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let client = StandaloneClient::create_client(connection_request, Some(push_sender), None, None)
+    let client = create_test_standalone_client(connection_request, Some(push_sender))
         .await
         .unwrap();
 

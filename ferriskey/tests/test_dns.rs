@@ -81,7 +81,7 @@ mod dns_tests {
             },
         );
         connection_request.tls_mode = Some(TlsMode::SecureTls);
-        connection_request.root_certs = vec![CA_CERT_BYTES.clone().into()];
+        connection_request.root_certs = vec![CA_CERT_BYTES.clone()];
 
         // Wait to ensure server is ready before connecting.
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -107,7 +107,7 @@ mod dns_tests {
         // Wait to ensure server is ready before connecting.
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-        let client = StandaloneClient::create_client(connection_request, None, None, None)
+        let client = create_test_standalone_client(connection_request, None)
             .await
             .ok()?;
         Some((client, server))
@@ -135,12 +135,12 @@ mod dns_tests {
             },
         );
         connection_request.tls_mode = Some(TlsMode::SecureTls);
-        connection_request.root_certs = vec![CA_CERT_BYTES.clone().into()];
+        connection_request.root_certs = vec![CA_CERT_BYTES.clone()];
 
         // Wait to ensure server is ready before connecting.
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-        let client = StandaloneClient::create_client(connection_request, None, None, None)
+        let client = create_test_standalone_client(connection_request, None)
             .await
             .ok()?;
         Some((client, server))

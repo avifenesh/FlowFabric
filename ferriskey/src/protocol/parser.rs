@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn decode_eof_returns_none_at_eof() {
         use tokio_util::codec::Decoder;
-        let mut codec = ValueCodec::default();
+        let mut codec = ValueCodec;
 
         let mut bytes = bytes::BytesMut::from(&b"+GET 123\r\n"[..]);
         assert_eq!(
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn decode_eof_returns_error_inside_array_and_can_parse_more_inputs() {
         use tokio_util::codec::Decoder;
-        let mut codec = ValueCodec::default();
+        let mut codec = ValueCodec;
 
         let mut bytes =
             bytes::BytesMut::from(b"*3\r\n+OK\r\n-LOADING server is loading\r\n+OK\r\n".as_slice());
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn test_codec_incomplete_returns_none() {
         use tokio_util::codec::Decoder;
-        let mut codec = ValueCodec::default();
+        let mut codec = ValueCodec;
 
         // Incomplete bulk string — should return None, not error
         let mut bytes = bytes::BytesMut::from(&b"$5\r\nhel"[..]);

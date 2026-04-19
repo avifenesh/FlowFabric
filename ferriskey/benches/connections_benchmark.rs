@@ -225,14 +225,14 @@ fn create_runtime() -> Runtime {
 
 fn parse_cpu_count(cpu_str: &str) -> usize {
     // "4-15" -> 12, "0-7" -> 8, "0-15" -> 16
-    if let Some((start, end)) = cpu_str.split_once('-') {
-        if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
+    if let Some((start, end)) = cpu_str.split_once('-')
+        && let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
             return e - s + 1;
         }
-    }
     num_cpus::get()
 }
 
+#[cfg(target_os = "linux")]
 fn set_cpu_affinity(cpu_str: &str) -> Result<(), String> {
     // Use libc sched_setaffinity to pin this process
     if let Some((start, end)) = cpu_str.split_once('-') {
@@ -251,6 +251,15 @@ fn set_cpu_affinity(cpu_str: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// CPU pinning stub for non-Linux platforms. macOS and Windows lack
+/// `sched_setaffinity` (macOS had `thread_policy_set` affinity hints
+/// which Apple now silently ignores). Benchmarks on those platforms
+/// skip pinning entirely; the caller logs a warning and continues.
+#[cfg(not(target_os = "linux"))]
+fn set_cpu_affinity(_cpu_str: &str) -> Result<(), String> {
+    Err("CPU affinity is only supported on Linux".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +282,7 @@ impl FastRng {
     }
 
     fn is_get(&mut self) -> bool {
-        (self.next_u64() % 5) != 0
+        !self.next_u64().is_multiple_of(5)
     }
 }
 
@@ -403,7 +412,7 @@ async fn run_pipeline_workload<C: ConnectionLike + Clone + Send + 'static>(
 
             // Seed key
             let _ = conn
-                .req_packed_command(&cmd("SET").arg(&key).arg("val"))
+                .req_packed_command(cmd("SET").arg(&key).arg("val"))
                 .await;
 
             // Build pipeline once — same key, same slot
@@ -506,7 +515,7 @@ async fn run_mget_workload<C: ConnectionLike + Clone + Send + 'static>(
             // Seed keys
             for k in &keys {
                 let _ = conn
-                    .req_packed_command(&cmd("SET").arg(k).arg("v"))
+                    .req_packed_command(cmd("SET").arg(k).arg("v"))
                     .await;
             }
 
@@ -608,7 +617,7 @@ async fn run_batch_cross_slot_workload<C: ConnectionLike + Clone + Send + 'stati
             // Seed keys
             for k in &keys {
                 let _ = conn
-                    .req_packed_command(&cmd("SET").arg(k).arg("v"))
+                    .req_packed_command(cmd("SET").arg(k).arg("v"))
                     .await;
             }
 
@@ -699,7 +708,7 @@ fn main() {
     let permutations = cfg.value_sizes.len() * cfg.concurrencies.len();
     let total_runs = permutations * cfg.runs;
     let est_mins =
-        (total_runs as u64 * (cfg.duration.as_secs() + cfg.warmup.as_secs()) + 59) / 60;
+        (total_runs as u64 * (cfg.duration.as_secs() + cfg.warmup.as_secs())).div_ceil(60);
 
     println!("=== Ferriskey Benchmark [{}] ===", cfg.profile);
     println!(
