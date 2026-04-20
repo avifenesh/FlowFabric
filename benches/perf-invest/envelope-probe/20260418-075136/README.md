@@ -90,5 +90,5 @@ perf script -i 20260418-075136/probe-redis-rs.perf.data  | inferno-collapse-perf
 
 ## Next
 
-See `benches/perf-invest/report-envelope.md` for the per-item
-analysis (round-1 inclusive % vs current inclusive %).
+Per-item envelope analysis landed via the Tier 1 envelope-collapse
+PR (#18). Raw .folded files in this directory are the data source.

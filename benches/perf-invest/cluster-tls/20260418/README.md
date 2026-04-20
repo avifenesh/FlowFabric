@@ -82,8 +82,7 @@ Total wall clock: ~15 min active (including seeding + drain phases).
 Every workload pins its keys to a single cluster slot via the
 `{wider}` (or `{benchq}` for BLMPOP) hash tag. **This measures
 client-in-cluster-mode + TLS overhead, NOT cross-slot routing.**
-Cross-slot performance is a potential bonus bin (see
-`report-w2-round2.md §4`).
+Cross-slot performance is a potential bonus bin (separate scenario).
 
 Streams uses per-worker stream keys `{wider}:stream:w{N}` — the
 `{wider}` tag means all 16 streams live on the same shard; workers

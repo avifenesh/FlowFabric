@@ -74,5 +74,4 @@ cargo flamegraph --profile perf --bin <bin> \
 
 ## Next
 
-See `benches/perf-invest/report-w1.md` for the hot-function analysis
-and recommended optimisations.
+Hot-function analysis landed via the Tier 1 envelope-collapse PR (#18).

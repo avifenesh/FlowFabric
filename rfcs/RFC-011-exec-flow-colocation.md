@@ -1,10 +1,8 @@
 # RFC-011: Exec/flow hash-slot co-location for atomic membership
 
-**Status:** Accepted. Implementation starts immediately after this RFC lands and survives cross-review debate (all three workers ACCEPT).
-**Author:** Worker-2 (FlowFabric team).
-**Supersedes:** issue #21 (reconciliation scanner) on phase-3 merge. Commit `8df40fc` on `feat/p36-fix-flow-id-atomicity` is the interim safety net; phase 3 rewrites the docs it added.
-**Referenced by:** `benches/perf-invest/bridge-event-gap-report.md` §4.
-**Cost estimate:** 28-40 engineer-hours across 3 workers, 5 phases. See §8 for hour-level breakdown.
+**Status:** Accepted and implemented.
+**Created:** 2026-04-18
+**Supersedes:** issue #21 (reconciliation scanner) on phase-3 merge.
 
 ---
 
@@ -587,7 +585,7 @@ A reviewer running `cargo check` on ff-test post-phase-1 and seeing ~172 errors 
 * `Server::add_execution_to_flow` collapses to one FCALL, KEYS grows from 3 to 4, phase-2 HSET block deletes.
 * Docstrings on both sides rewrite around the atomic single-commit shape; orphan-window language removes.
 * Integration test added (see §7.3.1 for spec).
-* Interim docs (commit `8df40fc`) rewritten: `lua/flow.lua:114-175` loses the two-phase preamble; `server.rs:1240-1320` rustdoc rewrites; `benches/perf-invest/bridge-event-gap-report.md` §4 gets a final "landed" update.
+* Interim docs (commit `8df40fc`) rewritten: `lua/flow.lua:114-175` loses the two-phase preamble; `server.rs:1240-1320` rustdoc rewrites.
 * Issue #21 closed with a pointer to the phase-3 merge commit; labelled `superseded`.
 
 **Revision 4 amendments (2026-04-19) — merge-order note.** The four amendments below describe behaviours that landed in phase-3's code commits on `feat/rfc011-phase3-atomic` (c1e8678 + 88693b8 + fef949f). This RFC revision merges AFTER PR #28 (phase-3 code) per the same pattern used by revisions 3 / 4 in the rev-3 sequence — the prose describes the shipped shape, not a proposal.
@@ -812,7 +810,7 @@ Response: CONCEDE the derivation is indirect; TIGHTEN the language.
 
 The `wider_80_20-ferriskey-wider-8cb6dff.json` measurement is raw SET/GET throughput, not FCALL. FCALL has Lua-script overhead (registration lookup, argument marshalling, Lua bytecode execution, reply serialisation) that a raw SET does not. Our FCALL-heavy workload is slower than raw GET/SET by a factor we haven't measured independently.
 
-**Corrected phrasing for §4.4** (will land in a follow-up revision commit after this response): "Per-slot GET/SET throughput from the existing bench: 115k ops/sec. FlowFabric's per-op cost is 3-5 Valkey round-trips (claim → attempt commands → complete/fail), each of which is an FCALL; FCALL throughput is empirically 30-60% of raw SET/GET on comparable hardware per the ferriskey round-3 bench results in `benches/perf-invest/report-envelope.md`. A conservative envelope for per-slot FCALL throughput is **30-40k FCALLs/sec**; for a 4-5 FCALL/exec workload, that's **~7-10k execs/sec per lane per slot**."
+**Corrected phrasing for §4.4**: "Per-slot GET/SET throughput from the existing bench: 115k ops/sec (raw data: `benches/perf-invest/wider_80_20-ferriskey-wider-8cb6dff.json` + sibling files). FlowFabric's per-op cost is 3-5 Valkey round-trips (claim → attempt commands → complete/fail), each of which is an FCALL; FCALL throughput is empirically 30-60% of raw SET/GET on comparable hardware. A conservative envelope for per-slot FCALL throughput is **30-40k FCALLs/sec**; for a 4-5 FCALL/exec workload, that's **~7-10k execs/sec per lane per slot**."
 
 That tightening preserves the §5.2 "10k-member soft limit" rationale — 10k members at 7-10k execs/sec saturates the slot for ~1-1.4 seconds end-to-end, which is still the sub-second p99 budget concern. The number is lower than the original (~20-40k/sec), but the shape of the argument survives.
 
@@ -1023,9 +1021,7 @@ Rationale:
 
 ## §14 References
 
-* `benches/perf-invest/bridge-event-gap-report.md` §4 — gap-report amendment (rewrites to reference this RFC post-phase-3).
-* Commit `8df40fc` on `feat/p36-fix-flow-id-atomicity` — interim two-phase-contract documentation + issue #21. Superseded on phase-3 merge.
-* `lua/flow.lua:114-175` — current (interim) `ff_add_execution_to_flow` docstring with two-phase contract; rewritten in phase 3.
-* `crates/ff-server/src/server.rs:1240-1320` — current (interim) `add_execution_to_flow` method; collapses in phase 3.
+* `lua/flow.lua` — `ff_add_execution_to_flow`, single-atomic-FCALL shape.
+* `crates/ff-server/src/server.rs` — `add_execution_to_flow` method, collapsed to one FCALL.
 * `benches/perf-invest/wider_80_20-ferriskey-wider-8cb6dff.json` — per-slot throughput measurement (115k ops/sec) backing the §4.4 hotspot analysis.
 * RFC-001 §4 (ExecutionId lifecycle), RFC-007 §3 (flow structural keys), RFC-010 §4.1 (Valkey architecture partition overview) — all touched by this RFC; cross-references updated in phase 3.
