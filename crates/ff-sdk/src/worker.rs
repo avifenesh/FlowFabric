@@ -976,6 +976,44 @@ impl FlowFabricWorker {
         Ok(task)
     }
 
+    /// Scheduler-routed claim: POST the server's
+    /// `/v1/workers/{id}/claim`, then chain to
+    /// [`Self::claim_from_grant`].
+    ///
+    /// Batch C item 2 PR-B. This is the production entry point —
+    /// budget + quota + capability admission run server-side inside
+    /// `ff_scheduler::Scheduler::claim_for_worker`. Callers don't
+    /// enable the `direct-valkey-claim` feature.
+    ///
+    /// Returns `Ok(None)` when the server says no eligible execution
+    /// (HTTP 204). Callers typically back off by
+    /// `config.claim_poll_interval_ms` and try again, same cadence
+    /// as the direct-claim path's `Ok(None)`.
+    ///
+    /// The `admin` client is the established HTTP surface
+    /// (`FlowFabricAdminClient`) reused here so workers don't keep a
+    /// second reqwest client around. Build once at worker boot and
+    /// hand in by reference on every claim.
+    pub async fn claim_via_server(
+        &self,
+        admin: &crate::FlowFabricAdminClient,
+        lane: &LaneId,
+        grant_ttl_ms: u64,
+    ) -> Result<Option<ClaimedTask>, SdkError> {
+        let req = crate::admin::ClaimForWorkerRequest {
+            worker_id: self.config.worker_id.to_string(),
+            lane_id: lane.to_string(),
+            worker_instance_id: self.config.worker_instance_id.to_string(),
+            capabilities: self.config.capabilities.clone(),
+            grant_ttl_ms,
+        };
+        let Some(resp) = admin.claim_for_worker(req).await? else {
+            return Ok(None);
+        };
+        let grant = resp.into_grant()?;
+        self.claim_from_grant(lane.clone(), grant).await.map(Some)
+    }
+
     /// Consume a [`ReclaimGrant`] and transition the granted
     /// `attempt_interrupted` execution into a `started` state on this
     /// worker. Symmetric partner to [`claim_from_grant`] for the

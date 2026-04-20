@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use ff_core::types::BudgetId;
-use ff_sdk::{ConditionMatcher, FlowFabricWorker, SuspendOutcome, TimeoutBehavior, WorkerConfig};
+use ff_sdk::{
+    ConditionMatcher, FlowFabricAdminClient, FlowFabricWorker, SuspendOutcome,
+    TimeoutBehavior, WorkerConfig,
+};
 use tokio::sync::Mutex;
 
 use common::{AgentStep, PatchResult, TaskPayload, DEFAULT_LANE, DEFAULT_MODEL, DEFAULT_NAMESPACE};
@@ -23,6 +26,17 @@ struct Args {
     /// Valkey port.
     #[arg(long, env = "FF_PORT", default_value_t = 6379)]
     port: u16,
+
+    /// ff-server base URL. The worker claims via
+    /// `POST /v1/workers/{id}/claim` — the scheduler-routed entry
+    /// point that runs admission control server-side.
+    #[arg(long, env = "FF_SERVER_URL", default_value = "http://localhost:9090")]
+    server_url: String,
+
+    /// Optional bearer token for ff-server (matches FF_API_TOKEN on
+    /// the server side). Leave unset for an unauthenticated dev server.
+    #[arg(long, env = "FF_API_TOKEN")]
+    api_token: Option<String>,
 
     /// OpenRouter API key.
     #[arg(long, env = "OPENROUTER_API_KEY")]
@@ -75,7 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let worker = FlowFabricWorker::connect(config).await?;
+    let admin = match args.api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(tok) => FlowFabricAdminClient::with_token(&args.server_url, tok)?,
+        None => FlowFabricAdminClient::new(&args.server_url)?,
+    };
     let llm = LlmClient::new(&args.api_key, &args.model);
+
+    let lane = ff_core::types::LaneId::try_new(&args.lane)?;
 
     // Patches awaiting review. suspend() consumes the task, so we stash the
     // result here. When the execution resumes and the worker re-claims it,
@@ -104,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("shutdown signal received");
                 break;
             }
-            result = worker.claim_next() => {
+            // 10s grant TTL gives the worker time to call
+            // claim_from_grant even under moderate network jitter.
+            result = worker.claim_via_server(&admin, &lane, 10_000) => {
                 match result {
                     Ok(Some(task)) => {
                         let eid = task.execution_id().to_string();
@@ -126,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "claim_next failed");
+                        tracing::error!(error = %e, "claim_via_server failed");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
