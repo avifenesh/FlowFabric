@@ -110,7 +110,7 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 
 KEYS-arity changes (and the `LIBRARY_VERSION` bump that paired with Batch A) require **blue-green or stop-then-start deployment**. Running old and new `ff-server` binaries against the same Valkey simultaneously can produce Lua errors on the old binary because the new binary loads a library whose KEYS arity differs from what the old binary expects — `redis.call(..., nil, ...)` surfaces as `ResponseError`, not silent corruption, but requests will fail until the old instances are drained.
 
-The version string lives in **`lua/version.lua`** (single source of truth). `crates/ff-script/build.rs` extracts it at compile time and exposes it to Rust via `env!("FLOWFABRIC_LUA_VERSION")`, so the Rust `LIBRARY_VERSION` constant tracks the Lua value automatically — do not maintain a separate Rust literal.
+The version string lives in **`lua/version.lua`** (single source of truth). `scripts/gen-ff-script-lua.sh` extracts it and writes `crates/ff-script/src/flowfabric_lua_version`, which Rust reads via `include_str!`. Regenerate after any edit to `lua/*.lua`; CI fails on drift.
 
 Future: per-FCALL version negotiation. For now: drain old instances before starting new ones, or run a single writer at a time.
 
