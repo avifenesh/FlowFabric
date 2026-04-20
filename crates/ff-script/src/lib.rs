@@ -12,22 +12,21 @@ pub mod stream_tail;
 pub use error::ScriptError;
 pub use retry::{is_retryable_kind, kind_to_stable_str};
 
-/// The compiled FlowFabric Lua library source, concatenated by build.rs.
-/// Includes the `#!lua name=flowfabric` preamble, all shared helpers,
-/// and all registered functions.
-pub const LIBRARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/flowfabric.lua"));
+/// The compiled FlowFabric Lua library source.
+///
+/// Generated from `lua/*.lua` by `scripts/gen-ff-script-lua.sh` and checked
+/// into the crate as `flowfabric.lua` so it ships inside the published
+/// tarball. CI (`matrix.yml`) fails if this file drifts from what the
+/// script would produce.
+pub const LIBRARY_SOURCE: &str = include_str!("flowfabric.lua");
 
 /// Expected library version. Must match `FCALL ff_version 0` return.
 ///
-/// **Single source of truth is `lua/version.lua`.** `build.rs` extracts the
-/// version string at compile time and injects it here via `env!()`. Do NOT
-/// hand-maintain a separate literal — the extract is the one knob. Bump
-/// `lua/version.lua` whenever any Lua function's KEYS or ARGV arity
-/// changes, or a new function is added. The loader compares this constant
-/// against the server's `ff_version` output; a mismatch triggers `FUNCTION
-/// LOAD REPLACE` so old binaries attached to a newly-upgraded Valkey don't
-/// call into a library whose key signatures they don't agree with.
-pub const LIBRARY_VERSION: &str = env!("FLOWFABRIC_LUA_VERSION");
+/// **Single source of truth is `lua/version.lua`.** The gen script
+/// extracts the `return 'X'` literal and writes it to
+/// `flowfabric_lua_version`. Bump `lua/version.lua` whenever any Lua
+/// function's KEYS or ARGV arity changes, or a new function is added.
+pub const LIBRARY_VERSION: &str = include_str!("flowfabric_lua_version");
 
 // Re-export the trait so callers can use it without reaching into result.
 pub use result::FromFcallResult;
