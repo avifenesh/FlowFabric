@@ -352,8 +352,6 @@ All hits resolved → migration complete.
 - [RFC-011 exec/flow hash-slot co-location](../rfcs/RFC-011-exec-flow-colocation.md)
   — primary design doc with revisions 3 + 4
 - Merged PRs in order: #19, #20, #23, #25, #26, #27, #28, #29
-- Team discussion: `benches/perf-invest/rfc-exec-colocation-debate.md`
-  (full cross-review transcript)
 - Phase-3 atomicity tests: `crates/ff-test/tests/e2e_flow_atomicity.rs`
   (pattern reference for consumer-side integration testing)
 

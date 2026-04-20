@@ -9,8 +9,9 @@ edition = "2024"
 publish = false
 license = "Apache-2.0"
 
-# Minimal probes to verify the theoretical blocking-command trace in
-# report-w1-round2.md. Three bins per client (one per scenario):
+# Minimal probes to verify the theoretical blocking-command trace
+# flagged during the round-2 ferriskey envelope investigation.
+# Three bins per client (one per scenario):
 #   * probe-ferriskey-1x1  — 1 client × 1 BLMPOP, no concurrency
 #   * probe-ferriskey-5x1  — 5 cloned clients × 1 concurrent BLMPOP each
 #   * probe-redis-rs-1x1   — same, redis-rs

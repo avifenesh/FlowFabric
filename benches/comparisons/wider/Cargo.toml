@@ -14,7 +14,7 @@ license = "Apache-2.0"
 # Sits alongside `baseline/` (redis-rs scenario 1) and
 # `ferriskey-baseline/` (ferriskey scenario 1) but broadens the
 # comparison so a single data point (BLMPOP-heavy scenario 1) doesn't
-# carry the headline. See benches/perf-invest/report-w2.md.
+# carry the headline.
 #
 # Two bins per workload — one per client — trivially side-by-side so
 # a reviewer can eyeball both hot loops without an abstraction layer

@@ -40,8 +40,9 @@ runs.
 - **BLMPOP**: the only workload with a persistent gap. Compresses
   from -45.81 % (localhost) to -32.50 % (cluster+TLS) but does not
   close. On cluster+TLS: **p50 is tied**, the gap lives entirely in
-  the tail + overall throughput. See `report-w2-round2.md §3` for
-  the mechanism hypothesis.
+  the tail + overall throughput. Mechanism: BLMPOP head-of-line
+  blocking on the multiplexed connection; filed as issue #12 and
+  closed as an architectural non-fix.
 
 ## Why the scaled-down numbers
 
