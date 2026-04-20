@@ -134,7 +134,10 @@ async fn measure_one(env: &ff_bench::workload::BenchEnv) -> anyhow::Result<Durat
     let reviewer_inner = reviewer.clone();
     let res = measure_one_inner(env, &reviewer_inner, &eid_slot_inner).await;
     if res.is_err() {
-        if let Some(eid) = eid_slot.lock().expect("poisoned").take() {
+        // Take + drop the guard BEFORE awaiting; clippy's
+        // await_holding_lock catches this otherwise.
+        let taken = eid_slot.lock().expect("poisoned").take();
+        if let Some(eid) = taken {
             // Best-effort cleanup; ignore errors (execution may have
             // already landed in a terminal state via the failed path).
             let cancel_url = format!("{}/v1/executions/{}/cancel", env.server, eid);
