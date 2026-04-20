@@ -192,6 +192,11 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
         .route("/v1/executions/{id}/priority", put(change_priority))
         .route("/v1/executions/{id}/replay", post(replay_execution))
         .route("/v1/executions/{id}/revoke-lease", post(revoke_lease))
+        // Scheduler-routed claim (Batch C item 2). Worker POSTs lane +
+        // identity + capabilities; server runs budget/quota/capability
+        // admission via ff-scheduler and returns a ClaimGrant on
+        // success (204 No Content when no eligible execution).
+        .route("/v1/workers/{worker_id}/claim", post(claim_for_worker))
         // Stream read + tail (RFC-006 #2)
         .route(
             "/v1/executions/{id}/attempts/{idx}/stream",
@@ -556,6 +561,124 @@ async fn revoke_lease(
 ) -> Result<Json<RevokeLeaseResult>, ApiError> {
     let eid = parse_execution_id(&id)?;
     Ok(Json(server.revoke_lease(&eid).await?))
+}
+
+// ── Scheduler-routed claim (Batch C item 2 PR-B) ──
+//
+// The server exposes the scheduler's `claim_for_worker` cycle via
+// HTTP so ff-sdk workers can acquire claim grants without enabling
+// the `direct-valkey-claim` feature. The request body carries lane +
+// identity + capabilities; the server returns a serialized
+// `ClaimGrant` (or 204 No Content when no eligible execution exists).
+
+/// Request body for `POST /v1/workers/{worker_id}/claim`.
+#[derive(Deserialize)]
+struct ClaimForWorkerBody {
+    lane_id: String,
+    worker_instance_id: String,
+    /// Capability tokens this worker advertises. Sorted + validated
+    /// on the scheduler side; any non-printable/CSV-breaking token
+    /// surfaces as 400.
+    #[serde(default)]
+    capabilities: Vec<String>,
+    /// Grant TTL in milliseconds. Bounded so a worker can't request a
+    /// multi-hour grant and squat the execution.
+    grant_ttl_ms: u64,
+}
+
+/// Wire shape for `ff_core::contracts::ClaimGrant`. Core type is not
+/// serde-derived (it carries a `Partition` with a non-scalar family
+/// enum); keep a DTO here so we own the HTTP shape without touching
+/// the core contract.
+#[derive(Serialize)]
+struct ClaimGrantDto {
+    execution_id: String,
+    partition_family: &'static str,
+    partition_index: u16,
+    grant_key: String,
+    expires_at_ms: u64,
+}
+
+impl From<ff_core::contracts::ClaimGrant> for ClaimGrantDto {
+    fn from(g: ff_core::contracts::ClaimGrant) -> Self {
+        let family = match g.partition.family {
+            ff_core::partition::PartitionFamily::Flow => "flow",
+            ff_core::partition::PartitionFamily::Execution => "execution",
+            ff_core::partition::PartitionFamily::Budget => "budget",
+            ff_core::partition::PartitionFamily::Quota => "quota",
+        };
+        Self {
+            execution_id: g.execution_id.to_string(),
+            partition_family: family,
+            partition_index: g.partition.index,
+            grant_key: g.grant_key,
+            expires_at_ms: g.expires_at_ms,
+        }
+    }
+}
+
+/// Maximum grant TTL accepted via HTTP. Mirrors the scheduler's
+/// internal ceiling so a misconfigured worker can't squat an
+/// execution on a multi-hour grant.
+const CLAIM_GRANT_TTL_MS_MAX: u64 = 60_000;
+
+/// Reject empty / whitespace / non-printable identifiers the way
+/// [`LaneId::try_new`] does for lanes. WorkerId + WorkerInstanceId
+/// feed into scheduler scan jitter + Valkey key construction; silent
+/// acceptance of "" or "w\nork" would either mis-key or mis-hash.
+fn validate_identifier(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.is_empty() {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: must not be empty"
+        ))));
+    }
+    if value.len() > 256 {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: exceeds 256 bytes (got {})",
+            value.len()
+        ))));
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: must not contain whitespace or control characters"
+        ))));
+    }
+    Ok(())
+}
+
+async fn claim_for_worker(
+    State(server): State<Arc<Server>>,
+    Path(worker_id): Path<String>,
+    AppJson(body): AppJson<ClaimForWorkerBody>,
+) -> Result<Response, ApiError> {
+    validate_identifier("worker_id", &worker_id)?;
+    validate_identifier("worker_instance_id", &body.worker_instance_id)?;
+    let worker_id = WorkerId::new(worker_id);
+    let worker_instance_id = WorkerInstanceId::new(body.worker_instance_id);
+    let lane = LaneId::try_new(body.lane_id).map_err(|e| {
+        ApiError(ServerError::InvalidInput(format!("lane_id: {e}")))
+    })?;
+    if body.grant_ttl_ms == 0 || body.grant_ttl_ms > CLAIM_GRANT_TTL_MS_MAX {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "grant_ttl_ms must be in 1..={CLAIM_GRANT_TTL_MS_MAX}"
+        ))));
+    }
+    let caps: std::collections::BTreeSet<String> =
+        body.capabilities.into_iter().collect();
+
+    match server
+        .claim_for_worker(
+            &lane,
+            &worker_id,
+            &worker_instance_id,
+            &caps,
+            body.grant_ttl_ms,
+        )
+        .await?
+    {
+        Some(grant) => Ok((StatusCode::OK, Json(ClaimGrantDto::from(grant))).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
 }
 
 // ── Stream read + tail ──

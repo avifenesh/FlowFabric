@@ -130,14 +130,35 @@ to work; both variants produce the `{fp:N}` hash tag and route via
 > `insecure-direct-claim`, update to `direct-valkey-claim` before
 > following the rest of this step.
 
-**FF change:** two new public entry points on `FlowFabricWorker` replace the
+**FF change:** three public entry points on `FlowFabricWorker` replace the
 `direct-valkey-claim` feature-gated direct-FCALL path. They acquire the
 worker's concurrency permit before the FCALL so a saturated worker never
 consumes a grant.
 
+The new default production path is **`claim_via_server`** — issued via the
+server's `POST /v1/workers/{id}/claim` endpoint. That endpoint runs the
+full `ff_scheduler::Scheduler::claim_for_worker` admission cycle (budget
+breach, quota sliding-window, capability match) before minting the grant.
+The SDK method fetches the grant and chains to `claim_from_grant` so the
+lease is still minted on the worker's own Valkey client. Consumers that
+already have a `FlowFabricAdminClient` for other admin endpoints just
+pass it in — no second HTTP client needed.
+
 ```rust
 impl FlowFabricWorker {
-    /// Consume a scheduler-issued ClaimGrant → ClaimedTask.
+    /// Production entry point — scheduler-routed claim.
+    /// POSTs /v1/workers/{id}/claim, parses the ClaimGrant, chains
+    /// to claim_from_grant. Returns Ok(None) on HTTP 204 (no eligible
+    /// execution this cycle).
+    pub async fn claim_via_server(
+        &self,
+        admin: &FlowFabricAdminClient,
+        lane: &LaneId,
+        grant_ttl_ms: u64,
+    ) -> Result<Option<ClaimedTask>, SdkError>;
+
+    /// Low-level entry — consume a caller-provided ClaimGrant.
+    /// Useful if the caller has its own scheduler invocation path.
     /// Errors: WorkerAtCapacity (retryable), Script(ClaimGrantExpired|...).
     pub async fn claim_from_grant(
         &self,

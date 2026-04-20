@@ -900,6 +900,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-engine",
+ "ff-scheduler",
  "ff-script",
  "futures",
  "serde",

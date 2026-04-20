@@ -117,6 +117,84 @@ impl FlowFabricAdminClient {
         })
     }
 
+    /// POST `/v1/workers/{worker_id}/claim` — scheduler-routed claim.
+    ///
+    /// Batch C item 2 PR-B. Swaps the SDK's direct-Valkey claim for a
+    /// server-side one: the request carries lane + identity +
+    /// capabilities + grant TTL; the server runs budget, quota, and
+    /// capability admission via `ff_scheduler::Scheduler::claim_for_worker`
+    /// and returns a `ClaimGrant` on success.
+    ///
+    /// Returns `Ok(None)` when the server responds 204 No Content
+    /// (no eligible execution on the lane). Callers that want to keep
+    /// polling should back off per their claim cadence.
+    pub async fn claim_for_worker(
+        &self,
+        req: ClaimForWorkerRequest,
+    ) -> Result<Option<ClaimForWorkerResponse>, SdkError> {
+        // Percent-encode `worker_id` in the URL path — `WorkerId` is a
+        // free-form string (could contain `/`, spaces, `%`, etc.) and
+        // splicing it verbatim would produce malformed URLs or
+        // misrouted paths. `Url::path_segments_mut().push` handles the
+        // encoding natively.
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| {
+            SdkError::Config(format!("invalid base_url '{}': {e}", self.base_url))
+        })?;
+        {
+            let mut segs = url.path_segments_mut().map_err(|_| {
+                SdkError::Config(format!(
+                    "base_url cannot be a base URL: '{}'",
+                    self.base_url
+                ))
+            })?;
+            segs.extend(&["v1", "workers", &req.worker_id, "claim"]);
+        }
+        let url = url.to_string();
+        let resp = self
+            .http
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| SdkError::Http {
+                source: e,
+                context: "POST /v1/workers/{worker_id}/claim".into(),
+            })?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if status.is_success() {
+            return resp
+                .json::<ClaimForWorkerResponse>()
+                .await
+                .map(Some)
+                .map_err(|e| SdkError::Http {
+                    source: e,
+                    context: "decode claim_for_worker response body".into(),
+                });
+        }
+
+        // Error path — mirror rotate_waitpoint_secret's ErrorBody decode.
+        let status_u16 = status.as_u16();
+        let raw = resp.text().await.map_err(|e| SdkError::Http {
+            source: e,
+            context: format!("read claim_for_worker error body (status {status_u16})"),
+        })?;
+        let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
+        Err(SdkError::AdminApi {
+            status: status_u16,
+            message: parsed
+                .as_ref()
+                .map(|b| b.error.clone())
+                .unwrap_or_else(|| raw.clone()),
+            kind: parsed.as_ref().and_then(|b| b.kind.clone()),
+            retryable: parsed.as_ref().and_then(|b| b.retryable),
+            raw_body: raw,
+        })
+    }
+
     /// Rotate the waitpoint HMAC secret on the server.
     ///
     /// Promotes the currently-installed kid to `previous_kid`
@@ -247,6 +325,87 @@ struct AdminErrorBody {
     retryable: Option<bool>,
 }
 
+/// Request body for `POST /v1/workers/{worker_id}/claim`.
+///
+/// Mirrors `ff_server::api::ClaimForWorkerBody` 1:1. `worker_id`
+/// goes in the URL path (not the body) but is kept on the struct
+/// for ergonomics — callers don't juggle a separate arg.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimForWorkerRequest {
+    #[serde(skip)]
+    pub worker_id: String,
+    pub lane_id: String,
+    pub worker_instance_id: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Grant TTL in milliseconds. Server rejects 0 or anything over
+    /// 60s (its `CLAIM_GRANT_TTL_MS_MAX`).
+    pub grant_ttl_ms: u64,
+}
+
+/// Response body for `POST /v1/workers/{worker_id}/claim`.
+///
+/// Wire shape of `ff_core::contracts::ClaimGrant`. The core type is
+/// not serde-derived (carries a `Partition` with a non-scalar family
+/// enum) so the SDK decodes into this DTO and reconstructs the core
+/// type via [`Self::into_grant`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaimForWorkerResponse {
+    pub execution_id: String,
+    pub partition_family: String,
+    pub partition_index: u16,
+    pub grant_key: String,
+    pub expires_at_ms: u64,
+}
+
+impl ClaimForWorkerResponse {
+    /// Convert the wire DTO into a typed
+    /// [`ff_core::contracts::ClaimGrant`] for handoff to
+    /// [`crate::FlowFabricWorker::claim_from_grant`]. Returns
+    /// [`SdkError::AdminApi`] on malformed execution_id / unknown
+    /// partition_family (server and SDK have drifted; fail loud so
+    /// callers don't route to a ghost partition).
+    pub fn into_grant(self) -> Result<ff_core::contracts::ClaimGrant, SdkError> {
+        let execution_id = ff_core::types::ExecutionId::parse(&self.execution_id)
+            .map_err(|e| SdkError::AdminApi {
+                status: 200,
+                message: format!(
+                    "claim_for_worker: server returned malformed execution_id '{}': {e}",
+                    self.execution_id
+                ),
+                kind: Some("malformed_response".to_owned()),
+                retryable: Some(false),
+                raw_body: String::new(),
+            })?;
+        let family = match self.partition_family.as_str() {
+            "flow" => ff_core::partition::PartitionFamily::Flow,
+            "execution" => ff_core::partition::PartitionFamily::Execution,
+            "budget" => ff_core::partition::PartitionFamily::Budget,
+            "quota" => ff_core::partition::PartitionFamily::Quota,
+            other => {
+                return Err(SdkError::AdminApi {
+                    status: 200,
+                    message: format!(
+                        "claim_for_worker: unknown partition_family '{other}'"
+                    ),
+                    kind: Some("malformed_response".to_owned()),
+                    retryable: Some(false),
+                    raw_body: String::new(),
+                });
+            }
+        };
+        Ok(ff_core::contracts::ClaimGrant {
+            execution_id,
+            partition: ff_core::partition::Partition {
+                family,
+                index: self.partition_index,
+            },
+            grant_key: self.grant_key,
+            expires_at_ms: self.expires_at_ms,
+        })
+    }
+}
+
 /// Trim trailing slashes from a base URL so `format!("{base}/v1/...")`
 /// never produces `https://host//v1/...`. Mirror of
 /// media-pipeline's pattern.
@@ -332,5 +491,57 @@ mod tests {
         let raw = r#"{"rotated": 1, "failed": [], "new_kid": "k1"}"#;
         let r: RotateWaitpointSecretResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(r.in_progress, Vec::<u16>::new());
+    }
+
+    // ── ClaimForWorkerResponse::into_grant ──
+
+    fn sample_claim_response(family: &str) -> ClaimForWorkerResponse {
+        ClaimForWorkerResponse {
+            execution_id: "{fp:5}:11111111-1111-1111-1111-111111111111".to_owned(),
+            partition_family: family.to_owned(),
+            partition_index: 5,
+            grant_key: "ff:exec:{fp:5}:11111111-1111-1111-1111-111111111111:claim_grant".to_owned(),
+            expires_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn into_grant_accepts_all_known_families() {
+        for family in ["flow", "execution", "budget", "quota"] {
+            let g = sample_claim_response(family).into_grant().unwrap_or_else(|e| {
+                panic!("family {family} should parse: {e:?}")
+            });
+            assert_eq!(g.partition.index, 5);
+            assert_eq!(g.expires_at_ms, 1_700_000_000_000);
+        }
+    }
+
+    #[test]
+    fn into_grant_rejects_unknown_family() {
+        let resp = sample_claim_response("nonsense");
+        let err = resp.into_grant().unwrap_err();
+        match err {
+            SdkError::AdminApi { message, kind, .. } => {
+                assert!(message.contains("unknown partition_family"),
+                    "msg: {message}");
+                assert_eq!(kind.as_deref(), Some("malformed_response"));
+            }
+            other => panic!("expected AdminApi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_grant_rejects_malformed_execution_id() {
+        let mut resp = sample_claim_response("flow");
+        resp.execution_id = "not-a-valid-eid".to_owned();
+        let err = resp.into_grant().unwrap_err();
+        match err {
+            SdkError::AdminApi { message, kind, .. } => {
+                assert!(message.contains("malformed execution_id"),
+                    "msg: {message}");
+                assert_eq!(kind.as_deref(), Some("malformed_response"));
+            }
+            other => panic!("expected AdminApi, got {other:?}"),
+        }
     }
 }

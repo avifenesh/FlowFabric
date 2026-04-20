@@ -157,7 +157,7 @@ FF_MAX_CONCURRENT_STREAM_OPS=2 cargo run -p ff-server &
 ## V1 shortcuts (documented)
 
 - **Client-side data passing (legacy, to be migrated).** The submit CLI currently waits for each upstream execution to complete, reads the raw result bytes from `GET /v1/executions/{id}/result`, and embeds them as the next execution's `input_payload`. Batch C item 3 has landed server-side auto-injection: when the flow edge is staged with a non-empty `data_passing_ref`, the engine atomically copies the upstream's `result` into the downstream's `input_payload` at satisfaction time inside `ff_resolve_dependency`. The submit CLI has not yet been migrated to the server-side path — tracked as a follow-up. See `docs/rfc011-operator-runbook.md` §"Data passing between flow nodes".
-- **`direct-valkey-claim` feature.** Workers use the direct Valkey claim path gated by the `direct-valkey-claim` feature on `ff-sdk`. Batch C will replace this with a proper scheduler-mediated claim API.
+- **Scheduler-routed claim.** As of Batch C item 2 PR-B, the 3 workers (transcribe, summarize, embed) claim via `FlowFabricWorker::claim_via_server` — an HTTP `POST /v1/workers/{id}/claim` that runs budget / quota / capability admission server-side through `ff-scheduler`. The `direct-valkey-claim` feature flag is gone from the example's `Cargo.toml`. Set `FF_SERVER_URL` (and optionally `FF_API_TOKEN`) to point the workers at the ff-server.
 
 ## Submit crash recovery (v1)
 

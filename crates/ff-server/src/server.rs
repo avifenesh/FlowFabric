@@ -1882,6 +1882,53 @@ impl Server {
         parse_change_priority_result(&raw, execution_id)
     }
 
+    /// Scheduler-routed claim entry point (Batch C item 2 PR-B).
+    ///
+    /// Delegates to [`ff_scheduler::Scheduler::claim_for_worker`] which
+    /// runs budget + quota + capability admission before issuing the
+    /// grant. Returns `Ok(None)` when no eligible execution exists on
+    /// the lane at this scan cycle. The worker's subsequent
+    /// `claim_from_grant(lane, grant)` mints the lease.
+    ///
+    /// Keeping the claim-grant mint inside the server (rather than the
+    /// worker) means capability CSV validation, budget/quota breach
+    /// checks, and lane routing run in one place for every tenant
+    /// worker — the same invariants as the `direct-valkey-claim` path
+    /// enforces inline, but gated at a single server choke point.
+    pub async fn claim_for_worker(
+        &self,
+        lane: &LaneId,
+        worker_id: &WorkerId,
+        worker_instance_id: &WorkerInstanceId,
+        worker_capabilities: &std::collections::BTreeSet<String>,
+        grant_ttl_ms: u64,
+    ) -> Result<Option<ff_core::contracts::ClaimGrant>, ServerError> {
+        let scheduler = ff_scheduler::Scheduler::new(
+            self.client.clone(),
+            self.config.partition_config,
+        );
+        scheduler
+            .claim_for_worker(
+                lane,
+                worker_id,
+                worker_instance_id,
+                worker_capabilities,
+                grant_ttl_ms,
+            )
+            .await
+            .map_err(|e| match e {
+                ff_scheduler::SchedulerError::Valkey(inner) => {
+                    ServerError::Valkey(inner)
+                }
+                ff_scheduler::SchedulerError::ValkeyContext { source, context } => {
+                    ServerError::ValkeyContext { source, context }
+                }
+                ff_scheduler::SchedulerError::Config(msg) => {
+                    ServerError::InvalidInput(msg)
+                }
+            })
+    }
+
     /// Revoke an active lease (operator-initiated).
     pub async fn revoke_lease(
         &self,
