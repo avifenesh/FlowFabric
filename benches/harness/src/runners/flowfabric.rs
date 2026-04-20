@@ -205,14 +205,21 @@ async fn drive_one_flow(
     // `expected_graph_revision` that the previous response dictates.
     let setup_start = Instant::now();
 
-    let flow_id = uuid::Uuid::new_v4().to_string();
+    // RFC-011 hash-tagged shape: exec_ids co-locate with their flow's
+    // partition via `ExecutionId::for_flow(flow_id, config)`. Using a
+    // bare UUID eid on a flow-member execution breaks
+    // `ff_add_execution_to_flow`'s single-slot atomic contract on
+    // cluster.
+    let fid = ff_core::types::FlowId::new();
+    let flow_id = fid.to_string();
     create_flow(client, env, &flow_id).await?;
 
     let mut eids: Vec<String> = Vec::with_capacity(nodes);
     let mut graph_rev: u64 = 0;
 
     for i in 0..nodes {
-        let eid = uuid::Uuid::new_v4().to_string();
+        let eid = ff_core::types::ExecutionId::for_flow(&fid, &env.partition_config)
+            .to_string();
         create_execution(client, env, &eid).await?;
         add_to_flow(client, env, &flow_id, &eid).await?;
         graph_rev += 1;
@@ -290,6 +297,12 @@ async fn create_flow(client: &Client, env: &BenchEnv, flow_id: &str) -> Result<(
 async fn create_execution(client: &Client, env: &BenchEnv, eid: &str) -> Result<()> {
     // input_payload serialises as an array of bytes; zero-length is
     // fine. The server-side path accepts empty payloads.
+    // `partition_id` metadata must match the `{fp:N}` hash tag
+    // embedded in the ExecutionId so exec_core's stored partition is
+    // consistent with the Valkey key's slot.
+    let partition_id = ff_core::types::ExecutionId::parse(eid)
+        .map(|e| e.partition())
+        .unwrap_or(0);
     let body = serde_json::json!({
         "execution_id": eid,
         "namespace": env.namespace,
@@ -300,7 +313,7 @@ async fn create_execution(client: &Client, env: &BenchEnv, eid: &str) -> Result<
         "priority": 100,
         "creator_identity": "ff-bench-flow-dag",
         "tags": {},
-        "partition_id": 0,
+        "partition_id": partition_id,
         "now": now_ms(),
     });
     post_ok(client, &format!("{}/v1/executions", env.server), &body, "create_execution").await

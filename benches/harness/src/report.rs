@@ -111,7 +111,7 @@ pub fn git_sha() -> String {
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| o.status.success().then(|| o.stdout))
+        .and_then(|o| o.status.success().then_some(o.stdout))
         .map(|b| String::from_utf8_lossy(&b).trim().to_owned());
     out.unwrap_or_else(|| "unknown".to_owned())
 }
@@ -171,7 +171,7 @@ pub fn host_info() -> HostInfo {
 fn probe_cpu_model() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        return read_proc_cpu_model();
+        read_proc_cpu_model()
     }
     #[cfg(target_os = "macos")]
     {
@@ -186,7 +186,7 @@ fn probe_cpu_model() -> Option<String> {
 fn probe_mem_gb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        return read_proc_mem_gb();
+        read_proc_mem_gb()
     }
     #[cfg(target_os = "macos")]
     {

@@ -21,12 +21,36 @@ pub struct BenchEnv {
     pub namespace: String,
     pub lane: String,
     pub cluster: bool,
+    /// Mirror of the server's partition config. Bench mint sites use
+    /// this so `{fp:N}` values in minted ExecutionIds fall inside the
+    /// server's configured ring, even when `FF_FLOW_PARTITIONS` deviates
+    /// from the default 256.
+    pub partition_config: ff_core::partition::PartitionConfig,
 }
 
 impl BenchEnv {
     pub fn from_env() -> Self {
         fn var(key: &str, default: &str) -> String {
             std::env::var(key).unwrap_or_else(|_| default.to_owned())
+        }
+        fn partition_config_from_env() -> ff_core::partition::PartitionConfig {
+            let mut config = ff_core::partition::PartitionConfig::default();
+            if let Ok(v) = std::env::var("FF_FLOW_PARTITIONS")
+                && let Ok(n) = v.parse::<u16>()
+                    && n > 0 {
+                        config.num_flow_partitions = n;
+                    }
+            if let Ok(v) = std::env::var("FF_BUDGET_PARTITIONS")
+                && let Ok(n) = v.parse::<u16>()
+                    && n > 0 {
+                        config.num_budget_partitions = n;
+                    }
+            if let Ok(v) = std::env::var("FF_QUOTA_PARTITIONS")
+                && let Ok(n) = v.parse::<u16>()
+                    && n > 0 {
+                        config.num_quota_partitions = n;
+                    }
+            config
         }
         Self {
             server: var("FF_BENCH_SERVER", "http://localhost:9090"),
@@ -37,6 +61,7 @@ impl BenchEnv {
             namespace: var("FF_BENCH_NAMESPACE", "default"),
             lane: var("FF_BENCH_LANE", "bench"),
             cluster: var("FF_BENCH_CLUSTER", "false") == "true",
+            partition_config: partition_config_from_env(),
         }
     }
 }
@@ -46,15 +71,14 @@ impl BenchEnv {
 /// small spikes shouldn't fail a run.
 pub fn http_client() -> Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(30));
-    if let Ok(token) = std::env::var("FF_API_TOKEN") {
-        if !token.is_empty() {
+    if let Ok(token) = std::env::var("FF_API_TOKEN")
+        && !token.is_empty() {
             let mut h = reqwest::header::HeaderMap::new();
             let val = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .context("bad FF_API_TOKEN")?;
             h.insert(reqwest::header::AUTHORIZATION, val);
             builder = builder.default_headers(h);
         }
-    }
     Ok(builder.build()?)
 }
 
@@ -81,7 +105,30 @@ pub async fn create_execution_with_deadline(
     payload_bytes: Vec<u8>,
     deadline_at_ms: Option<i64>,
 ) -> Result<String> {
-    let eid = uuid::Uuid::new_v4().to_string();
+    // Post-RFC-011: ExecutionId is `{fp:N}:<uuid>`, not a bare UUID.
+    //
+    // Mint path choice for benches matters: `ExecutionId::solo(lane, ..)`
+    // hashes the LANE id into a partition, so every solo-minted exec on
+    // the same lane lands on ONE partition of 256. A single-lane bench
+    // then sees a per-worker claim floor of `claim_poll_interval_ms ×
+    // (num_partitions / PARTITION_SCAN_CHUNK)` because the worker's
+    // rolling cursor has to sweep the whole ring to find the one hot
+    // partition.
+    //
+    // Instead, mint via `ExecutionId::for_flow` with a fresh FlowId per
+    // exec — each one hashes independently across partitions, matching
+    // the pre-RFC-011 bare-UUID distribution and exposing the real
+    // per-op throughput. No flow is actually staged; the flow_id is
+    // just scaffolding for the hash-tag.
+    let fid = ff_core::types::FlowId::new();
+    let eid_typed =
+        ff_core::types::ExecutionId::for_flow(&fid, &env.partition_config);
+    // `partition_id` metadata on exec_core must match the `{fp:N}`
+    // hash-tag inside the ExecutionId. The Lua only stores it for
+    // introspection, but inconsistent metadata is confusing to anyone
+    // reading the hash back.
+    let partition_id = eid_typed.partition();
+    let eid = eid_typed.to_string();
     let mut body = serde_json::json!({
         "execution_id": eid,
         "namespace": env.namespace,
@@ -92,7 +139,7 @@ pub async fn create_execution_with_deadline(
         "priority": 100,
         "creator_identity": "ff-bench",
         "tags": {},
-        "partition_id": 0,
+        "partition_id": partition_id,
         "now": now_ms(),
     });
     if let Some(deadline) = deadline_at_ms {
