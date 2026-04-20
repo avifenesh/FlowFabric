@@ -51,11 +51,30 @@ VERSION="$(awk '
   }
 ' "$LUA_DIR/version.lua")"
 
-count=$(printf '%s\n' "$VERSION" | grep -c .)
+# `grep -c .` exits 1 on zero matches; with pipefail that would abort before
+# we reach the helpful error message below. `|| :` neutralizes the exit code.
+count=$(printf '%s\n' "$VERSION" | grep -c . || :)
 if [ "$count" -ne 1 ]; then
   echo "error: expected exactly one non-commented \`return 'X'\` in lua/version.lua, got $count" >&2
   exit 1
 fi
+
+# Sanity bounds mirror the old build.rs: non-empty, no embedded quotes or
+# newlines (would imply a broken parse), short enough to be a version string.
+if [ -z "$VERSION" ]; then
+  echo "error: extracted LIBRARY_VERSION is empty" >&2
+  exit 1
+fi
+if [ "${#VERSION}" -ge 64 ]; then
+  echo "error: extracted LIBRARY_VERSION too long (${#VERSION} chars): $VERSION" >&2
+  exit 1
+fi
+case "$VERSION" in
+  *"'"*|*'"'*|*$'\n'*|*$'\r'*)
+    echo "error: extracted LIBRARY_VERSION contains illegal char: $VERSION" >&2
+    exit 1
+    ;;
+esac
 
 printf '%s' "$VERSION" > "$VER_OUT"
 
