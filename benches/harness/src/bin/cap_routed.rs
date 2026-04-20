@@ -113,7 +113,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use ff_bench::{write_report, LatencyMs, Report, SYSTEM_FLOWFABRIC};
 use ff_core::keys::IndexKeys;
-use ff_core::partition::{Partition, PartitionConfig, PartitionFamily};
+use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 use ff_sdk::{FlowFabricWorker, WorkerConfig};
 use rand::prelude::*;
@@ -409,7 +409,7 @@ async fn run_once(
         .enumerate()
         .map(|(wi, caps)| {
             let env = env.clone();
-            let caps: Vec<String> = caps.iter().cloned().collect();
+            let caps: Vec<String> = caps.to_vec();
             let tracker = tracker.clone();
             let report_tx = report_tx.clone();
             let shutdown_rx = shutdown_rx.clone();
@@ -458,18 +458,17 @@ async fn run_once(
                         // or Rejected observation will follow up on
                         // (each of which counts as an FCALL below).
                         let mut guard = tracker.lock().await;
-                        if let Some(entry) = guard.get_mut(&eid) {
-                            if entry.first_claim_us.is_none() {
+                        if let Some(entry) = guard.get_mut(&eid)
+                            && entry.first_claim_us.is_none() {
                                 entry.first_claim_us = Some(t_us);
                                 first_claim_us.push(t_us);
                             }
-                        }
                     }
                     ClaimObservation::Correct { eid, t_us } => {
                         scheduler_fcalls += 1;
                         let mut guard = tracker.lock().await;
-                        if let Some(entry) = guard.get_mut(&eid) {
-                            if entry.correct_claim_us.is_none() {
+                        if let Some(entry) = guard.get_mut(&eid)
+                            && entry.correct_claim_us.is_none() {
                                 entry.correct_claim_us = Some(t_us);
                                 correct_claim_us.push(t_us);
                                 correct_claims += 1;
@@ -484,7 +483,6 @@ async fn run_once(
                                     }
                                 }
                             }
-                        }
                     }
                     ClaimObservation::Rejected { eid } => {
                         scheduler_fcalls += 1;
@@ -592,7 +590,7 @@ async fn classify_stranded(
         .context("open ferriskey client for stranded-state sweep")?;
 
     let lane = LaneId::new(env.lane.clone());
-    let config = PartitionConfig::default();
+    let config = env.partition_config;
     let n = config.num_flow_partitions;
 
     let mut blocked_route: HashSet<String> = HashSet::new();
@@ -734,8 +732,10 @@ async fn create_with_caps(
     // every lane="bench" exec to a single partition — see
     // workload.rs for the rationale).
     let fid = ff_core::types::FlowId::new();
-    let partition_config = ff_core::partition::PartitionConfig::default();
-    let eid = ff_core::types::ExecutionId::for_flow(&fid, &partition_config).to_string();
+    let eid_typed =
+        ff_core::types::ExecutionId::for_flow(&fid, &env.partition_config);
+    let partition_id = eid_typed.partition();
+    let eid = eid_typed.to_string();
     let policy = serde_json::json!({
         "routing_requirements": {
             "required_capabilities": caps,
@@ -752,7 +752,7 @@ async fn create_with_caps(
         "creator_identity": "ff-bench-cap-routed",
         "tags": {},
         "policy": policy,
-        "partition_id": 0,
+        "partition_id": partition_id,
         "now": ff_bench::workload::now_ms(),
     });
     let url = format!("{}/v1/executions", env.server);

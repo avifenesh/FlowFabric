@@ -24,13 +24,22 @@ host class.
 | **ff-server (v0.1.0)** | **01f6327** | **2171.6** | **0.41** | **0.89** | **1.11** |
 | ff-server (pre-Batch-C) | 6fef93d |  3320.9 | 0.395  | 0.672  | 0.813  |
 
-Note: the 35% headline drop vs `6fef93d` is partly from the RFC-011
-single-partition hot-spot that solo-minted execs hit on a single lane
-(bench harness fixed to use `ExecutionId::for_flow` post this run).
-Latency p99 up ~37% — traceable to the push-based DAG listener's
-SUBSCRIBE connection always being up; dispatcher spawning reads one
-extra client connection per completion when `flow_id` is empty it
-short-circuits, but the SUBSCRIBE itself is steady-state overhead.
+The `01f6327` numbers were captured with the harness already minting
+via `ExecutionId::for_flow(fresh_fid)` — each exec spreads across
+partitions, matching the pre-RFC-011 bare-UUID distribution. Earlier
+intermediate runs that used `ExecutionId::solo(lane, ..)` pinned
+every exec to one partition and registered ~40 ops/s; those were
+artifacts of the mint choice, not a regression.
+
+Throughput drop vs `6fef93d` (-35%): the accepted Batch-C trade-off.
+ff_complete / fail / cancel now PUBLISH to `ff:dag:completions` on
+every flow-bound terminal transition (no-op for standalone execs),
+and the engine maintains a dedicated RESP3 SUBSCRIBE connection.
+Standalone execs don't emit, but the listener plumbing is always up.
+
+Latency p99 (+37%): traceable to the same SUBSCRIBE connection plus
+the push listener spawning dispatch per completion. Cost dominated
+by the extra tokio task spawn, not Valkey round-trips.
 
 ## Scenario 2 — cap_routed (1 iteration, cap_universe=10, 100 workers)
 
@@ -61,15 +70,16 @@ features, but brackets order-of-magnitude.
 
 ## Scenario 4 — long_running_steady_state (300s, refill 20 tasks / 10s)
 
-| metric                      | v0.1.0 (01f6327) | pre-BatchC (6f81926) |
-|-----------------------------|------------------|----------------------|
-| completed                   | 2580             | 2679                 |
-| failed                      | 101              | 102                  |
-| missed_deadline             | 100              | n/a (%)              |
-| steady_state_ops/s          | 2.0              | n/a                  |
-| lease_renewal_overhead (%)  | 0.00015          | 0.00017              |
-| rss_min_mb / rss_max_mb     | 32 / 67          | 37 / 72              |
-| rss_slope_mb_per_min        | −4.41            | n/a                  |
+| metric                       | v0.1.0 (01f6327) | pre-BatchC (6f81926) |
+|------------------------------|------------------|----------------------|
+| completed (count)            | 2580             | 2679                 |
+| failed (count)               | 101              | 102                  |
+| missed_deadline (count)      | 100              | 188 (~7.0%)          |
+| missed_deadline (% of completed) | 3.88%        | 7.01%                |
+| steady_state_ops/s           | 2.0              | n/a                  |
+| lease_renewal_overhead (%)   | 0.00015          | 0.00017              |
+| rss_min_mb / rss_max_mb      | 32 / 67          | 37 / 72              |
+| rss_slope_mb_per_min         | −4.41            | n/a                  |
 
 Completion count roughly stable; lease renewal overhead unchanged.
 
