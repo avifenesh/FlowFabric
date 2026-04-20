@@ -1,6 +1,8 @@
 # RFC-011: Exec/flow hash-slot co-location for atomic membership
 
-**Status:** Accepted and implemented. Supersedes issue #21 (reconciliation scanner) on phase-3 merge.
+**Status:** Accepted and implemented.
+**Created:** 2026-04-18
+**Supersedes:** issue #21 (reconciliation scanner) on phase-3 merge.
 
 ---
 
@@ -808,7 +810,7 @@ Response: CONCEDE the derivation is indirect; TIGHTEN the language.
 
 The `wider_80_20-ferriskey-wider-8cb6dff.json` measurement is raw SET/GET throughput, not FCALL. FCALL has Lua-script overhead (registration lookup, argument marshalling, Lua bytecode execution, reply serialisation) that a raw SET does not. Our FCALL-heavy workload is slower than raw GET/SET by a factor we haven't measured independently.
 
-**Corrected phrasing for §4.4** (will land in a follow-up revision commit after this response): "Per-slot GET/SET throughput from the existing bench: 115k ops/sec. FlowFabric's per-op cost is 3-5 Valkey round-trips (claim → attempt commands → complete/fail), each of which is an FCALL; FCALL throughput is empirically 30-60% of raw SET/GET on comparable hardware per the ferriskey round-3 bench results. A conservative envelope for per-slot FCALL throughput is **30-40k FCALLs/sec**; for a 4-5 FCALL/exec workload, that's **~7-10k execs/sec per lane per slot**."
+**Corrected phrasing for §4.4**: "Per-slot GET/SET throughput from the existing bench: 115k ops/sec (raw data: `benches/perf-invest/wider_80_20-ferriskey-wider-8cb6dff.json` + sibling files). FlowFabric's per-op cost is 3-5 Valkey round-trips (claim → attempt commands → complete/fail), each of which is an FCALL; FCALL throughput is empirically 30-60% of raw SET/GET on comparable hardware. A conservative envelope for per-slot FCALL throughput is **30-40k FCALLs/sec**; for a 4-5 FCALL/exec workload, that's **~7-10k execs/sec per lane per slot**."
 
 That tightening preserves the §5.2 "10k-member soft limit" rationale — 10k members at 7-10k execs/sec saturates the slot for ~1-1.4 seconds end-to-end, which is still the sub-second p99 budget concern. The number is lower than the original (~20-40k/sec), but the shape of the argument survives.
 

@@ -41,8 +41,8 @@ runs.
   from -45.81 % (localhost) to -32.50 % (cluster+TLS) but does not
   close. On cluster+TLS: **p50 is tied**, the gap lives entirely in
   the tail + overall throughput. Mechanism: BLMPOP head-of-line
-  blocking on the multiplexed connection; tracked as architectural
-  non-fix (closed issue #12).
+  blocking on the multiplexed connection; filed as issue #12 and
+  closed as an architectural non-fix.
 
 ## Why the scaled-down numbers
 
