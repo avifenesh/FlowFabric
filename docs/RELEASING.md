@@ -15,7 +15,8 @@ Seven crates, all pinned to the same version, published in topological order:
 3. `ff-script`       — typed FCALL wrappers + Lua library loader
 4. `ff-engine`       — cross-partition dispatch + scanners
    (includes the `completion_listener` module for push-based DAG
-   promotion; see docs/rfc011-operator-runbook.md §"DAG promotion")
+   promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
+   §"DAG promotion: push listener + safety-net reconciler")
 5. `ff-scheduler`    — claim-grant scheduler
 6. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
    off by default; production deployments use the scheduler-routed

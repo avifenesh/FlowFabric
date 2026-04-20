@@ -142,8 +142,10 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
+          VER="${TAG_VERSION#v}"
           cargo publish -p ff-core --no-verify || {
-            echo "::error::cargo publish ff-core failed -- yank ferriskey@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-core failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
             exit 1
           }
       - run: sleep 30
@@ -151,8 +153,11 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
+          VER="${TAG_VERSION#v}"
           cargo publish -p ff-script --no-verify || {
-            echo "::error::cargo publish ff-script failed -- yank ferriskey,ff-core@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-script failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
             exit 1
           }
       - run: sleep 30
@@ -160,8 +165,12 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
+          VER="${TAG_VERSION#v}"
           cargo publish -p ff-engine --no-verify || {
-            echo "::error::cargo publish ff-engine failed -- yank ferriskey,ff-core,ff-script@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-engine failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
             exit 1
           }
       - run: sleep 30
@@ -169,8 +178,13 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
+          VER="${TAG_VERSION#v}"
           cargo publish -p ff-scheduler --no-verify || {
-            echo "::error::cargo publish ff-scheduler failed -- yank ferriskey,ff-core,ff-script,ff-engine@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-scheduler failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-engine"
             exit 1
           }
       - run: sleep 30
@@ -178,8 +192,14 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
+          VER="${TAG_VERSION#v}"
           cargo publish -p ff-sdk --no-verify || {
-            echo "::error::cargo publish ff-sdk failed -- yank ferriskey,ff-core,ff-script,ff-engine,ff-scheduler@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-sdk failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-engine"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             exit 1
           }
       - run: sleep 30
@@ -187,8 +207,15 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
+          VER="${TAG_VERSION#v}"
           cargo publish -p ff-server --no-verify || {
-            echo "::error::cargo publish ff-server failed -- yank ferriskey,ff-core,ff-script,ff-engine,ff-scheduler,ff-sdk@${TAG_VERSION#v} before re-tagging"
+            echo "::error::cargo publish ff-server failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-engine"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
+            echo "::error::  cargo yank --version ${VER} ff-sdk"
             exit 1
           }
 
