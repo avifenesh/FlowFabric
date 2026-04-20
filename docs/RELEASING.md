@@ -6,32 +6,48 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Eight crates, all pinned to the same version, published in topological order:
+Seven crates, all pinned to the same version, published in topological order:
 
-1. `telemetrylib`    — root of the ferriskey subtree
-2. `ferriskey`       — Valkey client (reparented fork of glide-core)
-3. `ff-core`         — types, keys, errors
-4. `ff-script`       — typed FCALL wrappers + Lua library loader
-5. `ff-engine`       — cross-partition dispatch + scanners
-6. `ff-scheduler`    — claim-grant scheduler
-7. `ff-sdk`          — worker SDK
-8. `ff-server`       — HTTP server library + binary
+1. `ferriskey`       — Valkey client (reparented fork of glide-core;
+   the former `telemetrylib` sub-crate was inlined during the Tier 1
+   envelope collapse and is no longer a separate publish target)
+2. `ff-core`         — types, keys, errors
+3. `ff-script`       — typed FCALL wrappers + Lua library loader
+4. `ff-engine`       — cross-partition dispatch + scanners
+   (includes the `completion_listener` module for push-based DAG
+   promotion; see docs/rfc011-operator-runbook.md §"DAG promotion")
+5. `ff-scheduler`    — claim-grant scheduler
+6. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
+   off by default; production deployments use the scheduler-routed
+   HTTP path via `FlowFabricWorker::claim_via_server`
+7. `ff-server`       — HTTP server library + binary
 
 Excluded from publish:
 
 - `ff-test` — dev-only integration harness (`publish = false`).
+- `ff-bench` — internal bench harness at `benches/harness/`
+  (`publish = false`).
 
 ## Pre-flight checklist
 
 Before cutting a release, verify:
 
-- [ ] W3's benchmark numbers for the target version exist at
-      `benches/results/<new_version>/`. The release workflow does not
-      enforce this; it is an operator-level gate.
+- [ ] Benchmark numbers for the target version have been refreshed.
+      Raw JSONs are local (`benches/results/*.json` is gitignored);
+      the curated summary at `benches/results/baseline.md` is the
+      tracked artifact and must reflect the HEAD that will be tagged.
+      The release workflow does not enforce this; it is an
+      operator-level gate.
+- [ ] Valkey minimum is 8.0+. The server refuses to start against
+      Valkey < 8.0 (RFC-011 §13). Ensure all production + CI targets
+      are on 8.x before cutting.
+- [ ] RESP3 is required for the engine's completion listener.
+      `FlowFabricWorker::connect` defaults to RESP3; servers fronted
+      by protocol-downgrading proxies must be verified against.
 - [ ] `CARGO_REGISTRY_TOKEN` is configured in repo settings (Settings →
       Secrets and variables → Actions). Generate at
       <https://crates.io/me> → API Tokens with scope `publish-new` +
-      `publish-update`. The token must have upload rights to all eight
+      `publish-update`. The token must have upload rights to all seven
       crate names — claim them on crates.io first if they are new.
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.
@@ -61,9 +77,11 @@ Replace `patch` with `minor` or `major` as appropriate.
 
 On tag push matching `v*.*.*`:
 
-1. **verify** (CI gate) — `cargo check --workspace`, clippy -D warnings,
-   unit tests + `ff-test` serial e2e against a Valkey service container.
-   Same strictness as `.github/workflows/ci.yml`.
+1. **verify** (CI gate) — `cargo check --workspace`, clippy -D warnings
+   across the workspace AND ferriskey (the vendored fork's test suite
+   + benches are gated post-#37), unit tests + `ff-test` serial e2e
+   against a Valkey 8.x service container. Same strictness as
+   `.github/workflows/matrix.yml`.
 2. **publish** (needs verify) — sequential `cargo publish -p <crate>`
    in path→version-dep order with 30s sleeps between each for crates.io
    index propagation. `--no-verify` flag is passed since Job 1 already
