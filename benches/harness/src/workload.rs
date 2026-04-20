@@ -81,7 +81,24 @@ pub async fn create_execution_with_deadline(
     payload_bytes: Vec<u8>,
     deadline_at_ms: Option<i64>,
 ) -> Result<String> {
-    let eid = uuid::Uuid::new_v4().to_string();
+    // Post-RFC-011: ExecutionId is `{fp:N}:<uuid>`, not a bare UUID.
+    //
+    // Mint path choice for benches matters: `ExecutionId::solo(lane, ..)`
+    // hashes the LANE id into a partition, so every solo-minted exec on
+    // the same lane lands on ONE partition of 256. A single-lane bench
+    // then sees a per-worker claim floor of `claim_poll_interval_ms ×
+    // (num_partitions / PARTITION_SCAN_CHUNK)` because the worker's
+    // rolling cursor has to sweep the whole ring to find the one hot
+    // partition.
+    //
+    // Instead, mint via `ExecutionId::for_flow` with a fresh FlowId per
+    // exec — each one hashes independently across partitions, matching
+    // the pre-RFC-011 bare-UUID distribution and exposing the real
+    // per-op throughput. No flow is actually staged; the flow_id is
+    // just scaffolding for the hash-tag.
+    let fid = ff_core::types::FlowId::new();
+    let partition_config = ff_core::partition::PartitionConfig::default();
+    let eid = ff_core::types::ExecutionId::for_flow(&fid, &partition_config).to_string();
     let mut body = serde_json::json!({
         "execution_id": eid,
         "namespace": env.namespace,

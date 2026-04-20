@@ -729,7 +729,13 @@ async fn create_with_caps(
     seq: usize,
     caps: &[String],
 ) -> Result<String> {
-    let eid = uuid::Uuid::new_v4().to_string();
+    // RFC-011 hash-tagged ExecutionId shape. `for_flow` with a fresh
+    // flow_id per exec distributes across partitions (solo would pin
+    // every lane="bench" exec to a single partition — see
+    // workload.rs for the rationale).
+    let fid = ff_core::types::FlowId::new();
+    let partition_config = ff_core::partition::PartitionConfig::default();
+    let eid = ff_core::types::ExecutionId::for_flow(&fid, &partition_config).to_string();
     let policy = serde_json::json!({
         "routing_requirements": {
             "required_capabilities": caps,

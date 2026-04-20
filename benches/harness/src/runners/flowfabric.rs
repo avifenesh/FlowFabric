@@ -205,14 +205,22 @@ async fn drive_one_flow(
     // `expected_graph_revision` that the previous response dictates.
     let setup_start = Instant::now();
 
-    let flow_id = uuid::Uuid::new_v4().to_string();
+    // RFC-011 hash-tagged shape: exec_ids co-locate with their flow's
+    // partition via `ExecutionId::for_flow(flow_id, config)`. Using a
+    // bare UUID eid on a flow-member execution breaks
+    // `ff_add_execution_to_flow`'s single-slot atomic contract on
+    // cluster.
+    let fid = ff_core::types::FlowId::new();
+    let flow_id = fid.to_string();
     create_flow(client, env, &flow_id).await?;
 
+    let partition_config = ff_core::partition::PartitionConfig::default();
     let mut eids: Vec<String> = Vec::with_capacity(nodes);
     let mut graph_rev: u64 = 0;
 
     for i in 0..nodes {
-        let eid = uuid::Uuid::new_v4().to_string();
+        let eid = ff_core::types::ExecutionId::for_flow(&fid, &partition_config)
+            .to_string();
         create_execution(client, env, &eid).await?;
         add_to_flow(client, env, &flow_id, &eid).await?;
         graph_rev += 1;
