@@ -952,6 +952,30 @@ impl FlowFabricWorker {
     ///
     /// [`ClaimGrant`]: ff_core::contracts::ClaimGrant
     /// [`ff_scheduler::Scheduler::claim_for_worker`]: https://docs.rs/ff-scheduler
+    pub async fn claim_from_grant(
+        &self,
+        lane: LaneId,
+        grant: ff_core::contracts::ClaimGrant,
+    ) -> Result<ClaimedTask, SdkError> {
+        // Semaphore check FIRST. If the worker is saturated we must
+        // surface the condition to the caller without touching the
+        // grant — silently returning Ok(None) (as claim_next does)
+        // would drop a grant the scheduler has already committed work
+        // to issuing, wasting the slot until its TTL elapses.
+        let permit = self
+            .concurrency_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SdkError::WorkerAtCapacity)?;
+
+        let now = TimestampMs::now();
+        let mut task = self
+            .claim_execution(&grant.execution_id, &lane, &grant.partition, now)
+            .await?;
+        task.set_concurrency_permit(permit);
+        Ok(task)
+    }
+
     /// Scheduler-routed claim: POST the server's
     /// `/v1/workers/{id}/claim`, then chain to
     /// [`Self::claim_from_grant`].
@@ -988,30 +1012,6 @@ impl FlowFabricWorker {
         };
         let grant = resp.into_grant()?;
         self.claim_from_grant(lane.clone(), grant).await.map(Some)
-    }
-
-    pub async fn claim_from_grant(
-        &self,
-        lane: LaneId,
-        grant: ff_core::contracts::ClaimGrant,
-    ) -> Result<ClaimedTask, SdkError> {
-        // Semaphore check FIRST. If the worker is saturated we must
-        // surface the condition to the caller without touching the
-        // grant — silently returning Ok(None) (as claim_next does)
-        // would drop a grant the scheduler has already committed work
-        // to issuing, wasting the slot until its TTL elapses.
-        let permit = self
-            .concurrency_semaphore
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| SdkError::WorkerAtCapacity)?;
-
-        let now = TimestampMs::now();
-        let mut task = self
-            .claim_execution(&grant.execution_id, &lane, &grant.partition, now)
-            .await?;
-        task.set_concurrency_permit(permit);
-        Ok(task)
     }
 
     /// Consume a [`ReclaimGrant`] and transition the granted

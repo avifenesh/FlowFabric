@@ -622,11 +622,37 @@ impl From<ff_core::contracts::ClaimGrant> for ClaimGrantDto {
 /// execution on a multi-hour grant.
 const CLAIM_GRANT_TTL_MS_MAX: u64 = 60_000;
 
+/// Reject empty / whitespace / non-printable identifiers the way
+/// [`LaneId::try_new`] does for lanes. WorkerId + WorkerInstanceId
+/// feed into scheduler scan jitter + Valkey key construction; silent
+/// acceptance of "" or "w\nork" would either mis-key or mis-hash.
+fn validate_identifier(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.is_empty() {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: must not be empty"
+        ))));
+    }
+    if value.len() > 256 {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: exceeds 256 bytes (got {})",
+            value.len()
+        ))));
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "{field}: must not contain whitespace or control characters"
+        ))));
+    }
+    Ok(())
+}
+
 async fn claim_for_worker(
     State(server): State<Arc<Server>>,
     Path(worker_id): Path<String>,
     AppJson(body): AppJson<ClaimForWorkerBody>,
 ) -> Result<Response, ApiError> {
+    validate_identifier("worker_id", &worker_id)?;
+    validate_identifier("worker_instance_id", &body.worker_instance_id)?;
     let worker_id = WorkerId::new(worker_id);
     let worker_instance_id = WorkerInstanceId::new(body.worker_instance_id);
     let lane = LaneId::try_new(body.lane_id).map_err(|e| {

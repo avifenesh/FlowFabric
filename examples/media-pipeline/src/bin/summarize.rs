@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         Some(tok) => FlowFabricAdminClient::with_token(&args.server_url, tok)?,
         None => FlowFabricAdminClient::new(&args.server_url)?,
     };
-    let lane = ff_core::types::LaneId::new(&args.lane);
+    let lane = ff_core::types::LaneId::try_new(&args.lane)?;
     tracing::info!(
         instance = %instance_id,
         model = %args.model.display(),

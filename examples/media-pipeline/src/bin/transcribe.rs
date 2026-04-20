@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         Some(tok) => FlowFabricAdminClient::with_token(&args.server_url, tok)?,
         None => FlowFabricAdminClient::new(&args.server_url)?,
     };
-    let lane = ff_core::types::LaneId::new(&args.lane);
+    let lane = ff_core::types::LaneId::try_new(&args.lane)?;
     tracing::info!(instance = %instance_id, "transcribe worker connected");
 
     let shutdown = shutdown_signal();
@@ -117,6 +117,11 @@ async fn main() -> anyhow::Result<()> {
                             tracing::error!(execution_id = %eid, error = %e, "task failed");
                         }
                     }
+                    // Fixed 1s sleep; summarize/embed use a jittered
+                    // `idle_sleep` to avoid N workers waking on the
+                    // same second. Pre-existing inconsistency — left
+                    // for a follow-up that extracts one shared
+                    // idle_sleep helper across all three binaries.
                     Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
                     Err(e) => {
                         tracing::error!(error = %e, "claim_via_server failed");

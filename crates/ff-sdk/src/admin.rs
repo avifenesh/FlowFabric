@@ -117,33 +117,6 @@ impl FlowFabricAdminClient {
         })
     }
 
-    /// Rotate the waitpoint HMAC secret on the server.
-    ///
-    /// Promotes the currently-installed kid to `previous_kid`
-    /// (accepted for the server's configured
-    /// `FF_WAITPOINT_HMAC_GRACE_MS` window) and installs
-    /// `new_secret_hex` under `new_kid` as the new current. Fans
-    /// out across every execution partition. Idempotent: re-running
-    /// with the same `(new_kid, new_secret_hex)` converges.
-    ///
-    /// The server returns 200 if at least one partition rotated OR
-    /// at least one partition was already rotating under a
-    /// concurrent request. See `RotateWaitpointSecretResponse`
-    /// fields for the breakdown.
-    ///
-    /// # Errors
-    ///
-    /// * [`SdkError::AdminApi`] — non-2xx response (400 invalid
-    ///   input, 401 missing/bad bearer, 429 concurrent rotate,
-    ///   500 all partitions failed, 504 server-side timeout).
-    /// * [`SdkError::Http`] — transport error (connect, body
-    ///   decode, client-side timeout).
-    ///
-    /// # Retry semantics
-    ///
-    /// Rotation is idempotent on the same `(new_kid,
-    /// new_secret_hex)` so retries are SAFE even on 504s or
-    /// partial failures.
     /// POST `/v1/workers/{worker_id}/claim` — scheduler-routed claim.
     ///
     /// Batch C item 2 PR-B. Swaps the SDK's direct-Valkey claim for a
@@ -159,11 +132,24 @@ impl FlowFabricAdminClient {
         &self,
         req: ClaimForWorkerRequest,
     ) -> Result<Option<ClaimForWorkerResponse>, SdkError> {
-        let url = format!(
-            "{}/v1/workers/{}/claim",
-            self.base_url,
-            req.worker_id
-        );
+        // Percent-encode `worker_id` in the URL path — `WorkerId` is a
+        // free-form string (could contain `/`, spaces, `%`, etc.) and
+        // splicing it verbatim would produce malformed URLs or
+        // misrouted paths. `Url::path_segments_mut().push` handles the
+        // encoding natively.
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| {
+            SdkError::Config(format!("invalid base_url '{}': {e}", self.base_url))
+        })?;
+        {
+            let mut segs = url.path_segments_mut().map_err(|_| {
+                SdkError::Config(format!(
+                    "base_url cannot be a base URL: '{}'",
+                    self.base_url
+                ))
+            })?;
+            segs.extend(&["v1", "workers", &req.worker_id, "claim"]);
+        }
+        let url = url.to_string();
         let resp = self
             .http
             .post(&url)
@@ -209,6 +195,33 @@ impl FlowFabricAdminClient {
         })
     }
 
+    /// Rotate the waitpoint HMAC secret on the server.
+    ///
+    /// Promotes the currently-installed kid to `previous_kid`
+    /// (accepted for the server's configured
+    /// `FF_WAITPOINT_HMAC_GRACE_MS` window) and installs
+    /// `new_secret_hex` under `new_kid` as the new current. Fans
+    /// out across every execution partition. Idempotent: re-running
+    /// with the same `(new_kid, new_secret_hex)` converges.
+    ///
+    /// The server returns 200 if at least one partition rotated OR
+    /// at least one partition was already rotating under a
+    /// concurrent request. See `RotateWaitpointSecretResponse`
+    /// fields for the breakdown.
+    ///
+    /// # Errors
+    ///
+    /// * [`SdkError::AdminApi`] — non-2xx response (400 invalid
+    ///   input, 401 missing/bad bearer, 429 concurrent rotate,
+    ///   500 all partitions failed, 504 server-side timeout).
+    /// * [`SdkError::Http`] — transport error (connect, body
+    ///   decode, client-side timeout).
+    ///
+    /// # Retry semantics
+    ///
+    /// Rotation is idempotent on the same `(new_kid,
+    /// new_secret_hex)` so retries are SAFE even on 504s or
+    /// partial failures.
     pub async fn rotate_waitpoint_secret(
         &self,
         req: RotateWaitpointSecretRequest,
@@ -478,5 +491,57 @@ mod tests {
         let raw = r#"{"rotated": 1, "failed": [], "new_kid": "k1"}"#;
         let r: RotateWaitpointSecretResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(r.in_progress, Vec::<u16>::new());
+    }
+
+    // ── ClaimForWorkerResponse::into_grant ──
+
+    fn sample_claim_response(family: &str) -> ClaimForWorkerResponse {
+        ClaimForWorkerResponse {
+            execution_id: "{fp:5}:11111111-1111-1111-1111-111111111111".to_owned(),
+            partition_family: family.to_owned(),
+            partition_index: 5,
+            grant_key: "ff:exec:{fp:5}:11111111-1111-1111-1111-111111111111:claim_grant".to_owned(),
+            expires_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn into_grant_accepts_all_known_families() {
+        for family in ["flow", "execution", "budget", "quota"] {
+            let g = sample_claim_response(family).into_grant().unwrap_or_else(|e| {
+                panic!("family {family} should parse: {e:?}")
+            });
+            assert_eq!(g.partition.index, 5);
+            assert_eq!(g.expires_at_ms, 1_700_000_000_000);
+        }
+    }
+
+    #[test]
+    fn into_grant_rejects_unknown_family() {
+        let resp = sample_claim_response("nonsense");
+        let err = resp.into_grant().unwrap_err();
+        match err {
+            SdkError::AdminApi { message, kind, .. } => {
+                assert!(message.contains("unknown partition_family"),
+                    "msg: {message}");
+                assert_eq!(kind.as_deref(), Some("malformed_response"));
+            }
+            other => panic!("expected AdminApi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_grant_rejects_malformed_execution_id() {
+        let mut resp = sample_claim_response("flow");
+        resp.execution_id = "not-a-valid-eid".to_owned();
+        let err = resp.into_grant().unwrap_err();
+        match err {
+            SdkError::AdminApi { message, kind, .. } => {
+                assert!(message.contains("malformed execution_id"),
+                    "msg: {message}");
+                assert_eq!(kind.as_deref(), Some("malformed_response"));
+            }
+            other => panic!("expected AdminApi, got {other:?}"),
+        }
     }
 }

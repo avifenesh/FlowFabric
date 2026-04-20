@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let llm = LlmClient::new(&args.api_key, &args.model);
 
-    let lane = ff_core::types::LaneId::new(&args.lane);
+    let lane = ff_core::types::LaneId::try_new(&args.lane)?;
 
     // Patches awaiting review. suspend() consumes the task, so we stash the
     // result here. When the execution resumes and the worker re-claims it,
