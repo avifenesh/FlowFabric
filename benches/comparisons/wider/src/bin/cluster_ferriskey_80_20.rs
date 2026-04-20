@@ -7,8 +7,8 @@
 //!
 //! Key-hygiene: every key is pinned to the `{wider}` hash tag → one
 //! cluster slot → we measure cluster-client + TLS overhead, not
-//! cross-slot routing. See `report-w2-round2.md §4` for why that's
-//! intentional.
+//! cross-slot routing (intentional — cross-slot cost is a separate
+//! scenario, not what this bench measures).
 
 #[path = "../shared.rs"]
 mod shared;
