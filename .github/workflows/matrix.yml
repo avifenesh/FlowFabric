@@ -220,17 +220,45 @@ jobs:
   # by paths-ignore, `success` on a clean run, `failure` / `cancelled`
   # otherwise. `if: always()` keeps the job on the run graph even when
   # the matrix is skipped.
+  # Drift check: the ff-script Lua library is checked into the crate
+  # (crates/ff-script/src/flowfabric.lua + flowfabric_lua_version) so it
+  # ships inside the published tarball. If someone edits lua/*.lua
+  # without running scripts/gen-ff-script-lua.sh, the checked-in copy
+  # goes stale. This job regenerates and diffs; any divergence fails.
+  lua-drift:
+    name: ff-script lua drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: regenerate flowfabric.lua
+        run: scripts/gen-ff-script-lua.sh
+      - name: verify no drift
+        run: |
+          if ! git diff --exit-code -- \
+              crates/ff-script/src/flowfabric.lua \
+              crates/ff-script/src/flowfabric_lua_version; then
+            echo "::error::ff-script generated Lua is out of date. Run scripts/gen-ff-script-lua.sh and commit." >&2
+            exit 1
+          fi
+
   matrix-tests-complete:
     name: matrix-tests-complete
-    needs: matrix
+    needs: [matrix, lua-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate matrix result
         env:
           MATRIX_RESULT: ${{ needs.matrix.result }}
+          DRIFT_RESULT: ${{ needs.lua-drift.result }}
         run: |
+          fail=0
           case "$MATRIX_RESULT" in
-            success|skipped) echo "matrix: $MATRIX_RESULT — ok"; exit 0 ;;
-            *) echo "matrix: $MATRIX_RESULT — blocking merge" >&2; exit 1 ;;
+            success|skipped) echo "matrix: $MATRIX_RESULT — ok" ;;
+            *) echo "matrix: $MATRIX_RESULT — blocking merge" >&2; fail=1 ;;
           esac
+          case "$DRIFT_RESULT" in
+            success|skipped) echo "lua-drift: $DRIFT_RESULT — ok" ;;
+            *) echo "lua-drift: $DRIFT_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          exit $fail

@@ -8,12 +8,12 @@
 -- signatures they expect a different shape for.
 --
 -- SINGLE SOURCE OF TRUTH: Rust's `LIBRARY_VERSION` is extracted from the
--- `return 'X'` literal below at compile time (see crates/ff-script/build.rs).
--- Do NOT maintain a separate copy in crates/ff-script/src/lib.rs — there
--- is no Rust copy; `env!("FLOWFABRIC_LUA_VERSION")` reads this file.
+-- `return 'X'` literal below by `scripts/gen-ff-script-lua.sh`, which
+-- writes `crates/ff-script/src/flowfabric_lua_version`. Rust reads that
+-- file via `include_str!`. Do NOT maintain a separate Rust literal.
 -- Extract contract: the body MUST contain exactly one `return 'X'` literal
--- with single quotes (not double). Breaking the contract fails build.rs
--- with a pointer to this file.
+-- with single quotes (not double). CI runs the gen script and diffs; any
+-- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
   return '5'
