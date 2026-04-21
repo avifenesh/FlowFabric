@@ -748,3 +748,187 @@ redis.register_function('ff_close_waitpoint', function(keys, args)
 
   return ok()
 end)
+
+---------------------------------------------------------------------------
+-- ff_rotate_waitpoint_hmac_secret
+--
+-- Install a new waitpoint HMAC signing kid on a single partition. The
+-- server-side admin endpoint (ff-server POST /v1/admin/rotate-waitpoint-secret)
+-- delegates to this FCALL per partition. Direct-Valkey consumers (e.g.
+-- cairn-rs, issue #49) invoke it themselves across every partition.
+--
+-- FCALL atomicity is per-shard and per-call; previous implementations used
+-- a SETNX lock + read-modify-write from Rust. Here the script IS the
+-- atomicity boundary, so no lock is needed.
+--
+-- KEYS (1): hmac_secrets  (ff:sec:{p:N}:waitpoint_hmac)
+-- ARGV (3): new_kid, new_secret_hex, grace_ms
+--
+-- `now_ms` is derived server-side from `redis.call("TIME")` to match
+-- the rest of the library (lua/flow.lua, validate_waitpoint_token), so
+-- GC and validation agree on "now". `grace_ms` is a duration, not a
+-- clock value, so taking it from ARGV is safe — operators set it via
+-- FF_WAITPOINT_HMAC_GRACE_MS (ff-server) or pass their own value.
+--
+-- Outcomes:
+--   ok("rotated", previous_kid_or_empty, new_kid, gc_count)
+--   ok("noop",    kid)                           -- exact replay (same kid + secret)
+--   err("rotation_conflict", kid)                -- same kid, different secret
+--   err("invalid_kid")                           -- empty or contains ':'
+--   err("invalid_secret_hex")                    -- empty / odd length / non-hex
+--   err("invalid_grace_ms")                      -- not a non-negative integer
+--
+-- Authoritative implementation of waitpoint HMAC rotation: idempotent
+-- replay, torn-write repair, orphan GC across expired kids. INVARIANT:
+-- expires_at:<new_kid> is never written (current_kid has no expiry).
+-- ff-server's admin endpoint delegates to this FCALL — single source
+-- of truth lives here, not in Rust.
+---------------------------------------------------------------------------
+redis.register_function('ff_rotate_waitpoint_hmac_secret', function(keys, args)
+  local hmac_key       = keys[1]
+  local new_kid        = args[1]
+  local new_secret_hex = args[2]
+  local grace_ms_s     = args[3]
+
+  -- Combined validation (feedback: single condition is more readable).
+  if type(new_kid) ~= "string" or new_kid == "" or new_kid:find(":", 1, true) then
+    return err("invalid_kid")
+  end
+  if type(new_secret_hex) ~= "string"
+      or new_secret_hex == ""
+      or #new_secret_hex % 2 ~= 0
+      or new_secret_hex:find("[^0-9a-fA-F]") then
+    return err("invalid_secret_hex")
+  end
+
+  -- grace_ms must be a finite non-negative integer. The math.floor check
+  -- rejects decimals but NOT infinities (math.floor(math.huge) == math.huge
+  -- which would stamp "inf" into expires_at:*). Cap at 2^53-1 so the
+  -- stored value stays within the IEEE-754 double-precision integer range
+  -- AND within i64, keeping the Rust parser happy. 2^53-1 ms is ~285 years,
+  -- far beyond any operational grace window.
+  local grace_ms = tonumber(grace_ms_s)
+  if not grace_ms
+      or grace_ms ~= grace_ms -- NaN
+      or grace_ms < 0
+      or grace_ms > 9007199254740991 -- 2^53 - 1
+      or grace_ms ~= math.floor(grace_ms) then
+    return err("invalid_grace_ms")
+  end
+
+  -- Server-side time via redis.call("TIME"); never trust caller-supplied
+  -- timestamps for expiry decisions (consistency with flow.lua + helpers.lua
+  -- and with validate_waitpoint_token).
+  local now_ms          = server_time_ms()
+  local prev_expires_at = now_ms + grace_ms
+
+  local current_kid = redis.call("HGET", hmac_key, "current_kid")
+  if current_kid == false then current_kid = nil end
+
+  -- Idempotency branch: same kid already installed.
+  if current_kid == new_kid then
+    local stored = redis.call("HGET", hmac_key, "secret:" .. new_kid)
+    if stored == false then stored = nil end
+    if stored == new_secret_hex then
+      return ok("noop", new_kid)
+    elseif stored then
+      return err("rotation_conflict", new_kid)
+    else
+      -- Torn-write repair: current_kid=new_kid but secret:<new_kid> missing.
+      redis.call("HSET", hmac_key, "secret:" .. new_kid, new_secret_hex)
+      return ok("noop", new_kid)
+    end
+  end
+
+  -- Orphan GC: HGETALL once, collect kids whose expires_at has passed,
+  -- then a single HDEL. One entry per distinct kid ever installed plus
+  -- a handful of scalars; bounded in practice.
+  local raw = redis.call("HGETALL", hmac_key)
+  local expired_fields = {}
+  local gc_count = 0
+  for i = 1, #raw, 2 do
+    local field = raw[i]
+    local value = raw[i + 1]
+    if field:sub(1, 11) == "expires_at:" then
+      local kid = field:sub(12)
+      local exp = tonumber(value)
+      -- GC strictness MUST match validate_waitpoint_token's `exp < now_ms`
+      -- (lua/helpers.lua). Reaping on `exp <= now_ms` would delete a kid
+      -- that the validator still considers in-grace at the boundary
+      -- exp == now_ms, causing tokens that should validate to fail.
+      if not exp or exp <= 0 or exp < now_ms then
+        expired_fields[#expired_fields + 1] = "expires_at:" .. kid
+        expired_fields[#expired_fields + 1] = "secret:" .. kid
+        gc_count = gc_count + 1
+      end
+    end
+  end
+  if #expired_fields > 0 then
+    redis.call("HDEL", hmac_key, unpack(expired_fields))
+  end
+
+  -- Promote current → previous. INVARIANT: expires_at:<new_kid> is NEVER
+  -- written — current_kid has no expiry entry.
+  local prev_expires_str = tostring(prev_expires_at)
+  if current_kid then
+    redis.call("HSET", hmac_key,
+      "previous_kid", current_kid,
+      "previous_expires_at", prev_expires_str,
+      "expires_at:" .. current_kid, prev_expires_str,
+      "current_kid", new_kid,
+      "secret:" .. new_kid, new_secret_hex)
+  else
+    redis.call("HSET", hmac_key,
+      "current_kid", new_kid,
+      "secret:" .. new_kid, new_secret_hex)
+  end
+
+  return ok("rotated", current_kid or "", new_kid, tostring(gc_count))
+end)
+
+---------------------------------------------------------------------------
+-- ff_list_waitpoint_hmac_kids
+--
+-- Read-back for the waitpoint HMAC keystore. Insulates consumers (cairn
+-- admin UI, ff-server audit surface) from the hash-field naming so future
+-- layout changes don't break them.
+--
+-- KEYS (1): hmac_secrets  (ff:sec:{p:N}:waitpoint_hmac)
+-- ARGV: none
+--
+-- Returns ok(current_kid_or_empty, n, kid1, exp1_ms, kid2, exp2_ms, ...)
+-- "verifying" kids = those with a FUTURE expires_at:<kid> entry. Kids
+-- whose grace has already elapsed are NOT reported here — the contract
+-- promises kids that still validate tokens, so listing expired kids
+-- would mislead operators. Expired entries are swept by orphan GC on
+-- the next rotation. current_kid is excluded (it never has an expiry).
+-- Uninitialized → ok("", 0).
+---------------------------------------------------------------------------
+redis.register_function('ff_list_waitpoint_hmac_kids', function(keys, args)
+  local hmac_key = keys[1]
+  local raw = redis.call("HGETALL", hmac_key)
+  local now_ms = server_time_ms()
+
+  local current_kid = ""
+  local pairs_out = {}
+  local n = 0
+  for i = 1, #raw, 2 do
+    local field = raw[i]
+    local value = raw[i + 1]
+    if field == "current_kid" then
+      current_kid = value
+    elseif field:sub(1, 11) == "expires_at:" then
+      local kid = field:sub(12)
+      local exp = tonumber(value)
+      -- Match validator's `exp < now_ms` rejection rule so a kid listed
+      -- as verifying really does still validate tokens at call time.
+      if exp and exp > 0 and exp >= now_ms then
+        pairs_out[#pairs_out + 1] = kid
+        pairs_out[#pairs_out + 1] = value
+        n = n + 1
+      end
+    end
+  end
+
+  return ok(current_kid, tostring(n), unpack(pairs_out))
+end)

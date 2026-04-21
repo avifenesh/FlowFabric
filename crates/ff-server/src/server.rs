@@ -15,6 +15,7 @@ use ff_core::contracts::{
     ListExecutionsResult, PendingWaitpointInfo, ReplayExecutionResult,
     ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
     RevokeLeaseResult,
+    RotateWaitpointHmacSecretArgs,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
@@ -2969,23 +2970,8 @@ pub struct RotateWaitpointSecretResult {
     /// re-run after the underlying fault clears converges to the correct
     /// state.
     pub failed: Vec<u16>,
-    /// Partition indices where another rotation was already in progress
-    /// (SETNX lock held). These will be rotated by the concurrent request;
-    /// NOT a fault the operator should retry and NOT counted in `failed`.
-    /// Surfaced separately so dashboards distinguish "retry needed" from
-    /// "ignore, in-flight".
-    #[serde(default)]
-    pub in_progress: Vec<u16>,
     /// New kid installed as current.
     pub new_kid: String,
-}
-
-/// Per-partition rotation step outcome. `InProgress` means the SETNX lock
-/// was held by a concurrent rotation — not an error; the concurrent call
-/// will finish the work.
-enum RotationStepOutcome {
-    Rotated,
-    InProgress,
 }
 
 impl Server {
@@ -3035,28 +3021,25 @@ impl Server {
         };
 
         let n = self.config.partition_config.num_flow_partitions;
+        // "now" is derived inside the FCALL from `redis.call("TIME")`
+        // (consistency with validate_waitpoint_token and flow scanners);
+        // grace_ms is a duration — safe to carry from config.
         let grace_ms = self.config.waitpoint_hmac_grace_ms;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_millis() as i64;
-        let previous_expires_at = now_ms + grace_ms as i64;
 
         // Parallelize the rotation fan-out with the same bounded
         // concurrency as boot init (BOOT_INIT_CONCURRENCY = 16). A 256-
         // partition sequential rotation takes ~7.7s at 30ms cross-AZ RTT,
         // uncomfortably close to the 120s HTTP endpoint timeout under
-        // contention. The per-partition SETNX lock in
-        // `rotate_single_partition` prevents interleaved writes against
-        // the same partition; parallelism across DIFFERENT partitions is
-        // safe. The outer `admin_rotate_semaphore(1)` already bounds
-        // server-wide concurrent rotations, so this fan-out only affects
-        // a single in-flight rotate call at a time.
+        // contention. Atomicity per partition now lives inside the
+        // `ff_rotate_waitpoint_hmac_secret` FCALL (FCALL is atomic per
+        // shard); parallelism across DIFFERENT partitions is safe. The
+        // outer `admin_rotate_semaphore(1)` bounds server-wide concurrent
+        // rotations, so this fan-out only affects a single in-flight
+        // rotate call at a time.
         use futures::stream::{FuturesUnordered, StreamExt};
 
         let mut rotated = 0u16;
         let mut failed = Vec::new();
-        let mut in_progress: Vec<u16> = Vec::new();
         let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
         let mut next_index: u16 = 0;
 
@@ -3066,7 +3049,6 @@ impl Server {
                     family: PartitionFamily::Execution,
                     index: next_index,
                 };
-                let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
                 let idx = next_index;
                 // Clone only what the per-partition future needs. The
                 // new_kid / new_secret_hex references outlive the loop
@@ -3074,26 +3056,24 @@ impl Server {
                 // FuturesUnordered needs 'static futures. Own the strings.
                 let new_kid_owned = new_kid.to_owned();
                 let new_secret_owned = new_secret_hex.to_owned();
-                // Borrow-free call into rotate_single_partition: it only
-                // needs &self (Arc is fine; we already have &self here),
-                // &str (owned locals above), and i64 (Copy).
+                let partition_owned = partition;
                 let fut = async move {
                     let outcome = self
                         .rotate_single_partition(
-                            &key,
+                            &partition_owned,
                             &new_kid_owned,
                             &new_secret_owned,
-                            previous_expires_at,
+                            grace_ms,
                         )
                         .await;
-                    (idx, partition, outcome)
+                    (idx, partition_owned, outcome)
                 };
                 pending.push(fut);
                 next_index += 1;
             }
             match pending.next().await {
                 Some((idx, partition, outcome)) => match outcome {
-                    Ok(RotationStepOutcome::Rotated) => {
+                    Ok(()) => {
                         rotated += 1;
                         // Per-partition event → DEBUG (not INFO). Rationale:
                         // one rotate endpoint call produces 256 partition-level
@@ -3106,18 +3086,6 @@ impl Server {
                             partition = %partition,
                             new_kid = %new_kid,
                             "waitpoint_hmac_rotated"
-                        );
-                    }
-                    Ok(RotationStepOutcome::InProgress) => {
-                        // Another rotation is mid-flight on this partition.
-                        // Idempotent + per-partition locked; NOT a failure
-                        // the operator needs to retry. Kept out of `failed`
-                        // so that list stays actionable.
-                        in_progress.push(idx);
-                        tracing::debug!(
-                            partition = %partition,
-                            new_kid = %new_kid,
-                            "waitpoint_hmac_rotation_in_progress_skipped"
                         );
                     }
                     Err(e) => {
@@ -3146,242 +3114,64 @@ impl Server {
             total_partitions = n,
             rotated,
             failed_count = failed.len(),
-            in_progress_count = in_progress.len(),
             "waitpoint_hmac_rotation_complete"
         );
 
         Ok(RotateWaitpointSecretResult {
             rotated,
             failed,
-            in_progress,
             new_kid: new_kid.to_owned(),
         })
     }
 
-    /// Rotate on a single partition. Reads current_kid, promotes it to
-    /// previous_kid with `previous_expires_at`, installs new_kid + new secret.
-    ///
-    /// Serialized per-partition via a SETNX lock (`ff:sec:rotate_lock:{p:N}`)
-    /// with a 10s TTL. Concurrent operator-triggered rotations against the
-    /// same partition would otherwise interleave the HGET/HDEL/HSET sequence
-    /// and lose writes — the loser's secret would end up partially stored
-    /// and its tokens would stop validating. The lock key shares the
-    /// partition hash tag so it stays in-slot under cluster mode.
-    ///
-    /// A single-partition rotation completes in a few ms on local Valkey,
-    /// so the 10s TTL is a generous safety margin.
+    /// Rotate on a single partition by dispatching the
+    /// `ff_rotate_waitpoint_hmac_secret` FCALL. FCALL is atomic per shard,
+    /// so no external SETNX lock is needed — the script itself IS the
+    /// atomicity boundary. Single source of truth (Lua); the Rust
+    /// implementation that previously lived here was an exact duplicate
+    /// and has been removed.
     async fn rotate_single_partition(
         &self,
-        key: &str,
+        partition: &Partition,
         new_kid: &str,
         new_secret_hex: &str,
-        previous_expires_at: i64,
-    ) -> Result<RotationStepOutcome, ServerError> {
-        // Derive the lock key from the secrets key: keep the `{p:N}` hash tag
-        // so the lock lives in the same cluster slot as the hash we're
-        // mutating. `ff:sec:{p:N}:waitpoint_hmac` → `ff:sec:{p:N}:rotate_lock`.
-        let lock_key = rotate_lock_key_for(key);
-        const LOCK_TTL_MS: u64 = 10_000;
-        let acquired: Option<String> = self
-            .client
-            .cmd("SET")
-            .arg(&lock_key)
-            .arg("1")
-            .arg("NX")
-            .arg("PX")
-            .arg(LOCK_TTL_MS.to_string().as_str())
-            .execute()
-            .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: format!("SET NX {lock_key}"),
-            })?;
-        if acquired.is_none() {
-            // Concurrent rotation holds the lock. Return InProgress (not
-            // Err) — the concurrent caller will finish the work, the
-            // outer loop buckets this partition into `in_progress`, and
-            // the operator does not get a spurious "failed" count.
-            return Ok(RotationStepOutcome::InProgress);
-        }
-
-        // Best-effort DEL of the lock on all exit paths. Valkey auto-expires
-        // via PX TTL anyway, so a dropped future only costs the remaining
-        // lock window, not correctness.
-        let result = self
-            .rotate_single_partition_locked(key, new_kid, new_secret_hex, previous_expires_at)
-            .await;
-        let _: Option<i64> = self
-            .client
-            .cmd("DEL")
-            .arg(&lock_key)
-            .execute()
-            .await
-            .ok()
-            .flatten();
-        result.map(|()| RotationStepOutcome::Rotated)
-    }
-
-    async fn rotate_single_partition_locked(
-        &self,
-        key: &str,
-        new_kid: &str,
-        new_secret_hex: &str,
-        previous_expires_at: i64,
+        grace_ms: u64,
     ) -> Result<(), ServerError> {
-        let current_kid: Option<String> = self
-            .client
-            .hget(key, "current_kid")
-            .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: format!("HGET {key} current_kid"),
-            })?;
-
-        if current_kid.as_deref() == Some(new_kid) {
-            // Already rotated to this kid. Retry-safety rule (RFC-004):
-            // - same kid + same secret → no-op (operator retry after HTTP
-            //   timeout or transient 5xx is SAFE).
-            // - same kid + DIFFERENT secret → REJECT with RotationConflict.
-            //   Silently overwriting would invalidate every token minted
-            //   under the stored secret since the first rotation to this
-            //   kid, an unbounded amount of in-flight state.
-            let field = format!("secret:{new_kid}");
-            let stored_secret: Option<String> = self
-                .client
-                .hget(key, &field)
-                .await
-                .map_err(|e| ServerError::ValkeyContext {
-                    source: e,
-                    context: format!("HGET {key} secret:<kid> (idempotency check)"),
-                })?;
-            match stored_secret.as_deref() {
-                Some(s) if s == new_secret_hex => {
-                    // Exact replay — idempotent no-op.
-                    return Ok(());
-                }
-                Some(_) => {
-                    // Same kid, different secret bytes. This is almost
-                    // certainly an operator mistake (typed wrong hex, or
-                    // forgot they rotated, or two simultaneous rotations
-                    // racing with distinct material). Refuse with a
-                    // dedicated error that the HTTP layer maps to 409
-                    // Conflict so the caller knows this isn't a retry
-                    // opportunity.
-                    return Err(ServerError::OperationFailed(format!(
-                        "rotation conflict: kid {new_kid} already installed with a \
-                         different secret. Either use a fresh kid or restore the \
-                         original secret for this kid before retrying."
-                    )));
-                }
-                None => {
-                    // Torn write: current_kid=new_kid but secret:<new_kid>
-                    // missing. Repair with the presented secret. Matches
-                    // boot-init repair semantics.
-                    self.client
-                        .hset(key, &field, new_secret_hex)
-                        .await
-                        .map_err(|e| ServerError::ValkeyContext {
-                            source: e,
-                            context: format!("HSET {key} secret:<kid> (torn-write repair)"),
-                        })?;
-                    return Ok(());
-                }
+        let idx = IndexKeys::new(partition);
+        let args = RotateWaitpointHmacSecretArgs {
+            new_kid: new_kid.to_owned(),
+            new_secret_hex: new_secret_hex.to_owned(),
+            grace_ms,
+        };
+        let outcome = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
+            &self.client,
+            &idx,
+            &args,
+        )
+        .await
+        .map_err(|e| match e {
+            // Same kid + different secret. Map to the same 409-style
+            // error the old Rust path returned so HTTP callers keep the
+            // current surface.
+            ff_script::ScriptError::RotationConflict(kid) => {
+                ServerError::OperationFailed(format!(
+                    "rotation conflict: kid {kid} already installed with a \
+                     different secret. Either use a fresh kid or restore the \
+                     original secret for this kid before retrying."
+                ))
             }
-        }
-
-        // Orphan GC: scan the entire expires_at:* namespace and HDEL both
-        // expires_at:<kid> and secret:<kid> for every kid whose grace has
-        // elapsed. Multi-kid validation (helpers.lua) accepts ANY kid
-        // present with a future expires_at, so GC by recency (just
-        // previous_kid) would leak historical kids forever AND — worse —
-        // restricting validation to a two-slot window would violate the
-        // grace contract on rapid rotation (A→B→C inside 24h kept A
-        // accepted under the prior model only via previous_kid, which B
-        // now claims).
-        //
-        // HGETALL the whole hash once (bounded: one entry per distinct
-        // kid ever installed, plus scalar fields). Build the reaper set
-        // in-memory, then one HDEL. Cheap.
-        let full_hash: std::collections::HashMap<String, String> = self
-            .client
-            .hgetall(key)
-            .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: format!("HGETALL {key} (orphan scan)"),
-            })?;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_millis() as i64;
-        let mut expired_kids: Vec<String> = Vec::new();
-        for (field, value) in &full_hash {
-            if let Some(kid) = field.strip_prefix("expires_at:") {
-                let exp = value.parse::<i64>().unwrap_or(0);
-                if exp <= 0 || exp <= now_ms {
-                    expired_kids.push(kid.to_owned());
-                }
-            }
-        }
-        if !expired_kids.is_empty() {
-            let mut hdel = self.client.cmd("HDEL").arg(key);
-            for kid in &expired_kids {
-                hdel = hdel.arg(format!("expires_at:{kid}")).arg(format!("secret:{kid}"));
-            }
-            let _: i64 = hdel.execute().await.map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: format!("HDEL {key} expired kids (orphan GC)"),
-            })?;
-        }
-
-        // Promote current → previous: stamp expires_at:<current_kid> with
-        // the new previous_expires_at. This is the per-kid grace window
-        // that validate_waitpoint_token reads. previous_kid +
-        // previous_expires_at scalars are kept in lockstep for audit log
-        // observability (aggregated rotation event shape) and for any
-        // downgrade path that still reads the two-slot scheme.
-        //
-        // INVARIANT: expires_at:<new_kid> is NEVER written — current_kid
-        // has no expiry (always valid). It only gets an expires_at entry
-        // when a FUTURE rotation promotes it out of current.
-        let mut hset = self.client.cmd("HSET").arg(key);
-        let prev_expires_str = previous_expires_at.to_string();
-        let cur_owned;
-        let outgoing_expires_field;
-        if let Some(cur) = current_kid {
-            cur_owned = cur;
-            outgoing_expires_field = format!("expires_at:{cur_owned}");
-            hset = hset
-                .arg("previous_kid")
-                .arg(cur_owned.as_str())
-                .arg("previous_expires_at")
-                .arg(prev_expires_str.as_str())
-                .arg(outgoing_expires_field.as_str())
-                .arg(prev_expires_str.as_str());
-        }
-        let secret_field = format!("secret:{new_kid}");
-        let _: i64 = hset
-            .arg("current_kid")
-            .arg(new_kid)
-            .arg(&secret_field)
-            .arg(new_secret_hex)
-            .execute()
-            .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: format!("HSET {key} (rotate atomic)"),
-            })?;
+            ff_script::ScriptError::Valkey(v) => ServerError::ValkeyContext {
+                source: v,
+                context: format!("FCALL ff_rotate_waitpoint_hmac_secret partition={partition}"),
+            },
+            other => ServerError::OperationFailed(format!(
+                "rotation failed on partition {partition}: {other}"
+            )),
+        })?;
+        // Either outcome is a successful write from the operator's POV.
+        // Rotated → new install; Noop → idempotent replay.
+        let _ = outcome;
         Ok(())
-    }
-}
-
-/// Derive a per-partition rotation lock key that shares the hash tag of the
-/// secrets key (so lock and hash live in the same cluster slot).
-/// `ff:sec:{p:N}:waitpoint_hmac` → `ff:sec:{p:N}:rotate_lock`.
-fn rotate_lock_key_for(secrets_key: &str) -> String {
-    match secrets_key.rsplit_once(':') {
-        Some((prefix, _last)) => format!("{prefix}:rotate_lock"),
-        None => format!("{secrets_key}:rotate_lock"),
     }
 }
 

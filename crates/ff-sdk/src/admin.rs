@@ -302,11 +302,6 @@ pub struct RotateWaitpointSecretResponse {
     /// `(new_kid, new_secret_hex)` so a retry after the underlying
     /// fault clears converges.
     pub failed: Vec<u16>,
-    /// Partition indices where another rotation was already in
-    /// progress (per-partition `SETNX` lock held). These will be
-    /// rotated by the concurrent request; NOT a fault.
-    #[serde(default)]
-    pub in_progress: Vec<u16>,
     /// The `new_kid` that was installed as current on every
     /// rotated partition — echoes the request field back for
     /// confirmation.
@@ -470,27 +465,16 @@ mod tests {
 
     #[test]
     fn rotate_response_deserialises_server_shape() {
-        // Exact shape the server emits (ff-server server.rs:2636).
+        // Exact shape the server emits.
         let raw = r#"{
             "rotated": 3,
             "failed": [4, 5],
-            "in_progress": [6],
             "new_kid": "kid-2026-04-18"
         }"#;
         let r: RotateWaitpointSecretResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(r.rotated, 3);
         assert_eq!(r.failed, vec![4, 5]);
-        assert_eq!(r.in_progress, vec![6]);
         assert_eq!(r.new_kid, "kid-2026-04-18");
-    }
-
-    #[test]
-    fn rotate_response_handles_missing_in_progress() {
-        // Older server versions may omit in_progress. Default to
-        // empty so the client stays forward-compatible.
-        let raw = r#"{"rotated": 1, "failed": [], "new_kid": "k1"}"#;
-        let r: RotateWaitpointSecretResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(r.in_progress, Vec::<u16>::new());
     }
 
     // ── ClaimForWorkerResponse::into_grant ──

@@ -294,6 +294,103 @@ impl FromFcallResult for CloseWaitpointResult {
     }
 }
 
+// ─── ff_rotate_waitpoint_hmac_secret ──────────────────────────────────
+//
+// Lua KEYS (1): hmac_secrets
+// Lua ARGV (3): new_kid, new_secret_hex, grace_ms
+
+ff_function! {
+    /// Rotate the waitpoint HMAC signing kid on a single partition.
+    ///
+    /// Public FCALL surface for direct-Valkey consumers (e.g. cairn-rs).
+    /// ff-server's HTTP rotation endpoint delegates to this same FCALL.
+    /// Callers fan out across every partition themselves — this wrapper
+    /// touches exactly one.
+    ///
+    /// Returns [`RotateWaitpointHmacSecretOutcome::Noop`] on exact replay
+    /// (same kid + secret). Same kid + DIFFERENT secret surfaces as
+    /// [`ScriptError::RotationConflict`] — operator should pick a fresh kid.
+    pub ff_rotate_waitpoint_hmac_secret(args: RotateWaitpointHmacSecretArgs) -> RotateWaitpointHmacSecretOutcome {
+        keys(k: &IndexKeys) {
+            k.waitpoint_hmac_secrets(), // 1
+        }
+        argv {
+            args.new_kid.clone(),        // 1
+            args.new_secret_hex.clone(), // 2
+            args.grace_ms.to_string(),   // 3
+        }
+    }
+}
+
+impl FromFcallResult for RotateWaitpointHmacSecretOutcome {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        // Lua shapes:
+        //   ok("rotated", previous_kid_or_empty, new_kid, gc_count)
+        //   ok("noop",    kid)
+        let variant = r.field_str(0);
+        match variant.as_str() {
+            "rotated" => {
+                let prev = r.field_str(1);
+                let new_kid = r.field_str(2);
+                let gc_count = r.field_str(3).parse::<u32>().map_err(|e| {
+                    ScriptError::Parse(format!("bad gc_count: {e}"))
+                })?;
+                Ok(RotateWaitpointHmacSecretOutcome::Rotated {
+                    previous_kid: if prev.is_empty() { None } else { Some(prev) },
+                    new_kid,
+                    gc_count,
+                })
+            }
+            "noop" => Ok(RotateWaitpointHmacSecretOutcome::Noop {
+                kid: r.field_str(1),
+            }),
+            other => Err(ScriptError::Parse(format!(
+                "unexpected rotation outcome: {other}"
+            ))),
+        }
+    }
+}
+
+// ─── ff_list_waitpoint_hmac_kids ──────────────────────────────────────
+//
+// Lua KEYS (1): hmac_secrets
+// Lua ARGV (0): none
+
+ff_function! {
+    /// Read-back snapshot of the waitpoint HMAC keystore on one partition.
+    /// Callers that need cluster-wide state fan out across partitions.
+    pub ff_list_waitpoint_hmac_kids(_args: ListWaitpointHmacKidsArgs) -> WaitpointHmacKids {
+        keys(k: &IndexKeys) {
+            k.waitpoint_hmac_secrets(), // 1
+        }
+        argv {}
+    }
+}
+
+impl FromFcallResult for WaitpointHmacKids {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        // Lua shape: ok(current_kid_or_empty, n, kid1, exp1, kid2, exp2, ...)
+        let current = r.field_str(0);
+        let n = r.field_str(1).parse::<usize>().map_err(|e| {
+            ScriptError::Parse(format!("bad verifying count: {e}"))
+        })?;
+        let mut verifying = Vec::with_capacity(n);
+        for i in 0..n {
+            let kid = r.field_str(2 + 2 * i);
+            let exp = r.field_str(2 + 2 * i + 1).parse::<i64>().map_err(|e| {
+                ScriptError::Parse(format!("bad expires_at_ms for kid {kid}: {e}"))
+            })?;
+            verifying.push(VerifyingKid { kid, expires_at_ms: exp });
+        }
+        Ok(WaitpointHmacKids {
+            current_kid: if current.is_empty() { None } else { Some(current) },
+            verifying,
+        })
+    }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────
 
 fn parse_public_state(s: &str) -> Result<PublicState, ScriptError> {

@@ -505,19 +505,15 @@ async fn rotate_waitpoint_secret(
         }
     };
     // Operator action log at audit target (per-partition detail logged inside
-    // rotate_waitpoint_secret). Returns 200 if at least one partition rotated
-    // OR at least one partition was already in-flight under a concurrent
-    // rotation. Returns 400 only on actionable fault states.
+    // rotate_waitpoint_secret). Returns 400 only on actionable fault states.
     //
-    // Three distinct rotated==0 cases:
-    //   - all in_progress → concurrent rotation handling it, NOT a failure.
-    //     200 OK with the structured result so operators see what's happening.
-    //   - failed.is_empty() && in_progress.is_empty() → no partitions at all
-    //     (num_flow_partitions == 0; env_u16_positive rejects this at
-    //     boot so this is mostly dead code for library/Default callers).
+    // Two distinct rotated==0 cases:
+    //   - failed.is_empty() → no partitions at all (num_flow_partitions == 0;
+    //     env_u16_positive rejects this at boot so this is mostly dead code
+    //     for library/Default callers).
     //   - !failed.is_empty() → every partition attempt raised a real error.
     //     Operator investigates Valkey/auth/cluster health before retrying.
-    if result.rotated == 0 && result.failed.is_empty() && result.in_progress.is_empty() {
+    if result.rotated == 0 && result.failed.is_empty() {
         return Err(ApiError::from(ServerError::OperationFailed(
             "rotation had no partitions to operate on \
              (num_flow_partitions is 0 — server misconfigured)"
@@ -529,7 +525,6 @@ async fn rotate_waitpoint_secret(
             "rotation failed on all partitions (check Valkey connectivity)".to_owned(),
         )));
     }
-    // rotated==0 but some in_progress → 200 OK; caller polls / re-runs.
     Ok(Json(result).into_response())
 }
 
