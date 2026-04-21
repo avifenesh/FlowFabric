@@ -167,8 +167,8 @@ async fn test_rotate_waitpoint_secret_happy_path() {
         "server should echo back the new_kid we installed"
     );
     assert!(
-        resp.rotated as usize + resp.in_progress.len() > 0,
-        "at least one partition must have rotated or been in-progress; got {resp:?}"
+        resp.rotated > 0,
+        "at least one partition must have rotated; got {resp:?}"
     );
     assert!(
         resp.failed.is_empty(),
@@ -208,10 +208,6 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
     // but the happy-path test already guarantees failed.is_empty()
     // on a healthy cluster; here we'd just skip them defensively.
     //
-    // `in_progress` partitions are ALSO skipped — their state is
-    // transient (the concurrent rotation may be mid-fanout) and
-    // the server contract only promises eventual convergence for
-    // that set, not a post-call snapshot.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -223,16 +219,11 @@ async fn test_rotate_waitpoint_secret_updates_valkey_state() {
     // Collect the partition indices we expect to have fully rotated.
     // The server returns `rotated: u16` as a COUNT, not a list, so
     // we iterate `0..num_flow_partitions` and assert on every
-    // partition NOT in the `failed` or `in_progress` sets. RFC-011
-    // co-locates exec keys onto flow partitions, so
-    // `num_flow_partitions` is now the authoritative count.
+    // partition NOT in the `failed` set. RFC-011 co-locates exec keys
+    // onto flow partitions, so `num_flow_partitions` is now the
+    // authoritative count.
     let pc = ff_test::fixtures::TEST_PARTITION_CONFIG;
-    let skip: std::collections::HashSet<u16> = resp
-        .failed
-        .iter()
-        .copied()
-        .chain(resp.in_progress.iter().copied())
-        .collect();
+    let skip: std::collections::HashSet<u16> = resp.failed.iter().copied().collect();
 
     let mut checked = 0u16;
     for p_idx in 0..pc.num_flow_partitions {

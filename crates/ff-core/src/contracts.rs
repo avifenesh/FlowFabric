@@ -1461,3 +1461,61 @@ pub struct ListExecutionsResult {
     pub executions: Vec<ExecutionSummary>,
     pub total_returned: usize,
 }
+
+// ─── rotate_waitpoint_hmac_secret ───
+
+/// Args for `ff_rotate_waitpoint_hmac_secret`. Rotates the HMAC signing
+/// kid on ONE partition. Callers fan out across every partition themselves
+/// (ff-server does the parallel fan-out in `rotate_waitpoint_secret`;
+/// direct-Valkey consumers mirror the pattern).
+///
+/// "now" is derived server-side from `redis.call("TIME")` inside the FCALL
+/// (consistency with `validate_waitpoint_token` and flow scanners).
+/// `grace_ms` is a duration, not a clock value, so carrying it from the
+/// caller is safe.
+#[derive(Clone, Debug)]
+pub struct RotateWaitpointHmacSecretArgs {
+    pub new_kid: String,
+    pub new_secret_hex: String,
+    /// Grace window in ms. Must be non-negative. Tokens signed by the
+    /// outgoing kid remain valid for `grace_ms` after this rotation.
+    pub grace_ms: u64,
+}
+
+/// Outcome of a single-partition rotation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RotateWaitpointHmacSecretOutcome {
+    /// Installed the new kid. `previous_kid` is `None` on bootstrap
+    /// (no prior `current_kid`). `gc_count` counts expired kids reaped
+    /// during this rotation.
+    Rotated {
+        previous_kid: Option<String>,
+        new_kid: String,
+        gc_count: u32,
+    },
+    /// Exact replay — same kid + same secret already installed. Safe
+    /// operator retry; no state change.
+    Noop { kid: String },
+}
+
+// ─── list_waitpoint_hmac_kids ───
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListWaitpointHmacKidsArgs {}
+
+/// Snapshot of the waitpoint HMAC keystore on ONE partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitpointHmacKids {
+    /// The currently-signing kid. `None` if uninitialized.
+    pub current_kid: Option<String>,
+    /// Kids that still validate existing tokens but no longer sign
+    /// new ones. Order is Lua HGETALL traversal order — callers that
+    /// need a stable sort should sort by `expires_at_ms`.
+    pub verifying: Vec<VerifyingKid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyingKid {
+    pub kid: String,
+    pub expires_at_ms: i64,
+}

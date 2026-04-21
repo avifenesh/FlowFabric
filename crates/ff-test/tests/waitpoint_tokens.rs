@@ -428,12 +428,11 @@ async fn test_rotation_grace_allows_previous_kid() {
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
     assert!(k1_token.starts_with("k1:"), "token should be k1-signed: {k1_token}");
 
-    // Rotate to k2 with a grace window 10 minutes into the future.
-    let future_grace = TimestampMs::now().0 + 600_000;
+    // Rotate to k2 with a 10-minute grace window.
     tc.rotate_waitpoint_hmac_secret(
         "k2",
         "1111111111111111111111111111111111111111111111111111111111111111",
-        future_grace,
+        600_000,
     )
     .await;
 
@@ -455,14 +454,18 @@ async fn test_rotation_past_grace_rejects_previous_kid() {
     let (wp_id, _wp_key, k1_token) =
         suspend_and_get_token(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
 
-    // Rotate with a grace that expired 1s ago.
-    let past_grace = TimestampMs::now().0 - 1000;
+    // Rotate with a tiny (1ms) grace window, then manually stamp
+    // expires_at:k1 to a deep-past value so k1's grace is unambiguously
+    // elapsed. The FCALL's own timestamp is derived from redis TIME, so
+    // we can't shove "past" through the API — overriding the stored
+    // expires_at field simulates grace that elapsed after rotation.
     tc.rotate_waitpoint_hmac_secret(
         "k2",
         "2222222222222222222222222222222222222222222222222222222222222222",
-        past_grace,
+        1,
     )
     .await;
+    tc.hset_waitpoint_expires_at("k1", 1).await;
 
     let resp = try_deliver_signal(&tc, &eid, &wp_id, "wpt_signal", &k1_token).await;
     assert_err_code(&resp, "token_expired");
@@ -786,11 +789,10 @@ async fn test_rapid_rotation_preserves_in_grace_tokens() {
     assert!(k1_token.starts_with("k1:"), "expected k1-signed token: {k1_token}");
 
     // Rotate k1 → k2 with 10-minute grace. A-signed token must still work.
-    let future_grace = TimestampMs::now().0 + 600_000;
     tc.rotate_waitpoint_hmac_secret(
         "k2",
         "2222222222222222222222222222222222222222222222222222222222222222",
-        future_grace,
+        600_000,
     )
     .await;
 
@@ -801,7 +803,7 @@ async fn test_rapid_rotation_preserves_in_grace_tokens() {
     tc.rotate_waitpoint_hmac_secret(
         "k3",
         "3333333333333333333333333333333333333333333333333333333333333333",
-        future_grace,
+        600_000,
     )
     .await;
 
@@ -826,36 +828,24 @@ async fn test_rapid_rotation_past_grace_rejects_expired() {
     let (wp_b, _wk_b, k1_token) =
         suspend_and_get_token(&tc, &eid_b, &lid_b, &ep_b, &aid_b).await;
 
-    // Set previous_expires_at in the past so k1's grace is already elapsed.
-    let past_grace = TimestampMs::now().0 - 1_000;
+    // Rotate k1 → k2 with a tiny grace, then override expires_at:k1 to
+    // a deep-past value. secret:k1 stays in the hash until a LATER
+    // rotation's orphan GC sweeps it.
     tc.rotate_waitpoint_hmac_secret(
         "k2",
         "2222222222222222222222222222222222222222222222222222222222222222",
-        past_grace,
+        1,
     )
     .await;
+    tc.hset_waitpoint_expires_at("k1", 1).await;
 
-    // Subsequent rotate k2 → k3 triggers orphan GC which sweeps expired
-    // kids (including k1, whose expires_at is in the past). After this,
-    // secret:k1 should be gone from the hash.
-    let future_grace = TimestampMs::now().0 + 600_000;
-    tc.rotate_waitpoint_hmac_secret(
-        "k3",
-        "3333333333333333333333333333333333333333333333333333333333333333",
-        future_grace,
-    )
-    .await;
-
-    // k1-signed token → `token_expired`. expires_at:k1 is present in the
-    // hash (fixture helper writes it, mirroring production rotation) but
-    // its value is in the past. The multi-kid validator distinguishes
-    // "present kid whose grace has elapsed" (token_expired — actionable:
-    // operator rolled forward, client is holding an aged token) from
-    // "unknown kid" (invalid_token — never existed or already GC'd).
-    // Production orphan GC at the NEXT rotation will HDEL secret:k1 and
-    // expires_at:k1 because expires_at:k1 < now_ms; after that the same
-    // request would return invalid_token. The fixture doesn't run GC,
-    // so this pins the pre-GC "known kid, past grace" behavior.
+    // k1-signed token → `token_expired`. expires_at:k1 is present but
+    // in the past; multi-kid validator distinguishes "present kid whose
+    // grace has elapsed" (token_expired — actionable: operator rolled
+    // forward, client is holding an aged token) from "unknown kid"
+    // (invalid_token — never existed or already GC'd). A subsequent
+    // rotation would GC secret:k1; we stop before that to pin the
+    // "known kid, past grace" branch.
     let resp = try_deliver_signal(&tc, &eid_b, &wp_b, "wpt_signal", &k1_token).await;
     assert_err_code(&resp, "token_expired");
 }
