@@ -1225,16 +1225,44 @@ impl ClaimedTask {
             }
         }
 
+        if signal_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pipeline HGETALL signal_hash + GET signal_payload for all matched
+        // signals into one round-trip (closes #36 item 1). Previous
+        // implementation did 2N sequential round-trips; the single-matcher
+        // happy path is unaffected (1 pipelined round-trip ≈ 2 sequential
+        // for N=1), and "all" conditions with N>1 matchers see ~N× latency
+        // reduction on a loaded cluster.
+        let mut pipe = self.client.pipeline();
+        let mut slots = Vec::with_capacity(signal_ids.len());
+        for signal_id in &signal_ids {
+            let hash_slot = pipe
+                .cmd::<HashMap<String, String>>("HGETALL")
+                .arg(ctx.signal(signal_id))
+                .finish();
+            let payload_slot = pipe
+                .cmd::<Option<Value>>("GET")
+                .arg(ctx.signal_payload(signal_id))
+                .finish();
+            slots.push((hash_slot, payload_slot));
+        }
+        pipe.execute()
+            .await
+            .map_err(|e| SdkError::ValkeyContext {
+                source: e,
+                context: "pipeline HGETALL signal + GET payload".into(),
+            })?;
+
         let mut out: Vec<ResumeSignal> = Vec::with_capacity(signal_ids.len());
-        for signal_id in signal_ids {
-            let sig: HashMap<String, String> = self
-                .client
-                .hgetall(&ctx.signal(&signal_id))
-                .await
-                .map_err(|e| SdkError::ValkeyContext {
+        for (signal_id, (hash_slot, payload_slot)) in signal_ids.into_iter().zip(slots) {
+            let sig: HashMap<String, String> = hash_slot.value().map_err(|e| {
+                SdkError::ValkeyContext {
                     source: e,
-                    context: "HGETALL signal_hash".into(),
-                })?;
+                    context: format!("pipeline HGETALL signal_hash slot (signal_id={signal_id})"),
+                }
+            })?;
             if sig.is_empty() {
                 // Signal hash was GC'd (not currently a code path, but
                 // defensive against future cleanup scanners). Skip.
@@ -1246,15 +1274,10 @@ impl ClaimedTask {
             // which would panic/error on any non-UTF-8 payload (reachable
             // via direct-FCALL callers that bypass the SDK's lossy
             // UTF-8 encode path in deliver_signal).
-            let payload_raw: Option<Value> = self
-                .client
-                .cmd("GET")
-                .arg(ctx.signal_payload(&signal_id))
-                .execute()
-                .await
-                .map_err(|e| SdkError::ValkeyContext {
+            let payload_raw: Option<Value> =
+                payload_slot.value().map_err(|e| SdkError::ValkeyContext {
                     source: e,
-                    context: "GET signal_payload".into(),
+                    context: format!("pipeline GET signal_payload slot (signal_id={signal_id})"),
                 })?;
             let payload: Option<Vec<u8>> = match payload_raw {
                 Some(Value::BulkString(b)) => Some(b.to_vec()),
