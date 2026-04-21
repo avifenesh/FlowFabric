@@ -52,7 +52,10 @@ redis.register_function('ff_renew_lease', function(keys, args)
   -- Validate lifecycle
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
 
   -- Check revocation
@@ -234,7 +237,10 @@ redis.register_function('ff_revoke_lease', function(keys, args)
   -- Must be active + leased
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state ~= "leased" then
     if core.ownership_state == "lease_revoked" then

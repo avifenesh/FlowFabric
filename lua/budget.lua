@@ -332,7 +332,11 @@ redis.register_function('ff_block_execution_for_admission', function(keys, args)
   -- 2. Must be runnable
   if core.lifecycle_phase ~= "runnable" then
     if core.lifecycle_phase == "terminal" then
-      return err("execution_not_active", core.terminal_outcome or "", core.current_lease_epoch or "")
+      return err("execution_not_active",
+        core.terminal_outcome or "",
+        core.current_lease_epoch or "",
+        "terminal",
+        core.current_attempt_id or "")
     end
     return err("execution_not_eligible")
   end

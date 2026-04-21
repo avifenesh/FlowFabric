@@ -381,8 +381,12 @@ end
 -- @param now_ms current timestamp in milliseconds
 local function validate_lease(core, argv, now_ms)
   if core.lifecycle_phase ~= "active" then
+    -- See validate_lease_and_mark_expired for the full detail layout.
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state == "lease_revoked" then
     return err("lease_revoked")
@@ -495,8 +499,22 @@ end
 -- @param maxlen MAXLEN for lease_history stream
 local function validate_lease_and_mark_expired(core, argv, now_ms, keys, maxlen)
   if core.lifecycle_phase ~= "active" then
+    -- Enriched error detail lets the SDK reconcile a replay of a terminal
+    -- operation after a network drop: if the caller's (lease_epoch,
+    -- attempt_id) match what's stored and the outcome matches what they
+    -- asked for, treat the "error" as a successful replay. See
+    -- parse_terminal_replay() on the Rust side. Detail slots:
+    --   idx 2: terminal_outcome         (e.g. "success", "failed", "cancelled", "none")
+    --   idx 3: current_lease_epoch      (persists across terminal; cleared for retry-scheduled)
+    --   idx 4: lifecycle_phase          ("terminal" vs "runnable" disambiguates
+    --                                    terminal_failed from retry_scheduled replay)
+    --   idx 5: current_attempt_id       (preserved on terminal, cleared on retry;
+    --                                    per-attempt replay guard)
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state == "lease_revoked" then
     return err("lease_revoked")
@@ -851,7 +869,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '8'
+  return '9'
 end)
 
 
@@ -910,7 +928,10 @@ redis.register_function('ff_renew_lease', function(keys, args)
   -- Validate lifecycle
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
 
   -- Check revocation
@@ -1092,7 +1113,10 @@ redis.register_function('ff_revoke_lease', function(keys, args)
   -- Must be active + leased
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state ~= "leased" then
     if core.ownership_state == "lease_revoked" then
@@ -1904,10 +1928,15 @@ redis.register_function('ff_cancel_execution', function(keys, args)
   K.active_index_key = "ff:idx:" .. tag .. ":lane:" .. lane .. ":active"
   K.suspended_key    = "ff:idx:" .. tag .. ":lane:" .. lane .. ":suspended"
 
-  -- Already terminal
+  -- Already terminal. Enriched error detail mirrors validate_lease_and_mark_expired
+  -- so SDK-side replay reconciliation works for cancel the same as for
+  -- complete/fail.
   if core.lifecycle_phase == "terminal" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      "terminal",
+      core.current_attempt_id or "")
   end
 
   local cancelled_from = core.lifecycle_phase
@@ -3146,7 +3175,10 @@ redis.register_function('ff_update_progress', function(keys, args)
 
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state == "lease_revoked" then
     return err("lease_revoked")
@@ -3809,7 +3841,10 @@ redis.register_function('ff_create_pending_waitpoint', function(keys, args)
 
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state ~= "leased" then
     return err("no_active_lease")
@@ -5522,7 +5557,11 @@ redis.register_function('ff_block_execution_for_admission', function(keys, args)
   -- 2. Must be runnable
   if core.lifecycle_phase ~= "runnable" then
     if core.lifecycle_phase == "terminal" then
-      return err("execution_not_active", core.terminal_outcome or "", core.current_lease_epoch or "")
+      return err("execution_not_active",
+        core.terminal_outcome or "",
+        core.current_lease_epoch or "",
+        "terminal",
+        core.current_attempt_id or "")
     end
     return err("execution_not_eligible")
   end

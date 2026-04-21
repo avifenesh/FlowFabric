@@ -378,8 +378,12 @@ end
 -- @param now_ms current timestamp in milliseconds
 local function validate_lease(core, argv, now_ms)
   if core.lifecycle_phase ~= "active" then
+    -- See validate_lease_and_mark_expired for the full detail layout.
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state == "lease_revoked" then
     return err("lease_revoked")
@@ -492,8 +496,22 @@ end
 -- @param maxlen MAXLEN for lease_history stream
 local function validate_lease_and_mark_expired(core, argv, now_ms, keys, maxlen)
   if core.lifecycle_phase ~= "active" then
+    -- Enriched error detail lets the SDK reconcile a replay of a terminal
+    -- operation after a network drop: if the caller's (lease_epoch,
+    -- attempt_id) match what's stored and the outcome matches what they
+    -- asked for, treat the "error" as a successful replay. See
+    -- parse_terminal_replay() on the Rust side. Detail slots:
+    --   idx 2: terminal_outcome         (e.g. "success", "failed", "cancelled", "none")
+    --   idx 3: current_lease_epoch      (persists across terminal; cleared for retry-scheduled)
+    --   idx 4: lifecycle_phase          ("terminal" vs "runnable" disambiguates
+    --                                    terminal_failed from retry_scheduled replay)
+    --   idx 5: current_attempt_id       (preserved on terminal, cleared on retry;
+    --                                    per-attempt replay guard)
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state == "lease_revoked" then
     return err("lease_revoked")

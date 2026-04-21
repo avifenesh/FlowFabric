@@ -739,10 +739,15 @@ redis.register_function('ff_cancel_execution', function(keys, args)
   K.active_index_key = "ff:idx:" .. tag .. ":lane:" .. lane .. ":active"
   K.suspended_key    = "ff:idx:" .. tag .. ":lane:" .. lane .. ":suspended"
 
-  -- Already terminal
+  -- Already terminal. Enriched error detail mirrors validate_lease_and_mark_expired
+  -- so SDK-side replay reconciliation works for cancel the same as for
+  -- complete/fail.
   if core.lifecycle_phase == "terminal" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      "terminal",
+      core.current_attempt_id or "")
   end
 
   local cancelled_from = core.lifecycle_phase
