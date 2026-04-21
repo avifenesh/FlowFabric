@@ -787,7 +787,7 @@ impl FlowFabricWorker {
         })?;
 
         let mut out: Vec<EdgeSnapshot> = Vec::with_capacity(edge_ids.len());
-        for (edge_id, slot) in edge_ids.iter().zip(slots.into_iter()) {
+        for (edge_id, slot) in edge_ids.iter().zip(slots) {
             let raw = slot.value().map_err(|e| SdkError::ValkeyContext {
                 source: e,
                 context: "list_edges: decode HGETALL edge_hash".into(),
