@@ -762,7 +762,13 @@ end)
 -- atomicity boundary, so no lock is needed.
 --
 -- KEYS (1): hmac_secrets  (ff:sec:{p:N}:waitpoint_hmac)
--- ARGV (4): new_kid, new_secret_hex, previous_expires_at_ms, now_ms
+-- ARGV (3): new_kid, new_secret_hex, grace_ms
+--
+-- `now_ms` is derived server-side from `redis.call("TIME")` to match
+-- the rest of the library (lua/flow.lua, validate_waitpoint_token), so
+-- GC and validation agree on "now". `grace_ms` is a duration, not a
+-- clock value, so taking it from ARGV is safe — operators set it via
+-- FF_WAITPOINT_HMAC_GRACE_MS (ff-server) or pass their own value.
 --
 -- Outcomes:
 --   ok("rotated", previous_kid_or_empty, new_kid, gc_count)
@@ -770,6 +776,7 @@ end)
 --   err("rotation_conflict", kid)                -- same kid, different secret
 --   err("invalid_kid")                           -- empty or contains ':'
 --   err("invalid_secret_hex")                    -- empty / odd length / non-hex
+--   err("invalid_grace_ms")                      -- not a non-negative integer
 --
 -- Authoritative implementation of waitpoint HMAC rotation: idempotent
 -- replay, torn-write repair, orphan GC across expired kids. INVARIANT:
@@ -778,31 +785,34 @@ end)
 -- of truth lives here, not in Rust.
 ---------------------------------------------------------------------------
 redis.register_function('ff_rotate_waitpoint_hmac_secret', function(keys, args)
-  local hmac_key          = keys[1]
-  local new_kid           = args[1]
-  local new_secret_hex    = args[2]
-  local prev_expires_at_s = args[3]
-  local now_ms_s          = args[4]
+  local hmac_key       = keys[1]
+  local new_kid        = args[1]
+  local new_secret_hex = args[2]
+  local grace_ms_s     = args[3]
 
-  -- Input validation mirrors the Rust entry point (server.rs:3004-3016).
+  -- Combined validation (feedback: single condition is more readable).
   if type(new_kid) ~= "string" or new_kid == "" or new_kid:find(":", 1, true) then
     return err("invalid_kid")
   end
-  if type(new_secret_hex) ~= "string" or new_secret_hex == "" then
-    return err("invalid_secret_hex")
-  end
-  if #new_secret_hex % 2 ~= 0 then
-    return err("invalid_secret_hex")
-  end
-  if new_secret_hex:find("[^0-9a-fA-F]") then
+  if type(new_secret_hex) ~= "string"
+      or new_secret_hex == ""
+      or #new_secret_hex % 2 ~= 0
+      or new_secret_hex:find("[^0-9a-fA-F]") then
     return err("invalid_secret_hex")
   end
 
-  local prev_expires_at = tonumber(prev_expires_at_s)
-  local now_ms          = tonumber(now_ms_s)
-  if not prev_expires_at or not now_ms then
-    return err("invalid_timestamp")
+  -- grace_ms must be a non-negative integer; reject decimals so the
+  -- stored expires_at:* value stays i64-parseable on the Rust side.
+  local grace_ms = tonumber(grace_ms_s)
+  if not grace_ms or grace_ms < 0 or grace_ms ~= math.floor(grace_ms) then
+    return err("invalid_grace_ms")
   end
+
+  -- Server-side time via redis.call("TIME"); never trust caller-supplied
+  -- timestamps for expiry decisions (consistency with flow.lua + helpers.lua
+  -- and with validate_waitpoint_token).
+  local now_ms          = server_time_ms()
+  local prev_expires_at = now_ms + grace_ms
 
   local current_kid = redis.call("HGET", hmac_key, "current_kid")
   if current_kid == false then current_kid = nil end
@@ -834,7 +844,11 @@ redis.register_function('ff_rotate_waitpoint_hmac_secret', function(keys, args)
     if field:sub(1, 11) == "expires_at:" then
       local kid = field:sub(12)
       local exp = tonumber(value)
-      if not exp or exp <= 0 or exp <= now_ms then
+      -- GC strictness MUST match validate_waitpoint_token's `exp < now_ms`
+      -- (lua/helpers.lua). Reaping on `exp <= now_ms` would delete a kid
+      -- that the validator still considers in-grace at the boundary
+      -- exp == now_ms, causing tokens that should validate to fail.
+      if not exp or exp <= 0 or exp < now_ms then
         expired_fields[#expired_fields + 1] = "expires_at:" .. kid
         expired_fields[#expired_fields + 1] = "secret:" .. kid
         gc_count = gc_count + 1

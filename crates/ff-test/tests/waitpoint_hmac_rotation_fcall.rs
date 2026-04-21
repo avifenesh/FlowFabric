@@ -8,6 +8,13 @@
 //! idempotent replay, rotation conflict, orphan GC, list shape,
 //! input validation.
 //!
+//! Test fixture hex constants are NOT real HMAC signing secrets — they
+//! are public values in an integration test that runs against a throw-
+//! away test Valkey. They never appear in any log, metric, or other
+//! persistent sink. CodeQL "cleartext logging" flags on these lines are
+//! false positives; see `admin_rotate_api.rs` for the same rationale
+//! applied to the HTTP-level tests.
+//!
 //! Run with: cargo test -p ff-test --test waitpoint_hmac_rotation_fcall -- --test-threads=1
 
 use ff_core::contracts::{
@@ -22,17 +29,23 @@ use ff_script::functions::suspension::{
 };
 use ff_test::fixtures::TestCluster;
 
-// Non-sensitive hex fixtures. Fresh per-test isolation is via a unique
-// partition per test (ephemeral index the Rust side never reads), so
-// there is no cross-test bleed even when they run serially.
 const SECRET_A: &str = "11111111111111111111111111111111";
 const SECRET_B: &str = "22222222222222222222222222222222";
 const SECRET_C: &str = "33333333333333333333333333333333";
+const GRACE_MS: u64 = 60_000;
 
 fn partition(index: u16) -> Partition {
     Partition {
         family: PartitionFamily::Execution,
         index,
+    }
+}
+
+fn args(new_kid: &str, new_secret_hex: &str) -> RotateWaitpointHmacSecretArgs {
+    RotateWaitpointHmacSecretArgs {
+        new_kid: new_kid.to_owned(),
+        new_secret_hex: new_secret_hex.to_owned(),
+        grace_ms: GRACE_MS,
     }
 }
 
@@ -45,15 +58,7 @@ async fn clear_partition(tc: &TestCluster, p: &Partition) {
         .arg(key.as_str())
         .execute()
         .await
-        .ok()
-        .flatten();
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
+        .expect("DEL during test cleanup must succeed");
 }
 
 // Use high partition indices to avoid collision with other tests that
@@ -68,19 +73,9 @@ async fn bootstrap_rotate_sets_current_no_previous() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    let now = now_ms();
-    let outcome = ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-boot".to_owned(),
-            new_secret_hex: SECRET_A.to_owned(),
-            previous_expires_at_ms: now + 60_000,
-            now_ms: now,
-        },
-    )
-    .await
-    .unwrap();
+    let outcome = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-boot", SECRET_A))
+        .await
+        .unwrap();
 
     match outcome {
         RotateWaitpointHmacSecretOutcome::Rotated {
@@ -95,7 +90,6 @@ async fn bootstrap_rotate_sets_current_no_previous() {
         other => panic!("expected Rotated, got {other:?}"),
     }
 
-    // list: current=kid-boot, 0 verifying.
     let listing = ff_list_waitpoint_hmac_kids(tc.client(), &idx, &ListWaitpointHmacKidsArgs {})
         .await
         .unwrap();
@@ -116,34 +110,13 @@ async fn rotate_over_existing_promotes_previous() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    let t0 = now_ms();
-    ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-a".into(),
-            new_secret_hex: SECRET_A.into(),
-            previous_expires_at_ms: t0 + 60_000,
-            now_ms: t0,
-        },
-    )
-    .await
-    .unwrap();
+    ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-a", SECRET_A))
+        .await
+        .unwrap();
 
-    let t1 = now_ms();
-    let prev_exp = t1 + 60_000;
-    let outcome = ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-b".into(),
-            new_secret_hex: SECRET_B.into(),
-            previous_expires_at_ms: prev_exp,
-            now_ms: t1,
-        },
-    )
-    .await
-    .unwrap();
+    let outcome = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-b", SECRET_B))
+        .await
+        .unwrap();
 
     match outcome {
         RotateWaitpointHmacSecretOutcome::Rotated {
@@ -164,7 +137,17 @@ async fn rotate_over_existing_promotes_previous() {
     assert_eq!(listing.current_kid.as_deref(), Some("kid-b"));
     assert_eq!(listing.verifying.len(), 1);
     assert_eq!(listing.verifying[0].kid, "kid-a");
-    assert_eq!(listing.verifying[0].expires_at_ms, prev_exp);
+    // expires_at is derived inside the FCALL from redis.call("TIME");
+    // we can only assert it's a plausible future value.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let exp = listing.verifying[0].expires_at_ms;
+    assert!(
+        exp >= now_ms && exp <= now_ms + GRACE_MS as i64 + 5_000,
+        "expires_at {exp} not in expected window (now={now_ms}, grace={GRACE_MS})"
+    );
 }
 
 #[tokio::test]
@@ -175,14 +158,7 @@ async fn idempotent_replay_returns_noop() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    let t0 = now_ms();
-    let args = RotateWaitpointHmacSecretArgs {
-        new_kid: "kid-same".into(),
-        new_secret_hex: SECRET_A.into(),
-        previous_expires_at_ms: t0 + 60_000,
-        now_ms: t0,
-    };
-    let first = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args)
+    let first = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-same", SECRET_A))
         .await
         .unwrap();
     assert!(matches!(
@@ -190,7 +166,7 @@ async fn idempotent_replay_returns_noop() {
         RotateWaitpointHmacSecretOutcome::Rotated { .. }
     ));
 
-    let second = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args)
+    let second = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-same", SECRET_A))
         .await
         .unwrap();
     match second {
@@ -207,32 +183,13 @@ async fn rotation_conflict_on_same_kid_different_secret() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    let t0 = now_ms();
-    ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-x".into(),
-            new_secret_hex: SECRET_A.into(),
-            previous_expires_at_ms: t0 + 60_000,
-            now_ms: t0,
-        },
-    )
-    .await
-    .unwrap();
+    ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-x", SECRET_A))
+        .await
+        .unwrap();
 
-    let err = ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-x".into(),
-            new_secret_hex: SECRET_B.into(), // different
-            previous_expires_at_ms: t0 + 60_000,
-            now_ms: t0,
-        },
-    )
-    .await
-    .expect_err("conflict must surface as error");
+    let err = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-x", SECRET_B))
+        .await
+        .expect_err("conflict must surface as error");
     match err {
         ScriptError::RotationConflict(kid) => assert_eq!(kid, "kid-x"),
         other => panic!("expected RotationConflict, got {other:?}"),
@@ -247,22 +204,9 @@ async fn orphan_gc_reaps_expired_verifying_kids() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    // Plant kid-stale whose expires_at is already past at call time.
-    // Rotate A → B with a generous grace so kid-a stays, and kid-stale
-    // gets reaped in the same FCALL.
-    let t0 = now_ms();
-    ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-a".into(),
-            new_secret_hex: SECRET_A.into(),
-            previous_expires_at_ms: t0 + 60_000,
-            now_ms: t0,
-        },
-    )
-    .await
-    .unwrap();
+    ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-a", SECRET_A))
+        .await
+        .unwrap();
 
     // Inject a stale kid directly (simulates historical grace window
     // that elapsed while the keystore was quiet).
@@ -279,19 +223,9 @@ async fn orphan_gc_reaps_expired_verifying_kids() {
         .await
         .unwrap();
 
-    let t1 = now_ms();
-    let outcome = ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid-b".into(),
-            new_secret_hex: SECRET_B.into(),
-            previous_expires_at_ms: t1 + 60_000,
-            now_ms: t1,
-        },
-    )
-    .await
-    .unwrap();
+    let outcome = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-b", SECRET_B))
+        .await
+        .unwrap();
 
     match outcome {
         RotateWaitpointHmacSecretOutcome::Rotated {
@@ -306,7 +240,6 @@ async fn orphan_gc_reaps_expired_verifying_kids() {
         other => panic!("expected Rotated, got {other:?}"),
     }
 
-    // Listing must not include kid-stale.
     let listing = ff_list_waitpoint_hmac_kids(tc.client(), &idx, &ListWaitpointHmacKidsArgs {})
         .await
         .unwrap();
@@ -342,19 +275,9 @@ async fn invalid_kid_rejected() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    let t0 = now_ms();
-    let err = ff_rotate_waitpoint_hmac_secret(
-        tc.client(),
-        &idx,
-        &RotateWaitpointHmacSecretArgs {
-            new_kid: "kid:with:colon".into(),
-            new_secret_hex: SECRET_A.into(),
-            previous_expires_at_ms: t0 + 60_000,
-            now_ms: t0,
-        },
-    )
-    .await
-    .expect_err("colon in kid must fail");
+    let err = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid:with:colon", SECRET_A))
+        .await
+        .expect_err("colon in kid must fail");
     assert!(matches!(err, ScriptError::InvalidKid), "{err:?}");
 }
 
@@ -366,20 +289,10 @@ async fn invalid_secret_hex_rejected() {
     clear_partition(&tc, &p).await;
     let idx = IndexKeys::new(&p);
 
-    let t0 = now_ms();
     for bad in ["", "abc", "zz11", "1234567"] {
-        let err = ff_rotate_waitpoint_hmac_secret(
-            tc.client(),
-            &idx,
-            &RotateWaitpointHmacSecretArgs {
-                new_kid: "kid-ok".into(),
-                new_secret_hex: bad.into(),
-                previous_expires_at_ms: t0 + 60_000,
-                now_ms: t0,
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-ok", bad))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ScriptError::InvalidSecretHex),
             "bad={bad:?} → {err:?}"

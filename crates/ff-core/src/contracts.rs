@@ -1468,14 +1468,18 @@ pub struct ListExecutionsResult {
 /// kid on ONE partition. Callers fan out across every partition themselves
 /// (ff-server does the parallel fan-out in `rotate_waitpoint_secret`;
 /// direct-Valkey consumers mirror the pattern).
+///
+/// "now" is derived server-side from `redis.call("TIME")` inside the FCALL
+/// (consistency with `validate_waitpoint_token` and flow scanners).
+/// `grace_ms` is a duration, not a clock value, so carrying it from the
+/// caller is safe.
 #[derive(Clone, Debug)]
 pub struct RotateWaitpointHmacSecretArgs {
     pub new_kid: String,
     pub new_secret_hex: String,
-    /// Unix-ms at which tokens signed by the outgoing kid stop validating.
-    /// Operators pick this = `now_ms + grace_ms`.
-    pub previous_expires_at_ms: i64,
-    pub now_ms: i64,
+    /// Grace window in ms. Must be non-negative. Tokens signed by the
+    /// outgoing kid remain valid for `grace_ms` after this rotation.
+    pub grace_ms: u64,
 }
 
 /// Outcome of a single-partition rotation.

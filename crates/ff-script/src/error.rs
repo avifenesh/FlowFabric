@@ -384,9 +384,9 @@ pub enum ScriptError {
     #[error("invalid_secret_hex: secret must be a non-empty even-length hex string")]
     InvalidSecretHex,
 
-    /// Rotation FCALL: `previous_expires_at_ms` or `now_ms` not a number.
-    #[error("invalid_timestamp: timestamp arg must be a valid integer")]
-    InvalidTimestamp,
+    /// Rotation FCALL: `grace_ms` not a non-negative integer.
+    #[error("invalid_grace_ms: grace_ms must be a non-negative integer")]
+    InvalidGraceMs,
 
     /// Rotation FCALL: same kid already installed with a different secret.
     /// Carries the kid so operators see which one conflicted. Refuse — the
@@ -465,7 +465,7 @@ impl ScriptError {
             | Self::WaitpointNotTokenBound
             | Self::InvalidKid
             | Self::InvalidSecretHex
-            | Self::InvalidTimestamp
+            | Self::InvalidGraceMs
             | Self::RotationConflict(_)
             | Self::Parse(_) => ErrorClass::Terminal,
 
@@ -620,7 +620,7 @@ impl ScriptError {
             "waitpoint_not_token_bound" => Self::WaitpointNotTokenBound,
             "invalid_kid" => Self::InvalidKid,
             "invalid_secret_hex" => Self::InvalidSecretHex,
-            "invalid_timestamp" => Self::InvalidTimestamp,
+            "invalid_grace_ms" => Self::InvalidGraceMs,
             "rotation_conflict" => Self::RotationConflict(String::new()),
             _ => return None,
         })

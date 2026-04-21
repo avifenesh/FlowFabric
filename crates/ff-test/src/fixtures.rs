@@ -197,12 +197,8 @@ impl TestCluster {
         &self,
         new_kid: &str,
         new_secret_hex: &str,
-        previous_expires_at_ms: i64,
+        grace_ms: u64,
     ) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
         for index in 0..self.config.num_flow_partitions {
             let partition = ff_core::partition::Partition {
                 family: ff_core::partition::PartitionFamily::Execution,
@@ -215,12 +211,32 @@ impl TestCluster {
                 &ff_core::contracts::RotateWaitpointHmacSecretArgs {
                     new_kid: new_kid.to_owned(),
                     new_secret_hex: new_secret_hex.to_owned(),
-                    previous_expires_at_ms,
-                    now_ms,
+                    grace_ms,
                 },
             )
             .await
             .expect("FCALL ff_rotate_waitpoint_hmac_secret");
+        }
+    }
+
+    /// Override `expires_at:<kid>` on every execution partition.
+    /// Test-only escape hatch for simulating "grace has elapsed": the
+    /// FCALL computes expires_at = server-now + grace_ms, so it can't
+    /// write a past value itself. Tests use this to stamp an arbitrary
+    /// expires value (typically `1` for "deep past") after rotation.
+    pub async fn hset_waitpoint_expires_at(&self, kid: &str, expires_at_ms: i64) {
+        let field = format!("expires_at:{kid}");
+        let value = expires_at_ms.to_string();
+        for index in 0..self.config.num_flow_partitions {
+            let partition = ff_core::partition::Partition {
+                family: ff_core::partition::PartitionFamily::Execution,
+                index,
+            };
+            let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
+            self.client
+                .hset(&key, &field, &value)
+                .await
+                .expect("HSET expires_at:<kid> (test override)");
         }
     }
 

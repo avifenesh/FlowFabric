@@ -3021,12 +3021,10 @@ impl Server {
         };
 
         let n = self.config.partition_config.num_flow_partitions;
+        // "now" is derived inside the FCALL from `redis.call("TIME")`
+        // (consistency with validate_waitpoint_token and flow scanners);
+        // grace_ms is a duration — safe to carry from config.
         let grace_ms = self.config.waitpoint_hmac_grace_ms;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_millis() as i64;
-        let previous_expires_at = now_ms + grace_ms as i64;
 
         // Parallelize the rotation fan-out with the same bounded
         // concurrency as boot init (BOOT_INIT_CONCURRENCY = 16). A 256-
@@ -3065,7 +3063,7 @@ impl Server {
                             &partition_owned,
                             &new_kid_owned,
                             &new_secret_owned,
-                            previous_expires_at,
+                            grace_ms,
                         )
                         .await;
                     (idx, partition_owned, outcome)
@@ -3137,18 +3135,13 @@ impl Server {
         partition: &Partition,
         new_kid: &str,
         new_secret_hex: &str,
-        previous_expires_at: i64,
+        grace_ms: u64,
     ) -> Result<(), ServerError> {
         let idx = IndexKeys::new(partition);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_millis() as i64;
         let args = RotateWaitpointHmacSecretArgs {
             new_kid: new_kid.to_owned(),
             new_secret_hex: new_secret_hex.to_owned(),
-            previous_expires_at_ms: previous_expires_at,
-            now_ms,
+            grace_ms,
         };
         let outcome = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
             &self.client,

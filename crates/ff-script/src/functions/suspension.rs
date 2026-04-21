@@ -297,7 +297,7 @@ impl FromFcallResult for CloseWaitpointResult {
 // ─── ff_rotate_waitpoint_hmac_secret ──────────────────────────────────
 //
 // Lua KEYS (1): hmac_secrets
-// Lua ARGV (4): new_kid, new_secret_hex, previous_expires_at_ms, now_ms
+// Lua ARGV (3): new_kid, new_secret_hex, grace_ms
 
 ff_function! {
     /// Rotate the waitpoint HMAC signing kid on a single partition.
@@ -315,10 +315,9 @@ ff_function! {
             k.waitpoint_hmac_secrets(), // 1
         }
         argv {
-            args.new_kid.clone(),                    // 1
-            args.new_secret_hex.clone(),             // 2
-            args.previous_expires_at_ms.to_string(), // 3
-            args.now_ms.to_string(),                 // 4
+            args.new_kid.clone(),        // 1
+            args.new_secret_hex.clone(), // 2
+            args.grace_ms.to_string(),   // 3
         }
     }
 }
