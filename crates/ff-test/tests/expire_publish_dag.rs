@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use ferriskey::value::ProtocolVersion;
-use ferriskey::{ClientBuilder, PushKind, Value};
+use ferriskey::{Client, ClientBuilder, PushKind, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::execution_partition;
 use ff_core::types::*;
@@ -39,37 +39,59 @@ fn config() -> ff_core::partition::PartitionConfig {
 }
 
 /// Build a dedicated RESP3 client subscribed to COMPLETION_CHANNEL.
-/// Returns the receiver the test waits on. Mirrors the construction in
-/// `ff-engine/src/completion_listener.rs` so coverage stays honest.
-async fn subscribe_to_completions() -> mpsc::UnboundedReceiver<ferriskey::PushInfo> {
+/// Returns the client (so the test owns its lifetime — dropping closes
+/// the subscription) and the push receiver. Mirrors the engine's
+/// CompletionListener construction, including the FF_TLS / FF_CLUSTER
+/// env flags so this test behaves identically in CI's cluster mode.
+async fn subscribe_to_completions()
+-> (Client, mpsc::UnboundedReceiver<ferriskey::PushInfo>) {
     let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".to_owned());
     let port: u16 = std::env::var("FF_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(6379);
+    let tls = ff_test::fixtures::env_flag("FF_TLS");
+    let cluster = ff_test::fixtures::env_flag("FF_CLUSTER");
 
-    let (push_tx, push_rx) = mpsc::unbounded_channel();
-    let client = ClientBuilder::new()
+    let (push_tx, mut push_rx) = mpsc::unbounded_channel();
+    let mut builder = ClientBuilder::new()
         .protocol(ProtocolVersion::RESP3)
         .push_sender(push_tx)
-        .host(&host, port)
-        .build()
-        .await
-        .expect("build RESP3 listener client");
-    let _: Result<(), _> = client
+        .host(&host, port);
+    if tls {
+        builder = builder.tls();
+    }
+    if cluster {
+        builder = builder.cluster();
+    }
+    let client = builder.build().await.expect("build RESP3 listener client");
+
+    let sub_result: Result<(), _> = client
         .cmd("SUBSCRIBE")
         .arg(COMPLETION_CHANNEL)
         .execute()
         .await;
-    // Give the subscription a moment to register before the caller
-    // triggers the PUBLISH — on a fast local Valkey the SUBSCRIBE +
-    // PUBLISH race can otherwise drop the message.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Keep the client alive for the duration of the test by leaking it;
-    // dropping closes the subscription and starves push_rx. Tests are
-    // short-lived processes so this is fine.
-    Box::leak(Box::new(client));
-    push_rx
+    sub_result.expect("SUBSCRIBE ff:dag:completions");
+
+    // Wait for the server's Subscribe confirmation push frame so the
+    // subsequent PUBLISH can't race the subscription. Without this,
+    // the "no publish" assertion in expire_standalone_does_not_publish
+    // can pass vacuously if the subscription never actually registered.
+    let subscribed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let push = push_rx
+                .recv()
+                .await
+                .expect("push channel closed before subscribe confirmation");
+            if push.kind == PushKind::Subscribe {
+                return;
+            }
+        }
+    })
+    .await;
+    subscribed.expect("SUBSCRIBE confirmation push did not arrive within 2s");
+
+    (client, push_rx)
 }
 
 /// Await one `Message` push frame from COMPLETION_CHANNEL. Panics on
@@ -110,12 +132,14 @@ async fn expect_completion(
 async fn expire_runnable_flow_bound_publishes_to_dag_completions() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let mut rx = subscribe_to_completions().await;
+    let (_sub, mut rx) = subscribe_to_completions().await;
 
-    // Build a flow-bound execution with an already-past execution_deadline.
+    // Build a flow-bound execution. The test drives ff_expire_execution
+    // directly, so the exact `execution_deadline` value isn't load-bearing —
+    // it just has to be present so ff_create_execution populates the index.
     // Minting via `ExecutionId::for_flow` pins the exec to the flow's
-    // partition (RFC-011) so the exec_core HSET of flow_id is sufficient
-    // to make the terminal HSET path trigger the PUBLISH branch.
+    // partition (RFC-011) so the exec_core HSET of flow_id below is
+    // sufficient to make the terminal HSET path trigger the PUBLISH branch.
     let fid = FlowId::new();
     let eid = ExecutionId::for_flow(&fid, &config());
     let partition = execution_partition(&eid, &config());
@@ -231,7 +255,7 @@ async fn expire_runnable_flow_bound_publishes_to_dag_completions() {
 async fn expire_standalone_does_not_publish() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
-    let mut rx = subscribe_to_completions().await;
+    let (_sub, mut rx) = subscribe_to_completions().await;
 
     let eid = tc.new_execution_id();
     let partition = execution_partition(&eid, &config());
