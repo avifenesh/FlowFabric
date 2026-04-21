@@ -6,8 +6,8 @@
 use crate::policy::ExecutionPolicy;
 use crate::state::{AttemptType, PublicState, StateVector};
 use crate::types::{
-    AttemptId, AttemptIndex, CancelSource, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
-    Namespace, SignalId, SuspensionId, TimestampMs, WaitpointId, WaitpointToken, WorkerId,
+    AttemptId, AttemptIndex, CancelSource, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch,
+    LeaseId, Namespace, SignalId, SuspensionId, TimestampMs, WaitpointId, WaitpointToken, WorkerId,
     WorkerInstanceId,
 };
 use serde::{Deserialize, Serialize};
@@ -1654,6 +1654,87 @@ impl FlowSnapshot {
             cancel_reason,
             cancellation_policy,
             tags,
+        }
+    }
+}
+
+// ─── describe_edge / list_*_edges (issue #58.3) ───
+
+/// Engine-decoupled read-model for one dependency edge.
+///
+/// Returned by `ff_sdk::FlowFabricWorker::describe_edge`,
+/// `list_incoming_edges`, and `list_outgoing_edges`. Consumers consult
+/// this struct instead of reaching into Valkey's per-flow `edge:` hash
+/// directly — the engine is free to rename hash fields or restructure
+/// key layout under this surface.
+///
+/// `#[non_exhaustive]` — FF may add fields in minor releases without a
+/// semver break. Match with `..` or use [`EdgeSnapshot::new`].
+///
+/// # Fields
+///
+/// The struct mirrors the immutable edge record written by
+/// `ff_stage_dependency_edge` (see `lua/flow.lua`). The flow-scoped
+/// edge hash is only ever written once, at staging time; per-execution
+/// resolution state lives on a separate `dep:<edge_id>` hash and is not
+/// surfaced here. The `edge_state` field therefore reflects the
+/// staging-time literal (currently `pending`), not the downstream
+/// execution's dep-edge state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EdgeSnapshot {
+    pub edge_id: EdgeId,
+    pub flow_id: FlowId,
+    pub upstream_execution_id: ExecutionId,
+    pub downstream_execution_id: ExecutionId,
+    /// The `dependency_kind` literal (e.g. `success_only`) from
+    /// `stage_dependency_edge`. Preserved as-is; FF does not interpret
+    /// it on reads.
+    pub dependency_kind: String,
+    /// The satisfaction-condition literal stamped at staging time
+    /// (e.g. `all_required`).
+    pub satisfaction_condition: String,
+    /// Optional opaque handle to a data-passing artifact. `None` when
+    /// the stored field is empty (the most common case).
+    pub data_passing_ref: Option<String>,
+    /// Edge-state literal on the flow-scoped edge hash. Written once
+    /// at staging as `pending`; this hash is immutable on the flow
+    /// side. Per-execution resolution state is tracked separately on
+    /// the child's `dep:<edge_id>` hash.
+    pub edge_state: String,
+    pub created_at: TimestampMs,
+    /// Origin of the edge (e.g. `engine`). Preserved as-is.
+    pub created_by: String,
+}
+
+impl EdgeSnapshot {
+    /// Construct an [`EdgeSnapshot`]. Present so downstream crates
+    /// (ff-sdk's `describe_edge` / `list_*_edges`) can assemble the
+    /// struct despite the `#[non_exhaustive]` marker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        edge_id: EdgeId,
+        flow_id: FlowId,
+        upstream_execution_id: ExecutionId,
+        downstream_execution_id: ExecutionId,
+        dependency_kind: String,
+        satisfaction_condition: String,
+        data_passing_ref: Option<String>,
+        edge_state: String,
+        created_at: TimestampMs,
+        created_by: String,
+    ) -> Self {
+        Self {
+            edge_id,
+            flow_id,
+            upstream_execution_id,
+            downstream_execution_id,
+            dependency_kind,
+            satisfaction_condition,
+            data_passing_ref,
+            edge_state,
+            created_at,
+            created_by,
         }
     }
 }
