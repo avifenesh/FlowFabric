@@ -395,3 +395,49 @@ impl FromFcallResult for StageDependencyEdgeResult {
         })
     }
 }
+
+// ─── ff_set_flow_tags (issue #58.4) ─────────────────────────────────────
+//
+// Variadic-ARGV FCALL mirroring `ff_set_execution_tags`. Hand-rolled
+// since the `ff_function!` macro assumes a fixed ARGV vector.
+//
+// KEYS (2): flow_core, tags_key
+// ARGV (>=2, even): k1, v1, k2, v2, ...
+
+/// Call `ff_set_flow_tags`: write caller-supplied tag fields to the
+/// flow's separate tags key. Returns the number of pairs applied. Tag
+/// keys must match `^[a-z][a-z0-9_]*\.`. The Lua function also
+/// lazy-migrates any pre-58.4 reserved-namespace fields stashed
+/// inline on `flow_core` into the new tags key.
+pub async fn ff_set_flow_tags(
+    conn: &ferriskey::Client,
+    fctx: &FlowKeyContext,
+    args: &SetFlowTagsArgs,
+) -> Result<SetFlowTagsResult, ScriptError> {
+    let keys = [fctx.core(), fctx.tags()];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+
+    let mut argv: Vec<String> = Vec::with_capacity(args.tags.len() * 2);
+    for (k, v) in &args.tags {
+        argv.push(k.clone());
+        argv.push(v.clone());
+    }
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_set_flow_tags", &key_refs, &argv_refs)
+        .await
+        .map_err(ScriptError::Valkey)?;
+    SetFlowTagsResult::from_fcall_result(&raw)
+}
+
+impl FromFcallResult for SetFlowTagsResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let count: u32 = r
+            .field_str(0)
+            .parse()
+            .map_err(|e| ScriptError::Parse(format!("bad tag count: {e}")))?;
+        Ok(SetFlowTagsResult::Ok { count })
+    }
+}
