@@ -338,6 +338,14 @@ impl FlowKeyContext {
         format!("ff:flow:{}:{}:members", self.tag, self.fid)
     }
 
+    /// `ff:flow:{fp:N}:<flow_id>:tags` — User-supplied key-value labels.
+    /// Symmetric with [`ExecKeyContext::tags`]. Populated by
+    /// `ff_set_flow_tags`, which also lazy-migrates any pre-58.4
+    /// reserved-namespace fields stashed inline on `flow_core`.
+    pub fn tags(&self) -> String {
+        format!("ff:flow:{}:{}:tags", self.tag, self.fid)
+    }
+
     /// `ff:flow:{fp:N}:<flow_id>:member:<eid>`
     pub fn member(&self, eid: &ExecutionId) -> String {
         format!("ff:flow:{}:{}:member:{}", self.tag, self.fid, eid)

@@ -591,6 +591,96 @@ impl FromFcallResult for ExpireExecutionResultPartial {
     }
 }
 
+// ─── ff_set_execution_tags (issue #58.4) ────────────────────────────────
+//
+// Variadic-ARGV FCALL: k1, v1, k2, v2, ... Hand-rolled instead of the
+// `ff_function!` macro because the macro assumes a fixed ARGV vector;
+// tags carry a caller-supplied map.
+//
+// KEYS (2): exec_core, tags_key
+// ARGV (>=2, even): k1, v1, k2, v2, ...
+
+/// Call `ff_set_execution_tags`: write caller-supplied tag fields to
+/// the execution's separate tags key. Returns the number of pairs
+/// applied.
+///
+/// Tag keys must match `^[a-z][a-z0-9_]*\.` (the reserved caller
+/// namespace, e.g. `cairn.task_id`); a violating key makes the FCALL
+/// return `invalid_tag_key` carrying the offending key. Callers should
+/// use [`validate_tag_key`] for client-side fast-fail before reaching
+/// the FCALL. Empty or odd-length input returns `invalid_input`.
+pub async fn ff_set_execution_tags(
+    conn: &ferriskey::Client,
+    ctx: &ExecKeyContext,
+    args: &SetExecutionTagsArgs,
+) -> Result<SetExecutionTagsResult, ScriptError> {
+    let keys = [ctx.core(), ctx.tags()];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+
+    // Flatten the sorted map into alternating key/value ARGV. BTreeMap
+    // iteration is sorted, so ARGV is deterministic for identical
+    // inputs.
+    let mut argv: Vec<String> = Vec::with_capacity(args.tags.len() * 2);
+    for (k, v) in &args.tags {
+        argv.push(k.clone());
+        argv.push(v.clone());
+    }
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_set_execution_tags", &key_refs, &argv_refs)
+        .await
+        .map_err(ScriptError::Valkey)?;
+    SetExecutionTagsResult::from_fcall_result(&raw)
+}
+
+impl FromFcallResult for SetExecutionTagsResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        let count: u32 = r
+            .field_str(0)
+            .parse()
+            .map_err(|e| ScriptError::Parse(format!("bad tag count: {e}")))?;
+        Ok(SetExecutionTagsResult::Ok { count })
+    }
+}
+
+/// Client-side fast-fail validator for tag keys. Matches the Lua
+/// pattern `^[a-z][a-z0-9_]*%.` — requires:
+///
+///   * non-empty;
+///   * first char is lowercase ASCII letter;
+///   * subsequent chars up to the first `.` are lowercase alnum or `_`;
+///   * must contain at least one `.` after the prefix run.
+///
+/// Returns `Err(ScriptError::InvalidTagKey(key))` on rejection so
+/// callers match the same variant they'd see from the server-side
+/// path.
+pub fn validate_tag_key(key: &str) -> Result<(), ScriptError> {
+    let mut chars = key.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return Err(ScriptError::InvalidTagKey(key.to_owned())),
+    };
+    if !first.is_ascii_lowercase() {
+        return Err(ScriptError::InvalidTagKey(key.to_owned()));
+    }
+    let mut saw_dot = false;
+    for c in chars {
+        if c == '.' {
+            saw_dot = true;
+            break;
+        }
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(ScriptError::InvalidTagKey(key.to_owned()));
+        }
+    }
+    if !saw_dot {
+        return Err(ScriptError::InvalidTagKey(key.to_owned()));
+    }
+    Ok(())
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────
 
 fn parse_public_state(s: &str) -> Result<PublicState, ScriptError> {
@@ -716,5 +806,62 @@ mod partial_tests {
         let eid = test_eid();
         let full = partial.complete(eid);
         assert!(matches!(full, ExpireExecutionResult::AlreadyTerminal));
+    }
+}
+
+// ─── Tag-key validation tests (issue #58.4) ────────────────────────────
+#[cfg(test)]
+mod tag_key_tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_caller_namespaced_key() {
+        assert!(validate_tag_key("cairn.task_id").is_ok());
+        assert!(validate_tag_key("my_app.run_123").is_ok());
+        assert!(validate_tag_key("app2.x.y").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_key_without_dot() {
+        let err = validate_tag_key("no_dot_here").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(k) if k == "no_dot_here"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_key() {
+        let err = validate_tag_key("").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(k) if k.is_empty()));
+    }
+
+    #[test]
+    fn validate_rejects_uppercase_first_char() {
+        let err = validate_tag_key("Cairn.task_id").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(_)));
+    }
+
+    #[test]
+    fn validate_rejects_leading_digit() {
+        let err = validate_tag_key("1cairn.task_id").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(_)));
+    }
+
+    #[test]
+    fn validate_rejects_dash_in_prefix() {
+        let err = validate_tag_key("my-app.run").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(_)));
+    }
+
+    #[test]
+    fn validate_accepts_single_char_prefix() {
+        assert!(validate_tag_key("a.x").is_ok());
+    }
+
+    #[test]
+    fn from_code_invalid_tag_key_roundtrip() {
+        let err = ScriptError::from_code_with_detail("invalid_tag_key", "BadKey").unwrap();
+        match err {
+            ScriptError::InvalidTagKey(k) => assert_eq!(k, "BadKey"),
+            other => panic!("expected InvalidTagKey, got {other:?}"),
+        }
     }
 }
