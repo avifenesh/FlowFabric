@@ -1523,6 +1523,118 @@ impl LeaseSummary {
 
 // ─── Common sub-types ───
 
+// ─── describe_flow (issue #58.2) ───
+
+/// Engine-decoupled read-model for one flow.
+///
+/// Returned by `ff_sdk::FlowFabricWorker::describe_flow`. Consumers
+/// consult this struct instead of reaching into Valkey's flow_core hash
+/// directly — the engine is free to rename fields or restructure storage
+/// under this surface.
+///
+/// `#[non_exhaustive]` — FF may add fields in minor releases without a
+/// semver break. Match with `..` or use [`FlowSnapshot::new`].
+///
+/// # `public_flow_state`
+///
+/// Stored as an engine-written string literal on `flow_core`. Known
+/// values today: `open`, `running`, `blocked`, `cancelled`, `completed`,
+/// `failed`. Surfaced as `String` (not a typed enum) because FF does
+/// not yet expose a `PublicFlowState` type — callers that need to act
+/// on specific values should match on the literal. The flow_projector
+/// writes a parallel `public_flow_state` into the flow's summary hash;
+/// this field reflects the authoritative value on `flow_core`, which
+/// is what mutation guards (cancel/add-member) consult.
+///
+/// # `tags`
+///
+/// Unlike [`ExecutionSnapshot::tags`] (which has a dedicated tags
+/// hash), flow tags live inline on `flow_core`. FF's own fields are
+/// snake_case without a `.`; any field whose name starts with
+/// `<lowercase>.` (e.g. `cairn.task_id`) is treated as consumer-owned
+/// metadata and routed here. An empty map means no namespaced tags
+/// were written. The prefix convention mirrors
+/// [`ExecutionSnapshot::tags`] — consumers should keep tag keys
+/// namespaced (`cairn.*`, `operator.*`, etc.) so future FF field
+/// additions don't collide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FlowSnapshot {
+    pub flow_id: FlowId,
+    /// The `flow_kind` literal passed to `create_flow` (e.g. `dag`,
+    /// `pipeline`). Preserved as-is; FF does not interpret it.
+    pub flow_kind: String,
+    pub namespace: Namespace,
+    /// Authoritative flow state on `flow_core`. See the struct-level
+    /// docs for the set of known values.
+    pub public_flow_state: String,
+    /// Monotonically increasing revision bumped on every structural
+    /// mutation (add-member, stage-edge). Used by optimistic-concurrency
+    /// writers via `expected_graph_revision`.
+    pub graph_revision: u64,
+    /// Number of member executions added so far. Never decremented.
+    pub node_count: u32,
+    /// Number of dependency edges staged so far. Never decremented.
+    pub edge_count: u32,
+    pub created_at: TimestampMs,
+    /// Timestamp of the last write that mutated `flow_core`.
+    /// Engine-maintained.
+    pub last_mutation_at: TimestampMs,
+    /// When the flow reached a terminal state via `cancel_flow`. `None`
+    /// while the flow is live. Only written by the cancel path today;
+    /// `completed`/`failed` terminal states do not populate this field
+    /// (the flow_projector derives them from membership).
+    pub cancelled_at: Option<TimestampMs>,
+    /// Operator-supplied reason from the `cancel_flow` call. `None`
+    /// when the flow has not been cancelled.
+    pub cancel_reason: Option<String>,
+    /// The `cancellation_policy` value persisted by `cancel_flow`
+    /// (e.g. `cancel_all`, `cancel_flow_only`). `None` for flows
+    /// cancelled before this field was persisted, or not yet cancelled.
+    pub cancellation_policy: Option<String>,
+    /// Consumer-owned namespaced metadata (e.g. `cairn.task_id`). See
+    /// the struct-level docs for the routing rule.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl FlowSnapshot {
+    /// Construct a [`FlowSnapshot`]. Present so downstream crates
+    /// (ff-sdk's `describe_flow`) can assemble the struct despite the
+    /// `#[non_exhaustive]` marker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        flow_id: FlowId,
+        flow_kind: String,
+        namespace: Namespace,
+        public_flow_state: String,
+        graph_revision: u64,
+        node_count: u32,
+        edge_count: u32,
+        created_at: TimestampMs,
+        last_mutation_at: TimestampMs,
+        cancelled_at: Option<TimestampMs>,
+        cancel_reason: Option<String>,
+        cancellation_policy: Option<String>,
+        tags: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            flow_id,
+            flow_kind,
+            namespace,
+            public_flow_state,
+            graph_revision,
+            node_count,
+            edge_count,
+            created_at,
+            last_mutation_at,
+            cancelled_at,
+            cancel_reason,
+            cancellation_policy,
+            tags,
+        }
+    }
+}
+
 /// Summary of state after a mutation, returned by many functions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSummary {
