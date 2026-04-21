@@ -655,23 +655,32 @@ impl ClaimedTask {
             Ok(outcome) => Ok(outcome),
             // Terminal-op replay reconciliation. Two valid replay shapes:
             //   - lifecycle=terminal, outcome=failed    -> TerminalFailed
-            //   - lifecycle=runnable, outcome=none      -> RetryScheduled
-            // Both require epoch + attempt_id match so we only reconcile
-            // THIS caller's own commit, not a later re-claim's state.
-            // RetryScheduled loses delay_until_ms (not persisted on the
-            // replay error path — an HGET could recover it but that's a
-            // separate round-trip; return 0 so callers see "scheduled,
-            // exact delay unknown").
+            //   - lifecycle=runnable                    -> RetryScheduled
+            //
+            // Guard strength differs by branch because the Lua paths clear
+            // different fields:
+            //   - Terminal fail preserves both current_lease_epoch AND
+            //     current_attempt_id; we match on both (strongest guard).
+            //   - Retry-scheduled preserves current_lease_epoch but CLEARS
+            //     current_attempt_id to "" (execution.lua retry HSET). A
+            //     later re-claim bumps epoch to next_epoch, so epoch alone
+            //     is still a sufficient fence — if another worker has
+            //     claimed+processed since our fail, they'd have a different
+            //     epoch. RetryScheduled loses delay_until_ms (not persisted
+            //     on the replay error path); return 0 so callers see
+            //     "scheduled, exact delay unknown".
             Err(SdkError::Script(ScriptError::ExecutionNotActive {
                 ref terminal_outcome,
                 ref lease_epoch,
                 ref lifecycle_phase,
                 ref attempt_id,
-            })) if lease_epoch == &self.lease_epoch.to_string()
-                && attempt_id == &self.attempt_id.to_string() =>
-            {
+            })) if lease_epoch == &self.lease_epoch.to_string() => {
                 match (lifecycle_phase.as_str(), terminal_outcome.as_str()) {
-                    ("terminal", "failed") => Ok(FailOutcome::TerminalFailed),
+                    ("terminal", "failed")
+                        if attempt_id == &self.attempt_id.to_string() =>
+                    {
+                        Ok(FailOutcome::TerminalFailed)
+                    }
                     ("runnable", _) => Ok(FailOutcome::RetryScheduled {
                         delay_until: TimestampMs::from_millis(0),
                     }),

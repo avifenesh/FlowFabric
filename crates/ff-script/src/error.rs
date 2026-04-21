@@ -40,7 +40,7 @@ pub enum ScriptError {
     /// `attempt_id` is the per-attempt replay guard (preserved on
     /// terminal, cleared on retry).
     #[error(
-        "execution_not_active: lifecycle_phase={lifecycle_phase} terminal_outcome={terminal_outcome} lease_epoch={lease_epoch}"
+        "execution_not_active: lifecycle_phase={lifecycle_phase} terminal_outcome={terminal_outcome} lease_epoch={lease_epoch} attempt_id={attempt_id}"
     )]
     ExecutionNotActive {
         terminal_outcome: String,

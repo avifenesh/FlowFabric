@@ -1519,6 +1519,134 @@ async fn test_complete_replay_returns_enriched_detail() {
     );
 }
 
+/// Retry-scheduled replay: ff_fail_execution with retries remaining moves
+/// the exec to `runnable` (not `terminal`). On replay, the enriched
+/// execution_not_active error shows lifecycle_phase="runnable", and the
+/// SDK's fail() reconciler CANNOT match on attempt_id (the retry path
+/// clears current_attempt_id to "" — flagged by @cursor-bugbot /
+/// @gemini-code-assist on PR #55). The reconciler must match on
+/// lease_epoch only for this branch. This test pins that the retry
+/// path produces an empty attempt_id in the reply, so the SDK's
+/// epoch-only fence is necessary and sufficient.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_fail_retry_scheduled_replay_clears_attempt_id() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = tc.new_execution_id();
+    // Create with a retry policy that allows 1 retry (10ms backoff).
+    // The retry-policy JSON passed to ff_fail_execution is the INNER
+    // retry-policy object (no "retry_policy" outer key) — the Lua at
+    // lua/execution.lua:1141 reads policy.max_retries directly.
+    let policy_json = r#"{"max_retries":3,"backoff":{"type":"fixed","delay_ms":10}}"#;
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+
+    // Inline create_execution with policy so retry is possible.
+    let create_keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.payload(),
+        ctx.policy(),
+        ctx.tags(),
+        idx.lane_eligible(&lane_id),
+        ctx.noop(),
+        idx.execution_deadline(),
+        idx.all_executions(),
+    ];
+    let create_args: Vec<String> = vec![
+        eid.to_string(),
+        NS.to_owned(),
+        LANE.to_owned(),
+        "retry_replay_test".to_owned(),
+        "0".to_owned(),
+        "e2e-test".to_owned(),
+        policy_json.to_owned(),
+        r#"{"test":"retry_replay"}"#.to_owned(),
+        String::new(),
+        String::new(),
+        "{}".to_owned(),
+        String::new(),
+        partition.index.to_string(),
+    ];
+    let kr: Vec<&str> = create_keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
+    let raw: Value = tc.client()
+        .fcall("ff_create_execution", &kr, &ar)
+        .await
+        .expect("FCALL ff_create_execution");
+    assert_ok(&raw, "ff_create_execution");
+
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, _att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // First fail — retry gets scheduled (exec moves to runnable).
+    fcall_fail_execution(
+        &tc, &eid, LANE, WORKER_INST, &lease_id, &epoch, &attempt_id,
+        "transient error", "transient", policy_json,
+    ).await;
+
+    // Second call — replay with same lease/epoch/attempt_id. Lua is
+    // expected to return execution_not_active with lifecycle=runnable,
+    // terminal_outcome=none, epoch PRESERVED, attempt_id EMPTY.
+    let wid = WorkerInstanceId::new(WORKER_INST);
+    let replay_keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(AttemptIndex::new(0)),
+        idx.lease_expiry(),
+        idx.worker_leases(&wid),
+        idx.lane_terminal(&lane_id),
+        idx.lane_delayed(&lane_id),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lane_active(&lane_id),
+        ctx.stream_meta(AttemptIndex::new(0)),
+        idx.attempt_timeout(),
+        idx.execution_deadline(),
+    ];
+    let replay_args: Vec<String> = vec![
+        eid.to_string(),
+        lease_id.clone(),
+        epoch.clone(),
+        attempt_id.clone(),
+        "transient error".to_owned(),
+        "transient".to_owned(),
+        policy_json.to_owned(),
+    ];
+    let rkr: Vec<&str> = replay_keys.iter().map(|s| s.as_str()).collect();
+    let rar: Vec<&str> = replay_args.iter().map(|s| s.as_str()).collect();
+    let replay: Value = tc.client()
+        .fcall("ff_fail_execution", &rkr, &rar)
+        .await
+        .expect("FCALL ff_fail_execution (replay)");
+    let arr = match &replay {
+        Value::Array(a) => a,
+        _ => panic!("expected Array"),
+    };
+
+    assert_eq!(
+        match arr.first() {
+            Some(Ok(Value::Int(n))) => *n,
+            _ => panic!("expected Int status"),
+        },
+        0,
+        "replay must surface as status=0"
+    );
+    assert_eq!(field_str(arr, 1), "execution_not_active");
+    assert_eq!(field_str(arr, 2), "none", "terminal_outcome on runnable replay");
+    assert_eq!(field_str(arr, 3), epoch, "lease_epoch PRESERVED across retry");
+    assert_eq!(field_str(arr, 4), "runnable", "lifecycle_phase is runnable");
+    assert_eq!(
+        field_str(arr, 5),
+        "",
+        "current_attempt_id CLEARED by retry path — SDK must match on epoch only for this branch"
+    );
+}
+
 /// Expire an active execution via ff_expire_execution.
 #[tokio::test]
 #[serial_test::serial]
