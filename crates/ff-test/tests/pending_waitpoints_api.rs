@@ -52,7 +52,8 @@ impl TestApi {
             .await
             .expect("Server::start failed");
         let server = Arc::new(server);
-        let app = ff_server::api::router(server, &["*".to_owned()], None);
+        let app = ff_server::api::router(server, &["*".to_owned()], None)
+            .expect("router builds with wildcard CORS");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
