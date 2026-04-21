@@ -16,6 +16,7 @@ use crate::retry::is_retryable_kind;
 /// Call sites compare via `matches!`/`.class()` rather than `==`, so this is
 /// not a regression.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ScriptError {
     // ── Lease/Ownership errors ──
     /// Stop. Lease superseded by reclaim.
