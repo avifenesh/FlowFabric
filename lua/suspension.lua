@@ -771,10 +771,11 @@ end)
 --   err("invalid_kid")                           -- empty or contains ':'
 --   err("invalid_secret_hex")                    -- empty / odd length / non-hex
 --
--- Matches the semantics of the Rust `rotate_single_partition_locked`
--- (crates/ff-server/src/server.rs): idempotent replay, torn-write repair,
--- orphan GC across expired kids, INVARIANT that expires_at:<new_kid> is
--- never written (current_kid has no expiry).
+-- Authoritative implementation of waitpoint HMAC rotation: idempotent
+-- replay, torn-write repair, orphan GC across expired kids. INVARIANT:
+-- expires_at:<new_kid> is never written (current_kid has no expiry).
+-- ff-server's admin endpoint delegates to this FCALL — single source
+-- of truth lives here, not in Rust.
 ---------------------------------------------------------------------------
 redis.register_function('ff_rotate_waitpoint_hmac_secret', function(keys, args)
   local hmac_key          = keys[1]

@@ -826,7 +826,9 @@ async fn test_rapid_rotation_past_grace_rejects_expired() {
     let (wp_b, _wk_b, k1_token) =
         suspend_and_get_token(&tc, &eid_b, &lid_b, &ep_b, &aid_b).await;
 
-    // Set previous_expires_at in the past so k1's grace is already elapsed.
+    // Rotate k1 → k2 with the grace window already past. The rotation
+    // stamps expires_at:k1 = past_grace; secret:k1 stays in the hash
+    // until a LATER rotation's orphan GC sweeps it.
     let past_grace = TimestampMs::now().0 - 1_000;
     tc.rotate_waitpoint_hmac_secret(
         "k2",
@@ -835,27 +837,13 @@ async fn test_rapid_rotation_past_grace_rejects_expired() {
     )
     .await;
 
-    // Subsequent rotate k2 → k3 triggers orphan GC which sweeps expired
-    // kids (including k1, whose expires_at is in the past). After this,
-    // secret:k1 should be gone from the hash.
-    let future_grace = TimestampMs::now().0 + 600_000;
-    tc.rotate_waitpoint_hmac_secret(
-        "k3",
-        "3333333333333333333333333333333333333333333333333333333333333333",
-        future_grace,
-    )
-    .await;
-
-    // k1-signed token → `token_expired`. expires_at:k1 is present in the
-    // hash (fixture helper writes it, mirroring production rotation) but
-    // its value is in the past. The multi-kid validator distinguishes
-    // "present kid whose grace has elapsed" (token_expired — actionable:
-    // operator rolled forward, client is holding an aged token) from
-    // "unknown kid" (invalid_token — never existed or already GC'd).
-    // Production orphan GC at the NEXT rotation will HDEL secret:k1 and
-    // expires_at:k1 because expires_at:k1 < now_ms; after that the same
-    // request would return invalid_token. The fixture doesn't run GC,
-    // so this pins the pre-GC "known kid, past grace" behavior.
+    // k1-signed token → `token_expired`. expires_at:k1 is present but
+    // in the past; multi-kid validator distinguishes "present kid whose
+    // grace has elapsed" (token_expired — actionable: operator rolled
+    // forward, client is holding an aged token) from "unknown kid"
+    // (invalid_token — never existed or already GC'd). A subsequent
+    // rotation would GC secret:k1; we stop before that to pin the
+    // "known kid, past grace" branch.
     let resp = try_deliver_signal(&tc, &eid_b, &wp_b, "wpt_signal", &k1_token).await;
     assert_err_code(&resp, "token_expired");
 }

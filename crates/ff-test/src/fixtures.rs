@@ -190,56 +190,37 @@ impl TestCluster {
         }
     }
 
-    /// Rotate the waitpoint HMAC secret across partitions — promotes current
-    /// kid to previous with `previous_expires_at`, installs new kid. Used by
-    /// rotation tests that want to simulate operator rotation via fixtures.
+    /// Rotate the waitpoint HMAC secret across partitions. Thin fixture
+    /// wrapper around the `ff_rotate_waitpoint_hmac_secret` FCALL so
+    /// tests exercise the same rotation path cairn and ff-server use.
     pub async fn rotate_waitpoint_hmac_secret(
         &self,
         new_kid: &str,
         new_secret_hex: &str,
         previous_expires_at_ms: i64,
     ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         for index in 0..self.config.num_flow_partitions {
             let partition = ff_core::partition::Partition {
                 family: ff_core::partition::PartitionFamily::Execution,
                 index,
             };
-            let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
-            let current: Option<String> = self
-                .client
-                .hget(&key, "current_kid")
-                .await
-                .expect("HGET current_kid");
-            if let Some(cur) = current {
-                self.client
-                    .hset(&key, "previous_kid", &cur)
-                    .await
-                    .expect("HSET previous_kid");
-                self.client
-                    .hset(&key, "previous_expires_at", &previous_expires_at_ms.to_string())
-                    .await
-                    .expect("HSET previous_expires_at");
-                // Multi-kid validation (RFC-004 §Waitpoint Security): the
-                // per-kid expires_at:<kid> field is the authoritative
-                // grace signal. Mirror production Server::rotate_single_partition_locked
-                // which writes this alongside previous_kid / previous_expires_at.
-                self.client
-                    .hset(
-                        &key,
-                        &format!("expires_at:{cur}"),
-                        &previous_expires_at_ms.to_string(),
-                    )
-                    .await
-                    .expect("HSET expires_at:<outgoing_kid>");
-            }
-            self.client
-                .hset(&key, "current_kid", new_kid)
-                .await
-                .expect("HSET current_kid (rotate)");
-            self.client
-                .hset(&key, &format!("secret:{new_kid}"), new_secret_hex)
-                .await
-                .expect("HSET secret:<new_kid>");
+            let idx = ff_core::keys::IndexKeys::new(&partition);
+            ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
+                &self.client,
+                &idx,
+                &ff_core::contracts::RotateWaitpointHmacSecretArgs {
+                    new_kid: new_kid.to_owned(),
+                    new_secret_hex: new_secret_hex.to_owned(),
+                    previous_expires_at_ms,
+                    now_ms,
+                },
+            )
+            .await
+            .expect("FCALL ff_rotate_waitpoint_hmac_secret");
         }
     }
 
