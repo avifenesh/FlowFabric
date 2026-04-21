@@ -641,12 +641,18 @@ async fn test_api_cancel_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let result: CancelFlowResult = resp.json().await.expect("cancel flow result parse failed");
-    // Accept either variant — the default HTTP path returns CancellationScheduled
-    // when the flow has members, Cancelled otherwise.
+    // Accept Cancelled or CancellationScheduled — the default HTTP path
+    // returns CancellationScheduled when the flow has members, Cancelled
+    // otherwise. PartiallyCancelled is only ever produced by the
+    // sync-wait path on per-member failures, not by this default-dispatch
+    // smoke (and no failure is injected here), so reject it explicitly.
     match result {
         CancelFlowResult::Cancelled { cancellation_policy, .. }
         | CancelFlowResult::CancellationScheduled { cancellation_policy, .. } => {
             assert_eq!(cancellation_policy, "cancel_all");
+        }
+        other @ CancelFlowResult::PartiallyCancelled { .. } => {
+            panic!("unexpected PartiallyCancelled on default-dispatch cancel: {other:?}")
         }
     }
 }
