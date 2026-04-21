@@ -124,12 +124,17 @@ async fn reconcile_one_budget(
 
     // Defensive prune: index entry for a budget whose definition is gone
     // (manual delete / retention purge) — drop it so SMEMBERS stays correct.
+    //
+    // Fail-closed on transport errors: we MUST distinguish "key absent"
+    // (empty Vec) from "read failed" (Err). Pre-fix the unwrap_or_default
+    // collapsed them, so a transient WRONGTYPE / IoError / ClusterDown
+    // on the def key would SREM the budget from the partition index —
+    // durable metadata loss triggered by a momentary Valkey blip.
     let def_raw: Vec<String> = client
         .cmd("HGETALL")
         .arg(&def_key)
         .execute()
-        .await
-        .unwrap_or_default();
+        .await?;
     if def_raw.is_empty() {
         let _: Option<i64> = client
             .cmd("SREM")
@@ -152,21 +157,22 @@ async fn reconcile_one_budget(
         return Ok(false);
     }
 
-    // Read current usage counters
+    // Read current usage counters. Fail-closed on transport errors
+    // (same reasoning as def_key above): an empty Vec from a WRONGTYPE
+    // would make the subsequent breach comparison compute against zero
+    // and silently clear the `breached_at` marker below.
     let usage_raw: Vec<String> = client
         .cmd("HGETALL")
         .arg(&usage_key)
         .execute()
-        .await
-        .unwrap_or_default();
+        .await?;
 
-    // Read hard limits
+    // Read hard limits (same fail-closed treatment).
     let limits_raw: Vec<String> = client
         .cmd("HGETALL")
         .arg(&limits_key)
         .execute()
-        .await
-        .unwrap_or_default();
+        .await?;
 
     if limits_raw.is_empty() {
         return Ok(false); // No limits defined

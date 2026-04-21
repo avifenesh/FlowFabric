@@ -177,8 +177,26 @@ async fn dispatch_dependency_resolution_inner(
     let mut skipped_children: Vec<(ExecutionId, String)> = Vec::new();
 
     for edge_id in &edge_ids {
+        // Parse the edge id once up front — an adjacency-set entry that
+        // doesn't round-trip through EdgeId::parse is either corruption
+        // or a legacy marker. Defaulting to a fresh random UUID (the
+        // pre-fix behaviour of `unwrap_or_default()` via the uuid_id!
+        // macro) would point at a non-existent edge and mask the issue.
+        let parsed_edge_id = match ff_core::types::EdgeId::parse(edge_id) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    edge_id = edge_id.as_str(),
+                    flow_id = flow_id_str,
+                    error = %e,
+                    "dispatch_dep: invalid edge_id in outgoing adjacency set, skipping"
+                );
+                continue;
+            }
+        };
+
         // Read the edge record from flow partition to find downstream_execution_id
-        let edge_key = flow_ctx.edge(&ff_core::types::EdgeId::parse(edge_id).unwrap_or_default());
+        let edge_key = flow_ctx.edge(&parsed_edge_id);
         let downstream_eid_str: Option<String> = match client
             .cmd("HGET")
             .arg(&edge_key)
@@ -205,33 +223,61 @@ async fn dispatch_dependency_resolution_inner(
         let child_ctx = ExecKeyContext::new(&child_partition, &downstream_eid);
         let child_idx = IndexKeys::new(&child_partition);
 
-        // Read child's lane_id for lane-scoped index keys
+        // Read child's lane_id for lane-scoped index keys. Fail-closed:
+        // a transport error must NOT silently default to "default",
+        // which would mutate the wrong lane's eligible/terminal/blocked
+        // ZSETs on the ff_resolve_dependency FCALL below. Skip this
+        // edge; the dependency_reconciler will retry on its next pass.
         let child_core_key = child_ctx.core();
-        let lane_str: Option<String> = client
+        let lane_str: Option<String> = match client
             .cmd("HGET")
             .arg(&child_core_key)
             .arg("lane_id")
             .execute()
             .await
-            .unwrap_or(None);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    edge_id = edge_id.as_str(),
+                    downstream = downstream_eid_str.as_str(),
+                    error = %e,
+                    "dispatch_dep: HGET lane_id failed, skipping (reconciler will retry)"
+                );
+                continue;
+            }
+        };
         let lane_id = ff_core::types::LaneId::new(
             lane_str.as_deref().unwrap_or("default"),
         );
 
-        let att_idx_str: Option<String> = client
+        // current_attempt_index: same treatment as lane_id. Absence
+        // (None) legitimately means the child is at attempt 0; only a
+        // read failure skips.
+        let att_idx_str: Option<String> = match client
             .cmd("HGET")
             .arg(&child_core_key)
             .arg("current_attempt_index")
             .execute()
             .await
-            .unwrap_or(None);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    edge_id = edge_id.as_str(),
+                    downstream = downstream_eid_str.as_str(),
+                    error = %e,
+                    "dispatch_dep: HGET current_attempt_index failed, \
+                     skipping (reconciler will retry)"
+                );
+                continue;
+            }
+        };
         let att_idx = ff_core::types::AttemptIndex::new(
             att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
         );
 
-        let dep_hash = child_ctx.dep_edge(
-            &ff_core::types::EdgeId::parse(edge_id).unwrap_or_default(),
-        );
+        let dep_hash = child_ctx.dep_edge(&parsed_edge_id);
 
         // KEYS (11): exec_core, deps_meta, unresolved_set, dep_hash,
         //            eligible_zset, terminal_zset, blocked_deps_zset,

@@ -99,13 +99,20 @@ impl BudgetChecker {
 
     /// Check a budget by ID. Reads from Valkey on first call per budget,
     /// caches for subsequent candidates in the same cycle.
+    ///
+    /// Fail-closed: transport errors propagate as
+    /// [`SchedulerError::ValkeyContext`] rather than being cached as
+    /// `Ok`. Caching an Err would be wrong — a transient blip would then
+    /// pin every candidate in this cycle to the same denial.  Successful
+    /// results (including `HardBreach`) are still cached so 50K blocked
+    /// candidates sharing a budget do one read per cycle, not 50K.
     pub async fn check_budget(
         &mut self,
         client: &ferriskey::Client,
         budget_id: &str,
-    ) -> &BudgetCheckResult {
+    ) -> Result<&BudgetCheckResult, SchedulerError> {
         if self.cache.contains_key(budget_id) {
-            return &self.cache[budget_id];
+            return Ok(&self.cache[budget_id]);
         }
 
         // Compute real {b:M} partition tag from budget_id
@@ -127,20 +134,16 @@ impl BudgetChecker {
             }
         };
 
-        let result = match Self::read_and_check(client, &usage_key, &limits_key).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    budget_id,
-                    error = %e,
-                    "budget_checker: failed to read budget, allowing (advisory)"
-                );
-                BudgetCheckResult::Ok
-            }
-        };
+        let result =
+            Self::read_and_check(client, &usage_key, &limits_key)
+                .await
+                .map_err(|source| SchedulerError::ValkeyContext {
+                    source,
+                    context: format!("budget_checker read {budget_id}"),
+                })?;
 
         self.cache.insert(budget_id.to_owned(), result);
-        &self.cache[budget_id]
+        Ok(&self.cache[budget_id])
     }
 
     /// Read budget usage and limits, compare each dimension.
@@ -165,14 +168,17 @@ impl BudgetChecker {
                 _ => continue,
             };
 
-            // Read current usage for this dimension
+            // Read current usage for this dimension. Fail-closed: a
+            // transport error must NOT silently default the usage to 0
+            // (which would make every breach invisible).  Absence is
+            // still treated as 0 — the caller is expected to HSET
+            // usage_key on every increment.
             let usage_str: Option<String> = client
                 .cmd("HGET")
                 .arg(usage_key)
                 .arg(dimension)
                 .execute()
-                .await
-                .unwrap_or(None);
+                .await?;
             let usage: u64 = usage_str
                 .as_deref()
                 .and_then(|s| s.parse().ok())
@@ -614,7 +620,7 @@ impl Scheduler {
             if budget_id.is_empty() {
                 continue;
             }
-            let result = checker.check_budget(&self.client, budget_id).await;
+            let result = checker.check_budget(&self.client, budget_id).await?;
             if let BudgetCheckResult::HardBreach { detail, .. } = result {
                 return Ok(Some(detail.clone()));
             }
@@ -718,23 +724,38 @@ impl Scheduler {
                         "quota {}: concurrency cap {}",
                         quota_id_str, concurrency_cap
                     ))),
-                    _ => {
+                    other => {
+                        // Fail-closed: an unrecognised status is the Lua
+                        // telling us a contract we don't understand. Do
+                        // NOT default to admit — surface it so the
+                        // scheduler retries next cycle and ops sees the
+                        // event.
                         tracing::warn!(
                             quota_id = quota_id_str.as_str(),
-                            status = status.as_str(),
-                            "scheduler: unexpected admission result"
+                            status = other,
+                            "scheduler: unexpected admission result, denying (fail-closed)"
                         );
-                        Ok(QuotaCheckOutcome::NoQuota)
+                        Err(SchedulerError::Config(format!(
+                            "quota {quota_id_str}: unexpected admission status \"{other}\""
+                        )))
                     }
                 }
             }
             Err(e) => {
+                // Fail-closed: transport fault on the admission FCALL
+                // must NOT silently admit the candidate. Propagate so
+                // the outer cycle returns the error and the worker
+                // retries after the usual backoff; the next cycle will
+                // re-run the admission check against fresh state.
                 tracing::warn!(
                     quota_id = quota_id_str.as_str(),
                     error = %e,
-                    "scheduler: quota FCALL failed, allowing (advisory)"
+                    "scheduler: quota FCALL failed, denying (fail-closed)"
                 );
-                Ok(QuotaCheckOutcome::NoQuota) // allow on FCALL error (advisory)
+                Err(SchedulerError::ValkeyContext {
+                    source: e,
+                    context: format!("ff_check_admission_and_record {quota_id_str}"),
+                })
             }
         }
     }
