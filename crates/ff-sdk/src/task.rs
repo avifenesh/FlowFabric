@@ -505,13 +505,16 @@ impl ClaimedTask {
     /// network latency — the Lua fences on lease_id+epoch atomically.
     /// Consumes self — the task cannot be used after completion.
     ///
-    /// # Connection errors
+    /// # Connection errors and replay
     ///
-    /// If the Valkey connection drops during this call, the returned error
-    /// does **not** guarantee the operation failed — the Lua function may
-    /// have committed before the response was lost. Callers should treat
-    /// connection errors on `complete()` as "possibly succeeded" and verify
-    /// the execution state via `get_execution_state()` before retrying.
+    /// If the Valkey connection drops after the Lua commit but before the
+    /// client reads the response, retrying `complete()` with the same
+    /// `ClaimedTask` (same `lease_epoch` + `attempt_id`) is safe: the SDK
+    /// reconciles the "already terminal with matching outcome" response
+    /// into `Ok(())`. A retry after a different terminal op has raced in
+    /// (e.g. operator cancel) surfaces as `ExecutionNotActive` with the
+    /// populated `terminal_outcome` so the caller can see what actually
+    /// happened.
     pub async fn complete(self, result_payload: Option<Vec<u8>>) -> Result<(), SdkError> {
         let partition = execution_partition(&self.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &self.execution_id);
@@ -559,7 +562,28 @@ impl ClaimedTask {
             .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
-        parse_success_result(&raw, "ff_complete_execution")
+        match parse_success_result(&raw, "ff_complete_execution") {
+            Ok(()) => Ok(()),
+            // Terminal-op replay reconciliation: if this caller's own
+            // prior complete() already committed (same epoch + attempt_id)
+            // and the stored terminal_outcome is "success", return Ok —
+            // the network drop happened AFTER the server committed. Any
+            // other ExecutionNotActive combination (different epoch,
+            // different attempt, terminal_outcome!=success) is a real
+            // error the caller must see.
+            Err(SdkError::Script(ScriptError::ExecutionNotActive {
+                ref terminal_outcome,
+                ref lease_epoch,
+                ref attempt_id,
+                ..
+            })) if terminal_outcome == "success"
+                && lease_epoch == &self.lease_epoch.to_string()
+                && attempt_id == &self.attempt_id.to_string() =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Fail the execution with a reason and error category.
@@ -568,13 +592,14 @@ impl ClaimedTask {
     /// (delayed backoff). Otherwise, the execution becomes terminal failed.
     /// Returns [`FailOutcome`] so the caller knows what happened.
     ///
-    /// # Connection errors
+    /// # Connection errors and replay
     ///
-    /// If the Valkey connection drops during this call, the returned error
-    /// does **not** guarantee the operation failed — the Lua function may
-    /// have committed before the response was lost. Callers should treat
-    /// connection errors on `fail()` as "possibly succeeded" and verify
-    /// the execution state via `get_execution_state()` before retrying.
+    /// `fail()` is replay-safe under the same conditions as `complete()`:
+    /// a retry by the same caller matching `lease_epoch` + `attempt_id` is
+    /// reconciled into the outcome the server actually committed
+    /// (`TerminalFailed` if no retries left; `RetryScheduled` with
+    /// `delay_until = 0` if a retry was scheduled — the exact delay is
+    /// not recovered on the replay path).
     pub async fn fail(
         self,
         reason: &str,
@@ -626,7 +651,40 @@ impl ClaimedTask {
             .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
-        parse_fail_result(&raw)
+        match parse_fail_result(&raw) {
+            Ok(outcome) => Ok(outcome),
+            // Terminal-op replay reconciliation. Two valid replay shapes:
+            //   - lifecycle=terminal, outcome=failed    -> TerminalFailed
+            //   - lifecycle=runnable, outcome=none      -> RetryScheduled
+            // Both require epoch + attempt_id match so we only reconcile
+            // THIS caller's own commit, not a later re-claim's state.
+            // RetryScheduled loses delay_until_ms (not persisted on the
+            // replay error path — an HGET could recover it but that's a
+            // separate round-trip; return 0 so callers see "scheduled,
+            // exact delay unknown").
+            Err(SdkError::Script(ScriptError::ExecutionNotActive {
+                ref terminal_outcome,
+                ref lease_epoch,
+                ref lifecycle_phase,
+                ref attempt_id,
+            })) if lease_epoch == &self.lease_epoch.to_string()
+                && attempt_id == &self.attempt_id.to_string() =>
+            {
+                match (lifecycle_phase.as_str(), terminal_outcome.as_str()) {
+                    ("terminal", "failed") => Ok(FailOutcome::TerminalFailed),
+                    ("runnable", _) => Ok(FailOutcome::RetryScheduled {
+                        delay_until: TimestampMs::from_millis(0),
+                    }),
+                    _ => Err(SdkError::Script(ScriptError::ExecutionNotActive {
+                        terminal_outcome: terminal_outcome.clone(),
+                        lease_epoch: lease_epoch.clone(),
+                        lifecycle_phase: lifecycle_phase.clone(),
+                        attempt_id: attempt_id.clone(),
+                    })),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Cancel the execution.
@@ -634,13 +692,15 @@ impl ClaimedTask {
     /// Stops lease renewal, then calls `ff_cancel_execution` via FCALL.
     /// Consumes self.
     ///
-    /// # Connection errors
+    /// # Connection errors and replay
     ///
-    /// If the Valkey connection drops during this call, the returned error
-    /// does **not** guarantee the operation failed — the Lua function may
-    /// have committed before the response was lost. Callers should treat
-    /// connection errors on `cancel()` as "possibly succeeded" and verify
-    /// the execution state via `get_execution_state()` before retrying.
+    /// `cancel()` is replay-safe under the same conditions as `complete()`:
+    /// a retry by the same caller matching `lease_epoch` + `attempt_id`
+    /// returns `Ok(())` if the server's stored `terminal_outcome` is
+    /// `cancelled`. A retry that finds a different outcome (because a
+    /// concurrent `complete()` or `fail()` won the race) surfaces as
+    /// `ExecutionNotActive` with the populated `terminal_outcome` so the
+    /// caller can see that the cancel intent was NOT honored.
     pub async fn cancel(self, reason: &str) -> Result<(), SdkError> {
         self.cancel_inner(reason).await
     }
@@ -719,7 +779,27 @@ impl ClaimedTask {
             .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
-        parse_success_result(&raw, "ff_cancel_execution")
+        match parse_success_result(&raw, "ff_cancel_execution") {
+            Ok(()) => Ok(()),
+            // Terminal-op replay reconciliation for cancel: if this caller's
+            // own prior cancel() already committed (same epoch + attempt_id)
+            // and stored terminal_outcome is "cancelled", return Ok. A
+            // replay that finds outcome=success or outcome=failed means a
+            // different terminal op won the race — surface the error so
+            // the caller knows their cancel intent was NOT honored.
+            Err(SdkError::Script(ScriptError::ExecutionNotActive {
+                ref terminal_outcome,
+                ref lease_epoch,
+                ref attempt_id,
+                ..
+            })) if terminal_outcome == "cancelled"
+                && lease_epoch == &self.lease_epoch.to_string()
+                && attempt_id == &self.attempt_id.to_string() =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // ── Non-terminal operations ──
@@ -1413,7 +1493,7 @@ fn is_terminal_renewal_error(err: &ScriptError) -> bool {
         ScriptError::StaleLease
             | ScriptError::LeaseExpired
             | ScriptError::LeaseRevoked
-            | ScriptError::ExecutionNotActive
+            | ScriptError::ExecutionNotActive { .. }
             | ScriptError::ExecutionNotFound
     )
 }
@@ -1659,9 +1739,14 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
             let s = field_str(1);
             if s.is_empty() { "unknown".to_owned() } else { s }
         };
-        let detail = field_str(2);
+        // Collect all detail slots (idx >= 2). Most variants only read
+        // slot 0; ExecutionNotActive consumes slots 0..=3 (terminal_outcome,
+        // lease_epoch, lifecycle_phase, attempt_id) for terminal-op replay
+        // reconciliation after a network drop.
+        let details: Vec<String> = (2..arr.len()).map(field_str).collect();
+        let detail_refs: Vec<&str> = details.iter().map(|s| s.as_str()).collect();
 
-        let script_err = ScriptError::from_code_with_detail(&error_code, &detail)
+        let script_err = ScriptError::from_code_with_details(&error_code, &detail_refs)
             .unwrap_or_else(|| {
                 ScriptError::Parse(format!("{function_name}: unknown error: {error_code}"))
             });
@@ -1967,9 +2052,10 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
             let s = err_field_str(1);
             if s.is_empty() { "unknown".to_owned() } else { s }
         };
-        let detail = err_field_str(2);
+        let details: Vec<String> = (2..arr.len()).map(err_field_str).collect();
+        let detail_refs: Vec<&str> = details.iter().map(|s| s.as_str()).collect();
         return Err(SdkError::Script(
-            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
+            ScriptError::from_code_with_details(&error_code, &detail_refs).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_fail_execution: {error_code}"))
             }),
         ));
@@ -2423,4 +2509,108 @@ mod resume_signals_tests {
     // HGETALL to a bounded HGET + per-matcher HMGET loop (review
     // feedback on unbounded condition-hash reply size). That loop
     // is exercised by the integration tests in `ff-test`.
+}
+
+#[cfg(test)]
+mod terminal_replay_parsing_tests {
+    //! Unit tests for the SDK's parse path of the enriched
+    //! `execution_not_active` error returned on a terminal-op replay.
+    //! The integration test in ff-test/tests/e2e_lifecycle.rs proves
+    //! the Lua side emits the 4-slot detail; these tests prove the
+    //! Rust parser threads all 4 slots into the `ExecutionNotActive`
+    //! variant so the reconciler in complete()/fail()/cancel() can
+    //! match on them.
+
+    use super::*;
+    use ferriskey::Value;
+
+    // Use SimpleString rather than BulkString to avoid depending on bytes::Bytes
+    // in the test harness. parse_success_result + parse_fail_result handle both.
+    fn bulk(s: &str) -> Value {
+        Value::SimpleString(s.to_owned())
+    }
+
+    /// parse_success_result must fold idx 2..=5 into ExecutionNotActive.
+    #[test]
+    fn parse_success_result_extracts_all_four_detail_slots() {
+        let raw = Value::Array(vec![
+            Ok(Value::Int(0)),
+            Ok(bulk("execution_not_active")),
+            Ok(bulk("success")),
+            Ok(bulk("42")),
+            Ok(bulk("terminal")),
+            Ok(bulk("11111111-1111-1111-1111-111111111111")),
+        ]);
+        let err = parse_success_result(&raw, "test").unwrap_err();
+        match err {
+            SdkError::Script(ScriptError::ExecutionNotActive {
+                terminal_outcome,
+                lease_epoch,
+                lifecycle_phase,
+                attempt_id,
+            }) => {
+                assert_eq!(terminal_outcome, "success");
+                assert_eq!(lease_epoch, "42");
+                assert_eq!(lifecycle_phase, "terminal");
+                assert_eq!(attempt_id, "11111111-1111-1111-1111-111111111111");
+            }
+            other => panic!("expected ExecutionNotActive struct variant, got {other:?}"),
+        }
+    }
+
+    /// parse_fail_result must extract all detail slots too so the
+    /// reconciler in fail() can match lifecycle_phase = "runnable" for
+    /// retry-scheduled replays.
+    #[test]
+    fn parse_fail_result_extracts_all_four_detail_slots() {
+        let raw = Value::Array(vec![
+            Ok(Value::Int(0)),
+            Ok(bulk("execution_not_active")),
+            Ok(bulk("none")),
+            Ok(bulk("7")),
+            Ok(bulk("runnable")),
+            Ok(bulk("22222222-2222-2222-2222-222222222222")),
+        ]);
+        let err = parse_fail_result(&raw).unwrap_err();
+        match err {
+            SdkError::Script(ScriptError::ExecutionNotActive {
+                terminal_outcome,
+                lease_epoch,
+                lifecycle_phase,
+                attempt_id,
+            }) => {
+                assert_eq!(terminal_outcome, "none");
+                assert_eq!(lease_epoch, "7");
+                assert_eq!(lifecycle_phase, "runnable");
+                assert_eq!(attempt_id, "22222222-2222-2222-2222-222222222222");
+            }
+            other => panic!("expected ExecutionNotActive struct variant, got {other:?}"),
+        }
+    }
+
+    /// Empty detail slots must default to "" (not panic) so older-Lua
+    /// producers or malformed replies degrade to an unreconcilable
+    /// variant rather than a Parse error.
+    #[test]
+    fn parse_success_result_missing_slots_defaults_to_empty() {
+        let raw = Value::Array(vec![
+            Ok(Value::Int(0)),
+            Ok(bulk("execution_not_active")),
+        ]);
+        let err = parse_success_result(&raw, "test").unwrap_err();
+        match err {
+            SdkError::Script(ScriptError::ExecutionNotActive {
+                terminal_outcome,
+                lease_epoch,
+                lifecycle_phase,
+                attempt_id,
+            }) => {
+                assert_eq!(terminal_outcome, "");
+                assert_eq!(lease_epoch, "");
+                assert_eq!(lifecycle_phase, "");
+                assert_eq!(attempt_id, "");
+            }
+            other => panic!("expected ExecutionNotActive struct variant, got {other:?}"),
+        }
+    }
 }

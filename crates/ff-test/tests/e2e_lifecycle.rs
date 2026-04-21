@@ -1425,6 +1425,100 @@ async fn test_reclaim_removes_from_old_worker_leases() {
     );
 }
 
+/// Terminal-op replay reconciliation: after a successful ff_complete_execution,
+/// a second call with the SAME lease + attempt (simulating an SDK retry after
+/// a connection drop that lost the response) must return the enriched
+/// `execution_not_active` error carrying:
+///   idx 2: terminal_outcome  = "success"
+///   idx 3: lease_epoch       = <caller's epoch>
+///   idx 4: lifecycle_phase   = "terminal"
+///   idx 5: attempt_id        = <caller's attempt_id>
+/// The SDK-side reconciler in ClaimedTask::complete() turns this exact
+/// shape into Ok(()). Without all 4 fields, the reconciler can't safely
+/// prove "THIS caller's commit won" vs. "some other terminal op raced in".
+#[tokio::test]
+#[serial_test::serial]
+async fn test_complete_replay_returns_enriched_detail() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = tc.new_execution_id();
+    fcall_create_execution(&tc, &eid, NS, LANE, "replay_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, _att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+    let wid = WorkerInstanceId::new(WORKER_INST);
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(AttemptIndex::new(0)),
+        idx.lease_expiry(),
+        idx.worker_leases(&wid),
+        idx.lane_terminal(&lane_id),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lane_active(&lane_id),
+        ctx.stream_meta(AttemptIndex::new(0)),
+        ctx.result(),
+        idx.attempt_timeout(),
+        idx.execution_deadline(),
+    ];
+    let args: Vec<String> = vec![
+        eid.to_string(),
+        lease_id.clone(),
+        epoch.clone(),
+        attempt_id.clone(),
+        String::new(),
+    ];
+    let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    // First call — real commit.
+    let first: Value = tc
+        .client()
+        .fcall("ff_complete_execution", &kr, &ar)
+        .await
+        .expect("FCALL ff_complete_execution (first)");
+    assert_ok(&first, "ff_complete_execution (first)");
+
+    // Second call — replay. Same lease / epoch / attempt.
+    let second: Value = tc
+        .client()
+        .fcall("ff_complete_execution", &kr, &ar)
+        .await
+        .expect("FCALL ff_complete_execution (replay)");
+    let second_arr = match &second {
+        Value::Array(a) => a,
+        _ => panic!("expected Array, got {second:?}"),
+    };
+    assert_eq!(
+        match second_arr.first() {
+            Some(Ok(Value::Int(n))) => *n,
+            _ => panic!("expected Int status, got {:?}", second_arr.first()),
+        },
+        0,
+        "replay must surface as status=0"
+    );
+    assert_eq!(field_str(second_arr, 1), "execution_not_active");
+    assert_eq!(
+        field_str(second_arr, 2),
+        "success",
+        "terminal_outcome must echo the first commit's outcome"
+    );
+    assert_eq!(field_str(second_arr, 3), epoch, "lease_epoch");
+    assert_eq!(field_str(second_arr, 4), "terminal", "lifecycle_phase");
+    assert_eq!(
+        field_str(second_arr, 5),
+        attempt_id,
+        "attempt_id must match so the SDK can prove THIS caller's commit won"
+    );
+}
+
 /// Expire an active execution via ff_expire_execution.
 #[tokio::test]
 #[serial_test::serial]
