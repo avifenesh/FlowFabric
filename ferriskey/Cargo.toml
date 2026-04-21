@@ -44,7 +44,7 @@ num-bigint = "0.4"
 crc16 = "0.4"
 
 # Cluster
-rand = "0.9"
+rand = "0.10"
 dashmap = "6"
 parking_lot = "0.12"
 socket2 = { version = "0.6", features = ["all"] }

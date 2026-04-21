@@ -151,7 +151,7 @@ clap = { version = "4", features = ["derive", "env"] }
 hdrhistogram = "7"
 # Same PRNG the other bench bins use — a seeded StdRng gives
 # deterministic per-worker key draws across runs.
-rand = "0.9"
+rand = "0.10"
 # Round 2 cluster+TLS requires a process-wide rustls CryptoProvider
 # to be installed before any TLS connection. `aws-lc-rs` matches
 # ferriskey's own rustls config (ferriskey/Cargo.toml pins
