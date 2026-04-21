@@ -1677,5 +1677,22 @@ redis.register_function('ff_expire_execution', function(keys, args)
   redis.call("ZREM", K.execution_deadline_key, A.execution_id)
   redis.call("ZADD", K.terminal_key, now_ms, A.execution_id)
 
+  -- Push-based DAG promotion (Batch C item 6 follow-up, issue #44).
+  -- Same shape as ff_complete_execution / ff_fail_execution /
+  -- ff_cancel_execution — emit only for flow-bound executions. Covers
+  -- all three phases (active, suspended, runnable) because the terminal
+  -- HSET + ZADD above is shared across them. Without this, a never-
+  -- claimed flow-bound execution that hits execution_deadline relies on
+  -- the dependency_reconciler safety net (15s default) to unblock
+  -- children, spiking DAG latency on the timeout path.
+  if is_set(core.flow_id) then
+    local payload = cjson.encode({
+      execution_id = A.execution_id,
+      flow_id = core.flow_id,
+      outcome = "expired",
+    })
+    redis.call("PUBLISH", "ff:dag:completions", payload)
+  end
+
   return ok("expired", core.lifecycle_phase)
 end)
