@@ -315,6 +315,7 @@ impl Server {
             }),
             flow_projector_interval: config.engine_config.flow_projector_interval,
             execution_deadline_interval: config.engine_config.execution_deadline_interval,
+            cancel_reconciler_interval: config.engine_config.cancel_reconciler_interval,
         };
         // Engine scanners keep running on the MAIN `client` mux — NOT on
         // `tail_client`. Scanner cadence is foreground-latency-coupled by
@@ -1429,15 +1430,28 @@ impl Server {
         let fctx = FlowKeyContext::new(&partition, &args.flow_id);
         let fidx = FlowIndexKeys::new(&partition);
 
-        // KEYS (3): flow_core, members_set, flow_index
-        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members(), fidx.flow_index()];
+        // Grace window before the reconciler may pick up this flow.
+        // Kept short because the in-process dispatch is fast and bounded;
+        // long enough to cover transport round-trips under load without
+        // the reconciler fighting the live dispatch.
+        const CANCEL_RECONCILER_GRACE_MS: u64 = 30_000;
 
-        // ARGV (4): flow_id, reason, cancellation_policy, now_ms
+        // KEYS (5): flow_core, members_set, flow_index, pending_cancels, cancel_backlog
+        let fcall_keys: Vec<String> = vec![
+            fctx.core(),
+            fctx.members(),
+            fidx.flow_index(),
+            fctx.pending_cancels(),
+            fidx.cancel_backlog(),
+        ];
+
+        // ARGV (5): flow_id, reason, cancellation_policy, now_ms, grace_ms
         let fcall_args: Vec<String> = vec![
             args.flow_id.to_string(),
             args.reason.clone(),
             args.cancellation_policy.clone(),
             args.now.to_string(),
+            CANCEL_RECONCILER_GRACE_MS.to_string(),
         ];
 
         let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
@@ -1527,10 +1541,13 @@ impl Server {
             });
         }
 
+        let pending_cancels_key = fctx.pending_cancels();
+        let cancel_backlog_key = fidx.cancel_backlog();
+
         if wait {
             // Synchronous dispatch — cancel every member inline before returning.
             for eid_str in &members {
-                if let Err(e) = cancel_member_execution(
+                match cancel_member_execution(
                     &self.client,
                     &self.config.partition_config,
                     eid_str,
@@ -1539,11 +1556,24 @@ impl Server {
                 )
                 .await
                 {
-                    tracing::warn!(
-                        execution_id = %eid_str,
-                        error = %e,
-                        "cancel_flow(wait): individual execution cancel failed (may be terminal)"
-                    );
+                    Ok(()) => {
+                        ack_cancel_member(
+                            &self.client,
+                            &pending_cancels_key,
+                            &cancel_backlog_key,
+                            eid_str,
+                            &args.flow_id.to_string(),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %eid_str,
+                            error = %e,
+                            "cancel_flow(wait): individual execution cancel failed \
+                             (may be terminal; reconciler will retry if transient)"
+                        );
+                    }
                 }
             }
             return Ok(CancelFlowResult::Cancelled {
@@ -1582,6 +1612,10 @@ impl Server {
             }
         }
 
+        let pending_key_owned = pending_cancels_key.clone();
+        let backlog_key_owned = cancel_backlog_key.clone();
+        let flow_id_str = args.flow_id.to_string();
+
         guard.spawn(async move {
             // Bounded parallel dispatch via futures::stream::buffer_unordered.
             // Sequential cancel of a 1000-member flow at ~2ms/FCALL is ~2s —
@@ -1599,8 +1633,11 @@ impl Server {
                     let client = client.clone();
                     let reason = reason.clone();
                     let flow_id = flow_id.clone();
+                    let pending = pending_key_owned.clone();
+                    let backlog = backlog_key_owned.clone();
+                    let flow_id_str = flow_id_str.clone();
                     async move {
-                        if let Err(e) = cancel_member_execution(
+                        match cancel_member_execution(
                             &client,
                             &partition_config,
                             &eid_str,
@@ -1609,12 +1646,25 @@ impl Server {
                         )
                         .await
                         {
-                            tracing::warn!(
-                                flow_id = %flow_id,
-                                execution_id = %eid_str,
-                                error = %e,
-                                "cancel_flow(async): individual execution cancel failed (may be terminal)"
-                            );
+                            Ok(()) => {
+                                ack_cancel_member(
+                                    &client,
+                                    &pending,
+                                    &backlog,
+                                    &eid_str,
+                                    &flow_id_str,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    flow_id = %flow_id,
+                                    execution_id = %eid_str,
+                                    error = %e,
+                                    "cancel_flow(async): individual execution cancel failed \
+                                     (may be terminal; reconciler will retry if transient)"
+                                );
+                            }
                         }
                     }
                 })
@@ -3883,6 +3933,33 @@ fn extract_valkey_kind(e: &ServerError) -> Option<ferriskey::ErrorKind> {
 /// non-cancelled members. `FatalReceiveError` and non-retryable kinds bubble
 /// up immediately — those either indicate the Lua ran server-side anyway or a
 /// permanent mismatch that retries cannot fix.
+/// Acknowledge that a member cancel has committed. Fires
+/// `ff_ack_cancel_member` on `{fp:N}` to SREM the execution from the
+/// flow's `pending_cancels` set and, if empty, ZREM the flow from the
+/// partition-level `cancel_backlog`. Best-effort — failures are logged
+/// but not propagated, since the reconciler will catch anything that
+/// stays behind on its next pass.
+async fn ack_cancel_member(
+    client: &Client,
+    pending_cancels_key: &str,
+    cancel_backlog_key: &str,
+    eid_str: &str,
+    flow_id: &str,
+) {
+    let keys = [pending_cancels_key, cancel_backlog_key];
+    let args_v = [eid_str, flow_id];
+    let fut: Result<Value, _> =
+        client.fcall("ff_ack_cancel_member", &keys, &args_v).await;
+    if let Err(e) = fut {
+        tracing::warn!(
+            flow_id = %flow_id,
+            execution_id = %eid_str,
+            error = %e,
+            "ff_ack_cancel_member failed; reconciler will drain on next pass"
+        );
+    }
+}
+
 async fn cancel_member_execution(
     client: &Client,
     partition_config: &PartitionConfig,

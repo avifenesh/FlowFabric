@@ -221,6 +221,9 @@ impl ServerConfig {
             execution_deadline_interval: Duration::from_secs(
                 env_u64("FF_EXECUTION_DEADLINE_INTERVAL_S", 5)?
             ),
+            cancel_reconciler_interval: Duration::from_secs(
+                env_u64("FF_CANCEL_RECONCILER_INTERVAL_S", 15)?
+            ),
         };
 
         Ok(Self {
