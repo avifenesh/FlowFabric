@@ -40,7 +40,7 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
 };
 use media_pipeline::{
-    find_last_summary_final, FrameView, SummarizeResult, TranscribeResult,
+    find_last_summary_final, ApprovalDecision, FrameView, SummarizeResult, TranscribeResult,
     FRAME_FIELD_PAYLOAD, FRAME_FIELD_TYPE, FRAME_SUMMARY_FINAL, SIGNAL_NAME_APPROVAL,
     SUMMARY_CHAR_CAP,
 };
@@ -172,9 +172,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decide whether this claim is a fresh run or a resume-after-approval,
-/// then drive the appropriate path. A resume is identified by the
-/// presence of a persisted `summary_final` frame in the attempt stream.
+/// Decide whether this claim is a fresh run or a resume-after-review,
+/// then drive the appropriate path. The persisted `summary_final` frame
+/// tells us generation has already happened; `resume_signals()` tells us
+/// what the reviewer decided (approve vs reject with reason). Fresh
+/// claims have no signals, so the reject branch only fires on a real
+/// resume from a signed-rejection signal.
 async fn handle(
     task: ClaimedTask,
     engine: Arc<Engine>,
@@ -183,15 +186,71 @@ async fn handle(
     client: &ferriskey::Client,
     partition_config: &ff_core::partition::PartitionConfig,
 ) -> anyhow::Result<()> {
-    if let Some(result) = load_persisted_result(&task, client, partition_config).await? {
+    let persisted = load_persisted_result(&task, client, partition_config).await?;
+
+    if persisted.is_some() {
+        // Summary already generated in a prior attempt. Inspect the resume
+        // signal to decide complete-vs-fail. Previously the reviewer had
+        // to use POST /cancel to reject (no payload visibility); now the
+        // review CLI delivers a signed ApprovalDecision signal for both
+        // outcomes and we branch here.
+        let signals = task
+            .resume_signals()
+            .await
+            .context("resume_signals after review (approve or reject)")?;
+        if let Some(sig) = signals
+            .iter()
+            .find(|s| s.signal_name == SIGNAL_NAME_APPROVAL)
+        {
+            let decision: Option<ApprovalDecision> = sig
+                .payload
+                .as_deref()
+                .and_then(|b| serde_json::from_slice(b).ok());
+            match decision {
+                Some(ApprovalDecision::Approve) => {
+                    let result = persisted.expect("checked above");
+                    tracing::info!(
+                        execution_id = %task.execution_id(),
+                        tokens = result.token_count,
+                        "review approved — completing from persisted summary_final frame"
+                    );
+                    task.complete(Some(serde_json::to_vec(&result)?)).await?;
+                    return Ok(());
+                }
+                Some(ApprovalDecision::Reject { reason }) => {
+                    tracing::info!(
+                        execution_id = %task.execution_id(),
+                        reason = %reason,
+                        "review rejected — failing with reviewer reason"
+                    );
+                    task.fail(&reason, "human_rejected").await?;
+                    return Ok(());
+                }
+                None => {
+                    tracing::error!(
+                        execution_id = %task.execution_id(),
+                        "review signal had no parseable ApprovalDecision payload"
+                    );
+                    task.fail("review signal had unparseable payload", "bad_signal")
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+        // No signal present — legacy path for approve-via-signal-only
+        // deployments (pre-#36 review CLI). Complete as we did before so
+        // existing operator tooling that still only delivers approve
+        // keeps working during a rolling upgrade.
+        let result = persisted.expect("checked above");
         tracing::info!(
             execution_id = %task.execution_id(),
             tokens = result.token_count,
-            "resume after approval — completing from persisted summary_final frame"
+            "resume without payload signal — completing (legacy reviewer)"
         );
         task.complete(Some(serde_json::to_vec(&result)?)).await?;
         return Ok(());
     }
+
     process(task, engine, max_new_tokens, skip_approval).await
 }
 

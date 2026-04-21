@@ -59,100 +59,71 @@ async fn main() {
         .expect("clock")
         .as_millis() as i64;
 
-    if args.approve {
-        // Approval requires the HMAC waitpoint token. An empty / missing
-        // token gets `invalid_token` from ff_deliver_signal — fail fast
-        // at the CLI instead of sending a doomed POST.
-        let waitpoint_token = match args.waitpoint_token {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                eprintln!(
-                    "--waitpoint-token is required for --approve. The worker prints it as \
-                     `WAITPOINT_TOKEN=...` on suspend, and `GET /v1/executions/{{id}}/pending-waitpoints` \
-                     returns it on the matching waitpoint."
-                );
-                std::process::exit(1);
-            }
-        };
-
-        // Deliver approval signal — resumes the suspended execution
-        let review = ReviewPayload {
-            approved: true,
-            feedback: args.feedback,
-        };
-        let payload_bytes: Vec<u8> = serde_json::to_vec(&review).expect("serialize review");
-
-        let signal_id = uuid::Uuid::new_v4().to_string();
-        let body = serde_json::json!({
-            "execution_id": args.execution_id,
-            "waitpoint_id": args.waitpoint_id,
-            "signal_id": signal_id,
-            "signal_name": "review_response",
-            "signal_category": "human_review",
-            "source_type": "human",
-            "source_identity": "operator",
-            "payload": payload_bytes,
-            "payload_encoding": "json",
-            "target_scope": "execution",
-            "waitpoint_token": waitpoint_token,
-            "now": now_ms
-        });
-
-        let url = format!(
-            "{}/v1/executions/{}/signal",
-            args.server, args.execution_id
-        );
-        let resp = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .expect("signal request failed");
-
-        let status = resp.status();
-        let text = resp.text().await.expect("read body");
-
-        if !status.is_success() {
-            eprintln!("Signal error ({}): {}", status, text);
+    // Both approve and reject deliver the same `review_response` signal;
+    // the `approved` field inside the ReviewPayload tells the worker which
+    // branch to take. Previously, reject went through POST /cancel while
+    // only approve delivered a signal — that split meant the worker could
+    // not inspect rejection reason on re-claim (the cancel path never
+    // re-claims). Post-#36 `resume_signals()` surfaces the payload to the
+    // worker, which now does the fail-with-reason for rejections.
+    let waitpoint_token = match args.waitpoint_token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!(
+                "--waitpoint-token is required. The worker prints it as \
+                 `WAITPOINT_TOKEN=...` on suspend, and \
+                 `GET /v1/executions/{{id}}/pending-waitpoints` returns it on \
+                 the matching waitpoint."
+            );
             std::process::exit(1);
         }
+    };
 
-        println!("Approved. Signal delivered: {signal_id}");
-        println!("Response: {text}");
-    } else {
-        // Reject — cancel directly. ff_cancel_execution handles suspended
-        // executions (closes waitpoint, transitions to terminal cancelled).
-        // No signal needed — avoids race where signal resumes before cancel arrives.
-        let reason = args
-            .feedback
-            .unwrap_or_else(|| "rejected by reviewer".to_owned());
+    let review = ReviewPayload {
+        approved: args.approve,
+        feedback: args.feedback,
+    };
+    let payload_bytes: Vec<u8> = serde_json::to_vec(&review).expect("serialize review");
 
-        let cancel_body = serde_json::json!({
-            "execution_id": args.execution_id,
-            "reason": reason,
-            "source": "operator_override",
-            "now": now_ms
-        });
+    let signal_id = uuid::Uuid::new_v4().to_string();
+    let body = serde_json::json!({
+        "execution_id": args.execution_id,
+        "waitpoint_id": args.waitpoint_id,
+        "signal_id": signal_id,
+        "signal_name": "review_response",
+        "signal_category": "human_review",
+        "source_type": "human",
+        "source_identity": "operator",
+        "payload": payload_bytes,
+        "payload_encoding": "json",
+        "target_scope": "execution",
+        "waitpoint_token": waitpoint_token,
+        "now": now_ms
+    });
 
-        let cancel_url = format!(
-            "{}/v1/executions/{}/cancel",
-            args.server, args.execution_id
-        );
-        let resp = client
-            .post(&cancel_url)
-            .json(&cancel_body)
-            .send()
-            .await
-            .expect("cancel request failed");
+    let url = format!(
+        "{}/v1/executions/{}/signal",
+        args.server, args.execution_id
+    );
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("signal request failed");
 
-        let status = resp.status();
-        let text = resp.text().await.expect("read body");
+    let status = resp.status();
+    let text = resp.text().await.expect("read body");
 
-        if status.is_success() {
-            println!("Rejected. Execution cancelled.");
-        } else {
-            eprintln!("Cancel error ({}): {}", status, text);
-            std::process::exit(1);
-        }
+    if !status.is_success() {
+        eprintln!("Signal error ({}): {}", status, text);
+        std::process::exit(1);
     }
+
+    if args.approve {
+        println!("Approved. Signal delivered: {signal_id}");
+    } else {
+        println!("Rejected. Signal delivered: {signal_id}");
+    }
+    println!("Response: {text}");
 }

@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "crc16",
  "serde",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ferriskey",
  "ff-core",
