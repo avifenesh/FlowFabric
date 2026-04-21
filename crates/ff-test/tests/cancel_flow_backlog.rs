@@ -195,6 +195,71 @@ async fn cancel_all_with_no_members_skips_backlog() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn invalid_grace_ms_rejected() {
+    // Guards the Lua against ±inf / NaN / negative / non-integer
+    // grace_ms values. Without the guard a `tonumber("inf")` would
+    // poison cancel_backlog with an "inf" score that ZRANGEBYSCORE
+    // -inf <now> never matches — the flow would sit forever.
+    // (Caught by cursor-bugbot on PR #56.)
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let flow_id = FlowId::new();
+    create_flow(&tc, &flow_id).await;
+    add_member(&tc, &flow_id, "{fp:0}:99999999-9999-9999-9999-999999999999").await;
+
+    let partition = flow_partition(&flow_id, &config());
+    let fctx = FlowKeyContext::new(&partition, &flow_id);
+    let fidx = FlowIndexKeys::new(&partition);
+    let keys = [
+        fctx.core(),
+        fctx.members(),
+        fidx.flow_index(),
+        fctx.pending_cancels(),
+        fidx.cancel_backlog(),
+    ];
+
+    for bad in ["-1", "1.5", "1e309", "nan", "abc"] {
+        let args = [
+            flow_id.to_string(),
+            "bad-grace".into(),
+            "cancel_all".into(),
+            "0".into(),
+            bad.to_string(),
+        ];
+        let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let raw: Value = tc
+            .client()
+            .fcall("ff_cancel_flow", &kr, &ar)
+            .await
+            .expect("FCALL ff_cancel_flow");
+        let arr = match &raw {
+            Value::Array(a) => a,
+            _ => panic!("expected Array for grace_ms={bad}, got {raw:?}"),
+        };
+        let status = match arr.first() {
+            Some(Ok(Value::Int(n))) => *n,
+            _ => panic!("no status for grace_ms={bad}"),
+        };
+        assert_eq!(status, 0, "invalid grace_ms={bad} must return error");
+        let code = arr
+            .get(1)
+            .and_then(|v| match v {
+                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                Ok(Value::SimpleString(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            code, "invalid_grace_ms",
+            "grace_ms={bad} expected invalid_grace_ms, got {code}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn ack_cancel_member_drains_pending_and_cleans_backlog() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;

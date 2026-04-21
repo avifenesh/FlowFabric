@@ -198,17 +198,29 @@ impl Scanner for CancelReconciler {
                 continue;
             }
 
-            // Re-read the reason + cancelled_at from flow_core so the
-            // reconciler-initiated cancel carries the same operator
-            // intent as the original cancel_flow call.
-            let reason: Option<String> = client
+            // Re-read the reason from flow_core so the reconciler-
+            // initiated cancel carries the original operator intent.
+            // On transport error: retry this flow next cycle (don't
+            // issue member cancels with a fabricated reason).
+            let reason: String = match client
                 .cmd("HGET")
                 .arg(fctx.core().as_str())
                 .arg("cancel_reason")
-                .execute()
+                .execute::<Option<String>>()
                 .await
-                .unwrap_or(None);
-            let reason = reason.unwrap_or_else(|| "flow_cancelled".to_owned());
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => "flow_cancelled".to_owned(),
+                Err(e) => {
+                    tracing::warn!(
+                        flow_id = %flow_id,
+                        error = %e,
+                        "cancel_reconciler: HGET cancel_reason failed; retry next cycle"
+                    );
+                    errors += 1;
+                    continue;
+                }
+            };
 
             for eid_str in &member_strs {
                 let execution_id = match ExecutionId::parse(eid_str) {
@@ -240,14 +252,29 @@ impl Scanner for CancelReconciler {
                 .await
                 {
                     // ACK via FCALL so SREM + conditional backlog ZREM
-                    // are one atomic unit on the flow partition.
+                    // are one atomic unit on the flow partition. If the
+                    // ack itself fails transiently the member stays in
+                    // pending_cancels and the next cycle retries; count
+                    // it as an error so scanner stats reflect real
+                    // progress (Copilot feedback).
                     let flow_id_str = flow_id.to_string();
                     let ack_keys = [pending_key.as_str(), backlog_key.as_str()];
                     let ack_args = [eid_str.as_str(), flow_id_str.as_str()];
-                    let _: Result<ferriskey::Value, _> = client
-                        .fcall("ff_ack_cancel_member", &ack_keys, &ack_args)
-                        .await;
-                    processed += 1;
+                    match client
+                        .fcall::<ferriskey::Value>("ff_ack_cancel_member", &ack_keys, &ack_args)
+                        .await
+                    {
+                        Ok(_) => processed += 1,
+                        Err(e) => {
+                            tracing::debug!(
+                                flow_id = %flow_id,
+                                execution_id = %eid_str,
+                                error = %e,
+                                "cancel_reconciler: ack failed; retry next cycle"
+                            );
+                            errors += 1;
+                        }
+                    }
                 } else {
                     errors += 1;
                 }
@@ -264,10 +291,13 @@ impl Scanner for CancelReconciler {
 /// with). Returns false on transient transport errors; the next
 /// reconciler cycle will retry.
 ///
-/// KEYS/ARGV layout mirrors ff-server's `try_cancel_member_once`
-/// (source = "operator_override", no lease fence — the flow-level
-/// cancel has already terminated the flow, so the member's lease is
-/// irrelevant).
+/// Mirrors ff-server's `build_cancel_execution_fcall` exactly:
+/// pre-reads `lane_id`, `current_attempt_index`, `current_waitpoint_id`,
+/// `current_worker_instance_id` from exec_core so the 21-KEY list
+/// touches the REAL lane/worker indexes. Hardcoding those (first
+/// draft) would leave stale entries in lane_eligible / worker_leases /
+/// etc for any non-default-lane member — flagged by Copilot + Cursor
+/// Bugbot on PR #56.
 async fn cancel_member(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -277,43 +307,101 @@ async fn cancel_member(
     let partition = execution_partition(execution_id, partition_config);
     let ctx = ExecKeyContext::new(&partition, execution_id);
     let idx = IndexKeys::new(&partition);
-    // Lane is derived from exec_core inside the Lua; "default" here
-    // is only used to build KEYS that end up ignored when core says
-    // otherwise. ff-server's cancel_member_execution uses the same
-    // placeholder pattern.
-    let lane_id = LaneId::new("default");
 
-    let wp_id_str: Option<String> = client
-        .hget(&ctx.core(), "current_waitpoint_id")
-        .await
-        .unwrap_or(None);
-    let wp_id = match wp_id_str.as_deref().filter(|s| !s.is_empty()) {
-        Some(s) => WaitpointId::parse(s).unwrap_or_else(|_| WaitpointId::new()),
-        None => WaitpointId::default(),
+    // Pre-read dynamic fields. A transient HGET/HMGET failure here
+    // surfaces as a retry on the next reconciler pass (return false);
+    // we do NOT fall back to defaults, since that would produce the
+    // wrong KEYS layout.
+    let lane_str: Option<String> = match client.hget(&ctx.core(), "lane_id").await {
+        Ok(v) => v,
+        Err(e) => {
+            let kind = e.kind();
+            let retryable = is_retryable_kind(kind);
+            if !retryable {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "cancel_reconciler: permanent HGET lane_id error; ack to avoid poison"
+                );
+                return true;
+            }
+            tracing::debug!(
+                execution_id = %execution_id,
+                error = %e,
+                "cancel_reconciler: transient HGET lane_id; retry next cycle"
+            );
+            return false;
+        }
     };
+    let lane = LaneId::new(lane_str.as_deref().unwrap_or("default"));
+
+    let dyn_fields: Vec<Option<String>> = match client
+        .cmd("HMGET")
+        .arg(ctx.core())
+        .arg("current_attempt_index")
+        .arg("current_waitpoint_id")
+        .arg("current_worker_instance_id")
+        .execute()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let kind = e.kind();
+            let retryable = is_retryable_kind(kind);
+            if !retryable {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "cancel_reconciler: permanent HMGET error; ack to avoid poison"
+                );
+                return true;
+            }
+            tracing::debug!(
+                execution_id = %execution_id,
+                error = %e,
+                "cancel_reconciler: transient HMGET; retry next cycle"
+            );
+            return false;
+        }
+    };
+
+    let att_idx_val = dyn_fields
+        .first()
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let att_idx = AttemptIndex::new(att_idx_val);
+    let wp_id_str = dyn_fields.get(1).and_then(|v| v.as_ref()).cloned().unwrap_or_default();
+    let wp_id = if wp_id_str.is_empty() {
+        WaitpointId::new()
+    } else {
+        WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
+    };
+    let wiid_str = dyn_fields.get(2).and_then(|v| v.as_ref()).cloned().unwrap_or_default();
+    let wiid = WorkerInstanceId::new(&wiid_str);
 
     let keys: Vec<String> = vec![
         ctx.core(),
-        ctx.attempt_hash(AttemptIndex::new(0)),
-        ctx.stream_meta(AttemptIndex::new(0)),
+        ctx.attempt_hash(att_idx),
+        ctx.stream_meta(att_idx),
         ctx.lease_current(),
         ctx.lease_history(),
         idx.lease_expiry(),
-        idx.worker_leases(&WorkerInstanceId::new("")),
+        idx.worker_leases(&wiid),
         ctx.suspension_current(),
         ctx.waitpoint(&wp_id),
         ctx.waitpoint_condition(&wp_id),
         idx.suspension_timeout(),
-        idx.lane_terminal(&lane_id),
+        idx.lane_terminal(&lane),
         idx.attempt_timeout(),
         idx.execution_deadline(),
-        idx.lane_eligible(&lane_id),
-        idx.lane_delayed(&lane_id),
-        idx.lane_blocked_dependencies(&lane_id),
-        idx.lane_blocked_budget(&lane_id),
-        idx.lane_blocked_quota(&lane_id),
-        idx.lane_blocked_route(&lane_id),
-        idx.lane_blocked_operator(&lane_id),
+        idx.lane_eligible(&lane),
+        idx.lane_delayed(&lane),
+        idx.lane_blocked_dependencies(&lane),
+        idx.lane_blocked_budget(&lane),
+        idx.lane_blocked_quota(&lane),
+        idx.lane_blocked_route(&lane),
+        idx.lane_blocked_operator(&lane),
     ];
     let argv: Vec<String> = vec![
         execution_id.to_string(),
@@ -329,8 +417,6 @@ async fn cancel_member(
         Ok(ferriskey::Value::Array(arr)) => match arr.first() {
             Some(Ok(ferriskey::Value::Int(1))) => true,
             Some(Ok(ferriskey::Value::Int(0))) => {
-                // Error path. execution_not_active / execution_not_found
-                // both mean "already terminal" from our POV → ack.
                 let code = arr
                     .get(1)
                     .and_then(|r| match r {
@@ -347,25 +433,34 @@ async fn cancel_member(
         },
         Ok(_) => false,
         Err(e) => {
-            use ferriskey::ErrorKind::*;
-            let retryable = matches!(
-                e.kind(),
-                IoError | FatalSendError | TryAgain | BusyLoadingError | ClusterDown
-            );
+            let retryable = is_retryable_kind(e.kind());
             if !retryable {
                 tracing::warn!(
                     execution_id = %execution_id,
                     error = %e,
-                    "cancel_reconciler: permanent error; ack to avoid poisoning queue"
+                    "cancel_reconciler: permanent error on FCALL; ack to avoid poison"
                 );
                 return true;
             }
             tracing::debug!(
                 execution_id = %execution_id,
                 error = %e,
-                "cancel_reconciler: transient error; will retry next cycle"
+                "cancel_reconciler: transient FCALL error; retry next cycle"
             );
             false
         }
     }
+}
+
+/// Centralised retry classification so this scanner's policy tracks
+/// `ff_script::retry::is_retryable_kind`. Inlined (not imported) because
+/// ff-engine doesn't depend on ff-script to keep the scanner crate light;
+/// the variants are exhaustively matched with a `_ => false` fallback so
+/// a new upstream `ErrorKind` can't silently become retryable.
+fn is_retryable_kind(kind: ferriskey::ErrorKind) -> bool {
+    use ferriskey::ErrorKind::*;
+    matches!(
+        kind,
+        IoError | FatalSendError | TryAgain | BusyLoadingError | ClusterDown
+    )
 }

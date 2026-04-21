@@ -6052,8 +6052,29 @@ redis.register_function('ff_cancel_flow', function(keys, args)
     reason               = args[2],
     cancellation_policy  = args[3],
     -- args[4] is client-provided now_ms; intentionally ignored.
-    grace_ms             = tonumber(args[5]) or 30000,
   }
+
+  -- grace_ms must be a finite non-negative integer. Same guard as
+  -- ff_rotate_waitpoint_hmac_secret: reject NaN, ±inf, negative,
+  -- non-integer, or >2^53-1. math.floor alone doesn't catch
+  -- infinities (math.floor(math.huge) == math.huge) which would
+  -- stamp "inf" into cancel_backlog and permanently poison the entry.
+  -- Default 30000 (30s) if the arg is omitted or empty string.
+  local grace_ms
+  if args[5] == nil or args[5] == "" then
+    grace_ms = 30000
+  else
+    local g = tonumber(args[5])
+    if not g
+        or g ~= g                          -- NaN
+        or g < 0
+        or g > 9007199254740991            -- 2^53 - 1
+        or g ~= math.floor(g) then
+      return err("invalid_grace_ms")
+    end
+    grace_ms = g
+  end
+  A.grace_ms = grace_ms
 
   local now_ms = server_time_ms()
 
