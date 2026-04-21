@@ -31,9 +31,23 @@ pub enum ScriptError {
     #[error("lease_revoked: operator revoked lease")]
     LeaseRevoked,
 
-    /// Stop. Check enriched return: epoch match + success = your completion won.
-    #[error("execution_not_active: execution is not in active state")]
-    ExecutionNotActive,
+    /// Execution is not in `active` state. Carries enriched detail so the
+    /// SDK can reconcile a replay of a terminal operation after a network
+    /// drop: if `terminal_outcome` matches what the caller attempted AND
+    /// `lease_epoch` matches their lease, the prior call committed and
+    /// the retry should be treated as a successful replay. `lifecycle_phase`
+    /// distinguishes `terminal` from `runnable` (retry-scheduled).
+    /// `attempt_id` is the per-attempt replay guard (preserved on
+    /// terminal, cleared on retry).
+    #[error(
+        "execution_not_active: lifecycle_phase={lifecycle_phase} terminal_outcome={terminal_outcome} lease_epoch={lease_epoch} attempt_id={attempt_id}"
+    )]
+    ExecutionNotActive {
+        terminal_outcome: String,
+        lease_epoch: String,
+        lifecycle_phase: String,
+        attempt_id: String,
+    },
 
     /// Revoke target has no active lease (already revoked/expired/unowned).
     #[error("no_active_lease: target has no active lease")]
@@ -422,7 +436,7 @@ impl ScriptError {
             Self::StaleLease
             | Self::LeaseExpired
             | Self::LeaseRevoked
-            | Self::ExecutionNotActive
+            | Self::ExecutionNotActive { .. }
             | Self::TargetNotSignalable
             | Self::PayloadTooLarge
             | Self::SignalLimitExceeded
@@ -539,7 +553,12 @@ impl ScriptError {
             "stale_lease" => Self::StaleLease,
             "lease_expired" => Self::LeaseExpired,
             "lease_revoked" => Self::LeaseRevoked,
-            "execution_not_active" => Self::ExecutionNotActive,
+            "execution_not_active" => Self::ExecutionNotActive {
+                terminal_outcome: String::new(),
+                lease_epoch: String::new(),
+                lifecycle_phase: String::new(),
+                attempt_id: String::new(),
+            },
             "no_active_lease" => Self::NoActiveLease,
             "active_attempt_exists" => Self::ActiveAttemptExists,
             "use_claim_resumed_execution" => Self::UseClaimResumedExecution,
@@ -635,13 +654,29 @@ impl ScriptError {
     /// variant. Returns `None` only when the code is unknown — the detail
     /// is always folded in when applicable.
     pub fn from_code_with_detail(code: &str, detail: &str) -> Option<Self> {
+        Self::from_code_with_details(code, std::slice::from_ref(&detail))
+    }
+
+    /// Like `from_code_with_detail`, but accepts multi-field details for
+    /// variants whose Lua return carries more than one detail slot (e.g.
+    /// `ExecutionNotActive` ships `terminal_outcome, lease_epoch,
+    /// lifecycle_phase, attempt_id` at indexes 2..=5). Indexes below the
+    /// variant's expected arity default to `""`.
+    pub fn from_code_with_details(code: &str, details: &[&str]) -> Option<Self> {
         let base = Self::from_code(code)?;
+        let d = |i: usize| details.get(i).copied().unwrap_or("").to_owned();
         Some(match base {
-            Self::CapabilityMismatch(_) => Self::CapabilityMismatch(detail.to_owned()),
-            Self::InvalidCapabilities(_) => Self::InvalidCapabilities(detail.to_owned()),
-            Self::InvalidPolicyJson(_) => Self::InvalidPolicyJson(detail.to_owned()),
-            Self::InvalidInput(_) => Self::InvalidInput(detail.to_owned()),
-            Self::RotationConflict(_) => Self::RotationConflict(detail.to_owned()),
+            Self::CapabilityMismatch(_) => Self::CapabilityMismatch(d(0)),
+            Self::InvalidCapabilities(_) => Self::InvalidCapabilities(d(0)),
+            Self::InvalidPolicyJson(_) => Self::InvalidPolicyJson(d(0)),
+            Self::InvalidInput(_) => Self::InvalidInput(d(0)),
+            Self::RotationConflict(_) => Self::RotationConflict(d(0)),
+            Self::ExecutionNotActive { .. } => Self::ExecutionNotActive {
+                terminal_outcome: d(0),
+                lease_epoch: d(1),
+                lifecycle_phase: d(2),
+                attempt_id: d(3),
+            },
             other => other,
         })
     }

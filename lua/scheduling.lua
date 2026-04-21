@@ -264,7 +264,10 @@ redis.register_function('ff_update_progress', function(keys, args)
 
   if core.lifecycle_phase ~= "active" then
     return err("execution_not_active",
-      core.terminal_outcome or "", core.current_lease_epoch or "")
+      core.terminal_outcome or "",
+      core.current_lease_epoch or "",
+      core.lifecycle_phase or "",
+      core.current_attempt_id or "")
   end
   if core.ownership_state == "lease_revoked" then
     return err("lease_revoked")
