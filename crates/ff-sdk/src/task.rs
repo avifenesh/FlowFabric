@@ -1260,7 +1260,7 @@ impl ClaimedTask {
             let sig: HashMap<String, String> = hash_slot.value().map_err(|e| {
                 SdkError::ValkeyContext {
                     source: e,
-                    context: "pipeline HGETALL signal_hash slot".into(),
+                    context: format!("pipeline HGETALL signal_hash slot (signal_id={signal_id})"),
                 }
             })?;
             if sig.is_empty() {
@@ -1277,7 +1277,7 @@ impl ClaimedTask {
             let payload_raw: Option<Value> =
                 payload_slot.value().map_err(|e| SdkError::ValkeyContext {
                     source: e,
-                    context: "pipeline GET signal_payload slot".into(),
+                    context: format!("pipeline GET signal_payload slot (signal_id={signal_id})"),
                 })?;
             let payload: Option<Vec<u8>> = match payload_raw {
                 Some(Value::BulkString(b)) => Some(b.to_vec()),
