@@ -155,14 +155,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .as_deref()
                                 .and_then(|b| serde_json::from_slice(b).ok());
                             let patch_result = pending.lock().await.remove(&eid);
-                            match (decision, patch_result) {
-                                (Some(d), Some(patch)) if d.approved => {
-                                    tracing::info!(execution_id = %eid, "review approved — completing");
-                                    if let Err(e) = task.complete(Some(serde_json::to_vec(&patch)?)).await {
-                                        tracing::error!(execution_id = %eid, error = %e, "complete failed");
+                            match decision {
+                                Some(d) if d.approved => {
+                                    // Approval: complete with the stashed patch if we
+                                    // still have it. If the stash is gone (worker
+                                    // restarted between suspend and resume), fall
+                                    // through to `process_task` below so the agent
+                                    // re-runs and re-suspends — reviewer will see a
+                                    // fresh prompt. An approval MUST NOT be treated
+                                    // as rejection just because local state was lost
+                                    // (caught by @cursor-bugbot + @gemini-code-assist
+                                    // on PR #59).
+                                    match patch_result {
+                                        Some(patch) => {
+                                            tracing::info!(execution_id = %eid, "review approved — completing");
+                                            if let Err(e) = task.complete(Some(serde_json::to_vec(&patch)?)).await {
+                                                tracing::error!(execution_id = %eid, error = %e, "complete failed");
+                                            }
+                                            continue;
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                execution_id = %eid,
+                                                "review approved but patch stash missing (likely worker restart) — re-running agent"
+                                            );
+                                            if let Err(e) = process_task(task, &llm, &args.model, budget_id.as_ref(), &pending).await {
+                                                tracing::error!(execution_id = %eid, error = %e, "task re-run failed");
+                                            }
+                                            continue;
+                                        }
                                     }
                                 }
-                                (Some(d), _) => {
+                                Some(d) => {
                                     let reason = d
                                         .feedback
                                         .unwrap_or_else(|| "rejected by reviewer".to_owned());
@@ -174,8 +198,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Err(e) = task.fail(&reason, "human_rejected").await {
                                         tracing::error!(execution_id = %eid, error = %e, "fail call failed");
                                     }
+                                    continue;
                                 }
-                                (None, _) => {
+                                None => {
                                     // Signal with no/invalid payload — defensive fail
                                     // so a malformed approve CLI doesn't silently
                                     // complete with stale stash.
@@ -189,9 +214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     {
                                         tracing::error!(execution_id = %eid, error = %e, "fail call failed");
                                     }
+                                    continue;
                                 }
                             }
-                            continue;
                         }
 
                         if let Err(e) = process_task(task, &llm, &args.model, budget_id.as_ref(), &pending).await {

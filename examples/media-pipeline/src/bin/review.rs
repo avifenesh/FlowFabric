@@ -390,10 +390,30 @@ async fn main() -> Result<()> {
             }
 
             if !status.is_success() {
-                anyhow::bail!("reject signal delivery failed ({status}): {text}");
+                // Symmetric with the approve path: re-check state before
+                // bailing. A peer reviewer or FF_SKIP_APPROVAL could have
+                // moved the execution to a terminal state (completed,
+                // failed, cancelled) between our suspend check and our
+                // /signal call — any of those terminal outcomes means the
+                // review window closed without us, which is the same
+                // "someone else won" success case the approve path
+                // already handles.
+                let recheck = recheck_state(&client, &args).await.unwrap_or_default();
+                if recheck == "failed" || recheck == "cancelled" || recheck == "completed" {
+                    println!(
+                        "[review] /signal returned {status} but state={recheck} — peer won; exiting 0"
+                    );
+                    drain_and_stop(tail).await;
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "reject signal delivery failed ({status}): {text}. recheck state={recheck}"
+                );
             }
             println!("[review] reject signal delivered: {text}");
-            println!("[review] waiting for summarize to transition to failed");
+            // The summarize worker re-claims, calls resume_signals(), sees
+            // the Reject payload, and calls fail(). Keep the tail up for
+            // a short drain so any final frames flush, then return.
             drain_and_stop(tail).await;
             return Ok(());
         }

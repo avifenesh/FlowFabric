@@ -197,7 +197,7 @@ async fn handle(
         let signals = task
             .resume_signals()
             .await
-            .context("resume_signals after approval")?;
+            .context("resume_signals after review (approve or reject)")?;
         if let Some(sig) = signals
             .iter()
             .find(|s| s.signal_name == SIGNAL_NAME_APPROVAL)
