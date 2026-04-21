@@ -369,6 +369,99 @@ async fn set_flow_tags_lazy_migrates_inline_cairn_fields() {
 }
 
 #[tokio::test]
+async fn set_execution_tags_rejects_trailing_dot_at_lua_layer() {
+    // Lua-side pattern must reject `cairn.` (empty field segment)
+    // regardless of client-side validation.
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let (eid, ctx) = seed_execution(&tc).await;
+
+    let mut tags = BTreeMap::new();
+    tags.insert("cairn.".to_owned(), "value".to_owned());
+    let err = ff_set_execution_tags(
+        tc.client(),
+        &ctx,
+        &SetExecutionTagsArgs {
+            execution_id: eid,
+            tags,
+        },
+    )
+    .await
+    .expect_err("trailing-dot must fail server-side too");
+    match err {
+        ScriptError::InvalidTagKey(k) => assert_eq!(k, "cairn."),
+        other => panic!("expected InvalidTagKey, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_flow_tags_migration_uses_sentinel_to_skip_second_hgetall() {
+    // After the first call migrates legacy fields and sets
+    // `tags_migrated=1`, a subsequent call on a flow that still has
+    // dot-named residue on flow_core (inserted after the first call)
+    // MUST leave that residue in place — the sentinel short-circuits
+    // the migration pass. This keeps tag writes O(1) instead of
+    // paying an O(n) HGETALL on every call.
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let (fid, fctx) = seed_flow(&tc).await;
+
+    // First write → triggers migration pass + installs sentinel.
+    let mut tags = BTreeMap::new();
+    tags.insert("cairn.project".to_owned(), "alpha".to_owned());
+    ff_set_flow_tags(
+        tc.client(),
+        &fctx,
+        &SetFlowTagsArgs {
+            flow_id: fid.clone(),
+            tags,
+        },
+    )
+    .await
+    .expect("first tag write");
+
+    // Sentinel is installed.
+    assert_eq!(
+        tc.hget(&fctx.core(), "tags_migrated").await.as_deref(),
+        Some("1")
+    );
+
+    // Seed dot-named residue on flow_core (simulating a hypothetical
+    // bypass).
+    tc.client()
+        .hset(fctx.core(), "rogue.field", "should-not-migrate")
+        .await
+        .expect("seed rogue field");
+
+    // Second write — sentinel short-circuits the migration, so the
+    // rogue field stays on flow_core.
+    let mut tags = BTreeMap::new();
+    tags.insert("cairn.task_id".to_owned(), "t-999".to_owned());
+    ff_set_flow_tags(
+        tc.client(),
+        &fctx,
+        &SetFlowTagsArgs {
+            flow_id: fid,
+            tags,
+        },
+    )
+    .await
+    .expect("second tag write");
+
+    // Rogue field is still on flow_core (sentinel short-circuited).
+    assert_eq!(
+        tc.hget(&fctx.core(), "rogue.field").await.as_deref(),
+        Some("should-not-migrate"),
+        "sentinel must short-circuit migration on subsequent calls"
+    );
+    // The fresh tag landed on :tags as expected.
+    assert_eq!(
+        tc.hget(&fctx.tags(), "cairn.task_id").await.as_deref(),
+        Some("t-999")
+    );
+}
+
+#[tokio::test]
 async fn set_flow_tags_rejects_invalid_key() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;

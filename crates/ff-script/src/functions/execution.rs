@@ -646,16 +646,20 @@ impl FromFcallResult for SetExecutionTagsResult {
 }
 
 /// Client-side fast-fail validator for tag keys. Matches the Lua
-/// pattern `^[a-z][a-z0-9_]*%.` — requires:
+/// pattern `^[a-z][a-z0-9_]*%.[^.]` — requires:
 ///
 ///   * non-empty;
 ///   * first char is lowercase ASCII letter;
 ///   * subsequent chars up to the first `.` are lowercase alnum or `_`;
-///   * must contain at least one `.` after the prefix run.
+///   * the first `.` is followed by at least one non-dot character
+///     (so `cairn.` and `cairn..x` are rejected — the `<field>` part
+///     of `<caller>.<field>` must be non-empty).
 ///
-/// Returns `Err(ScriptError::InvalidTagKey(key))` on rejection so
-/// callers match the same variant they'd see from the server-side
-/// path.
+/// Characters in the suffix after the mandatory non-dot char are not
+/// further constrained: `app.sub.field` is legal, matching the Lua
+/// pattern. Returns `Err(ScriptError::InvalidTagKey(key))` on
+/// rejection so callers match the same variant they'd see from the
+/// server-side path.
 pub fn validate_tag_key(key: &str) -> Result<(), ScriptError> {
     let mut chars = key.chars();
     let first = match chars.next() {
@@ -666,7 +670,7 @@ pub fn validate_tag_key(key: &str) -> Result<(), ScriptError> {
         return Err(ScriptError::InvalidTagKey(key.to_owned()));
     }
     let mut saw_dot = false;
-    for c in chars {
+    for c in chars.by_ref() {
         if c == '.' {
             saw_dot = true;
             break;
@@ -678,7 +682,11 @@ pub fn validate_tag_key(key: &str) -> Result<(), ScriptError> {
     if !saw_dot {
         return Err(ScriptError::InvalidTagKey(key.to_owned()));
     }
-    Ok(())
+    // Require at least one non-dot character after the first dot.
+    match chars.next() {
+        Some(c) if c != '.' => Ok(()),
+        _ => Err(ScriptError::InvalidTagKey(key.to_owned())),
+    }
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────
@@ -854,6 +862,29 @@ mod tag_key_tests {
     #[test]
     fn validate_accepts_single_char_prefix() {
         assert!(validate_tag_key("a.x").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_trailing_dot() {
+        // `cairn.` has the prefix + dot but no field segment — the
+        // `<field>` part of `<caller>.<field>` is required.
+        let err = validate_tag_key("cairn.").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(_)));
+    }
+
+    #[test]
+    fn validate_rejects_double_dot_after_prefix() {
+        // `cairn..x` has an empty field segment immediately after the
+        // namespace dot.
+        let err = validate_tag_key("cairn..x").unwrap_err();
+        assert!(matches!(err, ScriptError::InvalidTagKey(_)));
+    }
+
+    #[test]
+    fn validate_accepts_dots_in_suffix() {
+        // After the mandatory non-dot char post-namespace, further
+        // dots are fine — `app.sub.field` is a legal nested tag key.
+        assert!(validate_tag_key("app.sub.field").is_ok());
     }
 
     #[test]

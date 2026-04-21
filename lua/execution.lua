@@ -1749,9 +1749,12 @@ redis.register_function('ff_set_execution_tags', function(keys, args)
     return err("execution_not_found")
   end
 
+  -- Require `<caller>.<field>` with at least one non-dot char after the
+  -- first dot, so `cairn.` and `cairn..x` are rejected. The suffix may
+  -- contain further dots (`app.sub.field` is legal).
   for i = 1, n, 2 do
     local k = args[i]
-    if type(k) ~= "string" or not string.find(k, "^[a-z][a-z0-9_]*%.") then
+    if type(k) ~= "string" or not string.find(k, "^[a-z][a-z0-9_]*%.[^.]") then
       return err("invalid_tag_key", tostring(k))
     end
   end
