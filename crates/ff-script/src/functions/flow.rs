@@ -121,8 +121,13 @@ impl FromFcallResult for AddExecutionToFlowResult {
 }
 
 // ─── ff_cancel_flow ──────────────────────────────────────────────────
-// KEYS (3): flow_core, members_set, flow_index
-// ARGV (4): flow_id, reason, cancellation_policy, now_ms
+// KEYS (5): flow_core, members_set, flow_index, pending_cancels, cancel_backlog
+// ARGV (5): flow_id, reason, cancellation_policy, now_ms, grace_ms
+//
+// pending_cancels + cancel_backlog are populated only on policy=cancel_all
+// with members > 0. The cancel_reconciler scanner drains any entries
+// live dispatch leaves behind. Passing grace_ms as "" accepts the Lua
+// default (30s).
 
 ff_function! {
     pub ff_cancel_flow(args: CancelFlowArgs) -> CancelFlowResult {
@@ -130,12 +135,15 @@ ff_function! {
             k.fctx.core(),
             k.fctx.members(),
             k.fidx.flow_index(),
+            k.fctx.pending_cancels(),
+            k.fidx.cancel_backlog(),
         }
         argv {
             args.flow_id.to_string(),
             args.reason.clone(),
             args.cancellation_policy.clone(),
             args.now.to_string(),
+            String::new(),
         }
     }
 }

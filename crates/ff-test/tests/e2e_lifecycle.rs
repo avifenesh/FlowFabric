@@ -3572,10 +3572,16 @@ async fn fcall_cancel_flow(
         format!("{prefix}:core"),
         format!("{prefix}:members"),
         "ff:idx:{fp:0}:flow_index".to_string(),
+        format!("{prefix}:pending_cancels"),
+        "ff:idx:{fp:0}:cancel_backlog".to_string(),
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
-        flow_id.to_owned(), reason.to_owned(), policy.to_owned(), now.to_string(),
+        flow_id.to_owned(),
+        reason.to_owned(),
+        policy.to_owned(),
+        now.to_string(),
+        String::new(), // grace_ms — Lua default 30000
     ];
     let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
