@@ -376,6 +376,24 @@ pub enum ScriptError {
     #[error("waitpoint_not_token_bound")]
     WaitpointNotTokenBound,
 
+    /// Rotation FCALL: `new_kid` empty or contains `:`.
+    #[error("invalid_kid: kid must be non-empty and contain no ':'")]
+    InvalidKid,
+
+    /// Rotation FCALL: `new_secret_hex` empty, odd length, or non-hex.
+    #[error("invalid_secret_hex: secret must be a non-empty even-length hex string")]
+    InvalidSecretHex,
+
+    /// Rotation FCALL: `previous_expires_at_ms` or `now_ms` not a number.
+    #[error("invalid_timestamp: timestamp arg must be a valid integer")]
+    InvalidTimestamp,
+
+    /// Rotation FCALL: same kid already installed with a different secret.
+    /// Carries the kid so operators see which one conflicted. Refuse — the
+    /// operator must pick a fresh kid or restore the stored secret.
+    #[error("rotation_conflict: kid {0} already installed with a different secret")]
+    RotationConflict(String),
+
     // ── Transport-level errors (not from Lua) ──
     /// Valkey connection or protocol error. Preserves `ferriskey::ErrorKind` so
     /// callers can distinguish transient/permanent/NOSCRIPT/MOVED/etc.
@@ -445,6 +463,10 @@ impl ScriptError {
             | Self::InvalidCapabilities(_)
             | Self::InvalidPolicyJson(_)
             | Self::WaitpointNotTokenBound
+            | Self::InvalidKid
+            | Self::InvalidSecretHex
+            | Self::InvalidTimestamp
+            | Self::RotationConflict(_)
             | Self::Parse(_) => ErrorClass::Terminal,
 
             // Transport errors classify by their ferriskey ErrorKind —
@@ -596,6 +618,10 @@ impl ScriptError {
             "invalid_capabilities" => Self::InvalidCapabilities(String::new()),
             "invalid_policy_json" => Self::InvalidPolicyJson(String::new()),
             "waitpoint_not_token_bound" => Self::WaitpointNotTokenBound,
+            "invalid_kid" => Self::InvalidKid,
+            "invalid_secret_hex" => Self::InvalidSecretHex,
+            "invalid_timestamp" => Self::InvalidTimestamp,
+            "rotation_conflict" => Self::RotationConflict(String::new()),
             _ => return None,
         })
     }
@@ -614,6 +640,7 @@ impl ScriptError {
             Self::InvalidCapabilities(_) => Self::InvalidCapabilities(detail.to_owned()),
             Self::InvalidPolicyJson(_) => Self::InvalidPolicyJson(detail.to_owned()),
             Self::InvalidInput(_) => Self::InvalidInput(detail.to_owned()),
+            Self::RotationConflict(_) => Self::RotationConflict(detail.to_owned()),
             other => other,
         })
     }
