@@ -14,11 +14,18 @@
 //!
 //! Failure injection:
 //!   We add a real, valid member execution to the flow (which cancels
-//!   cleanly), and SADD a *second* flow-partitioned id into the members
-//!   set without calling `create_execution` for it. The Lua
-//!   `ff_cancel_execution` for the ghost id returns non-success
-//!   (`execution_not_found`), `cancel_member_execution` propagates the
-//!   `ServerError`, and the wait loop observes one Ok and one Err.
+//!   cleanly). A second member id is created whose `attempt_hash` key
+//!   is planted as a *string* (SET instead of HSET). Because the real
+//!   execution's lifecycle_phase is `active` with a `current_attempt_index`
+//!   set, the Lua `ff_cancel_execution` proceeds to `HSET attempt_hash …`
+//!   which returns `WRONGTYPE` — a non-retryable transport error that
+//!   bubbles out as `ServerError::Valkey(...)`. That is NOT a
+//!   terminal-ack code, so the wait loop records one failed member.
+//!
+//!   Note: `execution_not_active` / `execution_not_found` are treated
+//!   as idempotent ack-worthy success (matching the cancel-reconciler's
+//!   behaviour), so a pure ghost-id injection would *not* produce a
+//!   PartiallyCancelled outcome under the current (correct) contract.
 //!
 //! Run with: cargo test -p ff-test --test pr_c1_cancel_flow_partial -- \
 //!           --test-threads=1
@@ -27,8 +34,8 @@ use ff_core::contracts::{
     AddExecutionToFlowArgs, CancelFlowArgs, CancelFlowResult,
     CreateExecutionArgs, CreateFlowArgs,
 };
-use ff_core::keys::FlowKeyContext;
-use ff_core::partition::flow_partition;
+use ff_core::keys::{ExecKeyContext, FlowKeyContext};
+use ff_core::partition::{execution_partition, flow_partition};
 use ff_core::state::PublicState;
 use ff_core::types::*;
 use ff_server::config::ServerConfig;
@@ -127,22 +134,81 @@ async fn cancel_flow_wait_reports_partial_on_member_failure() {
         .await
         .expect("add real member");
 
-    // 2. Inject a ghost member: construct a second flow-partitioned id and
-    //    SADD it directly into the members set *without* creating its
-    //    execution core. The Lua cancel call for it will return
-    //    `execution_not_found`, causing cancel_member_execution to Err.
-    let ghost_eid = ExecutionId::for_flow(&flow_id, &config);
-    assert_ne!(ghost_eid, real_eid, "ghost id should be distinct");
-    let fpart = flow_partition(&flow_id, &config);
-    let fctx = FlowKeyContext::new(&fpart, &flow_id);
+    // 2. Inject a broken member: create a second real execution, then
+    //    corrupt its `attempt_hash` key by SET-ing it as a string. The
+    //    Lua `ff_cancel_execution` proceeds past the lifecycle check
+    //    (phase="active", operator_override bypasses lease checks) and
+    //    hits `HSET K.attempt_hash …` because `current_attempt_index` is
+    //    set — HSET on a string returns WRONGTYPE, the FCALL bubbles as
+    //    `ServerError::Valkey(...)`, which is NOT a terminal-ack code
+    //    and is therefore recorded as a failed member.
+    let broken_eid = ExecutionId::for_flow(&flow_id, &config);
+    assert_ne!(broken_eid, real_eid, "broken id should be distinct");
+    server
+        .create_execution(&CreateExecutionArgs {
+            execution_id: broken_eid.clone(),
+            namespace: Namespace::new(NS),
+            lane_id: LaneId::new(LANE),
+            execution_kind: "broken-member".to_owned(),
+            input_payload: b"{}".to_vec(),
+            payload_encoding: Some("json".to_owned()),
+            priority: 0,
+            creator_identity: "pr-c1".to_owned(),
+            idempotency_key: None,
+            tags: std::collections::HashMap::new(),
+            policy: None,
+            delay_until: None,
+            execution_deadline_at: None,
+            partition_id: ff_core::partition::execution_partition(&broken_eid, &config).index,
+            now,
+        })
+        .await
+        .expect("create_execution broken");
+    server
+        .add_execution_to_flow(&AddExecutionToFlowArgs {
+            flow_id: flow_id.clone(),
+            execution_id: broken_eid.clone(),
+            now,
+        })
+        .await
+        .expect("add broken member");
+
+    // Flip the broken execution to lifecycle_phase="active" with a
+    // current_attempt_index so the cancel Lua takes the active-path
+    // HSET on attempt_hash.
+    let bpart = execution_partition(&broken_eid, &config);
+    let bctx = ExecKeyContext::new(&bpart, &broken_eid);
     let _: i64 = tc
         .client()
-        .cmd("SADD")
-        .arg(fctx.members().as_str())
-        .arg(ghost_eid.to_string().as_str())
+        .cmd("HSET")
+        .arg(bctx.core().as_str())
+        .arg("lifecycle_phase")
+        .arg("active")
+        .arg("ownership_state")
+        .arg("leased")
+        .arg("current_attempt_index")
+        .arg("1")
         .execute()
         .await
-        .expect("SADD ghost");
+        .expect("HSET broken core active");
+
+    // Plant the attempt_hash as a STRING (not a hash). Any HSET on it
+    // will return WRONGTYPE.
+    let attempt_key = bctx.attempt_hash(AttemptIndex::new(1));
+    let _: String = tc
+        .client()
+        .cmd("SET")
+        .arg(attempt_key.as_str())
+        .arg("wrongtype-sentinel")
+        .execute()
+        .await
+        .expect("SET attempt_hash as string");
+
+    // Touch the flow's members set via the public key to make the
+    // FlowKeyContext usage below not just for sanity — keep the
+    // helper around for assertion lookups.
+    let fpart = flow_partition(&flow_id, &config);
+    let _fctx = FlowKeyContext::new(&fpart, &flow_id);
 
     // 3. cancel_flow_wait — expect PartiallyCancelled with ghost_eid in
     //    failed_member_execution_ids.
@@ -171,12 +237,12 @@ async fn cancel_flow_wait_reports_partial_on_member_failure() {
             );
             assert_eq!(
                 failed_member_execution_ids[0],
-                ghost_eid.to_string(),
-                "failed id should be the ghost member"
+                broken_eid.to_string(),
+                "failed id should be the broken member"
             );
         }
         other => panic!(
-            "expected PartiallyCancelled (ghost member cancel failed), got {other:?}"
+            "expected PartiallyCancelled (broken member cancel failed), got {other:?}"
         ),
     }
 
@@ -184,7 +250,7 @@ async fn cancel_flow_wait_reports_partial_on_member_failure() {
     assert_eq!(
         server.get_execution_state(&real_eid).await.unwrap(),
         PublicState::Cancelled,
-        "real member should be cancelled even though the ghost one failed"
+        "real member should be cancelled even though the broken one failed"
     );
 
     server.shutdown().await;

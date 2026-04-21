@@ -9,10 +9,12 @@
 //!   "scheduler enforces admission control" contract.
 //!
 //! Post-fix:
-//!   Transport errors propagate as `SchedulerError::Valkey(…)` from
-//!   `Scheduler::claim_for_worker`; the caller (server → worker) sees a
-//!   5xx and retries next cycle. No admission granted while the fault
-//!   persists.
+//!   Transport errors from `Scheduler::claim_for_worker` propagate as
+//!   scheduler errors; budget-read failures on this path surface as
+//!   `SchedulerError::ValkeyContext { .. }` (context-preserving) rather
+//!   than bare `SchedulerError::Valkey(…)`. The caller (server →
+//!   worker) sees a 5xx and retries next cycle. No admission granted
+//!   while the fault persists.
 //!
 //! Failure injection:
 //!   Plant the budget `:limits` key as a *string* (SET instead of HSET).

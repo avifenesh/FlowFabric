@@ -1575,11 +1575,28 @@ impl Server {
                         .await;
                     }
                     Err(e) => {
+                        // If the member was already terminal (execution_not_active /
+                        // execution_not_found), treat this as ack-worthy success —
+                        // the member is effectively "cancelled" from the flow's
+                        // perspective and shouldn't be surfaced as a partial
+                        // failure. Mirrors cancel_reconciler::cancel_member which
+                        // acks on the same codes to avoid backlog poisoning.
+                        if is_terminal_ack_error(&e) {
+                            ack_cancel_member(
+                                &self.client,
+                                &pending_cancels_key,
+                                &cancel_backlog_key,
+                                eid_str,
+                                &args.flow_id.to_string(),
+                            )
+                            .await;
+                            continue;
+                        }
                         tracing::warn!(
                             execution_id = %eid_str,
                             error = %e,
                             "cancel_flow(wait): individual execution cancel failed \
-                             (may be terminal; reconciler will retry if transient)"
+                             (transport/contract fault; reconciler will retry if transient)"
                         );
                         failed.push(eid_str.clone());
                     }
@@ -1673,13 +1690,24 @@ impl Server {
                                 .await;
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    flow_id = %flow_id,
-                                    execution_id = %eid_str,
-                                    error = %e,
-                                    "cancel_flow(async): individual execution cancel failed \
-                                     (may be terminal; reconciler will retry if transient)"
-                                );
+                                if is_terminal_ack_error(&e) {
+                                    ack_cancel_member(
+                                        &client,
+                                        &pending,
+                                        &backlog,
+                                        &eid_str,
+                                        &flow_id_str,
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::warn!(
+                                        flow_id = %flow_id,
+                                        execution_id = %eid_str,
+                                        error = %e,
+                                        "cancel_flow(async): individual execution cancel failed \
+                                         (transport/contract fault; reconciler will retry if transient)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -3973,6 +4001,23 @@ async fn ack_cancel_member(
             error = %e,
             "ff_ack_cancel_member failed; reconciler will drain on next pass"
         );
+    }
+}
+
+/// Returns true if a cancel_member failure reflects an already-terminal
+/// (or never-existed) execution, which from the flow-cancel perspective
+/// is ack-worthy success rather than a partial failure. The Lua
+/// `ff_cancel_execution` function emits `execution_not_active` when the
+/// member is already in a terminal phase, and `execution_not_found` when
+/// the key is gone. Both codes arrive here wrapped in
+/// `ServerError::OperationFailed("ff_cancel_execution failed: <code>")`
+/// via `parse_cancel_result`.
+fn is_terminal_ack_error(err: &ServerError) -> bool {
+    match err {
+        ServerError::OperationFailed(msg) => {
+            msg.contains("execution_not_active") || msg.contains("execution_not_found")
+        }
+        _ => false,
     }
 }
 
