@@ -113,8 +113,17 @@ fn build_execution_snapshot(
 ) -> Result<Option<ExecutionSnapshot>, SdkError> {
     let public_state = parse_public_state(opt_str(core, "public_state").unwrap_or(""))?;
 
-    let lane_id_str = opt_str(core, "lane_id").unwrap_or("").to_owned();
-    let lane_id = LaneId::new(lane_id_str);
+    // `LaneId::try_new` validates non-empty + ASCII-printable + <= 64 bytes.
+    // Exec_core writes a LaneId that already passed these invariants at
+    // ingress; a read that fails validation here signals on-disk
+    // corruption — surface it rather than silently constructing an
+    // invalid LaneId that would mis-partition downstream.
+    let lane_id = LaneId::try_new(opt_str(core, "lane_id").unwrap_or("")).map_err(|e| {
+        SdkError::Config(format!(
+            "describe_execution: exec_core.lane_id fails LaneId validation \
+             (key corruption?): {e}"
+        ))
+    })?;
 
     let namespace_str = opt_str(core, "namespace").unwrap_or("").to_owned();
     let namespace = Namespace::new(namespace_str);
@@ -138,13 +147,26 @@ fn build_execution_snapshot(
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    let created_at = parse_ts(core, "created_at")?.unwrap_or(TimestampMs::from_millis(0));
-    let last_mutation_at =
-        parse_ts(core, "last_mutation_at")?.unwrap_or(TimestampMs::from_millis(0));
+    // created_at + last_mutation_at are engine-maintained invariants
+    // (lua/execution.lua writes both on create; every mutating FCALL
+    // updates last_mutation_at). Missing values indicate on-disk
+    // corruption, not a valid pre-create state — fail loudly.
+    let created_at = parse_ts(core, "created_at")?.ok_or_else(|| {
+        SdkError::Config(
+            "describe_execution: exec_core.created_at is missing or empty \
+             (key corruption?)"
+                .to_owned(),
+        )
+    })?;
+    let last_mutation_at = parse_ts(core, "last_mutation_at")?.ok_or_else(|| {
+        SdkError::Config(
+            "describe_execution: exec_core.last_mutation_at is missing or empty \
+             (key corruption?)"
+                .to_owned(),
+        )
+    })?;
 
-    let total_attempt_count: u32 = opt_str(core, "total_attempt_count")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let total_attempt_count: u32 = parse_u32_strict(core, "total_attempt_count")?.unwrap_or(0);
 
     let current_attempt = build_attempt_summary(core)?;
     let current_lease = build_lease_summary(core)?;
@@ -203,6 +225,40 @@ fn parse_ts(
     }
 }
 
+/// Strictly parse a `u32` field. Returns `Ok(None)` when the field is
+/// absent or empty (a valid pre-write state), `Err` when the value is
+/// present but unparseable (on-disk corruption), `Ok(Some(v))` otherwise.
+fn parse_u32_strict(
+    map: &HashMap<String, String>,
+    field: &str,
+) -> Result<Option<u32>, SdkError> {
+    match opt_str(map, field).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(raw) => Ok(Some(raw.parse().map_err(|e| {
+            SdkError::Config(format!(
+                "describe_execution: exec_core.{field} is not a valid u32 \
+                 ('{raw}'): {e}"
+            ))
+        })?)),
+    }
+}
+
+/// Strictly parse a `u64` field. Semantics mirror [`parse_u32_strict`].
+fn parse_u64_strict(
+    map: &HashMap<String, String>,
+    field: &str,
+) -> Result<Option<u64>, SdkError> {
+    match opt_str(map, field).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(raw) => Ok(Some(raw.parse().map_err(|e| {
+            SdkError::Config(format!(
+                "describe_execution: exec_core.{field} is not a valid u64 \
+                 ('{raw}'): {e}"
+            ))
+        })?)),
+    }
+}
+
 fn parse_public_state(raw: &str) -> Result<PublicState, SdkError> {
     // exec_core stores the snake_case literal (e.g. "waiting"). PublicState's
     // Deserialize accepts the JSON-quoted form, so wrap + delegate.
@@ -228,10 +284,17 @@ fn build_attempt_summary(
              UUID: {e}"
         ))
     })?;
-    let attempt_index: u32 = opt_str(core, "current_attempt_index")
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // When `current_attempt_id` is set, `current_attempt_index` MUST be
+    // set too — lua/execution.lua writes both atomically in
+    // `ff_claim_execution`. A missing index while the id is populated
+    // is corruption, not a valid intermediate state.
+    let attempt_index = parse_u32_strict(core, "current_attempt_index")?.ok_or_else(|| {
+        SdkError::Config(
+            "describe_execution: exec_core.current_attempt_index is missing \
+             while current_attempt_id is set (key corruption?)"
+                .to_owned(),
+        )
+    })?;
     Ok(Some(AttemptSummary::new(
         attempt_id,
         AttemptIndex::new(attempt_index),
@@ -252,10 +315,16 @@ fn build_lease_summary(
         None => return Ok(None),
         Some(ts) => ts,
     };
-    let epoch: u64 = opt_str(core, "current_lease_epoch")
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // A lease is only "held" if the epoch is present too — lua/helpers.lua
+    // sets/clears epoch atomically with wid + expires_at. Parse strictly
+    // and require it: a missing epoch alongside a live wid is corruption.
+    let epoch = parse_u64_strict(core, "current_lease_epoch")?.ok_or_else(|| {
+        SdkError::Config(
+            "describe_execution: exec_core.current_lease_epoch is missing \
+             while current_worker_instance_id is set (key corruption?)"
+                .to_owned(),
+        )
+    })?;
     Ok(Some(LeaseSummary::new(
         LeaseEpoch::new(epoch),
         WorkerInstanceId::new(wid_str.to_owned()),
@@ -319,6 +388,83 @@ mod tests {
             .unwrap_err();
         match err {
             SdkError::Config(msg) => assert!(msg.contains("public_state"), "msg: {msg}"),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_lane_id_fails_loud() {
+        // LaneId::try_new rejects non-printable bytes. Simulate on-disk
+        // corruption by stamping a lane_id with an embedded \n.
+        let mut core = minimal_core("waiting");
+        core.insert("lane_id".to_owned(), "lane\nbroken".to_owned());
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        match err {
+            SdkError::Config(msg) => assert!(msg.contains("lane_id"), "msg: {msg}"),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_timestamps_fail_loud() {
+        for field in ["created_at", "last_mutation_at"] {
+            let mut core = minimal_core("waiting");
+            core.remove(field);
+            let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+            match err {
+                SdkError::Config(msg) => {
+                    assert!(msg.contains(field), "msg for {field}: {msg}")
+                }
+                other => panic!("expected Config for {field}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_total_attempt_count_fails_loud() {
+        let mut core = minimal_core("waiting");
+        core.insert("total_attempt_count".to_owned(), "not-a-number".to_owned());
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        match err {
+            SdkError::Config(msg) => {
+                assert!(msg.contains("total_attempt_count"), "msg: {msg}")
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_id_without_index_fails_loud() {
+        // current_attempt_id set but current_attempt_index absent =>
+        // corruption, since lua/execution.lua writes both atomically.
+        let mut core = minimal_core("active");
+        core.insert(
+            "current_attempt_id".to_owned(),
+            AttemptId::new().to_string(),
+        );
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        match err {
+            SdkError::Config(msg) => {
+                assert!(msg.contains("current_attempt_index"), "msg: {msg}")
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_without_epoch_fails_loud() {
+        // wid + expires_at present but epoch missing => corruption.
+        let mut core = minimal_core("active");
+        core.insert(
+            "current_worker_instance_id".to_owned(),
+            "w-inst-1".to_owned(),
+        );
+        core.insert("lease_expires_at".to_owned(), "9000".to_owned());
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        match err {
+            SdkError::Config(msg) => {
+                assert!(msg.contains("current_lease_epoch"), "msg: {msg}")
+            }
             other => panic!("expected Config, got {other:?}"),
         }
     }

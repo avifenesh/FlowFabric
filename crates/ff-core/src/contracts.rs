@@ -1521,44 +1521,6 @@ impl LeaseSummary {
     }
 }
 
-// ─── set_execution_tags / set_flow_tags (issue #58.4) ───
-
-/// Args for `ff_set_execution_tags`. Tag keys MUST match
-/// `^[a-z][a-z0-9_]*\.` — the caller-namespace rule — or the FCALL
-/// returns `invalid_tag_key`. Values are arbitrary strings. The map is
-/// ordered (`BTreeMap`) so two callers submitting the same logical set
-/// of tags produce identical ARGV, which keeps FCALL tracing +
-/// idempotency reasoning simple.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SetExecutionTagsArgs {
-    pub execution_id: ExecutionId,
-    pub tags: BTreeMap<String, String>,
-}
-
-/// Result of `ff_set_execution_tags`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SetExecutionTagsResult {
-    /// Tags written. `count` is the number of key-value pairs applied.
-    Ok { count: u32 },
-}
-
-/// Args for `ff_set_flow_tags`. Same namespace rule as
-/// [`SetExecutionTagsArgs`]. The Lua function also lazy-migrates any
-/// pre-58.4 reserved-namespace fields stashed inline on `flow_core` into
-/// the new tags key.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SetFlowTagsArgs {
-    pub flow_id: FlowId,
-    pub tags: BTreeMap<String, String>,
-}
-
-/// Result of `ff_set_flow_tags`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SetFlowTagsResult {
-    /// Tags written. `count` is the number of key-value pairs applied.
-    Ok { count: u32 },
-}
-
 // ─── Common sub-types ───
 
 /// Summary of state after a mutation, returned by many functions.
