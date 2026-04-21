@@ -495,7 +495,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferriskey"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -575,17 +575,18 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "crc16",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 
 [[package]]
 name = "ff-script"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -597,11 +598,13 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ferriskey",
  "ff-core",
  "ff-script",
+ "reqwest",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1752,9 +1755,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.12"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "aws-lc-rs",
  "ring",
