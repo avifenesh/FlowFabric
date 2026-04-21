@@ -1546,6 +1546,14 @@ impl Server {
 
         if wait {
             // Synchronous dispatch — cancel every member inline before returning.
+            // Collect per-member failures so the caller sees a
+            // PartiallyCancelled outcome instead of a false-positive
+            // Cancelled when any member cancel faulted (ghost member,
+            // transport exhaustion, Lua reject). The cancel-backlog
+            // reconciler still retries the unacked members; surfacing
+            // the partial state lets operator tooling alert without
+            // polling per-member state.
+            let mut failed: Vec<String> = Vec::new();
             for eid_str in &members {
                 match cancel_member_execution(
                     &self.client,
@@ -1567,18 +1575,43 @@ impl Server {
                         .await;
                     }
                     Err(e) => {
+                        // If the member was already terminal (execution_not_active /
+                        // execution_not_found), treat this as ack-worthy success —
+                        // the member is effectively "cancelled" from the flow's
+                        // perspective and shouldn't be surfaced as a partial
+                        // failure. Mirrors cancel_reconciler::cancel_member which
+                        // acks on the same codes to avoid backlog poisoning.
+                        if is_terminal_ack_error(&e) {
+                            ack_cancel_member(
+                                &self.client,
+                                &pending_cancels_key,
+                                &cancel_backlog_key,
+                                eid_str,
+                                &args.flow_id.to_string(),
+                            )
+                            .await;
+                            continue;
+                        }
                         tracing::warn!(
                             execution_id = %eid_str,
                             error = %e,
                             "cancel_flow(wait): individual execution cancel failed \
-                             (may be terminal; reconciler will retry if transient)"
+                             (transport/contract fault; reconciler will retry if transient)"
                         );
+                        failed.push(eid_str.clone());
                     }
                 }
             }
-            return Ok(CancelFlowResult::Cancelled {
+            if failed.is_empty() {
+                return Ok(CancelFlowResult::Cancelled {
+                    cancellation_policy: policy,
+                    member_execution_ids: members,
+                });
+            }
+            return Ok(CancelFlowResult::PartiallyCancelled {
                 cancellation_policy: policy,
                 member_execution_ids: members,
+                failed_member_execution_ids: failed,
             });
         }
 
@@ -1657,13 +1690,24 @@ impl Server {
                                 .await;
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    flow_id = %flow_id,
-                                    execution_id = %eid_str,
-                                    error = %e,
-                                    "cancel_flow(async): individual execution cancel failed \
-                                     (may be terminal; reconciler will retry if transient)"
-                                );
+                                if is_terminal_ack_error(&e) {
+                                    ack_cancel_member(
+                                        &client,
+                                        &pending,
+                                        &backlog,
+                                        &eid_str,
+                                        &flow_id_str,
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::warn!(
+                                        flow_id = %flow_id,
+                                        execution_id = %eid_str,
+                                        error = %e,
+                                        "cancel_flow(async): individual execution cancel failed \
+                                         (transport/contract fault; reconciler will retry if transient)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -3957,6 +4001,23 @@ async fn ack_cancel_member(
             error = %e,
             "ff_ack_cancel_member failed; reconciler will drain on next pass"
         );
+    }
+}
+
+/// Returns true if a cancel_member failure reflects an already-terminal
+/// (or never-existed) execution, which from the flow-cancel perspective
+/// is ack-worthy success rather than a partial failure. The Lua
+/// `ff_cancel_execution` function emits `execution_not_active` when the
+/// member is already in a terminal phase, and `execution_not_found` when
+/// the key is gone. Both codes arrive here wrapped in
+/// `ServerError::OperationFailed("ff_cancel_execution failed: <code>")`
+/// via `parse_cancel_result`.
+fn is_terminal_ack_error(err: &ServerError) -> bool {
+    match err {
+        ServerError::OperationFailed(msg) => {
+            msg.contains("execution_not_active") || msg.contains("execution_not_found")
+        }
+        _ => false,
     }
 }
 

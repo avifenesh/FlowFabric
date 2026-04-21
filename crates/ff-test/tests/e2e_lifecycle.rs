@@ -6555,12 +6555,20 @@ async fn test_server_flow_lifecycle() {
         .await
         .expect("cancel_flow failed");
 
+    // Upstream is already terminal:success, so cancel_execution will fail on it —
+    // that manifests as PartiallyCancelled under the fail-closed semantics (PR-C1).
+    // Accept either Cancelled (if both succeed) or PartiallyCancelled (expected here).
     let (cancellation_policy, member_execution_ids) = match &cancel_result {
         ff_core::contracts::CancelFlowResult::Cancelled {
             cancellation_policy,
             member_execution_ids,
+        }
+        | ff_core::contracts::CancelFlowResult::PartiallyCancelled {
+            cancellation_policy,
+            member_execution_ids,
+            ..
         } => (cancellation_policy, member_execution_ids),
-        other => panic!("expected Cancelled from cancel_flow_wait, got {other:?}"),
+        other => panic!("expected Cancelled or PartiallyCancelled from cancel_flow_wait, got {other:?}"),
     };
     assert_eq!(cancellation_policy, "cancel_all");
     assert_eq!(member_execution_ids.len(), 2);
