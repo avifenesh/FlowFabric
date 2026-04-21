@@ -1422,6 +1422,142 @@ pub enum SetFlowTagsResult {
     Ok { count: u32 },
 }
 
+// ─── describe_execution (issue #58.1) ───
+
+/// Engine-decoupled read-model for one execution.
+///
+/// Returned by `ff_sdk::FlowFabricWorker::describe_execution`. Consumers
+/// consult this struct instead of reaching into Valkey's exec_core hash
+/// directly — the engine is free to rename fields or restructure storage
+/// under this surface.
+///
+/// `#[non_exhaustive]` — FF may add fields in minor releases without a
+/// semver break. Match with `..` or use field-by-field construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecutionSnapshot {
+    pub execution_id: ExecutionId,
+    pub flow_id: Option<FlowId>,
+    pub lane_id: LaneId,
+    pub namespace: Namespace,
+    pub public_state: PublicState,
+    /// Blocking reason string (e.g. `"waiting_for_worker"`,
+    /// `"waiting_for_delay"`, `"waiting_for_dependencies"`). `None` when
+    /// the exec_core field is empty.
+    pub blocking_reason: Option<String>,
+    /// Free-form operator-readable detail explaining `blocking_reason`.
+    /// `None` when the exec_core field is empty.
+    pub blocking_detail: Option<String>,
+    /// Summary of the execution's currently-active attempt. `None` when
+    /// no attempt has been started (pre-claim) or when the exec_core
+    /// attempt fields are all empty.
+    pub current_attempt: Option<AttemptSummary>,
+    /// Summary of the execution's currently-held lease. `None` when the
+    /// execution is not held by a worker.
+    pub current_lease: Option<LeaseSummary>,
+    /// The waitpoint this execution is currently suspended on, if any.
+    pub current_waitpoint: Option<WaitpointId>,
+    pub created_at: TimestampMs,
+    /// Timestamp of the last write that mutated exec_core. Engine-maintained.
+    pub last_mutation_at: TimestampMs,
+    pub total_attempt_count: u32,
+    /// Caller-owned labels. The prefix `^[a-z][a-z0-9_]*\.` is reserved for
+    /// consumer metadata (e.g. `cairn.task_id`); FF guarantees it will not
+    /// write keys matching that shape. FF's own fields stay in snake_case
+    /// without dots. Empty when no tags are set.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ExecutionSnapshot {
+    /// Construct an [`ExecutionSnapshot`]. Present so downstream crates
+    /// (ff-sdk's `describe_execution`) can assemble the struct despite
+    /// the `#[non_exhaustive]` marker. Prefer adding builder-style
+    /// helpers here over loosening `non_exhaustive`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        flow_id: Option<FlowId>,
+        lane_id: LaneId,
+        namespace: Namespace,
+        public_state: PublicState,
+        blocking_reason: Option<String>,
+        blocking_detail: Option<String>,
+        current_attempt: Option<AttemptSummary>,
+        current_lease: Option<LeaseSummary>,
+        current_waitpoint: Option<WaitpointId>,
+        created_at: TimestampMs,
+        last_mutation_at: TimestampMs,
+        total_attempt_count: u32,
+        tags: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            execution_id,
+            flow_id,
+            lane_id,
+            namespace,
+            public_state,
+            blocking_reason,
+            blocking_detail,
+            current_attempt,
+            current_lease,
+            current_waitpoint,
+            created_at,
+            last_mutation_at,
+            total_attempt_count,
+            tags,
+        }
+    }
+}
+
+/// Currently-active attempt summary inside an [`ExecutionSnapshot`].
+///
+/// `#[non_exhaustive]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AttemptSummary {
+    pub attempt_id: AttemptId,
+    pub attempt_index: AttemptIndex,
+}
+
+impl AttemptSummary {
+    /// Construct an [`AttemptSummary`]. See [`ExecutionSnapshot::new`]
+    /// for the rationale — `#[non_exhaustive]` blocks cross-crate
+    /// struct-literal construction.
+    pub fn new(attempt_id: AttemptId, attempt_index: AttemptIndex) -> Self {
+        Self {
+            attempt_id,
+            attempt_index,
+        }
+    }
+}
+
+/// Currently-held lease summary inside an [`ExecutionSnapshot`].
+///
+/// `#[non_exhaustive]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LeaseSummary {
+    pub lease_epoch: LeaseEpoch,
+    pub worker_instance_id: WorkerInstanceId,
+    pub expires_at: TimestampMs,
+}
+
+impl LeaseSummary {
+    /// Construct a [`LeaseSummary`]. See [`ExecutionSnapshot::new`]
+    /// for the rationale.
+    pub fn new(
+        lease_epoch: LeaseEpoch,
+        worker_instance_id: WorkerInstanceId,
+        expires_at: TimestampMs,
+    ) -> Self {
+        Self {
+            lease_epoch,
+            worker_instance_id,
+            expires_at,
+        }
+    }
+}
+
 // ─── Common sub-types ───
 
 /// Summary of state after a mutation, returned by many functions.
