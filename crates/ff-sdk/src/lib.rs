@@ -62,6 +62,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod snapshot;
 pub mod task;
 pub mod worker;
 
