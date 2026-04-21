@@ -131,11 +131,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Some(task)) => {
                         let eid = task.execution_id().to_string();
 
-                        // Re-claim after review approval — complete with stashed patch
-                        if let Some(patch_result) = pending.lock().await.remove(&eid) {
-                            tracing::info!(execution_id = %eid, "resumed after review — completing");
-                            if let Err(e) = task.complete(Some(serde_json::to_vec(&patch_result)?)).await {
-                                tracing::error!(execution_id = %eid, error = %e, "complete failed");
+                        // Re-claim after human review. resume_signals() returns the
+                        // matched signal for this resumed attempt (empty Vec on fresh
+                        // claims). We branch on the ReviewPayload inside the signal
+                        // rather than assuming approval — the approve CLI now
+                        // delivers either approve or reject via the same signal name,
+                        // so the worker MUST inspect payload.approved to decide
+                        // complete-vs-fail. Without this check, a rejection would
+                        // incorrectly complete the execution with the old patch.
+                        let signals = match task.resume_signals().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(execution_id = %eid, error = %e, "resume_signals failed");
+                                continue;
+                            }
+                        };
+                        if let Some(sig) = signals
+                            .iter()
+                            .find(|s| s.signal_name == "review_response")
+                        {
+                            let decision: Option<common::ReviewPayload> = sig
+                                .payload
+                                .as_deref()
+                                .and_then(|b| serde_json::from_slice(b).ok());
+                            let patch_result = pending.lock().await.remove(&eid);
+                            match (decision, patch_result) {
+                                (Some(d), Some(patch)) if d.approved => {
+                                    tracing::info!(execution_id = %eid, "review approved — completing");
+                                    if let Err(e) = task.complete(Some(serde_json::to_vec(&patch)?)).await {
+                                        tracing::error!(execution_id = %eid, error = %e, "complete failed");
+                                    }
+                                }
+                                (Some(d), _) => {
+                                    let reason = d
+                                        .feedback
+                                        .unwrap_or_else(|| "rejected by reviewer".to_owned());
+                                    tracing::info!(
+                                        execution_id = %eid,
+                                        reason = %reason,
+                                        "review rejected — failing with reviewer feedback"
+                                    );
+                                    if let Err(e) = task.fail(&reason, "human_rejected").await {
+                                        tracing::error!(execution_id = %eid, error = %e, "fail call failed");
+                                    }
+                                }
+                                (None, _) => {
+                                    // Signal with no/invalid payload — defensive fail
+                                    // so a malformed approve CLI doesn't silently
+                                    // complete with stale stash.
+                                    tracing::error!(
+                                        execution_id = %eid,
+                                        "review_response signal had no parseable ReviewPayload; failing"
+                                    );
+                                    if let Err(e) = task
+                                        .fail("review signal had unparseable payload", "bad_signal")
+                                        .await
+                                    {
+                                        tracing::error!(execution_id = %eid, error = %e, "fail call failed");
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -318,7 +372,11 @@ async fn process_task(
                 // Matches the media-pipeline convention.
                 println!("WAITPOINT_TOKEN={}", waitpoint_token.as_str());
                 println!(
-                    "  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --waitpoint-token {} --approve",
+                    "  # approve:\n  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --waitpoint-token {} --approve",
+                    waitpoint_token.as_str()
+                );
+                println!(
+                    "  # reject (same signal, approved=false inside payload):\n  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --waitpoint-token {} --reject --feedback \"...\"",
                     waitpoint_token.as_str()
                 );
             }
