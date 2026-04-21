@@ -1474,6 +1474,22 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
 
   -- 7. Update indexes
   redis.call("ZADD", K.lease_expiry_key, expires_at, A.execution_id)
+  -- SREM from the OLD worker's leases set before SADD to the new one.
+  -- K.worker_leases_key targets the NEW (reclaiming) worker, but the
+  -- execution is currently in the OLD worker's set via the original
+  -- claim's SADD. Without this SREM the execution stays indexed under
+  -- the old worker even though exec_core now reports a new owner,
+  -- breaking operator drain visibility and worker→execution lookup.
+  -- Same dynamic-key pattern as the max-reclaim branch above and as
+  -- ff_expire_execution's cleanup path. Skipped when the same worker
+  -- reclaims its own execution (idempotent no-op anyway).
+  local old_wiid = core.current_worker_instance_id or ""
+  if old_wiid ~= "" and old_wiid ~= A.worker_instance_id then
+    local tag_wl = string.match(K.core_key, "(%b{})")
+    redis.call("SREM",
+      "ff:idx:" .. tag_wl .. ":worker:" .. old_wiid .. ":leases",
+      A.execution_id)
+  end
   redis.call("SADD", K.worker_leases_key, A.execution_id)
   redis.call("ZADD", K.active_index_key, expires_at, A.execution_id)
 

@@ -1346,6 +1346,85 @@ async fn test_reclaim_expired_lease() {
     assert_attempt_state(&tc, &eid, AttemptIndex::new(1), "started").await;
 }
 
+/// Regression: reclaim must SREM the execution from the OLD worker's
+/// leases set. Before this fix, the happy path updated exec_core +
+/// SADDed the new worker's set but left the old entry behind, so
+/// `worker:<old>:leases` reported phantom ownership — breaking
+/// drain-by-worker and operator lookups.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_reclaim_removes_from_old_worker_leases() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = tc.new_execution_id();
+    let old_worker_inst = "worker-A";
+    let new_worker_inst = "worker-B";
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "reclaim_leaks_test", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, old_worker_inst).await;
+    fcall_claim_execution(&tc, &eid, LANE, WORKER, old_worker_inst, 100).await;
+
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let idx = IndexKeys::new(&partition);
+    let old_wiid = WorkerInstanceId::new(old_worker_inst);
+    let new_wiid = WorkerInstanceId::new(new_worker_inst);
+    let old_key = idx.worker_leases(&old_wiid);
+    let new_key = idx.worker_leases(&new_wiid);
+
+    // Sanity: before reclaim, the old worker owns it.
+    let old_before: bool = tc
+        .client()
+        .cmd("SISMEMBER")
+        .arg(old_key.as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("SISMEMBER old before");
+    assert!(old_before, "old worker should own before reclaim");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fcall_mark_lease_expired(&tc, &eid).await;
+    fcall_issue_reclaim_grant(&tc, &eid, WORKER, new_worker_inst, LANE).await;
+    fcall_reclaim_execution(
+        &tc,
+        &eid,
+        LANE,
+        WORKER,
+        new_worker_inst,
+        AttemptIndex::new(0),
+        30_000,
+    )
+    .await;
+
+    let old_after: bool = tc
+        .client()
+        .cmd("SISMEMBER")
+        .arg(old_key.as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("SISMEMBER old after");
+    assert!(
+        !old_after,
+        "old worker:<id>:leases MUST no longer contain the execution after reclaim (was leaking before the fix)"
+    );
+
+    let new_after: bool = tc
+        .client()
+        .cmd("SISMEMBER")
+        .arg(new_key.as_str())
+        .arg(eid.to_string().as_str())
+        .execute()
+        .await
+        .expect("SISMEMBER new after");
+    assert!(
+        new_after,
+        "new worker:<id>:leases MUST contain the execution after reclaim"
+    );
+}
+
 /// Expire an active execution via ff_expire_execution.
 #[tokio::test]
 #[serial_test::serial]
