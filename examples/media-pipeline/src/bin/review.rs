@@ -7,23 +7,27 @@
 //!     `--tamper-token` flag mutates the token before send so the user
 //!     can watch the server reject it with `invalid_token`.
 //!
-//! # v1 decision protocol: approve = signal, reject = cancel
+//! # Decision protocol: both approve AND reject deliver a signed signal
 //!
-//! ff-sdk does not surface the resume signal's payload to the re-claimed
-//! worker, so the summarize worker cannot distinguish approve vs reject
-//! by inspecting the signal on resume. Instead this CLI uses the control
-//! plane to differentiate:
+//! ff-sdk v0.3 added `ClaimedTask::resume_signals()`, which exposes the
+//! resume signal's payload to the re-claimed worker. The summarize
+//! worker now inspects the `ApprovalDecision` inside the signal to
+//! branch between complete (Approve) and fail-with-reason (Reject).
 //!
-//!   * `--approve` (or interactive `y`) → POST /signal (HMAC-authenticated).
-//!     Engine fulfils the waitpoint → summarize worker re-claims → reads
-//!     the persisted `summary_final` frame → `complete()`.
+//! Pre-v0.3 this CLI used POST /cancel for rejects because there was
+//! no way to ship the rejection reason through the resume path. With
+//! the payload-carrying resume we now use one HMAC-authenticated
+//! /signal call for both branches:
 //!
-//!   * `--reject <reason>` (or interactive `n`) → POST /cancel. The
-//!     execution transitions to terminal cancelled; no signal is sent
-//!     and no re-claim occurs.
-//!
-//! Tracked as a Batch C follow-up: "Expose resume signal payload on
-//! ClaimedTask so workers can route approve vs reject in-band".
+//!   * `--approve` (or interactive `y`) → POST /signal with
+//!     `ApprovalDecision::Approve`. Worker re-claims → `resume_signals()`
+//!     returns the signal → `complete()` from the persisted
+//!     `summary_final` frame.
+//!   * `--reject <reason>` (or interactive `n`) → POST /signal with
+//!     `ApprovalDecision::Reject { reason }`. Worker re-claims →
+//!     `resume_signals()` surfaces the reason → `fail(reason, "human_rejected")`.
+//!     The operator-supplied reason flows through exec_core.failure_reason
+//!     and the terminal event, which POST /cancel used to drop on the floor.
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -308,39 +312,108 @@ async fn main() -> Result<()> {
             println!("[review] waiting for summarize to complete");
         }
         ApprovalDecision::Reject { reason } => {
-            // v1 protocol: reject → /cancel, not /signal. ff-sdk does not
-            // surface the resume signal's payload to the summarize worker
-            // on re-claim, so approve vs reject cannot be disambiguated
-            // via the signal. Cancelling the execution is unambiguous:
-            // the worker never re-claims, the flow sees a terminal
-            // cancelled, and downstream edges skip.
-            if args.tamper_token {
-                eprintln!(
-                    "[review] --tamper-token is approve-only (the reject path uses POST /cancel \
-                     which has no HMAC to tamper); re-run without --tamper-token to reject, or \
-                     keep --tamper-token and pass --auto-approve / answer 'y' to exercise the \
-                     HMAC rejection path."
-                );
-                // Exit 2 distinguishes "invalid-args, run differently" from the
-                // pipeline-level exit 1 ("execution actually failed"). Scripts
-                // that wrap review.rs can treat exit 2 as retriable with
-                // different flags.
-                std::process::exit(2);
-            }
+            // Reject now uses the SAME HMAC-signed /signal path as approve.
+            // The ApprovalDecision payload tells the summarize worker which
+            // branch to take on resume (complete-from-persist vs fail-with-
+            // reason). This is symmetric with --approve, so --tamper-token
+            // exercises HMAC rejection on both outcomes.
+            let token = if args.tamper_token {
+                tamper(&wp.waitpoint_token)
+            } else {
+                wp.waitpoint_token.clone()
+            };
+            let signal_payload = serde_json::to_vec(&ApprovalDecision::Reject {
+                reason: reason.clone(),
+            })?;
+
+            let idempotency_key = format!(
+                "review-reject/{}/{}",
+                args.execution_id, wp.waitpoint_id
+            );
+
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
-                "reason": reason,
-                "source": "reviewer",
+                "waitpoint_id": wp.waitpoint_id,
+                "signal_id": uuid::Uuid::new_v4().to_string(),
+                "signal_name": SIGNAL_NAME_APPROVAL,
+                "signal_category": "human_review",
+                "source_type": "human",
+                "source_identity": "reviewer",
+                "payload": signal_payload,
+                "payload_encoding": "json",
+                "target_scope": "execution",
+                "idempotency_key": idempotency_key,
+                "waitpoint_token": token,
                 "now": now_ms(),
             });
-            let url = format!("{}/v1/executions/{}/cancel", args.server, args.execution_id);
-            let resp = client.post(&url).json(&body).send().await?;
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                anyhow::bail!("cancel failed ({status}): {text}");
+
+            let url = format!("{}/v1/executions/{}/signal", args.server, args.execution_id);
+            let send_result = client
+                .post(&url)
+                .json(&body)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await;
+
+            let (status, text) = match send_result {
+                Ok(resp) => {
+                    let s = resp.status();
+                    let t = resp.text().await.unwrap_or_default();
+                    (Some(s), t)
+                }
+                Err(e) => {
+                    println!("[review] /signal (reject) request error: {e} — rechecking state");
+                    let recheck = recheck_state(&client, &args).await?;
+                    if recheck == "failed" || recheck == "cancelled" {
+                        println!("[review] state={recheck} after error — reject landed; exiting 0");
+                        drain_and_stop(tail).await;
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "reject signal delivery error: {e}. execution state={recheck}. \
+                         Re-run review with the same args; idempotency_key \
+                         {idempotency_key} guarantees at-most-once."
+                    );
+                }
+            };
+            let status = status.expect("matched Ok arm above");
+
+            if args.tamper_token {
+                if status.is_success() {
+                    eprintln!("[review] FAIL — tampered reject token was accepted: {text}");
+                    std::process::exit(1);
+                }
+                println!("[review] tampered reject token rejected ({status}): {text}");
+                println!("[review] ── tail aborted: tamper-reject path ──");
+                drain_and_stop(tail).await;
+                return Ok(());
             }
-            println!("[review] rejected — execution cancelled: {text}");
+
+            if !status.is_success() {
+                // Symmetric with the approve path: re-check state before
+                // bailing. A peer reviewer or FF_SKIP_APPROVAL could have
+                // moved the execution to a terminal state (completed,
+                // failed, cancelled) between our suspend check and our
+                // /signal call — any of those terminal outcomes means the
+                // review window closed without us, which is the same
+                // "someone else won" success case the approve path
+                // already handles.
+                let recheck = recheck_state(&client, &args).await.unwrap_or_default();
+                if recheck == "failed" || recheck == "cancelled" || recheck == "completed" {
+                    println!(
+                        "[review] /signal returned {status} but state={recheck} — peer won; exiting 0"
+                    );
+                    drain_and_stop(tail).await;
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "reject signal delivery failed ({status}): {text}. recheck state={recheck}"
+                );
+            }
+            println!("[review] reject signal delivered: {text}");
+            // The summarize worker re-claims, calls resume_signals(), sees
+            // the Reject payload, and calls fail(). Keep the tail up for
+            // a short drain so any final frames flush, then return.
             drain_and_stop(tail).await;
             return Ok(());
         }
