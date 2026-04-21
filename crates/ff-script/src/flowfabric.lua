@@ -4151,10 +4151,18 @@ redis.register_function('ff_rotate_waitpoint_hmac_secret', function(keys, args)
     return err("invalid_secret_hex")
   end
 
-  -- grace_ms must be a non-negative integer; reject decimals so the
-  -- stored expires_at:* value stays i64-parseable on the Rust side.
+  -- grace_ms must be a finite non-negative integer. The math.floor check
+  -- rejects decimals but NOT infinities (math.floor(math.huge) == math.huge
+  -- which would stamp "inf" into expires_at:*). Cap at 2^53-1 so the
+  -- stored value stays within the IEEE-754 double-precision integer range
+  -- AND within i64, keeping the Rust parser happy. 2^53-1 ms is ~285 years,
+  -- far beyond any operational grace window.
   local grace_ms = tonumber(grace_ms_s)
-  if not grace_ms or grace_ms < 0 or grace_ms ~= math.floor(grace_ms) then
+  if not grace_ms
+      or grace_ms ~= grace_ms -- NaN
+      or grace_ms < 0
+      or grace_ms > 9007199254740991 -- 2^53 - 1
+      or grace_ms ~= math.floor(grace_ms) then
     return err("invalid_grace_ms")
   end
 
@@ -4239,12 +4247,17 @@ end)
 -- ARGV: none
 --
 -- Returns ok(current_kid_or_empty, n, kid1, exp1_ms, kid2, exp2_ms, ...)
--- "verifying" kids = those with an expires_at:<kid> entry (excludes
--- current_kid, which never has one). Uninitialized → ok("", 0).
+-- "verifying" kids = those with a FUTURE expires_at:<kid> entry. Kids
+-- whose grace has already elapsed are NOT reported here — the contract
+-- promises kids that still validate tokens, so listing expired kids
+-- would mislead operators. Expired entries are swept by orphan GC on
+-- the next rotation. current_kid is excluded (it never has an expiry).
+-- Uninitialized → ok("", 0).
 ---------------------------------------------------------------------------
 redis.register_function('ff_list_waitpoint_hmac_kids', function(keys, args)
   local hmac_key = keys[1]
   local raw = redis.call("HGETALL", hmac_key)
+  local now_ms = server_time_ms()
 
   local current_kid = ""
   local pairs_out = {}
@@ -4256,9 +4269,14 @@ redis.register_function('ff_list_waitpoint_hmac_kids', function(keys, args)
       current_kid = value
     elseif field:sub(1, 11) == "expires_at:" then
       local kid = field:sub(12)
-      pairs_out[#pairs_out + 1] = kid
-      pairs_out[#pairs_out + 1] = value
-      n = n + 1
+      local exp = tonumber(value)
+      -- Match validator's `exp < now_ms` rejection rule so a kid listed
+      -- as verifying really does still validate tokens at call time.
+      if exp and exp > 0 and exp >= now_ms then
+        pairs_out[#pairs_out + 1] = kid
+        pairs_out[#pairs_out + 1] = value
+        n = n + 1
+      end
     end
   end
 

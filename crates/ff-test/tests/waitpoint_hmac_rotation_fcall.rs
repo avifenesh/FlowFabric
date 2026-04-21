@@ -249,6 +249,76 @@ async fn orphan_gc_reaps_expired_verifying_kids() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn list_excludes_expired_verifying_kids() {
+    // Contract: ff_list_waitpoint_hmac_kids reports kids that STILL
+    // validate tokens. Expired verifying kids (grace elapsed) are
+    // filtered out even if they haven't been GC'd yet, so operators
+    // aren't misled by stale entries between rotations.
+    let tc = TestCluster::connect().await;
+    let p = partition(TEST_PARTITION_BASE + 8);
+    clear_partition(&tc, &p).await;
+    let idx = IndexKeys::new(&p);
+
+    ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-a", SECRET_A))
+        .await
+        .unwrap();
+    ff_rotate_waitpoint_hmac_secret(tc.client(), &idx, &args("kid-b", SECRET_B))
+        .await
+        .unwrap();
+    // kid-a is now verifying with a future expires_at. Stamp it to
+    // the deep past to simulate "grace elapsed but not yet GC'd".
+    let key = idx.waitpoint_hmac_secrets();
+    let _: i64 = tc
+        .client()
+        .cmd("HSET")
+        .arg(key.as_str())
+        .arg("expires_at:kid-a")
+        .arg("1")
+        .execute()
+        .await
+        .unwrap();
+
+    let listing = ff_list_waitpoint_hmac_kids(tc.client(), &idx, &ListWaitpointHmacKidsArgs {})
+        .await
+        .unwrap();
+    assert_eq!(listing.current_kid.as_deref(), Some("kid-b"));
+    assert!(
+        listing.verifying.is_empty(),
+        "expired kid-a must be filtered out of verifying: {:?}",
+        listing.verifying
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn invalid_grace_ms_rejected() {
+    let tc = TestCluster::connect().await;
+    let p = partition(TEST_PARTITION_BASE + 9);
+    clear_partition(&tc, &p).await;
+    let idx = IndexKeys::new(&p);
+
+    // Decimal, negative, and overflow-past-2^53-1 all rejected.
+    for grace_ms in [u64::MAX, 9_007_199_254_740_992] {
+        let err = ff_rotate_waitpoint_hmac_secret(
+            tc.client(),
+            &idx,
+            &RotateWaitpointHmacSecretArgs {
+                new_kid: "kid-ok".into(),
+                new_secret_hex: SECRET_A.into(),
+                grace_ms,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ScriptError::InvalidGraceMs),
+            "grace_ms={grace_ms} → {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn list_uninitialized_is_empty() {
     let tc = TestCluster::connect().await;
     let p = partition(TEST_PARTITION_BASE + 5);
