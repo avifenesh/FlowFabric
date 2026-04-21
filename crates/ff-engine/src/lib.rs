@@ -115,6 +115,15 @@ pub struct EngineConfig {
     pub flow_projector_interval: Duration,
     /// Execution deadline scanner interval. Default: 5s.
     pub execution_deadline_interval: Duration,
+
+    /// Cancel reconciler scanner interval. Default: 15s.
+    ///
+    /// Drains `ff_cancel_flow`'s per-partition `cancel_backlog` ZSET of
+    /// flows owing async member cancels. Each cancelled flow gets a
+    /// grace window (30s by default, set by ff-server) before the
+    /// reconciler picks it up, so the live in-process dispatch isn't
+    /// fought on the happy path.
+    pub cancel_reconciler_interval: Duration,
 }
 
 impl Default for EngineConfig {
@@ -137,6 +146,7 @@ impl Default for EngineConfig {
             completion_listener: None,
             flow_projector_interval: Duration::from_secs(15),
             execution_deadline_interval: Duration::from_secs(5),
+            cancel_reconciler_interval: Duration::from_secs(15),
         }
     }
 }
@@ -309,6 +319,20 @@ impl Engine {
             shutdown_rx.clone(),
         ));
 
+        // Cancel reconciler (iterates flow partitions). Drains
+        // cancel_backlog entries whose grace window has elapsed so a
+        // process crash mid-dispatch can't leave flow members un-cancelled.
+        let cancel_reconciler = Arc::new(scanner::cancel_reconciler::CancelReconciler::new(
+            config.cancel_reconciler_interval,
+            config.partition_config,
+        ));
+        handles.push(supervised_spawn(
+            cancel_reconciler,
+            client.clone(),
+            config.partition_config.num_flow_partitions,
+            shutdown_rx.clone(),
+        ));
+
         // Execution deadline scanner (iterates execution partitions)
         let deadline_scanner = Arc::new(ExecutionDeadlineScanner::new(
             config.execution_deadline_interval,
@@ -338,7 +362,7 @@ impl Engine {
             ));
         }
 
-        let scanner_count = if listener_enabled { "14 scanners + completion listener" } else { "14 scanners" };
+        let scanner_count = if listener_enabled { "15 scanners + completion listener" } else { "15 scanners" };
         tracing::info!(
             num_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,

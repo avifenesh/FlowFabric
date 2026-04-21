@@ -10,6 +10,7 @@ pub mod budget_reconciler;
 pub mod execution_deadline;
 pub mod budget_reset;
 pub mod delayed_promoter;
+pub mod cancel_reconciler;
 pub mod dependency_reconciler;
 pub mod flow_projector;
 pub mod index_reconciler;

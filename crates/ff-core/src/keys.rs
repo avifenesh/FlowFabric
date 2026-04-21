@@ -373,6 +373,16 @@ impl FlowKeyContext {
         format!("ff:flow:{}:{}:grant:{}", self.tag, self.fid, mutation_id)
     }
 
+    /// `ff:flow:{fp:N}:<flow_id>:pending_cancels` — SET of execution IDs
+    /// whose cancel is still owed after a `cancel_all` cancel_flow. The
+    /// live async dispatch SREMs entries as it succeeds; the cancel
+    /// reconciler scanner drains the remainder on its interval so a
+    /// process crash mid-dispatch or a member whose cancel hit a
+    /// permanent error can't leave a flow member un-cancelled.
+    pub fn pending_cancels(&self) -> String {
+        format!("ff:flow:{}:{}:pending_cancels", self.tag, self.fid)
+    }
+
     pub fn hash_tag(&self) -> &str {
         &self.tag
     }
@@ -394,6 +404,17 @@ impl FlowIndexKeys {
     /// Used by the flow projector for cluster-safe discovery (replaces SCAN).
     pub fn flow_index(&self) -> String {
         format!("ff:idx:{}:flow_index", self.tag)
+    }
+
+    /// `ff:idx:{fp:N}:cancel_backlog` — ZSET of flow IDs whose async
+    /// cancel dispatch is still owed members. Score = grace-window expiry
+    /// (unix ms). The cancel reconciler scanner ZRANGEBYSCOREs entries
+    /// whose score <= now, drains their `pending_cancels` set, and ZREMs
+    /// when empty. Live dispatch runs without waiting on this score, so
+    /// the grace window just keeps the reconciler from fighting the
+    /// happy path.
+    pub fn cancel_backlog(&self) -> String {
+        format!("ff:idx:{}:cancel_backlog", self.tag)
     }
 }
 

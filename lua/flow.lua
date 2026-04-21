@@ -248,10 +248,12 @@ end)
 ---------------------------------------------------------------------------
 redis.register_function('ff_cancel_flow', function(keys, args)
   local K = {
-    flow_core   = keys[1],
-    members_set = keys[2],
+    flow_core         = keys[1],
+    members_set       = keys[2],
     -- keys[3] is flow_index; present in KEYS for wrapper symmetry but
     -- unused in this function (see rationale near the end of the body).
+    pending_cancels   = keys[4],  -- SET populated only on first terminalization
+    cancel_backlog    = keys[5],  -- per-fp ZSET tracking flows owing members
   }
 
   local A = {
@@ -259,6 +261,7 @@ redis.register_function('ff_cancel_flow', function(keys, args)
     reason               = args[2],
     cancellation_policy  = args[3],
     -- args[4] is client-provided now_ms; intentionally ignored.
+    grace_ms             = tonumber(args[5]) or 30000,
   }
 
   local now_ms = server_time_ms()
@@ -305,7 +308,40 @@ redis.register_function('ff_cancel_flow', function(keys, args)
   -- terminal state. Removing the entry here would freeze the summary
   -- at whatever snapshot was current when cancel_flow fired.
 
-  -- 5. Return: ok(cancellation_policy, member1, member2, ...)
+  -- 5. Durable backlog for async member-cancel dispatch.
+  --
+  -- Only cancel_all policy dispatches per-member cancels; other policies
+  -- mark the flow terminal and leave members to the flow_projector /
+  -- retention. Skip the backlog writes outside cancel_all.
+  --
+  -- If a process crashes between `CancellationScheduled` returning and
+  -- the in-process dispatch finishing, OR if one member's cancel hits a
+  -- permanent error that the bounded retry can't recover, the member
+  -- would otherwise escape cancellation. Tracking the owed members in
+  -- a persistent SET + partition-level ZSET lets the cancel_reconciler
+  -- scanner drain the remainder on its interval.
+  --
+  -- Score = now + grace_ms so the reconciler doesn't race the live
+  -- dispatch that's about to start — live dispatch SREMs as it
+  -- succeeds; reconciler only picks up flows whose grace has elapsed.
+  if A.cancellation_policy == "cancel_all" and #members > 0 then
+    -- SADD chunked: Lua's unpack() arg limit is ~8000 on some builds
+    -- and some Valkey deployments enforce max-args lower. Chunk at
+    -- 1000 to stay well under both without a noticeable cost.
+    local i = 1
+    while i <= #members do
+      local chunk_end = math.min(i + 999, #members)
+      local sadd_args = {}
+      for j = i, chunk_end do
+        sadd_args[#sadd_args + 1] = members[j]
+      end
+      redis.call("SADD", K.pending_cancels, unpack(sadd_args))
+      i = chunk_end + 1
+    end
+    redis.call("ZADD", K.cancel_backlog, now_ms + A.grace_ms, A.flow_id)
+  end
+
+  -- 6. Return: ok(cancellation_policy, member1, member2, ...)
   -- Build array manually to include variable member list.
   local result = {1, "OK", A.cancellation_policy}
   for _, eid in ipairs(members) do
@@ -313,6 +349,32 @@ redis.register_function('ff_cancel_flow', function(keys, args)
   end
 
   return result
+end)
+
+---------------------------------------------------------------------------
+-- ff_ack_cancel_member  (on {fp:N})
+--
+-- Record that one flow member's cancel has been committed. Called by
+-- the live dispatch after each successful cancel_member_execution AND
+-- by the cancel_reconciler scanner after it catches up on crash-
+-- orphaned members. Atomically SREMs from pending_cancels and ZREMs
+-- the flow from the partition backlog when the set is empty.
+--
+-- KEYS (2): pending_cancels, cancel_backlog
+-- ARGV (2): eid, flow_id
+---------------------------------------------------------------------------
+redis.register_function('ff_ack_cancel_member', function(keys, args)
+  local pending = keys[1]
+  local backlog = keys[2]
+  local eid     = args[1]
+  local flow_id = args[2]
+
+  redis.call("SREM", pending, eid)
+  if redis.call("EXISTS", pending) == 0 then
+    redis.call("ZREM", backlog, flow_id)
+  end
+
+  return ok()
 end)
 
 ---------------------------------------------------------------------------
