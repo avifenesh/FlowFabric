@@ -1717,3 +1717,52 @@ redis.register_function('ff_expire_execution', function(keys, args)
 
   return ok("expired", core.lifecycle_phase)
 end)
+
+---------------------------------------------------------------------------
+-- ff_set_execution_tags  (issue #58.4)
+--
+-- Write caller-supplied tag fields to the execution's separate tags key
+-- (`ff:exec:{fp:N}:<eid>:tags`). Tag keys MUST match the reserved
+-- namespace pattern `^[a-z][a-z0-9_]*%.` — i.e. `<caller>.<field>` — so
+-- callers get `$caller.*` for metadata and FF reserves dot-free
+-- snake_case for its own fields. Keys failing validation fail-closed
+-- with `invalid_tag_key` + the offending key; no writes happen.
+--
+-- Atomically HSETs all validated pairs in one call, then bumps
+-- `last_mutation_at` on `exec_core` so observers see the mutation.
+--
+-- KEYS (2): exec_core, tags_key
+-- ARGV (>=2, even): k1, v1, k2, v2, ...
+---------------------------------------------------------------------------
+redis.register_function('ff_set_execution_tags', function(keys, args)
+  local K = {
+    core_key = keys[1],
+    tags_key = keys[2],
+  }
+
+  local n = #args
+  if n == 0 or (n % 2) ~= 0 then
+    return err("invalid_input", "tags must be non-empty even-length key/value pairs")
+  end
+
+  if redis.call("EXISTS", K.core_key) == 0 then
+    return err("execution_not_found")
+  end
+
+  -- Require `<caller>.<field>` with at least one non-dot char after the
+  -- first dot, so `cairn.` and `cairn..x` are rejected. The suffix may
+  -- contain further dots (`app.sub.field` is legal).
+  for i = 1, n, 2 do
+    local k = args[i]
+    if type(k) ~= "string" or not string.find(k, "^[a-z][a-z0-9_]*%.[^.]") then
+      return err("invalid_tag_key", tostring(k))
+    end
+  end
+
+  redis.call("HSET", K.tags_key, unpack(args))
+
+  local now_ms = server_time_ms()
+  redis.call("HSET", K.core_key, "last_mutation_at", tostring(now_ms))
+
+  return ok(tostring(n / 2))
+end)

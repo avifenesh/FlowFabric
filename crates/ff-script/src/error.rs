@@ -409,6 +409,14 @@ pub enum ScriptError {
     #[error("rotation_conflict: kid {0} already installed with a different secret")]
     RotationConflict(String),
 
+    /// `ff_set_execution_tags` / `ff_set_flow_tags` received a tag key
+    /// that does not match the reserved namespace `^[a-z][a-z0-9_]*\.`.
+    /// Callers must prefix tag keys with `<caller>.` (e.g.
+    /// `cairn.task_id`). TERMINAL: caller must fix input before retry.
+    /// Payload is the offending key for precise diagnostics.
+    #[error("invalid_tag_key: {0}")]
+    InvalidTagKey(String),
+
     // ── Transport-level errors (not from Lua) ──
     /// Valkey connection or protocol error. Preserves `ferriskey::ErrorKind` so
     /// callers can distinguish transient/permanent/NOSCRIPT/MOVED/etc.
@@ -482,6 +490,7 @@ impl ScriptError {
             | Self::InvalidSecretHex
             | Self::InvalidGraceMs
             | Self::RotationConflict(_)
+            | Self::InvalidTagKey(_)
             | Self::Parse(_) => ErrorClass::Terminal,
 
             // Transport errors classify by their ferriskey ErrorKind —
@@ -642,6 +651,7 @@ impl ScriptError {
             "invalid_secret_hex" => Self::InvalidSecretHex,
             "invalid_grace_ms" => Self::InvalidGraceMs,
             "rotation_conflict" => Self::RotationConflict(String::new()),
+            "invalid_tag_key" => Self::InvalidTagKey(String::new()),
             _ => return None,
         })
     }
@@ -671,6 +681,7 @@ impl ScriptError {
             Self::InvalidPolicyJson(_) => Self::InvalidPolicyJson(d(0)),
             Self::InvalidInput(_) => Self::InvalidInput(d(0)),
             Self::RotationConflict(_) => Self::RotationConflict(d(0)),
+            Self::InvalidTagKey(_) => Self::InvalidTagKey(d(0)),
             Self::ExecutionNotActive { .. } => Self::ExecutionNotActive {
                 terminal_outcome: d(0),
                 lease_epoch: d(1),

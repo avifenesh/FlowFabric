@@ -1049,3 +1049,80 @@ redis.register_function('ff_replay_execution', function(keys, args)
     return ok("0")
   end
 end)
+
+---------------------------------------------------------------------------
+-- ff_set_flow_tags  (issue #58.4)
+--
+-- Write caller-supplied tag fields to the flow's separate tags key
+-- (`ff:flow:{fp:N}:<flow_id>:tags`). Mirrors `ff_set_execution_tags`.
+--
+-- Lazy migration (Option 1(a)): BEFORE writing, any existing fields on
+-- `flow_core` whose name matches the reserved namespace
+-- `^[a-z][a-z0-9_]*%.` are moved to `tags_key` and HDEL'd from
+-- `flow_core`. Heals pre-58.4 flows that stored `<caller>.<field>` tags
+-- inline on `flow_core`. Idempotent: after first call, no fields match.
+--
+-- Tag keys MUST match `^[a-z][a-z0-9_]*%.`; violations fail-closed with
+-- `invalid_tag_key` (no migration, no write).
+--
+-- KEYS (2): flow_core, tags_key
+-- ARGV (>=2, even): k1, v1, k2, v2, ...
+---------------------------------------------------------------------------
+redis.register_function('ff_set_flow_tags', function(keys, args)
+  local K = {
+    flow_core = keys[1],
+    tags_key  = keys[2],
+  }
+
+  local n = #args
+  if n == 0 or (n % 2) ~= 0 then
+    return err("invalid_input", "tags must be non-empty even-length key/value pairs")
+  end
+
+  if redis.call("EXISTS", K.flow_core) == 0 then
+    return err("flow_not_found")
+  end
+
+  -- Require `<caller>.<field>` with at least one non-dot char after the
+  -- first dot (same rule as `ff_set_execution_tags`). Suffix may contain
+  -- further dots.
+  for i = 1, n, 2 do
+    local k = args[i]
+    if type(k) ~= "string" or not string.find(k, "^[a-z][a-z0-9_]*%.[^.]") then
+      return err("invalid_tag_key", tostring(k))
+    end
+  end
+
+  -- Lazy migration: only HGETALL the core hash once per flow. A sentinel
+  -- `tags_migrated=1` field on `flow_core` short-circuits subsequent
+  -- calls so tag writes on well-formed flows stay O(1) instead of paying
+  -- an O(n) scan of every flow_core field. The sentinel itself is
+  -- dot-free snake_case — it matches FF's own-field rule, not the
+  -- reserved caller namespace, so it can't be confused with a tag.
+  local migrated = redis.call("HGET", K.flow_core, "tags_migrated")
+  if migrated ~= "1" then
+    local flat = redis.call("HGETALL", K.flow_core)
+    local to_migrate = {}
+    local to_delete = {}
+    for i = 1, #flat, 2 do
+      local fname = flat[i]
+      if type(fname) == "string" and string.find(fname, "^[a-z][a-z0-9_]*%.[^.]") then
+        to_migrate[#to_migrate + 1] = fname
+        to_migrate[#to_migrate + 1] = flat[i + 1]
+        to_delete[#to_delete + 1] = fname
+      end
+    end
+    if #to_migrate > 0 then
+      redis.call("HSET", K.tags_key, unpack(to_migrate))
+      redis.call("HDEL", K.flow_core, unpack(to_delete))
+    end
+    redis.call("HSET", K.flow_core, "tags_migrated", "1")
+  end
+
+  redis.call("HSET", K.tags_key, unpack(args))
+
+  local now_ms = server_time_ms()
+  redis.call("HSET", K.flow_core, "last_mutation_at", tostring(now_ms))
+
+  return ok(tostring(n / 2))
+end)
