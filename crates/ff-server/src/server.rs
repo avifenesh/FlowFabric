@@ -1546,6 +1546,14 @@ impl Server {
 
         if wait {
             // Synchronous dispatch — cancel every member inline before returning.
+            // Collect per-member failures so the caller sees a
+            // PartiallyCancelled outcome instead of a false-positive
+            // Cancelled when any member cancel faulted (ghost member,
+            // transport exhaustion, Lua reject). The cancel-backlog
+            // reconciler still retries the unacked members; surfacing
+            // the partial state lets operator tooling alert without
+            // polling per-member state.
+            let mut failed: Vec<String> = Vec::new();
             for eid_str in &members {
                 match cancel_member_execution(
                     &self.client,
@@ -1573,12 +1581,20 @@ impl Server {
                             "cancel_flow(wait): individual execution cancel failed \
                              (may be terminal; reconciler will retry if transient)"
                         );
+                        failed.push(eid_str.clone());
                     }
                 }
             }
-            return Ok(CancelFlowResult::Cancelled {
+            if failed.is_empty() {
+                return Ok(CancelFlowResult::Cancelled {
+                    cancellation_policy: policy,
+                    member_execution_ids: members,
+                });
+            }
+            return Ok(CancelFlowResult::PartiallyCancelled {
                 cancellation_policy: policy,
                 member_execution_ids: members,
+                failed_member_execution_ids: failed,
             });
         }
 

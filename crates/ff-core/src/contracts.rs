@@ -1240,6 +1240,29 @@ pub enum CancelFlowResult {
         member_count: u32,
         member_execution_ids: Vec<String>,
     },
+    /// `?wait=true` dispatch completed but one or more member cancellations
+    /// failed mid-loop (e.g. ghost member, Lua error, transport fault after
+    /// retries exhausted). The flow itself is still flipped to cancelled
+    /// (atomic Lua already ran); callers SHOULD inspect
+    /// `failed_member_execution_ids` and either retry those ids directly
+    /// via `cancel_execution` or wait for the cancel-backlog reconciler
+    /// to retry them in the background.
+    ///
+    /// Only emitted by the synchronous wait path
+    /// ([`crate::CancelFlowArgs`] via `?wait=true`). The async path returns
+    /// [`CancelFlowResult::CancellationScheduled`] and delegates retries
+    /// to the reconciler — there is no visible "partial" state on the
+    /// async path because the dispatch result is not observed inline.
+    PartiallyCancelled {
+        cancellation_policy: String,
+        /// All member execution ids that the cancel_flow FCALL returned
+        /// (i.e. the full membership at the moment of cancellation).
+        member_execution_ids: Vec<String>,
+        /// Strict subset of `member_execution_ids` whose per-member cancel
+        /// FCALL returned an error. Order is deterministic (matches the
+        /// iteration order over `member_execution_ids`).
+        failed_member_execution_ids: Vec<String>,
+    },
 }
 
 // ─── stage_dependency_edge ───
