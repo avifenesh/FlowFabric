@@ -85,10 +85,12 @@ impl ValkeyBackend {
     ///
     /// **Stage 1a scope:** this constructor exists so ff-sdk's new
     /// `FlowFabricWorker::connect_with(backend)` path has something
-    /// to hand in. The Valkey dial currently delegates to ferriskey
-    /// with host/port from [`BackendConnection::Valkey`]; TLS and
-    /// cluster flags flow through unchanged. Full
-    /// `BackendTimeouts`/`BackendRetry` wiring is a Stage 1c task.
+    /// to hand in. The Valkey dial delegates to ferriskey's
+    /// [`ClientBuilder`] so host/port, TLS, and cluster flags flow
+    /// through, and [`BackendTimeouts::request`] maps to
+    /// `ClientBuilder::request_timeout` when set (`None` ⇒
+    /// ferriskey's default). Other `BackendTimeouts` /
+    /// `BackendRetry` fields remain Stage 1c work.
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
         // `BackendConnection` is `#[non_exhaustive]` for future
         // backends; the compiler treats the pattern as refutable,
@@ -101,24 +103,28 @@ impl ValkeyBackend {
                 op: "ValkeyBackend::connect (non-Valkey BackendConnection)",
             });
         };
-        let url = if v.tls {
-            format!("valkeys://{}:{}", v.host, v.port)
-        } else {
-            format!("valkey://{}:{}", v.host, v.port)
-        };
-        // Honour `v.cluster`. `Client::connect` dials standalone;
-        // `Client::connect_cluster` discovers the cluster topology
-        // and routes by slot — required for any non-default
-        // partition deployment the server has published.
-        let client = if v.cluster {
-            ferriskey::Client::connect_cluster(&[url.as_str()])
-                .await
-                .map_err(|e| transport_script(ScriptError::Valkey(e)))?
-        } else {
-            ferriskey::Client::connect(&url)
-                .await
-                .map_err(|e| transport_script(ScriptError::Valkey(e)))?
-        };
+        // Build via ferriskey's `ClientBuilder` so `BackendTimeouts`
+        // / `BackendRetry` fields have a single wiring point. For
+        // standalone (`v.cluster = false`) the builder dials one
+        // node; calling `.cluster()` switches the builder to
+        // topology-discovery mode (equivalent to the legacy
+        // `Client::connect_cluster`). `request_timeout` is applied
+        // only when the caller set it — `None` leaves ferriskey's
+        // default in place.
+        let mut builder = ferriskey::ClientBuilder::new().host(&v.host, v.port);
+        if v.tls {
+            builder = builder.tls();
+        }
+        if v.cluster {
+            builder = builder.cluster();
+        }
+        if let Some(request_timeout) = config.timeouts.request {
+            builder = builder.request_timeout(request_timeout);
+        }
+        let client = builder
+            .build()
+            .await
+            .map_err(|e| transport_script(ScriptError::Valkey(e)))?;
         // Load the deployment's partition config from
         // `ff:config:partitions` so `flow_partition` / key routing
         // aligns with what ff-server published. Using
@@ -1285,5 +1291,39 @@ mod tests {
     #[allow(dead_code)]
     fn _dyn_compatible(b: Arc<ValkeyBackend>) -> Arc<dyn EngineBackend> {
         b
+    }
+
+    // ── timeouts.request wiring ─────────────────────────────────
+    //
+    // Exercises the `BackendTimeouts.request` →
+    // `ClientBuilder::request_timeout` wiring in
+    // `ValkeyBackend::connect`. Requires a live Valkey at
+    // localhost:6379, so `#[ignore]`-gated:
+    //   cargo test -p ff-backend-valkey --lib -- --ignored
+    //
+    // The `Some(d)` → `builder.request_timeout(d)` branch is a
+    // single-line pass-through; ferriskey owns the "honoured on the
+    // wire" contract (its own tests cover that). This test's job is
+    // to prove both the `None` (builder-default) and `Some` arms of
+    // `connect` still complete end-to-end against a real server
+    // rather than hanging or rejecting a valid timeout.
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn connect_honours_backend_timeouts_request() {
+        // `None` request timeout ⇒ ferriskey default.
+        let default_cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        let _ = ValkeyBackend::connect(default_cfg)
+            .await
+            .expect("connect with default timeouts");
+
+        // `Some(d)` request timeout ⇒ threaded through the builder.
+        // 5s is comfortably above ferriskey's internal connect
+        // handshake so the build itself can't trip the timeout.
+        let mut tight_cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        tight_cfg.timeouts.request = Some(Duration::from_secs(5));
+        let _ = ValkeyBackend::connect(tight_cfg)
+            .await
+            .expect("connect with explicit request_timeout");
     }
 }
