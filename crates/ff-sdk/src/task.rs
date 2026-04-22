@@ -2234,14 +2234,16 @@ fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
         return Err(SdkError::Config {
             context: "read_stream_frames".into(),
             field: Some("count_limit".into()),
-            message: "must be >= 1".into(),
+            message: "count_limit must be >= 1".into(),
         });
     }
     if count_limit > STREAM_READ_HARD_CAP {
         return Err(SdkError::Config {
             context: "read_stream_frames".into(),
             field: Some("count_limit".into()),
-            message: format!("exceeds STREAM_READ_HARD_CAP ({STREAM_READ_HARD_CAP})"),
+            message: format!(
+                "count_limit exceeds STREAM_READ_HARD_CAP ({STREAM_READ_HARD_CAP})"
+            ),
         });
     }
     Ok(())
