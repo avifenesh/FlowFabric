@@ -53,7 +53,13 @@ async fn main() {
     };
 
     let server = Arc::new(server);
-    let app = api::router(server.clone(), &cors_origins, api_token);
+    let app = match api::router(server.clone(), &cors_origins, api_token) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build HTTP router");
+            std::process::exit(1);
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
