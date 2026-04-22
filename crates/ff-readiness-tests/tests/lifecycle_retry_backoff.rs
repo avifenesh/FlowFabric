@@ -39,9 +39,12 @@ const TEST_NAME: &str = "lifecycle_retry_backoff";
 const LANE: &str = "readiness-retry";
 const NS: &str = "readiness-retry-ns";
 
-/// Backoff floor the test pins. Large enough to dominate the 750ms
-/// engine delayed-promoter interval without making the test slow.
-const BACKOFF_FLOOR_MS: u64 = 500;
+/// Backoff floor the test pins. It must be larger than the default
+/// 750ms engine delayed-promoter interval; otherwise an observed
+/// re-claim delay could satisfy the assertion even if the configured
+/// backoff floor were ignored. Keep this comfortably above 750ms so
+/// the floor is the dominant term despite promoter-tick quantization.
+const BACKOFF_FLOOR_MS: u64 = 1500;
 
 /// Max retries — must be >= 1 for attempt 1 to be scheduled. The
 /// RED-proof flips this to 0.
@@ -164,8 +167,9 @@ async fn lifecycle_retry_backoff() {
     assert_eq!(task0.execution_id(), &eid);
 
     // 8. Emit one frame so attempt 0's stream is observable on the
-    //    post-terminal read below (the complete/fail path writes the
-    //    closed-frame, but appending here proves the progress path too).
+    //    post-terminal read below. The fail path closes `stream_meta`
+    //    but does not append a terminal stream frame, so this explicit
+    //    append is what makes the stream non-empty.
     let _ = task0
         .append_frame(
             "progress",
@@ -175,12 +179,15 @@ async fn lifecycle_retry_backoff() {
         .await
         .expect("append_frame attempt 0");
 
-    // 9. Fail with a retryable category → RetryScheduled.
-    let t_fail = Instant::now();
+    // 9. Fail with a retryable category → RetryScheduled. The timer
+    //    starts AFTER `fail` returns so fail-RPC/FCALL latency doesn't
+    //    get credited to the backoff budget — the assertion measures
+    //    only the post-fail scheduled delay.
     let outcome = task0
         .fail("injected", "transient")
         .await
         .expect("task0.fail");
+    let t_fail = Instant::now();
     assert!(
         matches!(outcome, ff_sdk::FailOutcome::RetryScheduled { .. }),
         "max_retries={MAX_RETRIES} + retryable category should schedule retry, got {outcome:?}"
@@ -289,7 +296,7 @@ async fn lifecycle_retry_backoff() {
     );
     assert!(
         stream_1_len >= 1,
-        "attempt 1 stream should carry the complete/closed frame, got {stream_1_len}"
+        "attempt 1 stream should contain at least the appended progress frame, got {stream_1_len}"
     );
 
     // 15. Evidence JSON.
