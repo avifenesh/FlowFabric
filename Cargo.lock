@@ -865,6 +865,7 @@ dependencies = [
  "ff-sdk",
  "ff-server",
  "ff-test",
+ "regex",
  "reqwest",
  "serde_json",
  "serial_test",

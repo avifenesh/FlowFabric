@@ -40,3 +40,8 @@ axum = { workspace = true }
 # `serial_test` is only used by `tests/*.rs` (readiness integration
 # tests) — keep it off the library dependency surface per reviewer.
 serial_test = "3"
+# `regex` is used by `tests/readme_literal.rs` to extract the env var
+# name + hex length from README.md and the SDK feature name from the
+# toml fence. Already a transitive dep via the workspace graph, so no
+# new build cost.
+regex = "1"
