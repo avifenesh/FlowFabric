@@ -9,6 +9,14 @@ Each cluster of files represents one exploration. Conventions:
 
 ## Index
 
+### RFC-012 #117 deferrals amendment (explored 2026-04-22, promoted as Round-7)
+
+Tracks issue [#117](https://github.com/avifenesh/FlowFabric/issues/117) (Stage 1b deferrals — three `ClaimedTask` methods that couldn't land as thin forwarders).
+
+- `RFC-012-amendment-117-deferrals.{K,L,M}-challenge.md` — three adversarial review rounds (Worker K round-1, Worker L round-2, Worker M round-3).
+
+**Outcome:** draft v4 promoted to `rfcs/RFC-012-engine-backend-trait.md` §R7 as the Round-7 amendment. The draft body was folded into the RFC; the three challenger reports are preserved here as the exploration-and-reasoning record. The amendment ships `create_waitpoint` (new method), `append_frame` (return widen), `report_usage` (return replace); `suspend` is deferred wholesale to Stage 1d.
+
 ### RFC-012 namespace amendment (explored 2026-04-22, not pursued)
 
 Tracks issue [#122](https://github.com/avifenesh/FlowFabric/issues/122) (cairn's multi-tenant isolation ask).
