@@ -838,6 +838,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-script",
+ "tracing",
 ]
 
 [[package]]
@@ -912,6 +913,7 @@ name = "ff-sdk"
 version = "0.3.0"
 dependencies = [
  "ferriskey",
+ "ff-backend-valkey",
  "ff-core",
  "ff-script",
  "reqwest",

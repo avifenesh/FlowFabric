@@ -14,6 +14,15 @@
 //! The `EngineBackend` trait stays object-safe; consumers can hold
 //! `Arc<dyn EngineBackend>`.
 
+// `EngineError` is ~200 bytes; the `EngineBackend` trait's method
+// signatures return `Result<_, EngineError>` throughout (that is the
+// public contract). Allow the lint crate-wide so intra-crate helpers
+// that mirror the trait's return shape don't need a per-fn allow.
+// A future PR can box `EngineError::Transport.source` / the larger
+// variants to shrink the `Err` side globally; that is a cross-crate
+// design change out of scope for Stage 1b.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,17 +31,23 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AdmissionDecision, BackendConfig, BackendConnection, CancelFlowPolicy, CancelFlowWait,
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle,
-    LeaseRenewal, ReclaimToken, ResumeSignal, UsageDimensions, WaitpointSpec,
+    HandleKind, LeaseRenewal, ReclaimToken, ResumeSignal, UsageDimensions, WaitpointSpec,
 };
 use ff_core::contracts::{CancelFlowArgs, CancelFlowResult, ExecutionSnapshot, FlowSnapshot};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
-use ff_core::keys::{FlowIndexKeys, FlowKeyContext};
-use ff_core::partition::{flow_partition, PartitionConfig};
-use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
+use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
+use ff_core::partition::{execution_partition, flow_partition, PartitionConfig};
+use ff_core::types::{
+    AttemptId, AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
+    SignalId, TimestampMs, WaitpointId, WorkerInstanceId,
+};
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
 use ff_script::functions::flow::{ff_cancel_flow, FlowStructOpKeys};
+use ff_script::result::FcallResult;
+
+mod handle_codec;
 
 /// Valkey-FCALL–backed `EngineBackend`.
 ///
@@ -132,6 +147,62 @@ impl ValkeyBackend {
     /// trait rather than reach in here.
     pub fn client(&self) -> &ferriskey::Client {
         &self.client
+    }
+
+    /// Wrap an already-dialed `ferriskey::Client` + known
+    /// `PartitionConfig` into a `ValkeyBackend`. Used by ff-sdk's
+    /// legacy `FlowFabricWorker::connect` path (RFC-012 Stage 1b) to
+    /// synthesise a backend around the client it dialed itself,
+    /// rather than re-dialing through
+    /// [`ValkeyBackend::connect`]. Keeps the Stage 1b migration a
+    /// pure refactor — no new round-trips, no second Valkey
+    /// connection.
+    pub fn from_client_and_partitions(
+        client: ferriskey::Client,
+        partition_config: PartitionConfig,
+    ) -> Arc<dyn EngineBackend> {
+        Arc::new(Self {
+            client,
+            partition_config,
+        })
+    }
+
+    /// Encode the minimum set of attempt-cookie fields into a
+    /// Valkey-tagged [`Handle`]. Stage 1b's `ClaimedTask::synth_handle`
+    /// calls this on every trait-forwarder entry; Stage 1d will move
+    /// the encode onto the claim path itself (so `ClaimedTask` caches
+    /// one `Handle` rather than synthesising per op).
+    ///
+    /// `kind` is `HandleKind::Fresh` on `claim_next` /
+    /// `claim_from_grant` and `HandleKind::Resumed` on
+    /// `claim_from_reclaim_grant`. The Lua side does not inspect the
+    /// kind today; it is carried on the `Handle` so trait methods
+    /// that want to match on lifecycle state (`suspend` returns a
+    /// `HandleKind::Suspended`) can do so additively without a
+    /// second-dimension lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_handle(
+        execution_id: ExecutionId,
+        attempt_index: AttemptIndex,
+        attempt_id: AttemptId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        lease_ttl_ms: u64,
+        lane_id: LaneId,
+        worker_instance_id: WorkerInstanceId,
+        kind: HandleKind,
+    ) -> Handle {
+        let fields = handle_codec::HandleFields {
+            execution_id,
+            attempt_index,
+            attempt_id,
+            lease_id,
+            lease_epoch,
+            lease_ttl_ms,
+            lane_id,
+            worker_instance_id,
+        };
+        handle_codec::encode_handle(&fields, kind)
     }
 }
 
@@ -255,6 +326,289 @@ fn now_ms_timestamp() -> TimestampMs {
     TimestampMs::from_millis(now)
 }
 
+/// Map a ferriskey transport error into an `EngineError::Transport` with
+/// the Valkey backend tag + a `ScriptError::Valkey` payload (so
+/// `valkey_kind()` downcasts still recover the `ErrorKind`). Used by
+/// every Stage 1b forwarder that bypasses the typed `ff_function!`
+/// wrappers in favour of direct `client.fcall(...)` to preserve
+/// byte-for-byte KEYS/ARGV parity with the SDK's pre-migration code.
+fn transport_fk(e: ferriskey::Error) -> EngineError {
+    transport_script(ScriptError::Valkey(e))
+}
+
+/// Parse a raw `{1, "OK", ...}` / `{0, "error", ...}` FCALL result into
+/// `EngineError` on the error path. The success path's field vector is
+/// discarded; callers that need fields fall through to
+/// `parse_success_fields` below.
+fn parse_success_only(raw: &ferriskey::Value) -> Result<(), EngineError> {
+    let _ = FcallResult::parse(raw)
+        .map_err(EngineError::from)?
+        .into_success()
+        .map_err(EngineError::from)?;
+    Ok(())
+}
+
+/// Stage 1b — `renew` FCALL body. Migrated from
+/// `ff_sdk::task::renew_lease_inner` with byte-for-byte KEYS/ARGV
+/// parity (lease_history_grace_ms = 5000, 4 KEYS, 7 ARGV). The
+/// `LeaseRenewal` return is synthesised from the Lua reply's
+/// `expires_at`; `lease_epoch` is threaded from the caller's handle
+/// (Lua's `ff_renew_lease` does not bump epoch, so the handle's value
+/// is still authoritative).
+async fn renew_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+) -> Result<LeaseRenewal, EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lease_expiry(),
+    ];
+
+    // `lease_history_grace_ms = 5000` preserved from the pre-Stage-1b
+    // SDK body (ff_sdk::task::renew_lease_inner). Diverges from the
+    // `RenewLeaseArgs::lease_history_grace_ms` serde default (60_000) —
+    // the SDK's 5_000 is load-bearing for cleanup timing and must not
+    // change under this refactor.
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.attempt_index.to_string(),
+        f.attempt_id.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        f.lease_ttl_ms.to_string(),
+        "5000".to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_renew_lease", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    let parsed = FcallResult::parse(&raw)
+        .map_err(EngineError::from)?
+        .into_success()
+        .map_err(EngineError::from)?;
+    // Lua returns: ok(new_expires_at_string). Surface parse failure
+    // as `Transport` (wraps `ScriptError::Parse`) so callers' existing
+    // error-handling paths (which already branch on transport +
+    // ScriptError::Parse downcast) continue to fire.
+    let expires_ms: i64 = parsed.field_str(0).parse().map_err(|_| {
+        EngineError::from(ScriptError::Parse {
+            fcall: "ff_renew_lease".into(),
+            execution_id: None,
+            message: format!("invalid expires_at: {}", parsed.field_str(0)),
+        })
+    })?;
+    Ok(LeaseRenewal::new(expires_ms.max(0) as u64, f.lease_epoch.0))
+}
+
+/// Stage 1b — `progress` FCALL body. Migrated from
+/// `ff_sdk::task::ClaimedTask::update_progress`. 1 KEY, 5 ARGV.
+async fn progress_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    percent: Option<u8>,
+    message: Option<&str>,
+) -> Result<(), EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+
+    let keys: Vec<String> = vec![ctx.core()];
+    // Pre-migration SDK always sent a pct byte and a message string.
+    // Preserve that wire by defaulting `None` to empty / 0 so the Lua
+    // function sees the exact same ARGV shape.
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        percent.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string()),
+        message.unwrap_or("").to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_update_progress", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    parse_success_only(&raw)
+}
+
+/// Stage 1b — `observe_signals` body. Migrated from
+/// `ff_sdk::task::ClaimedTask::resume_signals`. Reads
+/// `suspension:current`, filters by `attempt_index`, pulls matched
+/// `signal_id`s via `HMGET`, then pipelines per-signal
+/// `HGETALL signal_hash` + `GET signal_payload`.
+async fn observe_signals_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+) -> Result<Vec<ResumeSignal>, EngineError> {
+    use std::collections::HashMap;
+
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+
+    let susp: HashMap<String, String> = client
+        .hgetall(&ctx.suspension_current())
+        .await
+        .map_err(transport_fk)?;
+
+    let Some(waitpoint_id) = resume_waitpoint_id_from_suspension(&susp, f.attempt_index)?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let wp_cond_key = ctx.waitpoint_condition(&waitpoint_id);
+    let total_str: Option<String> = client
+        .hget(&wp_cond_key, "total_matchers")
+        .await
+        .map_err(transport_fk)?;
+    let total: usize = total_str
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut signal_ids: Vec<SignalId> = Vec::new();
+    for i in 0..total {
+        let fields: Vec<Option<String>> = client
+            .cmd("HMGET")
+            .arg(&wp_cond_key)
+            .arg(format!("matcher:{i}:satisfied"))
+            .arg(format!("matcher:{i}:signal_id"))
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let satisfied = fields.first().and_then(|o| o.as_deref());
+        if satisfied != Some("1") {
+            continue;
+        }
+        let Some(raw) = fields
+            .get(1)
+            .and_then(|o| o.as_deref())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        match SignalId::parse(raw) {
+            Ok(sid) => signal_ids.push(sid),
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = %f.execution_id,
+                    waitpoint_id = %waitpoint_id,
+                    raw = %raw,
+                    error = %e,
+                    "observe_signals: matcher signal_id failed to parse, skipping"
+                );
+            }
+        }
+    }
+
+    if signal_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pipe = client.pipeline();
+    let mut slots = Vec::with_capacity(signal_ids.len());
+    for signal_id in &signal_ids {
+        let hash_slot = pipe
+            .cmd::<HashMap<String, String>>("HGETALL")
+            .arg(ctx.signal(signal_id))
+            .finish();
+        let payload_slot = pipe
+            .cmd::<Option<ferriskey::Value>>("GET")
+            .arg(ctx.signal_payload(signal_id))
+            .finish();
+        slots.push((hash_slot, payload_slot));
+    }
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let mut out: Vec<ResumeSignal> = Vec::with_capacity(signal_ids.len());
+    for (signal_id, (hash_slot, payload_slot)) in signal_ids.into_iter().zip(slots) {
+        let sig: HashMap<String, String> = hash_slot.value().map_err(transport_fk)?;
+        if sig.is_empty() {
+            continue;
+        }
+        let payload_raw: Option<ferriskey::Value> =
+            payload_slot.value().map_err(transport_fk)?;
+        let payload: Option<Vec<u8>> = match payload_raw {
+            Some(ferriskey::Value::BulkString(b)) => Some(b.to_vec()),
+            Some(ferriskey::Value::SimpleString(s)) => Some(s.into_bytes()),
+            _ => None,
+        };
+        let accepted_at = sig
+            .get("accepted_at")
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(TimestampMs::from_millis)
+            .unwrap_or_else(|| TimestampMs::from_millis(0));
+
+        out.push(ResumeSignal {
+            signal_id,
+            signal_name: sig.get("signal_name").cloned().unwrap_or_default(),
+            signal_category: sig.get("signal_category").cloned().unwrap_or_default(),
+            source_type: sig.get("source_type").cloned().unwrap_or_default(),
+            source_identity: sig.get("source_identity").cloned().unwrap_or_default(),
+            correlation_id: sig.get("correlation_id").cloned().unwrap_or_default(),
+            accepted_at,
+            payload,
+        });
+    }
+    Ok(out)
+}
+
+/// Port of `ff_sdk::task::resume_waitpoint_id_from_suspension` — same
+/// invariants, same error shape. Kept crate-local (module-private) so
+/// Stage 1c consolidation can decide whether to promote.
+fn resume_waitpoint_id_from_suspension(
+    susp: &std::collections::HashMap<String, String>,
+    claimed_attempt: AttemptIndex,
+) -> Result<Option<WaitpointId>, EngineError> {
+    if susp.is_empty() {
+        return Ok(None);
+    }
+    let susp_att: u32 = susp
+        .get("attempt_index")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u32::MAX);
+    if susp_att != claimed_attempt.0 {
+        return Ok(None);
+    }
+    let close_reason = susp.get("close_reason").map(String::as_str).unwrap_or("");
+    if close_reason != "resumed" {
+        return Ok(None);
+    }
+    let wp_id_str = susp
+        .get("waitpoint_id")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if wp_id_str.is_empty() {
+        return Ok(None);
+    }
+    let waitpoint_id = WaitpointId::parse(wp_id_str).map_err(|e| {
+        EngineError::from(ScriptError::Parse {
+            fcall: "observe_signals".into(),
+            execution_id: None,
+            message: format!(
+                "observe_signals: suspension_current.waitpoint_id is not a valid UUID: {e}"
+            ),
+        })
+    })?;
+    Ok(Some(waitpoint_id))
+}
+
 #[async_trait]
 impl EngineBackend for ValkeyBackend {
     async fn claim(
@@ -266,17 +620,26 @@ impl EngineBackend for ValkeyBackend {
         Err(EngineError::Unavailable { op: "claim" })
     }
 
-    async fn renew(&self, _handle: &Handle) -> Result<LeaseRenewal, EngineError> {
-        Err(EngineError::Unavailable { op: "renew" })
+    async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+        let f = handle_codec::decode_handle(handle)?;
+        renew_impl(&self.client, &self.partition_config, &f).await
     }
 
     async fn progress(
         &self,
-        _handle: &Handle,
-        _percent: Option<u8>,
-        _message: Option<String>,
+        handle: &Handle,
+        percent: Option<u8>,
+        message: Option<String>,
     ) -> Result<(), EngineError> {
-        Err(EngineError::Unavailable { op: "progress" })
+        let f = handle_codec::decode_handle(handle)?;
+        progress_impl(
+            &self.client,
+            &self.partition_config,
+            &f,
+            percent,
+            message.as_deref(),
+        )
+        .await
     }
 
     async fn append_frame(&self, _handle: &Handle, _frame: Frame) -> Result<(), EngineError> {
@@ -315,11 +678,10 @@ impl EngineBackend for ValkeyBackend {
 
     async fn observe_signals(
         &self,
-        _handle: &Handle,
+        handle: &Handle,
     ) -> Result<Vec<ResumeSignal>, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "observe_signals",
-        })
+        let f = handle_codec::decode_handle(handle)?;
+        observe_signals_impl(&self.client, &self.partition_config, &f).await
     }
 
     async fn claim_from_reclaim(

@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferriskey::{Client, Value};
+use ff_core::backend::{Handle, HandleKind};
 use ff_core::contracts::ReportUsageResult;
+use ff_core::engine_backend::EngineBackend;
 use ff_script::error::ScriptError;
 use ff_core::keys::{usage_dedup_key, BudgetKeyContext, ExecKeyContext, IndexKeys};
 use ff_core::partition::{budget_partition, execution_partition, PartitionConfig};
@@ -160,6 +162,20 @@ pub use ff_core::backend::FailOutcome;
 pub struct ClaimedTask {
     /// Shared Valkey client.
     client: Client,
+    /// `EngineBackend` the trait-migrated ops forward through.
+    ///
+    /// **RFC-012 Stage 1b.** Today this is always a `ValkeyBackend`
+    /// wrapping `client`. 9 of 12 ops now route through
+    /// `backend.*()`; the remaining 3 (`create_pending_waitpoint`,
+    /// `append_frame`, `suspend`) still use `client.fcall(...)`
+    /// directly — see issue #117 for the trait-shape alignment
+    /// that unblocks them.
+    ///
+    /// Stage 1c will migrate the FlowFabricWorker hot paths (claim,
+    /// deliver_signal) through the same trait surface; Stage 1d
+    /// refactors this struct to carry a single `Handle` rather than
+    /// synthesising one per op via `synth_handle`.
+    backend: Arc<dyn EngineBackend>,
     /// Partition config for key construction.
     partition_config: PartitionConfig,
     /// Execution identity.
@@ -265,6 +281,7 @@ impl ClaimedTask {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client: Client,
+        backend: Arc<dyn EngineBackend>,
         partition_config: PartitionConfig,
         execution_id: ExecutionId,
         attempt_index: AttemptIndex,
@@ -281,14 +298,24 @@ impl ClaimedTask {
         let renewal_stop = Arc::new(Notify::new());
         let renewal_failures = Arc::new(AtomicU32::new(0));
 
-        let renewal_handle = spawn_renewal_task(
-            client.clone(),
-            partition_config,
+        // Stage 1b: the renewal task forwards through `backend.renew(&handle)`.
+        // Build the handle once at construction time and hand both Arc clones
+        // into the spawned task.
+        let renewal_handle_cookie = ff_backend_valkey::ValkeyBackend::encode_handle(
             execution_id.clone(),
             attempt_index,
             attempt_id.clone(),
             lease_id.clone(),
             lease_epoch,
+            lease_ttl_ms,
+            lane_id.clone(),
+            worker_instance_id.clone(),
+            HandleKind::Fresh,
+        );
+        let renewal_handle = spawn_renewal_task(
+            backend.clone(),
+            renewal_handle_cookie,
+            execution_id.clone(),
             lease_ttl_ms,
             renewal_stop.clone(),
             renewal_failures.clone(),
@@ -296,6 +323,7 @@ impl ClaimedTask {
 
         Self {
             client,
+            backend,
             partition_config,
             execution_id,
             attempt_index,
@@ -359,6 +387,35 @@ impl ClaimedTask {
 
     pub fn lane_id(&self) -> &LaneId {
         &self.lane_id
+    }
+
+    /// Synthesise a Valkey-backend `Handle` encoding this task's
+    /// attempt-cookie fields. Private to the SDK — the trait
+    /// forwarders call this per op to produce the `&Handle` argument
+    /// the `EngineBackend` methods take.
+    ///
+    /// **RFC-012 Stage 1b option A.** Refactoring `ClaimedTask` to
+    /// carry one cached `Handle` instead of synthesising per op is
+    /// deferred to Stage 1d (issue #89 follow-up). The per-op cost is
+    /// a single allocation of a small byte buffer — negligible
+    /// compared to the FCALL round-trip that follows.
+    ///
+    /// Kind is always `HandleKind::Fresh` because today the 9
+    /// Stage-1b ops all treat the backend tag + opaque bytes as
+    /// authoritative; they do not dispatch on kind. Stage 1d routes
+    /// resumed-claim callers through a `Resumed` synth.
+    fn synth_handle(&self) -> Handle {
+        ff_backend_valkey::ValkeyBackend::encode_handle(
+            self.execution_id.clone(),
+            self.attempt_index,
+            self.attempt_id.clone(),
+            self.lease_id.clone(),
+            self.lease_epoch,
+            self.lease_ttl_ms,
+            self.lane_id.clone(),
+            self.worker_instance_id.clone(),
+            HandleKind::Fresh,
+        )
     }
 
     /// Check if the lease is likely still valid based on renewal success.
@@ -798,49 +855,32 @@ impl ClaimedTask {
 
     // ── Non-terminal operations ──
 
-    /// Manually renew the lease. Also called by the background renewal task.
+    /// Manually renew the lease.
+    ///
+    /// **RFC-012 Stage 1b.** Forwards through the `EngineBackend`
+    /// trait. The background renewal task calls
+    /// `backend.renew(&handle)` directly (see `spawn_renewal_task`);
+    /// this method is the public entry point for workers that want
+    /// to force a renew out-of-band.
     pub async fn renew_lease(&self) -> Result<(), SdkError> {
-        renew_lease_inner(
-            &self.client,
-            &self.partition_config,
-            &self.execution_id,
-            self.attempt_index,
-            &self.attempt_id,
-            &self.lease_id,
-            self.lease_epoch,
-            self.lease_ttl_ms,
-        )
-        .await
+        let handle = self.synth_handle();
+        self.backend
+            .renew(&handle)
+            .await
+            .map(|_renewal| ())
+            .map_err(SdkError::from)
     }
 
     /// Update progress (pct 0-100 and optional message).
+    ///
+    /// **RFC-012 Stage 1b.** Forwards through the `EngineBackend`
+    /// trait (`backend.progress(&handle, Some(pct), Some(msg))`).
     pub async fn update_progress(&self, pct: u8, message: &str) -> Result<(), SdkError> {
-        let partition = execution_partition(&self.execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
-
-        // KEYS (1): exec_core
-        let keys: Vec<String> = vec![ctx.core()];
-
-        // ARGV (5): execution_id, lease_id, lease_epoch,
-        //           progress_pct, progress_message
-        let args: Vec<String> = vec![
-            self.execution_id.to_string(),
-            self.lease_id.to_string(),
-            self.lease_epoch.to_string(),
-            pct.to_string(),
-            message.to_owned(),
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .client
-            .fcall("ff_update_progress", &key_refs, &arg_refs)
+        let handle = self.synth_handle();
+        self.backend
+            .progress(&handle, Some(pct), Some(message.to_owned()))
             .await
-            .map_err(SdkError::Valkey)?;
-
-        parse_success_result(&raw, "ff_update_progress")
+            .map_err(SdkError::from)
     }
 
     /// Report usage against a budget and check limits.
@@ -1139,156 +1179,16 @@ impl ClaimedTask {
     /// `signal_id` set from `waitpoint_condition`'s `matcher:N:signal_id`
     /// fields and reads each signal's metadata + payload directly.
     pub async fn resume_signals(&self) -> Result<Vec<ResumeSignal>, SdkError> {
-        let partition = execution_partition(&self.execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
-
-        let susp: HashMap<String, String> = self
-            .client
-            .hgetall(&ctx.suspension_current())
+        // RFC-012 Stage 1b: forwards through `backend.observe_signals`.
+        // Pre-migration body (HGETALL suspension_current + HMGET
+        // matchers + pipelined HGETALL signal_hash / GET
+        // signal_payload) lives in
+        // `ff_backend_valkey::observe_signals_impl`.
+        let handle = self.synth_handle();
+        self.backend
+            .observe_signals(&handle)
             .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "HGETALL suspension_current".into(),
-            })?;
-
-        let Some(waitpoint_id) =
-            resume_waitpoint_id_from_suspension(&susp, self.attempt_index)?
-        else {
-            return Ok(Vec::new());
-        };
-
-        // Bounded read of waitpoint_condition: HGET total_matchers first,
-        // then HMGET exactly the fields we need per matcher slot. Avoids an
-        // unbounded HGETALL (matcher:N:* fields grow with condition size).
-        let wp_cond_key = ctx.waitpoint_condition(&waitpoint_id);
-        let total_str: Option<String> = self
-            .client
-            .hget(&wp_cond_key, "total_matchers")
-            .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "HGET total_matchers".into(),
-            })?;
-        let total: usize = total_str
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        let mut signal_ids: Vec<SignalId> = Vec::new();
-        for i in 0..total {
-            let fields: Vec<Option<String>> = self
-                .client
-                .cmd("HMGET")
-                .arg(&wp_cond_key)
-                .arg(format!("matcher:{i}:satisfied"))
-                .arg(format!("matcher:{i}:signal_id"))
-                .execute()
-                .await
-                .map_err(|e| SdkError::ValkeyContext {
-                    source: e,
-                    context: "HMGET matcher slot".into(),
-                })?;
-            let satisfied = fields.first().and_then(|o| o.as_deref());
-            if satisfied != Some("1") {
-                continue;
-            }
-            let Some(raw) = fields.get(1).and_then(|o| o.as_deref()).filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            match SignalId::parse(raw) {
-                Ok(sid) => signal_ids.push(sid),
-                Err(e) => {
-                    tracing::warn!(
-                        execution_id = %self.execution_id,
-                        waitpoint_id = %waitpoint_id,
-                        raw = %raw,
-                        error = %e,
-                        "resume_signals: matcher signal_id failed to parse, skipping"
-                    );
-                }
-            }
-        }
-
-        if signal_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Pipeline HGETALL signal_hash + GET signal_payload for all matched
-        // signals into one round-trip (closes #36 item 1). Previous
-        // implementation did 2N sequential round-trips; the single-matcher
-        // happy path is unaffected (1 pipelined round-trip ≈ 2 sequential
-        // for N=1), and "all" conditions with N>1 matchers see ~N× latency
-        // reduction on a loaded cluster.
-        let mut pipe = self.client.pipeline();
-        let mut slots = Vec::with_capacity(signal_ids.len());
-        for signal_id in &signal_ids {
-            let hash_slot = pipe
-                .cmd::<HashMap<String, String>>("HGETALL")
-                .arg(ctx.signal(signal_id))
-                .finish();
-            let payload_slot = pipe
-                .cmd::<Option<Value>>("GET")
-                .arg(ctx.signal_payload(signal_id))
-                .finish();
-            slots.push((hash_slot, payload_slot));
-        }
-        pipe.execute()
-            .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "pipeline HGETALL signal + GET payload".into(),
-            })?;
-
-        let mut out: Vec<ResumeSignal> = Vec::with_capacity(signal_ids.len());
-        for (signal_id, (hash_slot, payload_slot)) in signal_ids.into_iter().zip(slots) {
-            let sig: HashMap<String, String> = hash_slot.value().map_err(|e| {
-                SdkError::ValkeyContext {
-                    source: e,
-                    context: format!("pipeline HGETALL signal_hash slot (signal_id={signal_id})"),
-                }
-            })?;
-            if sig.is_empty() {
-                // Signal hash was GC'd (not currently a code path, but
-                // defensive against future cleanup scanners). Skip.
-                continue;
-            }
-
-            // Read payload as raw Value so non-UTF-8 bytes survive intact.
-            // Previously this was `get::<Option<String>>` + `into_bytes`,
-            // which would panic/error on any non-UTF-8 payload (reachable
-            // via direct-FCALL callers that bypass the SDK's lossy
-            // UTF-8 encode path in deliver_signal).
-            let payload_raw: Option<Value> =
-                payload_slot.value().map_err(|e| SdkError::ValkeyContext {
-                    source: e,
-                    context: format!("pipeline GET signal_payload slot (signal_id={signal_id})"),
-                })?;
-            let payload: Option<Vec<u8>> = match payload_raw {
-                Some(Value::BulkString(b)) => Some(b.to_vec()),
-                Some(Value::SimpleString(s)) => Some(s.into_bytes()),
-                _ => None,
-            };
-
-            let accepted_at = sig
-                .get("accepted_at")
-                .and_then(|s| s.parse::<i64>().ok())
-                .map(TimestampMs::from_millis)
-                .unwrap_or_else(|| TimestampMs::from_millis(0));
-
-            out.push(ResumeSignal {
-                signal_id,
-                signal_name: sig.get("signal_name").cloned().unwrap_or_default(),
-                signal_category: sig.get("signal_category").cloned().unwrap_or_default(),
-                source_type: sig.get("source_type").cloned().unwrap_or_default(),
-                source_identity: sig.get("source_identity").cloned().unwrap_or_default(),
-                correlation_id: sig.get("correlation_id").cloned().unwrap_or_default(),
-                accepted_at,
-                payload,
-            });
-        }
-
-        Ok(out)
+            .map_err(SdkError::from)
     }
 
     /// Signal the renewal task to stop. Called by every terminal op
@@ -1362,80 +1262,28 @@ impl Drop for ClaimedTask {
 
 // ── Lease renewal ──
 
-/// Perform a single lease renewal via FCALL ff_renew_lease.
+/// Spawn a background tokio task that renews the lease at `ttl / 3`
+/// intervals.
 ///
-/// The span is named `renew_lease` with target `ff_sdk::task` so bench
-/// harnesses can attach a `tracing_subscriber::Layer` and measure
-/// renewal count + per-call duration via `on_enter` / `on_exit`
-/// without polluting the hot path with additional instrumentation.
-/// See `benches/harness/src/bin/long_running.rs` for the consumer.
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(
-    name = "renew_lease",
-    skip_all,
-    fields(execution_id = %execution_id)
-)]
-async fn renew_lease_inner(
-    client: &Client,
-    partition_config: &PartitionConfig,
-    execution_id: &ExecutionId,
-    attempt_index: AttemptIndex,
-    attempt_id: &AttemptId,
-    lease_id: &LeaseId,
-    lease_epoch: LeaseEpoch,
-    lease_ttl_ms: u64,
-) -> Result<(), SdkError> {
-    let partition = execution_partition(execution_id, partition_config);
-    let ctx = ExecKeyContext::new(&partition, execution_id);
-    let idx = IndexKeys::new(&partition);
-
-    // KEYS: exec_core, lease_current, lease_history, lease_expiry_zset
-    let keys: Vec<String> = vec![
-        ctx.core(),
-        ctx.lease_current(),
-        ctx.lease_history(),
-        idx.lease_expiry(),
-    ];
-
-    // ARGV: execution_id, attempt_index, attempt_id, lease_id, lease_epoch,
-    //       lease_ttl_ms, lease_history_grace_ms
-    let lease_history_grace_ms = 5000_u64; // 5s grace for cleanup
-    let args: Vec<String> = vec![
-        execution_id.to_string(),
-        attempt_index.to_string(),
-        attempt_id.to_string(),
-        lease_id.to_string(),
-        lease_epoch.to_string(),
-        lease_ttl_ms.to_string(),
-        lease_history_grace_ms.to_string(),
-    ];
-
-    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    let raw: Value = client
-        .fcall("ff_renew_lease", &key_refs, &arg_refs)
-        .await
-        .map_err(SdkError::Valkey)?;
-
-    parse_success_result(&raw, "ff_renew_lease")
-}
-
-/// Spawn a background tokio task that renews the lease at `ttl / 3` intervals.
+/// **RFC-012 Stage 1b.** The renewal loop now forwards through the
+/// `EngineBackend` trait (`backend.renew(&handle)`) instead of calling
+/// `ff_renew_lease` via a direct FCALL. The Stage-1a `renew_lease_inner`
+/// free function was deleted; this task holds an `Arc<dyn EngineBackend>`
+/// + the encoded `Handle` instead.
 ///
 /// Stops when:
 /// - `stop_signal` is notified (complete/fail/cancel called)
 /// - Renewal fails with a terminal error (stale_lease, lease_expired, etc.)
 /// - The task handle is aborted (ClaimedTask dropped)
-#[allow(clippy::too_many_arguments, dead_code)]
+#[tracing::instrument(
+    name = "renew_lease",
+    skip_all,
+    fields(execution_id = %execution_id)
+)]
 fn spawn_renewal_task(
-    client: Client,
-    partition_config: PartitionConfig,
+    backend: Arc<dyn EngineBackend>,
+    handle: Handle,
     execution_id: ExecutionId,
-    attempt_index: AttemptIndex,
-    attempt_id: AttemptId,
-    lease_id: LeaseId,
-    lease_epoch: LeaseEpoch,
     lease_ttl_ms: u64,
     stop_signal: Arc<Notify>,
     failure_counter: Arc<AtomicU32>,
@@ -1458,26 +1306,15 @@ fn spawn_renewal_task(
                     return;
                 }
                 _ = tick.tick() => {
-                    match renew_lease_inner(
-                        &client,
-                        &partition_config,
-                        &execution_id,
-                        attempt_index,
-                        &attempt_id,
-                        &lease_id,
-                        lease_epoch,
-                        lease_ttl_ms,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
+                    match backend.renew(&handle).await {
+                        Ok(_renewal) => {
                             failure_counter.store(0, Ordering::Relaxed);
                             tracing::trace!(
                                 execution_id = %execution_id,
                                 "lease renewed"
                             );
                         }
-                        Err(SdkError::Engine(ref e)) if is_terminal_renewal_error(e) => {
+                        Err(e) if is_terminal_renewal_error(&e) => {
                             failure_counter.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 execution_id = %execution_id,
@@ -1712,6 +1549,15 @@ fn extract_pending_waitpoint_token(raw: &Value) -> Result<WaitpointToken, SdkErr
 /// (no record, stale prior-attempt, non-resumed close). Returns an error
 /// only for a present-but-malformed waitpoint_id, which indicates a Lua
 /// bug rather than a missing-data case.
+///
+/// RFC-012 Stage 1b: `ClaimedTask::resume_signals` now forwards through
+/// `EngineBackend::observe_signals`, which re-implements this invariant
+/// inside `ff_backend_valkey`. The SDK helper is retained with its unit
+/// tests so the parsing contract stays exercised at the SDK layer —
+/// Stage 1d will consolidate (either promote the helper into ff-core
+/// or drop these tests once the backend-side tests cover equivalent
+/// ground).
+#[allow(dead_code)]
 fn resume_waitpoint_id_from_suspension(
     susp: &HashMap<String, String>,
     claimed_attempt: AttemptIndex,

@@ -91,14 +91,24 @@ pub struct FlowFabricWorker {
     /// correctness because the sequence simply restarts a new cycle.
     #[cfg(feature = "direct-valkey-claim")]
     scan_cursor: AtomicUsize,
-    /// Optional [`EngineBackend`] handed in via
-    /// [`FlowFabricWorker::connect_with`]. Populated when the consumer
-    /// supplies a pre-constructed backend; `None` under the legacy
-    /// [`FlowFabricWorker::connect`] path, which continues to hold a
-    /// `ferriskey::Client` directly (Stage 1a hot-path behaviour
-    /// unchanged). Stage 1c migrates the hot path to go through the
-    /// trait uniformly.
-    backend: Option<Arc<dyn ff_core::engine_backend::EngineBackend>>,
+    /// The [`EngineBackend`] the Stage-1b trait forwarders route
+    /// through.
+    ///
+    /// **RFC-012 Stage 1b.** Always populated:
+    /// [`FlowFabricWorker::connect`] now wraps the worker's own
+    /// `ferriskey::Client` in a `ValkeyBackend` via
+    /// `ValkeyBackend::from_client_and_partitions`, and
+    /// [`FlowFabricWorker::connect_with`] replaces that default with
+    /// the caller-supplied `Arc<dyn EngineBackend>`. The
+    /// [`FlowFabricWorker::backend`] accessor still returns
+    /// `Option<&Arc<dyn EngineBackend>>` for API stability — Stage 1c
+    /// narrows the return type once consumers have migrated.
+    ///
+    /// Hot paths (claim, deliver_signal, admin queries) still use the
+    /// embedded `ferriskey::Client` directly at Stage 1b; Stage 1c
+    /// migrates them through this field, and Stage 1d removes the
+    /// embedded client.
+    backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
 }
 
 /// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
@@ -435,6 +445,15 @@ impl FlowFabricWorker {
             }
         }
 
+        // RFC-012 Stage 1b: wrap the dialed client in a
+        // ValkeyBackend so `ClaimedTask`'s trait forwarders have
+        // something to call. `from_client_and_partitions` reuses the
+        // already-dialed client — no second connection.
+        let backend = ff_backend_valkey::ValkeyBackend::from_client_and_partitions(
+            client.clone(),
+            partition_config,
+        );
+
         Ok(Self {
             client,
             config,
@@ -448,7 +467,7 @@ impl FlowFabricWorker {
             concurrency_semaphore,
             #[cfg(feature = "direct-valkey-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
-            backend: None,
+            backend,
         })
     }
 
@@ -481,16 +500,19 @@ impl FlowFabricWorker {
         backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
     ) -> Result<Self, SdkError> {
         let mut worker = Self::connect(config).await?;
-        worker.backend = Some(backend);
+        worker.backend = backend;
         Ok(worker)
     }
 
-    /// Borrow the `EngineBackend` handed in via
-    /// [`FlowFabricWorker::connect_with`], if any. Returns `None`
-    /// under the legacy [`FlowFabricWorker::connect`] construction
-    /// path.
+    /// Borrow the `EngineBackend` this worker forwards Stage-1b trait
+    /// ops through.
+    ///
+    /// **RFC-012 Stage 1b.** Always returns `Some(&self.backend)` —
+    /// the `Option` wrapper is retained for API stability with the
+    /// Stage-1a shape. Stage 1c narrows the return type to
+    /// `&Arc<dyn EngineBackend>`.
     pub fn backend(&self) -> Option<&Arc<dyn ff_core::engine_backend::EngineBackend>> {
-        self.backend.as_ref()
+        Some(&self.backend)
     }
 
     /// Get a reference to the underlying ferriskey client.
@@ -993,6 +1015,7 @@ impl FlowFabricWorker {
 
         Ok(ClaimedTask::new(
             self.client.clone(),
+            self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
             attempt_index,
@@ -1332,6 +1355,7 @@ impl FlowFabricWorker {
 
         Ok(ClaimedTask::new(
             self.client.clone(),
+            self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
             attempt_index,
