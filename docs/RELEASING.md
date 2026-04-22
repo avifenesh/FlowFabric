@@ -6,7 +6,7 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Eight crates, all pinned to the same version, published in topological order:
+Nine crates, all pinned to the same version, published in topological order:
 
 1. `ferriskey`       — Valkey client (reparented fork of glide-core;
    the former `telemetrylib` sub-crate was inlined during the Tier 1
@@ -17,15 +17,20 @@ Eight crates, all pinned to the same version, published in topological order:
    shim. Added to the publish set in v0.3.1 after v0.3.0
    partial-published (ff-engine depends on it as a workspace dep
    and its publish step fails without it being on crates.io).
-5. `ff-engine`       — cross-partition dispatch + scanners
+5. `ff-backend-valkey` — RFC-012 EngineBackend trait Valkey impl,
+   separated from ff-sdk in RFC-012 Stage 1a. Added to the publish
+   set in v0.3.2 after v0.3.1 partial-published (ff-sdk depends on
+   it as a workspace dep and its publish step fails without it
+   being on crates.io).
+6. `ff-engine`       — cross-partition dispatch + scanners
    (includes the `completion_listener` module for push-based DAG
    promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
    §"DAG promotion: push listener + safety-net reconciler")
-6. `ff-scheduler`    — claim-grant scheduler
-7. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
+7. `ff-scheduler`    — claim-grant scheduler
+8. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
    off by default; production deployments use the scheduler-routed
    HTTP path via `FlowFabricWorker::claim_via_server`
-8. `ff-server`       — HTTP server library + binary
+9. `ff-server`       — HTTP server library + binary
 
 Excluded from publish:
 
@@ -52,7 +57,7 @@ Before cutting a release, verify:
 - [ ] `CARGO_REGISTRY_TOKEN` is configured in repo settings (Settings →
       Secrets and variables → Actions). Generate at
       <https://crates.io/me> → API Tokens with scope `publish-new` +
-      `publish-update`. The token must have upload rights to all eight
+      `publish-update`. The token must have upload rights to all nine
       crate names — claim them on crates.io first if they are new.
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.
