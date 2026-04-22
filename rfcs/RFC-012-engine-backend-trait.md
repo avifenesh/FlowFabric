@@ -1,24 +1,36 @@
 # RFC-012: `EngineBackend` trait — abstracting FlowFabric's write surface
 
-**Status:** Draft — round 2 (post Worker K CHALLENGE; round-2 revisions applied).
+**Status:** Draft — round 4 (post Worker M CHALLENGE; round-4 revisions applied).
 **Created:** 2026-04-22
 **Supersedes:** issue #89 (trait-extraction plan) on acceptance.
 **Related:** issues #87, #88, #90, #91, #92, #93 (concrete follow-up work this RFC authorises).
-**Predecessor:** issue #58 Phase 1 — sealed the read surface (`ExecutionSnapshot`, `FlowSnapshot`, `EdgeSnapshot`) and typed the error surface (`EngineError` — landed on `main` at `crates/ff-sdk/src/engine_error.rs` per PR #81; round-2 verified on `25b2aad`).
+**Predecessor:** issue #58 Phase 1 — sealed the read surface (`ExecutionSnapshot`, `FlowSnapshot`, `EdgeSnapshot`) and typed the error surface (`EngineError` — landed on `main` at `crates/ff-sdk/src/engine_error.rs` per PR #81).
 
-### Round-2 revision summary
+### Round-4 revision summary (post Worker M CHALLENGE at `183c10f`)
 
-Worker K's first-round CHALLENGE landed 8 must-fix items; the orchestrator corrected #1 (K read a stale checkout — `EngineError` does exist in `crates/ff-sdk/src/engine_error.rs`). Items #2–#8 drove the following RFC revisions, applied in-place:
+Worker M's round-3 CHALLENGE landed 7 must-fix items grounded in concrete type-existence checks against the tree. All 7 are addressed in-place; the RFC now cleanly separates Stage 0 (type plumbing + `EngineError` broadening) from Stage 1 (trait extraction), and fuses the former Stage 1 + Stage 2 into one stage per M6.
 
-* **#2 (resume atomicity fusion):** split `resume` into `observe_signals` + `claim_from_reclaim` (§3.1 item 8, §3.4).
-* **#3 (claim combined + reclaim third path):** kept `claim` for fresh work; reclaim moves to `claim_from_reclaim`; `claim_via_server` is explicitly an HTTP-orchestration concern, not a trait method (§3.1 item 1, §7.1).
-* **#4 (§3.4 atomicity overpromise):** added §3.4.1 distinguishing commit atomicity from notification atomicity; contract weakened for cross-entity side-effects on backends without atomic outbox.
-* **#5 (object-safety + associated-types contradiction):** §7.7 resolved in-RFC. Dropped five associated types; `Handle`/`ResumeHandle`/`SuspendToken` collapse to an opaque concrete struct; `Error` is the concrete `EngineError`; `CompletionStream` is `Pin<Box<dyn Stream<Item = CompletionPayload> + Send>>`. §3.3 sketch rewritten; §4 rewritten; §6.4 rewritten.
-* **#6 (`progress` Both-variant):** split back into `progress` (percent/message) + `append_frame`. `Both` variant deleted. Trait goes to 13 methods (§3.1 item 3, §7.5).
-* **#7 (Stage 3 `unimplemented!()`):** replaced with `Err(EngineError::Unavailable { op })`. Requires adding the `Unavailable` variant to `EngineError` as Phase-1 prerequisite, tracked in §5.3 (§5.3 rewritten).
-* **#8 (Stage 5 seal + cairn):** reframed per owner's cairn-no-gate decision. Internal `ff-*` grep is a gate; cairn's hot-path decoupling is not (§5.5 rewritten).
+* **M1 (Transport variant shape mismatch):** §4.2 now matches code verbatim (`Transport { source: Box<ScriptError> }`). §5 adds a Stage 0 prerequisite: broaden `Transport` to `Transport { backend: &'static str, source: Box<dyn std::error::Error + Send + Sync> }` before Stage 1 begins, tracked as a named Phase-1-scope PR.
+* **M2 (`EngineError` variant list incomplete):** §4.2 now cites `engine_error.rs` authoritatively and enumerates all current variants verbatim (`NotFound`, `Validation { kind, detail }`, `Contention`, `Conflict`, `State`, `Bug`, `Transport`) plus the Stage-0 additions (`Unavailable`, broadened `Transport`).
+* **M3 (~13 undefined types):** new §3.3.0 enumerates every type the §3.3 sketch references, splits them into "exists-in-tree" (4 types) vs "Stage-0 new-type deliverable" (13 types), names a target crate + approximate shape for each, and corrects the §5.1 landing-gate wording. Stage 1 is no longer described as "zero public-surface change"; Stage 0 is the public-surface-additive stage.
+* **M4 (`ResumeSignal` in wrong crate):** Stage 0 moves `ResumeSignal` from `ff-sdk/src/task.rs` to `ff-core::contracts`. Breaking-change profile documented: consumer re-exports from `ff_sdk::task::ResumeSignal` at old path via `pub use` during the 0.4.x window.
+* **M5 (`HandleKind` visibility unspecified):** §4.1 commits to `#[non_exhaustive] pub enum HandleKind`; consumers must include a `_` arm.
+* **M6 (Stage 1+2 force double migration):** former Stage 1 and Stage 2 fuse into a single "Stage 1: trait + backend-config" landing. §5 renumbered; §9 sequencing updated.
+* **M7 (§3.4.1 outbox inconsistency):** outbox is now **REQUIRED** for non-transactional backends; §3.4.1 updated. The "never-pre-commit" invariant is kept mandatory; outbox is the mechanism non-transactional backends MUST use to satisfy it.
 
-K's six "deserves debate" items are addressed in §7 (new entries §7.14–§7.16) and §8 (new entries §8.17–§8.19).
+M's deserves-debate items D1–D5 are addressed in §7 (new §7.17–§7.19) and §8 (new §8.21–§8.23). D3 (single terminal method) is recorded as a rejected alternative in §6.6.
+
+### Round-2 revision summary (post Worker K CHALLENGE, retained for trail)
+
+Worker K's first-round CHALLENGE landed 8 must-fix items; the orchestrator corrected #1 (K read a stale checkout — `EngineError` does exist in `crates/ff-sdk/src/engine_error.rs`). Items #2–#8 drove the following RFC revisions:
+
+* **#2:** split `resume` into `observe_signals` + `claim_from_reclaim` (§3.1 item 8).
+* **#3:** `claim` for fresh work; `claim_from_reclaim` for resumed; `claim_via_server` explicitly not on the trait.
+* **#4:** §3.4.1 distinguishes commit atomicity from notification atomicity.
+* **#5:** dropped five associated types; concrete `Handle`/`EngineError`/`Pin<Box<dyn Stream>>` at the trait boundary (§4).
+* **#6:** split `progress` Both-variant into `progress` + `append_frame` (13 methods).
+* **#7:** `Err(EngineError::Unavailable { op })` replaces `unimplemented!()` in staged backend skeletons.
+* **#8:** Stage 5 seal reframed per owner's cairn-no-gate decision.
 
 ---
 
@@ -116,7 +128,7 @@ The inventory assumes one trait (not multiple domain-split traits) per §6.2; a 
 
 *Maps to:* `ff_update_progress` (method 3) and `ff_append_frame` (method 3b).
 
-**4. `complete(handle, payload) -> Result<(), BackendError>`.** Terminal success. Consumes the handle. Payload is the attempt's result bytes (caller-chosen encoding; trait doesn't mandate JSON). On Valkey, complete runs a single 12-KEY FCALL that mutates exec state, flow-membership terminal set, unblocks children, and publishes a completion event. On Postgres, a single transaction mutates `executions`, `flow_memberships`, `child_dependencies`, and inserts into `completion_events`.
+**4. `complete(&handle, payload) -> Result<(), BackendError>`.** Terminal success. Round-4 (M-D2): borrows the handle rather than consuming it, so callers retain the handle for retry under `EngineError::Transport`. Backend enforces state-transition idempotency (§3.4 idempotent replay): a second call with the same handle after a successful first returns "already terminal" (`EngineError::State`). Payload is the attempt's result bytes (caller-chosen encoding; trait doesn't mandate JSON). On Valkey, complete runs a single 12-KEY FCALL that mutates exec state, flow-membership terminal set, unblocks children, and publishes a completion event. On Postgres, a single transaction mutates `executions`, `flow_memberships`, `child_dependencies`, and inserts into `completion_events`.
 
 *Maps to:* `ff_complete_execution`.
 
@@ -124,7 +136,7 @@ The inventory assumes one trait (not multiple domain-split traits) per §6.2; a 
 
 *Maps to:* `ff_fail_execution`. Includes the retry-scheduling sub-branches today visible as Lua status codes.
 
-**6. `cancel(handle, reason) -> Result<(), BackendError>`.** Terminal cancellation. Consumes the handle. Reason is an opaque caller string for observability; trait does not constrain its vocabulary.
+**6. `cancel(&handle, reason) -> Result<(), BackendError>`.** Terminal cancellation. Round-4 (M-D2): borrows. Reason is an opaque caller string for observability; trait does not constrain its vocabulary. Idempotent replay: second call after success returns `EngineError::State`.
 
 *Maps to:* `ff_cancel_execution`.
 
@@ -179,9 +191,52 @@ Four categories of write-like operation are omitted from `EngineBackend` deliber
 
 **Waitpoint HMAC rotation.** Admin-only operation, run by operators during key rotation, not by worker code. Lives on a parallel `AdminBackend` trait (`rotate_waitpoint_hmac`, `issue_hmac_rotation_grace_period`). A worker with an `EngineBackend` handle has no business rotating keys. Separating admin concerns keeps the hot-path trait lean.
 
+**Cross-execution signal observation (round-4, M-D5).** `observe_signals(&Handle)` on `EngineBackend` requires a handle — only the current handle-holder reads that attempt's signals. Admin / ops use cases that want to observe signals for an arbitrary execution id (without holding a handle; e.g., cairn's bridge-observer introspection) live on `AdminBackend::describe_signals(execution_id)`. This is symmetric with the admin-describe methods; `EngineBackend` is worker-scoped, `AdminBackend` is operator-scoped.
+
 **Stream reads (XRANGE / XREAD).** Stream access is a related-but-distinct decoupling issue (#92). Stream cursors are a different abstraction (they need a cursor type; XRANGE markers don't map to row-based backends without a translation layer). A separate `StreamBackend` trait owns the stream surface. Callers who want both hold two trait objects or a composite. This RFC names StreamBackend's existence; its shape lives in the #92 follow-up RFC.
 
 **Completion pubsub subscription.** Issue #90 files a `CompletionStream` trait. This RFC folds the trait's return-types into `EngineBackend`'s shape — specifically, any trait method that today returns a "subscribe to completions for this entity" side-effect returns a `CompletionStream` typed by the associated type (§4). The stream type itself is this RFC's responsibility (it shapes return types); the subscription mechanism for bulk-tailing the completion channel is #90's trait.
+
+### §3.3.0 Type inventory for the trait signatures (round-4, per M3)
+
+The §3.3 signatures reference 17 supporting types. Honesty requires naming which exist today and which are Stage-0 deliverables.
+
+**Exists in-tree today (no change needed):**
+
+| Type | Crate / file | Notes |
+|------|--------------|-------|
+| `LaneId` | `ff-core::types` (`crates/ff-core/src/types.rs:437`) | Newtype over `String`. |
+| `FailOutcome` | `ff-sdk::task` (`crates/ff-sdk/src/task.rs:169`) | Stays in ff-sdk OR moves to ff-core::contracts as part of Stage 0 cleanup (re-export via `pub use` at old path). Decision at Stage-0 impl time. |
+| `CancelFlowResult` | `ff-core::contracts` (`crates/ff-core/src/contracts.rs:1241`) | Use as-is. |
+| `ExecutionId` / `FlowId` / `EdgeId` | `ff-core::types` | Use as-is. |
+| `ExecutionSnapshot` / `FlowSnapshot` | `ff-core::contracts` | Phase 1 landed. |
+| `ResumeSignal` | `ff-sdk::task` (`crates/ff-sdk/src/task.rs:137`) | **Stage 0 MOVE** to `ff-core::contracts`; `pub use` shim at old path through 0.4.x. |
+
+**Stage 0 new-type deliverables (Phase-1-scope, additive):** 13 new public types, each a ~10-30 line addition in `ff-core::contracts` (unless noted). None are complex; most are small structs/enums mirroring what today lives as ad-hoc strings or `Vec<String>` on the inherent impl.
+
+| Type | Target crate | Approximate shape | Notes |
+|------|--------------|-------------------|-------|
+| `CapabilitySet` | `ff-core::contracts` | Newtype over `Vec<String>` (today: `Vec<String>` on `WorkerConfig`). | §7.2 debate still open re bitfield; newtype is the round-2 lean. |
+| `ClaimPolicy` | `ff-core::contracts` | Enum or struct carrying fairness hints, timeout, retry count. Start minimal: `ClaimPolicy { max_wait: Option<Duration> }`. | Bikeshed-prone; keep minimal at Stage 0. |
+| `Frame` | `ff-core::contracts` | Struct: `{ bytes: Bytes, kind: FrameKind, seq: Option<u64> }`. | Already conceptually exists in the `ff_append_frame` FCALL's args. |
+| `WaitpointSpec` | `ff-core::contracts` | `{ kind: WaitpointKind, matcher: Bytes, hmac_token: WaitpointHmac }`. | HMAC token shape mirrors today's signed-waitpoint wire. |
+| `FailureReason` | `ff-core::contracts` | Struct: `{ message: String, detail: Option<Bytes> }`. | Today: ad-hoc string arg. |
+| `FailureClass` | `ff-core::contracts` | Enum: `{ Transient, Permanent, InfraCrash, Timeout, Cancelled }`. | Mirrors Lua-side classification codes. |
+| `UsageDimensions` | `ff-core::contracts` | Struct mirroring `ff_report_usage_and_check`'s ARGV: token-counts, wall-time, custom-dim map. | |
+| `BudgetId` | `ff-core::types` | Newtype over `String` (matches `LaneId` / `FlowId` discipline). | |
+| `ReclaimToken` | `ff-core::contracts` | Newtype wrapping whatever bytes the reclaim scanner issues (today a `ReclaimGrant` struct in `ff-core::contracts:161`). Likely `ReclaimToken(ReclaimGrant)`. | May be pure re-export if `ReclaimGrant` proves sufficient. |
+| `LeaseRenewal` | `ff-core::contracts` | `{ expires_at_ms: u64, lease_epoch: u64 }`. | |
+| `AdmissionDecision` | `ff-core::contracts` | Enum: `{ Admitted, Throttled { retry_after_ms: u64 }, Rejected { reason } }`. | Returned by `report_usage`. |
+| `CancelFlowPolicy` | `ff-core::contracts` | Today this shape lives inside `CancelFlowArgs` (`contracts.rs:1233`) — extract the policy enum as a named type; keep `CancelFlowArgs` as the REST wrapper. | |
+| `CancelFlowWait` | `ff-core::contracts` | Enum: `{ NoWait, WaitTimeout(Duration), WaitIndefinite }`. | |
+| `CompletionPayload` | `ff-core::contracts` | Struct: `{ execution_id, outcome, payload_bytes, produced_at_ms, … }`. | Also deliverable from issue #90. |
+
+**Correction to §5.1's landing gate.** Round-2 said Stage 1 is "no public-surface changes beyond additive." That claim conflates trait-extraction with type-plumbing. Round-4 split:
+
+* **Stage 0** is where the ~13 new types + `EngineError::Unavailable` variant + `Transport` broadening + `ResumeSignal` crate move land. All additive; the crate move has a `pub use` shim. This stage is public-surface-touching by construction.
+* **Stage 1** is pure trait extraction against the Stage-0 types + the existing SDK wrapper types. This stage is "no public-surface change beyond additive" in the strict sense: the trait itself is new-public, every other public surface is stable.
+
+The distinction is crisp and matches how the landing PRs should be reviewed.
 
 ### §3.3 Trait method signatures (round-2 revised — option C, concrete types)
 
@@ -201,8 +256,8 @@ The round-2 trait uses **concrete types at the boundary**:
 ```text
 pub struct Handle {
     backend: BackendTag,      // { Valkey, Postgres, ... } for runtime dispatch within the handle
-    kind: HandleKind,         // { Fresh, Resumed, Suspended } — checked on every op call
-    opaque: Bytes,             // backend-private state (lease token, row id, etc.)
+    kind: HandleKind,         // { Fresh, Resumed, Suspended } — #[non_exhaustive], checked on every op call
+    opaque: HandleOpaque,     // newtype over Box<[u8]>; backend-private state
 }
 
 #[async_trait]
@@ -234,29 +289,29 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     async fn complete(
         &self,
-        handle: Handle,
+        handle: &Handle,                 // round-4 (M-D2): borrow, not consume
         payload: Option<Bytes>,
     ) -> Result<(), EngineError>;
 
     async fn fail(
         &self,
-        handle: Handle,
+        handle: &Handle,                 // round-4 (M-D2)
         reason: FailureReason,
         classification: FailureClass,
     ) -> Result<FailOutcome, EngineError>;
 
     async fn cancel(
         &self,
-        handle: Handle,
+        handle: &Handle,                 // round-4 (M-D2)
         reason: &str,
     ) -> Result<(), EngineError>;
 
     async fn suspend(
         &self,
-        handle: Handle,
-        waitpoints: Vec<WaitpointSpec>,
-        timeout: Option<Duration>,
-    ) -> Result<Handle, EngineError>;   // returns a fresh Handle with kind=Suspended
+        handle: &Handle,                 // round-4 (M-D2): suspend also borrows;
+        waitpoints: Vec<WaitpointSpec>,  // the returned fresh Handle (kind=Suspended)
+        timeout: Option<Duration>,       // is a new cookie the caller replaces their old one with.
+    ) -> Result<Handle, EngineError>;
 
     async fn observe_signals(
         &self,
@@ -326,7 +381,13 @@ Round-2 contract distinguishes two atomicity classes:
 
 **Backend-side contract.** A backend's `complete` (and siblings) implementation MUST ensure the notification is scheduled within or after the commit — never before (never-pre-commit is the invariant that makes the consumer-side "notification implies commit" assumption safe). Valkey satisfies this trivially: the FCALL's PUBLISH is in the same Lua execution as the state mutation. Postgres satisfies this via `NOTIFY` inside the transaction (NOTIFY deliveries are deferred to commit; rollback cancels queued notifies).
 
-**Outbox pattern (optional).** A backend that wants to strengthen to "notification-eventually-arrives given commit" (rather than notify-best-effort) is free to add an outbox table + publisher process. The trait contract does not require this; naïve fire-and-forget PUBLISH on Valkey is within contract, and plain NOTIFY on Postgres is within contract.
+**Outbox pattern: REQUIRED for non-transactional backends (round-4, M7).** The "never-pre-commit" invariant is mandatory. A backend whose underlying storage layer can deliver a notification atomically with the state transition (Valkey FCALL PUBLISH; Postgres `NOTIFY` inside a transaction) satisfies the invariant by construction; such backends do NOT need an outbox.
+
+A backend whose storage layer CANNOT atomically deliver notification with commit — hypothetical NATS-backed, Kafka-backed, or split-storage designs — MUST implement a transactional outbox (persistent row written inside the commit; separate publisher process drains the outbox after commit is durable). Fire-and-forget publish BEFORE commit is a contract violation; fire-and-forget publish AFTER commit without an outbox is a correctness gap (on crash between commit and publish, the event is lost — violating the consumer-side "notify implies commit" contract's dual "commit eventually implies notify" that an outbox guarantees).
+
+Round-2 said outbox was "optional." That wording was inconsistent with the mandatory never-pre-commit invariant: a non-transactional backend without an outbox either violates never-pre-commit (publish before commit) or drops notifications on crash (publish after commit without retry). Either is a contract violation. Round-4 resolves: outbox is a mechanism, and non-transactional backends MUST implement SOME mechanism (outbox is the standard one) to satisfy the invariant. Transactional backends are exempt because their native primitives satisfy the invariant without an outbox.
+
+The contract the trait enforces is behavioural (the invariant), not structural (the mechanism). A backend that uses a different mechanism to satisfy the invariant is fine; a backend that uses no mechanism is out of contract.
 
 **Why this matters 6 months out.** A cairn or external consumer writing logic of the form "I saw complete() return; therefore my peer-observer has been woken" will be broken on Postgres if we don't make the asymmetry explicit. The fix is not a weaker `complete` (it's atomic at commit) but an explicit named contract the consumer can code against.
 
@@ -341,12 +402,23 @@ Round-1 used five associated types; round-2 replaces all five with concrete type
 ```text
 pub struct Handle {
     backend: BackendTag,
-    kind: HandleKind,          // Fresh | Resumed | Suspended
-    opaque: bytes::Bytes,      // backend-private state
+    kind: HandleKind,                 // Fresh | Resumed | Suspended — #[non_exhaustive]
+    opaque: HandleOpaque,             // wraps Box<[u8]>; round-4 per §7.17, replacing bytes::Bytes
 }
+
+#[non_exhaustive]
+pub enum HandleKind {
+    Fresh,
+    Resumed,
+    Suspended,
+}
+
+pub struct HandleOpaque(Box<[u8]>);    // newtype; no `bytes` transitive dep
 ```
 
-Owned by the worker for the duration of the attempt. Consumed by terminal ops (`complete`, `fail`, `cancel`); transformed by `suspend` (returns a fresh Handle with kind=Suspended); borrowed by non-terminal ops (`renew`, `progress`, `append_frame`, `observe_signals`, `report_usage`).
+**`HandleKind` visibility + stability (round-4, M5).** `HandleKind` is `pub` and `#[non_exhaustive]`. Consumers that pattern-match MUST include a `_` arm; variant additions (e.g., `Detached`, `Orphaned` in a future RFC) are non-breaking. The variants are a useful debug/ops surface — a consumer inspecting a `Handle` for diagnostics knows whether it is fresh / resumed / suspended — which is the reason to leave `kind` pub-visible rather than sinking it into `opaque`. The `opaque` bytes remain backend-private; they are not pattern-matchable.
+
+Owned by the worker for the duration of the attempt. Borrowed by every op (round-4 per M-D2; round-2 had terminal ops consume the handle, which broke the retry-after-transport-error story). Terminal ops (`complete`, `fail`, `cancel`) leave the handle valid per idempotent replay — a second call returns `EngineError::State { ... }` indicating "already terminal." `suspend` borrows the handle and returns a fresh Handle (kind=Suspended) the caller substitutes in place of their old cookie.
 
 **Valkey impl:** the `opaque` bytes encode exec id, attempt id, lease id, lease epoch, capability binding, partition. Decode is backend-internal.
 
@@ -356,23 +428,52 @@ Owned by the worker for the duration of the attempt. Consumed by terminal ops (`
 
 **`HandleKind` runtime checking.** Round-1 used compile-time type distinctness (`ResumeHandle` vs `Handle`) to prevent threading a resumed handle into a path expecting a fresh one. Round-2 makes this a runtime check: the backend validates `kind` on entry to each op and returns `EngineError::State { expected, actual }` on mismatch. This matches the existing fence-triple runtime-check discipline — which, unlike the handle-kind split, we never proposed to make compile-time-enforced, because the runtime check is already cheap and the value is clear. (If reviewers revisit the cost/benefit and prefer the compile-time enum with a `Handle<Fresh>` / `Handle<Resumed>` phantom-typed approach, that's an additive change later; round-2 picks the simpler shape first.)
 
-### §4.2 `EngineError` — concrete, Phase-1 landed
+### §4.2 `EngineError` — concrete, Phase-1 landed (round-4 honest shape)
 
-Backends return the concrete `EngineError` defined in `crates/ff-sdk/src/engine_error.rs` (Phase 1 landed on `main` at `25b2aad`). Variants:
+Backends return the concrete `EngineError` defined in `crates/ff-sdk/src/engine_error.rs`. See that file for the authoritative variant list and `#[non_exhaustive]` posture; every top-level variant and every sub-kind is `#[non_exhaustive]` so FF can add Lua-side error codes in minors without breaking consumers.
 
-* `Validation` — input violates invariants (non-retryable)
-* `Contention(ContentionKind)` — caller should retry with backoff
-* `Conflict(ConflictKind)` — another caller won a race; caller decides whether to retry
-* `State(StateKind)` — the targeted entity is in the wrong state (e.g., already terminal)
-* `Bug(BugKind)` — internal inconsistency; file a bug
-* `Transport(Box<dyn Error + Send + Sync>)` — backend-specific connectivity / protocol failure
-* `Unavailable { op: &'static str }` — round-2 addition (K#7); op is declared but not yet implemented on this backend
+**Current variants (verbatim from `engine_error.rs`, round-4 per M2):**
 
-The `Transport` variant is where backend-private errors (`ferriskey::Error`, `sqlx::Error`, etc.) are carried. They are boxed-and-erased at the trait boundary so the trait itself depends on nothing backend-specific. Consumers wanting to introspect the transport-layer error for backend-specific diagnostics must downcast; ordinary flow-control uses the structural variants.
+```text
+#[non_exhaustive]
+pub enum EngineError {
+    NotFound { entity: &'static str },
+    Validation { kind: ValidationKind, detail: String },
+    Contention(ContentionKind),
+    Conflict(ConflictKind),
+    State(StateKind),
+    Bug(BugKind),
+    Transport { #[source] source: Box<ScriptError> },
+}
+```
 
-**Round-2 change (K#7):** the `Unavailable` variant is new. It was already logically needed for staged backend impls (§5.3); round-1 specified `unimplemented!()` which is a panic, not an error. Round-2 replaces all `unimplemented!()` in the Stage 3 Postgres skeleton with `Err(EngineError::Unavailable { op: "<name>" })`. This variant addition is a Phase-1-scope minor change (additive enum variant) tracked as a prerequisite for Stage 3.
+Round-2 paraphrased this enum and dropped `NotFound`; round-4 cites it authoritatively. The sub-kinds (`ValidationKind`, `ContentionKind`, `ConflictKind`, `StateKind`, `BugKind`) each carry a rich taxonomy — consumers match on the sub-kind, not on parsed strings. See the file for the full sub-kind lists.
 
-**Classification invariant.** Every backend must map its native errors into these structural variants deterministically. Valkey: `ScriptError` + `ferriskey::ErrorKind` classify per the existing `classify()` function (Phase 1). Postgres: `sqlx::Error` / `tokio_postgres::Error` classify per a new per-crate classifier (part of the Postgres-backend RFC). The invariant is a prose contract — Rust has no language-level constraint to enforce it. §7.9 debates enforcement via a `BackendError::classify()` sub-trait method; since `EngineError` is now the concrete trait-level error, classification happens inside the backend before returning, not via a sub-trait method. §7.9 is therefore partially obsolete post-round-2 (see updated §7.9).
+**Stage 0 broadening of `Transport` (round-4, M1).** The current `Transport { source: Box<ScriptError> }` variant is tightly coupled to `ff_script::error::ScriptError` — a `ValkeyBackend::fail()` can wrap a ferriskey error into a ScriptError, but a future `PostgresBackend::fail()` cannot construct a ScriptError to wrap a `sqlx::Error`. The trait claims backend-agnosticism; the current variant shape contradicts it.
+
+Stage 0 broadens the variant to:
+
+```text
+Transport {
+    backend: &'static str,         // "valkey", "postgres", etc. — diagnostic label
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+```
+
+This is an additive-but-not-strictly-compatible change (existing callers constructing `Transport { source: ... }` still compile if the rename is done via `#[deprecated]` alias or a named constructor `EngineError::transport_script(err)`; plain struct-literal construction does need a touch-up). The Stage 0 PR handles the migration across ff-* in one commit. Consumers downstream that match on `Transport { source }` see a widened `source` type; downcasting to `ScriptError` still works for Valkey-backed callers via `source.downcast_ref::<ScriptError>()`.
+
+**Stage 0 new variant: `Unavailable` (K#7 holdover).**
+
+```text
+Unavailable { op: &'static str }
+```
+
+Returned by staged backend impls for methods not yet wired up. Graceful degradation instead of `unimplemented!()` panics. Additive.
+
+**`NotFound` is already in the enum.** Round-2's paraphrase dropped it; round-4 restores the authoritative citation. Consumers must match `NotFound { entity }` for 404-style lookups (e.g., `describe_execution` for a nonexistent id).
+
+**Classification invariant.** Every backend must map its native errors into these structural variants deterministically. Valkey: `ScriptError` + `ferriskey::ErrorKind` classify per the existing `classify()` function (Phase 1). Postgres: `sqlx::Error` / `tokio_postgres::Error` classify per a new per-crate classifier (part of the Postgres-backend RFC). The invariant is a prose contract — Rust has no language-level constraint to enforce it. §7.9 debates enforcement via a `BackendError::classify()` sub-trait method; since `EngineError` is the concrete trait-level error, classification happens inside the backend before returning. §7.9 is therefore partially obsolete post-round-2.
 
 ### §4.3 `CompletionStream` — `Pin<Box<dyn Stream + Send>>`
 
@@ -396,33 +497,60 @@ Round-1 had two additional associated types (`SuspendToken`, `ResumeHandle`). Ro
 
 ---
 
-## §5 Migration plan
+## §5 Migration plan (round-4 — Stage 0 introduced, former Stages 1+2 fused)
 
 The trait extraction is staged. Each stage is independently landable, with an acceptance gate and rollback posture. No single PR attempts the full migration.
 
-### §5.1 Stage 1 — Trait extraction, Valkey impl stays put (this RFC accepted)
+Round-4 restructures the staging per M6 (fuse trait + config) and M1/M2/M3/M4 (acknowledge Stage 0 type-plumbing as its own stage):
 
-**Scope.** Define `EngineBackend` trait in a new module `ff_core::backend` (or `ff_sdk::backend` — location decision per §7). The current `FlowFabricWorker` + `ClaimedTask` inherent impls become a single `ValkeyBackend` implementation of the trait, living in a new crate `ff-backend-valkey` (or as a module in `ff-sdk` if the crate-split is deferred; §7.1).
+* **Stage 0** — additive type plumbing + `EngineError` broadening + `ResumeSignal` crate move. Public-surface-touching but strictly additive / shim-compatible.
+* **Stage 1** — trait extraction + `BackendConfig` in one landing (formerly Stages 1 & 2). Single migration event for consumers.
+* **Stage 2** (former Stage 3) — experimental `ff-backend-postgres`.
+* **Stage 3** (former Stage 4) — cairn migration (cairn-team timeline).
+* **Stage 4** (former Stage 5) — seal `ff_core::keys`.
 
-**What does not change:** Public SDK API. Consumers continue calling `ClaimedTask::complete(self, payload)`. The inherent impl becomes a thin forwarder to `ValkeyBackend::complete(handle, payload)`. Zero behaviour change. Zero wire change.
+### §5.0 Stage 0 — Type plumbing + `EngineError` broadening + `ResumeSignal` move
 
-**What does change:** The internal structure. A new trait exists; the Valkey backend exists as a named type implementing it. The existing SDK code rewires to use the trait internally. Downstream consumers are unaware.
+Stage 0 is prerequisite to Stage 1. Without it, Stage 1's trait signatures do not compile. It exists as its own named stage so the public-surface additions are reviewed as a cohort rather than buried in the trait-extraction PRs.
 
-**Landing gate.** `cargo test --workspace` green. `ff-test` green against a real Valkey. No public-surface changes flagged by `cargo semver-checks` (if configured) beyond additive.
+**Scope.**
+1. Land the 13 new public types per §3.3.0 in `ff-core::contracts` and `ff-core::types` (as mapped). Each is additive; each lands with rustdoc + minimal unit tests.
+2. Broaden `EngineError::Transport` per §4.2 to carry `Box<dyn std::error::Error + Send + Sync + 'static>` + a `backend: &'static str` tag. Provide a helper `EngineError::transport_script(err: ScriptError) -> Self` for the Valkey call sites to retain ergonomics. Migrate all `ff-*` construction sites in the same PR.
+3. Add `EngineError::Unavailable { op: &'static str }` variant (round-2 K#7 holdover).
+4. Move `ResumeSignal` from `ff-sdk/src/task.rs` to `ff-core::contracts`. Keep `pub use ff_core::contracts::ResumeSignal` in `ff-sdk::task` so `ff_sdk::task::ResumeSignal` continues to resolve through the 0.4.x window; schedule re-export removal for 0.5.0.
+5. Optionally move `FailOutcome` on the same pattern (ff-sdk → ff-core::contracts with shim). Decision at impl time based on whether the struct is truly ff-core-shaped.
 
-**Rollback.** Trait-extraction is a refactor; rollback is a revert. No user-observable shape to preserve.
+**What does not change:** trait, backends, SDK method names, wire shapes.
 
-### §5.2 Stage 2 — `BackendConfig` replaces `WorkerConfig`'s connection primitives (issue #93)
+**Landing gate.** `cargo test --workspace` green. `cargo semver-checks` (if configured) flags no non-additive changes. Downstream cairn-fabric smoke build (against a pre-release version) green.
 
-**Scope.** `WorkerConfig`'s `host`, `port`, `tls`, `cluster` fields move behind a `BackendConfig` trait (or struct — tbd at impl time). Worker-policy fields (`lanes`, `capabilities`, `lease_ttl_ms`, etc.) stay on `WorkerConfig`. `WorkerConfig::connect()` becomes `WorkerConfig::connect_with(backend)` taking a pre-constructed backend handle.
+**Rollback.** All changes are additive; revert is a revert.
 
-**Migration shim.** `WorkerConfig::new(host, port, ...)` continues to exist as a convenience constructor on the Valkey path, internally building a `ValkeyBackendConfig` and calling `connect_with`. Old-call-site code compiles unchanged. New call sites (multi-backend consumers) use the explicit form.
+**Est.** 6-10h. Lower bound of §10's range because the scope is mechanical.
 
-**Landing gate.** `ff-test` green. Example apps (`examples/media-pipeline`, `examples/coding-agent`) green. Cairn-fabric's CI green against the pre-0.4 release.
+### §5.1 Stage 1 — Trait extraction + `BackendConfig` (fused, M6)
 
-### §5.3 Stage 3 — Experimental `ff-backend-postgres` crate
+**Scope.**
+1. Define `EngineBackend` trait in `ff-backend-api` (new crate per §7.8).
+2. Move `WorkerConfig`'s `host/port/tls/cluster` fields behind a `BackendConfig` abstraction. Worker-policy fields stay on `WorkerConfig`. `WorkerConfig::connect_with(backend)` is the new construction path; `WorkerConfig::new(host, port, ...)` remains as a Valkey convenience shim that internally builds a `ValkeyBackendConfig` + constructs the backend.
+3. The current `FlowFabricWorker` + `ClaimedTask` inherent impls become a `ValkeyBackend` implementation of the trait (new crate `ff-backend-valkey`, or module in `ff-sdk` with a feature flag — decision at impl time, not RFC-material).
+4. SDK wrapper methods (`ClaimedTask::complete` etc.) become thin forwarders to the trait.
 
-**Prerequisite.** The `EngineError::Unavailable { op: &'static str }` variant (§4.2) lands as a Phase-1-scope PR before Stage 3 begins. This is a ~10-line additive enum-variant change to `crates/ff-sdk/src/engine_error.rs`; it does not break existing consumers.
+**Why fuse (M6).** Round-2 split trait-extraction from config-decoupling into two stages. Worker M correctly noted this forces two consumer migration events: once when they adopt the trait API, once when they want to swap backends via config. Pre-1.0 + single-consumer-mid-migration means two events is gratuitous cost. Fusing the two lands one coherent "the SDK is now backend-parametric" release.
+
+**What does not change (post-fuse):** SDK method names. Existing wire. Existing `WorkerConfig::new(host, port, ...)` call sites continue to compile. Consumers who don't touch the trait / don't want to swap backends are unaffected.
+
+**What does change:** the trait exists as a new public surface; `BackendConfig` replaces `WorkerConfig`'s connection fields; consumers who want to pass a pre-constructed backend have an explicit API for it.
+
+**Landing gate.** `cargo test --workspace` green. `ff-test` green against real Valkey. Example apps (`examples/media-pipeline`, `examples/coding-agent`) green without edits. Cairn-fabric smoke build green.
+
+**Rollback.** Revert-to-main is clean because Stage 0 (which bundles the public-surface-additive work) remains landed; the revert touches only trait definitions + SDK wiring.
+
+**Est.** 25-35h (slightly higher than round-2's Stage 1 at 20-30h because the fused scope includes the BackendConfig move).
+
+### §5.2 Stage 2 — Experimental `ff-backend-postgres` (formerly Stage 3)
+
+**Prerequisite.** Stage 0 + Stage 1 landed.
 
 **Scope.** A new crate `ff-backend-postgres` lands with a minimal `EngineBackend` impl. Minimum-surface: `claim` / `renew` / `progress` / `append_frame` / `complete` / `fail` / `describe_execution`. Unimplemented methods return `Err(EngineError::Unavailable { op: "<method_name>" })` — NOT `unimplemented!()`.
 
@@ -434,13 +562,13 @@ The trait extraction is staged. Each stage is independently landable, with an ac
 
 **Non-ship contract.** The crate ships under `[features]` or with a `README` that says "experimental; non-production." No version promise.
 
-### §5.4 Stage 4 — Cairn-fabric migration (cairn-team timeline)
+### §5.3 Stage 3 — Cairn-fabric migration (cairn-team timeline, formerly Stage 4)
 
 Cairn migrates at their own pace. Our side: keep the `EngineBackend` trait stable (no breaking changes post-Stage 1 without a minor version bump), provide the `ff-backend-valkey` crate, provide the migration guide. Cairn's team decides when to adopt.
 
 No gate on our side. This stage completes when cairn files a PR closing their migration.
 
-### §5.5 Stage 5 — Seal `ff_core::keys` as `pub(crate)`
+### §5.4 Stage 4 — Seal `ff_core::keys` as `pub(crate)` (formerly Stage 5)
 
 **Scope.** Once no internal `ff-*` crate imports from `ff_core::keys` (the raw Valkey key-name builders — `ExecKeyContext`, `IndexKeys`, etc.) outside the backend crates, flip the module visibility to `pub(crate)` inside the `ff-backend-valkey` crate. External consumers are fully abstracted from Valkey key names.
 
@@ -498,7 +626,17 @@ Where the rationale gives a clear single-consumer-class + shared-type-category s
 
 **Round-2 status: resolved.** Round-1 left this as "usable both ways" (generic + dyn). The round-2 concrete-types decision (§4, K#5) makes both usable simultaneously without trade-off: there are no associated types to project, `dyn EngineBackend` works directly, and `<B: EngineBackend>` works directly. The dispatch choice is 100% consumer-side. §7.7 is closed accordingly.
 
-### §6.5 Shared implementations across backends via a base trait
+### §6.5 Single `terminate(handle, Outcome)` method in place of `complete` / `fail` / `cancel` (round-4, M-D3)
+
+**Rejected.** A fused terminal op `terminate(handle, outcome: TerminalOutcome)` where `TerminalOutcome` is an enum like `{ Complete { payload }, Fail { reason, class }, Cancel { reason } }` would give one method in the trait instead of three. Considered and rejected:
+
+* Each of the three has a genuinely different signature + return type (`complete` returns `Result<(), _>`, `fail` returns `Result<FailOutcome, _>` with retry-scheduling info, `cancel` returns `Result<(), _>`). Collapsing forces the return type to an enum too (`TerminalResult { NoRetry, Retry { delay } }` and the always-`None` arms for `complete`/`cancel`) — more clutter, not less.
+* Variant-shaped per-arm payload pattern is clumsier at call sites than three named methods. `backend.complete(h, payload)` reads better than `backend.terminate(h, TerminalOutcome::Complete { payload })`.
+* The three ops map to three different Valkey FCALLs (`ff_complete_execution`, `ff_fail_execution`, `ff_cancel_execution`) and three different Postgres transactions — there is no backend-internal simplification to gain.
+
+The three-method shape stays.
+
+### §6.6 Shared implementations across backends via a base trait
 
 **Rejected as premature.** A hierarchy like `trait Backend { ... default impls ... }` + `trait EngineBackend: Backend` sharing commonalities across future backend impls (e.g., fence-triple verification logic) is worth considering once a second backend exists. Today, exactly one backend exists (Valkey); the default-impl slots would all be `unimplemented!()` placeholders. Deferred to post-Stage-3 when the Postgres backend has materialised and shared surfaces become visible.
 
@@ -627,9 +765,46 @@ What remains debate-worthy: the `EngineError::Transport(Box<dyn Error + Send + S
 
 **Lean:** `#[async_trait]` for now (established, well-understood; desugar cost is one Box-alloc per call, negligible relative to FCALL round-trip). Revisit in the post-2024-edition-stabilised era when native `async fn` gains object-safety support; the revisit is additive. Recorded in §8.19.
 
+### §7.17 `Bytes` vs `Box<[u8]>` for `Handle.opaque` payload (round-4, M-D1)
+
+**The choice.** §4.1's `Handle` uses `bytes::Bytes`. If the trait lives in `ff-backend-api` (§7.8 lean), that crate pulls the `bytes` crate as a public-type transitive dep. Cheaper alternative: `Box<[u8]>` (no extra dep, no ref-counting, one allocation per Handle) or a `HandleOpaque(Box<[u8]>)` newtype.
+
+**Arguments for `Bytes`:** cheap clone (ref-counted), zero-copy slicing, well-established in the Rust async ecosystem. Backends that hand the same opaque bytes to multiple call sites (e.g., caching the encoded Handle for reuse) pay zero copy cost.
+
+**Arguments for `Box<[u8]>`:** no extra public-type dep; consumers who already use `bytes` elsewhere are unaffected; consumers who don't avoid one transitive. A `Handle` is typically not cloned on the hot path (worker owns it for the attempt duration), so ref-counting is unused.
+
+**Lean (round-4):** `Box<[u8]>` wrapped in a `HandleOpaque` newtype. The transitive-dep cost is real for an architectural-keystone crate; ref-counting is unused; the newtype keeps the public-surface clean and lets us swap to `Bytes` later without a breaking change (additive From impls). Recorded as a minor lean; bikeshed-acceptable at impl time.
+
+### §7.18 Retry-after-transport-error semantics for terminal ops (round-4, M-D2)
+
+**The choice.** `complete(handle, payload)` / `fail(handle, ...)` / `cancel(handle, ...)` consume `Handle` by value. If the call fails with `EngineError::Transport { ... }`, the Handle is moved and gone. On a backend with idempotent replay (§3.4), the caller WANTS to retry the same attempt — but the Handle is dropped.
+
+**Options.**
+* (a) **Take `&Handle` for terminal ops too.** Rely on `HandleKind` state tracking inside the backend to reject double-terminal. Runtime `EngineError::State` on the second call. Simple, consistent with non-terminal ops.
+* (b) **Reconstruct Handle from SDK-side cache.** The SDK wrapper holds a copy of the `Handle` internally; on transport error, the wrapper reconstructs + retries. Callers never see the move-vs-borrow question.
+* (c) **Document the retry story.** Callers who want retry wrap the Handle in `Arc<Handle>` before calling; on transport error they still hold the `Arc` and can call `backend.complete((*arc).clone(), payload)` on retry. Requires `Handle: Clone`.
+
+**Lean (round-4):** (a). Taking `&Handle` for terminal ops uniforms the trait surface with non-terminal ops, relies on the existing `HandleKind` runtime-check discipline (§4.1), and gives caller-side retry for free. The "owned-by-value = consumed" signal the Rust type system offers is cosmetic here because idempotent-replay at the backend is the real guarantee. Update §3.3 sketch: `complete(&self, handle: &Handle, payload)` etc. Recorded as a round-4 revision to the §3.3 signatures; §3.1.1 method 4 / 5 / 6 prose updated accordingly.
+
+*Note:* this is a semantic widening vs. round-2, not a shape change. Existing Valkey-backend's idempotent-replay behaviour already supports `&Handle`; it was the round-2 sketch that artificially moved the Handle.
+
+### §7.19 `ff-server` + Postgres backend for HTTP claim routes (round-4, M-D4)
+
+**The choice.** Today `FlowFabricWorker::claim_via_server` (worker.rs:1014) is an HTTP-orchestration path. Round-2 §7.1 declared this off-trait. With a Postgres backend in play (Stage 2+), ff-server's HTTP claim route must reach a backend somehow.
+
+**Resolution.** `ff-server` holds `Arc<dyn EngineBackend>` and internally calls `backend.claim(...)` on behalf of HTTP callers. The HTTP route becomes a thin shell: parse request → call trait → serialize response. The Postgres-backed ff-server differs from the Valkey-backed ff-server only in what they pass to the `Arc::new(...)` constructor. This is option (a) in M's D4; option (b) (ff-server bypasses the trait) would defeat the entire decoupling.
+
+Recorded explicitly: `ff-server` is a consumer of `EngineBackend`, not a parallel-privileged component. No special routing path exists for HTTP claims.
+
+### §7.20 Admin signal-observation across executions (round-4, M-D5)
+
+**The choice.** `observe_signals(&Handle)` requires a handle — only the current handle-holder can observe. Cairn's bridge-observer pattern and some ops use cases want "observe signals for any execution id" (no handle).
+
+**Resolution.** This is an `AdminBackend` concern, not `EngineBackend`. Add to §3.2's explicit-not-in-trait list: "Cross-execution signal observation (admin scope) lives on `AdminBackend::describe_signals(execution_id)`." The `AdminBackend` trait is not defined in this RFC; the method is noted as part of its future surface so the decoupling is complete.
+
 ### §7.16 Postgres-first prototype before ratifying (K's deserves-debate #6)
 
-**The choice.** §5.3 (Stage 3) prototypes Postgres AFTER the trait is ratified. K argues the opposite order is the honest-trait-surface discipline.
+**The choice.** §5.2 (Stage 2, round-4 — former Stage 3) prototypes Postgres AFTER the trait is ratified. K argues the opposite order is the honest-trait-surface discipline.
 
 **Arguments for Postgres-first.**
 * Writing the impl first reveals unstated Valkey assumptions baked into the trait shape.
@@ -638,7 +813,7 @@ What remains debate-worthy: the `EngineError::Transport(Box<dyn Error + Send + S
 **Arguments for trait-first.**
 * Writing a Postgres impl against an unstable trait means throwing work away every time the trait reshapes in review.
 * The trait extraction unblocks #87 + #88 + #93 immediately; Postgres is a distant follow-on.
-* Stage 3 IS the prototype pressure-test; if it surfaces a trait problem, Stage 1 re-opens per the iterative discipline.
+* Stage 2 (formerly Stage 3, round-4 renumbered) IS the prototype pressure-test; if it surfaces a trait problem, Stage 1 re-opens per the iterative discipline.
 
 **Lean (round-2):** trait-first with Stage 3 as the pressure-test. The inverse-order cost is real (Postgres work thrown away on trait churn); the Stage-3-reopens-Stage-1 escape hatch is the standard RFC-iterative discipline. Recorded in §8.20.
 
@@ -726,9 +901,21 @@ The K objection (workers don't claim flows; `cancel_flow` is a control-plane op)
 
 **Response (round-2 CONCEDE — added to §7.15).** K correctly noted §7 had 13 open questions and this wasn't one. Round-2 adds §7.15 explicitly. The choice is forced by §7.7's object-safety decision: `#[async_trait]` for now. Additive swap to native async-fn-in-traits if / when they gain object-safety. The addition is an §7 entry, not an RFC-shape change.
 
+### §8.21 "`Bytes` as Handle payload adds a public-type transitive dep." (M's D1)
+
+**Response (round-4 CONCEDE).** Switch to `Box<[u8]>` wrapped in a `HandleOpaque` newtype. See §7.17. The transitive-dep cost for an architectural-keystone crate is real; ref-counting is unused on the hot path. Additive From impls let us swap to `Bytes` later without a breaking change.
+
+### §8.22 "Terminal ops consume Handle by value — retry-after-transport-error story broken." (M's D2)
+
+**Response (round-4 CONCEDE).** Switch terminal ops to `&Handle` per §7.18 option (a). The move-by-value gave cosmetic type-system-level "consumed" signalling; idempotent-replay at the backend is the real guarantee and is already preserved. §3.3 sketch updated accordingly in the impl PRs.
+
+### §8.23 "`claim_via_server` off-trait leaves ff-server + Postgres path undefined." (M's D4)
+
+**Response (round-4 RESOLVE).** `ff-server` holds `Arc<dyn EngineBackend>` and calls `backend.claim(...)` from its HTTP route. Same trait path for Valkey-backed and Postgres-backed ff-server deployments. See §7.19. ff-server is a consumer of the trait, not a trait-bypassing component.
+
 ### §8.20 "Postgres-first prototype before ratifying the trait." (K's deserves-debate #6)
 
-**Response (round-2 DEFEND — added to §7.16).** See §7.16 for the full argument. Summary: Stage 3 IS the prototype pressure-test; the inverse order costs Postgres impl work thrown away on trait churn; the Stage-3-reopens-Stage-1 escape hatch is the iterative discipline we already use for RFC-011-series work.
+**Response (round-2 DEFEND — added to §7.16).** See §7.16 for the full argument. Summary: Stage 2 (formerly Stage 3, round-4 renumbered) IS the prototype pressure-test; the inverse order costs Postgres impl work thrown away on trait churn; the Stage-3-reopens-Stage-1 escape hatch is the iterative discipline we already use for RFC-011-series work.
 
 ---
 
@@ -738,15 +925,15 @@ The follow-up issues all trace back to this RFC. Sequencing:
 
 **#87 (ferriskey::Client leak on FlowFabricWorker).** Collapses to "consumers interact with `dyn EngineBackend` or `<B: EngineBackend>`; ferriskey::Client becomes a `ValkeyBackend`-private field." Lands with Stage 1.
 
-**#88 (ferriskey::Error leak on SdkError).** Collapses to `B::Error` (per §4.2). Lands with Stage 1.
+**#88 (ferriskey::Error leak on SdkError).** Collapses at the trait boundary via the broadened `EngineError::Transport { backend, source: Box<dyn Error + Send + Sync> }` (Stage 0). ferriskey::Error is erased behind the Box. Lands with Stage 0 (broadening) + Stage 1 (trait).
 
-**#90 (CompletionStream trait replacing ff:dag:completions pubsub).** This RFC authorises the `CompletionStream` associated type (§4.4); the actual `CompletionBackend` trait definition + wire shape is issue #90's deliverable, landing in Stage 1 or Stage 2 depending on complexity. The shape is informed by this RFC's return-type choices.
+**#90 (CompletionStream trait replacing ff:dag:completions pubsub).** This RFC authorises the `CompletionStream` shape (§4.3) and names `CompletionPayload` as a Stage-0 new type (§3.3.0). The actual `CompletionBackend` trait definition lives in issue #90's deliverable, informed by this RFC's return-type choices.
 
-**#91 (opaque PartitionKey on wire types).** Parallel-independent work. `ClaimGrant.partition: String` → `ClaimGrant.partition: PartitionKey` (opaque newtype) is orthogonal to the trait extraction. Sequence before or after Stage 1; no dependency either way. Landing post-Stage-1 is slightly nicer because `ClaimGrant` then lives more fully inside the backend's type vocabulary.
+**#91 (opaque PartitionKey on wire types).** Parallel-independent work. `ClaimGrant.partition: String` → `ClaimGrant.partition: PartitionKey` (opaque newtype) is orthogonal to the trait extraction. Sequence before or after Stage 1; no dependency either way.
 
 **#92 (StreamCursor enum).** Separate `StreamBackend` trait per §6.2. Post-Stage-1 work.
 
-**#93 (BackendConfig).** Stage 2 in this RFC's staging. Depends on Stage 1.
+**#93 (BackendConfig).** FUSED into Stage 1 per round-4 M6. The former "Stage 2: BackendConfig" is no longer a separate stage; `BackendConfig` lands alongside the trait in one coherent release.
 
 ---
 
@@ -754,14 +941,14 @@ The follow-up issues all trace back to this RFC. Sequencing:
 
 A full hour-level breakdown follows the Stage 1 detailed design PR (pre-Stage-1). Rough envelope:
 
-| Stage | Owner           | Scope                                                             | Est.       |
-|-------|-----------------|-------------------------------------------------------------------|------------|
-| 1     | single-agent    | Trait definition + `ValkeyBackend` impl + SDK rewire + tests      | 20-30h     |
-| 2     | single-agent    | `BackendConfig` split + shim + example updates                    | 6-10h      |
-| 3     | cross-cutting   | `ff-backend-postgres` experimental crate + Postgres CI            | 20-30h     |
-| 4     | cairn team      | Cairn migration (external)                                        | cairn-side |
-| 5     | single-agent    | Seal `ff_core::keys` + final consumer-check audit                 | 2-4h       |
-| **Total (internal)** | | ~50-75h over 2-3 weeks wall-clock, non-blocking with other work | |
+| Stage | Owner           | Scope                                                                                  | Est.       |
+|-------|-----------------|----------------------------------------------------------------------------------------|------------|
+| 0     | single-agent    | 13 new types + `EngineError` Transport broadening + `Unavailable` variant + `ResumeSignal` move | 6-10h      |
+| 1     | single-agent    | Trait definition + `ValkeyBackend` impl + `BackendConfig` + SDK rewire + tests (fused) | 25-35h     |
+| 2     | cross-cutting   | `ff-backend-postgres` experimental crate + Postgres CI                                 | 20-30h     |
+| 3     | cairn team      | Cairn migration (external)                                                             | cairn-side |
+| 4     | single-agent    | Seal `ff_core::keys` + final consumer-check audit                                      | 2-4h       |
+| **Total (internal)** | | ~55-80h over 2-3 weeks wall-clock, non-blocking with other work                        | |
 
 The estimate is order-of-magnitude, not hour-exact. The Stage 1 PR cluster is the critical chunk; Stage 2+ are parallelisable with cairn-independent work.
 
