@@ -186,6 +186,22 @@ pub enum FrameKind {
 /// Today's FCALL takes the byte payload + frame_type + optional seq as
 /// discrete ARGV; Stage 0 collects them into a named type for trait
 /// signatures.
+///
+/// **Round-7 follow-up (PR #145 → #146):** extended with
+/// `frame_type: String` (the SDK-public free-form classifier — values
+/// like `"delta"`, `"log"`, `"agent_step"`, `"summary_token"`,
+/// `"transcribe_line"`, `"progress"` — distinct from the coarse
+/// [`FrameKind`] enum) and `correlation_id: Option<String>` (the
+/// wire-level `correlation_id` ARGV, surfaced at the SDK as
+/// `metadata: Option<&str>`). Adding these lets
+/// `ClaimedTask::append_frame` forward through the trait without
+/// wire-parity regression.
+///
+/// `frame_type` is free-form and is what the backend writes into the
+/// Lua-side `frame_type` ARGV. [`FrameKind`] remains for typed
+/// classification at the trait surface; when callers populate only
+/// `kind`, the backend falls back to a stable encoding of the enum
+/// variant (see `frame_kind_to_str` in `ff-backend-valkey`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Frame {
@@ -194,17 +210,30 @@ pub struct Frame {
     /// Optional monotonic sequence. Set by the caller when the stream
     /// protocol is sequence-bound; `None` lets the backend assign.
     pub seq: Option<u64>,
+    /// Free-form classifier written to the Lua-side `frame_type` ARGV.
+    /// Empty string means "defer to [`FrameKind`]" — the backend
+    /// substitutes the enum-variant encoding.
+    pub frame_type: String,
+    /// Optional correlation id (wire `correlation_id` ARGV). `None`
+    /// encodes as the empty string on the wire.
+    pub correlation_id: Option<String>,
 }
 
 impl Frame {
     /// Construct a frame. `seq` defaults to `None` (backend-assigned);
-    /// callers that need an explicit sequence use
-    /// [`Frame::with_seq`].
+    /// `frame_type` defaults to empty (backend falls back to
+    /// `FrameKind` encoding); `correlation_id` defaults to `None`.
+    /// Callers that need an explicit sequence use [`Frame::with_seq`];
+    /// callers on the SDK forwarder path populate `frame_type` +
+    /// `correlation_id` via [`Frame::with_frame_type`] /
+    /// [`Frame::with_correlation_id`].
     pub fn new(bytes: Vec<u8>, kind: FrameKind) -> Self {
         Self {
             bytes,
             kind,
             seq: None,
+            frame_type: String::new(),
+            correlation_id: None,
         }
     }
 
@@ -214,7 +243,21 @@ impl Frame {
             bytes,
             kind,
             seq: Some(seq),
+            frame_type: String::new(),
+            correlation_id: None,
         }
+    }
+
+    /// Builder-style setter for the free-form `frame_type` classifier.
+    pub fn with_frame_type(mut self, frame_type: impl Into<String>) -> Self {
+        self.frame_type = frame_type.into();
+        self
+    }
+
+    /// Builder-style setter for the optional `correlation_id`.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
     }
 }
 
@@ -919,11 +962,29 @@ mod tests {
             bytes: b"hello".to_vec(),
             kind: FrameKind::Stdout,
             seq: Some(3),
+            frame_type: "delta".to_owned(),
+            correlation_id: Some("req-42".to_owned()),
         };
         assert_eq!(f.clone(), f);
         assert_eq!(f.kind, FrameKind::Stdout);
+        assert_eq!(f.frame_type, "delta");
+        assert_eq!(f.correlation_id.as_deref(), Some("req-42"));
         assert_ne!(FrameKind::Stderr, FrameKind::Event);
         let _ = format!("{f:?}");
+    }
+
+    #[test]
+    fn frame_builders_populate_extended_fields() {
+        let f = Frame::new(b"payload".to_vec(), FrameKind::Event)
+            .with_frame_type("agent_step")
+            .with_correlation_id("corr-1");
+        assert_eq!(f.frame_type, "agent_step");
+        assert_eq!(f.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(f.seq, None);
+
+        let bare = Frame::new(b"p".to_vec(), FrameKind::Event);
+        assert_eq!(bare.frame_type, "");
+        assert_eq!(bare.correlation_id, None);
     }
 
     #[test]

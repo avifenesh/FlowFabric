@@ -7,6 +7,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking — `ff_core::backend::Frame` extended (RFC-012 §R7, PR #146):**
+  Added `frame_type: String` + `correlation_id: Option<String>` so
+  `ClaimedTask::append_frame` can forward through the `EngineBackend`
+  trait without wire-parity regression. Closes the Round-7
+  append_frame SDK-forwarder gap flagged in PR #145. `Frame` remains
+  `#[non_exhaustive]`; new `Frame::with_frame_type` /
+  `Frame::with_correlation_id` builder setters. The Valkey impl
+  uses `frame.frame_type` as the free-form `frame_type` ARGV when
+  non-empty, falling back to the `FrameKind` encoding when callers
+  populate only the typed `kind`.
+
 - **Breaking — `EngineBackend` trait (RFC-012 §R7, #117):**
   - `append_frame` now returns `AppendFrameOutcome { stream_id,
     frame_count }` (was `()`). The type moves from `ff_sdk::task`
