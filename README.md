@@ -45,14 +45,18 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 
 ## Quick start
 
-### 1. Start Valkey 8
+### 1. Start Valkey
 
-FlowFabric requires Valkey >= 8.0 (RFC-011 §13, enforced at boot). Valkey 7.x
-is rejected by `ff-server`.
+FlowFabric requires Valkey >= 7.2 (RFC-011 §13, enforced at boot). 7.2 is the
+release where the Valkey Functions API + RESP3 stabilized. Valkey 7.0 and
+earlier — and Redis of any version — are rejected by `ff-server`.
 
 ```bash
 docker run -d --name valkey -p 6379:6379 valkey/valkey:8-alpine
 ```
+
+The quickstart image pins major 8 for reproducibility, but any `valkey/valkey`
+tag whose version is ≥ 7.2 will boot. CI exercises both 7.2 and 8.
 
 ### 2. Start the FlowFabric server
 
@@ -159,10 +163,11 @@ Future: per-FCALL version negotiation. For now: drain old instances before start
 
 Two PR-time GitHub Actions workflows gate merges:
 
-- **`.github/workflows/matrix.yml`** — 5-job host × mode matrix against Valkey 8 (`valkey/valkey:8-alpine`). RFC-011 §13 requires Valkey >= 8.0, enforced at `ff-server` boot; the pre-RFC-011 Valkey 7.2 rows are retired.
-  - linux x86_64 (`ubuntu-latest`) × {standalone, cluster}
-  - linux arm64 (`ubuntu-24.04-arm`) × {standalone, cluster}
-  - macos arm64 (`macos-latest`) × standalone (Homebrew Valkey, currently tracking the 8.x line unpinned; docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
+- **`.github/workflows/matrix.yml`** — 6-job host × valkey × mode matrix. RFC-011 §13 requires Valkey >= 7.2, enforced at `ff-server` boot.
+  - linux x86_64 (`ubuntu-latest`) × valkey 8 (`valkey/valkey:8-alpine`) × {standalone, cluster}
+  - linux x86_64 (`ubuntu-latest`) × valkey 7.2 (`valkey/valkey:7.2`) × standalone — guards against accidental 8-specific primitive adoption
+  - linux arm64 (`ubuntu-24.04-arm`) × valkey 8 × {standalone, cluster}
+  - macos arm64 (`macos-latest`) × valkey 8 × standalone (Homebrew Valkey, currently tracking the 8.x line unpinned; docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
   - Cluster mode on linux uses a 3-master 3-replica cluster via `.github/cluster/docker-compose.cluster.yml` + `bootstrap.sh`.
 - **`.github/workflows/security-and-quality.yml`** — 6 independent gates, any one blocks merge:
   - `cargo audit` with `--deny warnings`; ignore list in `.cargo/audit.toml`

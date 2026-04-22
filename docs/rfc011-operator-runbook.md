@@ -29,9 +29,9 @@ operator responsible for the Valkey backend + FlowFabric server deployment.
 
 ## Valkey version requirement
 
-FlowFabric requires **Valkey ≥ 8.0** (see RFC-011 §13). The server verifies
-this at boot by issuing `INFO server` and parsing the authoritative version
-field:
+FlowFabric requires **Valkey ≥ 7.2** (see RFC-011 §13 and the §13 Amendment F
+floor-revert note). The server verifies this at boot by issuing `INFO server`
+and parsing the authoritative version field:
 
 - Prefers `valkey_version:` (present on Valkey 8.0+; this is the real
   server version).
@@ -43,15 +43,19 @@ compat and exposes the true version in `valkey_version:`. Operators
 inspecting the INFO response manually should read `valkey_version:`, not
 `redis_version:`, to see the real server version.
 
-If the major component is below 8, the server refuses to start with a typed
-`ServerError::ValkeyVersionTooLow { detected, required }` and exits.
+If the parsed `(major, minor)` is below `(7, 2)`, the server refuses to start
+with a typed `ServerError::ValkeyVersionTooLow { detected, required }` and
+exits.
 
-### Why 8.0
+### Why 7.2
 
-The hash-slot co-location design (RFC-011 §2) and the Valkey Functions API
-behavior the engine relies on stabilized in 8.0. Older versions will silently
-behave differently on some cluster edge cases. 8.0 is cairn-fabric's reference
-deployment, and it's what FlowFabric's integration tests pin.
+Valkey 7.2 is where the Functions API and RESP3 stabilized — the primitives
+the co-location design and typed FCALL wrappers actually depend on. Older
+versions do not implement the required APIs. We previously shipped an 8.0
+floor but reverted to 7.2 (RFC-011 §13 Amendment F) because nothing in the
+design requires 8-only behavior, and the lower floor supports downstream
+operators on slower-moving infra. CI exercises both 7.2 and 8 to guard
+against accidental 8-specific adoption.
 
 ### Rolling upgrade tolerance
 
@@ -61,8 +65,9 @@ The version check includes a **60-second exponential-backoff retry budget**
 - **Transport transients** — connection refused, `BusyLoadingError`,
   `ClusterDown`, etc. (Valkey error kinds classified as retryable).
 - **Low-version responses** — if the connected node happens to be a
-  pre-upgrade replica during a rolling upgrade, the 7.x response is treated
-  as a rolling-state transient and retried. After 60s of consistent low
+  pre-upgrade replica during a rolling upgrade (e.g. a 7.0 node briefly
+  reached while rolling to 7.2+), the response is treated as a
+  rolling-state transient and retried. After 60s of consistent low
   responses, the server exits with `ServerError::ValkeyVersionTooLow` —
   that's the misconfiguration signal, not a transient.
 
@@ -75,7 +80,7 @@ retrying them just hides the true cause under a 60s hang. Server boot fails
 immediately with the structured error and the underlying Valkey error kind
 preserved.
 
-## Rolling upgrade procedure (Valkey 7.x → 8.0+)
+## Rolling upgrade procedure (below-floor → ≥ 7.2)
 
 1. **Prepare:** confirm cairn (and any other consumer) is on a FF-SDK release
    that supports the target Valkey version. Consumer coordination is
@@ -85,14 +90,15 @@ preserved.
    - If single-node standalone: stop ff-server briefly, upgrade Valkey, start
      ff-server. The 60s retry budget tolerates restart windows under that.
    - If cluster: roll node-by-node. If ff-server restarts and connects to a
-     pre-upgrade (7.x) node while the roll is in progress, the version check
+     pre-upgrade node while the roll is in progress, the version check
      retries within the 60s budget; once the connected node completes its
      upgrade (or a reconnect lands on a post-upgrade node), the check
      succeeds. Keep the rolling window under 60s per node so the check
      doesn't exhaust before the node ahead finishes.
 
 3. **Verify:** after the upgrade, ff-server boot log should emit
-   `Valkey version accepted detected_major=8 required=8` at INFO level.
+   `Valkey version accepted detected_major=<M> detected_minor=<m> required_major=7 required_minor=2`
+   at INFO level.
 
 4. **Post-upgrade partition collision check** (optional, phase-5 probe):
    see the [Partition-collision observability](#partition-collision-observability)
@@ -268,7 +274,7 @@ context, it's stale; replace with an RFC-011 §7.3 pointer.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Server exits with `valkey version too low: detected 7, required >= 8.0` | Valkey 7.x backend | Upgrade Valkey to 8.0+; see [rolling upgrade](#rolling-upgrade-procedure-valkey-7x--80) |
+| Server exits with `valkey version too low: detected <M.m>, required >= 7.2` | Valkey below 7.2 backend | Upgrade Valkey to 7.2+; see [rolling upgrade](#rolling-upgrade-procedure-below-floor--72) |
 | Boot hangs for ~60s then exits with `valkey ({context}): ...` | Valkey unreachable during rolling upgrade OR truly down | If the cluster is mid-restart, wait and retry; otherwise check network/DNS |
 | `ServerError::PartitionMismatch` on `add_execution_to_flow` | Consumer minted exec with wrong flow/lane routing | Consumer bug — see [migration guide Step 1](rfc011-migration-for-consumers.md#step-1--executionid-construction) |
 | `partition_config mismatch: num_flow_partitions expected N, got M` on boot | `FF_FLOW_PARTITIONS` changed after first boot | Cannot hot-change partition count — re-seed or accept existing config |

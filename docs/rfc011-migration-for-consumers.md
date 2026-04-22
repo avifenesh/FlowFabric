@@ -292,19 +292,22 @@ let key = usage_dedup_key(hash_tag, dedup_id);
 **Action:** replace every hardcoded `format!("ff:usagededup:...")` in your
 codebase. Eliminates drift if the keyspace convention ever changes.
 
-## Step 6 — Valkey 8.0 minimum (future, phase 5)
+## Step 6 — Valkey 7.2 minimum (landed, phase 3; amended post-phase-3)
 
-**Status:** not yet landed. RFC-011 §13 requires Valkey 8.0+. Phase 5 adds a
-boot-time version check in ff-server and ff-sdk's admin client that fails
-fast if the detected version is below 8.0.
+**Status:** landed. RFC-011 §13 (as amended in Amendment F, floor-revert)
+requires Valkey 7.2+. `ff-server` performs a boot-time version check and
+fails fast if the detected `(major, minor)` is below `(7, 2)` with a typed
+`ServerError::ValkeyVersionTooLow { detected, required }`.
 
-**Action:** if your production Valkey is on 7.x, schedule an upgrade before
-pulling the phase-5 release. FlowFabric's reference deployment (cairn
-integration tests) already pins `valkey/valkey:8-alpine`.
+**Action:** if your production Valkey is on 7.0 / 7.1 (or pre-7), schedule an
+upgrade before pulling a post-amendment release. If you are already on 7.2+
+(including any 8.x), no action required. FlowFabric's reference deployment
+(cairn integration tests) pins `valkey/valkey:8-alpine`; CI also exercises
+`valkey/valkey:7.2` to guard the floor.
 
 A 60-second exponential-backoff retry budget in the boot-check tolerates
-rolling Valkey upgrades — you don't need downtime coordination, but both
-versions must be ≥ 8.0 during the rolling window.
+rolling Valkey upgrades — you don't need downtime coordination, but all
+connected nodes must reach ≥ 7.2 within the 60s window.
 
 ## Verification checklist
 

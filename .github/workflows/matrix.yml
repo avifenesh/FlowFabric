@@ -1,31 +1,33 @@
 name: Matrix CI
 
-# Cross-host + cross-mode verification against Valkey 8.
+# Cross-host + cross-mode + cross-version verification.
 #
-# Matrix coverage (5 jobs):
+# Matrix coverage (6 jobs):
 #
-#   linux x86_64  × valkey 8 × standalone   → ubuntu-latest
-#   linux x86_64  × valkey 8 × cluster      → ubuntu-latest
-#   linux arm64   × valkey 8 × standalone   → ubuntu-24.04-arm
-#   linux arm64   × valkey 8 × cluster      → ubuntu-24.04-arm
-#   macos arm64   × valkey 8 × standalone   → macos-latest
+#   linux x86_64  × valkey 8   × standalone   -> ubuntu-latest
+#   linux x86_64  × valkey 8   × cluster      -> ubuntu-latest
+#   linux x86_64  × valkey 7.2 × standalone   -> ubuntu-latest    (floor guard)
+#   linux arm64   × valkey 8   × standalone   -> ubuntu-24.04-arm
+#   linux arm64   × valkey 8   × cluster      -> ubuntu-24.04-arm
+#   macos arm64   × valkey 8   × standalone   -> macos-latest
 #
-# **Valkey version:** `valkey/valkey:8-alpine` (major-version pin).
-# RFC-011 §13 requires Valkey >= 8.0 (enforced at ff-server boot via
-# `verify_valkey_version`). Pinning to major 8 tracks patch releases
-# automatically without the drift risk of `:latest` rolling to 9.x with
-# breaking behavior changes. Matches cairn-fabric's integration-test pin.
-# The Valkey 7.2 rows from pre-RFC-011 coverage are retired — the server
-# refuses to start against 7.x.
+# **Valkey versions:** RFC-011 §13 sets the floor at Valkey >= 7.2
+# (enforced at ff-server boot via `verify_valkey_version`). 7.2 is where
+# Functions + RESP3 stabilized; those are the primitives we actually
+# depend on. We pin major 8 as the primary coverage (cairn-fabric's
+# reference deployment) and carry one 7.2 × standalone entry as a
+# guard against accidental 8-specific primitive adoption. If the 7.2
+# job breaks, that is a signal to either document the new dependency
+# in an RFC-011 §13 amendment or fix the accidental usage.
 #
-# Mac arm64 validates Apple Silicon Rust correctness on the latest
-# Valkey release; the 7.2 × mac combination is intentionally skipped
-# because Homebrew does not package 7.2 and docker-on-mac on GitHub
-# runners is flaky under privileged-mode requirements. x86_64 mac is
-# NOT in the matrix: GitHub's Intel runner (macos-13) is EOL December
-# 2025, and x86_64 Rust correctness is already validated through
-# ubuntu-latest. Linux covers the full Valkey version matrix where we
-# actually deploy.
+# Mac arm64 validates Apple Silicon Rust correctness on Valkey 8;
+# the 7.2 × mac combination is intentionally skipped because
+# Homebrew does not package 7.2 and docker-on-mac on GitHub runners
+# is flaky under privileged-mode requirements. x86_64 mac is NOT in
+# the matrix: GitHub's Intel runner (macos-13) is EOL December 2025,
+# and x86_64 Rust correctness is already validated through
+# ubuntu-latest. Linux covers the full Valkey version matrix where
+# we actually deploy.
 
 on:
   # `paths-ignore` drops doc-only PRs from CI entirely (the matrix
@@ -81,11 +83,11 @@ jobs:
           - { os: ubuntu-24.04-arm, kind: linux, arch: arm64 }
           - { os: macos-latest,     kind: mac,   arch: arm64 }
         valkey:
-          # Pin to major 8 (alpine variant) — matches cairn-fabric's
-          # integration-test pin and RFC-011 §13's required floor. Using
-          # a major-version tag tracks patch releases automatically without
-          # the drift risk of `:latest` (which could roll to 9.x with
-          # breaking behavior changes).
+          # Pin to major 8 (alpine variant) for primary coverage —
+          # matches cairn-fabric's integration-test pin. Using a
+          # major-version tag tracks patch releases automatically
+          # without the drift risk of `:latest` (which could roll to
+          # 9.x with breaking behavior changes).
           - { version: "8", image: "valkey/valkey:8-alpine" }
         mode: [standalone, cluster]
         exclude:
@@ -95,6 +97,16 @@ jobs:
           # 2025; x86_64 correctness is validated through ubuntu-latest.
           - host: { os: macos-latest, kind: mac, arch: arm64 }
             mode: cluster
+        include:
+          # RFC-011 §13 floor-guard entry: one x86_64 linux standalone
+          # job against Valkey 7.2 (the explicit floor). Purpose is to
+          # detect accidental 8-specific primitive adoption — not to
+          # replicate full matrix coverage. If this job starts failing,
+          # either amend RFC-011 §13 to raise the floor with a specific
+          # justification or fix the offending usage.
+          - host: { os: ubuntu-latest, kind: linux, arch: x86_64 }
+            valkey: { version: "7.2", image: "valkey/valkey:7.2" }
+            mode: standalone
 
     steps:
       # Third-party actions pinned to commit SHAs (CodeQL

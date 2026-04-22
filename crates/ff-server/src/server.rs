@@ -160,10 +160,10 @@ pub enum ServerError {
     /// Fields: (source_label, max_permits).
     #[error("too many concurrent {0} calls (max: {1})")]
     ConcurrencyLimitExceeded(&'static str, u32),
-    /// Detected Valkey version is below the RFC-011 §13 minimum. The hash-slot
-    /// co-location design and Valkey Functions API behavior the engine depends
-    /// on were introduced/stabilized in 8.0; older versions silently behave
-    /// differently on some cluster edge cases. Operator action: upgrade Valkey.
+    /// Detected Valkey version is below the RFC-011 §13 minimum. The engine
+    /// depends on Valkey Functions (stabilized in 7.2), RESP3 (7.2+), and
+    /// hash-tag routing; older versions do not implement the required
+    /// primitives. Operator action: upgrade Valkey.
     #[error(
         "valkey version too low: detected {detected}, required >= {required} (RFC-011 §13)"
     )]
@@ -2627,9 +2627,11 @@ impl Server {
 
 // ── Valkey version check (RFC-011 §13) ──
 
-/// Minimum Valkey version the engine requires (see RFC-011 §13). 8.0 ships the
-/// hash-slot and Functions behavior the co-location design relies on.
-const REQUIRED_VALKEY_MAJOR: u32 = 8;
+/// Minimum Valkey version the engine requires (see RFC-011 §13). 7.2 is the
+/// release where Valkey Functions and RESP3 stabilized — the primitives the
+/// co-location design and typed FCALL wrappers actually depend on.
+const REQUIRED_VALKEY_MAJOR: u32 = 7;
+const REQUIRED_VALKEY_MINOR: u32 = 2;
 
 /// Upper bound on the rolling-upgrade retry window (RFC-011 §9.17). A Valkey
 /// node cycling through SIGTERM → restart typically completes in well under
@@ -2637,7 +2639,7 @@ const REQUIRED_VALKEY_MAJOR: u32 = 8;
 /// boot indefinitely.
 const VERSION_CHECK_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
-/// Verify the connected Valkey reports `redis_version` ≥ 8.0.
+/// Verify the connected Valkey reports a version ≥ 7.2.
 ///
 /// Per RFC-011 §9.17, during a rolling upgrade the node we happen to connect
 /// to may temporarily be pre-upgrade while others are post-upgrade. The check
@@ -2645,8 +2647,8 @@ const VERSION_CHECK_RETRY_BUDGET: Duration = Duration::from_secs(60);
 /// responses) with exponential backoff, capped at a 60s budget.
 ///
 /// **Retries on:**
-/// - Low-version responses (`detected_major < REQUIRED_VALKEY_MAJOR`) — may
-///   resolve as the rolling upgrade progresses onto the connected node.
+/// - Low-version responses (below `(REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR)`)
+///   — may resolve as the rolling upgrade progresses onto the connected node.
 /// - Retryable ferriskey transport errors — connection refused,
 ///   `BusyLoadingError`, `ClusterDown`, etc., classified via
 ///   `ff_script::retry::is_retryable_kind`.
@@ -2667,24 +2669,31 @@ async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
     loop {
         let (should_retry, err_for_budget_exhaust, log_detail): (bool, ServerError, String) =
             match query_valkey_version(client).await {
-                Ok(detected_major) if detected_major >= REQUIRED_VALKEY_MAJOR => {
+                Ok((detected_major, detected_minor))
+                    if (detected_major, detected_minor)
+                        >= (REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR) =>
+                {
                     tracing::info!(
                         detected_major,
-                        required = REQUIRED_VALKEY_MAJOR,
+                        detected_minor,
+                        required_major = REQUIRED_VALKEY_MAJOR,
+                        required_minor = REQUIRED_VALKEY_MINOR,
                         "Valkey version accepted"
                     );
                     return Ok(());
                 }
-                Ok(detected_major) => (
+                Ok((detected_major, detected_minor)) => (
                     // Low version — may be a rolling-upgrade stale node.
                     // Retry within budget; after exhaustion, the cluster
                     // is misconfigured and fast-fail is the correct signal.
                     true,
                     ServerError::ValkeyVersionTooLow {
-                        detected: detected_major.to_string(),
-                        required: format!("{REQUIRED_VALKEY_MAJOR}.0"),
+                        detected: format!("{detected_major}.{detected_minor}"),
+                        required: format!("{REQUIRED_VALKEY_MAJOR}.{REQUIRED_VALKEY_MINOR}"),
                     },
-                    format!("detected_major={detected_major} < required={REQUIRED_VALKEY_MAJOR}"),
+                    format!(
+                        "detected={detected_major}.{detected_minor} < required={REQUIRED_VALKEY_MAJOR}.{REQUIRED_VALKEY_MINOR}"
+                    ),
                 ),
                 Err(e) => {
                     // Only retry if the underlying Valkey error is retryable
@@ -2719,7 +2728,8 @@ async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
     }
 }
 
-/// Run `INFO server` and extract the major component of the Valkey version.
+/// Run `INFO server` and extract the `(major, minor)` components of the
+/// Valkey version.
 ///
 /// Returns `Err` on transport errors, missing field, or unparsable version.
 /// Handles three response shapes:
@@ -2730,7 +2740,7 @@ async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
 ///   one entry and parse it. Divergent versions during a rolling upgrade
 ///   are handled by the outer retry loop.
 /// - **Empty / unexpected:** surfaces as `OperationFailed` with context.
-async fn query_valkey_version(client: &Client) -> Result<u32, ServerError> {
+async fn query_valkey_version(client: &Client) -> Result<(u32, u32), ServerError> {
     let raw: Value = client
         .cmd("INFO")
         .arg("server")
@@ -2741,7 +2751,7 @@ async fn query_valkey_version(client: &Client) -> Result<u32, ServerError> {
             context: "INFO server".into(),
         })?;
     let info_body = extract_info_body(&raw)?;
-    parse_valkey_major_version(&info_body)
+    parse_valkey_version(&info_body)
 }
 
 /// Normalize an `INFO server` response to a single string body.
@@ -2772,35 +2782,51 @@ fn extract_info_body(raw: &Value) -> Result<String, ServerError> {
     }
 }
 
-/// Extract the major component of the Valkey version from an `INFO server`
-/// response body. Pure parser — pulled out of [`query_valkey_version`] so it
-/// is unit-testable without a live Valkey.
+/// Extract the `(major, minor)` components of the Valkey version from an
+/// `INFO server` response body. Pure parser — pulled out of
+/// [`query_valkey_version`] so it is unit-testable without a live Valkey.
 ///
 /// Prefers the `valkey_version:` field introduced in Valkey 8.0+. Falls back
 /// to `redis_version:` for Valkey 7.x compat. **Note:** Valkey 8.x/9.x still
 /// emit `redis_version:7.2.4` for Redis-client compatibility; the real
 /// server version is in `valkey_version:`, so always check that field first.
-fn parse_valkey_major_version(info: &str) -> Result<u32, ServerError> {
-    let extract_major = |line: &str| -> Result<u32, ServerError> {
+fn parse_valkey_version(info: &str) -> Result<(u32, u32), ServerError> {
+    let extract_major_minor = |line: &str| -> Result<(u32, u32), ServerError> {
         let trimmed = line.trim();
-        let major_str = trimmed.split('.').next().unwrap_or("").trim();
+        let mut parts = trimmed.split('.');
+        let major_str = parts.next().unwrap_or("").trim();
         if major_str.is_empty() {
             return Err(ServerError::OperationFailed(format!(
                 "valkey version check: empty version field in '{trimmed}'"
             )));
         }
-        major_str.parse::<u32>().map_err(|_| {
+        let major = major_str.parse::<u32>().map_err(|_| {
             ServerError::OperationFailed(format!(
                 "valkey version check: non-numeric major in '{trimmed}'"
             ))
-        })
+        })?;
+        // Minor is required — a bare major ("7") cannot be compared against
+        // the (major, minor) floor reliably. Valkey always reports
+        // major.minor.patch for INFO, so missing minor is a real parse error.
+        let minor_str = parts.next().unwrap_or("").trim();
+        if minor_str.is_empty() {
+            return Err(ServerError::OperationFailed(format!(
+                "valkey version check: missing minor component in '{trimmed}'"
+            )));
+        }
+        let minor = minor_str.parse::<u32>().map_err(|_| {
+            ServerError::OperationFailed(format!(
+                "valkey version check: non-numeric minor in '{trimmed}'"
+            ))
+        })?;
+        Ok((major, minor))
     };
     // Prefer valkey_version (authoritative on Valkey 8.0+).
     if let Some(valkey_line) = info
         .lines()
         .find_map(|line| line.strip_prefix("valkey_version:"))
     {
-        return extract_major(valkey_line);
+        return extract_major_minor(valkey_line);
     }
     // Fall back to redis_version (Valkey 7.x only — 8.x+ pins this to 7.2.4
     // for Redis-client compat, so reading it there would under-report).
@@ -2808,7 +2834,7 @@ fn parse_valkey_major_version(info: &str) -> Result<u32, ServerError> {
         .lines()
         .find_map(|line| line.strip_prefix("redis_version:"))
     {
-        return extract_major(redis_line);
+        return extract_major_minor(redis_line);
     }
     Err(ServerError::OperationFailed(
         "valkey version check: INFO missing valkey_version and redis_version".into(),
@@ -4197,7 +4223,7 @@ mod tests {
     // ── Valkey version check (RFC-011 §13) ──
 
     #[test]
-    fn parse_valkey_major_prefers_valkey_version_over_redis_version() {
+    fn parse_valkey_version_prefers_valkey_version_over_redis_version() {
         // Valkey 8.x+ pins redis_version to 7.2.4 for Redis-client compat
         // and exposes the real version in valkey_version. Parser must use
         // valkey_version when both are present.
@@ -4207,11 +4233,11 @@ redis_version:7.2.4\r\n\
 valkey_version:9.0.3\r\n\
 server_mode:cluster\r\n\
 os:Linux\r\n";
-        assert_eq!(parse_valkey_major_version(info).unwrap(), 9);
+        assert_eq!(parse_valkey_version(info).unwrap(), (9, 0));
     }
 
     #[test]
-    fn parse_valkey_major_real_valkey_8_cluster_body() {
+    fn parse_valkey_version_real_valkey_8_cluster_body() {
         // Actual INFO server response observed on valkey/valkey:latest in
         // cluster mode (CI matrix): redis_version compat-pinned to 7.2.4,
         // valkey_version authoritative at 9.0.3.
@@ -4223,20 +4249,20 @@ valkey_version:9.0.3\r\n\
 valkey_release_stage:ga\r\n\
 redis_git_sha1:00000000\r\n\
 server_mode:cluster\r\n";
-        assert_eq!(parse_valkey_major_version(info).unwrap(), 9);
+        assert_eq!(parse_valkey_version(info).unwrap(), (9, 0));
     }
 
     #[test]
-    fn parse_valkey_major_falls_back_to_redis_version_on_valkey_7() {
+    fn parse_valkey_version_falls_back_to_redis_version_on_valkey_7() {
         // Valkey 7.x doesn't emit valkey_version; parser falls back.
         let info = "# Server\r\nredis_version:7.2.4\r\nfoo:bar\r\n";
-        assert_eq!(parse_valkey_major_version(info).unwrap(), 7);
+        assert_eq!(parse_valkey_version(info).unwrap(), (7, 2));
     }
 
     #[test]
-    fn parse_valkey_major_errors_when_no_version_field() {
+    fn parse_valkey_version_errors_when_no_version_field() {
         let info = "# Server\r\nfoo:bar\r\n";
-        let err = parse_valkey_major_version(info).unwrap_err();
+        let err = parse_valkey_version(info).unwrap_err();
         assert!(matches!(err, ServerError::OperationFailed(_)));
         assert!(
             err.to_string().contains("missing"),
@@ -4245,11 +4271,29 @@ server_mode:cluster\r\n";
     }
 
     #[test]
-    fn parse_valkey_major_errors_on_non_numeric() {
+    fn parse_valkey_version_errors_on_non_numeric_major() {
         let info = "valkey_version:invalid.x.y\n";
-        let err = parse_valkey_major_version(info).unwrap_err();
+        let err = parse_valkey_version(info).unwrap_err();
         assert!(matches!(err, ServerError::OperationFailed(_)));
         assert!(err.to_string().contains("non-numeric major"));
+    }
+
+    #[test]
+    fn parse_valkey_version_errors_on_non_numeric_minor() {
+        let info = "valkey_version:7.x.0\n";
+        let err = parse_valkey_version(info).unwrap_err();
+        assert!(matches!(err, ServerError::OperationFailed(_)));
+        assert!(err.to_string().contains("non-numeric minor"));
+    }
+
+    #[test]
+    fn parse_valkey_version_errors_on_missing_minor() {
+        // Bare major (no dot) — cannot be compared against a (major, minor)
+        // floor. Flag as a real parse error.
+        let info = "valkey_version:7\n";
+        let err = parse_valkey_version(info).unwrap_err();
+        assert!(matches!(err, ServerError::OperationFailed(_)));
+        assert!(err.to_string().contains("missing minor"));
     }
 
     #[test]
@@ -4270,7 +4314,7 @@ valkey_version:9.0.3\r\n";
         let map = Value::Map(vec![node_entry]);
         let body = extract_info_body(&map).unwrap();
         assert_eq!(body, body_text);
-        assert_eq!(parse_valkey_major_version(&body).unwrap(), 9);
+        assert_eq!(parse_valkey_version(&body).unwrap(), (9, 0));
     }
 
     #[test]
@@ -4284,8 +4328,8 @@ valkey_version:9.0.3\r\n";
     #[test]
     fn valkey_version_too_low_is_not_retryable() {
         let err = ServerError::ValkeyVersionTooLow {
-            detected: "7".into(),
-            required: "8.0".into(),
+            detected: "7.0".into(),
+            required: "7.2".into(),
         };
         assert!(!err.is_retryable());
         assert_eq!(err.valkey_kind(), None);
@@ -4294,12 +4338,12 @@ valkey_version:9.0.3\r\n";
     #[test]
     fn valkey_version_too_low_error_message_includes_both_versions() {
         let err = ServerError::ValkeyVersionTooLow {
-            detected: "7".into(),
-            required: "8.0".into(),
+            detected: "7.0".into(),
+            required: "7.2".into(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("7"), "detected version in message: {msg}");
-        assert!(msg.contains("8.0"), "required version in message: {msg}");
+        assert!(msg.contains("7.0"), "detected version in message: {msg}");
+        assert!(msg.contains("7.2"), "required version in message: {msg}");
         assert!(msg.contains("RFC-011"), "RFC pointer in message: {msg}");
     }
 }
