@@ -1,0 +1,22 @@
+   Compiling ff-readiness-tests v0.3.0 (/home/ubuntu/ff-worker-d-pr1b/crates/ff-readiness-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.25s
+     Running tests/waitpoint_hmac_roundtrip.rs (target/debug/deps/waitpoint_hmac_roundtrip-98a94bd72f8d524d)
+
+running 1 test
+test waitpoint_hmac_roundtrip ... FAILED
+
+failures:
+
+---- waitpoint_hmac_roundtrip stdout ----
+
+thread 'waitpoint_hmac_roundtrip' panicked at crates/ff-readiness-tests/tests/waitpoint_hmac_roundtrip.rs:122:10:
+tampered token must be rejected: TriggeredResume { signal_id: SignalId(6611186a-584e-4af9-8709-24b320c874cd) }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    waitpoint_hmac_roundtrip
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p ff-readiness-tests --test waitpoint_hmac_roundtrip`
