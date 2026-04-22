@@ -7802,8 +7802,8 @@ async fn test_read_stream_round_trips_append_frame_fields() {
         &config,
         &eid,
         AttemptIndex::new(att_idx.parse().unwrap()),
-        "-",
-        "+",
+        ff_sdk::StreamCursor::Start,
+        ff_sdk::StreamCursor::End,
         ff_sdk::STREAM_READ_HARD_CAP,
     )
     .await
@@ -7840,8 +7840,8 @@ async fn test_read_stream_empty_returns_empty() {
         &config,
         &eid,
         AttemptIndex::new(0),
-        "-",
-        "+",
+        ff_sdk::StreamCursor::Start,
+        ff_sdk::StreamCursor::End,
         100,
     )
     .await
@@ -7875,9 +7875,17 @@ async fn test_read_stream_slice_and_resume() {
 
     let att = AttemptIndex::new(att_idx.parse().unwrap());
 
-    let page1 = ff_sdk::read_stream(tc.client(), &config, &eid, att, "-", "+", 20)
-        .await
-        .expect("read page1");
+    let page1 = ff_sdk::read_stream(
+        tc.client(),
+        &config,
+        &eid,
+        att,
+        ff_sdk::StreamCursor::Start,
+        ff_sdk::StreamCursor::End,
+        20,
+    )
+    .await
+    .expect("read page1");
     assert_eq!(page1.frames.len(), 20);
 
     let last_id = page1.frames.last().unwrap().id.clone();
@@ -7886,9 +7894,17 @@ async fn test_read_stream_slice_and_resume() {
     let next_seq: u64 = seq.parse::<u64>().unwrap() + 1;
     let resume_from = format!("{ms}-{next_seq}");
 
-    let page2 = ff_sdk::read_stream(tc.client(), &config, &eid, att, &resume_from, "+", 100)
-        .await
-        .expect("read page2");
+    let page2 = ff_sdk::read_stream(
+        tc.client(),
+        &config,
+        &eid,
+        att,
+        ff_sdk::StreamCursor::At(resume_from),
+        ff_sdk::StreamCursor::End,
+        100,
+    )
+    .await
+    .expect("read page2");
     assert_eq!(page2.frames.len(), TOTAL - 20);
     assert_ne!(page2.frames[0].id, last_id, "resume must skip cursor entry");
 }
@@ -7909,7 +7925,7 @@ async fn test_tail_stream_timeout_returns_empty() {
         &config,
         &eid,
         AttemptIndex::new(0),
-        "0-0",
+        ff_sdk::StreamCursor::from_beginning(),
         200,
         50,
     )
@@ -7959,7 +7975,7 @@ async fn test_tail_stream_unblocks_on_write() {
         &config,
         &eid,
         AttemptIndex::new(att_idx.parse().unwrap()),
-        "0-0",
+        ff_sdk::StreamCursor::from_beginning(),
         2_000,
         50,
     )
@@ -7994,7 +8010,7 @@ async fn test_tail_stream_long_block_respects_ferriskey_timeout_extension() {
         &config,
         &eid,
         AttemptIndex::new(0),
-        "0-0",
+        ff_sdk::StreamCursor::from_beginning(),
         7_000, // deliberately > default 5s request_timeout
         50,
     )
@@ -8043,9 +8059,17 @@ async fn test_stream_closed_signal_propagates_to_read_and_tail() {
     let att = AttemptIndex::new(att_idx.parse().unwrap());
 
     // read_stream sees the frame AND the terminal markers.
-    let read = ff_sdk::read_stream(tc.client(), &config, &eid, att, "-", "+", 100)
-        .await
-        .expect("read_stream after complete");
+    let read = ff_sdk::read_stream(
+        tc.client(),
+        &config,
+        &eid,
+        att,
+        ff_sdk::StreamCursor::Start,
+        ff_sdk::StreamCursor::End,
+        100,
+    )
+    .await
+    .expect("read_stream after complete");
     assert_eq!(read.frames.len(), 1);
     assert!(read.is_closed(), "read_stream must report closed after complete");
     assert_eq!(read.closed_reason.as_deref(), Some("attempt_success"));
@@ -8054,9 +8078,17 @@ async fn test_stream_closed_signal_propagates_to_read_and_tail() {
     // tail_stream with block_ms=0 at the tip returns no new frames but
     // still reports closed — this is the signal consumers poll on.
     let tip = read.frames.last().unwrap().id.clone();
-    let tail = ff_sdk::tail_stream(tc.client(), &config, &eid, att, &tip, 0, 10)
-        .await
-        .expect("tail_stream at tip");
+    let tail = ff_sdk::tail_stream(
+        tc.client(),
+        &config,
+        &eid,
+        att,
+        ff_sdk::StreamCursor::At(tip),
+        0,
+        10,
+    )
+    .await
+    .expect("tail_stream at tip");
     assert!(tail.frames.is_empty());
     assert!(tail.is_closed(), "tail_stream must report closed after complete");
     assert_eq!(tail.closed_reason.as_deref(), Some("attempt_success"));
@@ -8095,7 +8127,13 @@ async fn test_lease_expired_closes_stream_meta() {
 
     let att = AttemptIndex::new(att_idx.parse().unwrap());
     let result = ff_sdk::read_stream(
-        tc.client(), &config, &eid, att, "-", "+", 100,
+        tc.client(),
+        &config,
+        &eid,
+        att,
+        ff_sdk::StreamCursor::Start,
+        ff_sdk::StreamCursor::End,
+        100,
     )
     .await
     .expect("read_stream after lease expiry");
@@ -8135,7 +8173,7 @@ async fn test_tail_stream_no_block_returns_available() {
         &config,
         &eid,
         AttemptIndex::new(att_idx.parse().unwrap()),
-        "0-0",
+        ff_sdk::StreamCursor::from_beginning(),
         0,
         50,
     )
@@ -8170,8 +8208,8 @@ async fn test_read_stream_rejects_zero_count_limit() {
         &config,
         &eid,
         AttemptIndex::new(0),
-        "-",
-        "+",
+        ff_sdk::StreamCursor::Start,
+        ff_sdk::StreamCursor::End,
         0,
     )
     .await
@@ -8198,7 +8236,7 @@ async fn test_tail_stream_rejects_zero_count_limit() {
         &config,
         &eid,
         AttemptIndex::new(0),
-        "0-0",
+        ff_sdk::StreamCursor::from_beginning(),
         0,
         0,
     )
