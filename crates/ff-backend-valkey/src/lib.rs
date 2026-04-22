@@ -89,8 +89,8 @@ impl ValkeyBackend {
     /// [`ClientBuilder`] so host/port, TLS, and cluster flags flow
     /// through, and [`BackendTimeouts::request`] maps to
     /// `ClientBuilder::request_timeout` when set (`None` ⇒
-    /// ferriskey's default). Other `BackendTimeouts` /
-    /// `BackendRetry` fields remain Stage 1c work.
+    /// ferriskey's default). `BackendRetry` and any future
+    /// `BackendTimeouts` fields remain Stage 1c work.
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
         // `BackendConnection` is `#[non_exhaustive]` for future
         // backends; the compiler treats the pattern as refutable,
@@ -98,33 +98,12 @@ impl ValkeyBackend {
         // non-Valkey BackendConnection handed to `ValkeyBackend`
         // surfaces as `EngineError::Unavailable` so callers get a
         // typed error rather than a panic.
-        let BackendConnection::Valkey(v) = config.connection else {
+        let BackendConnection::Valkey(v) = config.connection.clone() else {
             return Err(EngineError::Unavailable {
                 op: "ValkeyBackend::connect (non-Valkey BackendConnection)",
             });
         };
-        // Build via ferriskey's `ClientBuilder` so `BackendTimeouts`
-        // / `BackendRetry` fields have a single wiring point. For
-        // standalone (`v.cluster = false`) the builder dials one
-        // node; calling `.cluster()` switches the builder to
-        // topology-discovery mode (equivalent to the legacy
-        // `Client::connect_cluster`). `request_timeout` is applied
-        // only when the caller set it — `None` leaves ferriskey's
-        // default in place.
-        let mut builder = ferriskey::ClientBuilder::new().host(&v.host, v.port);
-        if v.tls {
-            builder = builder.tls();
-        }
-        if v.cluster {
-            builder = builder.cluster();
-        }
-        if let Some(request_timeout) = config.timeouts.request {
-            builder = builder.request_timeout(request_timeout);
-        }
-        let client = builder
-            .build()
-            .await
-            .map_err(|e| transport_script(ScriptError::Valkey(e)))?;
+        let client = build_client(&config).await?;
         // Load the deployment's partition config from
         // `ff:config:partitions` so `flow_partition` / key routing
         // aligns with what ff-server published. Using
@@ -245,6 +224,38 @@ impl ValkeyBackend {
 }
 
 /// Map [`CancelFlowPolicy`] to the Lua-side policy string.
+/// Build a dialed `ferriskey::Client` from a [`BackendConfig`].
+///
+/// Isolated from [`ValkeyBackend::connect`] so the `BackendConfig` →
+/// `ClientBuilder` mapping (host/port, TLS, cluster, timeouts) can
+/// be exercised directly in tests without the partition-config
+/// loading step that follows. Uses ferriskey's `ClientBuilder` so
+/// both standalone and cluster paths share one wiring point;
+/// `.cluster()` switches the builder to topology-discovery mode.
+/// `request_timeout` is applied only when the caller set it —
+/// `None` leaves ferriskey's default in place.
+async fn build_client(config: &BackendConfig) -> Result<ferriskey::Client, EngineError> {
+    let BackendConnection::Valkey(v) = &config.connection else {
+        return Err(EngineError::Unavailable {
+            op: "ValkeyBackend::connect (non-Valkey BackendConnection)",
+        });
+    };
+    let mut builder = ferriskey::ClientBuilder::new().host(&v.host, v.port);
+    if v.tls {
+        builder = builder.tls();
+    }
+    if v.cluster {
+        builder = builder.cluster();
+    }
+    if let Some(request_timeout) = config.timeouts.request {
+        builder = builder.request_timeout(request_timeout);
+    }
+    builder
+        .build()
+        .await
+        .map_err(|e| transport_script(ScriptError::Valkey(e)))
+}
+
 fn cancel_policy_to_str(p: CancelFlowPolicy) -> &'static str {
     match p {
         CancelFlowPolicy::FlowOnly => "flow_only",
@@ -1295,35 +1306,50 @@ mod tests {
 
     // ── timeouts.request wiring ─────────────────────────────────
     //
-    // Exercises the `BackendTimeouts.request` →
-    // `ClientBuilder::request_timeout` wiring in
-    // `ValkeyBackend::connect`. Requires a live Valkey at
+    // Exercises `BackendTimeouts.request` → `ClientBuilder::request_timeout`
+    // via the `build_client` helper. Requires a live Valkey at
     // localhost:6379, so `#[ignore]`-gated:
     //   cargo test -p ff-backend-valkey --lib -- --ignored
-    //
-    // The `Some(d)` → `builder.request_timeout(d)` branch is a
-    // single-line pass-through; ferriskey owns the "honoured on the
-    // wire" contract (its own tests cover that). This test's job is
-    // to prove both the `None` (builder-default) and `Some` arms of
-    // `connect` still complete end-to-end against a real server
-    // rather than hanging or rejecting a valid timeout.
 
+    /// `timeouts.request = None` leaves ferriskey's default in
+    /// place; `build_client` produces a working client.
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
-    async fn connect_honours_backend_timeouts_request() {
-        // `None` request timeout ⇒ ferriskey default.
-        let default_cfg = BackendConfig::valkey("127.0.0.1", 6379);
-        let _ = ValkeyBackend::connect(default_cfg)
+    async fn build_client_with_default_request_timeout() {
+        let cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        let client = build_client(&cfg)
             .await
-            .expect("connect with default timeouts");
+            .expect("build_client with default timeouts");
+        // Non-blocking round-trip confirms the client is live.
+        let _: ferriskey::Value = client
+            .cmd("PING")
+            .execute()
+            .await
+            .expect("PING on default-timeout client");
+    }
 
-        // `Some(d)` request timeout ⇒ threaded through the builder.
-        // 5s is comfortably above ferriskey's internal connect
-        // handshake so the build itself can't trip the timeout.
-        let mut tight_cfg = BackendConfig::valkey("127.0.0.1", 6379);
-        tight_cfg.timeouts.request = Some(Duration::from_secs(5));
-        let _ = ValkeyBackend::connect(tight_cfg)
+    /// Smoke test the `Some(d)` arm: a configured `request_timeout`
+    /// is accepted by the builder and the resulting client still
+    /// completes round-trips within the budget. Does **not** assert
+    /// the timeout fires on the wire — ferriskey treats blocking
+    /// commands (BLPOP etc.) as `server_timeout +
+    /// blocking_cmd_timeout_extension`, which masks a tight
+    /// `request_timeout` when the server-side timeout dominates.
+    /// The `request_timeout` → wire behaviour is covered by
+    /// ferriskey's own test suite; here we only prove our wiring
+    /// does not break the client.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn build_client_with_explicit_request_timeout_smoke() {
+        let mut cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        cfg.timeouts.request = Some(Duration::from_secs(5));
+        let client = build_client(&cfg)
             .await
-            .expect("connect with explicit request_timeout");
+            .expect("build_client with explicit request_timeout");
+        let _: ferriskey::Value = client
+            .cmd("PING")
+            .execute()
+            .await
+            .expect("PING on explicit-timeout client");
     }
 }
