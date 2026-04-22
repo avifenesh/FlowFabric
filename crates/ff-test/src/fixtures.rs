@@ -191,31 +191,33 @@ impl TestCluster {
     }
 
     /// Rotate the waitpoint HMAC secret across partitions. Thin fixture
-    /// wrapper around the `ff_rotate_waitpoint_hmac_secret` FCALL so
-    /// tests exercise the same rotation path cairn and ff-server use.
+    /// wrapper around [`ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions`]
+    /// so tests exercise the same rotation path cairn uses in production.
+    ///
+    /// Semantics: attempts every partition before panicking on any
+    /// failure (the SDK helper never short-circuits). Against the
+    /// FLUSHDB-scoped test harness this is equivalent to the old
+    /// "panic on first failure" behaviour — test state is reset
+    /// between runs, so a partial rotation has no cross-test blast
+    /// radius.
     pub async fn rotate_waitpoint_hmac_secret(
         &self,
         new_kid: &str,
         new_secret_hex: &str,
         grace_ms: u64,
     ) {
-        for index in 0..self.config.num_flow_partitions {
-            let partition = ff_core::partition::Partition {
-                family: ff_core::partition::PartitionFamily::Execution,
-                index,
-            };
-            let idx = ff_core::keys::IndexKeys::new(&partition);
-            ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
-                &self.client,
-                &idx,
-                &ff_core::contracts::RotateWaitpointHmacSecretArgs {
-                    new_kid: new_kid.to_owned(),
-                    new_secret_hex: new_secret_hex.to_owned(),
-                    grace_ms,
-                },
-            )
-            .await
-            .expect("FCALL ff_rotate_waitpoint_hmac_secret");
+        let results = ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions(
+            &self.client,
+            self.config.num_flow_partitions,
+            new_kid,
+            new_secret_hex,
+            grace_ms,
+        )
+        .await;
+        for entry in results {
+            entry
+                .result
+                .unwrap_or_else(|e| panic!("FCALL ff_rotate_waitpoint_hmac_secret on partition {}: {e}", entry.partition));
         }
     }
 
