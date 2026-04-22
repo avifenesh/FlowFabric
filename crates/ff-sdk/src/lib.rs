@@ -74,7 +74,8 @@ pub mod worker;
 // Re-exports for convenience
 #[cfg(feature = "valkey-default")]
 pub use admin::{
-    FlowFabricAdminClient, RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
+    rotate_waitpoint_hmac_secret_all_partitions, FlowFabricAdminClient, PartitionRotationOutcome,
+    RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
 };
 pub use config::WorkerConfig;
 pub use engine_error::{
