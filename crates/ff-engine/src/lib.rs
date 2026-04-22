@@ -9,6 +9,7 @@ pub mod supervisor;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ff_core::completion_backend::CompletionStream;
 use ff_core::partition::PartitionConfig;
 use ff_core::types::LaneId;
 use tokio::sync::watch;
@@ -30,22 +31,6 @@ use scanner::retention_trimmer::RetentionTrimmer;
 use scanner::suspension_timeout::SuspensionTimeoutScanner;
 use scanner::flow_projector::FlowProjector;
 use scanner::unblock::UnblockScanner;
-
-/// Connection parameters for the completion listener's dedicated RESP3
-/// client. Must match the deployment the dispatcher client connects to.
-#[derive(Clone, Debug)]
-pub struct CompletionListenerConfig {
-    /// Seed addresses — `(host, port)` pairs. For standalone, one entry.
-    /// For cluster, pass all configured seed nodes.
-    pub addresses: Vec<(String, u16)>,
-    /// Enable TLS (matches `ClientBuilder::tls_insecure` — the listener
-    /// uses insecure TLS because it only handles completion metadata,
-    /// never user payloads; if strict TLS is required, plumb a
-    /// custom flag).
-    pub tls: bool,
-    /// Enable cluster mode.
-    pub cluster: bool,
-}
 
 /// Engine configuration.
 pub struct EngineConfig {
@@ -77,35 +62,22 @@ pub struct EngineConfig {
     /// Dependency reconciler interval. Default: 15s.
     ///
     /// Post-Batch-C this scanner is a **safety net**, not the primary
-    /// promotion path. The [`completion_listener`] SUBSCRIBEs to
-    /// `ff:dag:completions` and dispatches dependency resolution
-    /// synchronously with each completion — under normal operation,
-    /// DAG latency is `~RTT × levels`, not `interval × levels`.
+    /// promotion path. When a [`CompletionStream`] is handed to
+    /// `start_with_completions`, push-based dispatch drives DAG
+    /// promotion synchronously with each completion — under normal
+    /// operation DAG latency is `~RTT × levels`, not `interval × levels`.
     ///
     /// The reconciler still runs as a catch-all for:
-    ///   - messages missed during listener restart or reconnect;
+    ///   - messages missed during subscriber restart or reconnect;
     ///   - pre-Batch-C executions without `core.flow_id` stamped;
     ///   - operator-driven edge mutation that doesn't pass through
     ///     the terminal-transition publish path.
     ///
-    /// 15s idle-scan cost is minimal. If the listener is disabled
-    /// (`completion_listener` = None), drop this to 1s to preserve
-    /// pre-Batch-C DAG latency behavior.
-    ///
-    /// [`completion_listener`]: Self::completion_listener
+    /// 15s idle-scan cost is minimal. If the push dispatch loop is
+    /// disabled (engine started via `start`/`start_with_metrics`
+    /// without a stream), drop this to 1s to preserve pre-Batch-C
+    /// DAG latency behavior.
     pub dependency_reconciler_interval: Duration,
-
-    /// Optional push-based DAG promotion listener (Batch C item 6).
-    /// When `Some`, the engine spawns a [`completion_listener`] task
-    /// that SUBSCRIBEs to `ff:dag:completions` on a dedicated RESP3
-    /// client and dispatches dependency resolution per completion.
-    ///
-    /// `None` disables the listener entirely — the reconciler alone
-    /// promotes. Useful for lightweight single-node deployments or
-    /// test harnesses that don't care about DAG latency.
-    ///
-    /// [`completion_listener`]: crate::completion_listener
-    pub completion_listener: Option<CompletionListenerConfig>,
     /// Flow summary projector interval. Default: 15s.
     ///
     /// Separate observability projection path — maintains the flow
@@ -143,7 +115,6 @@ impl Default for EngineConfig {
             quota_reconciler_interval: Duration::from_secs(30),
             unblock_interval: Duration::from_secs(5),
             dependency_reconciler_interval: Duration::from_secs(15),
-            completion_listener: None,
             flow_projector_interval: Duration::from_secs(15),
             execution_deadline_interval: Duration::from_secs(5),
             cancel_reconciler_interval: Duration::from_secs(15),
@@ -186,6 +157,34 @@ impl Engine {
         config: EngineConfig,
         client: ferriskey::Client,
         metrics: Arc<ff_observability::Metrics>,
+    ) -> Self {
+        Self::start_internal(config, client, metrics, None)
+    }
+
+    /// Start the engine with a shared observability registry and a
+    /// completion stream for push-based DAG promotion (issue #90).
+    ///
+    /// The stream is typically produced by
+    /// [`ff_core::completion_backend::CompletionBackend::subscribe_completions`].
+    /// The engine spawns a dispatch loop that drains the stream and
+    /// fires `ff_resolve_dependency` per completion, reducing DAG
+    /// latency from `interval × levels` to `~RTT × levels`. The
+    /// `dependency_reconciler` scanner remains as a safety net for
+    /// completions missed during subscriber reconnect windows.
+    pub fn start_with_completions(
+        config: EngineConfig,
+        client: ferriskey::Client,
+        metrics: Arc<ff_observability::Metrics>,
+        completions: CompletionStream,
+    ) -> Self {
+        Self::start_internal(config, client, metrics, Some(completions))
+    }
+
+    fn start_internal(
+        config: EngineConfig,
+        client: ferriskey::Client,
+        metrics: Arc<ff_observability::Metrics>,
+        completions: Option<CompletionStream>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let num_partitions = config.partition_config.num_flow_partitions;
@@ -384,24 +383,22 @@ impl Engine {
             metrics.clone(),
         ));
 
-        // Completion listener (Batch C item 6 — push-based DAG promotion).
-        // Optional: when Some, spawns a dedicated RESP3 client that
-        // SUBSCRIBEs to ff:dag:completions and dispatches dependency
-        // resolution per completion. See `completion_listener` module
-        // docs for the design rationale.
-        let listener_enabled = config.completion_listener.is_some();
-        if let Some(listener_cfg) = config.completion_listener {
-            handles.push(completion_listener::spawn_completion_listener(
+        // Completion dispatch loop (Batch C item 6 — push-based DAG
+        // promotion; backend-agnostic since issue #90). Optional: when
+        // a stream is provided, spawn a task that drains
+        // `CompletionPayload`s and fires dependency resolution per
+        // completion. See `completion_listener` module docs.
+        let listener_enabled = completions.is_some();
+        if let Some(stream) = completions {
+            handles.push(completion_listener::spawn_dispatch_loop(
                 router.clone(),
                 client,
-                listener_cfg.addresses,
-                listener_cfg.tls,
-                listener_cfg.cluster,
+                stream,
                 shutdown_rx,
             ));
         }
 
-        let scanner_count = if listener_enabled { "15 scanners + completion listener" } else { "15 scanners" };
+        let scanner_count = if listener_enabled { "15 scanners + completion dispatch" } else { "15 scanners" };
         tracing::info!(
             num_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,

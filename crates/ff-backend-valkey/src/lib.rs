@@ -47,7 +47,10 @@ use ff_script::error::ScriptError;
 use ff_script::functions::flow::{ff_cancel_flow, FlowStructOpKeys};
 use ff_script::result::FcallResult;
 
+mod completion;
 mod handle_codec;
+
+pub use completion::COMPLETION_CHANNEL;
 
 /// Valkey-FCALL–backed `EngineBackend`.
 ///
@@ -65,6 +68,13 @@ mod handle_codec;
 pub struct ValkeyBackend {
     client: ferriskey::Client,
     partition_config: PartitionConfig,
+    /// Connection config retained so [`CompletionBackend`] can open
+    /// dedicated RESP3 subscriber clients that reach the same
+    /// deployment. `None` when the backend was constructed via
+    /// [`ValkeyBackend::from_client_and_partitions`] without a
+    /// connection; in that case `subscribe_completions` returns
+    /// `EngineError::Unavailable`.
+    subscriber_connection: Option<ff_core::backend::ValkeyConnection>,
 }
 
 impl ValkeyBackend {
@@ -139,6 +149,7 @@ impl ValkeyBackend {
         Ok(Arc::new(Self {
             client,
             partition_config,
+            subscriber_connection: Some(v),
         }))
     }
 
@@ -164,6 +175,24 @@ impl ValkeyBackend {
         Arc::new(Self {
             client,
             partition_config,
+            subscriber_connection: None,
+        })
+    }
+
+    /// Like [`Self::from_client_and_partitions`] but retains the
+    /// connection config so the backend's [`CompletionBackend`] impl
+    /// can open dedicated RESP3 subscriber clients. Used by ff-server
+    /// wiring where we want a single `Arc` serving both the write
+    /// (`EngineBackend`) and completion-subscription surfaces.
+    pub fn from_client_partitions_and_connection(
+        client: ferriskey::Client,
+        partition_config: PartitionConfig,
+        connection: ff_core::backend::ValkeyConnection,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            partition_config,
+            subscriber_connection: Some(connection),
         })
     }
 

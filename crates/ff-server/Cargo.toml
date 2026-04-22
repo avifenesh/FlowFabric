@@ -30,6 +30,7 @@ observability = [
 ff-core = { workspace = true }
 ff-script = { workspace = true }
 ff-engine = { workspace = true }
+ff-backend-valkey = { workspace = true }
 ff-scheduler = { workspace = true }
 ff-observability = { workspace = true }
 ferriskey = { workspace = true }

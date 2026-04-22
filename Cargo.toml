@@ -56,3 +56,7 @@ async-trait = "0.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 futures = "0.3"
+# Minimal `Stream` trait for ff-core's `CompletionStream` type alias
+# (issue #90). Pulled in instead of the full `futures` crate to keep
+# ff-core's dep surface narrow — ff-core is the schema crate.
+futures-core = "0.3"
