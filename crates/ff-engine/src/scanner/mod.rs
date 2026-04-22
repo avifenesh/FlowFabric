@@ -144,6 +144,24 @@ pub trait Scanner: Send + Sync + 'static {
         client: &ferriskey::Client,
         partition: u16,
     ) -> impl std::future::Future<Output = ScanResult> + Send;
+
+    /// PR-94: per-cycle gauge sample. Returns `Some(depth)` summed
+    /// across all partitions by the scanner runner to produce a
+    /// single gauge value (today only `cancel_reconciler` exports
+    /// one, feeding `ff_cancel_backlog_depth`). Default: `None` so
+    /// scanners that don't export a gauge compile unchanged.
+    ///
+    /// Runs AFTER `scan_partition` for the same `partition` within
+    /// the same cycle, so implementations can reuse cached state.
+    /// The trivial default implementation returns `None` for every
+    /// partition and the runner writes nothing.
+    fn sample_backlog_depth(
+        &self,
+        _client: &ferriskey::Client,
+        _partition: u16,
+    ) -> impl std::future::Future<Output = Option<u64>> + Send {
+        async { None }
+    }
 }
 
 /// Drives a scanner across all execution partitions in a loop.
@@ -151,11 +169,16 @@ pub struct ScannerRunner;
 
 impl ScannerRunner {
     /// Spawn a tokio task that runs the scanner forever until shutdown.
+    ///
+    /// PR-94: the `metrics` handle records per-cycle duration +
+    /// cycle-total counter. Under the no-op shim (`observability`
+    /// feature off) the recorder calls compile to nothing.
     pub fn spawn<S: Scanner>(
         scanner: Arc<S>,
         client: ferriskey::Client,
         num_partitions: u16,
         mut shutdown: watch::Receiver<bool>,
+        metrics: Arc<ff_observability::Metrics>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let name = scanner.name();
@@ -166,6 +189,11 @@ impl ScannerRunner {
                 let cycle_start = tokio::time::Instant::now();
                 let mut total_processed: u32 = 0;
                 let mut total_errors: u32 = 0;
+                // `Some` iff at least one partition reported a depth —
+                // preserves the distinction between "scanner doesn't
+                // export depth" (stays None, no gauge write) and
+                // "depth is 0" (write 0, i.e. empty backlog).
+                let mut total_backlog_depth: Option<u64> = None;
 
                 for p in 0..num_partitions {
                     // Check for shutdown between partitions
@@ -177,9 +205,21 @@ impl ScannerRunner {
                     let result = scanner.scan_partition(&client, p).await;
                     total_processed += result.processed;
                     total_errors += result.errors;
+                    if let Some(d) = scanner.sample_backlog_depth(&client, p).await {
+                        total_backlog_depth =
+                            Some(total_backlog_depth.unwrap_or(0).saturating_add(d));
+                    }
                 }
 
                 let elapsed = cycle_start.elapsed();
+                // PR-94: scanner cycle metrics. Recorded every cycle,
+                // regardless of whether the cycle did any work, so
+                // operators can see cadence drift (a stuck scanner
+                // stops producing data points).
+                metrics.record_scanner_cycle(name, elapsed);
+                if let Some(depth) = total_backlog_depth {
+                    metrics.set_cancel_backlog_depth(depth);
+                }
                 if total_processed > 0 || total_errors > 0 {
                     tracing::info!(
                         scanner = name,

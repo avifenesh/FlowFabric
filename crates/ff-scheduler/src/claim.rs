@@ -292,6 +292,11 @@ pub struct Scheduler {
     /// partition index. A single atomic keeps "advance cursor iff we're
     /// the first call in a new window" race-free without a Mutex.
     rotation_state: AtomicU64,
+    /// PR-94: observability handle for claim_from_grant duration and
+    /// budget/quota hit counters. Defaults to the no-op shim so direct
+    /// callers don't need to care; ff-server wires in the real
+    /// registry via [`Self::with_metrics`].
+    metrics: std::sync::Arc<ff_observability::Metrics>,
 }
 
 impl Scheduler {
@@ -314,6 +319,24 @@ impl Scheduler {
             config,
             scheduler_config,
             rotation_state: AtomicU64::new(0),
+            metrics: std::sync::Arc::new(ff_observability::Metrics::new()),
+        }
+    }
+
+    /// PR-94: construct a scheduler with a shared observability
+    /// registry. Used by `ff-server` so claim/budget/quota metrics
+    /// land in the same registry exposed at `/metrics`.
+    pub fn with_metrics(
+        client: ferriskey::Client,
+        config: PartitionConfig,
+        metrics: std::sync::Arc<ff_observability::Metrics>,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            scheduler_config: SchedulerConfig::default(),
+            rotation_state: AtomicU64::new(0),
+            metrics,
         }
     }
 
@@ -378,6 +401,29 @@ impl Scheduler {
         worker_capabilities: &BTreeSet<String>,
         grant_ttl_ms: u64,
     ) -> Result<Option<ClaimGrant>, SchedulerError> {
+        // PR-94: grant issuance latency histogram. Captures the full
+        // cycle (candidate selection + budget/quota admission +
+        // issuance FCALL) so an operator can spot slow paths without
+        // having to correlate scheduler logs across partitions. Drop
+        // guard records on *every* exit path (including ?-propagated
+        // errors) so the histogram reflects wall-clock cost, not just
+        // the happy path.
+        struct ClaimTimer<'a> {
+            start: std::time::Instant,
+            lane: &'a str,
+            metrics: &'a ff_observability::Metrics,
+        }
+        impl Drop for ClaimTimer<'_> {
+            fn drop(&mut self) {
+                self.metrics
+                    .record_claim_from_grant(self.lane, self.start.elapsed());
+            }
+        }
+        let _claim_timer = ClaimTimer {
+            start: std::time::Instant::now(),
+            lane: lane.as_str(),
+            metrics: &self.metrics,
+        };
         let num_partitions = self.config.num_flow_partitions;
         // Guard misconfiguration: a zero partition count would hit a
         // `% num_partitions` division-by-zero in the scan_start / jitter
@@ -836,7 +882,11 @@ impl Scheduler {
                 continue;
             }
             let result = checker.check_budget(&self.client, budget_id).await?;
-            if let BudgetCheckResult::HardBreach { detail, .. } = result {
+            if let BudgetCheckResult::HardBreach { dimension, detail } = &result {
+                // PR-94: budget hard-breach counter, labelled by
+                // dimension so operators can distinguish "tokens"
+                // breaches from "cost" breaches at a glance.
+                self.metrics.inc_budget_hit(dimension);
                 return Ok(Some(detail.clone()));
             }
         }
@@ -931,14 +981,23 @@ impl Scheduler {
                         quota_id: quota_id_str.clone(),
                         eid: eid_s.to_owned(),
                     }),
-                    "RATE_EXCEEDED" => Ok(QuotaCheckOutcome::Blocked(format!(
-                        "quota {}: rate limit {}/{} per {}s window",
-                        quota_id_str, rate_limit, rate_limit, window_secs
-                    ))),
-                    "CONCURRENCY_EXCEEDED" => Ok(QuotaCheckOutcome::Blocked(format!(
-                        "quota {}: concurrency cap {}",
-                        quota_id_str, concurrency_cap
-                    ))),
+                    "RATE_EXCEEDED" => {
+                        // PR-94: quota admission block, labelled by
+                        // reason so rate-vs-concurrency waves are
+                        // distinguishable in a dashboard.
+                        self.metrics.inc_quota_hit("rate");
+                        Ok(QuotaCheckOutcome::Blocked(format!(
+                            "quota {}: rate limit {}/{} per {}s window",
+                            quota_id_str, rate_limit, rate_limit, window_secs
+                        )))
+                    }
+                    "CONCURRENCY_EXCEEDED" => {
+                        self.metrics.inc_quota_hit("concurrency");
+                        Ok(QuotaCheckOutcome::Blocked(format!(
+                            "quota {}: concurrency cap {}",
+                            quota_id_str, concurrency_cap
+                        )))
+                    }
                     other => {
                         // Fail-closed: an unrecognised status is the Lua
                         // telling us a contract we don't understand. Do

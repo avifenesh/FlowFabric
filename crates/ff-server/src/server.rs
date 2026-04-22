@@ -201,6 +201,15 @@ pub struct Server {
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
     /// dispatch). Drained on shutdown with a bounded timeout.
     background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
+    /// PR-94: observability registry. Initialized to the no-op shim so
+    /// call sites are feature-symmetric; `install_metrics` swaps in a
+    /// real OTEL-backed registry at startup when the `observability`
+    /// feature is on. Held behind a `std::sync::OnceLock` so the swap
+    /// is safe after `Arc<Server>` has been handed to the router.
+    metrics: std::sync::OnceLock<Arc<ff_observability::Metrics>>,
+    /// No-op fallback returned from `metrics()` when `install_metrics`
+    /// has not been called. Always present so consumers don't branch.
+    metrics_fallback: Arc<ff_observability::Metrics>,
 }
 
 /// Server error type.
@@ -304,6 +313,19 @@ impl Server {
     /// 3. Load the FlowFabric Lua library
     /// 4. Start engine (14 background scanners)
     pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
+        Self::start_with_metrics(config, Arc::new(ff_observability::Metrics::new())).await
+    }
+
+    /// PR-94: boot the server with a shared observability registry.
+    ///
+    /// Scanner cycle + scheduler metrics record into this registry;
+    /// `main.rs` threads the same handle into the router so `/metrics`
+    /// exposes what the engine produces. The no-arg [`Server::start`]
+    /// forwards here with the no-op shim.
+    pub async fn start_with_metrics(
+        config: ServerConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Self, ServerError> {
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
             host = %config.host, port = config.port,
@@ -403,7 +425,7 @@ impl Server {
         // block scanners), and keeping scanners off the tail client means a
         // long-poll tail can never starve lease-expiry, retention-trim,
         // etc. Do not change this without revisiting RFC-006 Impl Notes.
-        let engine = Engine::start(engine_cfg, client.clone());
+        let engine = Engine::start_with_metrics(engine_cfg, client.clone(), metrics.clone());
 
         // Dedicated tail client. Built AFTER library load + HMAC install
         // because those steps use the main client; tail client only runs
@@ -501,9 +523,10 @@ impl Server {
             config.partition_config.num_quota_partitions,
         );
 
-        let scheduler = Arc::new(ff_scheduler::Scheduler::new(
+        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
             client.clone(),
             config.partition_config,
+            metrics.clone(),
         ));
 
         Ok(Self {
@@ -520,7 +543,36 @@ impl Server {
             config,
             scheduler,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
+            metrics: {
+                // Seed the OnceLock with the handle used by Engine +
+                // Scheduler so `Server::metrics()` returns the same
+                // registry (not a separate shim). `install_metrics`
+                // no-ops afterwards on duplicate attempts.
+                let lock = std::sync::OnceLock::new();
+                let _ = lock.set(metrics.clone());
+                lock
+            },
+            metrics_fallback: metrics,
         })
+    }
+
+    /// PR-94: swap in the real OTEL-backed metrics registry. Called
+    /// once by `main` after `Server::start` returns, before the HTTP
+    /// server begins accepting connections.
+    ///
+    /// Idempotent within a process: the underlying `OnceLock` only
+    /// accepts the first `set`; subsequent calls are discarded with a
+    /// warning (misuse, not a fatal condition).
+    pub fn install_metrics(&self, metrics: Arc<ff_observability::Metrics>) {
+        if self.metrics.set(metrics).is_err() {
+            tracing::warn!("install_metrics called more than once; ignoring duplicate");
+        }
+    }
+
+    /// PR-94: get the metrics handle, or the always-present no-op
+    /// fallback when `install_metrics` has not been called.
+    pub fn metrics(&self) -> &Arc<ff_observability::Metrics> {
+        self.metrics.get().unwrap_or(&self.metrics_fallback)
     }
 
     /// Get a reference to the ferriskey client.

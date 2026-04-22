@@ -163,6 +163,20 @@ impl Engine {
     ///
     /// Spawns background scanner tasks. Returns immediately.
     pub fn start(config: EngineConfig, client: ferriskey::Client) -> Self {
+        Self::start_with_metrics(config, client, Arc::new(ff_observability::Metrics::new()))
+    }
+
+    /// PR-94: start the engine with a shared observability registry.
+    ///
+    /// Used by `ff-server` so scanner cycle metrics funnel into the
+    /// same Prometheus registry exposed at `/metrics`. The no-arg
+    /// [`Engine::start`] forwards here with a disabled shim, so direct
+    /// callers (examples, tests) retain the previous behavior.
+    pub fn start_with_metrics(
+        config: EngineConfig,
+        client: ferriskey::Client,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let num_partitions = config.partition_config.num_flow_partitions;
         let router = Arc::new(PartitionRouter::new(config.partition_config));
@@ -176,6 +190,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Delayed promoter
@@ -188,6 +203,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Index reconciler
@@ -200,6 +216,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Attempt timeout scanner
@@ -212,6 +229,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Suspension timeout scanner
@@ -223,6 +241,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Pending waitpoint expiry scanner
@@ -234,6 +253,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Retention trimmer
@@ -246,6 +266,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Budget reset scanner (iterates budget partitions)
@@ -257,6 +278,7 @@ impl Engine {
             client.clone(),
             config.partition_config.num_budget_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Budget reconciler (iterates budget partitions)
@@ -268,6 +290,7 @@ impl Engine {
             client.clone(),
             config.partition_config.num_budget_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Unblock scanner (iterates execution partitions, re-evaluates blocked)
@@ -281,6 +304,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Dependency reconciler (iterates execution partitions)
@@ -294,6 +318,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Quota reconciler (iterates quota partitions)
@@ -305,6 +330,7 @@ impl Engine {
             client.clone(),
             config.partition_config.num_quota_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Flow summary projector (iterates flow partitions)
@@ -317,6 +343,7 @@ impl Engine {
             client.clone(),
             config.partition_config.num_flow_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Cancel reconciler (iterates flow partitions). Drains
@@ -331,6 +358,7 @@ impl Engine {
             client.clone(),
             config.partition_config.num_flow_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Execution deadline scanner (iterates execution partitions)
@@ -343,6 +371,7 @@ impl Engine {
             client.clone(),
             num_partitions,
             shutdown_rx.clone(),
+            metrics.clone(),
         ));
 
         // Completion listener (Batch C item 6 — push-based DAG promotion).
