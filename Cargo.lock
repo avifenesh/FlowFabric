@@ -855,6 +855,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-readiness-tests"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "ferriskey",
+ "ff-core",
+ "ff-engine",
+ "ff-sdk",
+ "ff-server",
+ "ff-test",
+ "reqwest",
+ "serde_json",
+ "serial_test",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ff-scheduler"
 version = "0.3.0"
 dependencies = [
