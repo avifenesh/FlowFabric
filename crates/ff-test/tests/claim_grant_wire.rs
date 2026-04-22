@@ -49,8 +49,8 @@ fn server_side_json(g: &ClaimGrant) -> String {
     // in ff-server::api::claim_grant_dto_tests.
     serde_json::json!({
         "execution_id": g.execution_id.to_string(),
-        "partition_key": g.partition_key,
-        "grant_key": g.grant_key,
+        "partition_key": g.partition_key.as_str(),
+        "grant_key": g.grant_key.as_str(),
         "expires_at_ms": g.expires_at_ms,
     })
     .to_string()
@@ -77,7 +77,7 @@ fn claim_grant_round_trips_flow_family() {
     let resp: ff_sdk::admin::ClaimForWorkerResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(resp.partition_key.as_str(), "{fp:42}");
     let rebuilt = resp.into_grant().expect("into_grant must succeed");
-    assert_eq!(rebuilt.partition_key, grant.partition_key);
+    assert_eq!(rebuilt.partition_key.as_str(), grant.partition_key.as_str());
     assert_eq!(rebuilt.expires_at_ms, grant.expires_at_ms);
     assert_eq!(rebuilt.grant_key, grant.grant_key);
 }

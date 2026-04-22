@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn into_grant_accepts_all_known_families() {
+    fn into_grant_preserves_all_known_partition_key_shapes() {
         // Post-#91: families collapse into opaque PartitionKey literals.
         // Flow and Execution both produce "{fp:N}"; Budget is "{b:N}";
         // Quota is "{q:N}". The DTO preserves the wire string as-is;

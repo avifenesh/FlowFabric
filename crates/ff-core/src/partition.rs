@@ -5,8 +5,11 @@
 //! Public wire surfaces carry [`PartitionKey`] — an opaque
 //! `#[serde(transparent)]` newtype over the hash-tag literal
 //! (`"{fp:7}"`) — rather than the internal [`Partition`] struct. The
-//! `PartitionFamily` enum (with its `Execution` / `Flow` alias) stays
-//! entirely internal; consumers never deserialize it off the wire.
+//! [`PartitionFamily`] enum (including its `Execution` / `Flow`
+//! alias) remains a public `ff-core` type — in-tree consumers that
+//! construct a [`Partition`] directly still name it — but it is no
+//! longer part of the HTTP / SDK wire DTOs, so external consumers
+//! never deserialize it off the wire.
 //!
 //! ## Migration note (0.2 → 0.3)
 //!
@@ -170,11 +173,16 @@ impl std::fmt::Display for Partition {
 ///
 /// Consumers MUST treat a `PartitionKey` as opaque: pass it back to
 /// FlowFabric on subsequent calls, but do NOT parse the interior hash
-/// tag to make routing or policy decisions. FlowFabric may narrow the
-/// accepted shape (e.g. hash-tag alphabet, length bounds) in future
-/// versions without a semver bump. Consumers that need the parsed
-/// form call [`PartitionKey::parse`] / [`Self::as_partition`], which
-/// returns a typed error on malformed input.
+/// tag to make routing or policy decisions. Compatibility is only
+/// guaranteed for opaque round-tripping of keys PRODUCED by
+/// FlowFabric — consumers must not hand-construct hash-tag strings
+/// nor rely on non-canonical shapes being accepted. FlowFabric may
+/// narrow the accepted shape (e.g. hash-tag alphabet, length bounds)
+/// in future minor releases for producer-minted keys without a
+/// semver bump, because every such key still round-trips under the
+/// new rules. Consumers that need the parsed form call
+/// [`PartitionKey::parse`] / [`Self::as_partition`], which returns a
+/// typed error on malformed input.
 ///
 /// # Round-trip + alias collapse
 ///
