@@ -5,11 +5,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post, put, MethodRouter},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,129 @@ use ff_core::types::*;
 
 use crate::config::ConfigError;
 use crate::server::{Server, ServerError};
+
+// ── Per-route body-size limits (#97) ──
+//
+// Axum's out-of-the-box `DefaultBodyLimit` is 2 MiB and was applied silently
+// with no per-route override, meaning a misrouted multi-GB JSON would still
+// be buffered up to 2 MiB before rejection and mega-byte payloads on
+// control-plane endpoints (cancel, priority, claim, …) were accepted with
+// no protection beyond that global cap.
+//
+// We apply three categories, ordered by generosity:
+//
+//   * `BODY_LIMIT_LARGE_PAYLOAD` (1 MiB) — carries an application
+//     `input_payload` (`POST /v1/executions`). FlowFabric has no Lua-side
+//     cap on `input_payload` (`execution.lua` SETs whatever is passed);
+//     1 MiB matches common workflow-engine conventions (e.g. AWS Step
+//     Functions input size limit is 256 KB, Temporal's default is 2 MiB)
+//     and is an order of magnitude above typical JSON control envelopes.
+//
+//   * `BODY_LIMIT_MEDIUM_PAYLOAD` (256 KiB) — signal delivery
+//     (`POST /v1/executions/{id}/signal`) carries a `DeliverSignalArgs`
+//     with an optional `Vec<u8> payload`. Signals are notification-shaped
+//     events (webhooks, human approvals), not bulk-data transfers; 256 KiB
+//     is the same ceiling Step Functions imposes on task inputs and is
+//     comfortably above any real correlation-id / approval-blob.
+//
+//   * `BODY_LIMIT_CONTROL` (64 KiB) — everything else. Control-plane JSON
+//     bodies (cancel args, priority changes, claim requests, flow
+//     members, budget/quota definitions, rotate-secret keys) are all tiny
+//     fixed-shape records; 64 KiB leaves plenty of headroom for
+//     metadata-heavy bodies while capping DoS amplification by ~32× vs
+//     the previous axum default.
+//
+// Cross-checked against `lua/*.lua` — the only payload-size caps in the
+// Lua layer are `CAPS_MAX_BYTES=4096` / `CAPS_MAX_TOKENS=256` for
+// capability lists (`lua/helpers.lua`). No other Lua path enforces a
+// byte-length limit on incoming payloads, so HTTP is the right layer to
+// draw the line.
+//
+// Future admin routes that need larger bodies (e.g. bulk import) should
+// introduce a new `BODY_LIMIT_ADMIN_BULK` const and opt in per-route
+// rather than bumping `BODY_LIMIT_CONTROL`.
+
+const BODY_LIMIT_LARGE_PAYLOAD: usize = 1024 * 1024;     // 1 MiB
+const BODY_LIMIT_MEDIUM_PAYLOAD: usize = 256 * 1024;     // 256 KiB
+const BODY_LIMIT_CONTROL: usize = 64 * 1024;             // 64 KiB
+
+/// Limit metadata attached to a request via extension so the 413 error body
+/// can report the route's configured cap. The `DefaultBodyLimit::max(bytes)`
+/// layer enforces; this struct only exists for response shape.
+#[derive(Clone, Copy)]
+struct BodyLimit {
+    bytes: usize,
+}
+
+/// Apply per-route body-size cap + attach [`BodyLimit`] extension so the
+/// JSON rejection handler can report `limit_bytes` in the 413 response.
+///
+/// Three layers, each guarding a different failure mode:
+///
+///   1. `from_fn(enforce_body_limit)` — inspects `Content-Length` up front
+///      and rejects with our structured 413 body BEFORE the handler runs.
+///      This is the primary enforcement path and works regardless of
+///      whether the handler consumes the body. Also attaches the
+///      [`BodyLimit`] extension so `AppJson`'s 413 branch (below, case 2)
+///      can report `limit_bytes` even when rejection happens during
+///      streaming.
+///   2. `DefaultBodyLimit::max(bytes)` — hint consumed by `AppJson`
+///      (`Bytes::from_request` internally) for the case where a client
+///      lies in `Content-Length` or uses `Transfer-Encoding: chunked`:
+///      the body extractor trips on a streaming-length check and we
+///      rewrite the rejection into the structured 413 shape in
+///      `AppJson::from_request`.
+///   3. `tower_http::limit::RequestBodyLimitLayer::new(bytes)` —
+///      transport-level body cap that also fires on chunked transfers
+///      even when the handler never consumes the body. Returns a plain
+///      413 (no JSON body) in that edge case; the structured path in
+///      (1) covers the overwhelmingly common case (clients sending
+///      Content-Length).
+fn with_body_limit(route: MethodRouter<Arc<Server>>, bytes: usize) -> MethodRouter<Arc<Server>> {
+    let r: MethodRouter<Arc<Server>> =
+        route.layer(tower_http::limit::RequestBodyLimitLayer::new(bytes));
+    let r: MethodRouter<Arc<Server>> = r.layer(DefaultBodyLimit::max(bytes));
+    r.layer(middleware::from_fn(
+        move |req: Request, next: middleware::Next| enforce_body_limit(bytes, req, next),
+    ))
+}
+
+/// Content-Length-based body-size enforcement + [`BodyLimit`] extension.
+///
+/// Runs before the handler so routes whose handlers never consume the
+/// request body (`replay_execution`, `revoke_lease`, `reset_budget` — see
+/// Copilot review on PR#100) are still protected against large uploads.
+async fn enforce_body_limit(bytes: usize, mut req: Request, next: middleware::Next) -> Response {
+    if let Some(content_length) = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        && content_length > bytes
+    {
+        let route = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|m| m.as_str().to_owned())
+            .unwrap_or_default();
+        let body = PayloadTooLargeBody {
+            error: "payload_too_large",
+            limit_bytes: bytes,
+            route,
+        };
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+    }
+    req.extensions_mut().insert(BodyLimit { bytes });
+    next.run(req).await
+}
+
+/// Shape for the 413 response body.
+#[derive(Serialize)]
+struct PayloadTooLargeBody {
+    error: &'static str,
+    limit_bytes: usize,
+    route: String,
+}
 
 // ── Custom JSON extractor (uniform JSON error on malformed body) ──
 
@@ -39,11 +162,31 @@ where
         req: axum::extract::Request,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
+        // Snapshot metadata for a potential 413 before `Json::from_request`
+        // consumes the request. `BodyLimit` is `Copy` and `MatchedPath` is
+        // cheap to clone (its payload is an `Arc<str>`), so the non-413
+        // path pays at most two extension lookups plus a ref-count bump.
+        let limit = req.extensions().get::<BodyLimit>().copied();
+        let matched = req.extensions().get::<MatchedPath>().cloned();
+
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(AppJson(value)),
             Err(rejection) => {
                 let status = rejection.status();
                 tracing::debug!(detail = %rejection.body_text(), "JSON rejection");
+                if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    let limit_bytes = limit.map(|l| l.bytes).unwrap_or(0);
+                    let route = matched
+                        .as_ref()
+                        .map(|m| m.as_str().to_owned())
+                        .unwrap_or_default();
+                    let body = PayloadTooLargeBody {
+                        error: "payload_too_large",
+                        limit_bytes,
+                        route,
+                    };
+                    return Err((status, Json(body)).into_response());
+                }
                 let body = ErrorBody::plain(format!(
                     "invalid JSON: {}",
                     status.canonical_reason().unwrap_or("bad request"),
@@ -183,9 +326,18 @@ pub fn router(
     let auth_enabled = api_token.is_some();
     let cors = build_cors_layer(cors_origins, auth_enabled)?;
 
+    // Per-route body-size caps (#97). See module-level `BODY_LIMIT_*` consts
+    // for the category rationale; each route picks the tightest cap that
+    // still accommodates expected real traffic.
     let mut app = Router::new()
         // Executions
-        .route("/v1/executions", get(list_executions).post(create_execution))
+        .route(
+            "/v1/executions",
+            with_body_limit(
+                get(list_executions).post(create_execution),
+                BODY_LIMIT_LARGE_PAYLOAD,
+            ),
+        )
         .route("/v1/executions/{id}", get(get_execution))
         .route("/v1/executions/{id}/state", get(get_execution_state))
         .route(
@@ -193,16 +345,34 @@ pub fn router(
             get(list_pending_waitpoints),
         )
         .route("/v1/executions/{id}/result", get(get_execution_result))
-        .route("/v1/executions/{id}/cancel", post(cancel_execution))
-        .route("/v1/executions/{id}/signal", post(deliver_signal))
-        .route("/v1/executions/{id}/priority", put(change_priority))
-        .route("/v1/executions/{id}/replay", post(replay_execution))
-        .route("/v1/executions/{id}/revoke-lease", post(revoke_lease))
+        .route(
+            "/v1/executions/{id}/cancel",
+            with_body_limit(post(cancel_execution), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/executions/{id}/signal",
+            with_body_limit(post(deliver_signal), BODY_LIMIT_MEDIUM_PAYLOAD),
+        )
+        .route(
+            "/v1/executions/{id}/priority",
+            with_body_limit(put(change_priority), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/executions/{id}/replay",
+            with_body_limit(post(replay_execution), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/executions/{id}/revoke-lease",
+            with_body_limit(post(revoke_lease), BODY_LIMIT_CONTROL),
+        )
         // Scheduler-routed claim (Batch C item 2). Worker POSTs lane +
         // identity + capabilities; server runs budget/quota/capability
         // admission via ff-scheduler and returns a ClaimGrant on
         // success (204 No Content when no eligible execution).
-        .route("/v1/workers/{worker_id}/claim", post(claim_for_worker))
+        .route(
+            "/v1/workers/{worker_id}/claim",
+            with_body_limit(post(claim_for_worker), BODY_LIMIT_CONTROL),
+        )
         // Stream read + tail (RFC-006 #2)
         .route(
             "/v1/executions/{id}/attempts/{idx}/stream",
@@ -213,20 +383,50 @@ pub fn router(
             get(tail_attempt_stream),
         )
         // Flows
-        .route("/v1/flows", post(create_flow))
-        .route("/v1/flows/{id}/members", post(add_execution_to_flow))
-        .route("/v1/flows/{id}/cancel", post(cancel_flow))
-        .route("/v1/flows/{id}/edges", post(stage_dependency_edge))
-        .route("/v1/flows/{id}/edges/apply", post(apply_dependency_to_child))
+        .route(
+            "/v1/flows",
+            with_body_limit(post(create_flow), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/flows/{id}/members",
+            with_body_limit(post(add_execution_to_flow), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/flows/{id}/cancel",
+            with_body_limit(post(cancel_flow), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/flows/{id}/edges",
+            with_body_limit(post(stage_dependency_edge), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/flows/{id}/edges/apply",
+            with_body_limit(post(apply_dependency_to_child), BODY_LIMIT_CONTROL),
+        )
         // Budgets
-        .route("/v1/budgets", post(create_budget))
+        .route(
+            "/v1/budgets",
+            with_body_limit(post(create_budget), BODY_LIMIT_CONTROL),
+        )
         .route("/v1/budgets/{id}", get(get_budget_status))
-        .route("/v1/budgets/{id}/usage", post(report_usage))
-        .route("/v1/budgets/{id}/reset", post(reset_budget))
+        .route(
+            "/v1/budgets/{id}/usage",
+            with_body_limit(post(report_usage), BODY_LIMIT_CONTROL),
+        )
+        .route(
+            "/v1/budgets/{id}/reset",
+            with_body_limit(post(reset_budget), BODY_LIMIT_CONTROL),
+        )
         // Quotas
-        .route("/v1/quotas", post(create_quota_policy))
+        .route(
+            "/v1/quotas",
+            with_body_limit(post(create_quota_policy), BODY_LIMIT_CONTROL),
+        )
         // Admin: rotate waitpoint HMAC secret (RFC-004 §Waitpoint Security)
-        .route("/v1/admin/rotate-waitpoint-secret", post(rotate_waitpoint_secret))
+        .route(
+            "/v1/admin/rotate-waitpoint-secret",
+            with_body_limit(post(rotate_waitpoint_secret), BODY_LIMIT_CONTROL),
+        )
         // Health (always unauthenticated)
         .route("/healthz", get(healthz));
 
