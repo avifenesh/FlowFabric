@@ -343,15 +343,13 @@ pub struct ClaimForWorkerRequest {
 
 /// Response body for `POST /v1/workers/{worker_id}/claim`.
 ///
-/// Wire shape of `ff_core::contracts::ClaimGrant`. The core type is
-/// not serde-derived (carries a `Partition` with a non-scalar family
-/// enum) so the SDK decodes into this DTO and reconstructs the core
-/// type via [`Self::into_grant`].
+/// Wire shape of `ff_core::contracts::ClaimGrant`. Carries the opaque
+/// [`ff_core::partition::PartitionKey`] directly on the wire (issue
+/// #91); the SDK reconstructs the core type via [`Self::into_grant`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaimForWorkerResponse {
     pub execution_id: String,
-    pub partition_family: String,
-    pub partition_index: u16,
+    pub partition_key: ff_core::partition::PartitionKey,
     pub grant_key: String,
     pub expires_at_ms: u64,
 }
@@ -360,9 +358,13 @@ impl ClaimForWorkerResponse {
     /// Convert the wire DTO into a typed
     /// [`ff_core::contracts::ClaimGrant`] for handoff to
     /// [`crate::FlowFabricWorker::claim_from_grant`]. Returns
-    /// [`SdkError::AdminApi`] on malformed execution_id / unknown
-    /// partition_family (server and SDK have drifted; fail loud so
-    /// callers don't route to a ghost partition).
+    /// [`SdkError::AdminApi`] on malformed execution_id — a drift
+    /// signal that the server and SDK disagree on the wire shape, so
+    /// failing loud prevents routing to a ghost partition.
+    ///
+    /// The `partition_key` itself is not eagerly parsed here: it is
+    /// carried opaquely to the `claim_from_grant` hot path, which
+    /// parses it there and surfaces a typed error on malformed keys.
     pub fn into_grant(self) -> Result<ff_core::contracts::ClaimGrant, SdkError> {
         let execution_id = ff_core::types::ExecutionId::parse(&self.execution_id)
             .map_err(|e| SdkError::AdminApi {
@@ -375,29 +377,9 @@ impl ClaimForWorkerResponse {
                 retryable: Some(false),
                 raw_body: String::new(),
             })?;
-        let family = match self.partition_family.as_str() {
-            "flow" => ff_core::partition::PartitionFamily::Flow,
-            "execution" => ff_core::partition::PartitionFamily::Execution,
-            "budget" => ff_core::partition::PartitionFamily::Budget,
-            "quota" => ff_core::partition::PartitionFamily::Quota,
-            other => {
-                return Err(SdkError::AdminApi {
-                    status: 200,
-                    message: format!(
-                        "claim_for_worker: unknown partition_family '{other}'"
-                    ),
-                    kind: Some("malformed_response".to_owned()),
-                    retryable: Some(false),
-                    raw_body: String::new(),
-                });
-            }
-        };
         Ok(ff_core::contracts::ClaimGrant {
             execution_id,
-            partition: ff_core::partition::Partition {
-                family,
-                index: self.partition_index,
-            },
+            partition_key: self.partition_key,
             grant_key: self.grant_key,
             expires_at_ms: self.expires_at_ms,
         })
@@ -485,44 +467,49 @@ mod tests {
 
     // ── ClaimForWorkerResponse::into_grant ──
 
-    fn sample_claim_response(family: &str) -> ClaimForWorkerResponse {
+    fn sample_claim_response(partition_key: &str) -> ClaimForWorkerResponse {
         ClaimForWorkerResponse {
             execution_id: "{fp:5}:11111111-1111-1111-1111-111111111111".to_owned(),
-            partition_family: family.to_owned(),
-            partition_index: 5,
+            partition_key: serde_json::from_str(
+                &serde_json::to_string(partition_key).unwrap(),
+            )
+            .unwrap(),
             grant_key: "ff:exec:{fp:5}:11111111-1111-1111-1111-111111111111:claim_grant".to_owned(),
             expires_at_ms: 1_700_000_000_000,
         }
     }
 
     #[test]
-    fn into_grant_accepts_all_known_families() {
-        for family in ["flow", "execution", "budget", "quota"] {
-            let g = sample_claim_response(family).into_grant().unwrap_or_else(|e| {
-                panic!("family {family} should parse: {e:?}")
+    fn into_grant_preserves_all_known_partition_key_shapes() {
+        // Post-#91: families collapse into opaque PartitionKey literals.
+        // Flow and Execution both produce "{fp:N}"; Budget is "{b:N}";
+        // Quota is "{q:N}". The DTO preserves the wire string as-is;
+        // into_grant hands it opaquely to the core type.
+        for key_str in ["{fp:5}", "{b:5}", "{q:5}"] {
+            let g = sample_claim_response(key_str).into_grant().unwrap_or_else(|e| {
+                panic!("key {key_str} should parse: {e:?}")
             });
-            assert_eq!(g.partition.index, 5);
+            assert_eq!(g.partition_key.as_str(), key_str);
             assert_eq!(g.expires_at_ms, 1_700_000_000_000);
         }
     }
 
     #[test]
-    fn into_grant_rejects_unknown_family() {
-        let resp = sample_claim_response("nonsense");
-        let err = resp.into_grant().unwrap_err();
-        match err {
-            SdkError::AdminApi { message, kind, .. } => {
-                assert!(message.contains("unknown partition_family"),
-                    "msg: {message}");
-                assert_eq!(kind.as_deref(), Some("malformed_response"));
-            }
-            other => panic!("expected AdminApi, got {other:?}"),
-        }
+    fn into_grant_preserves_opaque_partition_key() {
+        // The SDK does NOT eagerly parse the partition_key on the
+        // admin boundary — malformed keys are caught at the
+        // claim_from_grant hot path where the typed Partition is
+        // actually needed. This test pins the opacity contract.
+        let resp = sample_claim_response("{zz:0}");
+        let g = resp.into_grant().expect("SDK must not parse partition_key");
+        assert_eq!(g.partition_key.as_str(), "{zz:0}");
+        // Parsing surfaces the error explicitly.
+        assert!(g.partition().is_err());
     }
 
     #[test]
     fn into_grant_rejects_malformed_execution_id() {
-        let mut resp = sample_claim_response("flow");
+        let mut resp = sample_claim_response("{fp:5}");
         resp.execution_id = "not-a-valid-eid".to_owned();
         let err = resp.into_grant().unwrap_err();
         match err {
@@ -533,5 +520,21 @@ mod tests {
             }
             other => panic!("expected AdminApi, got {other:?}"),
         }
+    }
+
+    // ── ClaimForWorkerResponse wire shape (issue #91) ──
+
+    #[test]
+    fn claim_for_worker_response_deserialises_opaque_partition_key() {
+        // Exact shape the server emits post-#91.
+        let raw = r#"{
+            "execution_id": "{fp:7}:11111111-1111-1111-1111-111111111111",
+            "partition_key": "{fp:7}",
+            "grant_key": "ff:exec:{fp:7}:11111111-1111-1111-1111-111111111111:claim_grant",
+            "expires_at_ms": 1700000000000
+        }"#;
+        let r: ClaimForWorkerResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.partition_key.as_str(), "{fp:7}");
+        assert_eq!(r.expires_at_ms, 1_700_000_000_000);
     }
 }

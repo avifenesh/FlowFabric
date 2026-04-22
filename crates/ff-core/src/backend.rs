@@ -758,10 +758,10 @@ mod tests {
     fn reclaim_token_wraps_grant() {
         let grant = ReclaimGrant {
             execution_id: ExecutionId::solo(&LaneId::new("default"), &Default::default()),
-            partition: Partition {
+            partition_key: crate::partition::PartitionKey::from(&Partition {
                 family: PartitionFamily::Flow,
                 index: 0,
-            },
+            }),
             grant_key: "gkey".into(),
             expires_at_ms: 123,
             lane_id: LaneId::new("default"),
