@@ -798,7 +798,7 @@ impl Scheduler {
                     );
                     return Ok(Some(ClaimGrant {
                         execution_id: eid,
-                        partition,
+                        partition_key: ff_core::partition::PartitionKey::from(&partition),
                         grant_key: grant_key.clone(),
                         expires_at_ms: now_ms + grant_ttl_ms,
                     }));

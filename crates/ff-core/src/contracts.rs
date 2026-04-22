@@ -108,13 +108,36 @@ pub enum IssueClaimGrantResult {
 pub struct ClaimGrant {
     /// The execution that was granted.
     pub execution_id: ExecutionId,
-    /// The partition where this execution lives.
-    pub partition: crate::partition::Partition,
+    /// Opaque partition handle for this execution's hash-tag slot.
+    ///
+    /// Public wire type: consumers pass it back to FlowFabric but
+    /// must not parse the interior hash tag for routing decisions.
+    /// Internal consumers that need the typed
+    /// [`crate::partition::Partition`] call [`Self::partition`].
+    pub partition_key: crate::partition::PartitionKey,
     /// The Valkey key holding the grant hash (for the worker to
     /// reference).
     pub grant_key: String,
     /// When the grant expires if not consumed.
     pub expires_at_ms: u64,
+}
+
+impl ClaimGrant {
+    /// Parse `partition_key` into a typed
+    /// [`crate::partition::Partition`]. Intended for internal
+    /// consumers (scheduler emitter, SDK worker claim path) that
+    /// need the family/index pair. Fails only on malformed keys
+    /// (which indicates a producer bug).
+    ///
+    /// Alias collapse applies: a grant issued against `Execution`
+    /// family round-trips to `Flow` (see [`crate::partition::PartitionKey`]
+    /// for the rationale — routing is preserved, only the metadata
+    /// family label normalises).
+    pub fn partition(
+        &self,
+    ) -> Result<crate::partition::Partition, crate::partition::PartitionKeyParseError> {
+        self.partition_key.parse()
+    }
 }
 
 /// A reclaim grant issued for a resumed (attempt_interrupted) execution.
@@ -161,8 +184,12 @@ pub struct ClaimGrant {
 pub struct ReclaimGrant {
     /// The execution granted for resumption.
     pub execution_id: ExecutionId,
-    /// The partition the execution lives on.
-    pub partition: crate::partition::Partition,
+    /// Opaque partition handle for this execution's hash-tag slot.
+    ///
+    /// Same wire-opacity contract as [`ClaimGrant::partition_key`].
+    /// Internal consumers call [`Self::partition`] for the parsed
+    /// form.
+    pub partition_key: crate::partition::PartitionKey,
     /// Valkey key of the grant hash — same key shape as
     /// [`ClaimGrant`].
     pub grant_key: String,
@@ -173,6 +200,17 @@ pub struct ReclaimGrant {
     /// `ff_claim_resumed_execution` for `KEYS[3]` (eligible_zset)
     /// and `KEYS[9]` (active_index).
     pub lane_id: LaneId,
+}
+
+impl ReclaimGrant {
+    /// Parse `partition_key` into a typed
+    /// [`crate::partition::Partition`]. See [`ClaimGrant::partition`]
+    /// for the alias-collapse note.
+    pub fn partition(
+        &self,
+    ) -> Result<crate::partition::Partition, crate::partition::PartitionKeyParseError> {
+        self.partition_key.parse()
+    }
 }
 
 // ─── claim_execution ───

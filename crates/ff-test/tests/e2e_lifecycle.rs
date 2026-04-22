@@ -4969,7 +4969,9 @@ async fn test_claim_from_grant_rejects_at_capacity() {
     // Valkey key.
     let rebuilt_g2 = ff_core::contracts::ClaimGrant {
         execution_id: eid_b.clone(),
-        partition: ff_core::partition::execution_partition(&eid_b, &test_config()),
+        partition_key: ff_core::partition::PartitionKey::from(
+            &ff_core::partition::execution_partition(&eid_b, &test_config()),
+        ),
         grant_key: g2_key.clone(),
         // expires_at_ms is advisory on the consumer side; Lua
         // enforces the real expiry via its own TIME read, so
@@ -8853,7 +8855,7 @@ async fn suspend_resume_setup_with_grant(
 
     ff_core::contracts::ReclaimGrant {
         execution_id: eid.clone(),
-        partition,
+        partition_key: ff_core::partition::PartitionKey::from(&partition),
         grant_key,
         expires_at_ms,
         lane_id,
@@ -9025,7 +9027,7 @@ async fn test_claim_from_reclaim_grant_not_resumed() {
 
     let grant = ff_core::contracts::ReclaimGrant {
         execution_id: eid.clone(),
-        partition,
+        partition_key: ff_core::partition::PartitionKey::from(&partition),
         grant_key,
         expires_at_ms,
         lane_id: LaneId::new(LANE),

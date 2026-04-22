@@ -1099,8 +1099,13 @@ impl FlowFabricWorker {
             .map_err(|_| SdkError::WorkerAtCapacity)?;
 
         let now = TimestampMs::now();
+        let partition = grant.partition().map_err(|e| SdkError::Config {
+            context: "claim_from_grant".to_owned(),
+            field: Some("partition_key".to_owned()),
+            message: e.to_string(),
+        })?;
         let mut task = self
-            .claim_execution(&grant.execution_id, &lane, &grant.partition, now)
+            .claim_execution(&grant.execution_id, &lane, &partition, now)
             .await?;
         task.set_concurrency_permit(permit);
         Ok(task)
@@ -1206,11 +1211,16 @@ impl FlowFabricWorker {
 
         // Grant carries partition + lane_id so no round-trip is needed
         // to resolve them before the FCALL.
+        let partition = grant.partition().map_err(|e| SdkError::Config {
+            context: "claim_from_reclaim_grant".to_owned(),
+            field: Some("partition_key".to_owned()),
+            message: e.to_string(),
+        })?;
         let mut task = self
             .claim_resumed_execution(
                 &grant.execution_id,
                 &grant.lane_id,
-                &grant.partition,
+                &partition,
             )
             .await?;
         task.set_concurrency_permit(permit);

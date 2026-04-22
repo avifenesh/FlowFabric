@@ -878,31 +878,22 @@ struct ClaimForWorkerBody {
     grant_ttl_ms: u64,
 }
 
-/// Wire shape for `ff_core::contracts::ClaimGrant`. Core type is not
-/// serde-derived (it carries a `Partition` with a non-scalar family
-/// enum); keep a DTO here so we own the HTTP shape without touching
-/// the core contract.
+/// Wire shape for `ff_core::contracts::ClaimGrant`. Carries the
+/// opaque [`ff_core::partition::PartitionKey`] on the wire; consumers
+/// never see the internal `PartitionFamily` enum (issue #91).
 #[derive(Serialize)]
 struct ClaimGrantDto {
     execution_id: String,
-    partition_family: &'static str,
-    partition_index: u16,
+    partition_key: ff_core::partition::PartitionKey,
     grant_key: String,
     expires_at_ms: u64,
 }
 
 impl From<ff_core::contracts::ClaimGrant> for ClaimGrantDto {
     fn from(g: ff_core::contracts::ClaimGrant) -> Self {
-        let family = match g.partition.family {
-            ff_core::partition::PartitionFamily::Flow => "flow",
-            ff_core::partition::PartitionFamily::Execution => "execution",
-            ff_core::partition::PartitionFamily::Budget => "budget",
-            ff_core::partition::PartitionFamily::Quota => "quota",
-        };
         Self {
             execution_id: g.execution_id.to_string(),
-            partition_family: family,
-            partition_index: g.partition.index,
+            partition_key: g.partition_key,
             grant_key: g.grant_key,
             expires_at_ms: g.expires_at_ms,
         }
@@ -1463,5 +1454,55 @@ mod cors_tests {
             "Authorization should not be advertised when auth is off; got: {allow_headers}"
         );
         assert!(allow_headers.contains("content-type"));
+    }
+}
+
+#[cfg(test)]
+mod claim_grant_dto_tests {
+    //! Wire-shape tests for `ClaimGrantDto` (issue #91).
+    //!
+    //! Pins the exact JSON shape the server emits on the
+    //! `POST /v1/workers/{id}/claim` 200 response so any drift shows
+    //! up at compile-adjacent test time rather than on a live SDK.
+    use super::*;
+    use ff_core::contracts::ClaimGrant;
+    use ff_core::partition::{Partition, PartitionFamily, PartitionKey};
+    use ff_core::types::{ExecutionId, FlowId};
+
+    fn sample_grant(family: PartitionFamily) -> ClaimGrant {
+        let config = ff_core::partition::PartitionConfig::default();
+        let fid = FlowId::new();
+        let eid = ExecutionId::for_flow(&fid, &config);
+        let p = Partition { family, index: 7 };
+        ClaimGrant {
+            execution_id: eid,
+            partition_key: PartitionKey::from(&p),
+            grant_key: "ff:exec:{fp:7}:deadbeef:claim_grant".to_owned(),
+            expires_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn claim_grant_dto_emits_opaque_partition_key() {
+        let dto = ClaimGrantDto::from(sample_grant(PartitionFamily::Flow));
+        let json = serde_json::to_value(&dto).unwrap();
+        // `partition_key` serialises transparent: a bare string, not
+        // an object, not a `partition_family`/`partition_index` pair.
+        assert_eq!(json["partition_key"], serde_json::json!("{fp:7}"));
+        assert!(json.get("partition_family").is_none());
+        assert!(json.get("partition_index").is_none());
+        assert_eq!(json["expires_at_ms"], serde_json::json!(1_700_000_000_000u64));
+    }
+
+    #[test]
+    fn claim_grant_dto_collapses_execution_alias_on_wire() {
+        // RFC-011 §11 alias: Execution-family grants emit the same
+        // `{fp:N}` hash tag as Flow. This test pins the wire-level
+        // equivalence.
+        let dto_flow = ClaimGrantDto::from(sample_grant(PartitionFamily::Flow));
+        let dto_exec = ClaimGrantDto::from(sample_grant(PartitionFamily::Execution));
+        let jf = serde_json::to_value(&dto_flow).unwrap();
+        let je = serde_json::to_value(&dto_exec).unwrap();
+        assert_eq!(jf["partition_key"], je["partition_key"]);
     }
 }
