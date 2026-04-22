@@ -58,22 +58,49 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Load configuration from environment variables.
     ///
+    /// The table below enumerates every variable this function reads. It is
+    /// the canonical rustdoc mirror of the identical table in the top-level
+    /// `README.md`. `docs/DEPLOYMENT.md` references these names.
+    ///
+    /// **Maintenance contract:** every `std::env::var(...)` call in the body
+    /// of `from_env` MUST have a row here. When you add, rename, or remove
+    /// an env var, update this table in the same commit. There is no
+    /// compile-time check — reviewers enforce it. Legacy aliases accepted
+    /// during a rename window (e.g. `FF_MAX_CONCURRENT_TAIL`) should be
+    /// listed alongside their preferred name.
+    ///
     /// | Variable | Default | Description |
     /// |----------|---------|-------------|
+    /// | `FF_WAITPOINT_HMAC_SECRET` | *required* | Hex-encoded HMAC signing secret for waitpoint tokens (RFC-004 §Waitpoint Security). Even-length hex; 64 chars (32 bytes) recommended. Boot fails without it. |
     /// | `FF_HOST` | `localhost` | Valkey host |
     /// | `FF_PORT` | `6379` | Valkey port |
-    /// | `FF_TLS` | `false` | Enable TLS (`1` or `true`) |
-    /// | `FF_CLUSTER` | `false` | Enable cluster mode (`1` or `true`) |
+    /// | `FF_TLS` | `false` | Enable TLS for Valkey (`1` or `true`) |
+    /// | `FF_CLUSTER` | `false` | Enable Valkey cluster mode (`1` or `true`) |
     /// | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
-    /// | `FF_LANES` | `default` | Comma-separated lane names |
+    /// | `FF_LANES` | `default` | Comma-separated lane names; at least one non-empty lane required |
     /// | `FF_FLOW_PARTITIONS` | `256` | Flow partition count — authoritative; under RFC-011 hash-tag co-location, exec keys also route here |
     /// | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
     /// | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
-    /// | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins (`*` = permissive) |
-    /// | `FF_API_TOKEN` | *(none)* | Shared-secret Bearer token. If set, all non-healthz requests require it. |
-    /// | `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease expiry scanner interval |
-    /// | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed promoter interval |
+    /// | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins (`*` = permissive). Empty string is rejected; unset the var to get the default. |
+    /// | `FF_API_TOKEN` | *(none)* | Shared-secret Bearer token. If set, all non-`/healthz` requests require it. |
+    /// | `FF_WAITPOINT_HMAC_GRACE_MS` | `86400000` | Grace window (ms) during which tokens signed by the previous kid remain accepted after rotation. Default 24h. |
+    /// | `FF_MAX_CONCURRENT_STREAM_OPS` | `64` | Shared semaphore bound for `read_attempt_stream` + `tail_attempt_stream`. Legacy `FF_MAX_CONCURRENT_TAIL` is accepted as a fallback; if both are set, the new name wins. |
+    /// | `FF_MAX_CONCURRENT_TAIL` | *(legacy)* | Deprecated alias for `FF_MAX_CONCURRENT_STREAM_OPS`; accepted during the R4 rename window. |
+    /// | `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease-expiry scanner interval |
+    /// | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed-promoter scanner interval |
     /// | `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval |
+    /// | `FF_ATTEMPT_TIMEOUT_INTERVAL_S` | `2` | Attempt-timeout scanner interval |
+    /// | `FF_SUSPENSION_TIMEOUT_INTERVAL_S` | `2` | Suspension-timeout scanner interval |
+    /// | `FF_PENDING_WP_EXPIRY_INTERVAL_S` | `5` | Pending-waitpoint expiry scanner interval |
+    /// | `FF_RETENTION_TRIMMER_INTERVAL_S` | `60` | Retention-trimmer scanner interval |
+    /// | `FF_BUDGET_RESET_INTERVAL_S` | `15` | Budget-reset scanner interval |
+    /// | `FF_BUDGET_RECONCILER_INTERVAL_S` | `30` | Budget reconciler interval |
+    /// | `FF_QUOTA_RECONCILER_INTERVAL_S` | `30` | Quota reconciler interval |
+    /// | `FF_UNBLOCK_INTERVAL_S` | `5` | Unblock scanner interval |
+    /// | `FF_DEPENDENCY_RECONCILER_INTERVAL_S` | `15` | DAG dependency reconciler interval (safety net behind push-based promotion) |
+    /// | `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval |
+    /// | `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval |
+    /// | `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel reconciler scanner interval |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env_or("FF_HOST", "localhost");
         let port = env_u16("FF_PORT", 6379)?;
