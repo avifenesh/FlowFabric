@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::budget_resets_key;
 use ff_core::partition::{Partition, PartitionFamily};
 
@@ -18,11 +19,22 @@ const BATCH_SIZE: u32 = 20;
 
 pub struct BudgetResetScanner {
     interval: Duration,
+    /// Issue #122: accepted for uniform API; not applied.
+    filter: ScannerFilter,
 }
 
 impl BudgetResetScanner {
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self::with_filter(interval, ScannerFilter::default())
+    }
+
+    /// Accepts a [`ScannerFilter`] for uniform construction across
+    /// all scanners (issue #122) but **does not apply it**. This
+    /// scanner iterates budget IDs — not executions — and the
+    /// `namespace` / `instance_tag` filter dimensions do not map
+    /// onto budget partitions.
+    pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
+        Self { interval, filter }
     }
 }
 
@@ -33,6 +45,10 @@ impl Scanner for BudgetResetScanner {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(

@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
 
@@ -20,11 +21,26 @@ use super::{ScanResult, Scanner};
 
 pub struct BudgetReconciler {
     interval: Duration,
+    /// Issue #122: accepted for uniform API; not applied. See
+    /// [`Self::with_filter`] rustdoc.
+    filter: ScannerFilter,
 }
 
 impl BudgetReconciler {
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self::with_filter(interval, ScannerFilter::default())
+    }
+
+    /// Accepts a [`ScannerFilter`] for uniform construction across
+    /// all scanners (issue #122) but **does not apply it**. This
+    /// scanner iterates budget IDs — not executions — and the
+    /// `namespace` / `instance_tag` filter dimensions are keyed on
+    /// per-execution fields that do not map onto budget partitions.
+    /// The argument is retained so callers can hand the engine's
+    /// single `EngineConfig.scanner_filter` to every scanner
+    /// constructor without special-casing.
+    pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
+        Self { interval, filter }
     }
 }
 
@@ -35,6 +51,10 @@ impl Scanner for BudgetReconciler {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(

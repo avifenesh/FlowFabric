@@ -23,13 +23,14 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{
     execution_partition, Partition, PartitionConfig, PartitionFamily,
 };
 use ff_core::types::{AttemptIndex, ExecutionId, FlowId, LaneId, WaitpointId, WorkerInstanceId};
 
-use super::{ScanResult, Scanner};
+use super::{should_skip_candidate, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 const MAX_MEMBERS_PER_FLOW_PER_CYCLE: usize = 500;
@@ -37,11 +38,27 @@ const MAX_MEMBERS_PER_FLOW_PER_CYCLE: usize = 500;
 pub struct CancelReconciler {
     interval: Duration,
     partition_config: PartitionConfig,
+    filter: ScannerFilter,
 }
 
 impl CancelReconciler {
     pub fn new(interval: Duration, partition_config: PartitionConfig) -> Self {
-        Self { interval, partition_config }
+        Self::with_filter(interval, partition_config, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per member
+    /// execution (issue #122). Each member's exec partition is
+    /// derived from its `ExecutionId` before the filter HGETs.
+    pub fn with_filter(
+        interval: Duration,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+    ) -> Self {
+        Self {
+            interval,
+            partition_config,
+            filter,
+        }
     }
 }
 
@@ -52,6 +69,10 @@ impl Scanner for CancelReconciler {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     /// PR-94: `ff_cancel_backlog_depth` gauge sample — ZCARD of the
@@ -269,6 +290,24 @@ impl Scanner for CancelReconciler {
                         continue;
                     }
                 };
+
+                // Issue #122: skip members that don't match our filter.
+                // Member exec_core may live on a different exec partition
+                // than this flow's partition — derive it from the eid.
+                let member_part = execution_partition(
+                    &execution_id,
+                    &self.partition_config,
+                ).index;
+                if should_skip_candidate(
+                    client,
+                    &self.filter,
+                    member_part,
+                    eid_str,
+                )
+                .await
+                {
+                    continue;
+                }
 
                 if cancel_member(
                     client,

@@ -11,11 +11,12 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 
-use super::{ScanResult, Scanner};
+use super::{should_skip_candidate, ScanResult, Scanner};
 
 /// How many entries to pull per SSCAN iteration.
 const SCAN_COUNT: u32 = 100;
@@ -24,11 +25,22 @@ pub struct IndexReconciler {
     interval: Duration,
     /// Lanes to check. Phase 1: just "default".
     lanes: Vec<LaneId>,
+    filter: ScannerFilter,
 }
 
 impl IndexReconciler {
     pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
-        Self { interval, lanes }
+        Self::with_filter(interval, lanes, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122).
+    pub fn with_filter(interval: Duration, lanes: Vec<LaneId>, filter: ScannerFilter) -> Self {
+        Self {
+            interval,
+            lanes,
+            filter,
+        }
     }
 }
 
@@ -39,6 +51,10 @@ impl Scanner for IndexReconciler {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -85,6 +101,9 @@ impl Scanner for IndexReconciler {
             };
 
             for eid_str in &members {
+                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                    continue;
+                }
                 match check_execution_index(client, &p, &idx, eid_str, &self.lanes).await {
                     Ok(true) => {} // consistent
                     Ok(false) => {

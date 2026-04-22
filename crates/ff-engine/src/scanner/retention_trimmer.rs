@@ -13,11 +13,12 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 
-use super::{ScanResult, Scanner};
+use super::{should_skip_candidate, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 20;
 
@@ -29,14 +30,22 @@ pub struct RetentionTrimmer {
     lanes: Vec<LaneId>,
     /// Default retention period in ms (used when execution has no policy).
     default_retention_ms: u64,
+    filter: ScannerFilter,
 }
 
 impl RetentionTrimmer {
     pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
+        Self::with_filter(interval, lanes, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122).
+    pub fn with_filter(interval: Duration, lanes: Vec<LaneId>, filter: ScannerFilter) -> Self {
         Self {
             interval,
             lanes,
             default_retention_ms: DEFAULT_RETENTION_MS,
+            filter,
         }
     }
 }
@@ -48,6 +57,10 @@ impl Scanner for RetentionTrimmer {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -107,6 +120,9 @@ impl Scanner for RetentionTrimmer {
             }
 
             for eid_str in &expired {
+                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                    continue;
+                }
                 match purge_execution(
                     client, &p, &idx, lane, eid_str, &terminal_key, now_ms,
                     self.default_retention_ms,

@@ -8,21 +8,35 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 
-use super::{FailureTracker, ScanResult, Scanner};
+use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 100;
 
 pub struct PendingWaitpointExpiryScanner {
     interval: Duration,
     failures: FailureTracker,
+    filter: ScannerFilter,
 }
 
 impl PendingWaitpointExpiryScanner {
     pub fn new(interval: Duration) -> Self {
-        Self { interval, failures: FailureTracker::new() }
+        Self::with_filter(interval, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122). The filter is resolved to the waitpoint's
+    /// owning execution via the waitpoint hash's `execution_id`
+    /// field, then applied via [`should_skip_candidate`].
+    pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+        }
     }
 }
 
@@ -33,6 +47,10 @@ impl Scanner for PendingWaitpointExpiryScanner {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -89,6 +107,31 @@ impl Scanner for PendingWaitpointExpiryScanner {
         for wp_id_str in &expired {
             if self.failures.should_skip(wp_id_str) {
                 continue;
+            }
+            // Issue #122: this scanner iterates waitpoint IDs, not
+            // exec IDs. To apply the filter we resolve the owning
+            // execution via the waitpoint hash's `execution_id`
+            // field (one HGET), then call the shared helper. When
+            // the filter is a no-op this entire block is skipped.
+            if !self.filter.is_noop() {
+                let waitpoint_hash = format!("ff:wp:{}:{}", tag, wp_id_str);
+                let eid: Option<String> = match client
+                    .cmd("HGET")
+                    .arg(&waitpoint_hash)
+                    .arg("execution_id")
+                    .execute()
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Conservative skip on transport error.
+                        continue;
+                    }
+                };
+                let Some(eid) = eid else { continue };
+                if should_skip_candidate(client, &self.filter, partition, &eid).await {
+                    continue;
+                }
             }
 
             match close_expired_waitpoint(client, &tag, &idx, wp_id_str).await {

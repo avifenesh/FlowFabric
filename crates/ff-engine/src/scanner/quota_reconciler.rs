@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
 
@@ -20,11 +21,22 @@ use super::{ScanResult, Scanner};
 
 pub struct QuotaReconciler {
     interval: Duration,
+    /// Issue #122: accepted for uniform API; not applied.
+    filter: ScannerFilter,
 }
 
 impl QuotaReconciler {
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self::with_filter(interval, ScannerFilter::default())
+    }
+
+    /// Accepts a [`ScannerFilter`] for uniform construction across
+    /// all scanners (issue #122) but **does not apply it**. This
+    /// scanner iterates quota policies — not executions — and the
+    /// `namespace` / `instance_tag` filter dimensions do not map
+    /// onto quota partitions.
+    pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
+        Self { interval, filter }
     }
 }
 
@@ -35,6 +47,10 @@ impl Scanner for QuotaReconciler {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
