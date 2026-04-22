@@ -20,3 +20,10 @@ tracing = { workspace = true }
 # JSON and serialises the nested `retry_policy` field into an
 # FCALL ARGV. Mirrors ff-sdk's pre-migration `read_retry_policy_json`.
 serde_json = { workspace = true }
+# Issue #90 — `CompletionBackend` impl spawns a subscriber task and
+# forwards parsed payloads over mpsc; `futures-core::Stream` for the
+# receiver→stream adapter. `serde` for the wire-payload Deserialize
+# derive.
+tokio = { workspace = true }
+futures-core = { workspace = true }
+serde = { workspace = true }
