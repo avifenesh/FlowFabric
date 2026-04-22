@@ -7,8 +7,8 @@ use crate::policy::ExecutionPolicy;
 use crate::state::{AttemptType, PublicState, StateVector};
 use crate::types::{
     AttemptId, AttemptIndex, CancelSource, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch,
-    LeaseId, Namespace, SignalId, SuspensionId, TimestampMs, WaitpointId, WaitpointToken, WorkerId,
-    WorkerInstanceId,
+    LeaseFence, LeaseId, Namespace, SignalId, SuspensionId, TimestampMs, WaitpointId,
+    WaitpointToken, WorkerId, WorkerInstanceId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -223,14 +223,20 @@ pub enum ClaimExecutionResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompleteExecutionArgs {
     pub execution_id: ExecutionId,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
+    /// RFC #58.5 — fence triple. `Some` for SDK worker paths (standard
+    /// stale-lease fence). `None` for operator overrides, in which case
+    /// `source` must be `CancelSource::OperatorOverride` or the Lua
+    /// returns `fence_required`.
+    #[serde(default)]
+    pub fence: Option<LeaseFence>,
     pub attempt_index: AttemptIndex,
-    pub attempt_id: AttemptId,
     #[serde(default)]
     pub result_payload: Option<Vec<u8>>,
     #[serde(default)]
     pub result_encoding: Option<String>,
+    /// RFC #58.5 — unfenced-call gate. Ignored when `fence` is `Some`.
+    #[serde(default)]
+    pub source: CancelSource,
     pub now: TimestampMs,
 }
 
@@ -249,9 +255,9 @@ pub enum CompleteExecutionResult {
 pub struct RenewLeaseArgs {
     pub execution_id: ExecutionId,
     pub attempt_index: AttemptIndex,
-    pub attempt_id: AttemptId,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
+    /// RFC #58.5 — fence triple. Required (no operator override path for
+    /// renew). `None` returns `fence_required`.
+    pub fence: Option<LeaseFence>,
     /// How long to extend the lease (milliseconds).
     pub lease_ttl_ms: u64,
     /// Grace period after lease_expires_at before the lease_current key is auto-deleted.
@@ -328,7 +334,10 @@ pub struct RevokeLeaseArgs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RevokeLeaseResult {
     /// Lease revoked.
-    Revoked { lease_id: String, lease_epoch: String },
+    Revoked {
+        lease_id: String,
+        lease_epoch: String,
+    },
     /// Already revoked or expired — no action needed.
     AlreadySatisfied { reason: String },
 }
@@ -338,11 +347,14 @@ pub enum RevokeLeaseResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DelayExecutionArgs {
     pub execution_id: ExecutionId,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
+    /// RFC #58.5 — fence triple. `None` requires `source ==
+    /// CancelSource::OperatorOverride`.
+    #[serde(default)]
+    pub fence: Option<LeaseFence>,
     pub attempt_index: AttemptIndex,
-    pub attempt_id: AttemptId,
     pub delay_until: TimestampMs,
+    #[serde(default)]
+    pub source: CancelSource,
     pub now: TimestampMs,
 }
 
@@ -360,10 +372,13 @@ pub enum DelayExecutionResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MoveToWaitingChildrenArgs {
     pub execution_id: ExecutionId,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
+    /// RFC #58.5 — fence triple. `None` requires `source ==
+    /// CancelSource::OperatorOverride`.
+    #[serde(default)]
+    pub fence: Option<LeaseFence>,
     pub attempt_index: AttemptIndex,
-    pub attempt_id: AttemptId,
+    #[serde(default)]
+    pub source: CancelSource,
     pub now: TimestampMs,
 }
 
@@ -422,10 +437,11 @@ pub enum UpdateProgressResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FailExecutionArgs {
     pub execution_id: ExecutionId,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
+    /// RFC #58.5 — fence triple. `None` requires `source ==
+    /// CancelSource::OperatorOverride`.
+    #[serde(default)]
+    pub fence: Option<LeaseFence>,
     pub attempt_index: AttemptIndex,
-    pub attempt_id: AttemptId,
     pub failure_reason: String,
     pub failure_category: String,
     /// JSON-encoded retry policy (from execution policy). Empty = no retries.
@@ -434,6 +450,8 @@ pub struct FailExecutionArgs {
     /// JSON-encoded attempt policy for the next retry attempt.
     #[serde(default)]
     pub next_attempt_policy_json: String,
+    #[serde(default)]
+    pub source: CancelSource,
 }
 
 /// Outcome of a fail_execution call.
@@ -545,10 +563,10 @@ pub enum ExpireExecutionResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SuspendExecutionArgs {
     pub execution_id: ExecutionId,
-    pub lease_id: LeaseId,
-    pub lease_epoch: LeaseEpoch,
+    /// RFC #58.5 — fence triple. Required (no operator override path for
+    /// suspend). `None` returns `fence_required`.
+    pub fence: Option<LeaseFence>,
     pub attempt_index: AttemptIndex,
-    pub attempt_id: AttemptId,
     pub suspension_id: SuspensionId,
     pub waitpoint_id: WaitpointId,
     pub waitpoint_key: String,
@@ -710,10 +728,7 @@ pub struct DeliverSignalArgs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliverSignalResult {
     /// Signal accepted with the given effect.
-    Accepted {
-        signal_id: SignalId,
-        effect: String,
-    },
+    Accepted { signal_id: SignalId, effect: String },
     /// Duplicate signal (idempotency key matched).
     Duplicate { existing_signal_id: SignalId },
 }
@@ -949,7 +964,11 @@ impl StreamFrames {
     /// Construct an empty open-stream result (no frames, no terminal
     /// markers). Useful for fast-path peek helpers.
     pub fn empty_open() -> Self {
-        Self { frames: Vec::new(), closed_at: None, closed_reason: None }
+        Self {
+            frames: Vec::new(),
+            closed_at: None,
+            closed_reason: None,
+        }
     }
 
     /// True iff the producer has closed this stream. Consumers should stop
@@ -1011,9 +1030,13 @@ pub struct CreateQuotaPolicyArgs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CreateQuotaPolicyResult {
     /// Quota policy created.
-    Created { quota_policy_id: crate::types::QuotaPolicyId },
+    Created {
+        quota_policy_id: crate::types::QuotaPolicyId,
+    },
     /// Already exists (idempotent).
-    AlreadySatisfied { quota_policy_id: crate::types::QuotaPolicyId },
+    AlreadySatisfied {
+        quota_policy_id: crate::types::QuotaPolicyId,
+    },
 }
 
 // ─── budget_status (read-only) ───

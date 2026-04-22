@@ -532,6 +532,43 @@ local function validate_lease_and_mark_expired(core, argv, now_ms, keys, maxlen)
   return nil
 end
 
+-- RFC #58.5 — resolve the (lease_id, lease_epoch, attempt_id) fence triple.
+-- Returns (fence_table, must_check) on success, or (nil, err_table) on a
+-- partial triple (programming error — caller passed some but not all three).
+--
+-- Semantics:
+--   * All three present (non-empty) → fence triple, must_check=true.
+--     Caller is expected to run validate_lease_and_mark_expired next.
+--   * All three empty               → server-resolved from exec_core,
+--                                      must_check=false. Caller decides
+--                                      whether unfenced mode is allowed
+--                                      (terminal ops gate on `source`;
+--                                      renew/suspend hard-reject).
+--   * Any mix of set/empty          → err("partial_fence_triple").
+--
+-- @param core  hgetall_to_table(exec_core)
+-- @param argv  table with .lease_id, .lease_epoch, .attempt_id (strings)
+local function resolve_lease_fence(core, argv)
+  local has_id = is_set(argv.lease_id)
+  local has_ep = is_set(argv.lease_epoch)
+  local has_at = is_set(argv.attempt_id)
+  if has_id or has_ep or has_at then
+    if not (has_id and has_ep and has_at) then
+      return nil, err("partial_fence_triple")
+    end
+    return {
+      lease_id    = argv.lease_id,
+      lease_epoch = argv.lease_epoch,
+      attempt_id  = argv.attempt_id,
+    }, true
+  end
+  return {
+    lease_id    = core.current_lease_id    or "",
+    lease_epoch = core.current_lease_epoch or "",
+    attempt_id  = core.current_attempt_id  or "",
+  }, false
+end
+
 -- Consolidates the ~15-line lease release block shared by 7 functions.
 -- DEL lease_current, ZREM lease_expiry + worker_leases + active_index,
 -- clear lease fields on exec_core, XADD lease_history "released".
