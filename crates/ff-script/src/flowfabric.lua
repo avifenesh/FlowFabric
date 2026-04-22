@@ -2175,6 +2175,9 @@ redis.register_function('ff_delay_execution', function(keys, args)
   local core = hgetall_to_table(raw)
 
   -- RFC #58.5 — fence resolution with operator override for terminal-style ops.
+  -- In both branches validate_lease_and_mark_expired runs afterwards, which
+  -- enforces lifecycle_phase=="active", ownership!=revoked, and expiry —
+  -- operator overrides cannot bypass those preconditions.
   local fence, must_check_or_err = resolve_lease_fence(core, A)
   if not fence then return must_check_or_err end
   if not must_check_or_err then
@@ -2182,11 +2185,10 @@ redis.register_function('ff_delay_execution', function(keys, args)
     A.lease_id    = fence.lease_id
     A.lease_epoch = fence.lease_epoch
     A.attempt_id  = fence.attempt_id
-  else
-    local lease_err = validate_lease_and_mark_expired(
-      core, A, now_ms, K, 1000)
-    if lease_err then return lease_err end
   end
+  local lease_err = validate_lease_and_mark_expired(
+    core, A, now_ms, K, 1000)
+  if lease_err then return lease_err end
 
   -- OOM-SAFE WRITE ORDERING: exec_core FIRST (point of no return)
   -- ALL 7 state vector dimensions
@@ -2280,6 +2282,9 @@ redis.register_function('ff_move_to_waiting_children', function(keys, args)
   local core = hgetall_to_table(raw)
 
   -- RFC #58.5 — fence resolution with operator override for terminal-style ops.
+  -- In both branches validate_lease_and_mark_expired runs afterwards, which
+  -- enforces lifecycle_phase=="active", ownership!=revoked, and expiry —
+  -- operator overrides cannot bypass those preconditions.
   local fence, must_check_or_err = resolve_lease_fence(core, A)
   if not fence then return must_check_or_err end
   if not must_check_or_err then
@@ -2287,11 +2292,10 @@ redis.register_function('ff_move_to_waiting_children', function(keys, args)
     A.lease_id    = fence.lease_id
     A.lease_epoch = fence.lease_epoch
     A.attempt_id  = fence.attempt_id
-  else
-    local lease_err = validate_lease_and_mark_expired(
-      core, A, now_ms, K, 1000)
-    if lease_err then return lease_err end
   end
+  local lease_err = validate_lease_and_mark_expired(
+    core, A, now_ms, K, 1000)
+  if lease_err then return lease_err end
 
   -- OOM-SAFE WRITE ORDERING: exec_core FIRST (point of no return, §4.8b Rule 2)
   -- ALL 7 state vector dimensions
@@ -2395,6 +2399,9 @@ redis.register_function('ff_fail_execution', function(keys, args)
   local core = hgetall_to_table(raw)
 
   -- RFC #58.5 — fence resolution with operator override for terminal ops.
+  -- In both branches validate_lease_and_mark_expired runs afterwards, which
+  -- enforces lifecycle_phase=="active", ownership!=revoked, and expiry —
+  -- operator overrides cannot bypass those preconditions.
   local fence, must_check_or_err = resolve_lease_fence(core, A)
   if not fence then return must_check_or_err end
   if not must_check_or_err then
@@ -2402,11 +2409,10 @@ redis.register_function('ff_fail_execution', function(keys, args)
     A.lease_id    = fence.lease_id
     A.lease_epoch = fence.lease_epoch
     A.attempt_id  = fence.attempt_id
-  else
-    local lease_err = validate_lease_and_mark_expired(
-      core, A, now_ms, K, 1000)
-    if lease_err then return lease_err end
   end
+  local lease_err = validate_lease_and_mark_expired(
+    core, A, now_ms, K, 1000)
+  if lease_err then return lease_err end
 
   -- 2. End current attempt
   redis.call("HSET", K.attempt_hash,
