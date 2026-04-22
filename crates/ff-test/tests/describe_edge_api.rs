@@ -424,7 +424,7 @@ async fn list_edges_detects_adjacency_endpoint_drift() {
         .await
         .expect_err("endpoint drift must surface");
     match err {
-        ff_sdk::SdkError::Config(msg) => {
+        ff_sdk::SdkError::Config { message: msg, .. } => {
             assert!(msg.contains("adjacency"), "msg: {msg}");
             assert!(
                 msg.contains("stored endpoint"),
@@ -468,7 +468,7 @@ async fn describe_edge_corrupt_state_surfaces_error() {
         .await
         .expect_err("unknown edge_hash field must surface as error");
     match err {
-        ff_sdk::SdkError::Config(msg) => {
+        ff_sdk::SdkError::Config { message: msg, .. } => {
             assert!(msg.contains("bogus_future_field"), "msg: {msg}");
         }
         other => panic!("expected SdkError::Config, got {other:?}"),

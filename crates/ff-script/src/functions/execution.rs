@@ -211,14 +211,22 @@ impl FromFcallResult for CreateExecutionResult {
         if r.status == "DUPLICATE" {
             let eid_str = r.field_str(0);
             let eid = ExecutionId::parse(&eid_str)
-                .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+                .map_err(|e| ScriptError::Parse {
+                    fcall: "ff_create_execution".into(),
+                    execution_id: None,
+                    message: format!("bad execution_id: {e}"),
+                })?;
             return Ok(CreateExecutionResult::Duplicate { execution_id: eid });
         }
         let r = r.into_success()?;
         let eid_str = r.field_str(0);
         let ps_str = r.field_str(1);
         let eid = ExecutionId::parse(&eid_str)
-            .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_create_execution".into(),
+                execution_id: None,
+                message: format!("bad execution_id: {e}"),
+            })?;
         let public_state = parse_public_state(&ps_str)?;
         Ok(CreateExecutionResult::Created {
             execution_id: eid,
@@ -278,21 +286,41 @@ impl FromFcallResult for ClaimExecutionResultPartial {
         let r = FcallResult::parse(raw)?.into_success()?;
         // ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)
         let lease_id = LeaseId::parse(&r.field_str(0))
-            .map_err(|e| ScriptError::Parse(format!("bad lease_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad lease_id: {e}"),
+            })?;
         let epoch = r
             .field_str(1)
             .parse::<u64>()
-            .map_err(|e| ScriptError::Parse(format!("bad epoch: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad epoch: {e}"),
+            })?;
         let expires_at = r
             .field_str(2)
             .parse::<i64>()
-            .map_err(|e| ScriptError::Parse(format!("bad expires_at: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad expires_at: {e}"),
+            })?;
         let attempt_id = AttemptId::parse(&r.field_str(3))
-            .map_err(|e| ScriptError::Parse(format!("bad attempt_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad attempt_id: {e}"),
+            })?;
         let attempt_index = r
             .field_str(4)
             .parse::<u32>()
-            .map_err(|e| ScriptError::Parse(format!("bad attempt_index: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad attempt_index: {e}"),
+            })?;
         let attempt_type = parse_attempt_type(&r.field_str(5))?;
 
         Ok(Self::Claimed(ClaimedExecutionPartial {
@@ -560,16 +588,24 @@ impl FromFcallResult for FailExecutionResult {
                 let delay_str = r.field_str(1);
                 let delay_ms: i64 = delay_str
                     .parse()
-                    .map_err(|e| ScriptError::Parse(format!("bad delay_until: {e}")))?;
+                    .map_err(|e| ScriptError::Parse {
+                        fcall: "ff_fail_execution".into(),
+                        execution_id: None,
+                        message: format!("bad delay_until: {e}"),
+                    })?;
                 Ok(FailExecutionResult::RetryScheduled {
                     delay_until: TimestampMs::from_millis(delay_ms),
                     next_attempt_index: AttemptIndex::new(0), // computed by claim_execution
                 })
             }
             "terminal_failed" => Ok(FailExecutionResult::TerminalFailed),
-            _ => Err(ScriptError::Parse(format!(
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_fail_execution".into(),
+                execution_id: None,
+                message: format!(
                 "unexpected fail sub-status: {sub_status}"
-            ))),
+            ),
+            }),
         }
     }
 }
@@ -670,7 +706,11 @@ impl FromFcallResult for SetExecutionTagsResult {
         let count: u32 = r
             .field_str(0)
             .parse()
-            .map_err(|e| ScriptError::Parse(format!("bad tag count: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_set_execution_tags".into(),
+                execution_id: None,
+                message: format!("bad tag count: {e}"),
+            })?;
         Ok(SetExecutionTagsResult::Ok { count })
     }
 }
@@ -734,7 +774,11 @@ fn parse_public_state(s: &str) -> Result<PublicState, ScriptError> {
         "cancelled" => Ok(PublicState::Cancelled),
         "expired" => Ok(PublicState::Expired),
         "skipped" => Ok(PublicState::Skipped),
-        _ => Err(ScriptError::Parse(format!("unknown public_state: {s}"))),
+        _ => Err(ScriptError::Parse {
+            fcall: "ff_set_execution_tags".into(),
+            execution_id: None,
+            message: format!("unknown public_state: {s}"),
+        }),
     }
 }
 
@@ -745,7 +789,11 @@ fn parse_attempt_type(s: &str) -> Result<AttemptType, ScriptError> {
         "reclaim" => Ok(AttemptType::Reclaim),
         "replay" => Ok(AttemptType::Replay),
         "fallback" => Ok(AttemptType::Fallback),
-        _ => Err(ScriptError::Parse(format!("unknown attempt_type: {s}"))),
+        _ => Err(ScriptError::Parse {
+            fcall: "parse_attempt_type".into(),
+            execution_id: None,
+            message: format!("unknown attempt_type: {s}"),
+        }),
     }
 }
 

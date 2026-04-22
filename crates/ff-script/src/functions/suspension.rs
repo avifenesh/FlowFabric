@@ -83,9 +83,17 @@ impl FromFcallResult for SuspendExecutionResult {
         // ALREADY_SATISFIED: {1, "ALREADY_SATISFIED", suspension_id, waitpoint_id, waitpoint_key, waitpoint_token}
         if r.status == "ALREADY_SATISFIED" {
             let sid = SuspensionId::parse(&r.field_str(0))
-                .map_err(|e| ScriptError::Parse(format!("bad suspension_id: {e}")))?;
+                .map_err(|e| ScriptError::Parse {
+                    fcall: "ff_suspend_execution".into(),
+                    execution_id: None,
+                    message: format!("bad suspension_id: {e}"),
+                })?;
             let wid = WaitpointId::parse(&r.field_str(1))
-                .map_err(|e| ScriptError::Parse(format!("bad waitpoint_id: {e}")))?;
+                .map_err(|e| ScriptError::Parse {
+                    fcall: "ff_suspend_execution".into(),
+                    execution_id: None,
+                    message: format!("bad waitpoint_id: {e}"),
+                })?;
             let wkey = r.field_str(2);
             let token = WaitpointToken::new(r.field_str(3));
             return Ok(SuspendExecutionResult::AlreadySatisfied {
@@ -98,9 +106,17 @@ impl FromFcallResult for SuspendExecutionResult {
         let r = r.into_success()?;
         // ok(suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
         let sid = SuspensionId::parse(&r.field_str(0))
-            .map_err(|e| ScriptError::Parse(format!("bad suspension_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_suspend_execution".into(),
+                execution_id: None,
+                message: format!("bad suspension_id: {e}"),
+            })?;
         let wid = WaitpointId::parse(&r.field_str(1))
-            .map_err(|e| ScriptError::Parse(format!("bad waitpoint_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_suspend_execution".into(),
+                execution_id: None,
+                message: format!("bad waitpoint_id: {e}"),
+            })?;
         let wkey = r.field_str(2);
         let token = WaitpointToken::new(r.field_str(3));
         Ok(SuspendExecutionResult::Suspended {
@@ -195,7 +211,11 @@ impl FromFcallResult for CreatePendingWaitpointResult {
         let r = FcallResult::parse(raw)?.into_success()?;
         // ok(waitpoint_id, waitpoint_key, waitpoint_token)
         let wid = WaitpointId::parse(&r.field_str(0))
-            .map_err(|e| ScriptError::Parse(format!("bad waitpoint_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_create_pending_waitpoint".into(),
+                execution_id: None,
+                message: format!("bad waitpoint_id: {e}"),
+            })?;
         let wkey = r.field_str(1);
         let token = WaitpointToken::new(r.field_str(2));
         Ok(CreatePendingWaitpointResult::Created {
@@ -338,7 +358,11 @@ impl FromFcallResult for RotateWaitpointHmacSecretOutcome {
                 let gc_count = r
                     .field_str(3)
                     .parse::<u32>()
-                    .map_err(|e| ScriptError::Parse(format!("bad gc_count: {e}")))?;
+                    .map_err(|e| ScriptError::Parse {
+                        fcall: "ff_rotate_waitpoint_hmac_secret_outcome".into(),
+                        execution_id: None,
+                        message: format!("bad gc_count: {e}"),
+                    })?;
                 Ok(RotateWaitpointHmacSecretOutcome::Rotated {
                     previous_kid: if prev.is_empty() { None } else { Some(prev) },
                     new_kid,
@@ -348,9 +372,13 @@ impl FromFcallResult for RotateWaitpointHmacSecretOutcome {
             "noop" => Ok(RotateWaitpointHmacSecretOutcome::Noop {
                 kid: r.field_str(1),
             }),
-            other => Err(ScriptError::Parse(format!(
+            other => Err(ScriptError::Parse {
+                fcall: "ff_rotate_waitpoint_hmac_secret_outcome".into(),
+                execution_id: None,
+                message: format!(
                 "unexpected rotation outcome: {other}"
-            ))),
+            ),
+            }),
         }
     }
 }
@@ -379,14 +407,22 @@ impl FromFcallResult for WaitpointHmacKids {
         let n = r
             .field_str(1)
             .parse::<usize>()
-            .map_err(|e| ScriptError::Parse(format!("bad verifying count: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_waitpoint_hmac_kids".into(),
+                execution_id: None,
+                message: format!("bad verifying count: {e}"),
+            })?;
         let mut verifying = Vec::with_capacity(n);
         for i in 0..n {
             let kid = r.field_str(2 + 2 * i);
             let exp = r
                 .field_str(2 + 2 * i + 1)
                 .parse::<i64>()
-                .map_err(|e| ScriptError::Parse(format!("bad expires_at_ms for kid {kid}: {e}")))?;
+                .map_err(|e| ScriptError::Parse {
+                    fcall: "ff_waitpoint_hmac_kids".into(),
+                    execution_id: None,
+                    message: format!("bad expires_at_ms for kid {kid}: {e}"),
+                })?;
             verifying.push(VerifyingKid {
                 kid,
                 expires_at_ms: exp,
@@ -418,6 +454,10 @@ fn parse_public_state(s: &str) -> Result<PublicState, ScriptError> {
         "cancelled" => Ok(PublicState::Cancelled),
         "expired" => Ok(PublicState::Expired),
         "skipped" => Ok(PublicState::Skipped),
-        _ => Err(ScriptError::Parse(format!("unknown public_state: {s}"))),
+        _ => Err(ScriptError::Parse {
+            fcall: "ff_waitpoint_hmac_kids".into(),
+            execution_id: None,
+            message: format!("unknown public_state: {s}"),
+        }),
     }
 }

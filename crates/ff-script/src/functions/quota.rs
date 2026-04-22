@@ -44,11 +44,19 @@ impl FromFcallResult for CreateQuotaPolicyResult {
         let r = FcallResult::parse(raw)?.into_success()?;
         let id_str = r.field_str(0);
         let qid = ff_core::types::QuotaPolicyId::parse(&id_str)
-            .map_err(|e| ScriptError::Parse(format!("invalid quota_policy_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_create_quota_policy".into(),
+                execution_id: None,
+                message: format!("invalid quota_policy_id: {e}"),
+            })?;
         match r.status.as_str() {
             "OK" => Ok(CreateQuotaPolicyResult::Created { quota_policy_id: qid }),
             "ALREADY_SATISFIED" => Ok(CreateQuotaPolicyResult::AlreadySatisfied { quota_policy_id: qid }),
-            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_create_quota_policy".into(),
+                execution_id: None,
+                message: format!("unexpected status: {}", r.status),
+            }),
         }
     }
 }
@@ -86,12 +94,20 @@ impl FromFcallResult for CheckAdmissionResult {
         // {"RATE_EXCEEDED", retry_after_ms}, {"CONCURRENCY_EXCEEDED"}
         let arr = match raw {
             ferriskey::Value::Array(arr) => arr,
-            _ => return Err(ScriptError::Parse("expected Array".into())),
+            _ => return Err(ScriptError::Parse {
+                fcall: "ff_check_admission".into(),
+                execution_id: None,
+                message: "expected Array".into(),
+            }),
         };
         let status = match arr.first() {
             Some(Ok(ferriskey::Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
             Some(Ok(ferriskey::Value::SimpleString(s))) => s.clone(),
-            _ => return Err(ScriptError::Parse("expected status string".into())),
+            _ => return Err(ScriptError::Parse {
+                fcall: "ff_check_admission".into(),
+                execution_id: None,
+                message: "expected status string".into(),
+            }),
         };
         match status.as_str() {
             "ADMITTED" => Ok(CheckAdmissionResult::Admitted),
@@ -110,9 +126,13 @@ impl FromFcallResult for CheckAdmissionResult {
                 })
             }
             "CONCURRENCY_EXCEEDED" => Ok(CheckAdmissionResult::ConcurrencyExceeded),
-            _ => Err(ScriptError::Parse(format!(
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_check_admission".into(),
+                execution_id: None,
+                message: format!(
                 "unknown admission status: {status}"
-            ))),
+            ),
+            }),
         }
     }
 }

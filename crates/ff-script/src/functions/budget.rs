@@ -60,24 +60,36 @@ pub async fn ff_create_budget(
     let dim_count = args.dimensions.len();
     // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
     if dim_count > MAX_BUDGET_DIMENSIONS {
-        return Err(ScriptError::Parse(format!(
+        return Err(ScriptError::Parse {
+            fcall: "ff_create_budget".into(),
+            execution_id: None,
+            message: format!(
             "too_many_dimensions: limit={}, got={}",
             MAX_BUDGET_DIMENSIONS, dim_count
-        )));
+        ),
+        });
     }
     if args.hard_limits.len() != dim_count {
-        return Err(ScriptError::Parse(format!(
+        return Err(ScriptError::Parse {
+            fcall: "ff_create_budget".into(),
+            execution_id: None,
+            message: format!(
             "dimension_limit_array_mismatch: dimensions={} hard_limits={}",
             dim_count,
             args.hard_limits.len()
-        )));
+        ),
+        });
     }
     if args.soft_limits.len() != dim_count {
-        return Err(ScriptError::Parse(format!(
+        return Err(ScriptError::Parse {
+            fcall: "ff_create_budget".into(),
+            execution_id: None,
+            message: format!(
             "dimension_limit_array_mismatch: dimensions={} soft_limits={}",
             dim_count,
             args.soft_limits.len()
-        )));
+        ),
+        });
     }
     // ARGV: budget_id, scope_type, scope_id, enforcement_mode,
     //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
@@ -116,11 +128,19 @@ impl FromFcallResult for CreateBudgetResult {
         let r = FcallResult::parse(raw)?.into_success()?;
         let id_str = r.field_str(0);
         let budget_id = ff_core::types::BudgetId::parse(&id_str)
-            .map_err(|e| ScriptError::Parse(format!("invalid budget_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_create_budget".into(),
+                execution_id: None,
+                message: format!("invalid budget_id: {e}"),
+            })?;
         match r.status.as_str() {
             "OK" => Ok(CreateBudgetResult::Created { budget_id }),
             "ALREADY_SATISFIED" => Ok(CreateBudgetResult::AlreadySatisfied { budget_id }),
-            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_create_budget".into(),
+                execution_id: None,
+                message: format!("unexpected status: {}", r.status),
+            }),
         }
     }
 }
@@ -148,17 +168,25 @@ pub async fn ff_report_usage_and_check(
     let dim_count = args.dimensions.len();
     // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
     if dim_count > MAX_BUDGET_DIMENSIONS {
-        return Err(ScriptError::Parse(format!(
+        return Err(ScriptError::Parse {
+            fcall: "ff_create_budget".into(),
+            execution_id: None,
+            message: format!(
             "too_many_dimensions: limit={}, got={}",
             MAX_BUDGET_DIMENSIONS, dim_count
-        )));
+        ),
+        });
     }
     if args.deltas.len() != dim_count {
-        return Err(ScriptError::Parse(format!(
+        return Err(ScriptError::Parse {
+            fcall: "ff_create_budget".into(),
+            execution_id: None,
+            message: format!(
             "dimension_delta_array_mismatch: dimensions={} deltas={}",
             dim_count,
             args.deltas.len()
-        )));
+        ),
+        });
     }
     let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
     argv.push(dim_count.to_string());
@@ -202,7 +230,11 @@ impl FromFcallResult for ReportUsageResult {
                     hard_limit: limit,
                 })
             }
-            _ => Err(ScriptError::Parse(format!("unknown budget status: {}", r.status))),
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_report_usage".into(),
+                execution_id: None,
+                message: format!("unknown budget status: {}", r.status),
+            }),
         }
     }
 }

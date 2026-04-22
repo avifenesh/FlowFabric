@@ -332,7 +332,7 @@ async fn describe_execution_corrupt_public_state_surfaces_error() {
         .await
         .expect_err("corrupt public_state must surface as error");
     match err {
-        ff_sdk::SdkError::Config(msg) => {
+        ff_sdk::SdkError::Config { message: msg, .. } => {
             assert!(
                 msg.contains("public_state"),
                 "error message must name the field: {msg}"

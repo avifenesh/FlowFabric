@@ -23,7 +23,11 @@ impl FromFcallResult for RenewLeaseResult {
         let expires_str = r.field_str(0);
         let expires_ms: i64 = expires_str
             .parse()
-            .map_err(|_| ScriptError::Parse(format!("invalid expires_at: {expires_str}")))?;
+            .map_err(|_| ScriptError::Parse {
+                fcall: "ff_renew_lease".into(),
+                execution_id: None,
+                message: format!("invalid expires_at: {expires_str}"),
+            })?;
         Ok(RenewLeaseResult::Renewed {
             expires_at: TimestampMs::from_millis(expires_ms),
         })
@@ -39,9 +43,13 @@ impl FromFcallResult for MarkLeaseExpiredResult {
             "ALREADY_SATISFIED" => Ok(MarkLeaseExpiredResult::AlreadySatisfied {
                 reason: r.field_str(0),
             }),
-            other => Err(ScriptError::Parse(format!(
+            other => Err(ScriptError::Parse {
+                fcall: "ff_mark_lease_expired".into(),
+                execution_id: None,
+                message: format!(
                 "unexpected status from ff_mark_lease_expired_if_due: {other}"
-            ))),
+            ),
+            }),
         }
     }
 }
@@ -62,9 +70,13 @@ impl FromFcallResult for RevokeLeaseResult {
             "ALREADY_SATISFIED" => Ok(RevokeLeaseResult::AlreadySatisfied {
                 reason: r.field_str(0),
             }),
-            other => Err(ScriptError::Parse(format!(
+            other => Err(ScriptError::Parse {
+                fcall: "ff_revoke_lease".into(),
+                execution_id: None,
+                message: format!(
                 "unexpected status from ff_revoke_lease: {other}"
-            ))),
+            ),
+            }),
         }
     }
 }

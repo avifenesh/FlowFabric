@@ -441,9 +441,28 @@ pub enum ScriptError {
     #[error("valkey: {0}")]
     Valkey(#[from] ferriskey::Error),
 
-    /// Failed to parse FCALL return value.
-    #[error("parse error: {0}")]
-    Parse(String),
+    /// Failed to parse FCALL return value. `fcall` names the FCALL OR the
+    /// nearest semantic parser (e.g. `"parse_report_usage_result"`,
+    /// `"stream_tail_decode"`, `"decode_flow_snapshot"`). Never empty.
+    /// `execution_id` is populated at sites where the exec_id is in scope
+    /// (the 13 task.rs sites) and `None` elsewhere. `message` carries
+    /// expected-vs-got detail.
+    #[error("{}", fmt_parse(.fcall, .execution_id.as_deref(), .message))]
+    Parse {
+        fcall: String,
+        execution_id: Option<String>,
+        message: String,
+    },
+}
+
+/// Renders `ScriptError::Parse` as
+/// `parse error: <fcall>[<exec=...>]: <message>`. The `exec=` slot is
+/// omitted when `execution_id` is `None`.
+fn fmt_parse(fcall: &str, execution_id: Option<&str>, message: &str) -> String {
+    match execution_id {
+        Some(eid) => format!("parse error: {fcall}[exec={eid}]: {message}"),
+        None => format!("parse error: {fcall}: {message}"),
+    }
 }
 
 impl ScriptError {
@@ -511,7 +530,7 @@ impl ScriptError {
             | Self::InvalidTagKey(_)
             | Self::FenceRequired
             | Self::PartialFenceTriple
-            | Self::Parse(_) => ErrorClass::Terminal,
+            | Self::Parse { .. } => ErrorClass::Terminal,
 
             // Transport errors classify by their ferriskey ErrorKind —
             // IoError / FatalSend / TryAgain / BusyLoading / ClusterDown are
@@ -882,6 +901,42 @@ mod tests {
         assert!(matches!(
             ScriptError::from_code("partial_fence_triple"),
             Some(ScriptError::PartialFenceTriple)
+        ));
+    }
+
+    /// Regression (#98): `ScriptError::Parse` carries `fcall`, optional
+    /// `execution_id`, and `message` separately. Display renders
+    /// `parse error: <fcall>[exec=<id>]: <message>` when `execution_id`
+    /// is `Some`, and omits the `[exec=...]` slot when `None`. `fcall`
+    /// must never be empty.
+    #[test]
+    fn parse_structured_fields_render_and_match() {
+        let with_exec = ScriptError::Parse {
+            fcall: "ff_claim_execution".into(),
+            execution_id: Some("018f-abc".into()),
+            message: "expected Array".into(),
+        };
+        assert_eq!(
+            with_exec.to_string(),
+            "parse error: ff_claim_execution[exec=018f-abc]: expected Array"
+        );
+        assert!(matches!(
+            &with_exec,
+            ScriptError::Parse { execution_id: Some(e), .. } if e == "018f-abc"
+        ));
+
+        let no_exec = ScriptError::Parse {
+            fcall: "stream_tail_decode".into(),
+            execution_id: None,
+            message: "unexpected array length 3".into(),
+        };
+        assert_eq!(
+            no_exec.to_string(),
+            "parse error: stream_tail_decode: unexpected array length 3"
+        );
+        assert!(matches!(
+            &no_exec,
+            ScriptError::Parse { execution_id: None, fcall, .. } if !fcall.is_empty()
         ));
     }
 }
