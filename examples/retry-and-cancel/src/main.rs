@@ -22,7 +22,7 @@
 //!
 //! * `valkey-server` reachable at `FF_HOST:FF_PORT` (defaults
 //!   `localhost:6379`).
-//! * `ferriskey` (the FlowFabric HTTP control-plane) reachable at
+//! * `ff-server` (the FlowFabric HTTP API / control-plane) reachable at
 //!   `FF_SERVER_URL` (default `http://localhost:9090`).
 //!
 //! # Run
@@ -275,7 +275,6 @@ async fn scene_cancel_flow_cascade(
     // state. wait=true should have flushed the cascade synchronously;
     // we still poll (short window) to tolerate observable-state
     // propagation jitter.
-    let _ = flow_partition_idx; // silence unused on non-debug builds
     for eid in &member_eids {
         let state = poll_until_terminal(http, server_url, &eid.to_string(), Duration::from_secs(10)).await?;
         if state != "cancelled" {
@@ -366,15 +365,10 @@ async fn submit_execution(
     policy: &ExecutionPolicy,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let payload_bytes = serde_json::to_vec(payload)?;
-    // Decode the partition from the hash-tag the SDK minted into the
-    // id. The server rejects mismatched `partition_id`, so this stays
-    // the single source of truth.
-    let partition_id: u16 = execution_id
-        .to_string()
-        .strip_prefix("{fp:")
-        .and_then(|s| s.split_once('}'))
-        .and_then(|(idx, _)| idx.parse().ok())
-        .ok_or("execution_id missing {fp:N} hash-tag")?;
+    // Use the typed accessor rather than reparsing the formatted
+    // execution id string. The server rejects mismatched
+    // `partition_id`, so this stays the single source of truth.
+    let partition_id: u16 = execution_id.partition();
 
     // `ExecutionPolicy` now serializes with `skip_serializing_if =
     // "Option::is_none"` on every optional field, so unset fields are
@@ -438,7 +432,13 @@ async fn poll_until_terminal(
                 .as_str()
                 .unwrap_or("unknown")
                 .to_owned();
-            if matches!(state.as_str(), "completed" | "failed" | "cancelled") {
+            // All public terminal states (see `ff_core::state::PublicState`).
+            // Missing any of these causes `poll_until_terminal` to spin
+            // until the budget expires, producing a misleading timeout.
+            if matches!(
+                state.as_str(),
+                "completed" | "failed" | "cancelled" | "expired" | "skipped"
+            ) {
                 return Ok(state);
             }
         }

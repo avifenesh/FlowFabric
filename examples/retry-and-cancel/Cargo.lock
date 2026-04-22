@@ -292,6 +292,7 @@ dependencies = [
 name = "ff-core"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "crc16",
  "serde",
  "serde_json",
