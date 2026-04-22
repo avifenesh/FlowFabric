@@ -13,9 +13,10 @@
 #     `publish-new` + `publish-update`.
 #   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
 #
-# Publish set (8 crates, topologically ordered):
+# Publish set (9 crates, topologically ordered):
 #   ferriskey -> ff-core -> ff-script -> ff-observability
-#     -> ff-engine -> ff-scheduler -> ff-sdk -> ff-server
+#     -> ff-backend-valkey -> ff-engine -> ff-scheduler
+#     -> ff-sdk -> ff-server
 # ff-test is dev-only (publish = false) and not in the set.
 # The former telemetrylib sub-crate was inlined into ferriskey
 # during the Tier 1 envelope collapse (PR #18).
@@ -23,6 +24,11 @@
 # v0.3.0 release partial-published (ff-engine requires it as a
 # workspace dep and failed the publish step when it was missing
 # from crates.io).
+# ff-backend-valkey was added to the publish set in v0.3.2 after
+# v0.3.1 partial-published (ff-sdk requires it as a workspace dep
+# and failed the publish step when it was missing from crates.io).
+# Introduced in RFC-012 Stage 1a (PR #114) as a separate crate from
+# ff-sdk.
 #
 # Partial-publish recovery:
 #   If publish succeeds for crate N but fails for crate N+1, the workflow
@@ -128,11 +134,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
       # Ordering respects path->version deps. ferriskey is a leaf after
       # the Tier 1 envelope collapse (PR #18) inlined the former
-      # telemetrylib sub-crate. ff-script, ff-sdk, ff-server, ff-engine,
-      # ff-scheduler all depend on ferriskey. ff-core is a leaf.
-      # ff-observability is a leaf that ff-engine depends on (added to
-      # the publish set in v0.3.1 after v0.3.0 partial-published).
-      # ff-server closes the chain.
+      # telemetrylib sub-crate. ff-core is a leaf. ff-script depends on
+      # ff-core. ff-observability is a leaf (added in v0.3.1 after v0.3.0
+      # partial-published). ff-backend-valkey depends on ff-core + ff-script
+      # (added in v0.3.2 after v0.3.1 partial-published). ff-engine depends
+      # on ff-core + ff-observability. ff-scheduler depends on ff-core +
+      # ff-script + ff-observability. ff-sdk depends on ff-core + ff-script
+      # and optionally ff-backend-valkey. ff-server closes the chain
+      # (depends on all of ff-core, ff-script, ff-engine, ff-backend-valkey,
+      # ff-scheduler, ff-observability).
       # `--no-verify` is safe because `verify` already built + clippied +
       # tested the same ref. Without it every `cargo publish` re-builds
       # from scratch.
@@ -181,6 +191,20 @@ jobs:
             exit 1
           }
       - run: sleep 30
+      - name: publish ff-backend-valkey
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${TAG_VERSION#v}"
+          cargo publish -p ff-backend-valkey --no-verify || {
+            echo "::error::cargo publish ff-backend-valkey failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
+            exit 1
+          }
+      - run: sleep 30
       - name: publish ff-engine
         env:
           TAG_VERSION: ${{ github.ref_name }}
@@ -192,6 +216,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             exit 1
           }
       - run: sleep 30
@@ -206,6 +231,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             exit 1
           }
@@ -221,6 +247,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             exit 1
@@ -237,6 +264,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-sdk"
