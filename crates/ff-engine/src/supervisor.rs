@@ -17,6 +17,7 @@ pub fn supervised_spawn<S: Scanner>(
     client: ferriskey::Client,
     num_partitions: u16,
     shutdown: watch::Receiver<bool>,
+    metrics: Arc<ff_observability::Metrics>,
 ) -> JoinHandle<()> {
     let restart_count = Arc::new(AtomicU32::new(0));
     let name = scanner.name();
@@ -33,6 +34,7 @@ pub fn supervised_spawn<S: Scanner>(
                 client.clone(),
                 num_partitions,
                 shutdown.clone(),
+                metrics.clone(),
             );
 
             match handle.await {

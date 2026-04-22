@@ -205,6 +205,20 @@ jobs:
             -p ff-sdk -p ff-server \
             --features ff-sdk/direct-valkey-claim
 
+      # PR-94: dedicated observability run. Exercises the OTEL +
+      # Prometheus code path (feature-gated; the default unit-test
+      # step above keeps OTEL out of the dep tree) and the
+      # integration test in crates/ff-server/tests/metrics.rs that
+      # asserts /metrics text-exposition format + non-zero counter
+      # samples. ~3min CI overhead, load-bearing because the
+      # shim-vs-real feature skew is easy to break silently.
+      - name: Unit tests (ff-server observability)
+        env:
+          FF_HOST: 127.0.0.1
+          FF_PORT: ${{ matrix.mode == 'cluster' && '7000' || '6379' }}
+          FF_CLUSTER: ${{ matrix.mode == 'cluster' && '1' || '0' }}
+        run: cargo test -p ff-server --features observability
+
       - name: Integration tests (serial)
         env:
           FF_HOST: 127.0.0.1

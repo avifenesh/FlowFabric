@@ -54,6 +54,33 @@ impl Scanner for CancelReconciler {
         self.interval
     }
 
+    /// PR-94: `ff_cancel_backlog_depth` gauge sample — ZCARD of the
+    /// per-partition cancel_backlog ZSET. Runs once per partition
+    /// per cycle. On error returns `None`; the scanner runner
+    /// treats any `None` during a cycle where other partitions
+    /// sampled as an invalidation and skips the gauge write
+    /// (leaves the prior scrape value in place) so a transient
+    /// ZCARD failure on one partition does not cause the gauge to
+    /// under-report as an apparent drain.
+    async fn sample_backlog_depth(
+        &self,
+        client: &ferriskey::Client,
+        partition: u16,
+    ) -> Option<u64> {
+        let p = Partition {
+            family: PartitionFamily::Flow,
+            index: partition,
+        };
+        let fidx = FlowIndexKeys::new(&p);
+        let backlog_key = fidx.cancel_backlog();
+        let card: Result<Option<u64>, _> = client
+            .cmd("ZCARD")
+            .arg(&backlog_key)
+            .execute()
+            .await;
+        card.ok().flatten()
+    }
+
     async fn scan_partition(
         &self,
         client: &ferriskey::Client,

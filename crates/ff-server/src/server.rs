@@ -201,6 +201,14 @@ pub struct Server {
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
     /// dispatch). Drained on shutdown with a bounded timeout.
     background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
+    /// PR-94: observability registry. Always present; the no-op shim
+    /// takes zero runtime cost when the `observability` feature is
+    /// off, and the real OTEL-backed registry is passed in via
+    /// [`Server::start_with_metrics`] when on. Same `Arc` is shared
+    /// with [`Engine::start_with_metrics`] and
+    /// [`ff_scheduler::Scheduler::with_metrics`] so a single scrape
+    /// sees everything the process produces.
+    metrics: Arc<ff_observability::Metrics>,
 }
 
 /// Server error type.
@@ -304,6 +312,22 @@ impl Server {
     /// 3. Load the FlowFabric Lua library
     /// 4. Start engine (14 background scanners)
     pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
+        Self::start_with_metrics(config, Arc::new(ff_observability::Metrics::new())).await
+    }
+
+    /// PR-94: boot the server with a shared observability registry.
+    ///
+    /// Scanner cycle + scheduler metrics record into this registry;
+    /// `main.rs` threads the same handle into the router so `/metrics`
+    /// exposes what the engine produces. The no-arg [`Server::start`]
+    /// forwards here with a fresh `Metrics::new()` — under the default
+    /// build that's the shim, under `observability` it's a real
+    /// registry not shared with any HTTP route (useful for tests
+    /// exercising the engine in isolation).
+    pub async fn start_with_metrics(
+        config: ServerConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Self, ServerError> {
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
             host = %config.host, port = config.port,
@@ -403,7 +427,7 @@ impl Server {
         // block scanners), and keeping scanners off the tail client means a
         // long-poll tail can never starve lease-expiry, retention-trim,
         // etc. Do not change this without revisiting RFC-006 Impl Notes.
-        let engine = Engine::start(engine_cfg, client.clone());
+        let engine = Engine::start_with_metrics(engine_cfg, client.clone(), metrics.clone());
 
         // Dedicated tail client. Built AFTER library load + HMAC install
         // because those steps use the main client; tail client only runs
@@ -501,9 +525,10 @@ impl Server {
             config.partition_config.num_quota_partitions,
         );
 
-        let scheduler = Arc::new(ff_scheduler::Scheduler::new(
+        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
             client.clone(),
             config.partition_config,
+            metrics.clone(),
         ));
 
         Ok(Self {
@@ -520,7 +545,13 @@ impl Server {
             config,
             scheduler,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
+            metrics,
         })
+    }
+
+    /// PR-94: access the shared observability registry.
+    pub fn metrics(&self) -> &Arc<ff_observability::Metrics> {
+        &self.metrics
     }
 
     /// Get a reference to the ferriskey client.

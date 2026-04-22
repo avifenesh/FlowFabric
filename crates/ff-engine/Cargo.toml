@@ -10,8 +10,15 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric cross-partition dispatch and background scanners"
 
+[features]
+# PR-94: opt in to OTEL-backed scanner cycle metrics. OFF by default.
+# The `ff-observability` dep is always present (no-op shim compiles to
+# zero cost); the feature flips its backend to real OTEL.
+observability = ["ff-observability/enabled"]
+
 [dependencies]
 ff-core = { workspace = true }
+ff-observability = { workspace = true }
 ferriskey = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
