@@ -754,3 +754,181 @@ async fn test_stream_semaphore_returns_429_on_burst() {
 
     _abort.abort();
 }
+
+// ── Body-size limits (#97) ───────────────────────────────────────────
+//
+// Pre-fix behavior: `ff-server` mounted no per-route `DefaultBodyLimit`
+// override, so axum's silent 2 MiB default applied uniformly. A 10 MiB
+// JSON to `/v1/executions/{id}/cancel` would be accepted up to 2 MiB
+// before rejection, and bodies under 2 MiB on control-plane endpoints
+// had no protection at all.
+//
+// Post-fix: each route opts into one of three caps (large / medium /
+// control — see `api.rs`), and 413 responses carry the structured
+// `{"error":"payload_too_large","limit_bytes":N,"route":"..."}` body.
+//
+// One integration test per category — the cap is enforced by a single
+// tower layer so coverage of one route per limit value is sufficient.
+
+const BODY_LIMIT_LARGE_PAYLOAD: usize = 1024 * 1024;     // 1 MiB
+const BODY_LIMIT_MEDIUM_PAYLOAD: usize = 256 * 1024;     // 256 KiB
+const BODY_LIMIT_CONTROL: usize = 64 * 1024;             // 64 KiB
+
+#[derive(Deserialize)]
+struct PayloadTooLargeBody {
+    error: String,
+    limit_bytes: usize,
+    route: String,
+}
+
+/// Build a request body of exactly `byte_len` bytes that is valid JSON
+/// (`{"x":"aaaa..."}`). Returns the raw bytes. The body intentionally does
+/// NOT deserialize into any real handler arg struct — we only care that
+/// the body-limit gate lets `limit` through and blocks `limit + 1`. Past
+/// the gate, the handler produces 400 (invalid-input), which is still
+/// "not 413" for the purposes of these tests.
+fn json_body_of_len(byte_len: usize) -> Vec<u8> {
+    // `{"x":"` + filler + `"}` → 8 wrapper bytes; filler = byte_len - 8.
+    assert!(byte_len >= 8, "byte_len must be >= 8");
+    let filler = byte_len - 8;
+    let mut buf = Vec::with_capacity(byte_len);
+    buf.extend_from_slice(b"{\"x\":\"");
+    buf.extend(std::iter::repeat_n(b'a', filler));
+    buf.extend_from_slice(b"\"}");
+    assert_eq!(buf.len(), byte_len);
+    buf
+}
+
+/// Post a raw body to `path`, asserting the cap reports `expected_route`
+/// in its 413 body. Runs at `limit - 1` (must NOT be 413) and
+/// `limit + 1` (MUST be 413 + structured body).
+async fn assert_body_limit(
+    api: &TestApi,
+    path: &str,
+    expected_route: &str,
+    limit: usize,
+) {
+    // Under-limit: the body-cap layer must let this through. The handler
+    // itself will 400 on the malformed JSON — that's fine, we only assert
+    // "not 413".
+    let under = json_body_of_len(limit - 1);
+    let resp = api
+        .client
+        .post(api.url(path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(under)
+        .send()
+        .await
+        .expect("under-limit request failed to send");
+    assert_ne!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "route {path}: {} bytes (limit - 1) unexpectedly returned 413",
+        limit - 1,
+    );
+
+    // Over-limit: must be 413 with the structured body.
+    let over = json_body_of_len(limit + 1);
+    let resp = api
+        .client
+        .post(api.url(path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(over)
+        .send()
+        .await
+        .expect("over-limit request failed to send");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "route {path}: {} bytes (limit + 1) should have returned 413",
+        limit + 1,
+    );
+    let body: PayloadTooLargeBody = resp.json().await.expect("413 body JSON parse failed");
+    assert_eq!(body.error, "payload_too_large");
+    assert_eq!(body.limit_bytes, limit);
+    assert_eq!(body.route, expected_route);
+}
+
+/// Large-payload category (1 MiB): `POST /v1/executions` carries the
+/// worker's `input_payload`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_api_body_limit_large_payload_create_execution() {
+    let api = TestApi::setup().await;
+    assert_body_limit(&api, "/v1/executions", "/v1/executions", BODY_LIMIT_LARGE_PAYLOAD).await;
+}
+
+/// Medium-payload category (256 KiB): `POST /v1/executions/{id}/signal`
+/// carries an optional `Vec<u8>` signal payload.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_api_body_limit_medium_payload_signal() {
+    let api = TestApi::setup().await;
+    // Use any syntactically-valid execution-id shape — the handler will
+    // 400 on the body, but we only check that the body-limit gate
+    // enforces the 256 KiB cap upstream of that.
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
+    let path = format!("/v1/executions/{eid}/signal");
+    assert_body_limit(
+        &api,
+        &path,
+        "/v1/executions/{id}/signal",
+        BODY_LIMIT_MEDIUM_PAYLOAD,
+    )
+    .await;
+}
+
+/// Control-plane category (64 KiB): exercised via
+/// `POST /v1/executions/{id}/cancel` as a representative control route.
+/// All other control-plane endpoints (priority, claim, flows, budgets,
+/// quotas, rotate-secret) share the same tower layer so one
+/// body-consuming route is enough for extractor-path coverage.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_api_body_limit_control_cancel_execution() {
+    let api = TestApi::setup().await;
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
+    let path = format!("/v1/executions/{eid}/cancel");
+    assert_body_limit(
+        &api,
+        &path,
+        "/v1/executions/{id}/cancel",
+        BODY_LIMIT_CONTROL,
+    )
+    .await;
+}
+
+/// Body-less routes — handlers that take `Path`/`State` but no body
+/// extractor. These rely on the `Content-Length` pre-check middleware
+/// (see PR#100 Copilot review) because `DefaultBodyLimit` alone is a
+/// no-op when the handler never reads the body. Covers one
+/// representative route per verb group.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_api_body_limit_control_replay_execution_bodyless() {
+    let api = TestApi::setup().await;
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
+    let path = format!("/v1/executions/{eid}/replay");
+    // `replay_execution` has no body extractor. A pre-fix request with
+    // Content-Length > BODY_LIMIT_CONTROL would have reached the handler
+    // and proceeded (the handler ignores the body). Post-fix the
+    // Content-Length check rejects with the structured 413.
+    let over = json_body_of_len(BODY_LIMIT_CONTROL + 1);
+    let resp = api
+        .client
+        .post(api.url(&path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(over)
+        .send()
+        .await
+        .expect("over-limit replay failed to send");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body-less /replay should 413 on over-limit",
+    );
+    let body: PayloadTooLargeBody = resp.json().await.expect("413 body parse");
+    assert_eq!(body.error, "payload_too_large");
+    assert_eq!(body.limit_bytes, BODY_LIMIT_CONTROL);
+    assert_eq!(body.route, "/v1/executions/{id}/replay");
+}
