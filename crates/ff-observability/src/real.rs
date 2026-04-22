@@ -44,8 +44,10 @@ const _CARDINALITY_ENVELOPE_MAX: usize = 1_000;
 /// the call sites.
 ///
 /// OTEL's Prometheus exporter normalizes per Prometheus conventions:
+///
 ///   * counter instruments get `_total` **appended** at exposition;
 ///   * instruments with `unit="s"` get `_seconds` **appended**.
+///
 /// We therefore DO NOT include `_total` / `_seconds` in the OTEL
 /// instrument name — they appear on the wire automatically. This
 /// keeps the exported names matching the plan inventory

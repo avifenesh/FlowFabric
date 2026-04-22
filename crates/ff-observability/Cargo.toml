@@ -24,11 +24,20 @@ enabled = [
 ]
 
 [dependencies]
-# Exact-patch pins per PR-94 plan §3. OTEL had breaking changes on
-# minor versions before 0.27 stabilized; caret-ranges would let a
-# downstream bump silently break compilation. Re-pin deliberately
-# when upgrading.
-opentelemetry = { version = "=0.27.1", default-features = false, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "=0.27.1", default-features = false, features = ["metrics"], optional = true }
-opentelemetry-prometheus = { version = "=0.27.0", optional = true }
-prometheus = { version = "=0.13.4", default-features = false, optional = true }
+# Exact-patch pins. Plan §3 locked OTEL 0.27.x, but `opentelemetry-
+# prometheus 0.27.0` depends on `prometheus 0.13.4` which in turn
+# pulls `protobuf 2.28.x` (RUSTSEC-2024-0437 uncontrolled-recursion,
+# cargo-audit hard fail). The 0.27-line does NOT have a mitigation —
+# neither opting out of prometheus's default features nor a patch
+# release drops the protobuf 2.x pull. Moving to 0.31.x (current
+# stable) is the minimum viable fix: OTEL 0.31 + opentelemetry-
+# prometheus 0.31 + prometheus 0.14 + protobuf 3.7.2 is clean.
+#
+# The 0.27 plan lock's rationale ("pre-0.27 minors were breaking")
+# still argues for an exact-patch pin; bumping to 0.31 is more
+# conservative than caret-ranging 0.27. Re-pin deliberately when
+# upgrading.
+opentelemetry = { version = "=0.31.0", default-features = false, features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "=0.31.0", default-features = false, features = ["metrics"], optional = true }
+opentelemetry-prometheus = { version = "=0.31.0", optional = true }
+prometheus = { version = "=0.14.0", default-features = false, optional = true }
