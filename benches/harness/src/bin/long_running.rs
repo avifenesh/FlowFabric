@@ -113,9 +113,49 @@ struct Args {
     workers: usize,
     #[arg(long, default_value_t = DEFAULT_SEED)]
     seed: usize,
+    /// Number of independent samples to run. Each sample is a full
+    /// `duration`-second run preceded by a Valkey FLUSHALL so residual
+    /// queue state from the previous sample does not pollute the
+    /// miss-rate. With `samples >= 2`, the reported
+    /// `missed_deadline_pct` is the mean across samples; the JSON
+    /// report additionally carries the per-sample array and stddev.
+    ///
+    /// Default is 1 to preserve existing single-sample behavior for
+    /// smoke tests; release-gate runs should use N >= 5 (see
+    /// `benches/results/baseline.md`) because the scenario is bimodal
+    /// across the 10s refill / 60s deadline boundary and single-run
+    /// variance covers 1.98%-7.04% on the reference host class (see
+    /// `rfcs/drafts/scenario-4-regression-investigation.md`).
+    #[arg(long, default_value_t = 1)]
+    samples: usize,
     /// Where to write the JSON report (relative to cwd / repo root).
     #[arg(long, default_value = "benches/results")]
     results_dir: String,
+}
+
+/// Per-sample aggregate, collected across samples when `--samples > 1`.
+struct SampleResult {
+    completed: u64,
+    failed: u64,
+    missed: u64,
+    missed_pct: f64,
+    throughput: f64,
+    steady_state_throughput: f64,
+    steady_state_window_completions: u64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    renewal_count: u64,
+    renewal_total_ns: u64,
+    renewal_overhead_pct: f64,
+    rss_start_mb: Option<u64>,
+    rss_end_mb: Option<u64>,
+    rss_min_mb: Option<u64>,
+    rss_max_mb: Option<u64>,
+    rss_slope_mb_per_min: Option<f64>,
+    rss_growth_pct: Option<f64>,
+    rss_series: Vec<[u64; 2]>,
+    termination_reason: &'static str,
 }
 
 // ── Renewal-overhead tracing Layer ─────────────────────────────────────
@@ -327,20 +367,298 @@ async fn main() -> Result<()> {
         .with(RenewalLayer::new(renewal_counters.clone()))
         .init();
 
+    let samples = args.samples.max(1);
     tracing::info!(
         duration_s = args.duration,
         workers = args.workers,
         seed = args.seed,
+        samples,
         "scenario 3 starting"
     );
 
     let http = ff_bench::workload::http_client()?;
 
+    let mut results: Vec<SampleResult> = Vec::with_capacity(samples);
+    for sample_idx in 0..samples {
+        // Between-sample reset: FLUSHALL residual queue + reset
+        // per-process renewal counters. The first sample inherits
+        // whatever state the operator left behind (matches existing
+        // single-sample protocol); subsequent samples get a clean
+        // slate so miss-rate is per-sample, not cumulative.
+        if sample_idx > 0 {
+            if let Err(e) = flush_valkey(&env).await {
+                tracing::warn!(
+                    sample_idx,
+                    error = %e,
+                    "FLUSHALL between samples failed; sample may inherit stale queue state",
+                );
+            }
+            renewal_counters.count.store(0, Ordering::Relaxed);
+            renewal_counters.total_ns.store(0, Ordering::Relaxed);
+        }
+        tracing::info!(sample_idx, samples, "starting sample");
+        let sample = run_sample(&args, &env, &http, &renewal_counters).await?;
+        tracing::info!(
+            sample_idx,
+            completed = sample.completed,
+            missed = sample.missed,
+            missed_pct = sample.missed_pct,
+            "sample complete",
+        );
+        results.push(sample);
+    }
+
+    // Aggregate across samples (mean + stddev on the key metrics).
+    let agg = aggregate_samples(&results);
+
+    // Write a single report. For multi-sample runs, the top-level
+    // `throughput_ops_per_sec` + latency percentiles are the mean
+    // across samples, and the config block carries the per-sample
+    // arrays + stddev. Single-sample runs emit the legacy shape.
+    write_aggregate_report(&args, &env, &results, &agg)?;
+
+    let first = &results[0];
+    if first.failed > 0 && first.completed == 0 {
+        anyhow::bail!("all workers reported failures — server likely unavailable");
+    }
+    Ok(())
+}
+
+/// Mean + stddev + min/max for the multi-sample headline metrics.
+#[derive(Debug)]
+struct Aggregate {
+    missed_pct_mean: f64,
+    missed_pct_stddev: f64,
+    missed_pct_min: f64,
+    missed_pct_max: f64,
+    throughput_mean: f64,
+    steady_state_throughput_mean: f64,
+    p50_mean: f64,
+    p95_mean: f64,
+    p99_mean: f64,
+}
+
+fn aggregate_samples(results: &[SampleResult]) -> Aggregate {
+    fn mean(xs: &[f64]) -> f64 {
+        if xs.is_empty() {
+            0.0
+        } else {
+            xs.iter().sum::<f64>() / xs.len() as f64
+        }
+    }
+    // Sample stddev (n-1 denominator); with N=1 returns 0.0.
+    fn stddev(xs: &[f64]) -> f64 {
+        if xs.len() < 2 {
+            return 0.0;
+        }
+        let m = mean(xs);
+        let var = xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (xs.len() - 1) as f64;
+        var.sqrt()
+    }
+    let missed: Vec<f64> = results.iter().map(|r| r.missed_pct).collect();
+    let tput: Vec<f64> = results.iter().map(|r| r.throughput).collect();
+    let ss_tput: Vec<f64> =
+        results.iter().map(|r| r.steady_state_throughput).collect();
+    let p50s: Vec<f64> = results.iter().map(|r| r.p50).collect();
+    let p95s: Vec<f64> = results.iter().map(|r| r.p95).collect();
+    let p99s: Vec<f64> = results.iter().map(|r| r.p99).collect();
+    Aggregate {
+        missed_pct_mean: mean(&missed),
+        missed_pct_stddev: stddev(&missed),
+        missed_pct_min: missed.iter().cloned().fold(f64::INFINITY, f64::min),
+        missed_pct_max: missed.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        throughput_mean: mean(&tput),
+        steady_state_throughput_mean: mean(&ss_tput),
+        p50_mean: mean(&p50s),
+        p95_mean: mean(&p95s),
+        p99_mean: mean(&p99s),
+    }
+}
+
+fn write_aggregate_report(
+    args: &Args,
+    env: &ff_bench::workload::BenchEnv,
+    results: &[SampleResult],
+    agg: &Aggregate,
+) -> Result<()> {
+    let samples = results.len();
+    // For single-sample runs, preserve the legacy report shape
+    // (scalar fields, no `_samples` arrays) so downstream consumers
+    // that post-date this change but predate multi-sample see the
+    // same JSON. For multi-sample runs, headline scalar fields
+    // carry the mean, and `_samples` arrays + stddev let consumers
+    // re-aggregate.
+    let first = &results[0];
+    let mut config = serde_json::json!({
+        "duration_s": args.duration,
+        "samples": samples,
+        "workers": args.workers,
+        "seed": args.seed,
+        "refill_topup_per_interval": REFILL_TOPUP,
+        "refill_interval_ms": REFILL_EVERY_MS,
+        "payload_bytes": PAYLOAD_BYTES,
+        "deadline_per_task_ms": TASK_DEADLINE_MS,
+        "task_work_ms": TASK_WORK_MS,
+        "termination_reason": first.termination_reason,
+        "completed": first.completed,
+        "failed": first.failed,
+        "missed_deadline_count": first.missed,
+        "missed_deadline_pct": if samples > 1 { agg.missed_pct_mean } else { first.missed_pct },
+        "missed_deadline_primitive": "submit_to_complete",
+        "steady_state_throughput_ops_per_sec": if samples > 1 {
+            agg.steady_state_throughput_mean
+        } else {
+            first.steady_state_throughput
+        },
+        "steady_state_window_s": STEADY_STATE_WINDOW_S,
+        "steady_state_window_completions": first.steady_state_window_completions,
+        "lease_renewal_count": first.renewal_count,
+        "lease_renewal_total_ns": first.renewal_total_ns,
+        "lease_renewal_overhead_pct": first.renewal_overhead_pct,
+        "lease_renewal_overhead_method": "span_enter_exit_measured",
+        "rss_start_mb": first.rss_start_mb,
+        "rss_end_mb": first.rss_end_mb,
+        "rss_growth_pct": first.rss_growth_pct,
+        "rss_sample_every_ms": RSS_SAMPLE_EVERY_MS,
+        "rss_series": first.rss_series,
+        "rss_min_mb": first.rss_min_mb,
+        "rss_max_mb": first.rss_max_mb,
+        "rss_slope_mb_per_min": first.rss_slope_mb_per_min,
+    });
+    if samples > 1 {
+        let obj = config.as_object_mut().expect("config is object");
+        obj.insert(
+            "missed_deadline_pct_mean".into(),
+            serde_json::json!(agg.missed_pct_mean),
+        );
+        obj.insert(
+            "missed_deadline_pct_stddev".into(),
+            serde_json::json!(agg.missed_pct_stddev),
+        );
+        obj.insert(
+            "missed_deadline_pct_min".into(),
+            serde_json::json!(agg.missed_pct_min),
+        );
+        obj.insert(
+            "missed_deadline_pct_max".into(),
+            serde_json::json!(agg.missed_pct_max),
+        );
+        obj.insert(
+            "missed_deadline_pct_samples".into(),
+            serde_json::json!(results.iter().map(|r| r.missed_pct).collect::<Vec<_>>()),
+        );
+        obj.insert(
+            "completed_samples".into(),
+            serde_json::json!(results.iter().map(|r| r.completed).collect::<Vec<_>>()),
+        );
+        obj.insert(
+            "missed_count_samples".into(),
+            serde_json::json!(results.iter().map(|r| r.missed).collect::<Vec<_>>()),
+        );
+        obj.insert(
+            "steady_state_throughput_ops_per_sec_mean".into(),
+            serde_json::json!(agg.steady_state_throughput_mean),
+        );
+        obj.insert(
+            "steady_state_throughput_ops_per_sec_samples".into(),
+            serde_json::json!(results
+                .iter()
+                .map(|r| r.steady_state_throughput)
+                .collect::<Vec<_>>()),
+        );
+    }
+    let headline_throughput = if samples > 1 { agg.throughput_mean } else { first.throughput };
+    let headline_latency = if samples > 1 {
+        LatencyMs { p50: agg.p50_mean, p95: agg.p95_mean, p99: agg.p99_mean }
+    } else {
+        LatencyMs { p50: first.p50, p95: first.p95, p99: first.p99 }
+    };
+    let mut report = Report::fill_env(
+        SCENARIO,
+        SYSTEM_FLOWFABRIC,
+        env.cluster,
+        config,
+        headline_throughput,
+        headline_latency,
+    );
+    let base_notes = "steady_state_throughput_ops_per_sec is the headline; \
+         whole-run throughput_ops_per_sec is burst-dominated by the \
+         pre-seeded queue drain. missed_deadline_pct is \
+         submit-to-complete; refill batches cause per-batch spikes \
+         because every task in a batch shares `submit_ms`, so the \
+         rate smooths only over windows >> refill_interval_ms. \
+         lease renewal overhead measured via span enter/exit — real \
+         under steady-state load, not a quiescent calibration.";
+    let mut notes = if samples > 1 {
+        format!(
+            "{base_notes} multi-sample run: N={samples}, \
+             missed_deadline_pct reported as mean across samples \
+             (stddev in config); Valkey FLUSHALL between samples. \
+             Headline scalar fields are per-sample means; \
+             per-sample arrays are in config.",
+        )
+    } else {
+        String::from(base_notes)
+    };
+    if first.termination_reason != "duration_elapsed" {
+        notes.push_str(&format!(
+            " terminated early on first sample: {}; metrics cover partial run.",
+            first.termination_reason,
+        ));
+    }
+    report.notes = Some(notes);
+    let dir = resolve_results_dir(&args.results_dir);
+    match write_report(&report, &dir) {
+        Ok(path) => println!("[bench] wrote {}", path.display()),
+        Err(e) => eprintln!("[bench] WARN: could not write report: {e}"),
+    }
+    Ok(())
+}
+
+/// Send `FLUSHALL` to Valkey via a raw RESP TCP round-trip. Used
+/// between samples to clear residual queue state; matches the
+/// operator-level "`valkey-cli FLUSHALL` before each run" protocol
+/// documented in `rfcs/drafts/scenario-4-regression-investigation.md`.
+async fn flush_valkey(env: &ff_bench::workload::BenchEnv) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let addr = format!("{}:{}", env.valkey_host, env.valkey_port);
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(&addr),
+    )
+    .await
+    .context("FLUSHALL connect timeout")?
+    .context("FLUSHALL connect")?;
+    stream
+        .write_all(b"*1\r\n$8\r\nFLUSHALL\r\n")
+        .await
+        .context("FLUSHALL write")?;
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .context("FLUSHALL read timeout")?
+        .context("FLUSHALL read")?;
+    let reply = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+    if !reply.starts_with("+OK") {
+        anyhow::bail!("FLUSHALL unexpected reply: {reply:?}");
+    }
+    Ok(())
+}
+
+/// Run a single sample of the scenario: seed, spawn workers, drive
+/// for `args.duration` seconds, drain, aggregate.
+async fn run_sample(
+    args: &Args,
+    env: &ff_bench::workload::BenchEnv,
+    http: &Client,
+    renewal_counters: &Arc<RenewalCounters>,
+) -> Result<SampleResult> {
     // Pre-seed the queue before spinning up workers so the first claim
     // attempts all succeed. Failures at this stage are usually "server
     // down" — fail loud rather than silently measuring an empty run.
     let seed_start = Instant::now();
-    seed_tasks(&http, &env, args.seed).await?;
+    seed_tasks(http, env, args.seed).await?;
     tracing::info!(
         seeded = args.seed,
         seed_wall_ms = seed_start.elapsed().as_millis() as u64,
@@ -351,7 +669,7 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(Notify::new());
     let stop_flag = Arc::new(AtomicBool::new(false));
     let outcomes: Arc<Mutex<Vec<WorkerOutcome>>> = Arc::new(Mutex::new(Vec::new()));
-    let outcomes_cap_per_worker = estimated_tasks_per_worker(&args);
+    let outcomes_cap_per_worker = estimated_tasks_per_worker(args);
 
     // Record RSS at run start.
     let rss_start_mb = read_rss_mb();
@@ -558,7 +876,6 @@ async fn main() -> Result<()> {
         "scenario 3 complete"
     );
 
-    // Write JSON report.
     let rss_growth_pct = match (rss_start_mb, rss_end_mb) {
         (Some(s), Some(e)) if s > 0 => Some(((e as f64 - s as f64) / s as f64) * 100.0),
         _ => None,
@@ -568,81 +885,30 @@ async fn main() -> Result<()> {
     // reshaping.
     let rss_series_json: Vec<[u64; 2]> =
         rss_series_vec.iter().map(|&(t, mb)| [t, mb]).collect();
-    let config = serde_json::json!({
-        "duration_s": args.duration,
-        "workers": args.workers,
-        "seed": args.seed,
-        "refill_topup_per_interval": REFILL_TOPUP,
-        "refill_interval_ms": REFILL_EVERY_MS,
-        "payload_bytes": PAYLOAD_BYTES,
-        "deadline_per_task_ms": TASK_DEADLINE_MS,
-        "task_work_ms": TASK_WORK_MS,
-        "termination_reason": termination_reason,
-        "completed": completed,
-        "failed": failed,
-        "missed_deadline_count": missed,
-        "missed_deadline_pct": missed_pct,
-        "missed_deadline_primitive": "submit_to_complete",
-        "steady_state_throughput_ops_per_sec": steady_state_throughput,
-        "steady_state_window_s": STEADY_STATE_WINDOW_S,
-        "steady_state_window_completions": in_window,
-        "lease_renewal_count": renewal_count,
-        "lease_renewal_total_ns": renewal_total_ns,
-        "lease_renewal_overhead_pct": renewal_overhead_pct,
-        "lease_renewal_overhead_method": "span_enter_exit_measured",
-        "rss_start_mb": rss_start_mb,
-        "rss_end_mb": rss_end_mb,
-        "rss_growth_pct": rss_growth_pct,
-        "rss_sample_every_ms": RSS_SAMPLE_EVERY_MS,
-        "rss_series": rss_series_json,
-        "rss_min_mb": rss_min_mb,
-        "rss_max_mb": rss_max_mb,
-        "rss_slope_mb_per_min": rss_slope_mb_per_min,
-    });
-    let mut report = Report::fill_env(
-        SCENARIO,
-        SYSTEM_FLOWFABRIC,
-        env.cluster,
-        config,
-        throughput,
-        LatencyMs {
-            p50: latency.p50,
-            p95: latency.p95,
-            p99: latency.p99,
-        },
-    );
-    // Always emit the refill-artifact caveat so consumers of the
-    // missed_deadline_pct metric see it in context; refilling N tasks
-    // at once (REFILL_TOPUP per REFILL_EVERY_MS) gives every task in
-    // a batch the same `submit_ms`, so under back-pressure the miss
-    // rate spikes near batch boundaries rather than smoothing out.
-    // headline-is-steady-state note (S3-F2) also lives here.
-    let mut notes = String::from(
-        "steady_state_throughput_ops_per_sec is the headline; \
-         whole-run throughput_ops_per_sec is burst-dominated by the \
-         pre-seeded queue drain. missed_deadline_pct is \
-         submit-to-complete; refill batches cause per-batch spikes \
-         because every task in a batch shares `submit_ms`, so the \
-         rate smooths only over windows >> refill_interval_ms. \
-         lease renewal overhead measured via span enter/exit — real \
-         under steady-state load, not a quiescent calibration.",
-    );
-    if termination_reason != "duration_elapsed" {
-        notes.push_str(&format!(
-            " terminated early: {termination_reason}; metrics cover partial run."
-        ));
-    }
-    report.notes = Some(notes);
-    let dir = resolve_results_dir(&args.results_dir);
-    match write_report(&report, &dir) {
-        Ok(path) => println!("[bench] wrote {}", path.display()),
-        Err(e) => eprintln!("[bench] WARN: could not write report: {e}"),
-    }
 
-    if failed > 0 && completed == 0 {
-        anyhow::bail!("all workers reported failures — server likely unavailable");
-    }
-    Ok(())
+    Ok(SampleResult {
+        completed,
+        failed,
+        missed,
+        missed_pct,
+        throughput,
+        steady_state_throughput,
+        steady_state_window_completions: in_window,
+        p50: latency.p50,
+        p95: latency.p95,
+        p99: latency.p99,
+        renewal_count,
+        renewal_total_ns,
+        renewal_overhead_pct,
+        rss_start_mb,
+        rss_end_mb,
+        rss_min_mb,
+        rss_max_mb,
+        rss_slope_mb_per_min,
+        rss_growth_pct,
+        rss_series: rss_series_json,
+        termination_reason,
+    })
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

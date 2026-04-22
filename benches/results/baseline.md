@@ -75,29 +75,46 @@ Flat vs v0.1.0 across all percentiles — the push-based promotion
 speedup (21× at p50 over pre-BatchC) holds. p99 tail growth still
 present; no follow-up investigation filed in this cycle.
 
-## Scenario 4 — long_running_steady_state (300s, refill 20 tasks / 10s)
+## Scenario 4 — long_running_steady_state (300s, refill 20 tasks / 10s, **N=5 samples**)
 
-| metric                       | v0.3.2 (da89fa9) | v0.1.0 (01f6327) | pre-BatchC (6f81926) |
-|------------------------------|------------------|------------------|----------------------|
-| completed (count)            | 2680             | 2580             | 2679                 |
-| failed (count)               | 105              | 101              | 102                  |
-| missed_deadline (count)      | 205              | 100              | 188                  |
-| missed_deadline (% of completed) | **7.11%**    | 3.88%            | 7.01%                |
-| steady_state_ops/s           | 2.0              | 2.0              | n/a                  |
-| lease_renewal_overhead (%)   | 0.000178         | 0.00015          | 0.00017              |
-| rss_min_mb / rss_max_mb      | 34 / 69          | 32 / 67          | 37 / 72              |
-| rss_slope_mb_per_min         | −4.10            | −4.41            | n/a                  |
+**Methodology (as of 2026-04-22):** Scenario 4 is bimodal across the
+10s refill / 60s deadline boundary (see
+`rfcs/drafts/scenario-4-regression-investigation.md`): depending on
+phase alignment between a refill batch and the steady-state drain, a
+single 300s run lands in either a low-miss regime (~2–4%) or a
+high-miss regime (~7%). Single-run sampling is therefore inadequate —
+the 3.88% v0.1.0 number and the 7.11% v0.3.2 number were both
+snapshots of opposite regimes of the same stable distribution, not a
+regression. The bench binary now takes `--samples N` and reports
+**mean ± stddev** across N independent 300s runs (Valkey `FLUSHALL`
+between samples). **N ≥ 5 is required** for release-gate numbers.
 
-**Regression flag:** `missed_deadline_pct` nearly doubled vs v0.1.0
-(3.88% → 7.11%), back to the pre-BatchC 7.01% level. Completed count
-grew modestly (2580 → 2680) so the denominator didn't shrink; the
-numerator (missed_deadline) jumped from 100 → 205. Single-run
-observation, no diagnosis performed in this refresh cycle. A repeat
-run is recommended before v0.4 to distinguish single-run noise from a
-real regression, and if reproducible, a flame capture on the refill
-window is the right next step. Not blocking v0.3.2 (which has already
-shipped); flagged here per `benches/results/baseline.md` operating
-discipline.
+| metric                       | v0.3.3 (d813772, N=5) | v0.3.2 (da89fa9, N=1) | v0.1.0 (01f6327, N=1) | pre-BatchC (6f81926, N=1) |
+|------------------------------|-----------------------|-----------------------|-----------------------|---------------------------|
+| missed_deadline_pct mean     | **4.71%**             | 7.11%                 | 3.88%                 | 7.01%                     |
+| missed_deadline_pct stddev   | **2.23%**             | n/a (single sample)   | n/a                   | n/a                       |
+| missed_deadline_pct min / max| 1.98% / 7.04%         | n/a                   | n/a                   | n/a                       |
+| per-sample missed_pct        | 3.80, 3.73, 1.98, 7.04, 6.98 | —              | —                     | —                         |
+| completed (mean across N)    | 2611                  | 2680                  | 2580                  | 2679                      |
+| failed (sample avg)          | ~101                  | 105                   | 101                   | 102                       |
+| steady_state_ops/s (mean)    | 2.0                   | 2.0                   | 2.0                   | n/a                       |
+| lease_renewal_overhead (%)   | 0.000174              | 0.000178              | 0.00015               | 0.00017                   |
+
+**No regression.** The N=5 sample at v0.3.3 (5 independent 300s runs
+on the reference host class, Valkey 7.2.12; versus the 8.1.0 the v0.1.0
+/ v0.3.2 single-sample entries were captured against — see host §) is
+`4.71% ± 2.23%`. Worker DD's bisect
+(`rfcs/drafts/scenario-4-regression-investigation.md`) cluster-sampled
+`missed_deadline_pct` at 6.98%–7.07% across 8 runs spanning 6 commits
+in `01f6327..da89fa9` — those 8 runs fell in the high-regime mode; the
+N=5 run here spans both modes (3× low, 2× high) and the reported mean
+is a mix of the two. Future comparisons are robust if both sides use
+N ≥ 5.
+
+The prior "regression" flag (3.88% → 7.11%) was a methodology artifact:
+two single-sample snapshots of a bimodal distribution compared as if
+they were point estimates of a scalar. Re-baseline each release's
+Scenario 4 row with N ≥ 5 before drawing comparisons.
 
 Lease renewal overhead and RSS profile both remain in the pre-v0.1.0
 envelope.
