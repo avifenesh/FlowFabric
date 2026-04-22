@@ -1,10 +1,16 @@
 # RFC-012: `EngineBackend` trait — abstracting FlowFabric's write surface
 
-**Status:** Draft — round 4 (post Worker M CHALLENGE; round-4 revisions applied).
+**Status:** Accepted (round-4) + round-5 micro-amendment (peer lease-releasing methods `delay` + `wait_children`).
 **Created:** 2026-04-22
 **Supersedes:** issue #89 (trait-extraction plan) on acceptance.
 **Related:** issues #87, #88, #90, #91, #92, #93 (concrete follow-up work this RFC authorises).
 **Predecessor:** issue #58 Phase 1 — sealed the read surface (`ExecutionSnapshot`, `FlowSnapshot`, `EdgeSnapshot`) and typed the error surface (`EngineError` — landed on `main` at `crates/ff-sdk/src/engine_error.rs` per PR #81).
+
+### Round-5 amendment summary (post-acceptance, Stage-0-blocking)
+
+During the issue #89 Phase-1 method inventory, Worker I discovered two lease-releasing `ClaimedTask` operations that the round-4 inventory did not elevate to peer trait methods: `delay_execution` (`crates/ff-sdk/src/task.rs:414`) and `move_to_waiting_children` (`crates/ff-sdk/src/task.rs:460`). Both are structurally peers of `suspend` — they hand back the lease, run a single FCALL (`ff_delay_execution`, `ff_move_to_waiting_children`) under the fence triple, and leave the attempt in a non-terminal state awaiting a later event (wall-clock time; child-dependency completion). Omitting them would force Stage 1 to ship an incomplete trait and file a follow-up RFC to bolt them on, compounding call-site debt (§1.3 bullet 3).
+
+This amendment adds them as methods 14 and 15 in §3.1.1. Trait count goes from 13 → 15. No other sections change; Stage-0 type inventory (§3.3.0) is untouched (the new methods' signatures reuse existing types: `TimestampMs` from `ff-core::types`, `Handle`, `EngineError`). The amendment is additive to the accepted round-4 shape.
 
 ### Round-4 revision summary (post Worker M CHALLENGE at `183c10f`)
 
@@ -88,7 +94,7 @@ This RFC defines a trait shape. It is explicitly not:
 
 * **Not a Postgres backend implementation.** A trait proposal is necessary-but-not-sufficient for a Postgres backend. The Postgres crate is a separate project with its own RFC (`RFC-014-postgres-backend`, notional) and its own review cycle. This RFC's §5 names which methods a Postgres impl must fulfil; it does not specify *how* Postgres fulfils them.
 * **Not a cairn migration.** Consumer migration is their concern and their timeline. Cross-team coordination is not on the critical path.
-* **Not a re-design of the execution model.** The trait mirrors the existing semantics — claim / progress / complete / fail / cancel / suspend / resume — just typed. RFCs 001-009 define those semantics; this RFC adds a dispatch seam, not a new semantics layer. A reviewer who finds a semantic mismatch between the trait and the existing RFCs should flag a bug in the trait, not propose a semantics change.
+* **Not a re-design of the execution model.** The trait mirrors the existing semantics — claim / progress / complete / fail / cancel / suspend / delay / wait_children / resume — just typed. RFCs 001-009 define those semantics; this RFC adds a dispatch seam, not a new semantics layer. A reviewer who finds a semantic mismatch between the trait and the existing RFCs should flag a bug in the trait, not propose a semantics change.
 * **Not a replacement of FCALLs inside the Valkey impl.** The 18 Lua functions continue to exist. They are how the Valkey backend fulfils the trait. A single trait method may drive one or several FCALLs; the point is that the FCALL names and KEYS/ARGV layouts are backend-internal once the trait lands. They do not appear in the public SDK surface.
 * **Not a new admin API surface.** Admin operations (waitpoint HMAC rotation, partition collision diagnostics, cutover runbook tooling) live on a separate trait or sit on the backend impl as inherent methods. §3.2 names the ones that *don't* go on `EngineBackend`.
 * **Not a synchronous-API proposal.** The trait is `async` throughout. The existing SDK is async; a blocking variant (if ever wanted) is a follow-up trait, not a parallel definition here.
@@ -98,9 +104,9 @@ This RFC defines a trait shape. It is explicitly not:
 
 ## §3 Proposed `EngineBackend` trait shape
 
-### §3.1 Operation inventory (13 methods — round-2 revised)
+### §3.1 Operation inventory (15 methods — round-5 amended)
 
-The owner's decision pins the granularity target at ~10-12 business-operation methods; round-2 revisions (K#2 split of `resume`, K#6 split of `progress`) brought the count to 13. The owner's "~10-12" is a range, not a hard ceiling; 13 is within the spirit of the decision (the `progress`/`append_frame` split replaces a fused method whose atomicity was unsound, and the `observe_signals`/`claim_from_reclaim` split replaces one method whose multi-round-trip honesty was broken). Below is the round-2 inventory.
+The owner's decision pins the granularity target at ~10-12 business-operation methods; round-2 revisions (K#2 split of `resume`, K#6 split of `progress`) brought the count to 13, and round-5's amendment adds the two missing lease-releasing peers of `suspend` (`delay`, `wait_children`) for a final count of 15. The owner's "~10-12" remains a range, not a hard ceiling; 15 is within the spirit of the decision — every count-growth step is a splits-for-honesty move, not a granularity creep (the `progress`/`append_frame` split replaces a fused method whose atomicity was unsound; `observe_signals`/`claim_from_reclaim` replaces one method whose multi-round-trip honesty was broken; `delay` and `wait_children` elevate two call sites that are structural peers of `suspend`). Below is the round-5 inventory.
 
 The inventory assumes one trait (not multiple domain-split traits) per §6.2; a consumer holding a `Backend: EngineBackend` gets the full write surface without composing four traits.
 
@@ -158,6 +164,18 @@ Split resolution:
 This also addresses K#3's reclaim-third-path concern: `claim` is fresh, `claim_from_reclaim` is reclaim-resumed, and `claim_via_server` (HTTP-routed) is not on the trait at all — it lives on the server crate above the trait.
 
 *Maps to:* (8) read-path (HGETALL/HMGET today) — no state mutation. (9) `ff_claim_resumed_execution`.
+
+**14. `delay(handle, delay_until) -> Result<(), EngineError>`.** Lease-releasing delay. The attempt hands the lease back and the execution moves to the `delayed` state; a scheduler tick at or after `delay_until` re-activates it. Structural peer of `suspend`: single FCALL under fence triple, non-terminal. Unlike `suspend`, `delay` waits on wall-clock time rather than a waitpoint set, and does NOT return a fresh `Handle` — the caller's handle is released outright; re-entry happens via a fresh `claim` after the scheduler fires.
+
+*Maps to:* `ff_delay_execution`. Call site: `ClaimedTask::delay_execution` (`crates/ff-sdk/src/task.rs:414`).
+
+*Round-5 note:* the round-4 inventory omitted this method. It is a structural peer of `suspend` — KEYS/ARGV shape matches (9 KEYS, 5 ARGV; fence triple; attempt-timeout zset membership), Lua function is one-to-one, and the state transition is lease-releasing-non-terminal. Omitting it would have forced Stage 1 to ship an incomplete trait.
+
+**15. `wait_children(handle) -> Result<(), EngineError>`.** Lease-releasing move to `waiting_children`. The attempt hands the lease back and the execution waits for its child-dependency set to complete; a completion event on the last child re-activates it. Structural peer of `suspend` and `delay`: single FCALL under fence triple, non-terminal. Waitpoint kind here is "all children terminal"; evaluation is scheduler-side, not matcher-slot-side.
+
+*Maps to:* `ff_move_to_waiting_children`. Call site: `ClaimedTask::move_to_waiting_children` (`crates/ff-sdk/src/task.rs:460`).
+
+*Round-5 note:* as with method 14, round-4 omitted this. It is a structural peer of `suspend` (9 KEYS, 4 ARGV; fence triple; attempt-timeout zset membership). Included in the amendment for the same reason.
 
 #### §3.1.2 Read-path ops (leveraging Phase 1)
 
@@ -323,6 +341,18 @@ pub trait EngineBackend: Send + Sync + 'static {
         token: ReclaimToken,
     ) -> Result<Option<Handle>, EngineError>; // kind=Resumed on Some
 
+    // Round-5 amendment: lease-releasing peers of `suspend`.
+    async fn delay(
+        &self,
+        handle: &Handle,
+        delay_until: TimestampMs,
+    ) -> Result<(), EngineError>;
+
+    async fn wait_children(
+        &self,
+        handle: &Handle,
+    ) -> Result<(), EngineError>;
+
     async fn describe_execution(
         &self,
         id: &ExecutionId,
@@ -357,7 +387,7 @@ Every trait method must preserve the same fence / idempotency / atomicity proper
 
 **Fence triple**: every op that mutates attempt state requires `(lease_id, lease_epoch, attempt_id)`. The handle carries these internally; the backend enforces them on every op call. On Valkey, fence-triple checks happen inside the Lua function via keys/args. On Postgres, fence-triple checks happen via `WHERE lease_id = $1 AND lease_epoch = $2 AND attempt_id = $3` in the UPDATE clause.
 
-**Idempotent replay**: `complete`, `fail`, `cancel`, `suspend` are idempotent under replay — calling twice with the same handle and args returns the same result (success on first call, "already in terminal state" on subsequent calls). The trait contract mandates this. Callers can safely retry under network uncertainty.
+**Idempotent replay**: `complete`, `fail`, `cancel`, `suspend`, `delay`, `wait_children` are idempotent under replay — calling twice with the same handle and args returns the same result (success on first call, "already in that state" on subsequent calls — terminal for `complete`/`fail`/`cancel`; lease-released-non-terminal for `suspend`/`delay`/`wait_children`, where the second call returns `EngineError::State` because the fence triple no longer matches a live lease). The trait contract mandates this. Callers can safely retry under network uncertainty.
 
 **Atomicity**: per-op state transitions are atomic — partial state is not observable. On Valkey this is the single-FCALL-per-op property (RFC-011 §5.5 closed the last cross-partition gap). On Postgres this is the per-transaction property. The trait contract names the atomicity requirement; a backend that can't honour it (e.g., a NATS-backed design that can't promise cross-subject atomicity) either must not implement `EngineBackend` or must degrade specific ops with a documented contract deviation.
 
@@ -367,7 +397,7 @@ Every trait method must preserve the same fence / idempotency / atomicity proper
 
 ### §3.4.1 Commit atomicity vs. notification atomicity (round-2, K#4)
 
-Round-1 §3.4 asserted "per-op state transitions are atomic" without distinguishing the state-transition commit from downstream side-effect delivery. For single-entity ops (e.g., `renew`, `progress`), the distinction is immaterial. For cross-entity ops (`complete`, `fail`, `cancel`, `cancel_flow`, `suspend`, `claim_from_reclaim`), the distinction is load-bearing. `complete` in particular mutates `executions`, flow-membership terminal set, child-dependency edges, and publishes a completion event. Valkey covers all four within one FCALL; Postgres cannot cover the NOTIFY publication within the row-commit transaction (NOTIFY delivers post-commit).
+Round-1 §3.4 asserted "per-op state transitions are atomic" without distinguishing the state-transition commit from downstream side-effect delivery. For single-entity ops (e.g., `renew`, `progress`), the distinction is immaterial. For cross-entity ops (`complete`, `fail`, `cancel`, `cancel_flow`, `suspend`, `delay`, `wait_children`, `claim_from_reclaim`), the distinction is load-bearing. `complete` in particular mutates `executions`, flow-membership terminal set, child-dependency edges, and publishes a completion event. Valkey covers all four within one FCALL; Postgres cannot cover the NOTIFY publication within the row-commit transaction (NOTIFY delivers post-commit).
 
 Round-2 contract distinguishes two atomicity classes:
 
