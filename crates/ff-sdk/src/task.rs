@@ -690,72 +690,32 @@ impl ClaimedTask {
     ///
     /// Non-consuming — the worker can append many frames during execution.
     /// The stream is created lazily on the first append.
-    //
-    // RFC-012 §R7.2.1 widened `EngineBackend::append_frame`'s return
-    // to `AppendFrameOutcome` — that half of the trait alignment is
-    // done. The SDK-side migration remains direct-FCALL for now
-    // because the trait's `Frame { kind: FrameKind, bytes, seq }`
-    // input shape does not carry the SDK-public `frame_type: &str`
-    // (free-form) or `metadata: Option<&str>` (wire `correlation_id`)
-    // arguments — 5 in-tree example callers pass frame_type strings
-    // ("delta", "log", "agent_step", "summary_token", etc.) that
-    // don't map onto `FrameKind::{Stdout,Stderr,Event,Blob}` without
-    // a silent wire regression. Closing this gap needs a `Frame`-
-    // shape extension (adds `frame_type: String` + `correlation_id:
-    // Option<String>`) — tracked for Stage 1d alongside the `suspend`
-    // input-shape rework. Until then the SDK keeps byte-for-byte
-    // wire parity by issuing `ff_append_frame` directly; the trait's
-    // `append_frame_impl` in ff-backend-valkey covers the
-    // FrameKind-based call sites.
+    ///
+    /// **RFC-012 §R7.2.1 / PR #146:** forwards through the
+    /// `EngineBackend` trait. The free-form `frame_type` tag and
+    /// optional `metadata` (wire `correlation_id`) travel on the
+    /// extended [`ff_core::backend::Frame`] shape (`frame_type:
+    /// String`, `correlation_id: Option<String>`), giving byte-for-byte
+    /// wire parity with the pre-migration direct-FCALL path.
     pub async fn append_frame(
         &self,
         frame_type: &str,
         payload: &[u8],
         metadata: Option<&str>,
     ) -> Result<AppendFrameOutcome, SdkError> {
-        let partition = execution_partition(&self.execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
-
-        let now = TimestampMs::now();
-
-        // KEYS (3): exec_core, stream_key, stream_meta
-        let keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.stream(self.attempt_index),
-            ctx.stream_meta(self.attempt_index),
-        ];
-
-        let payload_str = String::from_utf8_lossy(payload);
-
-        // ARGV (13): execution_id, attempt_index, lease_id, lease_epoch,
-        //            frame_type, ts, payload, encoding, correlation_id,
-        //            source, retention_maxlen, attempt_id, max_payload_bytes
-        let args: Vec<String> = vec![
-            self.execution_id.to_string(),     // 1
-            self.attempt_index.to_string(),    // 2
-            self.lease_id.to_string(),         // 3
-            self.lease_epoch.to_string(),      // 4
-            frame_type.to_owned(),             // 5
-            now.to_string(),                   // 6 ts
-            payload_str.into_owned(),          // 7
-            "utf8".to_owned(),                 // 8 encoding
-            metadata.unwrap_or("").to_owned(), // 9 correlation_id
-            "worker".to_owned(),               // 10 source
-            "10000".to_owned(),                // 11 retention_maxlen
-            self.attempt_id.to_string(),       // 12
-            "65536".to_owned(),                // 13 max_payload_bytes
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .client
-            .fcall("ff_append_frame", &key_refs, &arg_refs)
+        let handle = self.synth_handle();
+        let mut frame = ff_core::backend::Frame::new(
+            payload.to_vec(),
+            ff_core::backend::FrameKind::Event,
+        )
+        .with_frame_type(frame_type);
+        if let Some(cid) = metadata {
+            frame = frame.with_correlation_id(cid);
+        }
+        self.backend
+            .append_frame(&handle, frame)
             .await
-            .map_err(SdkError::Valkey)?;
-
-        parse_append_frame_result(&raw)
+            .map_err(SdkError::from)
     }
 
     // ── Phase 3: Suspend ──
@@ -1614,82 +1574,6 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
     } else {
         Ok(SignalOutcome::Accepted { signal_id, effect })
     }
-}
-
-/// Parse ff_append_frame result: ok(entry_id, frame_count)
-fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => {
-            return Err(SdkError::from(ScriptError::Parse {
-                fcall: "parse_append_frame_result".into(),
-                execution_id: None,
-                message: "ff_append_frame: expected Array".into(),
-            }));
-        }
-    };
-
-    let status_code = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => {
-            return Err(SdkError::from(ScriptError::Parse {
-                fcall: "parse_append_frame_result".into(),
-                execution_id: None,
-                message: "ff_append_frame: bad status code".into(),
-            }));
-        }
-    };
-
-    if status_code != 1 {
-        let err_field_str = |idx: usize| -> String {
-            arr.get(idx)
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::SimpleString(s)) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        };
-        let error_code = {
-            let s = err_field_str(1);
-            if s.is_empty() { "unknown".to_owned() } else { s }
-        };
-        let detail = err_field_str(2);
-        return Err(SdkError::from(
-            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
-                ScriptError::Parse {
-                    fcall: "parse_append_frame_result".into(),
-                    execution_id: None,
-                    message: format!("ff_append_frame: {error_code}"),
-                }
-            }),
-        ));
-    }
-
-    // ok(entry_id, frame_count)  → arr[2] = entry_id, arr[3] = frame_count
-    let stream_id = arr
-        .get(2)
-        .and_then(|v| match v {
-            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            Ok(Value::SimpleString(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    let frame_count = arr
-        .get(3)
-        .and_then(|v| match v {
-            Ok(Value::BulkString(b)) => String::from_utf8_lossy(b).parse::<u64>().ok(),
-            Ok(Value::SimpleString(s)) => s.parse::<u64>().ok(),
-            Ok(Value::Int(n)) => Some(*n as u64),
-            _ => None,
-        })
-        .unwrap_or(0);
-
-    Ok(AppendFrameOutcome {
-        stream_id,
-        frame_count,
-    })
 }
 
 /// Parse ff_fail_execution result:

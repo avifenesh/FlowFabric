@@ -727,7 +727,15 @@ async fn append_frame_impl(
 
     let now = now_ms_timestamp();
     let payload_str = String::from_utf8_lossy(&frame.bytes).into_owned();
-    let frame_type = frame_kind_to_str(frame.kind);
+    // Free-form `frame_type` wins when populated (SDK forwarder path
+    // sets it to "delta" / "agent_step" / etc.); otherwise fall back
+    // to the stable `FrameKind` encoding for typed-only callers.
+    let frame_type: String = if frame.frame_type.is_empty() {
+        frame_kind_to_str(frame.kind).to_owned()
+    } else {
+        frame.frame_type.clone()
+    };
+    let correlation_id = frame.correlation_id.clone().unwrap_or_default();
 
     let keys: Vec<String> = vec![
         ctx.core(),
@@ -743,11 +751,11 @@ async fn append_frame_impl(
         f.attempt_index.to_string(),
         f.lease_id.to_string(),
         f.lease_epoch.to_string(),
-        frame_type.to_owned(),
+        frame_type,
         now.to_string(),
         payload_str,
         "utf8".to_owned(),
-        String::new(), // correlation_id — trait `Frame` has no slot today
+        correlation_id,
         "worker".to_owned(),
         "10000".to_owned(),
         f.attempt_id.to_string(),
