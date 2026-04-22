@@ -7,6 +7,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Wired `BackendRetry` to ferriskey `ClientBuilder::retry_strategy` in
+  `ValkeyBackend::connect`. All 4 fields honored when set; when
+  all-`None`, ferriskey's builder default is used (no call to
+  `.retry_strategy`).
 - Reshaped `BackendRetry` to match ferriskey's `ConnectionRetryStrategy`
   (fields: `exponent_base`, `factor`, `number_of_retries`,
   `jitter_percent`). Previous `max_attempts`/`base_backoff` were
