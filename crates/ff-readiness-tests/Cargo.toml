@@ -1,0 +1,40 @@
+[package]
+name = "ff-readiness-tests"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "FlowFabric readiness tests — release-gate smoke tests (PR-D1)"
+
+# Skip cargo-release version bumps — dev-only, never published.
+[package.metadata.release]
+release = false
+
+[features]
+# Default OFF so `cargo test --workspace` does not attempt to run these.
+# CI enables `readiness` on the dedicated matrix cell (PR-D4).
+readiness = []
+
+[dependencies]
+ff-core = { workspace = true }
+ff-script = { workspace = true }
+ff-engine = { workspace = true }
+ff-scheduler = { workspace = true }
+ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
+ff-server = { workspace = true }
+ff-test = { workspace = true }
+ferriskey = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "process"] }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+serial_test = "3"
+axum = { workspace = true }
