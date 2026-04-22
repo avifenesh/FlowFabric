@@ -87,17 +87,19 @@ pub async fn stage_diamond_dag(server: &InProcessServer, ns: &str, lane: &str) -
     let c = create_member(server, &flow_id, ns, lane, "C", now).await;
     let d = create_member(server, &flow_id, ns, lane, "D", now).await;
 
-    // Each create_member bumps graph_revision by 1 via
-    // ff_add_execution_to_flow → start at 4 for the first edge and
-    // climb by 1 per stage_dependency_edge.
+    // ff_add_execution_to_flow bumps graph_revision by 1 per member,
+    // so the first staged edge expects revision 4. After that, thread
+    // the authoritative new_graph_revision returned by
+    // stage_dependency_edge through each subsequent call — assuming a
+    // fixed +1 bump is brittle against future Lua changes.
     let mut rev: u64 = 4;
-    let e_ab = stage_and_apply_edge(server, &flow_id, &a, &b, rev).await;
-    rev += 1;
-    let e_ac = stage_and_apply_edge(server, &flow_id, &a, &c, rev).await;
-    rev += 1;
-    let e_bd = stage_and_apply_edge(server, &flow_id, &b, &d, rev).await;
-    rev += 1;
-    let e_cd = stage_and_apply_edge(server, &flow_id, &c, &d, rev).await;
+    let (e_ab, new_rev) = stage_and_apply_edge(server, &flow_id, &a, &b, rev).await;
+    rev = new_rev;
+    let (e_ac, new_rev) = stage_and_apply_edge(server, &flow_id, &a, &c, rev).await;
+    rev = new_rev;
+    let (e_bd, new_rev) = stage_and_apply_edge(server, &flow_id, &b, &d, rev).await;
+    rev = new_rev;
+    let (e_cd, _final_rev) = stage_and_apply_edge(server, &flow_id, &c, &d, rev).await;
 
     // Edge ids are recoverable at read-time via list_*_edges; not
     // load-bearing for assertions, so don't stash them.
@@ -150,14 +152,17 @@ async fn create_member(
 }
 
 /// Stage one `success_only` edge + apply it to the downstream. Both
-/// ops always happen together in this test, so one helper.
+/// ops always happen together in this test, so one helper. Returns
+/// `(edge_id, new_graph_revision)` so callers thread the server's
+/// authoritative revision into the next stage call rather than
+/// assuming a fixed +1 bump.
 async fn stage_and_apply_edge(
     server: &InProcessServer,
     flow_id: &FlowId,
     up: &ExecutionId,
     down: &ExecutionId,
     expected_graph_revision: u64,
-) -> EdgeId {
+) -> (EdgeId, u64) {
     let edge_id = EdgeId::new();
     let now = TimestampMs::now();
     let staged = server
@@ -191,7 +196,7 @@ async fn stage_and_apply_edge(
         })
         .await
         .expect("apply_dependency_to_child");
-    edge_id
+    (edge_id, new_rev)
 }
 
 /// Poll `worker.claim_next` until the reclaimed task matches `eid`.
@@ -306,31 +311,39 @@ pub async fn await_public_state(
     }
 }
 
-/// Invariant helper: for `ms` milliseconds (sampled at 100ms cadence),
-/// the execution's `public_state` must NOT become `Waiting` (i.e.
-/// must NOT be eligible-to-claim). If it does, that is a
-/// fanin-semantics violation — an `all_required` downstream was
-/// promoted before ALL of its parents reached a satisfying terminal
-/// state.
+/// Invariant helper: for `ms` milliseconds (sampled at 100 ms cadence),
+/// the execution's `public_state` must NOT become `Waiting` (i.e. must
+/// NOT be eligible-to-claim). If it does, that is a fanin-semantics
+/// violation — an `all_required` downstream was promoted before ALL of
+/// its parents reached a satisfying terminal state.
 ///
 /// Single-shot checks against an async completion listener are racey,
-/// so we sample across the full window. `10x100ms` per the PR-D1c
-/// plan's D-eligibility-between-B-and-C invariant.
+/// so we sample across the full window. Uses an `Instant`-based
+/// deadline so the window covers exactly `ms` milliseconds even for
+/// `ms` values that aren't multiples of 100 (e.g. 150 ms previously
+/// floored to a single sample via integer division).
 pub async fn assert_not_waiting_for(
     worker: &ff_sdk::FlowFabricWorker,
     eid: &ExecutionId,
     ms: u64,
 ) {
-    let samples = (ms / 100).max(1) as usize;
-    for i in 0..samples {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let mut sample = 0usize;
+    loop {
         let got = read_public_state(worker, eid).await;
         assert_ne!(
             got,
             PublicState::Waiting,
-            "{eid} became Waiting at sample {i}/{samples} — fanin \
-             `all_required` violated (downstream promoted before all \
-             parents terminal); public_state={got:?}"
+            "{eid} became Waiting at sample {sample} within {ms}ms window \
+             — fanin `all_required` violated (downstream promoted before \
+             all parents terminal); public_state={got:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        sample += 1;
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
     }
 }
