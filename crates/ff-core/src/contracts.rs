@@ -1072,7 +1072,10 @@ pub struct ReportUsageArgs {
     pub deltas: Vec<u64>,
     pub now: TimestampMs,
     /// Optional idempotency key to prevent double-counting on retries.
-    /// Must share the budget's `{b:M}` hash tag for cluster safety.
+    /// Pass the raw dedup id (e.g. `"retry-42"`); the typed FCALL wrapper
+    /// wraps it into `ff:usagededup:{b:M}:<id>` using the budget
+    /// partition's hash tag so it co-locates with the other budget keys
+    /// (#108).
     #[serde(default)]
     pub dedup_key: Option<String>,
 }
