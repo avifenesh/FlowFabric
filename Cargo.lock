@@ -866,7 +866,6 @@ dependencies = [
  "ff-core",
  "ff-observability",
  "futures",
- "serde",
  "serde_json",
  "tokio",
  "tracing",

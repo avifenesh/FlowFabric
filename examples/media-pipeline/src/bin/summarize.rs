@@ -30,7 +30,7 @@ use anyhow::Context;
 use clap::Parser;
 use ff_sdk::{
     read_stream, ClaimedTask, ConditionMatcher, FlowFabricAdminClient, FlowFabricWorker,
-    SuspendOutcome, TimeoutBehavior, WorkerConfig, STREAM_READ_HARD_CAP,
+    StreamCursor, SuspendOutcome, TimeoutBehavior, WorkerConfig, STREAM_READ_HARD_CAP,
 };
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -285,8 +285,8 @@ async fn load_persisted_result(
         partition_config,
         task.execution_id(),
         task.attempt_index(),
-        "-",
-        "+",
+        StreamCursor::Start,
+        StreamCursor::End,
         STREAM_READ_HARD_CAP,
     )
     .await

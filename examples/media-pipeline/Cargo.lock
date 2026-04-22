@@ -884,10 +884,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-backend-valkey"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "ferriskey",
+ "ff-core",
+ "ff-script",
+ "futures-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ff-core"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "crc16",
+ "futures-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -911,6 +928,7 @@ name = "ff-sdk"
 version = "0.3.0"
 dependencies = [
  "ferriskey",
+ "ff-backend-valkey",
  "ff-core",
  "ff-script",
  "reqwest",
