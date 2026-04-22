@@ -559,7 +559,7 @@ pub enum FailOutcome {
 
 // ── Stage 1a: BackendConfig + sub-types ─────────────────────────────────
 
-/// Pool + keepalive timing shared across backend connections.
+/// Pool timing shared across backend connections.
 ///
 /// Fields are `#[non_exhaustive]` per project convention — connection
 /// tunables grow as new backends land. Default is the Phase-1 Valkey
@@ -570,8 +570,6 @@ pub enum FailOutcome {
 pub struct BackendTimeouts {
     /// Per-request timeout. `None` ⇒ backend default.
     pub request: Option<Duration>,
-    /// Idle-connection keepalive interval. `None` ⇒ backend default.
-    pub keepalive: Option<Duration>,
 }
 
 /// Retry policy shared across backend connections. Additive; Stage 1a

@@ -3,6 +3,17 @@
 All notable changes to FlowFabric are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Removed
+
+- **`BackendTimeouts.keepalive` field.** ferriskey handles TCP keepalive
+  unconditionally with OS-default settings
+  (`ferriskey/src/connection/tokio.rs:33-36`); the field was never wired
+  and had no observable behavior. Consumers can re-add custom-interval
+  wiring if needed via a future additive field. Breaking public-field
+  removal accepted under pre-1.0 posture.
+
 ## [0.3.3] - 2026-04-22
 
 ### Fixed
