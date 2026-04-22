@@ -552,7 +552,11 @@ end)
 --            terminal_zset, lease_current, lease_history, active_index,
 --            stream_meta, result_key, attempt_timeout_zset,
 --            execution_deadline_zset
--- ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, result_payload
+-- ARGV (6): execution_id, lease_id, lease_epoch, attempt_id, result_payload,
+--           source
+--   source (args[6]) — RFC #58.5: empty fence triple requires
+--   source == "operator_override" to proceed unfenced; otherwise the
+--   FCALL returns err("fence_required"). Terminal op, so gate is strict.
 ---------------------------------------------------------------------------
 redis.register_function('ff_complete_execution', function(keys, args)
   local K = {
@@ -572,10 +576,11 @@ redis.register_function('ff_complete_execution', function(keys, args)
 
   local A = {
     execution_id  = args[1],
-    lease_id      = args[2],
-    lease_epoch   = args[3],
-    attempt_id    = args[4],
+    lease_id      = args[2] or "",
+    lease_epoch   = args[3] or "",
+    attempt_id    = args[4] or "",
     result_payload = args[5] or "",
+    source         = args[6] or "",
   }
 
   local t = redis.call("TIME")
@@ -586,9 +591,20 @@ redis.register_function('ff_complete_execution', function(keys, args)
   if #raw == 0 then return err("execution_not_found") end
   local core = hgetall_to_table(raw)
 
-  local lease_err = validate_lease_and_mark_expired(
-    core, A, now_ms, K, 1000)
-  if lease_err then return lease_err end
+  -- RFC #58.5 — fence resolution. Terminal ops require either a
+  -- non-empty fence triple OR source=="operator_override".
+  local fence, must_check_or_err = resolve_lease_fence(core, A)
+  if not fence then return must_check_or_err end
+  if not must_check_or_err then
+    if A.source ~= "operator_override" then return err("fence_required") end
+    A.lease_id    = fence.lease_id
+    A.lease_epoch = fence.lease_epoch
+    A.attempt_id  = fence.attempt_id
+  else
+    local lease_err = validate_lease_and_mark_expired(
+      core, A, now_ms, K, 1000)
+    if lease_err then return lease_err end
+  end
 
   -- End attempt
   redis.call("HSET", K.attempt_hash,
@@ -885,7 +901,10 @@ end)
 -- KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
 --           lease_expiry_zset, worker_leases, active_index,
 --           delayed_zset, attempt_timeout_zset
--- ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, delay_until
+-- ARGV (6): execution_id, lease_id, lease_epoch, attempt_id, delay_until,
+--           source
+--   source (args[6]) — RFC #58.5: terminal-op-style fence gate. Empty
+--   fence triple requires source == "operator_override" to proceed unfenced.
 ---------------------------------------------------------------------------
 redis.register_function('ff_delay_execution', function(keys, args)
   local K = {
@@ -902,10 +921,11 @@ redis.register_function('ff_delay_execution', function(keys, args)
 
   local A = {
     execution_id = args[1],
-    lease_id     = args[2],
-    lease_epoch  = args[3],
-    attempt_id   = args[4],
+    lease_id     = args[2] or "",
+    lease_epoch  = args[3] or "",
+    attempt_id   = args[4] or "",
     delay_until  = args[5],
+    source       = args[6] or "",
   }
 
   local t = redis.call("TIME")
@@ -915,10 +935,19 @@ redis.register_function('ff_delay_execution', function(keys, args)
   if #raw == 0 then return err("execution_not_found") end
   local core = hgetall_to_table(raw)
 
-  -- Validate lease
-  local lease_err = validate_lease_and_mark_expired(
-    core, A, now_ms, K, 1000)
-  if lease_err then return lease_err end
+  -- RFC #58.5 — fence resolution with operator override for terminal-style ops.
+  local fence, must_check_or_err = resolve_lease_fence(core, A)
+  if not fence then return must_check_or_err end
+  if not must_check_or_err then
+    if A.source ~= "operator_override" then return err("fence_required") end
+    A.lease_id    = fence.lease_id
+    A.lease_epoch = fence.lease_epoch
+    A.attempt_id  = fence.attempt_id
+  else
+    local lease_err = validate_lease_and_mark_expired(
+      core, A, now_ms, K, 1000)
+    if lease_err then return lease_err end
+  end
 
   -- OOM-SAFE WRITE ORDERING: exec_core FIRST (point of no return)
   -- ALL 7 state vector dimensions
@@ -979,7 +1008,9 @@ end)
 -- KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
 --           lease_expiry_zset, worker_leases, active_index,
 --           blocked_deps_zset, attempt_timeout_zset
--- ARGV (4): execution_id, lease_id, lease_epoch, attempt_id
+-- ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, source
+--   source (args[5]) — RFC #58.5: terminal-op-style fence gate. Empty
+--   fence triple requires source == "operator_override" to proceed unfenced.
 ---------------------------------------------------------------------------
 redis.register_function('ff_move_to_waiting_children', function(keys, args)
   local K = {
@@ -996,9 +1027,10 @@ redis.register_function('ff_move_to_waiting_children', function(keys, args)
 
   local A = {
     execution_id = args[1],
-    lease_id     = args[2],
-    lease_epoch  = args[3],
-    attempt_id   = args[4],
+    lease_id     = args[2] or "",
+    lease_epoch  = args[3] or "",
+    attempt_id   = args[4] or "",
+    source       = args[5] or "",
   }
 
   local t = redis.call("TIME")
@@ -1008,10 +1040,19 @@ redis.register_function('ff_move_to_waiting_children', function(keys, args)
   if #raw == 0 then return err("execution_not_found") end
   local core = hgetall_to_table(raw)
 
-  -- Validate lease
-  local lease_err = validate_lease_and_mark_expired(
-    core, A, now_ms, K, 1000)
-  if lease_err then return lease_err end
+  -- RFC #58.5 — fence resolution with operator override for terminal-style ops.
+  local fence, must_check_or_err = resolve_lease_fence(core, A)
+  if not fence then return must_check_or_err end
+  if not must_check_or_err then
+    if A.source ~= "operator_override" then return err("fence_required") end
+    A.lease_id    = fence.lease_id
+    A.lease_epoch = fence.lease_epoch
+    A.attempt_id  = fence.attempt_id
+  else
+    local lease_err = validate_lease_and_mark_expired(
+      core, A, now_ms, K, 1000)
+    if lease_err then return lease_err end
+  end
 
   -- OOM-SAFE WRITE ORDERING: exec_core FIRST (point of no return, §4.8b Rule 2)
   -- ALL 7 state vector dimensions
@@ -1074,8 +1115,10 @@ end)
 --            terminal_zset, delayed_zset, lease_current, lease_history,
 --            active_index, stream_meta, attempt_timeout_zset,
 --            execution_deadline_zset
--- ARGV (7): execution_id, lease_id, lease_epoch, attempt_id,
---           failure_reason, failure_category, retry_policy_json
+-- ARGV (8): execution_id, lease_id, lease_epoch, attempt_id,
+--           failure_reason, failure_category, retry_policy_json, source
+--   source (args[8]) — RFC #58.5: terminal op, so empty fence triple
+--   requires source == "operator_override" to proceed unfenced.
 ---------------------------------------------------------------------------
 redis.register_function('ff_fail_execution', function(keys, args)
   local K = {
@@ -1095,12 +1138,13 @@ redis.register_function('ff_fail_execution', function(keys, args)
 
   local A = {
     execution_id     = args[1],
-    lease_id         = args[2],
-    lease_epoch      = args[3],
-    attempt_id       = args[4],
+    lease_id         = args[2] or "",
+    lease_epoch      = args[3] or "",
+    attempt_id       = args[4] or "",
     failure_reason   = args[5],
     failure_category = args[6],
     retry_policy_json = args[7] or "",
+    source            = args[8] or "",
   }
 
   local t = redis.call("TIME")
@@ -1111,9 +1155,19 @@ redis.register_function('ff_fail_execution', function(keys, args)
   if #raw == 0 then return err("execution_not_found") end
   local core = hgetall_to_table(raw)
 
-  local lease_err = validate_lease_and_mark_expired(
-    core, A, now_ms, K, 1000)
-  if lease_err then return lease_err end
+  -- RFC #58.5 — fence resolution with operator override for terminal ops.
+  local fence, must_check_or_err = resolve_lease_fence(core, A)
+  if not fence then return must_check_or_err end
+  if not must_check_or_err then
+    if A.source ~= "operator_override" then return err("fence_required") end
+    A.lease_id    = fence.lease_id
+    A.lease_epoch = fence.lease_epoch
+    A.attempt_id  = fence.attempt_id
+  else
+    local lease_err = validate_lease_and_mark_expired(
+      core, A, now_ms, K, 1000)
+    if lease_err then return lease_err end
+  end
 
   -- 2. End current attempt
   redis.call("HSET", K.attempt_hash,
