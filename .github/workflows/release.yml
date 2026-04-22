@@ -65,10 +65,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       valkey:
-        # Valkey >= 8.0 required by RFC-011 §13 (ff-server refuses to
-        # boot against 7.x). Major-version pin — tracks 8.x patches
-        # without drift risk from a moving `:latest`. Matches the
-        # matrix-ci and cairn-fabric pins for reproducibility.
+        # Valkey >= 7.2 required by RFC-011 §13 Amendment F (ff-server
+        # refuses to boot below 7.2). Release-time verification pins
+        # the major-8 alpine image — matches cairn-fabric's reference
+        # deployment. Matrix CI separately exercises the 7.2 floor;
+        # this job just needs a floor-compliant image to run the tests.
         image: valkey/valkey:8-alpine
         ports:
           - 6379:6379

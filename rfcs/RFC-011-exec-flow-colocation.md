@@ -1008,16 +1008,18 @@ Kept to the minimum. Each has a decision protocol for when data arrives; nothing
 
 ## §13 Valkey version compatibility
 
-**Floor: Valkey 8.0.**
+**Floor: Valkey 7.2.** (See Amendment F below for the floor-revert rationale; supersedes the originally-proposed 8.0 floor.)
 
 Rationale:
-* FlowFabric already depends on Valkey Functions (stabilised in Valkey 7.2 / Redis 7.0), RESP3 (Valkey 7.2+), and hash-tag routing (stable since Redis 3.0). We were effectively at the Valkey 7.2 floor before this RFC.
-* cairn-fabric (our only production-adjacent consumer) pins `valkey/valkey:8-alpine` in its test harness. Sources: `/tmp/cairn-rs/scripts/run-fabric-integration-tests.sh` (`VALKEY_IMAGE="${VALKEY_IMAGE:-valkey/valkey:8-alpine}"`), `/tmp/cairn-rs/crates/cairn-fabric/README.md` (same default), `/tmp/cairn-rs/.github/workflows/ci.yml` ("disposable Valkey 8 container via testcontainers-rs").
-* Moving our floor to 8.0 aligns with cairn's pin and unblocks future work (e.g. the Module API explorations in RFC-012, which target Valkey 8's `ValkeyModule_*` naming convention).
+* FlowFabric depends on Valkey Functions (stabilised in Valkey 7.2 / Redis 7.0), RESP3 (Valkey 7.2+), and hash-tag routing (stable since Redis 3.0). These are the primitives actually used by the co-location design — nothing the RFC adds requires an 8.0-only behavior.
+* cairn-fabric (our only production-adjacent consumer) pins `valkey/valkey:8-alpine` in its test harness, but cairn can run against any Valkey ≥ 7.2 — the 8 pin is its reproducibility choice, not a FlowFabric requirement. Sources: `/tmp/cairn-rs/scripts/run-fabric-integration-tests.sh`, `/tmp/cairn-rs/crates/cairn-fabric/README.md`.
+* Holding the floor at 7.2 keeps cairn's current deployment supported while leaving room for downstream operators who cannot move to 8 yet (slower-moving infra, managed-Valkey 7.2 instances, etc.).
 
-**Explicit compatibility commitment:** `ff-server` post-RFC-011 targets Valkey 8.0+. Valkey 7.x is not supported. Redis (any version) is not supported and never was — FlowFabric is a Valkey-native engine.
+**Explicit compatibility commitment:** `ff-server` targets Valkey 7.2+. Valkey 7.0 / 7.1 and earlier are not supported. Redis (any version) is not supported and never was — FlowFabric is a Valkey-native engine.
 
-**Version assertion:** `ff-server` boot-time version check (added in phase 3) reads `INFO server` and refuses to start against Valkey < 8.0 with a structured error message. **Retry budget: 60s with exponential backoff** to tolerate rolling-upgrade transients where a replica is temporarily stale (see §9.17). After 60s the server exits; that's a misconfiguration signal, not a transient. Single CI matrix entry: `VALKEY_IMAGE=valkey/valkey:8-alpine`.
+**Version assertion:** `ff-server` boot-time version check (added in phase 3) reads `INFO server` and refuses to start against Valkey < 7.2 with a structured `ServerError::ValkeyVersionTooLow { detected, required }` error. **Retry budget: 60s with exponential backoff** to tolerate rolling-upgrade transients where a replica is temporarily stale (see §9.17). After 60s the server exits; that's a misconfiguration signal, not a transient. CI matrix includes both `valkey/valkey:8-alpine` (primary) and `valkey/valkey:7.2` (floor guard) to prevent accidental 8-specific primitive adoption.
+
+**Amendment F — Floor revert from 8.0 to 7.2 (post-phase-3).** The originally-shipped phase-3 floor was Valkey 8.0. Post-ship review found the 8.0 floor was not load-bearing: every primitive this RFC actually uses (Functions, RESP3, hash-tags, co-located FCALL, `COPY … REPLACE`) was already available and stable in Valkey 7.2. The 8.0 rationale rested on "cairn pins 8" — but cairn's pin is a reproducibility choice and cairn can run against 7.2. Lowering the floor to 7.2 supports downstream operators on slower-moving infra without costing FlowFabric any capability. The 8.0 floor was implemented in `ff-server`'s `verify_valkey_version` as a major-only (`detected_major >= 8`) comparison; the revert changes it to a `(major, minor) >= (7, 2)` comparison and adds a parse step for the minor component (Valkey always reports `major.minor.patch` in INFO so no response-shape change is needed). CI gains a `valkey/valkey:7.2` × linux-x86_64 × standalone entry to guard against future accidental 8-specific adoption.
 
 ## §14 References
 
