@@ -109,6 +109,16 @@ pub struct FlowFabricWorker {
     /// migrates them through this field, and Stage 1d removes the
     /// embedded client.
     backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
+    /// Optional upcast to the same underlying backend viewed as a
+    /// [`CompletionBackend`](ff_core::completion_backend::CompletionBackend).
+    /// Populated by [`Self::connect`] from the bundled
+    /// `ValkeyBackend` (which implements the trait); cleared by
+    /// [`Self::connect_with`] because a caller-supplied
+    /// `Arc<dyn EngineBackend>` cannot be re-upcast. Cairn and other
+    /// completion-subscription consumers reach this through
+    /// [`Self::completion_backend`].
+    completion_backend_handle:
+        Option<Arc<dyn ff_core::completion_backend::CompletionBackend>>,
 }
 
 /// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
@@ -449,10 +459,18 @@ impl FlowFabricWorker {
         // ValkeyBackend so `ClaimedTask`'s trait forwarders have
         // something to call. `from_client_and_partitions` reuses the
         // already-dialed client — no second connection.
-        let backend = ff_backend_valkey::ValkeyBackend::from_client_and_partitions(
-            client.clone(),
-            partition_config,
-        );
+        // Share the concrete `Arc<ValkeyBackend>` across the two
+        // trait objects — one allocation, both accessors yield
+        // identity-equivalent handles.
+        let valkey_backend: Arc<ff_backend_valkey::ValkeyBackend> =
+            ff_backend_valkey::ValkeyBackend::from_client_and_partitions(
+                client.clone(),
+                partition_config,
+            );
+        let backend: Arc<dyn ff_core::engine_backend::EngineBackend> = valkey_backend.clone();
+        let completion_backend_handle: Option<
+            Arc<dyn ff_core::completion_backend::CompletionBackend>,
+        > = Some(valkey_backend);
 
         Ok(Self {
             client,
@@ -468,6 +486,7 @@ impl FlowFabricWorker {
             #[cfg(feature = "direct-valkey-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
             backend,
+            completion_backend_handle,
         })
     }
 
@@ -506,6 +525,12 @@ impl FlowFabricWorker {
     ) -> Result<Self, SdkError> {
         let mut worker = Self::connect(config).await?;
         worker.backend = backend;
+        // The caller-supplied trait object cannot be upcast to
+        // `CompletionBackend` without loss of identity; clear the
+        // default `ValkeyBackend`-derived handle so
+        // `completion_backend()` reports `None`, reflecting that
+        // the caller-supplied backend owns the surface now.
+        worker.completion_backend_handle = None;
         Ok(worker)
     }
 
@@ -518,6 +543,30 @@ impl FlowFabricWorker {
     /// `&Arc<dyn EngineBackend>`.
     pub fn backend(&self) -> Option<&Arc<dyn ff_core::engine_backend::EngineBackend>> {
         Some(&self.backend)
+    }
+
+    /// Handle to the completion-event subscription backend, for
+    /// consumers that need to observe execution completions (DAG
+    /// reconcilers, tenant-isolated subscribers).
+    ///
+    /// Returns `Some` when the worker was built through
+    /// [`Self::connect`] on the default `valkey-default` feature
+    /// (the bundled `ValkeyBackend` implements
+    /// [`CompletionBackend`](ff_core::completion_backend::CompletionBackend)).
+    /// Returns `None` when the worker was built via
+    /// [`Self::connect_with`] (the caller-supplied
+    /// `Arc<dyn EngineBackend>` cannot be re-upcast to
+    /// `CompletionBackend`), or for hypothetical future backends
+    /// that don't support push-based completion streams.
+    ///
+    /// The returned handle shares the same underlying allocation as
+    /// [`Self::backend`]; calls through it (e.g.
+    /// `subscribe_completions_filtered`) hit the same connection
+    /// the worker itself uses.
+    pub fn completion_backend(
+        &self,
+    ) -> Option<Arc<dyn ff_core::completion_backend::CompletionBackend>> {
+        self.completion_backend_handle.clone()
     }
 
     /// Get a reference to the underlying ferriskey client.
@@ -1596,6 +1645,27 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
         num_budget_partitions: parse("num_budget_partitions", 32),
         num_quota_partitions: parse("num_quota_partitions", 32),
     })
+}
+
+#[cfg(test)]
+mod completion_accessor_type_tests {
+    //! Type-level compile check that
+    //! [`FlowFabricWorker::completion_backend`] returns an
+    //! `Option<Arc<dyn CompletionBackend>>`. No Valkey required —
+    //! the assertion is at the function-pointer type level and the
+    //! #[test] body exists solely so the compiler elaborates it.
+    use super::FlowFabricWorker;
+    use ff_core::completion_backend::CompletionBackend;
+    use std::sync::Arc;
+
+    #[test]
+    fn completion_backend_accessor_signature() {
+        // If this line compiles, the public accessor returns the
+        // advertised type. The function is never called (no live
+        // worker), so no I/O happens.
+        let _f: fn(&FlowFabricWorker) -> Option<Arc<dyn CompletionBackend>> =
+            FlowFabricWorker::completion_backend;
+    }
 }
 
 #[cfg(all(test, feature = "direct-valkey-claim"))]
