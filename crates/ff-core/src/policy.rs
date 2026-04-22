@@ -69,10 +69,10 @@ impl Default for BackoffStrategy {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimeoutPolicy {
     /// Per-attempt timeout in milliseconds.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_timeout_ms: Option<u64>,
     /// Total execution deadline (absolute timestamp or duration from creation).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_deadline_ms: Option<u64>,
     /// Maximum number of lease-expiry reclaims before failing with max_reclaims_exceeded.
     /// Default: 100.
@@ -88,7 +88,7 @@ fn default_max_reclaim_count() -> u32 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SuspensionPolicy {
     /// Default suspension timeout in milliseconds.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_timeout_ms: Option<u64>,
     /// What happens when suspension times out: "fail" or "cancel".
     #[serde(default = "default_timeout_behavior")]
@@ -114,7 +114,7 @@ pub struct FallbackTier {
     /// Model identifier.
     pub model: String,
     /// Optional per-tier timeout override in ms.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }
 
@@ -129,10 +129,10 @@ pub struct RoutingRequirements {
     #[serde(default)]
     pub required_capabilities: BTreeSet<String>,
     /// Preferred locality/region.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_locality: Option<String>,
     /// Isolation level.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation_level: Option<String>,
 }
 
@@ -146,7 +146,7 @@ pub struct StreamPolicy {
     #[serde(default = "default_retention_maxlen")]
     pub retention_maxlen: u64,
     /// Stream retention TTL in ms after closure.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_ttl_ms: Option<u64>,
 }
 
@@ -165,22 +165,22 @@ pub struct ExecutionPolicy {
     #[serde(default)]
     pub priority: i32,
     /// Earliest eligible time.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_until: Option<TimestampMs>,
     /// Retry configuration.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
     /// Timeout configuration.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_policy: Option<TimeoutPolicy>,
     /// Maximum lease-expiry reclaims. Default: 100.
     #[serde(default = "default_max_reclaim_count")]
     pub max_reclaim_count: u32,
     /// Suspension behavior.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspension_policy: Option<SuspensionPolicy>,
     /// Fallback chain.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_policy: Option<FallbackPolicy>,
     /// Maximum number of replays. Default: 10.
     #[serde(default = "default_max_replay_count")]
@@ -189,13 +189,13 @@ pub struct ExecutionPolicy {
     #[serde(default)]
     pub budget_ids: Vec<BudgetId>,
     /// Routing requirements.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_requirements: Option<RoutingRequirements>,
     /// Idempotency dedup window in ms. V1 default: 24h.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_window_ms: Option<u64>,
     /// Stream policy.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_policy: Option<StreamPolicy>,
     /// Maximum signal records accepted. Default: 10000.
     #[serde(default = "default_max_signals")]
@@ -313,6 +313,105 @@ mod tests {
         let policy: RetryPolicy = serde_json::from_str(json).unwrap();
         assert_eq!(policy.max_retries, 5);
         assert_eq!(policy.backoff, BackoffStrategy::default());
+    }
+
+    /// Regression: `ExecutionPolicy::default()` must not serialize any
+    /// `null` fields. Lua's `cjson.decode` maps JSON `null` to a
+    /// `cjson.null` sentinel (userdata), which fails the
+    /// `type(field) == "table"` checks in `lua/policy.lua` and produces
+    /// `invalid_policy_json:<field>:not_object` errors on every HTTP
+    /// consumer that posts a default-constructed policy.
+    #[test]
+    fn default_execution_policy_has_no_nulls() {
+        let policy = ExecutionPolicy::default();
+        let json = serde_json::to_value(&policy).unwrap();
+        let obj = json.as_object().expect("top-level object");
+        for (key, value) in obj {
+            assert!(
+                !value.is_null(),
+                "default ExecutionPolicy must not emit null field `{key}` — \
+                 Lua policy validation rejects null for optional table fields"
+            );
+        }
+        // Sanity: the scalar fields with defaults are still present.
+        assert_eq!(obj.get("priority"), Some(&serde_json::json!(0)));
+        assert_eq!(obj.get("max_reclaim_count"), Some(&serde_json::json!(100)));
+    }
+
+    /// Regression: setting a single optional field must not surface
+    /// `null` for the other seven. Reproduces the original failure mode:
+    /// a consumer sets `retry_policy` only, and the server rejects the
+    /// request because `routing_requirements: null` is interpreted as
+    /// a non-table by cjson.
+    #[test]
+    fn partial_execution_policy_omits_unset_options() {
+        let policy = ExecutionPolicy {
+            retry_policy: Some(RetryPolicy::default()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&policy).unwrap();
+        let obj = json.as_object().expect("top-level object");
+        for field in [
+            "delay_until",
+            "timeout_policy",
+            "suspension_policy",
+            "fallback_policy",
+            "routing_requirements",
+            "dedup_window_ms",
+            "stream_policy",
+        ] {
+            assert!(
+                !obj.contains_key(field),
+                "field `{field}` must be absent when unset, not `null`"
+            );
+        }
+        assert!(obj.contains_key("retry_policy"));
+    }
+
+    /// Round-trip a fully-populated policy to prove `skip_serializing_if`
+    /// does not drop set values.
+    #[test]
+    fn populated_execution_policy_round_trip() {
+        let policy = ExecutionPolicy {
+            priority: 7,
+            delay_until: Some(TimestampMs(123_456)),
+            retry_policy: Some(RetryPolicy::default()),
+            timeout_policy: Some(TimeoutPolicy {
+                attempt_timeout_ms: Some(30_000),
+                execution_deadline_ms: Some(300_000),
+                max_reclaim_count: 5,
+            }),
+            suspension_policy: Some(SuspensionPolicy {
+                default_timeout_ms: Some(60_000),
+                timeout_behavior: "cancel".into(),
+            }),
+            fallback_policy: Some(FallbackPolicy {
+                tiers: vec![FallbackTier {
+                    provider: "anthropic".into(),
+                    model: "claude-opus".into(),
+                    timeout_ms: Some(45_000),
+                }],
+            }),
+            routing_requirements: Some(RoutingRequirements {
+                required_capabilities: BTreeSet::from(["gpu".to_owned()]),
+                preferred_locality: Some("us-west-2".into()),
+                isolation_level: Some("strict".into()),
+            }),
+            dedup_window_ms: Some(86_400_000),
+            stream_policy: Some(StreamPolicy {
+                durability_mode: "durable".into(),
+                retention_maxlen: 5000,
+                retention_ttl_ms: Some(3_600_000),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(
+            !json.contains(":null"),
+            "populated policy must not contain null fields: {json}"
+        );
+        let parsed: ExecutionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(policy, parsed);
     }
 
     #[test]
