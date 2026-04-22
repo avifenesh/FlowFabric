@@ -2,7 +2,7 @@
 
 use ff_core::contracts::*;
 use crate::error::ScriptError;
-use ff_core::keys::{ExecKeyContext, IndexKeys};
+use ff_core::keys::{usage_dedup_key, ExecKeyContext, IndexKeys};
 
 use crate::result::{FcallResult, FromFcallResult};
 
@@ -19,10 +19,17 @@ use crate::result::{FcallResult, FromFcallResult};
 pub const MAX_BUDGET_DIMENSIONS: usize = 64;
 
 /// Key context for budget operations on {b:M}.
+///
+/// `hash_tag` is the budget partition's Valkey hash-tag (e.g. `{b:3}`,
+/// braces included) so the typed wrapper can wrap any per-call `dedup_key`
+/// into a slot-co-located `ff:usagededup:{b:M}:<dedup_id>` key without the
+/// caller needing to know the wrapping format. Mirrors
+/// [`ff_core::keys::ExecKeyContext::hash_tag`] (#108).
 pub struct BudgetOpKeys<'a> {
     pub usage_key: &'a str,
     pub limits_key: &'a str,
     pub def_key: &'a str,
+    pub hash_tag: &'a str,
 }
 
 /// Key context for budget block/unblock on {p:N}.
@@ -197,7 +204,17 @@ pub async fn ff_report_usage_and_check(
         argv.push(delta.to_string());
     }
     argv.push(args.now.to_string());
-    argv.push(args.dedup_key.clone().unwrap_or_default());
+    // #108: wrap dedup_key with the budget hash-tag so it co-locates with
+    // `k.usage_key`/`k.limits_key`/`k.def_key` on the same cluster slot and
+    // matches the format produced by `ff-server` + `ff-sdk` at the REST
+    // boundary. Empty/missing dedup_key forwards as empty string
+    // (Lua disables dedup in that branch).
+    let dedup_key_val = args.dedup_key
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(|s| usage_dedup_key(k.hash_tag, s))
+        .unwrap_or_default();
+    argv.push(dedup_key_val);
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
