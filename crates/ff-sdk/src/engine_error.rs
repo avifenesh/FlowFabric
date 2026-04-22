@@ -87,15 +87,36 @@ pub enum EngineError {
     #[error("bug: {0:?}")]
     Bug(BugKind),
 
-    /// Valkey transport fault or FCALL response-parse failure.
-    /// Preserves the raw [`ScriptError`] via `Box` so callers can
-    /// recover the `ferriskey::ErrorKind` (for `Valkey`) or the
-    /// parse-site message (for `Parse`).
-    #[error("transport: {source}")]
+    /// Backend transport fault or response-parse failure (RFC-012 §4.2
+    /// round-4 shape). Broadened in Stage 0 to carry `Box<dyn Error>`
+    /// so non-Valkey backends (Postgres, future) can route their
+    /// native transport errors through this variant without going via
+    /// [`ScriptError`].
+    ///
+    /// * `backend` — static diagnostic label (`"valkey"`, `"postgres"`,
+    ///   etc.). Kept `&'static str` to avoid heap alloc on construction.
+    /// * `source` — boxed error. For the Valkey backend this is
+    ///   [`ScriptError`]; downcast with
+    ///   `source.downcast_ref::<ScriptError>()` to recover
+    ///   `ferriskey::ErrorKind` / parse detail.
+    ///
+    /// Valkey callers should prefer [`EngineError::transport_script`]
+    /// over struct-literal construction so the `backend` tag stays
+    /// consistent.
+    #[error("transport ({backend}): {source}")]
     Transport {
+        backend: &'static str,
         #[source]
-        source: Box<ScriptError>,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+
+    /// Backend method not wired up yet (RFC-012 §4.2 K#7 holdover).
+    /// Returned by staged backend impls for methods that are known
+    /// types in the trait but not yet implemented. Graceful degradation
+    /// in place of `unimplemented!()` panics. Additive; does not
+    /// participate in the `From<ScriptError>` mapping.
+    #[error("unavailable: {op}")]
+    Unavailable { op: &'static str },
 }
 
 /// Validation sub-kinds. 1:1 with the Lua validation codes.
@@ -316,6 +337,27 @@ pub enum BugKind {
 }
 
 impl EngineError {
+    /// Construct a Valkey-backed `Transport` from a [`ScriptError`].
+    /// Preferred over struct-literal construction so the `backend`
+    /// tag stays consistent across Valkey call sites.
+    pub fn transport_script(err: ScriptError) -> Self {
+        Self::Transport {
+            backend: "valkey",
+            source: Box::new(err),
+        }
+    }
+
+    /// If this is a `Transport` carrying a [`ScriptError`], return a
+    /// reference to the inner script error. Returns `None` when the
+    /// variant is something else, or when the boxed source is not a
+    /// `ScriptError` (e.g. a Postgres-backed transport error).
+    pub fn transport_script_ref(&self) -> Option<&ScriptError> {
+        match self {
+            Self::Transport { source, .. } => source.downcast_ref::<ScriptError>(),
+            _ => None,
+        }
+    }
+
     /// Classify an [`EngineError`] using the underlying
     /// [`ErrorClass`] table. Delegates to the `ScriptError` mapping
     /// via [`ScriptError::class`] when the original is recoverable
@@ -345,15 +387,30 @@ impl EngineError {
             ) => ErrorClass::Informational,
             Self::State(_) => ErrorClass::Terminal,
             Self::Bug(_) => ErrorClass::Bug,
-            Self::Transport { source } => source.class(),
+            // Downcast to ScriptError to reuse the Phase-1 classification
+            // table. A non-Valkey transport error (Postgres, future) has
+            // no ScriptError inside and is conservatively classified as
+            // Retryable (transport-level faults are recoverable by default).
+            Self::Transport { source, .. } => source
+                .downcast_ref::<ScriptError>()
+                .map(|s| s.class())
+                .unwrap_or(ErrorClass::Retryable),
+            // Unavailable is terminal at the call site — the method is
+            // not implemented; the caller must either fall back to a
+            // different code path or surface to the user.
+            Self::Unavailable { .. } => ErrorClass::Terminal,
         }
     }
 
     /// Returns the underlying ferriskey ErrorKind if this error maps
-    /// back to a transport-level fault.
+    /// back to a transport-level fault whose inner source is a
+    /// [`ScriptError`]. Postgres-backed or other non-Valkey transport
+    /// errors return `None`.
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
-            Self::Transport { source } => source.valkey_kind(),
+            Self::Transport { source, .. } => source
+                .downcast_ref::<ScriptError>()
+                .and_then(|s| s.valkey_kind()),
             _ => None,
         }
     }
@@ -390,9 +447,7 @@ impl EngineError {
             Err(transport) => {
                 // Follow-up read failed: fall back to the raw
                 // ScriptError so diagnostic detail is not lost.
-                return Err(Self::Transport {
-                    source: Box::new(ScriptError::Valkey(transport)),
-                });
+                return Err(Self::transport_script(ScriptError::Valkey(transport)));
             }
         };
         if raw.is_empty() {
@@ -400,17 +455,13 @@ impl EngineError {
             // dependency_already_exists — corruption or a
             // race with a concurrent writer. Surface as the
             // raw ScriptError rather than fabricate a stub.
-            return Err(Self::Transport {
-                source: Box::new(ScriptError::DependencyAlreadyExists),
-            });
+            return Err(Self::transport_script(ScriptError::DependencyAlreadyExists));
         }
         match crate::snapshot::build_edge_snapshot_public(flow_id, edge_id, &raw) {
             Ok(existing) => Ok(Self::Conflict(ConflictKind::DependencyAlreadyExists {
                 existing,
             })),
-            Err(_e) => Err(Self::Transport {
-                source: Box::new(ScriptError::DependencyAlreadyExists),
-            }),
+            Err(_e) => Err(Self::transport_script(ScriptError::DependencyAlreadyExists)),
         }
     }
 }
@@ -572,9 +623,7 @@ impl From<ScriptError> for EngineError {
             // raw ScriptError preserved — callers enrich via
             // `EngineError::enrich_dependency_conflict` at the
             // stage_dependency site.
-            S::DependencyAlreadyExists => Self::Transport {
-                source: Box::new(S::DependencyAlreadyExists),
-            },
+            S::DependencyAlreadyExists => Self::transport_script(S::DependencyAlreadyExists),
             S::CycleDetected => Self::Conflict(ConflictKind::CycleDetected),
             S::SelfReferencingEdge => Self::Conflict(ConflictKind::SelfReferencingEdge),
             S::ExecutionAlreadyInFlow => Self::Conflict(ConflictKind::ExecutionAlreadyInFlow),
@@ -624,9 +673,7 @@ impl From<ScriptError> for EngineError {
             S::AttemptNotInCreatedState => Self::Bug(BugKind::AttemptNotInCreatedState),
 
             // ── Transport (preserves source for Parse/Valkey) ──
-            e @ (S::Parse(_) | S::Valkey(_)) => Self::Transport {
-                source: Box::new(e),
-            },
+            e @ (S::Parse(_) | S::Valkey(_)) => Self::transport_script(e),
 
             // `ScriptError` is `#[non_exhaustive]`. A future variant
             // landed in ff-script before the mapping here was updated
@@ -635,9 +682,12 @@ impl From<ScriptError> for EngineError {
             // underlying error without a silent Display-string
             // downgrade. Adding the explicit variant later is a
             // non-breaking mapping refinement.
-            other => Self::Transport {
-                source: Box::new(other),
-            },
+            //
+            // This arm also routes Worker B's `FenceRequired` /
+            // `PartialFenceTriple` ScriptError variants through
+            // Transport until they are promoted to a typed EngineError
+            // bucket in a follow-up PR.
+            other => Self::transport_script(other),
         }
     }
 }
@@ -709,9 +759,14 @@ mod tests {
     fn dependency_already_exists_falls_through_to_transport_without_enrich() {
         // Plain From cannot fill `existing` — it defers to Transport
         // so the caller can upgrade via enrich_dependency_conflict.
-        match EngineError::from(ScriptError::DependencyAlreadyExists) {
-            EngineError::Transport { source } => {
-                assert!(matches!(*source, ScriptError::DependencyAlreadyExists));
+        let err = EngineError::from(ScriptError::DependencyAlreadyExists);
+        match &err {
+            EngineError::Transport { backend, source } => {
+                assert_eq!(*backend, "valkey");
+                assert!(matches!(
+                    source.downcast_ref::<ScriptError>(),
+                    Some(ScriptError::DependencyAlreadyExists)
+                ));
             }
             other => panic!("{other:?}"),
         }
@@ -755,12 +810,50 @@ mod tests {
 
     #[test]
     fn transport_preserves_parse() {
-        match EngineError::from(ScriptError::Parse("bad envelope".into())) {
-            EngineError::Transport { source } => {
-                assert!(matches!(*source, ScriptError::Parse(_)));
+        let err = EngineError::from(ScriptError::Parse("bad envelope".into()));
+        match &err {
+            EngineError::Transport { backend, source } => {
+                assert_eq!(*backend, "valkey");
+                assert!(matches!(
+                    source.downcast_ref::<ScriptError>(),
+                    Some(ScriptError::Parse(_))
+                ));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn transport_script_helper_round_trips() {
+        let err = EngineError::transport_script(ScriptError::AttemptNotFound);
+        assert!(matches!(
+            err.transport_script_ref(),
+            Some(ScriptError::AttemptNotFound)
+        ));
+        // Classification delegates to ScriptError::class via downcast
+        // — AttemptNotFound is Terminal per the Phase-1 table.
+        assert_eq!(err.class(), ScriptError::AttemptNotFound.class());
+    }
+
+    #[test]
+    fn unavailable_variant_is_terminal() {
+        let err = EngineError::Unavailable { op: "claim" };
+        assert_eq!(err.class(), ErrorClass::Terminal);
+        assert!(err.valkey_kind().is_none());
+        assert!(err.transport_script_ref().is_none());
+    }
+
+    #[test]
+    fn transport_with_non_script_source_classifies_retryable() {
+        // A hypothetical non-Valkey backend routing a native error.
+        let raw = std::io::Error::other("simulated postgres net error");
+        let err = EngineError::Transport {
+            backend: "postgres",
+            source: Box::new(raw),
+        };
+        assert_eq!(err.class(), ErrorClass::Retryable);
+        assert!(err.valkey_kind().is_none());
+        assert!(err.transport_script_ref().is_none());
     }
 
     #[test]
