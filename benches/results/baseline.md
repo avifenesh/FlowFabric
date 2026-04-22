@@ -82,39 +82,56 @@ present; no follow-up investigation filed in this cycle.
 `rfcs/drafts/scenario-4-regression-investigation.md`): depending on
 phase alignment between a refill batch and the steady-state drain, a
 single 300s run lands in either a low-miss regime (~2–4%) or a
-high-miss regime (~7%). Single-run sampling is therefore inadequate —
-the 3.88% v0.1.0 number and the 7.11% v0.3.2 number were both
-snapshots of opposite regimes of the same stable distribution, not a
-regression. The bench binary now takes `--samples N` and reports
-**mean ± stddev** across N independent 300s runs (Valkey `FLUSHALL`
-between samples). **N ≥ 5 is required** for release-gate numbers.
+high-miss regime (~6–7%). Single-run sampling is therefore inadequate —
+the 3.88% v0.1.0 number and the 7.11% v0.3.2 number in PR #133's
+baseline were both snapshots of opposite regimes of the same stable
+distribution, not a regression. The bench binary now takes
+`--samples N` and reports **mean ± stddev** across N independent 300s
+runs (Valkey `FLUSHALL` between samples). **N ≥ 5 is required** for
+release-gate numbers. Both endpoints below are now sampled at N=5 on
+the same host (Valkey 7.2.12).
 
-| metric                       | v0.3.3 (d813772, N=5) | v0.3.2 (da89fa9, N=1) | v0.1.0 (01f6327, N=1) | pre-BatchC (6f81926, N=1) |
-|------------------------------|-----------------------|-----------------------|-----------------------|---------------------------|
-| missed_deadline_pct mean     | **4.71%**             | 7.11%                 | 3.88%                 | 7.01%                     |
-| missed_deadline_pct stddev   | **2.23%**             | n/a (single sample)   | n/a                   | n/a                       |
-| missed_deadline_pct min / max| 1.98% / 7.04%         | n/a                   | n/a                   | n/a                       |
-| per-sample missed_pct        | 3.80, 3.73, 1.98, 7.04, 6.98 | —              | —                     | —                         |
-| completed (mean across N)    | 2611                  | 2680                  | 2580                  | 2679                      |
-| failed (sample avg)          | ~101                  | 105                   | 101                   | 102                       |
-| steady_state_ops/s (mean)    | 2.0                   | 2.0                   | 2.0                   | n/a                       |
-| lease_renewal_overhead (%)   | 0.000174              | 0.000178              | 0.00015               | 0.00017                   |
+| metric                        | HEAD (8a8d996, N=5) | v0.1.0 (01f6327, N=5) | v0.3.2 (da89fa9, N=1) | pre-BatchC (6f81926, N=1) |
+|-------------------------------|---------------------|-----------------------|-----------------------|---------------------------|
+| missed_deadline_pct mean      | **4.81%**           | **4.31%**             | 7.11%                 | 7.01%                     |
+| missed_deadline_pct stddev    | **1.55%**           | **1.81%**             | n/a (single sample)   | n/a                       |
+| missed_deadline_pct min / max | 3.59% / 7.01%       | 2.09% / 6.94%         | n/a                   | n/a                       |
+| per-sample missed_pct         | 3.80, 3.77, 3.59, 7.01, 5.90 | 5.04, 3.77, 3.73, 2.09, 6.94 | — | —               |
+| completed (mean across N)     | 2613                | 2599                  | 2680                  | 2679                      |
+| failed (mean across N)        | 103                 | 116                   | 105                   | 102                       |
+| steady_state_ops/s (mean)     | 2.0                 | 2.0                   | 2.0                   | n/a                       |
+| lease_renewal_overhead (%)    | 0.0                 | 0.0                   | 0.000178              | 0.00017                   |
 
-**No regression.** The N=5 sample at v0.3.3 (5 independent 300s runs
-on the reference host class, Valkey 7.2.12; versus the 8.1.0 the v0.1.0
-/ v0.3.2 single-sample entries were captured against — see host §) is
-`4.71% ± 2.23%`. Worker DD's bisect
+**No regression.** HEAD is `4.81% ± 1.55%`; v0.1.0 is `4.31% ± 1.81%`.
+Δ = +0.50pp, or ~0.3× the pooled stddev — well inside run-to-run
+variance. Both endpoints show the same bimodal pattern (3 low-regime +
+2 high-regime samples at each; see per-sample rows). The HEAD N=5
+measurement here also reproduces the shape of the v0.3.3 (`d813772`)
+N=5 measurement reported in PR #140 (4.71% ± 2.23%, samples
+`[3.80, 3.73, 1.98, 7.04, 6.98]`): means within 0.1pp, same 3-low +
+2-high split. Worker DD's bisect
 (`rfcs/drafts/scenario-4-regression-investigation.md`) cluster-sampled
 `missed_deadline_pct` at 6.98%–7.07% across 8 runs spanning 6 commits
-in `01f6327..da89fa9` — those 8 runs fell in the high-regime mode; the
-N=5 run here spans both modes (3× low, 2× high) and the reported mean
-is a mix of the two. Future comparisons are robust if both sides use
-N ≥ 5.
+in `01f6327..da89fa9` — those 8 runs all landed in the high-regime
+mode by chance; the N=5 runs here span both modes and confirm the
+distribution is stable across v0.1.0 → HEAD.
 
-The prior "regression" flag (3.88% → 7.11%) was a methodology artifact:
-two single-sample snapshots of a bimodal distribution compared as if
-they were point estimates of a scalar. Re-baseline each release's
-Scenario 4 row with N ≥ 5 before drawing comparisons.
+The prior "3.88% → 7.11% REGRESSION ×1.8" flag from PR #133's
+single-sample baseline was a methodology artifact: two single-sample
+snapshots of a bimodal distribution compared as if they were point
+estimates of a scalar. The v0.1.0 row in PR #133 is now superseded by
+the v0.1.0 N=5 column above; the v0.3.2 / pre-BatchC rows remain
+single-sample for historical reference and should not be compared
+directly against N=5 means. Re-baseline each release's Scenario 4 row
+with N ≥ 5 before drawing comparisons.
+
+Measurement note: the v0.1.0 long_running binary as shipped at
+`01f6327` was pre-RFC-011 and cannot submit executions against its
+own server (the ExecutionId hash-tag requirement landed in #46, post-
+v0.1.0 tag). The v0.1.0 N=5 run above was captured by applying the
+three-file harness fix from `4192664` onto the `01f6327` bench tree
+(bench wiring only; no server-side product change). This is the same
+composite Worker DD used for step 7 of the bisect.
 
 Lease renewal overhead and RSS profile both remain in the pre-v0.1.0
 envelope.
