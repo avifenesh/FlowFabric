@@ -6,22 +6,26 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Seven crates, all pinned to the same version, published in topological order:
+Eight crates, all pinned to the same version, published in topological order:
 
 1. `ferriskey`       — Valkey client (reparented fork of glide-core;
    the former `telemetrylib` sub-crate was inlined during the Tier 1
    envelope collapse and is no longer a separate publish target)
 2. `ff-core`         — types, keys, errors
 3. `ff-script`       — typed FCALL wrappers + Lua library loader
-4. `ff-engine`       — cross-partition dispatch + scanners
+4. `ff-observability` — OTEL metrics registry + typed handles + no-op
+   shim. Added to the publish set in v0.3.1 after v0.3.0
+   partial-published (ff-engine depends on it as a workspace dep
+   and its publish step fails without it being on crates.io).
+5. `ff-engine`       — cross-partition dispatch + scanners
    (includes the `completion_listener` module for push-based DAG
    promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
    §"DAG promotion: push listener + safety-net reconciler")
-5. `ff-scheduler`    — claim-grant scheduler
-6. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
+6. `ff-scheduler`    — claim-grant scheduler
+7. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
    off by default; production deployments use the scheduler-routed
    HTTP path via `FlowFabricWorker::claim_via_server`
-7. `ff-server`       — HTTP server library + binary
+8. `ff-server`       — HTTP server library + binary
 
 Excluded from publish:
 
@@ -48,7 +52,7 @@ Before cutting a release, verify:
 - [ ] `CARGO_REGISTRY_TOKEN` is configured in repo settings (Settings →
       Secrets and variables → Actions). Generate at
       <https://crates.io/me> → API Tokens with scope `publish-new` +
-      `publish-update`. The token must have upload rights to all seven
+      `publish-update`. The token must have upload rights to all eight
       crate names — claim them on crates.io first if they are new.
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.
