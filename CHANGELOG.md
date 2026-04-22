@@ -3,6 +3,48 @@
 All notable changes to FlowFabric are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.3] - 2026-04-22
+
+### Fixed
+
+- **`ScannerFilter` now constructible from outside ff-core.** The type
+  is `#[non_exhaustive]` to preserve additive compatibility, but 0.3.2
+  shipped with no public constructors/setters — external consumers
+  (cairn) could only name `ScannerFilter::NOOP`, making the headline
+  filtered-completion-subscription surface unusable. Adds
+  `ScannerFilter::new()`, `.with_namespace(ns)`, and
+  `.with_instance_tag(key, value)` chainable setters. Discovered in
+  the 0.3.2 published-artifact smoke
+  (`rfcs/drafts/0.3.2-smoke-report.md` Finding 1).
+- **`CompletionBackend` now reachable through `FlowFabricWorker`.**
+  0.3.2's `worker.backend()` returned `&Arc<dyn EngineBackend>`, and
+  `CompletionBackend` is a sibling trait (not a supertrait), so
+  consumers could not call `subscribe_completions_filtered` through
+  the public worker handle. Adds
+  `FlowFabricWorker::completion_backend(&self) -> Option<Arc<dyn CompletionBackend>>`
+  populated from the bundled `ValkeyBackend` on the `valkey-default`
+  feature. Returns `None` on the `connect_with` path (caller-supplied
+  trait object cannot be re-upcast). Discovered in the 0.3.2
+  published-artifact smoke
+  (`rfcs/drafts/0.3.2-smoke-report.md` Finding 2).
+
+### Changed
+
+- `ff_backend_valkey::ValkeyBackend::from_client_and_partitions` now
+  returns `Arc<Self>` (was `Arc<dyn EngineBackend>`). Required so the
+  same concrete allocation can back both `EngineBackend` and
+  `CompletionBackend` trait-object views. Only caller is ff-sdk's
+  `FlowFabricWorker::connect`; any external caller that relied on
+  the old signature can reinstate it with a one-line coercion
+  (`let backend: Arc<dyn EngineBackend> = arc;`).
+
+### Docs
+
+- Crate-level `ff-sdk` rustdoc quickstart now uses `claim_from_grant`
+  (the production path) instead of `claim_next` (which is gated
+  behind the default-off `direct-valkey-claim` feature). Smoke
+  Finding 3.
+
 ## [0.3.2] - 2026-04-22
 
 ### Fixed
