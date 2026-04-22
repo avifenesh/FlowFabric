@@ -968,46 +968,15 @@ async fn claim_for_worker(
 
 #[derive(Deserialize)]
 struct ReadStreamParams {
-    #[serde(default = "default_from_id")]
-    from: String,
-    #[serde(default = "default_to_id")]
-    to: String,
+    #[serde(default = "ff_core::contracts::StreamCursor::start")]
+    from: ff_core::contracts::StreamCursor,
+    #[serde(default = "ff_core::contracts::StreamCursor::end")]
+    to: ff_core::contracts::StreamCursor,
     #[serde(default = "default_read_limit")]
     limit: u64,
 }
 
-fn default_from_id() -> String { "-".to_owned() }
-fn default_to_id() -> String { "+".to_owned() }
 fn default_read_limit() -> u64 { 100 }
-
-/// Reject malformed `from`/`to`/`after` stream IDs at the REST boundary so
-/// Valkey doesn't have to. Accepts `"-"`, `"+"`, and `<ms>` or `<ms>-<seq>`
-/// decimal IDs as Valkey XRANGE/XREAD does.
-///
-/// Without this, a request like `?from=abc` would round-trip to Valkey,
-/// surface as a script error, and return HTTP 500 — which is wrong for
-/// caller-input validation.
-fn validate_stream_id(s: &str, field: &str, allow_open_markers: bool) -> Result<(), ApiError> {
-    if allow_open_markers && (s == "-" || s == "+") {
-        return Ok(());
-    }
-    // Allowed: `<digits>` or `<digits>-<digits>`.
-    let (ms_part, seq_part) = match s.split_once('-') {
-        Some((ms, seq)) => (ms, Some(seq)),
-        None => (s, None),
-    };
-    let ms_valid = !ms_part.is_empty() && ms_part.chars().all(|c| c.is_ascii_digit());
-    let seq_valid = seq_part
-        .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or(true);
-    if ms_valid && seq_valid {
-        Ok(())
-    } else {
-        Err(ApiError(ServerError::InvalidInput(format!(
-            "{field}: invalid stream ID '{s}' (expected '-', '+', '<ms>', or '<ms>-<seq>')"
-        ))))
-    }
-}
 
 #[derive(Serialize)]
 struct ReadStreamResponse {
@@ -1063,28 +1032,30 @@ async fn read_attempt_stream(
             "limit exceeds REST ceiling {REST_STREAM_LIMIT_CEILING}; paginate via from/to for larger spans"
         ))));
     }
-    validate_stream_id(&params.from, "from", true)?;
-    validate_stream_id(&params.to, "to", true)?;
-
     let eid = parse_execution_id(&id)?;
     let attempt_index = AttemptIndex::new(idx);
     let result = server
-        .read_attempt_stream(&eid, attempt_index, &params.from, &params.to, params.limit)
+        .read_attempt_stream(
+            &eid,
+            attempt_index,
+            params.from.to_wire(),
+            params.to.to_wire(),
+            params.limit,
+        )
         .await?;
     Ok(Json(result.into()))
 }
 
 #[derive(Deserialize)]
 struct TailStreamParams {
-    #[serde(default = "default_tail_after")]
-    after: String,
+    #[serde(default = "ff_core::contracts::StreamCursor::beginning")]
+    after: ff_core::contracts::StreamCursor,
     #[serde(default)]
     block_ms: u64,
     #[serde(default = "default_tail_limit")]
     limit: u64,
 }
 
-fn default_tail_after() -> String { "0-0".to_owned() }
 fn default_tail_limit() -> u64 { 50 }
 
 /// Ceiling on BLOCK duration for the tail endpoint. Kept below common LB
@@ -1117,13 +1088,31 @@ async fn tail_attempt_stream(
             "limit exceeds REST ceiling {REST_STREAM_LIMIT_CEILING}; paginate via after for larger spans"
         ))));
     }
-    // XREAD cursor must be a concrete ID — "-"/"+" are XRANGE-only.
-    validate_stream_id(&params.after, "after", false)?;
+    // XREAD cursor must be a concrete ID — `Start`/`End` are
+    // XRANGE-only. The opaque-cursor deserializer already rejects
+    // the bare `-`/`+` wire tokens; this boundary also rejects the
+    // structured `start`/`end` keywords because XREAD treats them
+    // as invalid ids.
+    if matches!(
+        params.after,
+        ff_core::contracts::StreamCursor::Start | ff_core::contracts::StreamCursor::End
+    ) {
+        return Err(ApiError(ServerError::InvalidInput(
+            "after: XREAD cursor must be a concrete entry id; pass '0-0' to start from the beginning"
+                .to_owned(),
+        )));
+    }
 
     let eid = parse_execution_id(&id)?;
     let attempt_index = AttemptIndex::new(idx);
     let result = server
-        .tail_attempt_stream(&eid, attempt_index, &params.after, params.block_ms, params.limit)
+        .tail_attempt_stream(
+            &eid,
+            attempt_index,
+            params.after.to_wire(),
+            params.block_ms,
+            params.limit,
+        )
         .await?;
     Ok(Json(result.into()))
 }
