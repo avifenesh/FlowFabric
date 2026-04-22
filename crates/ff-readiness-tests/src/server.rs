@@ -43,9 +43,13 @@ impl InProcessServer {
     }
 
     /// Boot an in-process server using `secret` as the waitpoint HMAC
-    /// key (validated by `ServerConfig::from_env`'s rules: even-length
-    /// ASCII hex). Used by the README-literal readiness test to prove
-    /// the boot contract the quickstart documents.
+    /// key, bypassing `ServerConfig::from_env` (the config is assembled
+    /// directly and `Server::start` does not re-validate hex shape).
+    /// Callers are responsible for supplying a secret that matches the
+    /// `from_env` contract (even-length ASCII hex, non-empty) when they
+    /// want to exercise that contract. Used by the README-literal
+    /// readiness test to cover the quickstart secret shape (2N hex
+    /// chars from `openssl rand -hex N`).
     pub async fn start_with_secret(lane: &str, secret: &str) -> Self {
         let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
         let port: u16 = std::env::var("FF_PORT")

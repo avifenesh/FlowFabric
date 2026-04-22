@@ -5,10 +5,16 @@
 //!
 //! 1. `readme_literal_quickstart_boot` — regex-extracts env var name +
 //!    byte count from the `openssl rand -hex N` snippet in step 2 of
-//!    the quickstart, mints a conforming hex secret of that length,
-//!    boots the in-process server with that var as the waitpoint HMAC
-//!    secret, and hits `/healthz` expecting 200. Proves the quickstart
-//!    boot contract is real.
+//!    the quickstart. Guards two things the quickstart promises:
+//!    (a) the env var name matches `ServerConfig::from_env`'s
+//!    canonical `FF_WAITPOINT_HMAC_SECRET` (direct string equality —
+//!    drift here is a README/impl bug); and (b) a secret shaped per
+//!    the snippet (2 × N hex chars) boots an in-process server and
+//!    serves `/healthz` with 200. The test does not reroute through
+//!    `ServerConfig::from_env` — it passes the minted secret directly
+//!    via `InProcessServer::start_with_secret`. That narrows what the
+//!    test proves: the *shape contract*, plus the env-var name
+//!    drift-guard, not the full env-parsing path.
 //!
 //! 2. `readme_literal_sdk_feature_gate` — regex-extracts the feature name from
 //!    the README's `## SDK claim_next() feature gate` toml fence and
@@ -26,9 +32,10 @@
 //!
 //! RED-proofs:
 //! * Mutating the env var name in README to `FF_WRONG_SECRET` makes
-//!   `readme_literal_quickstart_boot` fail at the boot step because
-//!   `ServerConfig` still reads the canonical name. Captured:
-//!   `tests/red-proofs/readme_literal_quickstart.log`.
+//!   `readme_literal_quickstart_boot` fail on assertion (a) — the
+//!   drift guard detects that README no longer names the canonical
+//!   `FF_WAITPOINT_HMAC_SECRET` that `ServerConfig::from_env` reads.
+//!   Captured: `tests/red-proofs/readme_literal_quickstart.log`.
 //! * Mutating the feature name in the README toml fence to a string
 //!   that `crates/ff-sdk/Cargo.toml` doesn't declare makes
 //!   `readme_literal_sdk_feature_gate` fail with the expected assertion.

@@ -1,5 +1,3 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
-     Running tests/readme_literal.rs (target/debug/deps/readme_literal-97a4f8b453a035ca)
 
 running 1 test
 test readme_literal_quickstart_boot ... FAILED
@@ -8,7 +6,7 @@ failures:
 
 ---- readme_literal_quickstart_boot stdout ----
 
-thread 'readme_literal_quickstart_boot' panicked at crates/ff-readiness-tests/tests/readme_literal.rs:110:5:
+thread 'readme_literal_quickstart_boot' panicked at crates/ff-readiness-tests/tests/readme_literal.rs:118:5:
 assertion `left == right` failed: README quickstart env var must match ServerConfig::from_env; investigate README or config.rs drift before editing this assertion
   left: "FF_WRONG_SECRET"
  right: "FF_WAITPOINT_HMAC_SECRET"
@@ -20,4 +18,3 @@ failures:
 
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
 
-error: test failed, to rerun pass `-p ff-readiness-tests --test readme_literal`
