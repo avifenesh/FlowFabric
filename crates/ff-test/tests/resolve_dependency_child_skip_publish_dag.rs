@@ -59,11 +59,12 @@ async fn subscribe_to_completions()
     }
     let client = builder.build().await.expect("build RESP3 listener client");
 
-    let _: Result<(), _> = client
+    let sub_result: Result<(), _> = client
         .cmd("SUBSCRIBE")
         .arg(COMPLETION_CHANNEL)
         .execute()
         .await;
+    sub_result.expect("SUBSCRIBE ff:dag:completions");
 
     let subscribed = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

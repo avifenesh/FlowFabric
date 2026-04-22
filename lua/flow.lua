@@ -787,10 +787,13 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     -- other terminal sites (ff_complete_execution et al.). Gated on
     -- `is_set(core.flow_id)` — a skip on a standalone exec would be a
     -- bug upstream (standalones have no edges), but the gate keeps the
-    -- invariant consistent with the other emit sites.
-    if is_set(core.flow_id) then
+    -- invariant consistent with the other emit sites. Also gated on
+    -- `is_set(core.execution_id)`: the ff-backend-valkey subscriber
+    -- fails to parse an empty execution_id and silently drops the
+    -- message, reintroducing reconciler-latency for that exec.
+    if is_set(core.flow_id) and is_set(core.execution_id) then
       local payload = cjson.encode({
-        execution_id = core.execution_id or "",
+        execution_id = core.execution_id,
         flow_id = core.flow_id,
         outcome = "skipped",
       })
