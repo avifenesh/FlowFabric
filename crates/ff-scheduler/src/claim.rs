@@ -260,10 +260,13 @@ impl Default for SchedulerConfig {
 /// Factored out of [`Scheduler::claim_for_worker`] so the modular-wrap +
 /// bounded-length contract has a dedicated unit test surface, independent
 /// of Valkey. Called with `count <= total`; values are always distinct.
-fn iter_partitions(total: u16, start: u16, count: u16) -> Vec<u16> {
+///
+/// Returns an iterator (not a Vec) to keep the hot claim path allocation-
+/// free — this runs once per claim tick per worker.
+fn iter_partitions(total: u16, start: u16, count: u16) -> impl Iterator<Item = u16> {
     debug_assert!(total > 0);
     let count = count.min(total);
-    (0..count).map(|i| start.wrapping_add(i) % total).collect()
+    (0..count).map(move |i| start.wrapping_add(i) % total)
 }
 
 /// Single-lane scheduler with budget/quota pre-checks.
@@ -376,6 +379,18 @@ impl Scheduler {
         grant_ttl_ms: u64,
     ) -> Result<Option<ClaimGrant>, SchedulerError> {
         let num_partitions = self.config.num_flow_partitions;
+        // Guard misconfiguration: a zero partition count would hit a
+        // `% num_partitions` division-by-zero in the scan_start / jitter
+        // computation below. The pre-bounded loop simply skipped on
+        // `for offset in 0..0`; preserve that graceful no-op rather than
+        // panicking. Config-returning (not Ok(None)) so an operator who
+        // misconfigures gets a loud, actionable error — silent Ok(None)
+        // would make every claim call look like an empty queue forever.
+        if num_partitions == 0 {
+            return Err(SchedulerError::Config(
+                "num_flow_partitions must be > 0".to_owned(),
+            ));
+        }
         let mut budget_checker = BudgetChecker::new(self.config);
 
         // Jitter the partition scan start to avoid thundering-herd on
@@ -1209,14 +1224,14 @@ mod tests {
     #[test]
     fn iter_partitions_no_wrap() {
         // start=10, count=5, total=256 → 10..15, no wrap involved.
-        let ps = iter_partitions(256, 10, 5);
+        let ps: Vec<u16> = iter_partitions(256, 10, 5).collect();
         assert_eq!(ps, vec![10, 11, 12, 13, 14]);
     }
 
     #[test]
     fn iter_partitions_wraps_modulo_total() {
         // start=254, count=5, total=256 → 254, 255, 0, 1, 2.
-        let ps = iter_partitions(256, 254, 5);
+        let ps: Vec<u16> = iter_partitions(256, 254, 5).collect();
         assert_eq!(ps, vec![254, 255, 0, 1, 2]);
     }
 
@@ -1224,7 +1239,7 @@ mod tests {
     fn iter_partitions_count_capped_to_total() {
         // Asking for more than `total` yields exactly `total` distinct
         // partitions — never a duplicate, never more than the universe.
-        let ps = iter_partitions(4, 1, 100);
+        let ps: Vec<u16> = iter_partitions(4, 1, 100).collect();
         assert_eq!(ps, vec![1, 2, 3, 0]);
     }
 
@@ -1235,8 +1250,8 @@ mod tests {
         // silently re-introduce the 256-round-trip-per-tick bug.
         for start in [0u16, 1, 50, 255] {
             for count in [0u16, 1, 16, 32, 256] {
-                let ps = iter_partitions(256, start, count);
-                assert_eq!(ps.len(), count.min(256) as usize);
+                let len = iter_partitions(256, start, count).count();
+                assert_eq!(len, count.min(256) as usize);
             }
         }
     }
