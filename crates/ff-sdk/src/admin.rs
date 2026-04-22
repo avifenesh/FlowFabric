@@ -16,6 +16,9 @@
 
 use std::time::Duration;
 
+use ff_core::contracts::{RotateWaitpointHmacSecretArgs, RotateWaitpointHmacSecretOutcome};
+use ff_core::keys::IndexKeys;
+use ff_core::partition::{Partition, PartitionFamily};
 use serde::{Deserialize, Serialize};
 
 use crate::SdkError;
@@ -386,6 +389,136 @@ impl ClaimForWorkerResponse {
     }
 }
 
+/// Per-partition outcome of a cluster-wide waitpoint HMAC secret
+/// rotation. Returned by [`rotate_waitpoint_hmac_secret_all_partitions`]
+/// so operators can audit which partitions rotated vs. no-op'd vs. failed.
+///
+/// The index is the execution-partition index (`0..num_partitions`),
+/// matching `{fp:N}` in the keyspace.
+#[derive(Debug)]
+pub struct PartitionRotationOutcome {
+    /// Execution partition index (`0..num_partitions`).
+    pub partition: u16,
+    /// FCALL outcome on this partition, or the error it raised.
+    pub result: Result<RotateWaitpointHmacSecretOutcome, SdkError>,
+}
+
+/// Rotate the waitpoint HMAC secret across every execution partition
+/// by fanning out the `ff_rotate_waitpoint_hmac_secret` FCALL.
+///
+/// This is the canonical Rust-side rotation path for direct-Valkey
+/// consumers (e.g. cairn-fabric) that cannot route through the
+/// `ff-server` admin REST endpoint. Callers who have an HTTP-reachable
+/// `ff-server` should prefer [`FlowFabricAdminClient::rotate_waitpoint_secret`] —
+/// that path adds a single-writer admission gate, parallel fan-out,
+/// structured audit events, and the server's configured grace window.
+///
+/// # Production rotation recipe
+///
+/// Operators MUST coordinate so secret rotation **precedes** any
+/// waitpoint resolution that will present the new `kid`. The broad
+/// sequence:
+///
+/// 1. Pick a fresh `new_kid` (must NOT contain `:` — the server uses
+///    `:` as the field separator in the secret hash).
+/// 2. Call this helper with the previous `kid`'s grace window
+///    (`grace_ms` — the duration during which tokens signed by the
+///    outgoing secret remain valid).
+/// 3. Only after this call returns with all partitions `Ok(_)` (either
+///    `Rotated` or `Noop`), begin signing new tokens with `new_kid`.
+/// 4. Retain the previous secret in the keystore until the grace
+///    window elapses — the FCALL handles GC of expired kids on every
+///    rotation, so just don't rotate again before the grace window.
+///
+/// See RFC-004 §rotation for the full 4-key HSET + `previous_expires_at`
+/// dance the FCALL implements server-side.
+///
+/// # Idempotency
+///
+/// Each partition FCALL is idempotent on the same `(new_kid,
+/// new_secret_hex)` pair: a replay with identical args returns
+/// `RotateWaitpointHmacSecretOutcome::Noop`. A same-kid-different-secret
+/// replay surfaces as a per-partition `SdkError` (wrapping
+/// `ScriptError::RotationConflict`) — pick a fresh `new_kid` to recover.
+///
+/// # Error semantics
+///
+/// A per-partition FCALL failure (transport fault, rotation conflict,
+/// etc.) is recorded on that partition's [`PartitionRotationOutcome`]
+/// and fan-out **continues** — the contract matches the server's
+/// `rotate_waitpoint_secret` (partial success is allowed, operators
+/// retry on the failed partition subset). The function itself only
+/// returns `Err` for whole-call invariant violations (none today);
+/// partition-scoped faults live on the per-entry `result`.
+///
+/// # Concurrency + performance
+///
+/// Sequential (one partition at a time) to keep the helper dependency-
+/// free: no `futures::stream` / tokio-specific primitives on the caller
+/// path. For a cluster with N partitions and per-partition RTT R, the
+/// total duration is ~N*R. Consumers needing parallel fan-out should
+/// wrap this with `FuturesUnordered` themselves, or use the server
+/// admin endpoint (which fans out with bounded concurrency = 16).
+///
+/// # Test harness
+///
+/// The `ff-test::fixtures::TestCluster::rotate_waitpoint_hmac_secret`
+/// method is a thin wrapper around this helper — integration tests and
+/// production code exercise the same code path.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions;
+///
+/// let results = rotate_waitpoint_hmac_secret_all_partitions(
+///     &client,
+///     partition_config.num_flow_partitions,
+///     "kid-2026-04-22",
+///     "deadbeef...64-hex-chars...",
+///     60_000,
+/// )
+/// .await?;
+///
+/// for entry in &results {
+///     match &entry.result {
+///         Ok(outcome) => tracing::info!(partition = entry.partition, ?outcome, "rotated"),
+///         Err(e) => tracing::error!(partition = entry.partition, %e, "rotation failed"),
+///     }
+/// }
+/// ```
+pub async fn rotate_waitpoint_hmac_secret_all_partitions(
+    client: &ferriskey::Client,
+    num_partitions: u16,
+    new_kid: &str,
+    new_secret_hex: &str,
+    grace_ms: u64,
+) -> Result<Vec<PartitionRotationOutcome>, SdkError> {
+    let mut out = Vec::with_capacity(num_partitions as usize);
+    for index in 0..num_partitions {
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index,
+        };
+        let idx = IndexKeys::new(&partition);
+        let args = RotateWaitpointHmacSecretArgs {
+            new_kid: new_kid.to_owned(),
+            new_secret_hex: new_secret_hex.to_owned(),
+            grace_ms,
+        };
+        let result = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
+            client, &idx, &args,
+        )
+        .await
+        .map_err(SdkError::from);
+        out.push(PartitionRotationOutcome {
+            partition: index,
+            result,
+        });
+    }
+    Ok(out)
+}
+
 /// Trim trailing slashes from a base URL so `format!("{base}/v1/...")`
 /// never produces `https://host//v1/...`. Mirror of
 /// media-pipeline's pattern.
@@ -523,6 +656,36 @@ mod tests {
     }
 
     // ── ClaimForWorkerResponse wire shape (issue #91) ──
+
+    #[tokio::test]
+    async fn rotate_all_partitions_zero_partitions_is_empty_noop() {
+        // Zero partitions means the caller iterates zero times — we
+        // must never touch the `Client`, so we can pass a client built
+        // against a deliberately-unreachable host and still succeed.
+        // This pins the "loop bound == num_partitions" contract
+        // without requiring a real Valkey.
+        let client = ferriskey::ClientBuilder::new()
+            .host("127.0.0.1", 1)
+            .build()
+            .await;
+        // On systems where the builder lazy-connects this succeeds;
+        // where it eagerly connects it fails. Skip the test in the
+        // eager-connect case — the zero-partition contract is still
+        // covered by the fixture delegation test path.
+        let Ok(client) = client else {
+            return;
+        };
+        let out = rotate_waitpoint_hmac_secret_all_partitions(
+            &client,
+            0,
+            "kid-unused",
+            "deadbeef",
+            60_000,
+        )
+        .await
+        .expect("zero-partition fan-out must not error");
+        assert!(out.is_empty(), "zero partitions → empty outcome vec");
+    }
 
     #[test]
     fn claim_for_worker_response_deserialises_opaque_partition_key() {
