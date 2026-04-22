@@ -12,6 +12,7 @@ members = [
     "crates/ff-server",
     "crates/ff-readiness-tests",
     "crates/ff-backend-valkey",
+    "crates/ff-observability",
 ]
 
 [workspace.package]
@@ -40,6 +41,7 @@ ff-sdk = { version = "0.3.0", path = "crates/ff-sdk" }
 ff-server = { version = "0.3.0", path = "crates/ff-server" }
 ff-test = { path = "crates/ff-test" }
 ff-backend-valkey = { version = "0.3.0", path = "crates/ff-backend-valkey" }
+ff-observability = { version = "0.3.0", path = "crates/ff-observability" }
 ferriskey = { version = "0.3.0", path = "ferriskey" }
 
 # Shared external deps

@@ -44,7 +44,14 @@ async fn main() {
     let cors_origins = config.cors_origins.clone();
     let api_token = config.api_token.clone();
 
-    let server = match Server::start(config).await {
+    // PR-94: build a metrics registry once at startup. The shim is
+    // zero-cost when the `observability` feature is off; when on, the
+    // same handle is shared between the server (scanners + scheduler
+    // call sites), the HTTP middleware, and the `/metrics` route so a
+    // scrape reflects everything the process produces.
+    let metrics = Arc::new(ff_server::Metrics::new());
+
+    let server = match Server::start_with_metrics(config, metrics.clone()).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "failed to start server");
@@ -53,7 +60,13 @@ async fn main() {
     };
 
     let server = Arc::new(server);
-    let app = match api::router(server.clone(), &cors_origins, api_token) {
+
+    let app = match api::router_with_metrics(
+        server.clone(),
+        &cors_origins,
+        api_token,
+        Some(metrics),
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "failed to build HTTP router");

@@ -323,6 +323,24 @@ pub fn router(
     cors_origins: &[String],
     api_token: Option<String>,
 ) -> Result<Router, ConfigError> {
+    router_with_metrics(server, cors_origins, api_token, None)
+}
+
+/// Router entry point that also mounts `/metrics` and the HTTP metrics
+/// middleware. Used by `main.rs` when the `observability` feature is on.
+///
+/// When `metrics` is `Some` AND the `observability` feature is compiled
+/// in, `/metrics` is mounted on an un-authenticated nested router (auth
+/// middleware does not apply — Prometheus convention). When the
+/// feature is off OR `metrics` is `None`, no `/metrics` route exists
+/// (returns 404) and no HTTP metrics middleware is installed.
+pub fn router_with_metrics(
+    server: Arc<Server>,
+    cors_origins: &[String],
+    api_token: Option<String>,
+    #[cfg_attr(not(feature = "observability"), allow(unused_variables))]
+    metrics: Option<Arc<crate::Metrics>>,
+) -> Result<Router, ConfigError> {
     let auth_enabled = api_token.is_some();
     let cors = build_cors_layer(cors_origins, auth_enabled)?;
 
@@ -438,9 +456,41 @@ pub fn router(
         }));
     }
 
-    Ok(app.layer(TraceLayer::new_for_http())
+    // PR-94: HTTP metrics middleware. Recorded AFTER the auth layer
+    // above so unauthorized 401s are still counted under their route,
+    // and BEFORE trace/cors so the metric captures handler time
+    // including the auth check itself. No-op when the
+    // `observability` feature is off.
+    #[cfg(feature = "observability")]
+    if let Some(m) = metrics.as_ref() {
+        let m = m.clone();
+        app = app.layer(middleware::from_fn_with_state(
+            m,
+            crate::metrics::http_middleware,
+        ));
+    }
+
+    #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
+    let mut app = app
+        .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(server))
+        .with_state(server);
+
+    // PR-94: `/metrics` — intentionally unauthenticated. Mounted on a
+    // separate router with its own State so the main app's auth
+    // middleware does not run for scrapes (Prometheus convention).
+    // Network-layer auth (ingress ACL, service-mesh policy, or
+    // metrics-only listen address) is the expected gate; FF does not
+    // own auth for scrape endpoints.
+    #[cfg(feature = "observability")]
+    if let Some(m) = metrics {
+        let metrics_router: Router = Router::new()
+            .route("/metrics", get(crate::metrics::metrics_handler))
+            .with_state(m);
+        app = app.merge(metrics_router);
+    }
+
+    Ok(app)
 }
 
 async fn auth_middleware(

@@ -15,12 +15,23 @@ description = "FlowFabric server library and HTTP binary"
 # and the flag propagates to the underlying ferriskey crate. OFF by
 # default.
 iam = ["ferriskey/iam"]
+# PR-94: OTEL-backed /metrics endpoint + HTTP metrics middleware +
+# cross-crate instrumentation. OFF by default — zero OTEL/Prometheus
+# crates in the dep tree when off. Enables the matching feature on
+# ff-engine + ff-scheduler so the engine/scanner call sites record
+# into the same registry.
+observability = [
+    "ff-observability/enabled",
+    "ff-engine/observability",
+    "ff-scheduler/observability",
+]
 
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }
 ff-engine = { workspace = true }
 ff-scheduler = { workspace = true }
+ff-observability = { workspace = true }
 ferriskey = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 tracing = { workspace = true }

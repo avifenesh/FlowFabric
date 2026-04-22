@@ -10,9 +10,15 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric claim-grant scheduler"
 
+[features]
+# PR-94: opt in to OTEL-backed scheduler metrics (claim_from_grant
+# latency, budget/quota hits). OFF by default.
+observability = ["ff-observability/enabled"]
+
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }
+ff-observability = { workspace = true }
 ferriskey = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
