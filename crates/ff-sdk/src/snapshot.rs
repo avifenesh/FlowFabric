@@ -887,7 +887,7 @@ fn build_edge_snapshot(
     for k in raw.keys() {
         if !EDGE_KNOWN_FIELDS.contains(&k.as_str()) {
             return Err(SdkError::Config(format!(
-                "describe_edge: edge_hash has unexpected field '{k}' \
+                "edge_snapshot: edge_hash has unexpected field '{k}' \
                  (protocol drift or corruption?)"
             )));
         }
@@ -897,12 +897,12 @@ fn build_edge_snapshot(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.edge_id is missing or empty (key corruption?)".to_owned(),
+                "edge_snapshot: edge_hash.edge_id is missing or empty (key corruption?)".to_owned(),
             )
         })?;
     if stored_edge_id_str != edge_id.to_string() {
         return Err(SdkError::Config(format!(
-            "describe_edge: edge_hash.edge_id '{stored_edge_id_str}' does not match \
+            "edge_snapshot: edge_hash.edge_id '{stored_edge_id_str}' does not match \
              requested edge_id '{edge_id}' (key corruption or wrong-key read?)"
         )));
     }
@@ -911,12 +911,12 @@ fn build_edge_snapshot(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.flow_id is missing or empty (key corruption?)".to_owned(),
+                "edge_snapshot: edge_hash.flow_id is missing or empty (key corruption?)".to_owned(),
             )
         })?;
     if stored_flow_id_str != flow_id.to_string() {
         return Err(SdkError::Config(format!(
-            "describe_edge: edge_hash.flow_id '{stored_flow_id_str}' does not match \
+            "edge_snapshot: edge_hash.flow_id '{stored_flow_id_str}' does not match \
              requested flow_id '{flow_id}' (key corruption or wrong-key read?)"
         )));
     }
@@ -928,7 +928,7 @@ fn build_edge_snapshot(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.dependency_kind is missing or empty \
+                "edge_snapshot: edge_hash.dependency_kind is missing or empty \
                  (key corruption?)"
                     .to_owned(),
             )
@@ -939,7 +939,7 @@ fn build_edge_snapshot(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.satisfaction_condition is missing or empty \
+                "edge_snapshot: edge_hash.satisfaction_condition is missing or empty \
                  (key corruption?)"
                     .to_owned(),
             )
@@ -956,16 +956,16 @@ fn build_edge_snapshot(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.edge_state is missing or empty (key corruption?)"
+                "edge_snapshot: edge_hash.edge_state is missing or empty (key corruption?)"
                     .to_owned(),
             )
         })?
         .to_owned();
 
     let created_at =
-        parse_ts(raw, "describe_edge: edge_hash", "created_at")?.ok_or_else(|| {
+        parse_ts(raw, "edge_snapshot: edge_hash", "created_at")?.ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.created_at is missing or empty (key corruption?)"
+                "edge_snapshot: edge_hash.created_at is missing or empty (key corruption?)"
                     .to_owned(),
             )
         })?;
@@ -974,7 +974,7 @@ fn build_edge_snapshot(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(
-                "describe_edge: edge_hash.created_by is missing or empty (key corruption?)"
+                "edge_snapshot: edge_hash.created_by is missing or empty (key corruption?)"
                     .to_owned(),
             )
         })?
@@ -999,12 +999,12 @@ fn parse_eid(raw: &HashMap<String, String>, field: &str) -> Result<ExecutionId, 
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             SdkError::Config(format!(
-                "describe_edge: edge_hash.{field} is missing or empty (key corruption?)"
+                "edge_snapshot: edge_hash.{field} is missing or empty (key corruption?)"
             ))
         })?;
     ExecutionId::parse(s).map_err(|e| {
         SdkError::Config(format!(
-            "describe_edge: edge_hash.{field} '{s}' is not a valid ExecutionId \
+            "edge_snapshot: edge_hash.{field} '{s}' is not a valid ExecutionId \
              (key corruption?): {e}"
         ))
     })
