@@ -49,7 +49,9 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 
 FlowFabric requires Valkey >= 7.2 (RFC-011 §13, enforced at boot). 7.2 is the
 release where the Valkey Functions API + RESP3 stabilized. Valkey 7.0 and
-earlier — and Redis of any version — are rejected by `ff-server`.
+earlier are rejected by `ff-server`; Redis is also rejected (the boot check
+requires an affirmative `server_name:valkey` INFO marker before accepting a
+`redis_version:` fallback, and Redis does not emit that marker).
 
 ```bash
 docker run -d --name valkey -p 6379:6379 valkey/valkey:8-alpine

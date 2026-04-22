@@ -2750,31 +2750,48 @@ async fn query_valkey_version(client: &Client) -> Result<(u32, u32), ServerError
             source: e,
             context: "INFO server".into(),
         })?;
-    let info_body = extract_info_body(&raw)?;
-    parse_valkey_version(&info_body)
+    let bodies = extract_info_bodies(&raw)?;
+    // Cluster: return the minimum (major, minor) across all nodes so a stale
+    // pre-upgrade replica cannot hide behind an already-upgraded primary.
+    // Standalone: exactly one body. The outer retry loop tolerates rolling
+    // upgrades — a briefly-low minimum gets retried; a persistently-low one
+    // exits with the structured floor error.
+    let mut min_version: Option<(u32, u32)> = None;
+    for body in &bodies {
+        let version = parse_valkey_version(body)?;
+        min_version = Some(match min_version {
+            None => version,
+            Some(existing) => existing.min(version),
+        });
+    }
+    min_version.ok_or_else(|| {
+        ServerError::OperationFailed(
+            "valkey version check: cluster INFO returned no node bodies".into(),
+        )
+    })
 }
 
-/// Normalize an `INFO server` response to a single string body.
+/// Normalize an `INFO server` response to one string body per node.
 ///
-/// Standalone returns the body directly. Cluster returns a map of
-/// `node_addr → body`; we pick any entry (they should all report the same
-/// version in a stable cluster; divergent versions during rolling upgrade
-/// are reconciled by the outer retry loop).
-fn extract_info_body(raw: &Value) -> Result<String, ServerError> {
+/// Standalone returns a single body. Cluster (RESP3 map keyed by node address)
+/// returns every node's body — the caller must consider all of them to reject
+/// a mixed-version cluster where one stale node is below the floor.
+fn extract_info_bodies(raw: &Value) -> Result<Vec<String>, ServerError> {
     match raw {
-        Value::BulkString(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
-        Value::VerbatimString { text, .. } => Ok(text.clone()),
-        Value::SimpleString(s) => Ok(s.clone()),
+        Value::BulkString(bytes) => Ok(vec![String::from_utf8_lossy(bytes).into_owned()]),
+        Value::VerbatimString { text, .. } => Ok(vec![text.clone()]),
+        Value::SimpleString(s) => Ok(vec![s.clone()]),
         Value::Map(entries) => {
-            // Pick the first entry's value. For cluster-wide INFO the map is
-            // node_addr → body; every body carries the same version. If a
-            // node is mid-upgrade, the outer retry loop handles divergence.
-            let (_, body) = entries.first().ok_or_else(|| {
-                ServerError::OperationFailed(
+            if entries.is_empty() {
+                return Err(ServerError::OperationFailed(
                     "valkey version check: cluster INFO returned empty map".into(),
-                )
-            })?;
-            extract_info_body(body)
+                ));
+            }
+            let mut out = Vec::with_capacity(entries.len());
+            for (_, body) in entries {
+                out.extend(extract_info_bodies(body)?);
+            }
+            Ok(out)
         }
         other => Err(ServerError::OperationFailed(format!(
             "valkey version check: unexpected INFO shape: {other:?}"
@@ -2786,10 +2803,16 @@ fn extract_info_body(raw: &Value) -> Result<String, ServerError> {
 /// `INFO server` response body. Pure parser — pulled out of
 /// [`query_valkey_version`] so it is unit-testable without a live Valkey.
 ///
-/// Prefers the `valkey_version:` field introduced in Valkey 8.0+. Falls back
-/// to `redis_version:` for Valkey 7.x compat. **Note:** Valkey 8.x/9.x still
-/// emit `redis_version:7.2.4` for Redis-client compatibility; the real
-/// server version is in `valkey_version:`, so always check that field first.
+/// **Prefers `valkey_version:`** (introduced in Valkey 8.0+; this is the real
+/// server version on 8.x/9.x, which pin `redis_version:7.2.4` for
+/// Redis-client compatibility).
+///
+/// **Falls back to `redis_version:` only when the body carries an affirmative
+/// `server_name:valkey` field.** `server_name:` was introduced in Valkey 7.2,
+/// which is our floor — so every floor-compliant Valkey deployment carries
+/// the marker. Redis does not emit `server_name:valkey`, which is how we
+/// reject a Redis backend that would otherwise look identical to Valkey 7.x
+/// at the `redis_version:` level.
 fn parse_valkey_version(info: &str) -> Result<(u32, u32), ServerError> {
     let extract_major_minor = |line: &str| -> Result<(u32, u32), ServerError> {
         let trimmed = line.trim();
@@ -2828,8 +2851,24 @@ fn parse_valkey_version(info: &str) -> Result<(u32, u32), ServerError> {
     {
         return extract_major_minor(valkey_line);
     }
-    // Fall back to redis_version (Valkey 7.x only — 8.x+ pins this to 7.2.4
-    // for Redis-client compat, so reading it there would under-report).
+    // No valkey_version — could be Valkey 7.2 (which doesn't emit the field)
+    // or could be Redis. Require an affirmative server_name:valkey marker
+    // before falling back to redis_version. This rejects Redis backends,
+    // which don't emit server_name:valkey.
+    let server_is_valkey = info
+        .lines()
+        .map(str::trim)
+        .any(|line| line.eq_ignore_ascii_case("server_name:valkey"));
+    if !server_is_valkey {
+        return Err(ServerError::OperationFailed(
+            "valkey version check: INFO missing valkey_version and server_name:valkey marker \
+             (unsupported backend — FlowFabric requires Valkey >= 7.2; Redis is not supported)"
+                .into(),
+        ));
+    }
+    // Valkey 7.x fallback. 8.x+ pins redis_version:7.2.4 for Redis-client
+    // compat, so reading it there would under-report — but 8.x+ is handled
+    // by the valkey_version branch above, so we only reach here on 7.x.
     if let Some(redis_line) = info
         .lines()
         .find_map(|line| line.strip_prefix("redis_version:"))
@@ -2837,7 +2876,8 @@ fn parse_valkey_version(info: &str) -> Result<(u32, u32), ServerError> {
         return extract_major_minor(redis_line);
     }
     Err(ServerError::OperationFailed(
-        "valkey version check: INFO missing valkey_version and redis_version".into(),
+        "valkey version check: INFO has server_name:valkey but no redis_version or valkey_version field"
+            .into(),
     ))
 }
 
@@ -4254,8 +4294,36 @@ server_mode:cluster\r\n";
 
     #[test]
     fn parse_valkey_version_falls_back_to_redis_version_on_valkey_7() {
-        // Valkey 7.x doesn't emit valkey_version; parser falls back.
-        let info = "# Server\r\nredis_version:7.2.4\r\nfoo:bar\r\n";
+        // Valkey 7.x doesn't emit valkey_version, but does emit
+        // server_name:valkey; parser falls back to redis_version.
+        let info = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nfoo:bar\r\n";
+        assert_eq!(parse_valkey_version(info).unwrap(), (7, 2));
+    }
+
+    #[test]
+    fn parse_valkey_version_rejects_redis_backend() {
+        // Real Redis emits redis_version: but not server_name:valkey and
+        // not valkey_version:. Parser must reject this affirmatively so an
+        // operator pointing ff-server at a Redis instance fails loud instead
+        // of silently running against an unsupported backend.
+        let info = "\
+# Server\r\n\
+redis_version:7.4.0\r\n\
+redis_mode:standalone\r\n\
+os:Linux\r\n";
+        let err = parse_valkey_version(info).unwrap_err();
+        assert!(matches!(err, ServerError::OperationFailed(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Redis is not supported") && msg.contains("server_name:valkey"),
+            "expected Redis-rejection message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_valkey_version_accepts_valkey_7_marker_case_insensitively() {
+        // INFO values are conventionally lowercase but be defensive.
+        let info = "redis_version:7.2.0\r\nSERVER_NAME:Valkey\r\n";
         assert_eq!(parse_valkey_version(info).unwrap(), (7, 2));
     }
 
@@ -4297,32 +4365,48 @@ server_mode:cluster\r\n";
     }
 
     #[test]
-    fn extract_info_body_unwraps_cluster_map() {
+    fn extract_info_bodies_unwraps_cluster_map_all_entries() {
         // Simulates cluster-mode INFO response: map of node_addr → body.
-        // extract_info_body picks any entry's body.
-        let body_text = "\
-# Server\r\n\
-redis_version:7.2.4\r\n\
-valkey_version:9.0.3\r\n";
-        let node_entry = (
-            Value::SimpleString("127.0.0.1:7000".to_string()),
-            Value::VerbatimString {
-                format: ferriskey::value::VerbatimFormat::Text,
-                text: body_text.to_string(),
-            },
-        );
-        let map = Value::Map(vec![node_entry]);
-        let body = extract_info_body(&map).unwrap();
-        assert_eq!(body, body_text);
-        assert_eq!(parse_valkey_version(&body).unwrap(), (9, 0));
+        // extract_info_bodies must return EVERY node's body so a stale
+        // pre-upgrade replica cannot hide behind an upgraded primary.
+        let body_a = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:9.0.3\r\n";
+        let body_b = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:8.0.0\r\n";
+        let map = Value::Map(vec![
+            (
+                Value::SimpleString("127.0.0.1:7000".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_a.to_string(),
+                },
+            ),
+            (
+                Value::SimpleString("127.0.0.1:7001".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_b.to_string(),
+                },
+            ),
+        ]);
+        let bodies = extract_info_bodies(&map).unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], body_a);
+        assert_eq!(bodies[1], body_b);
     }
 
     #[test]
-    fn extract_info_body_handles_simple_string() {
+    fn extract_info_bodies_handles_simple_string() {
         let body_text = "redis_version:7.2.4\r\nvalkey_version:9.0.3\r\n";
         let v = Value::SimpleString(body_text.to_string());
-        let body = extract_info_body(&v).unwrap();
-        assert_eq!(body, body_text);
+        let bodies = extract_info_bodies(&v).unwrap();
+        assert_eq!(bodies, vec![body_text.to_string()]);
+    }
+
+    #[test]
+    fn extract_info_bodies_rejects_empty_cluster_map() {
+        let map = Value::Map(vec![]);
+        let err = extract_info_bodies(&map).unwrap_err();
+        assert!(matches!(err, ServerError::OperationFailed(_)));
+        assert!(err.to_string().contains("empty map"));
     }
 
     #[test]

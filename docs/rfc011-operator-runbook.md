@@ -35,17 +35,25 @@ and parsing the authoritative version field:
 
 - Prefers `valkey_version:` (present on Valkey 8.0+; this is the real
   server version).
-- Falls back to `redis_version:` for Valkey 7.x, which doesn't emit
-  `valkey_version:`.
+- Falls back to `redis_version:` **only when the body also carries
+  `server_name:valkey`** (introduced in Valkey 7.2 — i.e. the floor itself).
+  Redis does not emit `server_name:valkey`, so a Redis backend is rejected
+  at parse time.
 
 **Note:** Valkey 8.x/9.x keeps `redis_version:7.2.4` pinned for Redis-client
 compat and exposes the true version in `valkey_version:`. Operators
 inspecting the INFO response manually should read `valkey_version:`, not
 `redis_version:`, to see the real server version.
 
-If the parsed `(major, minor)` is below `(7, 2)`, the server refuses to start
-with a typed `ServerError::ValkeyVersionTooLow { detected, required }` and
-exits.
+**Cluster behavior.** In cluster mode the RESP3 `INFO` response is a map of
+`node_addr → body`. The check parses every node's body and compares the
+**minimum** `(major, minor)` against the floor. That way a stale pre-upgrade
+replica cannot hide behind an already-upgraded primary — the minimum is
+what's actually serving reads to a subset of keys.
+
+If the parsed minimum `(major, minor)` is below `(7, 2)`, the server refuses
+to start with a typed `ServerError::ValkeyVersionTooLow { detected, required }`
+and exits.
 
 ### Why 7.2
 
