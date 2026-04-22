@@ -62,6 +62,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod engine_error;
 pub mod snapshot;
 pub mod task;
 pub mod worker;
@@ -71,6 +72,7 @@ pub use admin::{
     FlowFabricAdminClient, RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
 };
 pub use config::WorkerConfig;
+pub use engine_error::{BugKind, ConflictKind, ContentionKind, EngineError, StateKind, ValidationKind};
 pub use task::{
     read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, FailOutcome,
     ResumeSignal, Signal, SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior,
@@ -93,9 +95,16 @@ pub enum SdkError {
         context: String,
     },
 
-    /// FlowFabric Lua script error.
-    #[error("script: {0}")]
-    Script(#[from] ff_script::error::ScriptError),
+    /// FlowFabric engine error — typed sum over Lua error codes + transport
+    /// faults. See [`EngineError`] for the variant-granularity contract.
+    /// Replaces the previous `Script(ScriptError)` carrier (#58.6).
+    ///
+    /// `Box`ed to keep `SdkError`'s stack footprint small: the richest
+    /// variant (`ConflictKind::DependencyAlreadyExists { existing:
+    /// EdgeSnapshot }`) is ~200 bytes. Boxing keeps `Result<T, SdkError>`
+    /// at the same width every other variant pays.
+    #[error("engine: {0}")]
+    Engine(Box<EngineError>),
 
     /// Configuration error.
     #[error("config: {0}")]
@@ -168,15 +177,31 @@ pub enum SdkError {
     },
 }
 
+/// Preserves the ergonomic `?`-propagation from FCALL sites that
+/// return `Result<_, ScriptError>`. Routes through `EngineError`'s
+/// typed classification so every call site gets the same
+/// variant-level detail without hand-written conversion.
+impl From<ff_script::error::ScriptError> for SdkError {
+    fn from(err: ff_script::error::ScriptError) -> Self {
+        Self::Engine(Box::new(EngineError::from(err)))
+    }
+}
+
+impl From<EngineError> for SdkError {
+    fn from(err: EngineError) -> Self {
+        Self::Engine(Box::new(err))
+    }
+}
+
 impl SdkError {
     /// Returns the underlying ferriskey `ErrorKind` if this error carries one.
     /// Covers transport variants (`Valkey`, `ValkeyContext`) directly and
-    /// `Script(ScriptError::Valkey(...))` via delegation.
+    /// `Engine(EngineError::Transport { .. })` via delegation.
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
             Self::Valkey(e) => Some(e.kind()),
             Self::ValkeyContext { source, .. } => Some(source.kind()),
-            Self::Script(e) => e.valkey_kind(),
+            Self::Engine(e) => e.valkey_kind(),
             // HTTP/admin-surface errors carry no ferriskey::ErrorKind;
             // the admin path never touches Valkey directly from the
             // SDK side. Use `AdminApi.kind` for the server-supplied
@@ -189,14 +214,14 @@ impl SdkError {
 
     /// Whether this error is safely retryable by a caller. For transport
     /// variants, delegates to [`ff_script::retry::is_retryable_kind`]. For
-    /// `Script` errors, returns `true` iff the Lua error's classification
-    /// is `ErrorClass::Retryable`. `Config` errors are never retryable.
+    /// `Engine` errors, returns `true` iff the typed classification is
+    /// `ErrorClass::Retryable`. `Config` errors are never retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => {
                 ff_script::retry::is_retryable_kind(e.kind())
             }
-            Self::Script(e) => {
+            Self::Engine(e) => {
                 matches!(e.class(), ff_core::error::ErrorClass::Retryable)
             }
             // WorkerAtCapacity is retryable: the saturation is transient
@@ -249,15 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn valkey_kind_delegates_through_script_transport() {
-        let err = SdkError::Script(ScriptError::Valkey(mk_fk_err(ErrorKind::ClusterDown)));
+    fn valkey_kind_delegates_through_engine_transport() {
+        let err = SdkError::from(ScriptError::Valkey(mk_fk_err(ErrorKind::ClusterDown)));
         assert_eq!(err.valkey_kind(), Some(ErrorKind::ClusterDown));
     }
 
     #[test]
     fn valkey_kind_none_for_lua_and_config() {
         assert_eq!(
-            SdkError::Script(ScriptError::LeaseExpired).valkey_kind(),
+            SdkError::from(ScriptError::LeaseExpired).valkey_kind(),
             None
         );
         assert_eq!(SdkError::Config("bad host".into()).valkey_kind(), None);
@@ -271,14 +296,14 @@ mod tests {
     }
 
     #[test]
-    fn is_retryable_script_delegates_to_class() {
-        // NoEligibleExecution is classified Retryable in ScriptError::class().
-        assert!(SdkError::Script(ScriptError::NoEligibleExecution).is_retryable());
+    fn is_retryable_engine_delegates_to_class() {
+        // NoEligibleExecution is classified Retryable via EngineError::class().
+        assert!(SdkError::from(ScriptError::NoEligibleExecution).is_retryable());
         // StaleLease is Terminal.
-        assert!(!SdkError::Script(ScriptError::StaleLease).is_retryable());
-        // Script::Valkey(IoError) is Retryable via class() delegation.
+        assert!(!SdkError::from(ScriptError::StaleLease).is_retryable());
+        // Transport(Valkey(IoError)) is Retryable via class() delegation.
         assert!(
-            SdkError::Script(ScriptError::Valkey(mk_fk_err(ErrorKind::IoError))).is_retryable()
+            SdkError::from(ScriptError::Valkey(mk_fk_err(ErrorKind::IoError))).is_retryable()
         );
     }
 

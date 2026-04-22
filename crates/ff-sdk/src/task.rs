@@ -562,28 +562,33 @@ impl ClaimedTask {
             .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
-        match parse_success_result(&raw, "ff_complete_execution") {
-            Ok(()) => Ok(()),
-            // Terminal-op replay reconciliation: if this caller's own
-            // prior complete() already committed (same epoch + attempt_id)
-            // and the stored terminal_outcome is "success", return Ok —
-            // the network drop happened AFTER the server committed. Any
-            // other ExecutionNotActive combination (different epoch,
-            // different attempt, terminal_outcome!=success) is a real
-            // error the caller must see.
-            Err(SdkError::Script(ScriptError::ExecutionNotActive {
-                ref terminal_outcome,
-                ref lease_epoch,
-                ref attempt_id,
-                ..
-            })) if terminal_outcome == "success"
-                && lease_epoch == &self.lease_epoch.to_string()
-                && attempt_id == &self.attempt_id.to_string() =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
+        // Terminal-op replay reconciliation: if this caller's own
+        // prior complete() already committed (same epoch + attempt_id)
+        // and the stored terminal_outcome is "success", return Ok —
+        // the network drop happened AFTER the server committed. Any
+        // other ExecutionNotActive combination (different epoch,
+        // different attempt, terminal_outcome!=success) is a real
+        // error the caller must see.
+        let err = match parse_success_result(&raw, "ff_complete_execution") {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if let SdkError::Engine(ref boxed) = err
+            && let crate::EngineError::Contention(
+                crate::ContentionKind::ExecutionNotActive {
+                    ref terminal_outcome,
+                    ref lease_epoch,
+                    ref attempt_id,
+                    ..
+                },
+            ) = **boxed
+            && terminal_outcome == "success"
+            && lease_epoch == &self.lease_epoch.to_string()
+            && attempt_id == &self.attempt_id.to_string()
+        {
+            return Ok(());
         }
+        Err(err)
     }
 
     /// Fail the execution with a reason and error category.
@@ -651,49 +656,50 @@ impl ClaimedTask {
             .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
-        match parse_fail_result(&raw) {
-            Ok(outcome) => Ok(outcome),
-            // Terminal-op replay reconciliation. Two valid replay shapes:
-            //   - lifecycle=terminal, outcome=failed    -> TerminalFailed
-            //   - lifecycle=runnable                    -> RetryScheduled
-            //
-            // Guard strength differs by branch because the Lua paths clear
-            // different fields:
-            //   - Terminal fail preserves both current_lease_epoch AND
-            //     current_attempt_id; we match on both (strongest guard).
-            //   - Retry-scheduled preserves current_lease_epoch but CLEARS
-            //     current_attempt_id to "" (execution.lua retry HSET). A
-            //     later re-claim bumps epoch to next_epoch, so epoch alone
-            //     is still a sufficient fence — if another worker has
-            //     claimed+processed since our fail, they'd have a different
-            //     epoch. RetryScheduled loses delay_until_ms (not persisted
-            //     on the replay error path); return 0 so callers see
-            //     "scheduled, exact delay unknown".
-            Err(SdkError::Script(ScriptError::ExecutionNotActive {
-                ref terminal_outcome,
-                ref lease_epoch,
-                ref lifecycle_phase,
-                ref attempt_id,
-            })) if lease_epoch == &self.lease_epoch.to_string() => {
-                match (lifecycle_phase.as_str(), terminal_outcome.as_str()) {
-                    ("terminal", "failed")
-                        if attempt_id == &self.attempt_id.to_string() =>
-                    {
-                        Ok(FailOutcome::TerminalFailed)
-                    }
-                    ("runnable", _) => Ok(FailOutcome::RetryScheduled {
-                        delay_until: TimestampMs::from_millis(0),
-                    }),
-                    _ => Err(SdkError::Script(ScriptError::ExecutionNotActive {
-                        terminal_outcome: terminal_outcome.clone(),
-                        lease_epoch: lease_epoch.clone(),
-                        lifecycle_phase: lifecycle_phase.clone(),
-                        attempt_id: attempt_id.clone(),
-                    })),
+        // Terminal-op replay reconciliation. Two valid replay shapes:
+        //   - lifecycle=terminal, outcome=failed    -> TerminalFailed
+        //   - lifecycle=runnable                    -> RetryScheduled
+        //
+        // Guard strength differs by branch because the Lua paths clear
+        // different fields:
+        //   - Terminal fail preserves both current_lease_epoch AND
+        //     current_attempt_id; we match on both (strongest guard).
+        //   - Retry-scheduled preserves current_lease_epoch but CLEARS
+        //     current_attempt_id to "" (execution.lua retry HSET). A
+        //     later re-claim bumps epoch to next_epoch, so epoch alone
+        //     is still a sufficient fence — if another worker has
+        //     claimed+processed since our fail, they'd have a different
+        //     epoch. RetryScheduled loses delay_until_ms (not persisted
+        //     on the replay error path); return 0 so callers see
+        //     "scheduled, exact delay unknown".
+        let err = match parse_fail_result(&raw) {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => e,
+        };
+        if let SdkError::Engine(ref boxed) = err
+            && let crate::EngineError::Contention(
+                crate::ContentionKind::ExecutionNotActive {
+                    ref terminal_outcome,
+                    ref lease_epoch,
+                    ref lifecycle_phase,
+                    ref attempt_id,
+                },
+            ) = **boxed
+            && lease_epoch == &self.lease_epoch.to_string()
+        {
+            match (lifecycle_phase.as_str(), terminal_outcome.as_str()) {
+                ("terminal", "failed") if attempt_id == &self.attempt_id.to_string() => {
+                    return Ok(FailOutcome::TerminalFailed);
                 }
+                ("runnable", _) => {
+                    return Ok(FailOutcome::RetryScheduled {
+                        delay_until: TimestampMs::from_millis(0),
+                    });
+                }
+                _ => {}
             }
-            Err(e) => Err(e),
         }
+        Err(err)
     }
 
     /// Cancel the execution.
@@ -788,27 +794,32 @@ impl ClaimedTask {
             .map_err(SdkError::Valkey)?;
 
         self.stop_renewal();
-        match parse_success_result(&raw, "ff_cancel_execution") {
-            Ok(()) => Ok(()),
-            // Terminal-op replay reconciliation for cancel: if this caller's
-            // own prior cancel() already committed (same epoch + attempt_id)
-            // and stored terminal_outcome is "cancelled", return Ok. A
-            // replay that finds outcome=success or outcome=failed means a
-            // different terminal op won the race — surface the error so
-            // the caller knows their cancel intent was NOT honored.
-            Err(SdkError::Script(ScriptError::ExecutionNotActive {
-                ref terminal_outcome,
-                ref lease_epoch,
-                ref attempt_id,
-                ..
-            })) if terminal_outcome == "cancelled"
-                && lease_epoch == &self.lease_epoch.to_string()
-                && attempt_id == &self.attempt_id.to_string() =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
+        // Terminal-op replay reconciliation for cancel: if this caller's
+        // own prior cancel() already committed (same epoch + attempt_id)
+        // and stored terminal_outcome is "cancelled", return Ok. A
+        // replay that finds outcome=success or outcome=failed means a
+        // different terminal op won the race — surface the error so
+        // the caller knows their cancel intent was NOT honored.
+        let err = match parse_success_result(&raw, "ff_cancel_execution") {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if let SdkError::Engine(ref boxed) = err
+            && let crate::EngineError::Contention(
+                crate::ContentionKind::ExecutionNotActive {
+                    ref terminal_outcome,
+                    ref lease_epoch,
+                    ref attempt_id,
+                    ..
+                },
+            ) = **boxed
+            && terminal_outcome == "cancelled"
+            && lease_epoch == &self.lease_epoch.to_string()
+            && attempt_id == &self.attempt_id.to_string()
+        {
+            return Ok(());
         }
+        Err(err)
     }
 
     // ── Non-terminal operations ──
@@ -1492,7 +1503,7 @@ fn spawn_renewal_task(
                                 "lease renewed"
                             );
                         }
-                        Err(SdkError::Script(ref e)) if is_terminal_renewal_error(e) => {
+                        Err(SdkError::Engine(ref e)) if is_terminal_renewal_error(e) => {
                             failure_counter.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 execution_id = %execution_id,
@@ -1517,16 +1528,16 @@ fn spawn_renewal_task(
     })
 }
 
-/// Check if a script error means renewal should stop permanently.
+/// Check if an engine error means renewal should stop permanently.
 #[allow(dead_code)]
-fn is_terminal_renewal_error(err: &ScriptError) -> bool {
+fn is_terminal_renewal_error(err: &crate::EngineError) -> bool {
+    use crate::{ContentionKind, EngineError, StateKind};
     matches!(
         err,
-        ScriptError::StaleLease
-            | ScriptError::LeaseExpired
-            | ScriptError::LeaseRevoked
-            | ScriptError::ExecutionNotActive { .. }
-            | ScriptError::ExecutionNotFound
+        EngineError::State(
+            StateKind::StaleLease | StateKind::LeaseExpired | StateKind::LeaseRevoked
+        ) | EngineError::Contention(ContentionKind::ExecutionNotActive { .. })
+            | EngineError::NotFound { entity: "execution" }
     )
 }
 
@@ -1550,7 +1561,7 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_report_usage_and_check: expected Array".into(),
             )));
         }
@@ -1558,7 +1569,7 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_report_usage_and_check: expected Int status code".into(),
             )));
         }
@@ -1566,7 +1577,7 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
     if status_code != 1 {
         let error_code = usage_field_str(arr, 1);
         let detail = usage_field_str(arr, 2);
-        return Err(SdkError::Script(
+        return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_report_usage_and_check: {error_code}"))
             }),
@@ -1592,7 +1603,7 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
                 hard_limit: limit,
             })
         }
-        _ => Err(SdkError::Script(ScriptError::Parse(format!(
+        _ => Err(SdkError::from(ScriptError::Parse(format!(
             "ff_report_usage_and_check: unknown sub-status: {sub_status}"
         )))),
     }
@@ -1629,7 +1640,7 @@ fn parse_usage_u64(
     match arr.get(index) {
         Some(Ok(Value::Int(n))) => {
             u64::try_from(*n).map_err(|_| {
-                SdkError::Script(ScriptError::Parse(format!(
+                SdkError::from(ScriptError::Parse(format!(
                     "ff_report_usage_and_check {sub_status}: {field_name} \
                      (index {index}) negative int {n} cannot be u64"
                 )))
@@ -1638,23 +1649,23 @@ fn parse_usage_u64(
         Some(Ok(Value::BulkString(b))) => {
             let s = String::from_utf8_lossy(b);
             s.parse::<u64>().map_err(|_| {
-                SdkError::Script(ScriptError::Parse(format!(
+                SdkError::from(ScriptError::Parse(format!(
                     "ff_report_usage_and_check {sub_status}: {field_name} \
                      (index {index}) not a u64 string: {s:?}"
                 )))
             })
         }
         Some(Ok(Value::SimpleString(s))) => s.parse::<u64>().map_err(|_| {
-            SdkError::Script(ScriptError::Parse(format!(
+            SdkError::from(ScriptError::Parse(format!(
                 "ff_report_usage_and_check {sub_status}: {field_name} \
                  (index {index}) not a u64 string: {s:?}"
             )))
         }),
-        Some(_) => Err(SdkError::Script(ScriptError::Parse(format!(
+        Some(_) => Err(SdkError::from(ScriptError::Parse(format!(
             "ff_report_usage_and_check {sub_status}: {field_name} \
              (index {index}) wrong wire type (expected Int or String)"
         )))),
-        None => Err(SdkError::Script(ScriptError::Parse(format!(
+        None => Err(SdkError::from(ScriptError::Parse(format!(
             "ff_report_usage_and_check {sub_status}: {field_name} \
              (index {index}) missing from response"
         )))),
@@ -1680,7 +1691,7 @@ fn extract_pending_waitpoint_token(raw: &Value) -> Result<WaitpointToken, SdkErr
             _ => None,
         })
         .ok_or_else(|| {
-            SdkError::Script(ScriptError::Parse(
+            SdkError::from(ScriptError::Parse(
                 "ff_create_pending_waitpoint: missing waitpoint_token in response".into(),
             ))
         })?;
@@ -1719,7 +1730,7 @@ fn resume_waitpoint_id_from_suspension(
         return Ok(None);
     }
     let waitpoint_id = WaitpointId::parse(wp_id_str).map_err(|e| {
-        SdkError::Script(ScriptError::Parse(format!(
+        SdkError::from(ScriptError::Parse(format!(
             "resume_signals: suspension_current.waitpoint_id is not a valid UUID: {e}"
         )))
     })?;
@@ -1730,14 +1741,14 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(format!(
+            return Err(SdkError::from(ScriptError::Parse(format!(
                 "{function_name}: expected Array, got non-array"
             ))));
         }
     };
 
     if arr.is_empty() {
-        return Err(SdkError::Script(ScriptError::Parse(format!(
+        return Err(SdkError::from(ScriptError::Parse(format!(
             "{function_name}: empty result array"
         ))));
     }
@@ -1745,7 +1756,7 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(format!(
+            return Err(SdkError::from(ScriptError::Parse(format!(
                 "{function_name}: expected Int at index 0"
             ))));
         }
@@ -1783,7 +1794,7 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
                 ScriptError::Parse(format!("{function_name}: unknown error: {error_code}"))
             });
 
-        Err(SdkError::Script(script_err))
+        Err(SdkError::from(script_err))
     }
 }
 
@@ -1799,7 +1810,7 @@ fn parse_suspend_result(
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_suspend_execution: expected Array".into(),
             )));
         }
@@ -1808,7 +1819,7 @@ fn parse_suspend_result(
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_suspend_execution: bad status code".into(),
             )));
         }
@@ -1829,7 +1840,7 @@ fn parse_suspend_result(
             if s.is_empty() { "unknown".to_owned() } else { s }
         };
         let detail = err_field_str(2);
-        return Err(SdkError::Script(
+        return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_suspend_execution: {error_code}"))
             }),
@@ -1859,7 +1870,7 @@ fn parse_suspend_result(
         })
         .map(WaitpointToken::new)
         .ok_or_else(|| {
-            SdkError::Script(ScriptError::Parse(
+            SdkError::from(ScriptError::Parse(
                 "ff_suspend_execution: missing waitpoint_token in response".into(),
             ))
         })?;
@@ -1888,7 +1899,7 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_deliver_signal: expected Array".into(),
             )));
         }
@@ -1897,7 +1908,7 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_deliver_signal: bad status code".into(),
             )));
         }
@@ -1918,7 +1929,7 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
             if s.is_empty() { "unknown".to_owned() } else { s }
         };
         let detail = err_field_str(2);
-        return Err(SdkError::Script(
+        return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_deliver_signal: {error_code}"))
             }),
@@ -1968,7 +1979,7 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
         .unwrap_or_default();
 
     let signal_id = SignalId::parse(&signal_id_str).map_err(|e| {
-        SdkError::Script(ScriptError::Parse(format!(
+        SdkError::from(ScriptError::Parse(format!(
             "ff_deliver_signal: invalid signal_id from Lua: {e}"
         )))
     })?;
@@ -1985,7 +1996,7 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_append_frame: expected Array".into(),
             )));
         }
@@ -1994,7 +2005,7 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_append_frame: bad status code".into(),
             )));
         }
@@ -2015,7 +2026,7 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
             if s.is_empty() { "unknown".to_owned() } else { s }
         };
         let detail = err_field_str(2);
-        return Err(SdkError::Script(
+        return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_append_frame: {error_code}"))
             }),
@@ -2055,7 +2066,7 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_fail_execution: expected Array".into(),
             )));
         }
@@ -2064,7 +2075,7 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::Script(ScriptError::Parse(
+            return Err(SdkError::from(ScriptError::Parse(
                 "ff_fail_execution: bad status code".into(),
             )));
         }
@@ -2086,7 +2097,7 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
         };
         let details: Vec<String> = (2..arr.len()).map(err_field_str).collect();
         let detail_refs: Vec<&str> = details.iter().map(|s| s.as_str()).collect();
-        return Err(SdkError::Script(
+        return Err(SdkError::from(
             ScriptError::from_code_with_details(&error_code, &detail_refs).unwrap_or_else(|| {
                 ScriptError::Parse(format!("ff_fail_execution: {error_code}"))
             }),
@@ -2122,7 +2133,7 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
             })
         }
         "terminal_failed" => Ok(FailOutcome::TerminalFailed),
-        _ => Err(SdkError::Script(ScriptError::Parse(format!(
+        _ => Err(SdkError::from(ScriptError::Parse(format!(
             "ff_fail_execution: unexpected sub-status: {sub_status}"
         )))),
     }
@@ -2208,7 +2219,7 @@ pub async fn read_stream(
     let ReadFramesResult::Frames(f) =
         ff_script::functions::stream::ff_read_attempt_stream(client, &keys, &args)
             .await
-            .map_err(SdkError::Script)?;
+            .map_err(SdkError::from)?;
     Ok(f)
 }
 
@@ -2307,7 +2318,7 @@ pub async fn tail_stream(
         count_limit,
     )
     .await
-    .map_err(SdkError::Script)
+    .map_err(SdkError::from)
 }
 
 #[cfg(test)]
@@ -2574,13 +2585,19 @@ mod terminal_replay_parsing_tests {
             Ok(bulk("11111111-1111-1111-1111-111111111111")),
         ]);
         let err = parse_success_result(&raw, "test").unwrap_err();
-        match err {
-            SdkError::Script(ScriptError::ExecutionNotActive {
-                terminal_outcome,
-                lease_epoch,
-                lifecycle_phase,
-                attempt_id,
-            }) => {
+        let unboxed = match err {
+            SdkError::Engine(b) => *b,
+            other => panic!("expected ExecutionNotActive struct variant, got {other:?}"),
+        };
+        match unboxed {
+            crate::EngineError::Contention(
+                crate::ContentionKind::ExecutionNotActive {
+                    terminal_outcome,
+                    lease_epoch,
+                    lifecycle_phase,
+                    attempt_id,
+                },
+            ) => {
                 assert_eq!(terminal_outcome, "success");
                 assert_eq!(lease_epoch, "42");
                 assert_eq!(lifecycle_phase, "terminal");
@@ -2604,13 +2621,19 @@ mod terminal_replay_parsing_tests {
             Ok(bulk("22222222-2222-2222-2222-222222222222")),
         ]);
         let err = parse_fail_result(&raw).unwrap_err();
-        match err {
-            SdkError::Script(ScriptError::ExecutionNotActive {
-                terminal_outcome,
-                lease_epoch,
-                lifecycle_phase,
-                attempt_id,
-            }) => {
+        let unboxed = match err {
+            SdkError::Engine(b) => *b,
+            other => panic!("expected ExecutionNotActive struct variant, got {other:?}"),
+        };
+        match unboxed {
+            crate::EngineError::Contention(
+                crate::ContentionKind::ExecutionNotActive {
+                    terminal_outcome,
+                    lease_epoch,
+                    lifecycle_phase,
+                    attempt_id,
+                },
+            ) => {
                 assert_eq!(terminal_outcome, "none");
                 assert_eq!(lease_epoch, "7");
                 assert_eq!(lifecycle_phase, "runnable");
@@ -2630,13 +2653,19 @@ mod terminal_replay_parsing_tests {
             Ok(bulk("execution_not_active")),
         ]);
         let err = parse_success_result(&raw, "test").unwrap_err();
-        match err {
-            SdkError::Script(ScriptError::ExecutionNotActive {
-                terminal_outcome,
-                lease_epoch,
-                lifecycle_phase,
-                attempt_id,
-            }) => {
+        let unboxed = match err {
+            SdkError::Engine(b) => *b,
+            other => panic!("expected ExecutionNotActive struct variant, got {other:?}"),
+        };
+        match unboxed {
+            crate::EngineError::Contention(
+                crate::ContentionKind::ExecutionNotActive {
+                    terminal_outcome,
+                    lease_epoch,
+                    lifecycle_phase,
+                    attempt_id,
+                },
+            ) => {
                 assert_eq!(terminal_outcome, "");
                 assert_eq!(lease_epoch, "");
                 assert_eq!(lifecycle_phase, "");

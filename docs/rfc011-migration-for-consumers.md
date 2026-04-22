@@ -206,7 +206,12 @@ match worker.claim_from_grant(lane.clone(), grant).await {
     Err(SdkError::WorkerAtCapacity) => {
         // Retryable; retry after a task completes.
     }
-    Err(SdkError::Script(ScriptError::ClaimGrantExpired)) => {
+    Err(SdkError::Engine(ref boxed))
+        if matches!(
+            **boxed,
+            EngineError::Contention(ContentionKind::ClaimGrantExpired),
+        ) =>
+    {
         // Grant TTL elapsed — request a new grant.
     }
     Err(e) => return Err(e.into()),
