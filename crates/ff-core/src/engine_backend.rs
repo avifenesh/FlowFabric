@@ -48,11 +48,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::backend::{
-    AdmissionDecision, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
-    FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, ReclaimToken,
-    ResumeSignal, WaitpointSpec,
+    AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
+    FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
+    ReclaimToken, ResumeSignal, WaitpointSpec,
 };
-use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot};
+use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 use crate::engine_error::EngineError;
 use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 
@@ -60,7 +60,9 @@ use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 /// honours to serve a `FlowFabricWorker`.
 ///
 /// See RFC-012 §3.1 for the inventory rationale and §3.3 for the
-/// type-level shape. 15 methods.
+/// type-level shape. 16 methods (Round-7 added `create_waitpoint`;
+/// `append_frame` return widened; `report_usage` return replaced —
+/// RFC-012 §R7).
 ///
 /// # Note on `complete` payload shape
 ///
@@ -99,8 +101,13 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<(), EngineError>;
 
     /// Append one stream frame. Distinct from [`progress`](Self::progress)
-    /// per RFC-012 §3.1.1 K#6.
-    async fn append_frame(&self, handle: &Handle, frame: Frame) -> Result<(), EngineError>;
+    /// per RFC-012 §3.1.1 K#6. Returns the backend-assigned stream entry
+    /// id and post-append frame count (RFC-012 §R7.2.1).
+    async fn append_frame(
+        &self,
+        handle: &Handle,
+        frame: Frame,
+    ) -> Result<AppendFrameOutcome, EngineError>;
 
     /// Terminal success. Borrows `handle` (round-4 M-D2) so callers
     /// can retry under `EngineError::Transport` without losing the
@@ -132,6 +139,31 @@ pub trait EngineBackend: Send + Sync + 'static {
         waitpoints: Vec<WaitpointSpec>,
         timeout: Option<Duration>,
     ) -> Result<Handle, EngineError>;
+
+    /// Issue a pending waitpoint for future signal delivery.
+    ///
+    /// Waitpoints have two states in the Valkey wire contract:
+    /// **pending** (token issued, not yet backing a suspension) and
+    /// **active** (bound to a suspension). This method creates a
+    /// waitpoint in the **pending** state. A later `suspend` call
+    /// transitions a pending waitpoint to active (see Lua
+    /// `use_pending_waitpoint` ARGV flag at
+    /// `flowfabric.lua:3603,3641,3690`) — or, if buffered signals
+    /// already satisfy its condition, the suspend call returns
+    /// `SuspendOutcome::AlreadySatisfied` and the waitpoint activates
+    /// without ever releasing the lease.
+    ///
+    /// Pending-waitpoint expiry is a first-class terminal error on
+    /// the wire (`PendingWaitpointExpired` at
+    /// `ff-script/src/error.rs:170,403-408`). The attempt retains its
+    /// lease while the waitpoint is pending; signals delivered to
+    /// this waitpoint are buffered server-side (RFC-012 §R7.2.2).
+    async fn create_waitpoint(
+        &self,
+        handle: &Handle,
+        waitpoint_key: &str,
+        expires_in: Duration,
+    ) -> Result<PendingWaitpoint, EngineError>;
 
     /// Non-mutating observation of signals that satisfied the handle's
     /// resume condition.
@@ -185,16 +217,17 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     // ── Budget ──
 
-    /// Report usage and check admission. Returns the admission
-    /// decision; backends enforce idempotency via the caller-supplied
-    /// dedup key embedded in `UsageDimensions::custom` (today's
-    /// `ff_report_usage_and_check` contract).
+    /// Report usage against a budget and check limits. Returns the
+    /// typed [`ReportUsageResult`] variant; backends enforce
+    /// idempotency via the caller-supplied
+    /// [`UsageDimensions::dedup_key`] (RFC-012 §R7.2.3 — replaces
+    /// the pre-Round-7 `AdmissionDecision` return).
     async fn report_usage(
         &self,
         handle: &Handle,
         budget: &BudgetId,
         dimensions: crate::backend::UsageDimensions,
-    ) -> Result<AdmissionDecision, EngineError>;
+    ) -> Result<ReportUsageResult, EngineError>;
 }
 
 /// Object-safety assertion: `dyn EngineBackend` compiles iff every

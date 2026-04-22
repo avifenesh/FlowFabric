@@ -7,6 +7,39 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking — `EngineBackend` trait (RFC-012 §R7, #117):**
+  - `append_frame` now returns `AppendFrameOutcome { stream_id,
+    frame_count }` (was `()`). The type moves from `ff_sdk::task`
+    to `ff_core::backend`; a `pub use` shim preserves the
+    `ff_sdk::task::AppendFrameOutcome` path through 0.4.x. Derives
+    widen from `Clone, Debug` to `Clone, Debug, PartialEq, Eq`
+    matching the `FailOutcome` precedent.
+  - New trait method `create_waitpoint(handle, waitpoint_key: &str,
+    expires_in: Duration) -> PendingWaitpoint`. `PendingWaitpoint`
+    is new in `ff_core::backend` (`#[non_exhaustive]`; carries
+    `waitpoint_id` + `hmac_token`).
+  - `report_usage` now returns `ReportUsageResult` (was
+    `AdmissionDecision`). `ReportUsageResult` gains
+    `#[non_exhaustive]` in the same bundle so the replace-over-
+    widen is atomic.
+  - `AdmissionDecision` removed.
+  - `UsageDimensions` gains `dedup_key: Option<String>`
+    (idempotency on trait-level `report_usage`; previously only
+    reachable via the SDK-private wire).
+  - Trait method count 15 → 16; `async fn` compile count 16 → 17.
+    `suspend` migration remains deferred to Stage 1d per §R7.1 /
+    §R7.6.1 (entangled with input-shape rework).
+  - External `EngineBackend` impls: none in tree.
+    `ff-backend-valkey`'s `append_frame`, `create_waitpoint`,
+    `report_usage` bodies move from `Unavailable` stubs to real
+    Lua-backed impls (byte-for-byte wire parity with the SDK's
+    pre-migration bodies).
+  - `ff-sdk::ClaimedTask::{report_usage, create_pending_waitpoint}`
+    become thin trait forwarders. Public SDK signatures unchanged.
+    `ClaimedTask::append_frame` stays direct-FCALL pending a
+    `Frame`-shape extension (to preserve the free-form `frame_type`
+    strings that 5 in-tree callers rely on); closes in Stage 1d
+    alongside `suspend` input-shape work.
 - Wired `BackendRetry` to ferriskey `ClientBuilder::retry_strategy` in
   `ValkeyBackend::connect`. All 4 fields honored when set; when
   all-`None`, ferriskey's builder default is used (no call to

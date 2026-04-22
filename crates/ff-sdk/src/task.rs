@@ -8,8 +8,8 @@ use ff_core::backend::{Handle, HandleKind};
 use ff_core::contracts::ReportUsageResult;
 use ff_core::engine_backend::EngineBackend;
 use ff_script::error::ScriptError;
-use ff_core::keys::{usage_dedup_key, BudgetKeyContext, ExecKeyContext, IndexKeys};
-use ff_core::partition::{budget_partition, execution_partition, PartitionConfig};
+use ff_core::keys::{ExecKeyContext, IndexKeys};
+use ff_core::partition::{execution_partition, PartitionConfig};
 use ff_core::types::*;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
@@ -134,13 +134,14 @@ impl SignalOutcome {
 pub use ff_core::backend::ResumeSignal;
 
 /// Outcome of `append_frame()`.
-#[derive(Clone, Debug)]
-pub struct AppendFrameOutcome {
-    /// Valkey Stream entry ID assigned to this frame.
-    pub stream_id: String,
-    /// Total frame count in the stream after this append.
-    pub frame_count: u64,
-}
+///
+/// **RFC-012 §R7.2.1:** canonical definition moved to
+/// [`ff_core::backend::AppendFrameOutcome`]; this `pub use` shim
+/// preserves the `ff_sdk::task::AppendFrameOutcome` path through the
+/// 0.4.x window. Existing consumers construct + match exhaustively
+/// without change. The derive set widened from `Clone, Debug` to
+/// `Clone, Debug, PartialEq, Eq` matching the `FailOutcome` precedent.
+pub use ff_core::backend::AppendFrameOutcome;
 
 /// Outcome of a `fail()` call.
 ///
@@ -619,53 +620,31 @@ impl ClaimedTask {
     /// Non-consuming — the worker can report usage multiple times.
     /// `dimensions` is a slice of `(dimension_name, delta)` pairs.
     /// `dedup_key` prevents double-counting on retries (auto-prefixed with budget hash tag).
-    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b Tranche 3.
-    // `AdmissionDecision` (trait return) cannot losslessly encode
-    // `ReportUsageResult::{SoftBreach, HardBreach, AlreadyApplied}`
-    // — `SoftBreach` is a warning (not a rejection) and has no home
-    // in `Admitted / Throttled / Rejected`, and `HardBreach`'s
-    // structured dim/current/limit fields collapse to `Rejected { reason: String }`.
-    // Tracked in #117.
+    ///
+    /// **RFC-012 §R7.2.3:** forwards through
+    /// [`EngineBackend::report_usage`](ff_core::engine_backend::EngineBackend::report_usage).
+    /// The trait's `UsageDimensions.dedup_key` carries the raw key;
+    /// the backend impl applies the `usage_dedup_key(hash_tag, k)`
+    /// wrap so the dedup state co-locates with the budget partition
+    /// (PR #108).
     pub async fn report_usage(
         &self,
         budget_id: &BudgetId,
         dimensions: &[(&str, u64)],
         dedup_key: Option<&str>,
     ) -> Result<ReportUsageResult, SdkError> {
-        let partition = budget_partition(budget_id, &self.partition_config);
-        let bctx = BudgetKeyContext::new(&partition, budget_id);
-
-        // KEYS (3): budget_usage, budget_limits, budget_def
-        let keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
-
-        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
-        let now = TimestampMs::now();
-        let dim_count = dimensions.len();
-        let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
-        argv.push(dim_count.to_string());
-        for (dim, _) in dimensions {
-            argv.push((*dim).to_string());
+        let handle = self.synth_handle();
+        let mut dims = ff_core::backend::UsageDimensions::default();
+        for (name, delta) in dimensions {
+            dims.custom.insert((*name).to_owned(), *delta);
         }
-        for (_, delta) in dimensions {
-            argv.push(delta.to_string());
-        }
-        argv.push(now.to_string());
-        let dedup_key_val = dedup_key
+        dims.dedup_key = dedup_key
             .filter(|k| !k.is_empty())
-            .map(|k| usage_dedup_key(bctx.hash_tag(), k))
-            .unwrap_or_default();
-        argv.push(dedup_key_val);
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .client
-            .fcall("ff_report_usage_and_check", &key_refs, &argv_refs)
+            .map(|k| k.to_owned());
+        self.backend
+            .report_usage(&handle, budget_id, dims)
             .await
-            .map_err(SdkError::Valkey)?;
-
-        parse_report_usage_result(&raw)
+            .map_err(SdkError::from)
     }
 
     /// Create a pending waitpoint for future signal delivery.
@@ -678,53 +657,31 @@ impl ClaimedTask {
     /// Returns both the waitpoint_id AND the HMAC token required by external
     /// callers to buffer signals against this pending waitpoint
     /// (RFC-004 §Waitpoint Security).
-    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b. The
-    // `EngineBackend` trait has no `create_pending_waitpoint` slot —
-    // RFC-012 §3.1 inventory does not list this op today. Needs
-    // either a new trait method or a reshape of `suspend` that covers
-    // the lease-retaining flow. Tracked in #117.
+    ///
+    /// **RFC-012 §R7.2.2:** forwards through
+    /// [`EngineBackend::create_waitpoint`](ff_core::engine_backend::EngineBackend::create_waitpoint).
+    /// The trait returns
+    /// [`PendingWaitpoint`](ff_core::backend::PendingWaitpoint) whose
+    /// `hmac_token` is the same wire HMAC this method has always
+    /// produced; the SDK unwraps it back to the historical
+    /// `(WaitpointId, WaitpointToken)` tuple for caller-shape parity.
     pub async fn create_pending_waitpoint(
         &self,
         waitpoint_key: &str,
         expires_in_ms: u64,
     ) -> Result<(WaitpointId, WaitpointToken), SdkError> {
-        let partition = execution_partition(&self.execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        let waitpoint_id = WaitpointId::new();
-        let expires_at = TimestampMs::from_millis(TimestampMs::now().0 + expires_in_ms as i64);
-
-        // KEYS (4): exec_core, waitpoint_hash, pending_wp_expiry_zset, hmac_secrets
-        let keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.waitpoint(&waitpoint_id),
-            idx.pending_waitpoint_expiry(),
-            idx.waitpoint_hmac_secrets(),
-        ];
-
-        // ARGV (5): execution_id, attempt_index, waitpoint_id, waitpoint_key, expires_at
-        let args: Vec<String> = vec![
-            self.execution_id.to_string(),
-            self.attempt_index.to_string(),
-            waitpoint_id.to_string(),
-            waitpoint_key.to_owned(),
-            expires_at.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .client
-            .fcall("ff_create_pending_waitpoint", &key_refs, &arg_refs)
+        let handle = self.synth_handle();
+        let expires_in = std::time::Duration::from_millis(expires_in_ms);
+        let pending = self
+            .backend
+            .create_waitpoint(&handle, waitpoint_key, expires_in)
             .await
-            .map_err(SdkError::Valkey)?;
-
-        // Response: {1, "OK", waitpoint_id, waitpoint_key, waitpoint_token}.
-        // Extract the token (the waitpoint_id is the one we generated locally).
-        let token = extract_pending_waitpoint_token(&raw)?;
-        Ok((waitpoint_id, token))
+            .map_err(SdkError::from)?;
+        // `WaitpointHmac` wraps the canonical `WaitpointToken`; the
+        // `.token()` accessor borrows the underlying
+        // `WaitpointToken`, which is the caller's historical return
+        // shape.
+        Ok((pending.waitpoint_id, pending.hmac_token.token().clone()))
     }
 
     // ── Phase 4: Streaming ──
@@ -733,10 +690,23 @@ impl ClaimedTask {
     ///
     /// Non-consuming — the worker can append many frames during execution.
     /// The stream is created lazily on the first append.
-    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b. Trait
-    // method `append_frame` returns `()`; this SDK method returns
-    // `AppendFrameOutcome { stream_id, frame_count }` — the return-type
-    // delta is a hard ABI break on the Stage-1a trait. Tracked in #117.
+    //
+    // RFC-012 §R7.2.1 widened `EngineBackend::append_frame`'s return
+    // to `AppendFrameOutcome` — that half of the trait alignment is
+    // done. The SDK-side migration remains direct-FCALL for now
+    // because the trait's `Frame { kind: FrameKind, bytes, seq }`
+    // input shape does not carry the SDK-public `frame_type: &str`
+    // (free-form) or `metadata: Option<&str>` (wire `correlation_id`)
+    // arguments — 5 in-tree example callers pass frame_type strings
+    // ("delta", "log", "agent_step", "summary_token", etc.) that
+    // don't map onto `FrameKind::{Stdout,Stderr,Event,Blob}` without
+    // a silent wire regression. Closing this gap needs a `Frame`-
+    // shape extension (adds `frame_type: String` + `correlation_id:
+    // Option<String>`) — tracked for Stage 1d alongside the `suspend`
+    // input-shape rework. Until then the SDK keeps byte-for-byte
+    // wire parity by issuing `ff_append_frame` directly; the trait's
+    // `append_frame_impl` in ff-backend-valkey covers the
+    // FrameKind-based call sites.
     pub async fn append_frame(
         &self,
         frame_type: &str,
@@ -1300,34 +1270,6 @@ fn parse_usage_u64(
         ),
         })),
     }
-}
-
-/// Parse a standard {1, "OK", ...} / {0, "error", ...} FCALL result.
-/// Extract the waitpoint_token (field index 4 in the 0-indexed response array)
-/// from an `ff_create_pending_waitpoint` reply. Runs `parse_success_result`
-/// first so error cases produce the usual typed error, not a parse failure.
-fn extract_pending_waitpoint_token(raw: &Value) -> Result<WaitpointToken, SdkError> {
-    parse_success_result(raw, "ff_create_pending_waitpoint")?;
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => unreachable!("parse_success_result would have rejected non-array"),
-    };
-    // Layout: [0]=1, [1]="OK", [2]=waitpoint_id, [3]=waitpoint_key, [4]=waitpoint_token
-    let token_str = arr
-        .get(4)
-        .and_then(|v| match v {
-            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            Ok(Value::SimpleString(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            SdkError::from(ScriptError::Parse {
-                fcall: "extract_pending_waitpoint_token".into(),
-                execution_id: None,
-                message: "ff_create_pending_waitpoint: missing waitpoint_token in response".into(),
-            })
-        })?;
-    Ok(WaitpointToken::new(token_str))
 }
 
 /// Pure helper: decide whether `suspension:current` represents a
