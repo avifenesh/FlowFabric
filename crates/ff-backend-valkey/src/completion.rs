@@ -133,7 +133,14 @@ impl FilterGate {
     async fn admits(&self, eid: &ExecutionId) -> bool {
         let partition = execution_partition(eid, &self.partition_config);
         let tag = partition.hash_tag();
-        let eid_str = eid.to_string();
+        // Key construction uses the bare UUID (the hash-tag is already
+        // embedded in `tag`). `eid.to_string()` includes the `{fp:N}:`
+        // prefix; strip it to avoid building `ff:exec:{fp:N}:{fp:N}:...`.
+        let full = eid.to_string();
+        let eid_str = full
+            .find("}:")
+            .map(|i| &full[i + 2..])
+            .unwrap_or(full.as_str());
 
         // Check namespace first (cheaper — one HGET on exec_core, the
         // hash every scanner / op already touches).
