@@ -54,9 +54,11 @@ Redis 7.x works in practice today but is not part of the support matrix
 | Standalone  | Development, single-tenant, throughput fits one node (< ~50k ops/s). Simplest.  |
 | Cluster     | Horizontal write-scale needed, operational experience with cluster ops on hand. |
 
-FlowFabric hash-tags every key (`{fp:N}`, `{p:N}`, `{bp:N}`, `{qp:N}`) so
-related keys always land on the same slot. Increasing `FF_FLOW_PARTITIONS`
-gives the cluster more slots to spread across without changing the model.
+FlowFabric hash-tags every key — `{fp:N}` for flow + execution (RFC-011
+co-locates both families on the same tag), `{b:M}` for budgets, `{q:K}`
+for quotas — so related keys always land on the same slot. Increasing
+`FF_FLOW_PARTITIONS` gives the cluster more slots to spread across
+without changing the model.
 
 ### Persistence
 
@@ -109,8 +111,13 @@ invariants.
 
 ## 2. ff-server
 
-Stateless HTTP API in front of Valkey. Runs the 14 background scanners
-that drive timeouts, promotions, reconciliation, and retention.
+Stateless HTTP API in front of Valkey. Runs the 15 background scanners
+in `ff-engine` (attempt-timeout, budget-reset, budget-reconciler,
+cancel-reconciler, delayed-promoter, dependency-reconciler,
+execution-deadline, flow-projector, index-reconciler, lease-expiry,
+pending-waitpoint-expiry, quota-reconciler, retention-trimmer,
+suspension-timeout, unblock) plus an optional completion listener —
+they drive timeouts, promotions, reconciliation, and retention.
 
 ### Required env vars
 

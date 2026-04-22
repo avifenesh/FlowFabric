@@ -62,12 +62,14 @@ impl ServerConfig {
     /// the canonical rustdoc mirror of the identical table in the top-level
     /// `README.md`. `docs/DEPLOYMENT.md` references these names.
     ///
-    /// **Maintenance contract:** every `std::env::var(...)` call in the body
-    /// of `from_env` MUST have a row here. When you add, rename, or remove
-    /// an env var, update this table in the same commit. There is no
-    /// compile-time check — reviewers enforce it. Legacy aliases accepted
-    /// during a rename window (e.g. `FF_MAX_CONCURRENT_TAIL`) should be
-    /// listed alongside their preferred name.
+    /// **Maintenance contract:** every env var key this function consumes —
+    /// whether via a direct `std::env::var(...)` call or through the
+    /// `env_or` / `env_bool` / `env_u16` / `env_u16_positive` / `env_u64` /
+    /// `env_u32_positive` helpers — MUST have a row here. When you add,
+    /// rename, or remove an env var, update this table in the same commit.
+    /// There is no compile-time check — reviewers enforce it. Legacy
+    /// aliases accepted during a rename window (e.g. `FF_MAX_CONCURRENT_TAIL`)
+    /// should be listed alongside their preferred name.
     ///
     /// | Variable | Default | Description |
     /// |----------|---------|-------------|
