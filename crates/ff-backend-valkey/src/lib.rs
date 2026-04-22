@@ -173,13 +173,16 @@ impl ValkeyBackend {
     /// the encode onto the claim path itself (so `ClaimedTask` caches
     /// one `Handle` rather than synthesising per op).
     ///
-    /// `kind` is `HandleKind::Fresh` on `claim_next` /
-    /// `claim_from_grant` and `HandleKind::Resumed` on
-    /// `claim_from_reclaim_grant`. The Lua side does not inspect the
-    /// kind today; it is carried on the `Handle` so trait methods
-    /// that want to match on lifecycle state (`suspend` returns a
-    /// `HandleKind::Suspended`) can do so additively without a
-    /// second-dimension lookup.
+    /// `kind` today is always `HandleKind::Fresh` at the ff-sdk call
+    /// site — Stage 1b's 8 migrated ops do not dispatch on
+    /// `Handle.kind`, so the SDK does not yet distinguish
+    /// resumed-claim handles on the trait boundary. Stage 1d (or
+    /// the call-site that claims from a reclaim grant) will start
+    /// passing `HandleKind::Resumed` once a trait op needs the
+    /// distinction. The Lua side does not inspect the kind today;
+    /// it is carried on the `Handle` so trait methods that want to
+    /// match on lifecycle state (`suspend` returns a
+    /// `HandleKind::Suspended`) can do so additively.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_handle(
         execution_id: ExecutionId,
@@ -895,7 +898,22 @@ async fn fail_impl(
 
     let retry_policy_json = read_retry_policy_json(client, &ctx, &f.execution_id).await?;
 
-    let error_category = failure_class_to_lua_string(classification);
+    // Category string resolution: prefer the caller's raw-string
+    // stash in `FailureReason.detail` (see ff-sdk's
+    // `ClaimedTask::fail` carrier note). When the detail bytes are
+    // valid UTF-8 and non-empty, Lua sees the caller's exact
+    // category. Otherwise fall through to the trait-enum mapping
+    // (Transient / Permanent / …) so trait-direct callers still
+    // get a sensible string. Stage 1d retires the stash once
+    // `FailureClass::Custom(String)` lands.
+    let category_owned: Option<String> = reason
+        .detail
+        .as_ref()
+        .filter(|d| !d.is_empty())
+        .and_then(|d| std::str::from_utf8(d).ok())
+        .map(String::from);
+    let error_category: String = category_owned
+        .unwrap_or_else(|| failure_class_to_lua_string(classification).to_owned());
 
     let args: Vec<String> = vec![
         f.execution_id.to_string(),
@@ -903,7 +921,7 @@ async fn fail_impl(
         f.lease_epoch.to_string(),
         f.attempt_id.to_string(),
         reason.message,
-        error_category.to_owned(),
+        error_category,
         retry_policy_json,
     ];
 

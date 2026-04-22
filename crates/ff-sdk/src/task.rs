@@ -165,11 +165,11 @@ pub struct ClaimedTask {
     /// `EngineBackend` the trait-migrated ops forward through.
     ///
     /// **RFC-012 Stage 1b.** Today this is always a `ValkeyBackend`
-    /// wrapping `client`. 9 of 12 ops now route through
-    /// `backend.*()`; the remaining 3 (`create_pending_waitpoint`,
-    /// `append_frame`, `suspend`) still use `client.fcall(...)`
-    /// directly — see issue #117 for the trait-shape alignment
-    /// that unblocks them.
+    /// wrapping `client`. 8 of 12 ops now route through
+    /// `backend.*()`; the remaining 4 (`create_pending_waitpoint`,
+    /// `append_frame`, `suspend`, `report_usage`) still use
+    /// `client.fcall(...)` directly — see issue #117 for the
+    /// trait-shape alignment that unblocks them.
     ///
     /// Stage 1c will migrate the FlowFabricWorker hot paths (claim,
     /// deliver_signal) through the same trait surface; Stage 1d
@@ -443,15 +443,18 @@ impl ClaimedTask {
     /// Releases the lease. The execution moves to `delayed` state.
     /// Consumes self — the task cannot be used after delay.
     pub async fn delay_execution(self, delay_until: TimestampMs) -> Result<(), SdkError> {
-        // RFC-012 Stage 1b: forwards through `backend.delay`.
+        // RFC-012 Stage 1b: forwards through `backend.delay`. Matches
+        // the pre-migration `stop_renewal` contract: called only when
+        // the FCALL round-tripped (Ok or a typed Lua/engine error);
+        // raw transport errors bubble up without stopping renewal so
+        // the `Drop` warning still fires if the caller later drops
+        // `self` without retrying.
         let handle = self.synth_handle();
-        let out = self
-            .backend
-            .delay(&handle, delay_until)
-            .await
-            .map_err(SdkError::from);
-        self.stop_renewal();
-        out
+        let out = self.backend.delay(&handle, delay_until).await;
+        if fcall_landed(&out) {
+            self.stop_renewal();
+        }
+        out.map_err(SdkError::from)
     }
 
     /// Move execution to waiting_children state.
@@ -460,14 +463,13 @@ impl ClaimedTask {
     /// Consumes self.
     pub async fn move_to_waiting_children(self) -> Result<(), SdkError> {
         // RFC-012 Stage 1b: forwards through `backend.wait_children`.
+        // See `delay_execution` for the stop_renewal contract.
         let handle = self.synth_handle();
-        let out = self
-            .backend
-            .wait_children(&handle)
-            .await
-            .map_err(SdkError::from);
-        self.stop_renewal();
-        out
+        let out = self.backend.wait_children(&handle).await;
+        if fcall_landed(&out) {
+            self.stop_renewal();
+        }
+        out.map_err(SdkError::from)
     }
 
     /// Complete the execution successfully.
@@ -493,13 +495,11 @@ impl ClaimedTask {
         // (match same epoch + attempt_id + outcome=="success" → Ok)
         // moved to `ff_backend_valkey::complete_impl`.
         let handle = self.synth_handle();
-        let out = self
-            .backend
-            .complete(&handle, result_payload)
-            .await
-            .map_err(SdkError::from);
-        self.stop_renewal();
-        out
+        let out = self.backend.complete(&handle, result_payload).await;
+        if fcall_landed(&out) {
+            self.stop_renewal();
+        }
+        out.map_err(SdkError::from)
     }
 
     /// Fail the execution with a reason and error category.
@@ -525,21 +525,36 @@ impl ClaimedTask {
         // The FCALL body + retry-policy read + the two-shape replay
         // reconciliation (terminal/failed → TerminalFailed, runnable
         // → RetryScheduled{0}) moved to
-        // `ff_backend_valkey::fail_impl`. Mapping the SDK's
-        // free-form `error_category: &str` to `FailureClass` is
-        // local-lossy (unknown strings fall through to
-        // `Transient`); see `error_category_to_class` — Stage 1d
-        // widens `FailureClass` so this translation is exact.
+        // `ff_backend_valkey::fail_impl`.
+        //
+        // **Preserving the caller's raw category string.** The
+        // pre-Stage-1b code passed `error_category` straight to the
+        // Lua `failure_category` ARGV. Real callers use arbitrary
+        // lower_snake_case strings (`"lease_stale"`, `"bad_signal"`,
+        // `"inference_error"`, …) that do not correspond to the 5
+        // named `FailureClass` variants. A lossy enum conversion
+        // would rewrite every non-canonical category to
+        // `Transient` — a real behavior change for
+        // ff-readiness-tests + the examples crates.
+        //
+        // Instead: pack the raw category bytes into
+        // `FailureReason.detail`; `fail_impl` reads them back and
+        // threads them to Lua verbatim. The `classification` enum
+        // is derived from the string for the few consumers who
+        // match on the trait return today (none in-workspace).
+        // Stage 1d (or issue #117) widens `FailureClass` with a
+        // `Custom(String)` arm; this stash carrier retires then.
         let handle = self.synth_handle();
-        let failure_reason = ff_core::backend::FailureReason::new(reason.to_owned());
+        let failure_reason = ff_core::backend::FailureReason::with_detail(
+            reason.to_owned(),
+            error_category.as_bytes().to_vec(),
+        );
         let classification = error_category_to_class(error_category);
-        let out = self
-            .backend
-            .fail(&handle, failure_reason, classification)
-            .await
-            .map_err(SdkError::from);
-        self.stop_renewal();
-        out
+        let out = self.backend.fail(&handle, failure_reason, classification).await;
+        if fcall_landed(&out) {
+            self.stop_renewal();
+        }
+        out.map_err(SdkError::from)
     }
 
     /// Cancel the execution.
@@ -562,13 +577,11 @@ impl ClaimedTask {
         // and the `ExecutionNotActive` → outcome=="cancelled" replay
         // reconciliation all moved to `ff_backend_valkey::cancel_impl`.
         let handle = self.synth_handle();
-        let out = self
-            .backend
-            .cancel(&handle, reason)
-            .await
-            .map_err(SdkError::from);
-        self.stop_renewal();
-        out
+        let out = self.backend.cancel(&handle, reason).await;
+        if fcall_landed(&out) {
+            self.stop_renewal();
+        }
+        out.map_err(SdkError::from)
     }
 
     // ── Non-terminal operations ──
@@ -943,6 +956,28 @@ impl ClaimedTask {
 
 }
 
+/// True iff the backend's FCALL result represents a round-trip that
+/// reached the Lua side. `Ok(_)` and typed engine errors (validation,
+/// contention, conflict, state, bug) all count as "landed" — the
+/// server either committed or rejected with a typed response. Only
+/// raw `Transport` errors (connection drops, request timeouts, parse
+/// failures) count as "did not land", which matches the pre-Stage-1b
+/// SDK's `fcall(...).await.map_err(SdkError::Valkey)?` short-circuit
+/// — those errors returned before `stop_renewal()` ran, preserving
+/// the `Drop` warning for genuine "lease will leak" cases.
+///
+/// Stage 1b terminal-op forwarders use this predicate to decide
+/// whether to call `stop_renewal()`: yes for landed responses, no
+/// for transport errors so the caller's retry path still sees a
+/// running renewal task.
+fn fcall_landed<T>(r: &Result<T, crate::EngineError>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(crate::EngineError::Transport { .. }) => false,
+        Err(_) => true,
+    }
+}
+
 /// Map the SDK's free-form `error_category: &str` to the typed
 /// `FailureClass` the trait's `fail` method takes. Unknown categories
 /// fall through to `Transient` — the Lua side already tolerated
@@ -991,6 +1026,27 @@ impl Drop for ClaimedTask {
 
 // ── Lease renewal ──
 
+/// Per-tick renewal: single `backend.renew(&handle)` call wrapped in
+/// the `renew_lease` tracing span so bench harnesses' on_enter / on_exit
+/// hooks still see one span per renewal (restores PR #119 Cursor
+/// Bugbot finding — the top-level `spawn_renewal_task` fires once at
+/// construction time, not per-tick).
+///
+/// See `benches/harness/src/bin/long_running.rs` for the bench
+/// consumer that depends on this span naming.
+#[tracing::instrument(
+    name = "renew_lease",
+    skip_all,
+    fields(execution_id = %execution_id)
+)]
+async fn renew_once(
+    backend: &dyn EngineBackend,
+    handle: &Handle,
+    execution_id: &ExecutionId,
+) -> Result<(), crate::EngineError> {
+    backend.renew(handle).await.map(|_| ())
+}
+
 /// Spawn a background tokio task that renews the lease at `ttl / 3`
 /// intervals.
 ///
@@ -998,17 +1054,13 @@ impl Drop for ClaimedTask {
 /// `EngineBackend` trait (`backend.renew(&handle)`) instead of calling
 /// `ff_renew_lease` via a direct FCALL. The Stage-1a `renew_lease_inner`
 /// free function was deleted; this task holds an `Arc<dyn EngineBackend>`
-/// + the encoded `Handle` instead.
+/// + the encoded `Handle` instead. Per-tick tracing lives on
+///   [`renew_once`]; this function itself is sync + one-shot.
 ///
 /// Stops when:
 /// - `stop_signal` is notified (complete/fail/cancel called)
 /// - Renewal fails with a terminal error (stale_lease, lease_expired, etc.)
 /// - The task handle is aborted (ClaimedTask dropped)
-#[tracing::instrument(
-    name = "renew_lease",
-    skip_all,
-    fields(execution_id = %execution_id)
-)]
 fn spawn_renewal_task(
     backend: Arc<dyn EngineBackend>,
     handle: Handle,
@@ -1017,7 +1069,13 @@ fn spawn_renewal_task(
     stop_signal: Arc<Notify>,
     failure_counter: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
-    let interval = Duration::from_millis(lease_ttl_ms / 3);
+    // Clamp to ≥1ms so `tokio::time::interval(Duration::ZERO)` never
+    // panics if a caller (or a misconfigured test) passes a
+    // lease_ttl_ms < 3. The SDK config validator already enforces
+    // `lease_ttl_ms >= 1_000` for healthy deployments, but the clamp
+    // is a cheap belt-and-suspenders (Copilot review finding on
+    // PR #119).
+    let interval = Duration::from_millis((lease_ttl_ms / 3).max(1));
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -1035,7 +1093,7 @@ fn spawn_renewal_task(
                     return;
                 }
                 _ = tick.tick() => {
-                    match backend.renew(&handle).await {
+                    match renew_once(backend.as_ref(), &handle, &execution_id).await {
                         Ok(_renewal) => {
                             failure_counter.store(0, Ordering::Relaxed);
                             tracing::trace!(

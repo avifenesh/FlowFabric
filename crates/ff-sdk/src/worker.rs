@@ -471,28 +471,33 @@ impl FlowFabricWorker {
         })
     }
 
-    /// Store a pre-built [`EngineBackend`] on the worker for Stages
-    /// 1b-1d to route through. Builds the worker via the legacy
-    /// [`FlowFabricWorker::connect`] path first (so the embedded
-    /// `ferriskey::Client` that Stage 1a hot paths still use is
-    /// dialed), then attaches the injected backend via
-    /// [`Self::backend`].
+    /// Store a pre-built [`EngineBackend`] on the worker. Builds
+    /// the worker via the legacy [`FlowFabricWorker::connect`] path
+    /// first (so the embedded `ferriskey::Client` that the Stage 1b
+    /// non-migrated hot paths still use is dialed), then replaces
+    /// the default `ValkeyBackend` wrapper with the caller-supplied
+    /// `Arc<dyn EngineBackend>`.
     ///
-    /// **Stage 1a scope — caveats consumers must know.** The
-    /// injected backend is *stored, not consumed* by Stage 1a's hot
-    /// paths: `claim_next`, `claim_from_grant`,
-    /// `claim_from_reclaim_grant`, `deliver_signal`, and the admin
-    /// queries all still go through the embedded `ferriskey::Client`
-    /// dialed from `config.host`/`config.port`. Consequently this
-    /// constructor is NOT a drop-in way to swap in a non-Valkey
-    /// backend today — it requires a reachable Valkey node
-    /// regardless. Stage 1c routes the hot paths through
-    /// [`Self::backend`]; Stage 1d removes the embedded client.
+    /// **Stage 1b scope — what the injected backend covers today.**
+    /// After this PR, `ClaimedTask`'s 8 migrated ops
+    /// (`renew_lease` / `update_progress` / `resume_signals` /
+    /// `delay_execution` / `move_to_waiting_children` /
+    /// `complete` / `cancel` / `fail`) route through the injected
+    /// backend. That's the first material use of `connect_with`: a
+    /// mock backend now genuinely sees the worker's per-task
+    /// write-surface calls. The 4 trait-shape-deferred ops
+    /// (`create_pending_waitpoint`, `append_frame`, `suspend`,
+    /// `report_usage`) still reach the embedded
+    /// `ferriskey::Client` directly until issue #117's trait
+    /// amendment lands; `claim_next` / `claim_from_grant` /
+    /// `claim_from_reclaim_grant` / `deliver_signal` / admin queries
+    /// are Stage 1c hot-path work. Stage 1d removes the embedded
+    /// client entirely.
     ///
-    /// A mock / non-Valkey backend can still be injected here so
-    /// tests holding `worker.backend()` exercise the trait surface;
-    /// the hot paths won't call into the injected backend until
-    /// Stage 1c.
+    /// Today's constructor is therefore NOT yet a drop-in way to swap
+    /// in a non-Valkey backend — it requires a reachable Valkey node
+    /// for the 4 deferred + hot-path ops. Tests that exercise only
+    /// the 8 migrated ops can run fully against a mock backend.
     ///
     /// [`EngineBackend`]: ff_core::engine_backend::EngineBackend
     pub async fn connect_with(

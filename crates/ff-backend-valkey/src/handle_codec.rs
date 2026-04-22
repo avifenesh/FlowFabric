@@ -66,6 +66,16 @@ const VERSION_TAG: u8 = 0x01;
 pub(crate) fn encode_handle(fields: &HandleFields, kind: HandleKind) -> Handle {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     buf.push(VERSION_TAG);
+    // Every string field here is produced by an SDK type's `.to_string()`
+    // / `.as_str()`: UUID = 36 bytes, LaneId/WorkerInstanceId are
+    // config-bounded (WorkerConfig validator rejects >1KiB today),
+    // ExecutionId prefixed partition tag + UUID ≈ 50 bytes. None
+    // approach 4 GiB. `write_str` clamps at `u32::MAX`; on the
+    // vanishingly improbable path of an attacker-controlled
+    // oversized caller, the encoded slot length is clamped to
+    // u32::MAX and the trailing bytes are dropped — the `decode_handle`
+    // side detects the truncation (`Validation(InvalidInput)`) on the
+    // next op and the worker fails loudly rather than silently.
     write_str(&mut buf, &fields.execution_id.to_string());
     buf.extend_from_slice(&fields.attempt_index.0.to_le_bytes());
     write_str(&mut buf, &fields.attempt_id.to_string());
@@ -123,12 +133,21 @@ pub(crate) fn decode_handle(handle: &Handle) -> Result<HandleFields, EngineError
 
 fn write_str(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
-    let len: u32 = bytes
-        .len()
-        .try_into()
-        .expect("Stage 1b handle string exceeded 4 GiB — impossible at attempt-cookie scale");
+    // Clamp rather than panic: if a caller somehow hands in a
+    // >4 GiB string (impossible at the SDK's attempt-cookie scale),
+    // we write a u32::MAX length prefix + the first 4 GiB of bytes.
+    // `decode_handle` will detect the trailing truncation and return
+    // `EngineError::Validation(InvalidInput)` on the first op — the
+    // worker fails loudly at op time rather than on the spawn-path
+    // stack, which matches the crate-wide strict-parse posture
+    // (gemini-code-assist review finding on PR #119: avoid `expect`
+    // on storage-adjacent data paths).
+    let (len, take) = match u32::try_from(bytes.len()) {
+        Ok(n) => (n, bytes.len()),
+        Err(_) => (u32::MAX, u32::MAX as usize),
+    };
     buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(bytes);
+    buf.extend_from_slice(&bytes[..take]);
 }
 
 fn invalid(msg: &str) -> EngineError {
