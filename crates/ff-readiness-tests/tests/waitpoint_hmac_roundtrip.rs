@@ -179,7 +179,7 @@ async fn waitpoint_hmac_roundtrip() {
     let token_c_kid_prefix = format!("{NEW_KID}:");
     assert!(
         token_c.as_str().starts_with(&token_c_kid_prefix),
-        "post-rotation mint must be k2-signed; got token with prefix {:?}",
+        "post-rotation mint must be {NEW_KID}-signed; got token with prefix {:?}",
         token_c.as_str().split(':').next()
     );
 
@@ -189,7 +189,8 @@ async fn waitpoint_hmac_roundtrip() {
     //    executions suspended before the rotation and not yet signaled.
     //    Suspending a fourth exec pre-rotation isn't possible from here
     //    (rotation already ran), so re-install k1 as current, mint a
-    //    token, reinstate k2 via rotation, then stomp expires_at:k1. ──
+    //    token, rotate forward to k3 so k1 is no longer current, then
+    //    stomp expires_at:k1 to force past-grace. ──
     tc.install_waitpoint_hmac_secret(
         "k1",
         "0000000000000000000000000000000000000000000000000000000000000000",
@@ -363,9 +364,10 @@ async fn reclaim(worker: &ff_sdk::FlowFabricWorker, eid: &ExecutionId) -> Claime
                     break t;
                 }
                 // Not our exec (belongs to a sibling run on the same
-                // worker); relinquish by dropping. Drop panics on
-                // "terminal op missing" warnings — let the background
-                // lease expiry reclaim instead.
+                // worker); relinquish by dropping. ClaimedTask::Drop
+                // emits a tracing::warn! and aborts the renewal task —
+                // it does not panic — so the background lease expiry
+                // reclaims the task for the next poll.
                 drop(t);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
