@@ -8,9 +8,17 @@
 //!
 //! # Quick start
 //!
+//! The production claim path is
+//! [`FlowFabricWorker::claim_from_grant`]: obtain a
+//! [`ClaimGrant`] from `ff_scheduler::Scheduler::claim_for_worker`
+//! (the scheduler enforces budget, quota, and capability checks),
+//! then hand it to the SDK. `claim_next` is gated behind the
+//! default-off `direct-valkey-claim` feature and bypasses admission
+//! control — fine for benchmarks, not production.
+//!
 //! ```rust,ignore
 //! use ff_sdk::{FlowFabricWorker, WorkerConfig};
-//! use std::time::Duration;
+//! use ff_core::types::LaneId;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), ff_sdk::SdkError> {
@@ -24,19 +32,17 @@
 //!     );
 //!
 //!     let worker = FlowFabricWorker::connect(config).await?;
+//!     let lane = LaneId::new("main");
 //!
-//!     loop {
-//!         match worker.claim_next().await? {
-//!             Some(task) => {
-//!                 println!("claimed: {}", task.execution_id());
-//!                 // Process task...
-//!                 task.complete(Some(b"done".to_vec())).await?;
-//!             }
-//!             None => {
-//!                 tokio::time::sleep(Duration::from_secs(1)).await;
-//!             }
-//!         }
-//!     }
+//!     // In a real deployment `grant` is obtained from the
+//!     // scheduler's `claim_for_worker` RPC/helper; it carries the
+//!     // execution id, capability match, and admission result.
+//!     # let grant: ff_core::contracts::ClaimGrant = unimplemented!();
+//!     let task = worker.claim_from_grant(lane, grant).await?;
+//!     println!("claimed: {}", task.execution_id());
+//!     // Process task...
+//!     task.complete(Some(b"done".to_vec())).await?;
+//!     Ok(())
 //! }
 //! ```
 //!

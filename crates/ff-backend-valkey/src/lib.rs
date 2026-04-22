@@ -171,7 +171,7 @@ impl ValkeyBackend {
     pub fn from_client_and_partitions(
         client: ferriskey::Client,
         partition_config: PartitionConfig,
-    ) -> Arc<dyn EngineBackend> {
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             partition_config,

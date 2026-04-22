@@ -728,6 +728,32 @@ impl ScannerFilter {
         instance_tag: None,
     };
 
+    /// Create an empty filter (equivalent to [`Self::NOOP`]).
+    ///
+    /// Provided for external-crate consumers: `ScannerFilter` is
+    /// `#[non_exhaustive]`, so struct-literal and functional-update
+    /// construction are unavailable across crate boundaries. Start
+    /// from `new()` and chain `with_*` setters to build a filter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the tenant-scope namespace filter dimension. Consumes
+    /// and returns `self` for chaining.
+    pub fn with_namespace(mut self, ns: Namespace) -> Self {
+        self.namespace = Some(ns);
+        self
+    }
+
+    /// Set the exact-match exec-tag filter dimension. Consumes and
+    /// returns `self` for chaining. At filter time, scanners read
+    /// the `ff:exec:{p:N}:<eid>:tags` hash and compare the value at
+    /// `key` byte-for-byte against `value`.
+    pub fn with_instance_tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.instance_tag = Some((key.into(), value.into()));
+        self
+    }
+
     /// True iff the filter has no dimensions set — every candidate
     /// passes. Callers use this to short-circuit filtered subscribe
     /// paths back to the unfiltered ones.
@@ -1014,6 +1040,30 @@ mod tests {
         assert!(!f.matches(Some(&Namespace::new("tenant-a")), Some("i-2")));
         assert!(!f.matches(Some(&Namespace::new("tenant-b")), Some("i-1")));
         assert!(!f.matches(None, Some("i-1")));
+    }
+
+    #[test]
+    fn scanner_filter_builder_construction() {
+        // Simulates external-crate usage: only public constructors
+        // and chainable setters (no struct-literal access to the
+        // `#[non_exhaustive]` fields).
+        let empty = ScannerFilter::new();
+        assert!(empty.is_noop());
+        assert_eq!(empty, ScannerFilter::NOOP);
+
+        let ns_only = ScannerFilter::new().with_namespace(Namespace::new("tenant-a"));
+        assert!(!ns_only.is_noop());
+        assert!(ns_only.matches(Some(&Namespace::new("tenant-a")), None));
+
+        let tag_only = ScannerFilter::new().with_instance_tag("cairn.instance_id", "i-1");
+        assert!(!tag_only.is_noop());
+        assert!(tag_only.matches(None, Some("i-1")));
+
+        let both = ScannerFilter::new()
+            .with_namespace(Namespace::new("tenant-a"))
+            .with_instance_tag("cairn.instance_id", "i-1");
+        assert!(both.matches(Some(&Namespace::new("tenant-a")), Some("i-1")));
+        assert!(!both.matches(Some(&Namespace::new("tenant-b")), Some("i-1")));
     }
 
     #[test]
