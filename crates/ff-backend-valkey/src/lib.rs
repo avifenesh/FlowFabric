@@ -29,11 +29,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ff_core::backend::{
-    AdmissionDecision, BackendConfig, BackendConnection, CancelFlowPolicy, CancelFlowWait,
+    AppendFrameOutcome, BackendConfig, BackendConnection, CancelFlowPolicy, CancelFlowWait,
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle,
-    HandleKind, LeaseRenewal, ReclaimToken, ResumeSignal, UsageDimensions, WaitpointSpec,
+    HandleKind, LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
+    WaitpointSpec,
 };
-use ff_core::contracts::{CancelFlowArgs, CancelFlowResult, ExecutionSnapshot, FlowSnapshot};
+use ff_core::contracts::{
+    CancelFlowArgs, CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
@@ -1184,7 +1187,11 @@ impl EngineBackend for ValkeyBackend {
         .await
     }
 
-    async fn append_frame(&self, _handle: &Handle, _frame: Frame) -> Result<(), EngineError> {
+    async fn append_frame(
+        &self,
+        _handle: &Handle,
+        _frame: Frame,
+    ) -> Result<AppendFrameOutcome, EngineError> {
         Err(EngineError::Unavailable { op: "append_frame" })
     }
 
@@ -1219,6 +1226,17 @@ impl EngineBackend for ValkeyBackend {
         _timeout: Option<Duration>,
     ) -> Result<Handle, EngineError> {
         Err(EngineError::Unavailable { op: "suspend" })
+    }
+
+    async fn create_waitpoint(
+        &self,
+        _handle: &Handle,
+        _waitpoint_key: &str,
+        _expires_in: Duration,
+    ) -> Result<PendingWaitpoint, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "create_waitpoint",
+        })
     }
 
     async fn observe_signals(
@@ -1284,7 +1302,7 @@ impl EngineBackend for ValkeyBackend {
         _handle: &Handle,
         _budget: &BudgetId,
         _dimensions: UsageDimensions,
-    ) -> Result<AdmissionDecision, EngineError> {
+    ) -> Result<ReportUsageResult, EngineError> {
         Err(EngineError::Unavailable {
             op: "report_usage",
         })

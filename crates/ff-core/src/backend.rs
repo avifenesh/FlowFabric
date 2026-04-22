@@ -391,19 +391,6 @@ pub struct UsageDimensions {
     pub dedup_key: Option<String>,
 }
 
-/// Admission outcome returned by `report_usage`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AdmissionDecision {
-    /// Usage accepted; caller may continue.
-    Admitted,
-    /// Rate-limited or concurrency-capped; retry after the suggested
-    /// interval.
-    Throttled { retry_after_ms: u64 },
-    /// Rejected outright — budget exhausted or policy violation.
-    Rejected { reason: String },
-}
-
 // ── §3.3.0 Reclaim / lease types ────────────────────────────────────────
 
 /// Opaque cookie returned by the reclaim scanner; consumed by
@@ -977,18 +964,6 @@ mod tests {
         assert_eq!(u.clone(), u);
         assert_eq!(UsageDimensions::default().input_tokens, 0);
         assert_eq!(UsageDimensions::default().dedup_key, None);
-    }
-
-    #[test]
-    fn admission_decision_derives() {
-        let a = AdmissionDecision::Admitted;
-        let t = AdmissionDecision::Throttled { retry_after_ms: 25 };
-        let r = AdmissionDecision::Rejected {
-            reason: "quota".into(),
-        };
-        assert_eq!(a.clone(), a);
-        assert_eq!(t.clone(), t);
-        assert_ne!(a, r);
     }
 
     #[test]
