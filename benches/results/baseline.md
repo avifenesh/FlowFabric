@@ -64,16 +64,40 @@ improvement (175906 → 117197 ms) falls in the same band.
 
 ## Scenario 3 — flow_dag_linear (100 flows × 10 nodes, 16 workers)
 
-| system         | git_sha | flows/s | p50 ms  | p95 ms  | p99 ms   |
-|----------------|---------|---------|---------|---------|----------|
-| ff-server      | da89fa9 |   8.16  |  352.95 | (n/a)   | 11948.56 |
-| ff-server (v0.1.0) | 01f6327 |   8.18 | 347.63  | (n/a)   | 12055.19 |
-| ff-server (pre-BatchC) | b4ec2c2 |   5.96 | 7348.79 | 8555.88 | 9350.30 |
-| apalis-approx  | 1b2cce5 |   1.02  | n/a     | n/a     | n/a      |
+| system                    | git_sha | flows/s | p50 ms  | p95 ms  | p99 ms   |
+|---------------------------|---------|---------|---------|---------|----------|
+| ff-server                 | da89fa9 |   8.16  |  352.95 | (n/a)   | 11948.56 |
+| ff-server (v0.1.0)        | 01f6327 |   8.18  | 347.63  | (n/a)   | 12055.19 |
+| ff-server (pre-BatchC)    | b4ec2c2 |   5.96  | 7348.79 | 8555.88 | 9350.30  |
+| apalis (apalis-workflow, N=5)   | a4057c7 |   9.3   | n/a     | n/a     | n/a      |
+| apalis-approx (prior harness)   | 1b2cce5 |   1.02  | n/a     | n/a     | n/a      |
 
 Flat vs v0.1.0 across all percentiles — the push-based promotion
 speedup (21× at p50 over pre-BatchC) holds. p99 tail growth still
 present; no follow-up investigation filed in this cycle.
+
+**apalis harness update (2026-04-22, issue #51):** Scenario-4 apalis
+harness switched from a hand-rolled 10-stage inter-queue chain to
+`apalis-workflow::Workflow` (sequential `and_then` primitive) after
+the apalis maintainer (geofmureithi) flagged the prior harness as
+under-representing apalis. The `apalis-approx` row above is from a
+single-sample run at commit `1b2cce5` (different hardware / Valkey
+config) and should NOT be compared directly to either the
+`apalis` row (N=5, `a4057c7`, same host as current ff-server row) or
+the v0.3.2 numbers. When re-run on the current host with the
+**prior** harness at flows=100 N=5, apalis also measures 9.3 flows/s
+— the flows=100 workload sits at the 50 ms driver-poll-jitter floor
+(wall ≈ 10.70 s for both harnesses). At flows=500 the two harnesses
+diverge measurably: prior harness 34.0 flows/s (wall 14.69 s, N=3),
+`apalis-workflow` 9.8 flows/s (wall 50.93 s, N=5). The linear-chain
+shape favours the prior hand-rolled chain's cheap per-stage enqueue
+over `apalis-workflow`'s per-step state persistence. The harness is
+still correct to adopt — see COMPARISON.md — because this represents
+apalis's idiomatic shape, even if it measures slower on this
+specific scenario. Per-sample walls (new harness, flows=500, N=5):
+50.89, 50.88, 50.88, 50.97, 51.01 s. System label relabelled
+`apalis` (not `apalis-approx`) for the new harness row since the
+harness is no longer hand-rolled.
 
 ## Scenario 4 — long_running_steady_state (300s, refill 20 tasks / 10s, **N=5 samples**)
 
