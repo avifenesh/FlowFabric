@@ -34,20 +34,22 @@ use ff_core::backend::{
     HandleKind, LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
     WaitpointSpec,
 };
+use ff_core::contracts::decode::build_edge_snapshot;
 use ff_core::contracts::{
-    CancelFlowArgs, CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+    CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    ReportUsageResult,
 };
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
-use ff_core::partition::{execution_partition, flow_partition, PartitionConfig};
+use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
 use ff_core::types::{
-    AttemptId, AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
+    AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
     SignalId, TimestampMs, WaitpointId, WorkerInstanceId,
 };
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
-use ff_script::functions::flow::{ff_cancel_flow, FlowStructOpKeys};
+use ff_script::functions::flow::{FlowStructOpKeys, ff_cancel_flow};
 use ff_script::result::FcallResult;
 
 pub mod backend_error;
@@ -361,14 +363,120 @@ async fn cancel_flow_fcall(
         .map_err(EngineError::from)
 }
 
+/// Read all edges adjacent to `subject_eid` on the requested side.
+///
+/// Mirrors the ff-sdk free-fn `list_edges_from_set` pipeline shape
+/// (`SMEMBERS adj_set` + pipelined `HGETALL edge_hash`) but routes
+/// every parse / identity failure through
+/// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`]
+/// via [`ff_core::contracts::decode::build_edge_snapshot`]. The
+/// caller's `flow_id` is trusted — unlike the ff-sdk free-fn there
+/// is no `HGET exec_core.flow_id` resolution round trip; the trait
+/// method requires callers to pass the flow id they already know.
+///
+/// The adjacency SET's endpoint cross-check still runs here (the
+/// returned edge's `upstream_execution_id` for Outgoing, or
+/// `downstream_execution_id` for Incoming, must match
+/// `direction.subject()`) so a drifted SET entry does not silently
+/// surface an unrelated edge to the caller.
+async fn list_edges_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    flow_id: &FlowId,
+    direction: EdgeDirection,
+) -> Result<Vec<EdgeSnapshot>, EngineError> {
+    let partition = flow_partition(flow_id, partition_config);
+    let fctx = FlowKeyContext::new(&partition, flow_id);
+
+    let (adj_key, subject_eid, side_is_outgoing) = match &direction {
+        EdgeDirection::Outgoing { from_node } => (fctx.outgoing(from_node), from_node, true),
+        EdgeDirection::Incoming { to_node } => (fctx.incoming(to_node), to_node, false),
+    };
+
+    let edge_id_strs: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&adj_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    if edge_id_strs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Parse every edge id up front so a corrupt SET entry fails loud
+    // before we spend a round trip on it. Mirrors the ff-sdk posture.
+    let mut edge_ids: Vec<EdgeId> = Vec::with_capacity(edge_id_strs.len());
+    for raw in &edge_id_strs {
+        let parsed = EdgeId::parse(raw).map_err(|e| EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::Corruption,
+            detail: format!(
+                "list_edges: adjacency_set: edge_id: '{raw}' is not a valid EdgeId \
+                 (key corruption?): {e}"
+            ),
+        })?;
+        edge_ids.push(parsed);
+    }
+
+    let mut pipe = client.pipeline();
+    let slots: Vec<_> = edge_ids
+        .iter()
+        .map(|eid| {
+            pipe.cmd::<HashMap<String, String>>("HGETALL")
+                .arg(fctx.edge(eid))
+                .finish()
+        })
+        .collect();
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let mut out: Vec<EdgeSnapshot> = Vec::with_capacity(edge_ids.len());
+    for (edge_id, slot) in edge_ids.iter().zip(slots) {
+        let raw = slot.value().map_err(transport_fk)?;
+        if raw.is_empty() {
+            // Adjacency SET references an edge hash that no longer
+            // exists. FF never deletes edge hashes (staging is
+            // write-once) so treat as corruption.
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail: format!(
+                    "list_edges: adjacency_set: refers to edge_id '{edge_id}' but its \
+                     edge_hash is absent (key corruption?)"
+                ),
+            });
+        }
+        let snap = build_edge_snapshot(flow_id, edge_id, &raw)?;
+        // Endpoint cross-check: the decoded edge's endpoint on the
+        // listed side must match the subject execution.
+        let endpoint = if side_is_outgoing {
+            &snap.upstream_execution_id
+        } else {
+            &snap.downstream_execution_id
+        };
+        if endpoint != subject_eid {
+            let side = if side_is_outgoing {
+                "Outgoing"
+            } else {
+                "Incoming"
+            };
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail: format!(
+                    "list_edges: adjacency_set: for execution '{subject_eid}' \
+                     (side={side}) contains edge '{edge_id}' whose stored endpoint is \
+                     '{endpoint}' (adjacency/edge-hash drift?)"
+                ),
+            });
+        }
+        out.push(snap);
+    }
+    Ok(out)
+}
+
 /// Read the deployment's partition config from
 /// `ff:config:partitions`. Keeps `ValkeyBackend` aligned with
 /// ff-server's published `num_flow_partitions` / budget / quota
 /// counts. Mirrors the ff-sdk `worker::read_partition_config` helper
 /// (Stage 1c will deduplicate once the hot-path migration lands).
-async fn load_partition_config(
-    client: &ferriskey::Client,
-) -> Result<PartitionConfig, EngineError> {
+async fn load_partition_config(client: &ferriskey::Client) -> Result<PartitionConfig, EngineError> {
     let key = ff_core::keys::global_config_partitions();
     let fields: HashMap<String, String> = client
         .hgetall(&key)
@@ -513,7 +621,9 @@ async fn progress_impl(
         f.execution_id.to_string(),
         f.lease_id.to_string(),
         f.lease_epoch.to_string(),
-        percent.map(|p| p.to_string()).unwrap_or_else(|| "0".to_string()),
+        percent
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "0".to_string()),
         message.unwrap_or("").to_string(),
     ];
 
@@ -548,8 +658,7 @@ async fn observe_signals_impl(
         .await
         .map_err(transport_fk)?;
 
-    let Some(waitpoint_id) = resume_waitpoint_id_from_suspension(&susp, f.attempt_index)?
-    else {
+    let Some(waitpoint_id) = resume_waitpoint_id_from_suspension(&susp, f.attempt_index)? else {
         return Ok(Vec::new());
     };
 
@@ -623,8 +732,7 @@ async fn observe_signals_impl(
         if sig.is_empty() {
             continue;
         }
-        let payload_raw: Option<ferriskey::Value> =
-            payload_slot.value().map_err(transport_fk)?;
+        let payload_raw: Option<ferriskey::Value> = payload_slot.value().map_err(transport_fk)?;
         let payload: Option<Vec<u8>> = match payload_raw {
             Some(ferriskey::Value::BulkString(b)) => Some(b.to_vec()),
             Some(ferriskey::Value::SimpleString(s)) => Some(s.into_bytes()),
@@ -1279,8 +1387,8 @@ async fn fail_impl(
         .filter(|d| !d.is_empty())
         .and_then(|d| std::str::from_utf8(d).ok())
         .map(String::from);
-    let error_category: String = category_owned
-        .unwrap_or_else(|| failure_class_to_lua_string(classification).to_owned());
+    let error_category: String =
+        category_owned.unwrap_or_else(|| failure_class_to_lua_string(classification).to_owned());
 
     let args: Vec<String> = vec![
         f.execution_id.to_string(),
@@ -1343,14 +1451,12 @@ fn reconcile_terminal_replay(
     f: &handle_codec::HandleFields,
     expected_outcome: &str,
 ) -> bool {
-    if let EngineError::Contention(
-        ff_core::engine_error::ContentionKind::ExecutionNotActive {
-            ref terminal_outcome,
-            ref lease_epoch,
-            ref attempt_id,
-            ..
-        },
-    ) = *err
+    if let EngineError::Contention(ff_core::engine_error::ContentionKind::ExecutionNotActive {
+        ref terminal_outcome,
+        ref lease_epoch,
+        ref attempt_id,
+        ..
+    }) = *err
     {
         terminal_outcome == expected_outcome
             && lease_epoch == &f.lease_epoch.to_string()
@@ -1422,10 +1528,7 @@ async fn read_retry_policy_json(
     ctx: &ExecKeyContext,
     execution_id: &ExecutionId,
 ) -> Result<String, EngineError> {
-    let policy_str: Option<String> = client
-        .get(&ctx.policy())
-        .await
-        .map_err(transport_fk)?;
+    let policy_str: Option<String> = client.get(&ctx.policy()).await.map_err(transport_fk)?;
     match policy_str {
         Some(json) => match serde_json::from_str::<serde_json::Value>(&json) {
             Ok(policy) => {
@@ -1489,11 +1592,7 @@ impl EngineBackend for ValkeyBackend {
         append_frame_impl(&self.client, &self.partition_config, &f, frame).await
     }
 
-    async fn complete(
-        &self,
-        handle: &Handle,
-        payload: Option<Vec<u8>>,
-    ) -> Result<(), EngineError> {
+    async fn complete(&self, handle: &Handle, payload: Option<Vec<u8>>) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
         complete_impl(&self.client, &self.partition_config, &f, payload).await
     }
@@ -1505,7 +1604,14 @@ impl EngineBackend for ValkeyBackend {
         classification: FailureClass,
     ) -> Result<FailOutcome, EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        fail_impl(&self.client, &self.partition_config, &f, reason, classification).await
+        fail_impl(
+            &self.client,
+            &self.partition_config,
+            &f,
+            reason,
+            classification,
+        )
+        .await
     }
 
     async fn cancel(&self, handle: &Handle, reason: &str) -> Result<(), EngineError> {
@@ -1556,11 +1662,7 @@ impl EngineBackend for ValkeyBackend {
         })
     }
 
-    async fn delay(
-        &self,
-        handle: &Handle,
-        delay_until: TimestampMs,
-    ) -> Result<(), EngineError> {
+    async fn delay(&self, handle: &Handle, delay_until: TimestampMs) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
         delay_impl(&self.client, &self.partition_config, &f, delay_until).await
     }
@@ -1579,13 +1681,18 @@ impl EngineBackend for ValkeyBackend {
         })
     }
 
-    async fn describe_flow(
-        &self,
-        _id: &FlowId,
-    ) -> Result<Option<FlowSnapshot>, EngineError> {
+    async fn describe_flow(&self, _id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {
         Err(EngineError::Unavailable {
             op: "describe_flow",
         })
+    }
+
+    async fn list_edges(
+        &self,
+        flow_id: &FlowId,
+        direction: EdgeDirection,
+    ) -> Result<Vec<EdgeSnapshot>, EngineError> {
+        list_edges_impl(&self.client, &self.partition_config, flow_id, direction).await
     }
 
     async fn cancel_flow(
@@ -1614,7 +1721,10 @@ mod tests {
 
     #[test]
     fn cancel_policy_strings() {
-        assert_eq!(cancel_policy_to_str(CancelFlowPolicy::FlowOnly), "flow_only");
+        assert_eq!(
+            cancel_policy_to_str(CancelFlowPolicy::FlowOnly),
+            "flow_only"
+        );
         assert_eq!(
             cancel_policy_to_str(CancelFlowPolicy::CancelAll),
             "cancel_all"

@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use ff_core::contracts::decode::build_edge_snapshot as build_edge_snapshot_core;
 use ff_core::contracts::{
     AttemptSummary, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, LeaseSummary,
 };
@@ -111,13 +112,12 @@ fn build_execution_snapshot(
     // ingress; a read that fails validation here signals on-disk
     // corruption — surface it rather than silently constructing an
     // invalid LaneId that would mis-partition downstream.
-    let lane_id = LaneId::try_new(opt_str(core, "lane_id").unwrap_or("")).map_err(|e| {
-        SdkError::Config {
+    let lane_id =
+        LaneId::try_new(opt_str(core, "lane_id").unwrap_or("")).map_err(|e| SdkError::Config {
             context: "describe_execution: exec_core".into(),
             field: Some("lane_id".into()),
             message: format!("fails LaneId validation (key corruption?): {e}"),
-        }
-    })?;
+        })?;
 
     let namespace_str = opt_str(core, "namespace").unwrap_or("").to_owned();
     let namespace = Namespace::new(namespace_str);
@@ -582,23 +582,16 @@ fn is_namespaced_tag_key(k: &str) -> bool {
 // ═══════════════════════════════════════════════════════════════════════
 // describe_edge / list_*_edges (issue #58.3)
 // ═══════════════════════════════════════════════════════════════════════
-
-/// FF-owned fields on the flow-scoped `edge:<edge_id>` hash. An HGETALL
-/// field outside this set signals on-disk corruption or protocol drift
-/// and surfaces as `SdkError::Config` — matching the strict-parse
-/// posture on `describe_flow`.
-const EDGE_KNOWN_FIELDS: &[&str] = &[
-    "edge_id",
-    "flow_id",
-    "upstream_execution_id",
-    "downstream_execution_id",
-    "dependency_kind",
-    "satisfaction_condition",
-    "data_passing_ref",
-    "edge_state",
-    "created_at",
-    "created_by",
-];
+//
+// RFC-012 Stage 1c T2: the `EDGE_KNOWN_FIELDS` list and the
+// `build_edge_snapshot` decoder moved to
+// `ff_core::contracts::decode`. Parse failures now surface as
+// `EngineError::Validation { kind: Corruption, .. }` — callers that
+// match on `SdkError` see them wrapped as
+// `SdkError::Engine(EngineError::Validation(..))` via the crate-root
+// `From<EngineError> for SdkError` impl. The pipeline shape
+// (SMEMBERS + pipelined HGETALL) is unchanged; only the decoder
+// location moved so non-SDK backends can reuse it.
 
 impl FlowFabricWorker {
     /// Read a typed snapshot of one dependency edge.
@@ -640,7 +633,9 @@ impl FlowFabricWorker {
             return Ok(None);
         }
 
-        build_edge_snapshot(flow_id, edge_id, &raw).map(Some)
+        build_edge_snapshot_core(flow_id, edge_id, &raw)
+            .map(Some)
+            .map_err(SdkError::from)
     }
 
     /// List all outgoing dependency edges originating from an execution.
@@ -707,10 +702,7 @@ impl FlowFabricWorker {
     /// parsed-but-wrong flow_id would otherwise silently route the
     /// follow-up adjacency reads to the wrong partition and return
     /// bogus empty results. A mismatch surfaces as `SdkError::Config`.
-    async fn resolve_flow_id(
-        &self,
-        eid: &ExecutionId,
-    ) -> Result<Option<FlowId>, SdkError> {
+    async fn resolve_flow_id(&self, eid: &ExecutionId) -> Result<Option<FlowId>, SdkError> {
         let exec_partition = execution_partition(eid, self.partition_config());
         let ctx = ExecKeyContext::new(&exec_partition, eid);
         let raw: Option<String> = self
@@ -813,7 +805,7 @@ impl FlowFabricWorker {
                     ),
                 });
             }
-            let snap = build_edge_snapshot(flow_id, edge_id, &raw)?;
+            let snap = build_edge_snapshot_core(flow_id, edge_id, &raw).map_err(SdkError::from)?;
             // Cross-check: the edge hash's endpoint on the listed side
             // must match the execution we're listing for. A mismatch
             // means the adjacency SET and edge hash disagree (e.g. a
@@ -851,160 +843,21 @@ enum AdjacencySide {
     Incoming,
 }
 
-/// Crate-visible re-export of [`build_edge_snapshot`] for
-/// [`crate::engine_error::EngineError::enrich_dependency_conflict`].
-#[allow(dead_code)]
+/// Crate-visible thin adapter over
+/// [`ff_core::contracts::decode::build_edge_snapshot`] for
+/// [`crate::engine_error::enrich_dependency_conflict`]. Returns the
+/// native [`ff_core::engine_error::EngineError`] so the caller can
+/// route parse failures into the same `EngineError`-shaped surface
+/// it already uses. Kept as a named indirection so the one non-SDK
+/// internal user (`enrich_dependency_conflict`) has a stable call
+/// site; new callers should invoke the ff-core module directly.
+#[allow(dead_code, clippy::result_large_err)]
 pub(crate) fn build_edge_snapshot_public(
     flow_id: &FlowId,
     edge_id: &EdgeId,
     raw: &HashMap<String, String>,
-) -> Result<EdgeSnapshot, SdkError> {
-    build_edge_snapshot(flow_id, edge_id, raw)
-}
-
-/// Assemble an [`EdgeSnapshot`] from the raw HGETALL field map. Kept
-/// as a free function so unit tests can feed synthetic maps.
-///
-/// `flow_id` / `edge_id` are the caller's expected identities — both
-/// are cross-checked against the stored values to catch wrong-key
-/// reads and on-disk corruption.
-fn build_edge_snapshot(
-    flow_id: &FlowId,
-    edge_id: &EdgeId,
-    raw: &HashMap<String, String>,
-) -> Result<EdgeSnapshot, SdkError> {
-    // Sweep for unknown fields before parsing — a future FF rename
-    // that lands an unrecognised field must fail loud rather than
-    // silently drop data.
-    for k in raw.keys() {
-        if !EDGE_KNOWN_FIELDS.contains(&k.as_str()) {
-            return Err(SdkError::Config {
-                context: "edge_snapshot: edge_hash".into(),
-                field: None,
-                message: format!(
-                    "has unexpected field '{k}' (protocol drift or corruption?)"
-                ),
-            });
-        }
-    }
-
-    let stored_edge_id_str = opt_str(raw, "edge_id")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("edge_id".into()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?;
-    if stored_edge_id_str != edge_id.to_string() {
-        return Err(SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("edge_id".into()),
-            message: format!(
-                "'{stored_edge_id_str}' does not match requested edge_id \
-                 '{edge_id}' (key corruption or wrong-key read?)"
-            ),
-        });
-    }
-
-    let stored_flow_id_str = opt_str(raw, "flow_id")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("flow_id".into()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?;
-    if stored_flow_id_str != flow_id.to_string() {
-        return Err(SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("flow_id".into()),
-            message: format!(
-                "'{stored_flow_id_str}' does not match requested flow_id \
-                 '{flow_id}' (key corruption or wrong-key read?)"
-            ),
-        });
-    }
-
-    let upstream_execution_id = parse_eid(raw, "upstream_execution_id")?;
-    let downstream_execution_id = parse_eid(raw, "downstream_execution_id")?;
-
-    let dependency_kind = opt_str(raw, "dependency_kind")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("dependency_kind".into()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?
-        .to_owned();
-
-    let satisfaction_condition = opt_str(raw, "satisfaction_condition")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("satisfaction_condition".into()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?
-        .to_owned();
-
-    // data_passing_ref is stored as "" when the stager passed None.
-    // Treat empty as absent rather than surfacing an empty String.
-    let data_passing_ref = opt_str(raw, "data_passing_ref")
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-
-    let edge_state = opt_str(raw, "edge_state")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("edge_state".into()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?
-        .to_owned();
-
-    let created_at =
-        parse_ts(raw, "edge_snapshot: edge_hash", "created_at")?.ok_or_else(|| {
-            SdkError::Config {
-                context: "edge_snapshot: edge_hash".into(),
-                field: Some("created_at".into()),
-                message: "is missing or empty (key corruption?)".into(),
-            }
-        })?;
-
-    let created_by = opt_str(raw, "created_by")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some("created_by".into()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?
-        .to_owned();
-
-    Ok(EdgeSnapshot::new(
-        edge_id.clone(),
-        flow_id.clone(),
-        upstream_execution_id,
-        downstream_execution_id,
-        dependency_kind,
-        satisfaction_condition,
-        data_passing_ref,
-        edge_state,
-        created_at,
-        created_by,
-    ))
-}
-
-fn parse_eid(raw: &HashMap<String, String>, field: &str) -> Result<ExecutionId, SdkError> {
-    let s = opt_str(raw, field)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SdkError::Config {
-            context: "edge_snapshot: edge_hash".into(),
-            field: Some(field.to_owned()),
-            message: "is missing or empty (key corruption?)".into(),
-        })?;
-    ExecutionId::parse(s).map_err(|e| SdkError::Config {
-        context: "edge_snapshot: edge_hash".into(),
-        field: Some(field.to_owned()),
-        message: format!("'{s}' is not a valid ExecutionId (key corruption?): {e}"),
-    })
+) -> Result<EdgeSnapshot, ff_core::engine_error::EngineError> {
+    build_edge_snapshot_core(flow_id, edge_id, raw)
 }
 
 #[cfg(test)]
@@ -1065,7 +918,11 @@ mod tests {
         let err =
             build_execution_snapshot(eid(), &minimal_core("bogus"), HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
                 assert_eq!(field.as_deref(), Some("public_state"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -1080,7 +937,11 @@ mod tests {
         core.insert("lane_id".to_owned(), "lane\nbroken".to_owned());
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
                 assert_eq!(field.as_deref(), Some("lane_id"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -1094,7 +955,11 @@ mod tests {
             core.remove(want);
             let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
             match err {
-                SdkError::Config { field, message: msg, .. } => {
+                SdkError::Config {
+                    field,
+                    message: msg,
+                    ..
+                } => {
                     assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
                 }
                 other => panic!("expected Config for {want}, got {other:?}"),
@@ -1108,7 +973,11 @@ mod tests {
         core.insert("total_attempt_count".to_owned(), "not-a-number".to_owned());
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
                 assert_eq!(field.as_deref(), Some("total_attempt_count"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -1126,8 +995,16 @@ mod tests {
         );
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert_eq!(field.as_deref(), Some("current_attempt_index"), "msg: {msg}");
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
+                assert_eq!(
+                    field.as_deref(),
+                    Some("current_attempt_index"),
+                    "msg: {msg}"
+                );
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1144,7 +1021,11 @@ mod tests {
         core.insert("lease_expires_at".to_owned(), "9000".to_owned());
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
                 assert_eq!(field.as_deref(), Some("current_lease_epoch"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -1259,8 +1140,15 @@ mod tests {
         core.insert("bogus_future_field".to_owned(), "v".to_owned());
         let err = build_flow_snapshot(f, &core).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert!(field.is_none(), "expected whole-object error, got field={field:?}");
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
+                assert!(
+                    field.is_none(),
+                    "expected whole-object error, got field={field:?}"
+                );
                 assert!(msg.contains("bogus_future_field"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -1287,7 +1175,11 @@ mod tests {
                 panic!("field {want} should fail but build_flow_snapshot returned Ok")
             });
             match err {
-                SdkError::Config { field, message: msg, .. } => {
+                SdkError::Config {
+                    field,
+                    message: msg,
+                    ..
+                } => {
                     assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
                 }
                 other => panic!("expected Config for {want}, got {other:?}"),
@@ -1307,7 +1199,11 @@ mod tests {
                 panic!("empty {want} should fail but build_flow_snapshot returned Ok")
             });
             match err {
-                SdkError::Config { field, message: msg, .. } => {
+                SdkError::Config {
+                    field,
+                    message: msg,
+                    ..
+                } => {
                     assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
                 }
                 other => panic!("expected Config for {want}, got {other:?}"),
@@ -1324,7 +1220,11 @@ mod tests {
         let core = minimal_flow_core(&other, "open");
         let err = build_flow_snapshot(requested, &core).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
                 assert_eq!(field.as_deref(), Some("flow_id"), "msg: {msg}");
                 assert!(msg.contains("does not match"), "msg: {msg}");
             }
@@ -1339,7 +1239,11 @@ mod tests {
         core.insert("graph_revision".to_owned(), "not-a-number".to_owned());
         let err = build_flow_snapshot(f, &core).unwrap_err();
         match err {
-            SdkError::Config { field, message: msg, .. } => {
+            SdkError::Config {
+                field,
+                message: msg,
+                ..
+            } => {
                 assert_eq!(field.as_deref(), Some("graph_revision"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
@@ -1347,174 +1251,13 @@ mod tests {
     }
 
     // ─── EdgeSnapshot (describe_edge) ───
-
-    fn eids_for_flow(f: &FlowId) -> (ExecutionId, ExecutionId) {
-        let cfg = PartitionConfig::default();
-        (ExecutionId::for_flow(f, &cfg), ExecutionId::for_flow(f, &cfg))
-    }
-
-    fn minimal_edge_hash(
-        flow: &FlowId,
-        edge: &EdgeId,
-        up: &ExecutionId,
-        down: &ExecutionId,
-    ) -> HashMap<String, String> {
-        let mut m = HashMap::new();
-        m.insert("edge_id".into(), edge.to_string());
-        m.insert("flow_id".into(), flow.to_string());
-        m.insert("upstream_execution_id".into(), up.to_string());
-        m.insert("downstream_execution_id".into(), down.to_string());
-        m.insert("dependency_kind".into(), "success_only".into());
-        m.insert("satisfaction_condition".into(), "all_required".into());
-        m.insert("data_passing_ref".into(), String::new());
-        m.insert("edge_state".into(), "pending".into());
-        m.insert("created_at".into(), "1234".into());
-        m.insert("created_by".into(), "engine".into());
-        m
-    }
-
-    #[test]
-    fn edge_round_trips_all_fields() {
-        let f = fid();
-        let edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let raw = minimal_edge_hash(&f, &edge, &up, &down);
-        let snap = build_edge_snapshot(&f, &edge, &raw).unwrap();
-        assert_eq!(snap.edge_id, edge);
-        assert_eq!(snap.flow_id, f);
-        assert_eq!(snap.upstream_execution_id, up);
-        assert_eq!(snap.downstream_execution_id, down);
-        assert_eq!(snap.dependency_kind, "success_only");
-        assert_eq!(snap.satisfaction_condition, "all_required");
-        assert!(snap.data_passing_ref.is_none());
-        assert_eq!(snap.edge_state, "pending");
-        assert_eq!(snap.created_at.0, 1234);
-        assert_eq!(snap.created_by, "engine");
-    }
-
-    #[test]
-    fn edge_data_passing_ref_round_trips_when_set() {
-        let f = fid();
-        let edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let mut raw = minimal_edge_hash(&f, &edge, &up, &down);
-        raw.insert("data_passing_ref".into(), "ref://blob-42".into());
-        let snap = build_edge_snapshot(&f, &edge, &raw).unwrap();
-        assert_eq!(snap.data_passing_ref.as_deref(), Some("ref://blob-42"));
-    }
-
-    #[test]
-    fn edge_unknown_field_fails_loud() {
-        let f = fid();
-        let edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let mut raw = minimal_edge_hash(&f, &edge, &up, &down);
-        raw.insert("bogus_future_field".into(), "v".into());
-        let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
-        match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert!(field.is_none(), "expected whole-object error, got field={field:?}");
-                assert!(msg.contains("bogus_future_field"), "msg: {msg}");
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn edge_flow_id_mismatch_fails_loud() {
-        let f = fid();
-        let other = fid();
-        let edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let raw = minimal_edge_hash(&other, &edge, &up, &down);
-        let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
-        match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert_eq!(field.as_deref(), Some("flow_id"), "msg: {msg}");
-                assert!(msg.contains("does not match"), "msg: {msg}");
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn edge_edge_id_mismatch_fails_loud() {
-        let f = fid();
-        let edge = EdgeId::new();
-        let other_edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let raw = minimal_edge_hash(&f, &other_edge, &up, &down);
-        let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
-        match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert_eq!(field.as_deref(), Some("edge_id"), "msg: {msg}");
-                assert!(msg.contains("does not match"), "msg: {msg}");
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn edge_missing_required_fields_fail_loud() {
-        for want in [
-            "edge_id",
-            "flow_id",
-            "upstream_execution_id",
-            "downstream_execution_id",
-            "dependency_kind",
-            "satisfaction_condition",
-            "edge_state",
-            "created_at",
-            "created_by",
-        ] {
-            let f = fid();
-            let edge = EdgeId::new();
-            let (up, down) = eids_for_flow(&f);
-            let mut raw = minimal_edge_hash(&f, &edge, &up, &down);
-            raw.remove(want);
-            let err = build_edge_snapshot(&f, &edge, &raw)
-                .err()
-                .unwrap_or_else(|| panic!("missing {want} should fail"));
-            match err {
-                SdkError::Config { field, message: msg, .. } => {
-                    assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
-                }
-                other => panic!("expected Config for {want}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn edge_malformed_created_at_fails_loud() {
-        let f = fid();
-        let edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let mut raw = minimal_edge_hash(&f, &edge, &up, &down);
-        raw.insert("created_at".into(), "not-a-number".into());
-        let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
-        match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert_eq!(field.as_deref(), Some("created_at"), "msg: {msg}");
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn edge_malformed_upstream_eid_fails_loud() {
-        let f = fid();
-        let edge = EdgeId::new();
-        let (up, down) = eids_for_flow(&f);
-        let mut raw = minimal_edge_hash(&f, &edge, &up, &down);
-        raw.insert("upstream_execution_id".into(), "not-an-execution-id".into());
-        let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
-        match err {
-            SdkError::Config { field, message: msg, .. } => {
-                assert_eq!(field.as_deref(), Some("upstream_execution_id"), "msg: {msg}");
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
-    }
+    //
+    // RFC-012 Stage 1c T2: the edge-hash decoder moved to
+    // `ff_core::contracts::decode`. The unit-level coverage for
+    // unknown-field / missing-field / mismatch / malformed-number
+    // paths lives alongside the decoder at ff-core; the ff-sdk
+    // higher-level describe_edge + list_*_edges integration coverage
+    // lives in `crates/ff-test/tests/describe_edge_api.rs`.
 
     #[test]
     fn namespaced_tag_matcher_boundaries() {
