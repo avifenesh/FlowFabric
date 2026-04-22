@@ -6,6 +6,18 @@ use ff_core::keys::{ExecKeyContext, IndexKeys};
 
 use crate::result::{FcallResult, FromFcallResult};
 
+/// Single source of truth for the budget dimension cap (#104).
+///
+/// Enforced at both the HTTP boundary in `ff-server` (which re-exports this
+/// constant) and inside the typed FCALL wrappers below, so direct
+/// script-helper callers (tests, tools, alternate services) cannot reach
+/// Valkey with an unbounded `dim_count` by skipping the REST layer.
+///
+/// 64 is generously above any legitimate scoping dimension count
+/// (org/tenant/project/region/lane/tier/…) while bounding worst-case
+/// FCALL ARGV to ~200 strings — well below Valkey argv limits.
+pub const MAX_BUDGET_DIMENSIONS: usize = 64;
+
 /// Key context for budget operations on {b:M}.
 pub struct BudgetOpKeys<'a> {
     pub usage_key: &'a str,
@@ -46,6 +58,27 @@ pub async fn ff_create_budget(
     ];
 
     let dim_count = args.dimensions.len();
+    // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
+    if dim_count > MAX_BUDGET_DIMENSIONS {
+        return Err(ScriptError::Parse(format!(
+            "too_many_dimensions: limit={}, got={}",
+            MAX_BUDGET_DIMENSIONS, dim_count
+        )));
+    }
+    if args.hard_limits.len() != dim_count {
+        return Err(ScriptError::Parse(format!(
+            "dimension_limit_array_mismatch: dimensions={} hard_limits={}",
+            dim_count,
+            args.hard_limits.len()
+        )));
+    }
+    if args.soft_limits.len() != dim_count {
+        return Err(ScriptError::Parse(format!(
+            "dimension_limit_array_mismatch: dimensions={} soft_limits={}",
+            dim_count,
+            args.soft_limits.len()
+        )));
+    }
     // ARGV: budget_id, scope_type, scope_id, enforcement_mode,
     //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
     //   dim_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
@@ -113,6 +146,20 @@ pub async fn ff_report_usage_and_check(
 
     // Build flat ARGV: [dim_count, dim1..dimN, delta1..deltaN, now_ms, dedup_key]
     let dim_count = args.dimensions.len();
+    // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
+    if dim_count > MAX_BUDGET_DIMENSIONS {
+        return Err(ScriptError::Parse(format!(
+            "too_many_dimensions: limit={}, got={}",
+            MAX_BUDGET_DIMENSIONS, dim_count
+        )));
+    }
+    if args.deltas.len() != dim_count {
+        return Err(ScriptError::Parse(format!(
+            "dimension_delta_array_mismatch: dimensions={} deltas={}",
+            dim_count,
+            args.deltas.len()
+        )));
+    }
     let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
     argv.push(dim_count.to_string());
     for dim in &args.dimensions {

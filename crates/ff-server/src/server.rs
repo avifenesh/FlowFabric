@@ -39,6 +39,81 @@ use crate::config::ServerConfig;
 /// returns the full list; retries only need a sample.
 const ALREADY_TERMINAL_MEMBER_CAP: usize = 1000;
 
+/// Re-export of the budget dimension cap.
+///
+/// Defined as the single source of truth in `ff_script::functions::budget` so
+/// the typed FCALL wrappers and the REST boundary cannot silently drift
+/// (PR #106 review). The limit exists to cap FCALL ARGV allocation: both
+/// `create_budget` and `report_usage` build argv whose length is linear in
+/// `dimensions.len()`, so an untrusted caller could otherwise request an
+/// unbounded `Vec` allocation (CodeQL `rust/uncontrolled-allocation-size`,
+/// issue #104).
+pub(crate) use ff_script::functions::budget::MAX_BUDGET_DIMENSIONS;
+
+/// Validate `create_budget` dimension inputs before building the FCALL argv.
+///
+/// Rejects:
+///   * more than [`MAX_BUDGET_DIMENSIONS`] dimensions (prevents unbounded
+///     `Vec::with_capacity` allocation on attacker-controlled length);
+///   * parallel-array length mismatches between `dimensions`, `hard_limits`,
+///     and `soft_limits` — these are positional inputs the Lua side indexes
+///     by `i = 1..dim_count`, so a mismatch silently corrupts limits rather
+///     than raising.
+fn validate_create_budget_dimensions(
+    dimensions: &[String],
+    hard_limits: &[u64],
+    soft_limits: &[u64],
+) -> Result<(), ServerError> {
+    let dim_count = dimensions.len();
+    if dim_count > MAX_BUDGET_DIMENSIONS {
+        return Err(ServerError::InvalidInput(format!(
+            "too_many_dimensions: limit={}, got={}",
+            MAX_BUDGET_DIMENSIONS, dim_count
+        )));
+    }
+    if hard_limits.len() != dim_count {
+        return Err(ServerError::InvalidInput(format!(
+            "dimension_limit_array_mismatch: dimensions={} hard_limits={}",
+            dim_count,
+            hard_limits.len()
+        )));
+    }
+    if soft_limits.len() != dim_count {
+        return Err(ServerError::InvalidInput(format!(
+            "dimension_limit_array_mismatch: dimensions={} soft_limits={}",
+            dim_count,
+            soft_limits.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate `report_usage` dimension inputs before building the FCALL argv.
+///
+/// Same class of defense as [`validate_create_budget_dimensions`]: caps
+/// argv length and enforces the `dimensions`/`deltas` parallel-array
+/// invariant the Lua side relies on.
+fn validate_report_usage_dimensions(
+    dimensions: &[String],
+    deltas: &[u64],
+) -> Result<(), ServerError> {
+    let dim_count = dimensions.len();
+    if dim_count > MAX_BUDGET_DIMENSIONS {
+        return Err(ServerError::InvalidInput(format!(
+            "too_many_dimensions: limit={}, got={}",
+            MAX_BUDGET_DIMENSIONS, dim_count
+        )));
+    }
+    if deltas.len() != dim_count {
+        return Err(ServerError::InvalidInput(format!(
+            "dimension_delta_array_mismatch: dimensions={} deltas={}",
+            dim_count,
+            deltas.len()
+        )));
+    }
+    Ok(())
+}
+
 /// FlowFabric server — connects everything together.
 ///
 /// Manages the Valkey connection, Lua library loading, background scanners,
@@ -1017,6 +1092,12 @@ impl Server {
         &self,
         args: &CreateBudgetArgs,
     ) -> Result<CreateBudgetResult, ServerError> {
+        // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
+        validate_create_budget_dimensions(
+            &args.dimensions,
+            &args.hard_limits,
+            &args.soft_limits,
+        )?;
         let partition = budget_partition(&args.budget_id, &self.config.partition_config);
         let bctx = BudgetKeyContext::new(&partition, &args.budget_id);
         let resets_key = keys::budget_resets_key(bctx.hash_tag());
@@ -1186,6 +1267,8 @@ impl Server {
         budget_id: &BudgetId,
         args: &ReportUsageArgs,
     ) -> Result<ReportUsageResult, ServerError> {
+        // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
+        validate_report_usage_dimensions(&args.dimensions, &args.deltas)?;
         let partition = budget_partition(budget_id, &self.config.partition_config);
         let bctx = BudgetKeyContext::new(&partition, budget_id);
 
@@ -4192,6 +4275,110 @@ mod tests {
 
     fn mk_fk_err(kind: ErrorKind) -> ferriskey::Error {
         ferriskey::Error::from((kind, "synthetic"))
+    }
+
+    // ── Budget dimension-cap validation (issue #104) ──
+
+    #[test]
+    fn create_budget_rejects_over_cap_dimension_count() {
+        let n = MAX_BUDGET_DIMENSIONS + 1;
+        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let hard = vec![1u64; n];
+        let soft = vec![0u64; n];
+        let err = validate_create_budget_dimensions(&dims, &hard, &soft).unwrap_err();
+        match err {
+            ServerError::InvalidInput(msg) => {
+                assert!(msg.contains("too_many_dimensions"), "got: {msg}");
+                assert!(msg.contains(&format!("limit={}", MAX_BUDGET_DIMENSIONS)), "got: {msg}");
+                assert!(msg.contains(&format!("got={n}")), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_budget_accepts_exactly_cap_dimensions() {
+        let n = MAX_BUDGET_DIMENSIONS;
+        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let hard = vec![1u64; n];
+        let soft = vec![0u64; n];
+        assert!(validate_create_budget_dimensions(&dims, &hard, &soft).is_ok());
+    }
+
+    #[test]
+    fn create_budget_rejects_hard_limit_length_mismatch() {
+        let dims = vec!["a".to_string(), "b".to_string()];
+        let hard = vec![1u64]; // too short
+        let soft = vec![0u64, 0u64];
+        let err = validate_create_budget_dimensions(&dims, &hard, &soft).unwrap_err();
+        match err {
+            ServerError::InvalidInput(msg) => {
+                assert!(msg.contains("dimension_limit_array_mismatch"), "got: {msg}");
+                assert!(msg.contains("hard_limits=1"), "got: {msg}");
+                assert!(msg.contains("dimensions=2"), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_budget_rejects_soft_limit_length_mismatch() {
+        let dims = vec!["a".to_string(), "b".to_string()];
+        let hard = vec![1u64, 2u64];
+        let soft = vec![0u64, 0u64, 0u64]; // too long
+        let err = validate_create_budget_dimensions(&dims, &hard, &soft).unwrap_err();
+        match err {
+            ServerError::InvalidInput(msg) => {
+                assert!(msg.contains("dimension_limit_array_mismatch"), "got: {msg}");
+                assert!(msg.contains("soft_limits=3"), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_usage_rejects_over_cap_dimension_count() {
+        let n = MAX_BUDGET_DIMENSIONS + 1;
+        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let deltas = vec![1u64; n];
+        let err = validate_report_usage_dimensions(&dims, &deltas).unwrap_err();
+        match err {
+            ServerError::InvalidInput(msg) => {
+                assert!(msg.contains("too_many_dimensions"), "got: {msg}");
+                assert!(msg.contains(&format!("limit={}", MAX_BUDGET_DIMENSIONS)), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_usage_accepts_exactly_cap_dimensions() {
+        let n = MAX_BUDGET_DIMENSIONS;
+        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let deltas = vec![1u64; n];
+        assert!(validate_report_usage_dimensions(&dims, &deltas).is_ok());
+    }
+
+    #[test]
+    fn report_usage_rejects_delta_length_mismatch() {
+        let dims = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let deltas = vec![1u64, 2u64]; // too short
+        let err = validate_report_usage_dimensions(&dims, &deltas).unwrap_err();
+        match err {
+            ServerError::InvalidInput(msg) => {
+                assert!(msg.contains("dimension_delta_array_mismatch"), "got: {msg}");
+                assert!(msg.contains("dimensions=3"), "got: {msg}");
+                assert!(msg.contains("deltas=2"), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_usage_accepts_empty_dimensions() {
+        // Edge case: zero-dimension report_usage is a no-op that should pass
+        // validation (Lua handles dim_count=0 correctly).
+        assert!(validate_report_usage_dimensions(&[], &[]).is_ok());
     }
 
     #[test]
