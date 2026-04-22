@@ -25,7 +25,7 @@ we choose it explicitly; silent breakage during review is not.
 | 1 — submit → claim → complete | **Yes** — `apalis-scenario1` | Direct analog: `TaskSink::push` + `WorkerBuilder` with concurrency. |
 | 2 — suspend → signal → resume | **Skipped** | apalis has no first-class suspend/signal. Emulating it with external pub/sub would measure the emulator, not apalis. |
 | 3 — long-running steady-state | (owned by W2) | n/a here |
-| 4 — linear flow DAG           | **Yes, approximation** — `apalis-scenario4` | apalis has no DAG primitive. 10-stage chain wired by hand; each stage's handler pushes the next stage. Emits system label `apalis-approx`. |
+| 4 — linear flow DAG           | **Yes, native** — `apalis-scenario4` | Uses `apalis-workflow::Workflow` (sequential `and_then` combinator) over a single `RedisStorage`. Emits system label `apalis`. Prior to 2026-04-22 this harness was hand-rolled with 10 typed queues and labelled `apalis-approx`; see the update note further down. |
 | 5 — capability-routed claim   | **Skipped** | apalis queues are typed, not capability-routed. The closest mapping is "one queue per cap-set", which defeats the benchmark's point (routing arbitrates across a shared queue). |
 
 ## What's directly comparable
@@ -60,11 +60,65 @@ we choose it explicitly; silent breakage during review is not.
   strands the flow at stage i. FlowFabric engine retries/cancels per
   policy. Numbers assume no failures; with failures, apalis's numbers
   don't extrapolate.
-- **apalis-approx system label** — the JSON report for scenario 4
-  uses `system = "apalis-approx"` (not plain `apalis`) so an
-  aggregator doesn't accidentally graph these as a native DAG
-  benchmark. Tracked explicitly per
-  `ff_bench::comparison::SystemSupport::Approximation`.
+- **apalis system label (scenario 4)** — the JSON report for
+  scenario 4 now uses `system = "apalis"` because the harness uses
+  `apalis-workflow::Workflow` (apalis's first-class sequential
+  workflow primitive). Prior to 2026-04-22 this scenario emitted
+  `system = "apalis-approx"` because the harness was hand-rolled
+  across 10 typed queues — see the update note below.
+
+## Scenario 4 harness update (2026-04-22, issue #51)
+
+**Change**: Scenario 4's apalis harness switched from a hand-rolled
+10-stage chain (10 `WorkerBuilder` instances, each stage's handler
+pushing the next via a typed `RedisStorage<StageN>`) to a single
+`apalis-workflow::Workflow::new().and_then(…).and_then(…)` pipeline
+over ONE `RedisStorage` with one `WorkerBuilder`.
+
+**Why**: Issue #51. The apalis maintainer (geofmureithi) flagged the
+prior harness as under-representing apalis:
+
+> Ps in scenario 4, apalis offers apalis-workflow which has sequential
+> and dag primitives and would be better than the current approach (I
+> hope).
+
+See `rfcs/drafts/apalis-comparison.md` for Worker VV's full
+investigation. Adopting `apalis-workflow` is the hygienic fix — this
+bench should represent apalis's idiomatic shape.
+
+**Numerical effect (on the current bench host, Valkey 8.1.0)**:
+- At `flows=100` the scenario sits at the 50 ms driver-poll-jitter
+  floor (see the Polling-jitter-floor note in `src/scenario4.rs`):
+  both harnesses measure 9.3 flows/s (wall ≈ 10.70 s). No
+  measurable delta.
+- At `flows=500` the two diverge: prior harness 34.0 flows/s
+  (wall 14.69 s, N=3); `apalis-workflow` 9.8 flows/s (wall 50.93 s,
+  N=5). The linear-chain workload favours the prior hand-rolled
+  chain's cheap per-stage enqueue over `apalis-workflow`'s per-step
+  state persistence.
+
+The new harness is still correct to adopt even though this specific
+shape measures slower: COMPARISON is about apalis's idiomatic
+primitive, not "cheapest possible apalis harness". The FF-vs-apalis
+engine gap on this shape widens modestly as a result; that is the
+honest number.
+
+**Implementation note (Workflow bounds)**: apalis-workflow's
+`IntoWorkerService` impl requires `Backend::Args == BackendExt::Compact`.
+For `RedisStorage` that means the storage must be typed over the
+codec's compact form (`Vec<u8>`), not the user payload type.
+`src/scenario4.rs` does `RedisStorage::<Vec<u8>>::new(conn)`; the
+stage handlers still take typed `u64` (codec roundtrips at step
+boundaries). Payload is `u64` rather than a custom struct because
+`apalis-workflow::DagCodec` provides passthrough impls for primitives
+(String, integer types, bool, …) but not user types; the prior
+harness also only threaded a `flow_id` token (no data_passing) so
+this preserves the measurement contract.
+
+**Sample-teardown note**: `apalis-workflow` persists step-state keys
+in the backing Redis across runs. The harness runs `FLUSHALL` between
+N=5 samples to prevent sample-N state from leaking into sample-N+1
+(without this, sample 2+ deadline-fails with 0/100 completions).
 
 ## Running
 
