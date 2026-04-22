@@ -1,3 +1,51 @@
+//! Partition families, keys, and routing helpers.
+//!
+//! # Opaque wire keys (issue #91)
+//!
+//! Public wire surfaces carry [`PartitionKey`] — an opaque
+//! `#[serde(transparent)]` newtype over the hash-tag literal
+//! (`"{fp:7}"`) — rather than the internal [`Partition`] struct. The
+//! `PartitionFamily` enum (with its `Execution` / `Flow` alias) stays
+//! entirely internal; consumers never deserialize it off the wire.
+//!
+//! ## Migration note (0.2 → 0.3)
+//!
+//! The HTTP response body for `POST /v1/workers/{id}/claim` changed
+//! from
+//!
+//! ```json
+//! {
+//!   "execution_id": "{fp:7}:...",
+//!   "partition_family": "flow",
+//!   "partition_index": 7,
+//!   "grant_key": "...",
+//!   "expires_at_ms": 0
+//! }
+//! ```
+//!
+//! to
+//!
+//! ```json
+//! {
+//!   "execution_id": "{fp:7}:...",
+//!   "partition_key": "{fp:7}",
+//!   "grant_key": "...",
+//!   "expires_at_ms": 0
+//! }
+//! ```
+//!
+//! Consumers that need the parsed family/index call
+//! [`PartitionKey::parse`] (or [`crate::contracts::ClaimGrant::partition`] /
+//! [`crate::contracts::ReclaimGrant::partition`]) — these return a
+//! typed [`Partition`] so routing code stays unchanged.
+//!
+//! The `Execution` family label collapses to `Flow` on round-trip
+//! (both produce `{fp:N}` under RFC-011 §11 co-location). Consumers
+//! that read `grant.partition()?.family` for LOGGING will see
+//! `Flow` where `Execution` previously appeared — cosmetically
+//! visible, routing-equivalent. See [`PartitionKey`] rustdoc for
+//! the full contract.
+
 use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, QuotaPolicyId};
 use serde::{Deserialize, Serialize};
 
