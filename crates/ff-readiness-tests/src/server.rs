@@ -4,9 +4,9 @@
 //! # Binary spawner
 //!
 //! Uses `CARGO_BIN_EXE_ff-server` so integration tests depend on a
-//! fresh build. Binds `FF_LISTEN_ADDR` to `127.0.0.1:0` is not
-//! supported by the server (it reads the port literally), so tests
-//! pass a concrete port. The process is guarded via `ChildGuard`.
+//! fresh build. `FF_LISTEN_ADDR` accepts an ephemeral port such as
+//! `127.0.0.1:0` (the server binds via `TcpListener::bind`, same as
+//! the in-process path here). The process is guarded via `ChildGuard`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

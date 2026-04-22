@@ -34,5 +34,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "
 serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serial_test = "3"
 axum = { workspace = true }
+
+[dev-dependencies]
+# `serial_test` is only used by `tests/*.rs` (readiness integration
+# tests) — keep it off the library dependency surface per reviewer.
+serial_test = "3"
