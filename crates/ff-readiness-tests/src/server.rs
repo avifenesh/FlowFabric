@@ -35,6 +35,18 @@ impl Drop for InProcessServer {
 
 impl InProcessServer {
     pub async fn start(lane: &str) -> Self {
+        Self::start_with_secret(
+            lane,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await
+    }
+
+    /// Boot an in-process server using `secret` as the waitpoint HMAC
+    /// key (validated by `ServerConfig::from_env`'s rules: even-length
+    /// ASCII hex). Used by the README-literal readiness test to prove
+    /// the boot contract the quickstart documents.
+    pub async fn start_with_secret(lane: &str, secret: &str) -> Self {
         let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
         let port: u16 = std::env::var("FF_PORT")
             .ok()
@@ -59,8 +71,7 @@ impl InProcessServer {
             skip_library_load: true,
             cors_origins: vec!["*".to_owned()],
             api_token: None,
-            waitpoint_hmac_secret:
-                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            waitpoint_hmac_secret: secret.to_owned(),
             waitpoint_hmac_grace_ms: 86_400_000,
             max_concurrent_stream_ops: 64,
         };

@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests/readme_literal.rs (target/debug/deps/readme_literal-97a4f8b453a035ca)
+
+running 1 test
+test readme_literal_sdk_feature_gate ... FAILED
+
+failures:
+
+---- readme_literal_sdk_feature_gate stdout ----
+
+thread 'readme_literal_sdk_feature_gate' panicked at crates/ff-readiness-tests/tests/readme_literal.rs:176:5:
+README declares feature `nope-not-real` on ff-sdk but crates/ff-sdk/Cargo.toml [features] does not declare it; section was:
+
+direct-valkey-claim = []
+
+# Re-exports of ferriskey feature flags. Consumers opt in on ff-sdk and
+# the flag propagates to the underlying ferriskey crate. OFF by default
+# — the ~40-crate AWS dep graph does not land in builds that don't need
+# it.
+iam = ["ferriskey/iam"]
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    readme_literal_sdk_feature_gate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ff-readiness-tests --test readme_literal`
