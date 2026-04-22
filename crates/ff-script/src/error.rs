@@ -53,6 +53,24 @@ pub enum ScriptError {
     #[error("no_active_lease: target has no active lease")]
     NoActiveLease,
 
+    /// RFC #58.5: a lease-bound FCALL was invoked with an empty
+    /// `(lease_id, lease_epoch, attempt_id)` triple and the caller is not
+    /// an allowlisted operator override. Worker-path callers must always
+    /// pass the fence triple; unfenced callers must supply
+    /// `source == "operator_override"` (terminal ops) or use a different
+    /// FCALL (renew / suspend hard-reject with no override path).
+    /// TERMINAL: the caller is structurally incorrect; retrying without a
+    /// fence will not help.
+    #[error("fence_required: lease fence triple is mandatory for this FCALL")]
+    FenceRequired,
+
+    /// RFC #58.5: the fence triple arrived with some but not all three
+    /// fields populated. Programming error — either all of
+    /// (lease_id, lease_epoch, attempt_id) must be set, or all three must
+    /// be empty. TERMINAL.
+    #[error("partial_fence_triple: lease_id/lease_epoch/attempt_id must be all set or all empty")]
+    PartialFenceTriple,
+
     /// Bug. Active attempt already exists.
     #[error("active_attempt_exists: invariant violation")]
     ActiveAttemptExists,
@@ -491,6 +509,8 @@ impl ScriptError {
             | Self::InvalidGraceMs
             | Self::RotationConflict(_)
             | Self::InvalidTagKey(_)
+            | Self::FenceRequired
+            | Self::PartialFenceTriple
             | Self::Parse(_) => ErrorClass::Terminal,
 
             // Transport errors classify by their ferriskey ErrorKind —
@@ -652,6 +672,8 @@ impl ScriptError {
             "invalid_grace_ms" => Self::InvalidGraceMs,
             "rotation_conflict" => Self::RotationConflict(String::new()),
             "invalid_tag_key" => Self::InvalidTagKey(String::new()),
+            "fence_required" => Self::FenceRequired,
+            "partial_fence_triple" => Self::PartialFenceTriple,
             _ => return None,
         })
     }
@@ -840,5 +862,26 @@ mod tests {
     #[test]
     fn from_code_unknown_returns_none() {
         assert!(ScriptError::from_code("nonexistent_error").is_none());
+    }
+
+    #[test]
+    fn fence_required_classifies_terminal() {
+        assert_eq!(ScriptError::FenceRequired.class(), ErrorClass::Terminal);
+        assert_eq!(
+            ScriptError::PartialFenceTriple.class(),
+            ErrorClass::Terminal
+        );
+    }
+
+    #[test]
+    fn fence_required_from_code_roundtrips() {
+        assert!(matches!(
+            ScriptError::from_code("fence_required"),
+            Some(ScriptError::FenceRequired)
+        ));
+        assert!(matches!(
+            ScriptError::from_code("partial_fence_triple"),
+            Some(ScriptError::PartialFenceTriple)
+        ));
     }
 }

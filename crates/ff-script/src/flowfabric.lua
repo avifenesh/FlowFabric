@@ -1827,18 +1827,23 @@ redis.register_function('ff_complete_execution', function(keys, args)
 
   -- RFC #58.5 — fence resolution. Terminal ops require either a
   -- non-empty fence triple OR source=="operator_override".
+  -- In both branches validate_lease_and_mark_expired runs afterwards,
+  -- which enforces lifecycle_phase=="active", ownership!=revoked, and
+  -- expiry — so operator overrides cannot bypass those preconditions.
   local fence, must_check_or_err = resolve_lease_fence(core, A)
   if not fence then return must_check_or_err end
   if not must_check_or_err then
     if A.source ~= "operator_override" then return err("fence_required") end
+    -- Bind server-resolved fence so validate_lease_and_mark_expired's
+    -- identity check trivially matches; the lifecycle/expiry gates
+    -- still fire and are the real safety net for the override path.
     A.lease_id    = fence.lease_id
     A.lease_epoch = fence.lease_epoch
     A.attempt_id  = fence.attempt_id
-  else
-    local lease_err = validate_lease_and_mark_expired(
-      core, A, now_ms, K, 1000)
-    if lease_err then return lease_err end
   end
+  local lease_err = validate_lease_and_mark_expired(
+    core, A, now_ms, K, 1000)
+  if lease_err then return lease_err end
 
   -- End attempt
   redis.call("HSET", K.attempt_hash,
@@ -2158,7 +2163,7 @@ redis.register_function('ff_delay_execution', function(keys, args)
     lease_id     = args[2] or "",
     lease_epoch  = args[3] or "",
     attempt_id   = args[4] or "",
-    delay_until  = args[5],
+    delay_until  = args[5] or "",
     source       = args[6] or "",
   }
 
@@ -2375,8 +2380,8 @@ redis.register_function('ff_fail_execution', function(keys, args)
     lease_id         = args[2] or "",
     lease_epoch      = args[3] or "",
     attempt_id       = args[4] or "",
-    failure_reason   = args[5],
-    failure_category = args[6],
+    failure_reason   = args[5] or "",
+    failure_category = args[6] or "",
     retry_policy_json = args[7] or "",
     source            = args[8] or "",
   }
