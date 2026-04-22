@@ -198,7 +198,7 @@ ff_function! {
             args.delay_until.map(|t| t.to_string()).unwrap_or_default(),
             args.idempotency_key.as_ref().map(|_| "86400000".to_string()).unwrap_or_default(),
             serde_json::to_string(&args.tags).unwrap_or_else(|_| "{}".into()),
-            String::new(),
+            args.execution_deadline_at.map(|t| t.to_string()).unwrap_or_default(),
             args.partition_id.to_string(),
         }
     }

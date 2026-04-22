@@ -47,14 +47,29 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 
 ### 1. Start Valkey
 
+FlowFabric requires Valkey >= 7.2 (RFC-011 §13, enforced at boot). 7.2 is the
+release where the Valkey Functions API + RESP3 stabilized. Valkey 7.0 and
+earlier are rejected by `ff-server`; Redis is also rejected (the boot check
+requires an affirmative `server_name:valkey` INFO marker before accepting a
+`redis_version:` fallback, and Redis does not emit that marker).
+
 ```bash
-docker run -d --name valkey -p 6379:6379 valkey/valkey:7.2
+docker run -d --name valkey -p 6379:6379 valkey/valkey:8-alpine
 ```
+
+The quickstart image pins major 8 for reproducibility, but any `valkey/valkey`
+tag whose version is ≥ 7.2 will boot. CI exercises both 7.2 and 8.
 
 ### 2. Start the FlowFabric server
 
+`FF_WAITPOINT_HMAC_SECRET` is required at boot — the server refuses to start
+without it so waitpoint HMAC authentication can never be silently disabled
+(see RFC-004 §Waitpoint Security). Any even-length hex string works for
+local dev; production should use 64 hex chars (32 bytes) from a secret
+manager.
+
 ```bash
-cargo run -p ff-server
+FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 ```
 
 ### 3. Try the coding-agent example
@@ -96,7 +111,39 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 
 ## Production considerations
 
-- **Full env var reference** — see the `ServerConfig::from_env` rustdoc in `crates/ff-server/src/config.rs` for the complete table (FF_HOST, FF_PORT, FF_TLS, FF_CLUSTER, FF_LANES, FF_CORS_ORIGINS, FF_API_TOKEN, FF_WAITPOINT_HMAC_SECRET (required), FF_WAITPOINT_HMAC_GRACE_MS, FF_MAX_CONCURRENT_STREAM_OPS, scanner intervals, partition counts).
+- **Env var reference** — `ServerConfig::from_env` in `crates/ff-server/src/config.rs` is the source of truth. Full list below (required ones are marked `required`):
+
+  | Variable | Default | Description |
+  |----------|---------|-------------|
+  | `FF_WAITPOINT_HMAC_SECRET` | *required* | Hex-encoded HMAC signing secret for waitpoint tokens (RFC-004 §Waitpoint Security). Even-length hex; 64 chars (32 bytes) recommended. |
+  | `FF_HOST` | `localhost` | Valkey host |
+  | `FF_PORT` | `6379` | Valkey port |
+  | `FF_TLS` | `false` | Enable TLS (`1` or `true`) |
+  | `FF_CLUSTER` | `false` | Enable cluster mode |
+  | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
+  | `FF_LANES` | `default` | Comma-separated lane names |
+  | `FF_FLOW_PARTITIONS` | `256` | Flow partition count (exec keys co-locate under RFC-011) |
+  | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
+  | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
+  | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins; empty string is rejected |
+  | `FF_API_TOKEN` | *(none)* | Shared-secret Bearer token; if set, all non-`/healthz` requests require it |
+  | `FF_WAITPOINT_HMAC_GRACE_MS` | `86400000` | Grace window for previous-kid token acceptance after rotation |
+  | `FF_MAX_CONCURRENT_STREAM_OPS` | `64` | Shared semaphore for stream reads + tails; legacy `FF_MAX_CONCURRENT_TAIL` still accepted |
+  | `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease-expiry scanner interval |
+  | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed-promoter scanner interval |
+  | `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval |
+  | `FF_ATTEMPT_TIMEOUT_INTERVAL_S` | `2` | Attempt-timeout scanner interval |
+  | `FF_SUSPENSION_TIMEOUT_INTERVAL_S` | `2` | Suspension-timeout scanner interval |
+  | `FF_PENDING_WP_EXPIRY_INTERVAL_S` | `5` | Pending-waitpoint expiry interval |
+  | `FF_RETENTION_TRIMMER_INTERVAL_S` | `60` | Retention-trimmer scanner interval |
+  | `FF_BUDGET_RESET_INTERVAL_S` | `15` | Budget-reset scanner interval |
+  | `FF_BUDGET_RECONCILER_INTERVAL_S` | `30` | Budget reconciler interval |
+  | `FF_QUOTA_RECONCILER_INTERVAL_S` | `30` | Quota reconciler interval |
+  | `FF_UNBLOCK_INTERVAL_S` | `5` | Unblock scanner interval |
+  | `FF_DEPENDENCY_RECONCILER_INTERVAL_S` | `15` | DAG dependency reconciler interval |
+  | `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval |
+  | `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval |
+  | `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel-reconciler scanner interval |
 - **Auth is opt-in** — if `FF_API_TOKEN` is unset, every endpoint except `GET /healthz` is reachable without authentication. Always set `FF_API_TOKEN` (and consider CORS via `FF_CORS_ORIGINS`) before exposing the server beyond localhost.
 - **No API rate limiting** — deploy behind a reverse proxy (nginx, Envoy) with rate limiting configured
 - **No HTTP connection limit** — axum accepts unbounded connections; configure limits at the load balancer
@@ -118,10 +165,11 @@ Future: per-FCALL version negotiation. For now: drain old instances before start
 
 Two PR-time GitHub Actions workflows gate merges:
 
-- **`.github/workflows/matrix.yml`** — 10-job host × Valkey × mode matrix:
-  - linux x86_64 (`ubuntu-latest`) and linux arm64 (`ubuntu-24.04-arm`) × Valkey 7.2 + latest × {standalone, cluster}
-  - mac arm64 (`macos-latest`) and mac x86_64 (`macos-13`) × Valkey latest × standalone
-  - Linux covers the full version matrix where we deploy. Mac runners validate cross-arch Rust correctness against the latest Valkey release only (Homebrew does not package 7.2 and docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
+- **`.github/workflows/matrix.yml`** — 6-job host × valkey × mode matrix. RFC-011 §13 requires Valkey >= 7.2, enforced at `ff-server` boot.
+  - linux x86_64 (`ubuntu-latest`) × valkey 8 (`valkey/valkey:8-alpine`) × {standalone, cluster}
+  - linux x86_64 (`ubuntu-latest`) × valkey 7.2 (`valkey/valkey:7.2`) × standalone — guards against accidental 8-specific primitive adoption
+  - linux arm64 (`ubuntu-24.04-arm`) × valkey 8 × {standalone, cluster}
+  - macos arm64 (`macos-latest`) × valkey 8 × standalone (Homebrew Valkey, currently tracking the 8.x line unpinned; docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
   - Cluster mode on linux uses a 3-master 3-replica cluster via `.github/cluster/docker-compose.cluster.yml` + `bootstrap.sh`.
 - **`.github/workflows/security-and-quality.yml`** — 6 independent gates, any one blocks merge:
   - `cargo audit` with `--deny warnings`; ignore list in `.cargo/audit.toml`
