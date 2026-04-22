@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use axum::http::{HeaderName, Method};
+use axum::http::Method;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -301,10 +301,14 @@ fn build_cors_layer(origins: &[String], auth_enabled: bool) -> Result<CorsLayer,
     }
 
     let mut parsed = Vec::with_capacity(origins.len());
+    let mut accepted = Vec::with_capacity(origins.len());
     let mut invalid = Vec::new();
     for o in origins {
         match o.parse() {
-            Ok(v) => parsed.push(v),
+            Ok(v) => {
+                parsed.push(v);
+                accepted.push(o.as_str());
+            }
             Err(_) => invalid.push(o.clone()),
         }
     }
@@ -313,7 +317,7 @@ fn build_cors_layer(origins: &[String], auth_enabled: bool) -> Result<CorsLayer,
         return Err(ConfigError::InvalidValue {
             var: "FF_CORS_ORIGINS".to_owned(),
             message: format!(
-                "all configured origins failed to parse as HTTP header values: {:?}; \
+                "all configured origins failed to parse as valid HTTP header values: {:?}; \
                  refusing to fall back to permissive CORS",
                 origins
             ),
@@ -321,19 +325,20 @@ fn build_cors_layer(origins: &[String], auth_enabled: bool) -> Result<CorsLayer,
     }
 
     if !invalid.is_empty() {
+        // Collected `accepted` list during the single parse loop above to
+        // avoid an O(N*M) filter-contains scan per log event.
         tracing::warn!(
-            invalid = ?invalid,
-            accepted = ?origins
-                .iter()
-                .filter(|o| !invalid.contains(o))
-                .collect::<Vec<_>>(),
+            ?invalid,
+            ?accepted,
             "some FF_CORS_ORIGINS entries failed to parse and were dropped"
         );
     }
 
-    let mut headers = vec![HeaderName::from_static("content-type")];
+    // Prefer typed `header::*` constants over stringly-typed `from_static`
+    // so typos fail to compile rather than fail at runtime.
+    let mut headers = vec![axum::http::header::CONTENT_TYPE];
     if auth_enabled {
-        headers.push(HeaderName::from_static("authorization"));
+        headers.push(axum::http::header::AUTHORIZATION);
     }
 
     Ok(CorsLayer::new()
