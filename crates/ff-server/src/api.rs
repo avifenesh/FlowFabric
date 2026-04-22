@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use axum::http::{HeaderName, Method};
+use axum::http::Method;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -21,6 +21,7 @@ use ff_core::contracts::*;
 use ff_core::state::PublicState;
 use ff_core::types::*;
 
+use crate::config::ConfigError;
 use crate::server::{Server, ServerError};
 
 // ── Custom JSON extractor (uniform JSON error on malformed body) ──
@@ -174,8 +175,13 @@ impl IntoResponse for ApiError {
 
 // ── Router ──
 
-pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<String>) -> Router {
-    let cors = build_cors_layer(cors_origins);
+pub fn router(
+    server: Arc<Server>,
+    cors_origins: &[String],
+    api_token: Option<String>,
+) -> Result<Router, ConfigError> {
+    let auth_enabled = api_token.is_some();
+    let cors = build_cors_layer(cors_origins, auth_enabled)?;
 
     let mut app = Router::new()
         // Executions
@@ -232,9 +238,9 @@ pub fn router(server: Arc<Server>, cors_origins: &[String], api_token: Option<St
         }));
     }
 
-    app.layer(TraceLayer::new_for_http())
+    Ok(app.layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(server)
+        .with_state(server))
 }
 
 async fn auth_middleware(
@@ -279,25 +285,66 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn build_cors_layer(origins: &[String]) -> CorsLayer {
+/// Build the CORS layer from the configured `FF_CORS_ORIGINS` list.
+///
+/// Fails closed (#71): if every entry fails to parse as a `HeaderValue`,
+/// return `ConfigError` so startup aborts instead of silently falling back
+/// to `CorsLayer::permissive()` (a typo would otherwise broaden browser
+/// access to "allow any origin").
+///
+/// When `auth_enabled` is true (i.e. `FF_API_TOKEN` is set), `Authorization`
+/// is added to `allow_headers` (#66) so browser preflights for
+/// cross-origin authenticated requests succeed.
+fn build_cors_layer(origins: &[String], auth_enabled: bool) -> Result<CorsLayer, ConfigError> {
     if origins.iter().any(|o| o == "*") {
-        return CorsLayer::permissive();
+        return Ok(CorsLayer::permissive());
     }
-    let parsed: Vec<_> = origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
+
+    let mut parsed = Vec::with_capacity(origins.len());
+    let mut accepted = Vec::with_capacity(origins.len());
+    let mut invalid = Vec::new();
+    for o in origins {
+        match o.parse() {
+            Ok(v) => {
+                parsed.push(v);
+                accepted.push(o.as_str());
+            }
+            Err(_) => invalid.push(o.clone()),
+        }
+    }
+
     if parsed.is_empty() && !origins.is_empty() {
-        tracing::warn!(
-            configured = ?origins,
-            "all configured CORS origins failed to parse, falling back to permissive"
-        );
-        return CorsLayer::permissive();
+        return Err(ConfigError::InvalidValue {
+            var: "FF_CORS_ORIGINS".to_owned(),
+            message: format!(
+                "all configured origins failed to parse as valid HTTP header values: {:?}; \
+                 refusing to fall back to permissive CORS",
+                origins
+            ),
+        });
     }
-    CorsLayer::new()
+
+    if !invalid.is_empty() {
+        // Collected `accepted` list during the single parse loop above to
+        // avoid an O(N*M) filter-contains scan per log event.
+        tracing::warn!(
+            ?invalid,
+            ?accepted,
+            "some FF_CORS_ORIGINS entries failed to parse and were dropped"
+        );
+    }
+
+    // Prefer typed `header::*` constants over stringly-typed `from_static`
+    // so typos fail to compile rather than fail at runtime.
+    let mut headers = vec![axum::http::header::CONTENT_TYPE];
+    if auth_enabled {
+        headers.push(axum::http::header::AUTHORIZATION);
+    }
+
+    Ok(CorsLayer::new()
         .allow_origin(AllowOrigin::list(parsed))
         .allow_methods([Method::GET, Method::POST, Method::PUT])
-        .allow_headers([HeaderName::from_static("content-type")])
+        .allow_headers(headers))
 }
 
 // ── Execution handlers ──
@@ -1034,4 +1081,137 @@ fn parse_flow_id(s: &str) -> Result<FlowId, ApiError> {
 fn parse_budget_id(s: &str) -> Result<BudgetId, ApiError> {
     BudgetId::parse(s)
         .map_err(|e| ApiError(ServerError::InvalidInput(format!("invalid budget_id: {e}"))))
+}
+
+#[cfg(test)]
+mod cors_tests {
+    //! CORS + auth preflight tests (#66, #71).
+    //!
+    //! Exercised via `tower::ServiceExt::oneshot` against a minimal router
+    //! that applies only the CORS layer to a noop `/healthz`-style route.
+    //! This mirrors what browsers actually see (the `CorsLayer` is terminal
+    //! for OPTIONS preflights) without needing a live `Server`.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn app_with_cors(origins: &[String], auth_enabled: bool) -> Router {
+        let cors = build_cors_layer(origins, auth_enabled)
+            .expect("build_cors_layer succeeds for valid inputs");
+        Router::new().route("/noop", get(|| async { "ok" })).layer(cors)
+    }
+
+    #[test]
+    fn all_origins_invalid_returns_config_error_instead_of_permissive() {
+        // #71: invalid HeaderValue (contains a control character) should
+        // fail closed rather than falling back to permissive CORS.
+        //
+        // Note: `HeaderValue` parsing is intentionally lax — it accepts
+        // almost any printable ASCII, so "not a url" parses fine. We use
+        // a string with an embedded NUL byte to exercise the actual parse
+        // failure path.
+        let err = build_cors_layer(&["bad\0origin".to_owned()], false).unwrap_err();
+        let ConfigError::InvalidValue { var, message } = err;
+        assert_eq!(var, "FF_CORS_ORIGINS");
+        assert!(
+            message.contains("all configured origins failed to parse"),
+            "message was: {message}"
+        );
+    }
+
+    #[test]
+    fn wildcard_still_returns_permissive() {
+        // Explicit `*` is still the documented permissive path.
+        let layer = build_cors_layer(&["*".to_owned()], false);
+        assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn empty_origins_returns_empty_allowlist_ok() {
+        // Empty list (no origins configured) produces an empty allowlist;
+        // no browser origin matches. This is NOT the fail-open case — that
+        // only happens when origins are configured but all parse-invalid.
+        let layer = build_cors_layer(&[], false);
+        assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn mixed_valid_and_invalid_keeps_valid_entries() {
+        // A partial typo should not fail the whole boot — we log a warning
+        // and keep the parsable entries.
+        let layer = build_cors_layer(
+            &["https://ok.example.com".to_owned(), "bad\0origin".to_owned()],
+            false,
+        );
+        assert!(layer.is_ok());
+    }
+
+    #[tokio::test]
+    async fn preflight_allows_authorization_when_auth_enabled() {
+        // #66: with token auth on, browsers need `Authorization` in the
+        // preflight's `Access-Control-Allow-Headers` response.
+        let app = app_with_cors(&["https://client.example.com".to_owned()], true);
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/noop")
+            .header("origin", "https://client.example.com")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "authorization,content-type")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let allow_headers = resp
+            .headers()
+            .get("access-control-allow-headers")
+            .expect("access-control-allow-headers present")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            allow_headers.contains("authorization"),
+            "expected `authorization` in Access-Control-Allow-Headers, got: {allow_headers}"
+        );
+        assert!(
+            allow_headers.contains("content-type"),
+            "expected `content-type` in Access-Control-Allow-Headers, got: {allow_headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_omits_authorization_when_auth_disabled() {
+        // Negative case: without auth, Authorization is not needed and
+        // should not be advertised (principle of least privilege).
+        let app = app_with_cors(&["https://client.example.com".to_owned()], false);
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/noop")
+            .header("origin", "https://client.example.com")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "content-type")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let allow_headers = resp
+            .headers()
+            .get("access-control-allow-headers")
+            .expect("access-control-allow-headers present")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            !allow_headers.contains("authorization"),
+            "Authorization should not be advertised when auth is off; got: {allow_headers}"
+        );
+        assert!(allow_headers.contains("content-type"));
+    }
 }
