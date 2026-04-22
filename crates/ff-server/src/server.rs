@@ -4409,6 +4409,103 @@ os:Linux\r\n";
         assert!(err.to_string().contains("empty map"));
     }
 
+    /// End-to-end composition test for the cluster-min fix (issue #84):
+    /// `extract_info_bodies` → `parse_valkey_version` per node → min-reduce →
+    /// floor comparison. A mixed-version cluster where one node is 7.1.0 must
+    /// fail the gate, even if another node is already on 8.0.0 and that
+    /// node's entry appears first in the map.
+    #[test]
+    fn parse_valkey_version_min_across_cluster_map_picks_lowest() {
+        // node1 appears first and is above the floor. Pre-fix behavior
+        // (first-entry only) would accept. The min across all three nodes is
+        // (7, 1), below the (7, 2) floor, so the gate must reject.
+        let body_node1 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.0.0\r\n";
+        let body_node2 = "# Server\r\nredis_version:7.1.0\r\nserver_name:valkey\r\n";
+        let body_node3 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:7.2.0\r\n";
+        let map = Value::Map(vec![
+            (
+                Value::SimpleString("node1:6379".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_node1.to_string(),
+                },
+            ),
+            (
+                Value::SimpleString("node2:6379".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_node2.to_string(),
+                },
+            ),
+            (
+                Value::SimpleString("node3:6379".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_node3.to_string(),
+                },
+            ),
+        ]);
+
+        let bodies = extract_info_bodies(&map).unwrap();
+        let min = bodies
+            .iter()
+            .map(|b| parse_valkey_version(b).unwrap())
+            .min()
+            .unwrap();
+
+        assert_eq!(min, (7, 1), "min across cluster must be the lowest node");
+        assert!(
+            min < (REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR),
+            "mixed-version cluster with 7.1.0 node must fail the (7,2) gate"
+        );
+    }
+
+    /// Companion to `parse_valkey_version_min_across_cluster_map_picks_lowest`:
+    /// when every node is at or above the floor, the min-reduce + gate
+    /// composition accepts.
+    #[test]
+    fn parse_valkey_version_all_nodes_at_or_above_floor_accepts() {
+        let body_node1 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.0.0\r\n";
+        let body_node2 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:7.2.0\r\n";
+        let body_node3 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:9.0.3\r\n";
+        let map = Value::Map(vec![
+            (
+                Value::SimpleString("node1:6379".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_node1.to_string(),
+                },
+            ),
+            (
+                Value::SimpleString("node2:6379".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_node2.to_string(),
+                },
+            ),
+            (
+                Value::SimpleString("node3:6379".to_string()),
+                Value::VerbatimString {
+                    format: ferriskey::value::VerbatimFormat::Text,
+                    text: body_node3.to_string(),
+                },
+            ),
+        ]);
+
+        let bodies = extract_info_bodies(&map).unwrap();
+        let min = bodies
+            .iter()
+            .map(|b| parse_valkey_version(b).unwrap())
+            .min()
+            .unwrap();
+
+        assert_eq!(min, (7, 2), "min across cluster is the lowest node (7.2)");
+        assert!(
+            min >= (REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR),
+            "all-above-floor cluster must pass the gate"
+        );
+    }
+
     #[test]
     fn valkey_version_too_low_is_not_retryable() {
         let err = ServerError::ValkeyVersionTooLow {
