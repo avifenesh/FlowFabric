@@ -906,7 +906,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '12'
+  return '13'
 end)
 
 
@@ -4276,6 +4276,23 @@ redis.register_function('ff_expire_suspension', function(keys, args)
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
     redis.call("ZREM", K.suspended_zset, A.execution_id)
     redis.call("ZADD", K.terminal_key, now_ms, A.execution_id)
+
+    -- Push-based DAG promotion (bridge-event gap report §1.3 analogue).
+    -- Suspension-timeout terminals (fail / cancel / expire) are FF-
+    -- initiated transitions that cairn cannot observe via its
+    -- call-then-emit pattern. Without a PUBLISH, flow-bound children
+    -- only unblock via the dependency_reconciler safety net (15s).
+    -- Gated on `is_set(core.flow_id)` — standalone executions never
+    -- have downstream edges. Outcome matches terminal_outcome
+    -- ("failed" / "cancelled" / "expired").
+    if is_set(core.flow_id) then
+      local payload = cjson.encode({
+        execution_id = A.execution_id,
+        flow_id = core.flow_id,
+        outcome = terminal_outcome,
+      })
+      redis.call("PUBLISH", "ff:dag:completions", payload)
+    end
 
     return ok(behavior, public_state_val)
   end
