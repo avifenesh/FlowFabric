@@ -451,6 +451,18 @@ pub enum CancelFlowWait {
 /// One completion event delivered through the `CompletionStream`
 /// (RFC-012 §4.3). Also the payload type for issue #90's subscription
 /// API. Stage 0 authorises the type; issue #90 fixes the wire shape.
+///
+/// `flow_id` was added in issue #90 so DAG-dependency routing
+/// (`dispatch_dependency_resolution`) has the partition-routable flow
+/// handle without reparsing the Lua-emitted JSON downstream.
+/// `#[non_exhaustive]` keeps future field additions additive; use
+/// [`CompletionPayload::new`] and [`CompletionPayload::with_flow_id`]
+/// for construction.
+///
+/// `payload_bytes` / `produced_at_ms` are authorised but not yet
+/// populated by the Valkey Lua emitters — consumers on the
+/// `CompletionStream` read `execution_id` + `flow_id` today and must
+/// tolerate `payload_bytes = None` / `produced_at_ms = 0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CompletionPayload {
@@ -458,6 +470,9 @@ pub struct CompletionPayload {
     pub outcome: String,
     pub payload_bytes: Option<Vec<u8>>,
     pub produced_at_ms: TimestampMs,
+    /// Flow handle for partition routing. Added in issue #90 (#90);
+    /// `None` for emitters that don't yet surface it.
+    pub flow_id: Option<crate::types::FlowId>,
 }
 
 impl CompletionPayload {
@@ -472,7 +487,16 @@ impl CompletionPayload {
             outcome: outcome.into(),
             payload_bytes,
             produced_at_ms,
+            flow_id: None,
         }
+    }
+
+    /// Attach a flow handle to the payload. Additive builder so adding
+    /// `flow_id` didn't require a breaking change to [`Self::new`].
+    #[must_use]
+    pub fn with_flow_id(mut self, flow_id: crate::types::FlowId) -> Self {
+        self.flow_id = Some(flow_id);
+        self
     }
 }
 
@@ -796,6 +820,7 @@ mod tests {
             outcome: "success".into(),
             payload_bytes: Some(b"ok".to_vec()),
             produced_at_ms: TimestampMs::from_millis(1234),
+            flow_id: None,
         };
         assert_eq!(c.clone(), c);
         let _ = format!("{c:?}");
