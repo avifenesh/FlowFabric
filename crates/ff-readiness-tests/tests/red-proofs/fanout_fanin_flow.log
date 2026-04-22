@@ -1,0 +1,120 @@
+RED-PROOF transcripts for PR-D1c fanout/fanin DAG tests
+========================================================
+
+Covers both `tests/fanout_fanin_flow_happy.rs` and
+`tests/fanout_fanin_flow_fanin_skip.rs`. Each subtest was broken one
+at a time in-tree, run under the same cargo invocation as the green
+run, then restored. The panic messages below are the direct output of
+the broken runs.
+
+Both tests were initially co-located in a single file per the PR-D1c
+plan; local runs surfaced two discrete issues that the plan's
+"split if we see it locally" fallback covers:
+
+  1. Cross-test engine pollution — `InProcessServer::drop` only
+     aborts the axum handle, not the engine's JoinSet, so a second
+     in-binary test ended up with two concurrent completion_listeners
+     racing on the same Valkey.
+
+  2. `claim_specific` wedge on concurrent eligibility — after A
+     completes, B and C become eligible in parallel. A naïve
+     "claim B, drop anything else" loop holds the dropped sibling's
+     30 s lease, so the next `claim_specific(other)` times out at
+     10 s against a still-leased target. The happy and skip subtests
+     now use a new helper `claim_any_of` that consumes whichever
+     sibling the worker returns first.
+
+Both subtests now live in their own files and share helpers via
+`tests/common/mod.rs`.
+
+─── Subtest 1: fanout_fanin_flow_happy ──────────────────────────────
+
+BREAK: replace the post-A-complete bounded poll on B with a single-shot
+       assertion, so the async completion_listener hasn't yet promoted
+       B to Waiting.
+
+    -    await_public_state(&worker, b, PublicState::Waiting).await;
+    +    assert_public_state(&worker, b, PublicState::Waiting).await;
+
+CMD:   cargo test -p ff-readiness-tests --features readiness \
+           --test fanout_fanin_flow_happy -- --ignored --test-threads=1 --nocapture
+
+OUTPUT:
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.37s
+     Running tests/fanout_fanin_flow_happy.rs (target/debug/deps/fanout_fanin_flow_happy-37178f741946f5b0)
+
+running 1 test
+test fanout_fanin_flow_happy ...
+thread 'fanout_fanin_flow_happy' panicked at crates/ff-readiness-tests/tests/common/mod.rs:279:5:
+assertion `left == right` failed: {fp:3}:76c384f6-a745-4f76-b4e6-352f66745886 expected public_state=Waiting, got WaitingChildren
+  left: WaitingChildren
+ right: Waiting
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+    fanout_fanin_flow_happy
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+Assertion that fired:
+    assert_eq!(
+        got, expected,
+        "{eid} expected public_state={expected:?}, got {got:?}"
+    );  // in `assert_public_state`, common/mod.rs
+
+This proves the happy-path assertion is exercising the real fanout
+push-promotion path: the single-shot check against the async listener
+reliably observes WaitingChildren before B flips to Waiting.
+
+─── Subtest 2: fanout_fanin_flow_fanin_skip ─────────────────────────
+
+BREAK: flip the expected terminal of D from Skipped to Completed, so
+       the bounded poll hits the 5 s deadline against the actual
+       terminal (Skipped, as the B→D edge was resolved Impossible).
+
+    -    await_public_state(&worker, d, PublicState::Skipped).await;
+    +    await_public_state(&worker, d, PublicState::Completed).await;
+
+CMD:   cargo test -p ff-readiness-tests --features readiness \
+           --test fanout_fanin_flow_fanin_skip -- --ignored --test-threads=1 --nocapture
+
+OUTPUT:
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.17s
+     Running tests/fanout_fanin_flow_fanin_skip.rs (target/debug/deps/fanout_fanin_flow_fanin_skip-9d7c0f277616e30c)
+
+running 1 test
+test fanout_fanin_flow_fanin_skip ...
+thread 'fanout_fanin_flow_fanin_skip' panicked at crates/ff-readiness-tests/tests/common/mod.rs:300:13:
+timed out waiting for {fp:2}:33e4bee7-731b-4c57-b1d8-2aeb03e84e53 to become public_state=Completed (5s); last public_state=Skipped
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+    fanout_fanin_flow_fanin_skip
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.09s
+
+Assertion that fired (the timeout branch of `await_public_state`):
+    panic!(
+        "timed out waiting for {eid} to become public_state={expected:?} (5s); \
+         last public_state={got:?}"
+    );
+
+The message confirms the engine actually drove D to Skipped via the
+`success_only` impossibility propagation from B's failure — exactly
+the semantic the subtest is asserting.
+
+─── Restoration + green ─────────────────────────────────────────────
+
+Both breaks were reverted in-place. 8 consecutive FLUSHDB-then-run
+cycles of the full fanout_fanin_flow suite passed both subtests:
+
+    for i in {1..8}; do
+        valkey-cli FLUSHDB
+        cargo test -p ff-readiness-tests --features readiness \
+            -- --ignored fanout_fanin_flow --test-threads=1
+    done
+    # → 8/8 green (2 passed per run)
