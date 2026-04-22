@@ -526,7 +526,7 @@ impl FlowFabricWorker {
             };
 
             let execution_id = ExecutionId::parse(&execution_id_str).map_err(|e| {
-                SdkError::Script(ff_script::error::ScriptError::Parse(format!(
+                SdkError::from(ff_script::error::ScriptError::Parse(format!(
                     "bad execution_id in eligible set: {e}"
                 )))
             })?;
@@ -538,9 +538,19 @@ impl FlowFabricWorker {
 
             match grant_result {
                 Ok(()) => {}
-                Err(SdkError::Script(ff_script::error::ScriptError::CapabilityMismatch(
-                    ref missing,
-                ))) => {
+                Err(SdkError::Engine(ref boxed))
+                    if matches!(
+                        **boxed,
+                        crate::EngineError::Validation {
+                            kind: crate::ValidationKind::CapabilityMismatch,
+                            ..
+                        }
+                    ) =>
+                {
+                    let missing = match &**boxed {
+                        crate::EngineError::Validation { detail, .. } => detail.clone(),
+                        _ => unreachable!(),
+                    };
                     // Block-on-mismatch (RFC-009 §7.5) — parity with
                     // ff-scheduler's Scheduler::claim_for_worker. Without
                     // this, the inline-direct-claim path would hot-loop
@@ -559,7 +569,7 @@ impl FlowFabricWorker {
                     self.block_route(&execution_id, &lane_id, &partition, &idx).await;
                     continue;
                 }
-                Err(SdkError::Script(ref e)) if is_retryable_claim_error(e) => {
+                Err(SdkError::Engine(ref e)) if is_retryable_claim_error(e) => {
                     tracing::debug!(
                         execution_id = %execution_id,
                         error = %e,
@@ -582,7 +592,14 @@ impl FlowFabricWorker {
                     task.set_concurrency_permit(permit);
                     return Ok(Some(task));
                 }
-                Err(SdkError::Script(ff_script::error::ScriptError::UseClaimResumedExecution)) => {
+                Err(SdkError::Engine(ref boxed))
+                    if matches!(
+                        **boxed,
+                        crate::EngineError::Contention(
+                            crate::ContentionKind::UseClaimResumedExecution
+                        )
+                    ) =>
+                {
                     // Execution was resumed from suspension — attempt_interrupted.
                     // ff_claim_execution rejects this; use ff_claim_resumed_execution
                     // which reuses the existing attempt instead of creating a new one.
@@ -598,7 +615,7 @@ impl FlowFabricWorker {
                             task.set_concurrency_permit(permit);
                             return Ok(Some(task));
                         }
-                        Err(SdkError::Script(ref e2)) if is_retryable_claim_error(e2) => {
+                        Err(SdkError::Engine(ref e2)) if is_retryable_claim_error(e2) => {
                             tracing::debug!(
                                 execution_id = %execution_id,
                                 error = %e2,
@@ -609,7 +626,7 @@ impl FlowFabricWorker {
                         Err(e2) => return Err(e2),
                     }
                 }
-                Err(SdkError::Script(ref e)) if is_retryable_claim_error(e) => {
+                Err(SdkError::Engine(ref e)) if is_retryable_claim_error(e) => {
                     tracing::debug!(
                         execution_id = %execution_id,
                         error = %e,
@@ -821,7 +838,7 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
                     "ff_claim_execution: expected Array".into(),
                 )));
             }
@@ -830,7 +847,7 @@ impl FlowFabricWorker {
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
                     "ff_claim_execution: bad status code".into(),
                 )));
             }
@@ -852,7 +869,7 @@ impl FlowFabricWorker {
             };
             let detail = err_field_str(2);
 
-            return Err(SdkError::Script(
+            return Err(SdkError::from(
                 ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
                     .unwrap_or_else(|| {
                         ff_script::error::ScriptError::Parse(format!(
@@ -937,15 +954,15 @@ impl FlowFabricWorker {
     /// * [`SdkError::WorkerAtCapacity`] — `max_concurrent_tasks`
     ///   permits all held. Retryable; the grant is untouched.
     /// * `ScriptError::InvalidClaimGrant` — grant missing, consumed,
-    ///   or `worker_id` mismatch (wrapped in [`SdkError::Script`]).
+    ///   or `worker_id` mismatch (wrapped in [`SdkError::Engine`]).
     /// * `ScriptError::ClaimGrantExpired` — grant TTL elapsed
-    ///   (wrapped in [`SdkError::Script`]).
+    ///   (wrapped in [`SdkError::Engine`]).
     /// * `ScriptError::CapabilityMismatch` — execution's required
     ///   capabilities not a subset of this worker's caps (wrapped in
-    ///   [`SdkError::Script`]). Surfaced post-grant if a race
+    ///   [`SdkError::Engine`]). Surfaced post-grant if a race
     ///   between grant issuance and caps change allows it.
     /// * `ScriptError::Parse` — `ff_claim_execution` returned an
-    ///   unexpected shape (wrapped in [`SdkError::Script`]).
+    ///   unexpected shape (wrapped in [`SdkError::Engine`]).
     /// * [`SdkError::Valkey`] / [`SdkError::ValkeyContext`] —
     ///   transport error during the FCALL or the
     ///   `read_execution_context` follow-up.
@@ -1161,7 +1178,7 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
                     "ff_claim_resumed_execution: expected Array".into(),
                 )));
             }
@@ -1170,7 +1187,7 @@ impl FlowFabricWorker {
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::Script(ff_script::error::ScriptError::Parse(
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
                     "ff_claim_resumed_execution: bad status code".into(),
                 )));
             }
@@ -1192,7 +1209,7 @@ impl FlowFabricWorker {
             };
             let detail = err_field_str(2);
 
-            return Err(SdkError::Script(
+            return Err(SdkError::from(
                 ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
                     .unwrap_or_else(|| {
                         ff_script::error::ScriptError::Parse(format!(
@@ -1389,7 +1406,7 @@ impl FlowFabricWorker {
 }
 
 #[cfg(feature = "direct-valkey-claim")]
-fn is_retryable_claim_error(err: &ff_script::error::ScriptError) -> bool {
+fn is_retryable_claim_error(err: &crate::EngineError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
         err.class(),

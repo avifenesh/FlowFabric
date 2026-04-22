@@ -870,6 +870,17 @@ enum AdjacencySide {
     Incoming,
 }
 
+/// Crate-visible re-export of [`build_edge_snapshot`] for
+/// [`crate::engine_error::EngineError::enrich_dependency_conflict`].
+#[allow(dead_code)]
+pub(crate) fn build_edge_snapshot_public(
+    flow_id: &FlowId,
+    edge_id: &EdgeId,
+    raw: &HashMap<String, String>,
+) -> Result<EdgeSnapshot, SdkError> {
+    build_edge_snapshot(flow_id, edge_id, raw)
+}
+
 /// Assemble an [`EdgeSnapshot`] from the raw HGETALL field map. Kept
 /// as a free function so unit tests can feed synthetic maps.
 ///

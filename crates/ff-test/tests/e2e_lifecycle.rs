@@ -8960,8 +8960,12 @@ async fn test_claim_from_reclaim_grant_expired() {
         //     already evicted the key before the FCALL reaches
         //     HGETALL (#grant_raw == 0).
         // Both signal the same root cause — the grant's TTL elapsed.
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::ClaimGrantExpired)) => {}
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::InvalidClaimGrant)) => {}
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::ClaimGrantExpired)) =>
+        {}
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::InvalidClaimGrant)) =>
+        {}
         Err(other) => panic!("expected ClaimGrantExpired or InvalidClaimGrant, got {other:?}"),
         Ok(_) => panic!("expired grant should not succeed"),
     }
@@ -8985,7 +8989,9 @@ async fn test_claim_from_reclaim_grant_wrong_worker() {
     // Build a FlowFabricWorker with a DIFFERENT worker_id.
     let worker = build_reclaim_test_worker("worker-b", "worker-b-inst").await;
     match worker.claim_from_reclaim_grant(grant).await {
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::InvalidClaimGrant)) => {}
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::InvalidClaimGrant)) =>
+        {}
         Err(other) => panic!("expected InvalidClaimGrant, got {other:?}"),
         Ok(_) => panic!("worker-id mismatch should not succeed"),
     }
@@ -9027,8 +9033,12 @@ async fn test_claim_from_reclaim_grant_not_resumed() {
 
     let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
     match worker.claim_from_reclaim_grant(grant).await {
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::NotAResumedExecution)) => {}
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::ExecutionNotLeaseable)) => {
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::NotAResumedExecution)) =>
+        {}
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::ExecutionNotLeaseable)) =>
+        {
             // Acceptable alternate: some Lua orderings check
             // lifecycle_phase (runnable) before attempt_state. Either
             // error signals the same root cause — this is a non-
@@ -9071,8 +9081,12 @@ async fn test_claim_from_reclaim_grant_double_consume() {
     // differently we'd also see `InvalidClaimGrant` — accept either
     // as proof the second consume was rejected.
     match worker.claim_from_reclaim_grant(grant).await {
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::ExecutionNotLeaseable)) => {}
-        Err(ff_sdk::SdkError::Script(ff_script::error::ScriptError::InvalidClaimGrant)) => {}
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::ExecutionNotLeaseable)) =>
+        {}
+        Err(ff_sdk::SdkError::Engine(ref _b))
+            if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::InvalidClaimGrant)) =>
+        {}
         Err(other) => panic!("expected ExecutionNotLeaseable or InvalidClaimGrant on second consume, got {other:?}"),
         Ok(_) => panic!("second consume should not succeed"),
     }
