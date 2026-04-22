@@ -1092,11 +1092,9 @@ async fn tail_attempt_stream(
     // XRANGE-only. The opaque-cursor deserializer already rejects
     // the bare `-`/`+` wire tokens; this boundary also rejects the
     // structured `start`/`end` keywords because XREAD treats them
-    // as invalid ids.
-    if matches!(
-        params.after,
-        ff_core::contracts::StreamCursor::Start | ff_core::contracts::StreamCursor::End
-    ) {
+    // as invalid ids. Uses [`StreamCursor::is_concrete`] so the
+    // SDK + REST guards stay in lock-step.
+    if !params.after.is_concrete() {
         return Err(ApiError(ServerError::InvalidInput(
             "after: XREAD cursor must be a concrete entry id; pass '0-0' to start from the beginning"
                 .to_owned(),

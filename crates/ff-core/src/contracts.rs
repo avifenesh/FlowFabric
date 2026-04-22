@@ -958,9 +958,9 @@ pub enum AppendFrameResult {
 /// The ONLY accepted tokens are:
 ///
 /// * `"start"` — first entry in the stream (XRANGE `-` equivalent).
-///   Valid in [`read_stream`] / `ReadStreamParams`.
+///   Valid in `read_stream` / `ReadStreamParams`.
 /// * `"end"` — latest entry in the stream (XRANGE `+` equivalent).
-///   Valid in [`read_stream`] / `ReadStreamParams`.
+///   Valid in `read_stream` / `ReadStreamParams`.
 /// * `"<ms>"` or `"<ms>-<seq>"` — a concrete Valkey Stream entry id.
 ///   Valid everywhere.
 ///
@@ -974,7 +974,9 @@ pub enum AppendFrameResult {
 /// `StreamCursor::At("0-0".into())` — use the convenience constructor
 /// [`StreamCursor::from_beginning`] which returns exactly that value.
 /// `Start` / `End` are rejected by the SDK's `tail_stream` boundary
-/// because XREAD does not accept `-` / `+` as cursors.
+/// because XREAD does not accept `-` / `+` as cursors. The
+/// [`StreamCursor::is_concrete`] helper centralises this
+/// Start/End-vs-At decision for boundary-validation call sites.
 ///
 /// # Why an enum instead of a string
 ///
@@ -1033,12 +1035,41 @@ impl StreamCursor {
     /// `ReadFramesArgs` or calling `xread_block`) to translate the
     /// opaque wire grammar into the Lua-ABI form. NOT part of the
     /// public wire — do not emit these raw characters to consumers.
+    /// Hidden from the generated docs to discourage external use;
+    /// external consumers should never need to see the raw `-` / `+`.
+    #[doc(hidden)]
     pub fn to_wire(&self) -> &str {
         match self {
             Self::Start => "-",
             Self::End => "+",
             Self::At(s) => s.as_str(),
         }
+    }
+
+    /// Internal-only owned variant of [`Self::to_wire`] — moves the
+    /// inner `String` out of `At(s)` without cloning. Use at adapter
+    /// edges that construct an owned wire string (e.g.
+    /// `ReadFramesArgs.from_id`) from a `StreamCursor` that is about
+    /// to be dropped.
+    #[doc(hidden)]
+    pub fn into_wire_string(self) -> String {
+        match self {
+            Self::Start => "-".to_owned(),
+            Self::End => "+".to_owned(),
+            Self::At(s) => s,
+        }
+    }
+
+    /// True iff this cursor is a concrete entry id
+    /// (`"<ms>"` / `"<ms>-<seq>"`). False for the open markers
+    /// `Start` / `End`.
+    ///
+    /// Used by boundaries like XREAD (tailing) that do not accept
+    /// open markers — rejecting a cursor is equivalent to
+    /// `!cursor.is_concrete()`. Centralised here to keep the SDK and
+    /// REST guards in lock-step.
+    pub fn is_concrete(&self) -> bool {
+        matches!(self, Self::At(_))
     }
 }
 
@@ -1084,37 +1115,68 @@ impl std::fmt::Display for StreamCursorParseError {
 
 impl std::error::Error for StreamCursorParseError {}
 
+/// Shared grammar check — classifies `s` as `Start` / `End` / a
+/// concrete-id shape / malformed / empty, WITHOUT allocating. The
+/// owned vs borrowed entry points ([`StreamCursor::from_str`],
+/// [`StreamCursor::try_from`]) consume this classification and move
+/// the owned `String` into `At` when applicable, avoiding a
+/// round-trip `String → &str → String::to_owned` for the common
+/// REST-query path.
+enum StreamCursorClass {
+    Start,
+    End,
+    Concrete,
+    BareMarker,
+    Empty,
+    Malformed,
+}
+
+fn classify_stream_cursor(s: &str) -> StreamCursorClass {
+    if s.is_empty() {
+        return StreamCursorClass::Empty;
+    }
+    if s == "-" || s == "+" {
+        return StreamCursorClass::BareMarker;
+    }
+    if s == "start" {
+        return StreamCursorClass::Start;
+    }
+    if s == "end" {
+        return StreamCursorClass::End;
+    }
+    if !s.is_ascii() {
+        return StreamCursorClass::Malformed;
+    }
+    let (ms_part, seq_part) = match s.split_once('-') {
+        Some((ms, seq)) => (ms, Some(seq)),
+        None => (s, None),
+    };
+    let ms_ok = !ms_part.is_empty() && ms_part.bytes().all(|b| b.is_ascii_digit());
+    let seq_ok = seq_part
+        .map(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(true);
+    if ms_ok && seq_ok {
+        StreamCursorClass::Concrete
+    } else {
+        StreamCursorClass::Malformed
+    }
+}
+
 impl std::str::FromStr for StreamCursor {
     type Err = StreamCursorParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err(StreamCursorParseError::Empty);
-        }
-        if s == "-" || s == "+" {
-            return Err(StreamCursorParseError::BareMarkerRejected(s.to_owned()));
-        }
-        if s == "start" {
-            return Ok(Self::Start);
-        }
-        if s == "end" {
-            return Ok(Self::End);
-        }
-        if !s.is_ascii() {
-            return Err(StreamCursorParseError::Malformed(s.to_owned()));
-        }
-        let (ms_part, seq_part) = match s.split_once('-') {
-            Some((ms, seq)) => (ms, Some(seq)),
-            None => (s, None),
-        };
-        let ms_ok = !ms_part.is_empty() && ms_part.bytes().all(|b| b.is_ascii_digit());
-        let seq_ok = seq_part
-            .map(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            .unwrap_or(true);
-        if ms_ok && seq_ok {
-            Ok(Self::At(s.to_owned()))
-        } else {
-            Err(StreamCursorParseError::Malformed(s.to_owned()))
+        match classify_stream_cursor(s) {
+            StreamCursorClass::Start => Ok(Self::Start),
+            StreamCursorClass::End => Ok(Self::End),
+            StreamCursorClass::Concrete => Ok(Self::At(s.to_owned())),
+            StreamCursorClass::BareMarker => {
+                Err(StreamCursorParseError::BareMarkerRejected(s.to_owned()))
+            }
+            StreamCursorClass::Empty => Err(StreamCursorParseError::Empty),
+            StreamCursorClass::Malformed => {
+                Err(StreamCursorParseError::Malformed(s.to_owned()))
+            }
         }
     }
 }
@@ -1123,8 +1185,21 @@ impl TryFrom<String> for StreamCursor {
     type Error = StreamCursorParseError;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        // Forward to the `&str` impl to avoid duplicating the grammar.
-        <Self as std::str::FromStr>::from_str(&s)
+        // Owned parsing path — the `At` variant moves `s` in directly,
+        // avoiding the `&str → String::to_owned` re-allocation that a
+        // blind forward to `FromStr::from_str(&s)` would force. Error
+        // paths still pay one allocation to describe the offending
+        // input.
+        match classify_stream_cursor(&s) {
+            StreamCursorClass::Start => Ok(Self::Start),
+            StreamCursorClass::End => Ok(Self::End),
+            StreamCursorClass::Concrete => Ok(Self::At(s)),
+            StreamCursorClass::BareMarker => {
+                Err(StreamCursorParseError::BareMarkerRejected(s))
+            }
+            StreamCursorClass::Empty => Err(StreamCursorParseError::Empty),
+            StreamCursorClass::Malformed => Err(StreamCursorParseError::Malformed(s)),
+        }
     }
 }
 
@@ -2215,6 +2290,25 @@ mod tests {
         assert_eq!(
             StreamCursor::from_beginning(),
             StreamCursor::At("0-0".into())
+        );
+    }
+
+    #[test]
+    fn stream_cursor_is_concrete_classifies_variants() {
+        assert!(!StreamCursor::Start.is_concrete());
+        assert!(!StreamCursor::End.is_concrete());
+        assert!(StreamCursor::At("0-0".into()).is_concrete());
+        assert!(StreamCursor::At("123-0".into()).is_concrete());
+        assert!(StreamCursor::from_beginning().is_concrete());
+    }
+
+    #[test]
+    fn stream_cursor_into_wire_string_moves_without_cloning() {
+        assert_eq!(StreamCursor::Start.into_wire_string(), "-");
+        assert_eq!(StreamCursor::End.into_wire_string(), "+");
+        assert_eq!(
+            StreamCursor::At("17-3".into()).into_wire_string(),
+            "17-3"
         );
     }
 }

@@ -1872,7 +1872,7 @@ pub use ff_core::contracts::StreamCursor;
 /// function so unit tests can exercise the guard without constructing a
 /// live `ferriskey::Client`.
 fn validate_tail_cursor(after: &StreamCursor) -> Result<(), SdkError> {
-    if matches!(after, StreamCursor::Start | StreamCursor::End) {
+    if !after.is_concrete() {
         return Err(SdkError::Config {
             context: "tail_stream".into(),
             field: Some("after".into()),
@@ -1952,8 +1952,8 @@ pub async fn read_stream(
     let args = ReadFramesArgs {
         execution_id: execution_id.clone(),
         attempt_index,
-        from_id: from.to_wire().to_owned(),
-        to_id: to.to_wire().to_owned(),
+        from_id: from.into_wire_string(),
+        to_id: to.into_wire_string(),
         count_limit,
     };
 
