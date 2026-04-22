@@ -1,6 +1,6 @@
 # RFC-012: `EngineBackend` trait — abstracting FlowFabric's write surface
 
-**Status:** Accepted (round-4) + round-5 micro-amendment (peer lease-releasing methods `delay` + `wait_children`).
+**Status:** Accepted (round-4) + round-5 micro-amendment (peer lease-releasing methods `delay` + `wait_children`) + round-7 amendment (Stage 1b deferral resolutions — `create_waitpoint` add, `append_frame` return widen, `report_usage` return replace; `suspend` deferred to Stage 1d).
 **Created:** 2026-04-22
 **Supersedes:** issue #89 (trait-extraction plan) on acceptance.
 **Related:** issues #87, #88, #90, #91, #92, #93 (concrete follow-up work this RFC authorises).
@@ -11,6 +11,26 @@
 During the issue #89 Phase-1 method inventory, Worker I discovered two lease-releasing `ClaimedTask` operations that the round-4 inventory did not elevate to peer trait methods: `delay_execution` (`crates/ff-sdk/src/task.rs:414`) and `move_to_waiting_children` (`crates/ff-sdk/src/task.rs:460`). Both are structurally peers of `suspend` — they hand back the lease, run a single FCALL (`ff_delay_execution`, `ff_move_to_waiting_children`) under the fence triple, and leave the attempt in a non-terminal state awaiting a later event (wall-clock time; child-dependency completion). Omitting them would force Stage 1 to ship an incomplete trait and file a follow-up RFC to bolt them on, compounding call-site debt (§1.3 bullet 3).
 
 This amendment adds them as methods 14 and 15 in §3.1.1. Trait count goes from 13 → 15. No other sections change; Stage-0 type inventory (§3.3.0) is untouched (the new methods' signatures reuse existing types: `TimestampMs` from `ff-core::types`, `Handle`, `EngineError`). The amendment is additive to the accepted round-4 shape.
+
+### Round-7 amendment summary (post Stage 1b — issue #117 deferral resolutions)
+
+Stage 1b (shipped `6f54f9b`, PR #119) migrated 8 of the 12 `ClaimedTask` SDK methods onto the `EngineBackend` trait as thin forwarders. Four methods could not land as thin forwarders: three because the trait's return type was strictly less expressive than the SDK's, and one because the trait had no slot at all. Issue [#117](https://github.com/avifenesh/FlowFabric/issues/117) tracks the gap.
+
+This amendment ships **three of the four** deferred methods:
+
+* **`create_waitpoint`** — new trait method (method **16** in §3.1.1). Issues a pending waitpoint; activation happens via a later `suspend` call (Lua `use_pending_waitpoint` ARGV flag). Introduces new type `PendingWaitpoint` in `ff-core::backend`.
+* **`append_frame`** — return type widens from `()` to `AppendFrameOutcome { stream_id, frame_count }`. Moves `AppendFrameOutcome` from `ff-sdk::task` to `ff-core::backend` (Stage-0-style type move with `pub use` shim), mirroring the Stage-1a `FailOutcome` precedent.
+* **`report_usage`** — return type replaces `AdmissionDecision` with `ReportUsageResult { Ok, AlreadyApplied, SoftBreach, HardBreach }`. `AdmissionDecision` is removed. `ReportUsageResult` gains `#[non_exhaustive]` in the same commit (atomic — no semver-two-step).
+
+**`suspend` is deferred to Stage 1d** (tracked under #117). Round-3 review (Worker M) established that any trait `SuspendOutcome` shape preserving the existing Round-4 `HandleKind::Suspended` contract entangles with the SDK wire parser `parse_suspend_result` at `crates/ff-sdk/src/task.rs:1557-1562`, which constructs `Suspended` exhaustively from wire bytes with no access to `Handle`'s opaque payload. Stage 1d bundles `suspend`'s return-type widening with the input-shape rework (`ConditionMatcher`↔`WaitpointSpec` / typed `ResumeCondition`); round-7 ships what can ship independently.
+
+**Envelope prose.** Round-5 already relaxed the §3.1 "15 in spirit" envelope from round-4's 13. Round-7 relaxes further: trait grows 15 → 16 lifecycle ops (`async fn` count 16 → 17 including `create_waitpoint`). `create_waitpoint` is a gap-fill add, not a split-for-honesty; earlier round-2/round-5 prose is not rewritten, but readers should treat the "in spirit" envelope as "17 current trait methods" as of Round-5+Round-7.
+
+**Shape.** Trait-surface breaking. Widens 1 existing return type, replaces 1 existing return type, adds 1 new method, adds 1 new type in `ff-core::backend`, adds `#[non_exhaustive]` to 1 existing contract enum. No Lua / wire changes.
+
+**Target release: 0.4.0** — `report_usage`'s `AdmissionDecision → ReportUsageResult` swap is unambiguously breaking and forces the minor bump on its own. Lands INDEPENDENTLY of Stage 1c (not a sub-stage; parallel RFC-amendment-only landing).
+
+§3.1.1 (method 16), §3.3.0 (type inventory), §3.3 (signatures), and §5 (stage map) are updated in place. Full content and challenger record are captured in §R7 at the end of this RFC; exploration trail lives in `rfcs/drafts/RFC-012-amendment-117-deferrals.{K,L,M}-challenge.md`.
 
 ### Round-4 revision summary (post Worker M CHALLENGE at `183c10f`)
 
@@ -104,9 +124,9 @@ This RFC defines a trait shape. It is explicitly not:
 
 ## §3 Proposed `EngineBackend` trait shape
 
-### §3.1 Operation inventory (15 methods — round-5 amended)
+### §3.1 Operation inventory (16 methods — round-5 + round-7 amended)
 
-The owner's decision pins the granularity target at ~10-12 business-operation methods; round-2 revisions (K#2 split of `resume`, K#6 split of `progress`) brought the count to 13, and round-5's amendment adds the two missing lease-releasing peers of `suspend` (`delay`, `wait_children`) for a final count of 15. The owner's "~10-12" remains a range, not a hard ceiling; 15 is within the spirit of the decision — every count-growth step is a splits-for-honesty move, not a granularity creep (the `progress`/`append_frame` split replaces a fused method whose atomicity was unsound; `observe_signals`/`claim_from_reclaim` replaces one method whose multi-round-trip honesty was broken; `delay` and `wait_children` elevate two call sites that are structural peers of `suspend`). Below is the round-5 inventory.
+The owner's decision pins the granularity target at ~10-12 business-operation methods; round-2 revisions (K#2 split of `resume`, K#6 split of `progress`) brought the count to 13; round-5's amendment added the two missing lease-releasing peers of `suspend` (`delay`, `wait_children`) for a count of 15; round-7's amendment adds one gap-fill method (`create_waitpoint`, §R7) for a final count of 16. The owner's "~10-12" remains a range, not a hard ceiling; 16 is within the spirit of the decision — splits-for-honesty moves dominate (the `progress`/`append_frame` split replaces a fused method whose atomicity was unsound; `observe_signals`/`claim_from_reclaim` replaces one method whose multi-round-trip honesty was broken; `delay` and `wait_children` elevate two call sites that are structural peers of `suspend`), with `create_waitpoint` the one gap-fill add (the trait had no slot for pending-waitpoint issuance; see §R7.2.2). The `async fn` compile-count is 17 (one higher than the method count because method 3/3b are two `async fn`s under one taxonomy slot). Below is the round-5 + round-7 inventory.
 
 The inventory assumes one trait (not multiple domain-split traits) per §6.2; a consumer holding a `Backend: EngineBackend` gets the full write surface without composing four traits.
 
@@ -177,6 +197,14 @@ This also addresses K#3's reclaim-third-path concern: `claim` is fresh, `claim_f
 
 *Round-5 note:* as with method 14, round-4 omitted this. It is a structural peer of `suspend` (9 KEYS, 4 ARGV; fence triple; attempt-timeout zset membership). Included in the amendment for the same reason.
 
+**16. `create_waitpoint(handle, waitpoint_key, expires_in) -> Result<PendingWaitpoint, EngineError>`.** Issues a pending waitpoint for future signal delivery. Waitpoints have two wire states — **pending** (token issued, not yet backing a suspension) and **active** (bound to a suspension). This method creates a waitpoint in the pending state; a later `suspend` transitions pending → active via the Lua `use_pending_waitpoint` ARGV flag (`flowfabric.lua:3603,3641,3690`). If buffered signals already satisfy the condition, `suspend` returns `AlreadySatisfied` and the waitpoint activates without the lease being released. Pending-waitpoint expiry is a first-class terminal error on the wire (`PendingWaitpointExpired` at `ff-script/src/error.rs:170,403-408`).
+
+*Returns a `PendingWaitpoint { waitpoint_id, hmac_token }`*, where `hmac_token: WaitpointHmac` reuses the existing `ff-core::backend::WaitpointHmac` (Debug-redacts; no Display impl).
+
+*Maps to:* `ff_create_pending_waitpoint`. Call site: `ClaimedTask::create_pending_waitpoint` (`crates/ff-sdk/src/task.rs:686`).
+
+*Round-7 note:* added by the round-7 amendment (issue #117). Placed in §3.1.1 alongside other lifecycle ops (no new sub-bucket); the trait does not grow a "waitpoint management" §3.1.4 bucket for one method. Naming kept as `create_waitpoint` (not `create_pending_waitpoint`) — the trait surface describes the caller's business op, with the pending-vs-active disambiguation in the method's rustdoc. See §R7.2.2 for the full rationale and §R7.6.3 for the naming discussion. The `suspend`-side migration (return type widen + input-shape rework) is explicitly NOT part of round-7; it defers to Stage 1d per §R7.1 / §R7.6.1.
+
 #### §3.1.2 Read-path ops (leveraging Phase 1)
 
 **10. `describe_execution(id) -> Result<Option<ExecutionSnapshot>, EngineError>`.** Uses `ff_core::contracts::ExecutionSnapshot` directly; no reshaping. Already shipped by Phase 1 as an inherent method; promoted to trait here to round out the read surface.
@@ -215,9 +243,9 @@ Four categories of write-like operation are omitted from `EngineBackend` deliber
 
 **Completion pubsub subscription.** Issue #90 files a `CompletionStream` trait. This RFC folds the trait's return-types into `EngineBackend`'s shape — specifically, any trait method that today returns a "subscribe to completions for this entity" side-effect returns a `CompletionStream` typed by the associated type (§4). The stream type itself is this RFC's responsibility (it shapes return types); the subscription mechanism for bulk-tailing the completion channel is #90's trait.
 
-### §3.3.0 Type inventory for the trait signatures (round-4, per M3)
+### §3.3.0 Type inventory for the trait signatures (round-4, per M3; round-7 addendum)
 
-The §3.3 signatures reference 17 supporting types. Honesty requires naming which exist today and which are Stage-0 deliverables.
+The §3.3 signatures reference 17 supporting types. Honesty requires naming which exist today and which are Stage-0 deliverables. Round-7 amendment adds two type-moves/introductions (`AppendFrameOutcome`, `PendingWaitpoint`), marks `AdmissionDecision` for removal, and adds `#[non_exhaustive]` to `ReportUsageResult`. See §R7.2 for rationale.
 
 **Exists in-tree today (no change needed):**
 
@@ -244,10 +272,19 @@ The §3.3 signatures reference 17 supporting types. Honesty requires naming whic
 | `BudgetId` | `ff-core::types` | Newtype over `String` (matches `LaneId` / `FlowId` discipline). | **Erratum (Stage 1a):** already lives in `ff-core::types` via the `cf_id!` macro (`crates/ff-core/src/types.rs:278`); no new-type work needed. This row is a no-op for Stage 0 / 1a. |
 | `ReclaimToken` | `ff-core::contracts` | Newtype wrapping whatever bytes the reclaim scanner issues (today a `ReclaimGrant` struct in `ff-core::contracts:161`). Likely `ReclaimToken(ReclaimGrant)`. | May be pure re-export if `ReclaimGrant` proves sufficient. |
 | `LeaseRenewal` | `ff-core::contracts` | `{ expires_at_ms: u64, lease_epoch: u64 }`. | |
-| `AdmissionDecision` | `ff-core::contracts` | Enum: `{ Admitted, Throttled { retry_after_ms: u64 }, Rejected { reason } }`. | Returned by `report_usage`. |
+| `AdmissionDecision` | `ff-core::contracts` | Enum: `{ Admitted, Throttled { retry_after_ms: u64 }, Rejected { reason } }`. | Returned by `report_usage` at round-4; **REMOVED by round-7** — replaced by `ReportUsageResult` (see §R7.2.3). |
 | `CancelFlowPolicy` | `ff-core::contracts` | Today this shape lives inside `CancelFlowArgs` (`contracts.rs:1233`) — extract the policy enum as a named type; keep `CancelFlowArgs` as the REST wrapper. | |
 | `CancelFlowWait` | `ff-core::contracts` | Enum: `{ NoWait, WaitTimeout(Duration), WaitIndefinite }`. | |
 | `CompletionPayload` | `ff-core::contracts` | Struct: `{ execution_id, outcome, payload_bytes, produced_at_ms, … }`. | Also deliverable from issue #90. |
+
+**Round-7 addendum — type deltas for the #117 deferrals amendment (Stage-0-style, landing in the same PR as the trait changes).**
+
+| Type | Target crate | Round-7 change | Notes |
+|------|--------------|----------------|-------|
+| `AppendFrameOutcome` | `ff-core::backend` | **Stage-0-style MOVE** from `ff-sdk::task` (`task.rs:137-143`). Derives widen from `Clone, Debug` to `Clone, Debug, PartialEq, Eq` matching `FailOutcome` precedent. `pub use ff_core::backend::AppendFrameOutcome` shim at old path through 0.4.x. | Shape: `{ stream_id: String, frame_count: u64 }`. No `#[non_exhaustive]` — construction is internal to `ff-sdk`; no external constructors anticipated (consumer-shape evidence, per §R7.2.1 / MN3). `stream_id: String` is a stable shape commitment — a future typed `StreamId` newtype would be its own breaking change (§R7.5.6 / MD2). |
+| `PendingWaitpoint` | `ff-core::backend` | **NEW type** for `create_waitpoint`'s return. | Shape: `{ waitpoint_id: WaitpointId, hmac_token: WaitpointHmac }`. `#[non_exhaustive]` (new type; preserves additivity). `WaitpointHmac` already exists at `crates/ff-core/src/backend.rs:247-277` (Debug-redacts; no Display impl). |
+| `ReportUsageResult` | `ff-core::contracts` | **Gains `#[non_exhaustive]`** at `contracts.rs:1400`. Becomes the new return type of `report_usage` (replacing `AdmissionDecision`). Both deltas land in one atomic commit — no semver-two-step (§R7.7 / M3). | Existing variants: `Ok | AlreadyApplied | SoftBreach { … } | HardBreach { … }` (`contracts.rs:1400-1418`). Wire-fed by Lua `ff_report_usage_and_check` (parser at `task.rs:1194-1213`). |
+| `AdmissionDecision` | `ff-core::contracts` | **REMOVED.** | In-tree references unwind together: type def (`backend.rs:367-376`), trait sig (`engine_backend.rs:192-197`), stub impl (`ff-backend-valkey/src/lib.rs:1240-1249`), three test constructions (`backend.rs:888-890`). See §R7.2.3. |
 
 **Correction to §5.1's landing gate.** Round-2 said Stage 1 is "no public-surface changes beyond additive." That claim conflates trait-extraction with type-plumbing. Round-4 split:
 
@@ -303,7 +340,7 @@ pub trait EngineBackend: Send + Sync + 'static {
         &self,
         handle: &Handle,
         frame: Frame,
-    ) -> Result<(), EngineError>;
+    ) -> Result<AppendFrameOutcome, EngineError>; // round-7: widened from ()
 
     async fn complete(
         &self,
@@ -375,7 +412,16 @@ pub trait EngineBackend: Send + Sync + 'static {
         handle: &Handle,
         budget: &BudgetId,
         dimensions: UsageDimensions,
-    ) -> Result<AdmissionDecision, EngineError>;
+    ) -> Result<ReportUsageResult, EngineError>; // round-7: replaces AdmissionDecision
+
+    // Round-7 amendment: pending-waitpoint issuance (gap-fill for SDK
+    // ClaimedTask::create_pending_waitpoint). See §R7.2.2.
+    async fn create_waitpoint(
+        &self,
+        handle: &Handle,
+        waitpoint_key: &str,
+        expires_in: Duration,
+    ) -> Result<PendingWaitpoint, EngineError>;
 }
 ```
 
@@ -534,10 +580,12 @@ The trait extraction is staged. Each stage is independently landable, with an ac
 Round-4 restructures the staging per M6 (fuse trait + config) and M1/M2/M3/M4 (acknowledge Stage 0 type-plumbing as its own stage):
 
 * **Stage 0** — additive type plumbing + `EngineError` broadening + `ResumeSignal` crate move. Public-surface-touching but strictly additive / shim-compatible.
-* **Stage 1** — trait extraction + `BackendConfig` in one landing (formerly Stages 1 & 2). Single migration event for consumers.
+* **Stage 1** — trait extraction + `BackendConfig` in one landing (formerly Stages 1 & 2). Single migration event for consumers. Landing in sub-stages 1a → 1b (issue #119, shipped) → 1c.
 * **Stage 2** (former Stage 3) — experimental `ff-backend-postgres`.
 * **Stage 3** (former Stage 4) — cairn migration (cairn-team timeline).
 * **Stage 4** (former Stage 5) — seal `ff_core::keys`.
+
+**Round-7 amendment landing (parallel, independent of Stage 1c).** The #117 deferrals amendment (§R7) is NOT a Stage 1 sub-stage. It is a parallel, RFC-amendment-only landing: one commit touches trait signatures (`append_frame`, `report_usage`, new `create_waitpoint`), `ff-core::backend` type moves/introductions (`AppendFrameOutcome` move, `PendingWaitpoint` new, `AdmissionDecision` removed), `contracts.rs` (`ReportUsageResult` gets `#[non_exhaustive]`), and the Valkey backend impls (routes three methods to real bodies; `suspend` stays stubbed `EngineError::Unavailable`). Sequencing relative to Stage 1c is not constrained — either may land first; the round-7 deltas are shape-local. **Target release: 0.4.0** (breaking change on `report_usage` return type forces the minor bump on its own, independent of `suspend` deferral and any other Stage 1c scope).
 
 ### §5.0 Stage 0 — Type plumbing + `EngineError` broadening + `ResumeSignal` move
 
@@ -669,6 +717,248 @@ The three-method shape stays.
 ### §6.6 Shared implementations across backends via a base trait
 
 **Rejected as premature.** A hierarchy like `trait Backend { ... default impls ... }` + `trait EngineBackend: Backend` sharing commonalities across future backend impls (e.g., fence-triple verification logic) is worth considering once a second backend exists. Today, exactly one backend exists (Valkey); the default-impl slots would all be `unimplemented!()` placeholders. Deferred to post-Stage-3 when the Postgres backend has materialised and shared surfaces become visible.
+
+---
+
+## §R7 Round-7 amendment — Stage 1b deferral resolutions (issue #117)
+
+This appendix is the permanent record of the round-7 amendment. Top-of-RFC summary lives in the "Round-7 amendment summary" block above; the full reasoning, evidence log, and alternatives-considered trail live here. Challenger discipline (K → L → M) is preserved in `rfcs/drafts/RFC-012-amendment-117-deferrals.{K,L,M}-challenge.md`.
+
+**Tracks:** issue [#117](https://github.com/avifenesh/FlowFabric/issues/117). Originates from RFC-012 Stage 1b (shipped `6f54f9b`, PR #119 — 8 of 12 `ClaimedTask` ops migrated).
+**Shape:** trait-surface breaking. Widens 1 existing method return type, replaces 1 existing method return type, adds 1 new method, adds 1 new type in `ff-core::backend`, adds `#[non_exhaustive]` to 1 existing contract enum. No Lua / wire changes. Pre-1.0 posture: CHANGELOG-only communication, no BC shims beyond `pub use` path-preservation.
+**Base commit:** `da89fa9` (post-0.3.2 hotfix). Ships 3 of 4 deferred methods; `suspend` deferred wholesale to Stage 1d.
+**Manager adjudication on editorial opens (this PR):** §R7.6.2 — insert `create_waitpoint` as method 16 in §3.1.1 alongside other lifecycle ops (no new sub-bucket); §R7.6.3 — keep `create_waitpoint` name (rustdoc cites Lua `use_pending_waitpoint` ARGV flag for disambiguation); §R7.6.4 — envelope prose not rewritten; "15 in spirit" envelope relaxed to "17 current trait methods" as of Round-5+Round-7 (noted in this summary and the Round-7 top-of-RFC summary).
+
+### §R7.1 Motivation
+
+Stage 1b migrated 8 of the 12 `ClaimedTask` SDK methods onto the `EngineBackend` trait as thin forwarders (`crates/ff-sdk/src/task.rs:166-178` docstring). Four methods could not land as thin forwarders: three because the trait's return type is strictly less expressive than the SDK's, and one because the trait has no slot at all.
+
+This amendment ships **three of the four**. `suspend` is deferred to Stage 1d:
+
+| # | SDK site | SDK return | Trait return | Gap | Addressed here? |
+|---|----------|-----------|--------------|-----|-----------------|
+| 1 | `ClaimedTask::create_pending_waitpoint` (`task.rs:686`) | `(WaitpointId, WaitpointToken)` | **no slot** | Trait lacks a pending-waitpoint op entirely. | **Yes** — §R7.2.2 |
+| 2 | `ClaimedTask::append_frame` (`task.rs:740`) | `AppendFrameOutcome { stream_id, frame_count }` (`task.rs:136-143`) | `()` (`engine_backend.rs:103`) | Trait discards backend-emitted stream id + frame count. | **Yes** — §R7.2.1 |
+| 3 | `ClaimedTask::suspend` (`task.rs:812`) | `SuspendOutcome::{Suspended, AlreadySatisfied}` (`task.rs:72-90`) | fresh `Handle` (`engine_backend.rs:129-134`) | Trait cannot express the `AlreadySatisfied` (lease-retained) branch; return-type widening entangles with the SDK wire parser. | **Deferred — Stage 1d** |
+| 4 | `ClaimedTask::report_usage` (`task.rs:629`) | `ReportUsageResult::{Ok, AlreadyApplied, SoftBreach{…}, HardBreach{…}}` (`contracts.rs:1400-1418`) | `AdmissionDecision::{Admitted, Throttled{…}, Rejected{…}}` (`backend.rs:367-376`) | Variant sets don't overlap; structured breach fields collapse to `Rejected{reason: String}`. | **Yes** — §R7.2.3 |
+
+**Why `suspend` defers.** Round-3 review (M1) established that any trait `SuspendOutcome` shape that preserves the existing Round-4 `HandleKind::Suspended` contract (`engine_backend.rs:126-128`, `backend.rs:50,788`) entangles with the SDK's internal wire parser `parse_suspend_result` at `crates/ff-sdk/src/task.rs:1465,1557-1562`, which constructs `Suspended` exhaustively from wire bytes with no access to `Handle`'s opaque payload (`backend.rs:60-69`). The only clean options are (a) rewrite the SDK forwarder in the same PR — which in turn requires the `ConditionMatcher`↔`WaitpointSpec` input-shape work (§R7.6.1) — or (b) ship a weakened `Option<Handle>` shape. Both defeat the amendment's thin-forwarder intent. Stage 1d does the input shape anyway; `suspend` rides with it.
+
+Each TODO at the SDK site references `#117`. The `report_usage`, `append_frame`, and `suspend` trait impls are stubbed `EngineError::Unavailable` at `crates/ff-backend-valkey/src/lib.rs:1145-1147, 1173-1180, 1240-1249` — evidence the current trait shape is not usable, not merely unused.
+
+**Why round-7 and not Stage 1d-as-planned.** RFC-012 Stage-1 landing gate said "no public-surface change beyond additive" (§5.1, §3.3.0). Fixing these three requires breaking two existing trait signatures and adding one method. That's a round-7 amendment, not an implementation detail.
+
+### §R7.2 Proposed trait deltas
+
+#### §R7.2.1 `append_frame` — widen return
+
+**Current** (`crates/ff-core/src/engine_backend.rs:103`):
+```rust
+async fn append_frame(&self, handle: &Handle, frame: Frame) -> Result<(), EngineError>;
+```
+
+**Proposed:**
+```rust
+async fn append_frame(
+    &self,
+    handle: &Handle,
+    frame: Frame,
+) -> Result<AppendFrameOutcome, EngineError>;
+```
+
+**Type move.** `AppendFrameOutcome` moves from `ff-sdk::task` (`task.rs:137-143`) to `ff-core::backend`, mirroring the Stage-1a `FailOutcome` move (`backend.rs:546-558`, `task.rs:152`: `pub use ff_core::backend::FailOutcome`). Keep a `pub use` shim at `ff_sdk::task::AppendFrameOutcome` through 0.4.x. Derive set widens from SDK's `Clone, Debug` to match `FailOutcome` precedent (§R7.5.6):
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendFrameOutcome {
+    pub stream_id: String,
+    pub frame_count: u64,
+}
+```
+
+**No `#[non_exhaustive]`.** Today's `AppendFrameOutcome` construction is internal to `ff-sdk` (parser at `task.rs:1747`); future external constructors are not anticipated, matching `FailOutcome`'s consumer-shape rationale (`backend.rs:546-550`). Consumer-shape evidence, not just FailOutcome-consistency (MN3). Diverges from v1's silent addition (K3).
+
+**Rationale.** `append_frame`'s backend emission (Valkey XADD returns entry id, XLEN returns frame count — SDK parser at `task.rs:1678`) carries real caller-useful state.
+
+**Placement in §3.1.1.** Method 3b, unchanged.
+
+**Breakage scope.** Current `ff-backend-valkey::append_frame` returns `Err(EngineError::Unavailable { op: "append_frame" })` (`crates/ff-backend-valkey/src/lib.rs:1145-1147`) — a stub, not `()`-success. Zero direct trait-level consumers.
+
+#### §R7.2.2 `create_waitpoint` — new trait method
+
+**Current.** No slot. `ClaimedTask::create_pending_waitpoint` (`crates/ff-sdk/src/task.rs:686-728`) bypasses the trait via `self.client.fcall("ff_create_pending_waitpoint", …)`.
+
+**Proposed new method:**
+```rust
+/// Issue a pending waitpoint for future signal delivery.
+///
+/// Waitpoints have two states in the Valkey wire contract:
+/// **pending** (token issued, not yet backing a suspension) and
+/// **active** (bound to a suspension). This method creates a waitpoint
+/// in the **pending** state. A later `suspend` call transitions a
+/// pending waitpoint to active (see Lua `use_pending_waitpoint` ARGV
+/// flag at `flowfabric.lua:3603,3641,3690`) — or, if buffered signals
+/// already satisfy its condition, the suspend call returns
+/// `SuspendOutcome::AlreadySatisfied` and the waitpoint activates
+/// without ever releasing the lease.
+///
+/// Pending-waitpoint expiry is a first-class terminal error on the wire
+/// (`PendingWaitpointExpired` at `ff-script/src/error.rs:170,403-408`).
+/// The attempt retains its lease while the waitpoint is pending;
+/// signals delivered to this waitpoint are buffered server-side.
+async fn create_waitpoint(
+    &self,
+    handle: &Handle,
+    waitpoint_key: &str,
+    expires_in: Duration,
+) -> Result<PendingWaitpoint, EngineError>;
+```
+
+**New type in `ff-core::backend`:**
+```rust
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingWaitpoint {
+    pub waitpoint_id: WaitpointId,
+    pub hmac_token: WaitpointHmac,
+}
+```
+
+`WaitpointHmac` already exists at `crates/ff-core/src/backend.rs:247-277` — Debug-redacts, **no Display impl** (KN2 fix verified).
+
+**Naming decision — L2 resolved as option (c), manager adjudicated as final (§R7.6.3).** Keep `create_waitpoint`. v2's "pending is Valkey-internal" was factually wrong — "pending" is load-bearing in Rust contract code (`ff-script/src/error.rs:170,403-408`) and Lua (`flowfabric.lua:801-823,3641,3690`). Correct rationale:
+- The method creates the pending-kind exclusively; the docstring above disambiguates vs `suspend`'s waitpoint-activation path.
+- The trait surface describes the caller's business op ("issue a waitpoint I'll hand to a signal deliverer"), not the internal state machine. Symmetry with `suspend` as the activation path lives in prose, not in the method name.
+- Alternatives considered: (a) `create_pending_waitpoint` — verbose, matches SDK; (b) `issue_pending_waitpoint` — echoes "issue" but trait peer is `claim_from_reclaim`. Either is acceptable. `create_waitpoint` + explicit docstring wins on brevity.
+
+**Placement in §3.1.1** (lifecycle ops, KD4 accepted — no new sub-bucket; manager adjudicated §R7.6.2). RFC-§3.1 taxonomy count: 15 (pre) → 16 (post); `async fn` compile count: 16 (pre) → 17 (post). Both framings stated per K4 / LN2.
+
+**Rationale for placement vs alternatives.**
+- *Alt A: fold into `suspend`.* Rejected: SDK flow creates the waitpoint first (hand token to external signal deliverer), `suspend` later. Folding breaks the external-delivery handshake.
+- *Alt B: `AdminBackend`.* Rejected: worker-scoped op (requires lease-holder handle).
+- *Alt C: leave off-trait permanently.* Rejected: violates §5.4 sealability precondition.
+
+#### §R7.2.3 `report_usage` — replace `AdmissionDecision` with `ReportUsageResult`
+
+**Current** (`crates/ff-core/src/engine_backend.rs:192-197`):
+```rust
+async fn report_usage(&self, handle: &Handle, budget: &BudgetId,
+    dimensions: UsageDimensions) -> Result<AdmissionDecision, EngineError>;
+```
+with `AdmissionDecision::{Admitted, Throttled{retry_after_ms}, Rejected{reason}}` at `backend.rs:367-376`.
+
+**Proposed:**
+```rust
+async fn report_usage(&self, handle: &Handle, budget: &BudgetId,
+    dimensions: UsageDimensions) -> Result<ReportUsageResult, EngineError>;
+```
+
+`ReportUsageResult` defined at `crates/ff-core/src/contracts.rs:1400-1418` (`Ok | SoftBreach{…} | HardBreach{…} | AlreadyApplied`).
+
+**K1 fix: add `#[non_exhaustive]` to `ReportUsageResult` in this same PR.** Verified missing today (first `non_exhaustive` in `contracts.rs` is at line 1803 on an unrelated struct). Without it, replace-over-widen collapses. Landed atomically with the return-type swap in a single commit per M3 (§R7.7).
+
+**`AdmissionDecision` fate.** Delete. In-tree references: type def (`backend.rs:367-376`), trait sig (`engine_backend.rs:192-197`), stub impl (`ff-backend-valkey/src/lib.rs:1240-1249`), three test constructions (`backend.rs:888-890`). All move together.
+
+**Rationale — replace vs widen.** `AdmissionDecision`'s `Throttled`/`Rejected` variants are emitted by nobody (Lua `ff_report_usage_and_check` emits `Ok / ALREADY_APPLIED / SOFT_BREACH / HARD_BREACH` per `lua/budget.lua:99` + parser `task.rs:1194-1213`). `#[non_exhaustive]` preserves future additivity. `CheckAdmissionResult` (`contracts.rs:1447-1457`) already owns admission-rails (KD3).
+
+**Placement in §3.1.3.** Method 13, signature change only.
+
+### §R7.3 Migration path
+
+**External consumers** of the three methods: none. No direct `EngineBackend` impls outside `ff-backend-valkey` (in-tree verifiable; cross-repo claim dropped per KD2).
+
+**Internal consumers, one PR (atomic single commit per M3):**
+
+1. `crates/ff-backend-valkey/src/lib.rs` — route `append_frame` and `report_usage` impls to real bodies (currently stubbed `Unavailable`); add `create_waitpoint` impl. `suspend` impl untouched (still `Unavailable` — migration deferred to Stage 1d).
+2. `crates/ff-sdk/src/task.rs` — collapse `append_frame`, `create_pending_waitpoint`, `report_usage` TODO-#117 sites into trait forwarders. `suspend` site stays direct-FCALL (Stage 1d).
+3. `crates/ff-core/src/backend.rs` — delete `AdmissionDecision`, move `AppendFrameOutcome` in from `ff-sdk::task`, add `PendingWaitpoint`.
+4. `crates/ff-core/src/contracts.rs` — add `#[non_exhaustive]` to `ReportUsageResult` at line 1400.
+5. `crates/ff-core/src/engine_backend.rs` — touch 3 trait methods (2 updates, 1 add); re-verify `_assert_dyn_compatible` at `:205-206`.
+6. `crates/ff-sdk/src/task.rs` top — add `pub use ff_core::backend::AppendFrameOutcome` shim, matching `FailOutcome` at `:152`.
+
+**Envelope prose (§R7.6.4, manager adjudicated).** Do not rewrite earlier round prose in §3.1. The top-of-RFC Round-7 summary and §3.1's updated intro both note the envelope is relaxed to "17 current trait methods" as of Round-5+Round-7. No separate §3.1-prose edit needed.
+
+**CHANGELOG entry (0.4.0) — drafted for the trait-implementation PR, NOT this doc-only amendment PR:**
+> **Breaking — `EngineBackend`:** `append_frame` now returns `AppendFrameOutcome`; `report_usage` now returns `ReportUsageResult` (replaces `AdmissionDecision`). New trait method `create_waitpoint` (trait grows 16→17 `async fn`; RFC-taxonomy 15→16). `ReportUsageResult` gains `#[non_exhaustive]`. `AdmissionDecision` removed. `suspend` migration deferred to a later release (tracked under #117 Stage 1d). External consumers: none. See #117.
+
+### §R7.4 Non-goals
+
+- Not migrating `suspend` (deferred to Stage 1d per §R7.1 / §R7.6.1).
+- Not changing `UsageDimensions.dedup_key` reservation.
+- Not reserving variants on `ReportUsageResult` for hypothetical rate-limit backends. `#[non_exhaustive]` handles future additions (K1).
+- Not adding `AdminBackend::create_waitpoint`. Pending-waitpoint creation is worker-scoped.
+- Not extending `report_usage` to carry admission rails. `CheckAdmissionResult` already owns that role (KD3).
+- Not touching Lua. Wire shapes unchanged.
+- Not editing CHANGELOG in this PR (doc-only; actual 0.4.0 CHANGELOG entries land with the trait-implementation PR).
+
+### §R7.5 Alternatives considered
+
+#### §R7.5.1 `report_usage` replace vs widen
+Replace chosen (§R7.2.3). Widen rejected under K1-fix. KD3 citation: `CheckAdmissionResult` at `contracts.rs:1447-1457`.
+
+#### §R7.5.2 `create_waitpoint` new method vs fold
+New method (§R7.2.2 Alt A/B/C).
+
+#### §R7.5.3 `append_frame` widen vs `()` + separate stream_position op
+Widen. Two-op variant contradicts §3.4 atomicity.
+
+#### §R7.5.4 Split into two amendments
+Considered. Rejected: single landing PR, single CHANGELOG. (With `suspend` already deferred, the amendment is already the smaller of the two candidate splits.)
+
+#### §R7.5.5 Defer the whole amendment to Stage 1d
+Rejected. `report_usage`'s `AdmissionDecision → ReportUsageResult` swap is independent of `suspend`'s input-shape entanglement; ship what can ship. Stage 1d handles `suspend` only.
+
+#### §R7.5.6 Canonical derive posture for trait outcome types (LD3)
+`FailOutcome` (`backend.rs:546-558`), `AppendFrameOutcome`, `PendingWaitpoint` all use `Clone, Debug, PartialEq, Eq`. `ReportUsageResult` adds `Serialize, Deserialize` (wire parser corroboration). `#[non_exhaustive]` for types new-to-trait (`PendingWaitpoint`) or already-public-and-match-consumed (`ReportUsageResult`); absent for `FailOutcome` / `AppendFrameOutcome` (construction is SDK-internal today per MN3; exhaustive-construction desired).
+
+**Shape-commitment note (MD2).** `AppendFrameOutcome.stream_id: String` is a stable shape assumption — the field carries Valkey Stream entry ids (e.g. `1234567890-0`). A future normalisation (typed `StreamId` newtype, suffix-stripping) would be its own breaking change. Flagged so a later author isn't surprised.
+
+### §R7.6 Open questions
+
+#### §R7.6.1 `suspend` deferred — Stage 1d tracking
+`suspend`'s return-type widening (`SuspendOutcome`) and input-shape rework (SDK `&[ConditionMatcher]` + `TimeoutBehavior` → trait `Vec<WaitpointSpec>` + `Option<Duration>`, or a typed `ResumeCondition`) land together in Stage 1d. Entanglement with SDK `parse_suspend_result` at `task.rs:1465,1557-1562` makes partial migration net-negative (M1). **Owner question (Stage 1d):** typed `ResumeCondition` on trait in round-8, or ARGV-JSON in backend impl?
+
+#### §R7.6.2 `create_waitpoint` §3.1 placement — closed
+Manager adjudication (this PR): insert as method 16 in §3.1.1 alongside other lifecycle ops. Do NOT create a new §3.1.4 "waitpoint management" sub-bucket — one method doesn't warrant one. Trait async-fn count goes 16 → 17.
+
+#### §R7.6.3 `create_waitpoint` naming — closed
+Manager adjudication (this PR): keep `create_waitpoint`. Do not veto to `create_pending_waitpoint`. Rustdoc explicitly cites the Lua `use_pending_waitpoint` ARGV flag as context (§R7.2.2; per Worker Z-v3's fix).
+
+#### §R7.6.4 Envelope prose — closed
+Manager adjudication (this PR): acknowledge the "15 in spirit" envelope is relaxed to "17 current trait methods" as of Round-5+Round-7. Do not rewrite earlier round prose; the top-of-RFC Round-7 summary and §3.1's updated intro carry the note.
+
+(Previously v3 §R7.6.3, §R7.6.4, §R7.6.5, §R7.6.7 closed. v3 §R7.6.6 closed in-tree. v3 §R7.6.8 renumbered to §R7.6.4.)
+
+### §R7.7 Landing plan
+
+**Stage.** Parallel RFC-amendment-only landing, independent of Stage 1c (§5 stage-map addendum).
+
+**Atomicity.** Single commit, single 0.4.0 release cut. `ReportUsageResult`'s `#[non_exhaustive]` addition and the `report_usage` return-type replacement are one breaking-change event; no semver-two-step (M3). The release lane is 0.4.0 regardless of other open questions — `report_usage`'s `AdmissionDecision → ReportUsageResult` swap is unambiguously breaking and forces the minor bump on its own (MD1).
+
+**Acceptance gate.**
+1. All three in-amendment methods route through `EngineBackend` (no remaining `self.client.fcall("ff_*", …)` in `ClaimedTask` for `append_frame`, `create_pending_waitpoint`, `report_usage`). `suspend` not covered (deferred to Stage 1d).
+2. `cargo test --workspace` green; `ff-test` green against real Valkey.
+3. a. Static: `_assert_dyn_compatible` + `ValkeyBackend::_dyn_compatible` compile cleanly.
+   b. Runtime: `Arc<dyn EngineBackend>` smoke test exercising `create_waitpoint` dispatches and returns a valid `PendingWaitpoint`.
+4. CHANGELOG entry drafted for 0.4.0 (lands with the trait-implementation PR, not this doc-only amendment PR).
+
+**Rollback.** Clean. Stage 0 + 1a/b types stay. Three-method delta + one attribute-addition unwind mechanically.
+
+**Estimated effort.** 7-10h (3-delta scope; suspend's 3-6h deferred with it).
+
+**Challenger discipline.** K applied (v1→v2); L applied (v2→v3); M applied (v3→v4). Three rounds sufficient — M1 was the last structural finding and was decidable in-place.
+
+### §R7.8 Evidence log
+
+All line numbers against `da89fa9`; suspend-related entries retained only where `suspend` deferral is justified.
+
+- `crates/ff-sdk/src/task.rs:136-143` (`AppendFrameOutcome`), `:152` (`FailOutcome` shim), `:169` (Stage-1b doc), `:629-669` (`report_usage` + #117 TODO), `:686-728` (`create_pending_waitpoint`), `:740-789` (`append_frame`), `:1194-1213` (`parse_report_usage_result`), `:1465` (`parse_suspend_result` entry — referenced only to justify suspend deferral), `:1557-1562` (exhaustive `SuspendOutcome::Suspended` construction — the M1 evidence), `:1678` / `:1747` (`AppendFrameOutcome` parser + constructor).
+- `crates/ff-core/src/engine_backend.rs:103` (`append_frame` sig), `:192-197` (`report_usage` sig), `:205-206` (`_assert_dyn_compatible`). 16 `async fn` by `grep -c "^    async fn " …`.
+- `crates/ff-core/src/backend.rs:60-69` (`Handle` opaque payload — referenced in M1 deferral justification), `:247-277` (`WaitpointHmac` — Debug only, no Display), `:367-376` (`AdmissionDecision`, `#[non_exhaustive]`), `:546-558` (`FailOutcome` precedent), `:888-890` (`AdmissionDecision` test constructions).
+- `crates/ff-core/src/contracts.rs:1400-1418` (`ReportUsageResult` — NOT `#[non_exhaustive]` today), `:1447-1457` (`CheckAdmissionResult`).
+- `crates/ff-backend-valkey/src/lib.rs:1145-1147, 1173-1180, 1240-1249` (`append_frame` / `suspend` / `report_usage` stubs — `Unavailable`).
+- `crates/ff-script/src/error.rs:170` (`PendingWaitpointExpired`), `:403-408` (`WaitpointNotTokenBound` TERMINAL doc).
+- `crates/ff-script/src/flowfabric.lua:801-823` (`validate_pending_waitpoint` — pending vs active), `:3603` (ARGV contract), `:3641` (`use_pending_waitpoint` parse), `:3690` (pending activation branch).
 
 ---
 
