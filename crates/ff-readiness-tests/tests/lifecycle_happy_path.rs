@@ -230,6 +230,11 @@ async fn lifecycle_happy_path() {
         "stream should contain at least the progress frame, got {stream_len}"
     );
 
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    drop(worker);
+    server.shutdown().await;
+
     // 13. Evidence JSON.
     evidence::write(
         TEST_NAME,

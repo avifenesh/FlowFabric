@@ -159,6 +159,10 @@ async fn cancel_flow_partial() {
         ),
     }
 
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    server.shutdown().await;
+
     evidence::write(
         TEST_NAME,
         &json!({

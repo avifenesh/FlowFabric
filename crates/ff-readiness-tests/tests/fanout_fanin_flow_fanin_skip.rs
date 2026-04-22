@@ -108,6 +108,11 @@ async fn fanout_fanin_flow_fanin_skip() {
     // D via ff_resolve_dependency→Impossible. Bounded.
     await_public_state(&worker, d, PublicState::Skipped).await;
 
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    drop(worker);
+    server.shutdown().await;
+
     evidence::write(
         TEST_NAME,
         &json!({
