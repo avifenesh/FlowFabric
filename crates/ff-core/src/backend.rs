@@ -510,6 +510,122 @@ pub struct ResumeSignal {
     pub payload: Option<Vec<u8>>,
 }
 
+// ── Stage 1a: FailOutcome move ──────────────────────────────────────────
+
+/// Outcome of a `fail()` call.
+///
+/// **RFC-012 Stage 1a:** moved from `ff_sdk::task::FailOutcome` to
+/// `ff_core::backend::FailOutcome` so it is nameable by the
+/// `EngineBackend` trait signature. `ff_sdk::task` retains a
+/// `pub use` shim preserving the `ff_sdk::FailOutcome` path.
+///
+/// Not `#[non_exhaustive]` because existing consumers (ff-test,
+/// ff-readiness-tests) construct and match this enum exhaustively;
+/// the shape has been stable since the `fail()` API landed and any
+/// additive growth would be a follow-up RFC's deliberate break.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FailOutcome {
+    /// Retry was scheduled — execution is in delayed backoff.
+    RetryScheduled {
+        delay_until: crate::types::TimestampMs,
+    },
+    /// No retries left — execution is terminal failed.
+    TerminalFailed,
+}
+
+// ── Stage 1a: BackendConfig + sub-types ─────────────────────────────────
+
+/// Pool + keepalive timing shared across backend connections.
+///
+/// Fields are `#[non_exhaustive]` per project convention — connection
+/// tunables grow as new backends land. Default is the Phase-1 Valkey
+/// client's out-of-box shape (no explicit timeout, no explicit pool
+/// cap; inherits ferriskey defaults).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackendTimeouts {
+    /// Per-request timeout. `None` ⇒ backend default.
+    pub request: Option<Duration>,
+    /// Idle-connection keepalive interval. `None` ⇒ backend default.
+    pub keepalive: Option<Duration>,
+}
+
+/// Retry policy shared across backend connections. Additive; Stage 1a
+/// ships the minimal shape so the trait signatures can reference it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackendRetry {
+    /// Max retry attempts on transient transport errors. `None` ⇒
+    /// backend default.
+    pub max_attempts: Option<u32>,
+    /// Base backoff. `None` ⇒ backend default.
+    pub base_backoff: Option<Duration>,
+}
+
+/// Valkey-specific connection parameters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValkeyConnection {
+    /// Valkey hostname.
+    pub host: String,
+    /// Valkey port.
+    pub port: u16,
+    /// Enable TLS for the Valkey connection.
+    pub tls: bool,
+    /// Enable Valkey cluster mode.
+    pub cluster: bool,
+}
+
+impl ValkeyConnection {
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            tls: false,
+            cluster: false,
+        }
+    }
+}
+
+/// Discriminated union over per-backend connection shapes. Stage 1a
+/// ships the Valkey arm; future backends (Postgres) land additively
+/// under the `#[non_exhaustive]` guard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendConnection {
+    Valkey(ValkeyConnection),
+}
+
+/// Configuration passed to `ValkeyBackend::connect` (and, later, to
+/// other backend `connect` constructors). Carries the connection
+/// details + shared timing/retry policy. Replaces the Valkey-specific
+/// fields today on `WorkerConfig` (RFC-012 §5.1 migration plan).
+///
+/// `BackendConfig` is the replacement target for `WorkerConfig`'s
+/// `host` / `port` / `tls` / `cluster` fields. The full migration
+/// lands across Stage 1a (type introduction) and Stage 1c
+/// (`WorkerConfig` forwarding); worker-policy fields (lease TTL,
+/// claim poll interval, capability set) stay on `WorkerConfig`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BackendConfig {
+    pub connection: BackendConnection,
+    pub timeouts: BackendTimeouts,
+    pub retry: BackendRetry,
+}
+
+impl BackendConfig {
+    /// Build a Valkey BackendConfig from host+port. Other fields take
+    /// backend defaults.
+    pub fn valkey(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            connection: BackendConnection::Valkey(ValkeyConnection::new(host, port)),
+            timeouts: BackendTimeouts::default(),
+            retry: BackendRetry::default(),
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -699,5 +815,31 @@ mod tests {
         };
         assert_eq!(s.clone(), s);
         let _ = format!("{s:?}");
+    }
+
+    #[test]
+    fn fail_outcome_variants() {
+        let retry = FailOutcome::RetryScheduled {
+            delay_until: TimestampMs::from_millis(42),
+        };
+        let terminal = FailOutcome::TerminalFailed;
+        assert_ne!(retry, terminal);
+        assert_eq!(retry.clone(), retry);
+    }
+
+    #[test]
+    fn backend_config_valkey_ctor() {
+        let c = BackendConfig::valkey("host.local", 6379);
+        // Same-crate match against an otherwise `#[non_exhaustive]`
+        // enum is irrefutable — no wildcard needed and `let-else`
+        // would trip `irrefutable_let_patterns`.
+        let BackendConnection::Valkey(v) = &c.connection;
+        assert_eq!(v.host, "host.local");
+        assert_eq!(v.port, 6379);
+        assert!(!v.tls);
+        assert!(!v.cluster);
+        assert_eq!(c.timeouts, BackendTimeouts::default());
+        assert_eq!(c.retry, BackendRetry::default());
+        assert_eq!(c.clone(), c);
     }
 }

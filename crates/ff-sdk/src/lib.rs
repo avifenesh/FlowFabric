@@ -60,34 +60,51 @@
 //! [`ClaimGrant`]: ff_core::contracts::ClaimGrant
 //! [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
 
+#[cfg(feature = "valkey-default")]
 pub mod admin;
 pub mod config;
 pub mod engine_error;
+#[cfg(feature = "valkey-default")]
 pub mod snapshot;
+#[cfg(feature = "valkey-default")]
 pub mod task;
+#[cfg(feature = "valkey-default")]
 pub mod worker;
 
 // Re-exports for convenience
+#[cfg(feature = "valkey-default")]
 pub use admin::{
     FlowFabricAdminClient, RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
 };
 pub use config::WorkerConfig;
-pub use engine_error::{BugKind, ConflictKind, ContentionKind, EngineError, StateKind, ValidationKind};
-pub use task::{
-    read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, FailOutcome,
-    ResumeSignal, Signal, SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior,
-    MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
+pub use engine_error::{
+    BugKind, ConflictKind, ContentionKind, EngineError, StateKind, ValidationKind,
 };
+// `FailOutcome` is ff-core-native (Stage 1a move); re-export
+// unconditionally so consumers can name `ff_sdk::FailOutcome` even
+// under `--no-default-features`.
+pub use ff_core::backend::FailOutcome;
+// `ResumeSignal` is also ff-core-native (Stage 0 move).
+pub use ff_core::backend::ResumeSignal;
+#[cfg(feature = "valkey-default")]
+pub use task::{
+    read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, Signal,
+    SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior, MAX_TAIL_BLOCK_MS,
+    STREAM_READ_HARD_CAP,
+};
+#[cfg(feature = "valkey-default")]
 pub use worker::FlowFabricWorker;
 
 /// SDK error type.
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
     /// Valkey connection or command error (preserves ErrorKind for caller inspection).
+    #[cfg(feature = "valkey-default")]
     #[error("valkey: {0}")]
     Valkey(#[from] ferriskey::Error),
 
     /// Valkey error with additional context.
+    #[cfg(feature = "valkey-default")]
     #[error("valkey: {context}: {source}")]
     ValkeyContext {
         #[source]
@@ -202,6 +219,8 @@ fn fmt_config(context: &str, field: Option<&str>, message: &str) -> String {
 /// variant-level detail without hand-written conversion.
 impl From<ff_script::error::ScriptError> for SdkError {
     fn from(err: ff_script::error::ScriptError) -> Self {
+        // ff-script's `From<ScriptError> for EngineError` owns the
+        // mapping table (#58.6). See `ff_script::engine_error_ext`.
         Self::Engine(Box::new(EngineError::from(err)))
     }
 }
@@ -216,11 +235,12 @@ impl SdkError {
     /// Returns the underlying ferriskey `ErrorKind` if this error carries one.
     /// Covers transport variants (`Valkey`, `ValkeyContext`) directly and
     /// `Engine(EngineError::Transport { .. })` via delegation.
+    #[cfg(feature = "valkey-default")]
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
             Self::Valkey(e) => Some(e.kind()),
             Self::ValkeyContext { source, .. } => Some(source.kind()),
-            Self::Engine(e) => e.valkey_kind(),
+            Self::Engine(e) => ff_script::engine_error_ext::valkey_kind(e),
             // HTTP/admin-surface errors carry no ferriskey::ErrorKind;
             // the admin path never touches Valkey directly from the
             // SDK side. Use `AdminApi.kind` for the server-supplied
@@ -237,11 +257,15 @@ impl SdkError {
     /// `ErrorClass::Retryable`. `Config` errors are never retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
+            #[cfg(feature = "valkey-default")]
             Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => {
                 ff_script::retry::is_retryable_kind(e.kind())
             }
             Self::Engine(e) => {
-                matches!(e.class(), ff_core::error::ErrorClass::Retryable)
+                matches!(
+                    ff_script::engine_error_ext::class(e),
+                    ff_core::error::ErrorClass::Retryable
+                )
             }
             // WorkerAtCapacity is retryable: the saturation is transient
             // and clears as soon as a concurrent task completes.
@@ -266,7 +290,7 @@ impl SdkError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "valkey-default"))]
 mod tests {
     use super::*;
     use ferriskey::ErrorKind;

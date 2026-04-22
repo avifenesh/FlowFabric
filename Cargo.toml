@@ -11,6 +11,7 @@ members = [
     "crates/ff-test",
     "crates/ff-server",
     "crates/ff-readiness-tests",
+    "crates/ff-backend-valkey",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ ff-scheduler = { version = "0.3.0", path = "crates/ff-scheduler" }
 ff-sdk = { version = "0.3.0", path = "crates/ff-sdk" }
 ff-server = { version = "0.3.0", path = "crates/ff-server" }
 ff-test = { path = "crates/ff-test" }
+ff-backend-valkey = { version = "0.3.0", path = "crates/ff-backend-valkey" }
 ferriskey = { version = "0.3.0", path = "ferriskey" }
 
 # Shared external deps
@@ -48,6 +50,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tracing = "0.1"
 thiserror = "2"
 crc16 = "0.4"
+async-trait = "0.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 futures = "0.3"

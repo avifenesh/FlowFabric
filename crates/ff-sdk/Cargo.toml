@@ -11,7 +11,24 @@ categories.workspace = true
 description = "FlowFabric worker SDK — public API for worker authors"
 
 [features]
-direct-valkey-claim = []
+# Default feature set — existing consumers observe zero change.
+#
+# `valkey-default` pulls in the ferriskey-dependent SDK modules
+# (`task`, `worker`, `snapshot`, `admin`,
+# `engine_error::enrich_dependency_conflict`) + ff-sdk's direct
+# optional `ferriskey` dep + the Valkey-specific variants on
+# `SdkError`. Turning this OFF (`--no-default-features`) disables the
+# ferriskey-dependent SDK surface and removes ferriskey from ff-sdk's
+# direct optional deps — RFC-012 §1.3 agnosticism proof: ff-sdk
+# compiles as a pure type/config facade over ff-core's
+# `EngineBackend` trait without the Valkey transport surfacing.
+# (`ff-script` keeps an unconditional `ferriskey` dep today; that
+# transitive edge stays regardless of ff-sdk's feature. The
+# agnosticism claim is scoped to ff-sdk's *own* public surface, not
+# the entire build graph.)
+default = ["valkey-default"]
+
+direct-valkey-claim = ["valkey-default"]
 
 # Re-exports of ferriskey feature flags. Consumers opt in on ff-sdk and
 # the flag propagates to the underlying ferriskey crate. OFF by default
@@ -19,10 +36,15 @@ direct-valkey-claim = []
 # it.
 iam = ["ferriskey/iam"]
 
+# Pulls in the ferriskey transport + the SDK modules that depend on
+# it. Left as an explicit feature (on by default) so
+# `--no-default-features` builds can prove the agnosticism contract.
+valkey-default = ["dep:ferriskey"]
+
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }
-ferriskey = { workspace = true }
+ferriskey = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

@@ -241,7 +241,7 @@ The §3.3 signatures reference 17 supporting types. Honesty requires naming whic
 | `FailureReason` | `ff-core::contracts` | Struct: `{ message: String, detail: Option<Bytes> }`. | Today: ad-hoc string arg. |
 | `FailureClass` | `ff-core::contracts` | Enum: `{ Transient, Permanent, InfraCrash, Timeout, Cancelled }`. | Mirrors Lua-side classification codes. |
 | `UsageDimensions` | `ff-core::contracts` | Struct mirroring `ff_report_usage_and_check`'s ARGV: token-counts, wall-time, custom-dim map. | |
-| `BudgetId` | `ff-core::types` | Newtype over `String` (matches `LaneId` / `FlowId` discipline). | |
+| `BudgetId` | `ff-core::types` | Newtype over `String` (matches `LaneId` / `FlowId` discipline). | **Erratum (Stage 1a):** already lives in `ff-core::types` via the `cf_id!` macro (`crates/ff-core/src/types.rs:278`); no new-type work needed. This row is a no-op for Stage 0 / 1a. |
 | `ReclaimToken` | `ff-core::contracts` | Newtype wrapping whatever bytes the reclaim scanner issues (today a `ReclaimGrant` struct in `ff-core::contracts:161`). Likely `ReclaimToken(ReclaimGrant)`. | May be pure re-export if `ReclaimGrant` proves sufficient. |
 | `LeaseRenewal` | `ff-core::contracts` | `{ expires_at_ms: u64, lease_epoch: u64 }`. | |
 | `AdmissionDecision` | `ff-core::contracts` | Enum: `{ Admitted, Throttled { retry_after_ms: u64 }, Rejected { reason } }`. | Returned by `report_usage`. |

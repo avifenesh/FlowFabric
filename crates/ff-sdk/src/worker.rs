@@ -91,6 +91,14 @@ pub struct FlowFabricWorker {
     /// correctness because the sequence simply restarts a new cycle.
     #[cfg(feature = "direct-valkey-claim")]
     scan_cursor: AtomicUsize,
+    /// Optional [`EngineBackend`] handed in via
+    /// [`FlowFabricWorker::connect_with`]. Populated when the consumer
+    /// supplies a pre-constructed backend; `None` under the legacy
+    /// [`FlowFabricWorker::connect`] path, which continues to hold a
+    /// `ferriskey::Client` directly (Stage 1a hot-path behaviour
+    /// unchanged). Stage 1c migrates the hot path to go through the
+    /// trait uniformly.
+    backend: Option<Arc<dyn ff_core::engine_backend::EngineBackend>>,
 }
 
 /// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
@@ -440,7 +448,49 @@ impl FlowFabricWorker {
             concurrency_semaphore,
             #[cfg(feature = "direct-valkey-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
+            backend: None,
         })
+    }
+
+    /// Store a pre-built [`EngineBackend`] on the worker for Stages
+    /// 1b-1d to route through. Builds the worker via the legacy
+    /// [`FlowFabricWorker::connect`] path first (so the embedded
+    /// `ferriskey::Client` that Stage 1a hot paths still use is
+    /// dialed), then attaches the injected backend via
+    /// [`Self::backend`].
+    ///
+    /// **Stage 1a scope — caveats consumers must know.** The
+    /// injected backend is *stored, not consumed* by Stage 1a's hot
+    /// paths: `claim_next`, `claim_from_grant`,
+    /// `claim_from_reclaim_grant`, `deliver_signal`, and the admin
+    /// queries all still go through the embedded `ferriskey::Client`
+    /// dialed from `config.host`/`config.port`. Consequently this
+    /// constructor is NOT a drop-in way to swap in a non-Valkey
+    /// backend today — it requires a reachable Valkey node
+    /// regardless. Stage 1c routes the hot paths through
+    /// [`Self::backend`]; Stage 1d removes the embedded client.
+    ///
+    /// A mock / non-Valkey backend can still be injected here so
+    /// tests holding `worker.backend()` exercise the trait surface;
+    /// the hot paths won't call into the injected backend until
+    /// Stage 1c.
+    ///
+    /// [`EngineBackend`]: ff_core::engine_backend::EngineBackend
+    pub async fn connect_with(
+        config: WorkerConfig,
+        backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
+    ) -> Result<Self, SdkError> {
+        let mut worker = Self::connect(config).await?;
+        worker.backend = Some(backend);
+        Ok(worker)
+    }
+
+    /// Borrow the `EngineBackend` handed in via
+    /// [`FlowFabricWorker::connect_with`], if any. Returns `None`
+    /// under the legacy [`FlowFabricWorker::connect`] construction
+    /// path.
+    pub fn backend(&self) -> Option<&Arc<dyn ff_core::engine_backend::EngineBackend>> {
+        self.backend.as_ref()
     }
 
     /// Get a reference to the underlying ferriskey client.
@@ -1448,7 +1498,7 @@ impl FlowFabricWorker {
 fn is_retryable_claim_error(err: &crate::EngineError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
-        err.class(),
+        ff_script::engine_error_ext::class(err),
         ErrorClass::Retryable | ErrorClass::Informational
     )
 }

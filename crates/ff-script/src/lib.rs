@@ -2,6 +2,7 @@
 
 #[macro_use]
 pub mod macros;
+pub mod engine_error_ext;
 pub mod error;
 pub mod result;
 pub mod loader;
