@@ -299,6 +299,11 @@ async fn lifecycle_retry_backoff() {
         "attempt 1 stream should contain at least the appended progress frame, got {stream_1_len}"
     );
 
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    drop(worker);
+    server.shutdown().await;
+
     // 15. Evidence JSON.
     evidence::write(
         TEST_NAME,

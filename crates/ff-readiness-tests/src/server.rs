@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 
 use ff_core::types::LaneId;
 use ff_server::config::ServerConfig;
@@ -21,15 +21,31 @@ use crate::valkey::TEST_PARTITION_CONFIG;
 
 /// In-process server for tests 1–5. Wraps `Server::start` + an axum
 /// listener on a random port, same pattern as `ff-test::e2e_api`.
+///
+/// Tests MUST call [`InProcessServer::shutdown`] before the binding
+/// goes out of scope. `Drop` only aborts the axum listener as a
+/// best-effort fallback — it cannot drain the engine's
+/// `completion_listener` / background tasks, which leak across tests
+/// in the same process and corrupt Valkey state for subsequent tests.
 pub struct InProcessServer {
     pub server: Arc<Server>,
     pub base_url: String,
-    pub abort: AbortHandle,
+    pub axum_handle: JoinHandle<()>,
 }
 
 impl Drop for InProcessServer {
     fn drop(&mut self) {
-        self.abort.abort();
+        // Best-effort fallback only — async cleanup (engine drain,
+        // background task join) is impossible from `Drop`. If a test
+        // panics before reaching `.shutdown().await` this at least
+        // stops new axum connections. The engine's background tasks
+        // will still leak until the process exits.
+        tracing::warn!(
+            "InProcessServer dropped without explicit `.shutdown().await` — \
+             engine completion_listener and background tasks may leak across \
+             tests; call `server.shutdown().await` at the end of the test"
+        );
+        self.axum_handle.abort();
     }
 }
 
@@ -90,7 +106,7 @@ impl InProcessServer {
         let addr: SocketAddr = listener.local_addr().expect("local_addr");
         let base_url = format!("http://{addr}");
 
-        let handle = tokio::spawn(async move {
+        let axum_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
 
@@ -118,7 +134,63 @@ impl InProcessServer {
         Self {
             server,
             base_url,
-            abort: handle.abort_handle(),
+            axum_handle,
+        }
+    }
+
+    /// Required teardown for `InProcessServer`. Drains background tasks
+    /// and shuts down the engine.
+    ///
+    /// `Drop` is only a best-effort fallback that emits a warning —
+    /// always call this explicitly at the end of every test.
+    ///
+    /// Behavior:
+    /// 1. Abort the axum listener task and await its `JoinHandle` so
+    ///    no new HTTP requests can observe a half-shut-down engine.
+    /// 2. Unwrap the `Arc<Server>` — panics with an actionable message
+    ///    if the caller still holds clones of `server`.
+    /// 3. Call `Server::shutdown`, which closes the stream semaphore,
+    ///    drains background tasks (15s ceiling) and shuts down the
+    ///    engine. The step is wrapped in a 1s defensive outer
+    ///    timeout; a timeout panics with an actionable message.
+    pub async fn shutdown(self) {
+        // The struct implements `Drop`, so fields cannot be moved out
+        // directly. Wrap in `ManuallyDrop` to suppress the
+        // warn-emitting fallback drop, then read each field out by
+        // value exactly once.
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is a fresh `ManuallyDrop` wrapper; each field
+        // is read exactly once and never accessed again through
+        // `this`. `ManuallyDrop` suppresses `Drop::drop`, so nothing
+        // is double-dropped; each moved value is dropped on its own
+        // path below (or at this function's end).
+        let axum_handle = unsafe { std::ptr::read(&this.axum_handle) };
+        let server_arc = unsafe { std::ptr::read(&this.server) };
+        let _base_url = unsafe { std::ptr::read(&this.base_url) };
+
+        // Stop accepting new HTTP connections.
+        axum_handle.abort();
+        // Await so the task is fully torn down before we touch the
+        // shared `Arc<Server>` — `JoinError::cancelled` is expected.
+        let _ = axum_handle.await;
+
+        let server = Arc::try_unwrap(server_arc).unwrap_or_else(|_arc| {
+            panic!(
+                "InProcessServer::shutdown: outside clones of `server` still exist; \
+                 drop all clones before calling `.shutdown().await`"
+            )
+        });
+
+        // Defensive outer timeout. `Server::shutdown` bounds its own
+        // drain at ~15s internally, but readiness tests have no
+        // expected long-running background work at teardown — anything
+        // past 1s indicates a stuck engine or task.
+        match tokio::time::timeout(Duration::from_secs(1), server.shutdown()).await {
+            Ok(()) => {}
+            Err(_) => panic!(
+                "InProcessServer::shutdown: Server::shutdown did not complete within \
+                 1s — engine or background tasks are stuck; inspect tracing logs"
+            ),
         }
     }
 }
