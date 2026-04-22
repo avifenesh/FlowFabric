@@ -59,7 +59,12 @@ async fn cancel_flow_partial() {
     let (member_ids, broken_eid) = create_flow_with_two_members(&server, &flow_id).await;
     sabotage_member_attempt_hash(&tc, &broken_eid).await;
 
-    let http = reqwest::Client::new();
+    // Per-request timeout bounds stalled connects/reads so the
+    // ignored readiness run fails fast on regression, not hang.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("build reqwest client");
     let url = format!("{}/v1/flows/{}/cancel?wait=true", server.base_url, flow_id);
     let resp = http
         .post(&url)

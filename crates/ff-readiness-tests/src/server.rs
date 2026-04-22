@@ -79,8 +79,13 @@ impl InProcessServer {
             axum::serve(listener, app).await.ok();
         });
 
-        // Wait for /healthz to return 200 before handing back.
-        let client = reqwest::Client::new();
+        // Wait for /healthz to return 200 before handing back. The
+        // per-request timeout keeps a stalled connect from outlasting
+        // the outer 5s deadline (each probe is capped at 500ms).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("build healthz probe client");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let url = format!("{base_url}/healthz");
         loop {

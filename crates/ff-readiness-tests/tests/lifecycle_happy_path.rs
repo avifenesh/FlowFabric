@@ -120,13 +120,20 @@ async fn lifecycle_happy_path() {
         .await
         .expect("FlowFabricWorker::connect");
 
-    // 7. Claim the single eligible execution.
+    // 7. Claim the single eligible execution. Bounded so an
+    //    eligibility regression fails fast instead of hanging the
+    //    ignored run.
     let t_claim = Instant::now();
-    let task = worker
-        .claim_next()
-        .await
-        .expect("claim_next Result")
-        .expect("claim_next Some(task)");
+    let task = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(t) = worker.claim_next().await.expect("claim_next Result") {
+                break t;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("claim_next timed out after 10s — execution never became eligible");
     let claim_ms = t_claim.elapsed().as_millis() as u64;
     assert_eq!(
         task.execution_id(),
