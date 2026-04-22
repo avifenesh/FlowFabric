@@ -9,22 +9,38 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 
-use super::{FailureTracker, ScanResult, Scanner};
+use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
 pub struct AttemptTimeoutScanner {
     interval: Duration,
     failures: FailureTracker,
+    filter: ScannerFilter,
 }
 
 impl AttemptTimeoutScanner {
-    pub fn new(interval: Duration, _lanes: Vec<LaneId>) -> Self {
-        Self { interval, failures: FailureTracker::new() }
+    pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
+        Self::with_filter(interval, lanes, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122).
+    pub fn with_filter(
+        interval: Duration,
+        _lanes: Vec<LaneId>,
+        filter: ScannerFilter,
+    ) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+        }
     }
 }
 
@@ -35,6 +51,10 @@ impl Scanner for AttemptTimeoutScanner {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -89,6 +109,9 @@ impl Scanner for AttemptTimeoutScanner {
 
         for eid_str in &timed_out {
             if self.failures.should_skip(eid_str) {
+                continue;
+            }
+            if should_skip_candidate(client, &self.filter, partition, eid_str).await {
                 continue;
             }
 

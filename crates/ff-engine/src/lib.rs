@@ -9,6 +9,7 @@ pub mod supervisor;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::completion_backend::CompletionStream;
 use ff_core::partition::PartitionConfig;
 use ff_core::types::LaneId;
@@ -96,6 +97,28 @@ pub struct EngineConfig {
     /// reconciler picks it up, so the live in-process dispatch isn't
     /// fought on the happy path.
     pub cancel_reconciler_interval: Duration,
+
+    /// Per-consumer scanner filter (issue #122).
+    ///
+    /// Applied by every execution-shaped scanner (lease_expiry,
+    /// attempt_timeout, execution_deadline, suspension_timeout,
+    /// pending_wp_expiry, delayed_promoter, dependency_reconciler,
+    /// cancel_reconciler, unblock, index_reconciler,
+    /// retention_trimmer) to restrict the candidate set to
+    /// executions owned by this consumer. The four non-execution
+    /// scanners (budget_reconciler, budget_reset, quota_reconciler,
+    /// flow_projector) accept the filter for API uniformity but do
+    /// not apply it — their domains are not per-execution.
+    ///
+    /// Default: [`ScannerFilter::default`] — no filtering,
+    /// pre-#122 behaviour. Multi-tenant deployments that share a
+    /// single Valkey keyspace across two FlowFabric instances set
+    /// this (paired with
+    /// [`CompletionBackend::subscribe_completions_filtered`]) for
+    /// mutual isolation.
+    ///
+    /// [`CompletionBackend::subscribe_completions_filtered`]: ff_core::completion_backend::CompletionBackend::subscribe_completions_filtered
+    pub scanner_filter: ScannerFilter,
 }
 
 impl Default for EngineConfig {
@@ -118,6 +141,7 @@ impl Default for EngineConfig {
             flow_projector_interval: Duration::from_secs(15),
             execution_deadline_interval: Duration::from_secs(5),
             cancel_reconciler_interval: Duration::from_secs(15),
+            scanner_filter: ScannerFilter::default(),
         }
     }
 }
@@ -192,8 +216,13 @@ impl Engine {
 
         let mut handles = Vec::new();
 
+        let scanner_filter = config.scanner_filter.clone();
+
         // Lease expiry scanner
-        let lease_scanner = Arc::new(LeaseExpiryScanner::new(config.lease_expiry_interval));
+        let lease_scanner = Arc::new(LeaseExpiryScanner::with_filter(
+            config.lease_expiry_interval,
+            scanner_filter.clone(),
+        ));
         handles.push(supervised_spawn(
             lease_scanner,
             client.clone(),
@@ -203,9 +232,10 @@ impl Engine {
         ));
 
         // Delayed promoter
-        let delayed_scanner = Arc::new(DelayedPromoter::new(
+        let delayed_scanner = Arc::new(DelayedPromoter::with_filter(
             config.delayed_promoter_interval,
             config.lanes.clone(),
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             delayed_scanner,
@@ -216,9 +246,10 @@ impl Engine {
         ));
 
         // Index reconciler
-        let reconciler = Arc::new(IndexReconciler::new(
+        let reconciler = Arc::new(IndexReconciler::with_filter(
             config.index_reconciler_interval,
             config.lanes.clone(),
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             reconciler,
@@ -229,9 +260,10 @@ impl Engine {
         ));
 
         // Attempt timeout scanner
-        let timeout_scanner = Arc::new(AttemptTimeoutScanner::new(
+        let timeout_scanner = Arc::new(AttemptTimeoutScanner::with_filter(
             config.attempt_timeout_interval,
             config.lanes.clone(),
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             timeout_scanner,
@@ -242,8 +274,9 @@ impl Engine {
         ));
 
         // Suspension timeout scanner
-        let suspension_scanner = Arc::new(SuspensionTimeoutScanner::new(
+        let suspension_scanner = Arc::new(SuspensionTimeoutScanner::with_filter(
             config.suspension_timeout_interval,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             suspension_scanner,
@@ -254,8 +287,9 @@ impl Engine {
         ));
 
         // Pending waitpoint expiry scanner
-        let pending_wp_scanner = Arc::new(PendingWaitpointExpiryScanner::new(
+        let pending_wp_scanner = Arc::new(PendingWaitpointExpiryScanner::with_filter(
             config.pending_wp_expiry_interval,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             pending_wp_scanner,
@@ -266,9 +300,10 @@ impl Engine {
         ));
 
         // Retention trimmer
-        let retention_scanner = Arc::new(RetentionTrimmer::new(
+        let retention_scanner = Arc::new(RetentionTrimmer::with_filter(
             config.retention_trimmer_interval,
             config.lanes.clone(),
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             retention_scanner,
@@ -278,9 +313,12 @@ impl Engine {
             metrics.clone(),
         ));
 
-        // Budget reset scanner (iterates budget partitions)
-        let budget_reset = Arc::new(BudgetResetScanner::new(
+        // Budget reset scanner (iterates budget partitions).
+        // Filter is accepted but not applied (budget partitions don't
+        // carry the per-execution namespace / instance_tag shape).
+        let budget_reset = Arc::new(BudgetResetScanner::with_filter(
             config.budget_reset_interval,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             budget_reset,
@@ -290,9 +328,12 @@ impl Engine {
             metrics.clone(),
         ));
 
-        // Budget reconciler (iterates budget partitions)
-        let budget_reconciler = Arc::new(BudgetReconciler::new(
+        // Budget reconciler (iterates budget partitions). Filter
+        // accepted but not applied — see BudgetReconciler::with_filter
+        // rustdoc.
+        let budget_reconciler = Arc::new(BudgetReconciler::with_filter(
             config.budget_reconciler_interval,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             budget_reconciler,
@@ -303,10 +344,11 @@ impl Engine {
         ));
 
         // Unblock scanner (iterates execution partitions, re-evaluates blocked)
-        let unblock_scanner = Arc::new(UnblockScanner::new(
+        let unblock_scanner = Arc::new(UnblockScanner::with_filter(
             config.unblock_interval,
             config.lanes.clone(),
             config.partition_config,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             unblock_scanner,
@@ -317,10 +359,11 @@ impl Engine {
         ));
 
         // Dependency reconciler (iterates execution partitions)
-        let dep_reconciler = Arc::new(DependencyReconciler::new(
+        let dep_reconciler = Arc::new(DependencyReconciler::with_filter(
             config.dependency_reconciler_interval,
             config.lanes.clone(),
             config.partition_config,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             dep_reconciler,
@@ -330,9 +373,12 @@ impl Engine {
             metrics.clone(),
         ));
 
-        // Quota reconciler (iterates quota partitions)
-        let quota_reconciler = Arc::new(QuotaReconciler::new(
+        // Quota reconciler (iterates quota partitions). Filter
+        // accepted but not applied — see QuotaReconciler::with_filter
+        // rustdoc.
+        let quota_reconciler = Arc::new(QuotaReconciler::with_filter(
             config.quota_reconciler_interval,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             quota_reconciler,
@@ -342,10 +388,13 @@ impl Engine {
             metrics.clone(),
         ));
 
-        // Flow summary projector (iterates flow partitions)
-        let flow_projector = Arc::new(FlowProjector::new(
+        // Flow summary projector (iterates flow partitions). Filter
+        // accepted but not applied — see FlowProjector::with_filter
+        // rustdoc.
+        let flow_projector = Arc::new(FlowProjector::with_filter(
             config.flow_projector_interval,
             config.partition_config,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             flow_projector,
@@ -358,9 +407,10 @@ impl Engine {
         // Cancel reconciler (iterates flow partitions). Drains
         // cancel_backlog entries whose grace window has elapsed so a
         // process crash mid-dispatch can't leave flow members un-cancelled.
-        let cancel_reconciler = Arc::new(scanner::cancel_reconciler::CancelReconciler::new(
+        let cancel_reconciler = Arc::new(scanner::cancel_reconciler::CancelReconciler::with_filter(
             config.cancel_reconciler_interval,
             config.partition_config,
+            scanner_filter.clone(),
         ));
         handles.push(supervised_spawn(
             cancel_reconciler,
@@ -371,9 +421,10 @@ impl Engine {
         ));
 
         // Execution deadline scanner (iterates execution partitions)
-        let deadline_scanner = Arc::new(ExecutionDeadlineScanner::new(
+        let deadline_scanner = Arc::new(ExecutionDeadlineScanner::with_filter(
             config.execution_deadline_interval,
             config.lanes,
+            scanner_filter,
         ));
         handles.push(supervised_spawn(
             deadline_scanner,

@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
+use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::types::Namespace;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -138,6 +141,17 @@ pub trait Scanner: Send + Sync + 'static {
     /// How often to run a full scan across all partitions.
     fn interval(&self) -> Duration;
 
+    /// Per-consumer filter applied by execution-shaped scanners to
+    /// restrict the set of candidates they act on (issue #122).
+    ///
+    /// Default returns [`ScannerFilter::NOOP`] — pre-#122 behaviour.
+    /// Implementations override by storing a `ScannerFilter` on the
+    /// struct (constructed via `Self::with_filter(..)`) and
+    /// returning `&self.filter`.
+    fn filter(&self) -> &ScannerFilter {
+        &ScannerFilter::NOOP
+    }
+
     /// Scan a single partition. Called once per partition per cycle.
     fn scan_partition(
         &self,
@@ -162,6 +176,96 @@ pub trait Scanner: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Option<u64>> + Send {
         async { None }
     }
+}
+
+/// Issue #122: per-candidate filter helper shared by all
+/// execution-shaped scanners.
+///
+/// Returns true iff the candidate `eid` on `partition` should be
+/// SKIPPED by the scanner (i.e. the filter rejects it). A no-op
+/// filter never rejects — returns false without issuing any HGET.
+///
+/// # `eid` format
+///
+/// Callers pass `eid` as the **full** `{fp:N}:<uuid>` ExecutionId
+/// string — identical to what Lua stores as a ZSET member via
+/// `ZADD ... A.execution_id` and what every scanner reads out of
+/// per-partition index ZSETs with `ZRANGEBYSCORE`. The helper
+/// formats `format!("ff:exec:{}:{}:core", tag, eid)` which produces
+/// the canonical **double-tagged** production key shape
+/// `ff:exec:{fp:N}:{fp:N}:<uuid>:core` — the first tag comes from
+/// the partition's routing hash-tag; the second is the tag baked
+/// into the ExecutionId string. Matches
+/// [`ff_core::keys::ExecKeyContext::core`] / [`::tags`] exactly.
+/// Do not strip the prefix — doing so would build a
+/// single-tagged key that does not exist in production.
+///
+/// [`::tags`]: ff_core::keys::ExecKeyContext::tags
+///
+/// # Cost
+///
+/// 0 HGET if `filter.is_noop()`; 1 HGET when only `namespace` is
+/// set (on `ff:exec:{fp:N}:{fp:N}:<uuid>:core`); 1 HGET when only
+/// `instance_tag` is set (on `ff:exec:{fp:N}:{fp:N}:<uuid>:tags`);
+/// 2 HGETs when both are set. Namespace is checked first (cheaper
+/// — touches the already-hot `core` hash) and short-circuits on
+/// mismatch.
+///
+/// # Failure mode
+///
+/// On HGET failure the helper returns true (skip), conservatively:
+/// leaking a cross-tenant candidate due to a transient read error is
+/// worse than the scanner temporarily underclaiming — the next cycle
+/// picks it back up once the backend recovers.
+pub async fn should_skip_candidate(
+    client: &ferriskey::Client,
+    filter: &ScannerFilter,
+    partition: u16,
+    eid: &str,
+) -> bool {
+    if filter.is_noop() {
+        return false;
+    }
+    let p = Partition {
+        family: PartitionFamily::Execution,
+        index: partition,
+    };
+    let tag = p.hash_tag();
+
+    if let Some(ref want_ns) = filter.namespace {
+        let core_key = format!("ff:exec:{}:{}:core", tag, eid);
+        match client
+            .cmd("HGET")
+            .arg(&core_key)
+            .arg("namespace")
+            .execute::<Option<String>>()
+            .await
+        {
+            Ok(Some(s)) => {
+                if &Namespace::new(s) != want_ns {
+                    return true;
+                }
+            }
+            // nil or transport error — skip conservatively.
+            _ => return true,
+        }
+    }
+
+    if let Some((ref tag_key, ref want_value)) = filter.instance_tag {
+        let tags_key = format!("ff:exec:{}:{}:tags", tag, eid);
+        match client
+            .cmd("HGET")
+            .arg(&tags_key)
+            .arg(tag_key.as_str())
+            .execute::<Option<String>>()
+            .await
+        {
+            Ok(Some(v)) if &v == want_value => {}
+            _ => return true,
+        }
+    }
+
+    false
 }
 
 /// Drives a scanner across all execution partitions in a loop.

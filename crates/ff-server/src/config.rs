@@ -249,6 +249,9 @@ impl ServerConfig {
             cancel_reconciler_interval: Duration::from_secs(
                 env_u64("FF_CANCEL_RECONCILER_INTERVAL_S", 15)?
             ),
+            // Issue #122: default is no-op. Multi-tenant deployments
+            // override this after ServerConfig construction.
+            scanner_filter: Default::default(),
         };
 
         Ok(Self {

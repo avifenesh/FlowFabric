@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::FlowIndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily};
 
@@ -37,13 +38,35 @@ const BATCH_SIZE: usize = 50;
 pub struct FlowProjector {
     interval: Duration,
     partition_config: PartitionConfig,
+    /// Issue #122: accepted for uniform API; not applied. See
+    /// [`Self::with_filter`] rustdoc.
+    filter: ScannerFilter,
 }
 
 impl FlowProjector {
     pub fn new(interval: Duration, partition_config: PartitionConfig) -> Self {
+        Self::with_filter(interval, partition_config, ScannerFilter::default())
+    }
+
+    /// Accepts a [`ScannerFilter`] for uniform construction across
+    /// all scanners (issue #122) but **does not apply it**. This
+    /// scanner projects flow summaries by aggregating the public
+    /// states of many member executions per flow; per-member
+    /// filtering would add an HGET per member per flow (N×M), which
+    /// does not fit the "no extra HGET to filter" budget set in the
+    /// issue #122 design. The flow summary remains a cross-tenant
+    /// aggregate in shared-Valkey deployments — consumers that
+    /// need per-instance summaries should read exec_core directly
+    /// with the filter applied.
+    pub fn with_filter(
+        interval: Duration,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+    ) -> Self {
         Self {
             interval,
             partition_config,
+            filter,
         }
     }
 }
@@ -55,6 +78,10 @@ impl Scanner for FlowProjector {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
