@@ -16,3 +16,7 @@ ff-script = { workspace = true }
 ferriskey = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# RFC-012 Stage 1b — `fail_impl` reads the execution's retry policy
+# JSON and serialises the nested `retry_policy` field into an
+# FCALL ARGV. Mirrors ff-sdk's pre-migration `read_retry_policy_json`.
+serde_json = { workspace = true }

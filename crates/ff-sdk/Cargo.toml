@@ -39,11 +39,19 @@ iam = ["ferriskey/iam"]
 # Pulls in the ferriskey transport + the SDK modules that depend on
 # it. Left as an explicit feature (on by default) so
 # `--no-default-features` builds can prove the agnosticism contract.
-valkey-default = ["dep:ferriskey"]
+valkey-default = ["dep:ferriskey", "dep:ff-backend-valkey"]
 
 [dependencies]
 ff-core = { workspace = true }
 ff-script = { workspace = true }
+# RFC-012 Stage 1b — ff-sdk's `ClaimedTask` forwards 9 of 12 ops
+# through the `EngineBackend` trait. The legacy
+# `FlowFabricWorker::connect` path still dials Valkey itself; it
+# wraps its own client in a `ValkeyBackend` (via
+# `from_client_and_partitions`) so `ClaimedTask` has a backend to
+# forward through. Gated on `valkey-default` so the agnosticism
+# build (`--no-default-features`) stays backend-free.
+ff-backend-valkey = { workspace = true, optional = true }
 ferriskey = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
