@@ -87,10 +87,14 @@ impl ValkeyBackend {
     /// `FlowFabricWorker::connect_with(backend)` path has something
     /// to hand in. The Valkey dial delegates to ferriskey's
     /// [`ClientBuilder`] so host/port, TLS, and cluster flags flow
-    /// through, and [`BackendTimeouts::request`] maps to
+    /// through, [`BackendTimeouts::request`] maps to
     /// `ClientBuilder::request_timeout` when set (`None` ⇒
-    /// ferriskey's default). `BackendRetry` and any future
-    /// `BackendTimeouts` fields remain Stage 1c work.
+    /// ferriskey's default), and [`BackendRetry`] maps to
+    /// `ClientBuilder::retry_strategy` when any field is set
+    /// (all-`None` ⇒ ferriskey's builder default, i.e. no
+    /// `.retry_strategy(..)` call).
+    ///
+    /// [`BackendRetry`]: ff_core::backend::BackendRetry
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
         // `BackendConnection` is `#[non_exhaustive]` for future
         // backends; the compiler treats the pattern as refutable,
@@ -233,7 +237,13 @@ impl ValkeyBackend {
 /// both standalone and cluster paths share one wiring point;
 /// `.cluster()` switches the builder to topology-discovery mode.
 /// `request_timeout` is applied only when the caller set it —
-/// `None` leaves ferriskey's default in place.
+/// `None` leaves ferriskey's default in place. `retry_strategy` is
+/// applied only when at least one `BackendRetry` field is `Some`;
+/// all-`None` skips the call so ferriskey's builder default stands.
+/// Fields that are `None` within a partially-populated `BackendRetry`
+/// fall back to `ConnectionRetryStrategy::default()` per-field (0 /
+/// 0 / 0 / None); callers opting into any field should set all
+/// fields they care about.
 async fn build_client(config: &BackendConfig) -> Result<ferriskey::Client, EngineError> {
     let BackendConnection::Valkey(v) = &config.connection else {
         return Err(EngineError::Unavailable {
@@ -249,6 +259,21 @@ async fn build_client(config: &BackendConfig) -> Result<ferriskey::Client, Engin
     }
     if let Some(request_timeout) = config.timeouts.request {
         builder = builder.request_timeout(request_timeout);
+    }
+    let retry = &config.retry;
+    if retry.exponent_base.is_some()
+        || retry.factor.is_some()
+        || retry.number_of_retries.is_some()
+        || retry.jitter_percent.is_some()
+    {
+        let default = ferriskey::client::ConnectionRetryStrategy::default();
+        let strategy = ferriskey::client::ConnectionRetryStrategy {
+            exponent_base: retry.exponent_base.unwrap_or(default.exponent_base),
+            factor: retry.factor.unwrap_or(default.factor),
+            number_of_retries: retry.number_of_retries.unwrap_or(default.number_of_retries),
+            jitter_percent: retry.jitter_percent.or(default.jitter_percent),
+        };
+        builder = builder.retry_strategy(strategy);
     }
     builder
         .build()
@@ -1351,5 +1376,54 @@ mod tests {
             .execute()
             .await
             .expect("PING on explicit-timeout client");
+    }
+
+    // ── retry wiring ────────────────────────────────────────────
+    //
+    // Exercises `BackendRetry` → `ClientBuilder::retry_strategy`
+    // via the `build_client` helper. Requires a live Valkey at
+    // localhost:6379, so `#[ignore]`-gated:
+    //   cargo test -p ff-backend-valkey --lib -- --ignored
+
+    /// All-`None` `BackendRetry` (the default) skips
+    /// `.retry_strategy(..)` on the builder; ferriskey's internal
+    /// default stands and the client still dials.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn build_client_with_default_retry() {
+        let cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        assert_eq!(cfg.retry, ff_core::backend::BackendRetry::default());
+        let client = build_client(&cfg)
+            .await
+            .expect("build_client with default retry");
+        let _: ferriskey::Value = client
+            .cmd("PING")
+            .execute()
+            .await
+            .expect("PING on default-retry client");
+    }
+
+    /// Any `Some` field on `BackendRetry` triggers the
+    /// `.retry_strategy(..)` call path; the builder accepts the
+    /// constructed `ConnectionRetryStrategy` and the resulting
+    /// client still completes round-trips. Does **not** assert the
+    /// retry curve fires on the wire (that's ferriskey's own test
+    /// territory); this is a wiring smoke test.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn build_client_with_explicit_retry_smoke() {
+        let mut cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        cfg.retry.number_of_retries = Some(3);
+        cfg.retry.exponent_base = Some(2);
+        cfg.retry.factor = Some(100);
+        cfg.retry.jitter_percent = Some(20);
+        let client = build_client(&cfg)
+            .await
+            .expect("build_client with explicit retry strategy");
+        let _: ferriskey::Value = client
+            .cmd("PING")
+            .execute()
+            .await
+            .expect("PING on explicit-retry client");
     }
 }
