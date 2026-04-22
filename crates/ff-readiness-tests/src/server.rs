@@ -147,17 +147,31 @@ impl InProcessServer {
     /// Behavior:
     /// 1. Abort the axum listener task and await its `JoinHandle` so
     ///    no new HTTP requests can observe a half-shut-down engine.
+    ///    Cancellation after `abort()` is expected and ignored; any
+    ///    other `JoinError` (i.e. a panicked axum task) is surfaced
+    ///    via `panic!` so diagnostics are not swallowed.
     /// 2. Unwrap the `Arc<Server>` — panics with an actionable message
     ///    if the caller still holds clones of `server`.
     /// 3. Call `Server::shutdown`, which closes the stream semaphore,
-    ///    drains background tasks (15s ceiling) and shuts down the
-    ///    engine. The step is wrapped in a 1s defensive outer
-    ///    timeout; a timeout panics with an actionable message.
+    ///    drains background tasks (15s internal ceiling) and shuts
+    ///    down the engine. Wrapped in a 20s defensive outer timeout
+    ///    (15s upstream drain + 5s `ff-engine` supervised-spawn
+    ///    panic-backoff headroom); timeout panics with an actionable
+    ///    message.
     pub async fn shutdown(self) {
         // The struct implements `Drop`, so fields cannot be moved out
         // directly. Wrap in `ManuallyDrop` to suppress the
         // warn-emitting fallback drop, then read each field out by
         // value exactly once.
+        //
+        // An alternative design would store the fields as `Option<_>`
+        // and `.take()` them here, leaving `Drop` a silent no-op on
+        // the explicit-shutdown path. We chose `ManuallyDrop` to keep
+        // every direct access site (`server.server.create_flow(...)`,
+        // `server.base_url`) in the test files unchanged — the
+        // readiness tests have ~20 such accesses and an `Option<>`
+        // field would force `.unwrap()` or an accessor method at each
+        // one, for no functional gain.
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is a fresh `ManuallyDrop` wrapper; each field
         // is read exactly once and never accessed again through
@@ -171,8 +185,15 @@ impl InProcessServer {
         // Stop accepting new HTTP connections.
         axum_handle.abort();
         // Await so the task is fully torn down before we touch the
-        // shared `Arc<Server>` — `JoinError::cancelled` is expected.
-        let _ = axum_handle.await;
+        // shared `Arc<Server>`. Cancellation is the expected post-
+        // `abort()` outcome; a panicked task must not be silently
+        // swallowed — surface it so the test fails loudly instead of
+        // masking an axum-level bug.
+        match axum_handle.await {
+            Ok(()) => {}
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => panic!("InProcessServer::shutdown: axum task failed: {e}"),
+        }
 
         let server = Arc::try_unwrap(server_arc).unwrap_or_else(|_arc| {
             panic!(
@@ -182,14 +203,15 @@ impl InProcessServer {
         });
 
         // Defensive outer timeout. `Server::shutdown` bounds its own
-        // drain at ~15s internally, but readiness tests have no
-        // expected long-running background work at teardown — anything
-        // past 1s indicates a stuck engine or task.
-        match tokio::time::timeout(Duration::from_secs(1), server.shutdown()).await {
+        // drain at 15s (`background_tasks` JoinSet) and `ff-engine`'s
+        // `supervised_spawn` can take up to ~5s on panic backoff
+        // before observing shutdown. 20s covers both ceilings; past
+        // that the harness is genuinely wedged.
+        match tokio::time::timeout(Duration::from_secs(20), server.shutdown()).await {
             Ok(()) => {}
             Err(_) => panic!(
                 "InProcessServer::shutdown: Server::shutdown did not complete within \
-                 1s — engine or background tasks are stuck; inspect tracing logs"
+                 20s — engine or background tasks are stuck; inspect tracing logs"
             ),
         }
     }
