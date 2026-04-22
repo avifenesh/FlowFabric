@@ -119,7 +119,11 @@ impl FromFcallResult for DeliverSignalResult {
         if r.status == "DUPLICATE" {
             let sid_str = r.field_str(0);
             let sid = SignalId::parse(&sid_str)
-                .map_err(|e| ScriptError::Parse(format!("bad signal_id: {e}")))?;
+                .map_err(|e| ScriptError::Parse {
+                    fcall: "ff_deliver_signal".into(),
+                    execution_id: None,
+                    message: format!("bad signal_id: {e}"),
+                })?;
             return Ok(DeliverSignalResult::Duplicate {
                 existing_signal_id: sid,
             });
@@ -129,7 +133,11 @@ impl FromFcallResult for DeliverSignalResult {
         let sid_str = r.field_str(0);
         let effect = r.field_str(1);
         let sid = SignalId::parse(&sid_str)
-            .map_err(|e| ScriptError::Parse(format!("bad signal_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_deliver_signal".into(),
+                execution_id: None,
+                message: format!("bad signal_id: {e}"),
+            })?;
         Ok(DeliverSignalResult::Accepted {
             signal_id: sid,
             effect,
@@ -191,7 +199,11 @@ impl FromFcallResult for BufferSignalResult {
         if r.status == "DUPLICATE" {
             let sid_str = r.field_str(0);
             let sid = SignalId::parse(&sid_str)
-                .map_err(|e| ScriptError::Parse(format!("bad signal_id: {e}")))?;
+                .map_err(|e| ScriptError::Parse {
+                    fcall: "ff_buffer_signal".into(),
+                    execution_id: None,
+                    message: format!("bad signal_id: {e}"),
+                })?;
             return Ok(BufferSignalResult::Duplicate {
                 existing_signal_id: sid,
             });
@@ -200,7 +212,11 @@ impl FromFcallResult for BufferSignalResult {
         // ok(signal_id, "buffered_for_pending_waitpoint")
         let sid_str = r.field_str(0);
         let sid = SignalId::parse(&sid_str)
-            .map_err(|e| ScriptError::Parse(format!("bad signal_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_buffer_signal".into(),
+                execution_id: None,
+                message: format!("bad signal_id: {e}"),
+            })?;
         Ok(BufferSignalResult::Buffered { signal_id: sid })
     }
 }
@@ -250,15 +266,35 @@ impl FromFcallResult for ClaimResumedExecutionResultPartial {
         let r = FcallResult::parse(raw)?.into_success()?;
         // ok(lease_id, epoch, expires_at, attempt_id, attempt_index, "resumed")
         let lease_id = LeaseId::parse(&r.field_str(0))
-            .map_err(|e| ScriptError::Parse(format!("bad lease_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_resumed_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad lease_id: {e}"),
+            })?;
         let epoch = r.field_str(1).parse::<u64>()
-            .map_err(|e| ScriptError::Parse(format!("bad epoch: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_resumed_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad epoch: {e}"),
+            })?;
         let expires_at = r.field_str(2).parse::<i64>()
-            .map_err(|e| ScriptError::Parse(format!("bad expires_at: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_resumed_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad expires_at: {e}"),
+            })?;
         let attempt_id = AttemptId::parse(&r.field_str(3))
-            .map_err(|e| ScriptError::Parse(format!("bad attempt_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_resumed_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad attempt_id: {e}"),
+            })?;
         let attempt_index = r.field_str(4).parse::<u32>()
-            .map_err(|e| ScriptError::Parse(format!("bad attempt_index: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_claim_resumed_execution_result_partial".into(),
+                execution_id: None,
+                message: format!("bad attempt_index: {e}"),
+            })?;
 
         Ok(Self::Claimed(ClaimedResumedExecutionPartial {
             lease_id,

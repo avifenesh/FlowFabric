@@ -106,9 +106,19 @@ pub enum SdkError {
     #[error("engine: {0}")]
     Engine(Box<EngineError>),
 
-    /// Configuration error.
-    #[error("config: {0}")]
-    Config(String),
+    /// Configuration error. `context` identifies the call site / logical
+    /// operation (e.g. `"describe_execution: exec_core"`, `"admin_client"`).
+    /// `field` names the specific offending field when the error is
+    /// field-scoped (e.g. `Some("public_state")`), or `None` for
+    /// whole-object validation (e.g. `"at least one lane is required"`).
+    /// `message` carries dynamic detail: source-error rendering, the
+    /// offending raw value, etc.
+    #[error("{}", fmt_config(.context, .field.as_deref(), .message))]
+    Config {
+        context: String,
+        field: Option<String>,
+        message: String,
+    },
 
     /// Worker is at its configured `max_concurrent_tasks` capacity —
     /// the caller should retry later. Returned by
@@ -177,6 +187,15 @@ pub enum SdkError {
     },
 }
 
+/// Renders `SdkError::Config` as `config: <context>[.<field>]: <message>`.
+/// The `field` slot is omitted when `None` (whole-object validation).
+fn fmt_config(context: &str, field: Option<&str>, message: &str) -> String {
+    match field {
+        Some(f) => format!("config: {context}.{f}: {message}"),
+        None => format!("config: {context}: {message}"),
+    }
+}
+
 /// Preserves the ergonomic `?`-propagation from FCALL sites that
 /// return `Result<_, ScriptError>`. Routes through `EngineError`'s
 /// typed classification so every call site gets the same
@@ -206,7 +225,7 @@ impl SdkError {
             // the admin path never touches Valkey directly from the
             // SDK side. Use `AdminApi.kind` for the server-supplied
             // label when present.
-            Self::Config(_) | Self::WorkerAtCapacity | Self::Http { .. } | Self::AdminApi { .. } => {
+            Self::Config { .. } | Self::WorkerAtCapacity | Self::Http { .. } | Self::AdminApi { .. } => {
                 None
             }
         }
@@ -242,7 +261,7 @@ impl SdkError {
             Self::AdminApi {
                 status, retryable, ..
             } => retryable.unwrap_or(matches!(*status, 429 | 502 | 503 | 504)),
-            Self::Config(_) => false,
+            Self::Config { .. } => false,
         }
     }
 }
@@ -285,7 +304,15 @@ mod tests {
             SdkError::from(ScriptError::LeaseExpired).valkey_kind(),
             None
         );
-        assert_eq!(SdkError::Config("bad host".into()).valkey_kind(), None);
+        assert_eq!(
+            SdkError::Config {
+                context: "worker_config".into(),
+                field: Some("bearer_token".into()),
+                message: "bad host".into(),
+            }
+            .valkey_kind(),
+            None
+        );
     }
 
     #[test]
@@ -307,9 +334,51 @@ mod tests {
         );
     }
 
+    /// Regression (#98): `SdkError::Config` carries `context`, optional
+    /// `field`, and `message` separately so consumers can pattern-match on
+    /// the offending field without parsing the Display string. Test covers
+    /// both the field-scoped and whole-object renderings.
+    #[test]
+    fn config_structured_fields_render_and_match() {
+        let with_field = SdkError::Config {
+            context: "admin_client".into(),
+            field: Some("bearer_token".into()),
+            message: "is empty or all-whitespace".into(),
+        };
+        assert_eq!(
+            with_field.to_string(),
+            "config: admin_client.bearer_token: is empty or all-whitespace"
+        );
+        assert!(matches!(
+            &with_field,
+            SdkError::Config { field: Some(f), .. } if f == "bearer_token"
+        ));
+
+        let whole_object = SdkError::Config {
+            context: "worker_config".into(),
+            field: None,
+            message: "at least one lane is required".into(),
+        };
+        assert_eq!(
+            whole_object.to_string(),
+            "config: worker_config: at least one lane is required"
+        );
+        assert!(matches!(
+            &whole_object,
+            SdkError::Config { field: None, .. }
+        ));
+    }
+
     #[test]
     fn is_retryable_config_false() {
-        assert!(!SdkError::Config("at least one lane is required".into()).is_retryable());
+        assert!(
+            !SdkError::Config {
+                context: "worker_config".into(),
+                field: None,
+                message: "at least one lane is required".into(),
+            }
+            .is_retryable()
+        );
     }
 
     #[test]

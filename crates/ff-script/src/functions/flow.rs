@@ -63,11 +63,19 @@ impl FromFcallResult for CreateFlowResult {
         let r = FcallResult::parse(raw)?.into_success()?;
         let fid_str = r.field_str(0);
         let fid = ff_core::types::FlowId::parse(&fid_str)
-            .map_err(|e| ScriptError::Parse(format!("bad flow_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_create_flow".into(),
+                execution_id: None,
+                message: format!("bad flow_id: {e}"),
+            })?;
         match r.status.as_str() {
             "OK" => Ok(CreateFlowResult::Created { flow_id: fid }),
             "ALREADY_SATISFIED" => Ok(CreateFlowResult::AlreadySatisfied { flow_id: fid }),
-            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_create_flow".into(),
+                execution_id: None,
+                message: format!("unexpected status: {}", r.status),
+            }),
         }
     }
 }
@@ -99,7 +107,11 @@ impl FromFcallResult for AddExecutionToFlowResult {
         match r.status.as_str() {
             "ALREADY_SATISFIED" => {
                 let eid = ff_core::types::ExecutionId::parse(&eid_str)
-                    .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+                    .map_err(|e| ScriptError::Parse {
+                        fcall: "ff_add_execution_to_flow".into(),
+                        execution_id: None,
+                        message: format!("bad execution_id: {e}"),
+                    })?;
                 let nc: u32 = nc_str.parse().unwrap_or(0);
                 Ok(AddExecutionToFlowResult::AlreadyMember {
                     execution_id: eid,
@@ -108,14 +120,22 @@ impl FromFcallResult for AddExecutionToFlowResult {
             }
             "OK" => {
                 let eid = ff_core::types::ExecutionId::parse(&eid_str)
-                    .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+                    .map_err(|e| ScriptError::Parse {
+                        fcall: "ff_add_execution_to_flow".into(),
+                        execution_id: None,
+                        message: format!("bad execution_id: {e}"),
+                    })?;
                 let nc: u32 = nc_str.parse().unwrap_or(0);
                 Ok(AddExecutionToFlowResult::Added {
                     execution_id: eid,
                     new_node_count: nc,
                 })
             }
-            _ => Err(ScriptError::Parse(format!("unexpected status: {}", r.status))),
+            _ => Err(ScriptError::Parse {
+                fcall: "ff_add_execution_to_flow".into(),
+                execution_id: None,
+                message: format!("unexpected status: {}", r.status),
+            }),
         }
     }
 }
@@ -280,7 +300,11 @@ impl FromFcallResult for ResolveDependencyResult {
             "satisfied" => Ok(ResolveDependencyResult::Satisfied),
             "impossible" => Ok(ResolveDependencyResult::Impossible),
             "already_resolved" => Ok(ResolveDependencyResult::AlreadyResolved),
-            other => Err(ScriptError::Parse(format!("unknown resolve status: {other}"))),
+            other => Err(ScriptError::Parse {
+                fcall: "ff_resolve_dependency".into(),
+                execution_id: None,
+                message: format!("unknown resolve status: {other}"),
+            }),
         }
     }
 }
@@ -386,9 +410,17 @@ impl FromFcallResult for StageDependencyEdgeResult {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let r = FcallResult::parse(raw)?.into_success()?;
         let eid = ff_core::types::EdgeId::parse(&r.field_str(0))
-            .map_err(|e| ScriptError::Parse(format!("bad edge_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_stage_dependency_edge".into(),
+                execution_id: None,
+                message: format!("bad edge_id: {e}"),
+            })?;
         let rev: u64 = r.field_str(1).parse()
-            .map_err(|e| ScriptError::Parse(format!("bad graph_revision: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_stage_dependency_edge".into(),
+                execution_id: None,
+                message: format!("bad graph_revision: {e}"),
+            })?;
         Ok(StageDependencyEdgeResult::Staged {
             edge_id: eid,
             new_graph_revision: rev,
@@ -437,7 +469,11 @@ impl FromFcallResult for SetFlowTagsResult {
         let count: u32 = r
             .field_str(0)
             .parse()
-            .map_err(|e| ScriptError::Parse(format!("bad tag count: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_set_flow_tags".into(),
+                execution_id: None,
+                message: format!("bad tag count: {e}"),
+            })?;
         Ok(SetFlowTagsResult::Ok { count })
     }
 }

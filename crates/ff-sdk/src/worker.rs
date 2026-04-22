@@ -108,7 +108,11 @@ impl FlowFabricWorker {
     /// the library is already loaded.
     pub async fn connect(config: WorkerConfig) -> Result<Self, SdkError> {
         if config.lanes.is_empty() {
-            return Err(SdkError::Config("at least one lane is required".into()));
+            return Err(SdkError::Config {
+                context: "worker_config".into(),
+                field: None,
+                message: "at least one lane is required".into(),
+            });
         }
 
         let mut builder = ClientBuilder::new()
@@ -132,9 +136,11 @@ impl FlowFabricWorker {
             .await
             .map_err(|e| SdkError::ValkeyContext { source: e, context: "PING failed".into() })?;
         if pong != "PONG" {
-            return Err(SdkError::Config(format!(
-                "unexpected PING response: {pong}"
-            )));
+            return Err(SdkError::Config {
+                context: "worker_connect".into(),
+                field: None,
+                message: format!("unexpected PING response: {pong}"),
+            });
         }
 
         // Guard against two worker processes sharing the same
@@ -190,10 +196,14 @@ impl FlowFabricWorker {
                 context: "SET NX worker alive key".into(),
             })?;
         if set_result.is_none() {
-            return Err(SdkError::Config(format!(
-                "duplicate worker_instance_id '{}': another process already holds {alive_key}",
-                config.worker_instance_id
-            )));
+            return Err(SdkError::Config {
+                context: "worker_connect".into(),
+                field: Some("worker_instance_id".into()),
+                message: format!(
+                    "duplicate worker_instance_id '{}': another process already holds {alive_key}",
+                    config.worker_instance_id
+                ),
+            });
         }
 
         // Read partition config from Valkey (set by ff-server on startup).
@@ -242,14 +252,20 @@ impl FlowFabricWorker {
         #[cfg(feature = "direct-valkey-claim")]
         for cap in &config.capabilities {
             if cap.is_empty() {
-                return Err(SdkError::Config(
-                    "capability token must not be empty".into(),
-                ));
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: "capability token must not be empty".into(),
+                });
             }
             if cap.contains(',') {
-                return Err(SdkError::Config(format!(
-                    "capability token may not contain ',' (CSV delimiter): {cap:?}"
-                )));
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: format!(
+                        "capability token may not contain ',' (CSV delimiter): {cap:?}"
+                    ),
+                });
             }
             // Reject ASCII control bytes (0x00-0x1F, 0x7F) and any ASCII
             // whitespace (space, tab, LF, CR, FF, VT). UTF-8 printable
@@ -259,9 +275,14 @@ impl FlowFabricWorker {
             // never part of a multibyte continuation (only 0x80-0xBF are
             // continuations, ',' is 0x2C).
             if cap.chars().any(|c| c.is_control() || c.is_whitespace()) {
-                return Err(SdkError::Config(format!(
-                    "capability token must not contain whitespace or control characters: {cap:?}"
-                )));
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: format!(
+                        "capability token must not contain whitespace or control \
+                         characters: {cap:?}"
+                    ),
+                });
             }
         }
         #[cfg(feature = "direct-valkey-claim")]
@@ -273,19 +294,27 @@ impl FlowFabricWorker {
                 .filter(|s| !s.is_empty())
                 .collect();
             if set.len() > ff_core::policy::CAPS_MAX_TOKENS {
-                return Err(SdkError::Config(format!(
-                    "capability set exceeds CAPS_MAX_TOKENS ({}): {}",
-                    ff_core::policy::CAPS_MAX_TOKENS,
-                    set.len()
-                )));
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: format!(
+                        "capability set exceeds CAPS_MAX_TOKENS ({}): {}",
+                        ff_core::policy::CAPS_MAX_TOKENS,
+                        set.len()
+                    ),
+                });
             }
             let csv = set.into_iter().collect::<Vec<_>>().join(",");
             if csv.len() > ff_core::policy::CAPS_MAX_BYTES {
-                return Err(SdkError::Config(format!(
-                    "capability CSV exceeds CAPS_MAX_BYTES ({}): {}",
-                    ff_core::policy::CAPS_MAX_BYTES,
-                    csv.len()
-                )));
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: format!(
+                        "capability CSV exceeds CAPS_MAX_BYTES ({}): {}",
+                        ff_core::policy::CAPS_MAX_BYTES,
+                        csv.len()
+                    ),
+                });
             }
             csv
         };
@@ -526,9 +555,11 @@ impl FlowFabricWorker {
             };
 
             let execution_id = ExecutionId::parse(&execution_id_str).map_err(|e| {
-                SdkError::from(ff_script::error::ScriptError::Parse(format!(
-                    "bad execution_id in eligible set: {e}"
-                )))
+                SdkError::from(ff_script::error::ScriptError::Parse {
+                    fcall: "claim_execution_from_eligible_set".into(),
+                    execution_id: None,
+                    message: format!("bad execution_id in eligible set: {e}"),
+                })
             })?;
 
             // Step 1: Issue claim grant
@@ -838,18 +869,22 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
-                    "ff_claim_execution: expected Array".into(),
-                )));
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
+                    fcall: "ff_claim_execution".into(),
+                    execution_id: Some(execution_id.to_string()),
+                    message: "expected Array".into(),
+                }));
             }
         };
 
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
-                    "ff_claim_execution: bad status code".into(),
-                )));
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
+                    fcall: "ff_claim_execution".into(),
+                    execution_id: Some(execution_id.to_string()),
+                    message: "bad status code".into(),
+                }));
             }
         };
 
@@ -871,10 +906,10 @@ impl FlowFabricWorker {
 
             return Err(SdkError::from(
                 ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
-                    .unwrap_or_else(|| {
-                        ff_script::error::ScriptError::Parse(format!(
-                            "ff_claim_execution: {error_code}"
-                        ))
+                    .unwrap_or_else(|| ff_script::error::ScriptError::Parse {
+                        fcall: "ff_claim_execution".into(),
+                        execution_id: Some(execution_id.to_string()),
+                        message: format!("unknown error: {error_code}"),
                     }),
             ));
         }
@@ -1178,18 +1213,22 @@ impl FlowFabricWorker {
         let arr = match &raw {
             Value::Array(arr) => arr,
             _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
-                    "ff_claim_resumed_execution: expected Array".into(),
-                )));
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
+                    fcall: "ff_claim_resumed_execution".into(),
+                    execution_id: Some(execution_id.to_string()),
+                    message: "expected Array".into(),
+                }));
             }
         };
 
         let status_code = match arr.first() {
             Some(Ok(Value::Int(n))) => *n,
             _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse(
-                    "ff_claim_resumed_execution: bad status code".into(),
-                )));
+                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
+                    fcall: "ff_claim_resumed_execution".into(),
+                    execution_id: Some(execution_id.to_string()),
+                    message: "bad status code".into(),
+                }));
             }
         };
 
@@ -1211,10 +1250,10 @@ impl FlowFabricWorker {
 
             return Err(SdkError::from(
                 ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
-                    .unwrap_or_else(|| {
-                        ff_script::error::ScriptError::Parse(format!(
-                            "ff_claim_resumed_execution: {error_code}"
-                        ))
+                    .unwrap_or_else(|| ff_script::error::ScriptError::Parse {
+                        fcall: "ff_claim_resumed_execution".into(),
+                        execution_id: Some(execution_id.to_string()),
+                        message: format!("unknown error: {error_code}"),
                     }),
             ));
         }
@@ -1448,9 +1487,11 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
         .map_err(|e| SdkError::ValkeyContext { source: e, context: format!("HGETALL {key}") })?;
 
     if fields.is_empty() {
-        return Err(SdkError::Config(
-            "ff:config:partitions not found in Valkey".into(),
-        ));
+        return Err(SdkError::Config {
+            context: "read_partition_config".into(),
+            field: None,
+            message: "ff:config:partitions not found in Valkey".into(),
+        });
     }
 
     let parse = |field: &str, default: u16| -> u16 {

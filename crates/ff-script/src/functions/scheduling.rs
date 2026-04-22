@@ -67,7 +67,11 @@ impl FromFcallResult for IssueClaimGrantResult {
         // ok(execution_id)
         let eid_str = r.field_str(0);
         let eid = ExecutionId::parse(&eid_str)
-            .map_err(|e| ScriptError::Parse(format!("bad execution_id: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_issue_claim_grant".into(),
+                execution_id: None,
+                message: format!("bad execution_id: {e}"),
+            })?;
         Ok(IssueClaimGrantResult::Granted { execution_id: eid })
     }
 }

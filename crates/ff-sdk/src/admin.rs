@@ -83,19 +83,21 @@ impl FlowFabricAdminClient {
     ) -> Result<Self, SdkError> {
         let token_str = token.as_ref();
         if token_str.trim().is_empty() {
-            return Err(SdkError::Config(
-                "bearer token is empty or all-whitespace; use \
-                 FlowFabricAdminClient::new for unauthenticated access"
+            return Err(SdkError::Config {
+                context: "admin_client".into(),
+                field: Some("bearer_token".into()),
+                message: "is empty or all-whitespace; use \
+                          FlowFabricAdminClient::new for unauthenticated access"
                     .into(),
-            ));
+            });
         }
         let mut headers = reqwest::header::HeaderMap::new();
         let mut auth_value =
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token_str)).map_err(
-                |_| {
-                    SdkError::Config(
-                        "bearer token contains characters not valid in an HTTP header".into(),
-                    )
+                |_| SdkError::Config {
+                    context: "admin_client".into(),
+                    field: Some("bearer_token".into()),
+                    message: "contains characters not valid in an HTTP header".into(),
                 },
             )?;
         // Mark Authorization as sensitive so it doesn't appear in
@@ -137,15 +139,16 @@ impl FlowFabricAdminClient {
         // splicing it verbatim would produce malformed URLs or
         // misrouted paths. `Url::path_segments_mut().push` handles the
         // encoding natively.
-        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| {
-            SdkError::Config(format!("invalid base_url '{}': {e}", self.base_url))
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| SdkError::Config {
+            context: "admin_client: claim_for_worker".into(),
+            field: Some("base_url".into()),
+            message: format!("invalid base_url '{}': {e}", self.base_url),
         })?;
         {
-            let mut segs = url.path_segments_mut().map_err(|_| {
-                SdkError::Config(format!(
-                    "base_url cannot be a base URL: '{}'",
-                    self.base_url
-                ))
+            let mut segs = url.path_segments_mut().map_err(|_| SdkError::Config {
+                context: "admin_client: claim_for_worker".into(),
+                field: Some("base_url".into()),
+                message: format!("base_url cannot be a base URL: '{}'", self.base_url),
             })?;
             segs.extend(&["v1", "workers", &req.worker_id, "claim"]);
         }
@@ -427,7 +430,10 @@ mod tests {
         // Raw newline in the token would split the Authorization
         // header — must fail loudly at construction.
         let err = FlowFabricAdminClient::with_token("http://x", "tok\nevil").unwrap_err();
-        assert!(matches!(err, SdkError::Config(_)), "got: {err:?}");
+        assert!(
+            matches!(err, SdkError::Config { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -439,8 +445,8 @@ mod tests {
             let err = FlowFabricAdminClient::with_token("http://x", s)
                 .unwrap_err();
             assert!(
-                matches!(&err, SdkError::Config(msg) if msg.contains("empty")),
-                "token {s:?} should return Config(empty/whitespace); got: {err:?}"
+                matches!(&err, SdkError::Config { field: Some(f), .. } if f == "bearer_token"),
+                "token {s:?} should return Config with field=bearer_token; got: {err:?}"
             );
         }
     }

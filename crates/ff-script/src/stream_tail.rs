@@ -190,9 +190,11 @@ fn parse_xread_reply(raw: &Value, stream_key: &str) -> Result<Vec<StreamFrame>, 
                 let entries_val = match pair[1].as_ref() {
                     Ok(v) => v,
                     Err(e) => {
-                        return Err(ScriptError::Parse(format!(
-                            "XREAD entries (RESP2): {e}"
-                        )));
+                        return Err(ScriptError::Parse {
+                            fcall: "stream_tail_decode".into(),
+                            execution_id: None,
+                            message: format!("XREAD entries (RESP2): {e}"),
+                        });
                     }
                 };
                 return parse_entries_any(entries_val);
@@ -207,9 +209,11 @@ fn parse_xread_reply(raw: &Value, stream_key: &str) -> Result<Vec<StreamFrame>, 
             return Ok(Vec::new());
         }
         other => {
-            return Err(ScriptError::Parse(format!(
-                "XREAD: expected Map/Nil/Array, got {other:?}"
-            )));
+            return Err(ScriptError::Parse {
+                fcall: "stream_tail_decode".into(),
+                execution_id: None,
+                message: format!("XREAD: expected Map/Nil/Array, got {other:?}"),
+            });
         }
     };
 
@@ -233,7 +237,11 @@ fn parse_xread_reply(raw: &Value, stream_key: &str) -> Result<Vec<StreamFrame>, 
                 let mut frames = Vec::with_capacity(entries.len());
                 for (id_v, field_v) in entries {
                     let id = value_to_string(Some(id_v))
-                        .ok_or_else(|| ScriptError::Parse("XREAD entry: bad id".into()))?;
+                        .ok_or_else(|| ScriptError::Parse {
+                            fcall: "stream_tail_decode".into(),
+                            execution_id: None,
+                            message: "XREAD entry: bad id".into(),
+                        })?;
                     let fields = parse_fields_kv(field_v, FieldShape::Pairs)?;
                     frames.push(StreamFrame { id, fields });
                 }
@@ -251,9 +259,11 @@ fn parse_xread_reply(raw: &Value, stream_key: &str) -> Result<Vec<StreamFrame>, 
             }
             Value::Nil => Vec::new(),
             other => {
-                return Err(ScriptError::Parse(format!(
-                    "XREAD entries: expected Map/Array, got {other:?}"
-                )));
+                return Err(ScriptError::Parse {
+                    fcall: "stream_tail_decode".into(),
+                    execution_id: None,
+                    message: format!("XREAD entries: expected Map/Array, got {other:?}"),
+                });
             }
         };
         return Ok(frames);
@@ -280,14 +290,20 @@ fn parse_entries_any(raw: &Value) -> Result<Vec<StreamFrame>, ScriptError> {
             let mut frames = Vec::with_capacity(map.len());
             for (id_v, field_v) in map {
                 let id = value_to_string(Some(id_v))
-                    .ok_or_else(|| ScriptError::Parse("XREAD entry: bad id".into()))?;
+                    .ok_or_else(|| ScriptError::Parse {
+                        fcall: "parse_entries_any".into(),
+                        execution_id: None,
+                        message: "XREAD entry: bad id".into(),
+                    })?;
                 let fields = parse_fields_kv(field_v, FieldShape::Pairs)?;
                 frames.push(StreamFrame { id, fields });
             }
             Ok(frames)
         }
-        other => Err(ScriptError::Parse(format!(
-            "XREAD entries: expected Array/Map/Nil, got {other:?}"
-        ))),
+        other => Err(ScriptError::Parse {
+            fcall: "parse_entries_any".into(),
+            execution_id: None,
+            message: format!("XREAD entries: expected Array/Map/Nil, got {other:?}"),
+        }),
     }
 }

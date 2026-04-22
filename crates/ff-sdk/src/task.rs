@@ -1537,17 +1537,21 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_report_usage_and_check: expected Array".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_report_usage_result".into(),
+                execution_id: None,
+                message: "ff_report_usage_and_check: expected Array".into(),
+            }));
         }
     };
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_report_usage_and_check: expected Int status code".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_report_usage_result".into(),
+                execution_id: None,
+                message: "ff_report_usage_and_check: expected Int status code".into(),
+            }));
         }
     };
     if status_code != 1 {
@@ -1555,7 +1559,11 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
         let detail = usage_field_str(arr, 2);
         return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
-                ScriptError::Parse(format!("ff_report_usage_and_check: {error_code}"))
+                ScriptError::Parse {
+                    fcall: "parse_report_usage_result".into(),
+                    execution_id: None,
+                    message: format!("ff_report_usage_and_check: {error_code}"),
+                }
             }),
         ));
     }
@@ -1579,9 +1587,13 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
                 hard_limit: limit,
             })
         }
-        _ => Err(SdkError::from(ScriptError::Parse(format!(
+        _ => Err(SdkError::from(ScriptError::Parse {
+            fcall: "parse_report_usage_result".into(),
+            execution_id: None,
+            message: format!(
             "ff_report_usage_and_check: unknown sub-status: {sub_status}"
-        )))),
+        ),
+        })),
     }
 }
 
@@ -1616,35 +1628,55 @@ fn parse_usage_u64(
     match arr.get(index) {
         Some(Ok(Value::Int(n))) => {
             u64::try_from(*n).map_err(|_| {
-                SdkError::from(ScriptError::Parse(format!(
+                SdkError::from(ScriptError::Parse {
+                    fcall: "parse_usage_u64".into(),
+                    execution_id: None,
+                    message: format!(
                     "ff_report_usage_and_check {sub_status}: {field_name} \
                      (index {index}) negative int {n} cannot be u64"
-                )))
+                ),
+                })
             })
         }
         Some(Ok(Value::BulkString(b))) => {
             let s = String::from_utf8_lossy(b);
             s.parse::<u64>().map_err(|_| {
-                SdkError::from(ScriptError::Parse(format!(
+                SdkError::from(ScriptError::Parse {
+                    fcall: "parse_usage_u64".into(),
+                    execution_id: None,
+                    message: format!(
                     "ff_report_usage_and_check {sub_status}: {field_name} \
                      (index {index}) not a u64 string: {s:?}"
-                )))
+                ),
+                })
             })
         }
         Some(Ok(Value::SimpleString(s))) => s.parse::<u64>().map_err(|_| {
-            SdkError::from(ScriptError::Parse(format!(
+            SdkError::from(ScriptError::Parse {
+                fcall: "parse_usage_u64".into(),
+                execution_id: None,
+                message: format!(
                 "ff_report_usage_and_check {sub_status}: {field_name} \
                  (index {index}) not a u64 string: {s:?}"
-            )))
+            ),
+            })
         }),
-        Some(_) => Err(SdkError::from(ScriptError::Parse(format!(
+        Some(_) => Err(SdkError::from(ScriptError::Parse {
+            fcall: "parse_usage_u64".into(),
+            execution_id: None,
+            message: format!(
             "ff_report_usage_and_check {sub_status}: {field_name} \
              (index {index}) wrong wire type (expected Int or String)"
-        )))),
-        None => Err(SdkError::from(ScriptError::Parse(format!(
+        ),
+        })),
+        None => Err(SdkError::from(ScriptError::Parse {
+            fcall: "parse_usage_u64".into(),
+            execution_id: None,
+            message: format!(
             "ff_report_usage_and_check {sub_status}: {field_name} \
              (index {index}) missing from response"
-        )))),
+        ),
+        })),
     }
 }
 
@@ -1667,9 +1699,11 @@ fn extract_pending_waitpoint_token(raw: &Value) -> Result<WaitpointToken, SdkErr
             _ => None,
         })
         .ok_or_else(|| {
-            SdkError::from(ScriptError::Parse(
-                "ff_create_pending_waitpoint: missing waitpoint_token in response".into(),
-            ))
+            SdkError::from(ScriptError::Parse {
+                fcall: "extract_pending_waitpoint_token".into(),
+                execution_id: None,
+                message: "ff_create_pending_waitpoint: missing waitpoint_token in response".into(),
+            })
         })?;
     Ok(WaitpointToken::new(token_str))
 }
@@ -1706,9 +1740,13 @@ fn resume_waitpoint_id_from_suspension(
         return Ok(None);
     }
     let waitpoint_id = WaitpointId::parse(wp_id_str).map_err(|e| {
-        SdkError::from(ScriptError::Parse(format!(
+        SdkError::from(ScriptError::Parse {
+            fcall: "resume_waitpoint_id_from_suspension".into(),
+            execution_id: None,
+            message: format!(
             "resume_signals: suspension_current.waitpoint_id is not a valid UUID: {e}"
-        )))
+        ),
+        })
     })?;
     Ok(Some(waitpoint_id))
 }
@@ -1717,24 +1755,36 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(format!(
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_success_result".into(),
+                execution_id: None,
+                message: format!(
                 "{function_name}: expected Array, got non-array"
-            ))));
+            ),
+            }));
         }
     };
 
     if arr.is_empty() {
-        return Err(SdkError::from(ScriptError::Parse(format!(
+        return Err(SdkError::from(ScriptError::Parse {
+            fcall: "parse_success_result".into(),
+            execution_id: None,
+            message: format!(
             "{function_name}: empty result array"
-        ))));
+        ),
+        }));
     }
 
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(format!(
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_success_result".into(),
+                execution_id: None,
+                message: format!(
                 "{function_name}: expected Int at index 0"
-            ))));
+            ),
+            }));
         }
     };
 
@@ -1767,7 +1817,11 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
 
         let script_err = ScriptError::from_code_with_details(&error_code, &detail_refs)
             .unwrap_or_else(|| {
-                ScriptError::Parse(format!("{function_name}: unknown error: {error_code}"))
+                ScriptError::Parse {
+                    fcall: "parse_success_result".into(),
+                    execution_id: None,
+                    message: format!("{function_name}: unknown error: {error_code}"),
+                }
             });
 
         Err(SdkError::from(script_err))
@@ -1786,18 +1840,22 @@ fn parse_suspend_result(
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_suspend_execution: expected Array".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_suspend_result".into(),
+                execution_id: None,
+                message: "ff_suspend_execution: expected Array".into(),
+            }));
         }
     };
 
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_suspend_execution: bad status code".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_suspend_result".into(),
+                execution_id: None,
+                message: "ff_suspend_execution: bad status code".into(),
+            }));
         }
     };
 
@@ -1818,7 +1876,11 @@ fn parse_suspend_result(
         let detail = err_field_str(2);
         return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
-                ScriptError::Parse(format!("ff_suspend_execution: {error_code}"))
+                ScriptError::Parse {
+                    fcall: "parse_suspend_result".into(),
+                    execution_id: None,
+                    message: format!("ff_suspend_execution: {error_code}"),
+                }
             }),
         ));
     }
@@ -1846,9 +1908,11 @@ fn parse_suspend_result(
         })
         .map(WaitpointToken::new)
         .ok_or_else(|| {
-            SdkError::from(ScriptError::Parse(
-                "ff_suspend_execution: missing waitpoint_token in response".into(),
-            ))
+            SdkError::from(ScriptError::Parse {
+                fcall: "parse_suspend_result".into(),
+                execution_id: None,
+                message: "ff_suspend_execution: missing waitpoint_token in response".into(),
+            })
         })?;
 
     if sub_status == "ALREADY_SATISFIED" {
@@ -1875,18 +1939,22 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_deliver_signal: expected Array".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_signal_result".into(),
+                execution_id: None,
+                message: "ff_deliver_signal: expected Array".into(),
+            }));
         }
     };
 
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_deliver_signal: bad status code".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_signal_result".into(),
+                execution_id: None,
+                message: "ff_deliver_signal: bad status code".into(),
+            }));
         }
     };
 
@@ -1907,7 +1975,11 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
         let detail = err_field_str(2);
         return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
-                ScriptError::Parse(format!("ff_deliver_signal: {error_code}"))
+                ScriptError::Parse {
+                    fcall: "parse_signal_result".into(),
+                    execution_id: None,
+                    message: format!("ff_deliver_signal: {error_code}"),
+                }
             }),
         ));
     }
@@ -1955,9 +2027,13 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
         .unwrap_or_default();
 
     let signal_id = SignalId::parse(&signal_id_str).map_err(|e| {
-        SdkError::from(ScriptError::Parse(format!(
+        SdkError::from(ScriptError::Parse {
+            fcall: "parse_signal_result".into(),
+            execution_id: None,
+            message: format!(
             "ff_deliver_signal: invalid signal_id from Lua: {e}"
-        )))
+        ),
+        })
     })?;
 
     if effect == "resume_condition_satisfied" {
@@ -1972,18 +2048,22 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_append_frame: expected Array".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_append_frame_result".into(),
+                execution_id: None,
+                message: "ff_append_frame: expected Array".into(),
+            }));
         }
     };
 
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_append_frame: bad status code".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_append_frame_result".into(),
+                execution_id: None,
+                message: "ff_append_frame: bad status code".into(),
+            }));
         }
     };
 
@@ -2004,7 +2084,11 @@ fn parse_append_frame_result(raw: &Value) -> Result<AppendFrameOutcome, SdkError
         let detail = err_field_str(2);
         return Err(SdkError::from(
             ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
-                ScriptError::Parse(format!("ff_append_frame: {error_code}"))
+                ScriptError::Parse {
+                    fcall: "parse_append_frame_result".into(),
+                    execution_id: None,
+                    message: format!("ff_append_frame: {error_code}"),
+                }
             }),
         ));
     }
@@ -2042,18 +2126,22 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_fail_execution: expected Array".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_fail_result".into(),
+                execution_id: None,
+                message: "ff_fail_execution: expected Array".into(),
+            }));
         }
     };
 
     let status_code = match arr.first() {
         Some(Ok(Value::Int(n))) => *n,
         _ => {
-            return Err(SdkError::from(ScriptError::Parse(
-                "ff_fail_execution: bad status code".into(),
-            )));
+            return Err(SdkError::from(ScriptError::Parse {
+                fcall: "parse_fail_result".into(),
+                execution_id: None,
+                message: "ff_fail_execution: bad status code".into(),
+            }));
         }
     };
 
@@ -2075,7 +2163,11 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
         let detail_refs: Vec<&str> = details.iter().map(|s| s.as_str()).collect();
         return Err(SdkError::from(
             ScriptError::from_code_with_details(&error_code, &detail_refs).unwrap_or_else(|| {
-                ScriptError::Parse(format!("ff_fail_execution: {error_code}"))
+                ScriptError::Parse {
+                    fcall: "parse_fail_result".into(),
+                    execution_id: None,
+                    message: format!("ff_fail_execution: {error_code}"),
+                }
             }),
         ));
     }
@@ -2109,9 +2201,13 @@ fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
             })
         }
         "terminal_failed" => Ok(FailOutcome::TerminalFailed),
-        _ => Err(SdkError::from(ScriptError::Parse(format!(
+        _ => Err(SdkError::from(ScriptError::Parse {
+            fcall: "parse_fail_result".into(),
+            execution_id: None,
+            message: format!(
             "ff_fail_execution: unexpected sub-status: {sub_status}"
-        )))),
+        ),
+        })),
     }
 }
 
@@ -2135,12 +2231,20 @@ pub use ff_core::contracts::StreamFrames;
 
 fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
     if count_limit == 0 {
-        return Err(SdkError::Config("count_limit must be >= 1".to_owned()));
+        return Err(SdkError::Config {
+            context: "read_stream_frames".into(),
+            field: Some("count_limit".into()),
+            message: "count_limit must be >= 1".into(),
+        });
     }
     if count_limit > STREAM_READ_HARD_CAP {
-        return Err(SdkError::Config(format!(
-            "count_limit exceeds STREAM_READ_HARD_CAP ({STREAM_READ_HARD_CAP})"
-        )));
+        return Err(SdkError::Config {
+            context: "read_stream_frames".into(),
+            field: Some("count_limit".into()),
+            message: format!(
+                "count_limit exceeds STREAM_READ_HARD_CAP ({STREAM_READ_HARD_CAP})"
+            ),
+        });
     }
     Ok(())
 }
@@ -2274,9 +2378,11 @@ pub async fn tail_stream(
     count_limit: u64,
 ) -> Result<StreamFrames, SdkError> {
     if block_ms > MAX_TAIL_BLOCK_MS {
-        return Err(SdkError::Config(format!(
-            "block_ms exceeds {MAX_TAIL_BLOCK_MS}ms ceiling"
-        )));
+        return Err(SdkError::Config {
+            context: "tail_stream".into(),
+            field: Some("block_ms".into()),
+            message: format!("exceeds {MAX_TAIL_BLOCK_MS}ms ceiling"),
+        });
     }
     validate_stream_read_count(count_limit)?;
 
