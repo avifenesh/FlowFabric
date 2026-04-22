@@ -118,6 +118,11 @@ pub struct Server {
     admin_rotate_semaphore: Arc<tokio::sync::Semaphore>,
     engine: Engine,
     config: ServerConfig,
+    /// Long-lived scheduler instance. Held on the server (not rebuilt per
+    /// claim call) so its rotation cursor can advance across calls — a
+    /// fresh-per-call scheduler would reset the cursor on every tick,
+    /// defeating the fairness property (RFC-009 §scan rotation).
+    scheduler: Arc<ff_scheduler::Scheduler>,
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
     /// dispatch). Drained on shutdown with a bounded timeout.
     background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
@@ -421,6 +426,11 @@ impl Server {
             config.partition_config.num_quota_partitions,
         );
 
+        let scheduler = Arc::new(ff_scheduler::Scheduler::new(
+            client.clone(),
+            config.partition_config,
+        ));
+
         Ok(Self {
             client,
             tail_client,
@@ -433,6 +443,7 @@ impl Server {
             admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             engine,
             config,
+            scheduler,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
         })
     }
@@ -1998,11 +2009,7 @@ impl Server {
         worker_capabilities: &std::collections::BTreeSet<String>,
         grant_ttl_ms: u64,
     ) -> Result<Option<ff_core::contracts::ClaimGrant>, ServerError> {
-        let scheduler = ff_scheduler::Scheduler::new(
-            self.client.clone(),
-            self.config.partition_config,
-        );
-        scheduler
+        self.scheduler
             .claim_for_worker(
                 lane,
                 worker_id,

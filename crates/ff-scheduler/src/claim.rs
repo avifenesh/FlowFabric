@@ -16,6 +16,7 @@ use ff_script::error::ScriptError;
 use ff_script::result::FcallResult;
 use ff_script::retry::is_retryable_kind;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Short stable digest of a worker's capability CSV. Used in per-mismatch
 /// log lines so a worker-caps-CSV up to 4KB does not get echoed on every
@@ -201,6 +202,73 @@ impl BudgetChecker {
     }
 }
 
+/// Tunable scheduler behavior, separate from the topology-level
+/// [`PartitionConfig`]. Lives in `ff-scheduler` because every field is a
+/// scheduler-internal scan policy — none of it leaks into persisted keys,
+/// Lua scripts, or cross-crate wire shapes (unlike `PartitionConfig`).
+/// If a future RFC needs a unified knob surface we can lift this up; not
+/// premature today.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerConfig {
+    /// Maximum number of partitions to probe in a single
+    /// [`Scheduler::claim_for_worker`] call before giving up and returning
+    /// `Ok(None)`.
+    ///
+    /// **Trade-off:** smaller = lower worst-case no-hit latency per claim
+    /// call (each probe is a ZRANGEBYSCORE round-trip, ~0.1ms LAN), larger
+    /// = better fairness per call (more partitions seen before a worker
+    /// yields). At the default of 32 with 256 partitions, any given
+    /// partition is reached within `ceil(256/32) = 8` scheduling ticks —
+    /// combined with the rotation cursor, that bounds worst-case
+    /// starvation for a specific partition's head-of-queue execution.
+    pub max_partitions_per_scan: u16,
+    /// Duration a rotation cursor position stays stable before advancing.
+    ///
+    /// **Trade-off:** too short and tight-loop workers re-enter the same
+    /// window on every tick (cursor never actually rotates relative to
+    /// them); too long and slow-poll workers keep seeing the same cursor
+    /// across many ticks (reducing fairness benefit). 250ms is a middle
+    /// ground: tight-loop workers (sub-ms claim cycles) see a fresh
+    /// window every ~250 ticks, 1s-poll workers see a fresh window every
+    /// 4 ticks. Tune down if your workers all idle-poll >1s; tune up if
+    /// you run a fleet of tight-loop claimers and want less cursor churn.
+    pub rotation_window_ms: u64,
+}
+
+impl SchedulerConfig {
+    /// Default scan budget: probe 32 partitions per claim call.
+    /// See [`Self::max_partitions_per_scan`] for the latency/fairness
+    /// rationale.
+    pub const DEFAULT_MAX_PARTITIONS_PER_SCAN: u16 = 32;
+
+    /// Default rotation window: advance the cursor every 250ms.
+    /// See [`Self::rotation_window_ms`].
+    pub const DEFAULT_ROTATION_WINDOW_MS: u64 = 250;
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_partitions_per_scan: Self::DEFAULT_MAX_PARTITIONS_PER_SCAN,
+            rotation_window_ms: Self::DEFAULT_ROTATION_WINDOW_MS,
+        }
+    }
+}
+
+/// Iterate partitions `[start, start+1, ..., start+count-1] mod total`.
+///
+/// Factored out of [`Scheduler::claim_for_worker`] so the modular-wrap +
+/// bounded-length contract has a dedicated unit test surface, independent
+/// of Valkey. Called with `count <= total`; values are always distinct.
+///
+/// Returns an iterator (not a Vec) to keep the hot claim path allocation-
+/// free — this runs once per claim tick per worker.
+fn iter_partitions(total: u16, start: u16, count: u16) -> impl Iterator<Item = u16> {
+    debug_assert!(total > 0);
+    let count = count.min(total);
+    (0..count).map(move |i| start.wrapping_add(i) % total)
+}
+
 /// Single-lane scheduler with budget/quota pre-checks.
 ///
 /// Iterates execution partitions sequentially, picks the first eligible
@@ -209,14 +277,84 @@ impl BudgetChecker {
 /// 2. Check quota admission (cross-partition FCALL)
 /// 3. If any check fails: block the candidate and try next
 /// 4. If all pass: issue the claim grant
+///
+/// Scan bounding + rotation: each call probes at most
+/// [`SchedulerConfig::max_partitions_per_scan`] partitions starting from
+/// a rotation cursor that advances once per
+/// [`SchedulerConfig::rotation_window_ms`]. The per-worker FNV jitter is
+/// applied on top so different workers diverge within any given window.
 pub struct Scheduler {
     client: ferriskey::Client,
     config: PartitionConfig,
+    scheduler_config: SchedulerConfig,
+    /// Packed rotation state: high 48 bits = last window epoch seen
+    /// (`now_ms / rotation_window_ms`), low 16 bits = current cursor
+    /// partition index. A single atomic keeps "advance cursor iff we're
+    /// the first call in a new window" race-free without a Mutex.
+    rotation_state: AtomicU64,
 }
 
 impl Scheduler {
     pub fn new(client: ferriskey::Client, config: PartitionConfig) -> Self {
-        Self { client, config }
+        Self::with_config(client, config, SchedulerConfig::default())
+    }
+
+    /// Construct a scheduler with an explicit [`SchedulerConfig`].
+    /// Use this when you need non-default scan bounds (e.g., in tests that
+    /// want to walk every partition in one call, or deployments with
+    /// non-default polling cadence). Most callers should use
+    /// [`Self::new`].
+    pub fn with_config(
+        client: ferriskey::Client,
+        config: PartitionConfig,
+        scheduler_config: SchedulerConfig,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            scheduler_config,
+            rotation_state: AtomicU64::new(0),
+        }
+    }
+
+    /// Return the current cursor for this call, advancing it if we're the
+    /// first caller to observe a new rotation window. Pure compare-exchange
+    /// on the packed atomic; no Mutex, no clock dep beyond `now_ms`.
+    fn rotation_cursor(&self, now_ms: u64, num_partitions: u16) -> u16 {
+        let window_ms = self.scheduler_config.rotation_window_ms.max(1);
+        let step = self.scheduler_config.max_partitions_per_scan.max(1);
+        let this_epoch = now_ms / window_ms;
+
+        loop {
+            let prev = self.rotation_state.load(Ordering::Relaxed);
+            let prev_epoch = prev >> 16;
+            let prev_cursor = (prev & 0xFFFF) as u16;
+
+            if prev_epoch == this_epoch {
+                return prev_cursor;
+            }
+            // New window: advance cursor by max_partitions_per_scan so
+            // the next scan covers a fresh slice. Modular wrap on
+            // num_partitions. Zero-partitions is a config bug; caller
+            // guards it, but fall back to 0 to be safe.
+            let new_cursor = if num_partitions == 0 {
+                0
+            } else {
+                prev_cursor.wrapping_add(step) % num_partitions
+            };
+            let new_state = (this_epoch << 16) | u64::from(new_cursor);
+            match self.rotation_state.compare_exchange(
+                prev,
+                new_state,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return new_cursor,
+                // Lost race; another caller advanced. Re-read and use
+                // whatever cursor now belongs to this epoch.
+                Err(_) => continue,
+            }
+        }
     }
 
     /// Find an eligible execution and issue a claim grant.
@@ -241,6 +379,18 @@ impl Scheduler {
         grant_ttl_ms: u64,
     ) -> Result<Option<ClaimGrant>, SchedulerError> {
         let num_partitions = self.config.num_flow_partitions;
+        // Guard misconfiguration: a zero partition count would hit a
+        // `% num_partitions` division-by-zero in the scan_start / jitter
+        // computation below. The pre-bounded loop simply skipped on
+        // `for offset in 0..0`; preserve that graceful no-op rather than
+        // panicking. Config-returning (not Ok(None)) so an operator who
+        // misconfigures gets a loud, actionable error — silent Ok(None)
+        // would make every claim call look like an empty queue forever.
+        if num_partitions == 0 {
+            return Err(SchedulerError::Config(
+                "num_flow_partitions must be > 0".to_owned(),
+            ));
+        }
         let mut budget_checker = BudgetChecker::new(self.config);
 
         // Jitter the partition scan start to avoid thundering-herd on
@@ -314,11 +464,56 @@ impl Scheduler {
             )));
         }
 
-        for offset in 0..num_partitions {
-            // Jittered iteration: start at start_p, wrap modulo num_partitions.
-            // Still covers every partition once per cycle; prevents all
-            // workers from hammering partition 0 first simultaneously.
-            let p_idx = (start_p + offset) % num_partitions;
+        // ── Bounded scan with rotation cursor ──
+        // Prior impl walked all `num_partitions` partitions on every call,
+        // which at `num_flow_partitions = 256` meant a quiet cluster cost
+        // 256 ZRANGEBYSCORE round-trips per claim tick per worker. The
+        // bounded scan caps per-call work at `max_partitions_per_scan`
+        // while the rotation cursor ensures every partition is still
+        // visited within `ceil(total / max_partitions_per_scan)` ticks.
+        //
+        // Needs `now_ms` to compute the rotation window, so we snap server
+        // time up front. One extra TIME round-trip for quiet-cluster no-hit
+        // calls, but on hit paths the existing inner-loop `server_time_ms`
+        // call is now redundant — we reuse this value.
+        let scan_now_ms = match server_time_ms(&self.client).await {
+            Ok(t) => t,
+            Err(e) => {
+                // Transport error talking to Valkey; surface via the same
+                // `ValkeyContext` channel the admission checks use so the
+                // caller retries after backoff instead of silently hitting
+                // partition 0 with a zero cursor.
+                return Err(SchedulerError::ValkeyContext {
+                    source: e,
+                    context: "scheduler: TIME for rotation cursor".to_owned(),
+                });
+            }
+        };
+        let rotation_cursor = self.rotation_cursor(scan_now_ms, num_partitions);
+        // Per-worker jitter stacks on the shared cursor: `start_p` diverges
+        // different workers within one window; `rotation_cursor` drifts the
+        // whole fleet across windows so no single partition is anyone's
+        // permanent "partition 0".
+        let scan_start = (start_p + rotation_cursor) % num_partitions;
+        let scan_budget = self
+            .scheduler_config
+            .max_partitions_per_scan
+            .min(num_partitions)
+            .max(1);
+
+        // Observability counters (RFC-plan item 3): one debug line per
+        // call, not per partition, so a tight-loop worker doesn't flood
+        // logs. `partitions_hit` is 0/1 in practice — the loop returns on
+        // the first grant — but keeping it a counter means future
+        // multi-grant variants (N per call) don't need the log format to
+        // change.
+        let mut partitions_visited: u16 = 0;
+        let mut partitions_skipped: u16 = 0;
+        let mut partitions_hit: u16 = 0;
+        let call_start = std::time::Instant::now();
+
+        for p_idx in iter_partitions(num_partitions, scan_start, scan_budget) {
+            partitions_visited += 1;
             let partition = Partition {
                 family: PartitionFamily::Execution,
                 index: p_idx,
@@ -347,13 +542,20 @@ impl Scheduler {
                         error = %e,
                         "scheduler: ZRANGEBYSCORE eligible failed, skipping partition"
                     );
+                    partitions_skipped += 1;
                     continue;
                 }
             };
 
             let eid_str = match candidates.first() {
                 Some(s) => s,
-                None => continue, // no eligible in this partition
+                None => {
+                    // Empty partition — this is the hot path on a quiet
+                    // cluster and the whole point of the bounded scan.
+                    // Don't count as a "skip" (skip implies something
+                    // went wrong); treat as a normal miss.
+                    continue;
+                }
             };
 
             // Parse the execution ID
@@ -366,6 +568,7 @@ impl Scheduler {
                         error = %e,
                         "scheduler: invalid execution_id in eligible set, skipping"
                     );
+                    partitions_skipped += 1;
                     continue;
                 }
             };
@@ -373,17 +576,13 @@ impl Scheduler {
             let exec_ctx = ExecKeyContext::new(&partition, &eid);
             let core_key = exec_ctx.core();
             let eid_s = eid.to_string();
-            let now_ms = match server_time_ms(&self.client).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(
-                        partition = p_idx,
-                        error = %e,
-                        "scheduler: failed to get server time, skipping partition"
-                    );
-                    continue;
-                }
-            };
+            // Reuse the call-scoped `scan_now_ms` we read for the rotation
+            // cursor. Semantics for block-detail timestamps are unchanged —
+            // a block decision at time T is still written with a T in the
+            // same call; the tiny staleness (<< 1 RTT) is dwarfed by the
+            // usual scheduler→Valkey latency and saves one TIME round-trip
+            // per candidate.
+            let now_ms = scan_now_ms;
 
             // ── Capability pre-check (in-slot HGET, cheap) ──
             // Runs BEFORE quota admission so we never ZADD a quota slot
@@ -521,10 +720,17 @@ impl Scheduler {
 
             match FcallResult::parse(&raw).and_then(|r| r.into_success()) {
                 Ok(_) => {
+                    partitions_hit += 1;
                     tracing::debug!(
                         partition = p_idx,
                         execution_id = eid_s.as_str(),
-                        "scheduler: claim grant issued"
+                        worker_instance_id = worker_instance_id.as_str(),
+                        start_p = scan_start,
+                        partitions_visited,
+                        partitions_skipped,
+                        partitions_hit,
+                        elapsed_ms = call_start.elapsed().as_millis() as u64,
+                        "scheduler: claim call completed (hit)"
                     );
                     return Ok(Some(ClaimGrant {
                         execution_id: eid,
@@ -585,6 +791,15 @@ impl Scheduler {
             }
         }
 
+        tracing::debug!(
+            worker_instance_id = worker_instance_id.as_str(),
+            start_p = scan_start,
+            partitions_visited,
+            partitions_skipped,
+            partitions_hit,
+            elapsed_ms = call_start.elapsed().as_millis() as u64,
+            "scheduler: claim call completed (no hit)"
+        );
         Ok(None)
     }
 
@@ -997,6 +1212,105 @@ mod tests {
     fn scheduler_valkey_kind_exposed() {
         let err = SchedulerError::Valkey(mk_fk_err(ErrorKind::TryAgain));
         assert_eq!(err.valkey_kind(), Some(ErrorKind::TryAgain));
+    }
+
+    // ── iter_partitions: regression test for the modular wrap + bounded
+    // length contract. The fairness behaviour of the bounded scheduler
+    // scan depends entirely on this helper returning exactly `count`
+    // distinct partition indices starting at `start` and wrapping modulo
+    // `total`. Tested in isolation so a bug here is distinguishable from
+    // a bug in the Valkey-backed loop. ──
+
+    #[test]
+    fn iter_partitions_no_wrap() {
+        // start=10, count=5, total=256 → 10..15, no wrap involved.
+        let ps: Vec<u16> = iter_partitions(256, 10, 5).collect();
+        assert_eq!(ps, vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn iter_partitions_wraps_modulo_total() {
+        // start=254, count=5, total=256 → 254, 255, 0, 1, 2.
+        let ps: Vec<u16> = iter_partitions(256, 254, 5).collect();
+        assert_eq!(ps, vec![254, 255, 0, 1, 2]);
+    }
+
+    #[test]
+    fn iter_partitions_count_capped_to_total() {
+        // Asking for more than `total` yields exactly `total` distinct
+        // partitions — never a duplicate, never more than the universe.
+        let ps: Vec<u16> = iter_partitions(4, 1, 100).collect();
+        assert_eq!(ps, vec![1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn iter_partitions_length_matches_count() {
+        // Invariant: output length == min(count, total). The scan loop
+        // upper-bounds round-trips on this, so regressing it would
+        // silently re-introduce the 256-round-trip-per-tick bug.
+        for start in [0u16, 1, 50, 255] {
+            for count in [0u16, 1, 16, 32, 256] {
+                let len = iter_partitions(256, start, count).count();
+                assert_eq!(len, count.min(256) as usize);
+            }
+        }
+    }
+
+    // ── Fairness: the union of the partitions visited across
+    // `ceil(total / max_partitions_per_scan)` successive scans, with the
+    // rotation cursor advancing each scan, must cover every partition
+    // exactly once. This is the contract the operator rustdoc promises
+    // ("any given partition reached within 8 ticks at defaults"). ──
+    #[test]
+    fn fairness_full_coverage_in_ceil_total_over_budget_scans() {
+        const TOTAL: u16 = 256;
+        const BUDGET: u16 = SchedulerConfig::DEFAULT_MAX_PARTITIONS_PER_SCAN;
+        let scans = TOTAL.div_ceil(BUDGET); // 8 at defaults
+
+        // Simulate the same advance logic the live cursor performs: each
+        // "scan" starts at the previous start + BUDGET (mod TOTAL). We
+        // pin start to 0 for determinism; the per-worker FNV jitter is a
+        // phase offset on top and doesn't change coverage.
+        let mut union = std::collections::BTreeSet::new();
+        let mut cursor: u16 = 0;
+        for _ in 0..scans {
+            for p in iter_partitions(TOTAL, cursor, BUDGET) {
+                union.insert(p);
+            }
+            cursor = cursor.wrapping_add(BUDGET) % TOTAL;
+        }
+
+        assert_eq!(union.len(), TOTAL as usize, "every partition visited once");
+        for p in 0..TOTAL {
+            assert!(union.contains(&p), "missing partition {p}");
+        }
+    }
+
+    #[test]
+    fn fairness_full_coverage_with_phase_offset() {
+        // Regression: the per-worker FNV phase must not change the
+        // coverage property. Pick a non-zero start; we still cover the
+        // whole universe in ceil(total/budget) scans.
+        const TOTAL: u16 = 256;
+        const BUDGET: u16 = SchedulerConfig::DEFAULT_MAX_PARTITIONS_PER_SCAN;
+        let scans = TOTAL.div_ceil(BUDGET);
+
+        let mut union = std::collections::BTreeSet::new();
+        let mut cursor: u16 = 137; // arbitrary per-worker jitter
+        for _ in 0..scans {
+            for p in iter_partitions(TOTAL, cursor, BUDGET) {
+                union.insert(p);
+            }
+            cursor = cursor.wrapping_add(BUDGET) % TOTAL;
+        }
+        assert_eq!(union.len(), TOTAL as usize);
+    }
+
+    #[test]
+    fn scheduler_config_defaults_match_rustdoc() {
+        let c = SchedulerConfig::default();
+        assert_eq!(c.max_partitions_per_scan, 32);
+        assert_eq!(c.rotation_window_ms, 250);
     }
 }
 
