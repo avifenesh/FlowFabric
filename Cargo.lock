@@ -838,6 +838,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-script",
+ "serde_json",
  "tracing",
 ]
 

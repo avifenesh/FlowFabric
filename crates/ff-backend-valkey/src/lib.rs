@@ -609,6 +609,459 @@ fn resume_waitpoint_id_from_suspension(
     Ok(Some(waitpoint_id))
 }
 
+// ── Tranche 2: terminal writes (delay, wait_children, complete, fail, cancel) ──
+
+/// Stage 1b — `delay` FCALL body. Migrated from
+/// `ff_sdk::task::ClaimedTask::delay_execution`. 9 KEYS, 5 ARGV.
+async fn delay_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    delay_until: TimestampMs,
+) -> Result<(), EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(f.attempt_index),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lease_expiry(),
+        idx.worker_leases(&f.worker_instance_id),
+        idx.lane_active(&f.lane_id),
+        idx.lane_delayed(&f.lane_id),
+        idx.attempt_timeout(),
+    ];
+
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        f.attempt_id.to_string(),
+        delay_until.to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_delay_execution", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    parse_success_only(&raw)
+}
+
+/// Stage 1b — `wait_children` FCALL body. Migrated from
+/// `ff_sdk::task::ClaimedTask::move_to_waiting_children`. 9 KEYS, 4
+/// ARGV.
+async fn wait_children_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+) -> Result<(), EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(f.attempt_index),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lease_expiry(),
+        idx.worker_leases(&f.worker_instance_id),
+        idx.lane_active(&f.lane_id),
+        idx.lane_blocked_dependencies(&f.lane_id),
+        idx.attempt_timeout(),
+    ];
+
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        f.attempt_id.to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_move_to_waiting_children", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    parse_success_only(&raw)
+}
+
+/// Stage 1b — `complete` FCALL body + replay reconciliation.
+/// Migrated from `ff_sdk::task::ClaimedTask::complete`. 12 KEYS, 5
+/// ARGV.
+///
+/// # Replay reconciliation
+///
+/// If the FCALL returns `ExecutionNotActive` AND the stored
+/// `terminal_outcome` is `"success"` AND `lease_epoch` +
+/// `attempt_id` match the caller's handle, the Ok path is taken:
+/// the prior commit landed and the network drop hit after commit.
+/// Any other `ExecutionNotActive` combination surfaces the error
+/// so the caller learns what actually happened.
+async fn complete_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    payload: Option<Vec<u8>>,
+) -> Result<(), EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(f.attempt_index),
+        idx.lease_expiry(),
+        idx.worker_leases(&f.worker_instance_id),
+        idx.lane_terminal(&f.lane_id),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lane_active(&f.lane_id),
+        ctx.stream_meta(f.attempt_index),
+        ctx.result(),
+        idx.attempt_timeout(),
+        idx.execution_deadline(),
+    ];
+
+    let result_bytes = payload.unwrap_or_default();
+    let result_str = String::from_utf8_lossy(&result_bytes);
+
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        f.attempt_id.to_string(),
+        result_str.into_owned(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_complete_execution", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    let err = match parse_success_only(&raw) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if reconcile_terminal_replay(&err, f, "success") {
+        return Ok(());
+    }
+    Err(err)
+}
+
+/// Stage 1b — `cancel` FCALL body + replay reconciliation. Migrated
+/// from `ff_sdk::task::ClaimedTask::cancel_inner`. 21 KEYS (of which
+/// slots 9/10 depend on the `current_waitpoint_id` field in
+/// `exec_core`; if absent, a placeholder `WaitpointId` is used — the
+/// Lua side tolerates this), 5 ARGV. Reconciles to `Ok` when the
+/// stored `terminal_outcome == "cancelled"`.
+async fn cancel_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    reason: &str,
+) -> Result<(), EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    // Read `current_waitpoint_id` exactly as the SDK did; needed for
+    // slots 9 + 10. Falls back to a placeholder UUID for not-suspended
+    // executions; Lua tolerates the placeholder.
+    let wp_id_str: Option<String> = client
+        .hget(&ctx.core(), "current_waitpoint_id")
+        .await
+        .map_err(transport_fk)?;
+    let wp_id = match wp_id_str.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => match WaitpointId::parse(s) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = %f.execution_id,
+                    raw = %s,
+                    error = %e,
+                    "corrupt waitpoint_id in exec_core, using placeholder"
+                );
+                WaitpointId::new()
+            }
+        },
+        None => WaitpointId::default(),
+    };
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(f.attempt_index),
+        ctx.stream_meta(f.attempt_index),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lease_expiry(),
+        idx.worker_leases(&f.worker_instance_id),
+        ctx.suspension_current(),
+        ctx.waitpoint(&wp_id),
+        ctx.waitpoint_condition(&wp_id),
+        idx.suspension_timeout(),
+        idx.lane_terminal(&f.lane_id),
+        idx.attempt_timeout(),
+        idx.execution_deadline(),
+        idx.lane_eligible(&f.lane_id),
+        idx.lane_delayed(&f.lane_id),
+        idx.lane_blocked_dependencies(&f.lane_id),
+        idx.lane_blocked_budget(&f.lane_id),
+        idx.lane_blocked_quota(&f.lane_id),
+        idx.lane_blocked_route(&f.lane_id),
+        idx.lane_blocked_operator(&f.lane_id),
+    ];
+
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        reason.to_owned(),
+        "worker".to_owned(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_cancel_execution", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    let err = match parse_success_only(&raw) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if reconcile_terminal_replay(&err, f, "cancelled") {
+        return Ok(());
+    }
+    Err(err)
+}
+
+/// Stage 1b — `fail` FCALL body + replay reconciliation. Migrated
+/// from `ff_sdk::task::ClaimedTask::fail`. 12 KEYS, 7 ARGV.
+///
+/// The `FailureClass` is mapped to the Lua `error_category` string
+/// at the call boundary; the SDK's string shape was free-form so we
+/// pick the Lua-side canonical lower_snake_case for each enum
+/// variant. Future trait amendments (issue #117 family) may widen
+/// `FailureClass` with a `Custom(String)` arm; for now the 5 named
+/// variants cover every shape the SDK exercises today.
+///
+/// `FailureReason.message` maps to the `failure_reason` ARGV slot.
+/// `FailureReason.detail` is not yet surfaced to Lua — the SDK's
+/// pre-Stage-1b call site passed the reason string straight through
+/// and Lua records that as `failure_reason`; Stage 1b preserves the
+/// shape to keep a zero-behavior-change guarantee. A future commit
+/// can thread `detail` once Lua grows a slot for it.
+async fn fail_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    reason: FailureReason,
+    classification: FailureClass,
+) -> Result<FailOutcome, EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(f.attempt_index),
+        idx.lease_expiry(),
+        idx.worker_leases(&f.worker_instance_id),
+        idx.lane_terminal(&f.lane_id),
+        idx.lane_delayed(&f.lane_id),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lane_active(&f.lane_id),
+        ctx.stream_meta(f.attempt_index),
+        idx.attempt_timeout(),
+        idx.execution_deadline(),
+    ];
+
+    let retry_policy_json = read_retry_policy_json(client, &ctx, &f.execution_id).await?;
+
+    let error_category = failure_class_to_lua_string(classification);
+
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        f.attempt_id.to_string(),
+        reason.message,
+        error_category.to_owned(),
+        retry_policy_json,
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_fail_execution", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    match parse_fail_result_engine(&raw) {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            // Replay reconciliation: two shapes valid for fail.
+            //   - lifecycle=terminal, outcome=failed -> TerminalFailed
+            //   - lifecycle=runnable                 -> RetryScheduled { delay_until = 0 }
+            if let EngineError::Contention(
+                ff_core::engine_error::ContentionKind::ExecutionNotActive {
+                    ref terminal_outcome,
+                    ref lease_epoch,
+                    ref lifecycle_phase,
+                    ref attempt_id,
+                },
+            ) = err
+                && lease_epoch == &f.lease_epoch.to_string()
+            {
+                match (lifecycle_phase.as_str(), terminal_outcome.as_str()) {
+                    ("terminal", "failed") if attempt_id == &f.attempt_id.to_string() => {
+                        return Ok(FailOutcome::TerminalFailed);
+                    }
+                    ("runnable", _) => {
+                        return Ok(FailOutcome::RetryScheduled {
+                            delay_until: TimestampMs::from_millis(0),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Reconcile a terminal-op `ExecutionNotActive` against the caller's
+/// handle: `true` iff the stored `terminal_outcome` matches
+/// `expected_outcome` AND the epoch + attempt both match this
+/// caller's claim. Shared by `complete` / `cancel`; `fail` has a
+/// two-shape path inlined above.
+fn reconcile_terminal_replay(
+    err: &EngineError,
+    f: &handle_codec::HandleFields,
+    expected_outcome: &str,
+) -> bool {
+    if let EngineError::Contention(
+        ff_core::engine_error::ContentionKind::ExecutionNotActive {
+            ref terminal_outcome,
+            ref lease_epoch,
+            ref attempt_id,
+            ..
+        },
+    ) = *err
+    {
+        terminal_outcome == expected_outcome
+            && lease_epoch == &f.lease_epoch.to_string()
+            && attempt_id == &f.attempt_id.to_string()
+    } else {
+        false
+    }
+}
+
+/// Parse `ff_fail_execution` success envelope into `FailOutcome`.
+/// Mirrors `ff_sdk::task::parse_fail_result` on the success side;
+/// errors route through `FcallResult`/`ScriptError`→`EngineError`.
+fn parse_fail_result_engine(raw: &ferriskey::Value) -> Result<FailOutcome, EngineError> {
+    let parsed = FcallResult::parse(raw)
+        .map_err(EngineError::from)?
+        .into_success()
+        .map_err(EngineError::from)?;
+    // `field_str(0)` is the sub_status (Lua returns:
+    //   ok("retry_scheduled", tostring(delay_until))
+    //   ok("terminal_failed")
+    // `FcallResult::into_success` strips the leading `1` + `"OK"`
+    // wrapper, so fields[0] here is the sub-status slot.
+    let sub_status = parsed.field_str(0);
+    match sub_status.as_str() {
+        "retry_scheduled" => {
+            let delay_str = parsed.field_str(1);
+            let delay_until = delay_str.parse::<i64>().unwrap_or(0);
+            Ok(FailOutcome::RetryScheduled {
+                delay_until: TimestampMs::from_millis(delay_until),
+            })
+        }
+        "terminal_failed" => Ok(FailOutcome::TerminalFailed),
+        other => Err(EngineError::from(ScriptError::Parse {
+            fcall: "ff_fail_execution".into(),
+            execution_id: None,
+            message: format!("unexpected sub-status: {other}"),
+        })),
+    }
+}
+
+/// Map the trait's `FailureClass` enum to the Lua-side `error_category`
+/// ARGV string. The 5 variants plus a non-exhaustive fallback cover
+/// every call site the SDK exercises today. When issue #117 or a
+/// follow-up RFC widens `FailureClass` with a `Custom(String)` arm,
+/// this match gains a pass-through for the new arm.
+fn failure_class_to_lua_string(c: FailureClass) -> &'static str {
+    match c {
+        FailureClass::Transient => "transient",
+        FailureClass::Permanent => "permanent",
+        FailureClass::InfraCrash => "infra_crash",
+        FailureClass::Timeout => "timeout",
+        FailureClass::Cancelled => "cancelled",
+        // `#[non_exhaustive]` — fall through to the least-destructive
+        // known category so a newly-added variant does not silently
+        // hard-fail an attempt. Follow-up RFCs that add variants must
+        // update this match explicitly.
+        _ => "transient",
+    }
+}
+
+/// Read the execution's retry policy JSON from `exec_policy`. Used by
+/// `fail_impl` — the FCALL's `retry_policy_json` ARGV is the
+/// serialised `retry_policy` key extracted from the stored policy
+/// JSON. Malformed stored JSON degrades to an empty string (matches
+/// the SDK's pre-migration behaviour — Lua then applies no-retry
+/// defaults).
+async fn read_retry_policy_json(
+    client: &ferriskey::Client,
+    ctx: &ExecKeyContext,
+    execution_id: &ExecutionId,
+) -> Result<String, EngineError> {
+    let policy_str: Option<String> = client
+        .get(&ctx.policy())
+        .await
+        .map_err(transport_fk)?;
+    match policy_str {
+        Some(json) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(policy) => {
+                if let Some(retry) = policy.get("retry_policy") {
+                    return Ok(serde_json::to_string(retry).unwrap_or_default());
+                }
+                Ok(String::new())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "malformed retry policy JSON, treating as no policy"
+                );
+                Ok(String::new())
+            }
+        },
+        None => Ok(String::new()),
+    }
+}
+
 #[async_trait]
 impl EngineBackend for ValkeyBackend {
     async fn claim(
@@ -648,23 +1101,26 @@ impl EngineBackend for ValkeyBackend {
 
     async fn complete(
         &self,
-        _handle: &Handle,
-        _payload: Option<Vec<u8>>,
+        handle: &Handle,
+        payload: Option<Vec<u8>>,
     ) -> Result<(), EngineError> {
-        Err(EngineError::Unavailable { op: "complete" })
+        let f = handle_codec::decode_handle(handle)?;
+        complete_impl(&self.client, &self.partition_config, &f, payload).await
     }
 
     async fn fail(
         &self,
-        _handle: &Handle,
-        _reason: FailureReason,
-        _classification: FailureClass,
+        handle: &Handle,
+        reason: FailureReason,
+        classification: FailureClass,
     ) -> Result<FailOutcome, EngineError> {
-        Err(EngineError::Unavailable { op: "fail" })
+        let f = handle_codec::decode_handle(handle)?;
+        fail_impl(&self.client, &self.partition_config, &f, reason, classification).await
     }
 
-    async fn cancel(&self, _handle: &Handle, _reason: &str) -> Result<(), EngineError> {
-        Err(EngineError::Unavailable { op: "cancel" })
+    async fn cancel(&self, handle: &Handle, reason: &str) -> Result<(), EngineError> {
+        let f = handle_codec::decode_handle(handle)?;
+        cancel_impl(&self.client, &self.partition_config, &f, reason).await
     }
 
     async fn suspend(
@@ -695,16 +1151,16 @@ impl EngineBackend for ValkeyBackend {
 
     async fn delay(
         &self,
-        _handle: &Handle,
-        _delay_until: TimestampMs,
+        handle: &Handle,
+        delay_until: TimestampMs,
     ) -> Result<(), EngineError> {
-        Err(EngineError::Unavailable { op: "delay" })
+        let f = handle_codec::decode_handle(handle)?;
+        delay_impl(&self.client, &self.partition_config, &f, delay_until).await
     }
 
-    async fn wait_children(&self, _handle: &Handle) -> Result<(), EngineError> {
-        Err(EngineError::Unavailable {
-            op: "wait_children",
-        })
+    async fn wait_children(&self, handle: &Handle) -> Result<(), EngineError> {
+        let f = handle_codec::decode_handle(handle)?;
+        wait_children_impl(&self.client, &self.partition_config, &f).await
     }
 
     async fn describe_execution(
