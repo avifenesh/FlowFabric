@@ -23,8 +23,9 @@ pub const MAX_BUDGET_DIMENSIONS: usize = 64;
 /// `hash_tag` is the budget partition's Valkey hash-tag (e.g. `{b:3}`,
 /// braces included) so the typed wrapper can wrap any per-call `dedup_key`
 /// into a slot-co-located `ff:usagededup:{b:M}:<dedup_id>` key without the
-/// caller needing to know the wrapping format. Mirrors
-/// [`ff_core::keys::ExecKeyContext::hash_tag`] (#108).
+/// caller needing to know the wrapping format. The canonical source for
+/// the value to pass is [`ff_core::keys::BudgetKeyContext::hash_tag`]
+/// (#108).
 pub struct BudgetOpKeys<'a> {
     pub usage_key: &'a str,
     pub limits_key: &'a str,
@@ -210,7 +211,7 @@ pub async fn ff_report_usage_and_check(
     // boundary. Empty/missing dedup_key forwards as empty string
     // (Lua disables dedup in that branch).
     let dedup_key_val = args.dedup_key
-        .as_ref()
+        .as_deref()
         .filter(|s| !s.is_empty())
         .map(|s| usage_dedup_key(k.hash_tag, s))
         .unwrap_or_default();
