@@ -7,7 +7,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Breaking — `ff_core::backend::Frame` extended (RFC-012 §R7, PR #146):**
+- **Breaking — `ff_core::backend::Frame` extended (RFC-012 §R7, PR #147):**
   Added `frame_type: String` + `correlation_id: Option<String>` so
   `ClaimedTask::append_frame` can forward through the `EngineBackend`
   trait without wire-parity regression. Closes the Round-7
