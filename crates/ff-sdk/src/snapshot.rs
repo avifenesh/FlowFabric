@@ -685,7 +685,13 @@ impl FlowFabricWorker {
         };
         let partition = flow_partition(&flow_id, self.partition_config());
         let ctx = FlowKeyContext::new(&partition, &flow_id);
-        self.list_edges_from_set(&ctx.outgoing(upstream_eid), &flow_id).await
+        self.list_edges_from_set(
+            &ctx.outgoing(upstream_eid),
+            &flow_id,
+            upstream_eid,
+            AdjacencySide::Outgoing,
+        )
+        .await
     }
 
     /// List all incoming dependency edges landing on an execution.
@@ -699,18 +705,30 @@ impl FlowFabricWorker {
         };
         let partition = flow_partition(&flow_id, self.partition_config());
         let ctx = FlowKeyContext::new(&partition, &flow_id);
-        self.list_edges_from_set(&ctx.incoming(downstream_eid), &flow_id).await
+        self.list_edges_from_set(
+            &ctx.incoming(downstream_eid),
+            &flow_id,
+            downstream_eid,
+            AdjacencySide::Incoming,
+        )
+        .await
     }
 
     /// `HGET exec_core.flow_id` and parse to a [`FlowId`]. `None` when
     /// the exec_core hash is absent OR the flow_id field is empty
     /// (standalone execution).
+    ///
+    /// Also pins the RFC-011 co-location invariant
+    /// (`execution_partition(eid) == flow_partition(flow_id)`) — a
+    /// parsed-but-wrong flow_id would otherwise silently route the
+    /// follow-up adjacency reads to the wrong partition and return
+    /// bogus empty results. A mismatch surfaces as `SdkError::Config`.
     async fn resolve_flow_id(
         &self,
         eid: &ExecutionId,
     ) -> Result<Option<FlowId>, SdkError> {
-        let partition = execution_partition(eid, self.partition_config());
-        let ctx = ExecKeyContext::new(&partition, eid);
+        let exec_partition = execution_partition(eid, self.partition_config());
+        let ctx = ExecKeyContext::new(&exec_partition, eid);
         let raw: Option<String> = self
             .client()
             .cmd("HGET")
@@ -725,22 +743,39 @@ impl FlowFabricWorker {
         let Some(raw) = raw.filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
-        FlowId::parse(&raw)
-            .map(Some)
-            .map_err(|e| {
-                SdkError::Config(format!(
-                    "list_edges: exec_core.flow_id '{raw}' is not a valid UUID \
-                     (key corruption?): {e}"
-                ))
-            })
+        let flow_id = FlowId::parse(&raw).map_err(|e| {
+            SdkError::Config(format!(
+                "list_edges: exec_core.flow_id '{raw}' is not a valid UUID \
+                 (key corruption?): {e}"
+            ))
+        })?;
+        let flow_partition_index = flow_partition(&flow_id, self.partition_config()).index;
+        if exec_partition.index != flow_partition_index {
+            return Err(SdkError::Config(format!(
+                "list_edges: exec_core.flow_id '{flow_id}' partition \
+                 {flow_partition_index} does not match execution partition \
+                 {} (RFC-011 co-location violation; key corruption?)",
+                exec_partition.index
+            )));
+        }
+        Ok(Some(flow_id))
     }
 
     /// Shared body for `list_incoming_edges` / `list_outgoing_edges`:
     /// SMEMBERS + pipelined HGETALL.
+    ///
+    /// `subject_eid` + `side` pin the expected endpoint on each
+    /// returned `EdgeSnapshot`: an adjacency SET entry whose edge
+    /// hash points at a different upstream (for `Outgoing` listings)
+    /// or downstream (for `Incoming`) is treated as corruption and
+    /// surfaced as `SdkError::Config`, matching the strict-parse
+    /// posture elsewhere in this module.
     async fn list_edges_from_set(
         &self,
         adj_key: &str,
         flow_id: &FlowId,
+        subject_eid: &ExecutionId,
+        side: AdjacencySide,
     ) -> Result<Vec<EdgeSnapshot>, SdkError> {
         let edge_id_strs: Vec<String> = self
             .client()
@@ -801,10 +836,38 @@ impl FlowFabricWorker {
                      but its edge_hash is absent (key corruption?)"
                 )));
             }
-            out.push(build_edge_snapshot(flow_id, edge_id, &raw)?);
+            let snap = build_edge_snapshot(flow_id, edge_id, &raw)?;
+            // Cross-check: the edge hash's endpoint on the listed side
+            // must match the execution we're listing for. A mismatch
+            // means the adjacency SET and edge hash disagree (e.g. a
+            // stale or corrupted SET entry) — refuse to silently
+            // return an edge the caller did not ask about.
+            let endpoint = match side {
+                AdjacencySide::Outgoing => &snap.upstream_execution_id,
+                AdjacencySide::Incoming => &snap.downstream_execution_id,
+            };
+            if endpoint != subject_eid {
+                return Err(SdkError::Config(format!(
+                    "list_edges: adjacency SET for execution '{subject_eid}' \
+                     (side={side:?}) contains edge '{edge_id}' whose stored \
+                     endpoint is '{endpoint}' (adjacency/edge-hash drift?)"
+                )));
+            }
+            out.push(snap);
         }
         Ok(out)
     }
+}
+
+/// Which side of an adjacency SET the subject execution lives on.
+/// Used by [`list_edges_from_set`] to cross-check the returned edge's
+/// stored endpoint against the listing's subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdjacencySide {
+    /// Outgoing: subject is the `upstream_execution_id` on each edge.
+    Outgoing,
+    /// Incoming: subject is the `downstream_execution_id` on each edge.
+    Incoming,
 }
 
 /// Assemble an [`EdgeSnapshot`] from the raw HGETALL field map. Kept

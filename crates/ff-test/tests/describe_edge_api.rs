@@ -388,6 +388,54 @@ async fn list_edges_returns_all_adjacent_edges() {
 }
 
 #[tokio::test]
+async fn list_edges_detects_adjacency_endpoint_drift() {
+    // Stamp a stale edge_id into an adjacency SET for an execution
+    // that is NOT actually the edge's endpoint. The fix for the
+    // Copilot review-comment catches this as corruption: the SET
+    // claims the edge is outgoing from `innocent`, but the edge
+    // hash's stored upstream is `up`. Must surface as Config.
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    seed_partition_config(&tc).await;
+    let worker = build_worker("drift").await;
+
+    let fid = FlowId::new();
+    create_flow(&tc, &fid).await;
+    let up = create_and_add_member(&tc, &fid).await;
+    let down = create_and_add_member(&tc, &fid).await;
+    let innocent = create_and_add_member(&tc, &fid).await;
+    let edge = stage_edge(&tc, &fid, &up, &down, 3, "").await;
+
+    // Directly SADD the edge_id into innocent's outgoing set.
+    let config = test_config();
+    let partition = flow_partition(&fid, &config);
+    let fctx = FlowKeyContext::new(&partition, &fid);
+    let _: i64 = tc
+        .client()
+        .cmd("SADD")
+        .arg(fctx.outgoing(&innocent))
+        .arg(edge.to_string())
+        .execute()
+        .await
+        .unwrap();
+
+    let err = worker
+        .list_outgoing_edges(&innocent)
+        .await
+        .expect_err("endpoint drift must surface");
+    match err {
+        ff_sdk::SdkError::Config(msg) => {
+            assert!(msg.contains("adjacency"), "msg: {msg}");
+            assert!(
+                msg.contains("stored endpoint"),
+                "msg should name drift: {msg}"
+            );
+        }
+        other => panic!("expected Config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn describe_edge_corrupt_state_surfaces_error() {
     // A future FF field rename or on-disk drift lands a non-FF-owned
     // unknown key. Must fail loud, matching the strict-parse posture.
