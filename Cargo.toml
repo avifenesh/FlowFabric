@@ -10,6 +10,7 @@ members = [
     "crates/ff-sdk",
     "crates/ff-test",
     "crates/ff-server",
+    "crates/ff-readiness-tests",
 ]
 
 [workspace.package]

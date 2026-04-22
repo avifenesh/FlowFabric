@@ -1,0 +1,19 @@
+   Compiling ff-readiness-tests v0.3.0 (/home/ubuntu/ff-worker-d-readiness/crates/ff-readiness-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.23s
+     Running tests/lifecycle_happy_path.rs (target/debug/deps/lifecycle_happy_path-7b2847340fe83d0b)
+
+running 1 test
+test lifecycle_happy_path ... 
+thread 'lifecycle_happy_path' panicked at crates/ff-readiness-tests/tests/lifecycle_happy_path.rs:191:13:
+timed out waiting for execution {fp:3}:48833442-f086-45c6-8472-8c190dd931f0 to reach terminal (5s); last public_state=Active
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lifecycle_happy_path
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+
+error: test failed, to rerun pass `-p ff-readiness-tests --test lifecycle_happy_path`

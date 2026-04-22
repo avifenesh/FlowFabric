@@ -1,0 +1,42 @@
+[package]
+name = "ff-readiness-tests"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "FlowFabric readiness tests — release-gate smoke tests (PR-D1)"
+
+# Skip cargo-release version bumps — dev-only, never published.
+[package.metadata.release]
+release = false
+
+[features]
+# Default OFF so `cargo test --workspace` does not attempt to run these.
+# CI enables `readiness` on the dedicated matrix cell (PR-D4).
+readiness = []
+
+[dependencies]
+# PR-D1 uses the in-process ff-server + in-process SDK worker. Dependencies
+# that later PRs will add (ff-script / ff-scheduler for FCALL-level helpers,
+# hmac/sha2/hex for waitpoint-token signing, uuid for ad-hoc ids, serde for
+# evidence deserialization) live on the branches that introduce them — kept
+# out here so `cargo-machete` stays green on the default workspace lint.
+ff-core = { workspace = true }
+ff-engine = { workspace = true }
+ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
+ff-server = { workspace = true }
+ff-test = { workspace = true }
+ferriskey = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "process"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { workspace = true }
+
+[dev-dependencies]
+# `serial_test` is only used by `tests/*.rs` (readiness integration
+# tests) — keep it off the library dependency surface per reviewer.
+serial_test = "3"
