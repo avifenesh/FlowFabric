@@ -1,0 +1,20 @@
+
+running 1 test
+test readme_literal_quickstart_boot ... FAILED
+
+failures:
+
+---- readme_literal_quickstart_boot stdout ----
+
+thread 'readme_literal_quickstart_boot' panicked at crates/ff-readiness-tests/tests/readme_literal.rs:118:5:
+assertion `left == right` failed: README quickstart env var must match ServerConfig::from_env; investigate README or config.rs drift before editing this assertion
+  left: "FF_WRONG_SECRET"
+ right: "FF_WAITPOINT_HMAC_SECRET"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    readme_literal_quickstart_boot
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
