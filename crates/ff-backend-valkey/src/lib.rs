@@ -686,6 +686,287 @@ fn resume_waitpoint_id_from_suspension(
     Ok(Some(waitpoint_id))
 }
 
+// ── RFC-012 §R7: append_frame / create_waitpoint / report_usage bodies ──
+
+/// Map `FrameKind` → the Lua-side `frame_type` string. The Lua wire is
+/// free-form (`ff_append_frame` stores `frame_type` opaquely), so the
+/// mapping is a stable encoding of the enum variant names matching the
+/// values the SDK callers used pre-migration.
+fn frame_kind_to_str(k: ff_core::backend::FrameKind) -> &'static str {
+    match k {
+        ff_core::backend::FrameKind::Stdout => "stdout",
+        ff_core::backend::FrameKind::Stderr => "stderr",
+        ff_core::backend::FrameKind::Event => "event",
+        ff_core::backend::FrameKind::Blob => "blob",
+        // `FrameKind` is `#[non_exhaustive]`. Unknown variants fall
+        // back to "event" (the most generic of the four) so a
+        // newly-added kind does not hard-fail an append on an
+        // intermediate-version backend; follow-up PRs that add a
+        // variant update this match explicitly.
+        _ => "event",
+    }
+}
+
+/// Round-7 — `append_frame` FCALL body. Migrated from
+/// `ff_sdk::task::ClaimedTask::append_frame`. 3 KEYS, 13 ARGV.
+///
+/// Byte-for-byte ARGV parity with the SDK's pre-migration call (see
+/// `crates/ff-sdk/src/task.rs` at the `ff_append_frame` FCALL site):
+/// retention_maxlen = "10000", source = "worker",
+/// max_payload_bytes = "65536", encoding = "utf8". A trait-level knob
+/// for those constants is future work (RFC-012 §R7.5.6 shape
+/// commitment — not changing the wire under this refactor).
+async fn append_frame_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    frame: Frame,
+) -> Result<AppendFrameOutcome, EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+
+    let now = now_ms_timestamp();
+    let payload_str = String::from_utf8_lossy(&frame.bytes).into_owned();
+    let frame_type = frame_kind_to_str(frame.kind);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.stream(f.attempt_index),
+        ctx.stream_meta(f.attempt_index),
+    ];
+
+    // ARGV (13): execution_id, attempt_index, lease_id, lease_epoch,
+    //            frame_type, ts, payload, encoding, correlation_id,
+    //            source, retention_maxlen, attempt_id, max_payload_bytes
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.attempt_index.to_string(),
+        f.lease_id.to_string(),
+        f.lease_epoch.to_string(),
+        frame_type.to_owned(),
+        now.to_string(),
+        payload_str,
+        "utf8".to_owned(),
+        String::new(), // correlation_id — trait `Frame` has no slot today
+        "worker".to_owned(),
+        "10000".to_owned(),
+        f.attempt_id.to_string(),
+        "65536".to_owned(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_append_frame", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    let parsed = FcallResult::parse(&raw)
+        .map_err(EngineError::from)?
+        .into_success()
+        .map_err(EngineError::from)?;
+
+    // ok(entry_id, frame_count) — `fields` is 0-indexed past status.
+    let stream_id = parsed.field_str(0);
+    let frame_count: u64 = parsed.field_str(1).parse().unwrap_or(0);
+
+    Ok(AppendFrameOutcome {
+        stream_id,
+        frame_count,
+    })
+}
+
+/// Round-7 — `create_waitpoint` FCALL body. Migrated from
+/// `ff_sdk::task::ClaimedTask::create_pending_waitpoint`. 4 KEYS, 5
+/// ARGV. Mints a fresh `WaitpointId` client-side and returns the
+/// server-assigned HMAC token.
+async fn create_waitpoint_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    waitpoint_key: &str,
+    expires_in: Duration,
+) -> Result<PendingWaitpoint, EngineError> {
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let waitpoint_id = WaitpointId::new();
+    let expires_at =
+        TimestampMs::from_millis(now_ms_timestamp().0 + expires_in.as_millis() as i64);
+
+    let keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.waitpoint(&waitpoint_id),
+        idx.pending_waitpoint_expiry(),
+        idx.waitpoint_hmac_secrets(),
+    ];
+
+    let args: Vec<String> = vec![
+        f.execution_id.to_string(),
+        f.attempt_index.to_string(),
+        waitpoint_id.to_string(),
+        waitpoint_key.to_owned(),
+        expires_at.to_string(),
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_create_pending_waitpoint", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    let parsed = FcallResult::parse(&raw)
+        .map_err(EngineError::from)?
+        .into_success()
+        .map_err(EngineError::from)?;
+
+    // Response fields (after status+OK): waitpoint_id, waitpoint_key, waitpoint_token.
+    let token_str = parsed.field_str(2);
+    if token_str.is_empty() {
+        return Err(EngineError::from(ScriptError::Parse {
+            fcall: "ff_create_pending_waitpoint".into(),
+            execution_id: Some(f.execution_id.to_string()),
+            message: "missing waitpoint_token in response".into(),
+        }));
+    }
+
+    Ok(PendingWaitpoint::new(
+        waitpoint_id,
+        ff_core::backend::WaitpointHmac::new(token_str),
+    ))
+}
+
+/// Round-7 — `report_usage` FCALL body. Migrated from
+/// `ff_sdk::task::ClaimedTask::report_usage`. 3 KEYS, N ARGV (variable
+/// by dimension count).
+///
+/// `UsageDimensions::custom` carries `(dim_name, delta)` pairs; the
+/// trait today exposes only the `custom` map (plus `input_tokens /
+/// output_tokens / wall_ms` as reserved fields). The wire transmits
+/// only the caller-supplied custom dimensions in the same format the
+/// SDK used pre-migration: dim_count, dim_1..N, delta_1..N, now_ms,
+/// dedup_key. `input_tokens`/`output_tokens`/`wall_ms` are currently
+/// reserved-but-inert on the wire — the SDK never surfaced them
+/// either, so preserving that behaviour keeps byte-for-byte wire
+/// parity.
+async fn report_usage_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    budget: &BudgetId,
+    dimensions: UsageDimensions,
+) -> Result<ReportUsageResult, EngineError> {
+    use ff_core::keys::{usage_dedup_key, BudgetKeyContext};
+    use ff_core::partition::budget_partition;
+
+    let partition = budget_partition(budget, partition_config);
+    let bctx = BudgetKeyContext::new(&partition, budget);
+
+    let keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
+
+    let now = now_ms_timestamp();
+    let dim_count = dimensions.custom.len();
+    let mut argv: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
+    argv.push(dim_count.to_string());
+    for name in dimensions.custom.keys() {
+        argv.push(name.clone());
+    }
+    for delta in dimensions.custom.values() {
+        argv.push(delta.to_string());
+    }
+    argv.push(now.to_string());
+    let dedup_key_val = dimensions
+        .dedup_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(|k| usage_dedup_key(bctx.hash_tag(), k))
+        .unwrap_or_default();
+    argv.push(dedup_key_val);
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+    let raw = client
+        .fcall::<ferriskey::Value>("ff_report_usage_and_check", &key_refs, &argv_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    parse_report_usage(&raw, &f.execution_id)
+}
+
+/// Parse a `ff_report_usage_and_check` reply into `ReportUsageResult`.
+///
+/// Lua wire: `{1, "OK"}`, `{1, "ALREADY_APPLIED"}`,
+/// `{1, "SOFT_BREACH", dim, current, limit}`,
+/// `{1, "HARD_BREACH", dim, current, limit}`; `{0, <code>, …}` on
+/// failure. The status code is always `1` on any recognised outcome
+/// (the breach shapes are sub-statuses of success on the wire —
+/// `ReportUsageResult` IS the outcome space, and the `Err` path is
+/// reserved for transport/invariant faults).
+fn parse_report_usage(
+    raw: &ferriskey::Value,
+    execution_id: &ExecutionId,
+) -> Result<ReportUsageResult, EngineError> {
+    let parsed = FcallResult::parse(raw)
+        .map_err(EngineError::from)?
+        .into_success()
+        .map_err(EngineError::from)?;
+
+    match parsed.status.as_str() {
+        "OK" => Ok(ReportUsageResult::Ok),
+        "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
+        "SOFT_BREACH" => {
+            let dim = parsed.field_str(0);
+            let current = parse_u64_field(&parsed, 1, "SOFT_BREACH", "current_usage", execution_id)?;
+            let limit = parse_u64_field(&parsed, 2, "SOFT_BREACH", "soft_limit", execution_id)?;
+            Ok(ReportUsageResult::SoftBreach {
+                dimension: dim,
+                current_usage: current,
+                soft_limit: limit,
+            })
+        }
+        "HARD_BREACH" => {
+            let dim = parsed.field_str(0);
+            let current = parse_u64_field(&parsed, 1, "HARD_BREACH", "current_usage", execution_id)?;
+            let limit = parse_u64_field(&parsed, 2, "HARD_BREACH", "hard_limit", execution_id)?;
+            Ok(ReportUsageResult::HardBreach {
+                dimension: dim,
+                current_usage: current,
+                hard_limit: limit,
+            })
+        }
+        other => Err(EngineError::from(ScriptError::Parse {
+            fcall: "ff_report_usage_and_check".into(),
+            execution_id: Some(execution_id.to_string()),
+            message: format!("unknown sub-status: {other}"),
+        })),
+    }
+}
+
+/// Parse a required u64 field from a `FcallResult` wire reply. Loud
+/// failure on missing/non-numeric — see the SDK-side parser for the
+/// rationale (silent coercion hides producer/consumer drift).
+fn parse_u64_field(
+    parsed: &FcallResult,
+    index: usize,
+    sub_status: &str,
+    field_name: &str,
+    execution_id: &ExecutionId,
+) -> Result<u64, EngineError> {
+    let s = parsed.field_str(index);
+    s.parse::<u64>().map_err(|_| {
+        EngineError::from(ScriptError::Parse {
+            fcall: "ff_report_usage_and_check".into(),
+            execution_id: Some(execution_id.to_string()),
+            message: format!("{sub_status}: {field_name} (index {index}) not a u64: {s:?}"),
+        })
+    })
+}
+
 // ── Tranche 2: terminal writes (delay, wait_children, complete, fail, cancel) ──
 
 /// Stage 1b — `delay` FCALL body. Migrated from
@@ -1189,10 +1470,11 @@ impl EngineBackend for ValkeyBackend {
 
     async fn append_frame(
         &self,
-        _handle: &Handle,
-        _frame: Frame,
+        handle: &Handle,
+        frame: Frame,
     ) -> Result<AppendFrameOutcome, EngineError> {
-        Err(EngineError::Unavailable { op: "append_frame" })
+        let f = handle_codec::decode_handle(handle)?;
+        append_frame_impl(&self.client, &self.partition_config, &f, frame).await
     }
 
     async fn complete(
@@ -1230,13 +1512,19 @@ impl EngineBackend for ValkeyBackend {
 
     async fn create_waitpoint(
         &self,
-        _handle: &Handle,
-        _waitpoint_key: &str,
-        _expires_in: Duration,
+        handle: &Handle,
+        waitpoint_key: &str,
+        expires_in: Duration,
     ) -> Result<PendingWaitpoint, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "create_waitpoint",
-        })
+        let f = handle_codec::decode_handle(handle)?;
+        create_waitpoint_impl(
+            &self.client,
+            &self.partition_config,
+            &f,
+            waitpoint_key,
+            expires_in,
+        )
+        .await
     }
 
     async fn observe_signals(
@@ -1299,13 +1587,12 @@ impl EngineBackend for ValkeyBackend {
 
     async fn report_usage(
         &self,
-        _handle: &Handle,
-        _budget: &BudgetId,
-        _dimensions: UsageDimensions,
+        handle: &Handle,
+        budget: &BudgetId,
+        dimensions: UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "report_usage",
-        })
+        let f = handle_codec::decode_handle(handle)?;
+        report_usage_impl(&self.client, &self.partition_config, &f, budget, dimensions).await
     }
 }
 
