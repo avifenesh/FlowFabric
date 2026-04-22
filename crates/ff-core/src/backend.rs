@@ -572,16 +572,31 @@ pub struct BackendTimeouts {
     pub request: Option<Duration>,
 }
 
-/// Retry policy shared across backend connections. Additive; Stage 1a
-/// ships the minimal shape so the trait signatures can reference it.
+/// Retry policy shared across backend connections.
+///
+/// Matches ferriskey's `ConnectionRetryStrategy` shape (see
+/// `ferriskey/src/client/types.rs:151`) so Stage 1c's Valkey wiring is a
+/// direct pass-through — we don't reimplement what ferriskey already
+/// provides. The Postgres backend (future) interprets the same fields
+/// under its own retry semantics, or maps `None` to its own defaults.
+///
+/// Each field is `Option<u32>`: `None` ⇒ backend default (for Valkey,
+/// this means `ConnectionRetryStrategy::default()`); `Some(v)` ⇒ pass
+/// `v` straight through.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BackendRetry {
-    /// Max retry attempts on transient transport errors. `None` ⇒
+    /// Exponent base for the backoff curve. `None` ⇒ backend default.
+    pub exponent_base: Option<u32>,
+    /// Multiplicative factor applied to each backoff step. `None` ⇒
     /// backend default.
-    pub max_attempts: Option<u32>,
-    /// Base backoff. `None` ⇒ backend default.
-    pub base_backoff: Option<Duration>,
+    pub factor: Option<u32>,
+    /// Maximum number of retry attempts on transient transport errors.
+    /// `None` ⇒ backend default.
+    pub number_of_retries: Option<u32>,
+    /// Jitter as a percentage of the computed backoff. `None` ⇒ backend
+    /// default.
+    pub jitter_percent: Option<u32>,
 }
 
 /// Valkey-specific connection parameters.
