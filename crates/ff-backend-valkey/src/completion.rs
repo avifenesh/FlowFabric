@@ -133,14 +133,15 @@ impl FilterGate {
     async fn admits(&self, eid: &ExecutionId) -> bool {
         let partition = execution_partition(eid, &self.partition_config);
         let tag = partition.hash_tag();
-        // Key construction uses the bare UUID (the hash-tag is already
-        // embedded in `tag`). `eid.to_string()` includes the `{fp:N}:`
-        // prefix; strip it to avoid building `ff:exec:{fp:N}:{fp:N}:...`.
-        let full = eid.to_string();
-        let eid_str = full
-            .find("}:")
-            .map(|i| &full[i + 2..])
-            .unwrap_or(full.as_str());
+        // Key construction uses the FULL `ExecutionId` string (which
+        // already carries its own `{fp:N}:` prefix). The canonical
+        // production exec_core / tags-hash keys are double-tagged —
+        // see `ExecKeyContext::core` / `::tags` in `ff_core::keys`
+        // (format is `ff:exec:{fp:N}:{fp:N}:<uuid>:<suffix>`). The
+        // first tag is the routing tag set by `self.tag`; the second
+        // is the tag embedded inside `ExecutionId::to_string()`.
+        // Stripping either would HGET a non-existent key.
+        let eid_str = eid.to_string();
 
         // Check namespace first (cheaper — one HGET on exec_core, the
         // hash every scanner / op already touches).

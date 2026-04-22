@@ -70,11 +70,26 @@ async fn backend() -> std::sync::Arc<ValkeyBackend> {
 /// shared Valkey keyspace.
 const PARTITION: u16 = 7;
 
-fn exec_core_key(eid: &str) -> String {
-    format!("ff:exec:{{fp:{PARTITION}}}:{eid}:core")
+/// Production exec-key format is DOUBLE-tagged
+/// (`ff:exec:{fp:N}:{fp:N}:<uuid>:<suffix>`): the first `{fp:N}` is
+/// the partition routing tag; the second is the `{fp:N}:` prefix
+/// embedded inside every `ExecutionId::to_string()`. See
+/// `ExecKeyContext::core` / `::tags` in `ff_core::keys`. The test
+/// fixtures must match production exactly or they would falsely
+/// validate the filter against a non-existent key.
+fn exec_core_key(full_eid: &str) -> String {
+    format!("ff:exec:{{fp:{PARTITION}}}:{full_eid}:core")
 }
-fn tags_key(eid: &str) -> String {
-    format!("ff:exec:{{fp:{PARTITION}}}:{eid}:tags")
+fn tags_key(full_eid: &str) -> String {
+    format!("ff:exec:{{fp:{PARTITION}}}:{full_eid}:tags")
+}
+
+/// Build the full `{fp:N}:<uuid>` ExecutionId string — matches what
+/// scanners read out of per-partition index ZSETs (they're members
+/// written by Lua `ZADD ... A.execution_id` where execution_id is
+/// the full-string form).
+fn full_eid(bare_uuid: &str) -> String {
+    format!("{{fp:{PARTITION}}}:{bare_uuid}")
 }
 
 /// Scanner path: `should_skip_candidate` returns the correct verdict
@@ -84,10 +99,11 @@ fn tags_key(eid: &str) -> String {
 async fn scanner_namespace_filter_isolates_candidates() {
     let client = build_client().await;
 
-    let alpha_eid = "11111111-1111-1111-1111-111111111111";
-    let beta_eid = "22222222-2222-2222-2222-222222222222";
-    let alpha_core = exec_core_key(alpha_eid);
-    let beta_core = exec_core_key(beta_eid);
+    // Full execution-id strings matching production shape.
+    let alpha_eid = full_eid("11111111-1111-1111-1111-111111111111");
+    let beta_eid = full_eid("22222222-2222-2222-2222-222222222222");
+    let alpha_core = exec_core_key(&alpha_eid);
+    let beta_core = exec_core_key(&beta_eid);
 
     // Seed exec_core fields: only `namespace` matters for this test.
     let _: i64 = client
@@ -114,26 +130,26 @@ async fn scanner_namespace_filter_isolates_candidates() {
 
     // Each filter must admit its own candidate and reject the other.
     assert!(
-        !should_skip_candidate(&client, &alpha_filter, PARTITION, alpha_eid).await,
+        !should_skip_candidate(&client, &alpha_filter, PARTITION, &alpha_eid).await,
         "alpha filter must admit alpha candidate"
     );
     assert!(
-        should_skip_candidate(&client, &alpha_filter, PARTITION, beta_eid).await,
+        should_skip_candidate(&client, &alpha_filter, PARTITION, &beta_eid).await,
         "alpha filter must reject beta candidate"
     );
     assert!(
-        !should_skip_candidate(&client, &beta_filter, PARTITION, beta_eid).await,
+        !should_skip_candidate(&client, &beta_filter, PARTITION, &beta_eid).await,
         "beta filter must admit beta candidate"
     );
     assert!(
-        should_skip_candidate(&client, &beta_filter, PARTITION, alpha_eid).await,
+        should_skip_candidate(&client, &beta_filter, PARTITION, &alpha_eid).await,
         "beta filter must reject alpha candidate"
     );
 
     // A no-op filter admits both — confirms the short-circuit path.
     let noop = ScannerFilter::default();
-    assert!(!should_skip_candidate(&client, &noop, PARTITION, alpha_eid).await);
-    assert!(!should_skip_candidate(&client, &noop, PARTITION, beta_eid).await);
+    assert!(!should_skip_candidate(&client, &noop, PARTITION, &alpha_eid).await);
+    assert!(!should_skip_candidate(&client, &noop, PARTITION, &beta_eid).await);
 
     // Cleanup.
     let _: i64 = client
@@ -167,14 +183,15 @@ async fn completion_instance_tag_filter_isolates_subscribers() {
     let seeder = build_client().await;
 
     // Two executions on the same partition, different instance tags.
-    let eid_i1 = format!("{{fp:{PARTITION}}}:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
-    let eid_i2 = format!("{{fp:{PARTITION}}}:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
-    let raw_i1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    let raw_i2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    // Full `{fp:N}:<uuid>` form — matches the wire shape the completion
+    // subscriber deserialises out of the PUBLISH payload AND the
+    // canonical double-tagged key the backend HGETs against.
+    let eid_i1 = full_eid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    let eid_i2 = full_eid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
 
     let _: i64 = seeder
         .cmd("HSET")
-        .arg(tags_key(raw_i1))
+        .arg(tags_key(&eid_i1))
         .arg("cairn.instance_id")
         .arg("instance-1")
         .execute()
@@ -182,7 +199,7 @@ async fn completion_instance_tag_filter_isolates_subscribers() {
         .expect("HSET tags i1");
     let _: i64 = seeder
         .cmd("HSET")
-        .arg(tags_key(raw_i2))
+        .arg(tags_key(&eid_i2))
         .arg("cairn.instance_id")
         .arg("instance-2")
         .execute()
@@ -268,8 +285,8 @@ async fn completion_instance_tag_filter_isolates_subscribers() {
     // Cleanup.
     let _: i64 = seeder
         .cmd("DEL")
-        .arg(tags_key(raw_i1))
-        .arg(tags_key(raw_i2))
+        .arg(tags_key(&eid_i1))
+        .arg(tags_key(&eid_i2))
         .execute()
         .await
         .unwrap_or(0);
