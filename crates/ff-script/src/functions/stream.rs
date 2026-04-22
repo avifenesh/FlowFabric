@@ -49,7 +49,11 @@ impl FromFcallResult for AppendFrameResult {
         // ok(entry_id, frame_count)
         let entry_id = r.field_str(0);
         let frame_count = r.field_str(1).parse::<u64>()
-            .map_err(|e| ScriptError::Parse(format!("bad frame_count: {e}")))?;
+            .map_err(|e| ScriptError::Parse {
+                fcall: "ff_append_frame".into(),
+                execution_id: None,
+                message: format!("bad frame_count: {e}"),
+            })?;
         Ok(AppendFrameResult::Appended {
             entry_id,
             frame_count,
@@ -83,8 +87,10 @@ impl FromFcallResult for ReadFramesResult {
         // - entries: array of [entry_id, [f1, v1, ...]]
         // - closed_at: string (ms timestamp) or "" if open
         // - closed_reason: string or "" if open
-        let entries = r.fields.first().ok_or_else(|| {
-            ScriptError::Parse("ff_read_attempt_stream: missing entries field".into())
+        let entries = r.fields.first().ok_or_else(|| ScriptError::Parse {
+            fcall: "ff_read_attempt_stream".into(),
+            execution_id: None,
+            message: "missing entries field".into(),
         })?;
         // XRANGE from a Valkey Function passes fields through as raw Lua
         // arrays — no ArrayOfPairs conversion, so always Flat here.
@@ -147,41 +153,52 @@ pub(crate) fn parse_entries(
         ferriskey::Value::Array(arr) => arr,
         ferriskey::Value::Nil => return Ok(Vec::new()),
         other => {
-            return Err(ScriptError::Parse(format!(
-                "XRANGE/XREAD entries: expected Array, got {other:?}"
-            )));
+            return Err(ScriptError::Parse {
+                fcall: "parse_entries".into(),
+                execution_id: None,
+                message: format!("XRANGE/XREAD entries: expected Array, got {other:?}"),
+            });
         }
     };
 
     let mut frames = Vec::with_capacity(entries.len());
     for entry in entries.iter() {
-        let entry = entry.as_ref().map_err(|e| {
-            ScriptError::Parse(format!("XRANGE entry error: {e}"))
+        let entry = entry.as_ref().map_err(|e| ScriptError::Parse {
+            fcall: "parse_entries".into(),
+            execution_id: None,
+            message: format!("XRANGE entry error: {e}"),
         })?;
         let parts = match entry {
             ferriskey::Value::Array(a) => a,
             other => {
-                return Err(ScriptError::Parse(format!(
-                    "XRANGE entry: expected Array, got {other:?}"
-                )));
+                return Err(ScriptError::Parse {
+                    fcall: "parse_entries".into(),
+                    execution_id: None,
+                    message: format!("XRANGE entry: expected Array, got {other:?}"),
+                });
             }
         };
         if parts.len() != 2 {
-            return Err(ScriptError::Parse(format!(
-                "XRANGE entry: expected 2 elements, got {}",
-                parts.len()
-            )));
+            return Err(ScriptError::Parse {
+                fcall: "parse_entries".into(),
+                execution_id: None,
+                message: format!("XRANGE entry: expected 2 elements, got {}", parts.len()),
+            });
         }
-        let id = value_to_string(parts[0].as_ref().ok()).ok_or_else(|| {
-            ScriptError::Parse("XRANGE entry: missing/invalid id".into())
+        let id = value_to_string(parts[0].as_ref().ok()).ok_or_else(|| ScriptError::Parse {
+            fcall: "parse_entries".into(),
+            execution_id: None,
+            message: "XRANGE entry: missing/invalid id".into(),
         })?;
 
         let field_val = match parts[1].as_ref() {
             Ok(v) => v,
             Err(e) => {
-                return Err(ScriptError::Parse(format!(
-                    "XRANGE entry fields error: {e}"
-                )));
+                return Err(ScriptError::Parse {
+                    fcall: "parse_entries".into(),
+                    execution_id: None,
+                    message: format!("XRANGE entry fields error: {e}"),
+                });
             }
         };
         let fields = parse_fields_kv(field_val, shape)?;
@@ -209,21 +226,33 @@ pub(crate) fn parse_fields_kv(
             let arr = match v {
                 ferriskey::Value::Array(arr) => arr,
                 other => {
-                    return Err(ScriptError::Parse(format!(
-                        "stream fields (Flat): expected Array, got {other:?}"
-                    )));
+                    return Err(ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: format!(
+                            "stream fields (Flat): expected Array, got {other:?}"
+                        ),
+                    });
                 }
             };
             if !arr.len().is_multiple_of(2) {
-                return Err(ScriptError::Parse(format!(
-                    "stream fields (Flat): odd element count {}",
-                    arr.len()
-                )));
+                return Err(ScriptError::Parse {
+                    fcall: "parse_fields_kv".into(),
+                    execution_id: None,
+                    message: format!(
+                        "stream fields (Flat): odd element count {}",
+                        arr.len()
+                    ),
+                });
             }
             let mut i = 0;
             while i < arr.len() {
                 let k = value_to_string(arr[i].as_ref().ok())
-                    .ok_or_else(|| ScriptError::Parse("stream field: bad key".into()))?;
+                    .ok_or_else(|| ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: "stream field: bad key".into(),
+                    })?;
                 let val = value_to_string(arr[i + 1].as_ref().ok()).unwrap_or_default();
                 out.insert(k, val);
                 i += 2;
@@ -233,28 +262,43 @@ pub(crate) fn parse_fields_kv(
             let arr = match v {
                 ferriskey::Value::Array(arr) => arr,
                 other => {
-                    return Err(ScriptError::Parse(format!(
-                        "stream fields (Pairs): expected Array, got {other:?}"
-                    )));
+                    return Err(ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: format!(
+                            "stream fields (Pairs): expected Array, got {other:?}"
+                        ),
+                    });
                 }
             };
             for pair in arr.iter() {
                 let inner = match pair.as_ref() {
                     Ok(ferriskey::Value::Array(inner)) => inner,
                     _ => {
-                        return Err(ScriptError::Parse(
-                            "stream fields (Pairs): expected 2-element Array per entry".into(),
-                        ));
+                        return Err(ScriptError::Parse {
+                            fcall: "parse_fields_kv".into(),
+                            execution_id: None,
+                            message: "stream fields (Pairs): expected 2-element Array per entry"
+                                .into(),
+                        });
                     }
                 };
                 if inner.len() != 2 {
-                    return Err(ScriptError::Parse(format!(
-                        "stream fields (Pairs): expected len=2, got {}",
-                        inner.len()
-                    )));
+                    return Err(ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: format!(
+                            "stream fields (Pairs): expected len=2, got {}",
+                            inner.len()
+                        ),
+                    });
                 }
                 let k = value_to_string(inner[0].as_ref().ok())
-                    .ok_or_else(|| ScriptError::Parse("stream field: bad key".into()))?;
+                    .ok_or_else(|| ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: "stream field: bad key".into(),
+                    })?;
                 let val = value_to_string(inner[1].as_ref().ok()).unwrap_or_default();
                 out.insert(k, val);
             }
@@ -263,14 +307,22 @@ pub(crate) fn parse_fields_kv(
             let pairs = match v {
                 ferriskey::Value::Map(pairs) => pairs,
                 other => {
-                    return Err(ScriptError::Parse(format!(
-                        "stream fields (Map): expected Map, got {other:?}"
-                    )));
+                    return Err(ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: format!(
+                            "stream fields (Map): expected Map, got {other:?}"
+                        ),
+                    });
                 }
             };
             for (k, vv) in pairs {
                 let key = value_to_string(Some(k))
-                    .ok_or_else(|| ScriptError::Parse("stream field: bad key".into()))?;
+                    .ok_or_else(|| ScriptError::Parse {
+                        fcall: "parse_fields_kv".into(),
+                        execution_id: None,
+                        message: "stream field: bad key".into(),
+                    })?;
                 let val = value_to_string(Some(vv)).unwrap_or_default();
                 out.insert(key, val);
             }

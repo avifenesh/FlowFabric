@@ -680,7 +680,7 @@ impl From<ScriptError> for EngineError {
             S::AttemptNotInCreatedState => Self::Bug(BugKind::AttemptNotInCreatedState),
 
             // ── Transport (preserves source for Parse/Valkey) ──
-            e @ (S::Parse(_) | S::Valkey(_)) => Self::transport_script(e),
+            e @ (S::Parse { .. } | S::Valkey(_)) => Self::transport_script(e),
 
             // `ScriptError` is `#[non_exhaustive]`. A future variant
             // landed in ff-script before the mapping here was updated
@@ -817,13 +817,17 @@ mod tests {
 
     #[test]
     fn transport_preserves_parse() {
-        let err = EngineError::from(ScriptError::Parse("bad envelope".into()));
+        let err = EngineError::from(ScriptError::Parse {
+            fcall: "test_bad_envelope".into(),
+            execution_id: None,
+            message: "bad envelope".into(),
+        });
         match &err {
             EngineError::Transport { backend, source } => {
                 assert_eq!(*backend, "valkey");
                 assert!(matches!(
                     source.downcast_ref::<ScriptError>(),
-                    Some(ScriptError::Parse(_))
+                    Some(ScriptError::Parse { .. })
                 ));
             }
             other => panic!("{other:?}"),

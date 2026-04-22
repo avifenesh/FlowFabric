@@ -29,25 +29,31 @@ impl FcallResult {
             // Individual callers handle that; this parser is for the
             // standard {status_code, status_string, ...} convention.
             _ => {
-                return Err(ScriptError::Parse(format!(
-                    "expected Array, got {:?}",
-                    value_type_name(raw)
-                )));
+                return Err(ScriptError::Parse {
+                    fcall: "FcallResult::parse".into(),
+                    execution_id: None,
+                    message: format!("expected Array, got {:?}", value_type_name(raw)),
+                });
             }
         };
 
         if items.is_empty() {
-            return Err(ScriptError::Parse("empty FCALL result array".into()));
+            return Err(ScriptError::Parse {
+                fcall: "FcallResult::parse".into(),
+                execution_id: None,
+                message: "empty FCALL result array".into(),
+            });
         }
 
         // Element [0]: status code (Int 1 or 0)
         let status_code = match items.first() {
             Some(Ok(Value::Int(n))) => *n,
             other => {
-                return Err(ScriptError::Parse(format!(
-                    "expected Int at index 0, got {:?}",
-                    other
-                )));
+                return Err(ScriptError::Parse {
+                    fcall: "FcallResult::parse".into(),
+                    execution_id: None,
+                    message: format!("expected Int at index 0, got {:?}", other),
+                });
             }
         };
 
@@ -86,8 +92,10 @@ impl FcallResult {
         } else {
             let detail = value_to_string(self.fields.first());
             let err = ScriptError::from_code_with_detail(&self.status, &detail)
-                .unwrap_or_else(|| {
-                    ScriptError::Parse(format!("unknown error code: {}", self.status))
+                .unwrap_or_else(|| ScriptError::Parse {
+                    fcall: "FcallResult::into_success".into(),
+                    execution_id: None,
+                    message: format!("unknown error code: {}", self.status),
                 });
             Err(err)
         }

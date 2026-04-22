@@ -121,10 +121,11 @@ fn build_execution_snapshot(
     // corruption — surface it rather than silently constructing an
     // invalid LaneId that would mis-partition downstream.
     let lane_id = LaneId::try_new(opt_str(core, "lane_id").unwrap_or("")).map_err(|e| {
-        SdkError::Config(format!(
-            "describe_execution: exec_core.lane_id fails LaneId validation \
-             (key corruption?): {e}"
-        ))
+        SdkError::Config {
+            context: "describe_execution: exec_core".into(),
+            field: Some("lane_id".into()),
+            message: format!("fails LaneId validation (key corruption?): {e}"),
+        }
     })?;
 
     let namespace_str = opt_str(core, "namespace").unwrap_or("").to_owned();
@@ -133,11 +134,10 @@ fn build_execution_snapshot(
     let flow_id = opt_str(core, "flow_id")
         .filter(|s| !s.is_empty())
         .map(|s| {
-            FlowId::parse(s).map_err(|e| {
-                SdkError::Config(format!(
-                    "describe_execution: exec_core.flow_id is not a valid UUID \
-                     (key corruption?): {e}"
-                ))
+            FlowId::parse(s).map_err(|e| SdkError::Config {
+                context: "describe_execution: exec_core".into(),
+                field: Some("flow_id".into()),
+                message: format!("is not a valid UUID (key corruption?): {e}"),
             })
         })
         .transpose()?;
@@ -155,19 +155,17 @@ fn build_execution_snapshot(
     // corruption, not a valid pre-create state — fail loudly.
     let created_at =
         parse_ts(core, "describe_execution: exec_core", "created_at")?.ok_or_else(|| {
-            SdkError::Config(
-                "describe_execution: exec_core.created_at is missing or empty \
-                 (key corruption?)"
-                    .to_owned(),
-            )
+            SdkError::Config {
+                context: "describe_execution: exec_core".into(),
+                field: Some("created_at".into()),
+                message: "is missing or empty (key corruption?)".into(),
+            }
         })?;
     let last_mutation_at = parse_ts(core, "describe_execution: exec_core", "last_mutation_at")?
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_execution: exec_core.last_mutation_at is missing or empty \
-                 (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_execution: exec_core".into(),
+            field: Some("last_mutation_at".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
 
     let total_attempt_count: u32 =
@@ -180,11 +178,10 @@ fn build_execution_snapshot(
     let current_waitpoint = opt_str(core, "current_waitpoint_id")
         .filter(|s| !s.is_empty())
         .map(|s| {
-            WaitpointId::parse(s).map_err(|e| {
-                SdkError::Config(format!(
-                    "describe_execution: exec_core.current_waitpoint_id is not a \
-                     valid UUID (key corruption?): {e}"
-                ))
+            WaitpointId::parse(s).map_err(|e| SdkError::Config {
+                context: "describe_execution: exec_core".into(),
+                field: Some("current_waitpoint_id".into()),
+                message: format!("is not a valid UUID (key corruption?): {e}"),
             })
         })
         .transpose()?;
@@ -225,10 +222,10 @@ fn parse_ts(
     match opt_str(map, field).filter(|s| !s.is_empty()) {
         None => Ok(None),
         Some(raw) => {
-            let ms: i64 = raw.parse().map_err(|e| {
-                SdkError::Config(format!(
-                    "{context}.{field} is not a valid ms timestamp ('{raw}'): {e}"
-                ))
+            let ms: i64 = raw.parse().map_err(|e| SdkError::Config {
+                context: context.to_owned(),
+                field: Some(field.to_owned()),
+                message: format!("is not a valid ms timestamp ('{raw}'): {e}"),
             })?;
             Ok(Some(TimestampMs::from_millis(ms)))
         }
@@ -246,10 +243,10 @@ fn parse_u32_strict(
 ) -> Result<Option<u32>, SdkError> {
     match opt_str(map, field).filter(|s| !s.is_empty()) {
         None => Ok(None),
-        Some(raw) => Ok(Some(raw.parse().map_err(|e| {
-            SdkError::Config(format!(
-                "{context}.{field} is not a valid u32 ('{raw}'): {e}"
-            ))
+        Some(raw) => Ok(Some(raw.parse().map_err(|e| SdkError::Config {
+            context: context.to_owned(),
+            field: Some(field.to_owned()),
+            message: format!("is not a valid u32 ('{raw}'): {e}"),
         })?)),
     }
 }
@@ -262,10 +259,10 @@ fn parse_u64_strict(
 ) -> Result<Option<u64>, SdkError> {
     match opt_str(map, field).filter(|s| !s.is_empty()) {
         None => Ok(None),
-        Some(raw) => Ok(Some(raw.parse().map_err(|e| {
-            SdkError::Config(format!(
-                "{context}.{field} is not a valid u64 ('{raw}'): {e}"
-            ))
+        Some(raw) => Ok(Some(raw.parse().map_err(|e| SdkError::Config {
+            context: context.to_owned(),
+            field: Some(field.to_owned()),
+            message: format!("is not a valid u64 ('{raw}'): {e}"),
         })?)),
     }
 }
@@ -274,11 +271,10 @@ fn parse_public_state(raw: &str) -> Result<PublicState, SdkError> {
     // exec_core stores the snake_case literal (e.g. "waiting"). PublicState's
     // Deserialize accepts the JSON-quoted form, so wrap + delegate.
     let quoted = format!("\"{raw}\"");
-    serde_json::from_str(&quoted).map_err(|e| {
-        SdkError::Config(format!(
-            "describe_execution: exec_core.public_state '{raw}' is not a known \
-             public state: {e}"
-        ))
+    serde_json::from_str(&quoted).map_err(|e| SdkError::Config {
+        context: "describe_execution: exec_core".into(),
+        field: Some("public_state".into()),
+        message: format!("'{raw}' is not a known public state: {e}"),
     })
 }
 
@@ -289,11 +285,10 @@ fn build_attempt_summary(
         None => return Ok(None),
         Some(s) => s,
     };
-    let attempt_id = AttemptId::parse(attempt_id_str).map_err(|e| {
-        SdkError::Config(format!(
-            "describe_execution: exec_core.current_attempt_id is not a valid \
-             UUID: {e}"
-        ))
+    let attempt_id = AttemptId::parse(attempt_id_str).map_err(|e| SdkError::Config {
+        context: "describe_execution: exec_core".into(),
+        field: Some("current_attempt_id".into()),
+        message: format!("is not a valid UUID: {e}"),
     })?;
     // When `current_attempt_id` is set, `current_attempt_index` MUST be
     // set too — lua/execution.lua writes both atomically in
@@ -304,12 +299,10 @@ fn build_attempt_summary(
         "describe_execution: exec_core",
         "current_attempt_index",
     )?
-    .ok_or_else(|| {
-        SdkError::Config(
-            "describe_execution: exec_core.current_attempt_index is missing \
-             while current_attempt_id is set (key corruption?)"
-                .to_owned(),
-        )
+    .ok_or_else(|| SdkError::Config {
+        context: "describe_execution: exec_core".into(),
+        field: Some("current_attempt_index".into()),
+        message: "is missing while current_attempt_id is set (key corruption?)".into(),
     })?;
     Ok(Some(AttemptSummary::new(
         attempt_id,
@@ -333,12 +326,10 @@ fn build_lease_summary(core: &HashMap<String, String>) -> Result<Option<LeaseSum
     // sets/clears epoch atomically with wid + expires_at. Parse strictly
     // and require it: a missing epoch alongside a live wid is corruption.
     let epoch = parse_u64_strict(core, "describe_execution: exec_core", "current_lease_epoch")?
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_execution: exec_core.current_lease_epoch is missing \
-             while current_worker_instance_id is set (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_execution: exec_core".into(),
+            field: Some("current_lease_epoch".into()),
+            message: "is missing while current_worker_instance_id is set (key corruption?)".into(),
         })?;
     Ok(Some(LeaseSummary::new(
         LeaseEpoch::new(epoch),
@@ -441,48 +432,48 @@ fn build_flow_snapshot(
     // on-disk corruption or a caller accidentally reading the wrong key.
     let stored_flow_id_str = opt_str(raw, "flow_id")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.flow_id is missing or empty (key corruption?)".to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("flow_id".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
     if stored_flow_id_str != flow_id.to_string() {
-        return Err(SdkError::Config(format!(
-            "describe_flow: flow_core.flow_id '{stored_flow_id_str}' does not match \
-             requested flow_id '{flow_id}' (key corruption or wrong-key read?)"
-        )));
+        return Err(SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("flow_id".into()),
+            message: format!(
+                "'{stored_flow_id_str}' does not match requested flow_id \
+                 '{flow_id}' (key corruption or wrong-key read?)"
+            ),
+        });
     }
 
     // namespace and flow_kind are engine-written at create time; absent
     // or empty values indicate on-disk corruption.
     let namespace_str = opt_str(raw, "namespace")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.namespace is missing or empty (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("namespace".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
     let namespace = Namespace::new(namespace_str.to_owned());
 
     let flow_kind = opt_str(raw, "flow_kind")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.flow_kind is missing or empty (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("flow_kind".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?
         .to_owned();
 
     let public_flow_state = opt_str(raw, "public_flow_state")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.public_flow_state is missing or empty \
-                 (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("public_flow_state".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?
         .to_owned();
 
@@ -490,38 +481,42 @@ fn build_flow_snapshot(
     // counters; missing values indicate corruption (ff_create_flow
     // writes "0" to all three). Parse strictly.
     let graph_revision = parse_u64_strict(raw, "describe_flow: flow_core", "graph_revision")?
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.graph_revision is missing (key corruption?)".to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("graph_revision".into()),
+            message: "is missing (key corruption?)".into(),
         })?;
     let node_count =
         parse_u32_strict(raw, "describe_flow: flow_core", "node_count")?.ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.node_count is missing (key corruption?)".to_owned(),
-            )
+            SdkError::Config {
+                context: "describe_flow: flow_core".into(),
+                field: Some("node_count".into()),
+                message: "is missing (key corruption?)".into(),
+            }
         })?;
     let edge_count =
         parse_u32_strict(raw, "describe_flow: flow_core", "edge_count")?.ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.edge_count is missing (key corruption?)".to_owned(),
-            )
+            SdkError::Config {
+                context: "describe_flow: flow_core".into(),
+                field: Some("edge_count".into()),
+                message: "is missing (key corruption?)".into(),
+            }
         })?;
 
     // created_at + last_mutation_at are engine-maintained; absent values
     // indicate corruption (ff_create_flow writes both).
     let created_at = parse_ts(raw, "describe_flow: flow_core", "created_at")?.ok_or_else(|| {
-        SdkError::Config(
-            "describe_flow: flow_core.created_at is missing or empty (key corruption?)".to_owned(),
-        )
+        SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("created_at".into()),
+            message: "is missing or empty (key corruption?)".into(),
+        }
     })?;
     let last_mutation_at = parse_ts(raw, "describe_flow: flow_core", "last_mutation_at")?
-        .ok_or_else(|| {
-            SdkError::Config(
-                "describe_flow: flow_core.last_mutation_at is missing or empty \
-                 (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "describe_flow: flow_core".into(),
+            field: Some("last_mutation_at".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
 
     let cancelled_at = parse_ts(raw, "describe_flow: flow_core", "cancelled_at")?;
@@ -544,10 +539,14 @@ fn build_flow_snapshot(
         if is_namespaced_tag_key(k) {
             tags.insert(k.clone(), v.clone());
         } else {
-            return Err(SdkError::Config(format!(
-                "describe_flow: flow_core has unexpected field '{k}' — not an FF \
-                 field and not a namespaced tag (lowercase-alphanumeric-prefix + '.')"
-            )));
+            return Err(SdkError::Config {
+                context: "describe_flow: flow_core".into(),
+                field: None,
+                message: format!(
+                    "has unexpected field '{k}' — not an FF field and not a namespaced \
+                     tag (lowercase-alphanumeric-prefix + '.')"
+                ),
+            });
         }
     }
 
@@ -743,20 +742,22 @@ impl FlowFabricWorker {
         let Some(raw) = raw.filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
-        let flow_id = FlowId::parse(&raw).map_err(|e| {
-            SdkError::Config(format!(
-                "list_edges: exec_core.flow_id '{raw}' is not a valid UUID \
-                 (key corruption?): {e}"
-            ))
+        let flow_id = FlowId::parse(&raw).map_err(|e| SdkError::Config {
+            context: "list_edges: exec_core".into(),
+            field: Some("flow_id".into()),
+            message: format!("'{raw}' is not a valid UUID (key corruption?): {e}"),
         })?;
         let flow_partition_index = flow_partition(&flow_id, self.partition_config()).index;
         if exec_partition.index != flow_partition_index {
-            return Err(SdkError::Config(format!(
-                "list_edges: exec_core.flow_id '{flow_id}' partition \
-                 {flow_partition_index} does not match execution partition \
-                 {} (RFC-011 co-location violation; key corruption?)",
-                exec_partition.index
-            )));
+            return Err(SdkError::Config {
+                context: "list_edges: exec_core".into(),
+                field: Some("flow_id".into()),
+                message: format!(
+                    "'{flow_id}' partition {flow_partition_index} does not match \
+                     execution partition {} (RFC-011 co-location violation; key corruption?)",
+                    exec_partition.index
+                ),
+            });
         }
         Ok(Some(flow_id))
     }
@@ -795,11 +796,10 @@ impl FlowFabricWorker {
         // before we spend a round trip on it.
         let mut edge_ids: Vec<EdgeId> = Vec::with_capacity(edge_id_strs.len());
         for raw in &edge_id_strs {
-            let parsed = EdgeId::parse(raw).map_err(|e| {
-                SdkError::Config(format!(
-                    "list_edges: adjacency SET has invalid edge_id '{raw}' \
-                     (key corruption?): {e}"
-                ))
+            let parsed = EdgeId::parse(raw).map_err(|e| SdkError::Config {
+                context: "list_edges: adjacency_set".into(),
+                field: Some("edge_id".into()),
+                message: format!("'{raw}' is not a valid EdgeId (key corruption?): {e}"),
             })?;
             edge_ids.push(parsed);
         }
@@ -831,10 +831,14 @@ impl FlowFabricWorker {
                 // Adjacency SET referenced an edge_hash that no longer
                 // exists. FF does not delete edge hashes today (staging
                 // is write-once), so this is corruption — fail loud.
-                return Err(SdkError::Config(format!(
-                    "list_edges: adjacency SET refers to edge_id '{edge_id}' \
-                     but its edge_hash is absent (key corruption?)"
-                )));
+                return Err(SdkError::Config {
+                    context: "list_edges: adjacency_set".into(),
+                    field: None,
+                    message: format!(
+                        "refers to edge_id '{edge_id}' but its edge_hash is absent \
+                         (key corruption?)"
+                    ),
+                });
             }
             let snap = build_edge_snapshot(flow_id, edge_id, &raw)?;
             // Cross-check: the edge hash's endpoint on the listed side
@@ -847,11 +851,15 @@ impl FlowFabricWorker {
                 AdjacencySide::Incoming => &snap.downstream_execution_id,
             };
             if endpoint != subject_eid {
-                return Err(SdkError::Config(format!(
-                    "list_edges: adjacency SET for execution '{subject_eid}' \
-                     (side={side:?}) contains edge '{edge_id}' whose stored \
-                     endpoint is '{endpoint}' (adjacency/edge-hash drift?)"
-                )));
+                return Err(SdkError::Config {
+                    context: "list_edges: adjacency_set".into(),
+                    field: None,
+                    message: format!(
+                        "for execution '{subject_eid}' (side={side:?}) contains edge \
+                         '{edge_id}' whose stored endpoint is '{endpoint}' \
+                         (adjacency/edge-hash drift?)"
+                    ),
+                });
             }
             out.push(snap);
         }
@@ -897,39 +905,50 @@ fn build_edge_snapshot(
     // silently drop data.
     for k in raw.keys() {
         if !EDGE_KNOWN_FIELDS.contains(&k.as_str()) {
-            return Err(SdkError::Config(format!(
-                "edge_snapshot: edge_hash has unexpected field '{k}' \
-                 (protocol drift or corruption?)"
-            )));
+            return Err(SdkError::Config {
+                context: "edge_snapshot: edge_hash".into(),
+                field: None,
+                message: format!(
+                    "has unexpected field '{k}' (protocol drift or corruption?)"
+                ),
+            });
         }
     }
 
     let stored_edge_id_str = opt_str(raw, "edge_id")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.edge_id is missing or empty (key corruption?)".to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("edge_id".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
     if stored_edge_id_str != edge_id.to_string() {
-        return Err(SdkError::Config(format!(
-            "edge_snapshot: edge_hash.edge_id '{stored_edge_id_str}' does not match \
-             requested edge_id '{edge_id}' (key corruption or wrong-key read?)"
-        )));
+        return Err(SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("edge_id".into()),
+            message: format!(
+                "'{stored_edge_id_str}' does not match requested edge_id \
+                 '{edge_id}' (key corruption or wrong-key read?)"
+            ),
+        });
     }
 
     let stored_flow_id_str = opt_str(raw, "flow_id")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.flow_id is missing or empty (key corruption?)".to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("flow_id".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
     if stored_flow_id_str != flow_id.to_string() {
-        return Err(SdkError::Config(format!(
-            "edge_snapshot: edge_hash.flow_id '{stored_flow_id_str}' does not match \
-             requested flow_id '{flow_id}' (key corruption or wrong-key read?)"
-        )));
+        return Err(SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("flow_id".into()),
+            message: format!(
+                "'{stored_flow_id_str}' does not match requested flow_id \
+                 '{flow_id}' (key corruption or wrong-key read?)"
+            ),
+        });
     }
 
     let upstream_execution_id = parse_eid(raw, "upstream_execution_id")?;
@@ -937,23 +956,19 @@ fn build_edge_snapshot(
 
     let dependency_kind = opt_str(raw, "dependency_kind")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.dependency_kind is missing or empty \
-                 (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("dependency_kind".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?
         .to_owned();
 
     let satisfaction_condition = opt_str(raw, "satisfaction_condition")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.satisfaction_condition is missing or empty \
-                 (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("satisfaction_condition".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?
         .to_owned();
 
@@ -965,29 +980,28 @@ fn build_edge_snapshot(
 
     let edge_state = opt_str(raw, "edge_state")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.edge_state is missing or empty (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("edge_state".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?
         .to_owned();
 
     let created_at =
         parse_ts(raw, "edge_snapshot: edge_hash", "created_at")?.ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.created_at is missing or empty (key corruption?)"
-                    .to_owned(),
-            )
+            SdkError::Config {
+                context: "edge_snapshot: edge_hash".into(),
+                field: Some("created_at".into()),
+                message: "is missing or empty (key corruption?)".into(),
+            }
         })?;
 
     let created_by = opt_str(raw, "created_by")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(
-                "edge_snapshot: edge_hash.created_by is missing or empty (key corruption?)"
-                    .to_owned(),
-            )
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some("created_by".into()),
+            message: "is missing or empty (key corruption?)".into(),
         })?
         .to_owned();
 
@@ -1008,16 +1022,15 @@ fn build_edge_snapshot(
 fn parse_eid(raw: &HashMap<String, String>, field: &str) -> Result<ExecutionId, SdkError> {
     let s = opt_str(raw, field)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            SdkError::Config(format!(
-                "edge_snapshot: edge_hash.{field} is missing or empty (key corruption?)"
-            ))
+        .ok_or_else(|| SdkError::Config {
+            context: "edge_snapshot: edge_hash".into(),
+            field: Some(field.to_owned()),
+            message: "is missing or empty (key corruption?)".into(),
         })?;
-    ExecutionId::parse(s).map_err(|e| {
-        SdkError::Config(format!(
-            "edge_snapshot: edge_hash.{field} '{s}' is not a valid ExecutionId \
-             (key corruption?): {e}"
-        ))
+    ExecutionId::parse(s).map_err(|e| SdkError::Config {
+        context: "edge_snapshot: edge_hash".into(),
+        field: Some(field.to_owned()),
+        message: format!("'{s}' is not a valid ExecutionId (key corruption?): {e}"),
     })
 }
 
@@ -1079,7 +1092,9 @@ mod tests {
         let err =
             build_execution_snapshot(eid(), &minimal_core("bogus"), HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config(msg) => assert!(msg.contains("public_state"), "msg: {msg}"),
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("public_state"), "msg: {msg}");
+            }
             other => panic!("expected Config, got {other:?}"),
         }
     }
@@ -1092,22 +1107,24 @@ mod tests {
         core.insert("lane_id".to_owned(), "lane\nbroken".to_owned());
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config(msg) => assert!(msg.contains("lane_id"), "msg: {msg}"),
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("lane_id"), "msg: {msg}");
+            }
             other => panic!("expected Config, got {other:?}"),
         }
     }
 
     #[test]
     fn missing_required_timestamps_fail_loud() {
-        for field in ["created_at", "last_mutation_at"] {
+        for want in ["created_at", "last_mutation_at"] {
             let mut core = minimal_core("waiting");
-            core.remove(field);
+            core.remove(want);
             let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
             match err {
-                SdkError::Config(msg) => {
-                    assert!(msg.contains(field), "msg for {field}: {msg}")
+                SdkError::Config { field, message: msg, .. } => {
+                    assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
                 }
-                other => panic!("expected Config for {field}, got {other:?}"),
+                other => panic!("expected Config for {want}, got {other:?}"),
             }
         }
     }
@@ -1118,8 +1135,8 @@ mod tests {
         core.insert("total_attempt_count".to_owned(), "not-a-number".to_owned());
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
-                assert!(msg.contains("total_attempt_count"), "msg: {msg}")
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("total_attempt_count"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1136,8 +1153,8 @@ mod tests {
         );
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
-                assert!(msg.contains("current_attempt_index"), "msg: {msg}")
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("current_attempt_index"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1154,8 +1171,8 @@ mod tests {
         core.insert("lease_expires_at".to_owned(), "9000".to_owned());
         let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
-                assert!(msg.contains("current_lease_epoch"), "msg: {msg}")
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("current_lease_epoch"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1269,8 +1286,9 @@ mod tests {
         core.insert("bogus_future_field".to_owned(), "v".to_owned());
         let err = build_flow_snapshot(f, &core).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
-                assert!(msg.contains("bogus_future_field"), "msg: {msg}")
+            SdkError::Config { field, message: msg, .. } => {
+                assert!(field.is_none(), "expected whole-object error, got field={field:?}");
+                assert!(msg.contains("bogus_future_field"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1278,7 +1296,7 @@ mod tests {
 
     #[test]
     fn missing_required_fields_fail_loud() {
-        for field in [
+        for want in [
             "flow_id",
             "namespace",
             "flow_kind",
@@ -1291,15 +1309,15 @@ mod tests {
         ] {
             let f = fid();
             let mut core = minimal_flow_core(&f, "open");
-            core.remove(field);
+            core.remove(want);
             let err = build_flow_snapshot(f, &core).err().unwrap_or_else(|| {
-                panic!("field {field} should fail but build_flow_snapshot returned Ok")
+                panic!("field {want} should fail but build_flow_snapshot returned Ok")
             });
             match err {
-                SdkError::Config(msg) => {
-                    assert!(msg.contains(field), "msg for {field}: {msg}")
+                SdkError::Config { field, message: msg, .. } => {
+                    assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
                 }
-                other => panic!("expected Config for {field}, got {other:?}"),
+                other => panic!("expected Config for {want}, got {other:?}"),
             }
         }
     }
@@ -1308,18 +1326,18 @@ mod tests {
     fn empty_required_strings_fail_loud() {
         // opt_str + .filter(|s| !s.is_empty()) must treat an empty
         // value the same as a missing one for strict-parsed fields.
-        for field in ["flow_id", "namespace", "flow_kind", "public_flow_state"] {
+        for want in ["flow_id", "namespace", "flow_kind", "public_flow_state"] {
             let f = fid();
             let mut core = minimal_flow_core(&f, "open");
-            core.insert(field.to_owned(), String::new());
+            core.insert(want.to_owned(), String::new());
             let err = build_flow_snapshot(f, &core).err().unwrap_or_else(|| {
-                panic!("empty {field} should fail but build_flow_snapshot returned Ok")
+                panic!("empty {want} should fail but build_flow_snapshot returned Ok")
             });
             match err {
-                SdkError::Config(msg) => {
-                    assert!(msg.contains(field), "msg for {field}: {msg}")
+                SdkError::Config { field, message: msg, .. } => {
+                    assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
                 }
-                other => panic!("expected Config for {field}, got {other:?}"),
+                other => panic!("expected Config for {want}, got {other:?}"),
             }
         }
     }
@@ -1333,9 +1351,9 @@ mod tests {
         let core = minimal_flow_core(&other, "open");
         let err = build_flow_snapshot(requested, &core).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("flow_id"), "msg: {msg}");
                 assert!(msg.contains("does not match"), "msg: {msg}");
-                assert!(msg.contains("flow_id"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1348,8 +1366,8 @@ mod tests {
         core.insert("graph_revision".to_owned(), "not-a-number".to_owned());
         let err = build_flow_snapshot(f, &core).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
-                assert!(msg.contains("graph_revision"), "msg: {msg}")
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("graph_revision"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1421,7 +1439,10 @@ mod tests {
         raw.insert("bogus_future_field".into(), "v".into());
         let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
         match err {
-            SdkError::Config(msg) => assert!(msg.contains("bogus_future_field"), "msg: {msg}"),
+            SdkError::Config { field, message: msg, .. } => {
+                assert!(field.is_none(), "expected whole-object error, got field={field:?}");
+                assert!(msg.contains("bogus_future_field"), "msg: {msg}");
+            }
             other => panic!("expected Config, got {other:?}"),
         }
     }
@@ -1435,9 +1456,9 @@ mod tests {
         let raw = minimal_edge_hash(&other, &edge, &up, &down);
         let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("flow_id"), "msg: {msg}");
                 assert!(msg.contains("does not match"), "msg: {msg}");
-                assert!(msg.contains("flow_id"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1452,9 +1473,9 @@ mod tests {
         let raw = minimal_edge_hash(&f, &other_edge, &up, &down);
         let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("edge_id"), "msg: {msg}");
                 assert!(msg.contains("does not match"), "msg: {msg}");
-                assert!(msg.contains("edge_id"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -1462,7 +1483,7 @@ mod tests {
 
     #[test]
     fn edge_missing_required_fields_fail_loud() {
-        for field in [
+        for want in [
             "edge_id",
             "flow_id",
             "upstream_execution_id",
@@ -1477,13 +1498,15 @@ mod tests {
             let edge = EdgeId::new();
             let (up, down) = eids_for_flow(&f);
             let mut raw = minimal_edge_hash(&f, &edge, &up, &down);
-            raw.remove(field);
+            raw.remove(want);
             let err = build_edge_snapshot(&f, &edge, &raw)
                 .err()
-                .unwrap_or_else(|| panic!("missing {field} should fail"));
+                .unwrap_or_else(|| panic!("missing {want} should fail"));
             match err {
-                SdkError::Config(msg) => assert!(msg.contains(field), "msg for {field}: {msg}"),
-                other => panic!("expected Config for {field}, got {other:?}"),
+                SdkError::Config { field, message: msg, .. } => {
+                    assert_eq!(field.as_deref(), Some(want), "msg for {want}: {msg}");
+                }
+                other => panic!("expected Config for {want}, got {other:?}"),
             }
         }
     }
@@ -1497,7 +1520,9 @@ mod tests {
         raw.insert("created_at".into(), "not-a-number".into());
         let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
         match err {
-            SdkError::Config(msg) => assert!(msg.contains("created_at"), "msg: {msg}"),
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("created_at"), "msg: {msg}");
+            }
             other => panic!("expected Config, got {other:?}"),
         }
     }
@@ -1511,8 +1536,8 @@ mod tests {
         raw.insert("upstream_execution_id".into(), "not-an-execution-id".into());
         let err = build_edge_snapshot(&f, &edge, &raw).unwrap_err();
         match err {
-            SdkError::Config(msg) => {
-                assert!(msg.contains("upstream_execution_id"), "msg: {msg}")
+            SdkError::Config { field, message: msg, .. } => {
+                assert_eq!(field.as_deref(), Some("upstream_execution_id"), "msg: {msg}");
             }
             other => panic!("expected Config, got {other:?}"),
         }
