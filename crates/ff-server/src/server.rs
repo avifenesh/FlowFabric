@@ -409,14 +409,6 @@ impl Server {
             quota_reconciler_interval: config.engine_config.quota_reconciler_interval,
             unblock_interval: config.engine_config.unblock_interval,
             dependency_reconciler_interval: config.engine_config.dependency_reconciler_interval,
-            // Push-based DAG promotion (Batch C item 6). Enabled by
-            // default with the server's Valkey endpoint; the engine
-            // spawns a dedicated RESP3 client for SUBSCRIBE.
-            completion_listener: Some(ff_engine::CompletionListenerConfig {
-                addresses: vec![(config.host.clone(), config.port)],
-                tls: config.tls,
-                cluster: config.cluster,
-            }),
             flow_projector_interval: config.engine_config.flow_projector_interval,
             execution_deadline_interval: config.engine_config.execution_deadline_interval,
             cancel_reconciler_interval: config.engine_config.cancel_reconciler_interval,
@@ -427,7 +419,33 @@ impl Server {
         // block scanners), and keeping scanners off the tail client means a
         // long-poll tail can never starve lease-expiry, retention-trim,
         // etc. Do not change this without revisiting RFC-006 Impl Notes.
-        let engine = Engine::start_with_metrics(engine_cfg, client.clone(), metrics.clone());
+        // Build the Valkey completion backend (issue #90) and subscribe.
+        // This replaces the pre-#90 `CompletionListenerConfig` path:
+        // the wire subscription now lives in ff-backend-valkey, the
+        // engine just consumes the resulting stream.
+        let mut valkey_conn = ff_core::backend::ValkeyConnection::new(
+            config.host.clone(),
+            config.port,
+        );
+        valkey_conn.tls = config.tls;
+        valkey_conn.cluster = config.cluster;
+        let completion_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
+            client.clone(),
+            config.partition_config,
+            valkey_conn,
+        );
+        let completion_stream = <ff_backend_valkey::ValkeyBackend as ff_core::completion_backend::CompletionBackend>::subscribe_completions(&completion_backend)
+            .await
+            .map_err(|e| ServerError::OperationFailed(format!(
+                "subscribe_completions: {e}"
+            )))?;
+
+        let engine = Engine::start_with_completions(
+            engine_cfg,
+            client.clone(),
+            metrics.clone(),
+            completion_stream,
+        );
 
         // Dedicated tail client. Built AFTER library load + HMAC install
         // because those steps use the main client; tail client only runs

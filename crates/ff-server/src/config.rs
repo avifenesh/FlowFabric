@@ -240,10 +240,6 @@ impl ServerConfig {
             quota_reconciler_interval,
             unblock_interval,
             dependency_reconciler_interval,
-            // Listener is owned by `Server::start`, which has the
-            // Valkey endpoint info. Left None here; populated when
-            // the ServerConfig gets consumed by the server.
-            completion_listener: None,
             flow_projector_interval: Duration::from_secs(
                 env_u64("FF_FLOW_PROJECTOR_INTERVAL_S", 15)?
             ),
