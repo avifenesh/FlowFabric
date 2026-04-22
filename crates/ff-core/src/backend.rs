@@ -276,6 +276,29 @@ impl std::fmt::Debug for WaitpointHmac {
     }
 }
 
+/// Handle returned by `create_waitpoint` — the id of the newly-minted
+/// pending waitpoint plus its HMAC token. Signals targeted at the
+/// waitpoint must present the token; a later `suspend` call transitions
+/// the waitpoint from `pending` to `active` (RFC-012 §R7.2.2).
+///
+/// `WaitpointHmac` redacts on `Debug`/`Display`, so deriving `Debug`
+/// here cannot leak the raw digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingWaitpoint {
+    pub waitpoint_id: crate::types::WaitpointId,
+    pub hmac_token: WaitpointHmac,
+}
+
+impl PendingWaitpoint {
+    pub fn new(waitpoint_id: crate::types::WaitpointId, hmac_token: WaitpointHmac) -> Self {
+        Self {
+            waitpoint_id,
+            hmac_token,
+        }
+    }
+}
+
 /// One waitpoint inside a suspend request. `suspend` takes a
 /// `Vec<WaitpointSpec>`; the resume condition (`any` / `all`) lives on
 /// the enclosing suspend args in the Phase-1 contract.
@@ -360,6 +383,12 @@ pub struct UsageDimensions {
     /// iteration order (important for dedup-key derivation on some
     /// budget schemes).
     pub custom: BTreeMap<String, u64>,
+    /// Optional caller-supplied idempotency key. When set, the backend
+    /// rejects a repeat application of the same key with
+    /// `ReportUsageResult::AlreadyApplied` rather than double-counting
+    /// (RFC-012 §R7.4; Lua `ff_report_usage_and_check` threads this as
+    /// the trailing ARGV). `None` / empty string disables dedup.
+    pub dedup_key: Option<String>,
 }
 
 /// Admission outcome returned by `report_usage`.
@@ -555,6 +584,32 @@ pub enum FailOutcome {
     },
     /// No retries left — execution is terminal failed.
     TerminalFailed,
+}
+
+// ── RFC-012 §R7: AppendFrameOutcome move ────────────────────────────────
+
+/// Outcome of an `append_frame()` call.
+///
+/// **RFC-012 §R7.2.1:** moved from `ff_sdk::task::AppendFrameOutcome`
+/// to `ff_core::backend::AppendFrameOutcome` so it is nameable by the
+/// `EngineBackend::append_frame` trait return. `ff_sdk::task` retains
+/// a `pub use` shim preserving the `ff_sdk::task::AppendFrameOutcome`
+/// path through 0.4.x.
+///
+/// Derive set matches the `FailOutcome` precedent
+/// (`Clone, Debug, PartialEq, Eq`). Not `#[non_exhaustive]`:
+/// construction is internal to the backend today (parser in
+/// `ff-backend-valkey`), and no external constructors are anticipated
+/// (consumer-shape evidence per §R7.2.1 / MN3).
+///
+/// `stream_id: String` is a stable shape commitment — a future typed
+/// `StreamId` newtype would be its own breaking change (§R7.5.6 / MD2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendFrameOutcome {
+    /// Valkey Stream entry ID assigned to this frame (e.g. `1234567890-0`).
+    pub stream_id: String,
+    /// Total frame count in the stream after this append.
+    pub frame_count: u64,
 }
 
 // ── Stage 1a: BackendConfig + sub-types ─────────────────────────────────
@@ -917,9 +972,11 @@ mod tests {
             output_tokens: 20,
             wall_ms: Some(150),
             custom: BTreeMap::from([("net_bytes".to_string(), 42)]),
+            dedup_key: Some("k1".into()),
         };
         assert_eq!(u.clone(), u);
         assert_eq!(UsageDimensions::default().input_tokens, 0);
+        assert_eq!(UsageDimensions::default().dedup_key, None);
     }
 
     #[test]

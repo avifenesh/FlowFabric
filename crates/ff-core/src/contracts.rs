@@ -1398,6 +1398,7 @@ pub struct ReportUsageArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ReportUsageResult {
     /// All increments applied, no breach.
     Ok,

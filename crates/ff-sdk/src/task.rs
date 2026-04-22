@@ -134,13 +134,14 @@ impl SignalOutcome {
 pub use ff_core::backend::ResumeSignal;
 
 /// Outcome of `append_frame()`.
-#[derive(Clone, Debug)]
-pub struct AppendFrameOutcome {
-    /// Valkey Stream entry ID assigned to this frame.
-    pub stream_id: String,
-    /// Total frame count in the stream after this append.
-    pub frame_count: u64,
-}
+///
+/// **RFC-012 §R7.2.1:** canonical definition moved to
+/// [`ff_core::backend::AppendFrameOutcome`]; this `pub use` shim
+/// preserves the `ff_sdk::task::AppendFrameOutcome` path through the
+/// 0.4.x window. Existing consumers construct + match exhaustively
+/// without change. The derive set widened from `Clone, Debug` to
+/// `Clone, Debug, PartialEq, Eq` matching the `FailOutcome` precedent.
+pub use ff_core::backend::AppendFrameOutcome;
 
 /// Outcome of a `fail()` call.
 ///
