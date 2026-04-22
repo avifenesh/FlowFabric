@@ -13,12 +13,16 @@
 #     `publish-new` + `publish-update`.
 #   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
 #
-# Publish set (7 crates, topologically ordered):
-#   ferriskey -> ff-core -> ff-script -> ff-engine
-#     -> ff-scheduler -> ff-sdk -> ff-server
+# Publish set (8 crates, topologically ordered):
+#   ferriskey -> ff-core -> ff-script -> ff-observability
+#     -> ff-engine -> ff-scheduler -> ff-sdk -> ff-server
 # ff-test is dev-only (publish = false) and not in the set.
 # The former telemetrylib sub-crate was inlined into ferriskey
 # during the Tier 1 envelope collapse (PR #18).
+# ff-observability was added to the publish set in v0.3.1 after the
+# v0.3.0 release partial-published (ff-engine requires it as a
+# workspace dep and failed the publish step when it was missing
+# from crates.io).
 #
 # Partial-publish recovery:
 #   If publish succeeds for crate N but fails for crate N+1, the workflow
@@ -126,6 +130,8 @@ jobs:
       # the Tier 1 envelope collapse (PR #18) inlined the former
       # telemetrylib sub-crate. ff-script, ff-sdk, ff-server, ff-engine,
       # ff-scheduler all depend on ferriskey. ff-core is a leaf.
+      # ff-observability is a leaf that ff-engine depends on (added to
+      # the publish set in v0.3.1 after v0.3.0 partial-published).
       # ff-server closes the chain.
       # `--no-verify` is safe because `verify` already built + clippied +
       # tested the same ref. Without it every `cargo publish` re-builds
@@ -162,6 +168,19 @@ jobs:
             exit 1
           }
       - run: sleep 30
+      - name: publish ff-observability
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${TAG_VERSION#v}"
+          cargo publish -p ff-observability --no-verify || {
+            echo "::error::cargo publish ff-observability failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            exit 1
+          }
+      - run: sleep 30
       - name: publish ff-engine
         env:
           TAG_VERSION: ${{ github.ref_name }}
@@ -172,6 +191,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ferriskey"
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
             exit 1
           }
       - run: sleep 30
@@ -185,6 +205,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ferriskey"
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             exit 1
           }
@@ -199,6 +220,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ferriskey"
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             exit 1
@@ -214,6 +236,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ferriskey"
             echo "::error::  cargo yank --version ${VER} ff-core"
             echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-sdk"

@@ -906,7 +906,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '12'
+  return '15'
 end)
 
 
@@ -4277,6 +4277,23 @@ redis.register_function('ff_expire_suspension', function(keys, args)
     redis.call("ZREM", K.suspended_zset, A.execution_id)
     redis.call("ZADD", K.terminal_key, now_ms, A.execution_id)
 
+    -- Push-based DAG promotion (bridge-event gap report §1.3 analogue).
+    -- Suspension-timeout terminals (fail / cancel / expire) are FF-
+    -- initiated transitions that cairn cannot observe via its
+    -- call-then-emit pattern. Without a PUBLISH, flow-bound children
+    -- only unblock via the dependency_reconciler safety net (15s).
+    -- Gated on `is_set(core.flow_id)` — standalone executions never
+    -- have downstream edges. Outcome matches terminal_outcome
+    -- ("failed" / "cancelled" / "expired").
+    if is_set(core.flow_id) then
+      local payload = cjson.encode({
+        execution_id = A.execution_id,
+        flow_id = core.flow_id,
+        outcome = terminal_outcome,
+      })
+      redis.call("PUBLISH", "ff:dag:completions", payload)
+    end
+
     return ok(behavior, public_state_val)
   end
 end)
@@ -6734,6 +6751,27 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     redis.call("ZREM", K.blocked_deps_zset, core.execution_id or "")
     redis.call("ZADD", K.terminal_zset, tonumber(A.now_ms), core.execution_id or "")
     child_skipped = true
+
+    -- Push-based DAG promotion (bridge-event gap report §1.3 analogue).
+    -- A child skipped due to an impossible upstream is an FF-initiated
+    -- terminal transition: cairn never calls anything for the skip, so
+    -- without a PUBLISH the skip's own downstream edges only resolve
+    -- via the 15s dependency_reconciler safety net. Symmetric with the
+    -- other terminal sites (ff_complete_execution et al.). Gated on
+    -- `is_set(core.flow_id)` — a skip on a standalone exec would be a
+    -- bug upstream (standalones have no edges), but the gate keeps the
+    -- invariant consistent with the other emit sites. Also gated on
+    -- `is_set(core.execution_id)`: the ff-backend-valkey subscriber
+    -- fails to parse an empty execution_id and silently drops the
+    -- message, reintroducing reconciler-latency for that exec.
+    if is_set(core.flow_id) and is_set(core.execution_id) then
+      local payload = cjson.encode({
+        execution_id = core.execution_id,
+        flow_id = core.flow_id,
+        outcome = "skipped",
+      })
+      redis.call("PUBLISH", "ff:dag:completions", payload)
+    end
   end
 
   return ok("impossible", child_skipped and "child_skipped" or "")
