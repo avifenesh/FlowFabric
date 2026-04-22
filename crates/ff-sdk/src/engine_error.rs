@@ -389,12 +389,19 @@ impl EngineError {
             Self::Bug(_) => ErrorClass::Bug,
             // Downcast to ScriptError to reuse the Phase-1 classification
             // table. A non-Valkey transport error (Postgres, future) has
-            // no ScriptError inside and is conservatively classified as
-            // Retryable (transport-level faults are recoverable by default).
+            // no ScriptError inside — without an explicit classification
+            // hint, classify as Terminal rather than Retryable. Retry is
+            // only safe when the inner error is a *known* transient; the
+            // safe default for an unknown error shape is no-retry.
+            // Future backends that need retryability should either box a
+            // classifiable error (today: ScriptError) or the Transport
+            // variant gains an explicit `class: ErrorClass` field (see
+            // inline comment in engine_error.rs; tracked as a Stage-1
+            // follow-up).
             Self::Transport { source, .. } => source
                 .downcast_ref::<ScriptError>()
                 .map(|s| s.class())
-                .unwrap_or(ErrorClass::Retryable),
+                .unwrap_or(ErrorClass::Terminal),
             // Unavailable is terminal at the call site — the method is
             // not implemented; the caller must either fall back to a
             // different code path or surface to the user.
@@ -844,14 +851,16 @@ mod tests {
     }
 
     #[test]
-    fn transport_with_non_script_source_classifies_retryable() {
+    fn transport_with_non_script_source_classifies_terminal() {
         // A hypothetical non-Valkey backend routing a native error.
+        // Without an explicit classification hint, the safe default is
+        // Terminal — retrying an unknown-shape error is unsafe.
         let raw = std::io::Error::other("simulated postgres net error");
         let err = EngineError::Transport {
             backend: "postgres",
             source: Box::new(raw),
         };
-        assert_eq!(err.class(), ErrorClass::Retryable);
+        assert_eq!(err.class(), ErrorClass::Terminal);
         assert!(err.valkey_kind().is_none());
         assert!(err.transport_script_ref().is_none());
     }

@@ -5,15 +5,23 @@
 //! (issue #89 follow-up); Stage 0 is strictly type-plumbing and the
 //! `ResumeSignal` crate move.
 //!
-//! Every public struct/enum is `#[non_exhaustive]` per project convention:
-//! variants / fields may grow in future minors, and consumers must write
-//! `_`-terminated matches and non-struct-literal construction paths.
+//! Public structs/enums whose fields or variants are expected to grow
+//! are marked `#[non_exhaustive]` per project convention — consumers
+//! must write `_`-terminated matches and use the provided constructors
+//! rather than struct literals. Exceptions:
+//!
+//! * Opaque single-field wrapper newtypes ([`HandleOpaque`],
+//!   [`WaitpointHmac`]) hide their inner field and need no non-exhaustive
+//!   annotation — the wrapped value is unreachable from outside.
+//! * [`ResumeSignal`] is intentionally NOT `#[non_exhaustive]` so the
+//!   ff-sdk crate-move (Stage 0) preserves struct-literal compatibility
+//!   at its existing call site.
 //!
 //! See `rfcs/RFC-012-engine-backend-trait.md` §3.3.0 for the authoritative
 //! type inventory and §4.1-§4.2 for the `Handle` / `EngineError` shapes.
 
 use crate::contracts::ReclaimGrant;
-use crate::types::TimestampMs;
+use crate::types::{TimestampMs, WaitpointToken};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -188,6 +196,28 @@ pub struct Frame {
     pub seq: Option<u64>,
 }
 
+impl Frame {
+    /// Construct a frame. `seq` defaults to `None` (backend-assigned);
+    /// callers that need an explicit sequence use
+    /// [`Frame::with_seq`].
+    pub fn new(bytes: Vec<u8>, kind: FrameKind) -> Self {
+        Self {
+            bytes,
+            kind,
+            seq: None,
+        }
+    }
+
+    /// Construct a frame with an explicit monotonic sequence.
+    pub fn with_seq(bytes: Vec<u8>, kind: FrameKind, seq: u64) -> Self {
+        Self {
+            bytes,
+            kind,
+            seq: Some(seq),
+        }
+    }
+}
+
 // ── §3.3.0 Suspend / waitpoint types ────────────────────────────────────
 
 /// Waitpoint matcher mode (mirrors today's suspend/close matcher kinds
@@ -204,19 +234,45 @@ pub enum WaitpointKind {
 }
 
 /// HMAC token that binds a waitpoint to its mint-time identity. Wire
-/// shape `kid:40hex` (see [`crate::types::WaitpointToken`]). Newtype
-/// kept distinct so trait signatures name the waitpoint-bound HMAC
-/// role explicitly rather than passing a bare `String`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct WaitpointHmac(String);
+/// shape `kid:40hex`.
+///
+/// Wraps [`crate::types::WaitpointToken`] so bearer-credential Debug /
+/// Display redaction (`WaitpointToken("kid1:<REDACTED:len=40>")`) flows
+/// through automatically — no derived formatter can leak the raw
+/// digest when a [`WaitpointSpec`] is debug-printed via
+/// `tracing::debug!(spec=?spec)`.
+///
+/// Newtype-wrapping (vs. a `pub use` alias) keeps trait signatures
+/// naming the waitpoint-bound HMAC role explicitly.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct WaitpointHmac(WaitpointToken);
 
 impl WaitpointHmac {
     pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
+        Self(WaitpointToken::from(token.into()))
     }
 
-    pub fn as_str(&self) -> &str {
+    /// Borrow the wrapped token. The wrapped type's `Debug`/`Display`
+    /// redact — call sites that need the raw digest must explicitly
+    /// call [`WaitpointToken::as_str`].
+    pub fn token(&self) -> &WaitpointToken {
         &self.0
+    }
+
+    /// Borrow the raw `kid:40hex` string. Prefer [`Self::token`] for
+    /// non-redacted call sites; this method exists only for transport
+    /// / FCALL ARGV construction where the raw wire bytes are required.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+// Forward Debug / Display to the wrapped WaitpointToken so the
+// redaction guarantees on that type extend here. Derived Debug would
+// expose the raw string field and defeat the wrap.
+impl std::fmt::Debug for WaitpointHmac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WaitpointHmac({:?})", self.0)
     }
 }
 
@@ -229,6 +285,16 @@ pub struct WaitpointSpec {
     pub kind: WaitpointKind,
     pub matcher: Vec<u8>,
     pub hmac_token: WaitpointHmac,
+}
+
+impl WaitpointSpec {
+    pub fn new(kind: WaitpointKind, matcher: Vec<u8>, hmac_token: WaitpointHmac) -> Self {
+        Self {
+            kind,
+            matcher,
+            hmac_token,
+        }
+    }
 }
 
 // ── §3.3.0 Failure classification types ─────────────────────────────────
@@ -340,6 +406,15 @@ pub struct LeaseRenewal {
     pub lease_epoch: u64,
 }
 
+impl LeaseRenewal {
+    pub fn new(expires_at_ms: u64, lease_epoch: u64) -> Self {
+        Self {
+            expires_at_ms,
+            lease_epoch,
+        }
+    }
+}
+
 // ── §3.3.0 Cancel-flow supporting types ─────────────────────────────────
 
 /// Cancel-flow policy — what to do with the flow's members. Today
@@ -383,6 +458,22 @@ pub struct CompletionPayload {
     pub outcome: String,
     pub payload_bytes: Option<Vec<u8>>,
     pub produced_at_ms: TimestampMs,
+}
+
+impl CompletionPayload {
+    pub fn new(
+        execution_id: crate::types::ExecutionId,
+        outcome: impl Into<String>,
+        payload_bytes: Option<Vec<u8>>,
+        produced_at_ms: TimestampMs,
+    ) -> Self {
+        Self {
+            execution_id,
+            outcome: outcome.into(),
+            payload_bytes,
+            produced_at_ms,
+        }
+    }
 }
 
 // ── §3.3.0 ResumeSignal (crate move from ff-sdk::task) ──────────────────
