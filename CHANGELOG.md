@@ -5,6 +5,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Reshaped `BackendRetry` to match ferriskey's `ConnectionRetryStrategy`
+  (fields: `exponent_base`, `factor`, `number_of_retries`,
+  `jitter_percent`). Previous `max_attempts`/`base_backoff` were
+  semantically mismatched with the underlying retry primitive; the new
+  shape is a direct pass-through. Breaking field reshape; pre-1.0
+  posture accepts.
+
 ### Removed
 
 - **`BackendTimeouts.keepalive` field.** ferriskey handles TCP keepalive
