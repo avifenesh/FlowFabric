@@ -9,6 +9,19 @@ Each cluster of files represents one exploration. Conventions:
 
 ## Index
 
+### 2026-04-22 session records (v0.3.x release saga + investigations)
+
+Retrospective, audit, and investigation artifacts from the 2026-04-22 v0.3.x release saga and concurrent Stage 1c / cairn-unblock work. Not normative RFCs — preserved as chain-of-reasoning, retrospective, and evidence. Cross-references PRs #119, #120–#124, #126–#128, #130–#136.
+
+- `release-saga-2026-04-22-post-mortem.md` — Worker JJ's post-mortem of the v0.3.x release saga (what failed, what held, what changed).
+- `0.3.2-smoke-report.md` — Worker X's smoke finding that caught the ScannerFilter + CompletionBackend blockers before tag.
+- `stage-1c-scope-audit.md` — Worker EE's Stage 1c scope inventory (what's in, what's out, what's deferred).
+- `backend-timeouts-retry-audit.md` — Worker FF's `BackendTimeouts` / `BackendRetry` field audit (which fields are wired, which are placeholders).
+- `scenario-4-regression-investigation.md` — Worker DD's Scenario 4 bisect finding: methodology artifact, not a regression.
+- `bridge-event-audit.md` — Worker V's bridge-event audit surfacing GAP-1 + GAP-2 that shipped in v0.3.1.
+- `87-88-scope-carveout.md` — Worker BB's #87/#88 scope audit and carve-out.
+- `RFC-012-amendment-117-deferrals.{K,L,M}-challenge.md` — challenger records for the #117 amendment (amendment itself landed in PR #135; challengers kept as exploration record).
+
 ### RFC-012 #117 deferrals amendment (explored 2026-04-22, promoted as Round-7)
 
 Tracks issue [#117](https://github.com/avifenesh/FlowFabric/issues/117) (Stage 1b deferrals — three `ClaimedTask` methods that couldn't land as thin forwarders).
