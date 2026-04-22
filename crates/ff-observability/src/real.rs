@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _};
+use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _, ObservableGauge};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::{Encoder, TextEncoder};
 
@@ -76,6 +76,12 @@ struct Inner {
     /// Shared with the observable-gauge callback registered below;
     /// `set_cancel_backlog_depth` stores here, OTEL reads at scrape.
     cancel_backlog_depth: Arc<AtomicU64>,
+    /// Must be held for the registry lifetime: OTEL deregisters the
+    /// callback when the `ObservableGauge` handle is dropped. Without
+    /// this field, `ff_cancel_backlog_depth` would never appear on
+    /// `/metrics` (the build-and-drop in `Metrics::new` would release
+    /// it before the first scrape).
+    _cancel_backlog_gauge: ObservableGauge<u64>,
     claim_duration: Histogram<f64>,
     lease_renewal: Counter<u64>,
     worker_at_capacity: Counter<u64>,
@@ -149,7 +155,7 @@ impl Metrics {
         // reads the same atomic each scrape.
         let cancel_backlog_depth = Arc::new(AtomicU64::new(0));
         let depth_cb = Arc::clone(&cancel_backlog_depth);
-        let _gauge = meter
+        let cancel_backlog_gauge = meter
             .u64_observable_gauge(name::CANCEL_BACKLOG_DEPTH)
             .with_description("Current cancel-reconciler backlog depth.")
             .with_callback(move |o| {
@@ -165,6 +171,7 @@ impl Metrics {
             scanner_duration,
             scanner_total,
             cancel_backlog_depth,
+            _cancel_backlog_gauge: cancel_backlog_gauge,
             claim_duration,
             lease_renewal,
             worker_at_capacity,

@@ -56,10 +56,12 @@ impl Scanner for CancelReconciler {
 
     /// PR-94: `ff_cancel_backlog_depth` gauge sample — ZCARD of the
     /// per-partition cancel_backlog ZSET. Runs once per partition
-    /// per cycle; the scanner runner sums across partitions before
-    /// writing the gauge. On error returns `None` so the gauge is
-    /// not written (avoids flapping to zero on a transient read
-    /// failure).
+    /// per cycle. On error returns `None`; the scanner runner
+    /// treats any `None` during a cycle where other partitions
+    /// sampled as an invalidation and skips the gauge write
+    /// (leaves the prior scrape value in place) so a transient
+    /// ZCARD failure on one partition does not cause the gauge to
+    /// under-report as an apparent drain.
     async fn sample_backlog_depth(
         &self,
         client: &ferriskey::Client,

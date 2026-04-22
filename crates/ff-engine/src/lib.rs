@@ -163,15 +163,25 @@ impl Engine {
     ///
     /// Spawns background scanner tasks. Returns immediately.
     pub fn start(config: EngineConfig, client: ferriskey::Client) -> Self {
+        // Construct a fresh metrics handle here so direct callers
+        // (examples, tests) don't need to. Under the default build
+        // (`observability` feature off) this is the no-op shim. With
+        // the feature on the handle is a real OTEL registry but — by
+        // design — one that nothing else shares; it's only useful for
+        // tests that want to exercise scanner cycle recording in
+        // isolation. Production code uses
+        // [`Self::start_with_metrics`] to plumb the same handle
+        // through the HTTP /metrics route.
         Self::start_with_metrics(config, client, Arc::new(ff_observability::Metrics::new()))
     }
 
     /// PR-94: start the engine with a shared observability registry.
     ///
     /// Used by `ff-server` so scanner cycle metrics funnel into the
-    /// same Prometheus registry exposed at `/metrics`. The no-arg
-    /// [`Engine::start`] forwards here with a disabled shim, so direct
-    /// callers (examples, tests) retain the previous behavior.
+    /// same Prometheus registry exposed at `/metrics`. Under the
+    /// `observability` feature (flipped via the same feature on
+    /// `ff-server` / `ff-engine`), the handle records into an OTEL
+    /// `MeterProvider`; otherwise the shim no-ops.
     pub fn start_with_metrics(
         config: EngineConfig,
         client: ferriskey::Client,

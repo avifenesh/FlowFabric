@@ -9,7 +9,8 @@
 //!
 //! * `enabled` **off** (default) — all types compile to zero-cost no-op
 //!   shims. No OTEL / Prometheus crates in the dep tree. Call sites use
-//!   `Metrics::disabled()` and every instrument method is a no-op.
+//!   the same `Metrics::new()` entry point as the real backend; every
+//!   instrument method is a no-op.
 //! * `enabled` **on** — real OTEL `MeterProvider` + Prometheus exporter.
 //!   `Metrics::new()` registers all instruments; [`Metrics::render`]
 //!   returns the text-exposition body for `/metrics`.

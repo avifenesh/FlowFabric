@@ -314,27 +314,42 @@ impl Scheduler {
         config: PartitionConfig,
         scheduler_config: SchedulerConfig,
     ) -> Self {
-        Self {
+        Self::with_config_and_metrics(
             client,
             config,
             scheduler_config,
-            rotation_state: AtomicU64::new(0),
-            metrics: std::sync::Arc::new(ff_observability::Metrics::new()),
-        }
+            std::sync::Arc::new(ff_observability::Metrics::new()),
+        )
     }
 
     /// PR-94: construct a scheduler with a shared observability
-    /// registry. Used by `ff-server` so claim/budget/quota metrics
-    /// land in the same registry exposed at `/metrics`.
+    /// registry and default [`SchedulerConfig`]. Used by `ff-server`
+    /// so claim/budget/quota metrics land in the same registry
+    /// exposed at `/metrics`. For test harnesses that need both a
+    /// custom `SchedulerConfig` AND observability, use
+    /// [`Self::with_config_and_metrics`].
     pub fn with_metrics(
         client: ferriskey::Client,
         config: PartitionConfig,
         metrics: std::sync::Arc<ff_observability::Metrics>,
     ) -> Self {
+        Self::with_config_and_metrics(client, config, SchedulerConfig::default(), metrics)
+    }
+
+    /// PR-94: construct a scheduler with an explicit
+    /// [`SchedulerConfig`] AND a shared observability registry.
+    /// Convenience constructor so callers don't have to thread
+    /// both concerns through separate builders.
+    pub fn with_config_and_metrics(
+        client: ferriskey::Client,
+        config: PartitionConfig,
+        scheduler_config: SchedulerConfig,
+        metrics: std::sync::Arc<ff_observability::Metrics>,
+    ) -> Self {
         Self {
             client,
             config,
-            scheduler_config: SchedulerConfig::default(),
+            scheduler_config,
             rotation_state: AtomicU64::new(0),
             metrics,
         }

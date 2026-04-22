@@ -189,11 +189,22 @@ impl ScannerRunner {
                 let cycle_start = tokio::time::Instant::now();
                 let mut total_processed: u32 = 0;
                 let mut total_errors: u32 = 0;
-                // `Some` iff at least one partition reported a depth —
-                // preserves the distinction between "scanner doesn't
-                // export depth" (stays None, no gauge write) and
-                // "depth is 0" (write 0, i.e. empty backlog).
-                let mut total_backlog_depth: Option<u64> = None;
+                // Gauge aggregation strategy: require **every**
+                // partition to return a sample before writing.
+                // A partial sum (some partitions sampled, some
+                // returned None on error) would under-report and
+                // make the gauge jump below the true backlog, which
+                // an operator could mis-interpret as drain progress.
+                // On any missing sample we set `sample_valid = false`
+                // and skip the gauge write — the previous value
+                // stands until a full cycle succeeds.
+                //
+                // First partition returning `Some(_)` sets
+                // `sampled = true`; a subsequent `None` on any
+                // partition invalidates the cycle's write.
+                let mut total_backlog_depth: u64 = 0;
+                let mut sampled = false;
+                let mut sample_valid = true;
 
                 for p in 0..num_partitions {
                     // Check for shutdown between partitions
@@ -205,9 +216,27 @@ impl ScannerRunner {
                     let result = scanner.scan_partition(&client, p).await;
                     total_processed += result.processed;
                     total_errors += result.errors;
-                    if let Some(d) = scanner.sample_backlog_depth(&client, p).await {
-                        total_backlog_depth =
-                            Some(total_backlog_depth.unwrap_or(0).saturating_add(d));
+
+                    // Only query the gauge-sample hook on scanners
+                    // that override it (default returns None for
+                    // every partition — the check short-circuits).
+                    match scanner.sample_backlog_depth(&client, p).await {
+                        Some(d) => {
+                            sampled = true;
+                            total_backlog_depth =
+                                total_backlog_depth.saturating_add(d);
+                        }
+                        None => {
+                            // A non-overriding scanner returns None
+                            // on every partition → `sampled` stays
+                            // false → gauge write skipped anyway.
+                            // An overriding scanner with a transient
+                            // failure invalidates the cycle only if
+                            // it had already sampled a partition.
+                            if sampled {
+                                sample_valid = false;
+                            }
+                        }
                     }
                 }
 
@@ -217,8 +246,19 @@ impl ScannerRunner {
                 // operators can see cadence drift (a stuck scanner
                 // stops producing data points).
                 metrics.record_scanner_cycle(name, elapsed);
-                if let Some(depth) = total_backlog_depth {
-                    metrics.set_cancel_backlog_depth(depth);
+                if sampled && sample_valid {
+                    metrics.set_cancel_backlog_depth(total_backlog_depth);
+                } else if sampled && !sample_valid {
+                    // At least one partition sampled but another
+                    // failed — leave the gauge at its prior value.
+                    // Log at debug so operators investigating a
+                    // flat gauge can correlate to the cycle where
+                    // sampling partially failed.
+                    tracing::debug!(
+                        scanner = name,
+                        "skipping cancel_backlog_depth gauge write this cycle \
+                         (partial partition sample)"
+                    );
                 }
                 if total_processed > 0 || total_errors > 0 {
                     tracing::info!(

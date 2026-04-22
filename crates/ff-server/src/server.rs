@@ -201,15 +201,14 @@ pub struct Server {
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
     /// dispatch). Drained on shutdown with a bounded timeout.
     background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
-    /// PR-94: observability registry. Initialized to the no-op shim so
-    /// call sites are feature-symmetric; `install_metrics` swaps in a
-    /// real OTEL-backed registry at startup when the `observability`
-    /// feature is on. Held behind a `std::sync::OnceLock` so the swap
-    /// is safe after `Arc<Server>` has been handed to the router.
-    metrics: std::sync::OnceLock<Arc<ff_observability::Metrics>>,
-    /// No-op fallback returned from `metrics()` when `install_metrics`
-    /// has not been called. Always present so consumers don't branch.
-    metrics_fallback: Arc<ff_observability::Metrics>,
+    /// PR-94: observability registry. Always present; the no-op shim
+    /// takes zero runtime cost when the `observability` feature is
+    /// off, and the real OTEL-backed registry is passed in via
+    /// [`Server::start_with_metrics`] when on. Same `Arc` is shared
+    /// with [`Engine::start_with_metrics`] and
+    /// [`ff_scheduler::Scheduler::with_metrics`] so a single scrape
+    /// sees everything the process produces.
+    metrics: Arc<ff_observability::Metrics>,
 }
 
 /// Server error type.
@@ -321,7 +320,10 @@ impl Server {
     /// Scanner cycle + scheduler metrics record into this registry;
     /// `main.rs` threads the same handle into the router so `/metrics`
     /// exposes what the engine produces. The no-arg [`Server::start`]
-    /// forwards here with the no-op shim.
+    /// forwards here with a fresh `Metrics::new()` — under the default
+    /// build that's the shim, under `observability` it's a real
+    /// registry not shared with any HTTP route (useful for tests
+    /// exercising the engine in isolation).
     pub async fn start_with_metrics(
         config: ServerConfig,
         metrics: Arc<ff_observability::Metrics>,
@@ -543,36 +545,13 @@ impl Server {
             config,
             scheduler,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
-            metrics: {
-                // Seed the OnceLock with the handle used by Engine +
-                // Scheduler so `Server::metrics()` returns the same
-                // registry (not a separate shim). `install_metrics`
-                // no-ops afterwards on duplicate attempts.
-                let lock = std::sync::OnceLock::new();
-                let _ = lock.set(metrics.clone());
-                lock
-            },
-            metrics_fallback: metrics,
+            metrics,
         })
     }
 
-    /// PR-94: swap in the real OTEL-backed metrics registry. Called
-    /// once by `main` after `Server::start` returns, before the HTTP
-    /// server begins accepting connections.
-    ///
-    /// Idempotent within a process: the underlying `OnceLock` only
-    /// accepts the first `set`; subsequent calls are discarded with a
-    /// warning (misuse, not a fatal condition).
-    pub fn install_metrics(&self, metrics: Arc<ff_observability::Metrics>) {
-        if self.metrics.set(metrics).is_err() {
-            tracing::warn!("install_metrics called more than once; ignoring duplicate");
-        }
-    }
-
-    /// PR-94: get the metrics handle, or the always-present no-op
-    /// fallback when `install_metrics` has not been called.
+    /// PR-94: access the shared observability registry.
     pub fn metrics(&self) -> &Arc<ff_observability::Metrics> {
-        self.metrics.get().unwrap_or(&self.metrics_fallback)
+        &self.metrics
     }
 
     /// Get a reference to the ferriskey client.

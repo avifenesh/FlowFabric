@@ -1,9 +1,11 @@
 //! PR-94: /metrics endpoint + text-exposition format integration test.
 //!
-//! Feature-gated (`observability` off → test body is `fn () {}`, stays
-//! compiled but exercises nothing). The full scope runs under the
-//! dedicated CI job (`cargo test -p ff-server --features observability`)
-//! added alongside this PR.
+//! The whole file is gated behind the `observability` feature
+//! (`#![cfg(feature = "observability")]`): when off the file compiles
+//! to nothing and the test binary contains no test cases. The
+//! dedicated CI job `cargo test -p ff-server --features observability`
+//! (added alongside this PR) is the one that actually exercises
+//! these cases.
 
 #![cfg(feature = "observability")]
 

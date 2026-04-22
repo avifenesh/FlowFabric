@@ -63,16 +63,46 @@ pub async fn http_middleware(
     req: Request,
     next: middleware::Next,
 ) -> Response {
-    let method = req.method().as_str().to_owned();
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_else(|| "unknown".to_owned());
+    // `Method::as_str` returns `&'static str` for standard HTTP
+    // verbs; no allocation on the hot path here. Snapshot before
+    // `req` moves into `next.run`.
+    let method: &'static str = method_as_static(req.method());
+    // `MatchedPath` internally holds an `Arc<str>`; `clone` is a
+    // refcount bump, not a heap copy.
+    let matched = req.extensions().get::<MatchedPath>().cloned();
+
     let start = Instant::now();
     let resp = next.run(req).await;
     let elapsed = start.elapsed();
     let status = resp.status().as_u16();
-    metrics.record_http_request(&method, &path, status, elapsed);
+
+    let path: &str = matched.as_ref().map(|m| m.as_str()).unwrap_or("unknown");
+    // OTEL KeyValue construction inside `record_http_request` is
+    // the only remaining allocation (method / path become owned
+    // strings there — unavoidable without a global interning
+    // layer).
+    metrics.record_http_request(method, path, status, elapsed);
     resp
+}
+
+/// Map a `http::Method` to a `&'static str` without allocating.
+///
+/// Standard HTTP verbs live as `const` on `Method`, so the match
+/// resolves to static strings at compile time. Anything else is
+/// bucketed under `"OTHER"` to keep the label-set cardinality
+/// bounded (a malicious client can otherwise spam arbitrary
+/// method names and blow up the `method` label space).
+fn method_as_static(m: &axum::http::Method) -> &'static str {
+    match *m {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::CONNECT => "CONNECT",
+        axum::http::Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
 }
