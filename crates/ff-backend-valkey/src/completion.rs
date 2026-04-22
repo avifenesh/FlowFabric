@@ -19,10 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ff_core::backend::{CompletionPayload, ValkeyConnection};
+use ff_core::backend::{CompletionPayload, ScannerFilter, ValkeyConnection};
 use ff_core::completion_backend::{CompletionBackend, CompletionStream};
 use ff_core::engine_error::EngineError;
-use ff_core::types::{ExecutionId, FlowId, TimestampMs};
+use ff_core::partition::execution_partition;
+use ff_core::types::{ExecutionId, FlowId, Namespace, TimestampMs};
 use ferriskey::value::ProtocolVersion;
 use ferriskey::{Client, ClientBuilder, PushInfo, PushKind, Value};
 use futures_core::Stream;
@@ -70,10 +71,108 @@ impl CompletionBackend for ValkeyBackend {
         // Spawn the reconnect/subscribe loop. Lifetime is tied to the
         // stream: when the consumer drops the `Receiver`, `tx.send()`
         // starts failing and the loop exits.
-        tokio::spawn(subscriber_loop(conn, tx));
+        tokio::spawn(subscriber_loop(conn, tx, None));
 
         let stream = ReceiverStream { rx };
         Ok(Box::pin(stream))
+    }
+
+    async fn subscribe_completions_filtered(
+        &self,
+        filter: &ScannerFilter,
+    ) -> Result<CompletionStream, EngineError> {
+        if filter.is_noop() {
+            return self.subscribe_completions().await;
+        }
+        let Some(conn) = self.subscriber_connection.clone() else {
+            return Err(EngineError::Unavailable {
+                op: "ValkeyBackend::subscribe_completions_filtered (no subscriber connection)",
+            });
+        };
+
+        let (tx, rx) = mpsc::channel::<CompletionPayload>(STREAM_CAPACITY);
+
+        // The filtered subscriber uses the same subscriber connection
+        // for the SUBSCRIBE loop, plus a clone of the main
+        // (non-subscriber) client for per-push HGETs. Cloning
+        // `ferriskey::Client` shares the underlying multiplexed
+        // connection — no extra TCP handshake.
+        let gate_client = self.client.clone();
+        let partition_config = self.partition_config;
+        let filter_owned = filter.clone();
+        tokio::spawn(subscriber_loop(
+            conn,
+            tx,
+            Some(FilterGate {
+                client: gate_client,
+                partition_config,
+                filter: filter_owned,
+            }),
+        ));
+
+        let stream = ReceiverStream { rx };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Per-push filter gate: holds the resources needed to perform the
+/// HGET(s) that decide whether a completion payload passes the
+/// configured [`ScannerFilter`].
+#[derive(Clone)]
+pub(crate) struct FilterGate {
+    pub(crate) client: ferriskey::Client,
+    pub(crate) partition_config: ff_core::partition::PartitionConfig,
+    pub(crate) filter: ScannerFilter,
+}
+
+impl FilterGate {
+    /// Returns true iff the execution identified by `eid` passes the
+    /// gate's [`ScannerFilter`]. On HGET failure conservatively drops
+    /// the event (returns false) so a backend hiccup can't leak a
+    /// cross-tenant completion.
+    async fn admits(&self, eid: &ExecutionId) -> bool {
+        let partition = execution_partition(eid, &self.partition_config);
+        let tag = partition.hash_tag();
+        let eid_str = eid.to_string();
+
+        // Check namespace first (cheaper — one HGET on exec_core, the
+        // hash every scanner / op already touches).
+        if let Some(ref want_ns) = self.filter.namespace {
+            let core_key = format!("ff:exec:{}:{}:core", tag, eid_str);
+            let got: Result<Option<String>, _> = self
+                .client
+                .cmd("HGET")
+                .arg(&core_key)
+                .arg("namespace")
+                .execute()
+                .await;
+            match got {
+                Ok(Some(s)) => {
+                    let have = Namespace::new(s);
+                    if &have != want_ns {
+                        return false;
+                    }
+                }
+                Ok(None) | Err(_) => return false,
+            }
+        }
+
+        if let Some((ref tag_key, ref want_value)) = self.filter.instance_tag {
+            let tags_key = format!("ff:exec:{}:{}:tags", tag, eid_str);
+            let got: Result<Option<String>, _> = self
+                .client
+                .cmd("HGET")
+                .arg(&tags_key)
+                .arg(tag_key)
+                .execute()
+                .await;
+            match got {
+                Ok(Some(v)) if &v == want_value => {}
+                _ => return false,
+            }
+        }
+
+        true
     }
 }
 
@@ -98,7 +197,17 @@ impl Stream for ReceiverStream {
 /// Reconnect loop: build a RESP3 subscriber, SUBSCRIBE, drain push
 /// frames until the channel closes or the consumer drops the stream.
 /// Transient errors sleep 1s and retry.
-async fn subscriber_loop(conn: ValkeyConnection, tx: mpsc::Sender<CompletionPayload>) {
+///
+/// `gate` (issue #122): when Some, every parsed push is asked
+/// `gate.admits(execution_id)` before being forwarded; rejected
+/// events are dropped silently. None preserves the pre-#122 unfiltered
+/// behaviour.
+///
+async fn subscriber_loop(
+    conn: ValkeyConnection,
+    tx: mpsc::Sender<CompletionPayload>,
+    gate: Option<FilterGate>,
+) {
     while !tx.is_closed() {
         let (push_tx, mut push_rx) = mpsc::unbounded_channel();
         let client = match build_subscriber_client(&conn, push_tx).await {
@@ -149,6 +258,16 @@ async fn subscriber_loop(conn: ValkeyConnection, tx: mpsc::Sender<CompletionPayl
                         break;
                     };
                     if let Some(payload) = parse_push(push) {
+                        // Issue #122: gate the push via HGET(s) when
+                        // a ScannerFilter is installed. A non-admit
+                        // silently drops the event — the other
+                        // instance(s) sharing the Valkey keyspace
+                        // will receive their own copy.
+                        if let Some(ref g) = gate
+                            && !g.admits(&payload.execution_id).await
+                        {
+                            continue;
+                        }
                         // `send()` awaits on backpressure; on
                         // consumer drop it returns Err, terminating
                         // the task cleanly.
