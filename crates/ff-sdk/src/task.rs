@@ -1861,6 +1861,30 @@ pub use ff_core::contracts::STREAM_READ_HARD_CAP;
 /// Re-export of `ff_core::contracts::StreamFrames` for SDK ergonomics.
 pub use ff_core::contracts::StreamFrames;
 
+/// Opaque cursor for [`read_stream`] / [`tail_stream`] — re-export of
+/// `ff_core::contracts::StreamCursor`. Wire tokens: `"start"`, `"end"`,
+/// `"<ms>"`, `"<ms>-<seq>"`. Bare `-` / `+` are rejected — use
+/// `StreamCursor::Start` / `StreamCursor::End` instead.
+pub use ff_core::contracts::StreamCursor;
+
+/// Reject `Start` / `End` cursors at the XREAD (`tail_stream`) boundary
+/// — XREAD does not accept the open markers. Pulled out as a bare
+/// function so unit tests can exercise the guard without constructing a
+/// live `ferriskey::Client`.
+fn validate_tail_cursor(after: &StreamCursor) -> Result<(), SdkError> {
+    if !after.is_concrete() {
+        return Err(SdkError::Config {
+            context: "tail_stream".into(),
+            field: Some("after".into()),
+            message: "XREAD cursor must be a concrete entry id; pass \
+                      StreamCursor::from_beginning() to start from the \
+                      beginning"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
     if count_limit == 0 {
         return Err(SdkError::Config {
@@ -1883,8 +1907,10 @@ fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
 
 /// Read frames from a completed or in-flight attempt's stream.
 ///
-/// `from_id` / `to_id` accept XRANGE special markers (`"-"`, `"+"`) or
-/// entry IDs. `count_limit` MUST be in `1..=STREAM_READ_HARD_CAP` —
+/// `from` / `to` are [`StreamCursor`] values — `StreamCursor::Start` /
+/// `StreamCursor::End` are equivalent to XRANGE `-` / `+`, and
+/// `StreamCursor::At("<id>")` reads from a concrete entry id.
+/// `count_limit` MUST be in `1..=STREAM_READ_HARD_CAP` —
 /// `0` returns [`SdkError::Config`].
 ///
 /// Returns a [`StreamFrames`] including `closed_at`/`closed_reason` so
@@ -1909,8 +1935,8 @@ pub async fn read_stream(
     partition_config: &PartitionConfig,
     execution_id: &ExecutionId,
     attempt_index: AttemptIndex,
-    from_id: &str,
-    to_id: &str,
+    from: StreamCursor,
+    to: StreamCursor,
     count_limit: u64,
 ) -> Result<StreamFrames, SdkError> {
     use ff_core::contracts::{ReadFramesArgs, ReadFramesResult};
@@ -1920,11 +1946,14 @@ pub async fn read_stream(
     let ctx = ExecKeyContext::new(&partition, execution_id);
     let keys = ff_script::functions::stream::StreamOpKeys { ctx: &ctx };
 
+    // Lower the opaque cursor to the Valkey XRANGE marker at the
+    // adapter edge. `ReadFramesArgs` is string-typed — the Lua ABI is
+    // untouched.
     let args = ReadFramesArgs {
         execution_id: execution_id.clone(),
         attempt_index,
-        from_id: from_id.to_owned(),
-        to_id: to_id.to_owned(),
+        from_id: from.into_wire_string(),
+        to_id: to.into_wire_string(),
         count_limit,
     };
 
@@ -1937,8 +1966,12 @@ pub async fn read_stream(
 
 /// Tail a live attempt's stream.
 ///
-/// `last_id` is exclusive — XREAD returns entries with id strictly greater
-/// than `last_id`. Pass `"0-0"` to start from the beginning.
+/// `after` is an exclusive [`StreamCursor`] — XREAD returns entries
+/// with id strictly greater than `after`. Pass
+/// `StreamCursor::from_beginning()` (i.e. `At("0-0")`) to start from
+/// the beginning. `StreamCursor::Start` / `StreamCursor::End` are
+/// REJECTED at this boundary because XREAD does not accept `-` / `+`
+/// as cursors — an invalid `after` surfaces as [`SdkError::Config`].
 ///
 /// `block_ms == 0` → non-blocking peek. `block_ms > 0` → blocks up to that
 /// many ms. Rejects `block_ms > MAX_TAIL_BLOCK_MS` and `count_limit`
@@ -2005,7 +2038,7 @@ pub async fn tail_stream(
     partition_config: &PartitionConfig,
     execution_id: &ExecutionId,
     attempt_index: AttemptIndex,
-    last_id: &str,
+    after: StreamCursor,
     block_ms: u64,
     count_limit: u64,
 ) -> Result<StreamFrames, SdkError> {
@@ -2017,6 +2050,11 @@ pub async fn tail_stream(
         });
     }
     validate_stream_read_count(count_limit)?;
+    // XREAD does not accept `-` / `+` markers as cursors — reject at
+    // the SDK boundary with `SdkError::Config` rather than forwarding
+    // an invalid `-`/`+` into ferriskey (which would surface as an
+    // opaque server error).
+    validate_tail_cursor(&after)?;
 
     let partition = execution_partition(execution_id, partition_config);
     let ctx = ExecKeyContext::new(&partition, execution_id);
@@ -2027,12 +2065,53 @@ pub async fn tail_stream(
         client,
         &stream_key,
         &stream_meta_key,
-        last_id,
+        after.to_wire(),
         block_ms,
         count_limit,
     )
     .await
     .map_err(SdkError::from)
+}
+
+#[cfg(test)]
+mod tail_stream_boundary_tests {
+    use super::*;
+
+    // `validate_tail_cursor` rejects `StreamCursor::Start` and
+    // `StreamCursor::End` before `tail_stream` touches the client —
+    // same shape as the `count_limit` guard above. The matching
+    // full-path rejection on the REST layer is covered by
+    // `ff-server::api`.
+
+    #[test]
+    fn rejects_start_cursor() {
+        let err = validate_tail_cursor(&StreamCursor::Start)
+            .expect_err("Start must be rejected");
+        match err {
+            SdkError::Config { field, context, .. } => {
+                assert_eq!(field.as_deref(), Some("after"));
+                assert_eq!(context, "tail_stream");
+            }
+            other => panic!("expected SdkError::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_end_cursor() {
+        let err = validate_tail_cursor(&StreamCursor::End)
+            .expect_err("End must be rejected");
+        assert!(matches!(err, SdkError::Config { .. }));
+    }
+
+    #[test]
+    fn accepts_at_cursor() {
+        validate_tail_cursor(&StreamCursor::At("0-0".into()))
+            .expect("At cursor must be accepted");
+        validate_tail_cursor(&StreamCursor::from_beginning())
+            .expect("from_beginning() must be accepted");
+        validate_tail_cursor(&StreamCursor::At("123-0".into()))
+            .expect("concrete id must be accepted");
+    }
 }
 
 #[cfg(test)]

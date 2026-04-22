@@ -89,8 +89,8 @@ pub use ff_core::backend::ResumeSignal;
 #[cfg(feature = "valkey-default")]
 pub use task::{
     read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, Signal,
-    SignalOutcome, StreamFrames, SuspendOutcome, TimeoutBehavior, MAX_TAIL_BLOCK_MS,
-    STREAM_READ_HARD_CAP,
+    SignalOutcome, StreamCursor, StreamFrames, SuspendOutcome, TimeoutBehavior,
+    MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
 };
 #[cfg(feature = "valkey-default")]
 pub use worker::FlowFabricWorker;
