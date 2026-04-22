@@ -193,6 +193,13 @@ impl TestCluster {
     /// Rotate the waitpoint HMAC secret across partitions. Thin fixture
     /// wrapper around [`ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions`]
     /// so tests exercise the same rotation path cairn uses in production.
+    ///
+    /// Semantics: attempts every partition before panicking on any
+    /// failure (the SDK helper never short-circuits). Against the
+    /// FLUSHDB-scoped test harness this is equivalent to the old
+    /// "panic on first failure" behaviour — test state is reset
+    /// between runs, so a partial rotation has no cross-test blast
+    /// radius.
     pub async fn rotate_waitpoint_hmac_secret(
         &self,
         new_kid: &str,
@@ -206,8 +213,7 @@ impl TestCluster {
             new_secret_hex,
             grace_ms,
         )
-        .await
-        .expect("rotate_waitpoint_hmac_secret_all_partitions");
+        .await;
         for entry in results {
             entry
                 .result

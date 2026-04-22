@@ -447,9 +447,12 @@ pub struct PartitionRotationOutcome {
 /// etc.) is recorded on that partition's [`PartitionRotationOutcome`]
 /// and fan-out **continues** — the contract matches the server's
 /// `rotate_waitpoint_secret` (partial success is allowed, operators
-/// retry on the failed partition subset). The function itself only
-/// returns `Err` for whole-call invariant violations (none today);
-/// partition-scoped faults live on the per-entry `result`.
+/// retry on the failed partition subset). Returning `Vec<_>` (not
+/// `Result<Vec<_>, _>`) is deliberate: every whole-call invariant is
+/// enforced by the underlying FCALL on each partition (kid non-empty,
+/// no `:`, even-length hex, etc.), so the aggregate has nothing left
+/// to reject at the Rust boundary. Callers decide how to treat partial
+/// failures (fail loud / retry the subset / record metrics).
 ///
 /// # Concurrency + performance
 ///
@@ -493,7 +496,15 @@ pub async fn rotate_waitpoint_hmac_secret_all_partitions(
     new_kid: &str,
     new_secret_hex: &str,
     grace_ms: u64,
-) -> Result<Vec<PartitionRotationOutcome>, SdkError> {
+) -> Vec<PartitionRotationOutcome> {
+    // Hoisted out of the loop — `ff_rotate_waitpoint_hmac_secret` only
+    // borrows the args, so every partition can reuse the same struct.
+    // Avoids N × 2 string clones on the hot fan-out path.
+    let args = RotateWaitpointHmacSecretArgs {
+        new_kid: new_kid.to_owned(),
+        new_secret_hex: new_secret_hex.to_owned(),
+        grace_ms,
+    };
     let mut out = Vec::with_capacity(num_partitions as usize);
     for index in 0..num_partitions {
         let partition = Partition {
@@ -501,11 +512,6 @@ pub async fn rotate_waitpoint_hmac_secret_all_partitions(
             index,
         };
         let idx = IndexKeys::new(&partition);
-        let args = RotateWaitpointHmacSecretArgs {
-            new_kid: new_kid.to_owned(),
-            new_secret_hex: new_secret_hex.to_owned(),
-            grace_ms,
-        };
         let result = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
             client, &idx, &args,
         )
@@ -516,7 +522,7 @@ pub async fn rotate_waitpoint_hmac_secret_all_partitions(
             result,
         });
     }
-    Ok(out)
+    out
 }
 
 /// Trim trailing slashes from a base URL so `format!("{base}/v1/...")`
@@ -657,35 +663,16 @@ mod tests {
 
     // ── ClaimForWorkerResponse wire shape (issue #91) ──
 
-    #[tokio::test]
-    async fn rotate_all_partitions_zero_partitions_is_empty_noop() {
-        // Zero partitions means the caller iterates zero times — we
-        // must never touch the `Client`, so we can pass a client built
-        // against a deliberately-unreachable host and still succeed.
-        // This pins the "loop bound == num_partitions" contract
-        // without requiring a real Valkey.
-        let client = ferriskey::ClientBuilder::new()
-            .host("127.0.0.1", 1)
-            .build()
-            .await;
-        // On systems where the builder lazy-connects this succeeds;
-        // where it eagerly connects it fails. Skip the test in the
-        // eager-connect case — the zero-partition contract is still
-        // covered by the fixture delegation test path.
-        let Ok(client) = client else {
-            return;
-        };
-        let out = rotate_waitpoint_hmac_secret_all_partitions(
-            &client,
-            0,
-            "kid-unused",
-            "deadbeef",
-            60_000,
-        )
-        .await
-        .expect("zero-partition fan-out must not error");
-        assert!(out.is_empty(), "zero partitions → empty outcome vec");
-    }
+    // `rotate_waitpoint_hmac_secret_all_partitions` exercise coverage
+    // lives in `ff-test` — the integration test harness in
+    // `crates/ff-test/tests/waitpoint_hmac_rotation_fcall.rs` and
+    // `waitpoint_tokens.rs` calls through the function via the
+    // `TestCluster::rotate_waitpoint_hmac_secret` fixture, which is
+    // now a thin delegator. A pure unit test here would require a
+    // mock `ferriskey::Client` (ferriskey's `Client` performs a live
+    // RESP handshake on `ClientBuilder::build`, so a local TCP
+    // listener alone isn't sufficient) — expensive to construct for
+    // one-line iteration-count coverage.
 
     #[test]
     fn claim_for_worker_response_deserialises_opaque_partition_key() {
