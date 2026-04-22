@@ -79,15 +79,64 @@ struct BodyLimit {
 
 /// Apply per-route body-size cap + attach [`BodyLimit`] extension so the
 /// JSON rejection handler can report `limit_bytes` in the 413 response.
+///
+/// Three layers, each guarding a different failure mode:
+///
+///   1. `from_fn(enforce_body_limit)` — inspects `Content-Length` up front
+///      and rejects with our structured 413 body BEFORE the handler runs.
+///      This is the primary enforcement path and works regardless of
+///      whether the handler consumes the body. Also attaches the
+///      [`BodyLimit`] extension so `AppJson`'s 413 branch (below, case 2)
+///      can report `limit_bytes` even when rejection happens during
+///      streaming.
+///   2. `DefaultBodyLimit::max(bytes)` — hint consumed by `AppJson`
+///      (`Bytes::from_request` internally) for the case where a client
+///      lies in `Content-Length` or uses `Transfer-Encoding: chunked`:
+///      the body extractor trips on a streaming-length check and we
+///      rewrite the rejection into the structured 413 shape in
+///      `AppJson::from_request`.
+///   3. `tower_http::limit::RequestBodyLimitLayer::new(bytes)` —
+///      transport-level body cap that also fires on chunked transfers
+///      even when the handler never consumes the body. Returns a plain
+///      413 (no JSON body) in that edge case; the structured path in
+///      (1) covers the overwhelmingly common case (clients sending
+///      Content-Length).
 fn with_body_limit(route: MethodRouter<Arc<Server>>, bytes: usize) -> MethodRouter<Arc<Server>> {
-    let attach_ext =
-        middleware::from_fn(move |mut req: Request, next: middleware::Next| async move {
-            req.extensions_mut().insert(BodyLimit { bytes });
-            let resp: Response = next.run(req).await;
-            resp
-        });
-    let r: MethodRouter<Arc<Server>> = route.layer(attach_ext);
-    r.layer(DefaultBodyLimit::max(bytes))
+    let r: MethodRouter<Arc<Server>> =
+        route.layer(tower_http::limit::RequestBodyLimitLayer::new(bytes));
+    let r: MethodRouter<Arc<Server>> = r.layer(DefaultBodyLimit::max(bytes));
+    r.layer(middleware::from_fn(
+        move |req: Request, next: middleware::Next| enforce_body_limit(bytes, req, next),
+    ))
+}
+
+/// Content-Length-based body-size enforcement + [`BodyLimit`] extension.
+///
+/// Runs before the handler so routes whose handlers never consume the
+/// request body (`replay_execution`, `revoke_lease`, `reset_budget` — see
+/// Copilot review on PR#100) are still protected against large uploads.
+async fn enforce_body_limit(bytes: usize, mut req: Request, next: middleware::Next) -> Response {
+    if let Some(content_length) = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        && content_length > bytes
+    {
+        let route = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|m| m.as_str().to_owned())
+            .unwrap_or_default();
+        let body = PayloadTooLargeBody {
+            error: "payload_too_large",
+            limit_bytes: bytes,
+            route,
+        };
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
+    }
+    req.extensions_mut().insert(BodyLimit { bytes });
+    next.run(req).await
 }
 
 /// Shape for the 413 response body.
@@ -113,14 +162,12 @@ where
         req: axum::extract::Request,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
-        // Snapshot route + limit before `Json::from_request` consumes the request
-        // so we can populate a structured 413 body if axum's body-length guard trips.
+        // Snapshot metadata for a potential 413 before `Json::from_request`
+        // consumes the request. `BodyLimit` is `Copy` and `MatchedPath` is
+        // cheap to clone (its payload is an `Arc<str>`), so the non-413
+        // path pays at most two extension lookups plus a ref-count bump.
         let limit = req.extensions().get::<BodyLimit>().copied();
-        let route = req
-            .extensions()
-            .get::<MatchedPath>()
-            .map(|m| m.as_str().to_owned())
-            .unwrap_or_default();
+        let matched = req.extensions().get::<MatchedPath>().cloned();
 
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(AppJson(value)),
@@ -129,6 +176,10 @@ where
                 tracing::debug!(detail = %rejection.body_text(), "JSON rejection");
                 if status == StatusCode::PAYLOAD_TOO_LARGE {
                     let limit_bytes = limit.map(|l| l.bytes).unwrap_or(0);
+                    let route = matched
+                        .as_ref()
+                        .map(|m| m.as_str().to_owned())
+                        .unwrap_or_default();
                     let body = PayloadTooLargeBody {
                         error: "payload_too_large",
                         limit_bytes,

@@ -795,7 +795,7 @@ fn json_body_of_len(byte_len: usize) -> Vec<u8> {
     buf.extend_from_slice(b"{\"x\":\"");
     buf.extend(std::iter::repeat_n(b'a', filler));
     buf.extend_from_slice(b"\"}");
-    debug_assert_eq!(buf.len(), byte_len);
+    assert_eq!(buf.len(), byte_len);
     buf
 }
 
@@ -880,9 +880,9 @@ async fn test_api_body_limit_medium_payload_signal() {
 
 /// Control-plane category (64 KiB): exercised via
 /// `POST /v1/executions/{id}/cancel` as a representative control route.
-/// All other control-plane endpoints (priority, replay, claim, flows,
-/// budgets, quotas, rotate-secret) share the same tower layer so
-/// one route is enough.
+/// All other control-plane endpoints (priority, claim, flows, budgets,
+/// quotas, rotate-secret) share the same tower layer so one
+/// body-consuming route is enough for extractor-path coverage.
 #[tokio::test]
 #[serial_test::serial]
 async fn test_api_body_limit_control_cancel_execution() {
@@ -896,4 +896,39 @@ async fn test_api_body_limit_control_cancel_execution() {
         BODY_LIMIT_CONTROL,
     )
     .await;
+}
+
+/// Body-less routes — handlers that take `Path`/`State` but no body
+/// extractor. These rely on the `Content-Length` pre-check middleware
+/// (see PR#100 Copilot review) because `DefaultBodyLimit` alone is a
+/// no-op when the handler never reads the body. Covers one
+/// representative route per verb group.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_api_body_limit_control_replay_execution_bodyless() {
+    let api = TestApi::setup().await;
+    let eid = ExecutionId::solo(&LaneId::new(LANE), &ff_test::fixtures::TEST_PARTITION_CONFIG);
+    let path = format!("/v1/executions/{eid}/replay");
+    // `replay_execution` has no body extractor. A pre-fix request with
+    // Content-Length > BODY_LIMIT_CONTROL would have reached the handler
+    // and proceeded (the handler ignores the body). Post-fix the
+    // Content-Length check rejects with the structured 413.
+    let over = json_body_of_len(BODY_LIMIT_CONTROL + 1);
+    let resp = api
+        .client
+        .post(api.url(&path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(over)
+        .send()
+        .await
+        .expect("over-limit replay failed to send");
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body-less /replay should 413 on over-limit",
+    );
+    let body: PayloadTooLargeBody = resp.json().await.expect("413 body parse");
+    assert_eq!(body.error, "payload_too_large");
+    assert_eq!(body.limit_bytes, BODY_LIMIT_CONTROL);
+    assert_eq!(body.route, "/v1/executions/{id}/replay");
 }
