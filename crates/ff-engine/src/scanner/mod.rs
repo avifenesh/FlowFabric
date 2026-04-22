@@ -185,11 +185,33 @@ pub trait Scanner: Send + Sync + 'static {
 /// SKIPPED by the scanner (i.e. the filter rejects it). A no-op
 /// filter never rejects — returns false without issuing any HGET.
 ///
-/// Cost: 0 HGET if `filter.is_noop()`; 1 HGET when only `namespace`
-/// is set (on `ff:exec:{p}:<eid>:core`); 1 HGET when only
-/// `instance_tag` is set (on `ff:exec:{p}:<eid>:tags`); 2 HGETs when
-/// both are set. Namespace is checked first (cheaper — touches the
-/// already-hot `core` hash) and short-circuits on mismatch.
+/// # `eid` format
+///
+/// Callers pass `eid` as the **full** `{fp:N}:<uuid>` ExecutionId
+/// string — identical to what Lua stores as a ZSET member via
+/// `ZADD ... A.execution_id` and what every scanner reads out of
+/// per-partition index ZSETs with `ZRANGEBYSCORE`. The helper
+/// formats `format!("ff:exec:{}:{}:core", tag, eid)` which produces
+/// the canonical **double-tagged** production key shape
+/// `ff:exec:{fp:N}:{fp:N}:<uuid>:core` — the first tag comes from
+/// the partition's routing hash-tag; the second is the tag baked
+/// into the ExecutionId string. Matches
+/// [`ff_core::keys::ExecKeyContext::core`] / [`::tags`] exactly.
+/// Do not strip the prefix — doing so would build a
+/// single-tagged key that does not exist in production.
+///
+/// [`::tags`]: ff_core::keys::ExecKeyContext::tags
+///
+/// # Cost
+///
+/// 0 HGET if `filter.is_noop()`; 1 HGET when only `namespace` is
+/// set (on `ff:exec:{fp:N}:{fp:N}:<uuid>:core`); 1 HGET when only
+/// `instance_tag` is set (on `ff:exec:{fp:N}:{fp:N}:<uuid>:tags`);
+/// 2 HGETs when both are set. Namespace is checked first (cheaper
+/// — touches the already-hot `core` hash) and short-circuits on
+/// mismatch.
+///
+/// # Failure mode
 ///
 /// On HGET failure the helper returns true (skip), conservatively:
 /// leaking a cross-tenant candidate due to a transient read error is
