@@ -943,6 +943,210 @@ pub enum AppendFrameResult {
     },
 }
 
+// ─── StreamCursor (issue #92) ───
+
+/// Opaque cursor for attempt-stream reads/tails.
+///
+/// Replaces the bare `&str` / `String` stream-id parameters previously
+/// carried on `read_stream` / `tail_stream` / `ReadStreamParams` /
+/// `TailStreamParams`. The wire form is a flat string — serde is
+/// transparent via `try_from`/`into` — so `?from=start&to=end` and
+/// `?after=123-0` continue to work for REST clients.
+///
+/// # Public wire grammar
+///
+/// The ONLY accepted tokens are:
+///
+/// * `"start"` — first entry in the stream (XRANGE `-` equivalent).
+///   Valid in [`read_stream`] / `ReadStreamParams`.
+/// * `"end"` — latest entry in the stream (XRANGE `+` equivalent).
+///   Valid in [`read_stream`] / `ReadStreamParams`.
+/// * `"<ms>"` or `"<ms>-<seq>"` — a concrete Valkey Stream entry id.
+///   Valid everywhere.
+///
+/// The bare XRANGE/XREAD markers `"-"` and `"+"` are **NOT** accepted
+/// on the wire. The opaque `StreamCursor` grammar is the public
+/// contract; the Valkey `-`/`+` markers are an internal implementation
+/// detail carried only inside the Lua-adjacent [`ReadFramesArgs`] /
+/// `xread_block` path via [`StreamCursor::to_wire`].
+///
+/// For XREAD (tail), the documented "from the beginning" convention is
+/// `StreamCursor::At("0-0".into())` — use the convenience constructor
+/// [`StreamCursor::from_beginning`] which returns exactly that value.
+/// `Start` / `End` are rejected by the SDK's `tail_stream` boundary
+/// because XREAD does not accept `-` / `+` as cursors.
+///
+/// # Why an enum instead of a string
+///
+/// A string parameter lets malformed ids escape to the Lua/Valkey
+/// layer, surfacing as a script error and HTTP 500. An enum with
+/// fallible `FromStr` / `TryFrom<String>` catches every malformed input
+/// at the wire boundary with a structured error, and prevents bare `-`
+/// / `+` from leaking into consumer code as tacit extensions of the
+/// public API.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StreamCursor {
+    /// First entry in the stream (XRANGE start marker).
+    Start,
+    /// Latest entry in the stream (XRANGE end marker).
+    End,
+    /// A concrete Valkey Stream entry id (`<ms>` or `<ms>-<seq>`).
+    ///
+    /// For XREAD-style tails, the documented "from the beginning"
+    /// convention is `At("0-0".to_owned())` — see
+    /// [`StreamCursor::from_beginning`].
+    At(String),
+}
+
+impl StreamCursor {
+    /// Convenience constructor for the XREAD-from-beginning convention
+    /// (`"0-0"`). XREAD's `last_id` is exclusive, so passing this as
+    /// the `after` cursor returns every entry in the stream.
+    pub fn from_beginning() -> Self {
+        Self::At("0-0".to_owned())
+    }
+
+    /// Serde default helper — emits `StreamCursor::Start`. Used as
+    /// `#[serde(default = "StreamCursor::start")]` on REST query
+    /// structs.
+    pub fn start() -> Self {
+        Self::Start
+    }
+
+    /// Serde default helper — emits `StreamCursor::End`.
+    pub fn end() -> Self {
+        Self::End
+    }
+
+    /// Serde default helper — emits
+    /// `StreamCursor::from_beginning()`. Used as the default for
+    /// `TailStreamParams::after`.
+    pub fn beginning() -> Self {
+        Self::from_beginning()
+    }
+
+    /// Internal-only: lower the cursor to the XRANGE/XREAD marker
+    /// string Valkey expects. `Start → "-"`, `End → "+"`,
+    /// `At(s) → s`.
+    ///
+    /// Used at the ff-script adapter edge (right before constructing
+    /// `ReadFramesArgs` or calling `xread_block`) to translate the
+    /// opaque wire grammar into the Lua-ABI form. NOT part of the
+    /// public wire — do not emit these raw characters to consumers.
+    pub fn to_wire(&self) -> &str {
+        match self {
+            Self::Start => "-",
+            Self::End => "+",
+            Self::At(s) => s.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start => f.write_str("start"),
+            Self::End => f.write_str("end"),
+            Self::At(s) => f.write_str(s),
+        }
+    }
+}
+
+/// Error produced when parsing a [`StreamCursor`] from a string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamCursorParseError {
+    /// Empty input.
+    Empty,
+    /// Input matched a rejected bare-marker alias (`"-"`, `"+"`).
+    /// The public wire requires `"start"` / `"end"`; the raw Valkey
+    /// markers are internal-only.
+    BareMarkerRejected(String),
+    /// Input was neither a recognized keyword nor a well-formed
+    /// Stream entry id. Entry ids must match `^\d+(?:-\d+)?$`.
+    Malformed(String),
+}
+
+impl std::fmt::Display for StreamCursorParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("stream cursor must not be empty"),
+            Self::BareMarkerRejected(s) => write!(
+                f,
+                "bare marker '{s}' is not a valid stream cursor; use 'start' or 'end'"
+            ),
+            Self::Malformed(s) => write!(
+                f,
+                "invalid stream cursor '{s}' (expected 'start', 'end', '<ms>', or '<ms>-<seq>')"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamCursorParseError {}
+
+impl std::str::FromStr for StreamCursor {
+    type Err = StreamCursorParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(StreamCursorParseError::Empty);
+        }
+        if s == "-" || s == "+" {
+            return Err(StreamCursorParseError::BareMarkerRejected(s.to_owned()));
+        }
+        if s == "start" {
+            return Ok(Self::Start);
+        }
+        if s == "end" {
+            return Ok(Self::End);
+        }
+        if !s.is_ascii() {
+            return Err(StreamCursorParseError::Malformed(s.to_owned()));
+        }
+        let (ms_part, seq_part) = match s.split_once('-') {
+            Some((ms, seq)) => (ms, Some(seq)),
+            None => (s, None),
+        };
+        let ms_ok = !ms_part.is_empty() && ms_part.bytes().all(|b| b.is_ascii_digit());
+        let seq_ok = seq_part
+            .map(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or(true);
+        if ms_ok && seq_ok {
+            Ok(Self::At(s.to_owned()))
+        } else {
+            Err(StreamCursorParseError::Malformed(s.to_owned()))
+        }
+    }
+}
+
+impl TryFrom<String> for StreamCursor {
+    type Error = StreamCursorParseError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        // Forward to the `&str` impl to avoid duplicating the grammar.
+        <Self as std::str::FromStr>::from_str(&s)
+    }
+}
+
+impl From<StreamCursor> for String {
+    fn from(c: StreamCursor) -> Self {
+        c.to_string()
+    }
+}
+
+impl Serialize for StreamCursor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamCursor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::try_from(s).map_err(serde::de::Error::custom)
+    }
+}
+
 // ─── read_attempt_stream / tail_attempt_stream ───
 
 /// Hard cap on the number of frames returned by a single read/tail call.
@@ -1892,6 +2096,126 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ClaimExecutionResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, parsed);
+    }
+
+    // ── StreamCursor (issue #92) ──
+
+    #[test]
+    fn stream_cursor_display_matches_wire_tokens() {
+        assert_eq!(StreamCursor::Start.to_string(), "start");
+        assert_eq!(StreamCursor::End.to_string(), "end");
+        assert_eq!(StreamCursor::At("123".into()).to_string(), "123");
+        assert_eq!(StreamCursor::At("123-4".into()).to_string(), "123-4");
+    }
+
+    #[test]
+    fn stream_cursor_to_wire_maps_to_valkey_markers() {
+        assert_eq!(StreamCursor::Start.to_wire(), "-");
+        assert_eq!(StreamCursor::End.to_wire(), "+");
+        assert_eq!(StreamCursor::At("0-0".into()).to_wire(), "0-0");
+        assert_eq!(StreamCursor::At("17-3".into()).to_wire(), "17-3");
+    }
+
+    #[test]
+    fn stream_cursor_from_str_accepts_wire_tokens() {
+        use std::str::FromStr;
+        assert_eq!(StreamCursor::from_str("start").unwrap(), StreamCursor::Start);
+        assert_eq!(StreamCursor::from_str("end").unwrap(), StreamCursor::End);
+        assert_eq!(
+            StreamCursor::from_str("123").unwrap(),
+            StreamCursor::At("123".into())
+        );
+        assert_eq!(
+            StreamCursor::from_str("0-0").unwrap(),
+            StreamCursor::At("0-0".into())
+        );
+        assert_eq!(
+            StreamCursor::from_str("1713100800150-0").unwrap(),
+            StreamCursor::At("1713100800150-0".into())
+        );
+    }
+
+    #[test]
+    fn stream_cursor_from_str_rejects_bare_markers() {
+        use std::str::FromStr;
+        assert!(matches!(
+            StreamCursor::from_str("-"),
+            Err(StreamCursorParseError::BareMarkerRejected(s)) if s == "-"
+        ));
+        assert!(matches!(
+            StreamCursor::from_str("+"),
+            Err(StreamCursorParseError::BareMarkerRejected(s)) if s == "+"
+        ));
+    }
+
+    #[test]
+    fn stream_cursor_from_str_rejects_empty() {
+        use std::str::FromStr;
+        assert_eq!(
+            StreamCursor::from_str(""),
+            Err(StreamCursorParseError::Empty)
+        );
+    }
+
+    #[test]
+    fn stream_cursor_from_str_rejects_malformed() {
+        use std::str::FromStr;
+        for bad in ["abc", "-1", "1-", "-1-2", "1-2-3", "1.2", "1 2", "Start", "END"] {
+            assert!(
+                matches!(
+                    StreamCursor::from_str(bad),
+                    Err(StreamCursorParseError::Malformed(_))
+                ),
+                "must reject {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn stream_cursor_from_str_rejects_non_ascii() {
+        use std::str::FromStr;
+        assert!(matches!(
+            StreamCursor::from_str("1\u{2013}2"),
+            Err(StreamCursorParseError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn stream_cursor_serde_round_trip() {
+        for c in [
+            StreamCursor::Start,
+            StreamCursor::End,
+            StreamCursor::At("0-0".into()),
+            StreamCursor::At("1713100800150-0".into()),
+        ] {
+            let json = serde_json::to_string(&c).unwrap();
+            let back: StreamCursor = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn stream_cursor_serializes_as_bare_string() {
+        assert_eq!(serde_json::to_string(&StreamCursor::Start).unwrap(), r#""start""#);
+        assert_eq!(serde_json::to_string(&StreamCursor::End).unwrap(), r#""end""#);
+        assert_eq!(
+            serde_json::to_string(&StreamCursor::At("123-0".into())).unwrap(),
+            r#""123-0""#
+        );
+    }
+
+    #[test]
+    fn stream_cursor_deserialize_rejects_bare_markers() {
+        assert!(serde_json::from_str::<StreamCursor>(r#""-""#).is_err());
+        assert!(serde_json::from_str::<StreamCursor>(r#""+""#).is_err());
+    }
+
+    #[test]
+    fn stream_cursor_from_beginning_is_zero_zero() {
+        assert_eq!(
+            StreamCursor::from_beginning(),
+            StreamCursor::At("0-0".into())
+        );
     }
 }
 
