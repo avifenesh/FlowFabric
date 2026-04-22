@@ -16,5 +16,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 crc16 = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]

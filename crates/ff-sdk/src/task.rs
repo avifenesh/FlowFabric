@@ -141,15 +141,13 @@ pub struct AppendFrameOutcome {
 }
 
 /// Outcome of a `fail()` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FailOutcome {
-    /// Retry was scheduled — execution is in delayed backoff.
-    RetryScheduled {
-        delay_until: TimestampMs,
-    },
-    /// No retries left — execution is terminal failed.
-    TerminalFailed,
-}
+///
+/// **RFC-012 Stage 1a:** canonical definition moved to
+/// [`ff_core::backend::FailOutcome`]; this `pub use` shim preserves
+/// the `ff_sdk::task::FailOutcome` path (and the `ff_sdk::FailOutcome`
+/// re-export in `lib.rs`) through the 0.4.x window. Existing
+/// consumers construct + match exhaustively without change.
+pub use ff_core::backend::FailOutcome;
 
 /// A claimed execution with an active lease. The worker processes this task
 /// and must call one of `complete()`, `fail()`, or `cancel()` when done.
