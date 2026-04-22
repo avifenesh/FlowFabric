@@ -120,9 +120,10 @@ async fn expect_completion(
 /// expected outcome.
 ///
 /// The Lua terminal branch only reads:
-///   - core.lifecycle_phase == "suspended"
-///   - suspension_current.{suspension_id, timeout_at, timeout_behavior}
-///   - core.flow_id (for the PUBLISH gate)
+/// - core.lifecycle_phase == "suspended"
+/// - suspension_current.{suspension_id, timeout_at, timeout_behavior}
+/// - core.flow_id (for the PUBLISH gate)
+///
 /// so we can skip the full claim/suspend scaffold.
 async fn seed_and_expire(
     tc: &TestCluster,
