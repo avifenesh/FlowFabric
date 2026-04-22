@@ -15,11 +15,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, execution_partition};
 use ff_core::types::{ExecutionId, LaneId};
 
-use super::{ScanResult, Scanner};
+use super::{should_skip_candidate, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 /// Max dep edges to resolve per execution per cycle.
@@ -29,11 +30,28 @@ pub struct DependencyReconciler {
     interval: Duration,
     lanes: Vec<LaneId>,
     partition_config: PartitionConfig,
+    filter: ScannerFilter,
 }
 
 impl DependencyReconciler {
     pub fn new(interval: Duration, lanes: Vec<LaneId>, partition_config: PartitionConfig) -> Self {
-        Self { interval, lanes, partition_config }
+        Self::with_filter(interval, lanes, partition_config, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122).
+    pub fn with_filter(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+    ) -> Self {
+        Self {
+            interval,
+            lanes,
+            partition_config,
+            filter,
+        }
     }
 }
 
@@ -44,6 +62,10 @@ impl Scanner for DependencyReconciler {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -90,6 +112,9 @@ impl Scanner for DependencyReconciler {
             };
 
             for eid_str in &blocked {
+                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                    continue;
+                }
                 match reconcile_one_execution(
                     client, &tag, &idx, lane, eid_str,
                     &mut upstream_cache, &self.partition_config,

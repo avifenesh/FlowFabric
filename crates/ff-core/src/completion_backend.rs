@@ -54,7 +54,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures_core::Stream;
 
-use crate::backend::CompletionPayload;
+use crate::backend::{CompletionPayload, ScannerFilter};
 use crate::engine_error::EngineError;
 
 /// A backend-agnostic stream of completion events.
@@ -86,6 +86,46 @@ pub trait CompletionBackend: Send + Sync + 'static {
     /// errors after the stream is returned are handled silently by
     /// the backend's reconnect loop — callers do not see them.
     async fn subscribe_completions(&self) -> Result<CompletionStream, EngineError>;
+
+    /// Subscribe to the completion event stream with a per-event
+    /// [`ScannerFilter`] applied at the backend boundary (issue #122).
+    ///
+    /// Identical contract to [`Self::subscribe_completions`] except
+    /// that events whose execution does not match `filter` are
+    /// dropped by the backend before reaching the stream.
+    ///
+    /// # Default implementation
+    ///
+    /// The default body delegates to `subscribe_completions` when
+    /// `filter.is_noop()` (the predicate would accept every event —
+    /// no cost to the per-push filter path). When the filter is
+    /// non-trivial the default returns
+    /// [`EngineError::Unavailable`] — a default *can't* implement
+    /// the filter correctly without backend-specific HGET routing,
+    /// and a silently-unfiltered stream would break tenant isolation.
+    /// Backends that implement the filter (today: Valkey) override
+    /// this method. External backends that need isolation MUST
+    /// override.
+    ///
+    /// # Cost (Valkey backend)
+    ///
+    /// Per push frame: one HGET on `exec_core` when `filter.namespace`
+    /// is set, and/or one HGET on `ff:exec:{p}:<eid>:tags` when
+    /// `filter.instance_tag` is set (2 HGETs total when both are
+    /// set). The backend short-circuits on the cheaper namespace
+    /// check first.
+    async fn subscribe_completions_filtered(
+        &self,
+        filter: &ScannerFilter,
+    ) -> Result<CompletionStream, EngineError> {
+        if filter.is_noop() {
+            self.subscribe_completions().await
+        } else {
+            Err(EngineError::Unavailable {
+                op: "subscribe_completions_filtered (filter non-trivial; backend did not override)",
+            })
+        }
+    }
 }
 
 /// Object-safety assertion: `dyn CompletionBackend` compiles iff

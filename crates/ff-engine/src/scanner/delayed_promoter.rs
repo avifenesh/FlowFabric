@@ -13,11 +13,12 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
 
-use super::{FailureTracker, ScanResult, Scanner};
+use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
@@ -26,11 +27,23 @@ pub struct DelayedPromoter {
     /// Lanes to scan. Phase 1: just "default".
     lanes: Vec<LaneId>,
     failures: FailureTracker,
+    filter: ScannerFilter,
 }
 
 impl DelayedPromoter {
     pub fn new(interval: Duration, lanes: Vec<LaneId>) -> Self {
-        Self { interval, lanes, failures: FailureTracker::new() }
+        Self::with_filter(interval, lanes, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122).
+    pub fn with_filter(interval: Duration, lanes: Vec<LaneId>, filter: ScannerFilter) -> Self {
+        Self {
+            interval,
+            lanes,
+            failures: FailureTracker::new(),
+            filter,
+        }
     }
 }
 
@@ -41,6 +54,10 @@ impl Scanner for DelayedPromoter {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -105,6 +122,9 @@ impl Scanner for DelayedPromoter {
             // ARGV(2): execution_id, now_ms
             for eid_str in &due {
                 if self.failures.should_skip(eid_str) {
+                    continue;
+                }
+                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
                     continue;
                 }
 

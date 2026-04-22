@@ -9,10 +9,11 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 
-use super::{FailureTracker, ScanResult, Scanner};
+use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
 /// Batch size per ZRANGEBYSCORE call.
 const BATCH_SIZE: u32 = 50;
@@ -20,11 +21,22 @@ const BATCH_SIZE: u32 = 50;
 pub struct LeaseExpiryScanner {
     interval: Duration,
     failures: FailureTracker,
+    filter: ScannerFilter,
 }
 
 impl LeaseExpiryScanner {
     pub fn new(interval: Duration) -> Self {
-        Self { interval, failures: FailureTracker::new() }
+        Self::with_filter(interval, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122). See [`ScannerFilter`] rustdoc for cost.
+    pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+        }
     }
 }
 
@@ -35,6 +47,10 @@ impl Scanner for LeaseExpiryScanner {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -93,6 +109,9 @@ impl Scanner for LeaseExpiryScanner {
         // ARGV(1): execution_id
         for eid_str in &expired {
             if self.failures.should_skip(eid_str) {
+                continue;
+            }
+            if should_skip_candidate(client, &self.filter, partition, eid_str).await {
                 continue;
             }
 

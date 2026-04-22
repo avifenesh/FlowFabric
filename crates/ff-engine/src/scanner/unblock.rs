@@ -28,11 +28,12 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition};
 use ff_core::types::{BudgetId, LaneId};
 
-use super::{ScanResult, Scanner};
+use super::{should_skip_candidate, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 100;
 
@@ -53,6 +54,7 @@ pub struct UnblockScanner {
     interval: Duration,
     lanes: Vec<LaneId>,
     partition_config: PartitionConfig,
+    filter: ScannerFilter,
     /// Shared worker-caps union cache across ALL partitions in one scan
     /// pass. Previously this cache was declared inside `scan_partition`
     /// which runs once PER PARTITION — at 256 partitions that meant up
@@ -80,10 +82,22 @@ struct CapsUnionCache {
 
 impl UnblockScanner {
     pub fn new(interval: Duration, lanes: Vec<LaneId>, partition_config: PartitionConfig) -> Self {
+        Self::with_filter(interval, lanes, partition_config, ScannerFilter::default())
+    }
+
+    /// Construct with a [`ScannerFilter`] applied per candidate
+    /// (issue #122).
+    pub fn with_filter(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+    ) -> Self {
         Self {
             interval,
             lanes,
             partition_config,
+            filter,
             caps_cache: Arc::new(AsyncMutex::new(CapsUnionCache {
                 snapshot: None,
                 fetched_at: None,
@@ -100,6 +114,10 @@ impl Scanner for UnblockScanner {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn filter(&self) -> &ScannerFilter {
+        &self.filter
     }
 
     async fn scan_partition(
@@ -137,6 +155,7 @@ impl Scanner for UnblockScanner {
                 "waiting_for_budget", &mut budget_cache,
                 &caps_cache,
                 &self.partition_config,
+                &self.filter,
             ).await;
             total_processed += r.processed;
             total_errors += r.errors;
@@ -148,6 +167,7 @@ impl Scanner for UnblockScanner {
                 "waiting_for_quota", &mut budget_cache,
                 &caps_cache,
                 &self.partition_config,
+                &self.filter,
             ).await;
             total_processed += r.processed;
             total_errors += r.errors;
@@ -161,6 +181,7 @@ impl Scanner for UnblockScanner {
                 "waiting_for_capable_worker", &mut budget_cache,
                 &caps_cache,
                 &self.partition_config,
+                &self.filter,
             ).await;
             total_processed += r.processed;
             total_errors += r.errors;
@@ -185,6 +206,7 @@ async fn scan_blocked_set(
     budget_cache: &mut HashMap<String, bool>,
     caps_cache: &Arc<AsyncMutex<CapsUnionCache>>,
     partition_config: &PartitionConfig,
+    filter: &ScannerFilter,
 ) -> ScanResult {
     // Read all members from the blocked set (they're scored by block time)
     let blocked: Vec<String> = match client
@@ -218,6 +240,9 @@ async fn scan_blocked_set(
     let tag = partition.hash_tag();
 
     for eid_str in &blocked {
+        if should_skip_candidate(client, filter, partition.index, eid_str).await {
+            continue;
+        }
         // Read blocking_reason from exec_core to confirm still blocked
         let core_key = format!("ff:exec:{}:{}:core", tag, eid_str);
         let reason: Option<String> = match client

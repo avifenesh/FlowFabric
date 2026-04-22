@@ -412,6 +412,7 @@ impl Server {
             flow_projector_interval: config.engine_config.flow_projector_interval,
             execution_deadline_interval: config.engine_config.execution_deadline_interval,
             cancel_reconciler_interval: config.engine_config.cancel_reconciler_interval,
+            scanner_filter: config.engine_config.scanner_filter.clone(),
         };
         // Engine scanners keep running on the MAIN `client` mux — NOT on
         // `tail_client`. Scanner cadence is foreground-latency-coupled by

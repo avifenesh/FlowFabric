@@ -21,7 +21,7 @@
 //! type inventory and §4.1-§4.2 for the `Handle` / `EngineError` shapes.
 
 use crate::contracts::ReclaimGrant;
-use crate::types::{TimestampMs, WaitpointToken};
+use crate::types::{Namespace, TimestampMs, WaitpointToken};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -650,6 +650,123 @@ impl BackendConfig {
     }
 }
 
+// ── Issue #122: ScannerFilter ───────────────────────────────────────────
+
+/// Per-consumer filter applied by FlowFabric's background scanners and
+/// completion subscribers so multiple FlowFabric instances sharing a
+/// single Valkey keyspace can operate on disjoint subsets of
+/// executions without mutual interference (issue #122).
+///
+/// Sibling of [`CompletionPayload`]: the former is a scan *output*
+/// shape, this is the *input* predicate scanners and completion
+/// subscribers consult per candidate.
+///
+/// # Fields & backing storage
+///
+/// * `namespace` — matches against the `namespace` field on
+///   `exec_core` (Valkey hash `ff:exec:{fp:N}:<eid>:core`). Cost:
+///   one HGET per candidate when set.
+/// * `instance_tag` — matches against an entry in the execution's
+///   user-supplied tags hash at the canonical key
+///   **`ff:exec:{p}:<eid>:tags`** (where `{p}` is the partition
+///   hash-tag, e.g. `{fp:42}`). Written by the Lua function
+///   `ff_create_execution` (see `lua/execution.lua`) and
+///   `ff_set_execution_tags`. The tuple is `(tag_key, tag_value)`:
+///   the HGET targets `tag_key` on the tags hash and compares the
+///   returned string (if any) byte-for-byte against `tag_value`.
+///   Cost: one HGET per candidate when set.
+///
+/// When both are set, scanners check `namespace` first (short-circuit
+/// on mismatch) then `instance_tag`, for a maximum of 2 HGETs per
+/// candidate.
+///
+/// # Semantics
+///
+/// * [`Self::is_noop`] returns true when both fields are `None` —
+///   the filter accepts every candidate. Used by the
+///   `subscribe_completions_filtered` default body to fall back to
+///   the unfiltered subscription.
+/// * [`Self::matches`] is the tight in-memory predicate once the
+///   HGET values have been fetched. Scanners fetch the fields
+///   lazily (namespace first) and pass the results in; the helper
+///   returns false as soon as one component mismatches.
+///
+/// # Scope
+///
+/// Today the filter is consulted by execution-shaped scanners
+/// (lease_expiry, attempt_timeout, execution_deadline,
+/// suspension_timeout, pending_wp_expiry, delayed_promoter,
+/// dependency_reconciler, cancel_reconciler, unblock,
+/// index_reconciler, retention_trimmer) and by completion
+/// subscribers. Non-execution scanners (budget_reconciler,
+/// budget_reset, quota_reconciler, flow_projector) accept a filter
+/// for API uniformity but do not apply it — their iteration domains
+/// (budgets, quotas, flows) are not keyed by the
+/// per-execution namespace / instance_tag shape.
+///
+/// `#[non_exhaustive]` so future dimensions (e.g. `lane_id`,
+/// `worker_instance`) can land additively.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScannerFilter {
+    /// Tenant / workspace scope. Matches against the `namespace`
+    /// field on `exec_core`.
+    pub namespace: Option<Namespace>,
+    /// Instance-scoped tag predicate `(tag_key, tag_value)`. Matches
+    /// against an entry in `ff:exec:{p}:<eid>:tags` (the tags hash
+    /// written by `ff_create_execution`).
+    pub instance_tag: Option<(String, String)>,
+}
+
+impl ScannerFilter {
+    /// Shared no-op filter — useful as the default for the
+    /// `Scanner::filter()` trait method so implementors that don't
+    /// override can hand back a `&'static` reference without
+    /// allocating per call.
+    pub const NOOP: Self = Self {
+        namespace: None,
+        instance_tag: None,
+    };
+
+    /// True iff the filter has no dimensions set — every candidate
+    /// passes. Callers use this to short-circuit filtered subscribe
+    /// paths back to the unfiltered ones.
+    pub fn is_noop(&self) -> bool {
+        self.namespace.is_none() && self.instance_tag.is_none()
+    }
+
+    /// Post-HGET in-memory match check.
+    ///
+    /// `core_namespace` should be the `namespace` field read from
+    /// `exec_core` (None if the HGET returned nil / was skipped).
+    /// `tag_value` should be the HGET result for the configured
+    /// `instance_tag.0` key on the execution's tags hash (None if
+    /// the HGET returned nil / was skipped).
+    ///
+    /// When a filter dimension is `None` the corresponding argument
+    /// is ignored — callers may pass `None` to skip the HGET and
+    /// save a round-trip.
+    pub fn matches(
+        &self,
+        core_namespace: Option<&Namespace>,
+        tag_value: Option<&str>,
+    ) -> bool {
+        if let Some(ref want) = self.namespace {
+            match core_namespace {
+                Some(have) if have == want => {}
+                _ => return false,
+            }
+        }
+        if let Some((_, ref want_value)) = self.instance_tag {
+            match tag_value {
+                Some(have) if have == want_value.as_str() => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -850,6 +967,53 @@ mod tests {
         let terminal = FailOutcome::TerminalFailed;
         assert_ne!(retry, terminal);
         assert_eq!(retry.clone(), retry);
+    }
+
+    #[test]
+    fn scanner_filter_noop_and_default() {
+        let f = ScannerFilter::default();
+        assert!(f.is_noop());
+        assert_eq!(f, ScannerFilter::NOOP);
+        // A no-op filter matches any candidate, including ones that
+        // produced no HGET results.
+        assert!(f.matches(None, None));
+        assert!(f.matches(Some(&Namespace::new("t1")), Some("v")));
+    }
+
+    #[test]
+    fn scanner_filter_namespace_match() {
+        let f = ScannerFilter {
+            namespace: Some(Namespace::new("tenant-a")),
+            instance_tag: None,
+        };
+        assert!(!f.is_noop());
+        assert!(f.matches(Some(&Namespace::new("tenant-a")), None));
+        assert!(!f.matches(Some(&Namespace::new("tenant-b")), None));
+        // Missing core namespace ⇒ no match.
+        assert!(!f.matches(None, None));
+    }
+
+    #[test]
+    fn scanner_filter_instance_tag_match() {
+        let f = ScannerFilter {
+            namespace: None,
+            instance_tag: Some(("cairn.instance_id".into(), "i-1".into())),
+        };
+        assert!(f.matches(None, Some("i-1")));
+        assert!(!f.matches(None, Some("i-2")));
+        assert!(!f.matches(None, None));
+    }
+
+    #[test]
+    fn scanner_filter_both_dimensions() {
+        let f = ScannerFilter {
+            namespace: Some(Namespace::new("tenant-a")),
+            instance_tag: Some(("cairn.instance_id".into(), "i-1".into())),
+        };
+        assert!(f.matches(Some(&Namespace::new("tenant-a")), Some("i-1")));
+        assert!(!f.matches(Some(&Namespace::new("tenant-a")), Some("i-2")));
+        assert!(!f.matches(Some(&Namespace::new("tenant-b")), Some("i-1")));
+        assert!(!f.matches(None, Some("i-1")));
     }
 
     #[test]
