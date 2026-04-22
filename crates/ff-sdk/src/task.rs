@@ -606,6 +606,13 @@ impl ClaimedTask {
     /// Non-consuming — the worker can report usage multiple times.
     /// `dimensions` is a slice of `(dimension_name, delta)` pairs.
     /// `dedup_key` prevents double-counting on retries (auto-prefixed with budget hash tag).
+    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b Tranche 3.
+    // `AdmissionDecision` (trait return) cannot losslessly encode
+    // `ReportUsageResult::{SoftBreach, HardBreach, AlreadyApplied}`
+    // — `SoftBreach` is a warning (not a rejection) and has no home
+    // in `Admitted / Throttled / Rejected`, and `HardBreach`'s
+    // structured dim/current/limit fields collapse to `Rejected { reason: String }`.
+    // Tracked in #117.
     pub async fn report_usage(
         &self,
         budget_id: &BudgetId,
@@ -658,6 +665,11 @@ impl ClaimedTask {
     /// Returns both the waitpoint_id AND the HMAC token required by external
     /// callers to buffer signals against this pending waitpoint
     /// (RFC-004 §Waitpoint Security).
+    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b. The
+    // `EngineBackend` trait has no `create_pending_waitpoint` slot —
+    // RFC-012 §3.1 inventory does not list this op today. Needs
+    // either a new trait method or a reshape of `suspend` that covers
+    // the lease-retaining flow. Tracked in #117.
     pub async fn create_pending_waitpoint(
         &self,
         waitpoint_key: &str,
@@ -708,6 +720,10 @@ impl ClaimedTask {
     ///
     /// Non-consuming — the worker can append many frames during execution.
     /// The stream is created lazily on the first append.
+    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b. Trait
+    // method `append_frame` returns `()`; this SDK method returns
+    // `AppendFrameOutcome { stream_id, frame_count }` — the return-type
+    // delta is a hard ABI break on the Stage-1a trait. Tracked in #117.
     pub async fn append_frame(
         &self,
         frame_type: &str,
@@ -774,6 +790,12 @@ impl ClaimedTask {
     /// returns `AlreadySatisfied` and the lease is NOT released.
     ///
     /// Consumes self — the task cannot be used after suspension.
+    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b. Trait
+    // method `suspend` returns `Handle` (a resumed-kind attempt
+    // cookie); this SDK method returns `SuspendOutcome { suspension_id,
+    // waitpoint_id, waitpoint_key, waitpoint_token }` — semantically
+    // distinct return shapes. Also: SDK takes `&[ConditionMatcher]` +
+    // `TimeoutBehavior` with no `WaitpointSpec` mapping. Tracked in #117.
     pub async fn suspend(
         self,
         reason_code: &str,
