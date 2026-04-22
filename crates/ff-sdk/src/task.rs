@@ -124,36 +124,12 @@ impl SignalOutcome {
 
 /// A signal that triggered a resume, readable by a worker after re-claim.
 ///
-/// Returned by [`ClaimedTask::resume_signals`] when a suspended execution
-/// is resumed because one or more matched signals satisfied its waitpoint's
-/// resume condition. The worker can then inspect `signal_name` to branch
-/// behavior (approve / reject / etc.) and use `payload` for richer decision
-/// data instead of inferring intent from stream frames.
-///
-/// Returned only for signals whose matcher slot in the waitpoint's resume
-/// condition is marked satisfied. Pre-buffered-but-unmatched signals are
-/// not included.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResumeSignal {
-    pub signal_id: SignalId,
-    pub signal_name: String,
-    pub signal_category: String,
-    pub source_type: String,
-    pub source_identity: String,
-    pub correlation_id: String,
-    /// Valkey-server `now_ms` timestamp at which `ff_deliver_signal`
-    /// accepted this signal. `0` if the stored `accepted_at` field is
-    /// missing or non-numeric (a Lua-side defect — not expected at
-    /// runtime).
-    pub accepted_at: TimestampMs,
-    /// Raw payload bytes, if the signal was delivered with one. `None`
-    /// for signals delivered without a payload. Note: the SDK's current
-    /// signal-delivery path (`FlowFabricWorker::deliver_signal`) writes
-    /// payloads as UTF-8 (lossy) with `payload_encoding="json"`; callers
-    /// that invoke `ff_deliver_signal` directly via FCALL with non-UTF-8
-    /// bytes will receive those bytes verbatim here.
-    pub payload: Option<Vec<u8>>,
-}
+/// **RFC-012 Stage 0:** the canonical definition has moved to
+/// [`ff_core::backend::ResumeSignal`]. This `pub use` shim preserves the
+/// `ff_sdk::task::ResumeSignal` path (and, via `ff_sdk::lib`'s re-export,
+/// `ff_sdk::ResumeSignal`) through the 0.4.x window. The shim is
+/// scheduled for removal in 0.5.0.
+pub use ff_core::backend::ResumeSignal;
 
 /// Outcome of `append_frame()`.
 #[derive(Clone, Debug)]
