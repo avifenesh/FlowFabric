@@ -355,6 +355,35 @@ pub async fn build_client_from_env() -> ferriskey::Result<Client> {
     builder.build().await
 }
 
+/// Build a [`BackendConfig`] (Valkey arm) from the same environment
+/// vars as [`build_client_from_env`]. Used by tests that construct a
+/// [`ff_sdk::WorkerConfig`] and need the nested `backend` field.
+///
+/// * `FF_HOST` (default: `localhost`)
+/// * `FF_PORT` (default: `6379`)
+/// * `FF_TLS` (default: `false`)
+/// * `FF_CLUSTER` (default: `false`)
+///
+/// [`BackendConfig`]: ff_core::backend::BackendConfig
+pub fn backend_config_from_env() -> ff_core::backend::BackendConfig {
+    use ff_core::backend::{BackendConfig, BackendConnection, ValkeyConnection};
+    let host = std::env::var("FF_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_owned());
+    let port: u16 = std::env::var("FF_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let mut conn = ValkeyConnection::new(host, port);
+    conn.tls = env_flag("FF_TLS");
+    conn.cluster = env_flag("FF_CLUSTER");
+    // `BackendConfig` is `#[non_exhaustive]` — build via the
+    // public `valkey` constructor then overwrite `connection` so
+    // TLS / cluster flags land. `timeouts` + `retry` stay at
+    // backend defaults.
+    let mut cfg = BackendConfig::valkey("", 0);
+    cfg.connection = BackendConnection::Valkey(conn);
+    cfg
+}
+
 /// Read an env var as a boolean flag (1, true, yes → true).
 pub fn env_flag(key: &str) -> bool {
     std::env::var(key)

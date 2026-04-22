@@ -251,7 +251,7 @@ impl ValkeyBackend {
 /// fall back to `ConnectionRetryStrategy::default()` per-field (0 /
 /// 0 / 0 / None); callers opting into any field should set all
 /// fields they care about.
-async fn build_client(config: &BackendConfig) -> Result<ferriskey::Client, EngineError> {
+pub async fn build_client(config: &BackendConfig) -> Result<ferriskey::Client, EngineError> {
     let BackendConnection::Valkey(v) = &config.connection else {
         return Err(EngineError::Unavailable {
             op: "ValkeyBackend::connect (non-Valkey BackendConnection)",

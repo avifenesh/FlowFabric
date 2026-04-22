@@ -93,6 +93,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     strings that 5 in-tree callers rely on); closes in Stage 1d
     alongside `suspend` input-shape work.
 
+- **`WorkerConfig` split (RFC-012 Stage 1c tranche 1).** The four
+  Valkey-specific fields (`host`, `port`, `tls`, `cluster`) moved into
+  the nested `backend: BackendConfig` field, which also carries
+  `BackendTimeouts` + `BackendRetry` policy. Worker-policy fields
+  (`worker_id`, `worker_instance_id`, `namespace`, `lanes`,
+  `capabilities`, `lease_ttl_ms`, `claim_poll_interval_ms`,
+  `max_concurrent_tasks`) stay on `WorkerConfig`. Breaking struct
+  reshape; pre-1.0 posture accepts.
+
+  Migration: construct `WorkerConfig { backend:
+  BackendConfig::valkey(host, port), worker_id: ..., ... }`. For TLS
+  or cluster mode, build a `ValkeyConnection` with the flags set and
+  overwrite `BackendConfig.connection`. For tuned request timeouts /
+  retry, populate `BackendConfig.timeouts` / `BackendConfig.retry`.
+
+- **`WorkerConfig::new` constructor removed** (RFC-012 Stage 1c
+  tranche 1). Pre-1.0 clean break — no deprecated shim. Construct via
+  struct literal.
+
 - Reshaped `BackendRetry` to match ferriskey's `ConnectionRetryStrategy`
   (fields: `exponent_base`, `factor`, `number_of_retries`,
   `jitter_percent`). Previous `max_attempts`/`base_backoff` were
@@ -107,8 +126,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   wiring if needed via a future additive field. Breaking public-field
   removal accepted under pre-1.0 posture.
 
+### Added
+
+- **`ff-core` feature-flag scaffold (RFC-012 Stage 1c tranche 1).**
+  `[features]` section declared with
+  `default = ["core", "streaming", "suspension", "budget"]`. Feature
+  bodies are intentionally empty at tranche 1; tranches 2-5 add
+  `#[cfg(feature = …)]` gates on `EngineBackend` trait methods so
+  backend crates may opt into a strict subset (e.g. a hypothetical
+  Postgres backend without `suspension`). Consumer API through
+  `ff-sdk` is unchanged — `ff-sdk` pulls default features.
+- **CI: `cargo check -p ff-core --no-default-features --features
+  core`** job in `matrix.yml` so a forgotten `cfg` gate on a future
+  trait-method add fails CI rather than silently widening the
+  mandatory-implementation surface.
+- **`ff_test::fixtures::backend_config_from_env`** helper (and a
+  re-export from `ff_readiness_tests::valkey`) that reads the same
+  `FF_HOST` / `FF_PORT` / `FF_TLS` / `FF_CLUSTER` env vars as
+  `build_client_from_env` and returns a `BackendConfig`. Used by
+  integration tests that construct `WorkerConfig` through the new
+  nested-backend shape.
+- **`ff_backend_valkey::build_client`** is now `pub`. `FlowFabricWorker::connect`
+  reuses it so the `BackendConfig` → `ferriskey::Client` mapping lives
+  in exactly one place.
+
 ### Changed
 
+- **`FlowFabricWorker::connect` now routes through
+  `ff_backend_valkey::build_client`** instead of carrying its own
+  `ClientBuilder` chain. Host/port, TLS, cluster mode, request
+  timeout, and retry strategy now all wire through one code path
+  shared with `ValkeyBackend::connect`.
 - Wired `BackendRetry` to ferriskey `ClientBuilder::retry_strategy` in
   `ValkeyBackend::connect`. All 4 fields honored when set; when
   all-`None`, ferriskey's builder default is used (no call to

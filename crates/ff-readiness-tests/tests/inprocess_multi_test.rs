@@ -99,13 +99,7 @@ async fn drive_one_execution(tag: &str) {
         .expect("add_execution_to_flow");
 
     let worker_config = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        tls: ff_readiness_tests::valkey::env_flag("FF_TLS"),
-        cluster: ff_readiness_tests::valkey::env_flag("FF_CLUSTER"),
+        backend: ff_readiness_tests::valkey::backend_config_from_env(),
         worker_id: WorkerId::new(format!("readiness-multi-worker-{tag}")),
         worker_instance_id: WorkerInstanceId::new(format!("readiness-multi-inst-{tag}")),
         namespace: Namespace::new(NS),
