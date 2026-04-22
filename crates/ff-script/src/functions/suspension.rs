@@ -1,8 +1,8 @@
 //! Typed FCALL wrappers for suspension and waitpoint functions
 //! (lua/suspension.lua).
 
-use ff_core::contracts::*;
 use crate::error::ScriptError;
+use ff_core::contracts::*;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::state::PublicState;
 use ff_core::types::*;
@@ -53,12 +53,14 @@ ff_function! {
             k.idx.attempt_timeout(),                                   // 16
             k.idx.waitpoint_hmac_secrets(),                            // 17
         }
+        // RFC #58.5: `fence` is Option<LeaseFence>. Suspend hard-rejects
+        // empty triples with `fence_required` — no operator override.
         argv {
             args.execution_id.to_string(),                             // 1
             args.attempt_index.to_string(),                            // 2
-            args.attempt_id.to_string(),                               // 3
-            args.lease_id.to_string(),                                 // 4
-            args.lease_epoch.to_string(),                              // 5
+            args.fence.as_ref().map(|f| f.attempt_id.to_string()).unwrap_or_default(),  // 3
+            args.fence.as_ref().map(|f| f.lease_id.to_string()).unwrap_or_default(),    // 4
+            args.fence.as_ref().map(|f| f.lease_epoch.to_string()).unwrap_or_default(), // 5
             args.suspension_id.to_string(),                            // 6
             args.waitpoint_id.to_string(),                             // 7
             args.waitpoint_key.clone(),                                // 8
@@ -250,10 +252,10 @@ impl FromFcallResult for ExpireSuspensionResult {
         // ok(behavior, public_state) or ok("not_found_cleaned") etc.
         let sub = r.field_str(0);
         match sub.as_str() {
-            "not_found_cleaned" | "not_suspended_cleaned" | "no_active_suspension_cleaned"
-            | "not_yet_due" => Ok(ExpireSuspensionResult::AlreadySatisfied {
-                reason: sub,
-            }),
+            "not_found_cleaned"
+            | "not_suspended_cleaned"
+            | "no_active_suspension_cleaned"
+            | "not_yet_due" => Ok(ExpireSuspensionResult::AlreadySatisfied { reason: sub }),
             "auto_resume" => Ok(ExpireSuspensionResult::Expired {
                 behavior_applied: "auto_resume".into(),
             }),
@@ -333,9 +335,10 @@ impl FromFcallResult for RotateWaitpointHmacSecretOutcome {
             "rotated" => {
                 let prev = r.field_str(1);
                 let new_kid = r.field_str(2);
-                let gc_count = r.field_str(3).parse::<u32>().map_err(|e| {
-                    ScriptError::Parse(format!("bad gc_count: {e}"))
-                })?;
+                let gc_count = r
+                    .field_str(3)
+                    .parse::<u32>()
+                    .map_err(|e| ScriptError::Parse(format!("bad gc_count: {e}")))?;
                 Ok(RotateWaitpointHmacSecretOutcome::Rotated {
                     previous_kid: if prev.is_empty() { None } else { Some(prev) },
                     new_kid,
@@ -373,19 +376,28 @@ impl FromFcallResult for WaitpointHmacKids {
         let r = FcallResult::parse(raw)?.into_success()?;
         // Lua shape: ok(current_kid_or_empty, n, kid1, exp1, kid2, exp2, ...)
         let current = r.field_str(0);
-        let n = r.field_str(1).parse::<usize>().map_err(|e| {
-            ScriptError::Parse(format!("bad verifying count: {e}"))
-        })?;
+        let n = r
+            .field_str(1)
+            .parse::<usize>()
+            .map_err(|e| ScriptError::Parse(format!("bad verifying count: {e}")))?;
         let mut verifying = Vec::with_capacity(n);
         for i in 0..n {
             let kid = r.field_str(2 + 2 * i);
-            let exp = r.field_str(2 + 2 * i + 1).parse::<i64>().map_err(|e| {
-                ScriptError::Parse(format!("bad expires_at_ms for kid {kid}: {e}"))
-            })?;
-            verifying.push(VerifyingKid { kid, expires_at_ms: exp });
+            let exp = r
+                .field_str(2 + 2 * i + 1)
+                .parse::<i64>()
+                .map_err(|e| ScriptError::Parse(format!("bad expires_at_ms for kid {kid}: {e}")))?;
+            verifying.push(VerifyingKid {
+                kid,
+                expires_at_ms: exp,
+            });
         }
         Ok(WaitpointHmacKids {
-            current_kid: if current.is_empty() { None } else { Some(current) },
+            current_kid: if current.is_empty() {
+                None
+            } else {
+                Some(current)
+            },
             verifying,
         })
     }

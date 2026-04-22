@@ -4,11 +4,11 @@
 //! Each function uses the `ff_function!` macro to generate an async fn
 //! that builds KEYS/ARGV, calls FCALL, and parses the result.
 
+use crate::error::ScriptError;
 use ff_core::contracts::{
     MarkLeaseExpiredArgs, MarkLeaseExpiredResult, RenewLeaseArgs, RenewLeaseResult,
     RevokeLeaseArgs, RevokeLeaseResult,
 };
-use crate::error::ScriptError;
 use ff_core::keys::ExecKeyContext;
 use ff_core::types::TimestampMs;
 
@@ -84,12 +84,14 @@ ff_function! {
             ctx.lease_history(),
             format!("ff:idx:{}:lease_expiry", ctx.hash_tag()),
         }
+        // RFC #58.5: `fence` is Option<LeaseFence>. Renew hard-rejects
+        // empty triples with `fence_required` — no operator override.
         argv {
             args.execution_id.to_string(),
             args.attempt_index.to_string(),
-            args.attempt_id.to_string(),
-            args.lease_id.to_string(),
-            args.lease_epoch.to_string(),
+            args.fence.as_ref().map(|f| f.attempt_id.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.lease_id.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.lease_epoch.to_string()).unwrap_or_default(),
             args.lease_ttl_ms.to_string(),
             args.lease_history_grace_ms.to_string(),
         }

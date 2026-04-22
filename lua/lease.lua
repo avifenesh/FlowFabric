@@ -31,9 +31,9 @@ redis.register_function('ff_renew_lease', function(keys, args)
   local A = {
     execution_id         = args[1],
     attempt_index        = args[2],
-    attempt_id           = args[3],
-    lease_id             = args[4],
-    lease_epoch          = args[5],
+    attempt_id           = args[3] or "",
+    lease_id             = args[4] or "",
+    lease_epoch          = args[5] or "",
     lease_ttl_ms         = lease_ttl_n,
     lease_history_grace_ms = grace_n,
   }
@@ -48,6 +48,14 @@ redis.register_function('ff_renew_lease', function(keys, args)
     return err("execution_not_found")
   end
   local core = hgetall_to_table(raw)
+
+  -- RFC #58.5 — renew_lease is only meaningful when the caller holds the
+  -- current lease. Hard-reject empty or partial fence triples; there is
+  -- no operator-override escape hatch (owner's directive — cleaner
+  -- behavior than resolving-then-passing-self-match).
+  local fence, must_check_or_err = resolve_lease_fence(core, A)
+  if not fence then return must_check_or_err end
+  if not must_check_or_err then return err("fence_required") end
 
   -- Validate lifecycle
   if core.lifecycle_phase ~= "active" then

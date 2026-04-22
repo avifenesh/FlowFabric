@@ -308,6 +308,31 @@ uuid_id! {
     SuspensionId
 }
 
+// ── Lease fence triple ──
+
+/// RFC #58.5 — the fence triple `(lease_id, lease_epoch, attempt_id)` that
+/// a lease-bound FCALL passes to assert "I am the rightful owner of the
+/// current lease and I expect the server's view to match".
+///
+/// When present (non-empty), the Lua side runs the stale-lease check
+/// (`validate_lease_and_mark_expired`) and rejects mismatches with
+/// `stale_lease`. When absent (`None`), the Lua side either:
+///   * Accepts the call as an operator override (terminal ops only —
+///     `ff_complete_execution`, `ff_fail_execution`, `ff_delay_execution`,
+///     `ff_move_to_waiting_children` — gated on a separate `source ==
+///     "operator_override"` ARGV), or
+///   * Hard-rejects with `fence_required` (`ff_renew_lease`,
+///     `ff_suspend_execution` — no override path).
+///
+/// Every SDK worker-driven call site MUST pass `Some(fence)`; unfenced
+/// callers are operator tooling, janitors, and read-model paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseFence {
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub attempt_id: AttemptId,
+}
+
 uuid_id! {
     /// Dependency edge identity.
     EdgeId
@@ -453,7 +478,11 @@ impl LaneId {
         if s.len() > LANE_ID_MAX_BYTES {
             return Err(LaneIdError::TooLong(s.len()));
         }
-        if let Some((idx, _)) = s.bytes().enumerate().find(|(_, b)| !(0x20..=0x7e).contains(b)) {
+        if let Some((idx, _)) = s
+            .bytes()
+            .enumerate()
+            .find(|(_, b)| !(0x20..=0x7e).contains(b))
+        {
             return Err(LaneIdError::NonPrintable(idx));
         }
         Ok(())
@@ -532,9 +561,7 @@ impl WaitpointToken {
     /// accidentally surface partial hex.
     fn parts_for_redaction(&self) -> (Option<&str>, usize) {
         match self.0.find(':') {
-            Some(i) if i > 0 && i < self.0.len() - 1 => {
-                (Some(&self.0[..i]), self.0.len() - i - 1)
-            }
+            Some(i) if i > 0 && i < self.0.len() - 1 => (Some(&self.0[..i]), self.0.len() - i - 1),
             _ => (None, 0),
         }
     }
@@ -728,11 +755,7 @@ mod tests {
         let fid = FlowId::new();
         // Include nil, v4, and a synthetic from_bytes (stand-in for v5/v7
         // which aren't enabled as uuid features in this crate).
-        for u in [
-            Uuid::nil(),
-            Uuid::new_v4(),
-            Uuid::from_bytes([0xab; 16]),
-        ] {
+        for u in [Uuid::nil(), Uuid::new_v4(), Uuid::from_bytes([0xab; 16])] {
             let eid = ExecutionId::deterministic_for_flow(&fid, &config, u);
             assert!(ExecutionId::parse(eid.as_str()).is_ok());
         }

@@ -14,8 +14,8 @@
 //! result variants that carry an `execution_id` force a compile error
 //! in `complete` until the new variant is wired through.
 
-use ff_core::contracts::*;
 use crate::error::ScriptError;
+use ff_core::contracts::*;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::state::{AttemptType, PublicState};
 use ff_core::types::*;
@@ -279,13 +279,19 @@ impl FromFcallResult for ClaimExecutionResultPartial {
         // ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)
         let lease_id = LeaseId::parse(&r.field_str(0))
             .map_err(|e| ScriptError::Parse(format!("bad lease_id: {e}")))?;
-        let epoch = r.field_str(1).parse::<u64>()
+        let epoch = r
+            .field_str(1)
+            .parse::<u64>()
             .map_err(|e| ScriptError::Parse(format!("bad epoch: {e}")))?;
-        let expires_at = r.field_str(2).parse::<i64>()
+        let expires_at = r
+            .field_str(2)
+            .parse::<i64>()
             .map_err(|e| ScriptError::Parse(format!("bad expires_at: {e}")))?;
         let attempt_id = AttemptId::parse(&r.field_str(3))
             .map_err(|e| ScriptError::Parse(format!("bad attempt_id: {e}")))?;
-        let attempt_index = r.field_str(4).parse::<u32>()
+        let attempt_index = r
+            .field_str(4)
+            .parse::<u32>()
             .map_err(|e| ScriptError::Parse(format!("bad attempt_index: {e}")))?;
         let attempt_type = parse_attempt_type(&r.field_str(5))?;
 
@@ -306,7 +312,12 @@ impl FromFcallResult for ClaimExecutionResultPartial {
 //                terminal_zset, lease_current, lease_history, active_index,
 //                stream_meta, result_key, attempt_timeout_zset,
 //                execution_deadline_zset
-// Lua ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, result_payload
+// Lua ARGV (6): execution_id, lease_id, lease_epoch, attempt_id,
+//               result_payload, source
+//
+// RFC #58.5: `fence` is `Option<LeaseFence>`. `None` emits empty strings
+// for the triple; the Lua then requires `source == "operator_override"`
+// or returns `fence_required`.
 
 ff_function! {
     pub ff_complete_execution(args: CompleteExecutionArgs) -> CompleteExecutionResultPartial {
@@ -326,12 +337,13 @@ ff_function! {
         }
         argv {
             args.execution_id.to_string(),
-            args.lease_id.to_string(),
-            args.lease_epoch.to_string(),
-            args.attempt_id.to_string(),
+            args.fence.as_ref().map(|f| f.lease_id.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.lease_epoch.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.attempt_id.to_string()).unwrap_or_default(),
             args.result_payload.as_ref()
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .unwrap_or_default(),
+            args.source.to_string(),
         }
     }
 }
@@ -340,7 +352,9 @@ impl FromFcallResult for CompleteExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok("completed")
-        Ok(Self::Completed { public_state: PublicState::Completed })
+        Ok(Self::Completed {
+            public_state: PublicState::Completed,
+        })
     }
 }
 
@@ -404,7 +418,9 @@ impl FromFcallResult for CancelExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok("cancelled", cancelled_from_state)
-        Ok(Self::Cancelled { public_state: PublicState::Cancelled })
+        Ok(Self::Cancelled {
+            public_state: PublicState::Cancelled,
+        })
     }
 }
 
@@ -413,7 +429,10 @@ impl FromFcallResult for CancelExecutionResultPartial {
 // Lua KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
 //               lease_expiry_zset, worker_leases, active_index,
 //               delayed_zset, attempt_timeout_zset
-// Lua ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, delay_until
+// Lua ARGV (6): execution_id, lease_id, lease_epoch, attempt_id,
+//               delay_until, source
+//
+// RFC #58.5: `fence` is `Option<LeaseFence>`. See ff_complete_execution.
 
 ff_function! {
     pub ff_delay_execution(args: DelayExecutionArgs) -> DelayExecutionResultPartial {
@@ -430,10 +449,11 @@ ff_function! {
         }
         argv {
             args.execution_id.to_string(),
-            args.lease_id.to_string(),
-            args.lease_epoch.to_string(),
-            args.attempt_id.to_string(),
+            args.fence.as_ref().map(|f| f.lease_id.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.lease_epoch.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.attempt_id.to_string()).unwrap_or_default(),
             args.delay_until.to_string(),
+            args.source.to_string(),
         }
     }
 }
@@ -442,7 +462,9 @@ impl FromFcallResult for DelayExecutionResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok(delay_until)
-        Ok(Self::Delayed { public_state: PublicState::Delayed })
+        Ok(Self::Delayed {
+            public_state: PublicState::Delayed,
+        })
     }
 }
 
@@ -451,7 +473,9 @@ impl FromFcallResult for DelayExecutionResultPartial {
 // Lua KEYS (9): exec_core, attempt_hash, lease_current, lease_history,
 //               lease_expiry_zset, worker_leases, active_index,
 //               blocked_deps_zset, attempt_timeout_zset
-// Lua ARGV (4): execution_id, lease_id, lease_epoch, attempt_id
+// Lua ARGV (5): execution_id, lease_id, lease_epoch, attempt_id, source
+//
+// RFC #58.5: `fence` is `Option<LeaseFence>`. See ff_complete_execution.
 
 ff_function! {
     pub ff_move_to_waiting_children(args: MoveToWaitingChildrenArgs) -> MoveToWaitingChildrenResultPartial {
@@ -468,9 +492,10 @@ ff_function! {
         }
         argv {
             args.execution_id.to_string(),
-            args.lease_id.to_string(),
-            args.lease_epoch.to_string(),
-            args.attempt_id.to_string(),
+            args.fence.as_ref().map(|f| f.lease_id.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.lease_epoch.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.attempt_id.to_string()).unwrap_or_default(),
+            args.source.to_string(),
         }
     }
 }
@@ -479,7 +504,9 @@ impl FromFcallResult for MoveToWaitingChildrenResultPartial {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
         let _r = FcallResult::parse(raw)?.into_success()?;
         // ok()
-        Ok(Self::Moved { public_state: PublicState::WaitingChildren })
+        Ok(Self::Moved {
+            public_state: PublicState::WaitingChildren,
+        })
     }
 }
 
@@ -489,8 +516,10 @@ impl FromFcallResult for MoveToWaitingChildrenResultPartial {
 //                terminal_zset, delayed_zset, lease_current, lease_history,
 //                active_index, stream_meta, attempt_timeout_zset,
 //                execution_deadline_zset
-// Lua ARGV (7): execution_id, lease_id, lease_epoch, attempt_id,
-//               failure_reason, failure_category, retry_policy_json
+// Lua ARGV (8): execution_id, lease_id, lease_epoch, attempt_id,
+//               failure_reason, failure_category, retry_policy_json, source
+//
+// RFC #58.5: `fence` is `Option<LeaseFence>`. See ff_complete_execution.
 
 ff_function! {
     pub ff_fail_execution(args: FailExecutionArgs) -> FailExecutionResult {
@@ -510,12 +539,13 @@ ff_function! {
         }
         argv {
             args.execution_id.to_string(),
-            args.lease_id.to_string(),
-            args.lease_epoch.to_string(),
-            args.attempt_id.to_string(),
+            args.fence.as_ref().map(|f| f.lease_id.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.lease_epoch.to_string()).unwrap_or_default(),
+            args.fence.as_ref().map(|f| f.attempt_id.to_string()).unwrap_or_default(),
             args.failure_reason.clone(),
             args.failure_category.clone(),
             args.retry_policy_json.clone(),
+            args.source.to_string(),
         }
     }
 }
@@ -754,7 +784,9 @@ mod partial_tests {
         let eid = test_eid();
         let full = partial.complete(eid.clone());
         match full {
-            CompleteExecutionResult::Completed { execution_id, .. } => assert_eq!(execution_id, eid),
+            CompleteExecutionResult::Completed { execution_id, .. } => {
+                assert_eq!(execution_id, eid)
+            }
         }
     }
 
@@ -790,7 +822,9 @@ mod partial_tests {
         let eid = test_eid();
         let full = partial.complete(eid.clone());
         match full {
-            MoveToWaitingChildrenResult::Moved { execution_id, .. } => assert_eq!(execution_id, eid),
+            MoveToWaitingChildrenResult::Moved { execution_id, .. } => {
+                assert_eq!(execution_id, eid)
+            }
         }
     }
 

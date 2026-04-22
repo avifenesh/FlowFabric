@@ -52,9 +52,9 @@ redis.register_function('ff_suspend_execution', function(keys, args)
   local A = {
     execution_id              = args[1],
     attempt_index             = args[2],
-    attempt_id                = args[3],
-    lease_id                  = args[4],
-    lease_epoch               = args[5],
+    attempt_id                = args[3] or "",
+    lease_id                  = args[4] or "",
+    lease_epoch               = args[5] or "",
     suspension_id             = args[6],
     waitpoint_id              = args[7],
     waitpoint_key             = args[8],
@@ -76,6 +76,12 @@ redis.register_function('ff_suspend_execution', function(keys, args)
   local raw = redis.call("HGETALL", K.core_key)
   if #raw == 0 then return err("execution_not_found") end
   local core = hgetall_to_table(raw)
+
+  -- RFC #58.5 — suspend_execution is lease-bound. Hard-reject empty or
+  -- partial fence triples; no operator-override escape hatch.
+  local fence, must_check_or_err = resolve_lease_fence(core, A)
+  if not fence then return must_check_or_err end
+  if not must_check_or_err then return err("fence_required") end
 
   -- 2. Validate lease (full check incl. expiry + revocation + identity)
   local lease_err = validate_lease_and_mark_expired(
