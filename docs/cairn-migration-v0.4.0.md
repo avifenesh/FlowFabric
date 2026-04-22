@@ -97,25 +97,32 @@ Namespace does **not** live on `BackendConfig`; it lives on
 ## 5. `FlowFabricWorker` + completion subscription
 
 ```rust
-let worker = FlowFabricWorker::connect_with(config, backend).await?;
+// Valkey impls both EngineBackend and CompletionBackend, so the same
+// Arc flows through both positions — one allocation, two trait views.
+let valkey = Arc::new(ValkeyBackend::connect(backend_config).await?);
+let worker = FlowFabricWorker::connect_with(
+    config,
+    valkey.clone(),
+    Some(valkey),
+).await?;
 
 let completion = worker
     .completion_backend()
-    .expect("valkey-default feature provides CompletionBackend impl");
+    .expect("Some(..) was passed to connect_with");
 
 let stream = completion.subscribe_completions_filtered(&filter).await?;
 ```
 
-**Important caveat on `connect_with` + `completion_backend()`:**
-`connect_with(config, Arc<dyn EngineBackend>)` clears the default
-`CompletionBackend` handle because a caller-supplied `Arc<dyn
-EngineBackend>` cannot be re-upcast. Consequently
-`worker.completion_backend()` returns `None` on that path
-(`crates/ff-sdk/src/worker.rs:522-569`).
+**`connect_with` + `completion_backend()` (0.3.4):** the third argument
+is an explicit `Option<Arc<dyn CompletionBackend>>`. Pass `Some(arc)`
+when the backend supports push-based completion; pass `None` for
+backends that do not (future Postgres without LISTEN/NOTIFY, test
+mocks). `worker.completion_backend()` returns whatever was passed.
 
-If you need completion subscription, use `FlowFabricWorker::connect`
-(the default path) under the `valkey-default` feature instead, and call
-`completion_backend()` on the result — that returns `Some(...)`.
+Pre-0.3.4 (`connect_with(config, backend)`) silently returned `None`
+from `completion_backend()` on this path because `Arc<dyn
+EngineBackend>` cannot be re-upcast to `Arc<dyn CompletionBackend>` in
+Rust's trait-object model. 0.3.4 makes the caller decide.
 
 ## 6. Gotchas
 

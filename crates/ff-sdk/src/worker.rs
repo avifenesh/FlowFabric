@@ -109,13 +109,15 @@ pub struct FlowFabricWorker {
     /// migrates them through this field, and Stage 1d removes the
     /// embedded client.
     backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
-    /// Optional upcast to the same underlying backend viewed as a
+    /// Optional handle to the same underlying backend viewed as a
     /// [`CompletionBackend`](ff_core::completion_backend::CompletionBackend).
     /// Populated by [`Self::connect`] from the bundled
-    /// `ValkeyBackend` (which implements the trait); cleared by
-    /// [`Self::connect_with`] because a caller-supplied
-    /// `Arc<dyn EngineBackend>` cannot be re-upcast. Cairn and other
-    /// completion-subscription consumers reach this through
+    /// `ValkeyBackend` (which implements the trait); supplied by the
+    /// caller on [`Self::connect_with`] as an explicit
+    /// `Option<Arc<dyn CompletionBackend>>` — `None` means "this
+    /// backend does not support push-based completion" (e.g. a future
+    /// Postgres backend without LISTEN/NOTIFY, or a test mock). Cairn
+    /// and other completion-subscription consumers reach this through
     /// [`Self::completion_backend`].
     completion_backend_handle:
         Option<Arc<dyn ff_core::completion_backend::CompletionBackend>>,
@@ -490,12 +492,56 @@ impl FlowFabricWorker {
         })
     }
 
-    /// Store a pre-built [`EngineBackend`] on the worker. Builds
-    /// the worker via the legacy [`FlowFabricWorker::connect`] path
-    /// first (so the embedded `ferriskey::Client` that the Stage 1b
-    /// non-migrated hot paths still use is dialed), then replaces
-    /// the default `ValkeyBackend` wrapper with the caller-supplied
-    /// `Arc<dyn EngineBackend>`.
+    /// Store pre-built [`EngineBackend`] and (optional)
+    /// [`CompletionBackend`] handles on the worker. Builds the worker
+    /// via the legacy [`FlowFabricWorker::connect`] path first (so the
+    /// embedded `ferriskey::Client` that the Stage 1b non-migrated hot
+    /// paths still use is dialed), then replaces the default
+    /// `ValkeyBackend` wrapper with the caller-supplied trait objects.
+    ///
+    /// The `completion` argument is explicit: 0.3.3 previously accepted
+    /// only `backend` and `completion_backend()` silently returned
+    /// `None` on this path because `Arc<dyn EngineBackend>` cannot be
+    /// upcast to `Arc<dyn CompletionBackend>` without loss of
+    /// trait-object identity. 0.3.4 lets the caller decide.
+    ///
+    /// - `Some(arc)` — caller supplies a completion backend.
+    ///   [`Self::completion_backend`] returns `Some(clone)`.
+    /// - `None` — this backend does not support push-based completion
+    ///   (future Postgres backend without LISTEN/NOTIFY, test mocks).
+    ///   [`Self::completion_backend`] returns `None`.
+    ///
+    /// When the underlying backend implements both traits (as
+    /// `ValkeyBackend` does), pass the same `Arc` twice — the two
+    /// trait-object views share one allocation:
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use ff_backend_valkey::ValkeyBackend;
+    /// use ff_sdk::{FlowFabricWorker, WorkerConfig};
+    ///
+    /// # async fn doc(worker_config: WorkerConfig,
+    /// #              backend_config: ff_backend_valkey::BackendConfig)
+    /// #     -> Result<(), ff_sdk::SdkError> {
+    /// // Valkey (completion supported):
+    /// let valkey = Arc::new(ValkeyBackend::connect(backend_config).await?);
+    /// let worker = FlowFabricWorker::connect_with(
+    ///     worker_config,
+    ///     valkey.clone(),
+    ///     Some(valkey),
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Backend without completion support:
+    ///
+    /// ```rust,ignore
+    /// let worker = FlowFabricWorker::connect_with(
+    ///     worker_config,
+    ///     backend,
+    ///     None,
+    /// ).await?;
+    /// ```
     ///
     /// **Stage 1b scope — what the injected backend covers today.**
     /// After this PR, `ClaimedTask`'s 8 migrated ops
@@ -519,18 +565,15 @@ impl FlowFabricWorker {
     /// the 8 migrated ops can run fully against a mock backend.
     ///
     /// [`EngineBackend`]: ff_core::engine_backend::EngineBackend
+    /// [`CompletionBackend`]: ff_core::completion_backend::CompletionBackend
     pub async fn connect_with(
         config: WorkerConfig,
         backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
+        completion: Option<Arc<dyn ff_core::completion_backend::CompletionBackend>>,
     ) -> Result<Self, SdkError> {
         let mut worker = Self::connect(config).await?;
         worker.backend = backend;
-        // The caller-supplied trait object cannot be upcast to
-        // `CompletionBackend` without loss of identity; clear the
-        // default `ValkeyBackend`-derived handle so
-        // `completion_backend()` reports `None`, reflecting that
-        // the caller-supplied backend owns the surface now.
-        worker.completion_backend_handle = None;
+        worker.completion_backend_handle = completion;
         Ok(worker)
     }
 
@@ -552,12 +595,12 @@ impl FlowFabricWorker {
     /// Returns `Some` when the worker was built through
     /// [`Self::connect`] on the default `valkey-default` feature
     /// (the bundled `ValkeyBackend` implements
-    /// [`CompletionBackend`](ff_core::completion_backend::CompletionBackend)).
-    /// Returns `None` when the worker was built via
-    /// [`Self::connect_with`] (the caller-supplied
-    /// `Arc<dyn EngineBackend>` cannot be re-upcast to
-    /// `CompletionBackend`), or for hypothetical future backends
-    /// that don't support push-based completion streams.
+    /// [`CompletionBackend`](ff_core::completion_backend::CompletionBackend)),
+    /// or via [`Self::connect_with`] with a `Some(..)` completion
+    /// handle. Returns `None` when the caller passed `None` to
+    /// [`Self::connect_with`] — i.e. the backend does not support
+    /// push-based completion streams (future Postgres without
+    /// LISTEN/NOTIFY, test mocks).
     ///
     /// The returned handle shares the same underlying allocation as
     /// [`Self::backend`]; calls through it (e.g.

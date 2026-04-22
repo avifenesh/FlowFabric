@@ -27,6 +27,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   wiring if needed via a future additive field. Breaking public-field
   removal accepted under pre-1.0 posture.
 
+## [0.3.4] - 2026-04-22
+
+### Fixed
+
+- **`FlowFabricWorker::connect_with` now takes `completion: Option<Arc<dyn CompletionBackend>>` as its third argument.** Breaking signature change.
+  - `Some(arc)` = caller-supplied completion backend (e.g. `Arc::clone(&valkey)` since `ValkeyBackend` impls both `EngineBackend` and `CompletionBackend`).
+  - `None` = this backend does not support push-based completion (future Postgres backend without LISTEN/NOTIFY; test mocks).
+  - Fixes 0.3.3 bug where `connect_with` silently nulled `completion_backend_handle` because `Arc<dyn EngineBackend>` can't be upcast to `Arc<dyn CompletionBackend>` in Rust's trait-object model. 0.3.4 makes the caller decide.
+
+  Migration:
+
+  ```rust
+  // Valkey (completion supported):
+  let valkey = Arc::new(ValkeyBackend::connect(backend_config).await?);
+  let worker = FlowFabricWorker::connect_with(
+      worker_config,
+      valkey.clone(),
+      Some(valkey),
+  ).await?;
+
+  // Backend without completion support:
+  let worker = FlowFabricWorker::connect_with(
+      worker_config,
+      backend,
+      None,
+  ).await?;
+  ```
+
 ## [0.3.3] - 2026-04-22
 
 ### Fixed
