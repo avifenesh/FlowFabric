@@ -48,10 +48,11 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 ### 1. Start Valkey
 
 FlowFabric is Valkey-native and is not tested or supported against Redis.
-The version check uses Valkey's `INFO` shape; pointing `ff-server` at a Redis
-server is outside the supported configuration matrix — behavior is undefined.
-The `redis_version:` fallback exists for pre-8.0 Valkey (which emits only
-`redis_version:`, not `valkey_version:`), not to legitimize Redis.
+The version check expects Valkey's `INFO` shape; pointing `ff-server` at a
+Redis server is unsupported and is rejected at boot by the version gate
+(`parse_valkey_version` requires `server_name:valkey` in INFO). The
+`redis_version:` fallback exists for pre-8.0 Valkey (which emits only
+`redis_version:`, not `valkey_version:`), not to legitimize or allow Redis.
 
 FlowFabric requires Valkey >= 7.2 (RFC-011 §13, enforced at boot). 7.2 is the
 release where the Valkey Functions API + RESP3 stabilized. Valkey 7.0 and
