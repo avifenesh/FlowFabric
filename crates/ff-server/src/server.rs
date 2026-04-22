@@ -39,18 +39,16 @@ use crate::config::ServerConfig;
 /// returns the full list; retries only need a sample.
 const ALREADY_TERMINAL_MEMBER_CAP: usize = 1000;
 
-/// Upper bound on the number of dimensions a single budget policy may declare,
-/// and on the number of dimensions a single `report_usage` call may touch.
+/// Re-export of the budget dimension cap.
 ///
-/// The limit exists to cap FCALL ARGV allocation: both `create_budget` and
-/// `report_usage` build argv whose length is linear in `dimensions.len()`,
-/// so an untrusted caller could otherwise request an unbounded `Vec`
-/// allocation (CodeQL `rust/uncontrolled-allocation-size`, issue #104).
-///
-/// 64 is generously above any legitimate scoping dimension count
-/// (org/tenant/project/region/lane/tier/…) while bounding worst-case
-/// ARGV to ~200 strings — well below Valkey argv limits.
-pub(crate) const MAX_BUDGET_DIMENSIONS: usize = 64;
+/// Defined as the single source of truth in `ff_script::functions::budget` so
+/// the typed FCALL wrappers and the REST boundary cannot silently drift
+/// (PR #106 review). The limit exists to cap FCALL ARGV allocation: both
+/// `create_budget` and `report_usage` build argv whose length is linear in
+/// `dimensions.len()`, so an untrusted caller could otherwise request an
+/// unbounded `Vec` allocation (CodeQL `rust/uncontrolled-allocation-size`,
+/// issue #104).
+pub(crate) use ff_script::functions::budget::MAX_BUDGET_DIMENSIONS;
 
 /// Validate `create_budget` dimension inputs before building the FCALL argv.
 ///

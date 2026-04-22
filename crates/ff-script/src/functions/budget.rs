@@ -6,9 +6,16 @@ use ff_core::keys::{ExecKeyContext, IndexKeys};
 
 use crate::result::{FcallResult, FromFcallResult};
 
-/// Mirror of `ff_server::server::MAX_BUDGET_DIMENSIONS` (#104). Duplicated
-/// here so direct script-helper callers (tests, tools) don't bypass the cap
-/// when they reach Valkey without traversing the HTTP server layer.
+/// Single source of truth for the budget dimension cap (#104).
+///
+/// Enforced at both the HTTP boundary in `ff-server` (which re-exports this
+/// constant) and inside the typed FCALL wrappers below, so direct
+/// script-helper callers (tests, tools, alternate services) cannot reach
+/// Valkey with an unbounded `dim_count` by skipping the REST layer.
+///
+/// 64 is generously above any legitimate scoping dimension count
+/// (org/tenant/project/region/lane/tier/…) while bounding worst-case
+/// FCALL ARGV to ~200 strings — well below Valkey argv limits.
 pub const MAX_BUDGET_DIMENSIONS: usize = 64;
 
 /// Key context for budget operations on {b:M}.
