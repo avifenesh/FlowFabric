@@ -140,6 +140,11 @@ async fn fanout_fanin_flow_happy() {
     task_d.complete(Some(b"D-ok".to_vec())).await.expect("complete D");
     await_public_state(&worker, d, PublicState::Completed).await;
 
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    drop(worker);
+    server.shutdown().await;
+
     evidence::write(
         TEST_NAME,
         &json!({

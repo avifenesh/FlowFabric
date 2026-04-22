@@ -222,6 +222,11 @@ async fn waitpoint_hmac_roundtrip() {
         "past-grace error must be 'token_expired'; got {expired_msg}"
     );
 
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    drop(worker);
+    server.shutdown().await;
+
     // Evidence JSON — mirrors lifecycle_retry_backoff's shape.
     evidence::write(
         TEST_NAME,

@@ -20,8 +20,9 @@
 //!    the README's `## SDK claim_next() feature gate` toml fence and
 //!    asserts `crates/ff-sdk/Cargo.toml` actually declares it in its
 //!    `[features]` section. Pure manifest parsing, no server — so the
-//!    multi-test-per-file risk is bounded (see issue #112 for the
-//!    follow-up to give `InProcessServer` a proper async shutdown).
+//!    multi-test-per-file risk is bounded. (PR #112 landed
+//!    `InProcessServer::shutdown(self).await`, which the boot test
+//!    above now calls explicitly.)
 //!
 //! Snippet 3 (coding-agent example) is out of scope — it needs
 //! `OPENROUTER_API_KEY` and is not part of the quickstart contract.
@@ -148,10 +149,9 @@ async fn readme_literal_quickstart_boot() {
         "GET /healthz must return 200 after a README-literal boot"
     );
 
-    // Explicit drop + yield so any pending axum task has a chance to
-    // observe the abort before the next serial test starts.
-    drop(server);
-    tokio::task::yield_now().await;
+    // Explicit teardown — drains engine + background tasks so state
+    // does not leak into the next serial readiness test.
+    server.shutdown().await;
 }
 
 #[tokio::test]
