@@ -1,0 +1,18 @@
+[package]
+name = "ff-backend-valkey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "FlowFabric EngineBackend impl — Valkey FCALL backend"
+
+[dependencies]
+ff-core = { workspace = true }
+ff-script = { workspace = true }
+ferriskey = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
