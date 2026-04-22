@@ -108,6 +108,155 @@ impl std::fmt::Display for Partition {
     }
 }
 
+/// Opaque routing handle for a partition, as exchanged on public wire
+/// surfaces.
+///
+/// `PartitionKey` is the hash-tag literal (`"{fp:7}"`, `"{b:0}"`, ...)
+/// wrapped in a `#[serde(transparent)]` newtype. It is the wire form
+/// of [`Partition`] on the public API — crates like `ff-server` and
+/// `ff-sdk` exchange `PartitionKey`, not [`Partition`], so the
+/// internal `PartitionFamily` enum (with its RFC-011 §11 alias
+/// between `Flow` and `Execution`) is never exposed on the wire.
+///
+/// # Opaque-ness contract
+///
+/// Consumers MUST treat a `PartitionKey` as opaque: pass it back to
+/// FlowFabric on subsequent calls, but do NOT parse the interior hash
+/// tag to make routing or policy decisions. FlowFabric may narrow the
+/// accepted shape (e.g. hash-tag alphabet, length bounds) in future
+/// versions without a semver bump. Consumers that need the parsed
+/// form call [`PartitionKey::parse`] / [`Self::as_partition`], which
+/// returns a typed error on malformed input.
+///
+/// # Round-trip + alias collapse
+///
+/// `From<&Partition> -> PartitionKey` is infallible (hash-tag
+/// construction never fails). `PartitionKey::parse` → `Partition` is
+/// fallible (rejects malformed keys). The round trip
+/// `Partition -> PartitionKey -> Partition` is **lossy for the
+/// `Execution` alias** — a `Partition { family: Execution, .. }`
+/// produces `"{fp:N}"`, which parses back to
+/// `Partition { family: Flow, .. }`. Routing and key construction are
+/// unaffected (both families emit identical hash tags under RFC-011
+/// §11), but consumers that read `grant.partition()?.family` for
+/// logging will see `Flow` where `Execution` previously appeared.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PartitionKey(String);
+
+impl PartitionKey {
+    /// Return the underlying hash-tag literal (`"{fp:7}"`). Intended
+    /// for consumers that pass the key through to another FlowFabric
+    /// call; NOT for parsing out the partition family/index.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse a hash-tag literal into a typed [`Partition`]. Accepts
+    /// the exact shape produced by [`Partition::hash_tag`] (`{fp:N}`,
+    /// `{b:N}`, `{q:N}` where `N` is a `u16`).
+    pub fn parse(&self) -> Result<Partition, PartitionKeyParseError> {
+        Partition::try_from(self)
+    }
+
+    /// Convenience alias for [`Self::parse`]. Present so callers
+    /// reading a `ClaimGrant.partition()` helper can chain without
+    /// naming the conversion explicitly.
+    pub fn as_partition(&self) -> Result<Partition, PartitionKeyParseError> {
+        self.parse()
+    }
+}
+
+impl std::fmt::Display for PartitionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&Partition> for PartitionKey {
+    fn from(p: &Partition) -> Self {
+        Self(p.hash_tag())
+    }
+}
+
+impl From<Partition> for PartitionKey {
+    fn from(p: Partition) -> Self {
+        Self::from(&p)
+    }
+}
+
+/// Errors produced when parsing a [`PartitionKey`] back into a
+/// [`Partition`].
+///
+/// The key is treated as opaque on the wire; parsing failures surface
+/// as `Err` so malformed producer output fails loudly instead of
+/// silently routing to a ghost partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartitionKeyParseError {
+    /// Key did not start with `{` and end with `}` (e.g. missing braces).
+    MissingBraces,
+    /// Interior did not split into exactly `<prefix>:<index>`.
+    MalformedBody,
+    /// `<prefix>` did not match a known family (`fp`, `b`, `q`).
+    UnknownFamilyPrefix(String),
+    /// `<index>` did not parse as a `u16`.
+    InvalidIndex(String),
+}
+
+impl std::fmt::Display for PartitionKeyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingBraces => {
+                f.write_str("partition key must be wrapped in '{...}'")
+            }
+            Self::MalformedBody => {
+                f.write_str("partition key body must be '<prefix>:<index>'")
+            }
+            Self::UnknownFamilyPrefix(p) => {
+                write!(f, "unknown partition family prefix '{p}' (expected 'fp', 'b', 'q')")
+            }
+            Self::InvalidIndex(s) => {
+                write!(f, "partition index '{s}' is not a valid u16")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PartitionKeyParseError {}
+
+impl TryFrom<&PartitionKey> for Partition {
+    type Error = PartitionKeyParseError;
+
+    fn try_from(key: &PartitionKey) -> Result<Self, Self::Error> {
+        let s = key.as_str();
+        let inner = s
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .ok_or(PartitionKeyParseError::MissingBraces)?;
+        let (prefix, index_s) = inner
+            .split_once(':')
+            .ok_or(PartitionKeyParseError::MalformedBody)?;
+        let family = match prefix {
+            // `fp` collapses to `Flow`; the `Execution` alias is lost
+            // on round-trip by design (RFC-011 §11 — both produce the
+            // same hash tag, so routing is preserved; only the
+            // metadata-layer family label diverges).
+            "fp" => PartitionFamily::Flow,
+            "b" => PartitionFamily::Budget,
+            "q" => PartitionFamily::Quota,
+            other => {
+                return Err(PartitionKeyParseError::UnknownFamilyPrefix(
+                    other.to_owned(),
+                ));
+            }
+        };
+        let index: u16 = index_s
+            .parse()
+            .map_err(|_| PartitionKeyParseError::InvalidIndex(index_s.to_owned()))?;
+        Ok(Partition { family, index })
+    }
+}
+
 /// Compute CRC16-CCITT of the given bytes, same algorithm as Valkey Cluster.
 fn crc16_ccitt(bytes: &[u8]) -> u16 {
     crc16::State::<crc16::XMODEM>::calculate(bytes)
@@ -533,5 +682,102 @@ mod tests {
         // Bare UUID fails Deserialize.
         let bare = r#""550e8400-e29b-41d4-a716-446655440000""#;
         assert!(serde_json::from_str::<ExecutionId>(bare).is_err());
+    }
+
+    // ── PartitionKey (issue #91) ──
+
+    #[test]
+    fn partition_key_from_partition_matches_hash_tag() {
+        for (family, expected_prefix) in [
+            (PartitionFamily::Flow, "fp"),
+            (PartitionFamily::Execution, "fp"),
+            (PartitionFamily::Budget, "b"),
+            (PartitionFamily::Quota, "q"),
+        ] {
+            let p = Partition { family, index: 42 };
+            let k: PartitionKey = (&p).into();
+            assert_eq!(k.as_str(), &format!("{{{expected_prefix}:42}}"));
+            assert_eq!(k.as_str(), p.hash_tag());
+        }
+    }
+
+    #[test]
+    fn partition_key_round_trip_flow_budget_quota() {
+        // Exact round-trip for non-alias families.
+        for family in [
+            PartitionFamily::Flow,
+            PartitionFamily::Budget,
+            PartitionFamily::Quota,
+        ] {
+            let p = Partition { family, index: 7 };
+            let k = PartitionKey::from(&p);
+            let back = k.parse().expect("must parse");
+            assert_eq!(back, p, "round-trip must be identity for {family:?}");
+        }
+    }
+
+    /// RFC-011 §11 alias collapse: `Execution` round-trips to `Flow`.
+    /// Routing is preserved (same hash tag, same `count_for`), only
+    /// the metadata-layer label differs. This test pins the documented
+    /// collapse so consumers can't quietly depend on `Execution`
+    /// surviving a wire hop.
+    #[test]
+    fn partition_key_collapses_execution_to_flow_on_parse() {
+        let p_exec = Partition { family: PartitionFamily::Execution, index: 3 };
+        let k = PartitionKey::from(&p_exec);
+        assert_eq!(k.as_str(), "{fp:3}");
+        let back = k.parse().expect("must parse");
+        // Alias collapse: index preserved, family normalises to Flow.
+        assert_eq!(back.family, PartitionFamily::Flow);
+        assert_eq!(back.index, 3);
+        // Routing equivalence: both produce identical hash tags.
+        assert_eq!(back.hash_tag(), p_exec.hash_tag());
+    }
+
+    #[test]
+    fn partition_key_serde_transparent() {
+        let p = Partition { family: PartitionFamily::Flow, index: 9 };
+        let k = PartitionKey::from(&p);
+        let json = serde_json::to_string(&k).unwrap();
+        assert_eq!(json, r#""{fp:9}""#, "must serialise as a bare string");
+        let parsed: PartitionKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, k);
+    }
+
+    #[test]
+    fn partition_key_parse_rejects_missing_braces() {
+        let k = PartitionKey("fp:0".to_owned());
+        assert_eq!(k.parse(), Err(PartitionKeyParseError::MissingBraces));
+    }
+
+    #[test]
+    fn partition_key_parse_rejects_malformed_body() {
+        let k = PartitionKey("{fp0}".to_owned());
+        assert_eq!(k.parse(), Err(PartitionKeyParseError::MalformedBody));
+    }
+
+    #[test]
+    fn partition_key_parse_rejects_unknown_prefix() {
+        let k = PartitionKey("{zz:0}".to_owned());
+        match k.parse() {
+            Err(PartitionKeyParseError::UnknownFamilyPrefix(p)) => assert_eq!(p, "zz"),
+            other => panic!("expected UnknownFamilyPrefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partition_key_parse_rejects_invalid_index() {
+        // Non-numeric
+        let k = PartitionKey("{fp:xx}".to_owned());
+        assert!(matches!(
+            k.parse(),
+            Err(PartitionKeyParseError::InvalidIndex(_))
+        ));
+        // u16 overflow
+        let k = PartitionKey("{fp:65536}".to_owned());
+        assert!(matches!(
+            k.parse(),
+            Err(PartitionKeyParseError::InvalidIndex(_))
+        ));
     }
 }
