@@ -293,9 +293,12 @@ pub struct Scheduler {
     /// the first call in a new window" race-free without a Mutex.
     rotation_state: AtomicU64,
     /// PR-94: observability handle for claim_from_grant duration and
-    /// budget/quota hit counters. Defaults to the no-op shim so direct
-    /// callers don't need to care; ff-server wires in the real
-    /// registry via [`Self::with_metrics`].
+    /// budget/quota hit counters. Defaults to a fresh
+    /// `ff_observability::Metrics::new()` — under the default build
+    /// (`observability` feature off) that's the no-op shim; with the
+    /// feature on it's a private real OTEL registry not shared with
+    /// any scrape. Callers that want a shared registry plumb it in
+    /// via [`Self::with_metrics`] / [`Self::with_config_and_metrics`].
     metrics: std::sync::Arc<ff_observability::Metrics>,
 }
 
