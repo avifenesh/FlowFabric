@@ -775,7 +775,7 @@ fn parse_public_state(s: &str) -> Result<PublicState, ScriptError> {
         "expired" => Ok(PublicState::Expired),
         "skipped" => Ok(PublicState::Skipped),
         _ => Err(ScriptError::Parse {
-            fcall: "ff_set_execution_tags".into(),
+            fcall: "parse_public_state".into(),
             execution_id: None,
             message: format!("unknown public_state: {s}"),
         }),

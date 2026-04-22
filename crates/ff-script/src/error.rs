@@ -456,7 +456,7 @@ pub enum ScriptError {
 }
 
 /// Renders `ScriptError::Parse` as
-/// `parse error: <fcall>[<exec=...>]: <message>`. The `exec=` slot is
+/// `parse error: <fcall>[exec=...]: <message>`. The `[exec=...]` slot is
 /// omitted when `execution_id` is `None`.
 fn fmt_parse(fcall: &str, execution_id: Option<&str>, message: &str) -> String {
     match execution_id {

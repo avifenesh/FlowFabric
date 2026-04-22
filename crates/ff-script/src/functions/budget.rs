@@ -169,7 +169,7 @@ pub async fn ff_report_usage_and_check(
     // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
     if dim_count > MAX_BUDGET_DIMENSIONS {
         return Err(ScriptError::Parse {
-            fcall: "ff_create_budget".into(),
+            fcall: "ff_report_usage_and_check".into(),
             execution_id: None,
             message: format!(
             "too_many_dimensions: limit={}, got={}",
@@ -179,7 +179,7 @@ pub async fn ff_report_usage_and_check(
     }
     if args.deltas.len() != dim_count {
         return Err(ScriptError::Parse {
-            fcall: "ff_create_budget".into(),
+            fcall: "ff_report_usage_and_check".into(),
             execution_id: None,
             message: format!(
             "dimension_delta_array_mismatch: dimensions={} deltas={}",
@@ -231,7 +231,7 @@ impl FromFcallResult for ReportUsageResult {
                 })
             }
             _ => Err(ScriptError::Parse {
-                fcall: "ff_report_usage".into(),
+                fcall: "ff_report_usage_and_check".into(),
                 execution_id: None,
                 message: format!("unknown budget status: {}", r.status),
             }),

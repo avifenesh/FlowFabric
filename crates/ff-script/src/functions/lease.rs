@@ -44,7 +44,7 @@ impl FromFcallResult for MarkLeaseExpiredResult {
                 reason: r.field_str(0),
             }),
             other => Err(ScriptError::Parse {
-                fcall: "ff_mark_lease_expired".into(),
+                fcall: "ff_mark_lease_expired_if_due".into(),
                 execution_id: None,
                 message: format!(
                 "unexpected status from ff_mark_lease_expired_if_due: {other}"
