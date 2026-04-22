@@ -1,0 +1,19 @@
+   Compiling ff-readiness-tests v0.3.0 (/home/ubuntu/ff-worker-d-pr1a/crates/ff-readiness-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.07s
+     Running tests/lifecycle_retry_backoff.rs (target/debug/deps/lifecycle_retry_backoff-df2cb1969987afc3)
+
+running 1 test
+test lifecycle_retry_backoff ... 
+thread 'lifecycle_retry_backoff' panicked at crates/ff-readiness-tests/tests/lifecycle_retry_backoff.rs:184:5:
+max_retries=0 + retryable category should schedule retry, got TerminalFailed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lifecycle_retry_backoff
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p ff-readiness-tests --test lifecycle_retry_backoff`
