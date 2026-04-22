@@ -162,7 +162,7 @@ Two PR-time GitHub Actions workflows gate merges:
 - **`.github/workflows/matrix.yml`** — 5-job host × mode matrix against Valkey 8 (`valkey/valkey:8-alpine`). RFC-011 §13 requires Valkey >= 8.0, enforced at `ff-server` boot; the pre-RFC-011 Valkey 7.2 rows are retired.
   - linux x86_64 (`ubuntu-latest`) × {standalone, cluster}
   - linux arm64 (`ubuntu-24.04-arm`) × {standalone, cluster}
-  - macos arm64 (`macos-latest`) × standalone (Homebrew Valkey 8; docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
+  - macos arm64 (`macos-latest`) × standalone (Homebrew Valkey, currently tracking the 8.x line unpinned; docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
   - Cluster mode on linux uses a 3-master 3-replica cluster via `.github/cluster/docker-compose.cluster.yml` + `bootstrap.sh`.
 - **`.github/workflows/security-and-quality.yml`** — 6 independent gates, any one blocks merge:
   - `cargo audit` with `--deny warnings`; ignore list in `.cargo/audit.toml`
