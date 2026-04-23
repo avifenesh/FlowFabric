@@ -23,10 +23,7 @@ const NS: &str = "resume-sig-ns";
 
 async fn build_worker(name_suffix: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(6379),
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        backend: ff_test::fixtures::backend_config_from_env(),
         worker_id: ff_core::types::WorkerId::new(format!("resume-sig-worker-{name_suffix}")),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "resume-sig-inst-{name_suffix}"

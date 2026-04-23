@@ -79,14 +79,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let config = WorkerConfig::new(
-        &args.host,
-        args.port,
-        "coding-agent",
-        format!("coding-agent-{}", uuid::Uuid::new_v4()),
-        &args.namespace,
-        &args.lane,
-    );
+    let config = WorkerConfig {
+        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        worker_id: ff_core::types::WorkerId::new("coding-agent"),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
+            "coding-agent-{}",
+            uuid::Uuid::new_v4()
+        )),
+        namespace: ff_core::types::Namespace::new(&args.namespace),
+        lanes: vec![ff_core::types::LaneId::new(&args.lane)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 1_000,
+        max_concurrent_tasks: 1,
+    };
 
     let worker = FlowFabricWorker::connect(config).await?;
     let admin = match args.api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {

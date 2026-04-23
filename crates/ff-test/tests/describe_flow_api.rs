@@ -40,13 +40,7 @@ async fn seed_partition_config(tc: &TestCluster) {
 
 async fn build_worker(name_suffix: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        backend: ff_test::fixtures::backend_config_from_env(),
         worker_id: WorkerId::new(format!("desc-flow-worker-{name_suffix}")),
         worker_instance_id: WorkerInstanceId::new(format!("desc-flow-inst-{name_suffix}")),
         namespace: Namespace::new(NS),
@@ -278,12 +272,20 @@ async fn describe_flow_corrupt_state_surfaces_error() {
         .await
         .expect_err("unknown flat flow_core field must surface as error");
     match err {
-        ff_sdk::SdkError::Config { message: msg, .. } => {
-            assert!(
-                msg.contains("bogus_future_field"),
-                "error message must name the field: {msg}"
-            );
-        }
-        other => panic!("expected SdkError::Config, got {other:?}"),
+        // RFC-012 Stage 1c T3: decoder returns
+        // `EngineError::Validation { kind: Corruption, .. }` now.
+        ff_sdk::SdkError::Engine(ref boxed) => match boxed.as_ref() {
+            ff_core::engine_error::EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail,
+            } => {
+                assert!(
+                    detail.contains("bogus_future_field"),
+                    "error detail must name the field: {detail}"
+                );
+            }
+            other => panic!("expected EngineError::Validation::Corruption, got {other:?}"),
+        },
+        other => panic!("expected SdkError::Engine(Validation::Corruption), got {other:?}"),
     }
 }

@@ -522,15 +522,23 @@ async fn echo_worker_loop(
     env: BenchEnv,
     shutdown_rx: Arc<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
-    let mut config = WorkerConfig::new(
-        &env.valkey_host,
-        env.valkey_port,
-        format!("bench-echo-{wi}"),
-        format!("bench-echo-{wi}-{}", uuid::Uuid::new_v4()),
-        &env.namespace,
-        &env.lane,
-    );
-    config.claim_poll_interval_ms = 50;
+    let config = WorkerConfig {
+        backend: ff_core::backend::BackendConfig::valkey(
+            env.valkey_host.clone(),
+            env.valkey_port,
+        ),
+        worker_id: ff_core::types::WorkerId::new(format!("bench-echo-{wi}")),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
+            "bench-echo-{wi}-{}",
+            uuid::Uuid::new_v4()
+        )),
+        namespace: ff_core::types::Namespace::new(&env.namespace),
+        lanes: vec![ff_core::types::LaneId::new(&env.lane)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 50,
+        max_concurrent_tasks: 1,
+    };
     let worker = FlowFabricWorker::connect(config).await?;
     let _ = AttemptIndex::new(0); // compile-time guard that the SDK type alias still exists
 

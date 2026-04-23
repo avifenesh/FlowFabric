@@ -77,13 +77,7 @@ async fn waitpoint_hmac_roundtrip() {
 
     // 2. Spawn the SDK worker once — all four executions below share it.
     let worker_config = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        tls: ff_readiness_tests::valkey::env_flag("FF_TLS"),
-        cluster: ff_readiness_tests::valkey::env_flag("FF_CLUSTER"),
+        backend: ff_readiness_tests::valkey::backend_config_from_env(),
         worker_id: WorkerId::new("readiness-hmac-worker"),
         worker_instance_id: WorkerInstanceId::new("readiness-hmac-inst"),
         namespace: Namespace::new(NS),

@@ -82,15 +82,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let instance_id = format!("transcribe-{}", uuid::Uuid::new_v4());
-    let mut config = WorkerConfig::new(
-        &args.host,
-        args.port,
-        "transcribe",
-        &instance_id,
-        &args.namespace,
-        &args.lane,
-    );
-    config.capabilities = vec!["asr".into(), "whisper-tiny-en".into()];
+    let config = WorkerConfig {
+        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        worker_id: ff_core::types::WorkerId::new("transcribe"),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(&instance_id),
+        namespace: ff_core::types::Namespace::new(&args.namespace),
+        lanes: vec![ff_core::types::LaneId::new(&args.lane)],
+        capabilities: vec!["asr".into(), "whisper-tiny-en".into()],
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 1_000,
+        max_concurrent_tasks: 1,
+    };
 
     let worker = FlowFabricWorker::connect(config).await?;
     let admin = match args.api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {

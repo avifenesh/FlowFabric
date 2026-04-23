@@ -1,15 +1,27 @@
+use ff_core::backend::BackendConfig;
 use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 
 /// Configuration for a FlowFabric worker.
+///
+/// **RFC-012 Stage 1c tranche 1.** Valkey-specific connection
+/// parameters (`host`, `port`, `tls`, `cluster`) moved to the nested
+/// [`BackendConfig`] field, which also carries
+/// [`BackendTimeouts`](ff_core::backend::BackendTimeouts) and
+/// [`BackendRetry`](ff_core::backend::BackendRetry) policy. Build one
+/// with [`BackendConfig::valkey`] for the common standalone case; for
+/// TLS / cluster / tuned retry, construct the
+/// [`ValkeyConnection`](ff_core::backend::ValkeyConnection) and
+/// [`BackendConfig`] fields directly.
+///
+/// Worker-policy fields (`lease_ttl_ms`, `claim_poll_interval_ms`,
+/// capability set, lane list, identity) stay on `WorkerConfig` —
+/// those are orthogonal to the storage backend choice.
+///
+/// `WorkerConfig::new` was removed in this stage (pre-1.0 clean
+/// break); construct via struct literal.
 pub struct WorkerConfig {
-    /// Valkey hostname. Default: `"localhost"`.
-    pub host: String,
-    /// Valkey port. Default: `6379`.
-    pub port: u16,
-    /// Enable TLS for the Valkey connection.
-    pub tls: bool,
-    /// Enable Valkey cluster mode.
-    pub cluster: bool,
+    /// Backend connection + shared timeouts / retry policy.
+    pub backend: BackendConfig,
     /// Logical worker identity (e.g., "gpu-worker-pool-1").
     pub worker_id: WorkerId,
     /// Concrete worker process/runtime instance identity (e.g., container ID).
@@ -29,31 +41,6 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
-    /// Create a minimal config for a single-lane worker.
-    pub fn new(
-        host: impl Into<String>,
-        port: u16,
-        worker_id: impl Into<String>,
-        worker_instance_id: impl Into<String>,
-        namespace: impl Into<String>,
-        lane: impl Into<String>,
-    ) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            tls: false,
-            cluster: false,
-            worker_id: WorkerId::new(worker_id),
-            worker_instance_id: WorkerInstanceId::new(worker_instance_id),
-            namespace: Namespace::new(namespace),
-            lanes: vec![LaneId::new(lane)],
-            capabilities: Vec::new(),
-            lease_ttl_ms: 30_000,
-            claim_poll_interval_ms: 1_000,
-            max_concurrent_tasks: 1,
-        }
-    }
-
     /// Lease renewal interval: TTL / 3 (renew at 1/3 of TTL, leaving 2/3 margin).
     pub fn renewal_interval_ms(&self) -> u64 {
         self.lease_ttl_ms / 3
