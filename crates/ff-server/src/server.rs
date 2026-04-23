@@ -427,6 +427,34 @@ impl Server {
             tracing::info!("skipping library load (skip_library_load=true)");
         }
 
+        // Step 3b: Seed the global lanes registry (`ff:idx:lanes`) with
+        // every lane from ServerConfig.lanes (issue #203).
+        //
+        // `EngineBackend::list_lanes` reads SMEMBERS from this global SET,
+        // so without a boot-time seed a freshly-provisioned deployment
+        // returns an empty lane list until the first execution is created
+        // on each lane. The Lua `ff_create_execution` path also SADDs on
+        // first-sight, which covers dynamic / post-boot lanes; this block
+        // covers the pre-declared set. SADD is idempotent.
+        //
+        // NOTE: `ff:idx:lanes` is intentionally NOT hash-tagged per
+        // partition — it is the single cross-partition global SET in the
+        // system (see `ff_core::keys::lanes_index_key`).
+        if !config.lanes.is_empty() {
+            let lane_strs: Vec<&str> = config.lanes.iter().map(|l| l.as_str()).collect();
+            let _: i64 = client
+                .cmd("SADD")
+                .arg(ff_core::keys::lanes_index_key().as_str())
+                .arg(lane_strs.as_slice())
+                .execute()
+                .await
+                .map_err(|e| crate::server::backend_context(e, "SADD ff:idx:lanes (seed)"))?;
+            tracing::info!(
+                lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+                "seeded lanes index (ff:idx:lanes)"
+            );
+        }
+
         // Step 4: Start engine with scanners
         // Build a fresh EngineConfig rather than cloning (EngineConfig doesn't derive Clone).
         let engine_cfg = ff_engine::EngineConfig {
