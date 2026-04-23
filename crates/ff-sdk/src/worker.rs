@@ -547,24 +547,27 @@ impl FlowFabricWorker {
     /// ```
     ///
     /// **Stage 1b + Round-7 scope — what the injected backend covers
-    /// today.** All per-task `ClaimedTask` ops (`update_progress` /
-    /// `resume_signals` / `delay_execution` /
-    /// `move_to_waiting_children` / `complete` / `cancel` / `fail` /
-    /// `create_pending_waitpoint` / `append_frame` / `suspend` /
-    /// `report_usage`) route through the injected backend — a mock
-    /// backend genuinely sees the worker's per-task write-surface
-    /// calls. Round-7 (#135/#145) closed the four trait-shape gaps
-    /// tracked by #117. The background `renew_lease_inner` task still
-    /// reaches the embedded `ferriskey::Client` directly;
-    /// `claim_next` / `claim_from_grant` /
+    /// today.** The injected backend currently covers these per-task
+    /// `ClaimedTask` ops: `update_progress` / `resume_signals` /
+    /// `delay_execution` / `move_to_waiting_children` / `complete` /
+    /// `cancel` / `fail` / `create_pending_waitpoint` /
+    /// `append_frame` / `report_usage`. A mock backend therefore sees
+    /// that portion of the worker's per-task write surface. Lease
+    /// renewal also routes through `backend.renew(&handle)`. Round-7
+    /// (#135/#145) closed the four trait-shape gaps tracked by #117,
+    /// but `suspend` still reaches the embedded `ferriskey::Client`
+    /// directly via `ff_suspend_execution` — this is the deferred
+    /// suspend per RFC-012 §R7.6.1, pending Stage 1d input-shape
+    /// work. `claim_next` / `claim_from_grant` /
     /// `claim_from_reclaim_grant` / `deliver_signal` / admin queries
     /// are Stage 1c hot-path work. Stage 1d removes the embedded
     /// client entirely.
     ///
     /// Today's constructor is therefore NOT yet a drop-in way to swap
     /// in a non-Valkey backend — it requires a reachable Valkey node
-    /// for the 4 deferred + hot-path ops. Tests that exercise only
-    /// the 8 migrated ops can run fully against a mock backend.
+    /// for `suspend` plus the remaining hot-path ops. Tests that
+    /// exercise only the migrated per-task ops can run fully against
+    /// a mock backend.
     ///
     /// [`EngineBackend`]: ff_core::engine_backend::EngineBackend
     /// [`CompletionBackend`]: ff_core::completion_backend::CompletionBackend
