@@ -837,6 +837,7 @@ dependencies = [
  "async-trait",
  "ferriskey",
  "ff-core",
+ "ff-observability",
  "ff-script",
  "futures-core",
  "serde",
@@ -972,6 +973,7 @@ dependencies = [
  "ff-backend-valkey",
  "ff-core",
  "ff-engine",
+ "ff-observability",
  "ff-scheduler",
  "ff-script",
  "ff-sdk",
@@ -983,6 +985,7 @@ dependencies = [
  "serial_test",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

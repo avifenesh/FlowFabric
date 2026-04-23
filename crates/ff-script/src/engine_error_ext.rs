@@ -39,6 +39,9 @@ pub fn transport_script(err: ScriptError) -> EngineError {
 pub fn transport_script_ref(err: &EngineError) -> Option<&ScriptError> {
     match err {
         EngineError::Transport { source, .. } => source.downcast_ref::<ScriptError>(),
+        // Descend through `backend_context(...)` wrappers so callers
+        // looking for the inner `ScriptError` recover it.
+        EngineError::Contextual { source, .. } => transport_script_ref(source),
         _ => None,
     }
 }
@@ -53,6 +56,8 @@ pub fn valkey_kind(err: &EngineError) -> Option<ferriskey::ErrorKind> {
         EngineError::Transport { source, .. } => source
             .downcast_ref::<ScriptError>()
             .and_then(|s| s.valkey_kind()),
+        // Descend through `backend_context(...)` wrappers.
+        EngineError::Contextual { source, .. } => valkey_kind(source),
         _ => None,
     }
 }
@@ -70,6 +75,9 @@ pub fn class(err: &EngineError) -> ErrorClass {
             .downcast_ref::<ScriptError>()
             .map(|s| s.class())
             .unwrap_or(ErrorClass::Terminal),
+        // Descend into context-wrapped errors so ScriptError-aware
+        // classification survives `backend_context(...)` wraps.
+        EngineError::Contextual { source, .. } => class(source),
         other => other.class(),
     }
 }
