@@ -35,13 +35,17 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 ## Features
 
 - **Lease-based ownership** -- workers hold leases on executions; auto-renewed, crash-safe
-- **Suspend / signal / resume** -- human-in-the-loop and async event-driven workflows
+- **Suspend / signal / resume** -- human-in-the-loop and async event-driven workflows with HMAC-signed waitpoint tokens
 - **Flow coordination** -- DAG execution with dependency edges, fan-out, skip propagation
 - **Budget and quota** -- per-dimension usage tracking, hard/soft limits, sliding-window rate limiting
 - **Streaming output** -- append-only frame streams scoped to each attempt
 - **Priority scheduling** -- score-based eligible sets with priority clamping
+- **Capability routing** -- workers advertise capabilities; scheduler subset-matches per-execution requirements
 - **REST API** -- 22 endpoints on axum with JSON error handling, CORS, health check
-- **Cluster-safe** -- all operations use hash-tag partitioning, no SCAN, no CrossSlot
+- **Backend trait** -- `EngineBackend` is the stable surface for alternate backends (Valkey today, Postgres in scope for later); cursor-paginated `list_executions` / `list_flows` / `list_lanes` / `list_suspended` for operator tooling
+- **Client-local tower-style layer surface** -- opt-in `TracingLayer`, `RateLimitLayer`, `MetricsLayer`, `CircuitBreakerLayer` compose around any `EngineBackend`
+- **Observability** -- OTEL via `ff-observability`, Prometheus scrape endpoint via `ff-server` (engine-side) or `ff-observability-http` crate (consumer-side), optional Sentry integration, Grafana dashboard JSON bundled
+- **Cluster-safe** -- all operations use hash-tag partitioning; cluster-aware enumeration via ferriskey's hash-tag-aware `cluster_scan` (single-shard routing when the match pattern embeds a tag)
 
 ## Quick start
 
@@ -77,14 +81,20 @@ manager.
 FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 ```
 
-### 3. Try the coding-agent example
+### 3. Try an example
 
-See [examples/coding-agent/](examples/coding-agent/) for a full working example with an LLM-powered worker, human-in-the-loop review, and CLI tooling.
+Three end-to-end examples live under [`examples/`](examples/):
+
+- **[`coding-agent`](examples/coding-agent/)** -- LLM-powered code-patch worker with streaming output and human-in-the-loop suspend/signal review. Requires `OPENROUTER_API_KEY`.
+- **[`media-pipeline`](examples/media-pipeline/)** -- three-stage audio pipeline (transcribe → summarize → embed) exercising capability routing, stream tail with terminal markers, and HMAC-signed waitpoint signals. Requires `OPENROUTER_API_KEY` + local whisper.cpp.
+- **[`retry-and-cancel`](examples/retry-and-cancel/)** -- minimal control-plane demo of retry-exhaustion terminal failure + `cancel_flow` cascade. No external dependencies beyond the running server.
+
+Quick start with the coding agent:
 
 ```bash
 # Terminal 1: worker
 cd examples/coding-agent
-OPENROUTER_API_KEY=sk-or-... cargo run --bin worker
+OPENROUTER_API_KEY=sk-or-... OPENROUTER_MODEL=moonshotai/kimi-k2.6 cargo run --bin worker
 
 # Terminal 2: submit a task
 cd examples/coding-agent
@@ -105,14 +115,18 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 
 | Crate | Description |
 |-------|-------------|
-| `ferriskey` | Valkey client -- forked from glide-core (valkey-glide) |
-| `ff-core` | Core types, state enums, partition math, key builders, error codes |
+| `ferriskey` | Valkey client -- in-tree, forked from glide-core (valkey-glide). Hash-tag-aware `cluster_scan` single-shard routing. |
+| `ff-core` | Core types, state enums, partition math, key builders, `EngineBackend` trait, error codes |
 | `ff-script` | Typed FCALL wrappers and Lua library loader |
 | `ff-engine` | Cross-partition dispatch and 14 background scanners |
 | `ff-scheduler` | Claim-grant cycle, fairness, capability matching |
-| `ff-sdk` | Worker SDK -- public API for worker authors |
-| `ff-server` | HTTP API server, Valkey connection, boot sequence |
+| `ff-backend-valkey` | `EngineBackend` implementation backed by Valkey FCALL |
+| `ff-sdk` | Worker SDK — public API for worker authors; includes the client-local `EngineBackendLayer` surface |
+| `ff-server` | HTTP API server, Valkey connection, boot sequence, engine `/metrics` endpoint |
+| `ff-observability` | OTEL + Prometheus instrumentation, optional Sentry integration |
+| `ff-observability-http` | Consumer-side `/metrics` axum router for workers embedding `ff-sdk` in library mode |
 | `ff-test` | Integration test harness, fixtures, assertion helpers |
+| `ff-readiness-tests` | Release-gate behavioral smokes (lifecycle, flow fanout/join, HMAC roundtrip, cancel cascade) |
 
 ## Production considerations
 
