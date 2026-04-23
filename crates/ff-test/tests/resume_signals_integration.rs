@@ -16,8 +16,8 @@
 //! Run with: cargo test -p ff-test --test resume_signals_integration -- --test-threads=1
 
 use ff_sdk::task::{
-    ResumeCondition, ResumePolicy, Signal, SignalMatcher, SignalOutcome, SuspensionReasonCode,
-    TimeoutBehavior,
+    CompositeBody, ResumeCondition, ResumePolicy, Signal, SignalMatcher, SignalOutcome,
+    SuspensionReasonCode, TimeoutBehavior,
 };
 use ff_test::fixtures::TestCluster;
 
@@ -190,10 +190,9 @@ async fn resume_signals_returns_single_matched_signal_with_payload() {
     task2.complete(None).await.unwrap();
 }
 
-// RFC-013 deferred multi-signal `all` / `any` composition to RFC-014's
-// `ResumeCondition::Composite(CompositeBody)`. This test is re-enabled
-// when RFC-014 lands.
-#[ignore = "pending RFC-014 Composite body"]
+// RFC-014 lands the composite `AllOf` variant. This test exercises a
+// single-waitpoint AllOf with two distinct-name matchers; both signals
+// must arrive before the suspension resumes.
 #[tokio::test]
 #[serial_test::serial]
 async fn resume_signals_all_mode_returns_both_matchers() {
@@ -204,17 +203,22 @@ async fn resume_signals_all_mode_returns_both_matchers() {
 
     let (eid, task) = create_and_claim(&tc, &worker, "all_mode").await;
 
-    // RFC-014 will re-enable multi-matcher suspensions via
-    // `ResumeCondition::Composite`. For now the single-matcher shape
-    // keeps this test compiling under #[ignore].
     let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task
         .suspend(
             SuspensionReasonCode::WaitingForApproval,
-            ResumeCondition::Single {
-                waitpoint_key: wp_key,
-                matcher: SignalMatcher::ByName("reviewer_a".into()),
-            },
+            ResumeCondition::Composite(CompositeBody::AllOf {
+                members: vec![
+                    ResumeCondition::Single {
+                        waitpoint_key: wp_key.clone(),
+                        matcher: SignalMatcher::ByName("reviewer_a".into()),
+                    },
+                    ResumeCondition::Single {
+                        waitpoint_key: wp_key.clone(),
+                        matcher: SignalMatcher::ByName("reviewer_b".into()),
+                    },
+                ],
+            }),
             Some((
                 ff_core::types::TimestampMs::from_millis(
                     ff_core::types::TimestampMs::now().0 + 60_000,

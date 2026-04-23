@@ -26,8 +26,8 @@ use crate::SdkError;
 // re-export preserves the `ff_sdk::SuspendOutcome` path; the other
 // paths are new.
 pub use ff_core::contracts::{
-    CompositeBody, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher,
-    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
+    CompositeBody, CountKind, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget,
+    SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
     SuspensionRequester, TimeoutBehavior, WaitpointBinding,
 };
 
@@ -908,6 +908,11 @@ impl ClaimedTask {
         // random internal key), rebind the Fresh binding to use the
         // condition's key so RFC-013 §2.4 "waitpoint_key cross-field
         // invariant" is honored. UsePending retains its own binding.
+        // RFC-014: for `Composite`, rebind to the first waitpoint_key
+        // observed in the composite tree (Single.waitpoint_key or
+        // Count.waitpoints[0]); consumers using single-waitpoint
+        // composites must keep all Single/Count waitpoint_keys equal
+        // (see RFC-014 single-waitpoint scoping).
         let waitpoint = match (&waitpoint, &resume_condition) {
             (
                 WaitpointBinding::Fresh { waitpoint_id, .. },
@@ -916,6 +921,19 @@ impl ClaimedTask {
                 waitpoint_id: waitpoint_id.clone(),
                 waitpoint_key: waitpoint_key.clone(),
             },
+            (
+                WaitpointBinding::Fresh { waitpoint_id, .. },
+                ResumeCondition::Composite(body),
+            ) => {
+                if let Some(key) = composite_first_waitpoint_key(body) {
+                    WaitpointBinding::Fresh {
+                        waitpoint_id: waitpoint_id.clone(),
+                        waitpoint_key: key,
+                    }
+                } else {
+                    waitpoint
+                }
+            }
             _ => waitpoint,
         };
         let mut args = SuspendArgs::new(
@@ -2099,6 +2117,23 @@ mod parse_report_usage_result_tests {
             msg.to_lowercase().contains("missing"),
             "error should say 'missing', got: {msg}"
         );
+    }
+}
+
+/// RFC-014 helper: pick the first waitpoint_key out of a composite
+/// tree so `try_suspend_inner` can rebind a Fresh waitpoint to the
+/// user-supplied key. Single-waitpoint scoping: all
+/// Single.waitpoint_key / Count.waitpoints[i] in the tree must be
+/// equal; this function returns the first one it encounters.
+fn composite_first_waitpoint_key(body: &CompositeBody) -> Option<String> {
+    match body {
+        CompositeBody::AllOf { members } => members.iter().find_map(|m| match m {
+            ResumeCondition::Single { waitpoint_key, .. } => Some(waitpoint_key.clone()),
+            ResumeCondition::Composite(inner) => composite_first_waitpoint_key(inner),
+            _ => None,
+        }),
+        CompositeBody::Count { waitpoints, .. } => waitpoints.first().cloned(),
+        _ => None,
     }
 }
 

@@ -128,8 +128,8 @@ pub use ff_core::backend::{
 // compiles.
 #[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::{
-    CompositeBody, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher,
-    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
+    CompositeBody, CountKind, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget,
+    SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
     SuspensionRequester, TimeoutBehavior, WaitpointBinding,
 };
 #[cfg(feature = "valkey-default")]

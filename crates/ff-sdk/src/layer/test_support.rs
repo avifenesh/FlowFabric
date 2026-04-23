@@ -144,12 +144,12 @@ impl EngineBackend for PassthroughBackend {
         // with a fresh suspended-kind handle and the caller's minted
         // ids echoed back. Layer tests only care that `suspend` was
         // dispatched; they never inspect the outcome's identity.
-        let waitpoint_id = match &args.waitpoint {
+        let waitpoint_id = match args.primary() {
             ff_core::backend::WaitpointBinding::Fresh { waitpoint_id, .. } => waitpoint_id.clone(),
             ff_core::backend::WaitpointBinding::UsePending { waitpoint_id } => waitpoint_id.clone(),
             _ => WaitpointId::new(),
         };
-        let waitpoint_key = match &args.waitpoint {
+        let waitpoint_key = match args.primary() {
             ff_core::backend::WaitpointBinding::Fresh { waitpoint_key, .. } => waitpoint_key.clone(),
             _ => format!("wpk:{waitpoint_id}"),
         };

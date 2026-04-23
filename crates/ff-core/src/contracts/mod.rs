@@ -2980,23 +2980,73 @@ pub enum SignalMatcher {
     Wildcard,
 }
 
-/// RFC-013 reserves this enum slot so RFC-014 can define the concrete
-/// composition vocabulary (AllOf / AnyOf / Count over nested
-/// [`ResumeCondition`]s) without breaking RFC-013's trait surface.
-///
-/// RFC-013 ships an empty placeholder: the type is non-constructible
-/// outside this crate today. RFC-014 will add variants additively under
-/// the `#[non_exhaustive]` guard — consumers matching on
-/// [`ResumeCondition::Composite(_)`] today need a `_` catch-all in the
-/// inner arm anyway, so the future additions are source-compatible.
+/// Hard cap on composite-condition nesting depth (RFC-014 §5.4
+/// invariant 4; §5.5 cap rationale). Soft-cap: bumping requires only
+/// this constant + the cap-rationale paragraph in RFC-014 §5.5 — no
+/// wire-format change. Keep in sync.
+pub const MAX_COMPOSITE_DEPTH: usize = 4;
+
+/// RFC-013 reserves this enum slot; RFC-014 populates it with the
+/// concrete composition vocabulary (`AllOf` + `Count`). The enum is
+/// `#[non_exhaustive]` so RFC-016 or later RFCs may add variants
+/// (`AnyOf` has been explicitly rejected per RFC-014 §2.3 in favour of
+/// `Count { n: 1, .. }`; the guard exists for orthogonal future work).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 #[non_exhaustive]
 pub enum CompositeBody {
-    // RFC-014 populates this enum. The placeholder variant is private
-    // to ff-core so no external caller can construct it.
-    #[doc(hidden)]
-    #[serde(skip)]
-    __Reserved(std::marker::PhantomData<()>),
+    /// All listed sub-conditions must be satisfied. Order-independent.
+    /// Once satisfied, further signals to member waitpoints are observed
+    /// but do not re-open satisfaction. RFC-014 §2.1.
+    AllOf {
+        members: Vec<ResumeCondition>,
+    },
+    /// At least `n` distinct satisfiers (by [`CountKind`]) must match.
+    /// `matcher` optionally constrains participating signals; `None`
+    /// lets any signal on any of `waitpoints` count. RFC-014 §2.1.
+    Count {
+        n: u32,
+        count_kind: CountKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        matcher: Option<SignalMatcher>,
+        waitpoints: Vec<String>,
+    },
+}
+
+/// How `Count` nodes distinguish satisfiers. RFC-014 §2.1 + §3.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum CountKind {
+    /// n distinct `waitpoint_id`s in `waitpoints` must fire.
+    DistinctWaitpoints,
+    /// n distinct `signal_id`s across the waitpoint set.
+    DistinctSignals,
+    /// n distinct `source_type:source_identity` tuples.
+    DistinctSources,
+}
+
+impl CompositeBody {
+    /// `AllOf { members }` constructor (RFC-014 §10.3 SDK surface).
+    pub fn all_of(members: impl IntoIterator<Item = ResumeCondition>) -> Self {
+        Self::AllOf {
+            members: members.into_iter().collect(),
+        }
+    }
+
+    /// `Count` constructor with explicit kind + waitpoint set.
+    pub fn count(
+        n: u32,
+        count_kind: CountKind,
+        matcher: Option<SignalMatcher>,
+        waitpoints: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self::Count {
+            n,
+            count_kind,
+            matcher,
+            waitpoints: waitpoints.into_iter().collect(),
+        }
+    }
 }
 
 /// Declarative resume condition for [`SuspendArgs::resume_condition`].
@@ -3022,6 +3072,170 @@ pub enum ResumeCondition {
     TimeoutOnly,
     /// Multi-condition composition; RFC-014 defines the body.
     Composite(CompositeBody),
+}
+
+/// RFC-014 §5.1 validation error shape. Emitted by
+/// [`ResumeCondition::validate_composite`] when a composite fails a
+/// structural / cardinality invariant at suspend-time, before any Valkey
+/// call. Carries a human-readable `detail` per §5.1.1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompositeValidationError {
+    pub detail: String,
+}
+
+impl CompositeValidationError {
+    fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl ResumeCondition {
+    /// RFC-014 §10.3 builder — `AllOf` across N distinct waitpoints,
+    /// each member a `Single { matcher: Wildcard }` leaf. Canonical
+    /// Pattern 3 shape for heterogeneous-subsystem "all fired"
+    /// semantics (e.g. `db-migration-complete` + `cache-warmed` +
+    /// `feature-flag-set`).
+    ///
+    /// Callers that need per-waitpoint matchers should construct the
+    /// tree directly via
+    /// [`ResumeCondition::Composite(CompositeBody::all_of(..))`].
+    pub fn all_of_waitpoints<I, S>(waitpoint_keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let members: Vec<ResumeCondition> = waitpoint_keys
+            .into_iter()
+            .map(|k| ResumeCondition::Single {
+                waitpoint_key: k.into(),
+                matcher: SignalMatcher::Wildcard,
+            })
+            .collect();
+        ResumeCondition::Composite(CompositeBody::AllOf { members })
+    }
+
+    /// Collect every distinct `waitpoint_key` the condition targets.
+    /// Used at suspend-time to validate the condition's wp set against
+    /// `SuspendArgs.waitpoints` (RFC-014 §5.1 multi-binding cross-
+    /// check). Order follows tree DFS, de-duplicated preserving first
+    /// occurrence.
+    pub fn referenced_waitpoint_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |k: &str| {
+            if !out.iter().any(|e| e == k) {
+                out.push(k.to_owned());
+            }
+        };
+        fn walk(cond: &ResumeCondition, push: &mut dyn FnMut(&str)) {
+            match cond {
+                ResumeCondition::Single { waitpoint_key, .. } => push(waitpoint_key),
+                ResumeCondition::Composite(body) => walk_body(body, push),
+                _ => {}
+            }
+        }
+        fn walk_body(body: &CompositeBody, push: &mut dyn FnMut(&str)) {
+            match body {
+                CompositeBody::AllOf { members } => {
+                    for m in members {
+                        walk(m, push);
+                    }
+                }
+                CompositeBody::Count { waitpoints, .. } => {
+                    for w in waitpoints {
+                        push(w.as_str());
+                    }
+                }
+            }
+        }
+        walk(self, &mut push);
+        out
+    }
+
+    /// Validate RFC-014 structural invariants on a composite condition.
+    /// Single / OperatorOnly / TimeoutOnly return Ok — they carry no
+    /// composite body. Checks cover:
+    /// * `AllOf { members: [] }` — §5.1 `allof_empty_members`
+    /// * `Count { n: 0 }` — §5.1 `count_n_zero`
+    /// * `Count { waitpoints: [] }` — §5.1 `count_waitpoints_empty`
+    /// * `Count { n > waitpoints.len(), DistinctWaitpoints }` — §5.1
+    ///   `count_exceeds_waitpoint_set`
+    /// * depth > [`MAX_COMPOSITE_DEPTH`] — §5.1 `condition_depth_exceeded`
+    pub fn validate_composite(&self) -> Result<(), CompositeValidationError> {
+        match self {
+            ResumeCondition::Composite(body) => validate_body(body, 1, ""),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn validate_body(
+    body: &CompositeBody,
+    depth: usize,
+    path: &str,
+) -> Result<(), CompositeValidationError> {
+    if depth > MAX_COMPOSITE_DEPTH {
+        return Err(CompositeValidationError::new(format!(
+            "depth {} exceeds cap {} at path {}",
+            depth,
+            MAX_COMPOSITE_DEPTH,
+            if path.is_empty() { "<root>" } else { path }
+        )));
+    }
+    match body {
+        CompositeBody::AllOf { members } => {
+            if members.is_empty() {
+                return Err(CompositeValidationError::new(format!(
+                    "allof_empty_members at path {}",
+                    if path.is_empty() { "<root>" } else { path }
+                )));
+            }
+            for (i, m) in members.iter().enumerate() {
+                let child_path = if path.is_empty() {
+                    format!("members[{i}]")
+                } else {
+                    format!("{path}.members[{i}]")
+                };
+                if let ResumeCondition::Composite(inner) = m {
+                    validate_body(inner, depth + 1, &child_path)?;
+                }
+                // Leaf `Single` / operator / timeout needs no further
+                // structural checks — RFC-013 already constrains them.
+            }
+            Ok(())
+        }
+        CompositeBody::Count {
+            n,
+            count_kind,
+            waitpoints,
+            ..
+        } => {
+            if *n == 0 {
+                return Err(CompositeValidationError::new(format!(
+                    "count_n_zero at path {}",
+                    if path.is_empty() { "<root>" } else { path }
+                )));
+            }
+            if waitpoints.is_empty() {
+                return Err(CompositeValidationError::new(format!(
+                    "count_waitpoints_empty at path {}",
+                    if path.is_empty() { "<root>" } else { path }
+                )));
+            }
+            if matches!(count_kind, CountKind::DistinctWaitpoints)
+                && (*n as usize) > waitpoints.len()
+            {
+                return Err(CompositeValidationError::new(format!(
+                    "count_exceeds_waitpoint_set: n={} > waitpoints.len()={} at path {}",
+                    n,
+                    waitpoints.len(),
+                    if path.is_empty() { "<root>" } else { path }
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Where a satisfied suspension routes back to.
@@ -3187,16 +3401,33 @@ impl WaitpointBinding {
     }
 }
 
-/// Trait-surface input to [`EngineBackend::suspend`] (RFC-013 §2.2).
+/// Trait-surface input to [`EngineBackend::suspend`] (RFC-013 §2.2 +
+/// RFC-014 Pattern 3 widening).
 ///
 /// Built via [`SuspendArgs::new`] + `with_*` setters; direct struct-
 /// literal construction across crate boundaries is not possible
 /// (`#[non_exhaustive]`).
+///
+/// ## Waitpoints
+///
+/// `waitpoints` is a non-empty `Vec<WaitpointBinding>`. The first entry
+/// is the "primary" binding (accessible via [`primary`](Self::primary))
+/// and carries the `current_waitpoint_id` written onto `exec_core` for
+/// operator visibility. Additional entries land in Valkey as their own
+/// waitpoint hashes / signal streams / HMAC tokens, enabling RFC-014
+/// Pattern 3 `AllOf { members: [Single{wp1}, Single{wp2}, ...] }` across
+/// distinct heterogeneous subsystems.
+///
+/// [`SuspendArgs::new`] takes exactly the primary binding; call
+/// [`with_waitpoint`](Self::with_waitpoint) to append further bindings
+/// (the RFC-014 builder API).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SuspendArgs {
     pub suspension_id: SuspensionId,
-    pub waitpoint: WaitpointBinding,
+    /// RFC-014 Pattern 3: all waitpoint bindings for this suspension.
+    /// Guaranteed non-empty; `waitpoints[0]` is the primary.
+    pub waitpoints: Vec<WaitpointBinding>,
     pub resume_condition: ResumeCondition,
     pub resume_policy: ResumePolicy,
     pub reason_code: SuspensionReasonCode,
@@ -3214,9 +3445,14 @@ pub struct SuspendArgs {
 impl SuspendArgs {
     /// Build a minimal `SuspendArgs` for a worker-originated suspension.
     ///
+    /// `waitpoint` becomes the primary binding. Append additional
+    /// bindings with [`with_waitpoint`](Self::with_waitpoint) (RFC-014
+    /// Pattern 3) or replace the set with
+    /// [`with_waitpoints`](Self::with_waitpoints).
+    ///
     /// Defaults: `requested_by = Worker`, `timeout_at = None`,
     /// `timeout_behavior = Fail`, `continuation_metadata_pointer = None`,
-    /// `idempotency_key = None`. Override via `with_*` setters.
+    /// `idempotency_key = None`.
     pub fn new(
         suspension_id: SuspensionId,
         waitpoint: WaitpointBinding,
@@ -3227,7 +3463,7 @@ impl SuspendArgs {
     ) -> Self {
         Self {
             suspension_id,
-            waitpoint,
+            waitpoints: vec![waitpoint],
             resume_condition,
             resume_policy,
             reason_code,
@@ -3238,6 +3474,12 @@ impl SuspendArgs {
             now,
             idempotency_key: None,
         }
+    }
+
+    /// Primary binding — `waitpoints[0]`. Guaranteed present by
+    /// construction.
+    pub fn primary(&self) -> &WaitpointBinding {
+        &self.waitpoints[0]
     }
 
     pub fn with_timeout(mut self, at: TimestampMs, behavior: TimeoutBehavior) -> Self {
@@ -3260,10 +3502,40 @@ impl SuspendArgs {
         self.idempotency_key = Some(key);
         self
     }
+
+    /// RFC-014 Pattern 3 — append a further waitpoint binding to this
+    /// suspension. Each additional binding yields its own waitpoint
+    /// hash, signal stream, condition hash and HMAC token in Valkey,
+    /// but all share the suspension record and composite evaluator
+    /// under one `suspension:current`.
+    ///
+    /// Ordering: the primary (from [`SuspendArgs::new`]) stays at
+    /// `waitpoints[0]`; subsequent `with_waitpoint` calls append at the
+    /// tail.
+    pub fn with_waitpoint(mut self, binding: WaitpointBinding) -> Self {
+        self.waitpoints.push(binding);
+        self
+    }
+
+    /// RFC-014 Pattern 3 — replace the full binding vector in one call.
+    /// Must be non-empty; an empty Vec is a programmer error and will
+    /// be rejected by the backend's `validate_suspend_args` with
+    /// `waitpoints_empty`.
+    pub fn with_waitpoints(mut self, bindings: Vec<WaitpointBinding>) -> Self {
+        self.waitpoints = bindings;
+        self
+    }
 }
 
 /// Shared "what happened on the waitpoint" payload carried in both
 /// [`SuspendOutcome`] variants.
+///
+/// For Pattern 3 (RFC-014) — multi-waitpoint suspensions — the primary
+/// binding's identity lives at the top level (`waitpoint_id` /
+/// `waitpoint_key` / `waitpoint_token`) and remaining bindings are
+/// exposed via `additional_waitpoints`, each carrying its own minted
+/// HMAC token so external signallers can deliver to any of the N
+/// waitpoints the suspension is listening on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SuspendOutcomeDetails {
@@ -3271,6 +3543,35 @@ pub struct SuspendOutcomeDetails {
     pub waitpoint_id: WaitpointId,
     pub waitpoint_key: String,
     pub waitpoint_token: WaitpointHmac,
+    /// RFC-014 Pattern 3 extras (beyond the primary). Empty for
+    /// single-waitpoint suspensions (patterns 1 + 2); carries one
+    /// entry per additional binding for Pattern 3.
+    pub additional_waitpoints: Vec<AdditionalWaitpointBinding>,
+}
+
+/// RFC-014 Pattern 3 — per-binding identity + HMAC token for
+/// waitpoints beyond the primary. Structure mirrors the top-level
+/// fields on [`SuspendOutcomeDetails`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AdditionalWaitpointBinding {
+    pub waitpoint_id: WaitpointId,
+    pub waitpoint_key: String,
+    pub waitpoint_token: WaitpointHmac,
+}
+
+impl AdditionalWaitpointBinding {
+    pub fn new(
+        waitpoint_id: WaitpointId,
+        waitpoint_key: String,
+        waitpoint_token: WaitpointHmac,
+    ) -> Self {
+        Self {
+            waitpoint_id,
+            waitpoint_key,
+            waitpoint_token,
+        }
+    }
 }
 
 impl SuspendOutcomeDetails {
@@ -3285,7 +3586,19 @@ impl SuspendOutcomeDetails {
             waitpoint_id,
             waitpoint_key,
             waitpoint_token,
+            additional_waitpoints: Vec::new(),
         }
+    }
+
+    /// Attach RFC-014 Pattern 3 additional-waitpoint bindings. The
+    /// primary binding stays at the top-level fields; `extras` lands
+    /// in [`additional_waitpoints`](Self::additional_waitpoints).
+    pub fn with_additional_waitpoints(
+        mut self,
+        extras: Vec<AdditionalWaitpointBinding>,
+    ) -> Self {
+        self.additional_waitpoints = extras;
+        self
     }
 }
 
@@ -3322,3 +3635,96 @@ impl SuspendOutcome {
 // consumers. The `backend` module re-exports these below so external
 // crates can reach them via the idiomatic `ff_core::backend` path that
 // already sources the other trait-surface types (RFC-013 §9.1).
+
+#[cfg(test)]
+mod rfc_014_validation_tests {
+    use super::*;
+
+    fn single(wp: &str) -> ResumeCondition {
+        ResumeCondition::Single {
+            waitpoint_key: wp.to_owned(),
+            matcher: SignalMatcher::ByName("x".to_owned()),
+        }
+    }
+
+    #[test]
+    fn single_passes_validate() {
+        assert!(single("wpk:a").validate_composite().is_ok());
+    }
+
+    #[test]
+    fn allof_empty_members_rejected() {
+        let c = ResumeCondition::Composite(CompositeBody::AllOf { members: vec![] });
+        let e = c.validate_composite().unwrap_err();
+        assert!(e.detail.contains("allof_empty_members"), "{}", e.detail);
+    }
+
+    #[test]
+    fn count_n_zero_rejected() {
+        let c = ResumeCondition::Composite(CompositeBody::Count {
+            n: 0,
+            count_kind: CountKind::DistinctWaitpoints,
+            matcher: None,
+            waitpoints: vec!["wpk:a".to_owned()],
+        });
+        let e = c.validate_composite().unwrap_err();
+        assert!(e.detail.contains("count_n_zero"), "{}", e.detail);
+    }
+
+    #[test]
+    fn count_waitpoints_empty_rejected() {
+        let c = ResumeCondition::Composite(CompositeBody::Count {
+            n: 1,
+            count_kind: CountKind::DistinctSources,
+            matcher: None,
+            waitpoints: vec![],
+        });
+        let e = c.validate_composite().unwrap_err();
+        assert!(e.detail.contains("count_waitpoints_empty"), "{}", e.detail);
+    }
+
+    #[test]
+    fn count_exceeds_waitpoint_set_rejected_only_for_distinct_waitpoints() {
+        // n=3, only 2 waitpoints, DistinctWaitpoints → reject.
+        let c = ResumeCondition::Composite(CompositeBody::Count {
+            n: 3,
+            count_kind: CountKind::DistinctWaitpoints,
+            matcher: None,
+            waitpoints: vec!["a".into(), "b".into()],
+        });
+        let e = c.validate_composite().unwrap_err();
+        assert!(e.detail.contains("count_exceeds_waitpoint_set"), "{}", e.detail);
+
+        // Same cardinality, DistinctSignals → allowed (no upper bound).
+        let c2 = ResumeCondition::Composite(CompositeBody::Count {
+            n: 3,
+            count_kind: CountKind::DistinctSignals,
+            matcher: None,
+            waitpoints: vec!["a".into(), "b".into()],
+        });
+        assert!(c2.validate_composite().is_ok());
+    }
+
+    #[test]
+    fn depth_4_accepted_depth_5_rejected() {
+        // Build Depth-4: AllOf { AllOf { AllOf { AllOf { Single } } } }
+        let leaf = single("wpk:leaf");
+        let d4 = ResumeCondition::Composite(CompositeBody::AllOf {
+            members: vec![ResumeCondition::Composite(CompositeBody::AllOf {
+                members: vec![ResumeCondition::Composite(CompositeBody::AllOf {
+                    members: vec![ResumeCondition::Composite(CompositeBody::AllOf {
+                        members: vec![leaf.clone()],
+                    })],
+                })],
+            })],
+        });
+        assert!(d4.validate_composite().is_ok());
+
+        // Depth-5 → reject.
+        let d5 = ResumeCondition::Composite(CompositeBody::AllOf {
+            members: vec![d4],
+        });
+        let e = d5.validate_composite().unwrap_err();
+        assert!(e.detail.contains("exceeds cap"), "{}", e.detail);
+    }
+}
