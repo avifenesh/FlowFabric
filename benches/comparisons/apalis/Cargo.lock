@@ -511,7 +511,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferriskey"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "ferriskey",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "crc16",
@@ -621,11 +621,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "ff-script"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
