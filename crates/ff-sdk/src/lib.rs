@@ -74,6 +74,13 @@
 pub mod admin;
 pub mod config;
 pub mod engine_error;
+#[cfg(any(
+    feature = "layer-tracing",
+    feature = "layer-ratelimit",
+    feature = "layer-metrics",
+    feature = "layer-circuit-breaker",
+))]
+pub mod layer;
 #[cfg(feature = "valkey-default")]
 pub mod snapshot;
 #[cfg(feature = "valkey-default")]
