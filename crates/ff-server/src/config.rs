@@ -252,6 +252,9 @@ impl ServerConfig {
             edge_cancel_dispatcher_interval: Duration::from_secs(
                 env_u64("FF_EDGE_CANCEL_DISPATCHER_INTERVAL_S", 1)?
             ),
+            edge_cancel_reconciler_interval: Duration::from_secs(
+                env_u64("FF_EDGE_CANCEL_RECONCILER_INTERVAL_S", 10)?
+            ),
             // Issue #122: default is no-op. Multi-tenant deployments
             // override this after ServerConfig construction.
             scanner_filter: Default::default(),

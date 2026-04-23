@@ -78,6 +78,11 @@ mod name {
     /// `already_terminal` | `not_found`). Cardinality = 3, no per-
     /// flow/exec labels.
     pub const SIBLING_CANCEL_DISPOSITION: &str = "ff_sibling_cancel_disposition";
+    /// RFC-016 Stage D: count of reconcile actions by the
+    /// edge_cancel_reconciler scanner (Invariant Q6 safety net).
+    /// Labelled by `action` ∈ `sremmed_stale` | `completed_drain` |
+    /// `no_op`. Cardinality = 3.
+    pub const SIBLING_CANCEL_RECONCILE: &str = "ff_sibling_cancel_reconcile";
 }
 
 struct Inner {
@@ -106,6 +111,7 @@ struct Inner {
     edge_group_policy: Counter<u64>,
     sibling_cancel_dispatched: Counter<u64>,
     sibling_cancel_disposition: Counter<u64>,
+    sibling_cancel_reconcile: Counter<u64>,
 }
 
 #[derive(Clone)]
@@ -198,6 +204,14 @@ impl Metrics {
                  `not_found`).",
             )
             .build();
+        let sibling_cancel_reconcile = meter
+            .u64_counter(name::SIBLING_CANCEL_RECONCILE)
+            .with_description(
+                "RFC-016 Stage D sibling-cancel reconcile actions, labelled \
+                 by `action` (`sremmed_stale` | `completed_drain` | \
+                 `no_op`). Invariant Q6 crash-recovery safety net.",
+            )
+            .build();
 
         // Cancel backlog depth — gauge backed by an AtomicU64 so set()
         // from any thread is lock-free. OTEL observable-gauge callback
@@ -230,6 +244,7 @@ impl Metrics {
             edge_group_policy,
             sibling_cancel_dispatched,
             sibling_cancel_disposition,
+            sibling_cancel_reconcile,
         }))
     }
 
@@ -349,6 +364,15 @@ impl Metrics {
         self.0
             .sibling_cancel_disposition
             .add(1, &[KeyValue::new("disposition", disposition)]);
+    }
+
+    /// Increment `ff_sibling_cancel_reconcile_total{action}`. Action is
+    /// one of `sremmed_stale` / `completed_drain` / `no_op`. Fixed-
+    /// cardinality (3) — no per-flow/exec labels.
+    pub fn inc_sibling_cancel_reconcile(&self, action: &'static str) {
+        self.0
+            .sibling_cancel_reconcile
+            .add(1, &[KeyValue::new("action", action)]);
     }
 }
 

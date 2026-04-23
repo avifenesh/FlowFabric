@@ -476,6 +476,7 @@ impl Server {
             execution_deadline_interval: config.engine_config.execution_deadline_interval,
             cancel_reconciler_interval: config.engine_config.cancel_reconciler_interval,
             edge_cancel_dispatcher_interval: config.engine_config.edge_cancel_dispatcher_interval,
+            edge_cancel_reconciler_interval: config.engine_config.edge_cancel_reconciler_interval,
             scanner_filter: config.engine_config.scanner_filter.clone(),
         };
         // Engine scanners keep running on the MAIN `client` mux — NOT on

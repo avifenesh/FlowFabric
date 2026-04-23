@@ -76,4 +76,8 @@ impl Metrics {
 
     pub fn inc_sibling_cancel_dispatched(&self, _reason: &'static str) {}
     pub fn inc_sibling_cancel_disposition(&self, _disposition: &'static str) {}
+
+    // ── RFC-016 Stage D: sibling-cancel reconciler ──
+
+    pub fn inc_sibling_cancel_reconcile(&self, _action: &'static str) {}
 }

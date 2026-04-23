@@ -7,6 +7,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-016 Stage D: sibling-cancel reconciler (Invariant Q6 crash recovery).**
+  New background scanner `edge_cancel_reconciler` (default interval 10s,
+  env `FF_EDGE_CANCEL_RECONCILER_INTERVAL_S`) consumes the per-flow-
+  partition `ff:idx:{fp:N}:pending_cancel_groups` SET directly (no full
+  scan) and heals crash-recovery residue left when the Stage C
+  dispatcher was interrupted between `SADD` + `ff_drain_sibling_cancel_
+  group`. New Lua function `ff_reconcile_sibling_cancel_group` decides
+  atomically per tuple: SREM stale entries (flag cleared / edgegroup
+  missing), complete interrupted drains (flag true + all siblings
+  terminal ⇒ HDEL flag + members + SREM), or no-op when siblings are
+  still non-terminal (dispatcher's domain). The reconciler MUST NOT
+  fight the dispatcher — it never re-attempts cancel dispatch. New
+  metric `ff_sibling_cancel_reconcile_total{action}` with cardinality 3
+  (`sremmed_stale` | `completed_drain` | `no_op`), no per-flow/exec
+  labels. New `EngineConfig::edge_cancel_reconciler_interval` (default
+  `Duration::from_secs(10)`). Lua library version 23 → 24. Stage E
+  (full cancel-to-terminal matrix + stress tests) + Phase 0 benchmarks
+  (v0.6 release gate) remain outstanding.
+
 - **RFC-014: Multi-signal resume conditions (`AllOf`, `Count{DistinctX}`).**
   `ResumeCondition::Composite(CompositeBody)` — the RFC-013 placeholder
   — is now populated with two variants: `CompositeBody::AllOf { members:
