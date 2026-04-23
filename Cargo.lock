@@ -935,6 +935,7 @@ version = "0.5.0"
 dependencies = [
  "axum",
  "ferriskey",
+ "ff-backend-valkey",
  "ff-core",
  "ff-engine",
  "ff-sdk",

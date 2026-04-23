@@ -24,6 +24,7 @@ readiness = []
 # hmac/sha2/hex for waitpoint-token signing, uuid for ad-hoc ids, serde for
 # evidence deserialization) live on the branches that introduce them — kept
 # out here so `cargo-machete` stays green on the default workspace lint.
+ff-backend-valkey = { workspace = true }
 ff-core = { workspace = true }
 ff-engine = { workspace = true }
 ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
