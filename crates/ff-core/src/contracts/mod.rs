@@ -2610,6 +2610,38 @@ impl ListSuspendedPage {
     }
 }
 
+// ─── list_executions ───
+
+/// One page of partition-scoped execution ids returned by
+/// [`EngineBackend::list_executions`](crate::engine_backend::EngineBackend::list_executions).
+///
+/// Pagination is forward-only and cursor-based. `next_cursor` carries
+/// the last `ExecutionId` emitted in `executions` iff another page is
+/// available; callers pass that id back as the next call's `cursor`
+/// (exclusive start). `next_cursor = None` signals end-of-stream.
+///
+/// `#[non_exhaustive]` — FF may add fields (e.g. `approximate_total`)
+/// in minor releases without a semver break. Use
+/// [`ListExecutionsPage::new`] for cross-crate construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ListExecutionsPage {
+    /// Execution ids on this page, in ascending lexicographic order.
+    pub executions: Vec<ExecutionId>,
+    /// Exclusive cursor to request the next page. `None` ⇒ no more
+    /// results.
+    pub next_cursor: Option<ExecutionId>,
+}
+
+impl ListExecutionsPage {
+    /// Construct a [`ListExecutionsPage`]. Present so downstream
+    /// crates can assemble the struct despite the `#[non_exhaustive]`
+    /// marker.
+    pub fn new(executions: Vec<ExecutionId>, next_cursor: Option<ExecutionId>) -> Self {
+        Self { executions, next_cursor }
+    }
+}
+
 // ─── rotate_waitpoint_hmac_secret ───
 
 /// Args for `ff_rotate_waitpoint_hmac_secret`. Rotates the HMAC signing

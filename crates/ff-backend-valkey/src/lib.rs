@@ -39,8 +39,8 @@ use ff_core::contracts::decode::{
 };
 use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    FlowStatus, FlowSummary, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
-    SuspendedExecutionEntry,
+    FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage,
+    ReportUsageResult, SuspendedExecutionEntry,
 };
 use ff_core::partition::PartitionKey;
 use ff_core::engine_backend::EngineBackend;
@@ -1145,6 +1145,98 @@ async fn list_lanes_impl(
         None
     };
     Ok(ListLanesPage::new(page, next_cursor))
+}
+
+/// Partition-scoped forward-only cursor listing of executions.
+///
+/// Reads `SMEMBERS ff:idx:{p:N}:all_executions`, parses every member
+/// as [`ExecutionId`] (failing loud on corruption), sorts lexicographic
+/// (stable across calls — ExecutionId prefix is the partition hash tag
+/// so intra-partition order is UUID-suffix order), filters to members
+/// strictly greater than `cursor`, and truncates to `limit`.
+/// `next_cursor` is the last emitted id iff at least one more member
+/// remains past the page boundary.
+///
+/// v1 note: a full `SMEMBERS` scan per page is acceptable for
+/// partitions holding O(10k) executions (retention trims terminal ids
+/// out; live-set cardinality stays bounded by worker concurrency). A
+/// future optimisation may introduce a parallel ZSET keyed by
+/// `created_at` so paging becomes a constant-time `ZRANGEBYSCORE` —
+/// that is out of scope for the list-executions trait landing.
+#[tracing::instrument(
+    name = "ff.list_executions",
+    skip_all,
+    fields(backend = "valkey", partition = %partition_key)
+)]
+async fn list_executions_impl(
+    client: &ferriskey::Client,
+    partition_key: &PartitionKey,
+    cursor: Option<&ExecutionId>,
+    limit: usize,
+) -> Result<ListExecutionsPage, EngineError> {
+    // `limit == 0` is a legitimate caller request (e.g. probing for
+    // cursor validity); short-circuit before touching Valkey.
+    if limit == 0 {
+        return Ok(ListExecutionsPage::new(Vec::new(), None));
+    }
+
+    let partition = partition_key
+        .parse()
+        .map_err(|e| EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::InvalidInput,
+            detail: format!(
+                "list_executions: partition: '{partition_key}' is not a valid PartitionKey: {e}"
+            ),
+        })?;
+    let idx = IndexKeys::new(&partition);
+    let all_key = idx.all_executions();
+
+    let raw_members: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&all_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    if raw_members.is_empty() {
+        return Ok(ListExecutionsPage::new(Vec::new(), None));
+    }
+
+    // Parse every member up-front; a corrupt SET entry surfaces as
+    // Validation { Corruption } rather than being silently skipped.
+    let mut parsed: Vec<ExecutionId> = Vec::with_capacity(raw_members.len());
+    for raw in &raw_members {
+        let eid = ExecutionId::parse(raw).map_err(|e| EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::Corruption,
+            detail: format!(
+                "list_executions: {all_key}: member: '{raw}' is not a valid ExecutionId \
+                 (key corruption?): {e}"
+            ),
+        })?;
+        parsed.push(eid);
+    }
+
+    // Lex sort on the wire string so the ordering is stable across
+    // concurrent inserts (ExecutionId has no Ord impl).
+    parsed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+    // Forward-only cursor: take members strictly greater than cursor.
+    let filtered: Vec<ExecutionId> = if let Some(c) = cursor {
+        let cs = c.as_str();
+        parsed
+            .into_iter()
+            .filter(|e| e.as_str() > cs)
+            .collect()
+    } else {
+        parsed
+    };
+
+    // Cap limit at 1000 per RFC-012 read-surface defaults.
+    let effective_limit = limit.min(1000);
+    let has_more = filtered.len() > effective_limit;
+    let page: Vec<ExecutionId> = filtered.into_iter().take(effective_limit).collect();
+    let next_cursor = if has_more { page.last().cloned() } else { None };
+    Ok(ListExecutionsPage::new(page, next_cursor))
 }
 
 /// Read the deployment's partition config from
@@ -2651,6 +2743,22 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "list_suspended: SCAN lane:*:suspended + ZRANGE + HMGET reason",
+                )
+            })
+    }
+
+    async fn list_executions(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListExecutionsPage, EngineError> {
+        list_executions_impl(&self.client, &partition, cursor.as_ref(), limit)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "list_executions: SMEMBERS all_executions + sort/filter",
                 )
             })
     }

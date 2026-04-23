@@ -24,8 +24,8 @@
 //! them without depending on ff-sdk.
 
 use ff_core::contracts::{
-    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage, ListLanesPage,
-    ListSuspendedPage,
+    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListExecutionsPage,
+    ListFlowsPage, ListLanesPage, ListSuspendedPage,
 };
 use ff_core::partition::{execution_partition, flow_partition, PartitionKey};
 use ff_core::types::{EdgeId, ExecutionId, FlowId, LaneId};
@@ -198,6 +198,26 @@ impl FlowFabricWorker {
         Ok(self
             .backend_ref()
             .list_suspended(partition, cursor, limit)
+            .await?)
+    }
+
+    /// Forward-only paginated listing of executions in a partition.
+    ///
+    /// Thin forwarder onto
+    /// [`EngineBackend::list_executions`](ff_core::engine_backend::EngineBackend::list_executions).
+    /// Pagination is cursor-based: pass `cursor = None` for the first
+    /// page and feed the returned
+    /// [`ListExecutionsPage::next_cursor`] back as `cursor` until it
+    /// returns `None`. See the trait rustdoc for the full contract.
+    pub async fn list_executions(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListExecutionsPage, SdkError> {
+        Ok(self
+            .backend_ref()
+            .list_executions(partition, cursor, limit)
             .await?)
     }
 
