@@ -41,7 +41,7 @@
 //! - Invalid routing scenarios
 
 use crate::cluster::routing::SlotAddr;
-use crate::cluster::topology::SLOT_SIZE;
+use crate::cluster::topology::{SLOT_SIZE, get_slot};
 use crate::cluster::{ClusterConnInner, Connect, InnerCore, RefreshPolicy};
 use crate::cmd::cmd;
 use crate::connection::ConnectionLike;
@@ -395,15 +395,34 @@ impl ScanState {
     async fn initiate_scan<C>(
         core: &InnerCore<C>,
         allow_non_covered_slots: bool,
+        match_pattern: Option<&[u8]>,
     ) -> Result<ScanState>
     where
         C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
     {
-        let mut new_scanned_slots_map: SlotsBitsArray = [0; BITS_ARRAY_SIZE as usize];
+        // Hash-tag-scoped scan: if the match pattern embeds a
+        // Valkey hash tag (`{tag}`), every matching key hashes
+        // into the single slot owned by that tag. Pre-mark every
+        // other slot as scanned so the scan only traverses the
+        // one primary that owns the tag's slot and finishes
+        // after that node's cursor wraps. Without this, ferriskey
+        // iterates every primary serially — correct, but wasteful
+        // when the caller has already pinned a hash tag.
+        let (mut new_scanned_slots_map, start_slot) = match match_pattern
+            .and_then(hashtag_from_pattern)
+        {
+            Some(tag) => {
+                let pinned = get_slot(tag);
+                let mut map: SlotsBitsArray = [u64::MAX; BITS_ARRAY_SIZE as usize];
+                unmark_slot_as_scanned(&mut map, pinned);
+                (map, pinned)
+            }
+            None => ([0; BITS_ARRAY_SIZE as usize], 0),
+        };
         let new_cursor = 0;
         let address = next_address_to_scan(
             core,
-            0,
+            start_slot,
             &mut new_scanned_slots_map,
             allow_non_covered_slots,
         )
@@ -510,6 +529,28 @@ fn mark_slot_as_scanned(scanned_slots_map: &mut SlotsBitsArray, slot: u16) {
     let slot_index = (slot as u64 / BITS_PER_U64 as u64) as usize;
     let slot_bit = slot as u64 % (BITS_PER_U64 as u64);
     scanned_slots_map[slot_index] |= 1 << slot_bit;
+}
+
+/// Clear the bit for `slot` in the bitmap, marking it as NOT
+/// scanned. Used by hash-tag-scoped initiation, where the bitmap
+/// starts with every slot marked scanned except the pinned slot
+/// so `next_address_to_scan` locates only the primary that owns
+/// the hash tag.
+fn unmark_slot_as_scanned(scanned_slots_map: &mut SlotsBitsArray, slot: u16) {
+    let slot_index = (slot as u64 / BITS_PER_U64 as u64) as usize;
+    let slot_bit = slot as u64 % (BITS_PER_U64 as u64);
+    scanned_slots_map[slot_index] &= !(1 << slot_bit);
+}
+
+/// Extract the bytes of the first Valkey hash tag (`{...}`) in a
+/// MATCH pattern, or `None` if absent or empty. Matches the
+/// tag-extraction logic in [`crate::cluster::topology`] used for
+/// slot routing so scan pinning and key routing agree.
+fn hashtag_from_pattern(pattern: &[u8]) -> Option<&[u8]> {
+    let open = pattern.iter().position(|b| *b == b'{')?;
+    let close_rel = pattern[open + 1..].iter().position(|b| *b == b'}')?;
+    let tag = &pattern[open + 1..open + 1 + close_rel];
+    (!tag.is_empty()).then_some(tag)
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -641,7 +682,13 @@ where
     // - Otherwise, initiate a new scan.
     let scan_state = match scan_state_cursor.state_from_wrapper() {
         Some(state) => state,
-        None => match ScanState::initiate_scan(&core, allow_non_covered_slots).await {
+        None => match ScanState::initiate_scan(
+            &core,
+            allow_non_covered_slots,
+            cluster_scan_args.match_pattern.as_deref(),
+        )
+        .await
+        {
             Ok(state) => state,
             Err(err) => {
                 // Early return if initiating the scan fails
@@ -887,6 +934,45 @@ mod tests {
         mark_slot_as_scanned(&mut scanned_slots_map, 5);
 
         assert_eq!(scanned_slots_map[0], 1 << 5);
+    }
+
+    #[test]
+    fn test_hashtag_from_pattern() {
+        assert_eq!(hashtag_from_pattern(b"ff:idx:{abc}:lane:*"), Some(&b"abc"[..]));
+        assert_eq!(hashtag_from_pattern(b"no-tag-here:*"), None);
+        assert_eq!(hashtag_from_pattern(b"{}empty"), None);
+        assert_eq!(hashtag_from_pattern(b"{only-open"), None);
+        // Only first occurrence considered.
+        assert_eq!(hashtag_from_pattern(b"{first}and{second}"), Some(&b"first"[..]));
+    }
+
+    #[test]
+    fn test_unmark_slot_as_scanned() {
+        let mut map: SlotsBitsArray = [u64::MAX; BITS_ARRAY_SIZE as usize];
+        unmark_slot_as_scanned(&mut map, 5);
+        // Slot 5 cleared, everything else set.
+        assert_eq!(map[0], u64::MAX & !(1u64 << 5));
+        for word in &map[1..] {
+            assert_eq!(*word, u64::MAX);
+        }
+        // next_slot should now return exactly 5.
+        assert_eq!(next_slot(&map), Some(5));
+    }
+
+    #[test]
+    fn test_hashtag_scoped_bitmap_finishes_after_pinned_slot() {
+        // Simulate the hash-tag-scoped initial bitmap: every slot
+        // marked scanned except the pinned one. Once the pinned
+        // node's slots (a super-set including the pinned slot)
+        // get marked scanned by the completed-address path,
+        // next_slot returns END_OF_SCAN so the scan finishes on
+        // a single node rather than iterating every primary.
+        let pinned = get_slot(b"abc");
+        let mut map: SlotsBitsArray = [u64::MAX; BITS_ARRAY_SIZE as usize];
+        unmark_slot_as_scanned(&mut map, pinned);
+        assert_eq!(next_slot(&map), Some(pinned));
+        mark_slot_as_scanned(&mut map, pinned);
+        assert_eq!(next_slot(&map), Some(END_OF_SCAN));
     }
 
     #[tokio::test]

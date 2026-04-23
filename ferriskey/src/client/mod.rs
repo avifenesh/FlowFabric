@@ -878,6 +878,40 @@ impl Client {
     //
     // The wrapper create an object contain the cursor-id with a drop function that will remove the cursor from the container.
     // When the ref is removed from the hash-map, there's no more references to the ScanState, and the GC will clean it.
+    /// Returns `true` when the underlying connection is in
+    /// cluster mode. Cheap: acquires the read-lock on the
+    /// already-initialized [`ClientWrapper`] and matches the
+    /// variant.
+    pub async fn is_cluster(&self) -> bool {
+        let guard = self.internal_client.read().await;
+        matches!(&*guard, ClientWrapper::Cluster { .. })
+    }
+
+    /// Typed-tuple variant of [`Self::cluster_scan`] for Rust
+    /// callers that want direct access to the next scan state and
+    /// key list without the language-binding cursor-id container
+    /// shim. Errors on standalone.
+    pub async fn cluster_scan_typed<'a>(
+        &'a mut self,
+        scan_state_cursor: &'a ScanStateRC,
+        cluster_scan_args: ClusterScanArgs,
+    ) -> Result<(ScanStateRC, Vec<Value>)> {
+        let scan_state_cursor_clone = scan_state_cursor.clone();
+        let cluster_scan_args_clone = cluster_scan_args.clone();
+        let client = self.get_or_initialize_client().await?;
+        match client {
+            ClientWrapper::Standalone(_) => Err(Error::from((
+                ErrorKind::InvalidClientConfig,
+                "Cluster scan is not supported in standalone mode",
+            ))),
+            ClientWrapper::Cluster { mut client } => {
+                client
+                    .cluster_scan(scan_state_cursor_clone, cluster_scan_args_clone)
+                    .await
+            }
+        }
+    }
+
     pub async fn cluster_scan<'a>(
         &'a mut self,
         scan_state_cursor: &'a ScanStateRC,
