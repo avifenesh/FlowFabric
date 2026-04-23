@@ -415,13 +415,34 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
         after: StreamCursor,
         block_ms: u64,
         count_limit: u64,
+        visibility: ff_core::backend::TailVisibility,
     ) -> Result<StreamFrames, EngineError> {
         with_hooks!(
             self,
             "tail_stream",
             self.inner
-                .tail_stream(execution_id, attempt_index, after, block_ms, count_limit)
+                .tail_stream(
+                    execution_id,
+                    attempt_index,
+                    after,
+                    block_ms,
+                    count_limit,
+                    visibility,
+                )
                 .await
+        )
+    }
+
+    #[cfg(feature = "valkey-default")]
+    async fn read_summary(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+    ) -> Result<Option<ff_core::backend::SummaryDocument>, EngineError> {
+        with_hooks!(
+            self,
+            "read_summary",
+            self.inner.read_summary(execution_id, attempt_index).await
         )
     }
 }

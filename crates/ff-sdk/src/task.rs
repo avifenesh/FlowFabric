@@ -430,6 +430,27 @@ impl ClaimedTask {
         block_ms: u64,
         count_limit: u64,
     ) -> Result<StreamFrames, SdkError> {
+        self.tail_stream_with_visibility(
+            after,
+            block_ms,
+            count_limit,
+            ff_core::backend::TailVisibility::All,
+        )
+        .await
+    }
+
+    /// Tail with an explicit [`TailVisibility`](ff_core::backend::TailVisibility)
+    /// filter (RFC-015 §6). Use [`TailVisibility::ExcludeBestEffort`]
+    /// (ff_core::backend::TailVisibility::ExcludeBestEffort) to drop
+    /// [`StreamMode::BestEffortLive`](ff_core::backend::StreamMode::BestEffortLive)
+    /// frames server-side.
+    pub async fn tail_stream_with_visibility(
+        &self,
+        after: StreamCursor,
+        block_ms: u64,
+        count_limit: u64,
+        visibility: ff_core::backend::TailVisibility,
+    ) -> Result<StreamFrames, SdkError> {
         if block_ms > MAX_TAIL_BLOCK_MS {
             return Err(SdkError::Config {
                 context: "tail_stream".into(),
@@ -447,6 +468,7 @@ impl ClaimedTask {
                 after,
                 block_ms,
                 count_limit,
+                visibility,
             )
             .await?)
     }
@@ -784,12 +806,33 @@ impl ClaimedTask {
         payload: &[u8],
         metadata: Option<&str>,
     ) -> Result<AppendFrameOutcome, SdkError> {
+        self.append_frame_with_mode(
+            frame_type,
+            payload,
+            metadata,
+            ff_core::backend::StreamMode::Durable,
+        )
+        .await
+    }
+
+    /// Append a frame under an explicit RFC-015
+    /// [`StreamMode`](ff_core::backend::StreamMode).
+    /// Defaults via [`Self::append_frame`] preserve pre-015 behaviour
+    /// ([`StreamMode::Durable`](ff_core::backend::StreamMode::Durable)).
+    pub async fn append_frame_with_mode(
+        &self,
+        frame_type: &str,
+        payload: &[u8],
+        metadata: Option<&str>,
+        mode: ff_core::backend::StreamMode,
+    ) -> Result<AppendFrameOutcome, SdkError> {
         let handle = self.synth_handle();
         let mut frame = ff_core::backend::Frame::new(
             payload.to_vec(),
             ff_core::backend::FrameKind::Event,
         )
-        .with_frame_type(frame_type);
+        .with_frame_type(frame_type)
+        .with_mode(mode);
         if let Some(cid) = metadata {
             frame = frame.with_correlation_id(cid);
         }
@@ -1928,6 +1971,29 @@ pub async fn tail_stream(
     block_ms: u64,
     count_limit: u64,
 ) -> Result<StreamFrames, SdkError> {
+    tail_stream_with_visibility(
+        backend,
+        execution_id,
+        attempt_index,
+        after,
+        block_ms,
+        count_limit,
+        ff_core::backend::TailVisibility::All,
+    )
+    .await
+}
+
+/// Tail helper with an explicit RFC-015
+/// [`TailVisibility`](ff_core::backend::TailVisibility) filter.
+pub async fn tail_stream_with_visibility(
+    backend: &dyn EngineBackend,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    after: StreamCursor,
+    block_ms: u64,
+    count_limit: u64,
+    visibility: ff_core::backend::TailVisibility,
+) -> Result<StreamFrames, SdkError> {
     if block_ms > MAX_TAIL_BLOCK_MS {
         return Err(SdkError::Config {
             context: "tail_stream".into(),
@@ -1943,7 +2009,14 @@ pub async fn tail_stream(
     validate_tail_cursor(&after)?;
 
     Ok(backend
-        .tail_stream(execution_id, attempt_index, after, block_ms, count_limit)
+        .tail_stream(
+            execution_id,
+            attempt_index,
+            after,
+            block_ms,
+            count_limit,
+            visibility,
+        )
         .await?)
 }
 

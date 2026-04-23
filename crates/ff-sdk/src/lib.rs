@@ -110,9 +110,17 @@ pub use ff_core::backend::FailOutcome;
 pub use ff_core::backend::ResumeSignal;
 #[cfg(feature = "valkey-default")]
 pub use task::{
-    read_stream, tail_stream, AppendFrameOutcome, ClaimedTask, ConditionMatcher, Signal,
-    SignalOutcome, StreamCursor, StreamFrames, SuspendOutcome, TimeoutBehavior,
-    MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
+    read_stream, tail_stream, tail_stream_with_visibility, AppendFrameOutcome, ClaimedTask,
+    ConditionMatcher, Signal, SignalOutcome, StreamCursor, StreamFrames, SuspendOutcome,
+    TimeoutBehavior, MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
+};
+// RFC-015 stream-durability-mode public surface. Re-exported so
+// consumers can name `ff_sdk::StreamMode` etc. alongside the older
+// `AppendFrameOutcome` / `StreamCursor` re-exports. Gated on
+// `valkey-default` because the worker surface that uses them is too.
+#[cfg(feature = "valkey-default")]
+pub use ff_core::backend::{
+    PatchKind, StreamMode, SummaryDocument, TailVisibility, SUMMARY_NULL_SENTINEL,
 };
 #[cfg(feature = "valkey-default")]
 pub use worker::FlowFabricWorker;
