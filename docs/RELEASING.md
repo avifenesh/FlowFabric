@@ -6,7 +6,7 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Nine crates, all pinned to the same version, published in topological order:
+Ten crates, all pinned to the same version, published in topological order:
 
 1. `ferriskey`       — Valkey client (reparented fork of glide-core;
    the former `telemetrylib` sub-crate was inlined during the Tier 1
@@ -17,20 +17,26 @@ Nine crates, all pinned to the same version, published in topological order:
    shim. Added to the publish set in v0.3.1 after v0.3.0
    partial-published (ff-engine depends on it as a workspace dep
    and its publish step fails without it being on crates.io).
-5. `ff-backend-valkey` — RFC-012 EngineBackend trait Valkey impl,
+5. `ff-observability-http` — consumer-side Prometheus `/metrics` HTTP
+   endpoint (axum Router + `serve()` convenience). Bridges
+   `ff-observability`'s registry to a scrape endpoint for consumers
+   embedding `ff-sdk` in library mode without `ff-server`. Added to
+   the publish set alongside its introduction; `ff-server` still
+   ships its own built-in `/metrics` route (PR #94).
+6. `ff-backend-valkey` — RFC-012 EngineBackend trait Valkey impl,
    separated from ff-sdk in RFC-012 Stage 1a. Added to the publish
    set in v0.3.2 after v0.3.1 partial-published (ff-sdk depends on
    it as a workspace dep and its publish step fails without it
    being on crates.io).
-6. `ff-engine`       — cross-partition dispatch + scanners
+7. `ff-engine`       — cross-partition dispatch + scanners
    (includes the `completion_listener` module for push-based DAG
    promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
    §"DAG promotion: push listener + safety-net reconciler")
-7. `ff-scheduler`    — claim-grant scheduler
-8. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
+8. `ff-scheduler`    — claim-grant scheduler
+9. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
    off by default; production deployments use the scheduler-routed
    HTTP path via `FlowFabricWorker::claim_via_server`
-9. `ff-server`       — HTTP server library + binary
+10. `ff-server`      — HTTP server library + binary
 
 Excluded from publish:
 
@@ -57,7 +63,7 @@ Before cutting a release, verify:
 - [ ] `CARGO_REGISTRY_TOKEN` is configured in repo settings (Settings →
       Secrets and variables → Actions). Generate at
       <https://crates.io/me> → API Tokens with scope `publish-new` +
-      `publish-update`. The token must have upload rights to all nine
+      `publish-update`. The token must have upload rights to all ten
       crate names — claim them on crates.io first if they are new.
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.

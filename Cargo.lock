@@ -883,6 +883,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-observability-http"
+version = "0.4.0"
+dependencies = [
+ "axum",
+ "ff-observability",
+ "tokio",
+]
+
+[[package]]
 name = "ff-readiness-tests"
 version = "0.4.0"
 dependencies = [

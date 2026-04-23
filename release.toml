@@ -2,13 +2,18 @@
 #
 # This config drives `cargo release <level>` to perform a consolidated,
 # workspace-wide version bump across the publishable crates:
-#   ferriskey, ff-core, ff-script, ff-observability, ff-backend-valkey,
+#   ferriskey, ff-core, ff-script, ff-observability,
+#   ff-observability-http, ff-backend-valkey,
 #   ff-engine, ff-scheduler, ff-sdk, ff-server
 # The former telemetrylib sub-crate was inlined into ferriskey in
 # PR #18; it is no longer a separate publish target. ff-observability
 # was added to the publish set in v0.3.1 after v0.3.0
 # partial-published. ff-backend-valkey was added to the publish set
 # in v0.3.2 after v0.3.1 partial-published (ff-sdk depends on it).
+# ff-observability-http was added alongside its introduction as a
+# consumer-side /metrics endpoint (axum bridge on top of
+# ff-observability); ff-server keeps its own built-in /metrics route
+# per PR #94.
 #
 # Intentionally excluded from the bump (via [package.metadata.release]
 # release = false in each crate's Cargo.toml):
