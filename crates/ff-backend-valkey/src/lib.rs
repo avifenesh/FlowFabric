@@ -535,36 +535,32 @@ async fn list_suspended_impl(
     let tag = parsed.hash_tag();
 
     // 1. Enumerate per-lane suspended ZSETs in this partition via
-    //    SCAN MATCH. Same iteration shape as quota_reconciler.rs.
-    let match_pat = format!("ff:idx:{tag}:lane:*:suspended");
-    let mut lane_keys: Vec<String> = Vec::new();
-    let mut scan_cursor = "0".to_string();
-    // Safety cap — refuse to enumerate pathologically large key spaces.
-    // 10k unique lane-suspended keys per partition is a loud operational
-    // anomaly; the cap bounds the scan cost at query time.
+    //    `KEYS`. Cluster routing for `KEYS`: ferriskey routes
+    //    `KEYS` as `AllPrimaries` + `CombineArrays` (see
+    //    `ferriskey/src/cluster/routing.rs`), so the returned array
+    //    is the union from every primary. Under RFC-011 hash-tag
+    //    co-location every lane:*:suspended key with this partition
+    //    tag lives on the same node; the broadcast is correct but
+    //    not minimal. Acceptable — `list_suspended` is operator-
+    //    tooling call shape, not hot path. `SCAN` was the earlier
+    //    choice; it does NOT work in cluster mode because its
+    //    per-node iteration lands on only one primary (see the CI
+    //    failure that drove this switch).
+    //
+    //    Safety cap — refuse to enumerate pathologically large key
+    //    spaces. 10k unique lane-suspended keys per partition is a
+    //    loud operational anomaly; the cap bounds the enumeration
+    //    cost at query time.
     const MAX_LANE_KEYS: usize = 10_000;
-    loop {
-        let raw: ferriskey::Value = client
-            .cmd("SCAN")
-            .arg(scan_cursor.as_str())
-            .arg("MATCH")
-            .arg(match_pat.as_str())
-            .arg("COUNT")
-            .arg("100")
-            .execute()
-            .await
-            .map_err(transport_fk)?;
-        let (next_cursor, keys) = parse_scan_response(&raw);
-        for k in keys {
-            if lane_keys.len() >= MAX_LANE_KEYS {
-                break;
-            }
-            lane_keys.push(k);
-        }
-        scan_cursor = next_cursor;
-        if scan_cursor == "0" || lane_keys.len() >= MAX_LANE_KEYS {
-            break;
-        }
+    let match_pat = format!("ff:idx:{tag}:lane:*:suspended");
+    let mut lane_keys: Vec<String> = client
+        .cmd("KEYS")
+        .arg(match_pat.as_str())
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    if lane_keys.len() > MAX_LANE_KEYS {
+        lane_keys.truncate(MAX_LANE_KEYS);
     }
     if lane_keys.is_empty() {
         return Ok(ListSuspendedPage::new(Vec::new(), None));
@@ -675,29 +671,6 @@ async fn list_suspended_impl(
     }
 
     Ok(ListSuspendedPage::new(entries, next_cursor))
-}
-
-/// Parse a SCAN/SSCAN reply `[cursor, [key1, key2, ...]]`. Mirrors
-/// the pattern in `ff_engine::scanner::quota_reconciler`.
-fn parse_scan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
-    let arr = match val {
-        ferriskey::Value::Array(a) if a.len() >= 2 => a,
-        _ => return ("0".to_string(), vec![]),
-    };
-    let cursor = match &arr[0] {
-        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
-        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
-        _ => return ("0".to_string(), vec![]),
-    };
-    let mut keys = Vec::new();
-    if let Ok(ferriskey::Value::Array(inner)) = &arr[1] {
-        for item in inner {
-            if let Ok(ferriskey::Value::BulkString(b)) = item {
-                keys.push(String::from_utf8_lossy(b).into_owned());
-            }
-        }
-    }
-    (cursor, keys)
 }
 
 /// Single `HGETALL flow_core` + decode via [`build_flow_snapshot`].
