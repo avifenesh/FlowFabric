@@ -68,6 +68,7 @@ pub use ferriskey_client::{
     Client, ClientBuilder, CommandBuilder, LazyClient, PipeCmdBuilder, PipeSlot, ReadFrom,
     TypedPipeline,
 };
+pub use cluster::scan::{ClusterScanArgs, ClusterScanArgsBuilder, ObjectType, ScanStateRC};
 
 /// Connect to a standalone Valkey server.
 ///

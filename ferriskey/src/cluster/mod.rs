@@ -28,7 +28,7 @@ pub mod connections;
 pub mod container;
 pub(crate) mod pipeline;
 pub mod routing;
-pub(crate) mod scan;
+pub mod scan;
 pub mod slotmap;
 pub mod topology;
 /// Exposed only for testing.

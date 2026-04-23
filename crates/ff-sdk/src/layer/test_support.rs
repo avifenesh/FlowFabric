@@ -20,8 +20,9 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
-    ListLanesPage, ReportUsageResult,
+    ListLanesPage, ListSuspendedPage, ReportUsageResult,
 };
+use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
 use ff_core::engine_backend::EngineBackend;
@@ -225,6 +226,16 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<ListLanesPage, EngineError> {
         self.record("list_lanes")?;
         Ok(ListLanesPage::new(Vec::new(), None))
+    }
+
+    async fn list_suspended(
+        &self,
+        _partition: PartitionKey,
+        _cursor: Option<ExecutionId>,
+        _limit: usize,
+    ) -> Result<ListSuspendedPage, EngineError> {
+        self.record("list_suspended")?;
+        Ok(ListSuspendedPage::new(Vec::new(), None))
     }
 
     async fn cancel_flow(
