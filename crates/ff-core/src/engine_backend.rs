@@ -54,7 +54,7 @@ use crate::backend::{
 };
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
-use crate::contracts::{EdgeDirection, EdgeSnapshot, ListFlowsPage};
+use crate::contracts::{EdgeDirection, EdgeSnapshot, ListFlowsPage, ListLanesPage};
 #[cfg(feature = "core")]
 use crate::partition::PartitionKey;
 #[cfg(feature = "streaming")]
@@ -329,6 +329,36 @@ pub trait EngineBackend: Send + Sync + 'static {
         cursor: Option<FlowId>,
         limit: usize,
     ) -> Result<ListFlowsPage, EngineError>;
+
+    /// Enumerate registered lanes with cursor-based pagination.
+    ///
+    /// Lanes are global (not partition-scoped) — the backend serves
+    /// this from its lane registry and does NOT accept a
+    /// [`crate::partition::Partition`] argument. Results are sorted
+    /// by [`LaneId`] name so the ordering is stable across calls and
+    /// cursors address a deterministic position in the sort.
+    ///
+    /// * `cursor` — exclusive lower bound. `None` starts from the
+    ///   first lane. To continue a walk, pass the previous page's
+    ///   [`ListLanesPage::next_cursor`].
+    /// * `limit` — hard cap on the number of lanes returned in the
+    ///   page. Backends MAY round this down when the registry size
+    ///   is smaller; they MUST NOT return more than `limit`.
+    ///
+    /// [`ListLanesPage::next_cursor`] is `Some(last_lane_in_page)`
+    /// iff at least one more lane exists after the returned page,
+    /// and `None` on the final page. Callers loop until `next_cursor`
+    /// is `None` to read the full registry.
+    ///
+    /// Gated on the `core` feature — lane enumeration is part of the
+    /// minimal snapshot surface an alternate backend must honour
+    /// alongside [`Self::describe_flow`] / [`Self::list_edges`].
+    #[cfg(feature = "core")]
+    async fn list_lanes(
+        &self,
+        cursor: Option<LaneId>,
+        limit: usize,
+    ) -> Result<ListLanesPage, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait

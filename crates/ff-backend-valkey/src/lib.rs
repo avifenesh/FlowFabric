@@ -39,7 +39,7 @@ use ff_core::contracts::decode::{
 };
 use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    FlowStatus, FlowSummary, ListFlowsPage, ReportUsageResult,
+    FlowStatus, FlowSummary, ListFlowsPage, ListLanesPage, ReportUsageResult,
 };
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
@@ -832,6 +832,72 @@ async fn resolve_execution_flow_id_impl(
         ),
     })?;
     Ok(Some(flow_id))
+}
+
+/// Read the global lane registry (`ff:idx:lanes`) as a sorted page.
+///
+/// `SMEMBERS ff:idx:lanes` + validate each entry via
+/// [`LaneId::try_new`] (corrupt entries surface as
+/// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`])
+/// + sort by lane name + slice on `(cursor, limit)`. The SET is
+/// bounded by the registry size, not the per-lane execution count, so
+/// a single-shot read is cheap enough for the registry sizes FF
+/// targets.
+///
+/// `ff:idx:lanes` has no hash tag — in cluster deployments it lives
+/// on its own slot, which is fine for a single-key SMEMBERS read.
+#[tracing::instrument(
+    name = "ff.list_lanes",
+    skip_all,
+    fields(backend = "valkey", limit)
+)]
+async fn list_lanes_impl(
+    client: &ferriskey::Client,
+    cursor: Option<LaneId>,
+    limit: usize,
+) -> Result<ListLanesPage, EngineError> {
+    if limit == 0 {
+        return Ok(ListLanesPage::new(Vec::new(), None));
+    }
+
+    let key = ff_core::keys::lanes_index_key();
+    let raw: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    // Validate + parse every member up front. A bad entry (e.g. an
+    // empty string or a lane name that violates `LaneId::try_new`
+    // bounds) indicates registry corruption and fails loud rather
+    // than silently dropping.
+    let mut lanes: Vec<LaneId> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let lane = LaneId::try_new(entry.clone()).map_err(|e| EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::Corruption,
+            detail: format!(
+                "list_lanes: ff:idx:lanes: member '{entry}' is not a valid LaneId \
+                 (key corruption?): {e:?}"
+            ),
+        })?;
+        lanes.push(lane);
+    }
+    lanes.sort();
+
+    // Slice `(cursor, cursor+limit]` — cursor is exclusive.
+    let start = match cursor {
+        Some(c) => lanes.partition_point(|l| l <= &c),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(lanes.len());
+    let page: Vec<LaneId> = lanes[start..end].to_vec();
+    let next_cursor = if end < lanes.len() {
+        page.last().cloned()
+    } else {
+        None
+    };
+    Ok(ListLanesPage::new(page, next_cursor))
 }
 
 /// Read the deployment's partition config from
@@ -2311,6 +2377,18 @@ impl EngineBackend for ValkeyBackend {
                     e,
                     "list_flows: SMEMBERS flow_index + pipeline HGETALL flow_core",
                 )
+            })
+    }
+
+    async fn list_lanes(
+        &self,
+        cursor: Option<LaneId>,
+        limit: usize,
+    ) -> Result<ListLanesPage, EngineError> {
+        list_lanes_impl(&self.client, cursor, limit)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "list_lanes: SMEMBERS ff:idx:lanes")
             })
     }
 

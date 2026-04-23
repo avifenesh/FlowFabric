@@ -4,7 +4,7 @@
 //! plugs into an `EngineBackend` impl via a small `LayerHooks`
 //! trait: one synchronous `before(method)` and one
 //! `after(method, duration, outcome)`. The generated
-//! `HookedBackend<H>` impl below handles the 17-method dispatch so
+//! `HookedBackend<H>` impl below handles the 18-method dispatch so
 //! layers don't re-implement it.
 //!
 //! Layers that need more than before/after (e.g. the circuit breaker
@@ -22,8 +22,8 @@ use ff_core::backend::{
     ResumeSignal, WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    ListFlowsPage, ReportUsageResult,
+    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
+    ListLanesPage, ReportUsageResult,
 };
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
@@ -298,6 +298,18 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "list_flows",
             self.inner.list_flows(partition, cursor, limit).await
+        )
+    }
+
+    async fn list_lanes(
+        &self,
+        cursor: Option<LaneId>,
+        limit: usize,
+    ) -> Result<ListLanesPage, EngineError> {
+        with_hooks!(
+            self,
+            "list_lanes",
+            self.inner.list_lanes(cursor, limit).await
         )
     }
 

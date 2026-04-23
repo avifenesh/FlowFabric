@@ -36,6 +36,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serves the same contract natively. `FlowFabricWorker::list_flows`
   wrapper on ff-sdk. Missing `flow_core` for an indexed id surfaces as
   `EngineError::Validation { kind: Corruption, .. }`.
+- **`EngineBackend::list_lanes` trait method + `FlowFabricWorker::list_lanes`
+  SDK wrapper (#184):** cursor-based pagination over the global lane
+  registry (`ff:idx:lanes`). The Valkey impl reads the SET via
+  `SMEMBERS`, sorts by `LaneId` name (lexicographic), and returns a
+  `limit`-sized page whose `next_cursor` is exclusive; callers loop
+  until `next_cursor == None` for the full registry. Gated on the
+  `core` feature. `LaneId` gained `PartialOrd` / `Ord` derives so the
+  page sort is stable across the trait + SDK surfaces. New
+  `ListLanesPage` (`#[non_exhaustive]`) in `ff_core::contracts`.
+  Lanes are global (not partition-scoped), so the trait method takes
+  no `Partition` argument. Prereq for ff-board's lane-overview panel
+  (issue #181 roll-up).
 - **Grafana dashboard JSON for operator observability** at
   `examples/grafana/flowfabric-ops.json`. Ten panels covering claim
   latency + rate, lease renewals, worker-at-capacity, admission

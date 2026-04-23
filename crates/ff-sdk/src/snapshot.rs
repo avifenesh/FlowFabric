@@ -24,10 +24,10 @@
 //! them without depending on ff-sdk.
 
 use ff_core::contracts::{
-    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
+    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage, ListLanesPage,
 };
 use ff_core::partition::{execution_partition, flow_partition, PartitionKey};
-use ff_core::types::{EdgeId, ExecutionId, FlowId};
+use ff_core::types::{EdgeId, ExecutionId, FlowId, LaneId};
 
 use crate::SdkError;
 use crate::worker::FlowFabricWorker;
@@ -158,6 +158,23 @@ impl FlowFabricWorker {
                 },
             )
             .await?)
+    }
+
+    /// Enumerate registered lanes with cursor-based pagination.
+    ///
+    /// Thin forwarder onto
+    /// [`EngineBackend::list_lanes`](ff_core::engine_backend::EngineBackend::list_lanes).
+    /// Lanes are global (not partition-scoped); the Valkey backend
+    /// serves this from the `ff:idx:lanes` SET, sorts by lane name,
+    /// and returns a `limit`-sized page starting after `cursor`
+    /// (exclusive). Loop until [`ListLanesPage::next_cursor`] is
+    /// `None` to read the full registry.
+    pub async fn list_lanes(
+        &self,
+        cursor: Option<LaneId>,
+        limit: usize,
+    ) -> Result<ListLanesPage, SdkError> {
+        Ok(self.backend_ref().list_lanes(cursor, limit).await?)
     }
 
     /// Resolve `exec_core.flow_id` via the trait and pin the RFC-011
