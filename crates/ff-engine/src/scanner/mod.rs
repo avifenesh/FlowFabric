@@ -12,6 +12,7 @@ pub mod budget_reset;
 pub mod delayed_promoter;
 pub mod cancel_reconciler;
 pub mod dependency_reconciler;
+pub mod edge_cancel_dispatcher;
 pub mod flow_projector;
 pub mod index_reconciler;
 pub mod lease_expiry;

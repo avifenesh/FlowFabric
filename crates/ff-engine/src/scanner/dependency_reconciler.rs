@@ -253,22 +253,42 @@ async fn reconcile_one_execution(
             // EXISTS guard skips the write.
             _ => format!("ff:flow:{}:_nil_:edgegroup:_nil_", tag),
         };
-        let keys: [&str; 12] = [
-            &exec_core,           // 1
-            &deps_meta,           // 2
-            &deps_unresolved_key, // 3
-            &dep_key,             // 4
-            &eligible_key,        // 5
-            &terminal_key,        // 6
-            &blocked_deps_key,    // 7
-            &attempt_hash,        // 8
-            &stream_meta,         // 9
-            &downstream_payload,  // 10
-            &upstream_result,     // 11
-            &edgegroup_key,       // 12
+        // RFC-016 Stage C: incoming_set + pending_cancel_groups SET
+        // for the sibling-enumeration + dispatcher-index path. Both
+        // live on the same {fp:N} slot as the edgegroup.
+        let incoming_set_key = match flow_id_str.as_deref() {
+            Some(fid) if !fid.is_empty() => {
+                format!("ff:flow:{}:{}:in:{}", tag, fid, eid_str)
+            }
+            _ => format!("ff:flow:{}:_nil_:in:_nil_", tag),
+        };
+        let pending_cancel_groups_key =
+            format!("ff:idx:{}:pending_cancel_groups", tag);
+        let flow_id_owned = flow_id_str.clone().unwrap_or_default();
+        let keys: [&str; 14] = [
+            &exec_core,                   // 1
+            &deps_meta,                   // 2
+            &deps_unresolved_key,         // 3
+            &dep_key,                     // 4
+            &eligible_key,                // 5
+            &terminal_key,                // 6
+            &blocked_deps_key,            // 7
+            &attempt_hash,                // 8
+            &stream_meta,                 // 9
+            &downstream_payload,          // 10
+            &upstream_result,             // 11
+            &edgegroup_key,               // 12
+            &incoming_set_key,            // 13 (RFC-016 Stage C)
+            &pending_cancel_groups_key,   // 14 (RFC-016 Stage C)
         ];
         let now_s = now_ms.to_string();
-        let argv: [&str; 3] = [edge_id.as_str(), resolution, &now_s];
+        let argv: [&str; 5] = [
+            edge_id.as_str(),
+            resolution,
+            &now_s,
+            flow_id_owned.as_str(),       // 4 (RFC-016 Stage C)
+            eid_str,                      // 5 (RFC-016 Stage C)
+        ];
 
         match client
             .fcall::<ferriskey::Value>("ff_resolve_dependency", &keys, &argv)

@@ -71,4 +71,9 @@ impl Metrics {
     // ── RFC-016 Stage A: edge-group policy ──
 
     pub fn inc_edge_group_policy(&self, _policy: &'static str) {}
+
+    // ── RFC-016 Stage C: sibling-cancel dispatcher ──
+
+    pub fn inc_sibling_cancel_dispatched(&self, _reason: &'static str) {}
+    pub fn inc_sibling_cancel_disposition(&self, _disposition: &'static str) {}
 }

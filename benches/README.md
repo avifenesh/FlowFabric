@@ -119,6 +119,29 @@ tracked in Batch C issues:
 Each Phase B/C scenario should write the same JSON schema and plug
 into the `SCENARIOS=(...)` list in `check-release.sh`.
 
+## Scenario 6 — RFC-016 Stage C quorum-cancel fan-out (pre-release gate)
+
+Measures end-to-end `CancelRemaining` sibling-cancel dispatch latency
+under `Quorum(1, n) + CancelRemaining` for `n` in `{10, 100, 1000}`.
+This is the RFC-016 §4.2 **ship SLO** gate for v0.6:
+
+| n     | Threshold                    |
+|-------|------------------------------|
+| 10    | characterization only        |
+| 100   | p99 ≤ 500 ms (SLO, §4.2)     |
+| 1000  | characterization only        |
+
+Run:
+
+```
+cargo bench -p ff-bench --bench quorum_cancel_fanout
+```
+
+The benchmark runs pre-release only; no enforcement at commit time.
+`benches/scripts/check_release.py` reads the per-size JSON reports
+(`quorum_cancel_fanout_n{10,100,1000}-<sha>.json`) and gates the
+release against the `n=100` SLO.
+
 ## Schema
 
 Every report matches this shape (see `harness/src/report.rs` for the

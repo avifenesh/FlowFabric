@@ -21,6 +21,16 @@ name = "suspend_signal_resume"
 harness = false
 path = "benches/suspend_signal_resume.rs"
 
+# Scenario 6 — RFC-016 Stage C quorum-cancel fan-out latency.
+# Measures end-to-end dispatch of sibling cancels under
+# `Quorum(1, n) + CancelRemaining` for n in {10, 100, 1000}. Release-
+# gate SLO: p99 <= 500 ms at n = 100 (§4.2). Harness lands in Stage C;
+# the full workload body is filled in before the v0.6 pre-release gate.
+[[bench]]
+name = "quorum_cancel_fanout"
+harness = false
+path = "benches/quorum_cancel_fanout.rs"
+
 # Scenario 3 — long-running steady-state (100 workers × 5 min).
 # Criterion's iteration model doesn't fit a 5-minute run; custom
 # tokio harness instead. Invoked via:

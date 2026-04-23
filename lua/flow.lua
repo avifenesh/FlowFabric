@@ -790,18 +790,63 @@ local function resolve_dependency_quorum(K, A, dep, policy_variant)
     redis.call("HSET", K.edgegroup, "satisfied_at", A.now_ms)
   end
 
-  -- Sibling-cancel flagging (Stage B only FLAGS — Stage C dispatches).
-  -- LetRun is pure: never flag, regardless of satisfied vs impossible.
+  -- Sibling-cancel flagging + membership snapshot (RFC-016 Stage C).
+  -- Stage B set the flag; Stage C additionally:
+  --   (a) writes the list of still-running-sibling execution ids to the
+  --       edgegroup hash field `cancel_siblings_pending_members`
+  --       (pipe-delimited string; empty ⇒ no sibling needs cancellation),
+  --   (b) SADDs the tuple `<flow_id>|<downstream_eid>` to the
+  --       per-flow-partition index SET `ff:pending_cancel_groups:{fp:N}`
+  --       so the dispatcher scanner can iterate without a full scan.
+  -- All writes stay on the downstream's {fp:N} slot; siblings are
+  -- guaranteed co-located with the flow per RFC-011 §11.
+  -- LetRun is pure: never flag, never enumerate siblings, regardless of
+  -- satisfied vs impossible (RFC-016 §5, adjudication 2026-04-23).
   if on_satisfied == "cancel_remaining" then
     redis.call("HSET", K.edgegroup,
       "cancel_siblings_pending_flag", "true",
       "cancel_siblings_reason",
         (new_state == "satisfied") and "sibling_quorum_satisfied"
                                     or "sibling_quorum_impossible")
-    -- Stage C will drain `cancel_siblings_pending` (a SET of execution
-    -- ids); Stage B initialises it empty — dispatcher enumeration
-    -- happens on the flow partition in Stage C, not here (the
-    -- downstream's edgegroup is on {fp:N}, not {p:N}).
+
+    -- Enumerate still-running siblings. The incoming_set lists all
+    -- inbound edge ids for the downstream; each edge hash stores the
+    -- upstream_execution_id. A sibling is "still running" iff its
+    -- exec_core's lifecycle_phase is NOT "terminal". The just-resolved
+    -- upstream's dep_hash is flipped above — but at this moment its
+    -- exec_core may or may not have reached terminal_outcome; include
+    -- only genuinely-non-terminal executions.
+    local members = {}
+    if is_set(K.incoming_set) and is_set(K.flow_edge_prefix) then
+      local edge_ids = redis.call("SMEMBERS", K.incoming_set)
+      for i = 1, #edge_ids do
+        local e_key = K.flow_edge_prefix .. edge_ids[i]
+        local up_eid = redis.call("HGET", e_key, "upstream_execution_id")
+        if is_set(up_eid) then
+          -- Build sibling exec_core key on the same slot (all members of
+          -- a flow share the {fp:N} hash-tag baked into the eid string).
+          local sib_core_key = "ff:exec:" .. A.exec_tag .. ":" .. up_eid .. ":core"
+          local sib_phase = redis.call("HGET", sib_core_key, "lifecycle_phase")
+          if is_set(sib_phase) and sib_phase ~= "terminal" then
+            members[#members + 1] = up_eid
+          end
+        end
+      end
+    end
+
+    local members_str = table.concat(members, "|")
+    redis.call("HSET", K.edgegroup,
+      "cancel_siblings_pending_members", members_str)
+
+    -- SADD the tuple even when members is empty — the dispatcher SREMs
+    -- the tuple atomically after it observes the empty list + clears
+    -- the flag (drain-done). This keeps crash-in-flight observable
+    -- via the SET rather than via a silent edgegroup-hash field.
+    if is_set(K.pending_cancel_groups_set)
+       and is_set(A.flow_id) and is_set(A.downstream_eid) then
+      redis.call("SADD", K.pending_cancel_groups_set,
+        A.flow_id .. "|" .. A.downstream_eid)
+    end
   end
 
   -- Downstream transition.
@@ -911,11 +956,19 @@ end
 -- eligible. Upstream + downstream are guaranteed co-located on the
 -- same {fp:N} slot by flow membership (RFC-011 §7.3).
 --
--- KEYS (12): exec_core, deps_meta, unresolved_set, dep_hash,
+-- KEYS (14): exec_core, deps_meta, unresolved_set, dep_hash,
 --            eligible_zset, terminal_zset, blocked_deps_zset,
 --            attempt_hash, stream_meta, downstream_payload,
---            upstream_result, edgegroup
--- ARGV (3): edge_id, upstream_outcome, now_ms
+--            upstream_result, edgegroup,
+--            -- RFC-016 Stage C additions (both required for the
+--            -- AnyOf/Quorum+CancelRemaining path; may be passed as
+--            -- empty strings when the caller knows the resolution
+--            -- cannot flip to a CancelRemaining terminal state):
+--            incoming_set, pending_cancel_groups_set
+-- ARGV (5): edge_id, upstream_outcome, now_ms,
+--            -- RFC-016 Stage C additions (required when the edgegroup
+--            -- uses CancelRemaining; may be empty for AllOf):
+--            flow_id, downstream_eid
 ---------------------------------------------------------------------------
 redis.register_function('ff_resolve_dependency', function(keys, args)
   local K = {
@@ -931,13 +984,33 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     downstream_payload = keys[10],
     upstream_result    = keys[11],
     edgegroup          = keys[12],
+    -- RFC-016 Stage C: sibling enumeration + pending-cancel-groups index.
+    incoming_set               = keys[13] or "",
+    pending_cancel_groups_set  = keys[14] or "",
   }
 
   local A = {
     edge_id           = args[1],
     upstream_outcome  = args[2],
     now_ms            = args[3],
+    flow_id           = args[4] or "",
+    downstream_eid    = args[5] or "",
   }
+
+  -- Derive the flow-partition hash-tag + per-flow edge-hash prefix from
+  -- the edgegroup key (format: `ff:flow:{fp:N}:<flow_id>:edgegroup:<eid>`).
+  -- These are used by the Stage C sibling-enumeration loop to read edge
+  -- hashes and sibling exec_cores on the same slot as the edgegroup.
+  local exec_tag = ""
+  local flow_edge_prefix = ""
+  if is_set(K.edgegroup) then
+    exec_tag = string.match(K.edgegroup, "(%b{})") or ""
+    if is_set(A.flow_id) then
+      flow_edge_prefix = "ff:flow:" .. exec_tag .. ":" .. A.flow_id .. ":edge:"
+    end
+  end
+  A.exec_tag = exec_tag
+  K.flow_edge_prefix = flow_edge_prefix
 
   -- 1. Read dep record
   local dep_raw = redis.call("HGETALL", K.dep_hash)
@@ -1149,6 +1222,57 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
   end
 
   return ok("impossible", child_skipped and "child_skipped" or "")
+end)
+
+---------------------------------------------------------------------------
+-- RFC-016 Stage C: ff_drain_sibling_cancel_group  (on {fp:N})
+--
+-- Atomic drain call issued by the ff-engine sibling-cancel dispatcher
+-- after it has fired `ff_cancel_execution` against every member of
+-- `cancel_siblings_pending_members`. In one Lua unit:
+--   (1) SREM `<flow_id>|<downstream_eid>` from the per-partition
+--       `ff:pending_cancel_groups:{fp:N}` index SET,
+--   (2) HDEL `cancel_siblings_pending_members` +
+--       `cancel_siblings_pending_flag` from the edgegroup hash,
+--       leaving `cancel_siblings_reason` + `satisfied_at` as
+--       observability breadcrumbs.
+--
+-- Returns "drained" on success (tuple was present in the SET) or
+-- "already_drained" when the dispatcher double-fires (idempotent).
+-- If the edgegroup hash is gone (retention / manual delete) the SET
+-- entry is still removed — nothing authoritative to clear on the
+-- hash — and the call returns "drained_sans_group".
+--
+-- KEYS (2): pending_cancel_groups_set, edgegroup
+-- ARGV (2): flow_id, downstream_eid
+---------------------------------------------------------------------------
+redis.register_function('ff_drain_sibling_cancel_group', function(keys, args)
+  local pending_set = keys[1]
+  local edgegroup = keys[2]
+  local flow_id = args[1] or ""
+  local downstream_eid = args[2] or ""
+
+  if not is_set(flow_id) or not is_set(downstream_eid) then
+    return err("invalid_args", "flow_id and downstream_eid required")
+  end
+
+  local member = flow_id .. "|" .. downstream_eid
+  local removed = redis.call("SREM", pending_set, member)
+
+  local group_exists = redis.call("EXISTS", edgegroup) == 1
+  if group_exists then
+    redis.call("HDEL", edgegroup,
+      "cancel_siblings_pending_flag",
+      "cancel_siblings_pending_members")
+  end
+
+  if removed == 0 then
+    return ok("already_drained", "")
+  end
+  if not group_exists then
+    return ok("drained_sans_group", "")
+  end
+  return ok("drained", "")
 end)
 
 ---------------------------------------------------------------------------
