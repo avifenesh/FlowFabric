@@ -87,6 +87,10 @@ pub use config::WorkerConfig;
 pub use engine_error::{
     BugKind, ConflictKind, ContentionKind, EngineError, StateKind, ValidationKind,
 };
+// #88: backend-agnostic transport error surface. Consumers that
+// previously matched on `ferriskey::ErrorKind` via `valkey_kind()`
+// now match on `BackendErrorKind` via `backend_kind()`.
+pub use ff_core::engine_error::{BackendError, BackendErrorKind};
 // `FailOutcome` is ff-core-native (Stage 1a move); re-export
 // unconditionally so consumers can name `ff_sdk::FailOutcome` even
 // under `--no-default-features`.
@@ -105,17 +109,21 @@ pub use worker::FlowFabricWorker;
 /// SDK error type.
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
-    /// Valkey connection or command error (preserves ErrorKind for caller inspection).
-    #[cfg(feature = "valkey-default")]
-    #[error("valkey: {0}")]
-    Valkey(#[from] ferriskey::Error),
+    /// Backend transport error. Previously wrapped `ferriskey::Error`
+    /// directly (#88); now carries a backend-agnostic
+    /// [`BackendError`] so consumers match on
+    /// [`BackendErrorKind`] instead of ferriskey's native taxonomy.
+    /// The ferriskey → [`BackendError`] mapping lives in
+    /// `ff_backend_valkey::backend_error::backend_error_from_ferriskey`.
+    #[error("backend: {0}")]
+    Backend(#[from] BackendError),
 
-    /// Valkey error with additional context.
-    #[cfg(feature = "valkey-default")]
-    #[error("valkey: {context}: {source}")]
-    ValkeyContext {
+    /// Backend error with additional context (e.g. call-site label).
+    /// Previously `ValkeyContext { source: ferriskey::Error }` (#88).
+    #[error("backend: {context}: {source}")]
+    BackendContext {
         #[source]
-        source: ferriskey::Error,
+        source: BackendError,
         context: String,
     },
 
@@ -160,13 +168,13 @@ pub enum SdkError {
     /// * [`SdkError::is_retryable`] returns `true` — saturation is
     ///   transient: any in-flight task's
     ///   complete/fail/cancel/drop releases a permit. Retry after
-    ///   milliseconds, not a retry loop with backoff for a Valkey
+    ///   milliseconds, not a retry loop with backoff for a backend
     ///   transport failure.
-    /// * [`SdkError::valkey_kind`] returns `None` — this is not a
-    ///   Valkey transport or Lua error, so there is no
-    ///   `ferriskey::ErrorKind` to inspect. Callers that fan out
-    ///   on `valkey_kind()` should match `WorkerAtCapacity`
-    ///   explicitly (or use `is_retryable()`).
+    /// * [`SdkError::backend_kind`] returns `None` — this is not a
+    ///   backend transport error, so there is no
+    ///   [`BackendErrorKind`] to inspect. Callers that fan out on
+    ///   `backend_kind()` should match `WorkerAtCapacity` explicitly
+    ///   (or use `is_retryable()`).
     ///
     /// [`FlowFabricWorker::claim_from_grant`]: crate::FlowFabricWorker::claim_from_grant
     /// [`FlowFabricWorker::claim_from_reclaim_grant`]: crate::FlowFabricWorker::claim_from_reclaim_grant
@@ -177,7 +185,7 @@ pub enum SdkError {
     /// the underlying `reqwest::Error` via `#[source]` so callers
     /// can inspect `is_timeout()` / `is_connect()` / etc. for
     /// finer-grained retry logic. Distinct from
-    /// [`SdkError::Valkey`] — this fires on the HTTP/JSON surface,
+    /// [`SdkError::Backend`] — this fires on the HTTP/JSON surface,
     /// not on the Lua/Valkey hot path.
     #[error("http: {context}: {source}")]
     Http {
@@ -220,6 +228,31 @@ fn fmt_config(context: &str, field: Option<&str>, message: &str) -> String {
     }
 }
 
+/// Lift a native `ferriskey::Error` into [`SdkError::Backend`] via
+/// [`ff_backend_valkey::backend_error_from_ferriskey`] (#88). Keeps
+/// `?`-propagation ergonomic at FCALL/transport call sites while
+/// the public variant stays backend-agnostic.
+#[cfg(feature = "valkey-default")]
+impl From<ferriskey::Error> for SdkError {
+    fn from(err: ferriskey::Error) -> Self {
+        Self::Backend(ff_backend_valkey::backend_error_from_ferriskey(&err))
+    }
+}
+
+/// Build an [`SdkError::BackendContext`] from a native
+/// `ferriskey::Error` and a call-site label, preserving the
+/// backend-agnostic shape on the public surface (#88).
+#[cfg(feature = "valkey-default")]
+pub(crate) fn backend_context(
+    err: ferriskey::Error,
+    context: impl Into<String>,
+) -> SdkError {
+    SdkError::BackendContext {
+        source: ff_backend_valkey::backend_error_from_ferriskey(&err),
+        context: context.into(),
+    }
+}
+
 /// Preserves the ergonomic `?`-propagation from FCALL sites that
 /// return `Result<_, ScriptError>`. Routes through `EngineError`'s
 /// typed classification so every call site gets the same
@@ -239,34 +272,44 @@ impl From<EngineError> for SdkError {
 }
 
 impl SdkError {
-    /// Returns the underlying ferriskey `ErrorKind` if this error carries one.
-    /// Covers transport variants (`Valkey`, `ValkeyContext`) directly and
-    /// `Engine(EngineError::Transport { .. })` via delegation.
-    #[cfg(feature = "valkey-default")]
-    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
+    /// Returns the classified [`BackendErrorKind`] if this error
+    /// carries a backend transport fault. Covers the direct
+    /// [`SdkError::Backend`] / [`SdkError::BackendContext`] variants
+    /// and `Engine(EngineError::Transport { .. })` via the
+    /// ScriptError-aware downcast in `ff_script::engine_error_ext`.
+    ///
+    /// Renamed from `valkey_kind` in #88 — the previous return type
+    /// `Option<ferriskey::ErrorKind>` leaked ferriskey into every
+    /// consumer doing retry classification.
+    pub fn backend_kind(&self) -> Option<BackendErrorKind> {
         match self {
-            Self::Valkey(e) => Some(e.kind()),
-            Self::ValkeyContext { source, .. } => Some(source.kind()),
-            Self::Engine(e) => ff_script::engine_error_ext::valkey_kind(e),
-            // HTTP/admin-surface errors carry no ferriskey::ErrorKind;
-            // the admin path never touches Valkey directly from the
-            // SDK side. Use `AdminApi.kind` for the server-supplied
+            Self::Backend(be) => Some(be.kind()),
+            Self::BackendContext { source, .. } => Some(source.kind()),
+            #[cfg(feature = "valkey-default")]
+            Self::Engine(e) => ff_script::engine_error_ext::valkey_kind(e)
+                .map(ff_backend_valkey::classify_ferriskey_kind),
+            #[cfg(not(feature = "valkey-default"))]
+            Self::Engine(_) => None,
+            // HTTP/admin-surface errors carry no backend fault;
+            // the admin path never touches the backend directly from
+            // the SDK side. Use `AdminApi.kind` for the server-supplied
             // label when present.
-            Self::Config { .. } | Self::WorkerAtCapacity | Self::Http { .. } | Self::AdminApi { .. } => {
-                None
-            }
+            Self::Config { .. }
+            | Self::WorkerAtCapacity
+            | Self::Http { .. }
+            | Self::AdminApi { .. } => None,
         }
     }
 
-    /// Whether this error is safely retryable by a caller. For transport
-    /// variants, delegates to [`ff_script::retry::is_retryable_kind`]. For
-    /// `Engine` errors, returns `true` iff the typed classification is
+    /// Whether this error is safely retryable by a caller. For backend
+    /// transport variants, delegates to
+    /// [`BackendErrorKind::is_retryable`]. For `Engine` errors, returns
+    /// `true` iff the typed classification is
     /// `ErrorClass::Retryable`. `Config` errors are never retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
-            #[cfg(feature = "valkey-default")]
-            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => {
-                ff_script::retry::is_retryable_kind(e.kind())
+            Self::Backend(be) | Self::BackendContext { source: be, .. } => {
+                be.kind().is_retryable()
             }
             Self::Engine(e) => {
                 matches!(
@@ -308,31 +351,28 @@ mod tests {
     }
 
     #[test]
-    fn valkey_kind_direct_and_context() {
+    fn backend_kind_direct_and_context() {
         assert_eq!(
-            SdkError::Valkey(mk_fk_err(ErrorKind::IoError)).valkey_kind(),
-            Some(ErrorKind::IoError)
+            SdkError::from(mk_fk_err(ErrorKind::IoError)).backend_kind(),
+            Some(BackendErrorKind::Transport)
         );
         assert_eq!(
-            SdkError::ValkeyContext {
-                source: mk_fk_err(ErrorKind::BusyLoadingError),
-                context: "connect".into()
-            }
-            .valkey_kind(),
-            Some(ErrorKind::BusyLoadingError)
+            crate::backend_context(mk_fk_err(ErrorKind::BusyLoadingError), "connect")
+                .backend_kind(),
+            Some(BackendErrorKind::BusyLoading)
         );
     }
 
     #[test]
-    fn valkey_kind_delegates_through_engine_transport() {
+    fn backend_kind_delegates_through_engine_transport() {
         let err = SdkError::from(ScriptError::Valkey(mk_fk_err(ErrorKind::ClusterDown)));
-        assert_eq!(err.valkey_kind(), Some(ErrorKind::ClusterDown));
+        assert_eq!(err.backend_kind(), Some(BackendErrorKind::Cluster));
     }
 
     #[test]
-    fn valkey_kind_none_for_lua_and_config() {
+    fn backend_kind_none_for_lua_and_config() {
         assert_eq!(
-            SdkError::from(ScriptError::LeaseExpired).valkey_kind(),
+            SdkError::from(ScriptError::LeaseExpired).backend_kind(),
             None
         );
         assert_eq!(
@@ -341,16 +381,21 @@ mod tests {
                 field: Some("bearer_token".into()),
                 message: "bad host".into(),
             }
-            .valkey_kind(),
+            .backend_kind(),
             None
         );
     }
 
     #[test]
     fn is_retryable_transport() {
-        assert!(SdkError::Valkey(mk_fk_err(ErrorKind::IoError)).is_retryable());
-        assert!(!SdkError::Valkey(mk_fk_err(ErrorKind::FatalReceiveError)).is_retryable());
-        assert!(!SdkError::Valkey(mk_fk_err(ErrorKind::AuthenticationFailed)).is_retryable());
+        // Transport-bucketed kinds (IoError, FatalSend/Receive,
+        // ProtocolDesync) are retryable under the #88 classifier.
+        assert!(SdkError::from(mk_fk_err(ErrorKind::IoError)).is_retryable());
+        // Auth-bucketed kinds are terminal.
+        assert!(!SdkError::from(mk_fk_err(ErrorKind::AuthenticationFailed)).is_retryable());
+        // Protocol-bucketed kinds (ResponseError, ParseError, TypeError,
+        // InvalidClientConfig, etc.) are terminal.
+        assert!(!SdkError::from(mk_fk_err(ErrorKind::ResponseError)).is_retryable());
     }
 
     #[test]
@@ -469,6 +514,6 @@ mod tests {
             retryable: Some(true),
             raw_body: String::new(),
         };
-        assert_eq!(err.valkey_kind(), None);
+        assert_eq!(err.backend_kind(), None);
     }
 }
