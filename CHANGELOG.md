@@ -33,6 +33,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Hot-path tracing span level downgraded to `debug` (#173):**
+  Downgraded 5 hot-path `EngineBackend` impl spans (complete, renew,
+  progress, observe_signals, append_frame) from implicit `info` to
+  explicit `level = "debug"` to reduce span overhead at production
+  `RUST_LOG=info`. See #173 +
+  `rfcs/drafts/scenario-5-flame-capture.md` for investigation.
 - **v0.4.1 DX polish bundle (#176):** doc-only follow-up to v0.4.0
   consumer validation — six runtime-smoke frictions documented in
   place, no code changes. Rustdoc notes added on
