@@ -23,8 +23,9 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
-    ListLanesPage, ReportUsageResult,
+    ListLanesPage, ListSuspendedPage, ReportUsageResult,
 };
+use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
 use ff_core::engine_backend::EngineBackend;
@@ -310,6 +311,19 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "list_lanes",
             self.inner.list_lanes(cursor, limit).await
+        )
+    }
+
+    async fn list_suspended(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListSuspendedPage, EngineError> {
+        with_hooks!(
+            self,
+            "list_suspended",
+            self.inner.list_suspended(partition, cursor, limit).await
         )
     }
 

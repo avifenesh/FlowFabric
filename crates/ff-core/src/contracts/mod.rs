@@ -2535,6 +2535,81 @@ impl ListLanesPage {
     }
 }
 
+// ─── list_suspended ───
+
+/// One entry in a [`ListSuspendedPage`] — a suspended execution and
+/// the reason it is blocked, answering an operator's "what's this
+/// waiting on?" without a follow-up round-trip.
+///
+/// `reason` carries the free-form `reason_code` recorded by the
+/// suspending worker at `lua/suspension.lua` (HSET `suspension:current
+/// reason_code`). It is a `String`, not a closed enum: the suspension
+/// pipeline accepts arbitrary caller-supplied codes (typical values
+/// are `"signal"`, `"timer"`, `"children"`, `"join"`, but consumers
+/// embed bespoke codes). A future enum projection can classify
+/// known codes once the set is frozen; until then, callers that want
+/// structured routing MUST match on the string explicitly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SuspendedExecutionEntry {
+    /// Execution currently in `lifecycle_phase=suspended`.
+    pub execution_id: ExecutionId,
+    /// Score stored on the per-lane suspended ZSET — the scheduled
+    /// `timeout_at` in milliseconds, or the `9999999999999` sentinel
+    /// when no timeout was set (see `lua/suspension.lua`).
+    pub suspended_at_ms: i64,
+    /// Free-form reason code from `suspension:current.reason_code`.
+    /// Empty string when the suspension hash is absent or does not
+    /// carry a `reason_code` field (older records). See the struct
+    /// rustdoc for the deliberate-String rationale.
+    pub reason: String,
+}
+
+impl SuspendedExecutionEntry {
+    /// Construct a new entry. Preferred over direct field init for
+    /// `#[non_exhaustive]` forward-compat.
+    pub fn new(execution_id: ExecutionId, suspended_at_ms: i64, reason: String) -> Self {
+        Self {
+            execution_id,
+            suspended_at_ms,
+            reason,
+        }
+    }
+}
+
+/// One cursor-paginated page of suspended executions.
+///
+/// Pagination is cursor-based (not offset/limit) so a Valkey backend
+/// can resume a partition scan from the last seen execution id and a
+/// future Postgres backend can do keyset pagination on
+/// `executions WHERE state='suspended'`. The cursor is opaque to
+/// callers: pass `next_cursor` back as the `cursor` argument to the
+/// next [`EngineBackend::list_suspended`] call to fetch the next
+/// page. `None` means the stream is exhausted.
+///
+/// [`EngineBackend::list_suspended`]: crate::engine_backend::EngineBackend::list_suspended
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ListSuspendedPage {
+    /// Entries on this page, ordered by ascending `suspended_at_ms`
+    /// (timeout order) with `execution_id` as a lex tiebreak.
+    pub entries: Vec<SuspendedExecutionEntry>,
+    /// Resume-point for the next page. `None` when no further
+    /// entries remain in the partition.
+    pub next_cursor: Option<ExecutionId>,
+}
+
+impl ListSuspendedPage {
+    /// Construct a new page. Preferred over direct field init for
+    /// `#[non_exhaustive]` forward-compat.
+    pub fn new(entries: Vec<SuspendedExecutionEntry>, next_cursor: Option<ExecutionId>) -> Self {
+        Self {
+            entries,
+            next_cursor,
+        }
+    }
+}
+
 // ─── rotate_waitpoint_hmac_secret ───
 
 /// Args for `ff_rotate_waitpoint_hmac_secret`. Rotates the HMAC signing

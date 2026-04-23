@@ -48,6 +48,36 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Lanes are global (not partition-scoped), so the trait method takes
   no `Partition` argument. Prereq for ff-board's lane-overview panel
   (issue #181 roll-up).
+- **`EngineBackend::list_suspended` — cursor-paginated suspended-
+  executions listing with reason populated (issue #183).** New
+  `core`-gated trait method on `EngineBackend` plus
+  `ff_core::contracts::{ListSuspendedPage, SuspendedExecutionEntry}`
+  (both `#[non_exhaustive]`). `SuspendedExecutionEntry` carries the
+  `reason_code` from `suspension:current` so `ff-board`-style panels
+  answer "what is this blocked on?" without a per-row round-trip.
+  `reason` is a `String` rather than a closed enum because the
+  suspending pipeline accepts free-form reason codes (typical values
+  `"signal"`, `"timer"`, `"children"`, `"join"` — but consumers
+  embed bespoke codes). Valkey backend impl on cluster routes
+  `cluster_scan` through the new hash-tag-aware single-shard path
+  (scans only the primary owning the partition tag); standalone
+  falls back to the cursor-based `SCAN MATCH` loop. Results merge by
+  ascending score with execution id as a lex tiebreak, slice past the
+  opaque cursor, and pipeline `HMGET suspension:current reason_code`
+  for the returned page. ff-sdk wrapper exposes the trait method
+  through `FlowFabricWorker::list_suspended`; the layer scaffolding
+  (`HookedBackend`, `PassthroughBackend`) forwards the new op for
+  hook observability.
+- **`ferriskey::cluster_scan` hash-tag-aware single-shard routing.**
+  When the `ClusterScanArgs.match_pattern` embeds a hash tag
+  (`{tag}`), the initial scan-state bitmap pre-marks every slot
+  scanned except the one owning the tag; the scan touches only that
+  primary and finishes once its cursor wraps. Pre-existing
+  no-tag behaviour is unchanged. Added `Client::is_cluster()` and a
+  typed `Client::cluster_scan()` wrapper that returns
+  `(ScanStateRC, Vec<Value>)` directly for Rust callers;
+  `ClusterScanArgs` / `ScanStateRC` / `ObjectType` re-exported at the
+  crate root.
 - **Grafana dashboard JSON for operator observability** at
   `examples/grafana/flowfabric-ops.json`. Ten panels covering claim
   latency + rate, lease renewals, worker-at-capacity, admission

@@ -331,6 +331,41 @@ impl Client {
         self.execute(c).await
     }
 
+    /// Returns `true` when the underlying connection is in
+    /// cluster mode, `false` for standalone. Lets callers that
+    /// need mode-specific behaviour (e.g. `cluster_scan` vs
+    /// plain `SCAN`) dispatch without introspecting the builder
+    /// that produced this client.
+    pub async fn is_cluster(&self) -> bool {
+        self.0.is_cluster().await
+    }
+
+    /// Cluster-wide `SCAN` driven by ferriskey's internal slot
+    /// bitmap. Returns the next [`ScanStateRC`] (call
+    /// [`ScanStateRC::is_finished`] to detect completion) plus the
+    /// batch of keys found on the node visited in this step.
+    ///
+    /// When [`ClusterScanArgs::match_pattern`] embeds a Valkey
+    /// hash tag (`{tag}`), the scan is pinned to the single
+    /// primary that owns the tag's slot and finishes after that
+    /// node's cursor wraps — an O(one-primary) operation, not
+    /// O(cluster-wide).
+    ///
+    /// Errors with [`crate::value::ErrorKind::InvalidClientConfig`]
+    /// when called on a standalone client. Callers should dispatch
+    /// on [`Client::is_cluster`].
+    pub async fn cluster_scan(
+        &self,
+        scan_state: &crate::ScanStateRC,
+        args: crate::ClusterScanArgs,
+    ) -> Result<(crate::ScanStateRC, Vec<crate::value::Value>)> {
+        // Clone mirrors the pattern used by `execute`: ClientInner
+        // needs `&mut self` for IAM token rotation; the clone is
+        // cheap (Arc fields + atomics).
+        let mut inner = (*self.0).clone();
+        inner.cluster_scan_typed(scan_state, args).await
+    }
+
     /// Start building an arbitrary command by name.
     pub fn cmd(&self, name: &str) -> CommandBuilder {
         CommandBuilder {

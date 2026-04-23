@@ -39,8 +39,10 @@ use ff_core::contracts::decode::{
 };
 use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    FlowStatus, FlowSummary, ListFlowsPage, ListLanesPage, ReportUsageResult,
+    FlowStatus, FlowSummary, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
+    SuspendedExecutionEntry,
 };
+use ff_core::partition::PartitionKey;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
@@ -492,6 +494,251 @@ async fn describe_execution_impl(
     }
     let tags_raw = tags_slot.value().map_err(transport_fk)?;
     build_execution_snapshot(id.clone(), &core, tags_raw)
+}
+
+/// List suspended executions in one partition, cursor-paginated,
+/// with suspension `reason_code` populated per entry (issue #183).
+///
+/// The engine maintains per-lane suspended ZSETs
+/// (`ff:idx:<tag>:lane:<lane_id>:suspended`) rather than a single
+/// partition-wide ZSET, so this impl issues a bounded `SCAN` for the
+/// lane-suspended key set under the partition's hash tag (single-
+/// slot under RFC-011 co-location), `ZRANGE`s each, merges by score
+/// ascending (with execution id as lex tiebreak), skips past the
+/// supplied cursor, and pipelines `HMGET suspension:current reason_code`
+/// for the returned slice.
+///
+/// Cluster note: the SCAN is issued with a MATCH pattern pinned to
+/// the partition's hash tag. ferriskey's SCAN routing may broadcast
+/// across nodes; the MATCH filter still yields only keys whose slot
+/// maps to the tag, so the result set is correct but the scan cost
+/// is per-node. Operator-tooling call shape — not hot path.
+#[tracing::instrument(
+    name = "ff.list_suspended",
+    skip_all,
+    fields(backend = "valkey", partition = %partition)
+)]
+async fn list_suspended_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    partition: PartitionKey,
+    cursor: Option<ExecutionId>,
+    limit: usize,
+) -> Result<ListSuspendedPage, EngineError> {
+    if limit == 0 {
+        return Ok(ListSuspendedPage::new(Vec::new(), None));
+    }
+    let parsed = partition.parse().map_err(|e| EngineError::Validation {
+        kind: ff_core::engine_error::ValidationKind::InvalidInput,
+        detail: format!("list_suspended: partition: {e}"),
+    })?;
+    let tag = parsed.hash_tag();
+
+    // 1. Enumerate per-lane suspended ZSETs in this partition via
+    //    `SCAN MATCH ff:idx:{tag}:lane:*:suspended`. Two paths:
+    //
+    //    * Standalone: loop `SCAN` with a string cursor until the
+    //      sentinel "0" is returned.
+    //    * Cluster: `Client::cluster_scan` with the same match
+    //      pattern. ferriskey recognises the embedded hash tag
+    //      (`{tag}`) and pins the scan to the single primary that
+    //      owns the tag's slot, finishing as soon as that node's
+    //      cursor wraps — not a cluster-wide broadcast. Using
+    //      plain `cmd("SCAN")` in cluster mode would route to one
+    //      arbitrary primary via `RouteBy::Undefined` and miss the
+    //      partition if the owning primary differs.
+    //
+    //    Safety cap — refuse to enumerate pathologically large key
+    //    spaces. 10k unique lane-suspended keys per partition is a
+    //    loud operational anomaly; the cap bounds the enumeration
+    //    cost at query time.
+    const MAX_LANE_KEYS: usize = 10_000;
+    let match_pat = format!("ff:idx:{tag}:lane:*:suspended");
+    let mut lane_keys: Vec<String> = Vec::new();
+    if client.is_cluster().await {
+        let args = ferriskey::ClusterScanArgs::builder()
+            .with_match_pattern(match_pat.as_str())
+            .with_count(100)
+            .build();
+        let mut cursor = ferriskey::ScanStateRC::new();
+        loop {
+            let (next_cursor, values) = client
+                .cluster_scan(&cursor, args.clone())
+                .await
+                .map_err(transport_fk)?;
+            for v in values {
+                if lane_keys.len() >= MAX_LANE_KEYS {
+                    break;
+                }
+                if let Ok(s) = ferriskey::from_owned_value::<String>(v) {
+                    lane_keys.push(s);
+                }
+            }
+            if next_cursor.is_finished() || lane_keys.len() >= MAX_LANE_KEYS {
+                break;
+            }
+            cursor = next_cursor;
+        }
+    } else {
+        let mut scan_cursor = "0".to_string();
+        loop {
+            let raw: ferriskey::Value = client
+                .cmd("SCAN")
+                .arg(scan_cursor.as_str())
+                .arg("MATCH")
+                .arg(match_pat.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await
+                .map_err(transport_fk)?;
+            let (next_cursor, keys) = parse_scan_response(&raw);
+            for k in keys {
+                if lane_keys.len() >= MAX_LANE_KEYS {
+                    break;
+                }
+                lane_keys.push(k);
+            }
+            scan_cursor = next_cursor;
+            if scan_cursor == "0" || lane_keys.len() >= MAX_LANE_KEYS {
+                break;
+            }
+        }
+    }
+    if lane_keys.is_empty() {
+        return Ok(ListSuspendedPage::new(Vec::new(), None));
+    }
+
+    // 2. Pipelined ZRANGE WITHSCORES on every lane ZSET. Each ZSET
+    //    is small-to-medium (suspended executions on one lane);
+    //    pulling the full range lets us merge + skip-past-cursor on
+    //    the client side with correct (score, eid) ordering.
+    let mut pipe = client.pipeline();
+    let slots: Vec<_> = lane_keys
+        .iter()
+        .map(|k| {
+            pipe.cmd::<Vec<(String, f64)>>("ZRANGE")
+                .arg(k.as_str())
+                .arg("0")
+                .arg("-1")
+                .arg("WITHSCORES")
+                .finish()
+        })
+        .collect();
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let mut merged: Vec<(ExecutionId, i64)> = Vec::new();
+    for (lane_key, slot) in lane_keys.iter().zip(slots) {
+        let pairs: Vec<(String, f64)> = slot.value().map_err(transport_fk)?;
+        for (eid_str, score) in pairs {
+            match ExecutionId::parse(&eid_str) {
+                Ok(eid) => merged.push((eid, score as i64)),
+                Err(e) => {
+                    tracing::warn!(
+                        raw_id = %eid_str,
+                        error = %e,
+                        zset = %lane_key,
+                        "list_suspended: ZSET member failed to parse as ExecutionId"
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Sort by (score asc, execution_id lex asc) for deterministic
+    //    cursor continuation.
+    merged.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+    });
+
+    // 4. Advance past cursor (exclusive) if supplied. Sort key is
+    //    (score asc, eid lex asc); locate the cursor's entry and
+    //    start at the next index. If the cursor's eid is no longer
+    //    present (resumed between pages), fall back to eid-lex
+    //    comparison.
+    let start_idx = if let Some(c) = &cursor {
+        if let Some(pos) = merged.iter().position(|(eid, _)| eid == c) {
+            pos + 1
+        } else {
+            let c_str = c.to_string();
+            merged
+                .iter()
+                .position(|(eid, _)| eid.to_string() > c_str)
+                .unwrap_or(merged.len())
+        }
+    } else {
+        0
+    };
+
+    let end_idx = (start_idx + limit).min(merged.len());
+    let page: Vec<(ExecutionId, i64)> = merged[start_idx..end_idx].to_vec();
+    let next_cursor = if end_idx < merged.len() {
+        page.last().map(|(eid, _)| eid.clone())
+    } else {
+        None
+    };
+
+    if page.is_empty() {
+        return Ok(ListSuspendedPage::new(Vec::new(), next_cursor));
+    }
+
+    // 5. Pipelined `HMGET suspension:current reason_code` for each
+    //    returned execution. `suspension:current` lives under the
+    //    execution's partition (same partition as the caller's
+    //    `partition` under RFC-011 co-location, but we compute the
+    //    per-eid context so alternate routing remains correct).
+    let mut pipe = client.pipeline();
+    let slots: Vec<_> = page
+        .iter()
+        .map(|(eid, _)| {
+            let ep = execution_partition(eid, partition_config);
+            let ctx = ExecKeyContext::new(&ep, eid);
+            pipe.cmd::<Vec<Option<String>>>("HMGET")
+                .arg(ctx.suspension_current())
+                .arg("reason_code")
+                .finish()
+        })
+        .collect();
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let mut entries = Vec::with_capacity(page.len());
+    for ((eid, score), slot) in page.into_iter().zip(slots) {
+        let fields: Vec<Option<String>> = slot.value().map_err(transport_fk)?;
+        let reason = fields
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap_or_default();
+        entries.push(SuspendedExecutionEntry::new(eid, score, reason));
+    }
+
+    Ok(ListSuspendedPage::new(entries, next_cursor))
+}
+
+/// Parse a SCAN/SSCAN reply `[cursor, [key1, key2, ...]]`. Mirrors
+/// the pattern in `ff_engine::scanner::quota_reconciler`. Used on
+/// the standalone `list_suspended` path; the cluster path uses
+/// `Client::cluster_scan` which returns typed values directly.
+fn parse_scan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+    let mut keys = Vec::new();
+    if let Ok(ferriskey::Value::Array(inner)) = &arr[1] {
+        for item in inner {
+            if let Ok(ferriskey::Value::BulkString(b)) = item {
+                keys.push(String::from_utf8_lossy(b).into_owned());
+            }
+        }
+    }
+    (cursor, keys)
 }
 
 /// Single `HGETALL flow_core` + decode via [`build_flow_snapshot`].
@@ -2389,6 +2636,22 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "list_lanes: SMEMBERS ff:idx:lanes")
+            })
+    }
+
+    async fn list_suspended(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListSuspendedPage, EngineError> {
+        list_suspended_impl(&self.client, &self.partition_config, partition, cursor, limit)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "list_suspended: SCAN lane:*:suspended + ZRANGE + HMGET reason",
+                )
             })
     }
 
