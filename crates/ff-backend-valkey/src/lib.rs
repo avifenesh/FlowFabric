@@ -613,18 +613,21 @@ async fn list_suspended_impl(
             .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
     });
 
-    // 4. Advance past cursor (exclusive) if supplied.
+    // 4. Advance past cursor (exclusive) if supplied. Sort key is
+    //    (score asc, eid lex asc); locate the cursor's entry and
+    //    start at the next index. If the cursor's eid is no longer
+    //    present (resumed between pages), fall back to eid-lex
+    //    comparison.
     let start_idx = if let Some(c) = &cursor {
-        let c_str = c.to_string();
-        // Find first entry strictly greater than the cursor under the
-        // sort key. Since the cursor itself is an ExecutionId, treat
-        // any entry whose eid lex-compares > cursor as "after cursor"
-        // within the same score band; entries at a strictly greater
-        // score are also after.
-        merged
-            .iter()
-            .position(|(eid, _)| eid.to_string() > c_str)
-            .unwrap_or(merged.len())
+        if let Some(pos) = merged.iter().position(|(eid, _)| eid == c) {
+            pos + 1
+        } else {
+            let c_str = c.to_string();
+            merged
+                .iter()
+                .position(|(eid, _)| eid.to_string() > c_str)
+                .unwrap_or(merged.len())
+        }
     } else {
         0
     };
