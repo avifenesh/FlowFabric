@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ff_core::partition::PartitionConfig;
+use ff_core::types::{ExecutionId, FlowId};
 use media_pipeline::{
     PipelineInput, SummarizeResult, TranscribeResult, FRAME_FIELD_PAYLOAD,
     FRAME_FIELD_TYPE, KIND_EMBED, KIND_SUMMARIZE, KIND_TRANSCRIBE, LABEL_EMBED,
@@ -69,6 +71,11 @@ struct Args {
     /// don't synchronize ZRANGEBYSCORE hits on an idle lane.
     #[arg(long, default_value_t = 2000)]
     poll_ms: u64,
+
+    /// Number of flow partitions the server is configured with
+    /// (matches `FF_FLOW_PARTITIONS`; default 256).
+    #[arg(long, default_value_t = 256)]
+    flow_partitions: u16,
 }
 
 #[tokio::main]
@@ -98,10 +105,15 @@ async fn main() -> Result<()> {
 async fn run_pipeline(client: &Client, args: &Args, stdout: &Arc<Mutex<Stdout>>) -> Result<()> {
     // Flow + execution IDs up-front — we need them for dependency edges
     // before each execution is created.
-    let flow_id = uuid::Uuid::new_v4().to_string();
-    let eid_transcribe = uuid::Uuid::new_v4().to_string();
-    let eid_summarize = uuid::Uuid::new_v4().to_string();
-    let eid_embed = uuid::Uuid::new_v4().to_string();
+    let partition_config = PartitionConfig {
+        num_flow_partitions: args.flow_partitions,
+        ..PartitionConfig::default()
+    };
+    let flow_id_typed = FlowId::new();
+    let flow_id = flow_id_typed.to_string();
+    let eid_transcribe = ExecutionId::for_flow(&flow_id_typed, &partition_config).to_string();
+    let eid_summarize = ExecutionId::for_flow(&flow_id_typed, &partition_config).to_string();
+    let eid_embed = ExecutionId::for_flow(&flow_id_typed, &partition_config).to_string();
 
     // Print the flow ID + transcribe EID up-front so diagnostics can
     // correlate early failures. The summarize and embed EIDs are
