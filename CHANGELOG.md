@@ -5,6 +5,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **ff-script + ff-sdk default-features leak on `ff-core` (#164):**
+  completes the feature-gate discipline started in #158. `ff-script`
+  and `ff-sdk` no longer depend on `ff-core` with default features
+  enabled, so downstream `ff-sdk --no-default-features` builds observe
+  only `ff-core/core` — the `streaming`, `suspension`, and `budget`
+  gates stay off as RFC-012 §1.3 intends. `ff-sdk`'s `valkey-default`
+  feature re-enables the three gated surfaces in lockstep with the
+  Valkey-dependent SDK modules (`task`, `worker`, `snapshot`,
+  `admin`), preserving the default build. Private feature reshape
+  only; no public API change (cargo-semver-checks clean).
+
 ## [0.4.0] - 2026-04-23
 
 ### Breaking changes

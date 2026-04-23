@@ -11,7 +11,14 @@ categories.workspace = true
 description = "FlowFabric typed FCALL wrappers and Lua library loader"
 
 [dependencies]
-ff-core = { workspace = true }
+# RFC-012 feature-gate discipline (#164, completes #158): default-features
+# disabled so ff-script does not re-enable ff-core's `streaming` /
+# `suspension` / `budget` feature flags for downstream consumers
+# (notably ff-sdk `--no-default-features`). ff-script touches only the
+# always-on surface (`contracts`, `keys`, `types`, `error`, `state`,
+# `partition`, `engine_error`); `core` is requested explicitly so the
+# dep stays correct if gates migrate onto those modules.
+ff-core = { version = "0.4.0", path = "../ff-core", default-features = false, features = ["core"] }
 ferriskey = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

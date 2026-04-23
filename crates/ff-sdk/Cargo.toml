@@ -39,10 +39,26 @@ iam = ["ferriskey/iam"]
 # Pulls in the ferriskey transport + the SDK modules that depend on
 # it. Left as an explicit feature (on by default) so
 # `--no-default-features` builds can prove the agnosticism contract.
-valkey-default = ["dep:ferriskey", "dep:ff-backend-valkey"]
+valkey-default = [
+    "dep:ferriskey",
+    "dep:ff-backend-valkey",
+    # RFC-012 feature-gate discipline (#164): the valkey-default-gated
+    # modules (`task`, `worker`, `snapshot`, `admin`) call streaming /
+    # suspension / budget methods on `EngineBackend`, so those ff-core
+    # features must be re-enabled in lockstep with this feature.
+    "ff-core/streaming",
+    "ff-core/suspension",
+    "ff-core/budget",
+]
 
 [dependencies]
-ff-core = { workspace = true }
+# RFC-012 feature-gate discipline (#164, completes #158): default-features
+# disabled so ff-sdk's `--no-default-features` build does NOT activate
+# ff-core's `streaming` / `suspension` / `budget` gates (which in
+# future tranches will add trait methods + types requiring the Valkey
+# backend). The `valkey-default` feature re-enables them below for the
+# default build.
+ff-core = { version = "0.4.0", path = "../ff-core", default-features = false, features = ["core"] }
 ff-script = { workspace = true }
 # RFC-012 Stage 1b — ff-sdk's `ClaimedTask` forwards 9 of 12 ops
 # through the `EngineBackend` trait. The legacy
