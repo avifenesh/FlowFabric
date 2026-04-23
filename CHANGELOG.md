@@ -36,6 +36,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`list_lanes` now reflects configured and dynamically-created lanes
+  (#203).** `EngineBackend::list_lanes` reads `SMEMBERS ff:idx:lanes`,
+  but before this fix no code path wrote to that SET — a
+  freshly-provisioned deployment returned an empty page even after
+  executions had been submitted. Fix writes the registry from two
+  sides: (1) `Server::start` SADDs every `ServerConfig.lanes` entry at
+  boot (covers the pre-declared set); (2) the Lua
+  `ff_create_execution` function SADDs the lane on every create
+  (covers post-boot / dynamic lanes). SADD is idempotent, so repeated
+  writes are free. Lua library version bumped 15 → 16, forcing
+  `FUNCTION LOAD REPLACE` on upgrade. `ff:idx:lanes` remains a single
+  non-hash-tagged global SET — cross-partition by design.
+
 - **HTTP-routed claim now re-claims resumed executions (#150, Bug B).**
   `FlowFabricWorker::claim_from_grant` (the entry used by
   `claim_via_server`) missed the `UseClaimResumedExecution` contention
