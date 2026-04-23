@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ff_observability::Metrics;
+use ff_observability::{AttemptOutcome, Metrics};
 use ff_observability_http::router;
 
 #[tokio::test]
@@ -36,6 +36,58 @@ async fn metrics_endpoint_serves_prometheus_text() {
         resp.contains("ff_lease_renewal_total")
             || resp.contains("ff_lease_renewal"),
         "expected a metric line in body, got: {resp}"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// Scrape `/metrics` after firing a mix of attempt outcomes across
+/// two lanes and assert the counter surfaces with both labels.
+#[tokio::test]
+async fn attempt_outcome_counter_scrapes_with_lane_and_outcome() {
+    let metrics = Arc::new(Metrics::new());
+    metrics.inc_attempt_outcome("default", AttemptOutcome::Ok);
+    metrics.inc_attempt_outcome("default", AttemptOutcome::Ok);
+    metrics.inc_attempt_outcome("default", AttemptOutcome::Error);
+    metrics.inc_attempt_outcome("priority", AttemptOutcome::Timeout);
+    metrics.inc_attempt_outcome("priority", AttemptOutcome::Cancelled);
+    metrics.inc_attempt_outcome("priority", AttemptOutcome::Retry);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(Arc::clone(&metrics));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let resp = raw_get(addr, "/metrics").await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "status line: {resp:?}");
+    assert!(
+        resp.contains("ff_attempt_outcome_total"),
+        "counter name missing: {resp}"
+    );
+    // Each of the 5 outcome labels must appear at least once, and
+    // both lane labels must be present.
+    for outcome in ["ok", "error", "timeout", "cancelled", "retry"] {
+        let needle = format!("outcome=\"{outcome}\"");
+        assert!(resp.contains(&needle), "missing {needle} in: {resp}");
+    }
+    assert!(resp.contains("lane=\"default\""), "missing lane=default");
+    assert!(resp.contains("lane=\"priority\""), "missing lane=priority");
+    // Double-count check: the (default, ok) series fired twice and must
+    // be exposed as value 2 (line ends with ` 2`).
+    let ok_line = resp
+        .lines()
+        .find(|l| {
+            l.starts_with("ff_attempt_outcome_total{")
+                && l.contains("lane=\"default\"")
+                && l.contains("outcome=\"ok\"")
+        })
+        .unwrap_or_else(|| panic!("no (default, ok) series line in: {resp}"));
+    assert!(
+        ok_line.trim_end().ends_with(" 2"),
+        "expected value=2 on {ok_line}"
     );
 
     server.abort();

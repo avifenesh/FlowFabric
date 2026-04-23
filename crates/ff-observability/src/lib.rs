@@ -31,6 +31,40 @@ pub use real::Metrics;
 #[cfg(not(feature = "enabled"))]
 pub use shim::Metrics;
 
+/// Terminal attempt outcome label for `ff_attempt_outcome_total`.
+///
+/// The variant set is fixed at 5 by the Observability RFC prereq #4
+/// adjudication so cardinality stays bounded at `5 × N lanes`. Kept
+/// feature-agnostic (defined here, not in `real`/`shim`) so call sites
+/// can construct the value identically whether metrics are compiled in
+/// or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// Attempt completed successfully (terminal-ok / `complete` FCALL).
+    Ok,
+    /// Attempt failed terminally — no retries left.
+    Error,
+    /// Attempt failed with classification = `Timeout`.
+    Timeout,
+    /// Attempt was cancelled (worker or flow-level cancel).
+    Cancelled,
+    /// Attempt failed but a retry was scheduled.
+    Retry,
+}
+
+impl AttemptOutcome {
+    /// Stable `&'static str` label — matches the Prometheus exposition.
+    pub fn as_stable_str(&self) -> &'static str {
+        match self {
+            AttemptOutcome::Ok => "ok",
+            AttemptOutcome::Error => "error",
+            AttemptOutcome::Timeout => "timeout",
+            AttemptOutcome::Cancelled => "cancelled",
+            AttemptOutcome::Retry => "retry",
+        }
+    }
+}
+
 // Sentry error-reporting module. Gated behind the `sentry` feature,
 // orthogonal to `enabled` (OTEL metrics) — consumers can turn either
 // on without pulling the other. See [`sentry`] module docs for the

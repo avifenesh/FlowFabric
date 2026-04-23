@@ -329,6 +329,46 @@
           "legendFormat": "{{path}}"
         }
       ]
+    },
+    {
+      "id": 11,
+      "title": "Attempt outcomes (per lane)",
+      "description": "ff_attempt_outcome_total split by lane + outcome (ok|error|timeout|cancelled|retry). Fires once per terminal attempt transition in ff-backend-valkey's complete/fail/cancel trait impl. Cardinality is bounded at 5 × N lanes (accepted at 5×16=80 per Observability RFC prereq #4).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*error.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*timeout.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*ok.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (lane, outcome) (rate(ff_attempt_outcome_total[$__rate_interval]))",
+          "legendFormat": "{{lane}} / {{outcome}}"
+        }
+      ]
     }
   ],
   "refresh": "30s",
