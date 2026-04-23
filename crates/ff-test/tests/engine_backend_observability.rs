@@ -55,7 +55,12 @@ async fn describe_execution_emits_tracing_span() {
         ValkeyBackend::from_client_and_partitions(tc.client().clone(), test_config());
 
     let capture = CaptureSpans::default();
-    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    // Install for the current thread-scope. Using `set_default`
+    // (rather than wrapping an inner `block_on`) keeps the async
+    // body running on the Tokio runtime — the prior `block_on`
+    // inside `#[tokio::test]` could starve the worker.
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
 
     // Call an instrumented trait method against a non-existent
     // execution id — the op returns `Ok(None)` but the span MUST
@@ -63,9 +68,7 @@ async fn describe_execution_emits_tracing_span() {
     // on entry, before the HGETALL round trip.
     let lane = LaneId::new("obs-test-lane");
     let eid = ExecutionId::solo(&lane, &test_config());
-    let _result = tracing::subscriber::with_default(subscriber, || {
-        futures::executor::block_on(backend.describe_execution(&eid))
-    });
+    let _result = backend.describe_execution(&eid).await;
 
     let names = capture.0.lock().unwrap().clone();
     assert!(
@@ -80,14 +83,14 @@ async fn with_metrics_setter_attaches_handle() {
     let mut backend =
         ValkeyBackend::from_client_and_partitions(tc.client().clone(), test_config());
     let metrics = Arc::new(ff_observability::Metrics::new());
-    // `Arc::get_mut` path — setter is a no-op if the `Arc` has been
-    // cloned already, so call before any clone.
-    ValkeyBackend::with_metrics(&mut backend, metrics.clone());
-    // Setter exercised; with_metrics is fire-and-forget. A live
-    // assertion that the handle is stored requires introspection
-    // into `ValkeyBackend` internals, which is crate-private. The
-    // compile + no-panic path is the coverage this test adds on
-    // top of the unit tests in ff-core::engine_error.
-    drop(backend);
-    drop(metrics);
+    // `Arc::get_mut` path — setter succeeds iff no other `Arc`
+    // clones exist. `from_client_and_partitions` returns a
+    // freshly-minted `Arc`, so this should return true.
+    let attached = ValkeyBackend::with_metrics(&mut backend, metrics.clone());
+    assert!(attached, "with_metrics should attach on a fresh Arc");
+
+    // A second call (still no other clones outstanding) still
+    // succeeds; the field is overwritten, not appended.
+    let attached_again = ValkeyBackend::with_metrics(&mut backend, metrics);
+    assert!(attached_again);
 }

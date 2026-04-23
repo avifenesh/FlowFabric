@@ -118,6 +118,18 @@ impl ValkeyBackend {
     ///
     /// [`BackendRetry`]: ff_core::backend::BackendRetry
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
+        Self::connect_inner(config, None, "connect").await
+    }
+
+    /// Shared dial + partition-config-load body for [`Self::connect`]
+    /// and [`Self::connect_with_metrics`]. The `op_label` feeds the
+    /// `EngineError::Unavailable.op` string when the config's
+    /// connection is not a `Valkey` variant.
+    async fn connect_inner(
+        config: BackendConfig,
+        metrics: Option<Arc<ff_observability::Metrics>>,
+        op_label: &'static str,
+    ) -> Result<Arc<dyn EngineBackend>, EngineError> {
         // `BackendConnection` is `#[non_exhaustive]` for future
         // backends; the compiler treats the pattern as refutable,
         // hence `let ... else`. Today only `Valkey` exists; a
@@ -125,8 +137,15 @@ impl ValkeyBackend {
         // surfaces as `EngineError::Unavailable` so callers get a
         // typed error rather than a panic.
         let BackendConnection::Valkey(v) = config.connection.clone() else {
+            // `op_label` is `&'static str`; use `match` to keep the
+            // `op: &'static str` shape without heap alloc.
             return Err(EngineError::Unavailable {
-                op: "ValkeyBackend::connect (non-Valkey BackendConnection)",
+                op: match op_label {
+                    "connect_with_metrics" => {
+                        "ValkeyBackend::connect_with_metrics (non-Valkey BackendConnection)"
+                    }
+                    _ => "ValkeyBackend::connect (non-Valkey BackendConnection)",
+                },
             });
         };
         let client = build_client(&config).await?;
@@ -161,7 +180,7 @@ impl ValkeyBackend {
             client,
             partition_config,
             subscriber_connection: Some(v),
-            metrics: None,
+            metrics,
         }))
     }
 
@@ -211,15 +230,22 @@ impl ValkeyBackend {
     }
 
     /// Attach an `ff_observability::Metrics` handle so the trait
-    /// impl's metric-emitting sites fire (issue #154). Call after
-    /// construction; returns `&mut Arc<Self>` to chain. If the
-    /// backend was constructed behind a `Arc<dyn EngineBackend>`
-    /// (e.g. via [`ValkeyBackend::connect`]), use the
-    /// [`ValkeyBackend::connect_with_metrics`] path instead — you
+    /// impl's metric-emitting sites fire (issue #154). Returns `true`
+    /// when the handle was installed (`Arc::get_mut` succeeded — this
+    /// requires the caller to hold the only outstanding `Arc<Self>`),
+    /// `false` otherwise. If the backend was constructed behind an
+    /// `Arc<dyn EngineBackend>` (e.g. via [`ValkeyBackend::connect`]),
+    /// use [`ValkeyBackend::connect_with_metrics`] instead — you
     /// cannot mutate through `Arc<dyn …>`.
-    pub fn with_metrics(self: &mut Arc<Self>, metrics: Arc<ff_observability::Metrics>) {
+    pub fn with_metrics(
+        self: &mut Arc<Self>,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> bool {
         if let Some(inner) = Arc::get_mut(self) {
             inner.metrics = Some(metrics);
+            true
+        } else {
+            false
         }
     }
 
@@ -230,34 +256,7 @@ impl ValkeyBackend {
         config: BackendConfig,
         metrics: Arc<ff_observability::Metrics>,
     ) -> Result<Arc<dyn EngineBackend>, EngineError> {
-        let BackendConnection::Valkey(v) = config.connection.clone() else {
-            return Err(EngineError::Unavailable {
-                op: "ValkeyBackend::connect_with_metrics (non-Valkey BackendConnection)",
-            });
-        };
-        let client = build_client(&config).await?;
-        let partition_config = match load_partition_config(&client).await {
-            Ok(cfg) => cfg,
-            Err(EngineError::Transport { source, .. })
-                if matches!(
-                    source.downcast_ref::<ScriptError>(),
-                    Some(ScriptError::Parse { .. })
-                ) =>
-            {
-                tracing::warn!(
-                    error = %source,
-                    "ff:config:partitions not found, using PartitionConfig::default()"
-                );
-                PartitionConfig::default()
-            }
-            Err(e) => return Err(e),
-        };
-        Ok(Arc::new(Self {
-            client,
-            partition_config,
-            subscriber_connection: Some(v),
-            metrics: Some(metrics),
-        }))
+        Self::connect_inner(config, Some(metrics), "connect_with_metrics").await
     }
 
     /// Encode the minimum set of attempt-cookie fields into a
@@ -1925,7 +1924,10 @@ impl EngineBackend for ValkeyBackend {
         )
         .await
         .map_err(|e| {
-            ff_core::engine_error::backend_context(e, "create_waitpoint: FCALL ff_create_waitpoint")
+            ff_core::engine_error::backend_context(
+                e,
+                "create_waitpoint: FCALL ff_create_pending_waitpoint",
+            )
         })
     }
 
@@ -1939,7 +1941,7 @@ impl EngineBackend for ValkeyBackend {
             .map_err(|e| {
                 ff_core::engine_error::backend_context(
                     e,
-                    "observe_signals: pipeline SMEMBERS signals + HGETALL",
+                    "observe_signals: HGETALL suspension + HMGET matcher slots",
                 )
             })
     }
@@ -1967,7 +1969,10 @@ impl EngineBackend for ValkeyBackend {
         wait_children_impl(&self.client, &self.partition_config, &f)
             .await
             .map_err(|e| {
-                ff_core::engine_error::backend_context(e, "wait_children: FCALL ff_wait_children")
+                ff_core::engine_error::backend_context(
+                    e,
+                    "wait_children: FCALL ff_move_to_waiting_children",
+                )
             })
     }
 

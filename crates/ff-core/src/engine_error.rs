@@ -129,9 +129,10 @@ pub enum EngineError {
 }
 
 /// Wrap an [`EngineError`] with a call-site label, preserving the
-/// inner variant for classification. Idempotent on nested
-/// `Contextual` wrappers in the sense that each call adds one more
-/// layer; callers should wrap once per op boundary.
+/// inner variant for classification. Each call wraps the error in a
+/// new `Contextual` layer; repeated calls will therefore nest
+/// additional `Contextual` wrappers, so callers should wrap once per
+/// op boundary.
 ///
 /// Promoted to ff-core so `ff-backend-valkey` can annotate its
 /// `EngineBackend` impls with the same context shape ff-sdk's
