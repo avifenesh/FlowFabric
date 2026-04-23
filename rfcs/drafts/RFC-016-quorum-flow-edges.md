@@ -32,6 +32,53 @@ Non-goals for this RFC:
 
 ## Detailed Design
 
+### §2.1. Worked examples
+
+LLM-consensus (3-of-5 voters, cancel the losers once consensus is reached):
+
+```rust
+let voters: Vec<ExecutionId> =
+    (0..5).map(|_| create_child_execution(flow_id, "vote", ...)).collect();
+let decide = create_child_execution(flow_id, "decide", ...);
+
+set_edge_group_policy(
+    flow_id,
+    decide,
+    EdgeDependencyPolicy::Quorum { k: 3, on_satisfied: OnSatisfied::CancelRemaining },
+);
+
+for v in &voters {
+    add_dependency(flow_id, *v, decide, EdgeSpec::default());
+}
+```
+
+Human-approval (2-of-5 reviewers, let stragglers finish for audit trail):
+
+```rust
+let reviewers: Vec<ExecutionId> = request_reviews(...);
+let approved = create_child_execution(flow_id, "approved", ...);
+
+set_edge_group_policy(
+    flow_id,
+    approved,
+    EdgeDependencyPolicy::Quorum { k: 2, on_satisfied: OnSatisfied::LetRun },
+);
+
+for r in &reviewers {
+    add_dependency(flow_id, *r, approved, EdgeSpec::default());
+}
+```
+
+Racy-fanout (`AnyOf`, cancel the losers):
+
+```rust
+set_edge_group_policy(
+    flow_id,
+    merged,
+    EdgeDependencyPolicy::AnyOf { on_satisfied: OnSatisfied::CancelRemaining },
+);
+```
+
 ### §2. `EdgeDependencyPolicy` shape
 
 Edges in RFC-007 are grouped by `downstream_execution_id`: a downstream execution has one **inbound edge group**, and the satisfaction condition was previously `all_required` across that group. RFC-016 elevates that satisfaction condition to a per-group policy.
@@ -81,16 +128,19 @@ Per downstream inbound edge group:
 | `policy` | `EdgeDependencyPolicy` | Frozen at edge-group staging. |
 | `n` | u32 | Total inbound edges in the group at staging time. |
 | `succeeded` | u32 | Upstream terminal = success. |
-| `failed` | u32 | Upstream terminal = failed (error, timeout, cancelled, attempt-exhausted). |
-| `skipped` | u32 | Upstream terminal = skipped (skip-propagation from further upstream). |
+| `failed` | u32 | Upstream terminal = failed (error, timeout, cancelled, attempt-exhausted). Sparse: see storage note. |
+| `skipped` | u32 | Upstream terminal = skipped (skip-propagation from further upstream). Sparse: see storage note. |
 | `running` | u32 | Derived: `n - (succeeded + failed + skipped)`. Not stored; computed. |
 | `group_state` | enum | `pending` → `satisfied` \| `impossible` \| `cancelled`. One-shot. |
-| `satisfied_at` | unix ms, nullable | When quorum was first met (for `LetRun` observability). |
+| `satisfied_at` | unix ms, nullable | When quorum was first met (for `LetRun` observability). Sparse. |
+| `cancel_siblings_pending` | list\<execution_id\> | Populated atomically on `satisfied` when `OnSatisfied::CancelRemaining` and `running > 0`; drained by the dispatcher (§8.5). Empty for `LetRun` and for `AllOf`. |
+
+**Storage sparseness (resolves M.D1).** `AllOf` groups maintain only `policy_variant`, `n`, `succeeded`, `group_state` — the 99% case pays close to today's per-downstream footprint. `failed`, `skipped`, `satisfied_at`, `cancel_siblings_pending` are written only by `AnyOf`/`Quorum` policies. Resolvers read whichever fields their policy requires.
 
 **Transitions.** Evaluated atomically on the downstream's partition inside `ff_resolve_dependency` (RFC-007 line 398, 623) each time an upstream terminal lands:
 
 1. On upstream terminal: increment the matching counter (`succeeded` / `failed` / `skipped`).
-2. If `group_state != pending`, stop (one-shot; already fired). Counters still update for observability.
+2. If `group_state != pending`, stop (one-shot; already fired). Counters still update for observability — this means `succeeded + failed + skipped` may reach `n` even after `group_state = impossible` (or `satisfied` under `LetRun`). Impossibility / satisfaction is one-shot; counters are not. Operator-facing docs MUST note this so `AllOf` snapshots showing `succeeded=3, failed=1, group_state=impossible` are not read as bugs.
 3. Evaluate satisfaction against `policy`:
    - `AllOf`: satisfied iff `succeeded == n`; impossible iff `failed + skipped >= 1`.
    - `AnyOf { .. }`: satisfied iff `succeeded >= 1`; impossible iff `failed + skipped == n`.
@@ -135,9 +185,23 @@ The reason is durably stored on the execution's terminal record so retry policie
 
 **Invariant Q5.** Cancels issued under `sibling_quorum_satisfied` never fail the parent flow. They are a first-class "successful resolution" outcome. The flow failure policy (RFC-007) MUST treat this cancel reason as benign.
 
+**Invariant Q6.** `cancel_siblings_pending` is empty iff every non-terminal sibling at `satisfied_at` has been dispatched exactly one `cancel_execution`. Populated atomically with the `satisfied` flip; drained atomically per dispatch ack (§8.5).
+
+### §4.1. Cancel dispatch batching (resolves M.D2)
+
+High-fanout groups (e.g., `quorum(1 of 1000)`) must not emit 999 individual cross-partition cancels in a single dispatcher tick. The resolver groups sibling cancels by partition:
+
+```
+cancel_siblings_by_partition: Map<PartitionId, Vec<ExecutionId>>
+```
+
+The dispatcher issues one Lua call per partition: `ff_cancel_executions_batch(ids, reason)`. A **soft advisory cap** of 128 siblings per group emits `ff_edge_group_sibling_cancel_soft_cap_exceeded_total` when exceeded; no hard cap in v1. The Stage C gate benchmark (see §11) MUST measure per-partition batch latency at N = 32, 128, 512, 1024 before Stage C ships.
+
 ### §5. `LetRun` semantics
 
 Under `OnSatisfied::LetRun`, when `group_state` flips to `satisfied`, no cancels are issued. Still-running siblings continue to terminal. Their terminal outcomes update the counters for observability (§3 step 1) but, because of Invariant Q1, never retrigger downstream eligibility — the downstream fires exactly once.
+
+**`LetRun` under `impossible`.** When `group_state` flips to `impossible` (Q3 short-circuit) under `LetRun`, the downstream is marked `skipped` and skip-propagation runs as today (§3 step 5), but still-running siblings are NOT cancelled — consistent with `LetRun`'s one-shot, no-rescind contract. Late sibling terminals continue to update counters for observability. `LetRun` is symmetric across both terminal `group_state` branches: no cancels, ever.
 
 **Why one-shot, not re-evaluate.** A re-evaluating model would mean a downstream could fire, complete, and then be "re-fired" when a late sibling terminal pushes `succeeded` higher. That is meaningless in the flow DAG (a completed execution cannot become "more eligible"); and for observability it conflates "satisfied" with "still gathering data." One-shot matches the intuition: the downstream decision was made at `satisfied_at`; anything after is telemetry.
 
@@ -162,10 +226,11 @@ set_edge_group_policy(flow_id, downstream_execution_id, policy: EdgeDependencyPo
 
 Semantics:
 
-- Must be called BEFORE any inbound edge to `downstream_execution_id` transitions to `active` (i.e., before any upstream resolves). Typically called immediately after `create_child_execution` and before the first `add_dependency`.
+- Must be called BEFORE the first `add_dependency(..., downstream_execution_id, ...)` call for this downstream. This is a strict, mechanically-enforceable ordering rule: `add_dependency` checks group existence and rejects policy change after its first call. Resolves K.D4 by picking option (a) — ordering is keyed on `add_dependency` entry, not on "first resolver run," avoiding the surprise path where adding a dependency on an already-terminal upstream implicitly activates a default-`AllOf` group.
 - Default if never called: `EdgeDependencyPolicy::AllOf`. Existing flows created pre-RFC-016 are implicitly `AllOf` — full backward compatibility.
-- For `Quorum { k }`, the final `k` must satisfy `1 <= k <= n` where `n` is `edge_count` on the downstream group at `group_state` evaluation time. If the flow uses dynamic expansion (`dynamic_expansion_enabled`), `n` is measured each time the resolver runs; if the group still has not reached `k` edges when an upstream resolves, the resolver simply waits (same as today's `AllOf` waiting for more edges to stage).
-- Errors: `invalid_policy` (k < 1), `policy_already_set` (attempt to change after active), `group_policy_fixed_after_activation` (any edge in group already resolved).
+- `add_dependency` does NOT take a policy parameter (resolves L.D2, option a). The sole entry point for setting policy is `set_edge_group_policy`. Higher-level SDK helpers (e.g., `add_quorum_group(flow_id, downstream, upstreams, policy)`) MAY wrap both calls; they are additive convenience, not engine surface. Stage B (§11) is updated accordingly — the "optional group-policy parameter on `add_dependency`" proposal is struck.
+- For `Quorum { k }`, the final `k` must satisfy `1 <= k <= n` where `n` is `edge_count` on the downstream group at `group_state` evaluation time. If the flow uses dynamic expansion (`dynamic_expansion_enabled`), `n` is measured each time the resolver runs; if the group still has not reached `k` edges when an upstream resolves, the resolver simply waits (same as today's `AllOf` waiting for more edges to stage) — see §8.4 for the explicit `k > current_n` tolerance and stuck-group observability.
+- Errors: `invalid_policy` (k < 1), `policy_already_set` (attempt to change after first `add_dependency`), `group_policy_fixed_after_activation` (any edge in group already resolved).
 
 #### §6.2 `EdgeSnapshot` additions
 
@@ -187,16 +252,20 @@ struct EdgeGroupSnapshot {
 
 Exposed via a new SDK read: `get_edge_group(flow_id, downstream_execution_id) -> Option<EdgeGroupSnapshot>`, and `describe_flow` gains a `edge_groups: Vec<EdgeGroupSnapshot>` field.
 
+**Lookup ergonomics (resolves L.D3).** `describe_flow` is the canonical listing; `get_edge_group(flow_id, downstream_execution_id)` is the direct-lookup primitive keyed by execution id. Name-based helpers (e.g., "find the approval step by step-name") are SDK-layer concerns and are out of scope for this RFC — SDKs are free to layer such helpers on top of `describe_flow`.
+
 `EdgeSnapshot` itself is unchanged. Per-edge identity, upstream/downstream pointer, and `edge_state` (pending/satisfied/impossible/cancelled) all keep their RFC-007 meanings.
 
 #### §6.3 Wire format (Valkey)
 
 RFC-007 line 453 defines edge keys. RFC-016 adds:
 
-- `ff:flow:{fp:N}:<flow_id>:edgegroup:<downstream_execution_id>` — hash with fields `policy_variant`, `k` (only for `Quorum`), `on_satisfied`, `n`, `succeeded`, `failed`, `skipped`, `group_state`, `satisfied_at`.
+- `ff:flow:{fp:N}:<flow_id>:edgegroup:<downstream_execution_id>` — hash. Field set is sparse (§3 storage sparseness): `AllOf` writes only `policy_variant`, `n`, `succeeded`, `group_state`; `AnyOf`/`Quorum` additionally write `on_satisfied`, `failed`, `skipped`, `satisfied_at`, and (under `CancelRemaining`) `cancel_siblings_pending`.
 - `policy_variant` values: `all_of` | `any_of` | `quorum` (string, forward-compatible with future additions).
 
-`ff_resolve_dependency` reads the group hash, increments the counter, evaluates satisfaction, and returns an action record `{ eligibility: satisfied|impossible|pending, cancel_siblings: [...] }`. The dispatcher side is unchanged except it honors the new `cancel_siblings` list alongside the existing `child_skipped` cascade.
+**`policy_variant` string vs. numeric trade (resolves M.D3, partial).** The string form is retained in v1 for debuggability — raw `HGETALL` output against the group hash is self-describing, which pays off in incident response. The per-group string cost (~7-8 bytes vs. 1 byte numeric tag) is acknowledged as a deliberate trade. If large-scale deployments surface this as a meaningful storage pressure, a future RFC may introduce a compact numeric code with a backwards-compatible dual-read path; the forward-compat contract in §6.4 already supports that migration without re-signing the hash format.
+
+`ff_resolve_dependency` reads the group hash, increments the counter, evaluates satisfaction, and returns an action record `{ eligibility: satisfied|impossible|pending, cancel_siblings_by_partition: Map<PartitionId, Vec<ExecutionId>> }` (§4.1). The dispatcher side is unchanged except it honors the new partition-batched `cancel_siblings_by_partition` map alongside the existing `child_skipped` cascade.
 
 #### §6.4 Forward-compat
 
@@ -210,6 +279,10 @@ New metrics (Prometheus labels follow RFC-010 conventions):
 - `ff_edge_group_evaluation_total{policy, outcome}` — counter of resolver evaluations. `outcome ∈ { pending, satisfied, impossible }`.
 - `ff_edge_group_sibling_cancel_total{reason}` — counter of sibling cancels issued. `reason ∈ { sibling_quorum_satisfied, sibling_quorum_impossible }`.
 - `ff_edge_group_let_run_late_terminal_total{terminal}` — counter of terminals arriving after `satisfied` under `LetRun`. `terminal ∈ { success, failed, skipped, cancelled }`. Useful to detect budget waste under mis-tuned `LetRun`.
+- `ff_edge_group_sibling_cancel_soft_cap_exceeded_total` — counter (unlabelled) of groups whose `cancel_siblings_pending` exceeded the 128 advisory soft cap (§4.1).
+- `ff_edge_group_evaluation_total{policy, outcome, reason}` adds an optional `reason` label for `outcome=pending` cases: `reason ∈ { k_exceeds_n, awaiting_upstream }` (resolves K.D5 — stuck-waiting `Quorum` groups during dynamic expansion are visible).
+
+**Label-set commitment.** Metric labels are bounded to `policy`, `outcome`, `reason`, `terminal`. `flow_id`, `execution_id`, and user-assigned names are NEVER metric labels in v1 (resolves M.D4). Per-flow quorum diagnostics live in `describe_flow.edge_groups` snapshots, not metrics.
 
 `describe_flow` additions:
 
@@ -256,13 +329,14 @@ When `dynamic_expansion_enabled = true`, edges may be added after group policy i
 - `n` is read at resolution time, not frozen at policy-set time.
 - Adding an edge to a group whose `group_state != pending` is rejected with `group_already_terminal`.
 - `Quorum { k }` validation (`k <= n`) is enforced at each edge add AND at each resolve evaluation. If edges are removed (not in v1, but designed for), an evaluation where `k > n` transitions to `impossible`.
+- **Transient `k > current_n` tolerance (resolves K.D5).** A group where `k > current_n` at resolve time is treated as `pending` (waiting for more edges to stage), not as an error. This matches today's `AllOf` "wait for more edges" behavior. Flows that want strict `k-of-N` declaration with N known up-front must either (i) use static edge staging (no dynamic expansion for this group), OR (ii) call `set_edge_group_policy` AFTER all edges are staged — at which point `k > n` raises `invalid_policy` synchronously. Stuck-waiting groups are observable via `ff_edge_group_evaluation_total{outcome=pending, reason=k_exceeds_n}` (§7).
 
 #### §8.5 Replay (RFC-001 + RFC-007)
 
 If the engine crashes between "resolver decides satisfied" and "downstream eligibility flip + sibling cancel dispatch," replay must be idempotent. Guarantees:
 
-1. `group_state`, `succeeded/failed/skipped`, and `satisfied_at` are stored in the group hash on the downstream's `{p:N}` partition within the same atomic Lua `ff_resolve_dependency` call that reads them. Counter increment + satisfaction decision + downstream-eligibility flip is one atomic transaction.
-2. Sibling cancel dispatch is a **separate** step performed by ff-engine after Lua returns. On crash mid-dispatch, the next resolver on the same group sees `group_state = satisfied` and re-emits the remaining non-terminal siblings in `cancel_siblings` (the resolver recomputes the list from live sibling lifecycle state, not a persisted queue). Duplicate cancels against already-terminal siblings are no-ops (§4 race handling).
+1. `group_state`, `succeeded/failed/skipped`, `satisfied_at`, and `cancel_siblings_pending` are stored in the group hash on the downstream's `{p:N}` partition within the same atomic Lua `ff_resolve_dependency` call that reads them. Counter increment + satisfaction decision + downstream-eligibility flip + `cancel_siblings_pending` population is one atomic transaction.
+2. Sibling cancel dispatch is a **separate** step performed by ff-engine after Lua returns. The resolver persists `cancel_siblings_pending: [execution_id, ...]` into the group hash within the same atomic transaction as the `satisfied` flip (correcting the earlier "recompute from live sibling state" description — Lua on the downstream's partition cannot read sibling execution lifecycle atomically, since siblings live on their own `{p:N}` partitions). The dispatcher drains `cancel_siblings_pending` and issues `ff_cancel_executions_batch` per partition (§4.1); each successful batch dispatch removes the acked ids from the field via atomic Lua `ff_ack_sibling_cancel`. On engine crash mid-dispatch, recovery is driven by the `ff_reconcile_pending_sibling_cancels` reconciler (see §11 Stage C) — on boot and periodically (e.g., every 30s) it scans groups with `group_state = satisfied AND cancel_siblings_pending != []` and re-issues. Duplicate cancels against already-terminal siblings are no-ops (§4 race handling). Invariant Q6 holds end-to-end.
 3. Downstream eligibility flip is idempotent: transitioning an execution from `eligible_now` to `eligible_now` is a no-op in RFC-001.
 4. `satisfied_at` is set once (conditional Lua update: `HSETNX` equivalent). Replay does not overwrite it.
 
@@ -270,7 +344,7 @@ If the engine crashes between "resolver decides satisfied" and "downstream eligi
 
 1. **`AnyOf { on_satisfied }` with `LetRun`: is this a real use case, or only `AnyOf { CancelRemaining }`?** Racy-mirror use cases want cancel. Human approval with `k=1` is unusual ("any reviewer approves, skip the rest") but plausible. Leaning: keep `LetRun` on `AnyOf` for symmetry; revisit if no consumer hits it within 6 months.
 2. **Should `sibling_quorum_impossible` also count as a cancel under `LetRun`?** Today §3 says no — `LetRun` means "don't cancel, ever." But if the group is impossible, siblings will only produce waste. Counter-argument: the user picked `LetRun` knowing some siblings are "for the record." Lean: keep LetRun semantics pure — never cancel under LetRun, even on impossible. Revisit with consumer input.
-3. **Cross-partition cost of `ff_edge_group_sibling_cancel_total` at high fanout.** For `quorum(1 of 1000)` (hypothetical stress shape), the first success triggers 999 cross-partition cancels. This is similar to the RFC-007 §Known v1 limitation large-fan-out burst and likely has the same mitigation (partition-batch + stagger). Needs a benchmark before declaring any `n` cap.
+3. **Cross-partition cost of `ff_edge_group_sibling_cancel_total` at high fanout.** For `quorum(1 of 1000)` (hypothetical stress shape), the first success triggers 999 cross-partition cancels. Mitigation is specified in §4.1 (partition-batched `ff_cancel_executions_batch`). The Stage C gate benchmark (§11) measures per-partition latency at N = 32/128/512/1024 as a ship-blocking requirement. A hard `n` cap is still deferred until that benchmark data exists; the advisory soft cap (128) is an observability hook, not an enforcement point.
 
 ### §10. Alternatives rejected
 
@@ -320,17 +394,20 @@ Staged, each stage independently shippable:
 2. **Stage B — `AnyOf` + `Quorum` resolver.**
    - Extend `ff_resolve_dependency` Lua with the four-counter evaluation (§3).
    - Implement `set_edge_group_policy` Class-A op with the error cases from §6.1.
-   - Wire `EdgeDependencyPolicy` through the SDK (`add_dependency` gains an optional group-policy parameter as sugar; `set_edge_group_policy` is the primary op).
+   - Wire `EdgeDependencyPolicy` through the SDK via `set_edge_group_policy` as the sole engine entry point (L.D2 disposition — `add_dependency` does NOT gain a policy parameter). Higher-level SDK wrappers (`add_quorum_group(...)`) are additive convenience above the engine surface.
    - Unit tests: all three variants, short-circuit impossibility (§3 Q3), dynamic-expansion `n` (§8.4), replay idempotence (§8.5).
    - Gate: scratch-project smoke (FlowFabric smoke harness) exercising `any_of(3)` and `quorum(2 of 3)`.
 
-3. **Stage C — `CancelRemaining`.**
-   - Introduce `cancel_execution(execution_id, reason: CancelReason)` per-exec API. This is a new engine surface; RFC-007 `cancel_flow` is unchanged.
-   - Resolver returns `cancel_siblings: [execution_id, ...]` on satisfied-with-cancel-remaining.
-   - Dispatcher cascades per-exec cancels cross-partition.
+3. **Stage C — `CancelRemaining` + dispatch batching + reconciler.**
+   - Introduce `cancel_execution(execution_id, reason: CancelReason)` per-exec API AND `ff_cancel_executions_batch(ids, reason)` Lua per-partition batch variant (§4.1). RFC-007 `cancel_flow` is unchanged.
+   - Resolver returns `cancel_siblings_by_partition: Map<PartitionId, Vec<ExecutionId>>` on satisfied-with-cancel-remaining and persists `cancel_siblings_pending` atomically (§8.5 item 2).
+   - Dispatcher cascades per-partition batched cancels and acks via `ff_ack_sibling_cancel`.
+   - Introduce `ff_reconcile_pending_sibling_cancels` periodic reconciler (engine boot + ~30s interval) that re-issues drained-but-unacked batches after crash (§8.5 item 2).
    - Flow-failure-policy integration: `sibling_quorum_satisfied` / `sibling_quorum_impossible` marked as benign (Invariant Q5).
-   - Metrics: `ff_edge_group_sibling_cancel_total`.
+   - Metrics: `ff_edge_group_sibling_cancel_total`, `ff_edge_group_sibling_cancel_soft_cap_exceeded_total`.
+   - **Gate (benchmark required before ship):** per-partition `ff_cancel_executions_batch` latency measured at N = 32, 128, 512, 1024 (§4.1); stage blocks until documented and under agreed threshold.
    - Gate: integration test — LLM-consensus-shaped flow (5 siblings, quorum 3, verify that on 3rd success the remaining 2 receive cancel and terminate with `cancel_reason = sibling_quorum_satisfied`).
+   - Gate: crash-replay integration test — kill ff-engine mid-cancel-dispatch, restart, verify reconciler drains `cancel_siblings_pending` and Invariant Q6 holds.
 
 4. **Stage D — `LetRun` + late-terminal observability.**
    - `OnSatisfied::LetRun` wiring (no cancels, one-shot downstream fire).
