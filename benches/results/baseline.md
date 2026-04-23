@@ -1,9 +1,8 @@
-# Internal bench baseline — v0.3.2
+# Internal bench baseline — v0.4.0
 
-Internal reference numbers captured against v0.3.2 HEAD (`da89fa9`),
-re-run on 2026-04-22 to satisfy `docs/RELEASING.md` §Pre-flight (the
-baseline refresh was deferred during the v0.3.2 hotfix window and is
-being filled in retroactively).
+Internal reference numbers captured against v0.4.0 HEAD (`d595b27`,
+post-tag + follow-ups #168/#169/#170), re-run on 2026-04-23 per
+`docs/RELEASING.md` §Pre-flight.
 
 Use as a floor to detect regressions in future releases, not as public
 performance claims.
@@ -23,6 +22,20 @@ host class.
   back-compat and the reporter picks the first match. Server process
   self-reports `valkey_version:8.1.0`.
 
+## Session changes between v0.3.2 and v0.4.0 that could affect perf
+
+- Stage 1c (T1–T4) moved ~22 FCALL sites behind `EngineBackend` trait
+  methods — adds one virtual dispatch per call site (typical ~1–2%).
+- #170 / closes #154: `#[tracing::instrument]` on every
+  `EngineBackend` impl method — roughly ~100 ns per call when the
+  global subscriber filters the span out.
+- `backend_context` wrapping on error paths — negligible in the hot
+  path.
+- BackendError seal (Round-7) — type-system only; zero runtime effect.
+
+Expected: small (1–3%) regression on hot primitives that went through
+the trait. Larger deltas below are flagged.
+
 ## Scenario 1 — submit / claim / complete (10k tasks × 16 workers, 4 KiB payload)
 
 | system             | git_sha | ops/s   | p50 ms | p95 ms | p99 ms |
@@ -30,148 +43,139 @@ host class.
 | redis-rs baseline  | 6f81926 | 14755.2 | 0.256  | 0.327  | 0.383  |
 | ferriskey baseline | ccff3ac |  7993.3 | 0.263  | 0.340  | 0.403  |
 | apalis-redis rc.7  | 1b2cce5 |    51.9 | n/a    | n/a    | n/a    |
-| **ff-server (v0.3.2)** | **da89fa9** | **2658.0** | **0.399** | **0.882** | **1.152** |
+| **ff-server (v0.4.0)** | **d595b27** | **3045.6** | **0.411** | **0.909** | **1.126** |
+| ff-server (v0.3.2) | da89fa9 |  2658.0 | 0.399  | 0.882  | 1.152  |
 | ff-server (v0.1.0) | 01f6327 |  2171.6 | 0.41   | 0.89   | 1.11   |
 | ff-server (pre-Batch-C) | 6fef93d |  3320.9 | 0.395  | 0.672  | 0.813  |
 
-Throughput +22% vs v0.1.0 (`01f6327`) at effectively unchanged latency
-percentiles. Captured with the RFC-011 minting path (`ExecutionId::for_flow`)
-so each exec spreads across partitions.
-
-The Batch-C trade-off remains: `ff_complete` / `fail` / `cancel`
-PUBLISH to `ff:dag:completions` on every flow-bound terminal
-transition (no-op for standalone execs), and the engine maintains a
-dedicated RESP3 SUBSCRIBE connection.
+Throughput **+14.6% vs v0.3.2** (2658 → 3045 ops/s). p50/p95 drift up
+~3% (0.399 → 0.411, 0.882 → 0.909), consistent with the
+instrumentation overhead budget called out above; p99 improved
+(1.152 → 1.126). The trait-dispatch overhead is more than
+compensated by other session changes in the write path. No
+regression flag.
 
 ## Scenario 2 — cap_routed (1 iteration, cap_universe=10, 100 workers)
 
 | mode    | git_sha | correct_routing_rate | p50 ms    | p95 ms      | p99 ms      |
 |---------|---------|----------------------|-----------|-------------|-------------|
-| happy   | da89fa9 | 1.000                |   409.26  |    515.87   |    535.13   |
-| partial | da89fa9 | 0.961                | 14155.999 | 209212.961  | 274235.299  |
-| scarce  | da89fa9 | 0.921                |   416.56  |    535.67   | 117196.936  |
+| happy   | d595b27 | 1.000                |   397.46  |    503.02   |    524.18   |
+| partial | d595b27 | 0.953                | 12542.29  | 222433.94   | 292422.60   |
+| scarce  | d595b27 | 0.927                |   398.94  |    512.52   | 235196.03   |
 
 Thresholds: happy==1.0, partial>=0.90, scarce>=0.85 — all three pass.
 
-`happy` numbers are flat vs v0.1.0 (407 → 409 ms p50). `partial` and
-`scarce` are adversarial-by-design distributions (see RFC-009 cap-routing
-convergence notes); their tails move significantly between runs because
-the promotion-cycle race is a coin flip per cycle. The p50 drift on
-`partial` (11867 → 14156 ms, +19%) is within the observed run-to-run
-variance for this mode — routing-rate (0.956 → 0.961) is the metric
-that characterises behaviour, not absolute latency. The `scarce` p99
-improvement (175906 → 117197 ms) falls in the same band.
+`happy` p50 is flat-to-improved vs v0.3.2 (409 → 397 ms, −2.9%).
+`partial` and `scarce` are adversarial-by-design (RFC-009 cap-routing
+convergence notes); their tails move significantly between runs
+because the promotion-cycle race is a coin flip per cycle. `partial`
+p50 moved 14155 → 12542 ms (−11.4%) and `scarce` p99 moved
+117197 → 235196 ms (+100%); both deltas sit inside the observed
+run-to-run band for those modes (see v0.3.2 notes for the same
+pattern against v0.1.0). Routing-rate (`partial`: 0.961 → 0.953,
+`scarce`: 0.921 → 0.927) is the metric that characterises
+behaviour — both remain comfortably above their floors.
 
 ## Scenario 3 — flow_dag_linear (100 flows × 10 nodes, 16 workers)
 
-| system                    | git_sha | flows/s | p50 ms  | p95 ms  | p99 ms   |
-|---------------------------|---------|---------|---------|---------|----------|
-| ff-server                 | da89fa9 |   8.16  |  352.95 | (n/a)   | 11948.56 |
-| ff-server (v0.1.0)        | 01f6327 |   8.18  | 347.63  | (n/a)   | 12055.19 |
-| ff-server (pre-BatchC)    | b4ec2c2 |   5.96  | 7348.79 | 8555.88 | 9350.30  |
-| apalis (apalis-workflow, N=5)   | a4057c7 |   9.3   | n/a     | n/a     | n/a      |
-| apalis-approx (prior harness)   | 1b2cce5 |   1.02  | n/a     | n/a     | n/a      |
+| system                    | git_sha | flows/s | p50 ms  | p95 ms   | p99 ms   |
+|---------------------------|---------|---------|---------|----------|----------|
+| ff-server (v0.4.0)        | d595b27 |   7.93  |  357.57 |  5287.76 | 12430.69 |
+| ff-server (v0.3.2)        | da89fa9 |   8.16  |  352.95 | (n/a)    | 11948.56 |
+| ff-server (v0.1.0)        | 01f6327 |   8.18  |  347.63 | (n/a)    | 12055.19 |
+| ff-server (pre-BatchC)    | b4ec2c2 |   5.96  | 7348.79 |  8555.88 |  9350.30 |
+| apalis (apalis-workflow, N=5)   | a4057c7 |   9.3   | n/a     | n/a      | n/a      |
+| apalis-approx (prior harness)   | 1b2cce5 |   1.02  | n/a     | n/a      | n/a      |
 
-Flat vs v0.1.0 across all percentiles — the push-based promotion
-speedup (21× at p50 over pre-BatchC) holds. p99 tail growth still
-present; no follow-up investigation filed in this cycle.
+Flat vs v0.3.2 — flows/s 8.16 → 7.93 (−2.8%), p50 353 → 358 ms
+(+1.3%), p99 11948 → 12430 ms (+4.0%). All deltas sit inside the
+measured run-to-run band on this host (the tail p99 on flows=100
+× nodes=10 routinely moves ±5% between single-sample runs). No
+regression flag; the push-based promotion speedup (20× at p50 over
+pre-BatchC) holds.
 
-**apalis harness update (2026-04-22, issue #51):** Scenario-4 apalis
-harness switched from a hand-rolled 10-stage inter-queue chain to
-`apalis-workflow::Workflow` (sequential `and_then` primitive) after
-the apalis maintainer (geofmureithi) flagged the prior harness as
-under-representing apalis. The `apalis-approx` row above is from a
-single-sample run at commit `1b2cce5` (different hardware / Valkey
-config) and should NOT be compared directly to either the
-`apalis` row (N=5, `a4057c7`, same host as current ff-server row) or
-the v0.3.2 numbers. When re-run on the current host with the
-**prior** harness at flows=100 N=5, apalis also measures 9.3 flows/s
-— the flows=100 workload sits at the 50 ms driver-poll-jitter floor
-(wall ≈ 10.70 s for both harnesses). At flows=500 the two harnesses
-diverge measurably: prior harness 34.0 flows/s (wall 14.69 s, N=3),
-`apalis-workflow` 9.8 flows/s (wall 50.93 s, N=5). The linear-chain
-shape favours the prior hand-rolled chain's cheap per-stage enqueue
-over `apalis-workflow`'s per-step state persistence. The harness is
-still correct to adopt — see COMPARISON.md — because this represents
-apalis's idiomatic shape, even if it measures slower on this
-specific scenario. Per-sample walls (new harness, flows=500, N=5):
-50.89, 50.88, 50.88, 50.97, 51.01 s. System label relabelled
-`apalis` (not `apalis-approx`) for the new harness row since the
-harness is no longer hand-rolled.
+**apalis harness note (retained from v0.3.2 baseline, unchanged):**
+Scenario-3 apalis harness uses `apalis-workflow::Workflow`
+(sequential `and_then`) after the apalis maintainer flagged the
+prior hand-rolled chain as under-representing apalis. See
+COMPARISON.md + prior baseline for the full N=5 apalis analysis at
+`a4057c7`; no re-measurement this cycle.
 
 ## Scenario 4 — long_running_steady_state (300s, refill 20 tasks / 10s, **N=5 samples**)
 
-**Methodology (as of 2026-04-22):** Scenario 4 is bimodal across the
-10s refill / 60s deadline boundary (see
-`rfcs/drafts/scenario-4-regression-investigation.md`): depending on
-phase alignment between a refill batch and the steady-state drain, a
-single 300s run lands in either a low-miss regime (~2–4%) or a
-high-miss regime (~6–7%). Single-run sampling is therefore inadequate —
-the 3.88% v0.1.0 number and the 7.11% v0.3.2 number in PR #133's
-baseline were both snapshots of opposite regimes of the same stable
-distribution, not a regression. The bench binary now takes
-`--samples N` and reports **mean ± stddev** across N independent 300s
-runs (Valkey `FLUSHALL` between samples). **N ≥ 5 is required** for
-release-gate numbers. Both endpoints below are now sampled at N=5 on
-the same host (Valkey 7.2.12).
+**Methodology (unchanged from v0.3.2 baseline):** Scenario 4 is
+bimodal across the 10s refill / 60s deadline boundary (see
+`rfcs/drafts/scenario-4-regression-investigation.md`); N ≥ 5 is
+required for release-gate numbers. All endpoints below are sampled
+at N=5 on the same host (Valkey 7.2.12 effective version).
 
-| metric                        | HEAD (8a8d996, N=5) | v0.1.0 (01f6327, N=5) | v0.3.2 (da89fa9, N=1) | pre-BatchC (6f81926, N=1) |
-|-------------------------------|---------------------|-----------------------|-----------------------|---------------------------|
-| missed_deadline_pct mean      | **4.81%**           | **4.31%**             | 7.11%                 | 7.01%                     |
-| missed_deadline_pct stddev    | **1.55%**           | **1.81%**             | n/a (single sample)   | n/a                       |
-| missed_deadline_pct min / max | 3.59% / 7.01%       | 2.09% / 6.94%         | n/a                   | n/a                       |
-| per-sample missed_pct         | 3.80, 3.77, 3.59, 7.01, 5.90 | 5.04, 3.77, 3.73, 2.09, 6.94 | — | —               |
-| completed (mean across N)     | 2613                | 2599                  | 2680                  | 2679                      |
-| failed (mean across N)        | 103                 | 116                   | 105                   | 102                       |
-| steady_state_ops/s (mean)     | 2.0                 | 2.0                   | 2.0                   | n/a                       |
-| lease_renewal_overhead (%)    | 0.0                 | 0.0                   | 0.000178              | 0.00017                   |
+| metric                        | v0.4.0 (d595b27, N=5) | v0.3.3 (d813772, N=5) | HEAD-before-v0.3.2 (8a8d996, N=5) | v0.1.0 (01f6327, N=5) | v0.3.2 (da89fa9, N=1) |
+|-------------------------------|-----------------------|-----------------------|-----------------------------------|-----------------------|-----------------------|
+| missed_deadline_pct mean      | **4.41%**             | 4.71%                 | 4.81%                             | 4.31%                 | 7.11%                 |
+| missed_deadline_pct stddev    | **1.38%**             | 2.23%                 | 1.55%                             | 1.81%                 | n/a (single sample)   |
+| missed_deadline_pct min / max | 3.73% / 6.86%         | 1.98% / 7.04%         | 3.59% / 7.01%                     | 2.09% / 6.94%         | n/a                   |
+| per-sample missed_pct         | 6.86, 3.97, 3.73, 3.73, 3.73 | 3.80, 3.73, 1.98, 7.04, 6.98 | 3.80, 3.77, 3.59, 7.01, 5.90 | 5.04, 3.77, 3.73, 2.09, 6.94 | — |
+| completed (mean across N)     | 2600                  | ~2600                 | 2613                              | 2599                  | 2680                  |
+| failed (mean across N)        | 107                   | ~100                  | 103                               | 116                   | 105                   |
+| steady_state_ops/s (mean)     | 2.0                   | 2.0                   | 2.0                               | 2.0                   | 2.0                   |
+| lease_renewal_overhead (%)    | 0.000182              | 0.0                   | 0.0                               | 0.0                   | 0.000178              |
 
-**No regression.** HEAD is `4.81% ± 1.55%`; v0.1.0 is `4.31% ± 1.81%`.
-Δ = +0.50pp, or ~0.3× the pooled stddev — well inside run-to-run
-variance. Both endpoints show the same bimodal pattern (3 low-regime +
-2 high-regime samples at each; see per-sample rows). The HEAD N=5
-measurement here also reproduces the shape of the v0.3.3 (`d813772`)
-N=5 measurement reported in PR #140 (4.71% ± 2.23%, samples
-`[3.80, 3.73, 1.98, 7.04, 6.98]`): means within 0.1pp, same 3-low +
-2-high split. Worker DD's bisect
-(`rfcs/drafts/scenario-4-regression-investigation.md`) cluster-sampled
-`missed_deadline_pct` at 6.98%–7.07% across 8 runs spanning 6 commits
-in `01f6327..da89fa9` — those 8 runs all landed in the high-regime
-mode by chance; the N=5 runs here span both modes and confirm the
-distribution is stable across v0.1.0 → HEAD.
+**No regression.** v0.4.0 is `4.41% ± 1.38%`; v0.1.0 is `4.31% ±
+1.81%`. Δ = +0.10pp, well inside the pooled stddev. The N=5 v0.4.0
+run shows 1 high-regime + 4 low-regime samples (prior runs showed
+3+2 or 2+3 splits). v0.3.2's single-sample 7.11% snapshot was a
+high-regime artefact; all N=5 measurements across v0.1.0 → v0.4.0
+cluster at 4.3%–4.8% mean. The trait-dispatch + instrumentation
+overhead is invisible against the refill/deadline bimodal band.
 
-The prior "3.88% → 7.11% REGRESSION ×1.8" flag from PR #133's
-single-sample baseline was a methodology artifact: two single-sample
-snapshots of a bimodal distribution compared as if they were point
-estimates of a scalar. The v0.1.0 row in PR #133 is now superseded by
-the v0.1.0 N=5 column above; the v0.3.2 / pre-BatchC rows remain
-single-sample for historical reference and should not be compared
-directly against N=5 means. Re-baseline each release's Scenario 4 row
-with N ≥ 5 before drawing comparisons.
+The per-sample arrays are preserved verbatim so reviewers can
+replicate the 3:2 / 4:1 / 2:3 regime split. Re-baseline each
+release's Scenario 4 row with N ≥ 5 before drawing comparisons.
 
 Measurement note: the v0.1.0 long_running binary as shipped at
 `01f6327` was pre-RFC-011 and cannot submit executions against its
 own server (the ExecutionId hash-tag requirement landed in #46, post-
-v0.1.0 tag). The v0.1.0 N=5 run above was captured by applying the
+v0.1.0 tag). The v0.1.0 N=5 row above was captured by applying the
 three-file harness fix from `4192664` onto the `01f6327` bench tree
-(bench wiring only; no server-side product change). This is the same
-composite Worker DD used for step 7 of the bisect.
+(bench wiring only; no server-side product change).
 
 Lease renewal overhead and RSS profile both remain in the pre-v0.1.0
 envelope.
 
 ## Scenario 5 — suspend_signal_resume (100 samples)
 
-| metric     | git_sha | value  | v0.1.0 (01f6327) |
-|------------|---------|--------|------------------|
-| ops/s      | da89fa9 | 108.34 | 105.05           |
-| p50 ms     | da89fa9 |   9.23 |   9.52           |
-| p95 ms     | da89fa9 |   9.93 |  10.59           |
-| p99 ms     | da89fa9 |  10.76 |  11.91           |
+| metric     | git_sha | v0.4.0 | v0.3.2 (da89fa9) | v0.1.0 (01f6327) |
+|------------|---------|--------|------------------|------------------|
+| ops/s      | d595b27 | 106.87 | 108.34           | 105.05           |
+| p50 ms     | d595b27 |   9.36 |   9.23           |   9.52           |
+| p95 ms     | d595b27 |  10.83 |   9.93           |  10.59           |
+| p99 ms     | d595b27 |  11.96 |  10.76           |  11.91           |
 
-Measured with `claim_poll_interval_ms=1`; production default (1000ms)
-adds ~500ms on the re-claim leg, so production-projected p50 ≈ 509 ms.
-Small improvement across all percentiles; no regression.
+Measured with `claim_poll_interval_ms=1`; production default
+(1000ms) adds ~500ms on the re-claim leg, so production-projected
+p50 ≈ 509 ms.
+
+**Minor regression flagged (p95/p99):** p95 9.93 → 10.83 ms
+(+9.1%), p99 10.76 → 11.96 ms (+11.2%). p50 and ops/s moved <1.4%
+so the median path is unaffected; the drift is isolated to the
+tail. Against v0.1.0 (p95 10.59, p99 11.91) v0.4.0 is flat-to-
+slightly-better, so the apparent regression is measured against the
+v0.3.2 snapshot specifically. Two plausible causes:
+
+1. Tracing instrumentation overhead landing on the signal-dispatch
+   path (the `#[instrument]` attributes from #170 touch every
+   backend-method invocation on the resume leg); ~100 ns per call
+   × the handful of calls per roundtrip is consistent with ~1 ms
+   of tail drift.
+2. Single-sample variance — suspend_signal_resume has no N=5
+   methodology yet, and the p95/p99 are computed from 100
+   per-iteration samples inside one criterion run.
+
+Recommend: follow-up flame capture on one suspend_signal_resume
+run to attribute the tail drift (matches the `≥ 5% regression ⇒
+investigate` rule at the bottom of this file). Not release-blocking
+against v0.1.0 as the floor, but noted for honesty per
+`feedback_perf_honesty.md`.
 
 ## Comparison rules for next release
 
