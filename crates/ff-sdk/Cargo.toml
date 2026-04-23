@@ -51,6 +51,17 @@ valkey-default = [
     "ff-core/budget",
 ]
 
+# Client-local layer surface for `EngineBackend`
+# (rfcs/drafts/RFC-draft-tower-layer-surface.md). Each built-in layer
+# is opt-in; `default = []` for this surface so no hidden cost for
+# consumers that do not wrap their backend. Each feature pulls the
+# minimal deps its layer needs (no cross-feature implication). See
+# `crates/ff-sdk/src/layer/*.rs` for per-layer docs.
+layer-tracing = ["dep:async-trait"]
+layer-ratelimit = ["dep:async-trait", "dep:governor"]
+layer-metrics = ["dep:async-trait"]
+layer-circuit-breaker = ["dep:async-trait"]
+
 [dependencies]
 # RFC-012 feature-gate discipline (#164, completes #158): default-features
 # disabled so ff-sdk's `--no-default-features` build does NOT activate
@@ -79,3 +90,12 @@ thiserror = { workspace = true }
 # what every other HTTP consumer in this workspace uses (ff-test,
 # examples/media-pipeline, examples/coding-agent).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Optional layer-surface deps (RFC-draft-tower-layer-surface.md).
+# Feature-gated so consumers paying the `default = []` path for the
+# layer features see zero compile-cost.
+async-trait = { workspace = true, optional = true }
+governor = { version = "0.7", default-features = false, optional = true, features = ["std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
