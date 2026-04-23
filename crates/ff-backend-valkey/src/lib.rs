@@ -776,6 +776,7 @@ fn parse_success_only(raw: &ferriskey::Value) -> Result<(), EngineError> {
 /// (Lua's `ff_renew_lease` does not bump epoch, so the handle's value
 /// is still authoritative).
 #[tracing::instrument(
+    level = "debug",
     name = "ff.renew",
     skip_all,
     fields(
@@ -845,6 +846,7 @@ async fn renew_impl(
 /// Stage 1b — `progress` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::update_progress`. 1 KEY, 5 ARGV.
 #[tracing::instrument(
+    level = "debug",
     name = "ff.progress",
     skip_all,
     fields(
@@ -895,6 +897,7 @@ async fn progress_impl(
 /// `signal_id`s via `HMGET`, then pipelines per-signal
 /// `HGETALL signal_hash` + `GET signal_payload`.
 #[tracing::instrument(
+    level = "debug",
     name = "ff.observe_signals",
     skip_all,
     fields(
@@ -1090,6 +1093,7 @@ fn frame_kind_to_str(k: ff_core::backend::FrameKind) -> &'static str {
 /// for those constants is future work (RFC-012 §R7.5.6 shape
 /// commitment — not changing the wire under this refactor).
 #[tracing::instrument(
+    level = "debug",
     name = "ff.append_frame",
     skip_all,
     fields(
@@ -1499,6 +1503,7 @@ async fn wait_children_impl(
 /// Any other `ExecutionNotActive` combination surfaces the error
 /// so the caller learns what actually happened.
 #[tracing::instrument(
+    level = "debug",
     name = "ff.complete",
     skip_all,
     fields(
