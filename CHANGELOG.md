@@ -7,6 +7,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`ff_sdk::SharedFfBackend` factory (#174):** amortises a single
+  dialed `Arc<ValkeyBackend>` (and its completion-subscription
+  surface) across multiple logical `FlowFabricWorker` instances in
+  the same process. Direct answer to the apalis "shared connections"
+  hook tracked in #51 and cairn-fabric's multi-queue use case.
+  Usage: `let shared = SharedFfBackend::connect(cfg).await?;
+  let worker = shared.worker(worker_cfg).await?;` — every subsequent
+  `.worker(..)` clones the same `Arc` into
+  `FlowFabricWorker::connect_with` as both the `EngineBackend` and
+  `CompletionBackend` trait-object views. Scope today: the
+  `Arc<ValkeyBackend>` (and therefore the completion subscriber
+  allocation) is shared; the worker's embedded hot-path
+  `ferriskey::Client` is still redialed per worker until RFC-012
+  Stage 1d removes the embedded client. Gated behind `valkey-default`.
+  New concrete-typed `ValkeyBackend::connect_concrete` constructor on
+  `ff-backend-valkey` supports the factory (the pre-existing
+  `::connect` still returns `Arc<dyn EngineBackend>` unchanged).
 - **Observability wiring on `EngineBackend` trait methods (#154):** every
   non-stub `*_impl` in `ff-backend-valkey` now carries
   `#[tracing::instrument(name = "ff.<method>", skip_all, fields(backend,

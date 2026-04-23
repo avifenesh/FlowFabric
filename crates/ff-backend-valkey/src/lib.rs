@@ -118,7 +118,23 @@ impl ValkeyBackend {
     ///
     /// [`BackendRetry`]: ff_core::backend::BackendRetry
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
-        Self::connect_inner(config, None, "connect").await
+        Self::connect_inner(config, None, "connect").await.map(|arc| arc as Arc<dyn EngineBackend>)
+    }
+
+    /// Dial a Valkey node and return the backend as the concrete
+    /// `Arc<ValkeyBackend>` (rather than the erased
+    /// `Arc<dyn EngineBackend>` that [`Self::connect`] returns).
+    ///
+    /// Motivating caller: `ff_sdk::SharedFfBackend` (issue #174) —
+    /// the factory needs to hand the same `Arc` in as both an
+    /// [`EngineBackend`] and a
+    /// [`CompletionBackend`](ff_core::completion_backend::CompletionBackend)
+    /// trait-object view, which requires starting from the concrete
+    /// type (coercing `Arc<dyn EngineBackend>` to
+    /// `Arc<dyn CompletionBackend>` loses trait-object identity and
+    /// would force a second allocation).
+    pub async fn connect_concrete(config: BackendConfig) -> Result<Arc<Self>, EngineError> {
+        Self::connect_inner(config, None, "connect_concrete").await
     }
 
     /// Shared dial + partition-config-load body for [`Self::connect`]
@@ -129,7 +145,7 @@ impl ValkeyBackend {
         config: BackendConfig,
         metrics: Option<Arc<ff_observability::Metrics>>,
         op_label: &'static str,
-    ) -> Result<Arc<dyn EngineBackend>, EngineError> {
+    ) -> Result<Arc<Self>, EngineError> {
         // `BackendConnection` is `#[non_exhaustive]` for future
         // backends; the compiler treats the pattern as refutable,
         // hence `let ... else`. Today only `Valkey` exists; a
@@ -143,6 +159,9 @@ impl ValkeyBackend {
                 op: match op_label {
                     "connect_with_metrics" => {
                         "ValkeyBackend::connect_with_metrics (non-Valkey BackendConnection)"
+                    }
+                    "connect_concrete" => {
+                        "ValkeyBackend::connect_concrete (non-Valkey BackendConnection)"
                     }
                     _ => "ValkeyBackend::connect (non-Valkey BackendConnection)",
                 },
@@ -256,7 +275,9 @@ impl ValkeyBackend {
         config: BackendConfig,
         metrics: Arc<ff_observability::Metrics>,
     ) -> Result<Arc<dyn EngineBackend>, EngineError> {
-        Self::connect_inner(config, Some(metrics), "connect_with_metrics").await
+        Self::connect_inner(config, Some(metrics), "connect_with_metrics")
+            .await
+            .map(|arc| arc as Arc<dyn EngineBackend>)
     }
 
     /// Encode the minimum set of attempt-cookie fields into a

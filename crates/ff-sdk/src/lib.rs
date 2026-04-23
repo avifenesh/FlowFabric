@@ -75,6 +75,8 @@ pub mod admin;
 pub mod config;
 pub mod engine_error;
 #[cfg(feature = "valkey-default")]
+pub mod shared;
+#[cfg(feature = "valkey-default")]
 pub mod snapshot;
 #[cfg(feature = "valkey-default")]
 pub mod task;
@@ -107,6 +109,8 @@ pub use task::{
     SignalOutcome, StreamCursor, StreamFrames, SuspendOutcome, TimeoutBehavior,
     MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
 };
+#[cfg(feature = "valkey-default")]
+pub use shared::SharedFfBackend;
 #[cfg(feature = "valkey-default")]
 pub use worker::FlowFabricWorker;
 
