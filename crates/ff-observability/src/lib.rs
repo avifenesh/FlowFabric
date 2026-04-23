@@ -30,3 +30,13 @@ mod shim;
 pub use real::Metrics;
 #[cfg(not(feature = "enabled"))]
 pub use shim::Metrics;
+
+// Sentry error-reporting module. Gated behind the `sentry` feature,
+// orthogonal to `enabled` (OTEL metrics) — consumers can turn either
+// on without pulling the other. See [`sentry`] module docs for the
+// env-var contract and usage.
+#[cfg(feature = "sentry")]
+pub mod sentry;
+
+#[cfg(feature = "sentry")]
+pub use sentry::{init_sentry, tracing_layer as sentry_tracing_layer};
