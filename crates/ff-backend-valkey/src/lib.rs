@@ -117,6 +117,26 @@ impl ValkeyBackend {
     /// `.retry_strategy(..)` call).
     ///
     /// [`BackendRetry`]: ff_core::backend::BackendRetry
+    ///
+    /// # Capability erasure
+    ///
+    /// The return type is `Arc<dyn EngineBackend>`, which cannot be
+    /// re-upcast to `Arc<dyn ff_core::completion_backend::CompletionBackend>`
+    /// (Rust's trait-object model does not support cross-trait
+    /// upcasts). Consumers that want BOTH the write surface and the
+    /// completion-subscription surface from a single dial must either:
+    ///
+    /// 1. Build the client + `ValkeyConnection` directly and call
+    ///    [`Self::from_client_partitions_and_connection`], holding
+    ///    the concrete `Arc<ValkeyBackend>` and cloning it into each
+    ///    trait-object position; or
+    /// 2. Construct via ff-server's own wiring (which keeps the
+    ///    concrete `Arc<ValkeyBackend>` for both positions).
+    ///
+    /// [`ValkeyBackend::connect`] is the simplest entry point for
+    /// write-only consumers; completion subscribers need one of the
+    /// patterns above. See `docs/cairn-migration-v0.4.0.md` §5 +
+    /// §15.
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
         Self::connect_inner(config, None, "connect").await
     }
