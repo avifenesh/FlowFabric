@@ -55,6 +55,7 @@ use crate::backend::{
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
 use crate::contracts::{
+    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs, DeliverSignalResult,
     EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListSuspendedPage,
 };
@@ -75,7 +76,8 @@ use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 /// See RFC-012 §3.1 for the inventory rationale and §3.3 for the
 /// type-level shape. 16 methods (Round-7 added `create_waitpoint`;
 /// `append_frame` return widened; `report_usage` return replaced —
-/// RFC-012 §R7).
+/// RFC-012 §R7). Issue #150 added the two trigger-surface methods
+/// (`deliver_signal` / `claim_resumed_execution`).
 ///
 /// # Note on `complete` payload shape
 ///
@@ -429,6 +431,62 @@ pub trait EngineBackend: Send + Sync + 'static {
         cursor: Option<ExecutionId>,
         limit: usize,
     ) -> Result<ListExecutionsPage, EngineError>;
+
+    // ── Trigger ops (issue #150) ──
+
+    /// Deliver an external signal to a suspended execution's waitpoint.
+    ///
+    /// The backend atomically records the signal, evaluates the resume
+    /// condition, and — when satisfied — transitions the execution
+    /// from `suspended` to `runnable` (or buffers the signal when the
+    /// waitpoint is still `pending`). Duplicate delivery — same
+    /// `idempotency_key` + waitpoint — surfaces as
+    /// [`DeliverSignalResult::Duplicate`] with the pre-existing
+    /// `signal_id` rather than mutating state twice.
+    ///
+    /// Input validation (HMAC token presence, payload size limits,
+    /// signal-name shape) is the backend's responsibility; callers
+    /// pass a fully populated [`DeliverSignalArgs`] and receive typed
+    /// outcomes or typed errors (`ScriptError::invalid_token`,
+    /// `ScriptError::token_expired`, `ScriptError::ExecutionNotFound`
+    /// surfaced via [`EngineError::Transport`] on the Valkey backend).
+    ///
+    /// Gated on the `core` feature — signal delivery is part of the
+    /// minimal trigger surface every backend must honour so ff-server
+    /// / REST handlers can dispatch against `Arc<dyn EngineBackend>`
+    /// without knowing which backend is running underneath.
+    #[cfg(feature = "core")]
+    async fn deliver_signal(
+        &self,
+        args: DeliverSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError>;
+
+    /// Claim a resumed execution — a previously-suspended attempt that
+    /// has cleared its resume condition (e.g. via
+    /// [`Self::deliver_signal`]) and now needs a worker to pick up the
+    /// same attempt index.
+    ///
+    /// Distinct from [`Self::claim`] (fresh work) and
+    /// [`Self::claim_from_reclaim`] (grant-based ownership transfer
+    /// after a crash): the resumed-claim path re-binds an existing
+    /// attempt rather than minting a new one. The backend issues a
+    /// fresh `lease_id` + bumps the `lease_epoch`, preserving
+    /// `attempt_id` / `attempt_index` so stream frames and progress
+    /// updates continue on the same attempt.
+    ///
+    /// Typed failures surface via `ScriptError` → `EngineError`:
+    /// `NotAResumedExecution` when the attempt state is not
+    /// `attempt_interrupted`, `ExecutionNotLeaseable` when the
+    /// lifecycle phase is not `runnable`, and `InvalidClaimGrant`
+    /// when the grant key is missing or was already consumed.
+    ///
+    /// Gated on the `core` feature — resumed-claim is part of the
+    /// minimal trigger surface every backend must honour.
+    #[cfg(feature = "core")]
+    async fn claim_resumed_execution(
+        &self,
+        args: ClaimResumedExecutionArgs,
+    ) -> Result<ClaimResumedExecutionResult, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait
