@@ -458,6 +458,61 @@ async fn cancel_flow_fcall(
         .map_err(EngineError::from)
 }
 
+/// RFC-016 Stage A: set the inbound-edge-group policy for a downstream
+/// execution. Stage A rejects any variant other than `AllOf`; Stage B's
+/// resolver extension lifts the restriction.
+async fn set_edge_group_policy_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    flow_id: &FlowId,
+    downstream_eid: &ExecutionId,
+    policy: ff_core::contracts::EdgeDependencyPolicy,
+) -> Result<ff_core::contracts::SetEdgeGroupPolicyResult, EngineError> {
+    use ff_core::contracts::EdgeDependencyPolicy;
+    use ff_script::functions::flow::{
+        ff_set_edge_group_policy, SetEdgeGroupPolicyKeys,
+    };
+
+    // Stage A validation: only AllOf is wired end-to-end. AnyOf /
+    // Quorum carry Stage B/C semantics that the resolver does not yet
+    // honour; fail closed with a typed error so callers cannot observe
+    // a Stage B shape served by Stage A logic.
+    match &policy {
+        EdgeDependencyPolicy::AllOf => {}
+        EdgeDependencyPolicy::AnyOf { .. } | EdgeDependencyPolicy::Quorum { .. } => {
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: "stage A supports AllOf only; AnyOf/Quorum land in stage B"
+                    .to_string(),
+            });
+        }
+        // Forward-compat: any future variant must be reviewed here
+        // before it can reach Lua. Fail closed with a typed error.
+        _ => {
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: "unknown EdgeDependencyPolicy variant".to_string(),
+            });
+        }
+    }
+
+    let partition = flow_partition(flow_id, partition_config);
+    let fctx = FlowKeyContext::new(&partition, flow_id);
+    let keys = SetEdgeGroupPolicyKeys {
+        fctx: &fctx,
+        downstream_eid,
+    };
+    let args = ff_core::contracts::SetEdgeGroupPolicyArgs {
+        flow_id: flow_id.clone(),
+        downstream_execution_id: downstream_eid.clone(),
+        policy,
+        now: now_ms_timestamp(),
+    };
+    ff_set_edge_group_policy(client, &keys, &args)
+        .await
+        .map_err(EngineError::from)
+}
+
 /// Pipeline two `HGETALL`s (exec_core + tags) on the execution's
 /// partition and decode via [`build_execution_snapshot`]. `Ok(None)`
 /// when exec_core is absent. Decode failures surface as
@@ -770,7 +825,157 @@ async fn describe_flow_impl(
     if raw.is_empty() {
         return Ok(None);
     }
-    build_flow_snapshot(id.clone(), &raw).map(Some)
+
+    // RFC-016 Stage A: collect inbound-edge-group snapshots from the
+    // per-downstream edgegroup hashes. Enumerate flow members, then for
+    // each member that has an `in:<eid>` adjacency SET, read its
+    // edgegroup hash. When the hash is absent (pre-Stage-A flow), fall
+    // back to the legacy `deps_meta.unsatisfied_required_count` counter
+    // on the member's exec partition (co-located under `{fp:N}`).
+    let edge_groups = read_edge_groups(client, &ctx, &partition, id).await?;
+    build_flow_snapshot(id.clone(), &raw, edge_groups).map(Some)
+}
+
+/// Stage A edge-group reader. Walks the flow's `members` SET, skips
+/// members without inbound edges, and decodes either the edgegroup
+/// hash (new) or the `deps_meta` fallback (existing flows). AllOf is
+/// the only variant Stage A emits.
+async fn read_edge_groups(
+    client: &ferriskey::Client,
+    fctx: &FlowKeyContext,
+    partition: &ff_core::partition::Partition,
+    _flow_id: &FlowId,
+) -> Result<Vec<ff_core::contracts::EdgeGroupSnapshot>, EngineError> {
+    use ff_core::contracts::{
+        EdgeDependencyPolicy, EdgeGroupSnapshot, EdgeGroupState,
+    };
+
+    // Read flow members. A flow with no members has no edge groups.
+    let members: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(fctx.members())
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut groups: Vec<EdgeGroupSnapshot> = Vec::new();
+    for member_str in members {
+        let member_eid = match ExecutionId::parse(&member_str) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Skip members with no inbound edges (no group exists).
+        let in_count: u64 = client
+            .cmd("SCARD")
+            .arg(fctx.incoming(&member_eid))
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        if in_count == 0 {
+            continue;
+        }
+
+        // Prefer the edgegroup hash when present.
+        let group_raw: HashMap<String, String> = client
+            .cmd("HGETALL")
+            .arg(fctx.edgegroup(&member_eid))
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+
+        if !group_raw.is_empty() {
+            let policy_str = group_raw
+                .get("policy_variant")
+                .map(String::as_str)
+                .unwrap_or("all_of");
+            let n: u32 = group_raw
+                .get("n")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(in_count as u32);
+            let succeeded: u32 = group_raw
+                .get("succeeded")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let failed: u32 = group_raw
+                .get("failed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let skipped: u32 = group_raw
+                .get("skipped")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let group_state = EdgeGroupState::from_literal(
+                group_raw
+                    .get("group_state")
+                    .map(String::as_str)
+                    .unwrap_or("pending"),
+            );
+            let running = n.saturating_sub(succeeded + failed + skipped);
+            let policy = match policy_str {
+                "all_of" => EdgeDependencyPolicy::AllOf,
+                // Stage A never writes any_of / quorum, but surface
+                // them as-is if a future engine did.
+                _ => EdgeDependencyPolicy::AllOf,
+            };
+            groups.push(EdgeGroupSnapshot::new(
+                member_eid.clone(),
+                policy,
+                n,
+                succeeded,
+                failed,
+                skipped,
+                running,
+                group_state,
+            ));
+            continue;
+        }
+
+        // Backward-compat shim: read `deps_meta` on the member's exec
+        // partition (co-located under `{fp:N}` post-RFC-011). AllOf is
+        // the only meaningful policy for existing flows.
+        let member_exec_ctx = ff_core::keys::ExecKeyContext::new(partition, &member_eid);
+        let deps_meta_raw: HashMap<String, String> = client
+            .cmd("HGETALL")
+            .arg(member_exec_ctx.deps_meta())
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let n = in_count as u32;
+        let unsatisfied: u32 = deps_meta_raw
+            .get("unsatisfied_required_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let impossible: u32 = deps_meta_raw
+            .get("impossible_required_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // `succeeded` derives as (n - unsatisfied - impossible) from
+        // the legacy counters — accurate for the AllOf case.
+        let succeeded = n.saturating_sub(unsatisfied + impossible);
+        let group_state = if impossible > 0 {
+            EdgeGroupState::Impossible
+        } else if unsatisfied == 0 {
+            EdgeGroupState::Satisfied
+        } else {
+            EdgeGroupState::Pending
+        };
+        groups.push(EdgeGroupSnapshot::new(
+            member_eid,
+            EdgeDependencyPolicy::AllOf,
+            n,
+            succeeded,
+            impossible, // lump impossibles into failed_count
+            0,
+            unsatisfied,
+            group_state,
+        ));
+    }
+
+    Ok(groups)
 }
 
 /// Page the `flow_index` SET for a partition, ordered by `flow_id`
@@ -889,7 +1094,10 @@ async fn list_flows_impl(
                 ),
             });
         }
-        let snap = build_flow_snapshot(fid.clone(), &raw)?;
+        // list_flows returns the lightweight summary — edge groups
+        // are not surfaced here; pass an empty vec to save the extra
+        // per-member HGETALL pipeline rounds.
+        let snap = build_flow_snapshot(fid.clone(), &raw, Vec::new())?;
         flows.push(FlowSummary::new(
             snap.flow_id,
             snap.created_at,
@@ -2902,6 +3110,36 @@ impl EngineBackend for ValkeyBackend {
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "cancel_flow: FCALL ff_cancel_flow")
             })
+    }
+
+    async fn set_edge_group_policy(
+        &self,
+        flow_id: &FlowId,
+        downstream_execution_id: &ExecutionId,
+        policy: ff_core::contracts::EdgeDependencyPolicy,
+    ) -> Result<ff_core::contracts::SetEdgeGroupPolicyResult, EngineError> {
+        let policy_label = policy.variant_str();
+        let result = set_edge_group_policy_impl(
+            &self.client,
+            &self.partition_config,
+            flow_id,
+            downstream_execution_id,
+            policy,
+        )
+        .await
+        .map_err(|e| {
+            ff_core::engine_error::backend_context(
+                e,
+                "set_edge_group_policy: FCALL ff_set_edge_group_policy",
+            )
+        })?;
+        if let Some(m) = &self.metrics {
+            // `policy_label` is one of the static &'static str literals
+            // returned by `EdgeDependencyPolicy::variant_str`. Safe to
+            // pass to `inc_edge_group_policy` which expects &'static str.
+            m.inc_edge_group_policy(policy_label);
+        }
+        Ok(result)
     }
 
     async fn deliver_signal(

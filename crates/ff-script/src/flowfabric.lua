@@ -906,7 +906,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '17'
+  return '18'
 end)
 
 
@@ -6668,13 +6668,68 @@ redis.register_function('ff_stage_dependency_edge', function(keys, args)
 end)
 
 ---------------------------------------------------------------------------
+-- RFC-016 #set_edge_group_policy  (on {fp:N})
+--
+-- Declare the inbound-edge-group policy for a downstream execution.
+-- Stage A honours only `all_of`; `any_of`/`quorum` land in Stage B.
+-- Must be called BEFORE the first `add_dependency` for this downstream.
+--
+-- KEYS (2): flow_core, edgegroup
+-- ARGV (3): policy_variant, on_satisfied, now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_set_edge_group_policy', function(keys, args)
+  local flow_core = keys[1]
+  local edgegroup = keys[2]
+  local policy_variant = args[1]
+  local on_satisfied = args[2] or ""
+  local now_ms = args[3]
+
+  if redis.call("EXISTS", flow_core) == 0 then
+    return err("flow_not_found")
+  end
+
+  -- Stage A: only `all_of` is honoured. `any_of`/`quorum` are rejected
+  -- with a typed validation error until Stage B's resolver lands. The
+  -- Rust side (set_edge_group_policy_impl) short-circuits before
+  -- invoking Lua, so this is a defense-in-depth gate.
+  if policy_variant ~= "all_of" then
+    return err("invalid_input",
+      "stage A supports AllOf only; AnyOf/Quorum land in stage B")
+  end
+
+  -- Ordering: reject if edges have already been staged for this
+  -- downstream (the group hash is populated either by this call or by
+  -- ff_apply_dependency_to_child's first-edge write).
+  local existing_n = tonumber(redis.call("HGET", edgegroup, "n") or "0")
+  if existing_n > 0 then
+    return err("invalid_input",
+      "edge_group_policy_already_fixed: dependencies already staged")
+  end
+
+  local existing_variant = redis.call("HGET", edgegroup, "policy_variant")
+  if existing_variant == policy_variant then
+    return ok("already_set")
+  end
+
+  redis.call("HSET", edgegroup,
+    "policy_variant", policy_variant,
+    "on_satisfied", on_satisfied,
+    "n", "0",
+    "succeeded", "0",
+    "group_state", "pending",
+    "created_at", now_ms)
+
+  return ok("set")
+end)
+
+---------------------------------------------------------------------------
 -- #22  ff_apply_dependency_to_child  (on {p:N})
 --
 -- Create dep record on child execution partition, increment unsatisfied
 -- count. If child is runnable: set blocked_by_dependencies.
 --
--- KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
---           eligible_zset, blocked_deps_zset, deps_all_edges
+-- KEYS (8): exec_core, deps_meta, unresolved_set, dep_hash,
+--           eligible_zset, blocked_deps_zset, deps_all_edges, edgegroup
 -- ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
 --           dependency_kind, data_passing_ref, now_ms
 ---------------------------------------------------------------------------
@@ -6687,6 +6742,7 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
     eligible_zset    = keys[5],
     blocked_deps_zset = keys[6],
     deps_all_edges   = keys[7],
+    edgegroup        = keys[8],
   }
 
   local A = {
@@ -6737,6 +6793,24 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
     "last_flow_graph_revision", A.graph_revision,
     "last_dependency_update_at", A.now_ms)
 
+  -- RFC-016 Stage A: dual-write the inbound edge-group hash. Default
+  -- policy is `all_of` when no explicit policy has been set (the
+  -- expected Stage A case for all existing flows). The edgegroup hash
+  -- becomes the source of truth for the AllOf counters in snapshots;
+  -- existing flows without a hash fall back to deps_meta on read.
+  if is_set(K.edgegroup) then
+    local existing_policy = redis.call("HGET", K.edgegroup, "policy_variant")
+    if not existing_policy then
+      redis.call("HSET", K.edgegroup,
+        "policy_variant", "all_of",
+        "n", "1",
+        "succeeded", "0",
+        "group_state", "pending")
+    else
+      redis.call("HINCRBY", K.edgegroup, "n", 1)
+    end
+  end
+
   -- 6. If runnable: block by dependencies (ALL 7 dims)
   if core.lifecycle_phase == "runnable" and core.terminal_outcome == "none" then
     redis.call("HSET", K.core_key,
@@ -6770,10 +6844,10 @@ end)
 -- eligible. Upstream + downstream are guaranteed co-located on the
 -- same {fp:N} slot by flow membership (RFC-011 §7.3).
 --
--- KEYS (11): exec_core, deps_meta, unresolved_set, dep_hash,
+-- KEYS (12): exec_core, deps_meta, unresolved_set, dep_hash,
 --            eligible_zset, terminal_zset, blocked_deps_zset,
 --            attempt_hash, stream_meta, downstream_payload,
---            upstream_result
+--            upstream_result, edgegroup
 -- ARGV (3): edge_id, upstream_outcome, now_ms
 ---------------------------------------------------------------------------
 redis.register_function('ff_resolve_dependency', function(keys, args)
@@ -6789,6 +6863,7 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     stream_meta       = keys[9],
     downstream_payload = keys[10],
     upstream_result    = keys[11],
+    edgegroup          = keys[12],
   }
 
   local A = {
@@ -6815,6 +6890,18 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
     local remaining = redis.call("HINCRBY", K.deps_meta,
       "unsatisfied_required_count", -1)
     redis.call("HSET", K.deps_meta, "last_dependency_update_at", A.now_ms)
+
+    -- RFC-016 Stage A: dual-write the edgegroup hash counters. The
+    -- eligibility decision below still keys off `remaining == 0` so
+    -- Stage A is behaviour-identical for existing flows; the
+    -- edgegroup hash provides the snapshot source of truth going
+    -- forward and is the foundation the Stage B resolver extends.
+    if is_set(K.edgegroup) and redis.call("EXISTS", K.edgegroup) == 1 then
+      redis.call("HINCRBY", K.edgegroup, "succeeded", 1)
+      if remaining == 0 then
+        redis.call("HSET", K.edgegroup, "group_state", "satisfied")
+      end
+    end
 
     -- Check if all deps now satisfied
     local raw = redis.call("HGETALL", K.core_key)
@@ -6891,6 +6978,16 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
   redis.call("HINCRBY", K.deps_meta, "unsatisfied_required_count", -1)
   redis.call("HINCRBY", K.deps_meta, "impossible_required_count", 1)
   redis.call("HSET", K.deps_meta, "last_dependency_update_at", A.now_ms)
+
+  -- RFC-016 Stage A: dual-write the edgegroup hash. AllOf short-
+  -- circuits to impossible on the first non-success terminal
+  -- (Invariant Q4). Failed/skipped bucket is lumped here as
+  -- `failed_count` for Stage A — Stage B will split them per the
+  -- four-counter model (§3).
+  if is_set(K.edgegroup) and redis.call("EXISTS", K.edgegroup) == 1 then
+    redis.call("HINCRBY", K.edgegroup, "failed", 1)
+    redis.call("HSET", K.edgegroup, "group_state", "impossible")
+  end
 
   local raw = redis.call("HGETALL", K.core_key)
   if #raw == 0 then return ok("impossible", "") end
