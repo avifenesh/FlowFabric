@@ -69,7 +69,7 @@ layer-circuit-breaker = ["dep:async-trait"]
 # future tranches will add trait methods + types requiring the Valkey
 # backend). The `valkey-default` feature re-enables them below for the
 # default build.
-ff-core = { version = "0.4.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core"] }
 ff-script = { workspace = true }
 # RFC-012 Stage 1b — ff-sdk's `ClaimedTask` forwards 9 of 12 ops
 # through the `EngineBackend` trait. The legacy

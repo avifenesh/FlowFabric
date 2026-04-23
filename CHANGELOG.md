@@ -5,6 +5,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-23
+
 ### Added
 
 - **`ff_attempt_outcome_total` counter metric** (`ff-observability` +
