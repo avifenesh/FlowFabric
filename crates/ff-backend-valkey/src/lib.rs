@@ -461,9 +461,11 @@ async fn cancel_flow_fcall(
         .map_err(EngineError::from)
 }
 
-/// RFC-016 Stage A: set the inbound-edge-group policy for a downstream
-/// execution. Stage A rejects any variant other than `AllOf`; Stage B's
-/// resolver extension lifts the restriction.
+/// RFC-016 Stage B: set the inbound-edge-group policy for a downstream
+/// execution. Stage B lifts the Stage-A restriction — `AnyOf` and
+/// `Quorum` are accepted and flow into the Lua resolver's four-counter
+/// state machine. Only invalid shapes (`k == 0`, absurdly large `k`)
+/// and unknown `#[non_exhaustive]` variants are rejected here.
 async fn set_edge_group_policy_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -476,18 +478,28 @@ async fn set_edge_group_policy_impl(
         ff_set_edge_group_policy, SetEdgeGroupPolicyKeys,
     };
 
-    // Stage A validation: only AllOf is wired end-to-end. AnyOf /
-    // Quorum carry Stage B/C semantics that the resolver does not yet
-    // honour; fail closed with a typed error so callers cannot observe
-    // a Stage B shape served by Stage A logic.
+    // Stage B validation. `k <= n` is enforced at resolve time (§8.4):
+    // with dynamic expansion, `n` may grow after this call, so only
+    // absolute invariants on `k` are checked here.
     match &policy {
         EdgeDependencyPolicy::AllOf => {}
-        EdgeDependencyPolicy::AnyOf { .. } | EdgeDependencyPolicy::Quorum { .. } => {
-            return Err(EngineError::Validation {
-                kind: ff_core::engine_error::ValidationKind::InvalidInput,
-                detail: "stage A supports AllOf only; AnyOf/Quorum land in stage B"
-                    .to_string(),
-            });
+        EdgeDependencyPolicy::AnyOf { .. } => {}
+        EdgeDependencyPolicy::Quorum { k, .. } => {
+            if *k == 0 {
+                return Err(EngineError::Validation {
+                    kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                    detail: "quorum k must be >= 1".to_string(),
+                });
+            }
+            // Guard against wraparound / pathological inputs. `usize::MAX
+            // / 2` is the RFC-cited cap; on 64-bit this comfortably
+            // exceeds any realistic fanout.
+            if (*k as u64) > (u32::MAX / 2) as u64 {
+                return Err(EngineError::Validation {
+                    kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                    detail: "quorum k exceeds supported maximum".to_string(),
+                });
+            }
         }
         // Forward-compat: any future variant must be reviewed here
         // before it can reach Lua. Fail closed with a typed error.
@@ -918,10 +930,33 @@ async fn read_edge_groups(
                     .unwrap_or("pending"),
             );
             let running = n.saturating_sub(succeeded + failed + skipped);
+            // RFC-016 Stage B: decode the on_satisfied / k side fields.
+            let on_sat_str = group_raw
+                .get("on_satisfied")
+                .map(String::as_str)
+                .unwrap_or("");
+            let on_satisfied = match on_sat_str {
+                "let_run" => ff_core::contracts::OnSatisfied::LetRun,
+                _ => ff_core::contracts::OnSatisfied::CancelRemaining,
+            };
             let policy = match policy_str {
                 "all_of" => EdgeDependencyPolicy::AllOf,
-                // Stage A never writes any_of / quorum, but surface
-                // them as-is if a future engine did.
+                "any_of" => EdgeDependencyPolicy::AnyOf {
+                    on_satisfied: on_satisfied.clone(),
+                },
+                "quorum" => {
+                    let k: u32 = group_raw
+                        .get("k")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1);
+                    EdgeDependencyPolicy::Quorum {
+                        k,
+                        on_satisfied: on_satisfied.clone(),
+                    }
+                }
+                // Unknown variant — forward-compat (§6.4). Surface as
+                // AllOf so operator tooling renders something rather
+                // than crashing; engines refuse the resolve path.
                 _ => EdgeDependencyPolicy::AllOf,
             };
             groups.push(EdgeGroupSnapshot::new(

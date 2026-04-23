@@ -439,9 +439,13 @@ impl FromFcallResult for StageDependencyEdgeResult {
     }
 }
 
-// ─── ff_set_edge_group_policy (RFC-016 Stage A) ─────────────────────────
+// ─── ff_set_edge_group_policy (RFC-016 Stage B) ─────────────────────────
 // KEYS (2): flow_core, edgegroup
-// ARGV (3): policy_variant, on_satisfied, now_ms
+// ARGV (4): policy_variant, on_satisfied, k, now_ms
+//
+// Stage B widens the ARGV: `k` (quorum threshold, "0" for AllOf/AnyOf)
+// joins the stored fields so the resolver can evaluate Quorum without a
+// separate Lua round-trip.
 
 pub struct SetEdgeGroupPolicyKeys<'a> {
     pub fctx: &'a FlowKeyContext,
@@ -462,11 +466,11 @@ ff_function! {
                 | ff_core::contracts::EdgeDependencyPolicy::Quorum { on_satisfied, .. } => {
                     on_satisfied.variant_str().to_string()
                 }
-                // `EdgeDependencyPolicy` is `#[non_exhaustive]`; future
-                // variants must be handled at the call-site level
-                // before reaching Lua. Stage A rejects non-AllOf at
-                // the backend boundary (set_edge_group_policy_impl).
                 _ => String::new(),
+            },
+            match &args.policy {
+                ff_core::contracts::EdgeDependencyPolicy::Quorum { k, .. } => k.to_string(),
+                _ => "0".to_string(),
             },
             args.now.to_string(),
         }
