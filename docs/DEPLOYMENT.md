@@ -137,6 +137,21 @@ they drive timeouts, promotions, reconciliation, and retention.
 | `FF_API_TOKEN`    | Random 32+ byte secret, base64.        | Without it, every route except `GET /healthz` is unauthenticated.           |
 | `FF_CORS_ORIGINS` | Comma-separated allowlist, or `*`      | Default is permissive (`*`). Tighten before exposing the API to browsers.   |
 
+### Optional: Sentry error reporting
+
+Enable the `sentry` feature on `ff-server` (or a consumer binary that
+depends on `ff-observability`) to ship `tracing::error!` events and
+panics to a Sentry project. All configuration is via `FF_SENTRY_*` env
+vars; leaving `FF_SENTRY_DSN` unset is a graceful no-op (no network, no
+background thread). See `ff-observability::sentry` rustdoc for the full
+contract.
+
+| Variable                | Default                  | Purpose                                                          |
+| ----------------------- | ------------------------ | ---------------------------------------------------------------- |
+| `FF_SENTRY_DSN`         | unset (disables)         | Sentry project DSN. Required to activate.                        |
+| `FF_SENTRY_ENVIRONMENT` | `production`             | Sentry `environment` tag (`staging`, `dev`, …).                  |
+| `FF_SENTRY_RELEASE`     | crate `CARGO_PKG_VERSION`| Sentry `release` tag — wire in a git SHA or build ID here.       |
+
 The complete list of variables (all the scanner intervals, partition
 counts, etc.) is in the rustdoc for
 [`ServerConfig::from_env`](../crates/ff-server/src/config.rs) and mirrored

@@ -22,6 +22,13 @@ enabled = [
     "dep:opentelemetry-prometheus",
     "dep:prometheus",
 ]
+# OFF by default. When ON, exposes `init_sentry()` which installs a
+# Sentry client + `sentry-tracing` layer when `FF_SENTRY_DSN` is set.
+# When OFF, neither sentry nor sentry-tracing appears in the dep tree.
+# Enabled transitively through `ff-server/sentry`. Orthogonal to
+# `enabled` (OTEL metrics) — the two features do not depend on each
+# other.
+sentry = ["dep:sentry", "dep:sentry-tracing", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 # Exact-patch pins. Plan §3 locked OTEL 0.27.x, but `opentelemetry-
@@ -41,3 +48,15 @@ opentelemetry = { version = "=0.31.0", default-features = false, features = ["me
 opentelemetry_sdk = { version = "=0.31.0", default-features = false, features = ["metrics"], optional = true }
 opentelemetry-prometheus = { version = "=0.31.0", optional = true }
 prometheus = { version = "=0.14.0", default-features = false, optional = true }
+
+# Sentry error reporting. Gated behind the `sentry` feature (orthogonal
+# to `enabled`). Caret-ranged on the current stable minor — the sentry
+# Rust SDK follows semver on the 0.x line and we want security patches
+# without a manual bump. Re-pin deliberately if a breaking minor lands.
+sentry = { version = "0.47", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"], optional = true }
+sentry-tracing = { version = "0.47", optional = true }
+# Only pulled when `sentry` is on — the layer returned from
+# `sentry_tracing_layer()` is generic over a `tracing::Subscriber`
+# registry, so the trait bounds need both crates in scope.
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"], optional = true }
