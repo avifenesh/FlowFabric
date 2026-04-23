@@ -152,7 +152,7 @@ Per downstream inbound edge group:
 
 **Invariant Q2.** `succeeded + failed + skipped <= n` at all times. The Lua resolver MUST reject counter increments that would exceed this (dedup key: `edge_id`; each edge resolves exactly once).
 
-**Invariant Q3.** Short-circuit impossibility fires as soon as `failed + skipped > n - k` regardless of how many upstreams are still running. Rationale: running the last sibling is wasted work; short-circuit matches the "cost-conscious" intent of the default. Under `OnSatisfied::CancelRemaining`, the short-circuit ALSO issues sibling cancels (same cancel machinery as §4, but reason is `sibling_quorum_impossible`). Under `OnSatisfied::LetRun`, the short-circuit skips the downstream but leaves siblings running — consistent with LetRun's "don't rescind" semantics.
+**Invariant Q3.** Short-circuit impossibility fires as soon as `failed + skipped > n - k` regardless of how many upstreams are still running. Rationale: running the last sibling is wasted work; short-circuit matches the "cost-conscious" intent of the default. Under `OnSatisfied::CancelRemaining`, the short-circuit ALSO issues sibling cancels (same cancel machinery as §4, but reason is `sibling_quorum_impossible`). Under `OnSatisfied::LetRun`, the short-circuit skips the downstream but leaves siblings running — `LetRun` is pure: siblings are NEVER cancelled under `LetRun`, regardless of whether the terminal `group_state` is `satisfied` or `impossible` (see §5 for the full statement and §12 adjudication).
 
 **Invariant Q4.** `AllOf` short-circuits to impossible on the **first** non-success terminal (today's behavior). No change for backward-compat.
 
@@ -201,11 +201,28 @@ The dispatcher issues one Lua call per partition: `ff_cancel_executions_batch(id
 
 **Dispatcher-side coalescing (resolves M.D6).** The ff-engine cancel dispatcher SHOULD coalesce `cancel_siblings_by_partition` entries across groups within a bounded window (implementation guidance: ~10ms, tunable) so that N concurrent satisfied groups targeting the same partition result in O(partitions-touched) Lua calls, not O(groups × partitions-per-group). This is a dispatcher concern, not a Lua surface change. The Stage C benchmark (§11) MUST exercise both the single-group-fan-out case (N = 32/128/512/1024 siblings on one group) AND the concurrent-groups case (≥500 groups satisfying within a ~100ms window).
 
+### §4.2. Pre-release benchmark gate (high-fanout sibling-cancel)
+
+**Adjudicated 2026-04-23.** RFC-016 does NOT ship with a hard `n` cap on `Quorum(k, n)`. Instead, v0.6 (the release carrying Stage C to production) is gated on an empirical benchmark of the high-fanout sibling-cancel path.
+
+**Shape to measure.** `Quorum(1, n) + CancelRemaining`, i.e., a single success among `n` siblings triggers `n - 1` sibling cancels. This is the worst-case cross-partition dispatch shape.
+
+**Points.** `n ∈ {10, 100, 1000}`.
+
+**Quantities.**
+- p50 / p95 / p99 of end-to-end `cancel_siblings_pending` dispatch latency (from `satisfied_at` timestamp to last sibling acked via `ff_ack_sibling_cancel`).
+- Valkey CPU utilization during the dispatch burst (per-shard, sampled at 1 Hz).
+- `ff_cancel_executions_batch` per-partition Lua latency p99.
+
+**Ship SLO (author's call, revisable if data warrants).** At `n = 100` under `Quorum(1, 100) + CancelRemaining`, p99 end-to-end dispatch latency MUST stay within **500 ms**. Valkey CPU during the burst MUST stay below **80%** on the hottest shard. The `n = 10` and `n = 1000` points are characterization-only (no pass/fail threshold in v0.6), informing whether a future hard cap or additional batching optimization is warranted.
+
+**Gate disposition.** Measured in Stage C alongside the existing `ff_cancel_executions_batch` benchmark (§11 Stage C gate). If the SLO fails at `n = 100`: v0.6 ships with a documented operator guidance cap (not an engine-enforced cap) AND the dispatcher coalescing / batch-size tuning is revisited. Engine-enforced hard caps remain deferred absent evidence; the project-wide stance is "benchmark first, cap only on evidence."
+
 ### §5. `LetRun` semantics
 
 Under `OnSatisfied::LetRun`, when `group_state` flips to `satisfied`, no cancels are issued. Still-running siblings continue to terminal. Their terminal outcomes update the counters for observability (§3 step 1) but, because of Invariant Q1, never retrigger downstream eligibility — the downstream fires exactly once.
 
-**`LetRun` under `impossible`.** When `group_state` flips to `impossible` (Q3 short-circuit) under `LetRun`, the downstream is marked `skipped` and skip-propagation runs as today (§3 step 5), but still-running siblings are NOT cancelled — consistent with `LetRun`'s one-shot, no-rescind contract. Late sibling terminals continue to update counters for observability. `LetRun` is symmetric across both terminal `group_state` branches: no cancels, ever.
+**`LetRun` under `impossible`.** When `group_state` flips to `impossible` (Q3 short-circuit) under `LetRun`, the downstream is marked `skipped` and skip-propagation runs as today (§3 step 5), but still-running siblings are NOT cancelled — consistent with `LetRun`'s one-shot, no-rescind contract. Late sibling terminals continue to update counters for observability. `LetRun` is symmetric across both terminal `group_state` branches: **no sibling cancels, ever, regardless of whether the group terminates via `satisfied` or `impossible`.** Siblings may still be doing useful work (observability, audit trails, idempotent side effects) even when the downstream is definitively skipped; the user chose `LetRun` knowing that. Adjudicated 2026-04-23, see §12.
 
 **Why one-shot, not re-evaluate.** A re-evaluating model would mean a downstream could fire, complete, and then be "re-fired" when a late sibling terminal pushes `succeeded` higher. That is meaningless in the flow DAG (a completed execution cannot become "more eligible"); and for observability it conflates "satisfied" with "still gathering data." One-shot matches the intuition: the downstream decision was made at `satisfied_at`; anything after is telemetry.
 
@@ -347,9 +364,9 @@ If the engine crashes between "resolver decides satisfied" and "downstream eligi
 
 ### §9. Open questions
 
-1. **`AnyOf { on_satisfied }` with `LetRun`: is this a real use case, or only `AnyOf { CancelRemaining }`?** Racy-mirror use cases want cancel. Human approval with `k=1` is unusual ("any reviewer approves, skip the rest") but plausible. Leaning: keep `LetRun` on `AnyOf` for symmetry; revisit if no consumer hits it within 6 months.
-2. **Should `sibling_quorum_impossible` also count as a cancel under `LetRun`?** Today §3 says no — `LetRun` means "don't cancel, ever." But if the group is impossible, siblings will only produce waste. Counter-argument: the user picked `LetRun` knowing some siblings are "for the record." Lean: keep LetRun semantics pure — never cancel under LetRun, even on impossible. Revisit with consumer input.
-3. **Cross-partition cost of `ff_edge_group_sibling_cancel_total` at high fanout.** For `quorum(1 of 1000)` (hypothetical stress shape), the first success triggers 999 cross-partition cancels. Mitigation is specified in §4.1 (partition-batched `ff_cancel_executions_batch`). The Stage C gate benchmark (§11) measures per-partition latency at N = 32/128/512/1024 as a ship-blocking requirement. A hard `n` cap is still deferred until that benchmark data exists; the advisory soft cap (128) is an observability hook, not an enforcement point.
+1. **`AnyOf { on_satisfied }` with `LetRun`: is this a real use case, or only `AnyOf { CancelRemaining }`?** **Adjudicated 2026-04-23 — keep for symmetry.** All `(AnyOf | Quorum) × (CancelRemaining | LetRun)` combinations are retained. Even if the `AnyOf { LetRun }` use case is niche, API regularity (one enum arm) outweighs trimming. See §12.
+2. **Should `sibling_quorum_impossible` also count as a cancel under `LetRun`?** **Adjudicated 2026-04-23 — no, `LetRun` stays pure.** `LetRun` means "never cancel siblings for this edge," period. When the group becomes impossible under `LetRun`, the downstream still skips (short-circuit skip logic) but siblings complete on their own terms. Rationale in §5 and §12.
+3. **Cross-partition cost of `ff_edge_group_sibling_cancel_total` at high fanout.** **Adjudicated 2026-04-23 — benchmark-gated, no hard cap until evidence.** No arbitrary `n` cap on `Quorum(k, n)`. The Stage C pre-release benchmark gate (§4.2) measures `cancel_siblings_pending` dispatch latency + Valkey CPU at `n ∈ {10, 100, 1000}` under `Quorum(1, n) + CancelRemaining`; v0.6 ships gated on the p99 SLO documented there. The advisory soft cap (128) remains an observability hook, not enforcement.
 
 ### §10. Alternatives rejected
 
@@ -410,7 +427,7 @@ Staged, each stage independently shippable:
    - Introduce `ff_reconcile_pending_sibling_cancels` periodic reconciler (engine boot + ~30s interval) that iterates the per-partition `ff:pending_cancel_groups:{p:N}` index SET — never full-scans — and re-issues drained-but-unacked batches (§8.5 item 2).
    - Flow-failure-policy integration: `sibling_quorum_satisfied` / `sibling_quorum_impossible` marked as benign (Invariant Q5).
    - Metrics: `ff_edge_group_sibling_cancel_total`, `ff_edge_group_sibling_cancel_soft_cap_exceeded_total`.
-   - **Gate (benchmark required before ship):** per-partition `ff_cancel_executions_batch` latency measured at N = 32, 128, 512, 1024 (§4.1) AND the concurrent-groups case (≥500 groups satisfying within a ~100ms window) to validate dispatcher-side coalescing; stage blocks until documented and under agreed threshold.
+   - **Gate (benchmark required before ship):** per-partition `ff_cancel_executions_batch` latency measured at N = 32, 128, 512, 1024 (§4.1) AND the concurrent-groups case (≥500 groups satisfying within a ~100ms window) to validate dispatcher-side coalescing; AND the §4.2 high-fanout benchmark (`Quorum(1, n) + CancelRemaining` at `n ∈ {10, 100, 1000}`, SLO at `n = 100`); stage blocks until documented and under agreed thresholds.
    - Gate: integration test — LLM-consensus-shaped flow (5 siblings, quorum 3, verify that on 3rd success the remaining 2 receive cancel and terminate with `cancel_reason = sibling_quorum_satisfied`).
    - Gate: crash-replay integration test — kill ff-engine mid-cancel-dispatch, restart, verify reconciler drains `cancel_siblings_pending` and Invariant Q6 holds.
 
@@ -425,6 +442,16 @@ Staged, each stage independently shippable:
    - Docs + examples.
 
 Each stage lands behind a feature flag (`edge_dependency_policy_v1`) on the engine until Stage E. The flag default flips to on after Stage E CI green + smoke clean.
+
+### §12. Adjudications applied
+
+Owner adjudications closed on 2026-04-23 against the post-Round-3-ACCEPT draft:
+
+1. **Keep `AnyOf { LetRun }` variant for API symmetry.** All four `(AnyOf | Quorum) × (CancelRemaining | LetRun)` combinations are retained. Even if `AnyOf { LetRun }` is niche ("any reviewer approves, let the rest keep typing"), the regularity of the API — one enum arm per combination — outweighs pruning. No §2/§5 language is changed; §9 Q1 is closed here.
+
+2. **`LetRun` is pure: no sibling cancels, ever.** When `Quorum(k)` becomes impossible AND the edge policy is `LetRun`, still-running siblings are NOT cancelled. The downstream still skips via the existing short-circuit skip logic (§3 Q3, §5), but siblings complete on their own terms. Rationale: siblings may still be doing useful work (observability, audit, idempotent side effects); the user chose `LetRun` knowing that. §3 / §5 / §10.4 already reflect this; §9 Q2 is closed here.
+
+3. **High-fanout sibling-cancel cost: benchmark-gated, no hard cap.** v0.6 does NOT ship with an arbitrary `n` cap on `Quorum(k, n)`. Instead, §4.2 specifies the pre-release benchmark (`Quorum(1, n) + CancelRemaining` at `n ∈ {10, 100, 1000}`) with a p99 ≤ 500 ms SLO at `n = 100` as the ship gate. The 128 soft cap (§4.1) remains an observability hook, not an enforcement point. Engine-enforced caps are deferred to post-v0.6 data. §9 Q3 is closed here (benchmark-deferred).
 
 ## References
 
