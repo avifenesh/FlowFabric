@@ -12,26 +12,23 @@ and `rfcs/drafts/0.4.0-release-readiness-audit.md`.*
 
 ## Highlights
 
-0.4.0 is the first release carrying the full **RFC-012 Round-7
-`EngineBackend` trait surface**. `append_frame`, `create_waitpoint`,
-and `report_usage` are now real trait methods with backend-parametric
-return types — no more `Unavailable` stubs, no more SDK-internal
-direct-FCALL shortcuts around the trait. Consumers building alternate
-backends (Postgres, in-memory test doubles) now have a coherent
-16-method contract to implement against.
+0.4.0 carries the full **RFC-012 Round-7 `EngineBackend` trait
+surface**. `append_frame`, `create_waitpoint`, and `report_usage`
+are real trait methods with backend-parametric return types — no
+more `Unavailable` stubs, no SDK-internal direct-FCALL shortcuts.
+Alternate backends (Postgres, test doubles) now have a coherent
+16-method contract.
 
-Two surfaces that previously leaked ferriskey implementation details
-are sealed: **`ferriskey::Error` no longer appears in `SdkError` /
-`ServerError`** (a new `ff_core::BackendError` taxonomy replaces it),
-and **`WorkerConfig` splits its Valkey-specific fields into a nested
-`BackendConfig`** that can carry timeouts, retry policy, and
-connection handles uniformly. On the DX side, snapshot decoders now
-return `EngineError::Validation{Corruption}` for on-disk-corruption
-cases, `BackendTimeouts.request` and `BackendRetry` are actually
-wired through to ferriskey's `ClientBuilder` (both were silently
-dropped on the floor before), and four additive re-exports +
-`ScannerFilter::with_namespace` ergonomics round out cairn's
-migration path.
+Two ferriskey leaks are sealed: **`ferriskey::Error` no longer
+appears in `SdkError` / `ServerError`** (replaced by
+`ff_core::BackendError`), and **`WorkerConfig` splits its
+Valkey-specific fields into a nested `BackendConfig`** carrying
+timeouts, retry policy, and connection handles uniformly. Snapshot
+decoders now return `EngineError::Validation{Corruption}` on
+on-disk corruption, `BackendTimeouts.request` + `BackendRetry` are
+actually wired through to `ClientBuilder` (both were silently
+dropped before), and additive re-exports +
+`ScannerFilter::with_namespace` ergonomics round out cairn's path.
 
 ## Breaking changes
 
@@ -199,7 +196,5 @@ split, the `Frame` extension, and the snapshot-decoder
 See [`CHANGELOG.md`](../CHANGELOG.md) — the `[Unreleased]` section
 becomes 0.4.0 at tag time.
 
-### For the curious — merged PRs in this release
-
-#88 (via #151), #136, #137, #139, #140, #144, #145, #146, #147,
-#148, #149, #151, #152, #153, #155, #156, #157. T4 (#158) pending.
+Merged PRs in this release: #88 (via #151), #136, #137, #139,
+#140, #144, #145, #146, #147, #148, #149, #151-#157. T4 (#158) pending.
