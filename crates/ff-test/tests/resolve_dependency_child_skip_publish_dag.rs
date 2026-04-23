@@ -183,6 +183,22 @@ async fn seed_and_resolve_impossible(
     let att = AttemptIndex::new(0);
     let upstream_placeholder = tc.new_execution_id_on_partition(partition.index);
     let upstream_ctx = ExecKeyContext::new(&partition, &upstream_placeholder);
+    // RFC-016 Stage A added KEYS[12] (edgegroup). When the child is
+    // flow-bound we synthesize the authentic key; standalones get a
+    // well-formed sentinel on the same {fp:N} slot so Lua's is_set +
+    // EXISTS guard skips the write.
+    let edgegroup_key = match fid {
+        Some(f) => format!(
+            "ff:flow:{}:{}:edgegroup:{}",
+            partition.hash_tag(),
+            f,
+            downstream
+        ),
+        None => format!(
+            "ff:flow:{}:_nil_:edgegroup:_nil_",
+            partition.hash_tag()
+        ),
+    };
     let keys: Vec<String> = vec![
         ctx.core(),
         ctx.deps_meta(),
@@ -195,6 +211,7 @@ async fn seed_and_resolve_impossible(
         ctx.stream_meta(att),
         ctx.payload(),
         upstream_ctx.result(),
+        edgegroup_key,
     ];
     let args: Vec<String> = vec![
         edge_id_str,

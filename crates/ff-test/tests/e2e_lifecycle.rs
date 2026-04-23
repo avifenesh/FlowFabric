@@ -3655,11 +3655,21 @@ async fn fcall_apply_dependency_with_data_passing(
     let idx = IndexKeys::new(&p);
     let lane_id = LaneId::new(LANE);
     let eid_p = ff_core::types::EdgeId::parse(edge_id).unwrap();
+    // RFC-016 Stage A added KEYS[8] (edgegroup). Build the real key
+    // on the same {fp:N} slot as the downstream's exec partition
+    // (flow/exec partitions co-locate post-RFC-011).
+    let edgegroup = format!(
+        "ff:flow:{}:{}:edgegroup:{}",
+        p.hash_tag(),
+        flow_id,
+        downstream
+    );
     let keys: Vec<String> = vec![
         ctx.core(), ctx.deps_meta(), ctx.deps_unresolved(),
         ctx.dep_edge(&eid_p), idx.lane_eligible(&lane_id),
         idx.lane_blocked_dependencies(&lane_id),
         ctx.deps_all_edges(),
+        edgegroup,
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![
@@ -3687,12 +3697,29 @@ async fn fcall_resolve_dependency(
     let lane_id = LaneId::new(LANE);
     let eid_p = ff_core::types::EdgeId::parse(edge_id).unwrap();
     let att = AttemptIndex::new(0);
+    // RFC-016 Stage A added KEYS[12] (edgegroup). Read the downstream's
+    // flow_id off exec_core so the helper stays generic across tests
+    // that construct flow ids with different string shapes.
+    let fid_opt: Option<String> = tc.client().cmd("HGET")
+        .arg(ctx.core().as_str())
+        .arg("flow_id")
+        .execute().await.unwrap_or_default();
+    let edgegroup = match fid_opt.as_deref() {
+        Some(f) if !f.is_empty() => format!(
+            "ff:flow:{}:{}:edgegroup:{}",
+            p.hash_tag(), f, downstream
+        ),
+        _ => format!(
+            "ff:flow:{}:_nil_:edgegroup:_nil_", p.hash_tag()
+        ),
+    };
     let keys: Vec<String> = vec![
         ctx.core(), ctx.deps_meta(), ctx.deps_unresolved(),
         ctx.dep_edge(&eid_p), idx.lane_eligible(&lane_id),
         idx.lane_terminal(&lane_id), idx.lane_blocked_dependencies(&lane_id),
         ctx.attempt_hash(att), ctx.stream_meta(att),
         ctx.payload(), upstream_ctx.result(),
+        edgegroup,
     ];
     let now = TimestampMs::now();
     let args: Vec<String> = vec![

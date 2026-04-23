@@ -1997,6 +1997,21 @@ pub struct FlowSnapshot {
     /// Consumer-owned namespaced metadata (e.g. `cairn.task_id`). See
     /// the struct-level docs for the routing rule.
     pub tags: BTreeMap<String, String>,
+    /// RFC-016 Stage A: inbound edge groups known on this flow.
+    ///
+    /// One entry per downstream execution that has at least one staged
+    /// inbound dependency edge. Populated from the
+    /// `ff:flow:{fp:N}:<flow_id>:edgegroup:<downstream_eid>` hash —
+    /// when that hash is absent (existing flows created before Stage A),
+    /// the backend falls back to reading the legacy
+    /// `deps_meta.unsatisfied_required_count` counter on the
+    /// downstream's exec partition and reports the group as
+    /// [`EdgeDependencyPolicy::AllOf`] with the derived counters
+    /// (backward-compat shim — see RFC-016 §11 Stage A).
+    ///
+    /// Every entry in Stage A reports `policy = AllOf`; Stage B/C/D/E
+    /// extend the variants and wire the quorum counters.
+    pub edge_groups: Vec<EdgeGroupSnapshot>,
 }
 
 impl FlowSnapshot {
@@ -2018,6 +2033,7 @@ impl FlowSnapshot {
         cancel_reason: Option<String>,
         cancellation_policy: Option<String>,
         tags: BTreeMap<String, String>,
+        edge_groups: Vec<EdgeGroupSnapshot>,
     ) -> Self {
         Self {
             flow_id,
@@ -2033,6 +2049,7 @@ impl FlowSnapshot {
             cancel_reason,
             cancellation_policy,
             tags,
+            edge_groups,
         }
     }
 }
@@ -2160,6 +2177,206 @@ impl EdgeSnapshot {
             created_by,
         }
     }
+}
+
+// ─── RFC-016 edge-group policy (Stage A) ───
+
+/// Policy controlling how an inbound edge group's satisfaction is
+/// decided.
+///
+/// Stage A honours only [`EdgeDependencyPolicy::AllOf`] — the two
+/// quorum variants exist so the wire/snapshot surface is stable for
+/// Stage B/C/D's resolver extensions, but
+/// [`crate::engine_backend::EngineBackend::set_edge_group_policy`]
+/// rejects them with [`crate::engine_error::EngineError::Validation`]
+/// until Stage B lands.
+///
+/// `#[non_exhaustive]` — future stages may add variants (e.g.
+/// `Threshold` — see RFC-016 §10.3) without a semver break. Construct
+/// via the [`EdgeDependencyPolicy::all_of`], [`EdgeDependencyPolicy::any_of`],
+/// and [`EdgeDependencyPolicy::quorum`] helpers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EdgeDependencyPolicy {
+    /// Today's behavior: every edge in the inbound group must be
+    /// satisfied (RFC-007 `all_required` + `success_only`).
+    AllOf,
+    /// k-of-n where k==1 — satisfied on the first upstream success.
+    /// Stage A: rejected on
+    /// [`crate::engine_backend::EngineBackend::set_edge_group_policy`];
+    /// resolver emits nothing for this variant yet.
+    AnyOf {
+        #[serde(rename = "on_satisfied")]
+        on_satisfied: OnSatisfied,
+    },
+    /// k-of-n quorum. Stage A: rejected on
+    /// [`crate::engine_backend::EngineBackend::set_edge_group_policy`].
+    Quorum {
+        k: u32,
+        #[serde(rename = "on_satisfied")]
+        on_satisfied: OnSatisfied,
+    },
+}
+
+impl EdgeDependencyPolicy {
+    /// Construct the default all-of policy (RFC-007 behavior).
+    pub fn all_of() -> Self {
+        Self::AllOf
+    }
+
+    /// Construct an any-of policy — reserved for Stage B.
+    pub fn any_of(on_satisfied: OnSatisfied) -> Self {
+        Self::AnyOf { on_satisfied }
+    }
+
+    /// Construct a quorum policy — reserved for Stage B.
+    pub fn quorum(k: u32, on_satisfied: OnSatisfied) -> Self {
+        Self::Quorum { k, on_satisfied }
+    }
+
+    /// Stable string label used for wire format + metric labels.
+    /// `all_of` | `any_of` | `quorum`.
+    pub fn variant_str(&self) -> &'static str {
+        match self {
+            Self::AllOf => "all_of",
+            Self::AnyOf { .. } => "any_of",
+            Self::Quorum { .. } => "quorum",
+        }
+    }
+}
+
+/// Policy for unfinished sibling upstreams once the quorum is met.
+///
+/// `#[non_exhaustive]` — RFC-016 §10.5 rejects a third variant today
+/// but keeps the door open. Construct via [`OnSatisfied::cancel_remaining`]
+/// / [`OnSatisfied::let_run`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum OnSatisfied {
+    /// Default. Cancel any still-running siblings once quorum met.
+    CancelRemaining,
+    /// Let stragglers finish; their terminals update counters for
+    /// observability only (one-shot downstream).
+    LetRun,
+}
+
+impl OnSatisfied {
+    /// Construct the default `cancel_remaining` disposition.
+    pub fn cancel_remaining() -> Self {
+        Self::CancelRemaining
+    }
+
+    /// Construct the `let_run` disposition.
+    pub fn let_run() -> Self {
+        Self::LetRun
+    }
+
+    /// Stable string label for wire format.
+    pub fn variant_str(&self) -> &'static str {
+        match self {
+            Self::CancelRemaining => "cancel_remaining",
+            Self::LetRun => "let_run",
+        }
+    }
+}
+
+/// Edge-group lifecycle state (Stage A exposes only `pending` +
+/// `satisfied` + `impossible`; `cancelled` reserved for Stage C).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeGroupState {
+    Pending,
+    Satisfied,
+    Impossible,
+    Cancelled,
+}
+
+impl EdgeGroupState {
+    pub fn from_literal(s: &str) -> Self {
+        match s {
+            "satisfied" => Self::Satisfied,
+            "impossible" => Self::Impossible,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Pending,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Satisfied => "satisfied",
+            Self::Impossible => "impossible",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Snapshot of one inbound edge group (per downstream execution).
+///
+/// Exposed via [`FlowSnapshot::edge_groups`]. Stage A only populates
+/// `AllOf` groups and their counters; Stage B/C add `failed` /
+/// `skipped` / `satisfied_at` wiring for the quorum variants.
+///
+/// `#[non_exhaustive]` — future stages will add fields (`satisfied_at`,
+/// `failed_count` write-path, `cancel_siblings_pending`). Match with
+/// `..` or use [`EdgeGroupSnapshot::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EdgeGroupSnapshot {
+    pub downstream_execution_id: ExecutionId,
+    pub policy: EdgeDependencyPolicy,
+    pub total_deps: u32,
+    pub satisfied_count: u32,
+    pub failed_count: u32,
+    pub skipped_count: u32,
+    pub running_count: u32,
+    pub group_state: EdgeGroupState,
+}
+
+impl EdgeGroupSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        downstream_execution_id: ExecutionId,
+        policy: EdgeDependencyPolicy,
+        total_deps: u32,
+        satisfied_count: u32,
+        failed_count: u32,
+        skipped_count: u32,
+        running_count: u32,
+        group_state: EdgeGroupState,
+    ) -> Self {
+        Self {
+            downstream_execution_id,
+            policy,
+            total_deps,
+            satisfied_count,
+            failed_count,
+            skipped_count,
+            running_count,
+            group_state,
+        }
+    }
+}
+
+// ─── set_edge_group_policy (RFC-016 §6.1) ───
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetEdgeGroupPolicyArgs {
+    pub flow_id: FlowId,
+    pub downstream_execution_id: ExecutionId,
+    pub policy: EdgeDependencyPolicy,
+    pub now: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetEdgeGroupPolicyResult {
+    /// Policy stored (fresh write).
+    Set,
+    /// Policy already stored with an identical value (idempotent).
+    AlreadySet,
 }
 
 // ─── list_flows (issue #185) ───

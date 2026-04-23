@@ -246,6 +246,18 @@ impl EngineBackend for PassthroughBackend {
         Err(EngineError::Unavailable { op: "cancel_flow" })
     }
 
+    async fn set_edge_group_policy(
+        &self,
+        _flow_id: &FlowId,
+        _downstream_execution_id: &ff_core::types::ExecutionId,
+        _policy: ff_core::contracts::EdgeDependencyPolicy,
+    ) -> Result<ff_core::contracts::SetEdgeGroupPolicyResult, EngineError> {
+        self.record("set_edge_group_policy")?;
+        Err(EngineError::Unavailable {
+            op: "set_edge_group_policy",
+        })
+    }
+
     async fn list_flows(
         &self,
         _partition: ff_core::partition::PartitionKey,

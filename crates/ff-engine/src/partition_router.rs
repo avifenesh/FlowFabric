@@ -299,7 +299,8 @@ async fn dispatch_dependency_resolution_inner(
         let upstream_ctx = ExecKeyContext::new(&child_partition, eid);
         let upstream_result = upstream_ctx.result();
 
-        let keys: [&str; 11] = [
+        let edgegroup = flow_ctx.edgegroup(&downstream_eid);
+        let keys: [&str; 12] = [
             &child_core_key,       // 1
             &deps_meta,            // 2
             &unresolved,           // 3
@@ -311,6 +312,7 @@ async fn dispatch_dependency_resolution_inner(
             &stream_meta,          // 9
             &downstream_payload,   // 10
             &upstream_result,      // 11
+            &edgegroup,            // 12 (RFC-016 Stage A)
         ];
         let argv: [&str; 3] = [edge_id, upstream_outcome, &now_ms];
 

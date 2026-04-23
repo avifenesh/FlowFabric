@@ -341,6 +341,21 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
         )
     }
 
+    async fn set_edge_group_policy(
+        &self,
+        flow_id: &FlowId,
+        downstream_execution_id: &ff_core::types::ExecutionId,
+        policy: ff_core::contracts::EdgeDependencyPolicy,
+    ) -> Result<ff_core::contracts::SetEdgeGroupPolicyResult, EngineError> {
+        with_hooks!(
+            self,
+            "set_edge_group_policy",
+            self.inner
+                .set_edge_group_policy(flow_id, downstream_execution_id, policy)
+                .await
+        )
+    }
+
     async fn report_usage(
         &self,
         handle: &Handle,

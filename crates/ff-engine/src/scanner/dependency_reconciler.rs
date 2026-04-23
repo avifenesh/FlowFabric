@@ -225,13 +225,35 @@ async fn reconcile_one_execution(
         // [1] exec_core, [2] deps_meta, [3] unresolved_set, [4] dep_hash,
         // [5] eligible_zset, [6] terminal_zset, [7] blocked_deps_zset,
         // [8] attempt_hash, [9] stream_meta, [10] downstream_payload,
-        // [11] upstream_result
-        // [10]/[11] added for Batch C item 3. Upstream + downstream are
-        // co-located on the same {fp:N} slot via flow membership;
-        // build both keys with the same partition tag.
+        // [11] upstream_result, [12] edgegroup (RFC-016 Stage A)
+        // [10]/[11] added for Batch C item 3. [12] added for RFC-016
+        // Stage A: the per-downstream edgegroup hash lives under the
+        // flow partition, which is the same `{fp:N}` slot via RFC-011
+        // flow-affinity co-location.
         let downstream_payload = format!("ff:exec:{}:{}:payload", tag, eid_str);
         let upstream_result = format!("ff:exec:{}:{}:result", tag, upstream_id);
-        let keys: [&str; 11] = [
+        // Read the downstream's flow_id so we can construct the
+        // edgegroup key. Absent / empty flow_id (standalones) means
+        // there is no edge group; the key is harmless — Lua's
+        // `is_set`+`EXISTS` guards skip edgegroup writes.
+        let flow_id_str: Option<String> = client
+            .cmd("HGET")
+            .arg(&exec_core)
+            .arg("flow_id")
+            .execute()
+            .await
+            .unwrap_or_default();
+        let edgegroup_key = match flow_id_str.as_deref() {
+            Some(fid) if !fid.is_empty() => {
+                format!("ff:flow:{}:{}:edgegroup:{}", tag, fid, eid_str)
+            }
+            // Standalone execution — no dep edges possible, but we
+            // still need a cluster-slot-valid KEYS[12]. Use a
+            // well-formed sentinel key on the same {fp:N} tag; Lua's
+            // EXISTS guard skips the write.
+            _ => format!("ff:flow:{}:_nil_:edgegroup:_nil_", tag),
+        };
+        let keys: [&str; 12] = [
             &exec_core,           // 1
             &deps_meta,           // 2
             &deps_unresolved_key, // 3
@@ -243,6 +265,7 @@ async fn reconcile_one_execution(
             &stream_meta,         // 9
             &downstream_payload,  // 10
             &upstream_result,     // 11
+            &edgegroup_key,       // 12
         ];
         let now_s = now_ms.to_string();
         let argv: [&str; 3] = [edge_id.as_str(), resolution, &now_s];

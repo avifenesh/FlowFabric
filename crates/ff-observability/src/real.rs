@@ -65,6 +65,10 @@ mod name {
     pub const WORKER_AT_CAPACITY: &str = "ff_worker_at_capacity";
     pub const BUDGET_HIT: &str = "ff_budget_hit";
     pub const QUOTA_HIT: &str = "ff_quota_hit";
+    /// RFC-016 Stage A: gauge-style counter of edge-group policy
+    /// applications, labelled `policy`. Stage A emits only
+    /// `policy="all_of"`; Stage B adds `any_of` / `quorum`.
+    pub const EDGE_GROUP_POLICY: &str = "ff_edge_group_policy";
 }
 
 struct Inner {
@@ -90,6 +94,7 @@ struct Inner {
     worker_at_capacity: Counter<u64>,
     budget_hit: Counter<u64>,
     quota_hit: Counter<u64>,
+    edge_group_policy: Counter<u64>,
 }
 
 #[derive(Clone)]
@@ -159,6 +164,13 @@ impl Metrics {
             .u64_counter(name::QUOTA_HIT)
             .with_description("Quota admission block count, labelled by reason.")
             .build();
+        let edge_group_policy = meter
+            .u64_counter(name::EDGE_GROUP_POLICY)
+            .with_description(
+                "RFC-016 edge-group policy applications, labelled by `policy`. \
+                 Stage A emits only `policy=\"all_of\"`.",
+            )
+            .build();
 
         // Cancel backlog depth — gauge backed by an AtomicU64 so set()
         // from any thread is lock-free. OTEL observable-gauge callback
@@ -188,6 +200,7 @@ impl Metrics {
             worker_at_capacity,
             budget_hit,
             quota_hit,
+            edge_group_policy,
         }))
     }
 
@@ -278,6 +291,16 @@ impl Metrics {
     }
     pub fn inc_quota_hit(&self, reason: &'static str) {
         self.0.quota_hit.add(1, &[KeyValue::new("reason", reason)]);
+    }
+
+    // ── RFC-016 Stage A: edge-group policy ──
+
+    /// Increment `ff_edge_group_policy_total{policy}`. Stage A call
+    /// sites emit `policy="all_of"`; Stage B adds the other variants.
+    pub fn inc_edge_group_policy(&self, policy: &'static str) {
+        self.0
+            .edge_group_policy
+            .add(1, &[KeyValue::new("policy", policy)]);
     }
 }
 

@@ -504,6 +504,7 @@ pub const FLOW_CORE_KNOWN_FIELDS: &[&str] = &[
 pub fn build_flow_snapshot(
     flow_id: FlowId,
     raw: &HashMap<String, String>,
+    edge_groups: Vec<crate::contracts::EdgeGroupSnapshot>,
 ) -> Result<FlowSnapshot, EngineError> {
     let ctx = "describe_flow: flow_core";
 
@@ -612,6 +613,7 @@ pub fn build_flow_snapshot(
         cancel_reason,
         cancellation_policy,
         tags,
+        edge_groups,
     ))
 }
 
@@ -954,7 +956,7 @@ mod tests {
     #[test]
     fn open_flow_round_trips() {
         let f = fid();
-        let snap = build_flow_snapshot(f.clone(), &minimal_flow_core(&f, "open")).unwrap();
+        let snap = build_flow_snapshot(f.clone(), &minimal_flow_core(&f, "open"), Vec::new()).unwrap();
         assert_eq!(snap.flow_id, f);
         assert_eq!(snap.flow_kind, "dag");
         assert_eq!(snap.namespace.as_str(), "ns");
@@ -977,7 +979,7 @@ mod tests {
         core.insert("cancelled_at".to_owned(), "2000".to_owned());
         core.insert("cancel_reason".to_owned(), "operator".to_owned());
         core.insert("cancellation_policy".to_owned(), "cancel_all".to_owned());
-        let snap = build_flow_snapshot(f, &core).unwrap();
+        let snap = build_flow_snapshot(f, &core, Vec::new()).unwrap();
         assert_eq!(snap.public_flow_state, "cancelled");
         assert_eq!(snap.cancelled_at.unwrap().0, 2000);
         assert_eq!(snap.cancel_reason.as_deref(), Some("operator"));
@@ -991,7 +993,7 @@ mod tests {
         core.insert("cairn.task_id".to_owned(), "t-1".to_owned());
         core.insert("cairn.project".to_owned(), "proj".to_owned());
         core.insert("operator.label".to_owned(), "v".to_owned());
-        let snap = build_flow_snapshot(f, &core).unwrap();
+        let snap = build_flow_snapshot(f, &core, Vec::new()).unwrap();
         assert_eq!(snap.tags.len(), 3);
         let keys: Vec<_> = snap.tags.keys().cloned().collect();
         assert_eq!(
@@ -1009,7 +1011,7 @@ mod tests {
         let f = fid();
         let mut core = minimal_flow_core(&f, "open");
         core.insert("bogus_future_field".to_owned(), "v".to_owned());
-        let err = build_flow_snapshot(f, &core).unwrap_err();
+        let err = build_flow_snapshot(f, &core, Vec::new()).unwrap_err();
         expect_corruption_field(err, |d| d.contains("bogus_future_field"));
     }
 
@@ -1029,7 +1031,7 @@ mod tests {
             let f = fid();
             let mut core = minimal_flow_core(&f, "open");
             core.remove(want);
-            let err = build_flow_snapshot(f, &core).err().unwrap_or_else(|| {
+            let err = build_flow_snapshot(f, &core, Vec::new()).err().unwrap_or_else(|| {
                 panic!("field {want} should fail but build_flow_snapshot returned Ok")
             });
             expect_corruption_field(err, |d| d.contains(want));
@@ -1042,7 +1044,7 @@ mod tests {
             let f = fid();
             let mut core = minimal_flow_core(&f, "open");
             core.insert(want.to_owned(), String::new());
-            let err = build_flow_snapshot(f, &core).err().unwrap_or_else(|| {
+            let err = build_flow_snapshot(f, &core, Vec::new()).err().unwrap_or_else(|| {
                 panic!("empty {want} should fail but build_flow_snapshot returned Ok")
             });
             expect_corruption_field(err, |d| d.contains(want));
@@ -1054,7 +1056,7 @@ mod tests {
         let requested = fid();
         let other = fid();
         let core = minimal_flow_core(&other, "open");
-        let err = build_flow_snapshot(requested, &core).unwrap_err();
+        let err = build_flow_snapshot(requested, &core, Vec::new()).unwrap_err();
         expect_corruption_field(err, |d| d.contains("flow_id") && d.contains("does not match"));
     }
 
@@ -1063,7 +1065,7 @@ mod tests {
         let f = fid();
         let mut core = minimal_flow_core(&f, "open");
         core.insert("graph_revision".to_owned(), "not-a-number".to_owned());
-        let err = build_flow_snapshot(f, &core).unwrap_err();
+        let err = build_flow_snapshot(f, &core, Vec::new()).unwrap_err();
         expect_corruption_field(err, |d| d.contains("graph_revision"));
     }
 
