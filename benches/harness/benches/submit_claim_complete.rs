@@ -181,16 +181,24 @@ async fn drive_worker(
 ) -> anyhow::Result<Vec<u64>> {
     use std::sync::atomic::Ordering;
 
-    let mut config = WorkerConfig::new(
-        &env.valkey_host,
-        env.valkey_port,
-        format!("bench-worker-{wi}"),
-        format!("bench-worker-{wi}-{}", uuid::Uuid::new_v4()),
-        &env.namespace,
-        &env.lane,
-    );
-    // Keep poll interval tight so drains don't get dragged by backoff.
-    config.claim_poll_interval_ms = POLL_INTERVAL_MS;
+    let config = WorkerConfig {
+        backend: ff_core::backend::BackendConfig::valkey(
+            env.valkey_host.clone(),
+            env.valkey_port,
+        ),
+        worker_id: ff_core::types::WorkerId::new(format!("bench-worker-{wi}")),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
+            "bench-worker-{wi}-{}",
+            uuid::Uuid::new_v4()
+        )),
+        namespace: ff_core::types::Namespace::new(&env.namespace),
+        lanes: vec![ff_core::types::LaneId::new(&env.lane)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        // Keep poll interval tight so drains don't get dragged by backoff.
+        claim_poll_interval_ms: POLL_INTERVAL_MS,
+        max_concurrent_tasks: 1,
+    };
     let worker = FlowFabricWorker::connect(config).await?;
 
     // Per-worker buffer: no lock, no contention. Merged by the driver

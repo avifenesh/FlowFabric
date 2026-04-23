@@ -3,6 +3,8 @@
 //! Each Args struct defines the typed inputs to a Valkey Function.
 //! Each Result enum defines the possible outcomes (success variants + error codes).
 
+pub mod decode;
+
 use crate::policy::ExecutionPolicy;
 use crate::state::{AttemptType, PublicState, StateVector};
 use crate::types::{
@@ -1174,9 +1176,7 @@ impl std::str::FromStr for StreamCursor {
                 Err(StreamCursorParseError::BareMarkerRejected(s.to_owned()))
             }
             StreamCursorClass::Empty => Err(StreamCursorParseError::Empty),
-            StreamCursorClass::Malformed => {
-                Err(StreamCursorParseError::Malformed(s.to_owned()))
-            }
+            StreamCursorClass::Malformed => Err(StreamCursorParseError::Malformed(s.to_owned())),
         }
     }
 }
@@ -1194,9 +1194,7 @@ impl TryFrom<String> for StreamCursor {
             StreamCursorClass::Start => Ok(Self::Start),
             StreamCursorClass::End => Ok(Self::End),
             StreamCursorClass::Concrete => Ok(Self::At(s)),
-            StreamCursorClass::BareMarker => {
-                Err(StreamCursorParseError::BareMarkerRejected(s))
-            }
+            StreamCursorClass::BareMarker => Err(StreamCursorParseError::BareMarkerRejected(s)),
             StreamCursorClass::Empty => Err(StreamCursorParseError::Empty),
             StreamCursorClass::Malformed => Err(StreamCursorParseError::Malformed(s)),
         }
@@ -2088,6 +2086,50 @@ pub struct EdgeSnapshot {
     pub created_by: String,
 }
 
+/// Direction marker for [`crate::engine_backend::EngineBackend::list_edges`].
+///
+/// Carries the subject execution whose adjacency side the caller wants
+/// to list — mirrors the internal `AdjacencySide + subject_eid` pair
+/// the ff-sdk free-fn `list_edges_from_set` already uses. Keeping
+/// direction + subject fused in one enum means the trait method has a
+/// single `direction` parameter rather than a `(side, eid)` pair, and
+/// the backend impl can't forget one of the two.
+///
+/// * `Outgoing { from_node }` — the caller wants every edge whose
+///   `upstream_execution_id == from_node`. Corresponds to the
+///   `out:<execution_id>` adjacency SET under the execution's flow
+///   partition.
+/// * `Incoming { to_node }` — the caller wants every edge whose
+///   `downstream_execution_id == to_node`. Corresponds to the
+///   `in:<execution_id>` adjacency SET under the execution's flow
+///   partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EdgeDirection {
+    /// Edges leaving `from_node` — `out:` adjacency SET.
+    Outgoing {
+        /// The subject execution whose outgoing edges to list.
+        from_node: ExecutionId,
+    },
+    /// Edges landing on `to_node` — `in:` adjacency SET.
+    Incoming {
+        /// The subject execution whose incoming edges to list.
+        to_node: ExecutionId,
+    },
+}
+
+impl EdgeDirection {
+    /// Return the subject execution id regardless of direction. Shared
+    /// helper for backend impls that need the execution id for the
+    /// initial `HGET exec_core.flow_id` lookup (flow routing) before
+    /// they know which adjacency SET to read.
+    pub fn subject(&self) -> &ExecutionId {
+        match self {
+            Self::Outgoing { from_node } => from_node,
+            Self::Incoming { to_node } => to_node,
+        }
+    }
+}
+
 impl EdgeSnapshot {
     /// Construct an [`EdgeSnapshot`]. Present so downstream crates
     /// (ff-sdk's `describe_edge` / `list_*_edges`) can assemble the
@@ -2195,7 +2237,10 @@ mod tests {
     #[test]
     fn stream_cursor_from_str_accepts_wire_tokens() {
         use std::str::FromStr;
-        assert_eq!(StreamCursor::from_str("start").unwrap(), StreamCursor::Start);
+        assert_eq!(
+            StreamCursor::from_str("start").unwrap(),
+            StreamCursor::Start
+        );
         assert_eq!(StreamCursor::from_str("end").unwrap(), StreamCursor::End);
         assert_eq!(
             StreamCursor::from_str("123").unwrap(),
@@ -2236,7 +2281,9 @@ mod tests {
     #[test]
     fn stream_cursor_from_str_rejects_malformed() {
         use std::str::FromStr;
-        for bad in ["abc", "-1", "1-", "-1-2", "1-2-3", "1.2", "1 2", "Start", "END"] {
+        for bad in [
+            "abc", "-1", "1-", "-1-2", "1-2-3", "1.2", "1 2", "Start", "END",
+        ] {
             assert!(
                 matches!(
                     StreamCursor::from_str(bad),
@@ -2272,8 +2319,14 @@ mod tests {
 
     #[test]
     fn stream_cursor_serializes_as_bare_string() {
-        assert_eq!(serde_json::to_string(&StreamCursor::Start).unwrap(), r#""start""#);
-        assert_eq!(serde_json::to_string(&StreamCursor::End).unwrap(), r#""end""#);
+        assert_eq!(
+            serde_json::to_string(&StreamCursor::Start).unwrap(),
+            r#""start""#
+        );
+        assert_eq!(
+            serde_json::to_string(&StreamCursor::End).unwrap(),
+            r#""end""#
+        );
         assert_eq!(
             serde_json::to_string(&StreamCursor::At("123-0".into())).unwrap(),
             r#""123-0""#
@@ -2307,10 +2360,7 @@ mod tests {
     fn stream_cursor_into_wire_string_moves_without_cloning() {
         assert_eq!(StreamCursor::Start.into_wire_string(), "-");
         assert_eq!(StreamCursor::End.into_wire_string(), "+");
-        assert_eq!(
-            StreamCursor::At("17-3".into()).into_wire_string(),
-            "17-3"
-        );
+        assert_eq!(StreamCursor::At("17-3".into()).into_wire_string(), "17-3");
     }
 }
 

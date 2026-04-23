@@ -2,9 +2,8 @@ use std::collections::HashMap;
 #[cfg(feature = "direct-valkey-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use ferriskey::{Client, ClientBuilder, Value};
+use ferriskey::{Client, Value};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::*;
@@ -34,9 +33,21 @@ use crate::SdkError;
 /// # Usage
 ///
 /// ```rust,ignore
+/// use ff_core::backend::BackendConfig;
+/// use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 /// use ff_sdk::{FlowFabricWorker, WorkerConfig};
 ///
-/// let config = WorkerConfig::new("localhost", 6379, "w1", "w1-i1", "default", "main");
+/// let config = WorkerConfig {
+///     backend: BackendConfig::valkey("localhost", 6379),
+///     worker_id: WorkerId::new("w1"),
+///     worker_instance_id: WorkerInstanceId::new("w1-i1"),
+///     namespace: Namespace::new("default"),
+///     lanes: vec![LaneId::new("main")],
+///     capabilities: Vec::new(),
+///     lease_ttl_ms: 30_000,
+///     claim_poll_interval_ms: 1_000,
+///     max_concurrent_tasks: 1,
+/// };
 /// let worker = FlowFabricWorker::connect(config).await?;
 ///
 /// loop {
@@ -145,19 +156,14 @@ impl FlowFabricWorker {
             });
         }
 
-        let mut builder = ClientBuilder::new()
-            .host(&config.host, config.port)
-            .connect_timeout(Duration::from_secs(10))
-            .request_timeout(Duration::from_millis(5000));
-        if config.tls {
-            builder = builder.tls();
-        }
-        if config.cluster {
-            builder = builder.cluster();
-        }
-        let client = builder.build()
-            .await
-            .map_err(|e| crate::backend_context(e, "failed to connect"))?;
+        // Build the ferriskey client from the nested `BackendConfig`.
+        // Delegates to `ff_backend_valkey::build_client` so host/port +
+        // TLS + cluster + `BackendTimeouts::request` +
+        // `BackendRetry` wiring lives in exactly one place (pre-Stage
+        // 1c this path had its own `ClientBuilder` chain that diverged
+        // from the backend's shape; RFC-012 Stage 1c tranche 1
+        // consolidates).
+        let client = ff_backend_valkey::build_client(&config.backend).await?;
 
         // Verify connectivity
         let pong: String = client
@@ -583,6 +589,16 @@ impl FlowFabricWorker {
     /// `&Arc<dyn EngineBackend>`.
     pub fn backend(&self) -> Option<&Arc<dyn ff_core::engine_backend::EngineBackend>> {
         Some(&self.backend)
+    }
+
+    /// Crate-internal direct borrow of the backend. The public
+    /// [`Self::backend`] still returns `Option` for API stability
+    /// (Stage 1b holdover). Snapshot trait-forwarders in
+    /// [`crate::snapshot`] need an un-wrapped reference.
+    pub(crate) fn backend_ref(
+        &self,
+    ) -> &Arc<dyn ff_core::engine_backend::EngineBackend> {
+        &self.backend
     }
 
     /// Handle to the completion-event subscription backend, for
@@ -1379,6 +1395,9 @@ impl FlowFabricWorker {
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
+        // TODO(#150): migrate when EngineBackend trait grows a
+        // `claim_resumed_execution` method; for now this FCALL stays on
+        // ff-sdk's direct client path.
         let raw: Value = self
             .client
             .fcall("ff_claim_resumed_execution", &key_refs, &arg_refs)
@@ -1606,6 +1625,9 @@ impl FlowFabricWorker {
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
+        // TODO(#150): migrate when EngineBackend trait grows a
+        // `deliver_signal` method; for now this FCALL stays on
+        // ff-sdk's direct client path.
         let raw: Value = self
             .client
             .fcall("ff_deliver_signal", &key_refs, &arg_refs)

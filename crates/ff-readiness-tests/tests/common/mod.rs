@@ -42,13 +42,7 @@ pub struct Dag {
 /// Spawn an SDK worker against the lane + namespace.
 pub async fn spawn_worker(lane: &str, ns: &str, suffix: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        tls: ff_readiness_tests::valkey::env_flag("FF_TLS"),
-        cluster: ff_readiness_tests::valkey::env_flag("FF_CLUSTER"),
+        backend: ff_readiness_tests::valkey::backend_config_from_env(),
         worker_id: WorkerId::new(format!("readiness-fanout-worker-{suffix}")),
         worker_instance_id: WorkerInstanceId::new(format!("readiness-fanout-inst-{suffix}")),
         namespace: Namespace::new(ns),

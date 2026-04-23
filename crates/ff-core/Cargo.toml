@@ -10,6 +10,28 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric core types, partition math, key builders, error codes"
 
+[features]
+# RFC-012 Stage 1c tranche-1 scaffold: backend-implementer feature
+# surface. `default = [all]` means consumer crates (ff-sdk and
+# downstream) see the full trait with zero toggles. Backend crates may
+# opt into a strict subset; a `default-features = false` dependency
+# with, say, `features = ["core"]` will in later tranches see a
+# trait slice without streaming / suspension / budget methods.
+#
+# Tranche 1 only declares the feature names — the `EngineBackend`
+# trait does not yet carry `#[cfg(feature = "…")]` gates on any
+# method. Tranches 2-5 land the gates as each method migrates. All
+# feature bodies are intentionally empty here.
+#
+# Grouping rationale (per plan §Trait feature-gate strategy): names
+# track storage primitives, not consumer APIs — primitives change
+# slower than APIs, which keeps the cfg-gate topology stable.
+default = ["core", "streaming", "suspension", "budget"]
+core = []
+streaming = []
+suspension = []
+budget = []
+
 [dependencies]
 uuid = { workspace = true }
 serde = { workspace = true }

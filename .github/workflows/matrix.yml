@@ -172,6 +172,17 @@ jobs:
       - name: cargo check
         run: cargo check --workspace --all-features
 
+      # RFC-012 Stage 1c tranche 1: feature-matrix floor. ff-core
+      # declares default = ["core", "streaming", "suspension",
+      # "budget"]; backend crates may opt into a strict subset.
+      # Exercise the minimal backend shape (core alone) so a future
+      # trait-method add with a forgotten cfg-gate fails CI rather
+      # than silently widening the mandatory-implementation surface.
+      # Feature bodies are empty today — tranches 2-5 add the
+      # cfg-gated methods.
+      - name: cargo check -p ff-core --no-default-features --features core
+        run: cargo check -p ff-core --no-default-features --features core
+
       - name: cargo clippy
         run: |
           cargo clippy \

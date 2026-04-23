@@ -132,13 +132,7 @@ async fn lifecycle_retry_backoff() {
 
     // 6. Spawn in-process SDK worker.
     let worker_config = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        tls: ff_readiness_tests::valkey::env_flag("FF_TLS"),
-        cluster: ff_readiness_tests::valkey::env_flag("FF_CLUSTER"),
+        backend: ff_readiness_tests::valkey::backend_config_from_env(),
         worker_id: WorkerId::new("readiness-retry-worker"),
         worker_instance_id: WorkerInstanceId::new("readiness-retry-inst"),
         namespace: Namespace::new(NS),

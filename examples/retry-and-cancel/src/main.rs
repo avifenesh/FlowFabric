@@ -296,14 +296,20 @@ async fn run_worker(
     admin: Arc<FlowFabricAdminClient>,
     done: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = WorkerConfig::new(
-        host,
-        port,
-        WORKER_POOL,
-        format!("{WORKER_POOL}-{}", uuid::Uuid::new_v4()),
-        NAMESPACE,
-        LANE,
-    );
+    let config = WorkerConfig {
+        backend: ff_core::backend::BackendConfig::valkey(host, port),
+        worker_id: ff_core::types::WorkerId::new(WORKER_POOL),
+        worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
+            "{WORKER_POOL}-{}",
+            uuid::Uuid::new_v4()
+        )),
+        namespace: ff_core::types::Namespace::new(NAMESPACE),
+        lanes: vec![ff_core::types::LaneId::new(LANE)],
+        capabilities: Vec::new(),
+        lease_ttl_ms: 30_000,
+        claim_poll_interval_ms: 1_000,
+        max_concurrent_tasks: 1,
+    };
     let worker = FlowFabricWorker::connect(config).await?;
     let lane = LaneId::try_new(LANE)?;
 

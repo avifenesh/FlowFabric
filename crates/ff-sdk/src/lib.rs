@@ -18,18 +18,22 @@
 //!
 //! ```rust,ignore
 //! use ff_sdk::{FlowFabricWorker, WorkerConfig};
-//! use ff_core::types::LaneId;
+//! use ff_core::backend::BackendConfig;
+//! use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), ff_sdk::SdkError> {
-//!     let config = WorkerConfig::new(
-//!         "localhost",
-//!         6379,
-//!         "my-worker",
-//!         "my-worker-instance-1",
-//!         "default",
-//!         "main",
-//!     );
+//!     let config = WorkerConfig {
+//!         backend: BackendConfig::valkey("localhost", 6379),
+//!         worker_id: WorkerId::new("my-worker"),
+//!         worker_instance_id: WorkerInstanceId::new("my-worker-instance-1"),
+//!         namespace: Namespace::new("default"),
+//!         lanes: vec![LaneId::new("main")],
+//!         capabilities: Vec::new(),
+//!         lease_ttl_ms: 30_000,
+//!         claim_poll_interval_ms: 1_000,
+//!         max_concurrent_tasks: 1,
+//!     };
 //!
 //!     let worker = FlowFabricWorker::connect(config).await?;
 //!     let lane = LaneId::new("main");

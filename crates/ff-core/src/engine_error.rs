@@ -162,6 +162,18 @@ pub enum ValidationKind {
     InvalidTagKey,
     /// Unrecognized stream frame type.
     InvalidFrameType,
+    /// On-disk corruption or protocol drift: an engine-owned hash /
+    /// key returned a field shape the decoder could not parse (missing
+    /// required field, malformed timestamp, unknown extra field,
+    /// cross-field identity mismatch, etc.). `detail` carries the
+    /// decoder's diagnostic string — the specific field name and/or
+    /// offending value — in the form
+    /// `"<context>: <field?>: <message>"` so operators can locate the
+    /// bad key without reparsing.
+    ///
+    /// Classified as `Terminal`: a consumer retrying the read will
+    /// see the same bytes. Surface to the operator; do not loop.
+    Corruption,
 }
 
 /// Contention sub-kinds (retryable per RFC-010 §10.7). Caller should
@@ -228,7 +240,9 @@ pub enum ConflictKind {
     /// to perform the follow-up read and promote the error.
     ///
     /// [`EdgeSnapshot`]: crate::contracts::EdgeSnapshot
-    DependencyAlreadyExists { existing: crate::contracts::EdgeSnapshot },
+    DependencyAlreadyExists {
+        existing: crate::contracts::EdgeSnapshot,
+    },
     /// Edge would create a cycle.
     CycleDetected,
     /// Self-referencing edge (upstream == downstream).

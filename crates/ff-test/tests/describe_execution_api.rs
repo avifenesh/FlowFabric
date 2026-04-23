@@ -41,13 +41,7 @@ async fn seed_partition_config(tc: &TestCluster) {
 
 async fn build_worker(name_suffix: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        host: std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("FF_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        backend: ff_test::fixtures::backend_config_from_env(),
         worker_id: WorkerId::new(format!("desc-exec-worker-{name_suffix}")),
         worker_instance_id: WorkerInstanceId::new(format!("desc-exec-inst-{name_suffix}")),
         namespace: Namespace::new(NS),
@@ -332,20 +326,24 @@ async fn describe_execution_corrupt_public_state_surfaces_error() {
         .await
         .expect_err("corrupt public_state must surface as error");
     match err {
-        ff_sdk::SdkError::Config {
-            field: ref f,
-            message: ref msg,
-            ..
-        } => {
-            // Post-#98 structured shape: the field name lives in
-            // `field`, not interpolated into `message`. Verify the
-            // error names public_state in either slot so the test
-            // survives future rephrasings of the human-readable part.
-            assert!(
-                f.as_deref() == Some("public_state") || msg.contains("public_state"),
-                "error must name the field (field={f:?}, msg={msg})"
-            );
-        }
-        other => panic!("expected SdkError::Config, got {other:?}"),
+        // RFC-012 Stage 1c T3: the strict-parse decoder moved into
+        // `ff_core::contracts::decode` and now surfaces via
+        // `EngineError::Validation { kind: Corruption, detail }`
+        // (wrapped by ff-sdk's `From<EngineError> for SdkError` into
+        // `SdkError::Engine`). The field name is embedded in `detail`
+        // with the shape `"<context>: <field>: <message>"`.
+        ff_sdk::SdkError::Engine(ref boxed) => match boxed.as_ref() {
+            ff_core::engine_error::EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail,
+            } => {
+                assert!(
+                    detail.contains("public_state"),
+                    "error must name the field (detail={detail})"
+                );
+            }
+            other => panic!("expected EngineError::Validation::Corruption, got {other:?}"),
+        },
+        other => panic!("expected SdkError::Engine(Validation::Corruption), got {other:?}"),
     }
 }

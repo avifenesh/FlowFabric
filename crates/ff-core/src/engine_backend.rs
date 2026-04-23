@@ -53,6 +53,8 @@ use crate::backend::{
     ReclaimToken, ResumeSignal, WaitpointSpec,
 };
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
+#[cfg(feature = "core")]
+use crate::contracts::{EdgeDirection, EdgeSnapshot};
 use crate::engine_error::EngineError;
 use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 
@@ -112,11 +114,7 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Terminal success. Borrows `handle` (round-4 M-D2) so callers
     /// can retry under `EngineError::Transport` without losing the
     /// cookie. Payload is `Option<Vec<u8>>` per the note above.
-    async fn complete(
-        &self,
-        handle: &Handle,
-        payload: Option<Vec<u8>>,
-    ) -> Result<(), EngineError>;
+    async fn complete(&self, handle: &Handle, payload: Option<Vec<u8>>) -> Result<(), EngineError>;
 
     /// Terminal failure with classification. Returns [`FailOutcome`]
     /// so the caller learns whether a retry was scheduled.
@@ -167,25 +165,17 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     /// Non-mutating observation of signals that satisfied the handle's
     /// resume condition.
-    async fn observe_signals(&self, handle: &Handle)
-        -> Result<Vec<ResumeSignal>, EngineError>;
+    async fn observe_signals(&self, handle: &Handle) -> Result<Vec<ResumeSignal>, EngineError>;
 
     /// Consume a reclaim grant to mint a resumed-kind handle. Returns
     /// `Ok(None)` when the grant's target execution is no longer
     /// resumable (already reclaimed, terminal, etc.).
-    async fn claim_from_reclaim(
-        &self,
-        token: ReclaimToken,
-    ) -> Result<Option<Handle>, EngineError>;
+    async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError>;
 
     // Round-5 amendment: lease-releasing peers of `suspend`.
 
     /// Park the execution until `delay_until`, releasing the lease.
-    async fn delay(
-        &self,
-        handle: &Handle,
-        delay_until: TimestampMs,
-    ) -> Result<(), EngineError>;
+    async fn delay(&self, handle: &Handle, delay_until: TimestampMs) -> Result<(), EngineError>;
 
     /// Mark the execution as waiting for its child flow to complete,
     /// releasing the lease.
@@ -200,10 +190,36 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<Option<ExecutionSnapshot>, EngineError>;
 
     /// Snapshot a flow by id. `Ok(None)` ⇒ no such flow.
-    async fn describe_flow(
+    async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError>;
+
+    /// List dependency edges adjacent to an execution. Read-only; the
+    /// backend resolves the subject execution's flow, reads the
+    /// direction-specific adjacency SET, and decodes each member's
+    /// flow-scoped `edge:<edge_id>` hash.
+    ///
+    /// Returns an empty `Vec` when the subject has no edges on the
+    /// requested side — including standalone executions (no owning
+    /// flow). Ordering is unspecified: the underlying adjacency SET
+    /// is an unordered SMEMBERS read. Callers that need deterministic
+    /// order should sort by [`EdgeSnapshot::edge_id`] /
+    /// [`EdgeSnapshot::created_at`] themselves.
+    ///
+    /// Parse failures on the edge hash surface as
+    /// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`]
+    /// — unknown fields, missing required fields, endpoint mismatches
+    /// against the adjacency SET all fail loud rather than silently
+    /// returning partial results.
+    ///
+    /// Gated on the `core` feature — edge reads are part of the
+    /// minimal engine surface a Postgres-style backend must honour.
+    ///
+    /// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`]: crate::engine_error::EngineError::Validation
+    #[cfg(feature = "core")]
+    async fn list_edges(
         &self,
-        id: &FlowId,
-    ) -> Result<Option<FlowSnapshot>, EngineError>;
+        flow_id: &FlowId,
+        direction: EdgeDirection,
+    ) -> Result<Vec<EdgeSnapshot>, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait
@@ -237,4 +253,3 @@ pub trait EngineBackend: Send + Sync + 'static {
 /// EngineBackend>` use.
 #[allow(dead_code)]
 fn _assert_dyn_compatible(_: &dyn EngineBackend) {}
-

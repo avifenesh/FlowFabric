@@ -3,7 +3,9 @@
 //! PR-D1 keeps this a passthrough — future PRs (D2+) may add
 //! version-probe + matrix-cell plumbing here.
 
-pub use ff_test::fixtures::{build_client_from_env, env_flag, TestCluster, TEST_PARTITION_CONFIG};
+pub use ff_test::fixtures::{
+    backend_config_from_env, build_client_from_env, env_flag, TestCluster, TEST_PARTITION_CONFIG,
+};
 
 /// Probe Valkey's server version. Prefers `valkey_version:` from INFO,
 /// falls back to `redis_version:` for older or Redis-OSS deployments.
