@@ -314,6 +314,19 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     "closed_at", "",
     "close_reason", "")
 
+  -- 10b. RFC-014 §3.1: seed composite member_map (write-once) when the
+  -- resume condition carries a composite tree. No-op for single-matcher
+  -- / operator / timeout conditions.
+  do
+    local spec_ok, spec = pcall(cjson.decode, A.resume_condition_json)
+    if spec_ok and type(spec) == "table" and spec.composite then
+      seed_composite_member_map(
+        K.suspension_current .. ":member_map",
+        spec.tree,
+        waitpoint_key)
+    end
+  end
+
   -- 11. Add to per-lane suspended index + suspension timeout
   -- Score: timeout_at if set, otherwise MAX for "no timeout" ordering
   redis.call("ZADD", K.suspended_zset,
@@ -442,6 +455,11 @@ redis.register_function('ff_resume_execution', function(keys, args)
 
   -- Remove from suspension timeout index
   redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
+
+  -- RFC-014 §3.1.1 composite cleanup owner: operator-driven resume path.
+  composite_cleanup(
+    K.suspension_current .. ":satisfied_set",
+    K.suspension_current .. ":member_map")
 
   return ok(public_state)
 end)
@@ -652,6 +670,11 @@ redis.register_function('ff_expire_suspension', function(keys, args)
 
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
 
+    -- RFC-014 §3.1.1 composite cleanup owner: expire (auto_resume) path.
+    composite_cleanup(
+      K.suspension_current .. ":satisfied_set",
+      K.suspension_current .. ":member_map")
+
     return ok("auto_resume", "waiting")
 
   elseif behavior == "escalate" then
@@ -750,6 +773,11 @@ redis.register_function('ff_expire_suspension', function(keys, args)
     redis.call("HSET", K.suspension_current,
       "closed_at", tostring(now_ms),
       "close_reason", close_reason)
+
+    -- RFC-014 §3.1.1 composite cleanup owner: expire (terminal) paths.
+    composite_cleanup(
+      K.suspension_current .. ":satisfied_set",
+      K.suspension_current .. ":member_map")
 
     -- Remove from suspension indexes, add to terminal
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)

@@ -39,11 +39,11 @@ use ff_core::contracts::decode::{
 };
 use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
-    DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot,
-    FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage, ListLanesPage,
-    ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
-    SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspendedExecutionEntry,
-    WaitpointBinding,
+    CompositeBody, CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
+    ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage,
+    ListLanesPage, ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy,
+    ResumeTarget, SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails,
+    SuspendedExecutionEntry, WaitpointBinding,
 };
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
@@ -1713,46 +1713,62 @@ async fn observe_signals_impl(
     };
 
     let wp_cond_key = ctx.waitpoint_condition(&waitpoint_id);
-    let total_str: Option<String> = client
-        .hget(&wp_cond_key, "total_matchers")
-        .await
-        .map_err(transport_fk)?;
-    let total: usize = total_str
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
+    // RFC-014: composite suspensions stash the satisfier signal id list
+    // under `suspension_current.all_satisfier_signals` (JSON array).
+    // Fall through to the legacy matcher-array path only for non-
+    // composite (RFC-013 Single/Operator/Timeout) conditions.
     let mut signal_ids: Vec<SignalId> = Vec::new();
-    for i in 0..total {
-        let fields: Vec<Option<String>> = client
-            .cmd("HMGET")
-            .arg(&wp_cond_key)
-            .arg(format!("matcher:{i}:satisfied"))
-            .arg(format!("matcher:{i}:signal_id"))
-            .execute()
+    if susp.get("all_satisfier_signals").map(|s| !s.is_empty()).unwrap_or(false) {
+        let raw = susp.get("all_satisfier_signals").cloned().unwrap_or_default();
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(&raw) {
+            for s in arr {
+                if let Ok(sid) = SignalId::parse(&s) {
+                    signal_ids.push(sid);
+                }
+            }
+        }
+    }
+    if signal_ids.is_empty() {
+        let total_str: Option<String> = client
+            .hget(&wp_cond_key, "total_matchers")
             .await
             .map_err(transport_fk)?;
-        let satisfied = fields.first().and_then(|o| o.as_deref());
-        if satisfied != Some("1") {
-            continue;
-        }
-        let Some(raw) = fields
-            .get(1)
-            .and_then(|o| o.as_deref())
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        match SignalId::parse(raw) {
-            Ok(sid) => signal_ids.push(sid),
-            Err(e) => {
-                tracing::warn!(
-                    execution_id = %f.execution_id,
-                    waitpoint_id = %waitpoint_id,
-                    raw = %raw,
-                    error = %e,
-                    "observe_signals: matcher signal_id failed to parse, skipping"
-                );
+        let total: usize = total_str
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        for i in 0..total {
+            let fields: Vec<Option<String>> = client
+                .cmd("HMGET")
+                .arg(&wp_cond_key)
+                .arg(format!("matcher:{i}:satisfied"))
+                .arg(format!("matcher:{i}:signal_id"))
+                .execute()
+                .await
+                .map_err(transport_fk)?;
+            let satisfied = fields.first().and_then(|o| o.as_deref());
+            if satisfied != Some("1") {
+                continue;
+            }
+            let Some(raw) = fields
+                .get(1)
+                .and_then(|o| o.as_deref())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            match SignalId::parse(raw) {
+                Ok(sid) => signal_ids.push(sid),
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %f.execution_id,
+                        waitpoint_id = %waitpoint_id,
+                        raw = %raw,
+                        error = %e,
+                        "observe_signals: matcher signal_id failed to parse, skipping"
+                    );
+                }
             }
         }
     }
@@ -2734,6 +2750,92 @@ const SUSPEND_DEDUP_MAX_TTL_MS: u64 = 604_800_000;
 /// Clock-skew tolerance for `timeout_at` validation (RFC-013 §2.2).
 const SUSPEND_CLOCK_SKEW_TOLERANCE_MS: i64 = 600_000;
 
+/// RFC-014 §3.3 — emit a compact tree spec the Lua evaluator walks
+/// per-signal. Each node carries `kind` + per-kind fields plus a
+/// `path` string that doubles as the satisfier-token prefix for
+/// non-leaf satisfaction (`node:<path>`).
+fn composite_node_to_json(cond: &ResumeCondition, path: &str) -> serde_json::Value {
+    match cond {
+        ResumeCondition::Single {
+            waitpoint_key,
+            matcher,
+        } => serde_json::json!({
+            "kind": "Single",
+            "path": path,
+            "waitpoint_key": waitpoint_key,
+            "matcher": signal_matcher_to_json(matcher),
+        }),
+        ResumeCondition::Composite(body) => composite_body_to_json(body, path),
+        ResumeCondition::OperatorOnly | ResumeCondition::TimeoutOnly => {
+            // Not meaningfully satisfiable by signal delivery under a
+            // composite; Lua treats these as never-satisfied leaves.
+            serde_json::json!({ "kind": "NeverBySignal", "path": path })
+        }
+        _ => serde_json::json!({ "kind": "NeverBySignal", "path": path }),
+    }
+}
+
+fn composite_body_to_json(body: &CompositeBody, path: &str) -> serde_json::Value {
+    match body {
+        CompositeBody::AllOf { members } => {
+            let members_json: Vec<serde_json::Value> = members
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let child_path = if path.is_empty() {
+                        format!("members[{i}]")
+                    } else {
+                        format!("{path}.members[{i}]")
+                    };
+                    composite_node_to_json(m, &child_path)
+                })
+                .collect();
+            serde_json::json!({
+                "kind": "AllOf",
+                "path": path,
+                "members": members_json,
+            })
+        }
+        CompositeBody::Count {
+            n,
+            count_kind,
+            matcher,
+            waitpoints,
+        } => {
+            let ck = match count_kind {
+                CountKind::DistinctWaitpoints => "DistinctWaitpoints",
+                CountKind::DistinctSignals => "DistinctSignals",
+                CountKind::DistinctSources => "DistinctSources",
+                _ => "DistinctWaitpoints",
+            };
+            serde_json::json!({
+                "kind": "Count",
+                "path": path,
+                "n": n,
+                "count_kind": ck,
+                "matcher": matcher.as_ref().map(signal_matcher_to_json),
+                "waitpoints": waitpoints,
+            })
+        }
+        // Future CompositeBody variants (e.g. RFC-016 additions) are not
+        // serializable by this tree walker until they land. Emit a
+        // never-satisfiable sentinel so Lua rejects rather than panics.
+        _ => serde_json::json!({ "kind": "NeverBySignal", "path": path }),
+    }
+}
+
+fn composite_tree_to_json(body: &CompositeBody) -> serde_json::Value {
+    composite_body_to_json(body, "")
+}
+
+fn signal_matcher_to_json(m: &SignalMatcher) -> serde_json::Value {
+    match m {
+        SignalMatcher::ByName(n) => serde_json::json!({ "kind": "ByName", "name": n }),
+        SignalMatcher::Wildcard => serde_json::json!({ "kind": "Wildcard" }),
+        _ => serde_json::json!({ "kind": "Wildcard" }),
+    }
+}
+
 /// Serialize a [`ResumeCondition`] into the `resume_condition_json` ARGV
 /// string today's Lua reads. Internal to the backend — consumers never
 /// see this string.
@@ -2778,13 +2880,33 @@ fn resume_condition_to_json(
             "timeout_behavior": timeout_behavior.as_wire_str(),
             "allow_operator_override": true,
         }),
-        ResumeCondition::Composite(_) => {
-            // RFC-014 populates CompositeBody. RFC-013 ships the slot
-            // but does not accept a composite at the backend.
-            return Err(EngineError::Validation {
-                kind: ValidationKind::InvalidInput,
-                detail: "resume_condition: Composite is reserved for RFC-014".into(),
-            });
+        ResumeCondition::Composite(body) => {
+            // RFC-014 §7.2 wire format. Lua consumes:
+            //   composite  = "1"          — branch marker
+            //   version    = 1            — rejects v>1
+            //   tree       = <compact spec>
+            //   member_map = [[wp_id_key, node_path], ...]
+            //                (populated at `suspend_execution` from the
+            //                 waitpoint_id that Lua mints; the Rust side
+            //                 sends `waitpoint_key` tokens that Lua
+            //                 rewrites to ids. Simpler: we emit node
+            //                 waitpoint_keys directly and Lua resolves.)
+            // See §3 algorithm.
+            let tree = composite_tree_to_json(body);
+            serde_json::json!({
+                "v": 1,
+                "composite": true,
+                "timeout_behavior": timeout_behavior.as_wire_str(),
+                "allow_operator_override": true,
+                // Legacy-shape stubs so older consumers of the stored
+                // resume_condition_json (operator diagnostics) can still
+                // discover mode/name without parsing the tree.
+                "condition_type": "composite",
+                "required_signal_names": [],
+                "signal_match_mode": "composite",
+                "minimum_signal_count": 1,
+                "tree": tree,
+            })
         }
         _ => {
             return Err(EngineError::Validation {
@@ -2862,6 +2984,13 @@ fn validate_suspend_args(args: &SuspendArgs) -> Result<(), EngineError> {
                 detail: "timeout_at_in_past".into(),
             });
         }
+    }
+    // RFC-014 §5.1 composite structural validation.
+    if let Err(e) = args.resume_condition.validate_composite() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: e.detail,
+        });
     }
     Ok(())
 }

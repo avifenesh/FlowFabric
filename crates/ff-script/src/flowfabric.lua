@@ -686,8 +686,41 @@ end
 -- evaluate_signal_against_condition and is_condition_satisfied.
 -- @param json  JSON string of the resume condition
 -- @return table with matchers array, match_mode, minimum_signal_count, etc.
+--   For composite conditions (RFC-014) the returned table also carries
+--   `composite = true` and a parsed `tree` spec; the matcher fields
+--   remain populated (empty) so legacy diagnostics that read
+--   `satisfied_count` / `total_matchers` on the wp_condition hash still
+--   work without crashing.
 local function initialize_condition(json)
   local spec = cjson.decode(json)
+  -- RFC-014: composite path. The Rust-side serializer sets
+  -- `composite = true` on multi-signal conditions. Legacy single/
+  -- operator/timeout paths continue to use the matcher array below.
+  if spec.composite then
+    if spec.v and tonumber(spec.v) ~= 1 then
+      -- Future-proofing: unknown version. RFC-014 §7.2 rejects v>1.
+      return {
+        condition_type       = "composite",
+        composite            = true,
+        invalid              = "invalid_resume_condition",
+        matchers             = {},
+        total_matchers       = 0,
+        satisfied_count      = 0,
+        closed               = false,
+      }
+    end
+    return {
+      condition_type       = "composite",
+      composite            = true,
+      tree                 = spec.tree,
+      match_mode           = "composite",
+      minimum_signal_count = 1,
+      total_matchers       = 0,
+      satisfied_count      = 0,
+      matchers             = {},
+      closed               = false,
+    }
+  end
   local matchers = {}
   local names = spec.required_signal_names or {}
   if #names == 0 then
@@ -716,6 +749,23 @@ end
 -- @param cond   condition table from initialize_condition
 -- @param now_ms current timestamp
 local function write_condition_hash(key, cond, now_ms)
+  -- RFC-014 composite path: write a minimal marker + the parsed tree.
+  -- The composite evaluator reads `composite` + `tree_json` at signal
+  -- delivery time; legacy `satisfied_count` / `total_matchers` fields
+  -- stay zero so operator diagnostics that read them don't blow up.
+  if cond.composite then
+    redis.call("HSET", key,
+      "condition_type", "composite",
+      "composite", "1",
+      "match_mode", "composite",
+      "minimum_signal_count", "1",
+      "total_matchers", "0",
+      "satisfied_count", "0",
+      "closed", cond.closed and "1" or "0",
+      "updated_at", tostring(now_ms),
+      "tree_json", cond.tree and cjson.encode(cond.tree) or "")
+    return
+  end
   local fields = {
     "condition_type", cond.condition_type,
     "match_mode", cond.match_mode,
@@ -772,6 +822,274 @@ local function is_condition_satisfied(cond)
   end
   -- count(n) mode — same as any with minimum_signal_count = n
   return cond.satisfied_count >= min_count
+end
+
+---------------------------------------------------------------------------
+-- RFC-014 composite condition evaluator
+--
+-- Storage model (§3.1):
+--   satisfied_set_key: SET of satisfier tokens ("wp:<id>" | "sig:<id>" |
+--                     "src:<type>:<identity>" | "node:<path>").
+--   member_map_key:   HASH of waitpoint_key → node_path (write-once at
+--                     suspend-time, informational only under single-
+--                     waitpoint scoping — see §3.1).
+--
+-- Per-signal algorithm (§3.3):
+--   1. Walk the tree, identifying nodes this signal may contribute to.
+--   2. For each such node, apply the local matcher (step 2.5); reject on
+--      mismatch with `signal_ignored_matcher_failed`.
+--   3. SADD the per-kind satisfier token to satisfied_set. Dedup returns
+--      `appended_to_waitpoint_duplicate`.
+--   4. Re-evaluate the tree: if the root is satisfied, emit
+--      `resume_condition_satisfied`.
+---------------------------------------------------------------------------
+
+-- Does a matcher accept this signal? Matches RFC-013 SignalMatcher shape.
+-- ByName compares by signal_name; Wildcard accepts any.
+local function matcher_accepts(matcher, signal_name)
+  if matcher == nil or type(matcher) ~= "table" then
+    return true
+  end
+  if matcher.kind == "Wildcard" or matcher.kind == nil then
+    return true
+  end
+  if matcher.kind == "ByName" then
+    return matcher.name == signal_name
+  end
+  return false
+end
+
+-- Compute the satisfier token for a Count node given CountKind + signal.
+local function count_satisfier_token(kind, signal, waitpoint_id)
+  if kind == "DistinctSignals" then
+    return "sig:" .. (signal.signal_id or "")
+  elseif kind == "DistinctSources" then
+    return "src:" .. (signal.source_type or "") .. ":" .. (signal.source_identity or "")
+  end
+  -- DistinctWaitpoints (default)
+  return "wp:" .. (waitpoint_id or "")
+end
+
+-- Set-membership helper: tokens table keyed-by-name (in-memory snapshot).
+local function set_has(tokens, token)
+  return tokens[token] == true
+end
+
+-- Count how many satisfier tokens a Count node currently has in the set.
+-- For DistinctWaitpoints we count tokens of the form `wp:<id>` where <id>
+-- corresponds to any waitpoint_key in node.waitpoints. For
+-- DistinctSignals / DistinctSources we count tokens of the right prefix
+-- that were SADDed while delivering a signal matching this node (scoped
+-- correctness relies on the per-node matcher filter at step 2.5).
+local function count_node_satisfiers(node, tokens)
+  local kind = node.count_kind or "DistinctWaitpoints"
+  local count = 0
+  -- For single-waitpoint composites (current scope), `tokens` contains
+  -- the satisfier tokens of signals that landed on THIS node after
+  -- passing the matcher filter. The tokens are already namespaced by
+  -- the delivery routine so counting by prefix is sufficient.
+  local prefix
+  if kind == "DistinctWaitpoints" then
+    prefix = "wp:"
+  elseif kind == "DistinctSignals" then
+    prefix = "sig:"
+  else
+    prefix = "src:"
+  end
+  local plen = #prefix
+  for token, _ in pairs(tokens) do
+    if string.sub(token, 1, plen) == prefix then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+-- Evaluate a node against the current satisfied-set snapshot.
+-- @param node    parsed tree node
+-- @param tokens  table<string, true> snapshot of satisfied_set
+-- @return true if satisfied
+local function composite_evaluate_node(node, tokens)
+  if node == nil then return false end
+  local kind = node.kind
+  if kind == "Single" then
+    -- Leaf: the wp:<id> token is the satisfaction marker (RFC §3.2).
+    -- We look up by path instead so a same-waitpoint AllOf can
+    -- disambiguate by matcher; the delivery routine writes
+    -- `leaf:<path>` tokens for satisfied Single-under-AllOf leaves.
+    return set_has(tokens, "leaf:" .. (node.path or ""))
+  elseif kind == "AllOf" then
+    local members = node.members or {}
+    for _, child in ipairs(members) do
+      if child.kind == "Single" then
+        if not set_has(tokens, "leaf:" .. (child.path or "")) then
+          return false
+        end
+      else
+        if not set_has(tokens, "node:" .. (child.path or "")) then
+          return false
+        end
+      end
+    end
+    return true
+  elseif kind == "Count" then
+    -- Timeout token short-circuits a Count (RFC §6.1).
+    if tokens["timeout:*"] == true then return true end
+    return count_node_satisfiers(node, tokens) >= (tonumber(node.n) or 1)
+  end
+  -- NeverBySignal / unknown
+  return false
+end
+
+-- Load satisfied_set contents into an in-memory table<string, true>.
+local function load_satisfied_set(satisfied_set_key)
+  local members = redis.call("SMEMBERS", satisfied_set_key)
+  local t = {}
+  for _, m in ipairs(members) do
+    t[m] = true
+  end
+  return t
+end
+
+-- Find nodes in the tree that this signal may contribute to. Returns a
+-- list of {node, ancestors} where ancestors is the path from the node
+-- upward to the root (exclusive of the node itself).
+local function composite_collect_candidate_nodes(tree, waitpoint_key, signal_name)
+  -- For single-waitpoint composites, every Single/Count node whose
+  -- waitpoint_key (or waitpoints list) contains `waitpoint_key` is a
+  -- candidate. Walk the tree DFS, tracking ancestors.
+  local results = {}
+  local function walk(node, ancestors)
+    if node == nil then return end
+    local kind = node.kind
+    if kind == "Single" then
+      if node.waitpoint_key == waitpoint_key then
+        results[#results + 1] = { node = node, ancestors = ancestors }
+      end
+    elseif kind == "Count" then
+      local matches_wp = false
+      for _, wk in ipairs(node.waitpoints or {}) do
+        if wk == waitpoint_key then matches_wp = true; break end
+      end
+      if matches_wp then
+        results[#results + 1] = { node = node, ancestors = ancestors }
+      end
+    elseif kind == "AllOf" then
+      local nested = {}
+      for i = 1, #ancestors do nested[i] = ancestors[i] end
+      nested[#nested + 1] = node
+      for _, child in ipairs(node.members or {}) do
+        walk(child, nested)
+      end
+    end
+  end
+  walk(tree, {})
+  return results
+end
+
+-- Emit initial member_map for operator diagnostics (RFC §4.4).
+-- Single-waitpoint scope: every candidate node path for the suspension's
+-- waitpoint_key maps back to that key. Write-once at suspend-time.
+local function seed_composite_member_map(member_map_key, tree, waitpoint_key)
+  local cands = composite_collect_candidate_nodes(tree, waitpoint_key, nil)
+  if #cands == 0 then return end
+  local fields = {}
+  for _, c in ipairs(cands) do
+    fields[#fields + 1] = "wp:" .. waitpoint_key .. ":" .. (c.node.path or "")
+    fields[#fields + 1] = c.node.path or ""
+  end
+  if #fields > 0 then
+    redis.call("HSET", member_map_key, unpack(fields))
+  end
+end
+
+-- Deliver a signal against a composite condition. Returns a table:
+--   { effect = <string>, resume = <bool>, closer = <signal_id>,
+--     all_satisfiers_json = <string> }
+-- satisfied_set_key / member_map_key are RFC-014 §3.1 keys.
+local function composite_deliver_signal(
+  tree, satisfied_set_key, member_map_key, waitpoint_id, waitpoint_key,
+  signal)
+  local tokens = load_satisfied_set(satisfied_set_key)
+  local candidates = composite_collect_candidate_nodes(tree, waitpoint_key, signal.signal_name)
+  if #candidates == 0 then
+    return { effect = "signal_ignored_not_in_condition", resume = false }
+  end
+
+  local added_any = false
+  local matcher_failed_all = true
+  -- RFC §3.3 step 2.5: per-node matcher filter. If ANY candidate node's
+  -- matcher accepts this signal, we proceed; if all reject, bail with
+  -- `signal_ignored_matcher_failed`.
+  for _, c in ipairs(candidates) do
+    local node = c.node
+    local matcher = node.matcher
+    if matcher_accepts(matcher, signal.signal_name) then
+      matcher_failed_all = false
+      local token
+      if node.kind == "Single" then
+        token = "leaf:" .. (node.path or "")
+      else -- Count
+        token = count_satisfier_token(node.count_kind, signal, waitpoint_id)
+      end
+      local added = redis.call("SADD", satisfied_set_key, token)
+      if added == 1 then
+        added_any = true
+        -- Track the signal id for `all_satisfier_signals` emission.
+        redis.call("SADD", satisfied_set_key .. ":signals", signal.signal_id)
+      end
+    end
+  end
+
+  if matcher_failed_all then
+    return { effect = "signal_ignored_matcher_failed", resume = false }
+  end
+  if not added_any then
+    return { effect = "appended_to_waitpoint_duplicate", resume = false }
+  end
+
+  -- Re-load + re-evaluate (cheap: depth ≤ 4).
+  tokens = load_satisfied_set(satisfied_set_key)
+
+  -- Propagate non-leaf child satisfaction upward: for each AllOf
+  -- ancestor whose child is now satisfied, SADD `node:<child_path>`.
+  -- Bounded by depth.
+  local function propagate(node)
+    if node == nil or node.kind ~= "AllOf" then return end
+    for _, child in ipairs(node.members or {}) do
+      if child.kind ~= "Single" then
+        if composite_evaluate_node(child, tokens) then
+          local added2 = redis.call("SADD", satisfied_set_key, "node:" .. (child.path or ""))
+          if added2 == 1 then
+            tokens["node:" .. (child.path or "")] = true
+          end
+          propagate(child)
+        end
+      end
+    end
+  end
+  propagate(tree)
+
+  local root_sat = composite_evaluate_node(tree, tokens)
+  if root_sat then
+    -- Gather satisfier signals (the ids we SADDed during this and prior
+    -- deliveries).
+    local sig_ids = redis.call("SMEMBERS", satisfied_set_key .. ":signals")
+    return {
+      effect = "resume_condition_satisfied",
+      resume = true,
+      closer = signal.signal_id,
+      all_satisfiers_json = cjson.encode(sig_ids),
+    }
+  end
+  return { effect = "appended_to_waitpoint", resume = false }
+end
+
+-- Clear composite keys on suspension termination (§3.1.1).
+local function composite_cleanup(satisfied_set_key, member_map_key)
+  redis.call("DEL", satisfied_set_key)
+  redis.call("DEL", satisfied_set_key .. ":signals")
+  redis.call("DEL", member_map_key)
 end
 
 -- Extract a named field from a Valkey Stream entry's flat field array.
@@ -906,7 +1224,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '20'
+  return '21'
 end)
 
 
@@ -2090,6 +2408,10 @@ redis.register_function('ff_cancel_execution', function(keys, args)
         "closed_at", tostring(now_ms),
         "closed_reason", "cancelled")
     end
+    -- RFC-014 §3.1.1 composite cleanup owner: cancel path.
+    composite_cleanup(
+      K.suspension_current .. ":satisfied_set",
+      K.suspension_current .. ":member_map")
   end
 
   -- ALL PATHS: exec_core FIRST for terminal transition (§4.8b Rule 2)
@@ -3897,6 +4219,19 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     "closed_at", "",
     "close_reason", "")
 
+  -- 10b. RFC-014 §3.1: seed composite member_map (write-once) when the
+  -- resume condition carries a composite tree. No-op for single-matcher
+  -- / operator / timeout conditions.
+  do
+    local spec_ok, spec = pcall(cjson.decode, A.resume_condition_json)
+    if spec_ok and type(spec) == "table" and spec.composite then
+      seed_composite_member_map(
+        K.suspension_current .. ":member_map",
+        spec.tree,
+        waitpoint_key)
+    end
+  end
+
   -- 11. Add to per-lane suspended index + suspension timeout
   -- Score: timeout_at if set, otherwise MAX for "no timeout" ordering
   redis.call("ZADD", K.suspended_zset,
@@ -4025,6 +4360,11 @@ redis.register_function('ff_resume_execution', function(keys, args)
 
   -- Remove from suspension timeout index
   redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
+
+  -- RFC-014 §3.1.1 composite cleanup owner: operator-driven resume path.
+  composite_cleanup(
+    K.suspension_current .. ":satisfied_set",
+    K.suspension_current .. ":member_map")
 
   return ok(public_state)
 end)
@@ -4235,6 +4575,11 @@ redis.register_function('ff_expire_suspension', function(keys, args)
 
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
 
+    -- RFC-014 §3.1.1 composite cleanup owner: expire (auto_resume) path.
+    composite_cleanup(
+      K.suspension_current .. ":satisfied_set",
+      K.suspension_current .. ":member_map")
+
     return ok("auto_resume", "waiting")
 
   elseif behavior == "escalate" then
@@ -4333,6 +4678,11 @@ redis.register_function('ff_expire_suspension', function(keys, args)
     redis.call("HSET", K.suspension_current,
       "closed_at", tostring(now_ms),
       "close_reason", close_reason)
+
+    -- RFC-014 §3.1.1 composite cleanup owner: expire (terminal) paths.
+    composite_cleanup(
+      K.suspension_current .. ":satisfied_set",
+      K.suspension_current .. ":member_map")
 
     -- Remove from suspension indexes, add to terminal
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)
@@ -4791,6 +5141,112 @@ redis.register_function('ff_deliver_signal', function(keys, args)
   -- 8. Evaluate resume condition
   local effect = "appended_to_waitpoint"
   local matched = false
+
+  -- RFC-014 §3.3: composite branch. `wp_condition` stores a `composite=1`
+  -- marker when suspension serialized a multi-signal tree. We short-
+  -- circuit here and run the composite evaluator (depth-bounded).
+  local composite_mode = (wp_cond.composite == "1")
+  if composite_mode then
+    -- Load tree + waitpoint_key for candidate lookup.
+    local susp_raw = redis.call("HGETALL", K.suspension_current)
+    local susp = hgetall_to_table(susp_raw)
+    local tree_json = wp_cond.tree_json or ""
+    local tree = tree_json ~= "" and cjson.decode(tree_json) or nil
+    local satisfied_set_key = K.suspension_current .. ":satisfied_set"
+    local member_map_key    = K.suspension_current .. ":member_map"
+
+    local signal_for_eval = {
+      signal_id = A.signal_id,
+      signal_name = A.signal_name,
+      source_type = A.source_type,
+      source_identity = A.source_identity,
+    }
+    local outcome = composite_deliver_signal(
+      tree, satisfied_set_key, member_map_key,
+      A.waitpoint_id, susp.waitpoint_key or "", signal_for_eval)
+
+    effect = outcome.effect or "appended_to_waitpoint"
+    matched = (effect ~= "signal_ignored_not_in_condition"
+               and effect ~= "signal_ignored_matcher_failed")
+
+    if outcome.resume then
+      -- Close suspension via the standard path (same as single-matcher
+      -- resume below). Composite-scoped cleanup follows §3.1.1.
+      local lp2 = core.lifecycle_phase
+      if lp2 == "suspended" then
+        local es, br, bd, ps
+        if A.resume_delay_ms > 0 then
+          es = "not_eligible_until_time"
+          br = "waiting_for_resume_delay"
+          bd = "resume delay " .. A.resume_delay_ms .. "ms after signal " .. A.signal_name
+          ps = "delayed"
+        else
+          es = "eligible_now"
+          br = "waiting_for_worker"
+          bd = ""
+          ps = "waiting"
+        end
+        redis.call("HSET", K.core_key,
+          "lifecycle_phase", "runnable",
+          "ownership_state", "unowned",
+          "eligibility_state", es,
+          "blocking_reason", br,
+          "blocking_detail", bd,
+          "terminal_outcome", "none",
+          "attempt_state", "attempt_interrupted",
+          "public_state", ps,
+          "current_suspension_id", "",
+          "current_waitpoint_id", "",
+          "last_transition_at", tostring(now_ms),
+          "last_mutation_at", tostring(now_ms))
+
+        local priority = tonumber(core.priority or "0")
+        local created_at_exec = tonumber(core.created_at or "0")
+        redis.call("ZREM", K.suspended_zset, A.execution_id)
+        if A.resume_delay_ms > 0 then
+          redis.call("ZADD", K.delayed_zset,
+            now_ms + A.resume_delay_ms, A.execution_id)
+        else
+          redis.call("ZADD", K.eligible_zset,
+            0 - (priority * 1000000000000) + created_at_exec,
+            A.execution_id)
+        end
+      end
+
+      redis.call("HSET", K.wp_condition,
+        "closed", "1",
+        "closed_at", tostring(now_ms),
+        "closed_reason", "satisfied")
+      redis.call("HSET", K.waitpoint_hash,
+        "state", "closed",
+        "satisfied_at", tostring(now_ms),
+        "closed_at", tostring(now_ms),
+        "close_reason", "resumed")
+      if redis.call("EXISTS", K.suspension_current) == 1 then
+        redis.call("HSET", K.suspension_current,
+          "satisfied_at", tostring(now_ms),
+          "closed_at", tostring(now_ms),
+          "close_reason", "resumed",
+          "closer_signal_id", outcome.closer or A.signal_id,
+          "all_satisfier_signals", outcome.all_satisfiers_json or "[]")
+      end
+      redis.call("ZREM", K.suspension_timeout_zset, A.execution_id)
+      -- RFC-014 §3.1.1 cleanup owner: deliver_signal close path.
+      composite_cleanup(satisfied_set_key, member_map_key)
+    end
+
+    -- Record signal hash observed_effect + waitpoint counters + return.
+    redis.call("HSET", K.signal_hash, "observed_effect", effect)
+    redis.call("HINCRBY", K.waitpoint_hash, "signal_count", 1)
+    if matched then
+      redis.call("HINCRBY", K.waitpoint_hash, "matched_signal_count", 1)
+    end
+    redis.call("HSET", K.waitpoint_hash, "last_signal_at", tostring(now_ms))
+    if redis.call("EXISTS", K.suspension_current) == 1 and not outcome.resume then
+      redis.call("HSET", K.suspension_current, "last_signal_at", tostring(now_ms))
+    end
+    return ok(A.signal_id, effect)
+  end
 
   local total = tonumber(wp_cond.total_matchers or "0")
   for i = 0, total - 1 do

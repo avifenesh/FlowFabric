@@ -856,6 +856,10 @@ redis.register_function('ff_cancel_execution', function(keys, args)
         "closed_at", tostring(now_ms),
         "closed_reason", "cancelled")
     end
+    -- RFC-014 §3.1.1 composite cleanup owner: cancel path.
+    composite_cleanup(
+      K.suspension_current .. ":satisfied_set",
+      K.suspension_current .. ":member_map")
   end
 
   -- ALL PATHS: exec_core FIRST for terminal transition (§4.8b Rule 2)

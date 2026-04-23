@@ -7,6 +7,47 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-014: Multi-signal resume conditions (`AllOf`, `Count{DistinctX}`).**
+  `ResumeCondition::Composite(CompositeBody)` — the RFC-013 placeholder
+  — is now populated with two variants: `CompositeBody::AllOf { members:
+  Vec<ResumeCondition> }` (all sub-conditions must be satisfied) and
+  `CompositeBody::Count { n, count_kind, matcher, waitpoints }` with
+  `CountKind ∈ { DistinctWaitpoints, DistinctSignals, DistinctSources }`.
+  Rust-side validation enforces RFC-014 §5.1 invariants at suspend-time
+  (depth cap 4 via `ff_core::contracts::MAX_COMPOSITE_DEPTH`, `n > 0`,
+  non-empty `waitpoints`, `n ≤ waitpoints.len()` for DistinctWaitpoints,
+  non-empty `AllOf.members`); failures surface as
+  `EngineError::Validation { kind: InvalidInput, detail: "..." }` per
+  §5.1.1. The Valkey backend serializes composites via a new tagged-tree
+  wire format (`{ v: 1, composite: true, tree: ... }`, §7.2), and the
+  Lua evaluator (`lua/helpers.lua` + `lua/signal.lua`) walks the tree
+  depth-boundedly per signal, using `ff:exec:{p:N}:<eid>:suspension:
+  current:satisfied_set` (SET, RFC-014 §3.1) for durable satisfier
+  tokens and a `:member_map` HASH for operator diagnostics. Satisfier
+  tokens: `wp:<id>` / `sig:<id>` / `src:<type>:<identity>` +
+  `leaf:<path>` / `node:<path>` per §3.2. Matcher-filter step
+  (`signal_ignored_matcher_failed`) lands pre-SADD; SADD gives
+  idempotency (`appended_to_waitpoint_duplicate`). The closer signal id
+  + full satisfier set are published on `suspension:current` as
+  `closer_signal_id` + `all_satisfier_signals` (JSON array) per §4.5;
+  `resume_signals()` / `observe_signals` now reads this composite path
+  ahead of the legacy matcher-array shape. `ff_cancel_execution`,
+  `ff_expire_suspension`, and `ff_resume_execution` all delete the
+  composite state keys on the three terminating paths (§3.1.1). SDK
+  surface: `CompositeBody` + `CountKind` re-exported at
+  `ff_sdk::{CompositeBody, CountKind}` and `ff_sdk::task::{CompositeBody,
+  CountKind}`; `ClaimedTask::try_suspend_inner` rebinds the Fresh
+  waitpoint_key from a composite tree's first Single/Count key so
+  single-waitpoint composite scoping works end-to-end. Lua library
+  version bumped 20 → 21.
+
+  **Scope deviation from RFC-014 §10.2:** this impl targets single-
+  waitpoint composites (patterns 1 + 2 from RFC §1.4: shared waitpoint
+  with distinct-source / distinct-signal counts, and same-waitpoint
+  AllOf over distinct signal-name matchers). Pattern 3 (`AllOf` across
+  N distinct waitpoint_ids) requires multi-binding `SuspendArgs` which
+  is out of scope here and tracked as a follow-up.
+
 - **RFC-016 Stage B: AnyOf / Quorum edge-dependency resolver.** Lights
   up the four-counter state machine on top of the Stage A edgegroup
   hash. `EngineBackend::set_edge_group_policy` now ACCEPTS
