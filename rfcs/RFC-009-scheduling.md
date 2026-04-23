@@ -400,6 +400,15 @@ Starvation still surfaces in logs: the scheduler and SDK emit a single `tracing:
 - Worker-connect-triggered `blocked_route` sweep (V1 uses the periodic unblock scanner — promotion latency is bounded by unblock scanner interval, not connect time).
 - Reclaim scanner integration for `ff_issue_reclaim_grant` — deferred to cairn Batch C (no production Rust caller today). When added, MUST apply the same block-on-capability-mismatch pattern as the claim path; the Lua helper already stamps `last_capability_mismatch_at` and documents the invariant inline.
 
+**Operator mitigation for adversarial cap distributions.** The periodic-sweep promotion above converges fast on homogeneous-pool deployments (cairn-shaped, per `rfcs/drafts/rfc-009-v2-real-world-analysis.md:90-108`) but exhibits a geometric latency tail when a single lane mixes workers whose capable-fraction for a given `R` falls below ~15%. This is a latency issue, not a correctness bug — every task remains claimable, no task is lost (analysis §"User experience if hit", lines 153-167) — but an operator who hits it should know what to reach for.
+
+- *Symptom.* Tasks accumulate in `ff:idx:{fp:N}:lane:<lane>:blocked_route` despite workers being online; `lane_blocked_route` ZCARD on a healthy lane drains within one `unblock_interval` (default 5 s, `ff-engine/src/lib.rs:139`). A ZCARD that stays non-zero across many sweeps on a lane with live workers is the signal. The `last_capability_mismatch_at` HSET gives per-execution recency (line 368 above); scanner telemetry (`visited/skipped/hit/elapsed` per follow-up #86) shows sweep-level pressure.
+- *Mitigation, in order of preference.*
+  1. **Provision more capable workers.** Bring the capable-fraction above ~25% on affected lanes. Per bench inflection (analysis lines 78-86), E[cycles] drops to ~4 and wall-time convergence tightens to ~20 s with the tail well under 1 %.
+  2. **Partition by lane.** Give rare-capability tasks a dedicated lane and subscribe only matching workers to it; the per-lane capable-fraction becomes 1.0 and thrash is structurally absent (analysis lines 96-100). This is the cairn deployment shape.
+  3. **Shorten the unblock scanner sweep.** Lower `EngineConfig::unblock_interval` (`ff-engine/src/lib.rs:62`). Trades Valkey CPU for a tighter convergence bound on mixed fleets — useful as a bridge while re-provisioning or re-partitioning.
+- *V2 options remain available.* The two paths above (Option A worker-connect-triggered sweep; Option B caps-selectivity priority bias) are the structural fixes if mitigations prove insufficient. Trigger-based resume criteria and full analysis live in `rfcs/drafts/rfc-009-v2-real-world-analysis.md`; re-open #11 (closed 2026-04-22 as accepted limitation) if a production consumer reports the adversarial shape.
+
 ---
 
 ### 8. Lane / Queue Facade
