@@ -30,6 +30,17 @@ use crate::types::{TimestampMs, WaitpointToken};
 // crossing into `ff_core::types`. Also brings `Namespace` into local
 // scope for the definitions below.
 pub use crate::types::Namespace;
+
+// RFC-013 Stage 1d — re-export the typed suspend trait surface so
+// external crates using `ff_core::backend::*` can reach the new types
+// without a second `use ff_core::contracts` line. Keeps the trait
+// naming surface coherent (`PendingWaitpoint`, `WaitpointSpec`, and
+// the new `SuspendArgs` / `SuspendOutcome` all live at the same path).
+pub use crate::contracts::{
+    CompositeBody, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher,
+    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
+    SuspensionRequester, TimeoutBehavior, WaitpointBinding,
+};
 use std::collections::BTreeMap;
 use std::time::Duration;
 

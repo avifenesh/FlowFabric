@@ -16,17 +16,18 @@
 -- Mints the waitpoint HMAC token (RFC-004 §Waitpoint Security) returned
 -- alongside the waitpoint_id for external signal delivery.
 --
--- KEYS (17): exec_core, attempt_record, lease_current, lease_history,
+-- KEYS (18): exec_core, attempt_record, lease_current, lease_history,
 --            lease_expiry_zset, worker_leases, suspension_current,
 --            waitpoint_hash, waitpoint_signals, suspension_timeout_zset,
 --            pending_wp_expiry_zset, active_index, suspended_zset,
 --            waitpoint_history, wp_condition, attempt_timeout_zset,
---            hmac_secrets
--- ARGV (17): execution_id, attempt_index, attempt_id, lease_id,
+--            hmac_secrets, dedup_hash (RFC-013)
+-- ARGV (19): execution_id, attempt_index, attempt_id, lease_id,
 --            lease_epoch, suspension_id, waitpoint_id, waitpoint_key,
 --            reason_code, requested_by, timeout_at, resume_condition_json,
 --            resume_policy_json, continuation_metadata_pointer,
---            use_pending_waitpoint, timeout_behavior, lease_history_maxlen
+--            use_pending_waitpoint, timeout_behavior, lease_history_maxlen,
+--            idempotency_key (RFC-013), dedup_ttl_ms (RFC-013)
 ---------------------------------------------------------------------------
 redis.register_function('ff_suspend_execution', function(keys, args)
   local K = {
@@ -47,6 +48,7 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     wp_condition          = keys[15],
     attempt_timeout_key   = keys[16],
     hmac_secrets          = keys[17],
+    dedup_hash            = keys[18],
   }
 
   local A = {
@@ -67,10 +69,42 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     use_pending_waitpoint     = args[15] or "",
     timeout_behavior          = args[16] or "fail",
     lease_history_maxlen      = tonumber(args[17] or "1000"),
+    idempotency_key           = args[18] or "",
+    dedup_ttl_ms              = tonumber(args[19] or "0"),
   }
 
   local t = redis.call("TIME")
   local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+  -- RFC-013 §9.2 — idempotency_key dedup branch. When the caller set an
+  -- idempotency_key, check the dedup hash first: a hit short-circuits with
+  -- the previously-serialized outcome verbatim, performing no state
+  -- mutation. On miss, fall through to the canonical path and write the
+  -- outcome into the dedup hash with TTL after commit.
+  local _dedup_active = (A.idempotency_key ~= "" and K.dedup_hash and K.dedup_hash ~= "")
+  if _dedup_active then
+    local stored = redis.call("HGET", K.dedup_hash, "outcome")
+    if stored == false then stored = nil end
+    if stored then
+      -- Stored format pins v=1 per §9.2 "Serialized-outcome stability":
+      -- "<status>\t<suspension_id>\t<waitpoint_id>\t<waitpoint_key>\t<waitpoint_token>".
+      local parts = {}
+      local idx = 1
+      for piece in string.gmatch(stored, "([^\t]*)\t?") do
+        parts[idx] = piece
+        idx = idx + 1
+        if idx > 5 then break end
+      end
+      if #parts >= 5 then
+        if parts[1] == "ALREADY_SATISFIED" then
+          return ok_already_satisfied(parts[2], parts[3], parts[4], parts[5])
+        else
+          return ok(parts[2], parts[3], parts[4], parts[5])
+        end
+      end
+      -- Malformed entry: fall through and treat as miss.
+    end
+  end
 
   -- 1. Read execution core
   local raw = redis.call("HGETALL", K.core_key)
@@ -163,6 +197,15 @@ redis.register_function('ff_suspend_execution', function(keys, args)
           "closed_at", tostring(now_ms), "close_reason", "resumed")
         write_condition_hash(K.wp_condition, wp_cond, now_ms)
         -- Do NOT release lease, do NOT change execution state.
+        -- RFC-013 §9.2 — write dedup outcome before returning.
+        if _dedup_active then
+          local payload = "ALREADY_SATISFIED\t" .. A.suspension_id .. "\t" .. waitpoint_id ..
+            "\t" .. waitpoint_key .. "\t" .. waitpoint_token
+          redis.call("HSET", K.dedup_hash, "outcome", payload)
+          if A.dedup_ttl_ms > 0 then
+            redis.call("PEXPIRE", K.dedup_hash, A.dedup_ttl_ms)
+          end
+        end
         return ok_already_satisfied(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
       end
       -- Condition not yet satisfied — proceed with suspension.
@@ -279,6 +322,16 @@ redis.register_function('ff_suspend_execution', function(keys, args)
 
   if is_set(A.timeout_at) then
     redis.call("ZADD", K.suspension_timeout_key, tonumber(A.timeout_at), A.execution_id)
+  end
+
+  -- RFC-013 §9.2 — write dedup outcome before returning.
+  if _dedup_active then
+    local payload = "OK\t" .. A.suspension_id .. "\t" .. waitpoint_id ..
+      "\t" .. waitpoint_key .. "\t" .. waitpoint_token
+    redis.call("HSET", K.dedup_hash, "outcome", payload)
+    if A.dedup_ttl_ms > 0 then
+      redis.call("PEXPIRE", K.dedup_hash, A.dedup_ttl_ms)
+    end
   end
 
   return ok(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)

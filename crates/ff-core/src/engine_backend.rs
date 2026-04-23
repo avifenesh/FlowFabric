@@ -50,9 +50,12 @@ use async_trait::async_trait;
 use crate::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility, WaitpointSpec,
+    ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility,
 };
-use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
+use crate::contracts::{
+    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult, SuspendArgs,
+    SuspendOutcome,
+};
 #[cfg(feature = "core")]
 use crate::contracts::{
     ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs, DeliverSignalResult,
@@ -151,15 +154,29 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Cooperative cancel by the worker holding the lease.
     async fn cancel(&self, handle: &Handle, reason: &str) -> Result<(), EngineError>;
 
-    /// Suspend the execution awaiting one or more waitpoints. Returns
-    /// a fresh `Handle` whose `HandleKind::Suspended` supersedes the
-    /// caller's pre-suspend handle.
+    /// Suspend the execution awaiting a typed resume condition
+    /// (RFC-013 Stage 1d).
+    ///
+    /// Borrows `handle` (round-4 M-D2). Terminal-looking behaviour is
+    /// expressed through [`SuspendOutcome`]:
+    ///
+    /// * [`SuspendOutcome::Suspended`] — the pre-suspend handle is
+    ///   logically invalidated; the fresh `HandleKind::Suspended`
+    ///   handle inside the variant supersedes it. Runtime enforcement
+    ///   via the fence triple: subsequent ops against the stale handle
+    ///   surface as `Contention(LeaseConflict)`.
+    /// * [`SuspendOutcome::AlreadySatisfied`] — buffered signals on a
+    ///   pending waitpoint already matched the resume condition at
+    ///   suspension time. The lease is NOT released; the caller's
+    ///   pre-suspend handle remains valid.
+    ///
+    /// See RFC-013 §2 for the type shapes, §3 for the replay /
+    /// idempotency contract, §4 for the error taxonomy.
     async fn suspend(
         &self,
         handle: &Handle,
-        waitpoints: Vec<WaitpointSpec>,
-        timeout: Option<Duration>,
-    ) -> Result<Handle, EngineError>;
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError>;
 
     /// Issue a pending waitpoint for future signal delivery.
     ///

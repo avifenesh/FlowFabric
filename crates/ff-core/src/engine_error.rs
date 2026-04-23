@@ -378,6 +378,12 @@ pub enum StateKind {
     MaxRetriesExhausted,
     /// Already closed. No-op.
     StreamAlreadyClosed,
+    /// RFC-013 Stage 1d — strict `suspend` path refuses the
+    /// early-satisfied branch. The underlying backend outcome is
+    /// [`crate::contracts::SuspendOutcome::AlreadySatisfied`]; only the
+    /// SDK's strict `ClaimedTask::suspend` wrapper maps it to this
+    /// error. `ClaimedTask::try_suspend` returns the outcome directly.
+    AlreadySatisfied,
 }
 
 /// FF-internal invariant-violation sub-kinds. Should not be reachable
@@ -521,6 +527,7 @@ impl EngineError {
             Self::State(
                 StateKind::ExecutionNotSuspended
                 | StateKind::AlreadySuspended
+                | StateKind::AlreadySatisfied
                 | StateKind::WaitpointClosed
                 | StateKind::DuplicateSignal
                 | StateKind::GrantAlreadyExists

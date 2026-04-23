@@ -111,8 +111,8 @@ pub use ff_core::backend::ResumeSignal;
 #[cfg(feature = "valkey-default")]
 pub use task::{
     read_stream, tail_stream, tail_stream_with_visibility, AppendFrameOutcome, ClaimedTask,
-    ConditionMatcher, Signal, SignalOutcome, StreamCursor, StreamFrames, SuspendOutcome,
-    TimeoutBehavior, MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
+    Signal, SignalOutcome, StreamCursor, StreamFrames, SuspendedHandle, TrySuspendOutcome,
+    MAX_TAIL_BLOCK_MS, STREAM_READ_HARD_CAP,
 };
 // RFC-015 stream-durability-mode public surface. Re-exported so
 // consumers can name `ff_sdk::StreamMode` etc. alongside the older
@@ -121,6 +121,16 @@ pub use task::{
 #[cfg(feature = "valkey-default")]
 pub use ff_core::backend::{
     PatchKind, StreamMode, SummaryDocument, TailVisibility, SUMMARY_NULL_SENTINEL,
+};
+// RFC-013 Stage 1d — typed suspend surface lives in `ff_core::contracts`
+// and is reachable via `ff_sdk::*` too. `SuspendOutcome` path is
+// preserved via this re-export so `ff_sdk::SuspendOutcome` still
+// compiles.
+#[cfg(feature = "valkey-default")]
+pub use ff_core::contracts::{
+    CompositeBody, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher,
+    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
+    SuspensionRequester, TimeoutBehavior, WaitpointBinding,
 };
 #[cfg(feature = "valkey-default")]
 pub use worker::FlowFabricWorker;

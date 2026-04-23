@@ -39,7 +39,10 @@ use ff_core::types::*;
 use ff_readiness_tests::evidence;
 use ff_readiness_tests::server::InProcessServer;
 use ff_readiness_tests::valkey::{probe_server_version, TestCluster, TEST_PARTITION_CONFIG};
-use ff_sdk::task::{ClaimedTask, ConditionMatcher, Signal, SignalOutcome, SuspendOutcome, TimeoutBehavior};
+use ff_sdk::task::{
+    ClaimedTask, ResumeCondition, ResumePolicy, Signal, SignalMatcher, SignalOutcome,
+    SuspensionReasonCode, TimeoutBehavior,
+};
 use ff_sdk::SdkError;
 use serde_json::json;
 
@@ -316,25 +319,28 @@ async fn create_claim(
 /// Suspend a claimed task on a single `review` matcher and unwrap the
 /// suspended outcome. Consumes the task (suspend's API contract).
 async fn suspend_with_review(task: ClaimedTask) -> (WaitpointId, WaitpointToken) {
+    let wp_key = format!("wpk:{}", ff_core::types::WaitpointId::new());
     let outcome = task
         .suspend(
-            "waiting_for_review",
-            &[ConditionMatcher {
-                signal_name: SIGNAL_NAME.into(),
-            }],
-            Some(60_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForOperatorReview,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key,
+                matcher: SignalMatcher::ByName(SIGNAL_NAME.into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 60_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
         .await
         .expect("suspend");
-    match outcome {
-        SuspendOutcome::Suspended {
-            waitpoint_id,
-            waitpoint_token,
-            ..
-        } => (waitpoint_id, waitpoint_token),
-        other => panic!("expected Suspended, got {other:?}"),
-    }
+    (
+        outcome.details.waitpoint_id.clone(),
+        outcome.details.waitpoint_token.token().clone(),
+    )
 }
 
 /// Build the canonical test `Signal` (review / decision / test) carrying

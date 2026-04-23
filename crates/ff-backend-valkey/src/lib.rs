@@ -32,7 +32,7 @@ use ff_core::backend::{
     AppendFrameOutcome, BackendConnection, CancelFlowPolicy, CancelFlowWait,
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle,
     HandleKind, LeaseRenewal, PatchKind, PendingWaitpoint, ReclaimToken, ResumeSignal,
-    StreamMode, SummaryDocument, TailVisibility, UsageDimensions, WaitpointSpec,
+    StreamMode, SummaryDocument, TailVisibility, UsageDimensions, WaitpointHmac,
 };
 use ff_core::contracts::decode::{
     build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
@@ -41,8 +41,11 @@ use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
     DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot,
     FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage, ListLanesPage,
-    ListSuspendedPage, ReportUsageResult, SuspendedExecutionEntry,
+    ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
+    SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspendedExecutionEntry,
+    WaitpointBinding,
 };
+use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
@@ -2685,6 +2688,331 @@ async fn read_retry_policy_json(
     }
 }
 
+// ── RFC-013 Stage 1d: suspend_impl ────────────────────────────────────
+
+/// Grace window added to caller-supplied `timeout_at` when deriving the
+/// dedup-hash TTL (RFC-013 §2.2).
+const SUSPEND_DEDUP_GRACE_MS: u64 = 60_000;
+/// Upper bound on the dedup-hash TTL (RFC-013 §2.2). Also the default
+/// when `timeout_at` is `None`. 7 days.
+const SUSPEND_DEDUP_MAX_TTL_MS: u64 = 604_800_000;
+/// Clock-skew tolerance for `timeout_at` validation (RFC-013 §2.2).
+const SUSPEND_CLOCK_SKEW_TOLERANCE_MS: i64 = 600_000;
+
+/// Serialize a [`ResumeCondition`] into the `resume_condition_json` ARGV
+/// string today's Lua reads. Internal to the backend — consumers never
+/// see this string.
+fn resume_condition_to_json(
+    cond: &ResumeCondition,
+    timeout_behavior: &ff_core::contracts::TimeoutBehavior,
+) -> Result<String, EngineError> {
+    let v: serde_json::Value = match cond {
+        ResumeCondition::Single {
+            waitpoint_key: _,
+            matcher,
+        } => {
+            let names: Vec<String> = match matcher {
+                SignalMatcher::ByName(n) => vec![n.clone()],
+                SignalMatcher::Wildcard => Vec::new(),
+                _ => Vec::new(),
+            };
+            serde_json::json!({
+                "condition_type": "signal_set",
+                "required_signal_names": names,
+                "signal_match_mode": "any",
+                "minimum_signal_count": 1,
+                "timeout_behavior": timeout_behavior.as_wire_str(),
+                "allow_operator_override": true,
+            })
+        }
+        ResumeCondition::OperatorOnly => serde_json::json!({
+            "condition_type": "signal_set",
+            // No signal name will ever match this sentinel — only an
+            // operator resume closes the waitpoint (RFC-013 §2.4).
+            "required_signal_names": ["__operator_only__"],
+            "signal_match_mode": "all",
+            "minimum_signal_count": 1,
+            "timeout_behavior": timeout_behavior.as_wire_str(),
+            "allow_operator_override": true,
+        }),
+        ResumeCondition::TimeoutOnly => serde_json::json!({
+            "condition_type": "signal_set",
+            "required_signal_names": ["__timeout_only__"],
+            "signal_match_mode": "all",
+            "minimum_signal_count": 1,
+            "timeout_behavior": timeout_behavior.as_wire_str(),
+            "allow_operator_override": true,
+        }),
+        ResumeCondition::Composite(_) => {
+            // RFC-014 populates CompositeBody. RFC-013 ships the slot
+            // but does not accept a composite at the backend.
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "resume_condition: Composite is reserved for RFC-014".into(),
+            });
+        }
+        _ => {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "resume_condition: unsupported variant".into(),
+            });
+        }
+    };
+    Ok(v.to_string())
+}
+
+/// Serialize a [`ResumePolicy`] into the `resume_policy_json` ARGV
+/// string Lua reads.
+fn resume_policy_to_json(p: &ResumePolicy) -> String {
+    let target = match p.resume_target {
+        ResumeTarget::Runnable => "runnable",
+        _ => "runnable",
+    };
+    let mut obj = serde_json::json!({
+        "resume_target": target,
+        "close_waitpoint_on_resume": p.close_waitpoint_on_resume,
+        "consume_matched_signals": p.consume_matched_signals,
+        "retain_signal_buffer_until_closed": p.retain_signal_buffer_until_closed,
+    });
+    if let Some(d) = p.resume_delay_ms {
+        obj.as_object_mut()
+            .expect("json object")
+            .insert("resume_delay_ms".into(), serde_json::json!(d));
+    }
+    obj.to_string()
+}
+
+/// Rust-side pre-FCALL validation (RFC-013 §4).
+fn validate_suspend_args(args: &SuspendArgs) -> Result<(), EngineError> {
+    // waitpoint_key cross-field invariant.
+    if let (
+        WaitpointBinding::Fresh { waitpoint_key: a, .. },
+        ResumeCondition::Single { waitpoint_key: b, .. },
+    ) = (&args.waitpoint, &args.resume_condition)
+    {
+        if a != b {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "waitpoint_key_mismatch".into(),
+            });
+        }
+    }
+    // TimeoutOnly requires timeout_at.
+    if matches!(args.resume_condition, ResumeCondition::TimeoutOnly)
+        && args.timeout_at.is_none()
+    {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "timeout_only_without_deadline".into(),
+        });
+    }
+    // Empty ByName rejected (wildcard is its own variant).
+    if let ResumeCondition::Single {
+        matcher: SignalMatcher::ByName(n),
+        ..
+    } = &args.resume_condition
+    {
+        if n.is_empty() {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "resume_condition: empty signal name (use Wildcard instead)".into(),
+            });
+        }
+    }
+    // timeout_at in the past (with clock-skew tolerance).
+    if let Some(at) = args.timeout_at {
+        if at.0 + SUSPEND_CLOCK_SKEW_TOLERANCE_MS < args.now.0 {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "timeout_at_in_past".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Compute dedup TTL per RFC-013 §2.2:
+/// `min(timeout_at - now + GRACE, MAX_TTL)`; `MAX_TTL` when no deadline.
+fn compute_dedup_ttl_ms(args: &SuspendArgs) -> u64 {
+    match args.timeout_at {
+        Some(at) => {
+            let delta = (at.0 - args.now.0).max(0) as u64;
+            delta.saturating_add(SUSPEND_DEDUP_GRACE_MS).min(SUSPEND_DEDUP_MAX_TTL_MS)
+        }
+        None => SUSPEND_DEDUP_MAX_TTL_MS,
+    }
+}
+
+#[tracing::instrument(
+    name = "ff.suspend",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
+async fn suspend_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    f: &handle_codec::HandleFields,
+    args: SuspendArgs,
+) -> Result<SuspendOutcome, EngineError> {
+    validate_suspend_args(&args)?;
+
+    let partition = execution_partition(&f.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &f.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    // Extract (waitpoint_id, waitpoint_key, use_pending) from the
+    // typed binding. `UsePending` supplies an empty waitpoint_key;
+    // the Lua side resolves the authoritative key from the waitpoint
+    // hash.
+    let (wp_id, wp_key, use_pending) = match &args.waitpoint {
+        WaitpointBinding::Fresh {
+            waitpoint_id,
+            waitpoint_key,
+        } => (waitpoint_id.clone(), waitpoint_key.clone(), false),
+        WaitpointBinding::UsePending { waitpoint_id } => {
+            (waitpoint_id.clone(), String::new(), true)
+        }
+        _ => {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "waitpoint: unsupported binding variant".into(),
+            });
+        }
+    };
+
+    let resume_condition_json =
+        resume_condition_to_json(&args.resume_condition, &args.timeout_behavior)?;
+    let resume_policy_json = resume_policy_to_json(&args.resume_policy);
+
+    let idem_key = args
+        .idempotency_key
+        .as_ref()
+        .map(|k| k.as_str().to_owned())
+        .unwrap_or_default();
+    let dedup_ttl = if idem_key.is_empty() {
+        0
+    } else {
+        compute_dedup_ttl_ms(&args)
+    };
+
+    let dedup_hash_key = if idem_key.is_empty() {
+        // Noop placeholder — shares partition hash tag so KEYS stay
+        // on-slot in cluster mode.
+        ctx.noop()
+    } else {
+        ctx.suspend_dedup(&idem_key)
+    };
+
+    // KEYS (18): per RFC-013 §9.2.
+    let keys: Vec<String> = vec![
+        ctx.core(),                                  // 1
+        ctx.attempt_hash(f.attempt_index),           // 2
+        ctx.lease_current(),                         // 3
+        ctx.lease_history(),                         // 4
+        idx.lease_expiry(),                          // 5
+        idx.worker_leases(&f.worker_instance_id),    // 6
+        ctx.suspension_current(),                    // 7
+        ctx.waitpoint(&wp_id),                       // 8
+        ctx.waitpoint_signals(&wp_id),               // 9
+        idx.suspension_timeout(),                    // 10
+        idx.pending_waitpoint_expiry(),              // 11
+        idx.lane_active(&f.lane_id),                 // 12
+        idx.lane_suspended(&f.lane_id),              // 13
+        ctx.waitpoints(),                            // 14
+        ctx.waitpoint_condition(&wp_id),             // 15
+        idx.attempt_timeout(),                       // 16
+        idx.waitpoint_hmac_secrets(),                // 17
+        dedup_hash_key,                              // 18
+    ];
+
+    // ARGV (19): per RFC-013 §9.2.
+    let argv: Vec<String> = vec![
+        f.execution_id.to_string(),                                                   // 1
+        f.attempt_index.to_string(),                                                  // 2
+        f.attempt_id.to_string(),                                                     // 3
+        f.lease_id.to_string(),                                                       // 4
+        f.lease_epoch.to_string(),                                                    // 5
+        args.suspension_id.to_string(),                                               // 6
+        wp_id.to_string(),                                                            // 7
+        wp_key,                                                                       // 8
+        args.reason_code.as_wire_str().to_owned(),                                    // 9
+        args.requested_by.as_wire_str().to_owned(),                                   // 10
+        args.timeout_at.map_or(String::new(), |t| t.to_string()),                     // 11
+        resume_condition_json,                                                        // 12
+        resume_policy_json,                                                           // 13
+        args.continuation_metadata_pointer.clone().unwrap_or_default(),               // 14
+        if use_pending { "1".to_owned() } else { String::new() },                     // 15
+        args.timeout_behavior.as_wire_str().to_owned(),                               // 16
+        "1000".to_owned(),                                                            // 17 lease_history_maxlen
+        idem_key,                                                                     // 18
+        dedup_ttl.to_string(),                                                        // 19
+    ];
+
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+
+    let raw: ferriskey::Value = client
+        .fcall("ff_suspend_execution", &key_refs, &arg_refs)
+        .await
+        .map_err(transport_fk)?;
+
+    let result = FcallResult::parse(&raw).map_err(EngineError::from)?;
+    if !result.success {
+        return Err(EngineError::from(
+            result.into_success().unwrap_err(),
+        ));
+    }
+
+    // Success: fields are [suspension_id, waitpoint_id, waitpoint_key, waitpoint_token].
+    let s_id = result.field_str(0);
+    let w_id_str = result.field_str(1);
+    let w_key = result.field_str(2);
+    let w_tok = result.field_str(3);
+
+    let suspension_id = ff_core::types::SuspensionId::parse(&s_id).map_err(|e| {
+        transport_script(ScriptError::Parse {
+            fcall: "suspend_impl".into(),
+            execution_id: Some(f.execution_id.to_string()),
+            message: format!("bad suspension_id: {e}"),
+        })
+    })?;
+    let waitpoint_id = WaitpointId::parse(&w_id_str).map_err(|e| {
+        transport_script(ScriptError::Parse {
+            fcall: "suspend_impl".into(),
+            execution_id: Some(f.execution_id.to_string()),
+            message: format!("bad waitpoint_id: {e}"),
+        })
+    })?;
+
+    let details = SuspendOutcomeDetails::new(
+        suspension_id,
+        waitpoint_id,
+        w_key,
+        WaitpointHmac::new(w_tok),
+    );
+
+    match result.status.as_str() {
+        "ALREADY_SATISFIED" => Ok(SuspendOutcome::AlreadySatisfied { details }),
+        _ => {
+            // Mint a fresh Suspended-kind handle carrying the caller's
+            // execution identity. The new handle has the same fence
+            // triple as the caller's pre-suspend handle — its purpose
+            // is to carry a `HandleKind::Suspended` tag for
+            // `observe_signals` / `claim_from_reclaim` routing.
+            let suspended_handle = handle_codec::encode_handle(f, HandleKind::Suspended);
+            Ok(SuspendOutcome::Suspended {
+                details,
+                handle: suspended_handle,
+            })
+        }
+    }
+}
+
 /// Thin forwarder to `ff_script::functions::signal::ff_deliver_signal`.
 ///
 /// Reads `lane_id` off `exec_core` (the caller's args carry no lane —
@@ -2901,11 +3229,25 @@ impl EngineBackend for ValkeyBackend {
 
     async fn suspend(
         &self,
-        _handle: &Handle,
-        _waitpoints: Vec<WaitpointSpec>,
-        _timeout: Option<Duration>,
-    ) -> Result<Handle, EngineError> {
-        Err(EngineError::Unavailable { op: "suspend" })
+        handle: &Handle,
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        // Pre-FCALL handle-kind check (RFC-013 §3.2 — the Suspended-kind
+        // pre-check fires before any dedup lookup and is not dedup-
+        // dodgeable).
+        if handle.kind == HandleKind::Suspended {
+            return Err(EngineError::State(StateKind::AlreadySuspended));
+        }
+        // RFC-013 §4 — Rust-side input validation fires before the
+        // handle decode so malformed SuspendArgs surface as
+        // `Validation(InvalidInput)` regardless of handle bytes shape.
+        validate_suspend_args(&args)?;
+        let f = handle_codec::decode_handle(handle)?;
+        suspend_impl(&self.client, &self.partition_config, &f, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "suspend: FCALL ff_suspend_execution")
+            })
     }
 
     async fn create_waitpoint(

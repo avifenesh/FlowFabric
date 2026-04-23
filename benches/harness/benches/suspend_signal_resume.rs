@@ -34,7 +34,10 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use ff_bench::{
     report::Percentiles, write_report, LatencyMs, Report, SYSTEM_FLOWFABRIC,
 };
-use ff_sdk::{ConditionMatcher, FlowFabricWorker, SuspendOutcome, TimeoutBehavior, WorkerConfig};
+use ff_sdk::{
+    FlowFabricWorker, ResumeCondition, ResumePolicy, SignalMatcher, SuspensionReasonCode,
+    TimeoutBehavior, WorkerConfig,
+};
 use serde::Deserialize;
 
 const SCENARIO: &str = "suspend_signal_resume";
@@ -389,27 +392,25 @@ async fn measure_one_inner(
     // ── MEASURED WINDOW ───────────────────────────────────────────────
     let t0 = Instant::now();
 
+    let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task
         .suspend(
-            "bench_suspend",
-            &[ConditionMatcher {
-                signal_name: SIGNAL_NAME.into(),
-            }],
-            Some(60_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForSignal,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key,
+                matcher: SignalMatcher::ByName(SIGNAL_NAME.into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 60_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
         .await?;
-
-    let (waitpoint_id, waitpoint_token) = match outcome {
-        SuspendOutcome::Suspended {
-            waitpoint_id,
-            waitpoint_token,
-            ..
-        } => (waitpoint_id, waitpoint_token),
-        SuspendOutcome::AlreadySatisfied { .. } => {
-            anyhow::bail!("scenario 2: AlreadySatisfied on a fresh waitpoint");
-        }
-    };
+    let waitpoint_id = outcome.details.waitpoint_id.clone();
+    let waitpoint_token = outcome.details.waitpoint_token.token().clone();
 
     // Reviewer fetches the token via the server's REST endpoint. This is
     // the realistic path (matches media-pipeline review CLI); fetching

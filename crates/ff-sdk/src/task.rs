@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferriskey::{Client, Value};
-use ff_core::backend::{Handle, HandleKind};
+use ff_core::backend::{Handle, HandleKind, PendingWaitpoint};
 use ff_core::contracts::ReportUsageResult;
 use ff_core::engine_backend::EngineBackend;
+use ff_core::engine_error::StateKind;
 use ff_script::error::ScriptError;
-use ff_core::keys::{ExecKeyContext, IndexKeys};
-use ff_core::partition::{execution_partition, PartitionConfig};
+use ff_core::partition::PartitionConfig;
 use ff_core::types::*;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
@@ -18,75 +18,55 @@ use crate::SdkError;
 
 // ── Phase 3: Suspend/Signal types ──
 
-/// Timeout behavior when a suspension deadline is reached.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TimeoutBehavior {
-    Fail,
-    Cancel,
-    Expire,
-    AutoResume,
-    Escalate,
+// RFC-013 Stage 1d — `TimeoutBehavior`, `SuspendOutcome`,
+// `ResumeCondition`, `SignalMatcher`, `ResumePolicy`,
+// `SuspensionReasonCode`, `SuspensionRequester`, `WaitpointBinding`,
+// `SuspendArgs`, `SuspendOutcomeDetails`, `IdempotencyKey`,
+// `CompositeBody` all live in `ff_core::contracts`. The `SuspendOutcome`
+// re-export preserves the `ff_sdk::SuspendOutcome` path; the other
+// paths are new.
+pub use ff_core::contracts::{
+    CompositeBody, IdempotencyKey, ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher,
+    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
+    SuspensionRequester, TimeoutBehavior, WaitpointBinding,
+};
+
+/// RFC-013 Stage 1d — cookie returned by the strict `suspend` wrapper.
+///
+/// The returned `handle` is a `HandleKind::Suspended` cookie the caller
+/// uses for `observe_signals` and the eventual re-claim via
+/// `claim_resumed_execution`. Consuming `ClaimedTask::suspend`
+/// invalidates the pre-suspend `ClaimedTask` (already moved by the
+/// `self: ClaimedTask` receiver); this handle is the only live cookie
+/// left on the caller side.
+#[derive(Debug)]
+pub struct SuspendedHandle {
+    pub handle: Handle,
+    pub details: SuspendOutcomeDetails,
 }
 
-impl TimeoutBehavior {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Fail => "fail",
-            Self::Cancel => "cancel",
-            Self::Expire => "expire",
-            Self::AutoResume => "auto_resume_with_timeout_signal",
-            Self::Escalate => "escalate",
-        }
-    }
-}
-
-impl std::fmt::Display for TimeoutBehavior {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for TimeoutBehavior {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "fail" => Ok(Self::Fail),
-            "cancel" => Ok(Self::Cancel),
-            "expire" => Ok(Self::Expire),
-            "auto_resume_with_timeout_signal" | "auto_resume" => Ok(Self::AutoResume),
-            "escalate" => Ok(Self::Escalate),
-            other => Err(format!("unknown timeout behavior: {other}")),
-        }
-    }
-}
-
-/// A condition matcher for the resume condition.
-#[derive(Clone, Debug)]
-pub struct ConditionMatcher {
-    /// Signal name to match (empty = wildcard).
-    pub signal_name: String,
-}
-
-/// Outcome of a `suspend()` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SuspendOutcome {
-    /// Execution is now suspended, waitpoint active.
-    Suspended {
-        suspension_id: SuspensionId,
-        waitpoint_id: WaitpointId,
-        waitpoint_key: String,
-        /// HMAC token that signal deliverers must supply to this waitpoint.
-        waitpoint_token: WaitpointToken,
-    },
-    /// Buffered signals already satisfied the condition — suspension skipped.
-    /// The caller still holds the lease.
+/// RFC-013 Stage 1d — outcome of the fallible `try_suspend` wrapper.
+///
+/// Unlike the strict wrapper, `AlreadySatisfied` hands the `ClaimedTask`
+/// back to the caller so work continues on the retained lease.
+pub enum TrySuspendOutcome {
+    Suspended(SuspendedHandle),
     AlreadySatisfied {
-        suspension_id: SuspensionId,
-        waitpoint_id: WaitpointId,
-        waitpoint_key: String,
-        waitpoint_token: WaitpointToken,
+        task: ClaimedTask,
+        details: SuspendOutcomeDetails,
     },
+}
+
+impl std::fmt::Debug for TrySuspendOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Suspended(h) => f.debug_tuple("Suspended").field(h).finish(),
+            Self::AlreadySatisfied { details, .. } => f
+                .debug_struct("AlreadySatisfied")
+                .field("details", details)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// A signal to deliver to a suspended execution's waitpoint.
@@ -842,128 +822,145 @@ impl ClaimedTask {
             .map_err(SdkError::from)
     }
 
-    // ── Phase 3: Suspend ──
+    // ── RFC-013 Stage 1d: Suspend ──
 
-    /// Suspend the execution, releasing the lease and creating a waitpoint.
+    /// **Strict suspend.** Consumes `self` and yields a
+    /// [`SuspendedHandle`] or errors. On the early-satisfied path
+    /// (buffered signals already matched the condition), returns
+    /// `EngineError::State(AlreadySatisfied)` — use `try_suspend` when
+    /// that branch is part of the flow's happy path.
     ///
-    /// The execution transitions to `suspended` and the worker loses ownership.
-    /// An external signal matching the condition will resume the execution.
-    ///
-    /// If `condition_matchers` is empty, a wildcard matcher is created that
-    /// matches ANY signal name. To require an explicit operator resume with
-    /// no signal match, pass a sentinel name that no real signal will use.
-    ///
-    /// If buffered signals on a pending waitpoint already satisfy the condition,
-    /// returns `AlreadySatisfied` and the lease is NOT released.
-    ///
-    /// Consumes self — the task cannot be used after suspension.
-    // TODO(stage-1d-or-rfc-amendment): deferred from Stage 1b. Trait
-    // method `suspend` returns `Handle` (a resumed-kind attempt
-    // cookie); this SDK method returns `SuspendOutcome { suspension_id,
-    // waitpoint_id, waitpoint_key, waitpoint_token }` — semantically
-    // distinct return shapes. Also: SDK takes `&[ConditionMatcher]` +
-    // `TimeoutBehavior` with no `WaitpointSpec` mapping. Tracked in #117.
+    /// RFC-013 §5.1 — this is the classic Rust `foo` / `try_foo`
+    /// split; `suspend` is the unconditional form. Defaults
+    /// `WaitpointBinding::fresh()` for the waitpoint. For pending
+    /// waitpoints previously issued via `create_pending_waitpoint`,
+    /// use `try_suspend_on_pending`.
     pub async fn suspend(
         self,
-        reason_code: &str,
-        condition_matchers: &[ConditionMatcher],
-        timeout_ms: Option<u64>,
-        timeout_behavior: TimeoutBehavior,
-    ) -> Result<SuspendOutcome, SdkError> {
-        let partition = execution_partition(&self.execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &self.execution_id);
-        let idx = IndexKeys::new(&partition);
+        reason_code: SuspensionReasonCode,
+        resume_condition: ResumeCondition,
+        timeout: Option<(TimestampMs, TimeoutBehavior)>,
+        resume_policy: ResumePolicy,
+    ) -> Result<SuspendedHandle, SdkError> {
+        let outcome = self
+            .try_suspend_inner(WaitpointBinding::fresh(), reason_code, resume_condition, timeout, resume_policy)
+            .await?;
+        match outcome {
+            TrySuspendOutcome::Suspended(h) => Ok(h),
+            TrySuspendOutcome::AlreadySatisfied { .. } => Err(SdkError::from(
+                crate::EngineError::State(StateKind::AlreadySatisfied),
+            )),
+        }
+    }
 
-        let suspension_id = SuspensionId::new();
-        let waitpoint_id = WaitpointId::new();
-        // For now, use a simple opaque key (real implementation would use HMAC token)
-        let waitpoint_key = format!("wpk:{}", waitpoint_id);
+    /// **Fallible suspend.** On the early-satisfied path, the
+    /// `ClaimedTask` is handed back unchanged so the worker can
+    /// continue running against the retained lease.
+    ///
+    /// RFC-013 §5.1 — use this when consuming a pending waitpoint whose
+    /// buffered signals may already match the condition.
+    pub async fn try_suspend(
+        self,
+        reason_code: SuspensionReasonCode,
+        resume_condition: ResumeCondition,
+        timeout: Option<(TimestampMs, TimeoutBehavior)>,
+        resume_policy: ResumePolicy,
+    ) -> Result<TrySuspendOutcome, SdkError> {
+        self.try_suspend_inner(WaitpointBinding::fresh(), reason_code, resume_condition, timeout, resume_policy)
+            .await
+    }
 
-        let timeout_at = timeout_ms.map(|ms| TimestampMs::from_millis(TimestampMs::now().0 + ms as i64));
+    /// Convenience: `try_suspend` against a pending waitpoint previously
+    /// issued via `create_pending_waitpoint`.
+    pub async fn try_suspend_on_pending(
+        self,
+        pending: &PendingWaitpoint,
+        reason_code: SuspensionReasonCode,
+        resume_condition: ResumeCondition,
+        timeout: Option<(TimestampMs, TimeoutBehavior)>,
+        resume_policy: ResumePolicy,
+    ) -> Result<TrySuspendOutcome, SdkError> {
+        self.try_suspend_inner(
+            WaitpointBinding::use_pending(pending),
+            reason_code,
+            resume_condition,
+            timeout,
+            resume_policy,
+        )
+        .await
+    }
 
-        // Build resume condition JSON
-        let required_signal_names: Vec<&str> = condition_matchers
-            .iter()
-            .map(|m| m.signal_name.as_str())
-            .collect();
-        let match_mode = if required_signal_names.len() <= 1 { "any" } else { "all" };
-        let resume_condition_json = serde_json::json!({
-            "condition_type": "signal_set",
-            "required_signal_names": required_signal_names,
-            "signal_match_mode": match_mode,
-            "minimum_signal_count": 1,
-            "timeout_behavior": timeout_behavior.as_str(),
-            "allow_operator_override": true,
-        }).to_string();
+    async fn try_suspend_inner(
+        self,
+        waitpoint: WaitpointBinding,
+        reason_code: SuspensionReasonCode,
+        resume_condition: ResumeCondition,
+        timeout: Option<(TimestampMs, TimeoutBehavior)>,
+        resume_policy: ResumePolicy,
+    ) -> Result<TrySuspendOutcome, SdkError> {
+        let handle = self.synth_handle();
+        let (timeout_at, timeout_behavior) = match timeout {
+            Some((at, b)) => (Some(at), b),
+            None => (None, TimeoutBehavior::Fail),
+        };
+        // If the caller passed `ResumeCondition::Single { waitpoint_key }`
+        // alongside the default `WaitpointBinding::fresh()` (which mints a
+        // random internal key), rebind the Fresh binding to use the
+        // condition's key so RFC-013 §2.4 "waitpoint_key cross-field
+        // invariant" is honored. UsePending retains its own binding.
+        let waitpoint = match (&waitpoint, &resume_condition) {
+            (
+                WaitpointBinding::Fresh { waitpoint_id, .. },
+                ResumeCondition::Single { waitpoint_key, .. },
+            ) => WaitpointBinding::Fresh {
+                waitpoint_id: waitpoint_id.clone(),
+                waitpoint_key: waitpoint_key.clone(),
+            },
+            _ => waitpoint,
+        };
+        let mut args = SuspendArgs::new(
+            SuspensionId::new(),
+            waitpoint,
+            resume_condition,
+            resume_policy,
+            reason_code,
+            TimestampMs::now(),
+        )
+        .with_requester(SuspensionRequester::Worker);
+        if let Some(at) = timeout_at {
+            args = args.with_timeout(at, timeout_behavior);
+        }
 
-        let resume_policy_json = serde_json::json!({
-            "resume_target": "runnable",
-            "close_waitpoint_on_resume": true,
-            "consume_matched_signals": true,
-            "retain_signal_buffer_until_closed": true,
-        }).to_string();
-
-        // KEYS (17): exec_core, attempt_record, lease_current, lease_history,
-        //            lease_expiry, worker_leases, suspension_current, waitpoint_hash,
-        //            waitpoint_signals, suspension_timeout, pending_wp_expiry,
-        //            active_index, suspended_index, waitpoint_history, wp_condition,
-        //            attempt_timeout, hmac_secrets
-        let keys: Vec<String> = vec![
-            ctx.core(),                                          // 1
-            ctx.attempt_hash(self.attempt_index),                // 2
-            ctx.lease_current(),                                 // 3
-            ctx.lease_history(),                                 // 4
-            idx.lease_expiry(),                                  // 5
-            idx.worker_leases(&self.worker_instance_id),         // 6
-            ctx.suspension_current(),                            // 7
-            ctx.waitpoint(&waitpoint_id),                        // 8
-            ctx.waitpoint_signals(&waitpoint_id),                // 9
-            idx.suspension_timeout(),                            // 10
-            idx.pending_waitpoint_expiry(),                      // 11
-            idx.lane_active(&self.lane_id),                      // 12
-            idx.lane_suspended(&self.lane_id),                   // 13
-            ctx.waitpoints(),                                    // 14
-            ctx.waitpoint_condition(&waitpoint_id),              // 15
-            idx.attempt_timeout(),                               // 16
-            idx.waitpoint_hmac_secrets(),                        // 17
-        ];
-
-        // ARGV (17): execution_id, attempt_index, attempt_id, lease_id,
-        //            lease_epoch, suspension_id, waitpoint_id, waitpoint_key,
-        //            reason_code, requested_by, timeout_at, resume_condition_json,
-        //            resume_policy_json, continuation_metadata_pointer,
-        //            use_pending_waitpoint, timeout_behavior, lease_history_maxlen
-        let args: Vec<String> = vec![
-            self.execution_id.to_string(),                          // 1
-            self.attempt_index.to_string(),                         // 2
-            self.attempt_id.to_string(),                            // 3
-            self.lease_id.to_string(),                              // 4
-            self.lease_epoch.to_string(),                           // 5
-            suspension_id.to_string(),                              // 6
-            waitpoint_id.to_string(),                               // 7
-            waitpoint_key.clone(),                                  // 8
-            reason_code.to_owned(),                                 // 9
-            "worker".to_owned(),                                    // 10
-            timeout_at.map_or(String::new(), |t| t.to_string()),   // 11
-            resume_condition_json,                                  // 12
-            resume_policy_json,                                     // 13
-            String::new(),                                          // 14 continuation_metadata_ptr
-            String::new(),                                          // 15 use_pending_waitpoint
-            timeout_behavior.as_str().to_owned(),                   // 16
-            "1000".to_owned(),                                      // 17 lease_history_maxlen
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .client
-            .fcall("ff_suspend_execution", &key_refs, &arg_refs)
+        let outcome = self
+            .backend
+            .suspend(&handle, args)
             .await
             .map_err(SdkError::from)?;
-
-        self.stop_renewal();
-        parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
+        match outcome {
+            SuspendOutcome::Suspended { details, handle: new_handle } => {
+                // Renewal is stopped only AFTER a successful Suspended
+                // outcome. The suspended-kind handle is what the caller
+                // will later hand to `observe_signals` / `claim_from_reclaim`.
+                self.stop_renewal();
+                Ok(TrySuspendOutcome::Suspended(SuspendedHandle {
+                    handle: new_handle,
+                    details,
+                }))
+            }
+            SuspendOutcome::AlreadySatisfied { details } => {
+                // Lease is retained Lua-side; keep the ClaimedTask alive
+                // so the worker continues against the existing lease.
+                Ok(TrySuspendOutcome::AlreadySatisfied {
+                    task: self,
+                    details,
+                })
+            }
+            _ => Err(SdkError::from(ScriptError::Parse {
+                fcall: "try_suspend_inner".into(),
+                execution_id: None,
+                message: "unexpected SuspendOutcome variant".into(),
+            })),
+        }
     }
 
     /// Read the signals that satisfied the waitpoint and triggered this
@@ -1485,109 +1482,9 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
     }
 }
 
-/// Parse ff_suspend_execution result:
-///   ok(suspension_id, waitpoint_id, waitpoint_key)
-///   ok_already_satisfied(suspension_id, waitpoint_id, waitpoint_key)
-fn parse_suspend_result(
-    raw: &Value,
-    suspension_id: SuspensionId,
-    waitpoint_id: WaitpointId,
-    waitpoint_key: String,
-) -> Result<SuspendOutcome, SdkError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => {
-            return Err(SdkError::from(ScriptError::Parse {
-                fcall: "parse_suspend_result".into(),
-                execution_id: None,
-                message: "ff_suspend_execution: expected Array".into(),
-            }));
-        }
-    };
-
-    let status_code = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => {
-            return Err(SdkError::from(ScriptError::Parse {
-                fcall: "parse_suspend_result".into(),
-                execution_id: None,
-                message: "ff_suspend_execution: bad status code".into(),
-            }));
-        }
-    };
-
-    if status_code != 1 {
-        let err_field_str = |idx: usize| -> String {
-            arr.get(idx)
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::SimpleString(s)) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        };
-        let error_code = {
-            let s = err_field_str(1);
-            if s.is_empty() { "unknown".to_owned() } else { s }
-        };
-        let detail = err_field_str(2);
-        return Err(SdkError::from(
-            ScriptError::from_code_with_detail(&error_code, &detail).unwrap_or_else(|| {
-                ScriptError::Parse {
-                    fcall: "parse_suspend_result".into(),
-                    execution_id: None,
-                    message: format!("ff_suspend_execution: {error_code}"),
-                }
-            }),
-        ));
-    }
-
-    // Check sub-status at index 1
-    let sub_status = arr
-        .get(1)
-        .and_then(|v| match v {
-            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            Ok(Value::SimpleString(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    // Lua returns: {1, status, suspension_id, waitpoint_id, waitpoint_key, waitpoint_token}
-    // The suspension_id/waitpoint_id/waitpoint_key values the worker passed in are
-    // authoritative (Lua echoes them); waitpoint_token however is MINTED by Lua and
-    // must be read from the response.
-    let waitpoint_token = arr
-        .get(5)
-        .and_then(|v| match v {
-            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            Ok(Value::SimpleString(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .map(WaitpointToken::new)
-        .ok_or_else(|| {
-            SdkError::from(ScriptError::Parse {
-                fcall: "parse_suspend_result".into(),
-                execution_id: None,
-                message: "ff_suspend_execution: missing waitpoint_token in response".into(),
-            })
-        })?;
-
-    if sub_status == "ALREADY_SATISFIED" {
-        Ok(SuspendOutcome::AlreadySatisfied {
-            suspension_id,
-            waitpoint_id,
-            waitpoint_key,
-            waitpoint_token,
-        })
-    } else {
-        Ok(SuspendOutcome::Suspended {
-            suspension_id,
-            waitpoint_id,
-            waitpoint_key,
-            waitpoint_token,
-        })
-    }
-}
+// RFC-013 Stage 1d — `parse_suspend_result` removed. The backend impl
+// in `ff_backend_valkey` now parses the Lua return and produces a typed
+// `SuspendOutcome`; the SDK forwarder consumes that directly.
 
 /// Parse ff_deliver_signal result:
 ///   ok(signal_id, effect)

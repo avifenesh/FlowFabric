@@ -16,12 +16,12 @@ use ff_core::backend::{
     AppendFrameOutcome, BackendTag, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, HandleKind, HandleOpaque,
     LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions, WaitpointHmac,
-    WaitpointSpec,
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
     DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
+    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails,
 };
 use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
@@ -137,11 +137,35 @@ impl EngineBackend for PassthroughBackend {
     async fn suspend(
         &self,
         _handle: &Handle,
-        _waitpoints: Vec<WaitpointSpec>,
-        _timeout: Option<Duration>,
-    ) -> Result<Handle, EngineError> {
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
         self.record("suspend")?;
-        Ok(Self::handle())
+        // Synthetic success: materialize a `SuspendOutcome::Suspended`
+        // with a fresh suspended-kind handle and the caller's minted
+        // ids echoed back. Layer tests only care that `suspend` was
+        // dispatched; they never inspect the outcome's identity.
+        let waitpoint_id = match &args.waitpoint {
+            ff_core::backend::WaitpointBinding::Fresh { waitpoint_id, .. } => waitpoint_id.clone(),
+            ff_core::backend::WaitpointBinding::UsePending { waitpoint_id } => waitpoint_id.clone(),
+            _ => WaitpointId::new(),
+        };
+        let waitpoint_key = match &args.waitpoint {
+            ff_core::backend::WaitpointBinding::Fresh { waitpoint_key, .. } => waitpoint_key.clone(),
+            _ => format!("wpk:{waitpoint_id}"),
+        };
+        Ok(SuspendOutcome::Suspended {
+            details: SuspendOutcomeDetails::new(
+                args.suspension_id,
+                waitpoint_id,
+                waitpoint_key,
+                WaitpointHmac::new("tok:passthrough"),
+            ),
+            handle: Handle::new(
+                BackendTag::Valkey,
+                HandleKind::Suspended,
+                HandleOpaque::new(Box::new([])),
+            ),
+        })
     }
 
     async fn create_waitpoint(
