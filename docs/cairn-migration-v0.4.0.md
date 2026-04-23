@@ -150,8 +150,346 @@ Rust's trait-object model. 0.3.4 makes the caller decide.
   `crates/ff-core/src/keys.rs:644`. Use that helper; do not hardcode
   `format!("ff:usagededup:{hash_tag}:{dedup_id}")` parallel to it.
 
+## 7. `Frame` gained `frame_type` + `correlation_id` (#147)
+
+```rust
+use ff_core::backend::{Frame, FrameKind};
+
+// Preferred: constructor + builder chainers.
+let frame = Frame::new(bytes, FrameKind::Output)
+    .with_frame_type("tool_call")
+    .with_correlation_id(request_id);
+
+// Struct-literal callers MUST use `..Default::default()` or a helper
+// — `Frame` is `#[non_exhaustive]` and gained two fields in 0.4.0.
+let frame = Frame {
+    bytes,
+    kind: FrameKind::Output,
+    seq: None,
+    frame_type: String::from("tool_call"),
+    correlation_id: Some(request_id),
+    // If this line is omitted, the literal fails with E0063 on any
+    // future field addition; keep it even when naming every current
+    // field explicitly.
+    ..Default::default()
+};
+```
+
+**What changed.** `ff_core::backend::Frame` (`crates/ff-core/src/backend.rs:207`) added:
+- `frame_type: String` — free-form classifier forwarded to the Lua-side
+  `frame_type` ARGV. Empty string means "defer to `FrameKind`", and the
+  backend substitutes the enum-variant encoding.
+- `correlation_id: Option<String>` — wire `correlation_id` ARGV; `None`
+  encodes as the empty string.
+
+**Gotcha.** `FrameKind` is *not* gone. The pre-0.4.0 `kind` field stays
+as the typed classification; `frame_type` is additive for SDK
+forwarders that carry a string-valued type tag. If you only have a
+`FrameKind`, leave `frame_type` as `String::new()` and the backend
+falls back to `frame_kind_to_str` (see `ff-backend-valkey`).
+
+**Rationale.** SDK forwarders on the proxy-style path need to preserve
+upstream classifiers and correlation identifiers verbatim; boxing them
+through `FrameKind` would have forced a variant explosion on every new
+consumer shape. Source: PR #147; struct definition
+`crates/ff-core/src/backend.rs:205-220`; constructors
+`:230-260`.
+
+## 8. `EngineBackend` trait deltas (#145, Round-7)
+
+Three breaking changes land together on the trait surface. Impls
+written against 0.3.x will not compile.
+
+### 8.1 `append_frame` return widened to `AppendFrameOutcome`
+
+```rust
+// Before (0.3.x):
+async fn append_frame(&self, ..., frame: Frame) -> Result<(), EngineError>;
+
+// After (0.4.0):
+async fn append_frame(&self, ..., frame: Frame)
+    -> Result<AppendFrameOutcome, EngineError>;
+```
+
+`AppendFrameOutcome` (`crates/ff-core/src/backend.rs:638`) carries:
+
+```rust
+pub struct AppendFrameOutcome {
+    pub stream_id: String,  // Valkey Stream entry id, e.g. "1234567890-0"
+    pub frame_count: u64,   // total frames in the stream post-append
+}
+```
+
+Not `#[non_exhaustive]` — construction is backend-internal
+(parser in `ff-backend-valkey`); consumers destructure or read fields.
+
+**Gotcha.** Callers that discarded the unit return (`let _ = backend.append_frame(...).await?;`)
+keep compiling but now discard the outcome; touch those sites if you
+want the stream id or frame count for logging.
+
+### 8.2 New `create_waitpoint` trait method
+
+```rust
+async fn create_waitpoint(
+    &self,
+    handle: &Handle,
+    waitpoint_key: &str,
+    expires_in: Duration,
+) -> Result<PendingWaitpoint, EngineError>;
+```
+
+Every `EngineBackend` impl must provide this method. `PendingWaitpoint`
+lives at `crates/ff-core/src/backend.rs:322`. Expiry is a first-class
+terminal error on the wire (`PendingWaitpointExpired` in
+`ff-script/src/error.rs`).
+
+Source: `crates/ff-core/src/engine_backend.rs:161`.
+
+### 8.3 `report_usage` returns `ReportUsageResult`; `AdmissionDecision` deleted
+
+```rust
+// Before (0.3.x):
+async fn report_usage(...) -> Result<AdmissionDecision, EngineError>;
+
+// After (0.4.0):
+async fn report_usage(...) -> Result<ReportUsageResult, EngineError>;
+```
+
+`AdmissionDecision` is removed from the public surface. The
+replacement (`crates/ff-core/src/contracts.rs:1402`) is a richer
+variant set:
+
+```rust
+#[non_exhaustive]
+pub enum ReportUsageResult {
+    Ok,
+    SoftBreach { dimension: String, current_usage: u64, soft_limit: u64 },
+    HardBreach { dimension: String, current_usage: u64, hard_limit: u64 },
+    AlreadyApplied,  // dedup key matched; no double-count
+}
+```
+
+**Migration mapping.** Previous admit/deny callers collapse roughly as:
+
+| Pre-0.4.0                       | Post-0.4.0                         |
+| ------------------------------- | ---------------------------------- |
+| `AdmissionDecision::Admit`      | `ReportUsageResult::Ok`            |
+| `AdmissionDecision::Deny { .. }`| `ReportUsageResult::HardBreach {..}` |
+| (none — silently double-counted)| `ReportUsageResult::AlreadyApplied`|
+| (none)                          | `ReportUsageResult::SoftBreach {..}`|
+
+`SoftBreach` is advisory: increments **are** applied. `HardBreach`
+rejects the report and does **not** apply increments. `AlreadyApplied`
+is the dedup success path (see §10).
+
+**Gotcha.** `ReportUsageResult` is `#[non_exhaustive]` — match arms
+must include a wildcard, and exhaustive matches against the 0.3.x
+two-variant enum become non-exhaustive warnings in 0.4.0.
+
+Source: PR #145; `crates/ff-core/src/engine_backend.rs:221-230`.
+
+## 9. `BackendError` seal: `SdkError::Valkey*` → `SdkError::Backend*` (#151, HIGH IMPACT)
+
+The public error surface no longer leaks `ferriskey::Error`. Every
+consumer that matched on `SdkError::Valkey` / `ServerError::Valkey*`
+or called `valkey_kind()` MUST update.
+
+### 9.1 Rust error variants
+
+```rust
+// Before (0.3.x):
+match err {
+    SdkError::Valkey(fk_err) => { /* match on ferriskey::ErrorKind */ }
+    SdkError::ValkeyContext { source, context } => { ... }
+    _ => { ... }
+}
+
+// After (0.4.0):
+use ff_sdk::{BackendError, BackendErrorKind};
+
+match err {
+    SdkError::Backend(be) => {
+        match be.kind() {
+            BackendErrorKind::Transport    => { /* retry */ }
+            BackendErrorKind::Timeout      => { /* retry */ }
+            BackendErrorKind::Cluster      => { /* retry after settle */ }
+            BackendErrorKind::BusyLoading  => { /* retry */ }
+            BackendErrorKind::Auth         => { /* surface, do NOT retry */ }
+            BackendErrorKind::Protocol     => { /* surface */ }
+            BackendErrorKind::ScriptNotLoaded => { /* re-load */ }
+            BackendErrorKind::Other        => { /* log + surface */ }
+        }
+    }
+    SdkError::BackendContext { source, context } => { ... }
+    _ => { ... }
+}
+```
+
+`ServerError::Valkey` / `ServerError::ValkeyContext` renamed to
+`ServerError::Backend` / `ServerError::BackendContext` in the same
+shape (source `crates/ff-server/src/server.rs:224,302,318`).
+
+### 9.2 Classifier rename: `valkey_kind()` → `backend_kind()`
+
+```rust
+// Before: err.valkey_kind() -> Option<ferriskey::ErrorKind>
+// After:  err.backend_kind() -> Option<BackendErrorKind>
+```
+
+`BackendErrorKind` is `#[non_exhaustive]` — include a wildcard arm.
+`::is_retryable()` and `::as_stable_str()` are stable on this type
+(source `crates/ff-core/src/engine_error.rs:413-460`).
+
+### 9.3 HTTP `ErrorBody.kind` wire strings changed
+
+This is the **most subtle** breaking change in #151, because it
+silently changes HTTP bodies without any Rust-compile signal.
+
+Pre-0.4.0, ff-server rendered `ErrorBody.kind` from the ferriskey
+native-kind debug string (e.g. `"IoError"`, `"ClusterDown"`,
+`"MasterDown"`, `"ConnectionNotFoundForRoute"`). Post-0.4.0 (#151),
+`ff-server` emits the stable classification from
+`BackendErrorKind::as_stable_str()`
+(`crates/ff-server/src/api.rs:251-282`):
+
+| `BackendErrorKind` variant | Wire string           |
+| -------------------------- | --------------------- |
+| `Transport`                | `"transport"`         |
+| `Protocol`                 | `"protocol"`          |
+| `Timeout`                  | `"timeout"`           |
+| `Auth`                     | `"auth"`              |
+| `Cluster`                  | `"cluster"`           |
+| `BusyLoading`              | `"busy_loading"`      |
+| `ScriptNotLoaded`          | `"script_not_loaded"` |
+| `Other`                    | `"other"`             |
+
+**Consumer action (cairn-fabric HTTP client).** Any `match` on
+`ErrorBody.kind` string values must switch from the ferriskey debug
+spellings to the stable-kebab set above. A bridge layer that
+previously held `fn retryable(k: &str) -> bool` keyed on ferriskey
+spellings needs a new table keyed on `BackendErrorKind::as_stable_str()`
+outputs.
+
+**Gotcha.** The variant set is curated — several ferriskey kinds
+collapse to `Other`. Callers that relied on fine-grained ferriskey
+kinds to drive behavior (e.g. distinguishing `MasterDown` from
+`ClusterDown`) must accept the coarser bucket. ff-core's
+`BackendErrorKind::is_retryable` owns the canonical retry decision
+(`crates/ff-core/src/engine_error.rs:573-587`); prefer calling that
+over rolling a parallel table.
+
+**Rationale.** Sealing ferriskey from the public surface (#88) keeps
+ff-sdk consumers out of ferriskey's SemVer — a backend swap doesn't
+cascade a major bump through downstream crates. Source: PR #151;
+`crates/ff-core/src/engine_error.rs:347-460`, `crates/ff-sdk/src/lib.rs:93-119`.
+
+## 10. `UsageDimensions` gained `dedup_key: Option<String>` (Round-7)
+
+```rust
+use ff_core::backend::UsageDimensions;
+
+let dims = UsageDimensions {
+    input_tokens: 1200,
+    output_tokens: 340,
+    wall_ms: Some(850),
+    dedup_key: Some(request_id.clone()),
+    ..Default::default()
+};
+```
+
+**What changed.** `UsageDimensions` (`crates/ff-core/src/backend.rs:417`)
+gained `dedup_key: Option<String>`. The field is additive; pre-0.4.0
+construction sites compile after adding `..Default::default()` (the
+type is `#[non_exhaustive]` and already `Default`).
+
+**Semantics.** `Some(key)` threads through to
+`ff_report_usage_and_check`'s trailing ARGV. A repeat call with the
+same key returns `ReportUsageResult::AlreadyApplied` instead of
+double-counting. `None` / empty string disables dedup and restores
+pre-0.4.0 semantics.
+
+**Gotcha.** This is **not** the legacy `UsageDimensions::custom`
+magic-entry dedup id called out in §6. `dedup_key` is a first-class
+field; the `custom`-map variant remains for the
+`usage_dedup_key(hash_tag, dedup_id)` callsite documented in §6.
+Reports that set *both* produce undefined-at-doc-write-time
+precedence — pick one path per report.
+
+Source: RFC-012 §R7.4 (Round-7 impl); field definition
+`crates/ff-core/src/backend.rs:434-441`.
+
+## 11. `WorkerConfig` hoists backend fields into `BackendConfig` (T1, PR #146)
+
+> **Status note.** PR #146 is **in-flight at doc-write time
+> (2026-04-22).** The shape below reflects the accepted T1 plan; the
+> exact constructor signature may shift slightly in the final merged
+> commit. Cross-check `crates/ff-sdk/src/config.rs` on `origin/main`
+> before relying on this section verbatim.
+
+```rust
+// Before (0.3.x, still on main as of doc-write):
+let config = WorkerConfig::new(
+    "127.0.0.1", 6379,
+    "gpu-worker", "instance-1", "tenant-a", "lane-fast",
+);
+
+// After (post-T1, 0.4.0 target shape):
+use ff_core::backend::BackendConfig;
+use ff_sdk::WorkerConfig;
+
+let config = WorkerConfig {
+    backend: BackendConfig::valkey("127.0.0.1", 6379),
+    worker_id: WorkerId::new("gpu-worker"),
+    worker_instance_id: WorkerInstanceId::new("instance-1"),
+    namespace: Namespace::new("tenant-a"),
+    lanes: vec![LaneId::new("lane-fast")],
+    capabilities: Vec::new(),
+    lease_ttl_ms: 30_000,
+    claim_poll_interval_ms: 1_000,
+    max_concurrent_tasks: 1,
+    // ..Default::default() where T1 lands a Default impl; otherwise
+    // every field is named explicitly.
+};
+```
+
+**What changed.** `WorkerConfig` loses its inline `host: String` /
+`port: u16` / `tls: bool` / `cluster: bool` fields. Those move under
+`pub backend: BackendConfig`, which owns the full backend surface
+(host, port, TLS, cluster, timeouts, retry) — matching the
+`BackendConfig::valkey(host, port)` entry point already documented
+in §4.
+
+The `WorkerConfig::new(host, port, ...)` constructor is **removed**.
+Consumers build a `BackendConfig` first (via `::valkey(host, port)`
+plus field-mut for TLS / cluster / timeouts / retry per §2–§4), then
+embed it via struct-literal — or via whatever builder pattern T1
+lands.
+
+**Gotcha.** TLS and cluster flags previously on `WorkerConfig`
+directly are now reached through `config.backend.tls` /
+`config.backend.cluster` (or the `BackendConfig` builder/field-mut
+path — ZZ's T1 plan decides the shape). Callers grepping for `.tls`
+on `WorkerConfig` will miss the relocated field.
+
+**Rationale.** Pulling backend tunables into `BackendConfig` lets a
+Postgres-backed `WorkerConfig` compose the same outer shape against
+a `BackendConfig::postgres(...)` constructor, without polluting
+`WorkerConfig` with backend-specific fields. This is the structural
+precondition for the RFC-#58 decoupling work.
+
+Source: PR #146 (in-flight); current pre-T1 shape
+`crates/ff-sdk/src/config.rs:1-61`.
+
 ## References
 
 - RFC-012 Stage 1a: type introduction (landed).
 - `rfcs/drafts/backend-timeouts-retry-audit.md` — audit behind #136/#137/#139.
+- `rfcs/drafts/0.4.0-release-readiness-audit.md` — Worker III audit
+  identifying the §7–§11 gaps filled here.
+- PR #145 — trait deltas (`append_frame` outcome, `create_waitpoint`,
+  `report_usage` → `ReportUsageResult`, `AdmissionDecision` deleted).
+- PR #146 (in-flight) — T1 `WorkerConfig` / `BackendConfig` nesting.
+- PR #147 — `Frame` gains `frame_type` + `correlation_id`.
+- PR #151 — `BackendError` seal; `SdkError::Valkey*` → `SdkError::Backend*`;
+  HTTP wire-kind strings change.
 - `docs/rfc011-migration-for-consumers.md` — prior consumer migration.
