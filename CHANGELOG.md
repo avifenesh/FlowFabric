@@ -34,6 +34,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   constants need no change. No public item was removed or renamed —
   only cfg-gated.
 
+### Added
+
+- **`EngineBackend::deliver_signal` + `EngineBackend::claim_resumed_execution`
+  — trigger-surface trait methods (#150).** Two new core-feature-gated
+  methods on `EngineBackend` that expose signal delivery and resumed-
+  execution claim at the trait layer, so alternate backends (future
+  Postgres) have an explicit obligation to honour them rather than
+  forcing callers onto REST / direct-FCALL paths. Both take the
+  existing `ff_core::contracts` typed args (`DeliverSignalArgs` →
+  `DeliverSignalResult`; `ClaimResumedExecutionArgs` →
+  `ClaimResumedExecutionResult`) and surface typed `ScriptError`
+  failures (`invalid_token`, `not_a_resumed_execution`, etc.) via
+  `EngineError::Transport`. The Valkey impl forwards through the
+  existing `ff_script::functions::signal` FCALL wrappers. `ff-sdk`'s
+  `FlowFabricWorker::deliver_signal` public API and the private
+  `claim_resumed_execution` used by `claim_from_reclaim_grant` now
+  route through the trait rather than firing `client.fcall` directly
+  — closing the two `TODO(#150)` migration markers. `HookedBackend`
+  and the layer-test `PassthroughBackend` grew matching dispatch
+  arms. Integration coverage in
+  `crates/ff-test/tests/engine_backend_{deliver_signal,claim_resumed}.rs`.
+
 ## [0.5.0] - 2026-04-23
 
 ### Added

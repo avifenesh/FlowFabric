@@ -22,7 +22,8 @@ use ff_core::backend::{
     ResumeSignal, WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
+    DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
 };
 use ff_core::partition::PartitionKey;
@@ -363,6 +364,28 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "list_executions",
             self.inner.list_executions(partition, cursor, limit).await
+        )
+    }
+
+    async fn deliver_signal(
+        &self,
+        args: DeliverSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        with_hooks!(
+            self,
+            "deliver_signal",
+            self.inner.deliver_signal(args).await
+        )
+    }
+
+    async fn claim_resumed_execution(
+        &self,
+        args: ClaimResumedExecutionArgs,
+    ) -> Result<ClaimResumedExecutionResult, EngineError> {
+        with_hooks!(
+            self,
+            "claim_resumed_execution",
+            self.inner.claim_resumed_execution(args).await
         )
     }
 

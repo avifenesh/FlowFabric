@@ -1343,13 +1343,13 @@ impl FlowFabricWorker {
         Ok(task)
     }
 
-    /// Low-level resume claim. Invokes `ff_claim_resumed_execution`
-    /// and returns a `ClaimedTask` bound to the resumed attempt.
+    /// Low-level resume claim. Forwards through
+    /// [`EngineBackend::claim_resumed_execution`](ff_core::engine_backend::EngineBackend::claim_resumed_execution)
+    /// — the trait-level trigger surface landed in issue #150 — and
+    /// returns a [`ClaimedTask`] bound to the resumed attempt.
     ///
-    /// Previously gated behind `direct-valkey-claim`; ungated so the
-    /// public [`claim_from_reclaim_grant`] entry point can reuse it.
-    /// The method stays private — external callers use
-    /// `claim_from_reclaim_grant`.
+    /// The method stays private; external callers use
+    /// [`claim_from_reclaim_grant`].
     ///
     /// [`claim_from_reclaim_grant`]: FlowFabricWorker::claim_from_reclaim_grant
     async fn claim_resumed_execution(
@@ -1359,10 +1359,11 @@ impl FlowFabricWorker {
         partition: &ff_core::partition::Partition,
     ) -> Result<ClaimedTask, SdkError> {
         let ctx = ExecKeyContext::new(partition, execution_id);
-        let idx = IndexKeys::new(partition);
 
         // Pre-read current_attempt_index for the existing attempt hash key.
-        // This is load-bearing: KEYS[6] must point to the real attempt hash.
+        // This is load-bearing: the backend's KEYS[6] must point to the
+        // real attempt hash, and the backend takes the index verbatim
+        // from `ClaimResumedExecutionArgs::current_attempt_index`.
         let att_idx_str: Option<String> = self.client
             .cmd("HGET")
             .arg(ctx.core())
@@ -1374,114 +1375,20 @@ impl FlowFabricWorker {
             att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
         );
 
-        let lease_id = LeaseId::new().to_string();
-
-        // KEYS (11): must match lua/signal.lua ff_claim_resumed_execution
-        let keys: Vec<String> = vec![
-            ctx.core(),                                             // 1  exec_core
-            ctx.claim_grant(),                                      // 2  claim_grant
-            idx.lane_eligible(lane_id),                             // 3  eligible_zset
-            idx.lease_expiry(),                                     // 4  lease_expiry_zset
-            idx.worker_leases(&self.config.worker_instance_id),     // 5  worker_leases
-            ctx.attempt_hash(att_idx),                              // 6  existing_attempt_hash
-            ctx.lease_current(),                                    // 7  lease_current
-            ctx.lease_history(),                                    // 8  lease_history
-            idx.lane_active(lane_id),                               // 9  active_index
-            idx.attempt_timeout(),                                  // 10 attempt_timeout_zset
-            idx.execution_deadline(),                               // 11 execution_deadline_zset
-        ];
-
-        // ARGV (8): must match lua/signal.lua ff_claim_resumed_execution
-        let args: Vec<String> = vec![
-            execution_id.to_string(),                               // 1  execution_id
-            self.config.worker_id.to_string(),                      // 2  worker_id
-            self.config.worker_instance_id.to_string(),             // 3  worker_instance_id
-            lane_id.to_string(),                                    // 4  lane
-            String::new(),                                          // 5  capability_hash
-            lease_id.clone(),                                       // 6  lease_id
-            self.config.lease_ttl_ms.to_string(),                   // 7  lease_ttl_ms
-            String::new(),                                          // 8  remaining_attempt_timeout_ms
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        // TODO(#150): migrate when EngineBackend trait grows a
-        // `claim_resumed_execution` method; for now this FCALL stays on
-        // ff-sdk's direct client path.
-        let raw: Value = self
-            .client
-            .fcall("ff_claim_resumed_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(SdkError::from)?;
-
-        // Parse result — same format as ff_claim_execution:
-        // {1, "OK", lease_id, lease_epoch, expires_at, attempt_id, attempt_index, attempt_type}
-        let arr = match &raw {
-            Value::Array(arr) => arr,
-            _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
-                    fcall: "ff_claim_resumed_execution".into(),
-                    execution_id: Some(execution_id.to_string()),
-                    message: "expected Array".into(),
-                }));
-            }
+        let args = ff_core::contracts::ClaimResumedExecutionArgs {
+            execution_id: execution_id.clone(),
+            worker_id: self.config.worker_id.clone(),
+            worker_instance_id: self.config.worker_instance_id.clone(),
+            lane_id: lane_id.clone(),
+            lease_id: LeaseId::new(),
+            lease_ttl_ms: self.config.lease_ttl_ms,
+            current_attempt_index: att_idx,
+            remaining_attempt_timeout_ms: None,
+            now: TimestampMs::now(),
         };
 
-        let status_code = match arr.first() {
-            Some(Ok(Value::Int(n))) => *n,
-            _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
-                    fcall: "ff_claim_resumed_execution".into(),
-                    execution_id: Some(execution_id.to_string()),
-                    message: "bad status code".into(),
-                }));
-            }
-        };
-
-        if status_code != 1 {
-            let err_field_str = |idx: usize| -> String {
-                arr.get(idx)
-                    .and_then(|v| match v {
-                        Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                        Ok(Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
-            };
-            let error_code = {
-                let s = err_field_str(1);
-                if s.is_empty() { "unknown".to_owned() } else { s }
-            };
-            let detail = err_field_str(2);
-
-            return Err(SdkError::from(
-                ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
-                    .unwrap_or_else(|| ff_script::error::ScriptError::Parse {
-                        fcall: "ff_claim_resumed_execution".into(),
-                        execution_id: Some(execution_id.to_string()),
-                        message: format!("unknown error: {error_code}"),
-                    }),
-            ));
-        }
-
-        let field_str = |idx: usize| -> String {
-            arr.get(idx + 2)
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::SimpleString(s)) => Some(s.clone()),
-                    Ok(Value::Int(n)) => Some(n.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        };
-
-        let lease_id = LeaseId::parse(&field_str(0))
-            .unwrap_or_else(|_| LeaseId::new());
-        let lease_epoch = LeaseEpoch::new(field_str(1).parse().unwrap_or(1));
-        let attempt_index = AttemptIndex::new(field_str(4).parse().unwrap_or(0));
-        let attempt_id = AttemptId::parse(&field_str(3))
-            .unwrap_or_else(|_| AttemptId::new());
+        let ff_core::contracts::ClaimResumedExecutionResult::Claimed(claimed) =
+            self.backend.claim_resumed_execution(args).await?;
 
         let (input_payload, execution_kind, tags) = self
             .read_execution_context(execution_id, partition)
@@ -1492,10 +1399,10 @@ impl FlowFabricWorker {
             self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
-            attempt_index,
-            attempt_id,
-            lease_id,
-            lease_epoch,
+            claimed.attempt_index,
+            claimed.attempt_id,
+            claimed.lease_id,
+            claimed.lease_epoch,
             self.config.lease_ttl_ms,
             lane_id.clone(),
             self.config.worker_instance_id.clone(),
@@ -1548,104 +1455,53 @@ impl FlowFabricWorker {
     ///
     /// The engine atomically records the signal, evaluates the resume condition,
     /// and optionally transitions the execution from `suspended` to `runnable`.
+    ///
+    /// Forwards through
+    /// [`EngineBackend::deliver_signal`](ff_core::engine_backend::EngineBackend::deliver_signal)
+    /// — the trait-level trigger surface landed in issue #150.
     pub async fn deliver_signal(
         &self,
         execution_id: &ExecutionId,
         waitpoint_id: &WaitpointId,
         signal: crate::task::Signal,
     ) -> Result<crate::task::SignalOutcome, SdkError> {
-        let partition = ff_core::partition::execution_partition(execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        let signal_id = ff_core::types::SignalId::new();
-        let now = TimestampMs::now();
-
-        // Pre-read lane_id from exec_core — the execution may be on any lane,
-        // not necessarily one of this worker's configured lanes.
-        let lane_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| crate::backend_context(e, "HGET lane_id"))?;
-        let lane_id = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
-
-        // KEYS (14): exec_core, wp_condition, wp_signals_stream,
-        //            exec_signals_zset, signal_hash, signal_payload,
-        //            idem_key, waitpoint_hash, suspension_current,
-        //            eligible_zset, suspended_zset, delayed_zset,
-        //            suspension_timeout_zset, hmac_secrets
-        let idem_key = if let Some(ref ik) = signal.idempotency_key {
-            ctx.signal_dedup(waitpoint_id, ik)
-        } else {
-            ctx.noop() // must share {p:N} hash tag for cluster mode
+        let args = ff_core::contracts::DeliverSignalArgs {
+            execution_id: execution_id.clone(),
+            waitpoint_id: waitpoint_id.clone(),
+            signal_id: ff_core::types::SignalId::new(),
+            signal_name: signal.signal_name,
+            signal_category: signal.signal_category,
+            source_type: signal.source_type,
+            source_identity: signal.source_identity,
+            payload: signal.payload,
+            payload_encoding: Some("json".to_owned()),
+            correlation_id: None,
+            idempotency_key: signal.idempotency_key,
+            target_scope: "waitpoint".to_owned(),
+            created_at: Some(TimestampMs::now()),
+            dedup_ttl_ms: None,
+            resume_delay_ms: None,
+            max_signals_per_execution: None,
+            signal_maxlen: None,
+            waitpoint_token: signal.waitpoint_token,
+            now: TimestampMs::now(),
         };
-        let keys: Vec<String> = vec![
-            ctx.core(),                                    // 1
-            ctx.waitpoint_condition(waitpoint_id),         // 2
-            ctx.waitpoint_signals(waitpoint_id),           // 3
-            ctx.exec_signals(),                            // 4
-            ctx.signal(&signal_id),                        // 5
-            ctx.signal_payload(&signal_id),                // 6
-            idem_key,                                      // 7
-            ctx.waitpoint(waitpoint_id),                   // 8
-            ctx.suspension_current(),                      // 9
-            idx.lane_eligible(&lane_id),                   // 10
-            idx.lane_suspended(&lane_id),                  // 11
-            idx.lane_delayed(&lane_id),                    // 12
-            idx.suspension_timeout(),                      // 13
-            idx.waitpoint_hmac_secrets(),                  // 14
-        ];
 
-        let payload_str = signal
-            .payload
-            .as_ref()
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .unwrap_or_default();
-
-        // ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
-        //            signal_category, source_type, source_identity,
-        //            payload, payload_encoding, idempotency_key,
-        //            correlation_id, target_scope, created_at,
-        //            dedup_ttl_ms, resume_delay_ms, signal_maxlen,
-        //            max_signals_per_execution, waitpoint_token
-        let args: Vec<String> = vec![
-            signal_id.to_string(),                           // 1
-            execution_id.to_string(),                        // 2
-            waitpoint_id.to_string(),                        // 3
-            signal.signal_name,                              // 4
-            signal.signal_category,                          // 5
-            signal.source_type,                              // 6
-            signal.source_identity,                          // 7
-            payload_str,                                     // 8
-            "json".to_owned(),                               // 9 payload_encoding
-            signal.idempotency_key.unwrap_or_default(),      // 10
-            String::new(),                                   // 11 correlation_id
-            "waitpoint".to_owned(),                          // 12 target_scope
-            now.to_string(),                                 // 13 created_at
-            "86400000".to_owned(),                           // 14 dedup_ttl_ms
-            "0".to_owned(),                                  // 15 resume_delay_ms
-            "1000".to_owned(),                               // 16 signal_maxlen
-            "10000".to_owned(),                              // 17 max_signals
-            // WIRE BOUNDARY — raw token must reach Lua unredacted. Do NOT
-            // use ToString/Display (those are redacted for log safety);
-            // .as_str() is the explicit opt-in that gets the secret bytes.
-            signal.waitpoint_token.as_str().to_owned(),      // 18 waitpoint_token
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        // TODO(#150): migrate when EngineBackend trait grows a
-        // `deliver_signal` method; for now this FCALL stays on
-        // ff-sdk's direct client path.
-        let raw: Value = self
-            .client
-            .fcall("ff_deliver_signal", &key_refs, &arg_refs)
-            .await
-            .map_err(SdkError::from)?;
-
-        crate::task::parse_signal_result(&raw)
+        let result = self.backend.deliver_signal(args).await?;
+        Ok(match result {
+            ff_core::contracts::DeliverSignalResult::Accepted { signal_id, effect } => {
+                if effect == "resume_condition_satisfied" {
+                    crate::task::SignalOutcome::TriggeredResume { signal_id }
+                } else {
+                    crate::task::SignalOutcome::Accepted { signal_id, effect }
+                }
+            }
+            ff_core::contracts::DeliverSignalResult::Duplicate { existing_signal_id } => {
+                crate::task::SignalOutcome::Duplicate {
+                    existing_signal_id: existing_signal_id.to_string(),
+                }
+            }
+        })
     }
 
     #[cfg(feature = "direct-valkey-claim")]
