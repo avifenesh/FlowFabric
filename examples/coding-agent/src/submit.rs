@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use common::{TaskPayload, DEFAULT_LANE, DEFAULT_NAMESPACE, DEFAULT_SERVER_URL};
+use ff_core::partition::PartitionConfig;
+use ff_core::types::{ExecutionId, LaneId};
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -41,6 +43,11 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     priority: i32,
 
+    /// Number of flow partitions the server is configured with
+    /// (matches `FF_FLOW_PARTITIONS`; default 256).
+    #[arg(long, default_value_t = 256)]
+    flow_partitions: u16,
+
     /// Exit immediately after submit (don't poll for state changes).
     #[arg(long)]
     no_wait: bool,
@@ -51,7 +58,12 @@ async fn main() {
     let args = Args::parse();
     let client = reqwest::Client::new();
 
-    let execution_id = uuid::Uuid::new_v4().to_string();
+    let partition_config = PartitionConfig {
+        num_flow_partitions: args.flow_partitions,
+        ..PartitionConfig::default()
+    };
+    let execution_id =
+        ExecutionId::solo(&LaneId::from(args.lane.as_str()), &partition_config).to_string();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
