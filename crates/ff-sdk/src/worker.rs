@@ -1395,6 +1395,9 @@ impl FlowFabricWorker {
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
+        // TODO(#150): migrate when EngineBackend trait grows a
+        // `claim_resumed_execution` method; for now this FCALL stays on
+        // ff-sdk's direct client path.
         let raw: Value = self
             .client
             .fcall("ff_claim_resumed_execution", &key_refs, &arg_refs)
@@ -1622,6 +1625,9 @@ impl FlowFabricWorker {
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
+        // TODO(#150): migrate when EngineBackend trait grows a
+        // `deliver_signal` method; for now this FCALL stays on
+        // ff-sdk's direct client path.
         let raw: Value = self
             .client
             .fcall("ff_deliver_signal", &key_refs, &arg_refs)
