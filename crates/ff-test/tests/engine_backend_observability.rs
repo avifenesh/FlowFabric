@@ -48,17 +48,18 @@ fn test_config() -> PartitionConfig {
     ff_test::fixtures::TEST_PARTITION_CONFIG
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn describe_execution_emits_tracing_span() {
     let tc = TestCluster::connect().await;
     let backend: Arc<dyn EngineBackend> =
         ValkeyBackend::from_client_and_partitions(tc.client().clone(), test_config());
 
     let capture = CaptureSpans::default();
-    // Install for the current thread-scope. Using `set_default`
-    // (rather than wrapping an inner `block_on`) keeps the async
-    // body running on the Tokio runtime — the prior `block_on`
-    // inside `#[tokio::test]` could starve the worker.
+    // `set_default` is thread-local; pair it with
+    // `flavor = "current_thread"` so the async body stays on the
+    // thread that installed the subscriber. Prior `block_on` form
+    // starved the runtime; prior `multi_thread` form risked polling
+    // on a worker without the subscriber installed.
     let _guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
 
@@ -77,7 +78,7 @@ async fn describe_execution_emits_tracing_span() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn with_metrics_setter_attaches_handle() {
     let tc = TestCluster::connect().await;
     let mut backend =

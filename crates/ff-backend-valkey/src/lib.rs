@@ -1884,6 +1884,12 @@ impl EngineBackend for ValkeyBackend {
     }
 
     async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+        // Decode first. A decode failure is caller-input
+        // malformation (corrupt backend tag / version / field shape)
+        // — it is NOT an attempted renewal, so we deliberately do
+        // NOT fire `inc_lease_renewal` on this path. The counter
+        // measures renew RPCs, and a caller handing us a bad handle
+        // never issued one.
         let f = handle_codec::decode_handle(handle)?;
         let result = renew_impl(&self.client, &self.partition_config, &f)
             .await
