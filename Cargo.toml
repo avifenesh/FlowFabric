@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["FlowFabric Contributors"]
@@ -33,16 +33,16 @@ categories = ["database", "asynchronous"]
 # Cargo uses `path` locally and falls back to the registry version
 # when a dependent is published. Keep these in sync with
 # `[workspace.package] version`.
-ff-core = { version = "0.3.4", path = "crates/ff-core" }
-ff-script = { version = "0.3.4", path = "crates/ff-script" }
-ff-engine = { version = "0.3.4", path = "crates/ff-engine" }
-ff-scheduler = { version = "0.3.4", path = "crates/ff-scheduler" }
-ff-sdk = { version = "0.3.4", path = "crates/ff-sdk" }
-ff-server = { version = "0.3.4", path = "crates/ff-server" }
+ff-core = { version = "0.4.0", path = "crates/ff-core" }
+ff-script = { version = "0.4.0", path = "crates/ff-script" }
+ff-engine = { version = "0.4.0", path = "crates/ff-engine" }
+ff-scheduler = { version = "0.4.0", path = "crates/ff-scheduler" }
+ff-sdk = { version = "0.4.0", path = "crates/ff-sdk" }
+ff-server = { version = "0.4.0", path = "crates/ff-server" }
 ff-test = { path = "crates/ff-test" }
-ff-backend-valkey = { version = "0.3.4", path = "crates/ff-backend-valkey" }
-ff-observability = { version = "0.3.4", path = "crates/ff-observability" }
-ferriskey = { version = "0.3.4", path = "ferriskey" }
+ff-backend-valkey = { version = "0.4.0", path = "crates/ff-backend-valkey" }
+ff-observability = { version = "0.4.0", path = "crates/ff-observability" }
+ferriskey = { version = "0.4.0", path = "ferriskey" }
 
 # Shared external deps
 uuid = { version = "1", features = ["v4", "serde"] }
