@@ -190,6 +190,198 @@ pub enum FrameKind {
     Blob,
 }
 
+// ── RFC-015 §1–§6: Stream-durability modes ──────────────────────────────
+
+/// Patch format used by [`StreamMode::DurableSummary`] to apply each
+/// frame's payload against the server-side rolling summary document.
+///
+/// v0.6 ships a single variant, `JsonMergePatch` (RFC 7396). The enum
+/// is `#[non_exhaustive]` so the future `PatchKind::StringAppend`
+/// variant flagged in RFC-015 §11 can land additively without a
+/// breaking change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PatchKind {
+    /// RFC 7396 JSON Merge Patch. Locked choice for v0.6 (RFC-015 §3.2).
+    JsonMergePatch,
+}
+
+/// Per-call durability mode for [`EngineBackend::append_frame`].
+///
+/// RFC-015 §1. Mode is **per-call** — workers routinely mix frame types
+/// (tokens + progress + final summary) in a single attempt and the right
+/// durability differs per frame type. See RFC-015 §5 for the caveat on
+/// mixed-mode streams.
+///
+/// `#[non_exhaustive]`: new modes land additively (the v0.6 PR deliberately
+/// excludes `KeepAllDeltas`, dropped by owner adjudication; a future
+/// mode for e.g. per-frame-replicated streams would land here).
+///
+/// ## Doc-comment contract on [`Self::Durable`]
+///
+/// If the same stream also receives [`Self::BestEffortLive`] frames,
+/// `Durable` frames are subject to the best-effort MAXLEN trim (see
+/// RFC-015 §5). Callers that need strict retention for `Durable` frames
+/// alongside best-effort telemetry must not mix modes on one stream or
+/// should place the durable frames on a sibling stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StreamMode {
+    /// Current default — every frame XADDs as a durable entry.
+    Durable,
+    /// Server-side rolling-summary collapse. Each frame's payload is a
+    /// delta/patch applied atomically to a summary Hash (per
+    /// [`PatchKind`]); the delta is also XADDed to the stream with
+    /// `mode=summary` fields so live tailers continue to observe change
+    /// events. RFC-015 §3.
+    DurableSummary { patch_kind: PatchKind },
+    /// Short-lived frame. XADDed with `mode=best_effort`; per-stream
+    /// MAXLEN rolls it off and the stream key gets a TTL refresh only
+    /// when the stream has never held a durable frame (RFC-015 §4.1).
+    BestEffortLive { ttl_ms: u32 },
+}
+
+impl StreamMode {
+    /// The v0.6 default — [`Self::Durable`]. Provided for symmetry with
+    /// the other constructors (the enum is `#[non_exhaustive]` so
+    /// cross-crate consumers cannot construct variants by name).
+    pub fn durable() -> Self {
+        StreamMode::Durable
+    }
+
+    /// [`Self::DurableSummary`] with [`PatchKind::JsonMergePatch`] —
+    /// the only supported `PatchKind` in v0.6.
+    pub fn durable_summary() -> Self {
+        StreamMode::DurableSummary {
+            patch_kind: PatchKind::JsonMergePatch,
+        }
+    }
+
+    /// [`Self::BestEffortLive`] with the caller-supplied `ttl_ms`.
+    /// RFC-015 §4 guidance: `5_000..=30_000` ms. Below ~1000 ms a live
+    /// tailer may not connect in time; above ~60_000 ms the memory
+    /// argument against plain [`Self::Durable`] weakens.
+    pub fn best_effort_live(ttl_ms: u32) -> Self {
+        StreamMode::BestEffortLive { ttl_ms }
+    }
+
+    /// Stable wire-level token for this mode, written to the XADD entry
+    /// `mode` field (RFC-015 §6.1). Tail filters compare against these
+    /// string values server-side.
+    pub fn wire_str(&self) -> &'static str {
+        match self {
+            StreamMode::Durable => "durable",
+            StreamMode::DurableSummary { .. } => "summary",
+            StreamMode::BestEffortLive { .. } => "best_effort",
+        }
+    }
+}
+
+impl Default for StreamMode {
+    fn default() -> Self {
+        StreamMode::Durable
+    }
+}
+
+/// Tail-stream visibility filter (RFC-015 §6).
+///
+/// Default [`Self::All`] preserves v1 behaviour; opt-in
+/// [`Self::ExcludeBestEffort`] filters out `BestEffortLive` frames on
+/// the server side (the XADD `mode` field is a cheap field check in
+/// `ff_read_attempt_stream` / `xread_block`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum TailVisibility {
+    /// Default. Returns every XADD entry in the stream regardless of
+    /// mode.
+    #[default]
+    All,
+    /// Returns only frames appended under [`StreamMode::Durable`] or
+    /// [`StreamMode::DurableSummary`] (i.e. filters out
+    /// [`StreamMode::BestEffortLive`]). Named to be self-describing:
+    /// the filter excludes best-effort frames, not "only Durable" —
+    /// `DurableSummary` deltas are included because they have a
+    /// durable backing (the summary Hash).
+    ExcludeBestEffort,
+}
+
+impl TailVisibility {
+    /// Stable wire-level token pushed as an ARGV to the Lua tail/read
+    /// implementations. `""` (empty) means default = `All` (no filter).
+    pub fn wire_str(&self) -> &'static str {
+        match self {
+            TailVisibility::All => "",
+            TailVisibility::ExcludeBestEffort => "exclude_best_effort",
+        }
+    }
+}
+
+/// Byte-exact null-sentinel used by [`StreamMode::DurableSummary`] +
+/// [`PatchKind::JsonMergePatch`] to set a field to JSON `null` (RFC-015
+/// §3.2).
+///
+/// RFC 7396 treats `null` as "delete the key", so callers that actually
+/// want a literal JSON `null` leaf send this sentinel string as the
+/// scalar leaf value; the Lua apply-path rewrites the sentinel to JSON
+/// `null` after the merge.
+///
+/// # Round-trip invariant
+///
+/// The summary document — as returned by a `read_summary` call — NEVER
+/// contains the sentinel string. Any `null` observed always means "this
+/// field is explicitly null." See [`SummaryDocument`].
+pub const SUMMARY_NULL_SENTINEL: &str = "__ff_null__";
+
+/// Materialised rolling summary document returned by a summary-read
+/// call (RFC-015 §6.3).
+///
+/// `document` is the caller-owned JSON value; scalar leaves that the
+/// caller wrote through the [`SUMMARY_NULL_SENTINEL`] contract appear
+/// here as JSON `null` (not as the sentinel string — the round-trip
+/// invariant erases the sentinel on read).
+///
+/// `#[non_exhaustive]` keeps future additive fields (e.g. a compacted
+/// delta cursor, a schema-version tag) additive. Construct via
+/// [`Self::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SummaryDocument {
+    /// The rolling summary as JSON bytes (UTF-8, encoded by the
+    /// server-side applier after merge). Stored as `Vec<u8>` instead
+    /// of `serde_json::Value` to keep `ff_core::backend` free of a
+    /// public `serde_json` type dependency.
+    pub document_json: Vec<u8>,
+    /// Monotonic version bumped on every delta applied. `0` is never
+    /// observed — the first applied delta returns `1`.
+    pub version: u64,
+    /// Which [`PatchKind`] was used to build the document.
+    pub patch_kind: PatchKind,
+    /// Unix millis of the most recent delta application.
+    pub last_updated_ms: u64,
+    /// Unix millis of the first delta applied to this attempt.
+    pub first_applied_ms: u64,
+}
+
+impl SummaryDocument {
+    /// Build a summary snapshot. Used by backends parsing the Hash
+    /// fields; external consumers receive these from `read_summary`.
+    pub fn new(
+        document_json: Vec<u8>,
+        version: u64,
+        patch_kind: PatchKind,
+        last_updated_ms: u64,
+        first_applied_ms: u64,
+    ) -> Self {
+        Self {
+            document_json,
+            version,
+            patch_kind,
+            last_updated_ms,
+            first_applied_ms,
+        }
+    }
+}
+
 /// Single stream frame appended via `append_frame` (RFC-012 §3.3.0).
 /// Today's FCALL takes the byte payload + frame_type + optional seq as
 /// discrete ARGV; Stage 0 collects them into a named type for trait
@@ -225,6 +417,12 @@ pub struct Frame {
     /// Optional correlation id (wire `correlation_id` ARGV). `None`
     /// encodes as the empty string on the wire.
     pub correlation_id: Option<String>,
+    /// Durability mode for this frame (RFC-015 §1). Defaults to
+    /// [`StreamMode::Durable`] for v1-caller parity — the field was
+    /// added additively so pre-RFC-015 construction via
+    /// [`Self::new`] / [`Self::with_seq`] sees `Durable` without code
+    /// change.
+    pub mode: StreamMode,
 }
 
 impl Frame {
@@ -242,6 +440,7 @@ impl Frame {
             seq: None,
             frame_type: String::new(),
             correlation_id: None,
+            mode: StreamMode::Durable,
         }
     }
 
@@ -253,7 +452,15 @@ impl Frame {
             seq: Some(seq),
             frame_type: String::new(),
             correlation_id: None,
+            mode: StreamMode::Durable,
         }
+    }
+
+    /// Builder-style setter for the RFC-015 durability [`StreamMode`].
+    /// Defaults to [`StreamMode::Durable`] (v1 parity) when unset.
+    pub fn with_mode(mut self, mode: StreamMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Builder-style setter for the free-form `frame_type` classifier.
@@ -684,12 +891,47 @@ pub enum FailOutcome {
 ///
 /// `stream_id: String` is a stable shape commitment — a future typed
 /// `StreamId` newtype would be its own breaking change (§R7.5.6 / MD2).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// RFC-015 §9 made this type `#[non_exhaustive]` so the new
+/// `summary_version: Option<u64>` field (populated only for
+/// [`StreamMode::DurableSummary`] appends) can land additively and
+/// future per-mode outcome fields can follow. Construct via
+/// [`Self::new`] + the chainable setters; cross-crate consumers cannot
+/// use struct-literal construction.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct AppendFrameOutcome {
     /// Valkey Stream entry ID assigned to this frame (e.g. `1234567890-0`).
     pub stream_id: String,
     /// Total frame count in the stream after this append.
     pub frame_count: u64,
+    /// Rolling summary `version` after the delta applied, populated
+    /// only for [`StreamMode::DurableSummary`] appends (RFC-015 §3.3
+    /// step 6). `None` for [`StreamMode::Durable`] /
+    /// [`StreamMode::BestEffortLive`] appends — callers that need
+    /// "total deltas applied" read this field.
+    pub summary_version: Option<u64>,
+}
+
+impl AppendFrameOutcome {
+    /// Build an outcome with the mandatory `stream_id` / `frame_count`
+    /// fields. `summary_version` defaults to `None` — call
+    /// [`Self::with_summary_version`] for [`StreamMode::DurableSummary`]
+    /// appends.
+    pub fn new(stream_id: impl Into<String>, frame_count: u64) -> Self {
+        Self {
+            stream_id: stream_id.into(),
+            frame_count,
+            summary_version: None,
+        }
+    }
+
+    /// Attach a rolling summary version (RFC-015 §9).
+    #[must_use]
+    pub fn with_summary_version(mut self, version: u64) -> Self {
+        self.summary_version = Some(version);
+        self
+    }
 }
 
 // ── Stage 1a: BackendConfig + sub-types ─────────────────────────────────
@@ -1020,6 +1262,7 @@ mod tests {
             seq: Some(3),
             frame_type: "delta".to_owned(),
             correlation_id: Some("req-42".to_owned()),
+            mode: StreamMode::Durable,
         };
         assert_eq!(f.clone(), f);
         assert_eq!(f.kind, FrameKind::Stdout);
@@ -1242,6 +1485,105 @@ mod tests {
             .with_instance_tag("cairn.instance_id", "i-1");
         assert!(both.matches(Some(&Namespace::new("tenant-a")), Some("i-1")));
         assert!(!both.matches(Some(&Namespace::new("tenant-b")), Some("i-1")));
+    }
+
+    // ── RFC-015 Stream-durability-mode types ──
+
+    #[test]
+    fn stream_mode_constructors_and_wire_str() {
+        assert_eq!(StreamMode::durable().wire_str(), "durable");
+        assert_eq!(StreamMode::durable(), StreamMode::Durable);
+
+        let s = StreamMode::durable_summary();
+        assert_eq!(s.wire_str(), "summary");
+        match s {
+            StreamMode::DurableSummary { patch_kind } => {
+                assert_eq!(patch_kind, PatchKind::JsonMergePatch);
+            }
+            _ => panic!("expected DurableSummary"),
+        }
+
+        let b = StreamMode::best_effort_live(15_000);
+        assert_eq!(b.wire_str(), "best_effort");
+        match b {
+            StreamMode::BestEffortLive { ttl_ms } => assert_eq!(ttl_ms, 15_000),
+            _ => panic!("expected BestEffortLive"),
+        }
+        assert_eq!(StreamMode::default(), StreamMode::Durable);
+    }
+
+    #[test]
+    fn tail_visibility_default_and_wire() {
+        assert_eq!(TailVisibility::default(), TailVisibility::All);
+        assert_eq!(TailVisibility::All.wire_str(), "");
+        assert_eq!(
+            TailVisibility::ExcludeBestEffort.wire_str(),
+            "exclude_best_effort"
+        );
+    }
+
+    #[test]
+    fn append_frame_outcome_summary_version_builder() {
+        let base = AppendFrameOutcome::new("1713-0", 3);
+        assert_eq!(base.stream_id, "1713-0");
+        assert_eq!(base.frame_count, 3);
+        assert_eq!(base.summary_version, None);
+
+        let with_v = AppendFrameOutcome::new("1713-0", 3).with_summary_version(7);
+        assert_eq!(with_v.summary_version, Some(7));
+        assert_eq!(with_v.clone(), with_v);
+    }
+
+    /// RFC-015 §3.2 null-sentinel round-trip invariant.
+    ///
+    /// The sentinel (`"__ff_null__"`) is the byte-exact string callers
+    /// use to encode "set this leaf to JSON null" in a JSON Merge Patch
+    /// frame (because RFC 7396 otherwise treats `null` as delete-key).
+    /// The invariant: on read, the summary document NEVER contains the
+    /// sentinel string — it is always rewritten to JSON null.
+    ///
+    /// The full end-to-end invariant is exercised against the Lua
+    /// applier in `crates/ff-test/tests/engine_backend_stream_modes.rs`
+    /// (integration). Here we just pin the byte sequence + the
+    /// type-level constant so any accidental edit of the sentinel
+    /// string fails the unit build before it reaches an integration
+    /// run.
+    #[test]
+    fn summary_null_sentinel_byte_exact() {
+        assert_eq!(SUMMARY_NULL_SENTINEL, "__ff_null__");
+        assert_eq!(SUMMARY_NULL_SENTINEL.len(), 11);
+        assert!(SUMMARY_NULL_SENTINEL.bytes().all(|b| b.is_ascii()));
+        assert_eq!(SUMMARY_NULL_SENTINEL.trim(), SUMMARY_NULL_SENTINEL);
+    }
+
+    #[test]
+    fn summary_document_constructor() {
+        let doc = SummaryDocument::new(
+            br#"{"tokens":3}"#.to_vec(),
+            2,
+            PatchKind::JsonMergePatch,
+            1_700_000_100,
+            1_700_000_000,
+        );
+        assert_eq!(doc.version, 2);
+        assert_eq!(doc.patch_kind, PatchKind::JsonMergePatch);
+        assert_eq!(doc.first_applied_ms, 1_700_000_000);
+        assert_eq!(doc.clone(), doc);
+    }
+
+    #[test]
+    fn frame_builder_sets_mode() {
+        let f = Frame::new(b"p".to_vec(), FrameKind::Event);
+        assert_eq!(f.mode, StreamMode::Durable);
+
+        let f = Frame::new(b"p".to_vec(), FrameKind::Event)
+            .with_mode(StreamMode::durable_summary());
+        match f.mode {
+            StreamMode::DurableSummary { patch_kind } => {
+                assert_eq!(patch_kind, PatchKind::JsonMergePatch);
+            }
+            other => panic!("expected DurableSummary, got {other:?}"),
+        }
     }
 
     #[test]

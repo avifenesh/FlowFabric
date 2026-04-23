@@ -102,10 +102,7 @@ impl EngineBackend for PassthroughBackend {
         _frame: Frame,
     ) -> Result<AppendFrameOutcome, EngineError> {
         self.record("append_frame")?;
-        Ok(AppendFrameOutcome {
-            stream_id: String::new(),
-            frame_count: 0,
-        })
+        Ok(AppendFrameOutcome::new(String::new(), 0))
     }
 
     async fn complete(
@@ -320,8 +317,19 @@ impl EngineBackend for PassthroughBackend {
         _after: StreamCursor,
         _block_ms: u64,
         _count_limit: u64,
+        _visibility: ff_core::backend::TailVisibility,
     ) -> Result<StreamFrames, EngineError> {
         self.record("tail_stream")?;
         Err(EngineError::Unavailable { op: "tail_stream" })
+    }
+
+    #[cfg(feature = "valkey-default")]
+    async fn read_summary(
+        &self,
+        _execution_id: &ExecutionId,
+        _attempt_index: AttemptIndex,
+    ) -> Result<Option<ff_core::backend::SummaryDocument>, EngineError> {
+        self.record("read_summary")?;
+        Err(EngineError::Unavailable { op: "read_summary" })
     }
 }

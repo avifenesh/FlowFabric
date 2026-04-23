@@ -5,6 +5,51 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **RFC-015: Stream durability modes (`DurableSummary`, `BestEffortLive`).**
+  `append_frame` now carries a per-call `StreamMode` (on the `Frame`
+  value) selecting one of `Durable` (default, pre-015 behaviour),
+  `DurableSummary { patch_kind: PatchKind }`, or
+  `BestEffortLive { ttl_ms: u32 }`. `DurableSummary` frames apply a
+  JSON Merge Patch (RFC 7396) to a server-side rolling summary Hash at
+  `ff:attempt:{p:N}:<eid>:<aidx>:summary` inside a single Valkey
+  Function invocation (atomic decode → merge → encode → version bump)
+  and also XADD the delta with `mode=summary summary_version=<n>`
+  fields so live tailers continue to observe change events.
+  `BestEffortLive` frames XADD with `mode=best_effort`, trim to a
+  conservative `MAXLEN ~ 64` (EMA-driven sizing is benchmark-gated per
+  RFC-015 §4.3 and ships post-measurement), and set `PEXPIRE` on the
+  stream key *only* while the stream has never held a durable frame —
+  the Lua function `PERSIST`s the key on the first durable append and
+  never re-sets a TTL thereafter (mixed-mode safety, §4.1).
+  `AppendFrameOutcome` is now `#[non_exhaustive]` and gains
+  `summary_version: Option<u64>` populated on `DurableSummary` appends
+  (§9). `EngineBackend::tail_stream` takes a new `TailVisibility` arg
+  (`All` default / `ExcludeBestEffort`) that filters XADD entries by
+  their `mode` field server-side (§6.1), and a new
+  `EngineBackend::read_summary` returns the materialised
+  `SummaryDocument` for an attempt (§6.3). The RFC-7396 "null means
+  delete" ambiguity is handled by a byte-exact sentinel string
+  `"__ff_null__"` (exposed as `ff_core::backend::SUMMARY_NULL_SENTINEL`
+  / `ff_sdk::SUMMARY_NULL_SENTINEL`) which the Lua applier rewrites to
+  JSON null post-merge; the round-trip invariant (the sentinel never
+  appears in a returned `SummaryDocument`) is pinned at the type level
+  and in integration tests. SDK surface:
+  `ClaimedTask::append_frame_with_mode`,
+  `ClaimedTask::tail_stream_with_visibility`, free-function
+  `tail_stream_with_visibility`, re-exports for `StreamMode`,
+  `TailVisibility`, `SummaryDocument`, `PatchKind`, and
+  `SUMMARY_NULL_SENTINEL` under `ff_sdk`. Integration coverage:
+  `crates/ff-test/tests/engine_backend_stream_modes.rs` (9 scenarios).
+  No behaviour change for pre-015 callers — `Frame::new` defaults
+  `mode` to `Durable`, `tail_stream` defaults `visibility` to `All`,
+  pre-015 XADD entries without a `mode` field are read as `durable`
+  per §8.1. Owner-adjudicated decisions honoured: `KeepAllDeltas`
+  dropped; `JsonMergePatch` the sole v0.6 `PatchKind` (open enum for
+  the future `StringAppend`); EMA α deferred-to-measurement, not baked
+  in. Lua library bumped to version `17`.
+
 ### Changed
 
 - **`ff-script` gates its `ferriskey` dep behind a new `valkey-client`
