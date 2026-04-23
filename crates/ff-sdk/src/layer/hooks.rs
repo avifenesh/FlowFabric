@@ -22,8 +22,8 @@ use ff_core::backend::{
     ResumeSignal, WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
-    ListLanesPage, ListSuspendedPage, ReportUsageResult,
+    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
 };
 use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
@@ -350,6 +350,20 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "report_usage",
             self.inner.report_usage(handle, budget, dimensions).await
+        )
+    }
+
+    #[cfg(feature = "core")]
+    async fn list_executions(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListExecutionsPage, EngineError> {
+        with_hooks!(
+            self,
+            "list_executions",
+            self.inner.list_executions(partition, cursor, limit).await
         )
     }
 
