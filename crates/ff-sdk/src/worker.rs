@@ -147,6 +147,19 @@ impl FlowFabricWorker {
     /// library — that is the server's responsibility (ff-server calls
     /// `ff_script::loader::ensure_library()` on startup). The SDK assumes
     /// the library is already loaded.
+    ///
+    /// # Smoke / dev scripts: rotate `WorkerInstanceId`
+    ///
+    /// The SDK writes a SET-NX liveness sentinel keyed on the worker's
+    /// `WorkerInstanceId`. When a smoke / dev script reuses the same
+    /// `WorkerInstanceId` across restarts, subsequent runs trap behind
+    /// the prior run's SET-NX until the liveness key's TTL (≈ 2× the
+    /// configured lease TTL) expires — the worker appears stuck and
+    /// claims nothing. Iterative scripts should synthesise a fresh
+    /// `WorkerInstanceId` per process (e.g. `WorkerInstanceId::new()`
+    /// or embed a UUID/timestamp) rather than hard-coding a stable
+    /// value. Production workers that cleanly shut down release the
+    /// key; only crashed / kill -9'd processes hit this trap.
     pub async fn connect(config: WorkerConfig) -> Result<Self, SdkError> {
         if config.lanes.is_empty() {
             return Err(SdkError::Config {

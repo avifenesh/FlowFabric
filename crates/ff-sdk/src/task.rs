@@ -668,6 +668,17 @@ impl ClaimedTask {
     ///
     /// **RFC-012 Stage 1b.** Forwards through the `EngineBackend`
     /// trait (`backend.progress(&handle, Some(pct), Some(msg))`).
+    ///
+    /// # Not for stream frames
+    ///
+    /// `update_progress` writes the `progress_percent` / `progress_message`
+    /// fields on `exec_core` (the execution's state hash). It is a
+    /// scalar heartbeat — each call overwrites the previous value and
+    /// nothing is appended to the output stream. Producers emitting
+    /// stream frames (arbitrary `frame_type` + payload, consumed via
+    /// `ClaimedTask::read_stream` / `tail_stream` or the HTTP
+    /// stream-tail routes) MUST use [`Self::append_frame`] instead;
+    /// `update_progress` is invisible to stream consumers.
     pub async fn update_progress(&self, pct: u8, message: &str) -> Result<(), SdkError> {
         let handle = self.synth_handle();
         self.backend
@@ -758,6 +769,15 @@ impl ClaimedTask {
     /// extended [`ff_core::backend::Frame`] shape (`frame_type:
     /// String`, `correlation_id: Option<String>`), giving byte-for-byte
     /// wire parity with the pre-migration direct-FCALL path.
+    ///
+    /// # `append_frame` vs [`Self::update_progress`]
+    ///
+    /// Stream-frame producers (arbitrary `frame_type` + payload
+    /// consumed via `ClaimedTask::read_stream` / `tail_stream` or the
+    /// HTTP stream-tail routes) MUST use `append_frame`.
+    /// `update_progress` writes scalar `progress_percent` /
+    /// `progress_message` fields to `exec_core` and is invisible to
+    /// stream consumers.
     pub async fn append_frame(
         &self,
         frame_type: &str,

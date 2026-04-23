@@ -640,6 +640,95 @@ are infallible — no `TryInto` plumbing required. Existing
 
 Source: PR #157.
 
+## 15. v0.4.1 DX polish bundle (#176)
+
+Six runtime-smoke frictions surfaced during v0.4.0 consumer validation.
+All doc-only — no code changes required. Three of them have
+cross-cutting migration implications worth calling out here; the
+other three are localised rustdoc notes (see the linked sites).
+
+### 15.1 Completion PUBLISH is gated on `flow_id`
+
+The Lua terminal (`crates/ff-script/src/flowfabric.lua`) emits
+`PUBLISH ff:dag:completions …` **only** when `core.flow_id` is set.
+Standalone executions (submitted without a flow) never hit the
+channel. Consumers subscribing via
+[`CompletionBackend::subscribe_completions`](../crates/ff-core/src/completion_backend.rs)
+or `subscribe_completions_filtered` observe nothing for them — the
+terminal state lands in `exec_core` and the `dependency_reconciler`
+interval scan picks it up, but the push stream stays silent.
+
+Smoke tests that submit a single execution and `.next().await` on a
+completion stream will hang. Either submit under a flow, or poll
+`describe_execution` instead.
+
+### 15.2 `ValkeyBackend::connect` erases `CompletionBackend`
+
+`ValkeyBackend::connect(config) -> Arc<dyn EngineBackend>` loses the
+`CompletionBackend` capability: Rust's trait-object model cannot
+re-upcast `Arc<dyn EngineBackend>` to `Arc<dyn CompletionBackend>`.
+
+Consumers that need both trait views from one dial should build the
+client + `ValkeyConnection` directly and call
+[`ValkeyBackend::from_client_partitions_and_connection`](../crates/ff-backend-valkey/src/lib.rs),
+holding the concrete `Arc<ValkeyBackend>` and cloning it into each
+trait-object position:
+
+```rust
+use std::sync::Arc;
+use ff_backend_valkey::ValkeyBackend;
+use ff_core::backend::ValkeyConnection;
+use ff_core::completion_backend::CompletionBackend;
+use ff_core::engine_backend::EngineBackend;
+
+let client = /* build ferriskey::Client */;
+let partition_config = /* load from ff:config:partitions */;
+let conn: ValkeyConnection = /* … */;
+let backend: Arc<ValkeyBackend> =
+    ValkeyBackend::from_client_partitions_and_connection(
+        client, partition_config, conn);
+
+let engine: Arc<dyn EngineBackend> = backend.clone();
+let completion: Arc<dyn CompletionBackend> = backend;
+```
+
+See also §5 (`connect_with` + `completion_backend()` on the worker).
+
+### 15.3 `Server::start` hard-fails on `PartitionConfig` mismatch
+
+`ff-server`'s boot sequence validates the `ff:config:partitions` hash
+against the configured `PartitionConfig` (see
+`crates/ff-server/src/server.rs` — step 2). A mismatch aborts start
+rather than silently re-tagging keys on a mis-sized deployment.
+
+Dev / smoke workflows that change `PartitionConfig` must either:
+
+- `FLUSHDB` / `FLUSHALL` the target Valkey before starting, so the
+  server creates the config fresh; or
+- Match the host's persisted `PartitionConfig` (inspect with
+  `GET ff:config:partitions`).
+
+This is intentional — silent divergence would route keys to
+different slots on different processes. Production deployments
+should treat `PartitionConfig` as a cluster-lifetime constant.
+
+### 15.4 Other items (rustdoc-only)
+
+- `update_progress` vs `append_frame` — cross-referenced in both
+  methods' rustdoc (`ff-sdk::task::ClaimedTask`,
+  `ff-core::engine_backend::EngineBackend`). `update_progress` is a
+  scalar heartbeat on `exec_core`; stream-frame producers must use
+  `append_frame`.
+- SET-NX liveness key traps repeat runs for ≈ 2× lease TTL —
+  rustdoc note on `FlowFabricWorker::connect` recommends rotating
+  `WorkerInstanceId` per smoke-script run.
+- `claim_for_worker` lane-FIFO surprise — rustdoc note on
+  `Scheduler::claim_for_worker` explains that leftover eligible execs
+  from prior runs drain before the current submission is observed;
+  recommend a fresh lane name for smoke tests.
+
+Source: issue #176.
+
 ## References
 
 - RFC-012 Stage 1a: type introduction (landed).

@@ -101,6 +101,11 @@ pub trait EngineBackend: Send + Sync + 'static {
     async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError>;
 
     /// Numeric-progress heartbeat.
+    ///
+    /// Writes scalar `progress_percent` / `progress_message` fields on
+    /// `exec_core`; each call overwrites the previous value. This does
+    /// NOT append to the output stream — stream-frame producers must use
+    /// [`append_frame`](Self::append_frame) instead.
     async fn progress(
         &self,
         handle: &Handle,
@@ -111,6 +116,11 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Append one stream frame. Distinct from [`progress`](Self::progress)
     /// per RFC-012 §3.1.1 K#6. Returns the backend-assigned stream entry
     /// id and post-append frame count (RFC-012 §R7.2.1).
+    ///
+    /// Stream-frame producers (arbitrary `frame_type` + payload, consumed
+    /// via the read/tail surfaces) MUST use this method rather than
+    /// [`progress`](Self::progress); the latter updates scalar fields on
+    /// `exec_core` and is invisible to stream consumers.
     async fn append_frame(
         &self,
         handle: &Handle,

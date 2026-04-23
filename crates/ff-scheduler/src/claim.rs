@@ -411,6 +411,18 @@ impl Scheduler {
     /// Returns `Ok(None)` if no eligible executions exist anywhere.
     /// Returns `Ok(Some(grant))` on success.
     /// Returns `Err` on Valkey errors.
+    ///
+    /// # Lane-FIFO: prior-run leftovers drain first
+    ///
+    /// Claim grants are issued in per-lane FIFO order over the lane's
+    /// eligible queue. A smoke / dev script that reuses a lane across
+    /// runs will observe the lane's leftover executions from earlier
+    /// runs — failed, orphaned, or still-eligible — drain *before*
+    /// the fresh submission is claimed. This surfaces as a confusing
+    /// "wrong execution picked up" during iterative development.
+    /// Smoke tests should either (a) use a fresh lane name per run
+    /// (e.g. suffixing with a UUID or timestamp), or (b) call
+    /// `cancel_flow` / `FLUSHDB` between runs to drain the lane.
     pub async fn claim_for_worker(
         &self,
         lane: &LaneId,

@@ -31,6 +31,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `valkey_kind`) transparently descend through the wrapper so
   retry/terminal semantics are preserved.
 
+### Changed
+
+- **v0.4.1 DX polish bundle (#176):** doc-only follow-up to v0.4.0
+  consumer validation — six runtime-smoke frictions documented in
+  place, no code changes. Rustdoc notes added on
+  `CompletionBackend::subscribe_completions_filtered` (completion
+  PUBLISH gated on `flow_id` — solo executions never emit),
+  `ClaimedTask::update_progress` + `::append_frame` + the same pair
+  on the `EngineBackend` trait (cross-reference: `update_progress`
+  writes scalar fields on `exec_core`, stream-frame producers must
+  use `append_frame`), `ValkeyBackend::connect` (capability erasure
+  when returning `Arc<dyn EngineBackend>`; use
+  `from_client_partitions_and_connection` to retain
+  `CompletionBackend`), `FlowFabricWorker::connect` (rotate
+  `WorkerInstanceId` per smoke-script run to avoid the 2×
+  lease-TTL SET-NX liveness trap), and `Scheduler::claim_for_worker`
+  (lane-FIFO drains prior-run leftovers before fresh submissions —
+  recommend a fresh lane per smoke run). `docs/cairn-migration-v0.4.0.md`
+  §15 captures the three cross-cutting items (flow_id gating,
+  `connect` capability erasure, `Server::start` hard-fail on
+  `PartitionConfig` mismatch).
+
 ### Fixed
 
 - **ff-script + ff-sdk default-features leak on `ff-core` (#164):**
