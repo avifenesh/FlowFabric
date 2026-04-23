@@ -207,9 +207,10 @@ impl From<ServerError> for ApiError {
     }
 }
 
-/// HTTP error body. `kind`/`retryable` are populated for 500s backed by a
-/// `ferriskey::Error` so HTTP clients (e.g. cairn-fabric) can make retry
-/// decisions without parsing the `error` string.
+/// HTTP error body. `kind`/`retryable` are populated for 500s backed by
+/// a backend transport fault (see `ff_core::BackendErrorKind`) so HTTP
+/// clients (e.g. cairn-fabric) can make retry decisions without parsing
+/// the `error` string.
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
@@ -227,8 +228,6 @@ impl ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        use ff_script::retry::kind_to_stable_str;
-
         let (status, body) = match &self.0 {
             ServerError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, ErrorBody::plain(msg.clone()))
@@ -249,13 +248,12 @@ impl IntoResponse for ApiError {
                     retryable: Some(true),
                 },
             ),
-            ServerError::Valkey(e) => {
-                let kind_str = kind_to_stable_str(e.kind());
+            ServerError::Backend(be) => {
+                let kind_str = be.kind().as_stable_str();
                 tracing::error!(
                     kind = kind_str,
-                    code = e.code().unwrap_or(""),
-                    detail = e.detail().unwrap_or(""),
-                    "valkey error"
+                    message = be.message(),
+                    "backend error"
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -266,14 +264,13 @@ impl IntoResponse for ApiError {
                     },
                 )
             }
-            ServerError::ValkeyContext { source, context } => {
-                let kind_str = kind_to_stable_str(source.kind());
+            ServerError::BackendContext { source, context } => {
+                let kind_str = source.kind().as_stable_str();
                 tracing::error!(
                     kind = kind_str,
-                    code = source.code().unwrap_or(""),
-                    detail = source.detail().unwrap_or(""),
+                    message = source.message(),
                     context = %context,
-                    "valkey error"
+                    "backend error"
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -285,7 +282,10 @@ impl IntoResponse for ApiError {
                 )
             }
             ServerError::LibraryLoad(load_err) => {
-                let kind_str = load_err.valkey_kind().map(kind_to_stable_str);
+                let kind_str = load_err
+                    .valkey_kind()
+                    .map(ff_backend_valkey::classify_ferriskey_kind)
+                    .map(|k| k.as_stable_str());
                 tracing::error!(
                     kind = kind_str.unwrap_or(""),
                     error = %load_err,
@@ -1280,7 +1280,7 @@ async fn healthz(
         .cmd("PING")
         .execute()
         .await
-        .map_err(|e| ApiError(ServerError::ValkeyContext { source: e, context: "healthz PING".into() }))?;
+        .map_err(|e| ApiError(crate::server::backend_context(e, "healthz PING")))?;
     Ok(Json(HealthResponse { status: "ok" }))
 }
 

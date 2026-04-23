@@ -214,14 +214,20 @@ pub struct Server {
 /// Server error type.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    /// Valkey connection or command error (preserves ErrorKind for caller inspection).
-    #[error("valkey: {0}")]
-    Valkey(#[from] ferriskey::Error),
-    /// Valkey error with additional context (preserves ErrorKind via #[source]).
-    #[error("valkey ({context}): {source}")]
-    ValkeyContext {
+    /// Backend transport error. Previously wrapped `ferriskey::Error`
+    /// directly (#88); now carries a backend-agnostic
+    /// [`ff_core::BackendError`] so consumers match on
+    /// [`ff_core::BackendErrorKind`] instead of ferriskey's native
+    /// taxonomy. The ferriskey → [`ff_core::BackendError`] mapping
+    /// lives in `ff_backend_valkey::backend_error_from_ferriskey`.
+    #[error("backend: {0}")]
+    Backend(#[from] ff_core::BackendError),
+    /// Backend error with additional context. Previously
+    /// `ValkeyContext { source: ferriskey::Error }` (#88).
+    #[error("backend ({context}): {source}")]
+    BackendContext {
         #[source]
-        source: ferriskey::Error,
+        source: ff_core::BackendError,
         context: String,
     },
     #[error("config: {0}")]
@@ -261,27 +267,56 @@ pub enum ServerError {
     },
 }
 
+/// Lift a native `ferriskey::Error` into [`ServerError::Backend`] via
+/// [`ff_backend_valkey::backend_error_from_ferriskey`] (#88). Keeps
+/// `?`-propagation ergonomic at ferriskey call sites while the
+/// public variant stays backend-agnostic.
+impl From<ferriskey::Error> for ServerError {
+    fn from(err: ferriskey::Error) -> Self {
+        Self::Backend(ff_backend_valkey::backend_error_from_ferriskey(&err))
+    }
+}
+
+/// Build a [`ServerError::BackendContext`] from a native
+/// `ferriskey::Error` and a call-site label (#88).
+pub(crate) fn backend_context(
+    err: ferriskey::Error,
+    context: impl Into<String>,
+) -> ServerError {
+    ServerError::BackendContext {
+        source: ff_backend_valkey::backend_error_from_ferriskey(&err),
+        context: context.into(),
+    }
+}
+
 impl ServerError {
-    /// Returns the underlying ferriskey ErrorKind, if this error carries one.
-    /// Covers direct Valkey variants and library-load failures that bubble a
-    /// `ferriskey::Error` through `LoadError::Valkey`.
-    pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
+    /// Returns the classified [`ff_core::BackendErrorKind`] if this
+    /// error carries a backend transport fault. Covers direct
+    /// Backend variants and library-load failures.
+    ///
+    /// Renamed from `valkey_kind` in #88 — the previous return type
+    /// `Option<ferriskey::ErrorKind>` leaked ferriskey into every
+    /// consumer doing retry/error classification.
+    pub fn backend_kind(&self) -> Option<ff_core::BackendErrorKind> {
         match self {
-            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
-            Self::LibraryLoad(e) => e.valkey_kind(),
+            Self::Backend(be) | Self::BackendContext { source: be, .. } => Some(be.kind()),
+            Self::LibraryLoad(e) => e
+                .valkey_kind()
+                .map(ff_backend_valkey::classify_ferriskey_kind),
             _ => None,
         }
     }
 
-    /// Whether this error is safely retryable by a caller. Semantics match
-    /// `ScriptError::class() == Retryable` for Lua errors plus a kind-aware
-    /// check for transport/library-load failures. Business-logic rejections
-    /// (NotFound, InvalidInput, OperationFailed, Script, Config, PartitionMismatch)
-    /// return false — those won't change on retry.
+    /// Whether this error is safely retryable by a caller. For
+    /// backend transport variants, delegates to
+    /// [`ff_core::BackendErrorKind::is_retryable`]. Business-logic
+    /// rejections (NotFound, InvalidInput, OperationFailed, Script,
+    /// Config, PartitionMismatch) return false — those won't change
+    /// on retry.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => {
-                is_retryable_kind(e.kind())
+            Self::Backend(be) | Self::BackendContext { source: be, .. } => {
+                be.kind().is_retryable()
             }
             Self::LibraryLoad(load_err) => load_err
                 .valkey_kind()
@@ -347,14 +382,14 @@ impl Server {
         let client = builder
             .build()
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "connect".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "connect"))?;
 
         // Verify connectivity
         let pong: String = client
             .cmd("PING")
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "PING".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "PING"))?;
         if pong != "PONG" {
             return Err(ServerError::OperationFailed(format!(
                 "unexpected PING response: {pong}"
@@ -470,18 +505,12 @@ impl Server {
         let tail_client = tail_builder
             .build()
             .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "connect (tail)".into(),
-            })?;
+            .map_err(|e| crate::server::backend_context(e, "connect (tail)"))?;
         let tail_pong: String = tail_client
             .cmd("PING")
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "PING (tail)".into(),
-            })?;
+            .map_err(|e| crate::server::backend_context(e, "PING (tail)"))?;
         if tail_pong != "PONG" {
             return Err(ServerError::OperationFailed(format!(
                 "tail client unexpected PING response: {tail_pong}"
@@ -735,7 +764,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "public_state")
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET public_state".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGET public_state"))?;
 
         match state_str {
             Some(s) => {
@@ -800,10 +829,7 @@ impl Server {
             .arg(ctx.result())
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "GET exec result".into(),
-            })?;
+            .map_err(|e| crate::server::backend_context(e, "GET exec result"))?;
         Ok(payload)
     }
 
@@ -865,10 +891,7 @@ impl Server {
             .arg(ctx.core())
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "EXISTS exec_core (pending waitpoints)".into(),
-            })?;
+            .map_err(|e| crate::server::backend_context(e, "EXISTS exec_core (pending waitpoints)"))?;
         if !core_exists {
             return Err(ServerError::NotFound(format!(
                 "execution not found: {execution_id}"
@@ -896,10 +919,7 @@ impl Server {
                 .arg(WAITPOINTS_SSCAN_COUNT.to_string().as_str())
                 .execute()
                 .await
-                .map_err(|e| ServerError::ValkeyContext {
-                    source: e,
-                    context: "SSCAN waitpoints".into(),
-                })?;
+                .map_err(|e| crate::server::backend_context(e, "SSCAN waitpoints"))?;
             cursor = reply.0;
             wp_ids_raw.extend(reply.1);
             if cursor == "0" {
@@ -978,10 +998,7 @@ impl Server {
         pass1
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "pipeline HMGET waitpoints + HGET total_matchers".into(),
-            })?;
+            .map_err(|e| crate::server::backend_context(e, "pipeline HMGET waitpoints + HGET total_matchers"))?;
 
         // Collect pass-1 results + queue pass-2 HMGETs for condition
         // matcher names on waitpoints that are actionable (state in
@@ -1000,10 +1017,7 @@ impl Server {
             .zip(cond_slots)
         {
             let wp_fields: Vec<Option<String>> =
-                wp_slot.value().map_err(|e| ServerError::ValkeyContext {
-                    source: e,
-                    context: format!("pipeline slot HMGET waitpoint {wp_id}"),
-                })?;
+                wp_slot.value().map_err(|e| crate::server::backend_context(e, format!("pipeline slot HMGET waitpoint {wp_id}")))?;
 
             // Waitpoint hash may have been GC'd between the SSCAN and
             // this HMGET (rotation / cleanup race). Skip silently.
@@ -1041,10 +1055,7 @@ impl Server {
 
             let total_matchers = cond_slot
                 .value()
-                .map_err(|e| ServerError::ValkeyContext {
-                    source: e,
-                    context: format!("pipeline slot HGET total_matchers {wp_id}"),
-                })?
+                .map_err(|e| crate::server::backend_context(e, format!("pipeline slot HGET total_matchers {wp_id}")))?
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
 
@@ -1080,10 +1091,7 @@ impl Server {
             matcher_slots.push(Some(cmd.finish()));
         }
         if pass2_needed {
-            pass2.execute().await.map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: "pipeline HMGET wp_condition matchers".into(),
-            })?;
+            pass2.execute().await.map_err(|e| crate::server::backend_context(e, "pipeline HMGET wp_condition matchers"))?;
         }
 
         let parse_ts = |raw: &str| -> Option<TimestampMs> {
@@ -1106,13 +1114,10 @@ impl Server {
                 None => Vec::new(),
                 Some(s) => {
                     let vals: Vec<Option<String>> =
-                        s.value().map_err(|e| ServerError::ValkeyContext {
-                            source: e,
-                            context: format!(
+                        s.value().map_err(|e| crate::server::backend_context(e, format!(
                                 "pipeline slot HMGET wp_condition matchers {}",
                                 k.wp_id
-                            ),
-                        })?;
+                            )))?;
                     vals.into_iter()
                         .flatten()
                         .filter(|name| !name.is_empty())
@@ -1248,7 +1253,7 @@ impl Server {
             .client
             .hgetall(&bctx.definition())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL budget_def".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGETALL budget_def"))?;
 
         if def.is_empty() {
             return Err(ServerError::NotFound(format!(
@@ -1261,7 +1266,7 @@ impl Server {
             .client
             .hgetall(&bctx.usage())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL budget_usage".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGETALL budget_usage"))?;
         let usage: HashMap<String, u64> = usage_raw
             .into_iter()
             .filter(|(k, _)| k != "_init")
@@ -1273,7 +1278,7 @@ impl Server {
             .client
             .hgetall(&bctx.limits())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL budget_limits".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGETALL budget_limits"))?;
         let mut hard_limits = HashMap::new();
         let mut soft_limits = HashMap::new();
         for (k, v) in &limits_raw {
@@ -1623,10 +1628,7 @@ impl Server {
                     .arg("cancel_reason")
                     .execute()
                     .await
-                    .map_err(|e| ServerError::ValkeyContext {
-                        source: e,
-                        context: "HMGET flow_core cancellation_policy,cancel_reason".into(),
-                    })?;
+                    .map_err(|e| crate::server::backend_context(e, "HMGET flow_core cancellation_policy,cancel_reason"))?;
                 let stored_policy = flow_meta
                     .first()
                     .and_then(|v| v.as_ref())
@@ -1643,10 +1645,7 @@ impl Server {
                     .arg(fctx.members())
                     .execute()
                     .await
-                    .map_err(|e| ServerError::ValkeyContext {
-                        source: e,
-                        context: "SMEMBERS flow members (already terminal)".into(),
-                    })?;
+                    .map_err(|e| crate::server::backend_context(e, "SMEMBERS flow members (already terminal)"))?;
                 // Cap the returned list to avoid pathological bandwidth on
                 // idempotent retries for flows with 10k+ members. Clients
                 // already received the authoritative member list on the
@@ -1941,7 +1940,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         // KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
@@ -1997,7 +1996,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         let wp_id = &args.waitpoint_id;
@@ -2099,7 +2098,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         // KEYS (2): exec_core, eligible_zset
@@ -2152,15 +2151,11 @@ impl Server {
             )
             .await
             .map_err(|e| match e {
-                ff_scheduler::SchedulerError::Valkey(inner) => {
-                    ServerError::Valkey(inner)
-                }
+                ff_scheduler::SchedulerError::Valkey(inner) => ServerError::from(inner),
                 ff_scheduler::SchedulerError::ValkeyContext { source, context } => {
-                    ServerError::ValkeyContext { source, context }
+                    crate::server::backend_context(source, context)
                 }
-                ff_scheduler::SchedulerError::Config(msg) => {
-                    ServerError::InvalidInput(msg)
-                }
+                ff_scheduler::SchedulerError::Config(msg) => ServerError::InvalidInput(msg),
             })
     }
 
@@ -2178,7 +2173,7 @@ impl Server {
             .client
             .hget(&ctx.core(), "current_worker_instance_id")
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET worker_instance_id".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGET worker_instance_id"))?;
         let wiid = match wiid_str {
             Some(ref s) if !s.is_empty() => WorkerInstanceId::new(s),
             _ => {
@@ -2226,7 +2221,7 @@ impl Server {
             .client
             .hgetall(&ctx.core())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGETALL exec_core".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HGETALL exec_core"))?;
 
         if fields.is_empty() {
             return Err(ServerError::NotFound(format!(
@@ -2351,7 +2346,7 @@ impl Server {
             .arg(limit)
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: format!("ZRANGE {zset_key}") })?;
+            .map_err(|e| crate::server::backend_context(e, format!("ZRANGE {zset_key}")))?;
 
         if eids.is_empty() {
             return Ok(ListExecutionsResult {
@@ -2404,12 +2399,12 @@ impl Server {
 
         pipe.execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "pipeline HMGET".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "pipeline HMGET"))?;
 
         let mut summaries = Vec::with_capacity(parsed.len());
         for (eid, slot) in parsed.into_iter().zip(slots) {
             let fields: Vec<Option<String>> = slot.value()
-                .map_err(|e| ServerError::ValkeyContext { source: e, context: "pipeline slot".into() })?;
+                .map_err(|e| crate::server::backend_context(e, "pipeline slot"))?;
 
             let field = |i: usize| -> String {
                 fields
@@ -2469,7 +2464,7 @@ impl Server {
             .arg("terminal_outcome")
             .execute()
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HMGET replay pre-read".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HMGET replay pre-read"))?;
         let lane = LaneId::new(
             dyn_fields
                 .first()
@@ -2517,7 +2512,7 @@ impl Server {
                 .arg(flow_ctx.incoming(execution_id))
                 .execute()
                 .await
-                .map_err(|e| ServerError::ValkeyContext { source: e, context: "SMEMBERS replay edges".into() })?;
+                .map_err(|e| crate::server::backend_context(e, "SMEMBERS replay edges"))?;
 
             // Extended KEYS: blocked_deps_zset, deps_meta, deps_unresolved, dep_edge_0..N
             fcall_keys.push(idx.lane_blocked_dependencies(&lane)); // 5
@@ -2841,9 +2836,9 @@ async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
                     // fail so operators see the true root cause immediately,
                     // not a 60s hang followed by a generic "transient" error.
                     let retryable = e
-                        .valkey_kind()
-                        .map(ff_script::retry::is_retryable_kind)
-                        // Non-Valkey errors (parse, missing field, operation
+                        .backend_kind()
+                        .map(|k| k.is_retryable())
+                        // Non-backend errors (parse, missing field, operation
                         // failures) are treated as transient — a fresh-boot
                         // Valkey may not have redis_version populated yet.
                         .unwrap_or(true);
@@ -2886,10 +2881,7 @@ async fn query_valkey_version(client: &Client) -> Result<(u32, u32), ServerError
         .arg("server")
         .execute()
         .await
-        .map_err(|e| ServerError::ValkeyContext {
-            source: e,
-            context: "INFO server".into(),
-        })?;
+        .map_err(|e| crate::server::backend_context(e, "INFO server"))?;
     let bodies = extract_info_bodies(&raw)?;
     // Cluster: return the minimum (major, minor) across all nodes so a stale
     // pre-upgrade replica cannot hide behind an already-upgraded primary.
@@ -3036,7 +3028,7 @@ async fn validate_or_create_partition_config(
     let existing: HashMap<String, String> = client
         .hgetall(&key)
         .await
-        .map_err(|e| ServerError::ValkeyContext { source: e, context: format!("HGETALL {key}") })?;
+        .map_err(|e| crate::server::backend_context(e, format!("HGETALL {key}")))?;
 
     if existing.is_empty() {
         // First boot — create the config
@@ -3044,15 +3036,15 @@ async fn validate_or_create_partition_config(
         client
             .hset(&key, "num_flow_partitions", &config.num_flow_partitions.to_string())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_flow_partitions".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HSET num_flow_partitions"))?;
         client
             .hset(&key, "num_budget_partitions", &config.num_budget_partitions.to_string())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_budget_partitions".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HSET num_budget_partitions"))?;
         client
             .hset(&key, "num_quota_partitions", &config.num_quota_partitions.to_string())
             .await
-            .map_err(|e| ServerError::ValkeyContext { source: e, context: "HSET num_quota_partitions".into() })?;
+            .map_err(|e| crate::server::backend_context(e, "HSET num_quota_partitions"))?;
         return Ok(());
     }
 
@@ -3126,10 +3118,7 @@ async fn init_one_partition(
         .arg("current_kid")
         .execute()
         .await
-        .map_err(|e| ServerError::ValkeyContext {
-            source: e,
-            context: format!("HGET {key} current_kid (init probe)"),
-        })?;
+        .map_err(|e| crate::server::backend_context(e, format!("HGET {key} current_kid (init probe)")))?;
 
     if let Some(stored_kid) = stored_kid {
         // We didn't know the stored kid up front, so now HGET the real
@@ -3139,10 +3128,7 @@ async fn init_one_partition(
         let stored_secret: Option<String> = client
             .hget(&key, &field)
             .await
-            .map_err(|e| ServerError::ValkeyContext {
-                source: e,
-                context: format!("HGET {key} secret:<kid> (init check)"),
-            })?;
+            .map_err(|e| crate::server::backend_context(e, format!("HGET {key} secret:<kid> (init check)")))?;
         if stored_secret.is_none() {
             // Torn write from a previous boot: current_kid present but
             // secret:<kid> missing. Without repair, mint returns
@@ -3152,10 +3138,7 @@ async fn init_one_partition(
             client
                 .hset(&key, &field, secret_hex)
                 .await
-                .map_err(|e| ServerError::ValkeyContext {
-                    source: e,
-                    context: format!("HSET {key} secret:<kid> (repair torn write)"),
-                })?;
+                .map_err(|e| crate::server::backend_context(e, format!("HSET {key} secret:<kid> (repair torn write)")))?;
             return Ok(PartitionBootOutcome::Repaired);
         }
         if stored_secret.as_deref() != Some(secret_hex) {
@@ -3177,10 +3160,7 @@ async fn init_one_partition(
         .arg(secret_hex)
         .execute()
         .await
-        .map_err(|e| ServerError::ValkeyContext {
-            source: e,
-            context: format!("HSET {key} (init waitpoint HMAC atomic)"),
-        })?;
+        .map_err(|e| crate::server::backend_context(e, format!("HSET {key} (init waitpoint HMAC atomic)")))?;
     Ok(PartitionBootOutcome::Installed)
 }
 
@@ -3460,10 +3440,10 @@ impl Server {
                      original secret for this kid before retrying."
                 ))
             }
-            ff_script::ScriptError::Valkey(v) => ServerError::ValkeyContext {
-                source: v,
-                context: format!("FCALL ff_rotate_waitpoint_hmac_secret partition={partition}"),
-            },
+            ff_script::ScriptError::Valkey(v) => crate::server::backend_context(
+                v,
+                format!("FCALL ff_rotate_waitpoint_hmac_secret partition={partition}"),
+            ),
             other => ServerError::OperationFailed(format!(
                 "rotation failed on partition {partition}: {other}"
             )),
@@ -3941,10 +3921,9 @@ fn parse_replay_result(raw: &Value) -> Result<ReplayExecutionResult, ServerError
 /// transient error like `IoError`.
 fn script_error_to_server(e: ff_script::error::ScriptError) -> ServerError {
     match e {
-        ff_script::error::ScriptError::Valkey(valkey_err) => ServerError::ValkeyContext {
-            source: valkey_err,
-            context: "stream FCALL transport".into(),
-        },
+        ff_script::error::ScriptError::Valkey(valkey_err) => {
+            crate::server::backend_context(valkey_err, "stream FCALL transport")
+        }
         other => ServerError::Script(other.to_string()),
     }
 }
@@ -4073,9 +4052,9 @@ async fn fcall_with_reload_on_client(
             client
                 .fcall(function, keys, args)
                 .await
-                .map_err(ServerError::Valkey)
+                .map_err(ServerError::from)
         }
-        Err(e) => Err(ServerError::Valkey(e)),
+        Err(e) => Err(ServerError::from(e)),
     }
 }
 
@@ -4094,7 +4073,7 @@ async fn build_cancel_execution_fcall(
     let lane_str: Option<String> = client
         .hget(&ctx.core(), "lane_id")
         .await
-        .map_err(|e| ServerError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+        .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
     let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
     let dyn_fields: Vec<Option<String>> = client
@@ -4105,7 +4084,7 @@ async fn build_cancel_execution_fcall(
         .arg("current_worker_instance_id")
         .execute()
         .await
-        .map_err(|e| ServerError::ValkeyContext { source: e, context: "HMGET cancel pre-read".into() })?;
+        .map_err(|e| crate::server::backend_context(e, "HMGET cancel pre-read"))?;
 
     let att_idx_val = dyn_fields.first()
         .and_then(|v| v.as_ref())
@@ -4159,18 +4138,18 @@ async fn build_cancel_execution_fcall(
 /// The last entry is not slept on because it's the final attempt.
 const CANCEL_MEMBER_RETRY_DELAYS_MS: [u64; 3] = [100, 500, 2_000];
 
-/// Reach into a `ServerError` for a `ferriskey::ErrorKind` when one is
-/// available. Matches the variants that can carry a transport-layer kind:
-/// direct `Valkey`, `ValkeyContext`, and `LibraryLoad` (which itself wraps
-/// a `ferriskey::Error`).
-fn extract_valkey_kind(e: &ServerError) -> Option<ferriskey::ErrorKind> {
-    match e {
-        ServerError::Valkey(err) | ServerError::ValkeyContext { source: err, .. } => {
-            Some(err.kind())
-        }
-        ServerError::LibraryLoad(load_err) => load_err.valkey_kind(),
-        _ => None,
-    }
+/// Reach into a `ServerError` for a transport-layer retryability hint.
+/// Matches the variants that can carry a backend transport fault:
+/// direct `Backend`, `BackendContext`, and `LibraryLoad` (which
+/// wraps a ferriskey error internally).
+///
+/// Renamed from `extract_valkey_kind` in #88 — the previous return
+/// type `Option<ferriskey::ErrorKind>` leaked ferriskey into the
+/// server's internal retry logic. Callers now get a backend-agnostic
+/// [`BackendErrorKind`] and dispatch via
+/// [`BackendErrorKind::is_retryable`].
+fn extract_backend_kind(e: &ServerError) -> Option<ff_core::BackendErrorKind> {
+    e.backend_kind()
 }
 
 /// Cancel a single member execution from a cancel_flow dispatch context.
@@ -4255,8 +4234,8 @@ async fn cancel_member_execution(
                 // Only retry transport-layer transients; business-logic
                 // errors (Script / OperationFailed / NotFound / InvalidInput)
                 // won't change on retry.
-                let retryable = extract_valkey_kind(&e)
-                    .map(ff_script::retry::is_retryable_kind)
+                let retryable = extract_backend_kind(&e)
+                    .map(|k| k.is_retryable())
                     .unwrap_or(false);
                 if !retryable || is_last {
                     return Err(e);
@@ -4432,33 +4411,35 @@ mod tests {
     }
 
     #[test]
-    fn is_retryable_valkey_variant_uses_kind_table() {
-        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::IoError)).is_retryable());
-        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::FatalSendError)).is_retryable());
-        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::TryAgain)).is_retryable());
-        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::BusyLoadingError)).is_retryable());
-        assert!(ServerError::Valkey(mk_fk_err(ErrorKind::ClusterDown)).is_retryable());
+    fn is_retryable_backend_variant_uses_kind_table() {
+        // Transport-bucketed: retryable.
+        assert!(ServerError::from(mk_fk_err(ErrorKind::IoError)).is_retryable());
+        assert!(ServerError::from(mk_fk_err(ErrorKind::FatalSendError)).is_retryable());
+        assert!(ServerError::from(mk_fk_err(ErrorKind::FatalReceiveError)).is_retryable());
+        // Cluster-bucketed (Moved / Ask / TryAgain / ClusterDown): retryable
+        // after topology settles — the #88 BackendErrorKind classifier
+        // treats these as transient cluster-churn, a semantic refinement
+        // over the previous ff-script retry table.
+        assert!(ServerError::from(mk_fk_err(ErrorKind::TryAgain)).is_retryable());
+        assert!(ServerError::from(mk_fk_err(ErrorKind::ClusterDown)).is_retryable());
+        assert!(ServerError::from(mk_fk_err(ErrorKind::Moved)).is_retryable());
+        assert!(ServerError::from(mk_fk_err(ErrorKind::Ask)).is_retryable());
+        // BusyLoading: retryable.
+        assert!(ServerError::from(mk_fk_err(ErrorKind::BusyLoadingError)).is_retryable());
 
-        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::FatalReceiveError)).is_retryable());
-        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::AuthenticationFailed)).is_retryable());
-        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::NoScriptError)).is_retryable());
-        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::Moved)).is_retryable());
-        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::Ask)).is_retryable());
-        assert!(!ServerError::Valkey(mk_fk_err(ErrorKind::ReadOnly)).is_retryable());
+        // Auth / Protocol / ScriptNotLoaded: terminal.
+        assert!(!ServerError::from(mk_fk_err(ErrorKind::AuthenticationFailed)).is_retryable());
+        assert!(!ServerError::from(mk_fk_err(ErrorKind::NoScriptError)).is_retryable());
+        assert!(!ServerError::from(mk_fk_err(ErrorKind::ReadOnly)).is_retryable());
     }
 
     #[test]
-    fn is_retryable_valkey_context_uses_kind_table() {
-        let err = ServerError::ValkeyContext {
-            source: mk_fk_err(ErrorKind::IoError),
-            context: "HGET test".into(),
-        };
+    fn is_retryable_backend_context_uses_kind_table() {
+        let err = crate::server::backend_context(mk_fk_err(ErrorKind::IoError), "HGET test");
         assert!(err.is_retryable());
 
-        let err = ServerError::ValkeyContext {
-            source: mk_fk_err(ErrorKind::AuthenticationFailed),
-            context: "auth".into(),
-        };
+        let err =
+            crate::server::backend_context(mk_fk_err(ErrorKind::AuthenticationFailed), "auth");
         assert!(!err.is_retryable());
     }
 
@@ -4491,17 +4472,17 @@ mod tests {
     }
 
     #[test]
-    fn valkey_kind_delegates_through_library_load() {
+    fn backend_kind_delegates_through_library_load() {
         let err = ServerError::LibraryLoad(ff_script::loader::LoadError::Valkey(
             mk_fk_err(ErrorKind::ClusterDown),
         ));
-        assert_eq!(err.valkey_kind(), Some(ErrorKind::ClusterDown));
+        assert_eq!(err.backend_kind(), Some(ff_core::BackendErrorKind::Cluster));
 
         let err = ServerError::LibraryLoad(ff_script::loader::LoadError::VersionMismatch {
             expected: "1".into(),
             got: "2".into(),
         });
-        assert_eq!(err.valkey_kind(), None);
+        assert_eq!(err.backend_kind(), None);
     }
 
     // ── Valkey version check (RFC-011 §13) ──
@@ -4757,7 +4738,7 @@ os:Linux\r\n";
             required: "7.2".into(),
         };
         assert!(!err.is_retryable());
-        assert_eq!(err.valkey_kind(), None);
+        assert_eq!(err.backend_kind(), None);
     }
 
     #[test]
