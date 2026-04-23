@@ -34,7 +34,9 @@ use ff_core::backend::{
     HandleKind, LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
     WaitpointSpec,
 };
-use ff_core::contracts::decode::build_edge_snapshot;
+use ff_core::contracts::decode::{
+    build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
+};
 use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ReportUsageResult,
@@ -361,6 +363,66 @@ async fn cancel_flow_fcall(
     ff_cancel_flow(client, &keys, &args)
         .await
         .map_err(EngineError::from)
+}
+
+/// Pipeline two `HGETALL`s (exec_core + tags) on the execution's
+/// partition and decode via [`build_execution_snapshot`]. `Ok(None)`
+/// when exec_core is absent. Decode failures surface as
+/// `EngineError::Validation { kind: Corruption, .. }`.
+///
+/// Mirrors the pre-T3 ff-sdk pipeline shape: the two keys share
+/// `{fp:N}` so cluster mode routes them to the same slot.
+async fn describe_execution_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<Option<ExecutionSnapshot>, EngineError> {
+    let partition = execution_partition(id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, id);
+    let core_key = ctx.core();
+    let tags_key = ctx.tags();
+
+    let mut pipe = client.pipeline();
+    let core_slot = pipe
+        .cmd::<HashMap<String, String>>("HGETALL")
+        .arg(&core_key)
+        .finish();
+    let tags_slot = pipe
+        .cmd::<HashMap<String, String>>("HGETALL")
+        .arg(&tags_key)
+        .finish();
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let core = core_slot.value().map_err(transport_fk)?;
+    if core.is_empty() {
+        return Ok(None);
+    }
+    let tags_raw = tags_slot.value().map_err(transport_fk)?;
+    build_execution_snapshot(id.clone(), &core, tags_raw)
+}
+
+/// Single `HGETALL flow_core` + decode via [`build_flow_snapshot`].
+/// `Ok(None)` when flow_core is absent. Decode failures surface as
+/// `EngineError::Validation { kind: Corruption, .. }`.
+async fn describe_flow_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    id: &FlowId,
+) -> Result<Option<FlowSnapshot>, EngineError> {
+    let partition = flow_partition(id, partition_config);
+    let ctx = FlowKeyContext::new(&partition, id);
+    let core_key = ctx.core();
+
+    let raw: HashMap<String, String> = client
+        .cmd("HGETALL")
+        .arg(&core_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    build_flow_snapshot(id.clone(), &raw).map(Some)
 }
 
 /// Read all edges adjacent to `subject_eid` on the requested side.
@@ -1674,17 +1736,13 @@ impl EngineBackend for ValkeyBackend {
 
     async fn describe_execution(
         &self,
-        _id: &ExecutionId,
+        id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "describe_execution",
-        })
+        describe_execution_impl(&self.client, &self.partition_config, id).await
     }
 
-    async fn describe_flow(&self, _id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "describe_flow",
-        })
+    async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {
+        describe_flow_impl(&self.client, &self.partition_config, id).await
     }
 
     async fn list_edges(
