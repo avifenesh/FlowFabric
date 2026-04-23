@@ -390,6 +390,62 @@ impl ClaimedTask {
         &self.lane_id
     }
 
+    /// Read frames from this task's attempt stream.
+    ///
+    /// Forwards through the task's `Arc<dyn EngineBackend>` — consumers
+    /// no longer need the `ferriskey::Client` leak (#87). See
+    /// [`EngineBackend::read_stream`](ff_core::engine_backend::EngineBackend::read_stream)
+    /// for the backend-level contract.
+    ///
+    /// Validation (count_limit bounds) runs at this boundary — out-of-range
+    /// input surfaces as [`SdkError::Config`] before reaching the backend.
+    pub async fn read_stream(
+        &self,
+        from: StreamCursor,
+        to: StreamCursor,
+        count_limit: u64,
+    ) -> Result<StreamFrames, SdkError> {
+        validate_stream_read_count(count_limit)?;
+        Ok(self
+            .backend
+            .read_stream(&self.execution_id, self.attempt_index, from, to, count_limit)
+            .await?)
+    }
+
+    /// Tail this task's attempt stream for new frames.
+    ///
+    /// See [`EngineBackend::tail_stream`](ff_core::engine_backend::EngineBackend::tail_stream)
+    /// for the head-of-line warning — the task's backend is shared
+    /// with claim/complete/fail hot paths. Consumers that need
+    /// isolation should build a dedicated `EngineBackend` for tail
+    /// reads.
+    pub async fn tail_stream(
+        &self,
+        after: StreamCursor,
+        block_ms: u64,
+        count_limit: u64,
+    ) -> Result<StreamFrames, SdkError> {
+        if block_ms > MAX_TAIL_BLOCK_MS {
+            return Err(SdkError::Config {
+                context: "tail_stream".into(),
+                field: Some("block_ms".into()),
+                message: format!("exceeds {MAX_TAIL_BLOCK_MS}ms ceiling"),
+            });
+        }
+        validate_stream_read_count(count_limit)?;
+        validate_tail_cursor(&after)?;
+        Ok(self
+            .backend
+            .tail_stream(
+                &self.execution_id,
+                self.attempt_index,
+                after,
+                block_ms,
+                count_limit,
+            )
+            .await?)
+    }
+
     /// Synthesise a Valkey-backend `Handle` encoding this task's
     /// attempt-cookie fields. Private to the SDK — the trait
     /// forwarders call this per op to produce the `&Handle` argument
@@ -1757,37 +1813,17 @@ fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
 /// `tail_client`; direct SDK callers should either use a dedicated
 /// client OR paginate through smaller `count_limit` slices.
 pub async fn read_stream(
-    client: &Client,
-    partition_config: &PartitionConfig,
+    backend: &dyn EngineBackend,
     execution_id: &ExecutionId,
     attempt_index: AttemptIndex,
     from: StreamCursor,
     to: StreamCursor,
     count_limit: u64,
 ) -> Result<StreamFrames, SdkError> {
-    use ff_core::contracts::{ReadFramesArgs, ReadFramesResult};
     validate_stream_read_count(count_limit)?;
-
-    let partition = execution_partition(execution_id, partition_config);
-    let ctx = ExecKeyContext::new(&partition, execution_id);
-    let keys = ff_script::functions::stream::StreamOpKeys { ctx: &ctx };
-
-    // Lower the opaque cursor to the Valkey XRANGE marker at the
-    // adapter edge. `ReadFramesArgs` is string-typed — the Lua ABI is
-    // untouched.
-    let args = ReadFramesArgs {
-        execution_id: execution_id.clone(),
-        attempt_index,
-        from_id: from.into_wire_string(),
-        to_id: to.into_wire_string(),
-        count_limit,
-    };
-
-    let ReadFramesResult::Frames(f) =
-        ff_script::functions::stream::ff_read_attempt_stream(client, &keys, &args)
-            .await
-            .map_err(SdkError::from)?;
-    Ok(f)
+    Ok(backend
+        .read_stream(execution_id, attempt_index, from, to, count_limit)
+        .await?)
 }
 
 /// Tail a live attempt's stream.
@@ -1860,8 +1896,7 @@ pub async fn read_stream(
 /// configuration is required for timeout reasons — only for head-of-line
 /// isolation above.
 pub async fn tail_stream(
-    client: &Client,
-    partition_config: &PartitionConfig,
+    backend: &dyn EngineBackend,
     execution_id: &ExecutionId,
     attempt_index: AttemptIndex,
     after: StreamCursor,
@@ -1878,25 +1913,13 @@ pub async fn tail_stream(
     validate_stream_read_count(count_limit)?;
     // XREAD does not accept `-` / `+` markers as cursors — reject at
     // the SDK boundary with `SdkError::Config` rather than forwarding
-    // an invalid `-`/`+` into ferriskey (which would surface as an
-    // opaque server error).
+    // an invalid `-`/`+` into the backend (which would surface as an
+    // opaque `EngineError::Transport`).
     validate_tail_cursor(&after)?;
 
-    let partition = execution_partition(execution_id, partition_config);
-    let ctx = ExecKeyContext::new(&partition, execution_id);
-    let stream_key = ctx.stream(attempt_index);
-    let stream_meta_key = ctx.stream_meta(attempt_index);
-
-    ff_script::stream_tail::xread_block(
-        client,
-        &stream_key,
-        &stream_meta_key,
-        after.to_wire(),
-        block_ms,
-        count_limit,
-    )
-    .await
-    .map_err(SdkError::from)
+    Ok(backend
+        .tail_stream(execution_id, attempt_index, after, block_ms, count_limit)
+        .await?)
 }
 
 #[cfg(test)]

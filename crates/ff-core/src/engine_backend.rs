@@ -55,7 +55,11 @@ use crate::backend::{
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
 use crate::contracts::{EdgeDirection, EdgeSnapshot};
+#[cfg(feature = "streaming")]
+use crate::contracts::{StreamCursor, StreamFrames};
 use crate::engine_error::EngineError;
+#[cfg(feature = "streaming")]
+use crate::types::AttemptIndex;
 use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 
 /// The engine write surface — a single trait a backend implementation
@@ -244,6 +248,55 @@ pub trait EngineBackend: Send + Sync + 'static {
         budget: &BudgetId,
         dimensions: crate::backend::UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError>;
+
+    // ── Stream reads (RFC-012 Stage 1c tranche-4; issue #87) ──
+
+    /// Read frames from a completed or in-flight attempt's stream.
+    ///
+    /// `from` / `to` are [`StreamCursor`] values — `StreamCursor::Start`
+    /// / `StreamCursor::End` are equivalent to XRANGE `-` / `+`, and
+    /// `StreamCursor::At("<id>")` reads from a concrete entry id.
+    ///
+    /// Input validation (count_limit bounds, cursor shape) is the
+    /// caller's responsibility — SDK-side wrappers in
+    /// [`ff-sdk`](https://docs.rs/ff-sdk) enforce bounds before
+    /// forwarding. Backends MAY additionally reject out-of-range
+    /// input via [`EngineError::Validation`].
+    ///
+    /// Gated on the `streaming` feature — stream reads are part of
+    /// the stream-subset surface a backend without XREAD-like
+    /// primitives may omit.
+    #[cfg(feature = "streaming")]
+    async fn read_stream(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        from: StreamCursor,
+        to: StreamCursor,
+        count_limit: u64,
+    ) -> Result<StreamFrames, EngineError>;
+
+    /// Tail a live attempt's stream.
+    ///
+    /// `after` is an exclusive [`StreamCursor`] — entries with id
+    /// strictly greater than `after` are returned. `StreamCursor::Start`
+    /// / `StreamCursor::End` are NOT accepted here; callers MUST pass
+    /// a concrete id (or `StreamCursor::from_beginning()`). The SDK
+    /// wrapper rejects the open markers before reaching the backend.
+    ///
+    /// `block_ms == 0` → non-blocking peek. `block_ms > 0` → blocks up
+    /// to that many ms for a new entry.
+    ///
+    /// Gated on the `streaming` feature — see [`read_stream`](Self::read_stream).
+    #[cfg(feature = "streaming")]
+    async fn tail_stream(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        after: StreamCursor,
+        block_ms: u64,
+        count_limit: u64,
+    ) -> Result<StreamFrames, EngineError>;
 }
 
 /// Object-safety assertion: `dyn EngineBackend` compiles iff every

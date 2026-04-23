@@ -1776,6 +1776,122 @@ impl EngineBackend for ValkeyBackend {
         let f = handle_codec::decode_handle(handle)?;
         report_usage_impl(&self.client, &self.partition_config, &f, budget, dimensions).await
     }
+
+    #[cfg(feature = "streaming")]
+    async fn read_stream(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        from: ff_core::contracts::StreamCursor,
+        to: ff_core::contracts::StreamCursor,
+        count_limit: u64,
+    ) -> Result<ff_core::contracts::StreamFrames, EngineError> {
+        read_stream_impl(
+            &self.client,
+            &self.partition_config,
+            execution_id,
+            attempt_index,
+            from,
+            to,
+            count_limit,
+        )
+        .await
+    }
+
+    #[cfg(feature = "streaming")]
+    async fn tail_stream(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        after: ff_core::contracts::StreamCursor,
+        block_ms: u64,
+        count_limit: u64,
+    ) -> Result<ff_core::contracts::StreamFrames, EngineError> {
+        tail_stream_impl(
+            &self.client,
+            &self.partition_config,
+            execution_id,
+            attempt_index,
+            after,
+            block_ms,
+            count_limit,
+        )
+        .await
+    }
+}
+
+// ── Stream read implementations (RFC-012 Stage 1c tranche-4; #87) ──
+
+/// Valkey XRANGE-backed stream reader. Mirrors the free-function body
+/// that previously lived in `ff_sdk::task::read_stream` — moved here so
+/// the `ferriskey::Client` parameter no longer leaks through the SDK's
+/// public surface.
+#[cfg(feature = "streaming")]
+async fn read_stream_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    from: ff_core::contracts::StreamCursor,
+    to: ff_core::contracts::StreamCursor,
+    count_limit: u64,
+) -> Result<ff_core::contracts::StreamFrames, EngineError> {
+    use ff_core::contracts::{ReadFramesArgs, ReadFramesResult};
+
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let keys = ff_script::functions::stream::StreamOpKeys { ctx: &ctx };
+
+    // Lower the opaque cursor to the Valkey XRANGE marker at the
+    // adapter edge. `ReadFramesArgs` is string-typed — the Lua ABI is
+    // untouched.
+    let args = ReadFramesArgs {
+        execution_id: execution_id.clone(),
+        attempt_index,
+        from_id: from.into_wire_string(),
+        to_id: to.into_wire_string(),
+        count_limit,
+    };
+
+    let ReadFramesResult::Frames(f) =
+        ff_script::functions::stream::ff_read_attempt_stream(client, &keys, &args)
+            .await
+            .map_err(transport_script)?;
+    Ok(f)
+}
+
+/// Valkey XREAD BLOCK-backed stream tailer. See
+/// [`read_stream_impl`] for the migration rationale.
+///
+/// Callers concerned with head-of-line blocking should build a
+/// dedicated `ValkeyBackend` backed by its own `ferriskey::Client` —
+/// the REST server's `tail_client` split in `ff-server` is the
+/// canonical pattern.
+#[cfg(feature = "streaming")]
+async fn tail_stream_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    after: ff_core::contracts::StreamCursor,
+    block_ms: u64,
+    count_limit: u64,
+) -> Result<ff_core::contracts::StreamFrames, EngineError> {
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let stream_key = ctx.stream(attempt_index);
+    let stream_meta_key = ctx.stream_meta(attempt_index);
+
+    ff_script::stream_tail::xread_block(
+        client,
+        &stream_key,
+        &stream_meta_key,
+        after.to_wire(),
+        block_ms,
+        count_limit,
+    )
+    .await
+    .map_err(transport_script)
 }
 
 #[cfg(test)]
