@@ -205,9 +205,23 @@ where `recent_rate_hz` is an EMA of append rate stored on the stream metadata Ha
 
 **Cost of EMA tracking.** The EMA update adds 2 HSET + 1 HGET on the metadata Hash per best-effort append. Because the metadata Hash is already touched for lease validation, the amortized cost is a few extra field operations in a Hash already in the working set — small relative to the XADD.
 
+**EMA decay constant α — unset in this RFC, gated on benchmark.** This RFC deliberately does not bake an α value into the spec. See §4.3.
+
 **Guarantee:** "Visible to a tailer that starts before `append_time + ttl_ms`". After `ttl_ms`, the frame may or may not exist (MAXLEN may have rolled it off; key TTL may have fired).
 
-### §4.3 Empty-stream tail
+### §4.3 Tuning-before-ship (EMA α gate)
+
+The EMA decay constant α used in §4.2's `recent_rate_hz` update is **not specified in this RFC**. Picking α blindly — e.g., defaulting to α = 0.2 with a ~5-sample span — risks over- or under-sizing `K` for real cairn workloads, which directly drives the memory-vs-visibility tradeoff that motivates `BestEffortLive` in the first place.
+
+**Pre-release gate for v0.6:**
+
+- **Benchmark shape.** Sample append-rate on a production cairn workload over a continuous 24 h window (at minimum; longer preferred if cairn diurnal pattern is pronounced). Record the per-stream append-rate distribution and derive p50 and p99 percentile-based window sizes.
+- **α selection criterion.** Choose α such that the EMA-predicted `K` tracks the observed p99 window size within a bounded overshoot (exact bound to be set by the measurement team at gate time, informed by the observed distribution's shape — not guessed here) while not collapsing to the p50 during rate lulls.
+- **Gate.** The v0.6 release cannot ship `BestEffortLive` until the α value is selected from this measurement and recorded in the implementation PR + changelog. If the measurement is unavailable by release time, `BestEffortLive` is held back to a later release; `Durable` + `DurableSummary` may ship independently.
+
+This gate closes §11's "EMA α" open question with a decision: deferred-to-measurement, not deferred-indefinitely.
+
+### §4.4 Empty-stream tail
 
 If a consumer calls `tail_stream` after all best-effort frames have expired and no durable frames exist: the read returns an **empty frame list plus the terminal marker** (if the attempt has ended) or an **empty frame list plus the 5 s XREAD BLOCK timeout** (if the attempt is still live but quiet). This is identical to the "attempt produced no output" v1 behavior — no new error kind.
 
@@ -341,8 +355,10 @@ pub struct AppendFrameOutcome {
 
 ## §10 Open questions
 
-1. **Rate-EMA decay constant for `BestEffortLive` window sizing (§4.2).** Proposing EMA α = 0.2 (span ≈ 5 samples), but this needs measurement against cairn's real append-rate distribution before lock.
-2. **Do we need a `read_summary_history` for replay/debug?** The chosen design discards pre-compaction deltas (only the rolling summary + a ~64-entry live window survive). An optional "keep-all-deltas" variant of `DurableSummary` was considered but rejected for v1 scope (§11). Is there a debug/audit use case that forces us to keep it?
+All previously-open questions are resolved in this draft. Retained here with resolution pointers for reviewer traceability.
+
+1. **(Resolved — owner adjudication, 2026-04-23.)** Rate-EMA decay constant α for `BestEffortLive` window sizing (§4.2). Decision: **not specified in this RFC; gated on a pre-v0.6-release benchmark.** See §4.3 for the benchmark shape and gate criteria.
+2. **(Resolved — owner adjudication, 2026-04-23.)** A `KeepAllDeltas`/`read_summary_history` variant of `DurableSummary` was considered to serve replay/debug. Decision: **dropped from v0.6.** Debug and audit consumers can use raw `Durable` mode for the same need; a second `DurableSummary` variant is not worth the doubled test matrix. See §11 "Alternatives rejected" for the full rationale.
 3. **(Resolved, moved to §6.3.)** Cross-attempt summary merging in `read_execution_stream` is locked to "latest-attempt summary in dedicated field." See §6.3.
 
 ## §11 Alternatives rejected
@@ -351,7 +367,7 @@ pub struct AppendFrameOutcome {
 - **Server-side generic compression** (keep `durable_full`, run LZ4 on stream entries). Rejected: saves ~2–3×, not 10×; Valkey does not expose stream-entry-level compression primitives, would require a custom Module; still holds O(frame_count) entries.
 - **Per-entry TTL via XDEL-scanner** (background job that XDELs entries older than `now - ttl`). Rejected: O(n) scan cost per stream; contention with append path; no atomicity guarantee.
 - **Separate "summary stream" and "token stream"** (two streams per attempt). Rejected: doubles metadata cost, complicates lease validation, does not fit the "mode is per-call" shape that workers actually want.
-- **`DurableSummary` with per-frame keep-all-deltas retention.** Rejected for v1; re-open if debug/audit use case in §10.2 materializes.
+- **`DurableSummary::KeepAllDeltas` variant (per-frame keep-all-deltas retention).** Considered and dropped from v0.6 by owner adjudication (2026-04-23). Rationale: debug and audit consumers that want every delta preserved can use raw `Durable` mode to achieve the same retention, and the summary Hash is already the authoritative final-state record. Shipping a second `DurableSummary` variant would double the test matrix (apply path × compaction path × tailer-filter path × cross-attempt merge path) for a use case already served by existing modes. Re-open only if a concrete consumer surfaces that cannot be served by `Durable` (e.g., needs both the collapsed summary Hash and lossless delta history simultaneously). v0.6 `DurableSummary` ships as summary-only tail (summary Hash + ~64-entry live-tail window per §3.5) — no `KeepAllDeltas` variant.
 - **JSON Patch (RFC 6902) as PatchKind.** Evaluated in §3.2 and rejected (verbosity + Lua complexity).
 - **`PatchKind::StringAppend { path }` for token-by-token append workloads.** Deferred, not rejected. Re-open trigger: if cairn's production measurement shows per-token `DurableSummary` appends against a growing `output.content` field (which drives O(N²) wire bytes under JSON Merge Patch — see §"Patch batching assumption"), add a second `PatchKind` variant that interprets the frame payload as a string to concatenate at a given JSON Pointer path. Estimated Lua cost: ~10–15 lines. Kept out of v1 because the batching guidance (≥ 50 tokens/frame) is believed sufficient for the memory targets, and adding a second PatchKind is a type-surface expansion that is cheaper to do once cairn measurement is in hand.
 
