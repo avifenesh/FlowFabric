@@ -165,14 +165,16 @@ pub struct ClaimedTask {
     client: Client,
     /// `EngineBackend` the trait-migrated ops forward through.
     ///
-    /// **RFC-012 Stage 1b.** Today this is always a `ValkeyBackend`
-    /// wrapping `client`. 8 of 12 ops now route through
-    /// `backend.*()`; the remaining 4 (`create_pending_waitpoint`,
-    /// `append_frame`, `suspend`, `report_usage`) still use
-    /// `client.fcall(...)` directly — see issue #117 for the
-    /// trait-shape alignment that unblocks them.
+    /// **RFC-012 Stage 1b + Round-7.** Today this is always a
+    /// `ValkeyBackend` wrapping `client`. All per-task ops
+    /// (`complete`/`fail`/`cancel`/`delay`/`wait_children`/
+    /// `update_progress`/`resume_signals`/`create_pending_waitpoint`/
+    /// `append_frame`/`suspend`/`report_usage`) now route through
+    /// `backend.*()`; only the background `renew_lease_inner` task
+    /// still uses `client.fcall(...)` directly. Round-7 (#135/#145)
+    /// closed the four trait-shape gaps tracked by #117.
     ///
-    /// Stage 1c will migrate the FlowFabricWorker hot paths (claim,
+    /// Stage 1c migrates the FlowFabricWorker hot paths (claim,
     /// deliver_signal) through the same trait surface; Stage 1d
     /// refactors this struct to carry a single `Handle` rather than
     /// synthesising one per op via `synth_handle`.

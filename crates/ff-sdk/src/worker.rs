@@ -546,18 +546,17 @@ impl FlowFabricWorker {
     /// ).await?;
     /// ```
     ///
-    /// **Stage 1b scope — what the injected backend covers today.**
-    /// After this PR, `ClaimedTask`'s 8 migrated ops
-    /// (`renew_lease` / `update_progress` / `resume_signals` /
-    /// `delay_execution` / `move_to_waiting_children` /
-    /// `complete` / `cancel` / `fail`) route through the injected
-    /// backend. That's the first material use of `connect_with`: a
-    /// mock backend now genuinely sees the worker's per-task
-    /// write-surface calls. The 4 trait-shape-deferred ops
-    /// (`create_pending_waitpoint`, `append_frame`, `suspend`,
-    /// `report_usage`) still reach the embedded
-    /// `ferriskey::Client` directly until issue #117's trait
-    /// amendment lands; `claim_next` / `claim_from_grant` /
+    /// **Stage 1b + Round-7 scope — what the injected backend covers
+    /// today.** All per-task `ClaimedTask` ops (`update_progress` /
+    /// `resume_signals` / `delay_execution` /
+    /// `move_to_waiting_children` / `complete` / `cancel` / `fail` /
+    /// `create_pending_waitpoint` / `append_frame` / `suspend` /
+    /// `report_usage`) route through the injected backend — a mock
+    /// backend genuinely sees the worker's per-task write-surface
+    /// calls. Round-7 (#135/#145) closed the four trait-shape gaps
+    /// tracked by #117. The background `renew_lease_inner` task still
+    /// reaches the embedded `ferriskey::Client` directly;
+    /// `claim_next` / `claim_from_grant` /
     /// `claim_from_reclaim_grant` / `deliver_signal` / admin queries
     /// are Stage 1c hot-path work. Stage 1d removes the embedded
     /// client entirely.
