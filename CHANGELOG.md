@@ -7,6 +7,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Grafana dashboard JSON for operator observability** at
+  `examples/grafana/flowfabric-ops.json`. Ten panels covering claim
+  latency + rate, lease renewals, worker-at-capacity, admission
+  control (quota + budget), scanner cadence + latency, cancel backlog,
+  and HTTP request rate + latency. Built against the metrics
+  `ff-observability` emits through its OTEL → Prometheus pipeline
+  (post #170). Importable via Grafana UI or the `/api/dashboards/db`
+  endpoint; see `examples/grafana/README.md`. Positioned as the
+  0.5.x operator-visibility alternative while `ff-board` builds out.
 - **Observability wiring on `EngineBackend` trait methods (#154):** every
   non-stub `*_impl` in `ff-backend-valkey` now carries
   `#[tracing::instrument(name = "ff.<method>", skip_all, fields(backend,

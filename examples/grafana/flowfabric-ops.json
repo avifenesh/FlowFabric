@@ -1,0 +1,363 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "FlowFabric operator dashboard — the 0.5.x alternative to the forthcoming Web UI (ff-board). Panels are built against metrics emitted by the ff-observability OTEL pipeline exposed on ff-server's /metrics endpoint (post PR #170). Metric names are authoritative: they match ff-observability/src/real.rs exactly and include the Prometheus-exporter suffixes (_total, _seconds) automatically appended by opentelemetry_prometheus.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Claim-from-grant latency (per lane)",
+      "description": "Histogram quantiles over ff_claim_from_grant_duration_seconds. One series per quantile × lane. Rising P99 with flat P50 typically means tail contention on a specific lane; rising P50 means broad backend pressure.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum by (le, lane) (rate(ff_claim_from_grant_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{lane}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le, lane) (rate(ff_claim_from_grant_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{lane}}"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum by (le, lane) (rate(ff_claim_from_grant_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 {{lane}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Claim-from-grant rate (per lane)",
+      "description": "Successful claim_from_grant operations per second, per lane. Histogram _count series gives the observation rate. Useful as the denominator when reasoning about latency spikes.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "stacking": { "mode": "normal", "group": "A" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (lane) (rate(ff_claim_from_grant_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{lane}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Lease renewals (by outcome)",
+      "description": "ff_lease_renewal_total split by outcome label (ok|err). A sustained err rate or a sharp drop in ok indicates lease-renewal failure — workers will lose their lease and the attempt will be reclaimed.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "err" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ok" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (outcome) (rate(ff_lease_renewal_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Worker-at-capacity rejections",
+      "description": "ff_worker_at_capacity_total — claim attempts rejected because every worker slot was busy. Sustained non-zero rate means you are under-provisioned on workers for the offered load.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(ff_worker_at_capacity_total[$__rate_interval]))",
+          "legendFormat": "rejections/s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Admission control — quota blocks & budget breaches",
+      "description": "ff_quota_hit_total (reason=rate|concurrency) and ff_budget_hit_total (dimension=...) side-by-side. Quota hits are soft admission denials; budget hits are hard-breach events surfaced by ff-scheduler's claim path.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (reason) (rate(ff_quota_hit_total[$__rate_interval]))",
+          "legendFormat": "quota:{{reason}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (dimension) (rate(ff_budget_hit_total[$__rate_interval]))",
+          "legendFormat": "budget:{{dimension}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Scanner cycle duration P95 (per scanner)",
+      "description": "P95 over ff_scanner_cycle_duration_seconds, grouped by scanner label. A scanner whose P95 climbs toward its sleep interval is about to fall behind — investigate partition count or Valkey latency.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le, scanner) (rate(ff_scanner_cycle_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{scanner}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Scanner cycle cadence (per scanner)",
+      "description": "ff_scanner_cycle_total rate — cycles per second, one series per scanner. A stuck scanner stops producing data points here; a flatline at 0 (or the series disappearing) is the actionable signal. Reference values are scanner-specific sleep intervals.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (scanner) (rate(ff_scanner_cycle_total[$__rate_interval]))",
+          "legendFormat": "{{scanner}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Cancel-reconciler backlog depth",
+      "description": "ff_cancel_backlog_depth — observable gauge sampled by the cancel-reconciler scanner each cycle. Steady growth means the reconciler is not draining as fast as cancels are being requested; investigate cancel-processing throughput.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "ff_cancel_backlog_depth",
+          "legendFormat": "depth"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "HTTP request rate (by status class)",
+      "description": "ff_http_requests_total aggregated to status class (2xx/3xx/4xx/5xx). 5xx trend is the primary ff-server health signal; 4xx trend typically reflects client misuse (bad handles, missing tokens).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "stacking": { "mode": "normal", "group": "A" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "5xx" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "4xx" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "2xx" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (class) (label_replace(rate(ff_http_requests_total[$__rate_interval]), \"class\", \"${1}xx\", \"status\", \"([0-9])[0-9][0-9]\"))",
+          "legendFormat": "{{class}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "HTTP request P95 latency (by path)",
+      "description": "P95 over ff_http_request_duration_seconds, grouped by path label. The path label is the matched route template (not the raw URL), so cardinality stays bounded per RFC cardinality envelope.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(ff_http_request_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["flowfabric", "operations", "observability"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "prometheus", "value": "prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "FlowFabric — Operator Observability",
+  "uid": "flowfabric-ops",
+  "version": 1,
+  "weekStart": ""
+}
