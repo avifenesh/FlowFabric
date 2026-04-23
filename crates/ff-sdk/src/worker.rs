@@ -1220,9 +1220,34 @@ impl FlowFabricWorker {
             field: Some("partition_key".to_owned()),
             message: e.to_string(),
         })?;
-        let mut task = self
+        let mut task = match self
             .claim_execution(&grant.execution_id, &lane, &partition, now)
-            .await?;
+            .await
+        {
+            Ok(task) => task,
+            Err(SdkError::Engine(ref boxed))
+                if matches!(
+                    **boxed,
+                    crate::EngineError::Contention(
+                        crate::ContentionKind::UseClaimResumedExecution
+                    )
+                ) =>
+            {
+                // Execution was resumed from suspension — attempt_interrupted.
+                // ff_claim_execution rejects this; use ff_claim_resumed_execution
+                // which reuses the existing attempt instead of creating a new one.
+                // Mirrors the fallback inside `claim_next` so HTTP-routed callers
+                // (`claim_via_server` → `claim_from_grant`) get the same transparent
+                // re-claim behavior.
+                tracing::debug!(
+                    execution_id = %grant.execution_id,
+                    "execution is resumed, using claim_resumed path"
+                );
+                self.claim_resumed_execution(&grant.execution_id, &lane, &partition)
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
         task.set_concurrency_permit(permit);
         Ok(task)
     }
