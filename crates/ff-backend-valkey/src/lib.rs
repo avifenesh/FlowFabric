@@ -39,7 +39,7 @@ use ff_core::contracts::decode::{
 };
 use ff_core::contracts::{
     CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    ReportUsageResult,
+    FlowStatus, FlowSummary, ListFlowsPage, ReportUsageResult,
 };
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
@@ -521,6 +521,138 @@ async fn describe_flow_impl(
         return Ok(None);
     }
     build_flow_snapshot(id.clone(), &raw).map(Some)
+}
+
+/// Page the `flow_index` SET for a partition, ordered by `flow_id`
+/// (UUID byte-lexicographic), and pipeline `HGETALL flow_core` per row
+/// to build [`FlowSummary`] rows.
+///
+/// Cursor semantics: `cursor == None` starts from the smallest
+/// `flow_id`; `Some(fid)` starts strictly after `fid`. `next_cursor`
+/// is `Some(last_row_flow_id)` when the partition has more rows after
+/// the returned page, else `None`.
+///
+/// Missing `flow_core` for an indexed id is surfaced as
+/// `EngineError::Validation { kind: Corruption, .. }` — the same
+/// posture `list_edges_impl` takes for a drifted adjacency SET. FF's
+/// invariant is that a live `flow_index` entry has a present
+/// `flow_core`; the flow projector removes the index entry on
+/// terminal cleanup.
+#[tracing::instrument(
+    name = "ff.list_flows",
+    skip_all,
+    fields(backend = "valkey", partition = %partition)
+)]
+async fn list_flows_impl(
+    client: &ferriskey::Client,
+    partition: &ff_core::partition::PartitionKey,
+    cursor: Option<FlowId>,
+    limit: usize,
+) -> Result<ListFlowsPage, EngineError> {
+    if limit == 0 {
+        return Ok(ListFlowsPage::new(Vec::new(), None));
+    }
+
+    // Parse the opaque PartitionKey into a typed Partition so we can
+    // construct the {fp:N} flow-index key. Malformed keys surface as
+    // validation errors at the caller's boundary.
+    let part = partition.parse().map_err(|e| EngineError::Validation {
+        kind: ff_core::engine_error::ValidationKind::InvalidInput,
+        detail: format!("list_flows: partition: {e}"),
+    })?;
+    let fidx = FlowIndexKeys::new(&part);
+    let index_key = fidx.flow_index();
+
+    // SMEMBERS the full index and sort client-side. The flow projector
+    // keeps this SET bounded by pruning terminal flows, so partition-
+    // scoped listings stay tractable. A Postgres backend would serve
+    // `WHERE partition_key = $1 AND flow_id > $cursor ORDER BY
+    // flow_id LIMIT $limit + 1` directly; this impl is the SET
+    // equivalent.
+    let all_ids: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&index_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    // Parse + sort by UUID bytes. Corrupt entries (non-UUID strings)
+    // fail loud.
+    let mut parsed: Vec<FlowId> = Vec::with_capacity(all_ids.len());
+    for raw in &all_ids {
+        let fid = FlowId::parse(raw).map_err(|e| EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::Corruption,
+            detail: format!(
+                "list_flows: flow_index: '{raw}' is not a valid FlowId \
+                 (key corruption?): {e}"
+            ),
+        })?;
+        parsed.push(fid);
+    }
+    // UUID byte-lexicographic order — matches the Postgres `uuid`
+    // column's default ordering so the trait contract is backend-
+    // agnostic.
+    parsed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+    // Slice after the cursor (exclusive). binary_search lets us skip
+    // past the entire prefix in O(log n) rather than a linear scan.
+    let start = match &cursor {
+        Some(c) => match parsed.binary_search_by(|probe| probe.as_bytes().cmp(c.as_bytes())) {
+            Ok(pos) => pos + 1,
+            Err(pos) => pos,
+        },
+        None => 0,
+    };
+
+    let page: Vec<FlowId> = parsed.iter().skip(start).take(limit).cloned().collect();
+    if page.is_empty() {
+        return Ok(ListFlowsPage::new(Vec::new(), None));
+    }
+    let has_more = start + page.len() < parsed.len();
+
+    // Pipeline one HGETALL flow_core per page row. All keys share the
+    // partition's {fp:N} tag so a single pipeline is cluster-safe.
+    let mut pipe = client.pipeline();
+    let slots: Vec<_> = page
+        .iter()
+        .map(|fid| {
+            let fctx = FlowKeyContext::new(&part, fid);
+            pipe.cmd::<HashMap<String, String>>("HGETALL")
+                .arg(fctx.core())
+                .finish()
+        })
+        .collect();
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let mut flows: Vec<FlowSummary> = Vec::with_capacity(page.len());
+    for (fid, slot) in page.iter().zip(slots) {
+        let raw = slot.value().map_err(transport_fk)?;
+        if raw.is_empty() {
+            // flow_index drift — index entry without a flow_core. FF
+            // invariants say the projector removes the index entry
+            // before the flow_core disappears; treat as corruption.
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail: format!(
+                    "list_flows: flow_index entry '{fid}' has no flow_core \
+                     (index/core drift — projector bug?)"
+                ),
+            });
+        }
+        let snap = build_flow_snapshot(fid.clone(), &raw)?;
+        flows.push(FlowSummary::new(
+            snap.flow_id,
+            snap.created_at,
+            FlowStatus::from_public_flow_state(&snap.public_flow_state),
+        ));
+    }
+
+    let next_cursor = if has_more {
+        flows.last().map(|f| f.flow_id.clone())
+    } else {
+        None
+    };
+    Ok(ListFlowsPage::new(flows, next_cursor))
 }
 
 /// Read all edges adjacent to `subject_eid` on the requested side.
@@ -2162,6 +2294,22 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "resolve_execution_flow_id: HGET exec_core.flow_id",
+                )
+            })
+    }
+
+    async fn list_flows(
+        &self,
+        partition: ff_core::partition::PartitionKey,
+        cursor: Option<FlowId>,
+        limit: usize,
+    ) -> Result<ListFlowsPage, EngineError> {
+        list_flows_impl(&self.client, &partition, cursor, limit)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "list_flows: SMEMBERS flow_index + pipeline HGETALL flow_core",
                 )
             })
     }

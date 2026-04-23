@@ -54,7 +54,9 @@ use crate::backend::{
 };
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
-use crate::contracts::{EdgeDirection, EdgeSnapshot};
+use crate::contracts::{EdgeDirection, EdgeSnapshot, ListFlowsPage};
+#[cfg(feature = "core")]
+use crate::partition::PartitionKey;
 #[cfg(feature = "streaming")]
 use crate::contracts::{StreamCursor, StreamFrames};
 use crate::engine_error::EngineError;
@@ -280,6 +282,53 @@ pub trait EngineBackend: Send + Sync + 'static {
         &self,
         eid: &ExecutionId,
     ) -> Result<Option<FlowId>, EngineError>;
+
+    /// List flows on a partition with cursor-based pagination (issue
+    /// #185).
+    ///
+    /// Returns a [`ListFlowsPage`] of [`FlowSummary`](crate::contracts::FlowSummary)
+    /// rows ordered by `flow_id` (UUID byte-lexicographic). `cursor`
+    /// is `None` for the first page; callers forward the returned
+    /// `next_cursor` verbatim to continue iteration, and the listing
+    /// is exhausted when `next_cursor` is `None`. `limit` is the
+    /// maximum number of rows to return on this page — implementations
+    /// MAY return fewer (end of partition) but MUST NOT exceed it.
+    ///
+    /// Ordering rationale: flow ids are UUIDs, and both Valkey
+    /// (sort after-the-fact) and Postgres (`ORDER BY flow_id`) can
+    /// agree on byte-lexicographic order — the same order
+    /// `FlowId::to_string()` produces for canonical hyphenated UUIDs.
+    /// Mapping to `cursor > flow_id` keeps the contract backend-
+    /// independent.
+    ///
+    /// # Postgres implementation pattern
+    ///
+    /// A Postgres-backed implementation serves this directly with
+    ///
+    /// ```sql
+    /// SELECT flow_id, created_at_ms, public_flow_state
+    ///   FROM ff_flow
+    ///  WHERE partition_key = $1
+    ///    AND ($2::uuid IS NULL OR flow_id > $2)
+    ///  ORDER BY flow_id
+    ///  LIMIT $3 + 1;
+    /// ```
+    ///
+    /// — reading one extra row to decide whether `next_cursor` should
+    /// be set to the last row's `flow_id`. The Valkey implementation
+    /// maintains the `ff:idx:{fp:N}:flow_index` SET and performs the
+    /// sort + slice client-side (SMEMBERS then sort-by-UUID-bytes),
+    /// pipelining `HGETALL flow_core` for each row on the page.
+    ///
+    /// Gated on the `core` feature — flow listing is part of the
+    /// minimal engine surface a Postgres-style backend must honour.
+    #[cfg(feature = "core")]
+    async fn list_flows(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<FlowId>,
+        limit: usize,
+    ) -> Result<ListFlowsPage, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait

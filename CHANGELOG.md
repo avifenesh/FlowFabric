@@ -17,6 +17,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   per lane") on `examples/grafana/flowfabric-ops.json`. Public
   `ff_observability::AttemptOutcome` enum is feature-agnostic so call
   sites stay symmetric whether `observability` is on or off.
+- **`EngineBackend::list_flows` — cursor-paginated partition listing (#185).**
+  New trait method on `EngineBackend` (core-feature gated) that returns
+  a `ListFlowsPage` of `FlowSummary` rows ordered by `FlowId`
+  (UUID byte-lexicographic). Callers pass `cursor: None` on the first
+  call and forward the returned `next_cursor` to continue iteration;
+  `next_cursor: None` signals the partition is exhausted. New public
+  types in `ff_core::contracts`: `ListFlowsPage`, `FlowSummary`, and
+  `FlowStatus` (an `#[non_exhaustive]` enum mapping the free-form
+  `public_flow_state` literal — `open`/`running`/`blocked` collapse to
+  `Active`; `completed`/`failed`/`cancelled` project directly; unknown
+  literals surface as `Unknown` so callers fall back to
+  `describe_flow`). Valkey impl serves the SET-backed listing via
+  `SMEMBERS flow_index` + client-side UUID-byte sort + pipelined
+  `HGETALL flow_core` per page row; the trait rustdoc documents the
+  Postgres implementation pattern (`WHERE flow_id > $cursor
+  ORDER BY flow_id LIMIT $limit + 1`) so a future Postgres backend
+  serves the same contract natively. `FlowFabricWorker::list_flows`
+  wrapper on ff-sdk. Missing `flow_core` for an indexed id surfaces as
+  `EngineError::Validation { kind: Corruption, .. }`.
 - **Grafana dashboard JSON for operator observability** at
   `examples/grafana/flowfabric-ops.json`. Ten panels covering claim
   latency + rate, lease renewals, worker-at-capacity, admission

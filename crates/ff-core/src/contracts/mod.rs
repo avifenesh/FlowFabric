@@ -2162,6 +2162,121 @@ impl EdgeSnapshot {
     }
 }
 
+// ─── list_flows (issue #185) ───
+
+/// Typed flow-lifecycle status surfaced on [`FlowSummary`].
+///
+/// Mirrors the free-form `public_flow_state` literal that FF's flow
+/// lifecycle writes onto `flow_core` (known values: `open`, `running`,
+/// `blocked`, `cancelled`, `completed`, `failed` — see [`FlowSnapshot`]).
+/// The three "active" runtime states (`open`, `running`, `blocked`)
+/// collapse to [`FlowStatus::Active`] here — callers that need the
+/// exact runtime sub-state should use [`FlowSnapshot::public_flow_state`]
+/// via [`crate::engine_backend::EngineBackend::describe_flow`]. `failed`
+/// maps to [`FlowStatus::Failed`].
+///
+/// `#[non_exhaustive]` so future lifecycle states (if FF introduces
+/// any) can be added without a semver break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FlowStatus {
+    /// `open` / `running` / `blocked` — flow is still live on the engine.
+    Active,
+    /// Terminal success: all members reached a successful terminal state
+    /// and the flow projector flipped `public_flow_state` to `completed`.
+    Completed,
+    /// Terminal failure: one or more members failed and the flow
+    /// projector flipped `public_flow_state` to `failed`.
+    Failed,
+    /// Cancelled by an operator via `cancel_flow`.
+    Cancelled,
+    /// The stored `public_flow_state` literal is present but not a
+    /// known value. The raw literal is preserved on
+    /// [`FlowSnapshot::public_flow_state`] — callers that need to act
+    /// on it should fall back to [`crate::engine_backend::EngineBackend::describe_flow`].
+    Unknown,
+}
+
+impl FlowStatus {
+    /// Map the raw `public_flow_state` literal stored on `flow_core`
+    /// to a typed [`FlowStatus`]. Unknown literals surface as
+    /// [`FlowStatus::Unknown`] so the list surface stays forwards-
+    /// compatible with future engine-side state additions.
+    pub fn from_public_flow_state(raw: &str) -> Self {
+        match raw {
+            "open" | "running" | "blocked" => Self::Active,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Lightweight per-flow projection returned by
+/// [`crate::engine_backend::EngineBackend::list_flows`].
+///
+/// Deliberately narrower than [`FlowSnapshot`] — listing pages serve
+/// dashboard-style enumerations where the caller does not want to pay
+/// for the full `flow_core` hash on every row. Consumers that need
+/// revision / node-count / tags / cancel metadata should fan out to
+/// [`crate::engine_backend::EngineBackend::describe_flow`] for the
+/// specific ids they care about.
+///
+/// `#[non_exhaustive]` — FF may add fields in minor releases without
+/// a semver break. Match with `..` or use [`FlowSummary::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FlowSummary {
+    pub flow_id: FlowId,
+    /// Timestamp (ms since unix epoch) `flow_core.created_at` was
+    /// stamped. Mirrors [`FlowSnapshot::created_at`]; kept typed so
+    /// callers that want raw millis can read `.0`.
+    pub created_at: TimestampMs,
+    /// Typed projection of `flow_core.public_flow_state`. See
+    /// [`FlowStatus`] for the mapping.
+    pub status: FlowStatus,
+}
+
+impl FlowSummary {
+    /// Construct a [`FlowSummary`]. Present so downstream crates can
+    /// assemble the struct despite the `#[non_exhaustive]` marker.
+    pub fn new(flow_id: FlowId, created_at: TimestampMs, status: FlowStatus) -> Self {
+        Self {
+            flow_id,
+            created_at,
+            status,
+        }
+    }
+}
+
+/// One page of [`FlowSummary`] rows returned by
+/// [`crate::engine_backend::EngineBackend::list_flows`].
+///
+/// `next_cursor` is `Some(last_flow_id)` when at least one more row
+/// may exist on the partition — callers forward it verbatim as the
+/// next call's `cursor` argument to continue iteration. `None` means
+/// the listing is exhausted. Cursor semantics match the Postgres
+/// `WHERE flow_id > $cursor ORDER BY flow_id LIMIT $limit` pattern
+/// (see the trait method's rustdoc).
+///
+/// `#[non_exhaustive]` — FF may add summary-level fields (total count,
+/// partition hint) in future minor releases without a semver break.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListFlowsPage {
+    pub flows: Vec<FlowSummary>,
+    pub next_cursor: Option<FlowId>,
+}
+
+impl ListFlowsPage {
+    /// Construct a [`ListFlowsPage`]. Present so downstream crates can
+    /// assemble the struct despite the `#[non_exhaustive]` marker.
+    pub fn new(flows: Vec<FlowSummary>, next_cursor: Option<FlowId>) -> Self {
+        Self { flows, next_cursor }
+    }
+}
+
 /// Summary of state after a mutation, returned by many functions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSummary {

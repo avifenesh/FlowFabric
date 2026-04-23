@@ -23,7 +23,7 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    ReportUsageResult,
+    ListFlowsPage, ReportUsageResult,
 };
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
@@ -285,6 +285,19 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "resolve_execution_flow_id",
             self.inner.resolve_execution_flow_id(eid).await
+        )
+    }
+
+    async fn list_flows(
+        &self,
+        partition: ff_core::partition::PartitionKey,
+        cursor: Option<FlowId>,
+        limit: usize,
+    ) -> Result<ListFlowsPage, EngineError> {
+        with_hooks!(
+            self,
+            "list_flows",
+            self.inner.list_flows(partition, cursor, limit).await
         )
     }
 
