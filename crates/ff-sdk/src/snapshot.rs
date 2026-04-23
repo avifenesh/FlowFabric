@@ -83,22 +83,13 @@ impl FlowFabricWorker {
             .cmd::<HashMap<String, String>>("HGETALL")
             .arg(&tags_key)
             .finish();
-        pipe.execute().await.map_err(|e| SdkError::ValkeyContext {
-            source: e,
-            context: "describe_execution: pipeline HGETALL exec_core + tags".into(),
-        })?;
+        pipe.execute().await.map_err(|e| crate::backend_context(e, "describe_execution: pipeline HGETALL exec_core + tags"))?;
 
-        let core = core_slot.value().map_err(|e| SdkError::ValkeyContext {
-            source: e,
-            context: "describe_execution: decode HGETALL exec_core".into(),
-        })?;
+        let core = core_slot.value().map_err(|e| crate::backend_context(e, "describe_execution: decode HGETALL exec_core"))?;
         if core.is_empty() {
             return Ok(None);
         }
-        let tags_raw = tags_slot.value().map_err(|e| SdkError::ValkeyContext {
-            source: e,
-            context: "describe_execution: decode HGETALL tags".into(),
-        })?;
+        let tags_raw = tags_slot.value().map_err(|e| crate::backend_context(e, "describe_execution: decode HGETALL tags"))?;
 
         build_execution_snapshot(id.clone(), &core, tags_raw)
     }
@@ -406,10 +397,7 @@ impl FlowFabricWorker {
             .arg(&core_key)
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "describe_flow: HGETALL flow_core".into(),
-            })?;
+            .map_err(|e| crate::backend_context(e, "describe_flow: HGETALL flow_core"))?;
 
         if raw.is_empty() {
             return Ok(None);
@@ -646,10 +634,7 @@ impl FlowFabricWorker {
             .arg(&edge_key)
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "describe_edge: HGETALL edge_hash".into(),
-            })?;
+            .map_err(|e| crate::backend_context(e, "describe_edge: HGETALL edge_hash"))?;
 
         if raw.is_empty() {
             return Ok(None);
@@ -735,10 +720,7 @@ impl FlowFabricWorker {
             .arg("flow_id")
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "list_edges: HGET exec_core.flow_id".into(),
-            })?;
+            .map_err(|e| crate::backend_context(e, "list_edges: HGET exec_core.flow_id"))?;
         let Some(raw) = raw.filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
@@ -784,10 +766,7 @@ impl FlowFabricWorker {
             .arg(adj_key)
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "list_edges: SMEMBERS adj_set".into(),
-            })?;
+            .map_err(|e| crate::backend_context(e, "list_edges: SMEMBERS adj_set"))?;
         if edge_id_strs.is_empty() {
             return Ok(Vec::new());
         }
@@ -816,17 +795,11 @@ impl FlowFabricWorker {
                     .finish()
             })
             .collect();
-        pipe.execute().await.map_err(|e| SdkError::ValkeyContext {
-            source: e,
-            context: "list_edges: pipeline HGETALL edges".into(),
-        })?;
+        pipe.execute().await.map_err(|e| crate::backend_context(e, "list_edges: pipeline HGETALL edges"))?;
 
         let mut out: Vec<EdgeSnapshot> = Vec::with_capacity(edge_ids.len());
         for (edge_id, slot) in edge_ids.iter().zip(slots) {
-            let raw = slot.value().map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "list_edges: decode HGETALL edge_hash".into(),
-            })?;
+            let raw = slot.value().map_err(|e| crate::backend_context(e, "list_edges: decode HGETALL edge_hash"))?;
             if raw.is_empty() {
                 // Adjacency SET referenced an edge_hash that no longer
                 // exists. FF does not delete edge hashes today (staging

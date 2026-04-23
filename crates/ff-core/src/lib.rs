@@ -15,3 +15,7 @@ pub mod types;
 
 // Convenience re-export so consumers can write `ff_core::EngineError`.
 pub use engine_error::EngineError;
+// #88: backend-agnostic transport error carried across public
+// ff-sdk / ff-server surfaces. Kept alongside `EngineError` so
+// consumers can `use ff_core::{BackendError, BackendErrorKind}`.
+pub use engine_error::{BackendError, BackendErrorKind};

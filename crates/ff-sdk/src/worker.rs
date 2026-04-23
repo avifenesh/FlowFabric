@@ -157,14 +157,14 @@ impl FlowFabricWorker {
         }
         let client = builder.build()
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "failed to connect".into() })?;
+            .map_err(|e| crate::backend_context(e, "failed to connect"))?;
 
         // Verify connectivity
         let pong: String = client
             .cmd("PING")
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "PING failed".into() })?;
+            .map_err(|e| crate::backend_context(e, "PING failed"))?;
         if pong != "PONG" {
             return Err(SdkError::Config {
                 context: "worker_connect".into(),
@@ -221,10 +221,7 @@ impl FlowFabricWorker {
             .arg(alive_ttl_ms.to_string().as_str())
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext {
-                source: e,
-                context: "SET NX worker alive key".into(),
-            })?;
+            .map_err(|e| crate::backend_context(e, "SET NX worker alive key"))?;
         if set_result.is_none() {
             return Err(SdkError::Config {
                 context: "worker_connect".into(),
@@ -716,7 +713,7 @@ impl FlowFabricWorker {
                 .arg("1")
                 .execute()
                 .await
-                .map_err(|e| SdkError::ValkeyContext { source: e, context: "ZRANGEBYSCORE failed".into() })?;
+                .map_err(|e| crate::backend_context(e, "ZRANGEBYSCORE failed"))?;
 
             let execution_id_str = match extract_first_array_string(&result) {
                 Some(s) => s,
@@ -881,7 +878,7 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_issue_claim_grant", &key_refs, &arg_refs)
             .await
-            .map_err(SdkError::Valkey)?;
+            .map_err(SdkError::from)?;
 
         crate::task::parse_success_result(&raw, "ff_issue_claim_grant")
     }
@@ -1031,7 +1028,7 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_claim_execution", &key_refs, &arg_refs)
             .await
-            .map_err(SdkError::Valkey)?;
+            .map_err(SdkError::from)?;
 
         // Parse claim result: {1, "OK", lease_id, lease_epoch, attempt_index,
         //                      attempt_id, attempt_type, lease_expires_at}
@@ -1168,7 +1165,7 @@ impl FlowFabricWorker {
     ///   between grant issuance and caps change allows it.
     /// * `ScriptError::Parse` — `ff_claim_execution` returned an
     ///   unexpected shape (wrapped in [`SdkError::Engine`]).
-    /// * [`SdkError::Valkey`] / [`SdkError::ValkeyContext`] —
+    /// * [`SdkError::Backend`] / [`SdkError::BackendContext`] —
     ///   transport error during the FCALL or the
     ///   `read_execution_context` follow-up.
     ///
@@ -1280,7 +1277,7 @@ impl FlowFabricWorker {
     /// * `ScriptError::ExecutionNotLeaseable` — `lifecycle_phase` is
     ///   not `runnable`.
     /// * `ScriptError::ExecutionNotFound` — core key missing.
-    /// * [`SdkError::Valkey`] / [`SdkError::ValkeyContext`] —
+    /// * [`SdkError::Backend`] / [`SdkError::BackendContext`] —
     ///   transport.
     ///
     /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
@@ -1345,7 +1342,7 @@ impl FlowFabricWorker {
             .arg("current_attempt_index")
             .execute()
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "read attempt_index".into() })?;
+            .map_err(|e| crate::backend_context(e, "read attempt_index"))?;
         let att_idx = AttemptIndex::new(
             att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
         );
@@ -1386,7 +1383,7 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_claim_resumed_execution", &key_refs, &arg_refs)
             .await
-            .map_err(SdkError::Valkey)?;
+            .map_err(SdkError::from)?;
 
         // Parse result — same format as ff_claim_execution:
         // {1, "OK", lease_id, lease_epoch, expires_at, attempt_id, attempt_index, attempt_type}
@@ -1494,7 +1491,7 @@ impl FlowFabricWorker {
             .client
             .get(&ctx.payload())
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "GET payload failed".into() })?;
+            .map_err(|e| crate::backend_context(e, "GET payload failed"))?;
         let input_payload = payload.unwrap_or_default().into_bytes();
 
         // Read execution_kind from core
@@ -1502,7 +1499,7 @@ impl FlowFabricWorker {
             .client
             .hget(&ctx.core(), "execution_kind")
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGET execution_kind failed".into() })?;
+            .map_err(|e| crate::backend_context(e, "HGET execution_kind failed"))?;
         let execution_kind = kind.unwrap_or_default();
 
         // Read tags
@@ -1510,7 +1507,7 @@ impl FlowFabricWorker {
             .client
             .hgetall(&ctx.tags())
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGETALL tags".into() })?;
+            .map_err(|e| crate::backend_context(e, "HGETALL tags"))?;
 
         Ok((input_payload, execution_kind, tags))
     }
@@ -1540,7 +1537,7 @@ impl FlowFabricWorker {
             .client
             .hget(&ctx.core(), "lane_id")
             .await
-            .map_err(|e| SdkError::ValkeyContext { source: e, context: "HGET lane_id".into() })?;
+            .map_err(|e| crate::backend_context(e, "HGET lane_id"))?;
         let lane_id = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
         // KEYS (14): exec_core, wp_condition, wp_signals_stream,
@@ -1613,7 +1610,7 @@ impl FlowFabricWorker {
             .client
             .fcall("ff_deliver_signal", &key_refs, &arg_refs)
             .await
-            .map_err(SdkError::Valkey)?;
+            .map_err(SdkError::from)?;
 
         crate::task::parse_signal_result(&raw)
     }
@@ -1665,7 +1662,7 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
     let fields: HashMap<String, String> = client
         .hgetall(&key)
         .await
-        .map_err(|e| SdkError::ValkeyContext { source: e, context: format!("HGETALL {key}") })?;
+        .map_err(|e| crate::backend_context(e, format!("HGETALL {key}")))?;
 
     if fields.is_empty() {
         return Err(SdkError::Config {
