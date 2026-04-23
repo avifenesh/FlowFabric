@@ -22,10 +22,12 @@ description = "FlowFabric worker SDK — public API for worker authors"
 # direct optional deps — RFC-012 §1.3 agnosticism proof: ff-sdk
 # compiles as a pure type/config facade over ff-core's
 # `EngineBackend` trait without the Valkey transport surfacing.
-# (`ff-script` keeps an unconditional `ferriskey` dep today; that
-# transitive edge stays regardless of ff-sdk's feature. The
-# agnosticism claim is scoped to ff-sdk's *own* public surface, not
-# the entire build graph.)
+#
+# Issue #171: the `ff-script` ferriskey transitive edge is now also
+# gated — `valkey-default` propagates `ff-script/valkey-client` so the
+# default build is unchanged, and `--no-default-features` drops
+# `ferriskey` from the transitive graph (ff-sdk → ff-script → ferriskey
+# is fully optional).
 default = ["valkey-default"]
 
 direct-valkey-claim = ["valkey-default"]
@@ -49,6 +51,10 @@ valkey-default = [
     "ff-core/streaming",
     "ff-core/suspension",
     "ff-core/budget",
+    # Issue #171: propagate ff-script's ferriskey gate so the default
+    # build still sees `ScriptError::Valkey`, the FCALL functions
+    # modules, loader, retry, and engine_error_ext::valkey_kind.
+    "ff-script/valkey-client",
 ]
 
 # Client-local layer surface for `EngineBackend`
@@ -70,6 +76,10 @@ layer-circuit-breaker = ["dep:async-trait"]
 # backend). The `valkey-default` feature re-enables them below for the
 # default build.
 ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core"] }
+# Issue #171: ff-script's defaults are empty — the `valkey-client`
+# feature (which owns the `ferriskey` dep edge) is activated below by
+# the `valkey-default` feature, NOT here. This keeps
+# `ff-sdk --no-default-features` free of ferriskey.
 ff-script = { workspace = true }
 # RFC-012 Stage 1b — ff-sdk's `ClaimedTask` forwards 9 of 12 ops
 # through the `EngineBackend` trait. The legacy

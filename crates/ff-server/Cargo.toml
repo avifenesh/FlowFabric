@@ -34,7 +34,9 @@ sentry = ["ff-observability/sentry"]
 
 [dependencies]
 ff-core = { workspace = true }
-ff-script = { workspace = true }
+# Issue #171: ff-server calls into FCALL helpers (loader/functions), so
+# explicitly enable ff-script's `valkey-client` surface.
+ff-script = { workspace = true, features = ["valkey-client"] }
 ff-engine = { workspace = true }
 ff-backend-valkey = { workspace = true }
 ff-scheduler = { workspace = true }
