@@ -7,6 +7,43 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-014: Multi-signal resume conditions (`AllOf`, `Count{DistinctX}`).**
+  `ResumeCondition::Composite(CompositeBody)` — the RFC-013 placeholder
+  — is now populated with two variants: `CompositeBody::AllOf { members:
+  Vec<ResumeCondition> }` (all sub-conditions must be satisfied) and
+  `CompositeBody::Count { n, count_kind, matcher, waitpoints }` with
+  `CountKind ∈ { DistinctWaitpoints, DistinctSignals, DistinctSources }`.
+  Rust-side validation enforces RFC-014 §5.1 invariants at suspend-time
+  (depth cap 4 via `ff_core::contracts::MAX_COMPOSITE_DEPTH`, `n > 0`,
+  non-empty `waitpoints`, `n ≤ waitpoints.len()` for DistinctWaitpoints,
+  non-empty `AllOf.members`); failures surface as
+  `EngineError::Validation { kind: InvalidInput, detail: "..." }` per
+  §5.1.1. The Valkey backend serializes composites via a new tagged-tree
+  wire format (`{ v: 1, composite: true, tree: ... }`, §7.2), and the
+  Lua evaluator (`lua/helpers.lua` + `lua/signal.lua`) walks the tree
+  depth-boundedly per signal, using `ff:exec:{p:N}:<eid>:suspension:
+  current:satisfied_set` (SET, RFC-014 §3.1) for durable satisfier
+  tokens and a `:member_map` HASH for operator diagnostics. Satisfier
+  tokens: `wp:<id>` / `sig:<id>` / `src:<type>:<identity>` +
+  `leaf:<path>` / `node:<path>` per §3.2. Matcher-filter step
+  (`signal_ignored_matcher_failed`) lands pre-SADD; SADD gives
+  idempotency (`appended_to_waitpoint_duplicate`). The closer signal id
+  + full satisfier set are published on `suspension:current` as
+  `closer_signal_id` + `all_satisfier_signals` (JSON array) per §4.5;
+  `resume_signals()` / `observe_signals` now reads this composite path
+  ahead of the legacy matcher-array shape. `ff_cancel_execution`,
+  `ff_expire_suspension`, and `ff_resume_execution` all delete the
+  composite state keys on the three terminating paths (§3.1.1). SDK
+  surface: `CompositeBody` + `CountKind` re-exported at
+  `ff_sdk::{CompositeBody, CountKind}` and `ff_sdk::task::{CompositeBody,
+  CountKind}`; `ClaimedTask::try_suspend_inner` rebinds the Fresh
+  waitpoint_key from a composite tree's first Single/Count key so
+  composite scoping works end-to-end for patterns 1 + 2, and RFC-014
+  Pattern 3 (heterogeneous subsystems across N distinct waitpoint_ids,
+  widened `SuspendArgs.waitpoints: Vec<WaitpointBinding>`) also ships
+  in this release (see Changed below). Lua library version bumped
+  20 → 22 (21 → 22 covers the Pattern 3 multi-waitpoint widening).
+
 - **RFC-016 Stage B: AnyOf / Quorum edge-dependency resolver.** Lights
   up the four-counter state machine on top of the Stage A edgegroup
   hash. `EngineBackend::set_edge_group_policy` now ACCEPTS
@@ -139,6 +176,56 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `e2e_lifecycle::test_flow_*`) unaffected.
 
 ### Changed
+
+- **RFC-014 Pattern 3 — `SuspendArgs.waitpoint` widened to
+  `waitpoints: Vec<WaitpointBinding>` (pre-1.0 breaking change).**
+  Heterogeneous-subsystems composites (`AllOf` across N distinct
+  waitpoint_ids — "db-migration-complete AND cache-warmed AND
+  feature-flag-set") now land in the same suspension trait surface
+  PR #217 scoped to single-waitpoint. `SuspendArgs::new(..)` still
+  takes one primary `WaitpointBinding`; append further bindings via
+  `SuspendArgs::with_waitpoint(binding)` (appends, pre-1.0
+  incremental-migration friendly) or replace the whole vector via
+  `SuspendArgs::with_waitpoints(vec)`. Call `args.primary()` for the
+  first binding.
+
+  `SuspendOutcomeDetails` gains an `additional_waitpoints:
+  Vec<AdditionalWaitpointBinding>` field carrying per-extra
+  `(waitpoint_id, waitpoint_key, waitpoint_token)`; the top-level
+  `waitpoint_id` / `waitpoint_key` / `waitpoint_token` continue to
+  identify the primary (`waitpoints[0]`).
+
+  Valkey backend `ff_suspend_execution` now accepts
+  `KEYS = 18 + 3*N_extra` + `ARGV = 19 + 1 + 2*N_extra`; for each
+  extra binding Lua mints an independent HMAC token bound to its own
+  `ff:wp:{tag}:<id>` hash + `ff:wp:{tag}:<id>:condition` hash so
+  external signallers can deliver to any of the N waitpoints. The
+  full set is recorded on `suspension:current.additional_waitpoints_json`
+  so cleanup owners (`ff_cancel_execution`, `ff_expire_suspension`,
+  `ff_resume_execution`, composite-resume close in `ff_deliver_signal`)
+  iterate every per-extra waitpoint when closing the suspension.
+
+  SDK builder: `ResumeCondition::all_of_waitpoints([wp_a, wp_b, wp_c])`
+  (RFC-014 §10.3) is the canonical Pattern 3 shorthand, desugaring to
+  `AllOf { members: vec![Single{Wildcard}, Single{Wildcard}, ...] }`.
+  For per-member matchers construct the tree directly.
+
+  **Idempotency-key dedup widening (RFC-013 × RFC-014).** The
+  serialized dedup outcome adds an `N_extra` count + `N_extra × (id,
+  key, tok)` tail; replaying the same `idempotency_key` within the
+  TTL returns the full set verbatim (primary + extras). Tab-separated
+  wire format, always present even when `N_extra = 0`.
+
+  **Validator widenings.** `validate_suspend_args` now rejects
+  `waitpoints_empty` (defensive; `SuspendArgs::new` guarantees ≥1);
+  every additional binding must be `WaitpointBinding::Fresh` with a
+  non-empty `waitpoint_key` (UsePending + extras is rejected —
+  buffered-signal activation is inherently single-waitpoint); and for
+  multi-binding suspends the condition's referenced waitpoint_keys
+  must be exactly the binding set (`referenced_waitpoint_key_missing_binding`,
+  `extra_binding_not_referenced_by_condition`).
+
+  Lua library version bumped 21 → 22.
 
 - **`ff-script` gates its `ferriskey` dep behind a new `valkey-client`
   feature (#171).** Closes the backend-agnosticism leak flagged in the

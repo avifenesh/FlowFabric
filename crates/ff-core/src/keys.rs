@@ -125,6 +125,29 @@ impl ExecKeyContext {
         format!("ff:exec:{}:{}:suspension:current", self.tag, self.eid)
     }
 
+    /// `ff:exec:{p:N}:<eid>:suspension:current:satisfied_set` — RFC-014
+    /// §3.1. Durable SET of satisfier tokens accumulated during the
+    /// active suspension. Created at `suspend_execution` (for composite
+    /// conditions only) and deleted on the three terminating paths
+    /// (resume, cancel, expire).
+    pub fn suspension_satisfied_set(&self) -> String {
+        format!(
+            "ff:exec:{}:{}:suspension:current:satisfied_set",
+            self.tag, self.eid
+        )
+    }
+
+    /// `ff:exec:{p:N}:<eid>:suspension:current:member_map` — RFC-014
+    /// §3.1. Write-once HASH mapping `waitpoint_id → node_path`
+    /// (e.g. `"members[0]"`). Read by `deliver_signal` to locate which
+    /// composite node a signal affects.
+    pub fn suspension_member_map(&self) -> String {
+        format!(
+            "ff:exec:{}:{}:suspension:current:member_map",
+            self.tag, self.eid
+        )
+    }
+
     /// `ff:exec:{p:N}:<eid>:waitpoints` — Set of all waitpoint IDs.
     pub fn waitpoints(&self) -> String {
         format!("ff:exec:{}:{}:waitpoints", self.tag, self.eid)

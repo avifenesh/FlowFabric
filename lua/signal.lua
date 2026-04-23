@@ -193,6 +193,135 @@ redis.register_function('ff_deliver_signal', function(keys, args)
   local effect = "appended_to_waitpoint"
   local matched = false
 
+  -- RFC-014 §3.3: composite branch. `wp_condition` stores a `composite=1`
+  -- marker when suspension serialized a multi-signal tree. We short-
+  -- circuit here and run the composite evaluator (depth-bounded).
+  local composite_mode = (wp_cond.composite == "1")
+  if composite_mode then
+    -- Load tree + waitpoint_key for candidate lookup.
+    local susp_raw = redis.call("HGETALL", K.suspension_current)
+    local susp = hgetall_to_table(susp_raw)
+    local tree_json = wp_cond.tree_json or ""
+    local tree = tree_json ~= "" and cjson.decode(tree_json) or nil
+    local satisfied_set_key = K.suspension_current .. ":satisfied_set"
+    local member_map_key    = K.suspension_current .. ":member_map"
+
+    local signal_for_eval = {
+      signal_id = A.signal_id,
+      signal_name = A.signal_name,
+      source_type = A.source_type,
+      source_identity = A.source_identity,
+    }
+    -- RFC-014 Pattern 3: use THIS waitpoint's own key (loaded into
+    -- `wp_for_auth` above, keyed by A.waitpoint_id) so multi-waitpoint
+    -- AllOf resolves each leaf against its own wp_key, not the
+    -- suspension's primary key.
+    local this_wp_key = wp_for_auth.waitpoint_key or susp.waitpoint_key or ""
+    local outcome = composite_deliver_signal(
+      tree, satisfied_set_key, member_map_key,
+      A.waitpoint_id, this_wp_key, signal_for_eval)
+
+    effect = outcome.effect or "appended_to_waitpoint"
+    matched = (effect ~= "signal_ignored_not_in_condition"
+               and effect ~= "signal_ignored_matcher_failed")
+
+    if outcome.resume then
+      -- Close suspension via the standard path (same as single-matcher
+      -- resume below). Composite-scoped cleanup follows §3.1.1.
+      local lp2 = core.lifecycle_phase
+      if lp2 == "suspended" then
+        local es, br, bd, ps
+        if A.resume_delay_ms > 0 then
+          es = "not_eligible_until_time"
+          br = "waiting_for_resume_delay"
+          bd = "resume delay " .. A.resume_delay_ms .. "ms after signal " .. A.signal_name
+          ps = "delayed"
+        else
+          es = "eligible_now"
+          br = "waiting_for_worker"
+          bd = ""
+          ps = "waiting"
+        end
+        redis.call("HSET", K.core_key,
+          "lifecycle_phase", "runnable",
+          "ownership_state", "unowned",
+          "eligibility_state", es,
+          "blocking_reason", br,
+          "blocking_detail", bd,
+          "terminal_outcome", "none",
+          "attempt_state", "attempt_interrupted",
+          "public_state", ps,
+          "current_suspension_id", "",
+          "current_waitpoint_id", "",
+          "last_transition_at", tostring(now_ms),
+          "last_mutation_at", tostring(now_ms))
+
+        local priority = tonumber(core.priority or "0")
+        local created_at_exec = tonumber(core.created_at or "0")
+        redis.call("ZREM", K.suspended_zset, A.execution_id)
+        if A.resume_delay_ms > 0 then
+          redis.call("ZADD", K.delayed_zset,
+            now_ms + A.resume_delay_ms, A.execution_id)
+        else
+          redis.call("ZADD", K.eligible_zset,
+            0 - (priority * 1000000000000) + created_at_exec,
+            A.execution_id)
+        end
+      end
+
+      redis.call("HSET", K.wp_condition,
+        "closed", "1",
+        "closed_at", tostring(now_ms),
+        "closed_reason", "satisfied")
+      redis.call("HSET", K.waitpoint_hash,
+        "state", "closed",
+        "satisfied_at", tostring(now_ms),
+        "closed_at", tostring(now_ms),
+        "close_reason", "resumed")
+      if redis.call("EXISTS", K.suspension_current) == 1 then
+        redis.call("HSET", K.suspension_current,
+          "satisfied_at", tostring(now_ms),
+          "closed_at", tostring(now_ms),
+          "close_reason", "resumed",
+          "closer_signal_id", outcome.closer or A.signal_id,
+          "all_satisfier_signals", outcome.all_satisfiers_json or "[]")
+      end
+      redis.call("ZREM", K.suspension_timeout_zset, A.execution_id)
+      -- RFC-014 §3.1.1 cleanup owner: deliver_signal close path.
+      composite_cleanup(satisfied_set_key, member_map_key)
+      -- RFC-014 Pattern 3: close any OTHER waitpoints owned by this
+      -- suspension (the one the signal arrived on is already closed
+      -- via K.waitpoint_hash above). Reread susp to pick up the
+      -- additional_waitpoints_json that was seeded at suspend-time.
+      local susp_after = redis.call("HGETALL", K.suspension_current)
+      if #susp_after > 0 then
+        local susp2 = hgetall_to_table(susp_after)
+        close_additional_waitpoints(
+          K.suspension_current,
+          susp2.additional_waitpoints_json or "",
+          { "state", "closed",
+            "satisfied_at", tostring(now_ms),
+            "closed_at", tostring(now_ms),
+            "close_reason", "resumed" },
+          { "closed", "1",
+            "closed_at", tostring(now_ms),
+            "closed_reason", "satisfied" })
+      end
+    end
+
+    -- Record signal hash observed_effect + waitpoint counters + return.
+    redis.call("HSET", K.signal_hash, "observed_effect", effect)
+    redis.call("HINCRBY", K.waitpoint_hash, "signal_count", 1)
+    if matched then
+      redis.call("HINCRBY", K.waitpoint_hash, "matched_signal_count", 1)
+    end
+    redis.call("HSET", K.waitpoint_hash, "last_signal_at", tostring(now_ms))
+    if redis.call("EXISTS", K.suspension_current) == 1 and not outcome.resume then
+      redis.call("HSET", K.suspension_current, "last_signal_at", tostring(now_ms))
+    end
+    return ok(A.signal_id, effect)
+  end
+
   local total = tonumber(wp_cond.total_matchers or "0")
   for i = 0, total - 1 do
     local sat_key = "matcher:" .. i .. ":satisfied"
