@@ -7,6 +7,38 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking changes
 
+- **Seal `FlowFabricWorker::client()` + migrate stream fns through the
+  trait (#87, RFC-012 Stage 1c tranche-4):** the `FlowFabricWorker`
+  no longer leaks `ferriskey::Client` on its public surface, and the
+  free-fn `read_stream` / `tail_stream` helpers reshape from
+  `(&Client, &PartitionConfig, …)` to `(&dyn EngineBackend, …)`.
+  - `ff-core`: `EngineBackend` gains `read_stream` + `tail_stream`
+    methods, gated on the new `streaming` feature (default-on).
+    Backends that honour the `streaming` surface MUST implement
+    both.
+  - `ff-backend-valkey`: `ValkeyBackend` implements the new trait
+    methods behind a mirroring `streaming` feature (default-on).
+    The authoritative XRANGE / XREAD BLOCK bodies previously owned
+    by `ff-sdk::task::{read_stream,tail_stream}` now live here.
+  - `ff-sdk`: `FlowFabricWorker::client()` downgraded from `pub` to
+    `pub(crate)` — external consumers cannot obtain the ferriskey
+    client through the worker. New `ClaimedTask::read_stream` /
+    `ClaimedTask::tail_stream` methods forward through the task's
+    backend for task-holders. The free-fn `read_stream` /
+    `tail_stream` keep their public names but take `&dyn
+    EngineBackend` instead of `&Client` + `&PartitionConfig`;
+    validation (count_limit bounds, tail-cursor shape) still
+    executes at the SDK edge.
+  - `ff-test`: `TestCluster::backend()` accessor added so tests can
+    mint an `Arc<dyn EngineBackend>` without spinning a full
+    `FlowFabricWorker`.
+  - Migration: consumers holding a `ClaimedTask` should call
+    `task.read_stream(..)` / `task.tail_stream(..)`; non-task
+    callers should build an `EngineBackend` via
+    `ValkeyBackend::from_client_and_partitions(..)` and pass
+    `&*backend` to the free fns. The `examples/media-pipeline`
+    summarize worker exercises the task-method path.
+
 - **Seal `ferriskey::Error` leak via `BackendError` wrapper (#88):**
   Public SDK + server error surfaces no longer name `ferriskey::Error` /
   `ferriskey::ErrorKind` directly. A new `ff_core::BackendError` +

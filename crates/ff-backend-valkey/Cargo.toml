@@ -10,8 +10,16 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric EngineBackend impl — Valkey FCALL backend"
 
+[features]
+# RFC-012 Stage 1c tranche-4 (#87) — mirror ff-core's `streaming`
+# feature so the backend's `read_stream` / `tail_stream` impls land
+# only when the trait surface declares them. Default-on tracks
+# ff-core's default.
+default = ["streaming"]
+streaming = ["ff-core/streaming"]
+
 [dependencies]
-ff-core = { workspace = true }
+ff-core = { version = "0.3.4", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
 ff-script = { workspace = true }
 ferriskey = { workspace = true }
 async-trait = { workspace = true }

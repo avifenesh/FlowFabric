@@ -7763,7 +7763,6 @@ async fn test_read_stream_round_trips_append_frame_fields() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_read_rt", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
@@ -7780,8 +7779,7 @@ async fn test_read_stream_round_trips_append_frame_fields() {
     ).await;
 
     let result = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(att_idx.parse().unwrap()),
         ff_sdk::StreamCursor::Start,
@@ -7815,11 +7813,9 @@ async fn test_read_stream_empty_returns_empty() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     let result = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(0),
         ff_sdk::StreamCursor::Start,
@@ -7840,7 +7836,6 @@ async fn test_read_stream_slice_and_resume() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_slice", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
@@ -7858,8 +7853,7 @@ async fn test_read_stream_slice_and_resume() {
     let att = AttemptIndex::new(att_idx.parse().unwrap());
 
     let page1 = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         att,
         ff_sdk::StreamCursor::Start,
@@ -7877,8 +7871,7 @@ async fn test_read_stream_slice_and_resume() {
     let resume_from = format!("{ms}-{next_seq}");
 
     let page2 = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         att,
         ff_sdk::StreamCursor::At(resume_from),
@@ -7899,12 +7892,10 @@ async fn test_tail_stream_timeout_returns_empty() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     let started = std::time::Instant::now();
     let result = ff_sdk::tail_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(0),
         ff_sdk::StreamCursor::from_beginning(),
@@ -7931,7 +7922,6 @@ async fn test_tail_stream_unblocks_on_write() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_tail", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
@@ -7953,8 +7943,7 @@ async fn test_tail_stream_unblocks_on_write() {
     });
 
     let result = ff_sdk::tail_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(att_idx.parse().unwrap()),
         ff_sdk::StreamCursor::from_beginning(),
@@ -7984,12 +7973,10 @@ async fn test_tail_stream_long_block_respects_ferriskey_timeout_extension() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     let started = std::time::Instant::now();
     let result = ff_sdk::tail_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(0),
         ff_sdk::StreamCursor::from_beginning(),
@@ -8023,7 +8010,6 @@ async fn test_stream_closed_signal_propagates_to_read_and_tail() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_closed", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
@@ -8042,8 +8028,7 @@ async fn test_stream_closed_signal_propagates_to_read_and_tail() {
 
     // read_stream sees the frame AND the terminal markers.
     let read = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         att,
         ff_sdk::StreamCursor::Start,
@@ -8061,8 +8046,7 @@ async fn test_stream_closed_signal_propagates_to_read_and_tail() {
     // still reports closed — this is the signal consumers poll on.
     let tip = read.frames.last().unwrap().id.clone();
     let tail = ff_sdk::tail_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         att,
         ff_sdk::StreamCursor::At(tip),
@@ -8087,7 +8071,6 @@ async fn test_lease_expired_closes_stream_meta() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_lease_expire", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
@@ -8109,8 +8092,7 @@ async fn test_lease_expired_closes_stream_meta() {
 
     let att = AttemptIndex::new(att_idx.parse().unwrap());
     let result = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         att,
         ff_sdk::StreamCursor::Start,
@@ -8137,7 +8119,6 @@ async fn test_tail_stream_no_block_returns_available() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     fcall_create_execution(&tc, &eid, NS, LANE, "stream_peek", 0).await;
     fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
@@ -8151,8 +8132,7 @@ async fn test_tail_stream_no_block_returns_available() {
 
     let started = std::time::Instant::now();
     let result = ff_sdk::tail_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(att_idx.parse().unwrap()),
         ff_sdk::StreamCursor::from_beginning(),
@@ -8183,11 +8163,9 @@ async fn test_read_stream_rejects_zero_count_limit() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     let err = ff_sdk::read_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(0),
         ff_sdk::StreamCursor::Start,
@@ -8211,11 +8189,9 @@ async fn test_tail_stream_rejects_zero_count_limit() {
     tc.cleanup().await;
 
     let eid = tc.new_execution_id();
-    let config = test_config();
 
     let err = ff_sdk::tail_stream(
-        tc.client(),
-        &config,
+        &*tc.backend(),
         &eid,
         AttemptIndex::new(0),
         ff_sdk::StreamCursor::from_beginning(),

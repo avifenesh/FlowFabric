@@ -88,6 +88,19 @@ impl TestCluster {
         &self.client
     }
 
+    /// Build an `Arc<dyn EngineBackend>` wrapping this cluster's
+    /// client + partition config. Used by tests that exercise the
+    /// trait-forwarded surface (e.g. `read_stream`/`tail_stream`
+    /// post-#87) without spinning up a full `FlowFabricWorker`.
+    pub fn backend(
+        &self,
+    ) -> std::sync::Arc<dyn ff_core::engine_backend::EngineBackend> {
+        ff_backend_valkey::ValkeyBackend::from_client_and_partitions(
+            self.client.clone(),
+            self.config,
+        )
+    }
+
     /// Get the test partition config (small, suitable for testing).
     pub fn partition_config(&self) -> &PartitionConfig {
         &self.config

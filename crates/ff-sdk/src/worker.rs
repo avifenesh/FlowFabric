@@ -625,8 +625,22 @@ impl FlowFabricWorker {
         self.completion_backend_handle.clone()
     }
 
-    /// Get a reference to the underlying ferriskey client.
-    pub fn client(&self) -> &Client {
+    /// Crate-internal borrow of the underlying `ferriskey::Client`.
+    ///
+    /// **RFC-012 Stage 1c tranche-4 (#87):** downgraded from `pub` to
+    /// `pub(crate)`. The public `FlowFabricWorker` surface no longer
+    /// exposes the ferriskey type — consumers that previously reached
+    /// in for `read_stream` / `tail_stream` should now use
+    /// [`ClaimedTask::read_stream`](crate::ClaimedTask::read_stream) /
+    /// [`ClaimedTask::tail_stream`](crate::ClaimedTask::tail_stream)
+    /// (task-holders) or [`read_stream`](crate::read_stream) /
+    /// [`tail_stream`](crate::tail_stream) through a `&dyn
+    /// EngineBackend` (non-task callers).
+    ///
+    /// Retained for in-crate use by
+    /// [`crate::worker::FlowFabricWorker`]'s raw HGET helpers, which
+    /// are not yet migrated to the trait (separate tracking issue).
+    pub(crate) fn client(&self) -> &Client {
         &self.client
     }
 
@@ -636,11 +650,12 @@ impl FlowFabricWorker {
     }
 
     /// Get the server-published partition config this worker bound to at
-    /// `connect()`. Callers need this when computing partition hash-tags
-    /// for direct-client reads (e.g. ff-sdk::read_stream) to stay aligned
-    /// with the server's `num_flow_partitions` — using
-    /// `PartitionConfig::default()` assumes 256 partitions and silently
-    /// misses data on deployments with any other value.
+    /// `connect()`. Exposed so consumers that mint custom
+    /// [`ExecutionId`]s (e.g. for `describe_execution` lookups on ids
+    /// produced outside this worker) stay aligned with the server's
+    /// `num_flow_partitions` — using `PartitionConfig::default()`
+    /// assumes 256 partitions and silently misses data on deployments
+    /// with any other value.
     pub fn partition_config(&self) -> &ff_core::partition::PartitionConfig {
         &self.partition_config
     }
