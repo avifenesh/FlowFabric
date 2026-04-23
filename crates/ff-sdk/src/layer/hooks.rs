@@ -353,7 +353,6 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
         )
     }
 
-    #[cfg(feature = "core")]
     async fn list_executions(
         &self,
         partition: PartitionKey,
