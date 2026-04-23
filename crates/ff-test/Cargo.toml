@@ -34,8 +34,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-ff-server = { workspace = true }
-ff-observability = { workspace = true }
+# RFC-016 Stage E asserts metric emission end-to-end. The `observability`
+# feature on ff-server transitively enables `ff-observability/enabled` +
+# the ff-engine/ff-scheduler observability features so real instruments
+# back `Metrics::new()` instead of the no-op shim. Dev-only — production
+# callers of ff-server flip this via their own feature.
+ff-server = { workspace = true, features = ["observability"] }
+ff-observability = { workspace = true, features = ["enabled"] }
 serial_test = "3"
 axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

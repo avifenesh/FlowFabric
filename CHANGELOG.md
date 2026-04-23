@@ -5,6 +5,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **RFC-016 Stage E: full integration test matrix + cluster co-location.**
+  Test-only PR (no Lua, no impl code, no wire-format changes). Adds
+  `crates/ff-test/tests/flow_edge_policies_stage_e.rs` (11 new tests;
+  RFC-016 coverage is now 28 integration tests across Stages A–E):
+  the four-way `(AnyOf|Quorum) × (CancelRemaining|LetRun)` cancel-to-
+  terminal matrix with per-sibling `cancellation_reason` assertions;
+  cluster co-location hash-tag pin (flow_core + edgegroup hash +
+  `pending_cancel_groups` SET + every member exec_core share one
+  `{fp:N}` slot, validating single-slot operation under cluster mode);
+  skip-propagation cascade across two edge layers (impossible-quorum
+  at layer 1 cascades to AllOf skip at layer 2); one-shot replay
+  idempotence (re-resolving a winning upstream after the dispatcher
+  terminated siblings must not re-fire the downstream or advance
+  counters — edge-id dedup + HSETNX `satisfied_at`); a real OTEL
+  registry threaded through `Server::start_with_metrics` backing
+  `ff_sibling_cancel_dispatched_total{reason}` + `ff_sibling_cancel_
+  disposition_total{disposition}` pre/post assertions; idempotent-drain
+  stress at 8 concurrent pending groups; correctness-only high-fanout
+  at `Quorum(1, 50) + CancelRemaining` (Phase 0 benchmark at
+  `n ∈ {10, 100, 1000}` remains the v0.6 release gate, NOT a Stage E
+  deliverable); and a builder ergonomics round-trip
+  (`EdgeDependencyPolicy::all_of()` / `any_of()` / `quorum(k, ...)` +
+  `OnSatisfied::{cancel_remaining, let_run}()` + serde). `ff-test`
+  now pulls `ff-server` + `ff-observability` with `observability` /
+  `enabled` features through dev-deps so `Metrics::new()` backs real
+  instruments during tests (dev-deps only; production callers
+  unchanged). Stage E is the last Stage before Phase 0 high-fanout
+  benchmarks gate v0.6 ship (RFC-016 §4.2).
+
 ### Added
 
 - **RFC-016 Stage D: sibling-cancel reconciler (Invariant Q6 crash recovery).**
