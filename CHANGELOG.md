@@ -78,6 +78,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `(ScanStateRC, Vec<Value>)` directly for Rust callers;
   `ClusterScanArgs` / `ScanStateRC` / `ObjectType` re-exported at the
   crate root.
+- **`EngineBackend::list_executions` trait method + `ListExecutionsPage`
+  contract (issue #182).** Partition-scoped forward-only cursor
+  pagination over the `ff:idx:{p:N}:all_executions` set. Signature is
+  `list_executions(partition: PartitionKey, cursor: Option<ExecutionId>,
+  limit: usize) -> ListExecutionsPage` gated on the `core` feature so
+  Postgres-style backends must honour it. Response carries
+  `executions: Vec<ExecutionId>` + `next_cursor: Option<ExecutionId>`
+  (exclusive; `None` ⇒ end of stream). Valkey impl reads SMEMBERS,
+  lex-sorts on wire form, filters strictly greater than the caller's
+  cursor, and trims to `limit` (capped at 1000). `FlowFabricWorker::
+  list_executions` thin-forwards onto the trait.
 - **Grafana dashboard JSON for operator observability** at
   `examples/grafana/flowfabric-ops.json`. Ten panels covering claim
   latency + rate, lease renewals, worker-at-capacity, admission
@@ -139,6 +150,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **BREAKING (unreleased HTTP surface): `GET /v1/executions` reshaped
+  to forward-only cursor pagination (issue #182).** Query parameters
+  now `partition` (`u16`, required) + optional `cursor`
+  (`ExecutionId`, exclusive start) + optional `limit` (capped at
+  1000). Response shape swapped from
+  `{ executions: [ExecutionSummary], total_returned }` to
+  `{ executions: [ExecutionId], next_cursor: ExecutionId | null }`.
+  The previous `lane` + `state` filters were dropped; per-execution
+  metadata is now fetched via `GET /v1/executions/{id}` or the
+  `describe_execution` trait method. The old offset-based endpoint
+  was never published on crates.io, so this is unreleased-surface
+  churn only. Server::list_executions replaced by
+  Server::list_executions_page which mirrors the trait's shape.
 - **Hot-path tracing span level downgraded to `debug` (#173):**
   Downgraded 5 hot-path `EngineBackend` impl spans (complete, renew,
   progress, observe_signals, append_frame) from implicit `info` to
