@@ -20,7 +20,7 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    ReportUsageResult,
+    ListFlowsPage, ReportUsageResult,
 };
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
@@ -226,6 +226,16 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<CancelFlowResult, EngineError> {
         self.record("cancel_flow")?;
         Err(EngineError::Unavailable { op: "cancel_flow" })
+    }
+
+    async fn list_flows(
+        &self,
+        _partition: ff_core::partition::PartitionKey,
+        _cursor: Option<FlowId>,
+        _limit: usize,
+    ) -> Result<ListFlowsPage, EngineError> {
+        self.record("list_flows")?;
+        Ok(ListFlowsPage::new(Vec::new(), None))
     }
 
     async fn report_usage(
