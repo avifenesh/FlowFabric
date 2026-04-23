@@ -23,8 +23,10 @@
 //! non-SDK consumers (tests, REST server, alternate backends) share
 //! them without depending on ff-sdk.
 
-use ff_core::contracts::{EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot};
-use ff_core::partition::{execution_partition, flow_partition};
+use ff_core::contracts::{
+    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
+};
+use ff_core::partition::{execution_partition, flow_partition, PartitionKey};
 use ff_core::types::{EdgeId, ExecutionId, FlowId};
 
 use crate::SdkError;
@@ -55,6 +57,31 @@ impl FlowFabricWorker {
     /// impl.
     pub async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, SdkError> {
         Ok(self.backend_ref().describe_flow(id).await?)
+    }
+
+    /// List flows on a partition with cursor-based pagination
+    /// (issue #185).
+    ///
+    /// `partition` is an opaque [`PartitionKey`] — typically obtained
+    /// from a [`crate::ClaimGrant`] or from
+    /// [`ff_core::partition::flow_partition`] when the caller already
+    /// knows a `FlowId` on the partition it wants to enumerate.
+    /// `cursor` is `None` on the first call and the previous page's
+    /// `next_cursor` on subsequent calls; iteration terminates when
+    /// the returned `next_cursor` is `None`.
+    ///
+    /// Thin forwarder onto
+    /// [`EngineBackend::list_flows`](ff_core::engine_backend::EngineBackend::list_flows).
+    pub async fn list_flows(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<FlowId>,
+        limit: usize,
+    ) -> Result<ListFlowsPage, SdkError> {
+        Ok(self
+            .backend_ref()
+            .list_flows(partition, cursor, limit)
+            .await?)
     }
 
     /// Read a typed snapshot of one dependency edge.
