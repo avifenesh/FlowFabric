@@ -17,10 +17,9 @@
 //!    dual-written edgegroup hash or, for flows that pre-date this
 //!    release, the legacy `deps_meta` shim).
 //!
-//! 3. **Stage A rejects AnyOf / Quorum.** The `set_edge_group_policy`
-//!    entry point fails closed with a typed validation error when
-//!    called with a non-AllOf variant — Stage B is where those
-//!    resolver code paths land.
+//! The original Stage-A "rejects AnyOf/Quorum" test was retired when
+//! Stage B lifted that restriction; see `flow_edge_policies_stage_b.rs`
+//! for the new coverage (including the narrower `k == 0` rejection).
 //!
 //! Run with:
 //!   cargo test -p ff-test --test flow_edge_policies_stage_a -- --test-threads=1
@@ -442,40 +441,9 @@ async fn stage_a_backward_compat_shim_allof_without_explicit_policy() {
     );
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn stage_a_rejects_any_of_and_quorum() {
-    let tc = TestCluster::connect().await;
-    tc.cleanup().await;
-    seed_partition_config(&tc).await;
-    let server = start_server(&tc).await;
-    let worker = build_worker().await;
-
-    let fid = FlowId::new();
-    create_flow(&server, &fid).await;
-    let fp_idx = flow_partition(&fid, tc.partition_config()).index;
-    let d = tc.new_execution_id_on_partition(fp_idx);
-
-    use ff_core::contracts::OnSatisfied;
-    for bad in [
-        EdgeDependencyPolicy::any_of(OnSatisfied::cancel_remaining()),
-        EdgeDependencyPolicy::quorum(2, OnSatisfied::let_run()),
-    ] {
-        let result = worker.set_edge_group_policy(&fid, &d, bad).await;
-        match result {
-            Err(ff_sdk::SdkError::Engine(boxed)) => match *boxed {
-                ff_core::engine_error::EngineError::Validation {
-                    kind: ff_core::engine_error::ValidationKind::InvalidInput,
-                    ref detail,
-                } => {
-                    assert!(
-                        detail.contains("stage A supports AllOf only"),
-                        "detail: {detail}"
-                    );
-                }
-                other => panic!("expected Validation(InvalidInput), got: {other:?}"),
-            },
-            other => panic!("expected Engine(Validation), got: {other:?}"),
-        }
-    }
-}
+// NOTE: The original Stage-A-only `stage_a_rejects_any_of_and_quorum`
+// test lived here to pin the Stage A closed-door stance (AnyOf/Quorum
+// rejected with a typed validation error). RFC-016 Stage B intentionally
+// flips that gate to ACCEPT AnyOf/Quorum — the assertion is obsolete.
+// Stage B coverage for the AnyOf/Quorum paths and the narrower
+// `k == 0` validation lives in `flow_edge_policies_stage_b.rs`.

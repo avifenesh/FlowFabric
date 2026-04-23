@@ -906,7 +906,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '19'
+  return '20'
 end)
 
 
@@ -6724,30 +6724,44 @@ end)
 -- RFC-016 #set_edge_group_policy  (on {fp:N})
 --
 -- Declare the inbound-edge-group policy for a downstream execution.
--- Stage A honours only `all_of`; `any_of`/`quorum` land in Stage B.
--- Must be called BEFORE the first `add_dependency` for this downstream.
+-- Stage B accepts `all_of`, `any_of`, and `quorum`. Must be called
+-- BEFORE the first `add_dependency` for this downstream (enforced via
+-- the `n > 0` guard below).
 --
 -- KEYS (2): flow_core, edgegroup
--- ARGV (3): policy_variant, on_satisfied, now_ms
+-- ARGV (4): policy_variant, on_satisfied, k, now_ms
 ---------------------------------------------------------------------------
 redis.register_function('ff_set_edge_group_policy', function(keys, args)
   local flow_core = keys[1]
   local edgegroup = keys[2]
   local policy_variant = args[1]
   local on_satisfied = args[2] or ""
-  local now_ms = args[3]
+  local k_raw = args[3] or "0"
+  local now_ms = args[4]
 
   if redis.call("EXISTS", flow_core) == 0 then
     return err("flow_not_found")
   end
 
-  -- Stage A: only `all_of` is honoured. `any_of`/`quorum` are rejected
-  -- with a typed validation error until Stage B's resolver lands. The
-  -- Rust side (set_edge_group_policy_impl) short-circuits before
-  -- invoking Lua, so this is a defense-in-depth gate.
-  if policy_variant ~= "all_of" then
+  if policy_variant ~= "all_of"
+     and policy_variant ~= "any_of"
+     and policy_variant ~= "quorum" then
     return err("invalid_input",
-      "stage A supports AllOf only; AnyOf/Quorum land in stage B")
+      "unsupported_policy_variant: " .. tostring(policy_variant))
+  end
+
+  local k_num = tonumber(k_raw) or 0
+  if policy_variant == "quorum" then
+    if k_num < 1 then
+      return err("invalid_input", "quorum k must be >= 1")
+    end
+  end
+
+  if (policy_variant == "any_of" or policy_variant == "quorum")
+     and on_satisfied ~= "cancel_remaining"
+     and on_satisfied ~= "let_run" then
+    return err("invalid_input",
+      "on_satisfied required for any_of/quorum: cancel_remaining | let_run")
   end
 
   -- Ordering: reject if edges have already been staged for this
@@ -6761,14 +6775,19 @@ redis.register_function('ff_set_edge_group_policy', function(keys, args)
 
   local existing_variant = redis.call("HGET", edgegroup, "policy_variant")
   if existing_variant == policy_variant then
+    -- Idempotent on identical restate (ignoring on_satisfied / k
+    -- drift; Stage B trusts the caller not to flip those once set).
     return ok("already_set")
   end
 
   redis.call("HSET", edgegroup,
     "policy_variant", policy_variant,
     "on_satisfied", on_satisfied,
+    "k", tostring(k_num),
     "n", "0",
     "succeeded", "0",
+    "failed", "0",
+    "skipped", "0",
     "group_state", "pending",
     "created_at", now_ms)
 
@@ -6886,6 +6905,224 @@ redis.register_function('ff_apply_dependency_to_child', function(keys, args)
 end)
 
 ---------------------------------------------------------------------------
+-- RFC-016 Stage B quorum helper (AnyOf / Quorum edge-group evaluator).
+--
+-- Owns the downstream transition for non-AllOf edge groups. Called
+-- from `ff_resolve_dependency` when the edgegroup hash's
+-- `policy_variant` is `any_of` or `quorum`.
+--
+-- Four-counter model (§3):
+--   succeeded  — upstream terminal = success
+--   failed     — upstream terminal = failed | cancelled | expired
+--   skipped    — upstream terminal = skipped
+--   n          — frozen total inbound edges in the group
+--
+-- Eligibility evaluation:
+--   AnyOf (k=1)   satisfied iff succeeded >= 1
+--   Quorum(k)     satisfied iff succeeded >= k
+--                 impossible iff failed + skipped > n - k
+--
+-- Once-fired semantics (Invariant Q1): after `group_state != pending`,
+-- counters still update (telemetry) but the downstream is NOT
+-- retriggered and siblings are NOT re-flagged.
+--
+-- CancelRemaining: when the terminal transition happens (satisfied or
+-- short-circuit impossible), the still-running sibling list is
+-- snapshotted into `cancel_siblings_pending` and `cancel_siblings_pending_flag`
+-- is set to "true". The dispatcher (Stage C) drains these; Stage B
+-- only WRITES the flag / list.
+--
+-- LetRun: siblings are never flagged, regardless of terminal
+-- `group_state` branch (RFC-016 §5, adjudication 2026-04-23). Pure.
+---------------------------------------------------------------------------
+local function resolve_dependency_quorum(K, A, dep, policy_variant)
+  local outcome_bucket  -- "succeeded" | "failed" | "skipped"
+  if A.upstream_outcome == "success" then
+    outcome_bucket = "succeeded"
+  elseif A.upstream_outcome == "skipped" then
+    outcome_bucket = "skipped"
+  else
+    outcome_bucket = "failed"
+  end
+
+  -- Idempotency on dep_hash: mark the edge resolved + maintain
+  -- unresolved_set so describe_flow's legacy counters don't drift out
+  -- of sync with edge-level state. The edgegroup hash is the source of
+  -- truth for eligibility under AnyOf/Quorum; deps_meta counters are
+  -- not consulted on this path.
+  if outcome_bucket == "succeeded" then
+    redis.call("HSET", K.dep_hash,
+      "state", "satisfied", "last_resolved_at", A.now_ms)
+  else
+    redis.call("HSET", K.dep_hash,
+      "state", "impossible", "last_resolved_at", A.now_ms)
+  end
+  redis.call("SREM", K.unresolved_set, A.edge_id)
+
+  -- Atomically bump the matching counter on the edgegroup hash.
+  local new_count = redis.call("HINCRBY", K.edgegroup, outcome_bucket, 1)
+
+  -- Load the group snapshot for decision-making.
+  local group_raw = redis.call("HGETALL", K.edgegroup)
+  local group = hgetall_to_table(group_raw)
+  local n = tonumber(group.n or "0")
+  local succeeded = tonumber(group.succeeded or "0")
+  local failed = tonumber(group.failed or "0")
+  local skipped = tonumber(group.skipped or "0")
+  local prior_state = group.group_state or "pending"
+  local on_satisfied = group.on_satisfied or ""
+  local k
+  if policy_variant == "any_of" then
+    k = 1
+  else
+    k = tonumber(group.k or "1")
+    if k < 1 then k = 1 end
+  end
+
+  -- Invariant Q2 defence: counters must not exceed n.
+  if (succeeded + failed + skipped) > n then
+    -- Counter overflow (edge applied twice?) — flag corruption and
+    -- abort without transitioning the downstream.
+    return err("invariant_violation",
+      "edgegroup counters exceed n: " .. tostring(succeeded + failed + skipped) .. "/" .. tostring(n))
+  end
+
+  -- Once-fired (Q1): if group already terminal, only update counters.
+  -- The HINCRBY above already did that. No downstream transition.
+  if prior_state == "satisfied" or prior_state == "impossible"
+     or prior_state == "cancelled" then
+    return ok("already_fired", "")
+  end
+
+  -- Evaluate current state.
+  local new_state = "pending"
+  if succeeded >= k then
+    new_state = "satisfied"
+  elseif (failed + skipped) > (n - k) then
+    new_state = "impossible"
+  end
+
+  if new_state == "pending" then
+    return ok("pending", "")
+  end
+
+  -- Terminal transition: write group_state + satisfied_at, decide
+  -- cancel_siblings_pending, and flip the downstream execution.
+  redis.call("HSET", K.edgegroup, "group_state", new_state)
+  if new_state == "satisfied" then
+    redis.call("HSET", K.edgegroup, "satisfied_at", A.now_ms)
+  end
+
+  -- Sibling-cancel flagging (Stage B only FLAGS — Stage C dispatches).
+  -- LetRun is pure: never flag, regardless of satisfied vs impossible.
+  if on_satisfied == "cancel_remaining" then
+    redis.call("HSET", K.edgegroup,
+      "cancel_siblings_pending_flag", "true",
+      "cancel_siblings_reason",
+        (new_state == "satisfied") and "sibling_quorum_satisfied"
+                                    or "sibling_quorum_impossible")
+    -- Stage C will drain `cancel_siblings_pending` (a SET of execution
+    -- ids); Stage B initialises it empty — dispatcher enumeration
+    -- happens on the flow partition in Stage C, not here (the
+    -- downstream's edgegroup is on {fp:N}, not {p:N}).
+  end
+
+  -- Downstream transition.
+  local raw = redis.call("HGETALL", K.core_key)
+  if #raw == 0 then return ok(new_state, "") end
+  local core = hgetall_to_table(raw)
+
+  if new_state == "satisfied" then
+    -- Satisfied: flip eligible, optionally COPY data_passing_ref.
+    local data_injected = ""
+    if is_set(dep.data_passing_ref)
+       and outcome_bucket == "succeeded"
+       and core.terminal_outcome == "none" then
+      local copied = redis.call(
+        "COPY", K.upstream_result, K.downstream_payload, "REPLACE")
+      if copied == 1 then
+        data_injected = "data_injected"
+      end
+    end
+
+    if core.lifecycle_phase == "runnable"
+       and core.ownership_state == "unowned"
+       and core.terminal_outcome == "none"
+       and core.eligibility_state == "blocked_by_dependencies" then
+      local new_attempt_state = core.attempt_state
+      if not is_set(new_attempt_state) or new_attempt_state == "none" then
+        new_attempt_state = "pending_first_attempt"
+      end
+      redis.call("HSET", K.core_key,
+        "lifecycle_phase", core.lifecycle_phase,
+        "ownership_state", core.ownership_state or "unowned",
+        "eligibility_state", "eligible_now",
+        "blocking_reason", "waiting_for_worker",
+        "blocking_detail", "",
+        "terminal_outcome", "none",
+        "attempt_state", new_attempt_state,
+        "public_state", "waiting",
+        "last_transition_at", A.now_ms,
+        "last_mutation_at", A.now_ms)
+      redis.call("ZREM", K.blocked_deps_zset, core.execution_id or "")
+      local priority = tonumber(core.priority or "0")
+      local created_at_ms = tonumber(core.created_at or "0")
+      local score = 0 - (priority * 1000000000000) + created_at_ms
+      redis.call("ZADD", K.eligible_zset, score, core.execution_id or "")
+    end
+    return ok("satisfied", data_injected)
+  end
+
+  -- Impossible: short-circuit skip the downstream.
+  local child_skipped = false
+  if core.terminal_outcome == "none" then
+    local skip_attempt_state = core.attempt_state or "none"
+    if skip_attempt_state == "running_attempt"
+       or skip_attempt_state == "attempt_interrupted" then
+      skip_attempt_state = "attempt_terminal"
+      redis.call("HSET", K.attempt_hash,
+        "attempt_state", "ended_cancelled",
+        "ended_at", A.now_ms,
+        "failure_reason", "dependency_impossible")
+      if redis.call("EXISTS", K.stream_meta) == 1 then
+        redis.call("HSET", K.stream_meta,
+          "closed_at", A.now_ms,
+          "closed_reason", "dependency_impossible")
+      end
+    elseif is_set(skip_attempt_state) and skip_attempt_state ~= "none" then
+      skip_attempt_state = "none"
+    end
+
+    redis.call("HSET", K.core_key,
+      "lifecycle_phase", "terminal",
+      "ownership_state", "unowned",
+      "eligibility_state", "not_applicable",
+      "blocking_reason", "none",
+      "blocking_detail", "",
+      "terminal_outcome", "skipped",
+      "attempt_state", skip_attempt_state,
+      "public_state", "skipped",
+      "completed_at", A.now_ms,
+      "last_transition_at", A.now_ms,
+      "last_mutation_at", A.now_ms)
+    redis.call("ZREM", K.blocked_deps_zset, core.execution_id or "")
+    redis.call("ZADD", K.terminal_zset, tonumber(A.now_ms), core.execution_id or "")
+    child_skipped = true
+
+    if is_set(core.flow_id) and is_set(core.execution_id) then
+      local payload = cjson.encode({
+        execution_id = core.execution_id,
+        flow_id = core.flow_id,
+        outcome = "skipped",
+      })
+      redis.call("PUBLISH", "ff:dag:completions", payload)
+    end
+  end
+
+  return ok("impossible", child_skipped and "child_skipped" or "")
+end
+
+---------------------------------------------------------------------------
 -- #23  ff_resolve_dependency  (on {p:N})
 --
 -- Resolve one dependency edge: satisfied (upstream success) or impossible
@@ -6933,6 +7170,19 @@ redis.register_function('ff_resolve_dependency', function(keys, args)
   -- 2. Already resolved?
   if dep.state == "satisfied" or dep.state == "impossible" then
     return ok("already_resolved")
+  end
+
+  -- RFC-016 Stage B: branch on edge-group policy. AnyOf / Quorum run
+  -- the four-counter state machine and own the downstream transition;
+  -- AllOf (and legacy flows without an edgegroup hash) keep the
+  -- original path unchanged.
+  local policy_variant_b = nil
+  if is_set(K.edgegroup) and redis.call("EXISTS", K.edgegroup) == 1 then
+    policy_variant_b = redis.call("HGET", K.edgegroup, "policy_variant")
+  end
+
+  if policy_variant_b == "any_of" or policy_variant_b == "quorum" then
+    return resolve_dependency_quorum(K, A, dep, policy_variant_b)
   end
 
   -- 3. Satisfaction path (upstream completed successfully)

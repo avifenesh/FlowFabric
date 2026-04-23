@@ -7,6 +7,44 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-016 Stage B: AnyOf / Quorum edge-dependency resolver.** Lights
+  up the four-counter state machine on top of the Stage A edgegroup
+  hash. `EngineBackend::set_edge_group_policy` now ACCEPTS
+  `EdgeDependencyPolicy::AnyOf { on_satisfied }` and
+  `EdgeDependencyPolicy::Quorum { k, on_satisfied }` (Stage A rejected
+  them with a typed validation error); only `k == 0` / absurd `k` and
+  unknown `#[non_exhaustive]` variants remain rejected. The Lua
+  `ff_resolve_dependency` function gains a quorum branch that, when the
+  edgegroup hash's `policy_variant` is `any_of` or `quorum`, owns the
+  downstream transition via the §3 four-counter model: `succeeded`,
+  `failed`, `skipped` against frozen `n`. `AnyOf` fires on first
+  success; `Quorum(k)` fires on the k-th success; either short-circuits
+  to `impossible` (and skip-propagates the downstream) as soon as
+  `failed + skipped > n - k`. Transitions are strictly one-shot
+  (Invariant Q1) — late upstream terminals advance counters for
+  telemetry without re-firing or re-skipping. `OnSatisfied::
+  CancelRemaining` writes a `cancel_siblings_pending_flag = true`
+  (plus `cancel_siblings_reason` = `sibling_quorum_satisfied` or
+  `sibling_quorum_impossible`) into the edgegroup hash on the terminal
+  transition; `OnSatisfied::LetRun` NEVER writes the flag, regardless
+  of whether the group terminates via `satisfied` or `impossible`
+  (RFC-016 §5, adjudication 2026-04-23 — `LetRun` is pure).
+  **Stage B does NOT ship the sibling-cancel dispatcher, the
+  `ff:pending_cancel_groups:{p:N}` index SET, the reconciler, or
+  full cancel-to-terminal integration coverage — those land in
+  Stages C / D / E.** `ff_edge_group_policy_total{policy}` now emits
+  all three labels (`all_of` / `any_of` / `quorum`). The Stage A
+  snapshot decoder (`describe_flow.edge_groups`) was extended to
+  surface `AnyOf { on_satisfied }` and `Quorum { k, on_satisfied }`
+  from the edgegroup hash. Lua `ff_set_edge_group_policy` ARGV widens
+  from 3 → 4 (adds `k`). Integration coverage:
+  `crates/ff-test/tests/flow_edge_policies_stage_b.rs` (8 scenarios:
+  AnyOf × {CancelRemaining, LetRun}, Quorum(3/5) × {CancelRemaining,
+  LetRun}, impossible-quorum × {CancelRemaining, LetRun}, `k=0`
+  rejection, once-fired semantics). The retired Stage-A-only
+  `stage_a_rejects_any_of_and_quorum` assertion is replaced by a
+  module-level doc stub pointing at the Stage B file. Lua library
+  bumped 19 → 20.
 - **RFC-015: Stream durability modes (`DurableSummary`, `BestEffortLive`).**
   `append_frame` now carries a per-call `StreamMode` (on the `Frame`
   value) selecting one of `Durable` (default, pre-015 behaviour),
