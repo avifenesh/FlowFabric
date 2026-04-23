@@ -43,6 +43,8 @@ Today consumers expressing pattern (3) must spin an internal coordinator executi
 
 ### 1.3 What is **not** in scope (inherited deferrals stay deferred)
 
+(See §1.4 below for the canonical worked examples of patterns 1–3.)
+
 RFC-005 §Designed-for-deferred lists seven deferrals. This RFC takes two: `all_of` and `count(n)`. The remaining five **stay deferred** and must not drift into scope:
 
 - Signal routing to flow coordinator — RFC-016 concern.
@@ -52,6 +54,52 @@ RFC-005 §Designed-for-deferred lists seven deferrals. This RFC takes two: `all_
 - Bulk signal delivery — separate RFC (API surface).
 
 §9 names these explicitly under "Out of scope by choice, not oversight."
+
+### 1.4 Canonical worked examples
+
+The three §1.1 patterns map to these concrete builder-form constructions
+(see §10.3 for the full builder API):
+
+**Pattern 1 — 2-of-5 human reviewers (canonical style: shared waitpoint +
+`DistinctSources`).** Reviewer identity comes from policy at runtime;
+creating a waitpoint per reviewer forces a fan-out the policy engine cannot
+commit to at suspend-time. Preferred shape:
+
+```rust
+let cond = ResumeCondition::count(2)
+    .distinct_sources()
+    .on_waitpoint(wp_reviewers);  // one waitpoint, N signals land on it
+```
+
+A signal's `source_identity` is the reviewer's user id. Two signals from
+the same reviewer dedup at the token layer (§4.1).
+
+**Pattern 2 — N external callbacks from the same webhook endpoint.** Each
+callback carries its own `idempotency_key` / `signal_id`. Use
+`DistinctSignals`:
+
+```rust
+let cond = ResumeCondition::count(n)
+    .distinct_signals()
+    .on_waitpoint(wp_webhook);
+```
+
+**Pattern 3 — all-of distinct event types (heterogeneous subsystems).** Each
+subsystem owns its own waitpoint. Use `all_of_waitpoints`:
+
+```rust
+let cond = ResumeCondition::all_of_waitpoints([
+    wp_db_migration_complete,
+    wp_cache_warmed,
+    wp_feature_flag_set,
+]);
+```
+
+**When to prefer multi-waitpoint over shared-waitpoint.** Use one waitpoint
+per source when the subsystems are heterogeneous (different matchers,
+different payload schemas, different TTLs). Use a shared waitpoint when the
+signals are homogeneous and only the source_identity distinguishes them (the
+2-of-5 pattern).
 
 ---
 
@@ -138,6 +186,33 @@ RFC-010 §64 already defines `ff:exec:{p:N}:<execution_id>:suspension:current` H
 | `ff:exec:{p:N}:<execution_id>:suspension:current:satisfied_set` | SET | created at `suspend_execution`, deleted on resume/cancel/timeout | Populated with "satisfier tokens" — see §3.2. Membership is the durable satisfaction state. |
 | `ff:exec:{p:N}:<execution_id>:suspension:current:member_map` | HASH | same lifetime | Static map from `waitpoint_id` → `condition_path` (a JSON path like `"members[0]"` or `"members[1]"`). Written once at suspend-time; read at each signal delivery to locate which `AllOf` / `Count` node a signal affects. |
 
+#### 3.1.1 Cleanup owners
+
+Both keys are created at `suspend_execution` commit. They MUST be deleted
+by each of the three suspension-terminating paths, named explicitly:
+
+| Terminator | Deletion site |
+|---|---|
+| `resume_execution` (signal-driven, §3.3 root-satisfied path) | Lua `ff_deliver_signal.lua` at `close_and_resume` |
+| `cancel_execution` (RFC-013) | Lua `ff_cancel_execution.lua` |
+| `expire_suspension` (timeout expirer thread, RFC-004 §timeout-behavior) | Lua `ff_expire_suspension.lua` |
+
+Phase-2 integration test list (§10.2) includes
+`expire_deletes_satisfied_set_and_member_map` and
+`cancel_deletes_satisfied_set_and_member_map` to catch owner drift.
+
+#### 3.1.2 Key budget impact
+
+- Before RFC-014: suspension owns `{current HASH, waitpoints ZSET}`.
+- After RFC-014: suspension owns `{current HASH, waitpoints ZSET,
+  satisfied_set SET, member_map HASH}`. Net delta: +2 keys per active
+  suspension.
+- All four keys share the `{p:N}:<execution_id>` hash-tag → co-located on
+  the same cluster shard, accessible from a single Valkey Function call.
+- Key count is O(1) in condition complexity: nested depth and waitpoint-set
+  size do not add keys (both are encoded inside the SET/HASH values, not
+  as separate keys).
+
 Rationale:
 - **SET** gives O(1) "have we seen this satisfier before" (§4 idempotency).
 - **HASH** is a static lookup table, not touched by signal delivery except read. Write-once at suspend commit.
@@ -151,11 +226,27 @@ A satisfier token is the element stored in `satisfied_set`. Format depends on `C
 |---|---|---|
 | `DistinctWaitpoints` | `"wp:<waitpoint_id>"` | `wp:WP-abc123` |
 | `DistinctSignals` | `"sig:<signal_id>"` | `sig:SG-def456` |
-| `DistinctSources` | `"src:<source_type>:<source_identity>"` | `src:user:alice@example.com` |
+| `DistinctSources` | `"src:<source_type>:<source_identity>"` | `src:user:alice@example.com`, `src:system:operator-override` |
 
-For `AllOf` members, the token is always of the `wp:` form, since `AllOf` is satisfied per-member-waitpoint.
+**Source-type inclusion is intentional.** `source_type` is part of the
+token precisely so `src:user:alice` and `src:system:alice` count as
+distinct satisfiers. This closes §8 Q1: system-origin signals (e.g.
+operator overrides via `send_signal`) DO count toward a `DistinctSources`
+count. Operator tooling surfaces source_type breakdowns on
+`evaluate_resume_conditions` (§4.4) so "2 operator overrides" is visibly
+distinguishable from "2 user approvals."
 
-For nested conditions (`AllOf { members: [Count { ... }] }`), the `Count` sub-node maintains its own virtual satisfaction in-condition, and once satisfied contributes a synthetic `"node:<path>"` token to the parent's `satisfied_set`. See §3.4.
+Consumers that want "user-only" quorum encode the constraint via the
+`Count.matcher` field (§2.1), e.g. `matcher = source_type == "user"`. No
+separate `CountKind::DistinctUserSources` variant is introduced (rejected
+as overlapping with matcher-based filtering).
+
+**Token shape at leaves under `AllOf`.** For a direct `Single` child of
+`AllOf`, the satisfier token is `wp:<waitpoint_id>` — the `wp:` token IS
+the satisfaction marker, no synthetic `node:<path>` is emitted. For a
+non-`Single` child (`AllOf` or `Count`), once the child is satisfied a
+synthetic `node:<child_path>` token is SADDed. See §3.3 step 4 for the
+ordering and §3.3's restated `AllOf.evaluate_node` rule.
 
 ### 3.3 Matching algorithm (extends RFC-005 §8.3)
 
@@ -163,7 +254,11 @@ Lua pseudocode lives in `ff-script/src/functions/signal.rs`'s `deliver_signal` p
 
 ```
 on deliver_signal(signal, execution_id):
-    -- Load condition topology (parsed once, cached in function-scope table)
+    -- Parse condition topology. NOTE: "parse" is per-invocation only —
+    -- Valkey Functions are stateless across calls, so there is no
+    -- cross-call cache. Parse cost is O(condition size) ≤ O(8 KiB) per
+    -- signal (§5.1 cap). The parsed `cond` is a function-local table for
+    -- the duration of this single deliver_signal invocation only.
     local cond       = parse_resume_condition(HGET suspension:current resume_condition_json)
     local member_map = HGETALL suspension:current:member_map
     local satisfied  = SMEMBERS suspension:current:satisfied_set
@@ -179,6 +274,13 @@ on deliver_signal(signal, execution_id):
     -- 2. Compute the satisfier token for this signal against this node.
     local token = satisfier_token(signal, node.kind or "DistinctWaitpoints")
 
+    -- 2.5 Apply the node's local matcher, if any. A signal that fails the
+    --     matcher is recorded on the waitpoint (RFC-005 semantics) but
+    --     does not contribute a satisfier token to this node.
+    if node.matcher ~= nil and not match(signal, node.matcher) then
+        return {effect = "signal_ignored_matcher_failed"}
+    end
+
     -- 3. Idempotency: SADD returns 0 if already present.
     local added = SADD suspension:current:satisfied_set token
     if added == 0 then
@@ -186,8 +288,11 @@ on deliver_signal(signal, execution_id):
     end
 
     -- 4. Re-evaluate satisfaction of every node on the path to the root.
-    --    Satisfaction propagates upward: a satisfied child adds its
-    --    synthetic node-token to the parent's satisfied_set.
+    --    Satisfaction propagates upward: a non-leaf satisfied child adds
+    --    its synthetic `node:<child_path>` token to the parent's
+    --    satisfied_set. Leaf `Single` children need no synthetic token —
+    --    their `wp:<id>` IS the satisfaction marker (see §3.2 + the
+    --    restated AllOf rule below).
     local path = ancestor_path(node_path)   -- e.g. ["members[0]", ""]
     for _, p in ipairs(path) do
         local n = descend(cond, p)
@@ -195,7 +300,7 @@ on deliver_signal(signal, execution_id):
             if p == "" then
                 -- root satisfied → close suspension, mark resume-eligible
                 return close_and_resume(execution_id, signal)
-            else
+            elseif not is_single_leaf(n) then
                 SADD suspension:current:satisfied_set ("node:" .. p)
             end
         end
@@ -204,10 +309,15 @@ on deliver_signal(signal, execution_id):
     return {effect = "appended_to_waitpoint"}
 ```
 
-`evaluate_node` rules:
+`evaluate_node` rules (restated for clarity — leaf `Single` case is
+distinct from non-leaf):
+
 - `Single`: satisfied iff `wp:<waitpoint_id>` ∈ `satisfied_set`.
-- `AllOf { members }`: satisfied iff every member's synthetic `node:<child_path>` ∈ `satisfied_set` (leaf `Single` children use `wp:<id>`).
-- `Count { n, kind, waitpoints }`: satisfied iff `|{tokens in satisfied_set matching this node's kind+waitpoints}| >= n`.
+- `AllOf { members }`: satisfied iff, for each member `m` at child_path `cp`:
+  - if `m` is a `Single`, `wp:<m.waitpoint_id>` ∈ `satisfied_set`;
+  - else (`m` is `AllOf` or `Count`), `node:<cp>` ∈ `satisfied_set`.
+- `Count { n, kind, waitpoints }`: satisfied iff
+  `|{tokens in satisfied_set matching this node's kind+waitpoints}| >= n`.
 
 ### 3.4 Why a flat SET + path map, not nested HASHes
 
@@ -265,6 +375,28 @@ RFC-005 §323 defines `evaluate_resume_conditions(execution_id)` as an operator 
 
 This is Class C (derived/read-only). No state transitions from this call.
 
+The operator-facing output includes per-`DistinctSources` source_type
+breakdowns (e.g. `{ "user": 1, "system": 1 }`) so "2 operator overrides"
+is visibly distinguishable from "2 user approvals" (see §3.2 on Q1
+closure).
+
+### 4.5 Resume payload under multi-signal
+
+RFC-004's `resumed_with` payload surfaces what signal(s) unblocked the
+suspension. For a `Single`, this is the single signal. For multi-signal
+conditions it is two fields:
+
+| Field | Meaning |
+|---|---|
+| `closer_signal_id` | The signal whose acceptance + SADD caused `evaluate_node` at the root to flip to satisfied. Exactly one per resume. |
+| `all_satisfier_signals` | The subset of `list_waitpoint_signals` whose satisfier tokens are present in `satisfied_set` at close time. For a `Count(3, DistinctSources)`, this is three signals (one per source). For `AllOf { Count(3), Single }`, this is four signals. |
+
+Consumers that need only "who closed it" read `closer_signal_id`. Consumers
+that need the full satisfier set (e.g. to attribute approvals in an audit
+log) iterate `all_satisfier_signals`. Signals that landed but did not
+contribute a satisfier (duplicates, matcher-failed) are NOT in
+`all_satisfier_signals` but remain visible via `list_waitpoint_signals`.
+
 ---
 
 ## 5. Error taxonomy
@@ -280,12 +412,31 @@ This is Class C (derived/read-only). No state transitions from this call.
 | `condition_depth_exceeded` | Recursive nest depth > 4 | Suspend-time. Hard cap. |
 | `condition_size_exceeded` | Total serialized `resume_condition_json` > 8 KiB | Suspend-time. Bounds Lua parse cost. |
 
+#### 5.1.1 Error payload shape
+
+All new kinds map to a single structured error type:
+
+```rust
+pub enum EngineError {
+    // ...existing variants...
+    InvalidCondition {
+        kind: ConditionErrorKind,
+        detail: String,  // human-readable: "depth 5 exceeds cap 4 at path members[0].members[0].members[0]"
+    },
+}
+```
+
+`detail` is consumer-facing and MUST be specific enough to locate the
+offending subtree (depth, path, cardinality values). Consumer error-surfacing
+code (e.g. cairn's reviewer panel) renders the `detail` string verbatim.
+
 ### 5.2 Late-detection (at signal delivery)
 
 | Error (existing, clarified by RFC-014) | Condition |
 |---|---|
 | `invalid_resume_condition` (RFC-004 §412) | Extended: also fires if `resume_condition_json` fails to parse in Lua at suspend (catch-all). |
 | `signal_ignored_not_in_condition` (new) | Signal delivered to a waitpoint whose `waitpoint_id` is not in `member_map`. Signal is recorded, no satisfaction attempted. Returns this effect for observability. |
+| `signal_ignored_matcher_failed` (new) | Signal delivered to a waitpoint whose `waitpoint_id` IS in `member_map`, but the local node's `Count.matcher` (§2.1) rejects it. Signal is recorded on the waitpoint's signal list (RFC-005 semantics) but does not contribute a satisfier token. |
 
 ### 5.3 Why early detection for `count_exceeds_waitpoint_set`
 
@@ -304,6 +455,27 @@ RFC-014 chooses **suspend-time** validation for size/cardinality errors for thre
 3. Signal acceptance and satisfaction evaluation are atomic within a single Valkey Function call (Class A), consistent with RFC-005 §306.
 4. No nested condition exceeds depth 4. (Soft-cap; consumers have not presented a real pattern > 2.)
 5. `member_map` is write-once — read-only after `suspend_execution` commits.
+
+### 5.5 Cap rationale (depth 4, size 8 KiB)
+
+Both caps are soft — bumping either requires only a validator constant
+change, not a wire-format or schema change. The current values are chosen
+as:
+
+- **Depth 4.** Real consumer patterns top out at depth 2 (`AllOf { Count,
+  Single }` = depth 2). Depth 4 gives 2× headroom for future patterns
+  without inviting arbitrary recursion. Per-signal cost is O(depth); at
+  depth 4 the walk is four `evaluate_node` calls, each O(|members|) or
+  O(|tokens|). Fits in a single `deliver_signal` Function budget.
+- **Size 8 KiB.** Roughly 10% of Valkey's default ARGV soft limit (64 KiB
+  per parameter), leaving headroom for other ARGV fields in the same
+  `suspend_execution` call (waitpoint specs, continuation payload,
+  idempotency key). A condition at 8 KiB can encode ~200 nested `Single`s
+  or ~40 `Count`s with 5 waitpoints each — above observed real need.
+
+If a future consumer hits either cap, lifting them is a single-PR change
+(validator constant + the cap-rationale paragraph here). No persisted
+data migrates.
 
 ---
 
@@ -325,11 +497,44 @@ The `timeout_behavior` values (from RFC-004 §254) already support this:
 
 **This RFC does NOT introduce a new timeout mode.** It defines how existing modes compose with multi-signal conditions.
 
+**Timeout token form.** The synthetic timeout token is
+`timeout:<suspension_id>` — exactly one token per suspension, regardless of
+`CountKind`. A `Count { n, kind }` node that sees the timeout token
+short-circuits to satisfied (i.e. the timeout token is treated as a
+universal node-satisfier), it does NOT increment the distinct-satisfier
+count. Rationale: a timeout has no source_identity / signal_id /
+waitpoint_id, so it cannot contribute a distinct satisfier under any
+`CountKind`; treating it as a node-level short-circuit keeps the token
+algebra clean. The short-circuit fires only when
+`timeout_behavior == auto_resume_with_timeout_signal`; under `fail` the
+token is not SADDed and the execution transitions to failure directly.
+
+Consumers that want "resume only if ≥k of n signals arrived AND timeout
+fired" must express that as application-layer logic on the resumed
+worker — see §6.2.
+
 ### 6.2 Consumer opt-in for partial-count resume
 
 The pattern "resume with whatever count we have if timeout fires" is expressible **without** a new variant: put the timeout-handling logic in the resumed worker code. The execution resumes with `timeout_behavior = auto_resume_with_timeout_signal`, and the worker inspects `list_waitpoint_signals` to see what actually arrived. This keeps the condition language minimal.
 
 If a consumer wants *condition-level* "count(3) OR timeout-partial", they must write it as two sequential suspensions — one `Count(3)` with `fail` timeout, a retry-handler that runs a second suspension with a shorter timeout. This is verbose but expressible.
+
+**Idiomatic surface.** To make the common "wait for 2-of-5 with 30m
+timeout; on partial-quorum, escalate" pattern ergonomic, the
+`SuspensionTimedOut` error variant carries `partial_satisfiers` so the
+caller can branch without a second `evaluate_resume_conditions` round-trip:
+
+```rust
+match self.suspend(spec, cond_count_2_of_5, timeout_30m).await {
+    Ok(resume) => handle_full_quorum(resume),
+    Err(EngineError::SuspensionTimedOut { partial_satisfiers, .. }) =>
+        handle_partial(partial_satisfiers),
+}
+```
+
+`partial_satisfiers: Vec<SatisfierToken>` echoes the `satisfied_set`
+contents at timeout time. This is an additive error-field change; no new
+condition variant and no new `timeout_behavior` value.
 
 ### 6.3 Why not introduce `PartialCount` variant
 
@@ -384,11 +589,19 @@ RFC-016 addresses flow-edge quorum (DAG join semantics). RFC-014 handles waitpoi
 
 ## 8. Open questions
 
-1. **Do we support `CountKind::DistinctSources` with `source_type = "system"` signals?** Operator-override signals via `send_signal` with source_type=system could trivially satisfy a `DistinctSources(2)` count. Leaning: yes, count them, but note this in operator tooling so "2 operator overrides != 2 user approvals" is visible. Escalate to owner.
+All prior open questions are closed as of round-1 challenge revisions:
 
-2. **Should `AllOf` short-circuit evaluation on a satisfied signal that doesn't advance the root?** Current design: always evaluate up to root (§3.3 step 4). Alternative: mark node-satisfied only, defer root evaluation to a "maybe ready" queue. Leaning: no — root eval is O(depth ≤ 4) and happens per-signal. Not worth the complexity.
-
-3. **Is per-waitpoint quorum (`Count(2, kind=DistinctSources, waitpoints=[single_wp])`) enough to express "2-of-5 reviewers one waitpoint" OR do we need a `WaitpointSpec.expected_signal_count` hint to size TTL/cleanup?** Leaning: the `Count` variant already expresses it; TTL/cleanup is RFC-004's concern. But worth a round of review against real `cairn-fabric` review-approval flows before locking.
+1. **Closed — system-source signals count.** `CountKind::DistinctSources`
+   counts signals with `source_type = "system"` as distinct satisfiers;
+   `source_type` is part of the token (§3.2). Consumers that want
+   user-only quorum use `Count.matcher = source_type == "user"`.
+2. **Closed — no short-circuit.** Per-signal root evaluation is O(depth ≤ 4);
+   the "maybe ready" queue alternative adds complexity without measurable
+   win. Design stays as §3.3 step 4.
+3. **Closed — shared waitpoint is canonical.** The shared-waitpoint form
+   (`Count(2, DistinctSources, waitpoints=[wp_reviewers])`) is the
+   canonical 2-of-5 shape (§1.4). No `WaitpointSpec.expected_signal_count`
+   hint is added; signal TTL is out of scope per §1.3.
 
 ---
 
@@ -466,10 +679,21 @@ None of these are blockers for multi-signal resume. Multi-signal works with v1's
 - Integration tests in `crates/ff-backend-valkey/tests/`:
   - `count_2_distinct_sources_resumes_on_second_source`
   - `count_2_distinct_sources_ignores_duplicate_source`
+  - `count_2_distinct_sources_counts_system_signal` (Q1 closure)
+  - `count_matcher_filters_user_only_sources` (matcher-based filtering)
   - `allof_three_waitpoints_resumes_when_all_fired`
   - `allof_replay_after_partial_count_preserves_state`
   - `count_exceeds_waitpoint_set_rejected_at_suspend`
   - `timeout_with_partial_count_uses_timeout_behavior`
+  - `timeout_token_short_circuits_count_node` (§6.1 token form)
+  - `suspension_timed_out_error_carries_partial_satisfiers` (§6.2 idiom)
+  - `expire_deletes_satisfied_set_and_member_map` (§3.1.1 owner)
+  - `cancel_deletes_satisfied_set_and_member_map` (§3.1.1 owner)
+  - `resume_payload_exposes_closer_and_all_satisfiers` (§4.5)
+- Cluster-mode integration tests in
+  `crates/ff-backend-valkey/tests/cluster/`:
+  - `satisfied_set_colocated_with_suspension_in_cluster_mode`
+  - `member_map_colocated_with_suspension_in_cluster_mode`
 
 **Exit:** integration tests green against Valkey 8.x; `evaluate_resume_conditions` diagnostic reflects correct partial state.
 
@@ -477,9 +701,46 @@ None of these are blockers for multi-signal resume. Multi-signal works with v1's
 
 **Crates:** `ff-sdk`.
 
-- Public builder API: `ResumeCondition::all_of([...])`, `ResumeCondition::count(n).distinct_sources().on_waitpoints([...])`.
-- Doc tests in `ff-sdk/src/suspend.rs` covering the three canonical patterns from §1.1.
-- Smoke example in `examples/` that runs a 2-of-3 approval flow end-to-end.
+Public builder API (full surface; doctests cover each entry point):
+
+```rust
+impl ResumeCondition {
+    pub fn single(wp: WaitpointKey, matcher: ConditionMatcher) -> Self;
+
+    /// Explicit all-of with heterogeneous members (nested Count, etc.).
+    pub fn all_of(members: impl IntoIterator<Item = ResumeCondition>) -> Self;
+
+    /// Shorthand for the common `AllOf { members: [Single, Single, ...] }`
+    /// shape (pattern 3 — heterogeneous-subsystems-each-fired).
+    pub fn all_of_waitpoints(
+        wps: impl IntoIterator<Item = WaitpointKey>,
+    ) -> Self;
+
+    pub fn count(n: u32) -> CountBuilder;
+}
+
+impl CountBuilder {
+    pub fn distinct_waitpoints(self) -> Self;
+    pub fn distinct_signals(self) -> Self;
+    pub fn distinct_sources(self) -> Self;
+    pub fn with_matcher(self, m: ConditionMatcher) -> Self;
+
+    /// Multi-waitpoint terminator (pattern 3 variant).
+    pub fn on_waitpoints(
+        self,
+        wps: impl IntoIterator<Item = WaitpointKey>,
+    ) -> ResumeCondition;
+
+    /// Single-waitpoint terminator (canonical pattern 1 / 2 shape).
+    pub fn on_waitpoint(self, wp: WaitpointKey) -> ResumeCondition;
+}
+```
+
+- Doc tests in `ff-sdk/src/suspend.rs` covering each §1.4 canonical
+  pattern: 2-of-5 reviewers (shared waitpoint), N webhook callbacks
+  (distinct signals), all-of heterogeneous subsystems.
+- Smoke example in `examples/` that runs a 2-of-3 approval flow
+  end-to-end against a published artifact.
 
 **Exit:** scratch-project smoke (per the "smoke after publish" memory) validates the three patterns against a published artifact.
 
