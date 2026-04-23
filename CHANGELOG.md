@@ -5,6 +5,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-23
+
 ### Breaking changes
 
 - **Seal `FlowFabricWorker::client()` + migrate stream fns through the
