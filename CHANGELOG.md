@@ -5,9 +5,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed
+### Breaking changes
 
-- **Breaking — Seal `ferriskey::Error` leak via `BackendError` wrapper (#88):**
+- **Seal `ferriskey::Error` leak via `BackendError` wrapper (#88):**
   Public SDK + server error surfaces no longer name `ferriskey::Error` /
   `ferriskey::ErrorKind` directly. A new `ff_core::BackendError` +
   `ff_core::BackendErrorKind` taxonomy (non-exhaustive, backend-agnostic)
@@ -48,7 +48,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     client semantics where these are redirects/transients the caller
     should retry.
 
-- **Breaking — `ff_core::backend::Frame` extended (RFC-012 §R7, PR #147):**
+- **`ff_core::backend::Frame` extended (RFC-012 §R7, PR #147):**
   Added `frame_type: String` + `correlation_id: Option<String>` so
   `ClaimedTask::append_frame` can forward through the `EngineBackend`
   trait without wire-parity regression. Closes the Round-7
@@ -59,7 +59,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   non-empty, falling back to the `FrameKind` encoding when callers
   populate only the typed `kind`.
 
-- **Breaking — `EngineBackend` trait (RFC-012 §R7, #117):**
+- **`EngineBackend` trait (RFC-012 §R7, #117):**
   - `append_frame` now returns `AppendFrameOutcome { stream_id,
     frame_count }` (was `()`). The type moves from `ff_sdk::task`
     to `ff_core::backend`; a `pub use` shim preserves the
@@ -92,10 +92,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `Frame`-shape extension (to preserve the free-form `frame_type`
     strings that 5 in-tree callers rely on); closes in Stage 1d
     alongside `suspend` input-shape work.
-- Wired `BackendRetry` to ferriskey `ClientBuilder::retry_strategy` in
-  `ValkeyBackend::connect`. All 4 fields honored when set; when
-  all-`None`, ferriskey's builder default is used (no call to
-  `.retry_strategy`).
+
 - Reshaped `BackendRetry` to match ferriskey's `ConnectionRetryStrategy`
   (fields: `exponent_base`, `factor`, `number_of_retries`,
   `jitter_percent`). Previous `max_attempts`/`base_backoff` were
@@ -103,14 +100,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   shape is a direct pass-through. Breaking field reshape; pre-1.0
   posture accepts.
 
-### Removed
-
-- **`BackendTimeouts.keepalive` field.** ferriskey handles TCP keepalive
-  unconditionally with OS-default settings
+- **`BackendTimeouts.keepalive` field removed.** ferriskey handles TCP
+  keepalive unconditionally with OS-default settings
   (`ferriskey/src/connection/tokio.rs:33-36`); the field was never wired
   and had no observable behavior. Consumers can re-add custom-interval
   wiring if needed via a future additive field. Breaking public-field
   removal accepted under pre-1.0 posture.
+
+### Changed
+
+- Wired `BackendRetry` to ferriskey `ClientBuilder::retry_strategy` in
+  `ValkeyBackend::connect`. All 4 fields honored when set; when
+  all-`None`, ferriskey's builder default is used (no call to
+  `.retry_strategy`).
 
 ## [0.3.4] - 2026-04-22
 
