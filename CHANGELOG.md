@@ -182,6 +182,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   through the relocated `ff-core` decoders. `ff-sdk`'s
   `FlowFabricWorker::describe_execution` / `describe_flow` /
   `list_*_edges` collapse to thin forwarders over the trait.
+- **`BackendTimeouts.request` now honored (#139).** `ValkeyBackend::connect`
+  previously dropped `config.timeouts` on the floor, dialing via URL-based
+  `Client::connect` / `connect_cluster`; the field had no observable effect.
+  Migrated to `ferriskey::ClientBuilder` so `BackendTimeouts.request` threads
+  through to `ClientBuilder::request_timeout` (cluster + TLS flags also move
+  to the builder; no behavior change for those). `None` preserves the
+  ferriskey default. Behavior-visible: consumers that set a custom
+  `request` timeout will now see it enforced.
+
+### Infrastructure
+
+- Scenario 4 bench methodology: switched to N=5 multi-sample runs with
+  reported mean + stdev for statistical honesty; single-sample numbers
+  previously hid run-to-run variance (#140).
+- Refreshed Scenario 4 baseline at v0.1.0 + HEAD under the N=5
+  methodology so regression tracking has a current reference point
+  (#144).
+- Scenario 4 `apalis` comparison now uses `apalis-workflow` DAG rather
+  than hand-rolled chaining, aligning the comparand with apalis's
+  intended DAG surface (#51, #148).
 
 ## [0.3.4] - 2026-04-22
 
