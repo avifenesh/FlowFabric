@@ -19,8 +19,8 @@ use ff_core::backend::{
     WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    ListFlowsPage, ReportUsageResult,
+    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
+    ListLanesPage, ReportUsageResult,
 };
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
@@ -216,6 +216,15 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<Option<FlowId>, EngineError> {
         self.record("resolve_execution_flow_id")?;
         Ok(None)
+    }
+
+    async fn list_lanes(
+        &self,
+        _cursor: Option<LaneId>,
+        _limit: usize,
+    ) -> Result<ListLanesPage, EngineError> {
+        self.record("list_lanes")?;
+        Ok(ListLanesPage::new(Vec::new(), None))
     }
 
     async fn cancel_flow(

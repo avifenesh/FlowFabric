@@ -22,8 +22,8 @@ use ff_core::backend::{
     ResumeSignal, WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    ListFlowsPage, ReportUsageResult,
+    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
+    ListLanesPage, ReportUsageResult,
 };
 #[cfg(feature = "valkey-default")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
@@ -301,6 +301,18 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
         )
     }
 
+    async fn list_lanes(
+        &self,
+        cursor: Option<LaneId>,
+        limit: usize,
+    ) -> Result<ListLanesPage, EngineError> {
+        with_hooks!(
+            self,
+            "list_lanes",
+            self.inner.list_lanes(cursor, limit).await
+        )
+    }
+
     async fn cancel_flow(
         &self,
         id: &FlowId,
@@ -324,6 +336,19 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "report_usage",
             self.inner.report_usage(handle, budget, dimensions).await
+        )
+    }
+
+    #[cfg(feature = "core")]
+    async fn list_lanes(
+        &self,
+        cursor: Option<LaneId>,
+        limit: usize,
+    ) -> Result<ListLanesPage, EngineError> {
+        with_hooks!(
+            self,
+            "list_lanes",
+            self.inner.list_lanes(cursor, limit).await
         )
     }
 
