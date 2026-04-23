@@ -109,6 +109,38 @@ pub enum EngineError {
     /// participate in the `From<ScriptError>` mapping.
     #[error("unavailable: {op}")]
     Unavailable { op: &'static str },
+
+    /// An inner [`EngineError`] wrapped with a call-site label so
+    /// operators triaging logs can see which op the error came from
+    /// without inferring from surrounding spans. Constructed via
+    /// [`backend_context`]; carries a lightweight string context
+    /// (e.g. `"renew: FCALL ff_renew_lease"`).
+    ///
+    /// Classification helpers (`ErrorClass`, `BackendErrorKind`,
+    /// etc.) transparently descend into `source` so a consumer that
+    /// matches on the wrapper arm keeps the same retry/terminal
+    /// semantics as the unwrapped inner error.
+    #[error("{context}: {source}")]
+    Contextual {
+        #[source]
+        source: Box<EngineError>,
+        context: String,
+    },
+}
+
+/// Wrap an [`EngineError`] with a call-site label, preserving the
+/// inner variant for classification. Idempotent on nested
+/// `Contextual` wrappers in the sense that each call adds one more
+/// layer; callers should wrap once per op boundary.
+///
+/// Promoted to ff-core so `ff-backend-valkey` can annotate its
+/// `EngineBackend` impls with the same context shape ff-sdk's
+/// snapshot helpers use (issue #154).
+pub fn backend_context(err: EngineError, context: impl Into<String>) -> EngineError {
+    EngineError::Contextual {
+        source: Box::new(err),
+        context: context.into(),
+    }
 }
 
 /// Validation sub-kinds. 1:1 with the Lua validation codes.
@@ -500,6 +532,9 @@ impl EngineError {
             // not implemented; the caller must either fall back to a
             // different code path or surface to the user.
             Self::Unavailable { .. } => ErrorClass::Terminal,
+            // Descend into the wrapped error — context is diagnostic;
+            // classification follows the inner cause.
+            Self::Contextual { source, .. } => source.class(),
         }
     }
 }
@@ -548,6 +583,28 @@ mod tests {
     fn unavailable_is_terminal() {
         assert_eq!(
             EngineError::Unavailable { op: "foo" }.class(),
+            ErrorClass::Terminal
+        );
+    }
+
+    #[test]
+    fn backend_context_preserves_class_and_renders() {
+        // Retryable inner survives the wrap (issue #154).
+        let inner = EngineError::Contention(ContentionKind::LeaseConflict);
+        let wrapped = backend_context(inner, "renew: FCALL ff_renew_lease");
+        assert_eq!(wrapped.class(), ErrorClass::Retryable);
+        let rendered = format!("{wrapped}");
+        assert!(
+            rendered.starts_with("renew: FCALL ff_renew_lease: "),
+            "expected context prefix, got: {rendered}"
+        );
+        // Terminal inner also survives.
+        let inner = EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "bad".into(),
+        };
+        assert_eq!(
+            backend_context(inner, "x").class(),
             ErrorClass::Terminal
         );
     }

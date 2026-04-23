@@ -5,6 +5,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Observability wiring on `EngineBackend` trait methods (#154):** every
+  non-stub `*_impl` in `ff-backend-valkey` now carries
+  `#[tracing::instrument(name = "ff.<method>", skip_all, fields(backend,
+  execution_id|flow_id, …))]` so consumers can filter logs/spans per
+  trait op without pattern-matching free-text. `ValkeyBackend` accepts
+  an `Arc<ff_observability::Metrics>` via a new `with_metrics(..)` setter
+  plus a `connect_with_metrics(..)` constructor, behind a new
+  `observability` feature (off by default; transitively enabled through
+  `ff-observability/enabled`). The `inc_lease_renewal` counter fires at
+  the `renew` trait-impl boundary — first production emission site
+  (previously tests-only).
+- **`EngineError::Contextual` + `backend_context` helper (#154):**
+  promoted the call-site-label wrap from ff-sdk to
+  `ff-core::engine_error` so `ff-backend-valkey` can annotate its
+  `EngineBackend` impls with a lightweight context string (e.g.
+  `"renew: FCALL ff_renew_lease"`). Classification helpers (`class`,
+  `transport_script_ref`, `valkey_kind`) transparently descend through
+  the wrapper so retry/terminal semantics are preserved.
+
 ## [0.4.0] - 2026-04-23
 
 ### Breaking changes

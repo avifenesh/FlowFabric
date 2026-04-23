@@ -34,7 +34,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ff-server = { workspace = true }
+ff-observability = { workspace = true }
 serial_test = "3"
 axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures = { workspace = true }
+# Issue #154 — tracing span capture in the observability wiring test.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

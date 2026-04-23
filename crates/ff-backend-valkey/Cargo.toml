@@ -17,9 +17,19 @@ description = "FlowFabric EngineBackend impl — Valkey FCALL backend"
 # ff-core's default.
 default = ["streaming"]
 streaming = ["ff-core/streaming"]
+# Issue #154 — enable real OTEL metric emission via `ff-observability`.
+# Off by default: the `ff-observability` dep is always present (no-op
+# shim compiles to zero-cost no-ops), and turning this feature on
+# flips the shim to the real OTEL/Prometheus-backed implementation.
+# Mirrors `ff-engine` / `ff-scheduler` observability features.
+observability = ["ff-observability/enabled"]
 
 [dependencies]
 ff-core = { version = "0.4.0", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
+# Issue #154 — metric emission on `EngineBackend` impls. Always-present
+# so no cfg-gated field on `ValkeyBackend`; the `observability` feature
+# selects shim vs. real OTEL implementation.
+ff-observability = { workspace = true }
 ff-script = { workspace = true }
 ferriskey = { workspace = true }
 async-trait = { workspace = true }
