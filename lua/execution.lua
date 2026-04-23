@@ -860,6 +860,22 @@ redis.register_function('ff_cancel_execution', function(keys, args)
     composite_cleanup(
       K.suspension_current .. ":satisfied_set",
       K.suspension_current .. ":member_map")
+    -- RFC-014 Pattern 3: close additional waitpoints co-owned by the
+    -- suspension before it's discarded. Reread suspension to pick up
+    -- the additional_waitpoints_json field.
+    local susp_raw = redis.call("HGETALL", K.suspension_current)
+    if #susp_raw > 0 then
+      local susp = hgetall_to_table(susp_raw)
+      close_additional_waitpoints(
+        K.suspension_current,
+        susp.additional_waitpoints_json or "",
+        { "state", "closed",
+          "closed_at", tostring(now_ms),
+          "close_reason", "cancelled" },
+        { "closed", "1",
+          "closed_at", tostring(now_ms),
+          "closed_reason", "cancelled" })
+    end
   end
 
   -- ALL PATHS: exec_core FIRST for terminal transition (§4.8b Rule 2)

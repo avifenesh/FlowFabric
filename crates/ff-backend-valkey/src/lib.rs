@@ -38,12 +38,12 @@ use ff_core::contracts::decode::{
     build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
 };
 use ff_core::contracts::{
-    CancelFlowArgs, CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
-    CompositeBody, CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
-    ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage,
-    ListLanesPage, ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy,
-    ResumeTarget, SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails,
-    SuspendedExecutionEntry, WaitpointBinding,
+    AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimResumedExecutionArgs,
+    ClaimResumedExecutionResult, CompositeBody, CountKind, DeliverSignalArgs, DeliverSignalResult,
+    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
+    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
+    ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher, SuspendArgs, SuspendOutcome,
+    SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
 };
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
@@ -2939,19 +2939,81 @@ fn resume_policy_to_json(p: &ResumePolicy) -> String {
     obj.to_string()
 }
 
-/// Rust-side pre-FCALL validation (RFC-013 §4).
+/// Rust-side pre-FCALL validation (RFC-013 §4 + RFC-014 Pattern 3).
 fn validate_suspend_args(args: &SuspendArgs) -> Result<(), EngineError> {
-    // waitpoint_key cross-field invariant.
+    // Non-empty waitpoints vector (RFC-014 §2 Pattern 3 invariant).
+    if args.waitpoints.is_empty() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "waitpoints_empty".into(),
+        });
+    }
+    // waitpoint_key cross-field invariant (primary vs Single condition).
     if let (
         WaitpointBinding::Fresh { waitpoint_key: a, .. },
         ResumeCondition::Single { waitpoint_key: b, .. },
-    ) = (&args.waitpoint, &args.resume_condition)
+    ) = (args.primary(), &args.resume_condition)
     {
         if a != b {
             return Err(EngineError::Validation {
                 kind: ValidationKind::InvalidInput,
                 detail: "waitpoint_key_mismatch".into(),
             });
+        }
+    }
+    // RFC-014 Pattern 3 — every additional binding must be Fresh with a
+    // non-empty waitpoint_key. UsePending with extras is out of scope for
+    // this RFC (pending-activation composes an existing pending waitpoint,
+    // which is inherently single-waitpoint).
+    if args.waitpoints.len() > 1 {
+        for (i, b) in args.waitpoints.iter().enumerate().skip(1) {
+            match b {
+                WaitpointBinding::Fresh { waitpoint_key, .. } if !waitpoint_key.is_empty() => {}
+                WaitpointBinding::Fresh { .. } => {
+                    return Err(EngineError::Validation {
+                        kind: ValidationKind::InvalidInput,
+                        detail: format!(
+                            "additional_waitpoint_binding_empty_key at waitpoints[{i}]"
+                        ),
+                    });
+                }
+                _ => {
+                    return Err(EngineError::Validation {
+                        kind: ValidationKind::InvalidInput,
+                        detail: format!(
+                            "additional_waitpoint_binding_must_be_fresh at waitpoints[{i}]"
+                        ),
+                    });
+                }
+            }
+        }
+        // Cross-check: every waitpoint_key referenced by the resume
+        // condition must correspond to a binding, and vice versa — the
+        // Pattern 3 invariant.
+        let binding_keys: Vec<String> = args
+            .waitpoints
+            .iter()
+            .filter_map(|b| match b {
+                WaitpointBinding::Fresh { waitpoint_key, .. } => Some(waitpoint_key.clone()),
+                _ => None,
+            })
+            .collect();
+        let referenced = args.resume_condition.referenced_waitpoint_keys();
+        for r in &referenced {
+            if !binding_keys.iter().any(|b| b == r) {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: format!("referenced_waitpoint_key_missing_binding: {r}"),
+                });
+            }
+        }
+        for b in &binding_keys {
+            if !referenced.iter().any(|r| r == b) {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: format!("extra_binding_not_referenced_by_condition: {b}"),
+                });
+            }
         }
     }
     // TimeoutOnly requires timeout_at.
@@ -3030,10 +3092,10 @@ async fn suspend_impl(
     let idx = IndexKeys::new(&partition);
 
     // Extract (waitpoint_id, waitpoint_key, use_pending) from the
-    // typed binding. `UsePending` supplies an empty waitpoint_key;
+    // primary binding. `UsePending` supplies an empty waitpoint_key;
     // the Lua side resolves the authoritative key from the waitpoint
     // hash.
-    let (wp_id, wp_key, use_pending) = match &args.waitpoint {
+    let (wp_id, wp_key, use_pending) = match args.primary() {
         WaitpointBinding::Fresh {
             waitpoint_id,
             waitpoint_key,
@@ -3048,6 +3110,22 @@ async fn suspend_impl(
             });
         }
     };
+
+    // RFC-014 Pattern 3 — additional bindings. Validator has already
+    // enforced each extra is Fresh with a non-empty waitpoint_key
+    // (UsePending composites are out of scope for Pattern 3).
+    let extras: Vec<(WaitpointId, String)> = args
+        .waitpoints
+        .iter()
+        .skip(1)
+        .map(|b| match b {
+            WaitpointBinding::Fresh {
+                waitpoint_id,
+                waitpoint_key,
+            } => (waitpoint_id.clone(), waitpoint_key.clone()),
+            _ => unreachable!("validator rejects non-Fresh extras"),
+        })
+        .collect();
 
     let resume_condition_json =
         resume_condition_to_json(&args.resume_condition, &args.timeout_behavior)?;
@@ -3072,8 +3150,10 @@ async fn suspend_impl(
         ctx.suspend_dedup(&idem_key)
     };
 
-    // KEYS (18): per RFC-013 §9.2.
-    let keys: Vec<String> = vec![
+    // KEYS (18 base, per RFC-013 §9.2; followed by 3 × N_extra for
+    // RFC-014 Pattern 3 additional waitpoints: wp_hash, wp_signals,
+    // wp_condition per extra, in the same order as `extras`).
+    let mut keys: Vec<String> = vec![
         ctx.core(),                                  // 1
         ctx.attempt_hash(f.attempt_index),           // 2
         ctx.lease_current(),                         // 3
@@ -3093,9 +3173,15 @@ async fn suspend_impl(
         idx.waitpoint_hmac_secrets(),                // 17
         dedup_hash_key,                              // 18
     ];
+    for (extra_id, _extra_key) in &extras {
+        keys.push(ctx.waitpoint(extra_id));            // 19+3k
+        keys.push(ctx.waitpoint_signals(extra_id));    // 20+3k
+        keys.push(ctx.waitpoint_condition(extra_id));  // 21+3k
+    }
 
-    // ARGV (19): per RFC-013 §9.2.
-    let argv: Vec<String> = vec![
+    // ARGV (19 base + 1 N_extra slot + 2 × N_extra): RFC-013 §9.2 plus
+    // RFC-014 Pattern 3 tail (num_extra, then (wp_id, wp_key) pairs).
+    let mut argv: Vec<String> = vec![
         f.execution_id.to_string(),                                                   // 1
         f.attempt_index.to_string(),                                                  // 2
         f.attempt_id.to_string(),                                                     // 3
@@ -3115,7 +3201,12 @@ async fn suspend_impl(
         "1000".to_owned(),                                                            // 17 lease_history_maxlen
         idem_key,                                                                     // 18
         dedup_ttl.to_string(),                                                        // 19
+        extras.len().to_string(),                                                     // 20 N_extra
     ];
+    for (extra_id, extra_key) in &extras {
+        argv.push(extra_id.to_string());
+        argv.push(extra_key.clone());
+    }
 
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -3153,12 +3244,37 @@ async fn suspend_impl(
         })
     })?;
 
+    // RFC-014 Pattern 3 — parse additional waitpoint tokens from the
+    // Lua response tail. Wire shape: after the primary 4 fields the
+    // Lua returns `N_extra` then `N_extra × (wp_id, wp_key, token)`.
+    let n_extra: usize = result.field_str(4).parse().unwrap_or(0);
+    let mut additional: Vec<AdditionalWaitpointBinding> = Vec::with_capacity(n_extra);
+    for i in 0..n_extra {
+        let base = 5 + i * 3;
+        let ex_id = result.field_str(base);
+        let ex_key = result.field_str(base + 1);
+        let ex_tok = result.field_str(base + 2);
+        let wpid = WaitpointId::parse(&ex_id).map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "suspend_impl".into(),
+                execution_id: Some(f.execution_id.to_string()),
+                message: format!("bad additional waitpoint_id [{i}]: {e}"),
+            })
+        })?;
+        additional.push(AdditionalWaitpointBinding::new(
+            wpid,
+            ex_key,
+            WaitpointHmac::new(ex_tok),
+        ));
+    }
+
     let details = SuspendOutcomeDetails::new(
         suspension_id,
         waitpoint_id,
         w_key,
         WaitpointHmac::new(w_tok),
-    );
+    )
+    .with_additional_waitpoints(additional);
 
     match result.status.as_str() {
         "ALREADY_SATISFIED" => Ok(SuspendOutcome::AlreadySatisfied { details }),

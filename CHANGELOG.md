@@ -38,15 +38,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ff_sdk::{CompositeBody, CountKind}` and `ff_sdk::task::{CompositeBody,
   CountKind}`; `ClaimedTask::try_suspend_inner` rebinds the Fresh
   waitpoint_key from a composite tree's first Single/Count key so
-  single-waitpoint composite scoping works end-to-end. Lua library
-  version bumped 20 → 21.
-
-  **Scope deviation from RFC-014 §10.2:** this impl targets single-
-  waitpoint composites (patterns 1 + 2 from RFC §1.4: shared waitpoint
-  with distinct-source / distinct-signal counts, and same-waitpoint
-  AllOf over distinct signal-name matchers). Pattern 3 (`AllOf` across
-  N distinct waitpoint_ids) requires multi-binding `SuspendArgs` which
-  is out of scope here and tracked as a follow-up.
+  composite scoping works end-to-end for patterns 1 + 2, and RFC-014
+  Pattern 3 (heterogeneous subsystems across N distinct waitpoint_ids,
+  widened `SuspendArgs.waitpoints: Vec<WaitpointBinding>`) also ships
+  in this release (see Changed below). Lua library version bumped
+  20 → 22 (21 → 22 covers the Pattern 3 multi-waitpoint widening).
 
 - **RFC-016 Stage B: AnyOf / Quorum edge-dependency resolver.** Lights
   up the four-counter state machine on top of the Stage A edgegroup
@@ -180,6 +176,56 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `e2e_lifecycle::test_flow_*`) unaffected.
 
 ### Changed
+
+- **RFC-014 Pattern 3 — `SuspendArgs.waitpoint` widened to
+  `waitpoints: Vec<WaitpointBinding>` (pre-1.0 breaking change).**
+  Heterogeneous-subsystems composites (`AllOf` across N distinct
+  waitpoint_ids — "db-migration-complete AND cache-warmed AND
+  feature-flag-set") now land in the same suspension trait surface
+  PR #217 scoped to single-waitpoint. `SuspendArgs::new(..)` still
+  takes one primary `WaitpointBinding`; append further bindings via
+  `SuspendArgs::with_waitpoint(binding)` (appends, pre-1.0
+  incremental-migration friendly) or replace the whole vector via
+  `SuspendArgs::with_waitpoints(vec)`. Call `args.primary()` for the
+  first binding.
+
+  `SuspendOutcomeDetails` gains an `additional_waitpoints:
+  Vec<AdditionalWaitpointBinding>` field carrying per-extra
+  `(waitpoint_id, waitpoint_key, waitpoint_token)`; the top-level
+  `waitpoint_id` / `waitpoint_key` / `waitpoint_token` continue to
+  identify the primary (`waitpoints[0]`).
+
+  Valkey backend `ff_suspend_execution` now accepts
+  `KEYS = 18 + 3*N_extra` + `ARGV = 19 + 1 + 2*N_extra`; for each
+  extra binding Lua mints an independent HMAC token bound to its own
+  `ff:wp:{tag}:<id>` hash + `ff:wp:{tag}:<id>:condition` hash so
+  external signallers can deliver to any of the N waitpoints. The
+  full set is recorded on `suspension:current.additional_waitpoints_json`
+  so cleanup owners (`ff_cancel_execution`, `ff_expire_suspension`,
+  `ff_resume_execution`, composite-resume close in `ff_deliver_signal`)
+  iterate every per-extra waitpoint when closing the suspension.
+
+  SDK builder: `ResumeCondition::all_of_waitpoints([wp_a, wp_b, wp_c])`
+  (RFC-014 §10.3) is the canonical Pattern 3 shorthand, desugaring to
+  `AllOf { members: vec![Single{Wildcard}, Single{Wildcard}, ...] }`.
+  For per-member matchers construct the tree directly.
+
+  **Idempotency-key dedup widening (RFC-013 × RFC-014).** The
+  serialized dedup outcome adds an `N_extra` count + `N_extra × (id,
+  key, tok)` tail; replaying the same `idempotency_key` within the
+  TTL returns the full set verbatim (primary + extras). Tab-separated
+  wire format, always present even when `N_extra = 0`.
+
+  **Validator widenings.** `validate_suspend_args` now rejects
+  `waitpoints_empty` (defensive; `SuspendArgs::new` guarantees ≥1);
+  every additional binding must be `WaitpointBinding::Fresh` with a
+  non-empty `waitpoint_key` (UsePending + extras is rejected —
+  buffered-signal activation is inherently single-waitpoint); and for
+  multi-binding suspends the condition's referenced waitpoint_keys
+  must be exactly the binding set (`referenced_waitpoint_key_missing_binding`,
+  `extra_binding_not_referenced_by_condition`).
+
+  Lua library version bumped 21 → 22.
 
 - **`ff-script` gates its `ferriskey` dep behind a new `valkey-client`
   feature (#171).** Closes the backend-agnosticism leak flagged in the

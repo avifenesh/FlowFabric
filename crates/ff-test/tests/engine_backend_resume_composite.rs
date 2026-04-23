@@ -3,16 +3,14 @@
 //! Exercises the `AllOf` / `Count{DistinctWaitpoints,DistinctSignals,
 //! DistinctSources}` composite body through the
 //! [`EngineBackend::suspend`] + [`EngineBackend::deliver_signal`] trait
-//! surface. The current `SuspendArgs` carries exactly one
-//! `WaitpointBinding` so every composite here is scoped to a single
-//! mint waitpoint_id; multi-waitpoint `AllOf` across distinct
-//! waitpoint_ids is tracked separately (see RFC-014 Phase 1 notes —
-//! it requires a multi-binding `SuspendArgs`, out of scope for this PR).
+//! surface. Covers RFC-014 patterns 1 + 2 (shared-waitpoint composites)
+//! and pattern 3 (heterogeneous subsystems with N distinct waitpoints,
+//! widened `SuspendArgs.waitpoints: Vec<WaitpointBinding>`).
 //!
 //! Run with:
 //!   cargo test -p ff-test --test engine_backend_resume_composite -- --test-threads=1
 //!
-//! Test matrix (RFC-014 §10.2, adapted for single-waitpoint scope):
+//! Test matrix (RFC-014 §10.2):
 //!   - allof_two_matchers_resumes_when_both_fired
 //!   - allof_duplicate_signal_idempotent
 //!   - count_distinct_waitpoints_resumes_on_threshold
@@ -28,6 +26,9 @@
 //!   - resume_payload_exposes_all_satisfier_signals
 //!   - cancel_deletes_satisfied_set_and_member_map
 //!   - expire_deletes_satisfied_set_and_member_map
+//!   - allof_three_waitpoints_resumes_when_all_fired  (Pattern 3)
+//!   - multi_waitpoint_keys_colocated_under_partition_hash_tag (Pattern 3)
+//!   - cancel_closes_every_waitpoint_in_multi_binding (Pattern 3)
 
 use std::sync::Arc;
 
@@ -999,4 +1000,354 @@ async fn expire_deletes_satisfied_set_and_member_map() {
     let mmap = ctx.suspension_member_map();
     assert!(!key_exists(&tc, &sset).await, "satisfied_set must be deleted post-expire");
     assert!(!key_exists(&tc, &mmap).await, "member_map must be deleted post-expire");
+}
+
+// ── RFC-014 Pattern 3 — heterogeneous subsystems, N distinct waitpoints ──
+
+/// Canonical Pattern 3: suspend across three DISTINCT waitpoint_ids +
+/// waitpoint_keys, wired via `ResumeCondition::all_of_waitpoints(...)`.
+/// Delivery to the primary waitpoint plus the two extras (each with its
+/// own minted HMAC token) must drive the `AllOf` tree to satisfaction.
+#[tokio::test]
+#[serial_test::serial]
+async fn allof_three_waitpoints_resumes_when_all_fired() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = tc.new_execution_id();
+    let handle = create_and_claim_handle(&tc, &eid).await;
+    let backend = build_backend(&tc).await;
+
+    // Three heterogeneous waitpoint_keys.
+    let wp_db_id = WaitpointId::new();
+    let wp_db_key = format!("wpk:{wp_db_id}");
+    let wp_cache_id = WaitpointId::new();
+    let wp_cache_key = format!("wpk:{wp_cache_id}");
+    let wp_flag_id = WaitpointId::new();
+    let wp_flag_key = format!("wpk:{wp_flag_id}");
+
+    let cond = ResumeCondition::all_of_waitpoints([
+        wp_db_key.clone(),
+        wp_cache_key.clone(),
+        wp_flag_key.clone(),
+    ]);
+
+    let args = SuspendArgs::new(
+        SuspensionId::new(),
+        WaitpointBinding::Fresh {
+            waitpoint_id: wp_db_id.clone(),
+            waitpoint_key: wp_db_key.clone(),
+        },
+        cond,
+        ResumePolicy::normal(),
+        SuspensionReasonCode::WaitingForSignal,
+        TimestampMs::now(),
+    )
+    .with_timeout(
+        TimestampMs::from_millis(TimestampMs::now().0 + 60_000),
+        TimeoutBehavior::Fail,
+    )
+    .with_waitpoint(WaitpointBinding::Fresh {
+        waitpoint_id: wp_cache_id.clone(),
+        waitpoint_key: wp_cache_key.clone(),
+    })
+    .with_waitpoint(WaitpointBinding::Fresh {
+        waitpoint_id: wp_flag_id.clone(),
+        waitpoint_key: wp_flag_key.clone(),
+    });
+
+    let outcome = backend
+        .suspend(&handle, args)
+        .await
+        .expect("Pattern 3 suspend");
+    let details = match outcome {
+        SuspendOutcome::Suspended { details, .. } => details,
+        other => panic!("expected Suspended, got {other:?}"),
+    };
+
+    // Primary is the DB waitpoint; extras are cache + flag in order.
+    assert_eq!(details.waitpoint_id, wp_db_id);
+    assert_eq!(details.waitpoint_key, wp_db_key);
+    assert_eq!(details.additional_waitpoints.len(), 2);
+    let cache_extra = &details.additional_waitpoints[0];
+    let flag_extra = &details.additional_waitpoints[1];
+    assert_eq!(cache_extra.waitpoint_id, wp_cache_id);
+    assert_eq!(cache_extra.waitpoint_key, wp_cache_key);
+    assert_eq!(flag_extra.waitpoint_id, wp_flag_id);
+    assert_eq!(flag_extra.waitpoint_key, wp_flag_key);
+
+    let tok_db = details.waitpoint_token.token().clone();
+    let tok_cache = cache_extra.waitpoint_token.token().clone();
+    let tok_flag = flag_extra.waitpoint_token.token().clone();
+
+    // Signal #1: db-migration-complete → AllOf still pending.
+    let r1 = backend
+        .deliver_signal(deliver_args(
+            &eid,
+            wp_db_id.clone(),
+            "db_migration_complete",
+            "ops",
+            tok_db,
+        ))
+        .await
+        .unwrap();
+    match r1 {
+        DeliverSignalResult::Accepted { effect, .. } => {
+            assert_eq!(effect, "appended_to_waitpoint", "1st of 3 AllOf members");
+        }
+        other => panic!("got {other:?}"),
+    }
+
+    // Signal #2: cache-warmed via the cache waitpoint's OWN token.
+    let r2 = backend
+        .deliver_signal(deliver_args(
+            &eid,
+            wp_cache_id.clone(),
+            "cache_warmed",
+            "ops",
+            tok_cache,
+        ))
+        .await
+        .unwrap();
+    match r2 {
+        DeliverSignalResult::Accepted { effect, .. } => {
+            assert_eq!(effect, "appended_to_waitpoint", "2nd of 3 AllOf members");
+        }
+        other => panic!("got {other:?}"),
+    }
+
+    // Signal #3: feature-flag-set via the flag waitpoint's own token
+    // → resume.
+    let r3 = backend
+        .deliver_signal(deliver_args(
+            &eid,
+            wp_flag_id,
+            "feature_flag_set",
+            "ops",
+            tok_flag,
+        ))
+        .await
+        .unwrap();
+    match r3 {
+        DeliverSignalResult::Accepted { effect, .. } => {
+            assert_eq!(effect, "resume_condition_satisfied");
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+/// RFC-014 §10.2 cluster co-location — assert that all per-waitpoint
+/// keys for a multi-waitpoint suspend share the partition's hash tag
+/// (`{fp:N}`) so a single Valkey Function call stays on one slot under
+/// RFC-011 co-location. Runs in standalone mode too — the invariant is
+/// a pure-string property of the key layout.
+#[tokio::test]
+#[serial_test::serial]
+async fn multi_waitpoint_keys_colocated_under_partition_hash_tag() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = tc.new_execution_id();
+    let handle = create_and_claim_handle(&tc, &eid).await;
+    let backend = build_backend(&tc).await;
+
+    let wp_a_id = WaitpointId::new();
+    let wp_a_key = format!("wpk:{wp_a_id}");
+    let wp_b_id = WaitpointId::new();
+    let wp_b_key = format!("wpk:{wp_b_id}");
+    let wp_c_id = WaitpointId::new();
+    let wp_c_key = format!("wpk:{wp_c_id}");
+
+    let cond = ResumeCondition::all_of_waitpoints([
+        wp_a_key.clone(),
+        wp_b_key.clone(),
+        wp_c_key.clone(),
+    ]);
+
+    let args = SuspendArgs::new(
+        SuspensionId::new(),
+        WaitpointBinding::Fresh {
+            waitpoint_id: wp_a_id.clone(),
+            waitpoint_key: wp_a_key.clone(),
+        },
+        cond,
+        ResumePolicy::normal(),
+        SuspensionReasonCode::WaitingForSignal,
+        TimestampMs::now(),
+    )
+    .with_timeout(
+        TimestampMs::from_millis(TimestampMs::now().0 + 60_000),
+        TimeoutBehavior::Fail,
+    )
+    .with_waitpoint(WaitpointBinding::Fresh {
+        waitpoint_id: wp_b_id.clone(),
+        waitpoint_key: wp_b_key,
+    })
+    .with_waitpoint(WaitpointBinding::Fresh {
+        waitpoint_id: wp_c_id.clone(),
+        waitpoint_key: wp_c_key,
+    });
+
+    let outcome = backend.suspend(&handle, args).await.unwrap();
+    match outcome {
+        SuspendOutcome::Suspended { .. } => {}
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+
+    // RFC-011 §11 — execution-scoped keys are tagged `{fp:N}` where N
+    // is the execution's partition index.
+    let partition = execution_partition(&eid, &config());
+    let tag = partition.hash_tag(); // e.g. "{fp:12}"
+    let ctx = ExecKeyContext::new(&partition, &eid);
+
+    let suspension_key = ctx.suspension_current();
+    let wp_a_hash = ctx.waitpoint(&wp_a_id);
+    let wp_b_hash = ctx.waitpoint(&wp_b_id);
+    let wp_c_hash = ctx.waitpoint(&wp_c_id);
+    let wp_a_cond = ctx.waitpoint_condition(&wp_a_id);
+    let wp_b_cond = ctx.waitpoint_condition(&wp_b_id);
+    let wp_c_cond = ctx.waitpoint_condition(&wp_c_id);
+
+    for key in [
+        &suspension_key,
+        &wp_a_hash,
+        &wp_b_hash,
+        &wp_c_hash,
+        &wp_a_cond,
+        &wp_b_cond,
+        &wp_c_cond,
+    ] {
+        assert!(
+            key.contains(&tag),
+            "RFC-011 co-location violated: key {key:?} missing partition hash tag {tag}"
+        );
+    }
+}
+
+/// RFC-014 Pattern 3 cleanup: cancelling a multi-waitpoint suspension
+/// must close every extra waitpoint hash (not just the primary), so
+/// no dangling active waitpoints remain on the execution.
+#[tokio::test]
+#[serial_test::serial]
+async fn cancel_closes_every_waitpoint_in_multi_binding() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    let eid = tc.new_execution_id();
+    let handle = create_and_claim_handle(&tc, &eid).await;
+    let backend = build_backend(&tc).await;
+
+    let wp_a_id = WaitpointId::new();
+    let wp_a_key = format!("wpk:{wp_a_id}");
+    let wp_b_id = WaitpointId::new();
+    let wp_b_key = format!("wpk:{wp_b_id}");
+
+    let cond = ResumeCondition::all_of_waitpoints([
+        wp_a_key.clone(),
+        wp_b_key.clone(),
+    ]);
+    let args = SuspendArgs::new(
+        SuspensionId::new(),
+        WaitpointBinding::Fresh {
+            waitpoint_id: wp_a_id.clone(),
+            waitpoint_key: wp_a_key,
+        },
+        cond,
+        ResumePolicy::normal(),
+        SuspensionReasonCode::WaitingForSignal,
+        TimestampMs::now(),
+    )
+    .with_timeout(
+        TimestampMs::from_millis(TimestampMs::now().0 + 60_000),
+        TimeoutBehavior::Fail,
+    )
+    .with_waitpoint(WaitpointBinding::Fresh {
+        waitpoint_id: wp_b_id.clone(),
+        waitpoint_key: wp_b_key,
+    });
+    let _ = backend.suspend(&handle, args).await.unwrap();
+
+    // Cancel — operator override (no lease fields required).
+    let partition = execution_partition(&eid, &config());
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let idx = IndexKeys::new(&partition);
+    let lane_id = LaneId::new(LANE);
+    let cancel_keys: Vec<String> = vec![
+        ctx.core(),
+        ctx.attempt_hash(AttemptIndex::new(0)),
+        ctx.stream_meta(AttemptIndex::new(0)),
+        ctx.lease_current(),
+        ctx.lease_history(),
+        idx.lease_expiry(),
+        idx.worker_leases(&WorkerInstanceId::new(WORKER_INST)),
+        ctx.suspension_current(),
+        ctx.waitpoint(&wp_a_id),
+        ctx.waitpoint_condition(&wp_a_id),
+        idx.suspension_timeout(),
+        idx.lane_terminal(&lane_id),
+        idx.attempt_timeout(),
+        idx.execution_deadline(),
+        idx.lane_eligible(&lane_id),
+        idx.lane_delayed(&lane_id),
+        idx.lane_blocked_dependencies(&lane_id),
+        idx.lane_blocked_budget(&lane_id),
+        idx.lane_blocked_quota(&lane_id),
+        idx.lane_blocked_route(&lane_id),
+        idx.lane_blocked_operator(&lane_id),
+    ];
+    let cancel_args: Vec<String> = vec![
+        eid.to_string(),
+        "test-cancel".to_owned(),
+        "operator_override".to_owned(),
+        String::new(),
+        String::new(),
+    ];
+    let kr: Vec<&str> = cancel_keys.iter().map(String::as_str).collect();
+    let ar: Vec<&str> = cancel_args.iter().map(String::as_str).collect();
+    let _: Value = tc
+        .client()
+        .fcall("ff_cancel_execution", &kr, &ar)
+        .await
+        .expect("ff_cancel_execution");
+
+    // Primary waitpoint hash must be closed (cancel path touches it
+    // via K.waitpoint_hash). Extra waitpoint hash must ALSO be closed
+    // — that is the Pattern 3 cleanup invariant.
+    let wp_b_hash_key = ctx.waitpoint(&wp_b_id);
+    let state: Option<String> = tc
+        .client()
+        .cmd("HGET")
+        .arg(wp_b_hash_key.as_str())
+        .arg("waitpoint_id")
+        .execute()
+        .await
+        .expect("HGET");
+    assert_eq!(
+        state.as_deref(),
+        Some(wp_b_id.to_string().as_str()),
+        "extra waitpoint hash must still exist post-cancel for audit"
+    );
+    let close_reason: Option<String> = tc
+        .client()
+        .cmd("HGET")
+        .arg(wp_b_hash_key.as_str())
+        .arg("close_reason")
+        .execute()
+        .await
+        .expect("HGET close_reason");
+    assert_eq!(
+        close_reason.as_deref(),
+        Some("cancelled"),
+        "Pattern 3 extra waitpoint must be closed with reason=cancelled on cancel"
+    );
+    let state_field: Option<String> = tc
+        .client()
+        .cmd("HGET")
+        .arg(wp_b_hash_key.as_str())
+        .arg("state")
+        .execute()
+        .await
+        .expect("HGET state");
+    assert_eq!(
+        state_field.as_deref(),
+        Some("closed"),
+        "Pattern 3 extra waitpoint state must be 'closed' on cancel"
+    );
 }

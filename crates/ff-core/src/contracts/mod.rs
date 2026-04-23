@@ -3092,6 +3092,67 @@ impl CompositeValidationError {
 }
 
 impl ResumeCondition {
+    /// RFC-014 §10.3 builder — `AllOf` across N distinct waitpoints,
+    /// each member a `Single { matcher: Wildcard }` leaf. Canonical
+    /// Pattern 3 shape for heterogeneous-subsystem "all fired"
+    /// semantics (e.g. `db-migration-complete` + `cache-warmed` +
+    /// `feature-flag-set`).
+    ///
+    /// Callers that need per-waitpoint matchers should construct the
+    /// tree directly via
+    /// [`ResumeCondition::Composite(CompositeBody::all_of(..))`].
+    pub fn all_of_waitpoints<I, S>(waitpoint_keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let members: Vec<ResumeCondition> = waitpoint_keys
+            .into_iter()
+            .map(|k| ResumeCondition::Single {
+                waitpoint_key: k.into(),
+                matcher: SignalMatcher::Wildcard,
+            })
+            .collect();
+        ResumeCondition::Composite(CompositeBody::AllOf { members })
+    }
+
+    /// Collect every distinct `waitpoint_key` the condition targets.
+    /// Used at suspend-time to validate the condition's wp set against
+    /// `SuspendArgs.waitpoints` (RFC-014 §5.1 multi-binding cross-
+    /// check). Order follows tree DFS, de-duplicated preserving first
+    /// occurrence.
+    pub fn referenced_waitpoint_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |k: &str| {
+            if !out.iter().any(|e| e == k) {
+                out.push(k.to_owned());
+            }
+        };
+        fn walk(cond: &ResumeCondition, push: &mut dyn FnMut(&str)) {
+            match cond {
+                ResumeCondition::Single { waitpoint_key, .. } => push(waitpoint_key),
+                ResumeCondition::Composite(body) => walk_body(body, push),
+                _ => {}
+            }
+        }
+        fn walk_body(body: &CompositeBody, push: &mut dyn FnMut(&str)) {
+            match body {
+                CompositeBody::AllOf { members } => {
+                    for m in members {
+                        walk(m, push);
+                    }
+                }
+                CompositeBody::Count { waitpoints, .. } => {
+                    for w in waitpoints {
+                        push(w.as_str());
+                    }
+                }
+            }
+        }
+        walk(self, &mut push);
+        out
+    }
+
     /// Validate RFC-014 structural invariants on a composite condition.
     /// Single / OperatorOnly / TimeoutOnly return Ok — they carry no
     /// composite body. Checks cover:
@@ -3340,16 +3401,33 @@ impl WaitpointBinding {
     }
 }
 
-/// Trait-surface input to [`EngineBackend::suspend`] (RFC-013 §2.2).
+/// Trait-surface input to [`EngineBackend::suspend`] (RFC-013 §2.2 +
+/// RFC-014 Pattern 3 widening).
 ///
 /// Built via [`SuspendArgs::new`] + `with_*` setters; direct struct-
 /// literal construction across crate boundaries is not possible
 /// (`#[non_exhaustive]`).
+///
+/// ## Waitpoints
+///
+/// `waitpoints` is a non-empty `Vec<WaitpointBinding>`. The first entry
+/// is the "primary" binding (accessible via [`primary`](Self::primary))
+/// and carries the `current_waitpoint_id` written onto `exec_core` for
+/// operator visibility. Additional entries land in Valkey as their own
+/// waitpoint hashes / signal streams / HMAC tokens, enabling RFC-014
+/// Pattern 3 `AllOf { members: [Single{wp1}, Single{wp2}, ...] }` across
+/// distinct heterogeneous subsystems.
+///
+/// [`SuspendArgs::new`] takes exactly the primary binding; call
+/// [`with_waitpoint`](Self::with_waitpoint) to append further bindings
+/// (the RFC-014 builder API).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SuspendArgs {
     pub suspension_id: SuspensionId,
-    pub waitpoint: WaitpointBinding,
+    /// RFC-014 Pattern 3: all waitpoint bindings for this suspension.
+    /// Guaranteed non-empty; `waitpoints[0]` is the primary.
+    pub waitpoints: Vec<WaitpointBinding>,
     pub resume_condition: ResumeCondition,
     pub resume_policy: ResumePolicy,
     pub reason_code: SuspensionReasonCode,
@@ -3367,9 +3445,14 @@ pub struct SuspendArgs {
 impl SuspendArgs {
     /// Build a minimal `SuspendArgs` for a worker-originated suspension.
     ///
+    /// `waitpoint` becomes the primary binding. Append additional
+    /// bindings with [`with_waitpoint`](Self::with_waitpoint) (RFC-014
+    /// Pattern 3) or replace the set with
+    /// [`with_waitpoints`](Self::with_waitpoints).
+    ///
     /// Defaults: `requested_by = Worker`, `timeout_at = None`,
     /// `timeout_behavior = Fail`, `continuation_metadata_pointer = None`,
-    /// `idempotency_key = None`. Override via `with_*` setters.
+    /// `idempotency_key = None`.
     pub fn new(
         suspension_id: SuspensionId,
         waitpoint: WaitpointBinding,
@@ -3380,7 +3463,7 @@ impl SuspendArgs {
     ) -> Self {
         Self {
             suspension_id,
-            waitpoint,
+            waitpoints: vec![waitpoint],
             resume_condition,
             resume_policy,
             reason_code,
@@ -3391,6 +3474,12 @@ impl SuspendArgs {
             now,
             idempotency_key: None,
         }
+    }
+
+    /// Primary binding — `waitpoints[0]`. Guaranteed present by
+    /// construction.
+    pub fn primary(&self) -> &WaitpointBinding {
+        &self.waitpoints[0]
     }
 
     pub fn with_timeout(mut self, at: TimestampMs, behavior: TimeoutBehavior) -> Self {
@@ -3413,10 +3502,40 @@ impl SuspendArgs {
         self.idempotency_key = Some(key);
         self
     }
+
+    /// RFC-014 Pattern 3 — append a further waitpoint binding to this
+    /// suspension. Each additional binding yields its own waitpoint
+    /// hash, signal stream, condition hash and HMAC token in Valkey,
+    /// but all share the suspension record and composite evaluator
+    /// under one `suspension:current`.
+    ///
+    /// Ordering: the primary (from [`SuspendArgs::new`]) stays at
+    /// `waitpoints[0]`; subsequent `with_waitpoint` calls append at the
+    /// tail.
+    pub fn with_waitpoint(mut self, binding: WaitpointBinding) -> Self {
+        self.waitpoints.push(binding);
+        self
+    }
+
+    /// RFC-014 Pattern 3 — replace the full binding vector in one call.
+    /// Must be non-empty; an empty Vec is a programmer error and will
+    /// be rejected by the backend's `validate_suspend_args` with
+    /// `waitpoints_empty`.
+    pub fn with_waitpoints(mut self, bindings: Vec<WaitpointBinding>) -> Self {
+        self.waitpoints = bindings;
+        self
+    }
 }
 
 /// Shared "what happened on the waitpoint" payload carried in both
 /// [`SuspendOutcome`] variants.
+///
+/// For Pattern 3 (RFC-014) — multi-waitpoint suspensions — the primary
+/// binding's identity lives at the top level (`waitpoint_id` /
+/// `waitpoint_key` / `waitpoint_token`) and remaining bindings are
+/// exposed via `additional_waitpoints`, each carrying its own minted
+/// HMAC token so external signallers can deliver to any of the N
+/// waitpoints the suspension is listening on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SuspendOutcomeDetails {
@@ -3424,6 +3543,35 @@ pub struct SuspendOutcomeDetails {
     pub waitpoint_id: WaitpointId,
     pub waitpoint_key: String,
     pub waitpoint_token: WaitpointHmac,
+    /// RFC-014 Pattern 3 extras (beyond the primary). Empty for
+    /// single-waitpoint suspensions (patterns 1 + 2); carries one
+    /// entry per additional binding for Pattern 3.
+    pub additional_waitpoints: Vec<AdditionalWaitpointBinding>,
+}
+
+/// RFC-014 Pattern 3 — per-binding identity + HMAC token for
+/// waitpoints beyond the primary. Structure mirrors the top-level
+/// fields on [`SuspendOutcomeDetails`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AdditionalWaitpointBinding {
+    pub waitpoint_id: WaitpointId,
+    pub waitpoint_key: String,
+    pub waitpoint_token: WaitpointHmac,
+}
+
+impl AdditionalWaitpointBinding {
+    pub fn new(
+        waitpoint_id: WaitpointId,
+        waitpoint_key: String,
+        waitpoint_token: WaitpointHmac,
+    ) -> Self {
+        Self {
+            waitpoint_id,
+            waitpoint_key,
+            waitpoint_token,
+        }
+    }
 }
 
 impl SuspendOutcomeDetails {
@@ -3438,7 +3586,19 @@ impl SuspendOutcomeDetails {
             waitpoint_id,
             waitpoint_key,
             waitpoint_token,
+            additional_waitpoints: Vec::new(),
         }
+    }
+
+    /// Attach RFC-014 Pattern 3 additional-waitpoint bindings. The
+    /// primary binding stays at the top-level fields; `extras` lands
+    /// in [`additional_waitpoints`](Self::additional_waitpoints).
+    pub fn with_additional_waitpoints(
+        mut self,
+        extras: Vec<AdditionalWaitpointBinding>,
+    ) -> Self {
+        self.additional_waitpoints = extras;
+        self
     }
 }
 

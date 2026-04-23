@@ -344,6 +344,32 @@ local function ok_duplicate(...)
   return {1, "DUPLICATE", ...}
 end
 
+-- RFC-014 Pattern 3 — expand {suspension_id, wp_id, wp_key, wp_tok,
+-- extras_table} into the 4 primary fields + N_extra count + N_extra ×
+-- (id, key, tok) response tail. `extras` is an array of {waitpoint_id,
+-- waitpoint_key, waitpoint_token} tables. Empty array → N_extra=0.
+local function ok_extras(susp_id, wp_id, wp_key, wp_tok, extras)
+  extras = extras or {}
+  local out = {1, "OK", susp_id, wp_id, wp_key, wp_tok, tostring(#extras)}
+  for _, e in ipairs(extras) do
+    out[#out + 1] = e.waitpoint_id or ""
+    out[#out + 1] = e.waitpoint_key or ""
+    out[#out + 1] = e.waitpoint_token or ""
+  end
+  return out
+end
+
+local function ok_already_satisfied_extras(susp_id, wp_id, wp_key, wp_tok, extras)
+  extras = extras or {}
+  local out = {1, "ALREADY_SATISFIED", susp_id, wp_id, wp_key, wp_tok, tostring(#extras)}
+  for _, e in ipairs(extras) do
+    out[#out + 1] = e.waitpoint_id or ""
+    out[#out + 1] = e.waitpoint_key or ""
+    out[#out + 1] = e.waitpoint_token or ""
+  end
+  return out
+end
+
 ---------------------------------------------------------------------------
 -- Data access
 ---------------------------------------------------------------------------
@@ -985,15 +1011,20 @@ local function composite_collect_candidate_nodes(tree, waitpoint_key, signal_nam
 end
 
 -- Emit initial member_map for operator diagnostics (RFC §4.4).
--- Single-waitpoint scope: every candidate node path for the suspension's
--- waitpoint_key maps back to that key. Write-once at suspend-time.
-local function seed_composite_member_map(member_map_key, tree, waitpoint_key)
-  local cands = composite_collect_candidate_nodes(tree, waitpoint_key, nil)
-  if #cands == 0 then return end
+-- Accepts a single waitpoint_key (patterns 1 + 2) or a list of
+-- waitpoint_keys (RFC-014 Pattern 3). Every candidate node path for
+-- each key maps back to that key. Write-once at suspend-time.
+local function seed_composite_member_map(member_map_key, tree, waitpoint_keys)
+  if type(waitpoint_keys) == "string" then
+    waitpoint_keys = { waitpoint_keys }
+  end
   local fields = {}
-  for _, c in ipairs(cands) do
-    fields[#fields + 1] = "wp:" .. waitpoint_key .. ":" .. (c.node.path or "")
-    fields[#fields + 1] = c.node.path or ""
+  for _, wk in ipairs(waitpoint_keys or {}) do
+    local cands = composite_collect_candidate_nodes(tree, wk, nil)
+    for _, c in ipairs(cands) do
+      fields[#fields + 1] = "wp:" .. wk .. ":" .. (c.node.path or "")
+      fields[#fields + 1] = c.node.path or ""
+    end
   end
   if #fields > 0 then
     redis.call("HSET", member_map_key, unpack(fields))
@@ -1087,6 +1118,43 @@ local function composite_cleanup(satisfied_set_key, member_map_key)
   redis.call("DEL", satisfied_set_key)
   redis.call("DEL", satisfied_set_key .. ":signals")
   redis.call("DEL", member_map_key)
+end
+
+-- RFC-014 Pattern 3 — close per-extra waitpoint storage on
+-- cancel/expire/resume. The extras list is stored in
+-- `suspension_current.additional_waitpoints_json` as a JSON array of
+-- {waitpoint_id, waitpoint_key} pairs at suspend-time. Cleanup owners
+-- reconstruct the wp_hash + wp_condition keys dynamically from the
+-- suspension's hash tag (same trick ff_cancel_execution uses for lane
+-- keys) so no KEYS arity growth is needed.
+--
+-- @param suspension_current_key  e.g. "ff:exec:{p:12}:E-...:suspension:current"
+-- @param additional_json         value of HGET suspension_current additional_waitpoints_json
+-- @param close_state_fields      table of HSET fields to apply to each extra waitpoint hash
+--                                (e.g. {"state","closed","close_reason","cancelled","closed_at","<now>"})
+-- @param close_cond_fields       table of HSET fields to apply to each extra wp_condition hash
+local function close_additional_waitpoints(suspension_current_key, additional_json,
+                                           close_state_fields, close_cond_fields)
+  if not additional_json or additional_json == "" or additional_json == "[]" then
+    return
+  end
+  local ok_dec, pairs_list = pcall(cjson.decode, additional_json)
+  if not ok_dec or type(pairs_list) ~= "table" then return end
+  local tag = string.match(suspension_current_key, "(%b{})")
+  if not tag then return end
+  for _, entry in ipairs(pairs_list) do
+    local wp_id = entry.waitpoint_id
+    if type(wp_id) == "string" and wp_id ~= "" then
+      local wp_hash_key = "ff:wp:" .. tag .. ":" .. wp_id
+      local wp_cond_key = "ff:wp:" .. tag .. ":" .. wp_id .. ":condition"
+      if redis.call("EXISTS", wp_hash_key) == 1 and close_state_fields and #close_state_fields > 0 then
+        redis.call("HSET", wp_hash_key, unpack(close_state_fields))
+      end
+      if redis.call("EXISTS", wp_cond_key) == 1 and close_cond_fields and #close_cond_fields > 0 then
+        redis.call("HSET", wp_cond_key, unpack(close_cond_fields))
+      end
+    end
+  end
 end
 
 -- Extract a named field from a Valkey Stream entry's flat field array.

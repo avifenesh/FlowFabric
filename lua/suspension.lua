@@ -11,23 +11,28 @@
 ---------------------------------------------------------------------------
 -- #13  ff_suspend_execution
 --
--- Validate lease, release ownership, create suspension + waitpoint
+-- Validate lease, release ownership, create suspension + waitpoint(s)
 -- (or activate pending), init condition, transition active → suspended.
--- Mints the waitpoint HMAC token (RFC-004 §Waitpoint Security) returned
--- alongside the waitpoint_id for external signal delivery.
+-- Mints the waitpoint HMAC token(s) (RFC-004 §Waitpoint Security)
+-- returned alongside the waitpoint_id(s) for external signal delivery.
 --
--- KEYS (18): exec_core, attempt_record, lease_current, lease_history,
---            lease_expiry_zset, worker_leases, suspension_current,
---            waitpoint_hash, waitpoint_signals, suspension_timeout_zset,
---            pending_wp_expiry_zset, active_index, suspended_zset,
---            waitpoint_history, wp_condition, attempt_timeout_zset,
---            hmac_secrets, dedup_hash (RFC-013)
--- ARGV (19): execution_id, attempt_index, attempt_id, lease_id,
---            lease_epoch, suspension_id, waitpoint_id, waitpoint_key,
---            reason_code, requested_by, timeout_at, resume_condition_json,
---            resume_policy_json, continuation_metadata_pointer,
---            use_pending_waitpoint, timeout_behavior, lease_history_maxlen,
---            idempotency_key (RFC-013), dedup_ttl_ms (RFC-013)
+-- KEYS (18 + 3*N_extra): exec_core, attempt_record, lease_current,
+--            lease_history, lease_expiry_zset, worker_leases,
+--            suspension_current, waitpoint_hash, waitpoint_signals,
+--            suspension_timeout_zset, pending_wp_expiry_zset,
+--            active_index, suspended_zset, waitpoint_history,
+--            wp_condition, attempt_timeout_zset, hmac_secrets,
+--            dedup_hash; then for each RFC-014 Pattern 3 additional
+--            waitpoint (wp_hash_extra, wp_signals_extra,
+--            wp_condition_extra).
+-- ARGV (19 + 1 + 2*N_extra): execution_id, attempt_index, attempt_id,
+--            lease_id, lease_epoch, suspension_id, waitpoint_id,
+--            waitpoint_key, reason_code, requested_by, timeout_at,
+--            resume_condition_json, resume_policy_json,
+--            continuation_metadata_pointer, use_pending_waitpoint,
+--            timeout_behavior, lease_history_maxlen, idempotency_key,
+--            dedup_ttl_ms, num_extra_waitpoints, then for each extra
+--            (waitpoint_id, waitpoint_key).
 ---------------------------------------------------------------------------
 redis.register_function('ff_suspend_execution', function(keys, args)
   local K = {
@@ -71,7 +76,29 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     lease_history_maxlen      = tonumber(args[17] or "1000"),
     idempotency_key           = args[18] or "",
     dedup_ttl_ms              = tonumber(args[19] or "0"),
+    num_extra_waitpoints      = tonumber(args[20] or "0"),
   }
+
+  -- RFC-014 Pattern 3: additional-waitpoint bindings. Parsed up front
+  -- so dedup hashing covers the full set (RFC-013 idempotency_key +
+  -- RFC-014 multi-waitpoint widening).
+  local extras = {}
+  for i = 1, A.num_extra_waitpoints do
+    local base_arg = 20 + (i - 1) * 2
+    local ex_id = args[base_arg + 1]
+    local ex_key = args[base_arg + 2]
+    if not ex_id or ex_id == "" or not ex_key or ex_key == "" then
+      return err("additional_waitpoint_binding_malformed")
+    end
+    local base_key = 18 + (i - 1) * 3
+    extras[#extras + 1] = {
+      waitpoint_id = ex_id,
+      waitpoint_key = ex_key,
+      wp_hash_key = keys[base_key + 1],
+      wp_signals_key = keys[base_key + 2],
+      wp_condition_key = keys[base_key + 3],
+    }
+  end
 
   local t = redis.call("TIME")
   local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -81,25 +108,52 @@ redis.register_function('ff_suspend_execution', function(keys, args)
   -- the previously-serialized outcome verbatim, performing no state
   -- mutation. On miss, fall through to the canonical path and write the
   -- outcome into the dedup hash with TTL after commit.
+  --
+  -- RFC-014 widens the format to carry additional waitpoint bindings:
+  -- "<status>\t<suspension_id>\t<waitpoint_id>\t<waitpoint_key>\t
+  --  <waitpoint_token>\t<N_extra>[\t<ex_id>\t<ex_key>\t<ex_tok>]*".
+  -- Pattern-1/2 payloads with no extras have N_extra = 0.
   local _dedup_active = (A.idempotency_key ~= "" and K.dedup_hash and K.dedup_hash ~= "")
   if _dedup_active then
     local stored = redis.call("HGET", K.dedup_hash, "outcome")
     if stored == false then stored = nil end
     if stored then
-      -- Stored format pins v=1 per §9.2 "Serialized-outcome stability":
-      -- "<status>\t<suspension_id>\t<waitpoint_id>\t<waitpoint_key>\t<waitpoint_token>".
+      -- Split on single "\t". `string.gmatch("[^\t]+")` would drop
+      -- empty fields (legal for e.g. an empty extras block).
       local parts = {}
-      local idx = 1
-      for piece in string.gmatch(stored, "([^\t]*)\t?") do
-        parts[idx] = piece
-        idx = idx + 1
-        if idx > 5 then break end
+      local pos = 1
+      while pos <= #stored + 1 do
+        local nxt = string.find(stored, "\t", pos, true)
+        if nxt then
+          parts[#parts + 1] = string.sub(stored, pos, nxt - 1)
+          pos = nxt + 1
+        else
+          parts[#parts + 1] = string.sub(stored, pos)
+          break
+        end
       end
       if #parts >= 5 then
-        if parts[1] == "ALREADY_SATISFIED" then
-          return ok_already_satisfied(parts[2], parts[3], parts[4], parts[5])
+        local status     = parts[1]
+        local susp_id    = parts[2]
+        local wp_id_out  = parts[3]
+        local wp_key_out = parts[4]
+        local wp_tok_out = parts[5]
+        local n_extra    = tonumber(parts[6] or "0") or 0
+        local extras_out = {}
+        for i = 1, n_extra do
+          local o = 6 + (i - 1) * 3
+          extras_out[#extras_out + 1] = {
+            waitpoint_id = parts[o + 1] or "",
+            waitpoint_key = parts[o + 2] or "",
+            waitpoint_token = parts[o + 3] or "",
+          }
+        end
+        if status == "ALREADY_SATISFIED" then
+          return ok_already_satisfied_extras(
+            susp_id, wp_id_out, wp_key_out, wp_tok_out, extras_out)
         else
-          return ok(parts[2], parts[3], parts[4], parts[5])
+          return ok_extras(
+            susp_id, wp_id_out, wp_key_out, wp_tok_out, extras_out)
         end
       end
       -- Malformed entry: fall through and treat as miss.
@@ -197,16 +251,17 @@ redis.register_function('ff_suspend_execution', function(keys, args)
           "closed_at", tostring(now_ms), "close_reason", "resumed")
         write_condition_hash(K.wp_condition, wp_cond, now_ms)
         -- Do NOT release lease, do NOT change execution state.
-        -- RFC-013 §9.2 — write dedup outcome before returning.
+        -- RFC-013 §9.2 — write dedup outcome. UsePending+extras is
+        -- rejected upstream, so N_extra is always 0 here.
         if _dedup_active then
           local payload = "ALREADY_SATISFIED\t" .. A.suspension_id .. "\t" .. waitpoint_id ..
-            "\t" .. waitpoint_key .. "\t" .. waitpoint_token
+            "\t" .. waitpoint_key .. "\t" .. waitpoint_token .. "\t0"
           redis.call("HSET", K.dedup_hash, "outcome", payload)
           if A.dedup_ttl_ms > 0 then
             redis.call("PEXPIRE", K.dedup_hash, A.dedup_ttl_ms)
           end
         end
-        return ok_already_satisfied(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
+        return ok_already_satisfied_extras(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token, {})
       end
       -- Condition not yet satisfied — proceed with suspension.
       -- Write partial condition state (some matchers may be satisfied).
@@ -243,6 +298,54 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     -- Initialize condition hash from resume condition spec
     local wp_cond = initialize_condition(A.resume_condition_json)
     write_condition_hash(K.wp_condition, wp_cond, now_ms)
+  end
+
+  -- 5b. RFC-014 Pattern 3: mint extras' HMAC tokens + waitpoint hashes
+  -- + wp_condition hashes. Each additional binding gets its own
+  -- storage so the composite evaluator can SADD per-waitpoint
+  -- satisfier tokens and the HMAC enforcement works uniformly for
+  -- external signal delivery to ANY of the N waitpoints.
+  -- UsePending with extras is rejected by the Rust validator.
+  local extras_out = {}
+  if A.use_pending_waitpoint ~= "1" then
+    for _, ex in ipairs(extras) do
+      local ex_token, ex_err = mint_waitpoint_token(
+        K.hmac_secrets, ex.waitpoint_id, ex.waitpoint_key, now_ms)
+      if not ex_token then return err(ex_err) end
+
+      redis.call("HSET", ex.wp_hash_key,
+        "waitpoint_id", ex.waitpoint_id,
+        "execution_id", A.execution_id,
+        "attempt_index", A.attempt_index,
+        "suspension_id", A.suspension_id,
+        "waitpoint_key", ex.waitpoint_key,
+        "waitpoint_token", ex_token,
+        "state", "active",
+        "created_at", tostring(now_ms),
+        "activated_at", tostring(now_ms),
+        "expires_at", is_set(A.timeout_at) and A.timeout_at or "",
+        "signal_count", "0",
+        "matched_signal_count", "0",
+        "last_signal_at", "")
+
+      -- Mirror the primary wp_condition hash shape so ff_deliver_signal's
+      -- `wp_cond.composite == "1"` branch routes correctly when a signal
+      -- lands on this extra waitpoint.
+      local ex_wp_cond = initialize_condition(A.resume_condition_json)
+      write_condition_hash(ex.wp_condition_key, ex_wp_cond, now_ms)
+
+      redis.call("SADD", K.waitpoint_history, ex.waitpoint_id)
+
+      extras_out[#extras_out + 1] = {
+        waitpoint_id = ex.waitpoint_id,
+        waitpoint_key = ex.waitpoint_key,
+        waitpoint_token = ex_token,
+      }
+    end
+  elseif #extras > 0 then
+    -- Defensive: Rust validator already rejects UsePending+extras, but
+    -- fail loudly if a client bypasses Rust entirely.
+    return err("use_pending_with_extras_unsupported")
   end
 
   -- 6. Record waitpoint_id in mandatory history set (required for cleanup cascade)
@@ -293,13 +396,29 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     "reason", "suspend",
     "ts", tostring(now_ms))
 
-  -- 10. Create suspension record
+  -- 10. Create suspension record. RFC-014: record the full list of
+  -- additional waitpoint_ids (JSON array of "<id>|<key>" pairs) so
+  -- cleanup owners (cancel / expire / resume) can iterate all
+  -- per-waitpoint storage on terminal transitions without needing
+  -- the caller to re-supply them.
+  local add_json = "[]"
+  if #extras_out > 0 then
+    local pairs_list = {}
+    for _, e in ipairs(extras_out) do
+      pairs_list[#pairs_list + 1] = {
+        waitpoint_id = e.waitpoint_id,
+        waitpoint_key = e.waitpoint_key,
+      }
+    end
+    add_json = cjson.encode(pairs_list)
+  end
   redis.call("HSET", K.suspension_current,
     "suspension_id", A.suspension_id,
     "execution_id", A.execution_id,
     "attempt_index", A.attempt_index,
     "waitpoint_id", waitpoint_id,
     "waitpoint_key", waitpoint_key,
+    "additional_waitpoints_json", add_json,
     "reason_code", A.reason_code,
     "requested_by", A.requested_by,
     "created_at", tostring(now_ms),
@@ -316,14 +435,19 @@ redis.register_function('ff_suspend_execution', function(keys, args)
 
   -- 10b. RFC-014 §3.1: seed composite member_map (write-once) when the
   -- resume condition carries a composite tree. No-op for single-matcher
-  -- / operator / timeout conditions.
+  -- / operator / timeout conditions. Pattern 3 — pass every binding's
+  -- waitpoint_key so candidate-node lookup covers all N leaves.
   do
     local spec_ok, spec = pcall(cjson.decode, A.resume_condition_json)
     if spec_ok and type(spec) == "table" and spec.composite then
+      local all_keys = { waitpoint_key }
+      for _, e in ipairs(extras_out) do
+        all_keys[#all_keys + 1] = e.waitpoint_key
+      end
       seed_composite_member_map(
         K.suspension_current .. ":member_map",
         spec.tree,
-        waitpoint_key)
+        all_keys)
     end
   end
 
@@ -337,17 +461,24 @@ redis.register_function('ff_suspend_execution', function(keys, args)
     redis.call("ZADD", K.suspension_timeout_key, tonumber(A.timeout_at), A.execution_id)
   end
 
-  -- RFC-013 §9.2 — write dedup outcome before returning.
+  -- RFC-013 §9.2 + RFC-014 — write dedup outcome. Includes extras tail.
   if _dedup_active then
-    local payload = "OK\t" .. A.suspension_id .. "\t" .. waitpoint_id ..
-      "\t" .. waitpoint_key .. "\t" .. waitpoint_token
-    redis.call("HSET", K.dedup_hash, "outcome", payload)
+    local pieces = {
+      "OK", A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token,
+      tostring(#extras_out),
+    }
+    for _, e in ipairs(extras_out) do
+      pieces[#pieces + 1] = e.waitpoint_id
+      pieces[#pieces + 1] = e.waitpoint_key
+      pieces[#pieces + 1] = e.waitpoint_token
+    end
+    redis.call("HSET", K.dedup_hash, "outcome", table.concat(pieces, "\t"))
     if A.dedup_ttl_ms > 0 then
       redis.call("PEXPIRE", K.dedup_hash, A.dedup_ttl_ms)
     end
   end
 
-  return ok(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token)
+  return ok_extras(A.suspension_id, waitpoint_id, waitpoint_key, waitpoint_token, extras_out)
 end)
 
 ---------------------------------------------------------------------------
@@ -460,6 +591,20 @@ redis.register_function('ff_resume_execution', function(keys, args)
   composite_cleanup(
     K.suspension_current .. ":satisfied_set",
     K.suspension_current .. ":member_map")
+
+  -- RFC-014 Pattern 3: close any additional waitpoints co-owned by
+  -- this suspension so their HMAC tokens can no longer authenticate
+  -- signal delivery once the suspension has resumed.
+  close_additional_waitpoints(
+    K.suspension_current,
+    susp.additional_waitpoints_json or "",
+    { "state", "closed",
+      "satisfied_at", tostring(now_ms),
+      "closed_at", tostring(now_ms),
+      "close_reason", "resumed" },
+    { "closed", "1",
+      "closed_at", tostring(now_ms),
+      "closed_reason", "resumed" })
 
   return ok(public_state)
 end)
@@ -674,6 +819,15 @@ redis.register_function('ff_expire_suspension', function(keys, args)
     composite_cleanup(
       K.suspension_current .. ":satisfied_set",
       K.suspension_current .. ":member_map")
+    close_additional_waitpoints(
+      K.suspension_current,
+      susp.additional_waitpoints_json or "",
+      { "state", "closed",
+        "closed_at", tostring(now_ms),
+        "close_reason", "timed_out_auto_resume" },
+      { "closed", "1",
+        "closed_at", tostring(now_ms),
+        "closed_reason", "timed_out_auto_resume" })
 
     return ok("auto_resume", "waiting")
 
@@ -778,6 +932,15 @@ redis.register_function('ff_expire_suspension', function(keys, args)
     composite_cleanup(
       K.suspension_current .. ":satisfied_set",
       K.suspension_current .. ":member_map")
+    close_additional_waitpoints(
+      K.suspension_current,
+      susp.additional_waitpoints_json or "",
+      { "state", "closed",
+        "closed_at", tostring(now_ms),
+        "close_reason", close_reason },
+      { "closed", "1",
+        "closed_at", tostring(now_ms),
+        "closed_reason", close_reason })
 
     -- Remove from suspension indexes, add to terminal
     redis.call("ZREM", K.suspension_timeout_key, A.execution_id)

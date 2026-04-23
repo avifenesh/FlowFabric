@@ -212,9 +212,14 @@ redis.register_function('ff_deliver_signal', function(keys, args)
       source_type = A.source_type,
       source_identity = A.source_identity,
     }
+    -- RFC-014 Pattern 3: use THIS waitpoint's own key (loaded into
+    -- `wp_for_auth` above, keyed by A.waitpoint_id) so multi-waitpoint
+    -- AllOf resolves each leaf against its own wp_key, not the
+    -- suspension's primary key.
+    local this_wp_key = wp_for_auth.waitpoint_key or susp.waitpoint_key or ""
     local outcome = composite_deliver_signal(
       tree, satisfied_set_key, member_map_key,
-      A.waitpoint_id, susp.waitpoint_key or "", signal_for_eval)
+      A.waitpoint_id, this_wp_key, signal_for_eval)
 
     effect = outcome.effect or "appended_to_waitpoint"
     matched = (effect ~= "signal_ignored_not_in_condition"
@@ -284,6 +289,24 @@ redis.register_function('ff_deliver_signal', function(keys, args)
       redis.call("ZREM", K.suspension_timeout_zset, A.execution_id)
       -- RFC-014 §3.1.1 cleanup owner: deliver_signal close path.
       composite_cleanup(satisfied_set_key, member_map_key)
+      -- RFC-014 Pattern 3: close any OTHER waitpoints owned by this
+      -- suspension (the one the signal arrived on is already closed
+      -- via K.waitpoint_hash above). Reread susp to pick up the
+      -- additional_waitpoints_json that was seeded at suspend-time.
+      local susp_after = redis.call("HGETALL", K.suspension_current)
+      if #susp_after > 0 then
+        local susp2 = hgetall_to_table(susp_after)
+        close_additional_waitpoints(
+          K.suspension_current,
+          susp2.additional_waitpoints_json or "",
+          { "state", "closed",
+            "satisfied_at", tostring(now_ms),
+            "closed_at", tostring(now_ms),
+            "close_reason", "resumed" },
+          { "closed", "1",
+            "closed_at", tostring(now_ms),
+            "closed_reason", "satisfied" })
+      end
     end
 
     -- Record signal hash observed_effect + waitpoint counters + return.
