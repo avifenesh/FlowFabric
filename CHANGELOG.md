@@ -112,6 +112,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tranche 1). Pre-1.0 clean break — no deprecated shim. Construct via
   struct literal.
 
+- **Snapshot decoders return `EngineError::Validation { Corruption }`
+  (RFC-012 Stage 1c T3).** `describe_execution`, `describe_flow`,
+  `describe_edge`, `list_incoming_edges`, and `list_outgoing_edges`
+  used to surface on-disk-corruption parse failures as
+  `SdkError::Config { field, message, .. }`. They now surface as
+  `SdkError::Engine(Box<EngineError::Validation { kind:
+  ValidationKind::Corruption, detail, .. }>)`. The decoders and
+  `FLOW_CORE_KNOWN_FIELDS` moved from `ff-sdk::snapshot` into
+  `ff_core::contracts::decode`. Callers matching on the `Config` shape
+  must migrate to `Engine(Validation::Corruption)` — see
+  `docs/cairn-migration-v0.4.0.md` §6. `SdkError::Config` is retained
+  for SDK-side input validation. Breaking error-shape change; pre-1.0
+  posture accepts.
+
 - Reshaped `BackendRetry` to match ferriskey's `ConnectionRetryStrategy`
   (fields: `exponent_base`, `factor`, `number_of_retries`,
   `jitter_percent`). Previous `max_attempts`/`base_backoff` were
@@ -161,6 +175,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ValkeyBackend::connect`. All 4 fields honored when set; when
   all-`None`, ferriskey's builder default is used (no call to
   `.retry_strategy`).
+- **`ValkeyBackend::describe_execution` and `::describe_flow` are now
+  wired (RFC-012 Stage 1c T3).** Previously returned
+  `EngineError::Unavailable`. Implementation uses the same HGETALL
+  pipeline ff-sdk owned pre-T3, now routing every parse failure
+  through the relocated `ff-core` decoders. `ff-sdk`'s
+  `FlowFabricWorker::describe_execution` / `describe_flow` /
+  `list_*_edges` collapse to thin forwarders over the trait.
 
 ## [0.3.4] - 2026-04-22
 

@@ -272,12 +272,20 @@ async fn describe_flow_corrupt_state_surfaces_error() {
         .await
         .expect_err("unknown flat flow_core field must surface as error");
     match err {
-        ff_sdk::SdkError::Config { message: msg, .. } => {
-            assert!(
-                msg.contains("bogus_future_field"),
-                "error message must name the field: {msg}"
-            );
-        }
-        other => panic!("expected SdkError::Config, got {other:?}"),
+        // RFC-012 Stage 1c T3: decoder returns
+        // `EngineError::Validation { kind: Corruption, .. }` now.
+        ff_sdk::SdkError::Engine(ref boxed) => match boxed.as_ref() {
+            ff_core::engine_error::EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail,
+            } => {
+                assert!(
+                    detail.contains("bogus_future_field"),
+                    "error detail must name the field: {detail}"
+                );
+            }
+            other => panic!("expected EngineError::Validation::Corruption, got {other:?}"),
+        },
+        other => panic!("expected SdkError::Engine(Validation::Corruption), got {other:?}"),
     }
 }

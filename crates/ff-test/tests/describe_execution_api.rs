@@ -326,20 +326,24 @@ async fn describe_execution_corrupt_public_state_surfaces_error() {
         .await
         .expect_err("corrupt public_state must surface as error");
     match err {
-        ff_sdk::SdkError::Config {
-            field: ref f,
-            message: ref msg,
-            ..
-        } => {
-            // Post-#98 structured shape: the field name lives in
-            // `field`, not interpolated into `message`. Verify the
-            // error names public_state in either slot so the test
-            // survives future rephrasings of the human-readable part.
-            assert!(
-                f.as_deref() == Some("public_state") || msg.contains("public_state"),
-                "error must name the field (field={f:?}, msg={msg})"
-            );
-        }
-        other => panic!("expected SdkError::Config, got {other:?}"),
+        // RFC-012 Stage 1c T3: the strict-parse decoder moved into
+        // `ff_core::contracts::decode` and now surfaces via
+        // `EngineError::Validation { kind: Corruption, detail }`
+        // (wrapped by ff-sdk's `From<EngineError> for SdkError` into
+        // `SdkError::Engine`). The field name is embedded in `detail`
+        // with the shape `"<context>: <field>: <message>"`.
+        ff_sdk::SdkError::Engine(ref boxed) => match boxed.as_ref() {
+            ff_core::engine_error::EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail,
+            } => {
+                assert!(
+                    detail.contains("public_state"),
+                    "error must name the field (detail={detail})"
+                );
+            }
+            other => panic!("expected EngineError::Validation::Corruption, got {other:?}"),
+        },
+        other => panic!("expected SdkError::Engine(Validation::Corruption), got {other:?}"),
     }
 }

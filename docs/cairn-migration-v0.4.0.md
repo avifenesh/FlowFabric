@@ -124,7 +124,76 @@ from `completion_backend()` on this path because `Arc<dyn
 EngineBackend>` cannot be re-upcast to `Arc<dyn CompletionBackend>` in
 Rust's trait-object model. 0.3.4 makes the caller decide.
 
-## 6. Gotchas
+## 6. `SdkError` shape migration (post-RFC-012 Stage 1c T3)
+
+Stage 1c T3 moves the strict-parse decoders for `describe_execution`,
+`describe_flow`, and `describe_edge` (plus `list_*_edges`) out of
+ff-sdk and into `ff_core::contracts::decode`. Every `EngineBackend`
+implementation now shares one error surface:
+`EngineError::Validation { kind: ValidationKind::Corruption, detail }`.
+
+### Before (pre-0.4.0 ff-sdk)
+
+```rust
+match err {
+    ff_sdk::SdkError::Config { field, message, .. } => {
+        // field is Option<String>; message is the full context.
+        assert_eq!(field.as_deref(), Some("public_state"));
+    }
+    other => panic!("expected Config, got {other:?}"),
+}
+```
+
+### After (0.4.0+)
+
+```rust
+match err {
+    ff_sdk::SdkError::Engine(boxed) => match boxed.as_ref() {
+        ff_core::engine_error::EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::Corruption,
+            detail,
+        } => {
+            // detail is a "<context>: <field>: <message>" string;
+            // substring-match the field name.
+            assert!(detail.contains("public_state"));
+        }
+        other => panic!("expected Validation::Corruption, got {other:?}"),
+    },
+    other => panic!("expected SdkError::Engine, got {other:?}"),
+}
+```
+
+### Scope
+
+Only on-disk-corruption paths change shape. This includes:
+
+- `describe_execution` — exec_core / tags hash parse failures.
+- `describe_flow` — flow_core hash parse failures, unknown-field sweep.
+- `describe_edge`, `list_incoming_edges`, `list_outgoing_edges` — edge
+  hash parse failures, adjacency-set endpoint drift.
+
+`SdkError::Config` still exists and is still returned for SDK-side
+input validation (e.g. `WorkerConfig` with zero lanes). Only the
+subset of `SdkError::Config` emitted by the snapshot decoders
+collapses into `SdkError::Engine(EngineError::Validation { Corruption, .. })`.
+
+### Detail format
+
+`detail` is a human-readable string with the shape
+`"<context>: <field>: <message>"` (field omitted for whole-object
+errors). The `field` is embedded — not a typed slot — so consumers
+that want field-level routing should substring-match. FF's own tests
+use `assert!(detail.contains("<field>"))`; this is the recommended
+pattern.
+
+### Classification
+
+`EngineError::Validation` classifies as
+`ErrorClass::Terminal` (see `EngineError::class()`), so
+`SdkError::is_retryable()` returns `false` for these — same retry
+posture as the pre-migration `SdkError::Config`.
+
+## 7. Gotchas
 
 - **`#[non_exhaustive]` forces `..Default::default()`** on
   `BackendTimeouts`, `BackendRetry`, and most other `ff-core::backend`

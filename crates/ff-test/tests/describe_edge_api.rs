@@ -418,14 +418,23 @@ async fn list_edges_detects_adjacency_endpoint_drift() {
         .await
         .expect_err("endpoint drift must surface");
     match err {
-        ff_sdk::SdkError::Config { message: msg, .. } => {
-            assert!(msg.contains("adjacency"), "msg: {msg}");
-            assert!(
-                msg.contains("stored endpoint"),
-                "msg should name drift: {msg}"
-            );
-        }
-        other => panic!("expected Config, got {other:?}"),
+        // RFC-012 Stage 1c T3: endpoint-drift detection lives in
+        // `ff_backend_valkey::list_edges_impl` and returns
+        // `EngineError::Validation { kind: Corruption, .. }`.
+        ff_sdk::SdkError::Engine(ref boxed) => match boxed.as_ref() {
+            ff_core::engine_error::EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail,
+            } => {
+                assert!(detail.contains("adjacency"), "detail: {detail}");
+                assert!(
+                    detail.contains("stored endpoint"),
+                    "detail should name drift: {detail}"
+                );
+            }
+            other => panic!("expected EngineError::Validation::Corruption, got {other:?}"),
+        },
+        other => panic!("expected SdkError::Engine(Validation::Corruption), got {other:?}"),
     }
 }
 
@@ -462,9 +471,18 @@ async fn describe_edge_corrupt_state_surfaces_error() {
         .await
         .expect_err("unknown edge_hash field must surface as error");
     match err {
-        ff_sdk::SdkError::Config { message: msg, .. } => {
-            assert!(msg.contains("bogus_future_field"), "msg: {msg}");
-        }
-        other => panic!("expected SdkError::Config, got {other:?}"),
+        // RFC-012 Stage 1c T3: `describe_edge` calls the ff-core
+        // decoder which returns `EngineError::Validation { kind:
+        // Corruption, detail }`.
+        ff_sdk::SdkError::Engine(ref boxed) => match boxed.as_ref() {
+            ff_core::engine_error::EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::Corruption,
+                detail,
+            } => {
+                assert!(detail.contains("bogus_future_field"), "detail: {detail}");
+            }
+            other => panic!("expected EngineError::Validation::Corruption, got {other:?}"),
+        },
+        other => panic!("expected SdkError::Engine(Validation::Corruption), got {other:?}"),
     }
 }
