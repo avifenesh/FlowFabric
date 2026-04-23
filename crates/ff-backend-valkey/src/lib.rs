@@ -38,9 +38,10 @@ use ff_core::contracts::decode::{
     build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
 };
 use ff_core::contracts::{
-    CancelFlowArgs, CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
-    FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage,
-    ReportUsageResult, SuspendedExecutionEntry,
+    CancelFlowArgs, CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
+    DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot,
+    FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage, ListLanesPage,
+    ListSuspendedPage, ReportUsageResult, SuspendedExecutionEntry,
 };
 use ff_core::partition::PartitionKey;
 use ff_core::engine_backend::EngineBackend;
@@ -53,7 +54,9 @@ use ff_core::types::{
 };
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
+use ff_script::functions::execution::ExecOpKeys;
 use ff_script::functions::flow::{FlowStructOpKeys, ff_cancel_flow};
+use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
 use ff_script::result::FcallResult;
 
 pub mod backend_error;
@@ -2434,6 +2437,91 @@ async fn read_retry_policy_json(
     }
 }
 
+/// Thin forwarder to `ff_script::functions::signal::ff_deliver_signal`.
+///
+/// Reads `lane_id` off `exec_core` (the caller's args carry no lane —
+/// the Lua KEYS require it to locate the lane_eligible / lane_suspended
+/// / lane_delayed index keys) and delegates. The `ff-sdk` worker's
+/// `deliver_signal` public API does the same HGET pre-read before
+/// firing the FCALL; this mirrors it at the backend layer so alternate
+/// backends don't need to teach callers about the lane.
+#[tracing::instrument(
+    name = "ff.deliver_signal",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        waitpoint_id = %args.waitpoint_id,
+        signal_id = %args.signal_id,
+    )
+)]
+async fn deliver_signal_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: DeliverSignalArgs,
+) -> Result<DeliverSignalResult, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    // Pre-read lane_id from exec_core. An absent lane_id means the
+    // execution record is missing / malformed — let the FCALL surface
+    // the canonical `execution_not_found` / `invalid_state` error.
+    let lane_str: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("lane_id")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let lane_id = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
+
+    let keys = SignalOpKeys {
+        ctx: &ctx,
+        idx: &idx,
+        lane_id: &lane_id,
+    };
+    ff_deliver_signal(client, &keys, &args)
+        .await
+        .map_err(EngineError::from)
+}
+
+/// Thin forwarder to
+/// `ff_script::functions::signal::ff_claim_resumed_execution`. The Lua
+/// returns a partial result (omits `execution_id`, which the caller
+/// already holds in the args); we re-hydrate before returning.
+#[tracing::instrument(
+    name = "ff.claim_resumed_execution",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        worker_instance_id = %args.worker_instance_id,
+        lease_id = %args.lease_id,
+    )
+)]
+async fn claim_resumed_execution_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: ClaimResumedExecutionArgs,
+) -> Result<ClaimResumedExecutionResult, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys = ExecOpKeys {
+        ctx: &ctx,
+        idx: &idx,
+        lane_id: &args.lane_id,
+        worker_instance_id: &args.worker_instance_id,
+    };
+    let execution_id = args.execution_id.clone();
+    let partial = ff_claim_resumed_execution(client, &keys, &args)
+        .await
+        .map_err(EngineError::from)?;
+    Ok(partial.complete(execution_id))
+}
+
 #[async_trait]
 impl EngineBackend for ValkeyBackend {
     async fn claim(
@@ -2773,6 +2861,31 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "cancel_flow: FCALL ff_cancel_flow")
+            })
+    }
+
+    async fn deliver_signal(
+        &self,
+        args: DeliverSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        deliver_signal_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "deliver_signal: FCALL ff_deliver_signal")
+            })
+    }
+
+    async fn claim_resumed_execution(
+        &self,
+        args: ClaimResumedExecutionArgs,
+    ) -> Result<ClaimResumedExecutionResult, EngineError> {
+        claim_resumed_execution_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "claim_resumed_execution: FCALL ff_claim_resumed_execution",
+                )
             })
     }
 

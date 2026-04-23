@@ -19,7 +19,8 @@ use ff_core::backend::{
     WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
+    DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
 };
 use ff_core::partition::PartitionKey;
@@ -276,6 +277,26 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<ListExecutionsPage, EngineError> {
         self.record("list_executions")?;
         Ok(ListExecutionsPage::new(Vec::new(), None))
+    }
+
+    async fn deliver_signal(
+        &self,
+        _args: DeliverSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        self.record("deliver_signal")?;
+        Err(EngineError::Unavailable {
+            op: "deliver_signal",
+        })
+    }
+
+    async fn claim_resumed_execution(
+        &self,
+        _args: ClaimResumedExecutionArgs,
+    ) -> Result<ClaimResumedExecutionResult, EngineError> {
+        self.record("claim_resumed_execution")?;
+        Err(EngineError::Unavailable {
+            op: "claim_resumed_execution",
+        })
     }
 
     #[cfg(feature = "valkey-default")]
