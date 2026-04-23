@@ -376,6 +376,18 @@ impl FlowKeyContext {
         format!("ff:flow:{}:{}:in:{}", self.tag, self.fid, downstream_eid)
     }
 
+    /// `ff:flow:{fp:N}:<flow_id>:edgegroup:<downstream_eid>` — RFC-016
+    /// Stage A edge-group hash. Fields written in Stage A:
+    /// `policy_variant` (`all_of`), `n`, `succeeded`, `group_state`.
+    /// Stage B+ adds `on_satisfied`, `failed`, `skipped`, `satisfied_at`,
+    /// `cancel_siblings_pending`.
+    pub fn edgegroup(&self, downstream_eid: &ExecutionId) -> String {
+        format!(
+            "ff:flow:{}:{}:edgegroup:{}",
+            self.tag, self.fid, downstream_eid
+        )
+    }
+
     /// `ff:flow:{fp:N}:<flow_id>:events`
     pub fn events(&self) -> String {
         format!("ff:flow:{}:{}:events", self.tag, self.fid)

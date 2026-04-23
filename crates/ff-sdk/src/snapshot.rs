@@ -60,6 +60,27 @@ impl FlowFabricWorker {
         Ok(self.backend_ref().describe_flow(id).await?)
     }
 
+    /// RFC-016 Stage A: declare the inbound edge-group policy for a
+    /// downstream execution. Must be called BEFORE the first
+    /// `add_dependency(... -> downstream_execution_id)` on this flow.
+    ///
+    /// Stage A accepts only
+    /// [`EdgeDependencyPolicy::AllOf`](ff_core::contracts::EdgeDependencyPolicy::AllOf);
+    /// `AnyOf` / `Quorum` return a typed
+    /// [`EngineError::Validation`](ff_core::engine_error::EngineError::Validation)
+    /// error until Stage B's resolver lands.
+    pub async fn set_edge_group_policy(
+        &self,
+        flow_id: &FlowId,
+        downstream_execution_id: &ExecutionId,
+        policy: ff_core::contracts::EdgeDependencyPolicy,
+    ) -> Result<ff_core::contracts::SetEdgeGroupPolicyResult, SdkError> {
+        Ok(self
+            .backend_ref()
+            .set_edge_group_policy(flow_id, downstream_execution_id, policy)
+            .await?)
+    }
+
     /// List flows on a partition with cursor-based pagination
     /// (issue #185).
     ///

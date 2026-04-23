@@ -1951,7 +1951,7 @@ impl Server {
     /// Apply a staged dependency edge to the child execution.
     ///
     /// Runs on the child execution partition {p:N}.
-    /// KEYS (7), ARGV (7) — matches lua/flow.lua ff_apply_dependency_to_child.
+    /// KEYS (8), ARGV (7) — matches lua/flow.lua ff_apply_dependency_to_child.
     pub async fn apply_dependency_to_child(
         &self,
         args: &ApplyDependencyToChildArgs,
@@ -1962,6 +1962,11 @@ impl Server {
         );
         let ctx = ExecKeyContext::new(&partition, &args.downstream_execution_id);
         let idx = IndexKeys::new(&partition);
+        let flow_partition = ff_core::partition::flow_partition(
+            &args.flow_id,
+            &self.config.partition_config,
+        );
+        let flow_ctx = ff_core::keys::FlowKeyContext::new(&flow_partition, &args.flow_id);
 
         // Pre-read lane_id for index keys
         let lane_str: Option<String> = self
@@ -1971,8 +1976,8 @@ impl Server {
             .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
         let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
 
-        // KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
-        //           eligible_zset, blocked_deps_zset, deps_all_edges
+        // KEYS (8): exec_core, deps_meta, unresolved_set, dep_hash,
+        //           eligible_zset, blocked_deps_zset, deps_all_edges, edgegroup
         let fcall_keys: Vec<String> = vec![
             ctx.core(),
             ctx.deps_meta(),
@@ -1981,6 +1986,7 @@ impl Server {
             idx.lane_eligible(&lane),
             idx.lane_blocked_dependencies(&lane),
             ctx.deps_all_edges(),
+            flow_ctx.edgegroup(&args.downstream_execution_id),
         ];
 
         // ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,

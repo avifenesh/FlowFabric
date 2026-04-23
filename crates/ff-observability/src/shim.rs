@@ -67,4 +67,8 @@ impl Metrics {
 
     pub fn inc_budget_hit(&self, _dimension: &str) {}
     pub fn inc_quota_hit(&self, _reason: &'static str) {}
+
+    // ── RFC-016 Stage A: edge-group policy ──
+
+    pub fn inc_edge_group_policy(&self, _policy: &'static str) {}
 }

@@ -498,6 +498,26 @@ pub trait EngineBackend: Send + Sync + 'static {
         wait: CancelFlowWait,
     ) -> Result<CancelFlowResult, EngineError>;
 
+    /// RFC-016 Stage A: set the inbound-edge-group policy for a
+    /// downstream execution. Must be called before the first
+    /// `add_dependency(... -> downstream_execution_id)` — the backend
+    /// rejects with [`EngineError::Conflict`] if edges have already
+    /// been staged for this group.
+    ///
+    /// Stage A honours only
+    /// [`EdgeDependencyPolicy::AllOf`](crate::contracts::EdgeDependencyPolicy::AllOf);
+    /// the `AnyOf` / `Quorum` variants return
+    /// [`EngineError::Validation`] with
+    /// `detail = "stage A supports AllOf only; AnyOf/Quorum land in stage B"`
+    /// until Stage B's resolver lands.
+    #[cfg(feature = "core")]
+    async fn set_edge_group_policy(
+        &self,
+        flow_id: &FlowId,
+        downstream_execution_id: &ExecutionId,
+        policy: crate::contracts::EdgeDependencyPolicy,
+    ) -> Result<crate::contracts::SetEdgeGroupPolicyResult, EngineError>;
+
     // ── Budget ──
 
     /// Report usage against a budget and check limits. Returns the

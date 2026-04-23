@@ -14,10 +14,17 @@ pub struct FlowStructOpKeys<'a> {
 }
 
 /// Key context for child-local dependency operations on {p:N}.
+///
+/// `flow_ctx` is required for dependency ops (every dependency edge
+/// belongs to a flow); it supplies the `edgegroup` key used by
+/// RFC-016 Stage A. Post-RFC-011 the flow and exec partitions share
+/// the `{fp:N}` hash tag so the FCALL is still single-slot.
 pub struct DepOpKeys<'a> {
     pub ctx: &'a ExecKeyContext,
     pub idx: &'a IndexKeys,
     pub lane_id: &'a ff_core::types::LaneId,
+    pub flow_ctx: &'a FlowKeyContext,
+    pub downstream_eid: &'a ff_core::types::ExecutionId,
 }
 
 /// Extended key context for [`ff_resolve_dependency`], which needs
@@ -36,6 +43,8 @@ pub struct ResolveDependencyKeys<'a> {
     pub idx: &'a IndexKeys,
     pub lane_id: &'a ff_core::types::LaneId,
     pub upstream_ctx: &'a ExecKeyContext,
+    pub flow_ctx: &'a FlowKeyContext,
+    pub downstream_eid: &'a ff_core::types::ExecutionId,
 }
 
 // ─── ff_create_flow ──────────────────────────────────────────────────
@@ -215,8 +224,8 @@ impl FromFcallResult for EvaluateFlowEligibilityResult {
 }
 
 // ─── ff_apply_dependency_to_child ─────────────────────────────────────
-// KEYS (7): exec_core, deps_meta, unresolved_set, dep_hash,
-//           eligible_zset, blocked_deps_zset, deps_all_edges
+// KEYS (8): exec_core, deps_meta, unresolved_set, dep_hash,
+//           eligible_zset, blocked_deps_zset, deps_all_edges, edgegroup
 // ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
 //           dependency_kind, data_passing_ref, now_ms
 
@@ -230,6 +239,7 @@ ff_function! {
             k.idx.lane_eligible(k.lane_id),
             k.idx.lane_blocked_dependencies(k.lane_id),
             k.ctx.deps_all_edges(),
+            k.flow_ctx.edgegroup(k.downstream_eid),
         }
         argv {
             args.flow_id.to_string(),
@@ -259,16 +269,16 @@ impl FromFcallResult for ApplyDependencyToChildResult {
 }
 
 // ─── ff_resolve_dependency ────────────────────────────────────────────
-// KEYS (11): exec_core, deps_meta, unresolved_set, dep_hash,
+// KEYS (12): exec_core, deps_meta, unresolved_set, dep_hash,
 //            eligible_zset, terminal_zset, blocked_deps_zset,
 //            attempt_hash, stream_meta, downstream_payload,
-//            upstream_result
+//            upstream_result, edgegroup
 // ARGV (3): edge_id, upstream_outcome, now_ms
 //
 // KEYS[10]/[11] added in Batch C item 3 for server-side
-// data_passing_ref resolution. Upstream and downstream are co-located
-// on the same {fp:N} slot via flow membership — the `upstream_ctx`
-// field on DepOpKeys builds the upstream key on that shared partition.
+// data_passing_ref resolution. KEYS[12] added in RFC-016 Stage A for
+// the per-downstream edge-group hash; flow/exec partitions co-locate
+// under `{fp:N}` post-RFC-011 so the FCALL remains single-slot.
 
 ff_function! {
     pub ff_resolve_dependency(args: ResolveDependencyArgs) -> ResolveDependencyResult {
@@ -284,6 +294,7 @@ ff_function! {
             k.ctx.stream_meta(ff_core::types::AttemptIndex::new(0)),  // placeholder
             k.ctx.payload(),
             k.upstream_ctx.result(),
+            k.flow_ctx.edgegroup(k.downstream_eid),
         }
         argv {
             args.edge_id.to_string(),
@@ -425,6 +436,55 @@ impl FromFcallResult for StageDependencyEdgeResult {
             edge_id: eid,
             new_graph_revision: rev,
         })
+    }
+}
+
+// ─── ff_set_edge_group_policy (RFC-016 Stage A) ─────────────────────────
+// KEYS (2): flow_core, edgegroup
+// ARGV (3): policy_variant, on_satisfied, now_ms
+
+pub struct SetEdgeGroupPolicyKeys<'a> {
+    pub fctx: &'a FlowKeyContext,
+    pub downstream_eid: &'a ff_core::types::ExecutionId,
+}
+
+ff_function! {
+    pub ff_set_edge_group_policy(args: SetEdgeGroupPolicyArgs) -> SetEdgeGroupPolicyResult {
+        keys(k: &SetEdgeGroupPolicyKeys<'_>) {
+            k.fctx.core(),
+            k.fctx.edgegroup(k.downstream_eid),
+        }
+        argv {
+            args.policy.variant_str().to_string(),
+            match &args.policy {
+                ff_core::contracts::EdgeDependencyPolicy::AllOf => String::new(),
+                ff_core::contracts::EdgeDependencyPolicy::AnyOf { on_satisfied }
+                | ff_core::contracts::EdgeDependencyPolicy::Quorum { on_satisfied, .. } => {
+                    on_satisfied.variant_str().to_string()
+                }
+                // `EdgeDependencyPolicy` is `#[non_exhaustive]`; future
+                // variants must be handled at the call-site level
+                // before reaching Lua. Stage A rejects non-AllOf at
+                // the backend boundary (set_edge_group_policy_impl).
+                _ => String::new(),
+            },
+            args.now.to_string(),
+        }
+    }
+}
+
+impl FromFcallResult for SetEdgeGroupPolicyResult {
+    fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        let r = FcallResult::parse(raw)?.into_success()?;
+        match r.field_str(0).as_str() {
+            "set" => Ok(SetEdgeGroupPolicyResult::Set),
+            "already_set" => Ok(SetEdgeGroupPolicyResult::AlreadySet),
+            other => Err(ScriptError::Parse {
+                fcall: "ff_set_edge_group_policy".into(),
+                execution_id: None,
+                message: format!("unexpected status: {other}"),
+            }),
+        }
     }
 }
 

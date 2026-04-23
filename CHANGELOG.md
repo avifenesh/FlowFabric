@@ -49,6 +49,56 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   dropped; `JsonMergePatch` the sole v0.6 `PatchKind` (open enum for
   the future `StringAppend`); EMA α deferred-to-measurement, not baked
   in. Lua library bumped to version `17`.
+- **RFC-016 Stage A: edge-dependency-policy foundations.** Introduces
+  the `EdgeDependencyPolicy` (`AllOf` / `AnyOf` / `Quorum`) and
+  `OnSatisfied` (`CancelRemaining` / `LetRun`) enums — both
+  `#[non_exhaustive]` with constructor helpers — plus a new
+  `EngineBackend::set_edge_group_policy(flow_id, downstream_eid,
+  policy)` op backed by Lua `ff_set_edge_group_policy`. Stage A
+  honours only `AllOf`; `AnyOf` / `Quorum` are rejected with
+  `EngineError::Validation { kind: InvalidInput, .. }` until Stage B
+  (RFC-016 §11) lands the resolver extension. `FlowFabricWorker::
+  set_edge_group_policy` is the consumer entry point.
+
+  A new per-downstream hash key
+  `ff:flow:{fp:N}:<flow_id>:edgegroup:<downstream_eid>` carries the
+  Stage A counters (`policy_variant`, `n`, `succeeded`,
+  `group_state`). `ff_apply_dependency_to_child` dual-writes to the
+  new hash on every edge application; `ff_resolve_dependency`
+  dual-writes the success / impossibility counters. The existing
+  `deps_meta.unsatisfied_required_count` counter remains the
+  authoritative eligibility driver for Stage A (zero behaviour change
+  on existing flows); the edgegroup hash is the new source of truth
+  for the `EdgeGroupSnapshot` surface and the foundation Stage B's
+  resolver extends.
+
+  **Migration.** Flows created before Stage A never populated the
+  edgegroup hash. `describe_flow.edge_groups` falls back to decoding
+  from `deps_meta.unsatisfied_required_count` /
+  `impossible_required_count` when the hash is absent — the snapshot
+  still reports `AllOf` + correct counters, observability is
+  transparent to operators. Future stages (Stage C `pending_cancel_
+  groups` reconciler + Stage E observability pagination) will retire
+  the shim once every live flow has transitioned; the shim is
+  tracked for removal post-Stage E.
+
+  Wire addition: `FlowSnapshot` gains `edge_groups:
+  Vec<EdgeGroupSnapshot>` (`#[non_exhaustive]`). Metric addition:
+  `ff_edge_group_policy_total{policy}` counter on `ff-observability`
+  — Stage A emits only `policy="all_of"`; the `any_of` / `quorum`
+  labels activate in Stage B.
+
+  Stage B/C/D/E scope (NOT in this PR): the `AnyOf` / `Quorum`
+  resolver (Stage B), `CancelRemaining` sibling-cancel dispatcher +
+  reconciler + `pending_cancel_groups` SET (Stage C), `LetRun` path
+  (Stage D), operator tooling + pagination (Stage E).
+
+  Lua library version 17 → 18 (new `ff_set_edge_group_policy`
+  function; `ff_apply_dependency_to_child` KEYS 7 → 8;
+  `ff_resolve_dependency` KEYS 11 → 12). Integration test:
+  `crates/ff-test/tests/flow_edge_policies_stage_a.rs`. Existing
+  readiness suite (`e2e_flow_atomicity`, `fanout_fanin_flow_*`,
+  `e2e_lifecycle::test_flow_*`) unaffected.
 
 ### Changed
 
