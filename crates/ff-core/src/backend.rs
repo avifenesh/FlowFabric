@@ -21,7 +21,15 @@
 //! type inventory and §4.1-§4.2 for the `Handle` / `EngineError` shapes.
 
 use crate::contracts::ReclaimGrant;
-use crate::types::{Namespace, TimestampMs, WaitpointToken};
+use crate::types::{TimestampMs, WaitpointToken};
+
+// DX (HHH v0.3.4 re-smoke): `Namespace` lives in `ff_core::types` but
+// is used on `BackendConfig` + `ScannerFilter` (both defined in this
+// module). Re-export here so consumers already scoped to
+// `ff_core::backend::*` can grab it without a second `use` line
+// crossing into `ff_core::types`. Also brings `Namespace` into local
+// scope for the definitions below.
+pub use crate::types::Namespace;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -838,8 +846,14 @@ impl ScannerFilter {
 
     /// Set the tenant-scope namespace filter dimension. Consumes
     /// and returns `self` for chaining.
-    pub fn with_namespace(mut self, ns: Namespace) -> Self {
-        self.namespace = Some(ns);
+    ///
+    /// Accepts anything that converts into [`Namespace`] so callers
+    /// can pass `&str` / `String` directly without the
+    /// `Namespace::new(...)` ceremony (the conversion is infallible;
+    /// [`Namespace`] has `From<&str>` and `From<String>` via the
+    /// crate's `string_id!` macro).
+    pub fn with_namespace(mut self, ns: impl Into<Namespace>) -> Self {
+        self.namespace = Some(ns.into());
         self
     }
 

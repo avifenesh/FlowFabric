@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ff_core::backend::{
-    AppendFrameOutcome, BackendConfig, BackendConnection, CancelFlowPolicy, CancelFlowWait,
+    AppendFrameOutcome, BackendConnection, CancelFlowPolicy, CancelFlowWait,
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle,
     HandleKind, LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
     WaitpointSpec,
@@ -62,6 +62,11 @@ pub use backend_error::{
     backend_error_from_ferriskey, classify_ferriskey_kind, BackendErrorWrapper,
 };
 pub use completion::COMPLETION_CHANNEL;
+// DX (HHH v0.3.4 re-smoke): consumers that have already imported
+// `ff_backend_valkey` shouldn't need to also dip into
+// `ff_core::backend` just to name `BackendConfig`. Re-export it here
+// so `ff_backend_valkey::BackendConfig` works as a single-crate path.
+pub use ff_core::backend::BackendConfig;
 
 /// Valkey-FCALL–backed `EngineBackend`.
 ///

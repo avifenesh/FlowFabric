@@ -163,6 +163,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`ff_backend_valkey::build_client`** is now `pub`. `FlowFabricWorker::connect`
   reuses it so the `BackendConfig` → `ferriskey::Client` mapping lives
   in exactly one place.
+- **DX polish — re-exports + `ScannerFilter::with_namespace` ergonomics
+  (HHH v0.3.4 re-smoke):** four additive papercut fixes for cairn's
+  migration path.
+  - `ff_core::ScannerFilter` re-exported at the crate root (was only
+    reachable via `ff_core::backend::ScannerFilter`).
+  - `ff_core::backend::Namespace` re-exported from `ff_core::types`
+    so consumers already scoped to `ff_core::backend::*` don't need
+    a second `use` crossing into `ff_core::types`. `Namespace`
+    remains canonically exported at `ff_core::types::Namespace`; this
+    is purely additive.
+  - `ff_backend_valkey::BackendConfig` re-exported from
+    `ff_core::backend::BackendConfig` so single-crate consumers of
+    `ff_backend_valkey` don't need to also name `ff_core::backend`.
+  - `ScannerFilter::with_namespace` now accepts
+    `impl Into<Namespace>` (was typed `Namespace`). Non-breaking:
+    existing `Namespace::new("t")`-style call sites still compile
+    via the identity `From<Namespace> for Namespace` impl, and `&str`
+    / `String` now work directly via `string_id!`'s `From` impls.
 
 ### Changed
 
