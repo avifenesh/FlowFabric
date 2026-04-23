@@ -1,0 +1,33 @@
+[package]
+name = "ff-observability-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "FlowFabric consumer-side Prometheus /metrics HTTP endpoint — bridges ff-observability's registry to an axum Router for consumers embedding ff-sdk without ff-server"
+
+[features]
+# OFF by default — the router mounts and `render()` returns empty text
+# until the consumer enables the real OTEL backend on `ff-observability`.
+# Turning `enabled` ON here transitively enables
+# `ff-observability/enabled`, matching the pattern used by the other
+# consumer-feature gates (`ff-server/observability`,
+# `ff-engine/observability`). Keep call shape identical under both
+# configurations so consumers don't branch on the feature.
+default = []
+enabled = ["ff-observability/enabled"]
+
+[dependencies]
+# ff-observability is the single owner of the OTEL/Prometheus deps —
+# this crate only wires its `render()` output into an axum Router so
+# consumers get `/metrics` without pulling ff-server.
+ff-observability = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
