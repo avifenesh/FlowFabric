@@ -91,6 +91,12 @@ pub struct ValkeyBackend {
     /// connection; in that case `subscribe_completions` returns
     /// `EngineError::Unavailable`.
     subscriber_connection: Option<ff_core::backend::ValkeyConnection>,
+    /// Optional observability handle. When set, the `EngineBackend`
+    /// trait impl fires handles (today: `inc_lease_renewal`) at the
+    /// matching call sites. `None` falls back to no-op (issue #154).
+    /// The `Metrics` type is a zero-cost shim unless this crate (or
+    /// a transitive dep) enables `ff-observability/enabled`.
+    metrics: Option<Arc<ff_observability::Metrics>>,
 }
 
 impl ValkeyBackend {
@@ -112,6 +118,18 @@ impl ValkeyBackend {
     ///
     /// [`BackendRetry`]: ff_core::backend::BackendRetry
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
+        Self::connect_inner(config, None, "connect").await
+    }
+
+    /// Shared dial + partition-config-load body for [`Self::connect`]
+    /// and [`Self::connect_with_metrics`]. The `op_label` feeds the
+    /// `EngineError::Unavailable.op` string when the config's
+    /// connection is not a `Valkey` variant.
+    async fn connect_inner(
+        config: BackendConfig,
+        metrics: Option<Arc<ff_observability::Metrics>>,
+        op_label: &'static str,
+    ) -> Result<Arc<dyn EngineBackend>, EngineError> {
         // `BackendConnection` is `#[non_exhaustive]` for future
         // backends; the compiler treats the pattern as refutable,
         // hence `let ... else`. Today only `Valkey` exists; a
@@ -119,8 +137,15 @@ impl ValkeyBackend {
         // surfaces as `EngineError::Unavailable` so callers get a
         // typed error rather than a panic.
         let BackendConnection::Valkey(v) = config.connection.clone() else {
+            // `op_label` is `&'static str`; use `match` to keep the
+            // `op: &'static str` shape without heap alloc.
             return Err(EngineError::Unavailable {
-                op: "ValkeyBackend::connect (non-Valkey BackendConnection)",
+                op: match op_label {
+                    "connect_with_metrics" => {
+                        "ValkeyBackend::connect_with_metrics (non-Valkey BackendConnection)"
+                    }
+                    _ => "ValkeyBackend::connect (non-Valkey BackendConnection)",
+                },
             });
         };
         let client = build_client(&config).await?;
@@ -155,6 +180,7 @@ impl ValkeyBackend {
             client,
             partition_config,
             subscriber_connection: Some(v),
+            metrics,
         }))
     }
 
@@ -181,6 +207,7 @@ impl ValkeyBackend {
             client,
             partition_config,
             subscriber_connection: None,
+            metrics: None,
         })
     }
 
@@ -198,7 +225,38 @@ impl ValkeyBackend {
             client,
             partition_config,
             subscriber_connection: Some(connection),
+            metrics: None,
         })
+    }
+
+    /// Attach an `ff_observability::Metrics` handle so the trait
+    /// impl's metric-emitting sites fire (issue #154). Returns `true`
+    /// when the handle was installed (`Arc::get_mut` succeeded — this
+    /// requires the caller to hold the only outstanding `Arc<Self>`),
+    /// `false` otherwise. If the backend was constructed behind an
+    /// `Arc<dyn EngineBackend>` (e.g. via [`ValkeyBackend::connect`]),
+    /// use [`ValkeyBackend::connect_with_metrics`] instead — you
+    /// cannot mutate through `Arc<dyn …>`.
+    pub fn with_metrics(
+        self: &mut Arc<Self>,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> bool {
+        if let Some(inner) = Arc::get_mut(self) {
+            inner.metrics = Some(metrics);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Dial + attach `Metrics` in one step. Alternative to
+    /// [`ValkeyBackend::connect`] that wires the metrics handle
+    /// before the returned `Arc<dyn EngineBackend>` is sealed. (issue #154)
+    pub async fn connect_with_metrics(
+        config: BackendConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Arc<dyn EngineBackend>, EngineError> {
+        Self::connect_inner(config, Some(metrics), "connect_with_metrics").await
     }
 
     /// Encode the minimum set of attempt-cookie fields into a
@@ -322,6 +380,11 @@ fn cancel_policy_to_str(p: CancelFlowPolicy) -> &'static str {
 /// wait modes explicitly with [`EngineError::Unavailable`] lets
 /// callers distinguish "backend won't do this yet" from a silent
 /// fallback. See RFC-012 §3.1.1 for the cancel_flow policy matrix.
+#[tracing::instrument(
+    name = "ff.cancel_flow",
+    skip_all,
+    fields(backend = "valkey", flow_id = %flow_id)
+)]
 async fn cancel_flow_fcall(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -377,6 +440,11 @@ async fn cancel_flow_fcall(
 ///
 /// Mirrors the pre-T3 ff-sdk pipeline shape: the two keys share
 /// `{fp:N}` so cluster mode routes them to the same slot.
+#[tracing::instrument(
+    name = "ff.describe_execution",
+    skip_all,
+    fields(backend = "valkey", execution_id = %id)
+)]
 async fn describe_execution_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -409,6 +477,11 @@ async fn describe_execution_impl(
 /// Single `HGETALL flow_core` + decode via [`build_flow_snapshot`].
 /// `Ok(None)` when flow_core is absent. Decode failures surface as
 /// `EngineError::Validation { kind: Corruption, .. }`.
+#[tracing::instrument(
+    name = "ff.describe_flow",
+    skip_all,
+    fields(backend = "valkey", flow_id = %id)
+)]
 async fn describe_flow_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -446,6 +519,11 @@ async fn describe_flow_impl(
 /// `downstream_execution_id` for Incoming, must match
 /// `direction.subject()`) so a drifted SET entry does not silently
 /// surface an unrelated edge to the caller.
+#[tracing::instrument(
+    name = "ff.list_edges",
+    skip_all,
+    fields(backend = "valkey", flow_id = %flow_id)
+)]
 async fn list_edges_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -541,6 +619,11 @@ async fn list_edges_impl(
 /// Single `HGETALL edge_hash` + decode via [`build_edge_snapshot`].
 /// `Ok(None)` when the edge hash is absent. Decode failures surface
 /// as `EngineError::Validation { kind: Corruption, .. }`.
+#[tracing::instrument(
+    name = "ff.describe_edge",
+    skip_all,
+    fields(backend = "valkey", flow_id = %flow_id, edge_id = %edge_id)
+)]
 async fn describe_edge_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -567,6 +650,11 @@ async fn describe_edge_impl(
 /// exec_core hash is absent OR the `flow_id` field is empty
 /// (standalone execution). A present-but-malformed value surfaces as
 /// `EngineError::Validation { kind: Corruption, .. }`.
+#[tracing::instrument(
+    name = "ff.resolve_execution_flow_id",
+    skip_all,
+    fields(backend = "valkey", execution_id = %eid)
+)]
 async fn resolve_execution_flow_id_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -667,6 +755,16 @@ fn parse_success_only(raw: &ferriskey::Value) -> Result<(), EngineError> {
 /// `expires_at`; `lease_epoch` is threaded from the caller's handle
 /// (Lua's `ff_renew_lease` does not bump epoch, so the handle's value
 /// is still authoritative).
+#[tracing::instrument(
+    name = "ff.renew",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn renew_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -726,6 +824,16 @@ async fn renew_impl(
 
 /// Stage 1b — `progress` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::update_progress`. 1 KEY, 5 ARGV.
+#[tracing::instrument(
+    name = "ff.progress",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn progress_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -766,6 +874,16 @@ async fn progress_impl(
 /// `suspension:current`, filters by `attempt_index`, pulls matched
 /// `signal_id`s via `HMGET`, then pipelines per-signal
 /// `HGETALL signal_hash` + `GET signal_payload`.
+#[tracing::instrument(
+    name = "ff.observe_signals",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn observe_signals_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -951,6 +1069,16 @@ fn frame_kind_to_str(k: ff_core::backend::FrameKind) -> &'static str {
 /// max_payload_bytes = "65536", encoding = "utf8". A trait-level knob
 /// for those constants is future work (RFC-012 §R7.5.6 shape
 /// commitment — not changing the wire under this refactor).
+#[tracing::instrument(
+    name = "ff.append_frame",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn append_frame_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1024,6 +1152,16 @@ async fn append_frame_impl(
 /// `ff_sdk::task::ClaimedTask::create_pending_waitpoint`. 4 KEYS, 5
 /// ARGV. Mints a fresh `WaitpointId` client-side and returns the
 /// server-assigned HMAC token.
+#[tracing::instrument(
+    name = "ff.create_waitpoint",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn create_waitpoint_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1096,6 +1234,17 @@ async fn create_waitpoint_impl(
 /// reserved-but-inert on the wire — the SDK never surfaced them
 /// either, so preserving that behaviour keeps byte-for-byte wire
 /// parity.
+#[tracing::instrument(
+    name = "ff.report_usage",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+        budget_id = %budget,
+    )
+)]
 async fn report_usage_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1214,6 +1363,16 @@ fn parse_u64_field(
 
 /// Stage 1b — `delay` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::delay_execution`. 9 KEYS, 5 ARGV.
+#[tracing::instrument(
+    name = "ff.delay",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn delay_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1258,6 +1417,16 @@ async fn delay_impl(
 /// Stage 1b — `wait_children` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::move_to_waiting_children`. 9 KEYS, 4
 /// ARGV.
+#[tracing::instrument(
+    name = "ff.wait_children",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn wait_children_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1309,6 +1478,16 @@ async fn wait_children_impl(
 /// the prior commit landed and the network drop hit after commit.
 /// Any other `ExecutionNotActive` combination surfaces the error
 /// so the caller learns what actually happened.
+#[tracing::instrument(
+    name = "ff.complete",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn complete_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1369,6 +1548,16 @@ async fn complete_impl(
 /// `exec_core`; if absent, a placeholder `WaitpointId` is used — the
 /// Lua side tolerates this), 5 ARGV. Reconciles to `Ok` when the
 /// stored `terminal_outcome == "cancelled"`.
+#[tracing::instrument(
+    name = "ff.cancel",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn cancel_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1468,6 +1657,16 @@ async fn cancel_impl(
 /// and Lua records that as `failure_reason`; Stage 1b preserves the
 /// shape to keep a zero-behavior-change guarantee. A future commit
 /// can thread `detail` once Lua grows a slot for it.
+#[tracing::instrument(
+    name = "ff.fail",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %f.execution_id,
+        attempt_id = %f.attempt_id,
+        lease_epoch = %f.lease_epoch,
+    )
+)]
 async fn fail_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1685,8 +1884,24 @@ impl EngineBackend for ValkeyBackend {
     }
 
     async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+        // Decode first. A decode failure is caller-input
+        // malformation (corrupt backend tag / version / field shape)
+        // — it is NOT an attempted renewal, so we deliberately do
+        // NOT fire `inc_lease_renewal` on this path. The counter
+        // measures renew RPCs, and a caller handing us a bad handle
+        // never issued one.
         let f = handle_codec::decode_handle(handle)?;
-        renew_impl(&self.client, &self.partition_config, &f).await
+        let result = renew_impl(&self.client, &self.partition_config, &f)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(e, "renew: FCALL ff_renew_lease"));
+        // Issue #154 — fire the production `inc_lease_renewal` counter
+        // from the trait boundary. The handle is a no-op when the
+        // `observability` feature is off; when on, this is the first
+        // production emission site (was tests-only previously).
+        if let Some(metrics) = &self.metrics {
+            metrics.inc_lease_renewal(if result.is_ok() { "ok" } else { "error" });
+        }
+        result
     }
 
     async fn progress(
@@ -1704,6 +1919,7 @@ impl EngineBackend for ValkeyBackend {
             message.as_deref(),
         )
         .await
+        .map_err(|e| ff_core::engine_error::backend_context(e, "progress: FCALL ff_update_progress"))
     }
 
     async fn append_frame(
@@ -1712,12 +1928,20 @@ impl EngineBackend for ValkeyBackend {
         frame: Frame,
     ) -> Result<AppendFrameOutcome, EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        append_frame_impl(&self.client, &self.partition_config, &f, frame).await
+        append_frame_impl(&self.client, &self.partition_config, &f, frame)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "append_frame: FCALL ff_append_frame")
+            })
     }
 
     async fn complete(&self, handle: &Handle, payload: Option<Vec<u8>>) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        complete_impl(&self.client, &self.partition_config, &f, payload).await
+        complete_impl(&self.client, &self.partition_config, &f, payload)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "complete: FCALL ff_complete_execution")
+            })
     }
 
     async fn fail(
@@ -1735,11 +1959,16 @@ impl EngineBackend for ValkeyBackend {
             classification,
         )
         .await
+        .map_err(|e| ff_core::engine_error::backend_context(e, "fail: FCALL ff_fail_execution"))
     }
 
     async fn cancel(&self, handle: &Handle, reason: &str) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        cancel_impl(&self.client, &self.partition_config, &f, reason).await
+        cancel_impl(&self.client, &self.partition_config, &f, reason)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "cancel: FCALL ff_cancel_execution")
+            })
     }
 
     async fn suspend(
@@ -1766,6 +1995,12 @@ impl EngineBackend for ValkeyBackend {
             expires_in,
         )
         .await
+        .map_err(|e| {
+            ff_core::engine_error::backend_context(
+                e,
+                "create_waitpoint: FCALL ff_create_pending_waitpoint",
+            )
+        })
     }
 
     async fn observe_signals(
@@ -1773,7 +2008,14 @@ impl EngineBackend for ValkeyBackend {
         handle: &Handle,
     ) -> Result<Vec<ResumeSignal>, EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        observe_signals_impl(&self.client, &self.partition_config, &f).await
+        observe_signals_impl(&self.client, &self.partition_config, &f)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "observe_signals: HGETALL suspension + HMGET matcher slots",
+                )
+            })
     }
 
     async fn claim_from_reclaim(
@@ -1787,23 +2029,45 @@ impl EngineBackend for ValkeyBackend {
 
     async fn delay(&self, handle: &Handle, delay_until: TimestampMs) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        delay_impl(&self.client, &self.partition_config, &f, delay_until).await
+        delay_impl(&self.client, &self.partition_config, &f, delay_until)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "delay: FCALL ff_delay_execution")
+            })
     }
 
     async fn wait_children(&self, handle: &Handle) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        wait_children_impl(&self.client, &self.partition_config, &f).await
+        wait_children_impl(&self.client, &self.partition_config, &f)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "wait_children: FCALL ff_move_to_waiting_children",
+                )
+            })
     }
 
     async fn describe_execution(
         &self,
         id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
-        describe_execution_impl(&self.client, &self.partition_config, id).await
+        describe_execution_impl(&self.client, &self.partition_config, id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "describe_execution: HGETALL exec_core + tags",
+                )
+            })
     }
 
     async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {
-        describe_flow_impl(&self.client, &self.partition_config, id).await
+        describe_flow_impl(&self.client, &self.partition_config, id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "describe_flow: HGETALL flow_core")
+            })
     }
 
     async fn list_edges(
@@ -1811,7 +2075,14 @@ impl EngineBackend for ValkeyBackend {
         flow_id: &FlowId,
         direction: EdgeDirection,
     ) -> Result<Vec<EdgeSnapshot>, EngineError> {
-        list_edges_impl(&self.client, &self.partition_config, flow_id, direction).await
+        list_edges_impl(&self.client, &self.partition_config, flow_id, direction)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "list_edges: pipeline SMEMBERS adj + HGETALL edge",
+                )
+            })
     }
 
     async fn describe_edge(
@@ -1819,14 +2090,25 @@ impl EngineBackend for ValkeyBackend {
         flow_id: &FlowId,
         edge_id: &EdgeId,
     ) -> Result<Option<EdgeSnapshot>, EngineError> {
-        describe_edge_impl(&self.client, &self.partition_config, flow_id, edge_id).await
+        describe_edge_impl(&self.client, &self.partition_config, flow_id, edge_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "describe_edge: HGETALL edge")
+            })
     }
 
     async fn resolve_execution_flow_id(
         &self,
         eid: &ExecutionId,
     ) -> Result<Option<FlowId>, EngineError> {
-        resolve_execution_flow_id_impl(&self.client, &self.partition_config, eid).await
+        resolve_execution_flow_id_impl(&self.client, &self.partition_config, eid)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "resolve_execution_flow_id: HGET exec_core.flow_id",
+                )
+            })
     }
 
     async fn cancel_flow(
@@ -1835,7 +2117,11 @@ impl EngineBackend for ValkeyBackend {
         policy: CancelFlowPolicy,
         wait: CancelFlowWait,
     ) -> Result<CancelFlowResult, EngineError> {
-        cancel_flow_fcall(&self.client, &self.partition_config, id, policy, wait).await
+        cancel_flow_fcall(&self.client, &self.partition_config, id, policy, wait)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "cancel_flow: FCALL ff_cancel_flow")
+            })
     }
 
     async fn report_usage(
@@ -1845,7 +2131,14 @@ impl EngineBackend for ValkeyBackend {
         dimensions: UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        report_usage_impl(&self.client, &self.partition_config, &f, budget, dimensions).await
+        report_usage_impl(&self.client, &self.partition_config, &f, budget, dimensions)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "report_usage: FCALL ff_report_usage_and_check",
+                )
+            })
     }
 
     #[cfg(feature = "streaming")]
@@ -1867,6 +2160,7 @@ impl EngineBackend for ValkeyBackend {
             count_limit,
         )
         .await
+        .map_err(|e| ff_core::engine_error::backend_context(e, "read_stream: XRANGE"))
     }
 
     #[cfg(feature = "streaming")]
@@ -1888,6 +2182,7 @@ impl EngineBackend for ValkeyBackend {
             count_limit,
         )
         .await
+        .map_err(|e| ff_core::engine_error::backend_context(e, "tail_stream: XREAD BLOCK"))
     }
 }
 
@@ -1898,6 +2193,15 @@ impl EngineBackend for ValkeyBackend {
 /// the `ferriskey::Client` parameter no longer leaks through the SDK's
 /// public surface.
 #[cfg(feature = "streaming")]
+#[tracing::instrument(
+    name = "ff.read_stream",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %execution_id,
+        attempt_index = %attempt_index,
+    )
+)]
 async fn read_stream_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -1939,6 +2243,15 @@ async fn read_stream_impl(
 /// the REST server's `tail_client` split in `ff-server` is the
 /// canonical pattern.
 #[cfg(feature = "streaming")]
+#[tracing::instrument(
+    name = "ff.tail_stream",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %execution_id,
+        attempt_index = %attempt_index,
+    )
+)]
 async fn tail_stream_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
