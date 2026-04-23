@@ -367,11 +367,18 @@ RFC-005 §323 defines `evaluate_resume_conditions(execution_id)` as an operator 
   satisfied_set: [...tokens],
   nodes: [
     { path: "", kind: "AllOf", satisfied: false, remaining_members: 1 },
-    { path: "members[0]", kind: "Count(2-of-3)", satisfied: true  },
+    { path: "members[0]", kind: "Count(2-of-3, DistinctSources)",
+      satisfied: true,
+      sources_by_type: { "user": 1, "system": 1 } },
     { path: "members[1]", kind: "Single", satisfied: false }
   ]
 }
 ```
+
+`sources_by_type` is populated only on `Count` nodes with
+`kind = DistinctSources`; it maps `source_type` → count of distinct
+satisfier tokens of that type currently in `satisfied_set` under this
+node.
 
 This is Class C (derived/read-only). No state transitions from this call.
 
@@ -437,6 +444,7 @@ code (e.g. cairn's reviewer panel) renders the `detail` string verbatim.
 | `invalid_resume_condition` (RFC-004 §412) | Extended: also fires if `resume_condition_json` fails to parse in Lua at suspend (catch-all). |
 | `signal_ignored_not_in_condition` (new) | Signal delivered to a waitpoint whose `waitpoint_id` is not in `member_map`. Signal is recorded, no satisfaction attempted. Returns this effect for observability. |
 | `signal_ignored_matcher_failed` (new) | Signal delivered to a waitpoint whose `waitpoint_id` IS in `member_map`, but the local node's `Count.matcher` (§2.1) rejects it. Signal is recorded on the waitpoint's signal list (RFC-005 semantics) but does not contribute a satisfier token. |
+| `appended_to_waitpoint_duplicate` (existing, clarified by RFC-014) | Signal matches a satisfier token already in `satisfied_set` (idempotent re-delivery, or `AllOf` member re-firing after root satisfaction). Signal is recorded on the waitpoint's signal list; no re-evaluation. Extends the pre-existing RFC-005 effect to cover token-level dedup per §4.1. |
 
 ### 5.3 Why early detection for `count_exceeds_waitpoint_set`
 
@@ -490,7 +498,7 @@ The `timeout_behavior` values (from RFC-004 §254) already support this:
 | `timeout_behavior` | Effect on partially-satisfied multi-signal condition |
 |---|---|
 | `fail` | Execution transitions to terminal failure regardless of partial satisfaction. (Most strict.) |
-| `auto_resume_with_timeout_signal` | Synthetic timeout token added to `satisfied_set`. Condition re-evaluated. If the condition treats the timeout token as satisfying (consumer opt-in via matcher, §6.2), resumes. Otherwise falls through to `fail`. |
+| `auto_resume_with_timeout_signal` | Synthetic timeout token `timeout:<suspension_id>` added to `satisfied_set`. Root condition is treated as satisfied (the timeout token is a universal node-satisfier — see the "Timeout token form" paragraph below). Execution resumes. The resumed worker inspects `list_waitpoint_signals` and `all_satisfier_signals` (§4.5) to branch on "was this timeout-induced or full-quorum" per §6.2. |
 | `cancel` | Execution cancels; no partial work propagated. |
 | `expire` | Suspension expires; execution state is what RFC-004 defines. |
 | `escalate` | Operator-notified, no auto-advance. |
@@ -663,7 +671,7 @@ None of these are blockers for multi-signal resume. Multi-signal works with v1's
 **Crates touched:** `ff-core` (types), `ff-sdk` (wire), `ff-backend-valkey` (argv build).
 
 - Add `AllOf` + `Count` variants + `CountKind` enum to `ResumeCondition`.
-- Add suspend-time validators (§5.1) returning `EngineError::InvalidCondition { kind }` variants.
+- Add suspend-time validators (§5.1) returning `EngineError::InvalidCondition { kind, detail }` per §5.1.1.
 - Wire-level serde with `v: 1` version tag (§7.2).
 - Unit tests: validator rejects impossible conditions; serde roundtrip; nesting depth bound.
 
@@ -736,6 +744,17 @@ impl CountBuilder {
 }
 ```
 
+**`CountKind` default.** If a `CountBuilder` reaches `on_waitpoint(s)`
+without any of `.distinct_waitpoints()` / `.distinct_signals()` /
+`.distinct_sources()` being called, the kind defaults to
+`DistinctWaitpoints`. Rationale: with a single waitpoint, this default
+reduces to classic single-signal satisfied-once semantics (one satisfier
+token, SADD dedups); with multiple waitpoints it yields
+"one-per-distinct-waitpoint," which is the least-surprising behavior.
+Consumers who want distinct-signal or distinct-source quorum must call
+the kind selector explicitly. Doctests cover both the default and each
+explicit kind.
+
 - Doc tests in `ff-sdk/src/suspend.rs` covering each §1.4 canonical
   pattern: 2-of-5 reviewers (shared waitpoint), N webhook callbacks
   (distinct signals), all-of heterogeneous subsystems.
@@ -748,7 +767,7 @@ impl CountBuilder {
 
 - `evaluate_resume_conditions` output wired to `ff-board-sdk` (if/when that lands).
 - Metric: `ff_suspension_condition_depth` histogram (per §5.4 invariant, catch drift).
-- Tracing: per-signal log of `effect` including new `appended_to_waitpoint_duplicate` and `signal_ignored_not_in_condition`.
+- Tracing: per-signal log of `effect` including new `appended_to_waitpoint_duplicate`, `signal_ignored_not_in_condition`, and `signal_ignored_matcher_failed`.
 
 **Exit:** operator can answer "why is this execution still suspended?" via `evaluate_resume_conditions` without reading Lua.
 
