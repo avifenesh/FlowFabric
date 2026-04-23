@@ -9,6 +9,20 @@ Each cluster of files represents one exploration. Conventions:
 
 ## Index
 
+### 2026-04-23 session exploration records (0.4.0 readiness + RFC-009 V2 + Stage-1c followups)
+
+Investigation-only artifacts from the 2026-04-23 session covering 0.4.0 release-readiness, RFC-009 V2 cap-routing dispositioning, Stage-1c planning refinement, observability coverage, and an open-issue obsolescence sweep. Not normative RFCs — preserved as chain-of-reasoning and evidence. Mirrors the 2026-04-22 archive pattern (PR #138).
+
+- `0.3.4-recheck-smoke.md` — Worker HHH, compile-only recheck of published v0.3.4 crates mirroring Worker X's 0.3.2 smoke. **Verdict:** green on default + `--no-default-features`; headline APIs type-check. **Status:** landed-elsewhere (informed 0.4.0 audit).
+- `0.4.0-release-readiness-audit.md` — Worker III, snapshot of commits since v0.3.4 and in-flight pieces expected in the 0.4.0 bundle. **Verdict:** readiness inventory (6 merged commits since v0.3.4 enumerated). **Status:** still-referenced (input to 0.4.0 tag planning).
+- `apalis-comparison.md` — Worker VV, response to issue #51 comparing apalis vs FlowFabric and assessing maintainer's shared-connection claim. **Verdict:** comparison + substantive-claim disposition. **Status:** explored-not-pursued as an RFC (feeds issue #51 reply).
+- `issue-43-scheduler-perf.md` — Worker (manager-directed), investigation of #43 bounded-scan + observability ask; notes PR #86 landed the partition-affine rotation. **Verdict:** issue stale — PR merged without `Closes #43`. **Status:** landed-elsewhere (candidate for issue close).
+- `observability-coverage-audit.md` — Worker OOO, post-Stage-1c-T3 audit of tracing/metrics/backend_context coverage across the 17 `EngineBackend` methods. **Verdict:** coverage matrix with gap-list; task brief's `Corruption` / `list_edges` references do not match code. **Status:** still-referenced (input to Stage-1c followups).
+- `open-issues-obsolescence-sweep.md` — Worker YY, manager-directed sweep of 9 open issues following the #43 pattern (merged PRs with parenthetical `(#N)` but no `Closes #N`). **Verdict:** per-issue classification (live vs obsolete). **Status:** still-referenced (triage input).
+- `rfc-009-status-summary.md` — Worker XX, consolidation of RFC-009's status vs issue #11 (cap-routing V2 options), RFC-011 / RFC-012 touches, and the scheduler-perf work. **Verdict:** issue #11 is LIVE; v1 shipped best-effort; V2 Options A/B not implemented. **Status:** still-referenced (pairs with Worker EEE's analysis).
+- `rfc-009-v2-real-world-analysis.md` — Worker EEE, assessment of whether the cap-routing thrash residual is a real production concern or bench-contrived. **Verdict:** (see file §Recommendation). **Status:** still-referenced (input to issue #11 disposition).
+- `stage-1c-plan-draft.md` — Worker SS-v4, revision of Stage-1c plan adopting the owner's trait feature-gate decision + v3→v4 changelog. **Verdict:** effort 34-50h; tranche scope with `#[cfg(feature = ...)]` scaffolding in tranche 1. **Status:** still-referenced (Stage-1c execution plan).
+
 ### 2026-04-22 session records (v0.3.x release saga + investigations)
 
 Retrospective, audit, and investigation artifacts from the 2026-04-22 v0.3.x release saga and concurrent Stage 1c / cairn-unblock work. Not normative RFCs — preserved as chain-of-reasoning, retrospective, and evidence. Cross-references PRs #119, #120–#124, #126–#128, #130–#136.
