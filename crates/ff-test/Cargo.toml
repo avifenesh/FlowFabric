@@ -19,7 +19,8 @@ release = false
 ff-core = { workspace = true }
 ff-engine = { workspace = true }
 ff-scheduler = { workspace = true }
-ff-script = { workspace = true }
+# Issue #171: test fixtures use FCALL helpers + ferriskey::Value parsers.
+ff-script = { workspace = true, features = ["valkey-client"] }
 ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
 # Promoted from dev-dependencies in #87 closure (Stage 1c tranche-4):
 # `TestCluster::backend()` minting lives in the fixtures library so

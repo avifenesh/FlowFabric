@@ -10,6 +10,37 @@ keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric typed FCALL wrappers and Lua library loader"
 
+[features]
+# Default-on so existing consumers (ff-sdk default, ff-backend-valkey,
+# ff-server, ff-scheduler, ff-engine) observe zero change.
+#
+# Issue #171 / feedback_feature_flag_propagation: gate the ferriskey
+# transport surface so consumers that set
+# `ff-sdk = { default-features = false }` do NOT pull `ferriskey` via
+# the ff-script → ferriskey unconditional edge. Alternate-backend
+# consumers (future Postgres) now get a `ferriskey`-free dep graph.
+#
+# Surface gated behind this feature:
+#   * `ScriptError::Valkey(ferriskey::Error)` variant + `valkey_kind()` method
+#   * `engine_error_ext::valkey_kind`
+#   * modules: `loader`, `retry`, `stream_tail`, `macros`, `result`, `functions`
+#
+# Surface still available without this feature:
+#   * `ScriptError` Lua-error variants (NotFound/Validation/State/etc.)
+#   * `ScriptError::class()` and `engine_error_ext::{class, transport_script,
+#     transport_script_ref}` — enables `ff-sdk --no-default-features` to
+#     classify `EngineError::Transport` wrappers without naming ferriskey.
+#   * `From<ScriptError> for EngineError` full mapping.
+#   * `LIBRARY_SOURCE` / `LIBRARY_VERSION` Lua constants.
+# Default is empty: consumers opt in to `valkey-client` explicitly so the
+# feature does NOT cascade through default-features inheritance (which
+# would defeat the `ff-sdk --no-default-features` agnosticism proof).
+# Every current internal consumer (ff-sdk[valkey-default],
+# ff-backend-valkey, ff-server, ff-scheduler, ff-test) enables this
+# feature directly in their own Cargo.toml.
+default = []
+valkey-client = ["dep:ferriskey"]
+
 [dependencies]
 # RFC-012 feature-gate discipline (#164, completes #158): default-features
 # disabled so ff-script does not re-enable ff-core's `streaming` /
@@ -19,7 +50,8 @@ description = "FlowFabric typed FCALL wrappers and Lua library loader"
 # `partition`, `engine_error`); `core` is requested explicitly so the
 # dep stays correct if gates migrate onto those modules.
 ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core"] }
-ferriskey = { workspace = true }
+# Issue #171: optional so `--no-default-features` drops the transport edge.
+ferriskey = { workspace = true, optional = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

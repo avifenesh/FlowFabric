@@ -6,6 +6,7 @@
 
 use ff_core::error::ErrorClass;
 
+#[cfg(feature = "valkey-client")]
 use crate::retry::is_retryable_kind;
 
 /// All error codes returned by FlowFabric Valkey Functions.
@@ -438,6 +439,11 @@ pub enum ScriptError {
     // ── Transport-level errors (not from Lua) ──
     /// Valkey connection or protocol error. Preserves `ferriskey::ErrorKind` so
     /// callers can distinguish transient/permanent/NOSCRIPT/MOVED/etc.
+    ///
+    /// Issue #171: gated behind `valkey-client` (default-on). Consumers
+    /// building `ff-sdk --no-default-features` get a ferriskey-free
+    /// `ScriptError` enum. All non-transport variants remain available.
+    #[cfg(feature = "valkey-client")]
     #[error("valkey: {0}")]
     Valkey(#[from] ferriskey::Error),
 
@@ -467,6 +473,9 @@ fn fmt_parse(fcall: &str, execution_id: Option<&str>, message: &str) -> String {
 
 impl ScriptError {
     /// Returns the underlying ferriskey ErrorKind if this is a transport error.
+    ///
+    /// Issue #171: gated with the `Valkey` variant behind `valkey-client`.
+    #[cfg(feature = "valkey-client")]
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
             Self::Valkey(e) => Some(e.kind()),
@@ -536,6 +545,7 @@ impl ScriptError {
             // IoError / FatalSend / TryAgain / BusyLoading / ClusterDown are
             // genuinely retryable even though all other Valkey errors are
             // terminal from the caller's perspective.
+            #[cfg(feature = "valkey-client")]
             Self::Valkey(e) => {
                 if is_retryable_kind(e.kind()) {
                     ErrorClass::Retryable
@@ -770,6 +780,7 @@ mod tests {
         assert_eq!(ScriptError::BudgetExceeded.class(), ErrorClass::Cooperative);
     }
 
+    #[cfg(feature = "valkey-client")]
     #[test]
     fn error_classification_valkey_transient_is_retryable() {
         use ferriskey::ErrorKind;
@@ -780,6 +791,7 @@ mod tests {
         assert_eq!(transient.class(), ErrorClass::Retryable);
     }
 
+    #[cfg(feature = "valkey-client")]
     #[test]
     fn error_classification_valkey_permanent_is_terminal() {
         use ferriskey::ErrorKind;

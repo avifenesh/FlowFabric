@@ -17,7 +17,9 @@ observability = ["ff-observability/enabled"]
 
 [dependencies]
 ff-core = { workspace = true }
-ff-script = { workspace = true }
+# Issue #171: ff-scheduler's claim dispatcher uses FCALL helpers from
+# ff-script, so explicitly enable `valkey-client`.
+ff-script = { workspace = true, features = ["valkey-client"] }
 ff-observability = { workspace = true }
 ferriskey = { workspace = true }
 thiserror = { workspace = true }

@@ -50,7 +50,11 @@ pub fn transport_script_ref(err: &EngineError) -> Option<&ScriptError> {
 /// to a transport-level fault whose inner source is a [`ScriptError`].
 /// Postgres-backed or other non-Valkey transport errors return `None`.
 ///
+/// Issue #171: gated behind `valkey-client` (default-on) so the
+/// ferriskey dep stays optional for alternate-backend consumers.
+///
 /// [`ErrorKind`]: ferriskey::ErrorKind
+#[cfg(feature = "valkey-client")]
 pub fn valkey_kind(err: &EngineError) -> Option<ferriskey::ErrorKind> {
     match err {
         EngineError::Transport { source, .. } => source
@@ -289,7 +293,10 @@ impl From<ScriptError> for EngineError {
             S::AttemptNotInCreatedState => Self::Bug(BugKind::AttemptNotInCreatedState),
 
             // ── Transport (preserves source for Parse/Valkey) ──
+            #[cfg(feature = "valkey-client")]
             e @ (S::Parse { .. } | S::Valkey(_)) => transport_script(e),
+            #[cfg(not(feature = "valkey-client"))]
+            e @ S::Parse { .. } => transport_script(e),
 
             // `ScriptError` is `#[non_exhaustive]`. A future variant
             // landed in ff-script before the mapping here was updated
@@ -446,6 +453,7 @@ mod tests {
         assert_eq!(class(&err), ScriptError::AttemptNotFound.class());
     }
 
+    #[cfg(feature = "valkey-client")]
     #[test]
     fn transport_preserves_valkey_kind() {
         let src = ScriptError::Valkey(ferriskey::Error::from((
@@ -456,6 +464,7 @@ mod tests {
         assert_eq!(valkey_kind(&err), Some(ferriskey::ErrorKind::IoError));
     }
 
+    #[cfg(feature = "valkey-client")]
     #[test]
     fn class_transport_delegates() {
         let err = EngineError::from(ScriptError::Valkey(ferriskey::Error::from((
@@ -473,6 +482,7 @@ mod tests {
             source: Box::new(raw),
         };
         assert_eq!(class(&err), ErrorClass::Terminal);
+        #[cfg(feature = "valkey-client")]
         assert!(valkey_kind(&err).is_none());
         assert!(transport_script_ref(&err).is_none());
     }
@@ -481,6 +491,7 @@ mod tests {
     fn unavailable_has_no_script_source() {
         let err = EngineError::Unavailable { op: "claim" };
         assert_eq!(class(&err), ErrorClass::Terminal);
+        #[cfg(feature = "valkey-client")]
         assert!(valkey_kind(&err).is_none());
         assert!(transport_script_ref(&err).is_none());
     }

@@ -30,7 +30,11 @@ ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, fe
 # so no cfg-gated field on `ValkeyBackend`; the `observability` feature
 # selects shim vs. real OTEL implementation.
 ff-observability = { workspace = true }
-ff-script = { workspace = true }
+# Issue #171: `ff-backend-valkey` IS the Valkey backend — always needs
+# ff-script's ferriskey-gated surface (loader, functions, result parsers,
+# retry classification, `ScriptError::Valkey`). Explicit feature activation
+# so the dep stays correct even if ff-script's defaults change.
+ff-script = { workspace = true, features = ["valkey-client"] }
 ferriskey = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
