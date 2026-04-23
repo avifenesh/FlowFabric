@@ -34,6 +34,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   constants need no change. No public item was removed or renamed —
   only cfg-gated.
 
+### Fixed
+
+- **HTTP-routed claim now re-claims resumed executions (#150, Bug B).**
+  `FlowFabricWorker::claim_from_grant` (the entry used by
+  `claim_via_server`) missed the `UseClaimResumedExecution` contention
+  fallback that `claim_next` already performed, so scheduler-routed
+  callers saw raw `SdkError::Engine(Contention(UseClaimResumedExecution))`
+  when picking up an `attempt_interrupted` execution after a
+  suspend→resume. The fallback now mirrors `claim_next` and transparently
+  forwards to `claim_resumed_execution`, matching the direct-claim path.
+
 ### Added
 
 - **`EngineBackend::deliver_signal` + `EngineBackend::claim_resumed_execution`
