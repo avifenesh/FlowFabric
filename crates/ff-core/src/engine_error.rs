@@ -128,19 +128,31 @@ pub enum EngineError {
     },
 }
 
-/// Wrap an [`EngineError`] with a call-site label, preserving the
-/// inner variant for classification. Each call wraps the error in a
-/// new `Contextual` layer; repeated calls will therefore nest
-/// additional `Contextual` wrappers, so callers should wrap once per
-/// op boundary.
+/// Wrap an [`EngineError`] with a call-site label when the error is
+/// a transport-family fault — `Transport` or `Unavailable`. Typed
+/// classifications (`NotFound`, `Validation`, `Contention`,
+/// `Conflict`, `State`, `Bug`) form the public contract boundary
+/// for consumers that `match` on the variant, so we return them
+/// unchanged. Repeated wraps on an already-`Contextual` error
+/// nest an additional layer; callers should wrap once per op
+/// boundary.
 ///
 /// Promoted to ff-core so `ff-backend-valkey` can annotate its
 /// `EngineBackend` impls with the same context shape ff-sdk's
 /// snapshot helpers use (issue #154).
 pub fn backend_context(err: EngineError, context: impl Into<String>) -> EngineError {
-    EngineError::Contextual {
-        source: Box::new(err),
-        context: context.into(),
+    match err {
+        EngineError::Transport { .. }
+        | EngineError::Unavailable { .. }
+        | EngineError::Contextual { .. } => EngineError::Contextual {
+            source: Box::new(err),
+            context: context.into(),
+        },
+        // Typed classifications are part of the public contract;
+        // wrapping them would break `match` call sites that inspect
+        // the inner variant (e.g. tests asserting
+        // `EngineError::Validation { kind: Corruption, .. }`).
+        other => other,
     }
 }
 
@@ -589,24 +601,42 @@ mod tests {
     }
 
     #[test]
-    fn backend_context_preserves_class_and_renders() {
-        // Retryable inner survives the wrap (issue #154).
-        let inner = EngineError::Contention(ContentionKind::LeaseConflict);
-        let wrapped = backend_context(inner, "renew: FCALL ff_renew_lease");
-        assert_eq!(wrapped.class(), ErrorClass::Retryable);
+    fn backend_context_wraps_transport_and_preserves_typed() {
+        // Transport gets wrapped with the call-site label (issue #154).
+        let raw = std::io::Error::other("simulated transport error");
+        let wrapped = backend_context(
+            EngineError::Transport {
+                backend: "valkey",
+                source: Box::new(raw),
+            },
+            "renew: FCALL ff_renew_lease",
+        );
         let rendered = format!("{wrapped}");
         assert!(
-            rendered.starts_with("renew: FCALL ff_renew_lease: "),
+            rendered.starts_with("renew: FCALL ff_renew_lease: transport (valkey): "),
             "expected context prefix, got: {rendered}"
         );
-        // Terminal inner also survives.
+        // Unavailable also wraps so callers can still filter on the op.
+        let wrapped = backend_context(EngineError::Unavailable { op: "x" }, "ctx");
+        assert!(matches!(wrapped, EngineError::Contextual { .. }));
+
+        // Typed classifications pass through unchanged so existing
+        // `match` call sites keep working.
         let inner = EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
+            kind: ValidationKind::Corruption,
             detail: "bad".into(),
         };
+        let passthrough = backend_context(inner, "describe_edge: HGETALL edge");
+        match passthrough {
+            EngineError::Validation { kind, .. } => {
+                assert_eq!(kind, ValidationKind::Corruption);
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let inner = EngineError::Contention(ContentionKind::LeaseConflict);
         assert_eq!(
-            backend_context(inner, "x").class(),
-            ErrorClass::Terminal
+            backend_context(inner, "renew: FCALL ff_renew_lease").class(),
+            ErrorClass::Retryable
         );
     }
 

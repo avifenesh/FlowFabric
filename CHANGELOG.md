@@ -22,9 +22,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   promoted the call-site-label wrap from ff-sdk to
   `ff-core::engine_error` so `ff-backend-valkey` can annotate its
   `EngineBackend` impls with a lightweight context string (e.g.
-  `"renew: FCALL ff_renew_lease"`). Classification helpers (`class`,
-  `transport_script_ref`, `valkey_kind`) transparently descend through
-  the wrapper so retry/terminal semantics are preserved.
+  `"renew: FCALL ff_renew_lease"`). Wrapping is surgical: only
+  `Transport` / `Unavailable` / already-`Contextual` errors get the
+  wrapper; typed classifications (`NotFound`, `Validation`,
+  `Contention`, `Conflict`, `State`, `Bug`) pass through unchanged so
+  consumers `match`-ing on the public variant surface remain
+  unaffected. Classification helpers (`class`, `transport_script_ref`,
+  `valkey_kind`) transparently descend through the wrapper so
+  retry/terminal semantics are preserved.
 
 ### Fixed
 
