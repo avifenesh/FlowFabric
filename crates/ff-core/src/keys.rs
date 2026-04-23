@@ -452,6 +452,11 @@ impl FlowKeyContext {
     pub fn hash_tag(&self) -> &str {
         &self.tag
     }
+
+    /// The owning flow id as a string (as supplied to `new`).
+    pub fn flow_id(&self) -> &str {
+        &self.fid
+    }
 }
 
 /// Flow-partition index keys.
@@ -481,6 +486,19 @@ impl FlowIndexKeys {
     /// happy path.
     pub fn cancel_backlog(&self) -> String {
         format!("ff:idx:{}:cancel_backlog", self.tag)
+    }
+
+    /// `ff:idx:{fp:N}:pending_cancel_groups` — RFC-016 Stage C
+    /// per-flow-partition SET of `<flow_id>|<downstream_eid>` tuples
+    /// whose edgegroup has a non-empty sibling-cancel queue awaiting
+    /// dispatch. Populated atomically by `ff_resolve_dependency` when
+    /// the AnyOf/Quorum resolver flips to `satisfied|impossible` under
+    /// `OnSatisfied::CancelRemaining`; drained by the dispatcher via
+    /// `ff_drain_sibling_cancel_group` once per-sibling cancels have
+    /// been acked. The sibling-cancel dispatcher scanner iterates this
+    /// SET (cluster-safe) instead of scanning edgegroup hashes.
+    pub fn pending_cancel_groups(&self) -> String {
+        format!("ff:idx:{}:pending_cancel_groups", self.tag)
     }
 }
 

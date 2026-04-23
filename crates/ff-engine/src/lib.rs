@@ -98,6 +98,25 @@ pub struct EngineConfig {
     /// fought on the happy path.
     pub cancel_reconciler_interval: Duration,
 
+    /// RFC-016 Stage C sibling-cancel dispatcher interval. Default: 1s.
+    ///
+    /// Drains the per-flow-partition `pending_cancel_groups` SET,
+    /// populated by `ff_resolve_dependency` whenever an AnyOf/Quorum
+    /// edge group fires terminal under `OnSatisfied::CancelRemaining`.
+    /// For each indexed group the dispatcher issues per-sibling
+    /// `ff_cancel_execution` with `FailureReason::sibling_quorum_{
+    /// satisfied,impossible}`, then atomically SREM+clear via
+    /// `ff_drain_sibling_cancel_group`.
+    ///
+    /// A short default (1s) minimises the window between quorum
+    /// satisfaction and sibling termination — this is the user-facing
+    /// latency floor for "kill the losers" workflows. Bump only if a
+    /// deployment's steady-state pending-set depth is observed to
+    /// backlog under the 1s cadence; Stage C's §4.2 benchmark gates
+    /// the release against the p99 ≤ 500 ms SLO at n=100 (§4.2 of
+    /// the RFC).
+    pub edge_cancel_dispatcher_interval: Duration,
+
     /// Per-consumer scanner filter (issue #122).
     ///
     /// Applied by every execution-shaped scanner (lease_expiry,
@@ -141,6 +160,7 @@ impl Default for EngineConfig {
             flow_projector_interval: Duration::from_secs(15),
             execution_deadline_interval: Duration::from_secs(5),
             cancel_reconciler_interval: Duration::from_secs(15),
+            edge_cancel_dispatcher_interval: Duration::from_secs(1),
             scanner_filter: ScannerFilter::default(),
         }
     }
@@ -420,6 +440,26 @@ impl Engine {
             metrics.clone(),
         ));
 
+        // RFC-016 Stage C: sibling-cancel dispatcher. Iterates flow
+        // partitions, drains `pending_cancel_groups` SET via
+        // `ff_drain_sibling_cancel_group`, issues per-sibling
+        // `ff_cancel_execution` with sibling_quorum reasons.
+        let edge_cancel_dispatcher = Arc::new(
+            scanner::edge_cancel_dispatcher::EdgeCancelDispatcher::with_filter_and_metrics(
+                config.edge_cancel_dispatcher_interval,
+                config.partition_config,
+                scanner_filter.clone(),
+                metrics.clone(),
+            ),
+        );
+        handles.push(supervised_spawn(
+            edge_cancel_dispatcher,
+            client.clone(),
+            config.partition_config.num_flow_partitions,
+            shutdown_rx.clone(),
+            metrics.clone(),
+        ));
+
         // Execution deadline scanner (iterates execution partitions)
         let deadline_scanner = Arc::new(ExecutionDeadlineScanner::with_filter(
             config.execution_deadline_interval,
@@ -449,7 +489,7 @@ impl Engine {
             ));
         }
 
-        let scanner_count = if listener_enabled { "15 scanners + completion dispatch" } else { "15 scanners" };
+        let scanner_count = if listener_enabled { "16 scanners + completion dispatch" } else { "16 scanners" };
         tracing::info!(
             num_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,

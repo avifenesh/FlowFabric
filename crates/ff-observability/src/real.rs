@@ -69,6 +69,15 @@ mod name {
     /// applications, labelled `policy`. Stage A emits only
     /// `policy="all_of"`; Stage B adds `any_of` / `quorum`.
     pub const EDGE_GROUP_POLICY: &str = "ff_edge_group_policy";
+    /// RFC-016 Stage C: count of sibling cancels dispatched by the
+    /// edge_cancel_dispatcher scanner, labelled by `reason`
+    /// (`sibling_quorum_satisfied` | `sibling_quorum_impossible`).
+    pub const SIBLING_CANCEL_DISPATCHED: &str = "ff_sibling_cancel_dispatched";
+    /// RFC-016 Stage C: count of sibling-cancel dispositions observed by
+    /// the dispatcher, labelled by `disposition` (`cancelled` |
+    /// `already_terminal` | `not_found`). Cardinality = 3, no per-
+    /// flow/exec labels.
+    pub const SIBLING_CANCEL_DISPOSITION: &str = "ff_sibling_cancel_disposition";
 }
 
 struct Inner {
@@ -95,6 +104,8 @@ struct Inner {
     budget_hit: Counter<u64>,
     quota_hit: Counter<u64>,
     edge_group_policy: Counter<u64>,
+    sibling_cancel_dispatched: Counter<u64>,
+    sibling_cancel_disposition: Counter<u64>,
 }
 
 #[derive(Clone)]
@@ -171,6 +182,22 @@ impl Metrics {
                  Stage A emits only `policy=\"all_of\"`.",
             )
             .build();
+        let sibling_cancel_dispatched = meter
+            .u64_counter(name::SIBLING_CANCEL_DISPATCHED)
+            .with_description(
+                "RFC-016 Stage C sibling cancels dispatched, labelled by \
+                 `reason` (`sibling_quorum_satisfied` | \
+                 `sibling_quorum_impossible`).",
+            )
+            .build();
+        let sibling_cancel_disposition = meter
+            .u64_counter(name::SIBLING_CANCEL_DISPOSITION)
+            .with_description(
+                "RFC-016 Stage C sibling-cancel dispositions, labelled by \
+                 `disposition` (`cancelled` | `already_terminal` | \
+                 `not_found`).",
+            )
+            .build();
 
         // Cancel backlog depth — gauge backed by an AtomicU64 so set()
         // from any thread is lock-free. OTEL observable-gauge callback
@@ -201,6 +228,8 @@ impl Metrics {
             budget_hit,
             quota_hit,
             edge_group_policy,
+            sibling_cancel_dispatched,
+            sibling_cancel_disposition,
         }))
     }
 
@@ -301,6 +330,25 @@ impl Metrics {
         self.0
             .edge_group_policy
             .add(1, &[KeyValue::new("policy", policy)]);
+    }
+
+    // ── RFC-016 Stage C: sibling-cancel dispatcher ──
+
+    /// Increment `ff_sibling_cancel_dispatched_total{reason}`. Reason is
+    /// `sibling_quorum_satisfied` or `sibling_quorum_impossible`.
+    pub fn inc_sibling_cancel_dispatched(&self, reason: &'static str) {
+        self.0
+            .sibling_cancel_dispatched
+            .add(1, &[KeyValue::new("reason", reason)]);
+    }
+
+    /// Increment `ff_sibling_cancel_disposition_total{disposition}`.
+    /// Disposition is one of `cancelled` / `already_terminal` /
+    /// `not_found`. Fixed-cardinality (3) — no per-flow/exec labels.
+    pub fn inc_sibling_cancel_disposition(&self, disposition: &'static str) {
+        self.0
+            .sibling_cancel_disposition
+            .add(1, &[KeyValue::new("disposition", disposition)]);
     }
 }
 
