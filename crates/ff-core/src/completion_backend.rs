@@ -114,6 +114,22 @@ pub trait CompletionBackend: Send + Sync + 'static {
     /// `filter.instance_tag` is set (2 HGETs total when both are
     /// set). The backend short-circuits on the cheaper namespace
     /// check first.
+    ///
+    /// # Gotcha: completions are only published for executions that
+    /// belong to a flow
+    ///
+    /// The Lua terminal emits `PUBLISH ff:dag:completions <payload>`
+    /// only when `core.flow_id` is set on the execution (see
+    /// `crates/ff-script/src/flowfabric.lua` — the PUBLISH is gated
+    /// on `is_set(core.flow_id)`). Solo / standalone executions
+    /// submitted without a flow never hit the channel, so a
+    /// completion subscriber will observe **nothing** for them —
+    /// the terminal state lands in `exec_core` as usual and the
+    /// `dependency_reconciler` interval scan picks it up, but the
+    /// push stream stays silent. Smoke tests that submit a single
+    /// execution and wait on a completion subscription will hang
+    /// indefinitely; either submit under a flow or poll
+    /// `describe_execution` instead.
     async fn subscribe_completions_filtered(
         &self,
         filter: &ScannerFilter,
