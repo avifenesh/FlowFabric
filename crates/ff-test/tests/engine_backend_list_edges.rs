@@ -133,7 +133,9 @@ async fn create_and_add_member(tc: &TestCluster, fid: &FlowId) -> ExecutionId {
     let fpart = flow_partition(fid, &config);
     let fctx = FlowKeyContext::new(&fpart, fid);
     let fidx = FlowIndexKeys::new(&fpart);
-    let keys: Vec<String> = vec![fctx.core(), fctx.members(), ctx.core(), fidx.flow_index()];
+    // KEYS order per flowfabric.lua `ff_add_execution_to_flow`:
+    // (1) flow_core, (2) members_set, (3) flow_index, (4) exec_core.
+    let keys: Vec<String> = vec![fctx.core(), fctx.members(), fidx.flow_index(), ctx.core()];
     let args: Vec<String> = vec![
         fid.to_string(),
         eid.to_string(),
