@@ -98,6 +98,8 @@ fn build_limiter(per_second: u32) -> Arc<Limiter> {
     Arc::new(RateLimiter::direct(quota))
 }
 
+impl super::sealed::SealedLayer for RateLimitLayer {}
+
 impl EngineBackendLayer for RateLimitLayer {
     fn layer(&self, inner: Arc<dyn EngineBackend>) -> Arc<dyn EngineBackend> {
         // Clone the bucket map so the HookedBackend owns it (cheap:

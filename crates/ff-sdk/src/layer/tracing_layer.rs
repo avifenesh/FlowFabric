@@ -67,6 +67,8 @@ impl TracingLayer {
     }
 }
 
+impl super::sealed::SealedLayer for TracingLayer {}
+
 impl EngineBackendLayer for TracingLayer {
     fn layer(&self, inner: Arc<dyn EngineBackend>) -> Arc<dyn EngineBackend> {
         Arc::new(HookedBackend::new(

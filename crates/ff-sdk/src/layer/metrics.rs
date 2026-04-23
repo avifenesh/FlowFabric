@@ -64,6 +64,8 @@ impl Default for MetricsLayer {
     }
 }
 
+impl super::sealed::SealedLayer for MetricsLayer {}
+
 impl EngineBackendLayer for MetricsLayer {
     fn layer(&self, inner: Arc<dyn EngineBackend>) -> Arc<dyn EngineBackend> {
         Arc::new(HookedBackend::new(

@@ -59,6 +59,8 @@ impl Default for CircuitBreakerLayer {
     }
 }
 
+impl super::sealed::SealedLayer for CircuitBreakerLayer {}
+
 impl EngineBackendLayer for CircuitBreakerLayer {
     fn layer(&self, inner: Arc<dyn EngineBackend>) -> Arc<dyn EngineBackend> {
         Arc::new(HookedBackend::new(
