@@ -18,7 +18,7 @@ description = "FlowFabric typed FCALL wrappers and Lua library loader"
 # always-on surface (`contracts`, `keys`, `types`, `error`, `state`,
 # `partition`, `engine_error`); `core` is requested explicitly so the
 # dep stays correct if gates migrate onto those modules.
-ff-core = { version = "0.4.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core"] }
 ferriskey = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
