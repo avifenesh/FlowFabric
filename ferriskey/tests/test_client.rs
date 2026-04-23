@@ -40,21 +40,23 @@ pub(crate) mod shared_client_tests {
     use utilities::cluster::*;
     use utilities::*;
 
-    #[cfg(feature = "test-util")]
-    use ferriskey::client::types::{AuthenticationInfo, IamCredentials, ServiceType, TlsMode};
+    #[cfg(all(feature = "test-util", feature = "iam"))]
+    use ferriskey::client::types::{
+        AuthenticationInfo, IamAuthenticationConfig, ServiceType, TlsMode,
+    };
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     const ELASTICACHE_CLUSTER_IAM_ENDPOINT: &str = "elasticache-cluster-iam.endpoint"; // Replace with your cluster endpoint
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     const ELASTICACHE_STANDALONE_IAM_ENDPOINT: &str = "elasticache-standalone-iam.endpoint"; // Replace with your standalone endpoint
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     const MEMORYDB_CLUSTER_IAM_ENDPOINT: &str = "memorydb-cluster-iam.endpoint"; // Replace with your cluster endpoint
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     const TEST_STANDALONE_NAME: &str = "test-standalone";
 
     // Import IAM test constants from constants module
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     use constants::{IAM_TEST_CLUSTER_NAME, IAM_TEST_REGION_US_EAST_1, IAM_USERNAME};
 
     struct TestBasics {
@@ -110,7 +112,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     fn setup_mock_aws_credentials() {
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test_access_key");
@@ -119,7 +121,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     fn cleanup_mock_aws_credentials() {
         unsafe {
             std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -411,7 +413,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     fn remove_test_credentials() {
         // Clear any existing AWS credentials
         unsafe {
@@ -424,7 +426,7 @@ pub(crate) mod shared_client_tests {
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     /// Helper function to create connection request with IAM authentication
     fn create_iam_connection_request(
         addresses: &[ferriskey::ConnectionAddr],
@@ -437,32 +439,30 @@ pub(crate) mod shared_client_tests {
     ) -> ferriskey::client::types::ConnectionRequest {
         let addresses_info = addresses.iter().map(get_address_info).collect();
 
-        let iam_credentials = IamCredentials {
-            cluster_name: cluster_name.into(),
-            region: region.into(),
-            service_type: service_type.into(),
+        let iam_config = IamAuthenticationConfig {
+            cluster_name: cluster_name.to_string(),
+            region: region.to_string(),
+            service_type,
             refresh_interval_seconds,
-            ..Default::default()
         };
 
         let auth_info = AuthenticationInfo {
-            password: String::new().into(), // Empty password when using IAM
-            username: username.into(),
-            iam_credentials: Option::some(iam_credentials),
-            ..Default::default()
+            password: Some(String::new()), // Empty password when using IAM
+            username: Some(username.to_string()),
+            iam_config: Some(iam_config),
         };
 
         ferriskey::client::types::ConnectionRequest {
             addresses: addresses_info,
-            tls_mode: TlsMode::SecureTls.into(),
+            tls_mode: Some(TlsMode::SecureTls),
             cluster_mode_enabled: cluster_mode,
-            request_timeout: 10000, // 10 seconds
-            authentication_info: Option::some(auth_info),
+            request_timeout: Some(10000), // 10 seconds
+            authentication_info: Some(auth_info),
             ..Default::default()
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -486,7 +486,7 @@ pub(crate) mod shared_client_tests {
                 region,
                 None, // Use default refresh interval
                 true, // cluster mode
-                ServiceType::ELASTICACHE,
+                ServiceType::ElastiCache,
             );
 
             // Attempt to create client with IAM authentication
@@ -522,7 +522,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -546,7 +546,7 @@ pub(crate) mod shared_client_tests {
                 region,
                 None,  // Use default refresh interval
                 false, // standalone mode
-                ServiceType::ELASTICACHE,
+                ServiceType::ElastiCache,
             );
 
             // Attempt to create client with IAM authentication
@@ -582,7 +582,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -606,7 +606,7 @@ pub(crate) mod shared_client_tests {
                 region,
                 None, // Use default refresh interval
                 true, // cluster mode
-                ServiceType::MEMORYDB,
+                ServiceType::MemoryDB,
             );
 
             // Attempt to create client with IAM authentication
@@ -642,7 +642,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -666,7 +666,7 @@ pub(crate) mod shared_client_tests {
                 region,
                 None, // Use default refresh interval
                 true, // cluster mode
-                ServiceType::ELASTICACHE,
+                ServiceType::ElastiCache,
             );
 
             // Enable lazy connection
@@ -744,7 +744,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -768,7 +768,7 @@ pub(crate) mod shared_client_tests {
                 region,
                 None,  // Use default refresh interval
                 false, // standalone mode
-                ServiceType::ELASTICACHE,
+                ServiceType::ElastiCache,
             );
 
             // Enable lazy connection
@@ -855,7 +855,7 @@ pub(crate) mod shared_client_tests {
      * - Sleep **> 900s and < refresh_interval_seconds** **before** killing the connection.
      *   The token will be expired and reconnect should fail.
      */
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -904,29 +904,27 @@ pub(crate) mod shared_client_tests {
             };
 
             // Create IAM connection request with mock credentials
-            let iam_credentials = IamCredentials {
-                cluster_name: cluster_name.into(),
-                region: region.into(),
-                service_type: ServiceType::ELASTICACHE.into(),
+            let iam_config = IamAuthenticationConfig {
+                cluster_name: cluster_name.to_string(),
+                region: region.to_string(),
+                service_type: ServiceType::ElastiCache,
                 refresh_interval_seconds: Some(5),
-                ..Default::default()
             };
 
             let auth_info = AuthenticationInfo {
-                password: String::new().into(),
-                username: username.into(),
-                iam_credentials: Option::some(iam_credentials),
-                ..Default::default()
+                password: Some(String::new()),
+                username: Some(username.to_string()),
+                iam_config: Some(iam_config),
             };
 
             let addresses_info = vec![get_address_info(&address)];
 
             let connection_request = ferriskey::client::types::ConnectionRequest {
                 addresses: addresses_info,
-                tls_mode: TlsMode::NoTls.into(),
+                tls_mode: Some(TlsMode::NoTls),
                 cluster_mode_enabled: use_cluster,
-                request_timeout: 10000,
-                authentication_info: Option::some(auth_info),
+                request_timeout: Some(10000),
+                authentication_info: Some(auth_info),
                 ..Default::default()
             };
 
@@ -970,7 +968,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     fn test_iam_cluster_refresh_token_after_connection_kill_and_token_expired() {
@@ -995,7 +993,7 @@ pub(crate) mod shared_client_tests {
                 // None,
                 Some(3600), // Use default refresh interval
                 true,       // cluster mode
-                ServiceType::ELASTICACHE,
+                ServiceType::ElastiCache,
             );
 
             // Attempt to create client with IAM authentication
@@ -1081,7 +1079,7 @@ pub(crate) mod shared_client_tests {
      * Install aws sdk for running the test.
      * Follow the steps inside the test to trigger a node failover, while keeping the token expired.
      */
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     fn test_iam_cluster_reconnection_after_node_kill() {
@@ -1104,7 +1102,7 @@ pub(crate) mod shared_client_tests {
                 region,
                 Some(2400), // 40 min
                 true,       // cluster mode
-                ServiceType::ELASTICACHE,
+                ServiceType::ElastiCache,
             );
 
             // Attempt to create client with IAM authentication
@@ -1120,7 +1118,7 @@ pub(crate) mod shared_client_tests {
                     // Change to 900
                     // wait enough for the token to be expired
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    log_info("Initial token is expired", "");
+                    eprintln!("Initial token is expired");
 
                     // run this script in the terminal to trigger a node failover after 900 seconds
                     //  aws elasticache test-failover \
@@ -1145,7 +1143,7 @@ pub(crate) mod shared_client_tests {
                     // Change to 900
                     // wait enough again for the token to be expired
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    log_info("Refresh token is expired", "");
+                    eprintln!("Refresh token is expired");
 
                     // run this script in the terminal to trigger a node failover after 900 seconds
                     //  aws elasticache test-failover \
@@ -1187,7 +1185,7 @@ pub(crate) mod shared_client_tests {
         });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(all(feature = "test-util", feature = "iam"))]
     #[rstest]
     #[serial_test::serial]
     #[timeout(SHORT_CLUSTER_TEST_TIMEOUT)]
@@ -1247,29 +1245,27 @@ pub(crate) mod shared_client_tests {
             };
 
             // Create IAM connection request with mock credentials
-            let iam_credentials = IamCredentials {
-                cluster_name: cluster_name.into(),
-                region: region.into(),
-                service_type: ServiceType::ELASTICACHE.into(),
+            let iam_config = IamAuthenticationConfig {
+                cluster_name: cluster_name.to_string(),
+                region: region.to_string(),
+                service_type: ServiceType::ElastiCache,
                 refresh_interval_seconds: Some(5),
-                ..Default::default()
             };
 
             let auth_info = AuthenticationInfo {
-                password: String::new().into(),
-                username: username.into(),
-                iam_credentials: Option::some(iam_credentials),
-                ..Default::default()
+                password: Some(String::new()),
+                username: Some(username.to_string()),
+                iam_config: Some(iam_config),
             };
 
             let addresses_info = vec![get_address_info(&address)];
 
             let connection_request = ferriskey::client::types::ConnectionRequest {
                 addresses: addresses_info,
-                tls_mode: TlsMode::NoTls.into(),
+                tls_mode: Some(TlsMode::NoTls),
                 cluster_mode_enabled: use_cluster,
-                request_timeout: 10000,
-                authentication_info: Option::some(auth_info),
+                request_timeout: Some(10000),
+                authentication_info: Some(auth_info),
                 ..Default::default()
             };
 

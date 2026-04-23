@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::compression::CompressionConfig;
 #[cfg(feature = "iam")]
-use crate::iam::ServiceType;
+pub use crate::iam::ServiceType;
 
 #[derive(Default, Clone, Debug)]
 pub struct ConnectionRequest {
