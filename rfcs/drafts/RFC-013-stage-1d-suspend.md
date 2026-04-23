@@ -131,6 +131,17 @@ pub struct SuspendArgs {
     /// `now` at caller time — the backend uses server-time `TIME` for
     /// Lua correctness but carries the caller clock for correlation.
     pub now: TimestampMs,
+
+    /// Optional idempotency key for retry-safe suspension. When set, the
+    /// backend dedups on `(partition, execution_id, idempotency_key)` for
+    /// a configured window: a second `suspend` with the same triple
+    /// returns the same `SuspendOutcome` as the first (idempotent replay).
+    /// When `None`, every call is fresh and subject to §3's non-idempotent
+    /// contract. Follows the `UsageDimensions.dedup_key` pattern from
+    /// RFC-012 §R7.2.3 — same shape, same semantics, same partition-scoped
+    /// dedup hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<IdempotencyKey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,6 +163,7 @@ Notes:
 - `continuation_metadata_pointer` stays `Option<String>` — same opacity as today. RFC-004 explicitly does not let the engine own continuation bytes.
 - `reason_code` + `requested_by` are typed enums (currently ARGV strings). The enum values are the set defined in RFC-004 §Suspension Reason Categories; `#[non_exhaustive]` so RFC-014/RFC-015 can extend.
 - `WaitpointSpec` (from round-7) is **not** reused as the `suspend` input: it was shaped for `create_waitpoint`'s pending issuance. Keeping them separate is cleaner than overloading one struct with conditional fields.
+- `idempotency_key` is a partition-scoped dedup key. Lua stores a hash `ff:dedup:suspend:{p:N}:<execution_id>:<idempotency_key>` → serialized `SuspendOutcome`, TTL = suspension-timeout ceiling + grace. On hit, the first outcome is returned verbatim (including the original `suspension_id` / `waitpoint_id` / `waitpoint_token`), and no state mutation occurs. This mirrors `UsageDimensions.dedup_key`'s semantics on `report_usage`. Absent a key, §3's non-idempotent contract applies.
 
 ### §2.3 `SuspendOutcome` shape
 
@@ -206,21 +218,13 @@ pub enum SuspendOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResumeCondition {
-    /// Single signal-name match. Matches the SDK's v1 `ConditionMatcher`
-    /// with `signal_name == ""` meaning wildcard.
-    Signal {
-        /// Empty = wildcard (any signal name).
-        signal_name: String,
+    /// Single waitpoint-key match with a matcher predicate. Replaces
+    /// the SDK's v1 `ConditionMatcher`. `matcher` is the per-waitpoint
+    /// predicate (signal-name-or-wildcard in v1; RFC-014 may extend).
+    Single {
+        waitpoint_key: String,
+        matcher: SignalMatcher,
     },
-
-    /// "any of these signal names" — matches when one signal in the
-    /// set arrives.
-    AnyOf { signal_names: Vec<String> },
-
-    /// "all of these signal names" — matches when every name has
-    /// arrived at least once. (RFC-004 §Resume Condition fields already
-    /// describes `all` as v1.)
-    AllOf { signal_names: Vec<String> },
 
     /// Operator-only resume — no signal ever satisfies; only an
     /// explicit operator resume closes. Used for escalate-style paths.
@@ -231,13 +235,24 @@ pub enum ResumeCondition {
     /// pure-delay suspensions where a signal arriving would be an
     /// error, not a resumer.)
     TimeoutOnly,
+
+    /// Multi-condition composition. The concrete body
+    /// (`CompositeBody`) is defined by RFC-014; RFC-013 only reserves
+    /// the enum slot so both RFCs can land without a trait break.
+    /// RFC-014's body is required to be additively extensible (nested
+    /// `ResumeCondition`s, `#[non_exhaustive]` on the body type) so
+    /// subsequent RFCs can grow the composition vocabulary without
+    /// breaking RFC-013's surface.
+    Composite(CompositeBody),
 }
 ```
 
 **Forward-compat hooks (RFC-014 will extend):**
-- `#[non_exhaustive]` lets RFC-014 add `Count { signal_name, n }`, `CompositeAll { clauses: Vec<ResumeCondition> }`, `CompositeAny { clauses }` without breaking downstream pattern matches.
-- Nesting is expressed by making the enum self-recursive in future variants — `AllOf` today takes `Vec<String>` (flat); RFC-014's `CompositeAll` takes `Vec<ResumeCondition>` (nested). Both coexist — `AllOf` is the flat-signal-name fast-path, `CompositeAll` is the RFC-014 general form. §7.3 tracks whether to collapse `AllOf` into `CompositeAll` at RFC-014 landing time.
-- `minimum_signal_count` (RFC-004 §Resume Condition Fields) is NOT a top-level `SuspendArgs` field; it is implicit per variant — `AllOf` ⇒ `n = |signal_names|`; `AnyOf` ⇒ `n = 1`; `Count` (RFC-014) will carry an explicit `n`.
+- `#[non_exhaustive]` lets RFC-014 add further top-level variants (e.g. `Count { signal_name, n }`) without breaking downstream pattern matches.
+- The `Composite(CompositeBody)` variant is RFC-013's reserved extension point. RFC-014 defines `CompositeBody` — expected shape: `enum CompositeBody { AllOf(Vec<ResumeCondition>), AnyOf(Vec<ResumeCondition>), Count { clause: Box<ResumeCondition>, n: u32 }, … }` with `#[non_exhaustive]`. The flat `AnyOf { signal_names: Vec<String> }` / `AllOf { signal_names: Vec<String> }` shapes an earlier draft proposed are **dropped**: they are a strict subset of RFC-014's recursive composites (e.g. `AnyOf { signal_names: ["a","b"] }` ≡ `Composite(CompositeBody::AnyOf(vec![Single{...a}, Single{...b}]))`). Keeping both would be redundant surface area.
+- `minimum_signal_count` (RFC-004 §Resume Condition Fields) is NOT a top-level `SuspendArgs` field; it is implicit per variant — `Composite(AllOf(clauses))` ⇒ `n = |clauses|`; `Composite(AnyOf(clauses))` ⇒ `n = 1`; `Composite(Count{n,…})` (RFC-014) carries an explicit `n`.
+
+**`SignalMatcher` shape:** v1 is `enum SignalMatcher { ByName(String), Wildcard }`. RFC-014 may extend (payload predicates, etc.) — `#[non_exhaustive]`.
 
 **Why not JSON passthrough:**
 - The round-7 §R7.6.1 open question offered "ARGV-JSON in backend impl" as an alternative. Rejected because: (i) a Postgres backend cannot produce the same JSON shape without re-implementing the Valkey Lua's `initialize_condition` helper; (ii) typed variants let `rustc` enforce exhaustiveness on the SDK forwarder — replacing runtime parse errors with compile errors when RFC-014 lands; (iii) JSON-at-the-seam means every consumer of `dyn EngineBackend` has to agree on a schema that is otherwise undocumented.
@@ -346,8 +361,8 @@ All three are `#[non_exhaustive]`; backend serializes to the corresponding Lua/w
 
 ### §3.3 Contract summary
 
-- `suspend` is **not** retry-idempotent. Retry requires a describe-and-reconcile dance. The `suspension_id` is echoed in `SuspendOutcome` for caller correlation, not for Lua-side dedup.
-- A future enhancement (out of scope): add an optional `idempotency_key` on `SuspendArgs` backed by a dedup hash scan, analogous to `DeliverSignalArgs::idempotency_key`. Tracked as §7.5.
+- `suspend` is **not** retry-idempotent **without** an `idempotency_key`. The `suspension_id` is echoed in `SuspendOutcome` for caller correlation, not for Lua-side dedup.
+- **With** `SuspendArgs::idempotency_key: Some(_)` (see §2.2), `suspend` is retry-idempotent: the backend keys a dedup hash on `(partition, execution_id, idempotency_key)` with TTL = suspension-timeout ceiling + grace. A second call within the window returns the first call's `SuspendOutcome` verbatim and performs no state mutation. Shape + semantics follow RFC-012 §R7.2.3's `UsageDimensions.dedup_key`. Without the key, callers must describe-and-reconcile on any retry.
 
 ---
 
@@ -364,12 +379,13 @@ All errors surface as `EngineError`. Variant-by-variant, by scenario:
 | Lease id/epoch/attempt mismatch on the handle | `Validation(InvalidLeaseForSuspend)` | Lua `invalid_lease_for_suspend`. |
 | `WaitpointBinding::UsePending` but waitpoint is missing / wrong exec / expired | `Contention(WaitpointNotFound)` or `State(PendingWaitpointExpired)` | Pre-existing variants from RFC-004 wire. |
 | `WaitpointBinding::Fresh` but `waitpoint_key` does not parse to `wpk:<uuid>` | `Validation(InvalidWaitpointKey)` | Pre-existing. |
-| `resume_condition == AnyOf { signal_names: [] }` or similar empty-condition footgun | `Validation(InvalidInput { detail: "resume_condition.signal_names" })` | Rust-side check before FCALL. |
+| `resume_condition == Single { matcher: ByName("") }` with no wildcard intent, or RFC-014 `Composite` with empty clause list | `Validation(InvalidInput { detail: "resume_condition" })` | Rust-side check before FCALL. |
 | `timeout_at` in the past | `Validation(InvalidInput { detail: "timeout_at_in_past" })` | Rust-side. |
 | HMAC secrets not initialised for partition | `Transport(boxed ScriptError::hmac_secret_not_initialized)` | Ops issue, not caller issue. |
 | Valkey connection error / transient | `Transport(…)` | Standard. |
+| Strict `suspend` (non-`try`) but buffered signals already satisfy the condition | `State(AlreadySatisfied)` | SDK-side: strict path refuses to return the early-satisfied branch. The typed backend outcome is `SuspendOutcome::AlreadySatisfied`; the strict wrapper maps it to this error. `try_suspend` returns the outcome directly instead. |
 
-**New kinds needed:** none. Every scenario maps to an existing variant after Round-7. The `InvalidLeaseForSuspend` variant was added in Round-4 specifically for this path.
+**New kinds needed:** one. `StateKind::AlreadySatisfied` is added to surface the strict-path refusal of the early-satisfied branch (the underlying backend outcome is always typed `SuspendOutcome`; only the SDK's strict wrapper turns it into an error). Every other scenario maps to an existing variant after Round-7. The `InvalidLeaseForSuspend` variant was added in Round-4 specifically for this path.
 
 **Classification note:** `LeaseConflict` + `ExecutionNotActive` are retryable; `AlreadySuspended` is cooperative (no-op — the caller's intent is already the state); everything else is either terminal (validation, bug) or transport (standard retry). See `EngineError::classify` for the authoritative mapping — this RFC adds no new classes.
 
@@ -379,55 +395,79 @@ All errors surface as `EngineError`. Variant-by-variant, by scenario:
 
 After this RFC lands:
 
-### §5.1 New SDK surface
+### §5.1 New SDK surface — `suspend` vs `try_suspend`
+
+The SDK exposes two methods following the classic Rust `foo` / `try_foo` pattern (cf. `Lock` / `TryLock`, `RwLock::read` / `try_read`, `Mutex::lock` / `try_lock`):
 
 ```rust
 // crates/ff-sdk/src/task.rs
 impl ClaimedTask {
+    /// **Strict suspend.** Always yields a Suspended handle or errors.
+    /// Consumes `self`. On the early-satisfied path, returns
+    /// `EngineError::State(AlreadySatisfied)` — the `ClaimedTask` is
+    /// already gone, and the lease is released Lua-side as part of the
+    /// error path. Use this when you've designed your flow to suspend
+    /// unconditionally and an early-satisfied waitpoint is a bug.
     pub async fn suspend(
         self,
         reason_code: SuspensionReasonCode,
         resume_condition: ResumeCondition,
         timeout: Option<(TimestampMs, TimeoutBehavior)>,
         resume_policy: ResumePolicy,
-    ) -> Result<SuspendOutcome, SdkError> {
+    ) -> Result<SuspendedHandle, SdkError> {
         let handle = self.to_handle();
-        let args = SuspendArgs {
-            suspension_id: SuspensionId::new(),
-            waitpoint: WaitpointBinding::Fresh {
-                waitpoint_id: WaitpointId::new(),
-                waitpoint_key: format!("wpk:{}", WaitpointId::new()),
-            },
-            resume_condition,
-            resume_policy,
-            reason_code,
-            requested_by: SuspensionRequester::Worker,
-            timeout_at: timeout.map(|(t, _)| t),
-            timeout_behavior: timeout.map(|(_, b)| b).unwrap_or(TimeoutBehavior::Fail),
-            continuation_metadata_pointer: None,
-            now: TimestampMs::now(),
-        };
+        let args = build_suspend_args(&self, reason_code, resume_condition, timeout, resume_policy);
         self.stop_renewal();
-        self.backend.suspend(&handle, args).await.map_err(SdkError::from)
+        match self.backend.suspend(&handle, args).await.map_err(SdkError::from)? {
+            SuspendOutcome::Suspended { handle, .. } => Ok(SuspendedHandle { handle, .. }),
+            SuspendOutcome::AlreadySatisfied { .. } => {
+                Err(SdkError::Engine(EngineError::State(StateKind::AlreadySatisfied)))
+            }
+        }
     }
 
-    /// Convenience: suspend with a pending waitpoint previously
+    /// **Fallible suspend.** Returns `SuspendOutcome::{Suspended,
+    /// AlreadySatisfied}`. On `AlreadySatisfied`, the `ClaimedTask`
+    /// is **kept alive** and handed back to the caller so the worker
+    /// can continue running against the existing lease. Use this when
+    /// consuming a pending waitpoint whose buffered signals may
+    /// already match the condition.
+    pub async fn try_suspend(
+        self,
+        reason_code: SuspensionReasonCode,
+        resume_condition: ResumeCondition,
+        timeout: Option<(TimestampMs, TimeoutBehavior)>,
+        resume_policy: ResumePolicy,
+    ) -> Result<TrySuspendOutcome, SdkError> { /* ... */ }
+
+    /// Convenience: `try_suspend` against a pending waitpoint previously
     /// issued via `create_waitpoint`.
-    pub async fn suspend_on_pending(
+    pub async fn try_suspend_on_pending(
         self,
         pending: &PendingWaitpoint,
         reason_code: SuspensionReasonCode,
         resume_condition: ResumeCondition,
         timeout: Option<(TimestampMs, TimeoutBehavior)>,
-    ) -> Result<SuspendOutcome, SdkError> { /* mirrors above with UsePending */ }
+    ) -> Result<TrySuspendOutcome, SdkError> { /* mirrors above with UsePending */ }
+}
+
+pub enum TrySuspendOutcome {
+    Suspended(SuspendedHandle),
+    AlreadySatisfied { task: ClaimedTask, details: SuspendOutcomeDetails },
 }
 ```
 
+Rationale for the split:
+- `suspend` / `try_suspend` is the idiomatic Rust pattern for "operation may fail in a structured, callable-recoverable way": the strict form returns the happy path directly, the try form returns a Result-of-outcome. `Mutex::lock` panics on poisoning; `Mutex::try_lock` returns `Result`. Same cadence.
+- 95% of suspend sites know they want to suspend unconditionally. For them, the strict form is cleaner and exhaustiveness-checks to one variant.
+- The 5% of sites that suspend on a pending waitpoint with possibly-buffered signals need to retain the lease when the early-signal path fires. `try_suspend` hands `ClaimedTask` back so the worker continues without a re-claim round-trip.
+- Moves the "AlreadySatisfied consumes vs retains the task" decision into the API surface instead of being a behavioral surprise.
+
 - `SuspendOutcome` is **re-exported** from `ff-core::backend` into `ff-sdk::task`. The SDK does not own the type.
-- Handlers pattern-match `SuspendOutcome` directly. No further wrapping — the enum is the SDK contract.
+- Handlers pattern-match `TrySuspendOutcome` (for `try_suspend`) or receive a `SuspendedHandle` directly (for `suspend`). No further wrapping.
 - **Deletions**:
   - `ff-sdk::task::parse_suspend_result` (100 LOC). Gone.
-  - `ff-sdk::task::ConditionMatcher` (the `struct { signal_name: String }`). Replaced by `ResumeCondition::Signal`.
+  - `ff-sdk::task::ConditionMatcher` (the `struct { signal_name: String }`). Replaced by `ResumeCondition::Single { waitpoint_key, matcher: SignalMatcher::ByName(name) }` (or `SignalMatcher::Wildcard`).
   - `ff-sdk::task::TimeoutBehavior` (if SDK-local — confirm in impl; otherwise just re-export from `ff-core`).
   - The direct `self.client.fcall("ff_suspend_execution", …)` call site. Replaced by `self.backend.suspend(…)`.
 
@@ -437,16 +477,18 @@ Signature-level SDK break. `ClaimedTask::suspend` goes from
 `(reason_code: &str, &[ConditionMatcher], Option<u64>, TimeoutBehavior)`
 to the shape in §5.1. All downstream callers (known: `ff-sdk` tests, `cairn-fabric` consumer) must update. Release notes:
 
-> **Breaking — `ff-sdk::ClaimedTask::suspend`:** signature changed. Pass typed `ResumeCondition` and `ResumePolicy`. `ConditionMatcher` is removed; use `ResumeCondition::Signal { signal_name }` for single-name, `ResumeCondition::AnyOf { signal_names }` for the previous multi-name fan-out. Internal parser `parse_suspend_result` deleted.
+> **Breaking — `ff-sdk::ClaimedTask::suspend`:** signature changed and split. `ClaimedTask::suspend` is now the strict form (returns `SuspendedHandle`; errors with `State(AlreadySatisfied)` on the early-satisfied branch). New `ClaimedTask::try_suspend` returns `TrySuspendOutcome::{Suspended, AlreadySatisfied{task, ..}}` and retains the `ClaimedTask` on `AlreadySatisfied`. Pass typed `ResumeCondition` and `ResumePolicy`. `ConditionMatcher` is removed; use `ResumeCondition::Single { waitpoint_key, matcher }` for single-name. Multi-name fan-out moves to RFC-014's `ResumeCondition::Composite(CompositeBody)`. Internal parser `parse_suspend_result` deleted.
 
 Consumer migration is mechanical; `cairn-fabric` owns its own migration (peer-team boundary per memory). The FF release produces a migration snippet but does not modify `cairn-fabric` code.
 
 ### §5.3 `Handle` substitution contract at call site
 
-Today's `ClaimedTask::suspend` consumes `self` — on any outcome, the task is gone. Under Stage 1d:
+Under Stage 1d, §5.1's two-method split determines what happens to `ClaimedTask`:
 
-- `Suspended { handle, … }`: caller replaces their `ClaimedTask` with — nothing. `ClaimedTask` is consumed; the returned `Handle` belongs to an opaque SDK post-suspension cookie. There is **no** public SDK type to "continue as suspended worker"; resumption goes through `claim_resumed_execution` which mints a fresh `ClaimedTask` on a later poll. The `Handle` is only useful to `observe_signals` until that re-claim happens — which is how today's SDK already works. We preserve that exact model.
-- `AlreadySatisfied { … }`: `ClaimedTask` is consumed but the lease is not released. The caller cannot continue running against the original task after an `AlreadySatisfied` outcome — the worker's current-task state is gone. This is a **breaking** behavioral carryover from today (`ClaimedTask::suspend` already consumes `self` in the AlreadySatisfied path). §7.2 proposes an owner-review alternative that preserves the task handle in `AlreadySatisfied`.
+- **`suspend` (strict), `Suspended` path**: `ClaimedTask` is consumed; caller receives a `SuspendedHandle` (opaque SDK post-suspension cookie). There is **no** public SDK type to "continue as suspended worker"; resumption goes through `claim_resumed_execution` which mints a fresh `ClaimedTask` on a later poll. The handle is only useful to `observe_signals` until that re-claim — preserving today's model.
+- **`suspend` (strict), `AlreadySatisfied` path**: impossible by contract — the strict form errors with `EngineError::State(AlreadySatisfied)` and `self` has already been moved. Callers using `suspend` have declared early-satisfaction is a bug.
+- **`try_suspend`, `Suspended` path**: same as strict. Caller gets a `SuspendedHandle`.
+- **`try_suspend`, `AlreadySatisfied` path**: `ClaimedTask` is handed back in `TrySuspendOutcome::AlreadySatisfied { task, details }`. Lease is retained (Lua never released it); fence triple still matches. Worker continues against the original task. The waitpoint is closed with `satisfied=1` and the buffered signals are consumed per `resume_policy.consume_matched_signals`.
 
 ---
 
@@ -455,7 +497,7 @@ Today's `ClaimedTask::suspend` consumes `self` — on any outcome, the task is g
 - **RFC-004 (Suspension)**: unchanged. This RFC re-shapes the Rust surface; the Valkey wire contract (Lua `ff_suspend_execution`, keys, ARGV, error codes) is preserved. Lua stays source of truth.
 - **RFC-005 (Signal)**: unchanged. `deliver_signal` and `claim_resumed_execution` landed in PR #200 with typed args (`DeliverSignalArgs`, `ClaimResumedExecutionArgs`) — this RFC aligns `suspend`'s input shape with that precedent.
 - **RFC-012 §R7.6.1**: this RFC is the answer to the pinned open question ("typed `ResumeCondition` on trait vs ARGV-JSON"). Decision: typed. See §8.2.
-- **RFC-014 (multi-signal conditions, parallel draft)**: `ResumeCondition` is designed to extend with `Count`, `CompositeAll`, `CompositeAny`. RFC-014 adds variants; does not re-shape the method.
+- **RFC-014 (multi-signal conditions, parallel draft)**: RFC-013 reserves `ResumeCondition::Composite(CompositeBody)`; RFC-014 defines `CompositeBody`. The flat `AnyOf`/`AllOf` variants an earlier draft proposed are dropped as a redundant subset of RFC-014's recursive composites (§2.4). RFC-014's `CompositeBody` is required to be `#[non_exhaustive]` and to take nested `ResumeCondition`s (not flat signal-name vecs) so subsequent RFCs can extend without breaking RFC-013's surface. RFC-014 may also add further top-level `ResumeCondition` variants (e.g. `Count`); none of that re-shapes the method.
 - **Waitpoint HMAC protocol (RFC-004 §Waitpoint Security)**: unchanged. `WaitpointHmac` carries the token through typed fields. Minting remains Lua-side; validation remains Lua-side; rotation remains via `/v1/admin/rotate-waitpoint-secret`.
 - **`create_waitpoint` (round-7, landed)**: `suspend` interoperates via `WaitpointBinding::UsePending`. The lua `use_pending_waitpoint` ARGV flag is the backend's serialization of that variant; no Lua change.
 - **`observe_signals` / `claim_resumed_execution` (landed)**: unchanged. The post-suspend handle hands off to those methods exactly as today.
@@ -464,44 +506,23 @@ Today's `ClaimedTask::suspend` consumes `self` — on any outcome, the task is g
 
 ## §7 — Open questions (owner review required)
 
+> **Adjudicated 2026-04-23** (owner): previous §7.2 (try_suspend split), §7.3 (drop flat `AnyOf`/`AllOf`), §7.5 (`idempotency_key` now) are answered and absorbed into §5 (SDK forwarder), §2.4 (`ResumeCondition`), and §2.2 (`SuspendArgs::idempotency_key`) respectively. Remaining open questions renumbered below.
+
 ### §7.1 `timeout: Option<(TimestampMs, TimeoutBehavior)>` vs split fields
 
-The SDK `suspend` in §5.1 bundles `timeout_at` + `timeout_behavior` into one `Option<(…)>`. An alternative: two separate `Option<TimestampMs>` + `TimeoutBehavior` params with `TimeoutBehavior::Fail` as default.
+The SDK `suspend` / `try_suspend` in §5.1 bundle `timeout_at` + `timeout_behavior` into one `Option<(…)>`. An alternative: two separate `Option<TimestampMs>` + `TimeoutBehavior` params with `TimeoutBehavior::Fail` as default.
 
 - **Tradeoff**: tuple form prevents the "timeout_at set but timeout_behavior forgotten, behavior silently defaulted" bug. Split form reads nicer at the call site (`None` for timeout is clearer than `None` on a tuple).
 - **Recommendation**: tuple form (catches the bug). Owner: pick.
 - The trait-level `SuspendArgs` shape is unaffected either way — this is an SDK ergonomics question.
 
-### §7.2 `AlreadySatisfied` — does `ClaimedTask` survive?
-
-Today's `ClaimedTask::suspend` consumes `self` unconditionally. On `AlreadySatisfied` the lease is retained but the `ClaimedTask` is gone — the worker cannot continue running without some other path to reconstruct task state. In practice today this means: callers who get `AlreadySatisfied` must return control and let the execution be re-claimed, even though the lease is technically held.
-
-Three options:
-1. **Keep today's behavior** (consume `self` in both variants). Simple. Requires the worker to tear down and wait for re-claim. `AlreadySatisfied` is effectively a bug: the lease lingers until renew-on-a-dropped-task runs out.
-2. **Return `Result<Either<(ClaimedTask, SuspendOutcome::AlreadySatisfied), SuspendOutcome::Suspended>, _>`** — on AlreadySatisfied, hand the `ClaimedTask` back so the worker continues. Needs the SDK wrapper method on ClaimedTask to be non-consuming in the AS branch, which is structurally awkward.
-3. **Split into two SDK methods**: `ClaimedTask::suspend_strict` (consumes self, errors on AS) and `ClaimedTask::try_suspend` (returns `Either`). Strict is the 95% path; try is the pending-waitpoint early-signal path.
-- **Recommendation**: option 3. Owner: pick. This is a call-site ergonomics question that doesn't affect the trait.
-
-### §7.3 `AllOf` / `AnyOf` flat forms vs RFC-014's recursive `Composite*`
-
-When RFC-014 lands its `CompositeAll { clauses: Vec<ResumeCondition> }`, the flat `AllOf { signal_names: Vec<String> }` becomes redundant. Two choices:
-
-- Keep `AllOf` as a flat fast-path (documented as "equivalent to `CompositeAll { clauses: signal_names.map(Signal) }`"). Migration-free.
-- Deprecate `AllOf` in RFC-014; remove in a later release. More churn, cleaner surface.
-- **Recommendation**: keep flat form permanently. The backend serializer can internally collapse. Owner: pick, or defer until RFC-014.
-
-### §7.4 `SuspensionRequester` default
+### §7.2 `SuspensionRequester` default
 
 SDK callers always pass `SuspensionRequester::Worker`. Do we need the field on `SuspendArgs` at all, or is it implicit (worker-originated)?
 - Operator-originated suspends (e.g. "admin pauses this exec") go through a different path (not `ClaimedTask::suspend` — there is no lease to surrender). So `suspend` as a trait op is always worker-requested in v1.
 - **Recommendation**: keep the field; RFC-004 has `paused_by_policy` and `system_timeout_policy` reasons that imply non-worker requesters will eventually flow through this method. Owner: confirm.
 
-### §7.5 Optional `idempotency_key` on `SuspendArgs`
-
-§3.3 flags that `suspend` is not retry-idempotent. Adding an `idempotency_key: Option<String>` field backed by a partition-scoped dedup hash (TTL = RFC-004 suspension-timeout ceiling) would make retry-after-network-error trivially safe at modest state cost.
-- **Recommendation**: not in Stage 1d. Track as a follow-up; §3.1's describe-and-retry pattern suffices for v0.6. Owner: confirm deferral.
-
-### §7.6 `continuation_metadata_pointer` — string or typed?
+### §7.3 `continuation_metadata_pointer` — string or typed?
 
 Today it's a free-form string. Proposal: keep as `Option<String>`. An alternative: typed `ContinuationPointer { scheme: String, path: String }` for slightly better self-describability at no enforcement cost (the engine still doesn't interpret bytes).
 - **Recommendation**: keep `Option<String>`. The engine has zero semantics to enforce on the contents; typing it is ceremony. Owner: confirm.
@@ -531,7 +552,7 @@ struct SuspendOutcome {
 ### §8.2 ARGV-JSON in the backend impl, keeping a stringly-typed `ResumeCondition: serde_json::Value` on the trait
 
 Round-7 §R7.6.1's alternative phrasing. **Rejected** because:
-- Pushes the schema into no-lint land. No rust-level check that `AnyOf.signal_names` isn't misspelled `signalNames`.
+- Pushes the schema into no-lint land. No rust-level check that `Single.matcher.by_name` isn't misspelled `byName`, or that `Composite.all_of` isn't `allOf`.
 - A Postgres backend can't produce the same JSON without cross-team sync.
 - RFC-014's additions become string-format RFCs instead of trait additions.
 
@@ -566,7 +587,7 @@ A flatter shape: always return a Handle, with metadata in a side struct, and enc
 1. **ff-core types** (§2.2 – §2.6): land `SuspendArgs`, `SuspendOutcome`, `WaitpointBinding`, `ResumeCondition`, `ResumePolicy`, `ResumeTarget`, `TimeoutBehavior`, `SuspensionReasonCode`, `SuspensionRequester` in `crates/ff-core/src/contracts/mod.rs` (and re-export from `ff-core::backend`). Zero behavioral change; just types.
 2. **Trait update** (§2.1): change `EngineBackend::suspend` signature in `crates/ff-core/src/engine_backend.rs`. Breaking change on the trait. Stubbed impl remains `EngineError::Unavailable { op: "suspend" }` — still compiles.
 3. **Valkey backend impl**: fill in `crates/ff-backend-valkey/src/lib.rs:~1240-1249`. Build KEYS (17) / ARGV (17) from `SuspendArgs`. Internal `ResumeCondition` → JSON serializer. Parse Lua return into `SuspendOutcome` — move `parse_suspend_result` logic into the backend, not SDK.
-4. **SDK forwarder** (§5.1): rewrite `ClaimedTask::suspend` to forward through the trait. Delete `parse_suspend_result`, `ConditionMatcher`, SDK-local `TimeoutBehavior` if present.
+4. **SDK forwarder** (§5.1): rewrite `ClaimedTask::suspend` as the strict wrapper and add `ClaimedTask::try_suspend` / `try_suspend_on_pending`. Introduce `SuspendedHandle` and `TrySuspendOutcome`. Delete `parse_suspend_result`, `ConditionMatcher`, SDK-local `TimeoutBehavior` if present.
 5. **Release notes + migration snippet** for 0.6.0.
 
 ### §9.2 Lua changes
@@ -578,10 +599,11 @@ A flatter shape: always return a Handle, with metadata in a side struct, and enc
 Required tests (at the landing PR's CI):
 
 1. **Unit tests on the Rust type layer**:
-   - `ResumeCondition::Signal { signal_name: "" }` round-trips as wildcard.
-   - `ResumeCondition::AllOf { signal_names: [] }` is rejected at Rust-side validation.
-   - `SuspendArgs` serde round-trip (JSON) for every `ResumeCondition` variant.
-   - `SuspendOutcome::Suspended`/`AlreadySatisfied` exhaustiveness check in the SDK wrapper.
+   - `ResumeCondition::Single { matcher: SignalMatcher::Wildcard, .. }` round-trips.
+   - `ResumeCondition::Single { matcher: SignalMatcher::ByName("") }` is rejected at Rust-side validation (empty name is not wildcard; wildcard is a dedicated variant).
+   - `SuspendArgs` serde round-trip (JSON) for every `ResumeCondition` variant (RFC-013 surface: `Single`, `OperatorOnly`, `TimeoutOnly`; `Composite` covered at RFC-014 landing).
+   - `SuspendOutcome::Suspended`/`AlreadySatisfied` exhaustiveness check in the SDK `try_suspend` wrapper; strict `suspend` wrapper mapping `AlreadySatisfied → State(AlreadySatisfied)` covered by one test.
+   - `SuspendArgs::idempotency_key` replay test: two calls with the same key return the same outcome; two calls with different keys act independently (second errors with `State(AlreadySuspended)`).
 
 2. **Valkey-backend integration tests**:
    - `suspend` with `WaitpointBinding::Fresh`, `ResumeCondition::Signal`, no timeout → `Suspended`.
@@ -590,8 +612,8 @@ Required tests (at the landing PR's CI):
    - `suspend` after fence-triple drift → `Contention(LeaseConflict)`.
    - `suspend` on already-suspended exec → `State(AlreadySuspended)`.
    - `suspend` with `timeout_at` in the past → `Validation(InvalidInput)`.
-   - `suspend` with `ResumeCondition::AnyOf { … }` + signal delivery that matches one name → resumes.
-   - `suspend` with `ResumeCondition::AllOf { ["a", "b"] }` + only `a` delivered → stays suspended; + `b` delivered → resumes.
+   - `suspend` with `ResumeCondition::Single { matcher: ByName("a") }` + `a` delivered → resumes; unrelated signal → stays suspended.
+   - Multi-signal `Composite` cases are covered under RFC-014's test matrix (RFC-013 reserves the slot but doesn't exercise the body).
    - `suspend` with `TimeoutBehavior::Fail` + timeout scanner tick → exec terminal, `close_reason = timed_out_fail`.
    - `suspend` with `TimeoutBehavior::AutoResumeWithTimeoutSignal` + timeout → exec runnable, close_reason `timed_out_auto_resume`.
    - Replay: two `suspend` calls with same args → first succeeds, second returns `State(AlreadySuspended)` (not idempotent).
