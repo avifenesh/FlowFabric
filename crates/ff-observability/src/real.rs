@@ -32,6 +32,7 @@ use prometheus::{Encoder, TextEncoder};
 /// * `ff_cancel_backlog_depth` — 1 (no labels)
 /// * `ff_claim_from_grant_duration_seconds` — ≤ 16 lanes
 /// * `ff_lease_renewal_total` — 2 outcomes (ok, err) = 2
+/// * `ff_attempt_outcome_total` — 5 outcomes × ≤ 16 lanes = 80 (prereq #4)
 /// * `ff_worker_at_capacity_total` — 1 (no labels)
 /// * `ff_budget_hit_total` — per-dimension, typically ≤ 8
 /// * `ff_quota_hit_total` — 2 reasons (rate, concurrency) = 2
@@ -60,6 +61,7 @@ mod name {
     pub const CANCEL_BACKLOG_DEPTH: &str = "ff_cancel_backlog_depth";
     pub const CLAIM_FROM_GRANT_DURATION: &str = "ff_claim_from_grant_duration";
     pub const LEASE_RENEWAL: &str = "ff_lease_renewal";
+    pub const ATTEMPT_OUTCOME: &str = "ff_attempt_outcome";
     pub const WORKER_AT_CAPACITY: &str = "ff_worker_at_capacity";
     pub const BUDGET_HIT: &str = "ff_budget_hit";
     pub const QUOTA_HIT: &str = "ff_quota_hit";
@@ -84,6 +86,7 @@ struct Inner {
     _cancel_backlog_gauge: ObservableGauge<u64>,
     claim_duration: Histogram<f64>,
     lease_renewal: Counter<u64>,
+    attempt_outcome: Counter<u64>,
     worker_at_capacity: Counter<u64>,
     budget_hit: Counter<u64>,
     quota_hit: Counter<u64>,
@@ -137,6 +140,13 @@ impl Metrics {
             .u64_counter(name::LEASE_RENEWAL)
             .with_description("Lease renewal attempts, labelled by outcome (ok|err).")
             .build();
+        let attempt_outcome = meter
+            .u64_counter(name::ATTEMPT_OUTCOME)
+            .with_description(
+                "Terminal attempt outcomes, labelled by lane + outcome \
+                 (ok|error|timeout|cancelled|retry).",
+            )
+            .build();
         let worker_at_capacity = meter
             .u64_counter(name::WORKER_AT_CAPACITY)
             .with_description("Count of claim attempts rejected with WorkerAtCapacity.")
@@ -174,6 +184,7 @@ impl Metrics {
             _cancel_backlog_gauge: cancel_backlog_gauge,
             claim_duration,
             lease_renewal,
+            attempt_outcome,
             worker_at_capacity,
             budget_hit,
             quota_hit,
@@ -187,19 +198,15 @@ impl Metrics {
         let mut buf = Vec::with_capacity(4096);
         // TextEncoder writes valid UTF-8; unwrap on encode is the
         // documented contract (see prometheus::TextEncoder docs).
-        encoder.encode(&metric_families, &mut buf).expect("prometheus text encode");
+        encoder
+            .encode(&metric_families, &mut buf)
+            .expect("prometheus text encode");
         String::from_utf8(buf).expect("prometheus text is utf-8")
     }
 
     // ── HTTP ──
 
-    pub fn record_http_request(
-        &self,
-        method: &str,
-        path: &str,
-        status: u16,
-        elapsed: Duration,
-    ) {
+    pub fn record_http_request(&self, method: &str, path: &str, status: u16, elapsed: Duration) {
         let attrs = [
             KeyValue::new("method", method.to_owned()),
             KeyValue::new("path", path.to_owned()),
@@ -214,7 +221,9 @@ impl Metrics {
     pub fn record_scanner_cycle(&self, scanner: &'static str, elapsed: Duration) {
         let attrs = [KeyValue::new("scanner", scanner)];
         self.0.scanner_total.add(1, &attrs);
-        self.0.scanner_duration.record(elapsed.as_secs_f64(), &attrs);
+        self.0
+            .scanner_duration
+            .record(elapsed.as_secs_f64(), &attrs);
     }
 
     // ── Cancel backlog ──
@@ -233,7 +242,25 @@ impl Metrics {
     // ── Lease ──
 
     pub fn inc_lease_renewal(&self, outcome: &'static str) {
-        self.0.lease_renewal.add(1, &[KeyValue::new("outcome", outcome)]);
+        self.0
+            .lease_renewal
+            .add(1, &[KeyValue::new("outcome", outcome)]);
+    }
+
+    // ── Attempt terminal outcome ──
+
+    /// Increment `ff_attempt_outcome_total` — fired at the trait
+    /// boundary when `complete` / `fail` / `cancel` succeed on the
+    /// backend. Cardinality is bounded at 5 outcomes × N lanes
+    /// (accepted at 5×16=80 per Observability RFC prereq #4).
+    pub fn inc_attempt_outcome(&self, lane: &str, outcome: super::AttemptOutcome) {
+        self.0.attempt_outcome.add(
+            1,
+            &[
+                KeyValue::new("lane", lane.to_owned()),
+                KeyValue::new("outcome", outcome.as_stable_str()),
+            ],
+        );
     }
 
     // ── Worker-at-capacity ──

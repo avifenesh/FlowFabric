@@ -7,6 +7,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`ff_attempt_outcome_total` counter metric** (`ff-observability` +
+  `ff-backend-valkey`). Labelled by `lane` + `outcome`
+  (`ok`|`error`|`timeout`|`cancelled`|`retry`), fired at the
+  `EngineBackend` trait boundary after `complete` / `fail` / `cancel`
+  succeed on the backend FCALL (including reconciled terminal replays).
+  Cardinality bounded at 5 × N lanes (accepted at 5×16=80 per
+  Observability RFC prereq #4). Surfaces as panel 11 ("Attempt outcomes
+  per lane") on `examples/grafana/flowfabric-ops.json`. Public
+  `ff_observability::AttemptOutcome` enum is feature-agnostic so call
+  sites stay symmetric whether `observability` is on or off.
 - **Grafana dashboard JSON for operator observability** at
   `examples/grafana/flowfabric-ops.json`. Ten panels covering claim
   latency + rate, lease renewals, worker-at-capacity, admission
