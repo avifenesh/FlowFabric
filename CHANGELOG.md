@@ -31,6 +31,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   crate is for the consumer-in-library-mode use case. Release workflow,
   `docs/RELEASING.md`, and `release.toml` updated for the new
   publish-list entry (guarded by the drift check added in PR #132).
+- **Sentry error reporting (`ff-observability/sentry`, `ff-server/sentry`):**
+  opt-in Sentry integration for engine-side (`ff-server`, `ff-engine`) and
+  consumer-side binaries. New `ff_observability::init_sentry()` reads
+  `FF_SENTRY_DSN` / `FF_SENTRY_ENVIRONMENT` / `FF_SENTRY_RELEASE`;
+  `ff_observability::sentry_tracing_layer()` composes a `sentry-tracing`
+  layer into any `tracing_subscriber::registry()`. Both features are off
+  by default and compile out entirely (no `sentry` / `sentry-tracing`
+  crates in the dep tree) — orthogonal to `observability` (OTEL metrics).
+  `ff-server` calls `init_sentry()` early in `main()` when built with
+  `--features sentry`; `FF_SENTRY_DSN` unset is a graceful no-op. See
+  `docs/DEPLOYMENT.md` for the env-var table.
 - **Observability wiring on `EngineBackend` trait methods (#154):** every
   non-stub `*_impl` in `ff-backend-valkey` now carries
   `#[tracing::instrument(name = "ff.<method>", skip_all, fields(backend,

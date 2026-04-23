@@ -25,6 +25,12 @@ observability = [
     "ff-engine/observability",
     "ff-scheduler/observability",
 ]
+# OFF by default. When ON, links `sentry` + `sentry-tracing` and calls
+# `ff_observability::init_sentry()` early in `main()` so `FF_SENTRY_DSN`
+# wires process-wide error reporting. When OFF, neither crate is in the
+# dep tree and the init call compiles out entirely. Orthogonal to
+# `observability` — metrics and error reporting are independent axes.
+sentry = ["ff-observability/sentry"]
 
 [dependencies]
 ff-core = { workspace = true }

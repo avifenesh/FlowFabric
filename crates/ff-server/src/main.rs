@@ -17,20 +17,38 @@ async fn main() {
         return;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    // `audit=info` is non-negotiable: rotation, security-kid
-                    // changes, and other compliance events use
-                    // `tracing::*!(target: "audit", ...)`. Without this
-                    // directive the default subscriber silently drops every
-                    // audit event (module-path directives like `ff_server=info`
-                    // do not match custom targets).
-                    "ff_server=info,ff_engine=info,ff_script=info,tower_http=debug,audit=info".into()
-                }),
-        )
-        .init();
+    // Initialize Sentry before tracing so the client is live when the
+    // `sentry-tracing` bridge starts forwarding events. No-op when
+    // `FF_SENTRY_DSN` is unset; compiles out when the `sentry` feature
+    // is off. Guard must live until the process exits to flush buffered
+    // events on drop.
+    #[cfg(feature = "sentry")]
+    let _sentry_guard = ff_observability::init_sentry();
+
+    // `audit=info` is non-negotiable: rotation, security-kid changes,
+    // and other compliance events use `tracing::*!(target: "audit",
+    // ...)`. Without this directive the default subscriber silently
+    // drops every audit event (module-path directives like
+    // `ff_server=info` do not match custom targets).
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "ff_server=info,ff_engine=info,ff_script=info,tower_http=debug,audit=info",
+            )
+        });
+
+    // Registry-based composition so the Sentry layer can attach
+    // alongside `fmt` when the `sentry` feature is on. Without the
+    // feature, only `fmt` + `env_filter` are installed — identical
+    // to the previous `fmt().with_env_filter().init()` shape.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer());
+    #[cfg(feature = "sentry")]
+    let subscriber = subscriber.with(ff_observability::sentry_tracing_layer());
+    subscriber.init();
 
     let config = match ServerConfig::from_env() {
         Ok(c) => c,
