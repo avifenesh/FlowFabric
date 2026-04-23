@@ -108,6 +108,16 @@ impl ExecKeyContext {
         format!("ff:stream:{}:{}:{}:meta", self.tag, self.eid, index)
     }
 
+    /// `ff:attempt:{p:N}:<eid>:<attempt_index>:summary` — Rolling summary
+    /// Hash for the `DurableSummary` stream mode (RFC-015 §3.1). Shares
+    /// the `{p:N}` hash-tag slot with [`Self::stream`] / [`Self::stream_meta`]
+    /// so the summary Hash, the stream key, and the stream-meta Hash are
+    /// all co-located for atomic multi-key FCALL application from the
+    /// single-shard Lua Function.
+    pub fn stream_summary(&self, index: AttemptIndex) -> String {
+        format!("ff:attempt:{}:{}:{}:summary", self.tag, self.eid, index)
+    }
+
     // ── Suspension / Waitpoint (RFC-004) ──
 
     /// `ff:exec:{p:N}:<eid>:suspension:current` — Current suspension episode.

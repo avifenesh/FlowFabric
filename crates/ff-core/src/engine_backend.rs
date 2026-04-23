@@ -50,7 +50,7 @@ use async_trait::async_trait;
 use crate::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    ReclaimToken, ResumeSignal, WaitpointSpec,
+    ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility, WaitpointSpec,
 };
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
@@ -550,6 +550,12 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// `block_ms == 0` → non-blocking peek. `block_ms > 0` → blocks up
     /// to that many ms for a new entry.
     ///
+    /// `visibility` (RFC-015 §6.1) filters the returned entries by
+    /// their stored [`StreamMode`](crate::backend::StreamMode)
+    /// `mode` field. Default
+    /// [`TailVisibility::All`](crate::backend::TailVisibility::All)
+    /// preserves v1 behaviour.
+    ///
     /// Gated on the `streaming` feature — see [`read_stream`](Self::read_stream).
     #[cfg(feature = "streaming")]
     async fn tail_stream(
@@ -559,7 +565,23 @@ pub trait EngineBackend: Send + Sync + 'static {
         after: StreamCursor,
         block_ms: u64,
         count_limit: u64,
+        visibility: TailVisibility,
     ) -> Result<StreamFrames, EngineError>;
+
+    /// Read the rolling summary document for an attempt (RFC-015 §6.3).
+    ///
+    /// Returns `Ok(None)` when no [`StreamMode::DurableSummary`](crate::backend::StreamMode::DurableSummary)
+    /// frame has ever been appended for the attempt. Non-blocking Hash
+    /// read; safe to call from any consumer without holding the lease.
+    ///
+    /// Gated on the `streaming` feature — summary reads are part of
+    /// the stream-subset surface.
+    #[cfg(feature = "streaming")]
+    async fn read_summary(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+    ) -> Result<Option<SummaryDocument>, EngineError>;
 }
 
 /// Object-safety assertion: `dyn EngineBackend` compiles iff every

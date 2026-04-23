@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, BackendConnection, CancelFlowPolicy, CancelFlowWait,
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle,
-    HandleKind, LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
-    WaitpointSpec,
+    HandleKind, LeaseRenewal, PatchKind, PendingWaitpoint, ReclaimToken, ResumeSignal,
+    StreamMode, SummaryDocument, TailVisibility, UsageDimensions, WaitpointSpec,
 };
 use ff_core::contracts::decode::{
     build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
@@ -1664,15 +1664,42 @@ async fn append_frame_impl(
     };
     let correlation_id = frame.correlation_id.clone().unwrap_or_default();
 
+    // KEYS (4): exec_core, stream_data, stream_meta, stream_summary
+    // (stream_summary added for RFC-015 DurableSummary; co-located in
+    // the same `{p:N}` slot so the Lua applier can HGET/HSET atomically).
     let keys: Vec<String> = vec![
         ctx.core(),
         ctx.stream(f.attempt_index),
         ctx.stream_meta(f.attempt_index),
+        ctx.stream_summary(f.attempt_index),
     ];
 
-    // ARGV (13): execution_id, attempt_index, lease_id, lease_epoch,
+    // Durability-mode wire encoding (RFC-015 §1). `StreamMode` and
+    // `PatchKind` are `#[non_exhaustive]`; the wildcard arms default
+    // newer variants to the pre-RFC-015 durable wire encoding (safe
+    // fallback) so an intermediate-version backend never silently
+    // mis-applies a newer mode.
+    let (mode_wire, patch_kind_wire, ttl_ms_wire): (&str, &str, String) = match frame.mode {
+        StreamMode::Durable => ("durable", "", "0".to_owned()),
+        StreamMode::DurableSummary { patch_kind } => {
+            let pk = match patch_kind {
+                PatchKind::JsonMergePatch => "json-merge-patch",
+                _ => "json-merge-patch",
+            };
+            ("summary", pk, "0".to_owned())
+        }
+        StreamMode::BestEffortLive { ttl_ms } => ("best_effort", "", ttl_ms.to_string()),
+        _ => ("durable", "", "0".to_owned()),
+    };
+
+    // ARGV (16): execution_id, attempt_index, lease_id, lease_epoch,
     //            frame_type, ts, payload, encoding, correlation_id,
-    //            source, retention_maxlen, attempt_id, max_payload_bytes
+    //            source, retention_maxlen, attempt_id, max_payload_bytes,
+    //            stream_mode, patch_kind, ttl_ms
+    // Post-RFC-015: ARGV 14-16 added for stream-mode plumbing. Pre-015
+    // callers that still pass 13 ARGV are defaulted to `durable` on
+    // the Lua side (missing = empty = durable), so the extension is
+    // backwards-compatible.
     let args: Vec<String> = vec![
         f.execution_id.to_string(),
         f.attempt_index.to_string(),
@@ -1687,6 +1714,9 @@ async fn append_frame_impl(
         "10000".to_owned(),
         f.attempt_id.to_string(),
         "65536".to_owned(),
+        mode_wire.to_owned(),
+        patch_kind_wire.to_owned(),
+        ttl_ms_wire,
     ];
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
@@ -1702,14 +1732,24 @@ async fn append_frame_impl(
         .into_success()
         .map_err(EngineError::from)?;
 
-    // ok(entry_id, frame_count) — `fields` is 0-indexed past status.
+    // ok(entry_id, frame_count[, summary_version]) — the third field is
+    // only present on DurableSummary appends (RFC-015 §9).
     let stream_id = parsed.field_str(0);
     let frame_count: u64 = parsed.field_str(1).parse().unwrap_or(0);
+    let summary_version: Option<u64> = {
+        let raw = parsed.field_str(2);
+        if raw.is_empty() {
+            None
+        } else {
+            raw.parse().ok()
+        }
+    };
 
-    Ok(AppendFrameOutcome {
-        stream_id,
-        frame_count,
-    })
+    let mut outcome = AppendFrameOutcome::new(stream_id, frame_count);
+    if let Some(v) = summary_version {
+        outcome = outcome.with_summary_version(v);
+    }
+    Ok(outcome)
 }
 
 /// Round-7 — `create_waitpoint` FCALL body. Migrated from
@@ -2936,6 +2976,7 @@ impl EngineBackend for ValkeyBackend {
         after: ff_core::contracts::StreamCursor,
         block_ms: u64,
         count_limit: u64,
+        visibility: TailVisibility,
     ) -> Result<ff_core::contracts::StreamFrames, EngineError> {
         tail_stream_impl(
             &self.client,
@@ -2945,9 +2986,26 @@ impl EngineBackend for ValkeyBackend {
             after,
             block_ms,
             count_limit,
+            visibility,
         )
         .await
         .map_err(|e| ff_core::engine_error::backend_context(e, "tail_stream: XREAD BLOCK"))
+    }
+
+    #[cfg(feature = "streaming")]
+    async fn read_summary(
+        &self,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+    ) -> Result<Option<SummaryDocument>, EngineError> {
+        read_summary_impl(
+            &self.client,
+            &self.partition_config,
+            execution_id,
+            attempt_index,
+        )
+        .await
+        .map_err(|e| ff_core::engine_error::backend_context(e, "read_summary: HGETALL summary"))
     }
 }
 
@@ -3028,6 +3086,7 @@ async fn tail_stream_impl(
     after: ff_core::contracts::StreamCursor,
     block_ms: u64,
     count_limit: u64,
+    visibility: TailVisibility,
 ) -> Result<ff_core::contracts::StreamFrames, EngineError> {
     let partition = execution_partition(execution_id, partition_config);
     let ctx = ExecKeyContext::new(&partition, execution_id);
@@ -3045,7 +3104,7 @@ async fn tail_stream_impl(
         .map_err(ff_script::error::ScriptError::from)
         .map_err(transport_script)?;
 
-    ff_script::stream_tail::xread_block(
+    let mut frames = ff_script::stream_tail::xread_block(
         &tail_client,
         &stream_key,
         &stream_meta_key,
@@ -3054,7 +3113,109 @@ async fn tail_stream_impl(
         count_limit,
     )
     .await
-    .map_err(transport_script)
+    .map_err(transport_script)?;
+
+    // RFC-015 §6.1 server-side visibility filter. Applied post-XREAD
+    // because `xread_block` is a Valkey primitive (not a Lua Function);
+    // the filter is a cheap `mode` field check on each returned entry.
+    // Frames written pre-RFC-015 have no `mode` field → treated as
+    // `durable` (RFC-015 §8.1).
+    if matches!(visibility, TailVisibility::ExcludeBestEffort) {
+        frames.frames.retain(|f| {
+            let mode = f.fields.get("mode").map(String::as_str).unwrap_or("durable");
+            mode != "best_effort"
+        });
+    }
+
+    Ok(frames)
+}
+
+// ── RFC-015 §6.3: read_summary ──
+#[cfg(feature = "streaming")]
+#[tracing::instrument(
+    name = "ff.read_summary",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %execution_id,
+        attempt_index = %attempt_index,
+    )
+)]
+async fn read_summary_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+) -> Result<Option<SummaryDocument>, EngineError> {
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let summary_key = ctx.stream_summary(attempt_index);
+
+    let raw: ferriskey::Value = client
+        .cmd("HGETALL")
+        .arg(&summary_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    // HGETALL returns a flat array of alternating keys/values. Empty ⇒ no
+    // summary (RFC-015 §6.3 returns `Ok(None)`).
+    let entries: Vec<String> = match raw {
+        ferriskey::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| match v {
+                Ok(ferriskey::Value::BulkString(b)) => {
+                    Some(String::from_utf8_lossy(&b).into_owned())
+                }
+                Ok(ferriskey::Value::SimpleString(s)) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut it = entries.into_iter();
+    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        map.insert(k, v);
+    }
+    let document_json = map
+        .remove("document")
+        .unwrap_or_else(|| "{}".to_owned())
+        .into_bytes();
+    let version: u64 = map
+        .get("version")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if version == 0 {
+        // No delta has been applied yet — the Hash only had metadata
+        // stubs (shouldn't happen on the v0.6 write path, but a defensive
+        // None keeps the `Option<SummaryDocument>` contract clean).
+        return Ok(None);
+    }
+    let patch_kind = match map.get("patch_kind").map(String::as_str) {
+        Some("json-merge-patch") => PatchKind::JsonMergePatch,
+        _ => PatchKind::JsonMergePatch,
+    };
+    let last_updated_ms: u64 = map
+        .get("last_updated_ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let first_applied_ms: u64 = map
+        .get("first_applied_ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(last_updated_ms);
+
+    Ok(Some(SummaryDocument::new(
+        document_json,
+        version,
+        patch_kind,
+        last_updated_ms,
+        first_applied_ms,
+    )))
 }
 
 #[cfg(test)]
