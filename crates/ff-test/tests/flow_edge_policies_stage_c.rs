@@ -1,41 +1,44 @@
-//! RFC-016 Stage A integration test.
+//! RFC-016 Stage C integration tests.
 //!
-//! Two scenarios:
+//! Stage C lights up the sibling-cancel dispatcher on top of the Stage
+//! B AnyOf/Quorum+CancelRemaining flag. Tests here assert end-to-end:
 //!
-//! 1. **Explicit `AllOf` via `set_edge_group_policy`.** Stage the
-//!    policy before the first `add_dependency`; stage 3 upstream→1
-//!    downstream edges; drive each upstream to `success` via
-//!    `ff_resolve_dependency`; assert `describe_flow.edge_groups`
-//!    reports `n=3, satisfied=3, state=Satisfied` and that the
-//!    downstream is eligible.
-//!
-//! 2. **Backward-compat shim.** Seed a flow that *never* calls
-//!    `set_edge_group_policy` (the path all existing flows take
-//!    before this release). Stage the same 3→1 shape; resolve all 3
-//!    upstreams; assert the downstream is eligible AND the snapshot
-//!    still reports AllOf / Satisfied (served either from the
-//!    dual-written edgegroup hash or, for flows that pre-date this
-//!    release, the legacy `deps_meta` shim).
-//!
-//! The original Stage-A "rejects AnyOf/Quorum" test was retired when
-//! Stage B lifted that restriction; see `flow_edge_policies_stage_b.rs`
-//! for the new coverage (including the narrower `k == 0` rejection).
+//! 1. AnyOf{CancelRemaining} fan-out 3: first success flips the group
+//!    to `satisfied`, the dispatcher scans within ~2s and cancels the
+//!    other two siblings -- both reach `terminal_outcome = cancelled`
+//!    with `cancellation_reason = sibling_quorum_satisfied`.
+//! 2. Quorum(3/5)+CancelRemaining: 3 successes fire the group, the
+//!    remaining 2 still-running siblings are cancelled within ~2s.
+//! 3. Impossible-quorum (Quorum(3/5)+CancelRemaining with 3 failures,
+//!    2 untouched): survivors are cancelled with reason
+//!    `sibling_quorum_impossible`.
+//! 4. AnyOf{LetRun}: first success fires the group BUT the dispatcher
+//!    never touches siblings -- they remain non-terminal even after
+//!    the scanner has had multiple ticks. LetRun is pure.
 //!
 //! Run with:
-//!   cargo test -p ff-test --test flow_edge_policies_stage_a -- --test-threads=1
+//!   cargo test -p ff-test --test flow_edge_policies_stage_c -- --test-threads=1
+//!
+//! Scanner default is 1s (`EngineConfig::edge_cancel_dispatcher_interval`);
+//! the assertions wait up to 3s to absorb a single tick's worth of
+//! jitter + the bounded cancel round-trip.
 
 use ferriskey::Value;
 use ff_core::contracts::{
     ApplyDependencyToChildArgs, CreateExecutionArgs, CreateFlowArgs,
-    EdgeDependencyPolicy, EdgeGroupState, StageDependencyEdgeArgs,
+    EdgeDependencyPolicy, OnSatisfied, StageDependencyEdgeArgs,
 };
 use ff_core::keys::{ExecKeyContext, FlowKeyContext};
 use ff_core::partition::{execution_partition, flow_partition};
 use ff_core::types::*;
 use ff_test::fixtures::TestCluster;
+use std::time::Duration;
 
-const NS: &str = "edgepol-ns";
-const LANE: &str = "edgepol-lane";
+const NS: &str = "edgepol-c-ns";
+const LANE: &str = "edgepol-c-lane";
+
+const ASSERT_DEADLINE: Duration = Duration::from_secs(3);
+const ASSERT_POLL: Duration = Duration::from_millis(100);
 
 fn cfg() -> ff_core::partition::PartitionConfig {
     ff_test::fixtures::TEST_PARTITION_CONFIG
@@ -61,6 +64,7 @@ async fn start_server(
         engine_config: ff_engine::EngineConfig {
             partition_config: pc,
             lanes: vec![LaneId::new(LANE)],
+            edge_cancel_dispatcher_interval: Duration::from_millis(250),
             ..Default::default()
         },
         skip_library_load: false,
@@ -80,8 +84,8 @@ async fn start_server(
 async fn build_worker() -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
         backend: ff_test::fixtures::backend_config_from_env(),
-        worker_id: WorkerId::new("edgepol-worker"),
-        worker_instance_id: WorkerInstanceId::new("edgepol-inst"),
+        worker_id: WorkerId::new("edgepol-c-worker"),
+        worker_instance_id: WorkerInstanceId::new("edgepol-c-inst"),
         namespace: Namespace::new(NS),
         lanes: vec![LaneId::new(LANE)],
         capabilities: Vec::new(),
@@ -104,7 +108,7 @@ fn mint_flow_with_members(
     (fid, members)
 }
 
-async fn create_flow(server: &ff_server::server::Server, fid: &FlowId) {
+async fn create_flow_api(server: &ff_server::server::Server, fid: &FlowId) {
     server
         .create_flow(&CreateFlowArgs {
             flow_id: fid.clone(),
@@ -116,7 +120,7 @@ async fn create_flow(server: &ff_server::server::Server, fid: &FlowId) {
         .expect("create_flow");
 }
 
-async fn create_exec(
+async fn create_exec_api(
     server: &ff_server::server::Server,
     tc: &TestCluster,
     eid: &ExecutionId,
@@ -203,15 +207,12 @@ async fn stage_and_apply(
     new_rev
 }
 
-/// Direct ff_resolve_dependency FCALL — drives the downstream's
-/// dep-hash state machine without needing the worker/claim/complete
-/// path. Finds the matching edge by scanning the downstream's `in:`
-/// adjacency SET.
-async fn fcall_resolve(
+async fn fcall_resolve_with(
     tc: &TestCluster,
     fid: &FlowId,
     downstream: &ExecutionId,
     upstream: &ExecutionId,
+    upstream_outcome: &str,
 ) {
     let partition = flow_partition(fid, tc.partition_config());
     let fctx = FlowKeyContext::new(&partition, fid);
@@ -254,8 +255,8 @@ async fn fcall_resolve(
     let lane = LaneId::new(LANE);
     let edgegroup = fctx.edgegroup(downstream);
     let incoming_set = fctx.incoming(downstream);
-    let pending_cancel_groups_set = ff_core::keys::FlowIndexKeys::new(&partition)
-        .pending_cancel_groups();
+    let pending_cancel_groups_set =
+        ff_core::keys::FlowIndexKeys::new(&partition).pending_cancel_groups();
 
     let keys: Vec<String> = vec![
         ctx.core(),
@@ -276,7 +277,7 @@ async fn fcall_resolve(
     let now = TimestampMs::now().0.to_string();
     let args: Vec<String> = vec![
         edge_str,
-        "success".into(),
+        upstream_outcome.into(),
         now,
         fid.to_string(),
         downstream.to_string(),
@@ -307,154 +308,254 @@ async fn seed_partition_config(tc: &TestCluster) {
         .unwrap();
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn stage_a_allof_explicit_policy_succeeds_when_all_upstreams_succeed() {
-    let tc = TestCluster::connect().await;
-    tc.cleanup().await;
-    seed_partition_config(&tc).await;
-    let server = start_server(&tc).await;
-    let worker = build_worker().await;
+async fn read_exec_field(
+    tc: &TestCluster,
+    eid: &ExecutionId,
+    field: &str,
+) -> Option<String> {
+    let partition = execution_partition(eid, tc.partition_config());
+    let ctx = ExecKeyContext::new(&partition, eid);
+    tc.client()
+        .cmd("HGET")
+        .arg(ctx.core().as_str())
+        .arg(field)
+        .execute()
+        .await
+        .unwrap()
+}
 
-    let (fid, members) = mint_flow_with_members(&tc, 4);
-    let (a, b, c, d) = (&members[0], &members[1], &members[2], &members[3]);
+async fn wait_for<F, Fut>(f: F) -> bool
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while start.elapsed() < ASSERT_DEADLINE {
+        if f().await {
+            return true;
+        }
+        tokio::time::sleep(ASSERT_POLL).await;
+    }
+    false
+}
 
-    create_flow(&server, &fid).await;
+async fn setup_fanin(
+    tc: &TestCluster,
+    server: &ff_server::server::Server,
+    worker: &ff_sdk::FlowFabricWorker,
+    upstream_n: usize,
+    policy: EdgeDependencyPolicy,
+) -> (FlowId, Vec<ExecutionId>, ExecutionId) {
+    let (fid, members) = mint_flow_with_members(tc, upstream_n + 1);
+    let downstream = members[upstream_n].clone();
+    let upstreams: Vec<ExecutionId> = members[..upstream_n].to_vec();
+
+    create_flow_api(server, &fid).await;
     for m in &members {
-        create_exec(&server, &tc, m).await;
-        add_member(&server, &fid, m).await;
+        create_exec_api(server, tc, m).await;
+        add_member(server, &fid, m).await;
     }
 
-    // Declare AllOf explicitly BEFORE staging any edge for d.
     worker
-        .set_edge_group_policy(&fid, d, EdgeDependencyPolicy::all_of())
+        .set_edge_group_policy(&fid, &downstream, policy)
         .await
-        .expect("set_edge_group_policy AllOf");
+        .expect("set_edge_group_policy");
 
-    // create_flow=1 rev + 4 add_member bumps = 5. But add_execution
-    // may not bump graph_revision today — thread the authoritative
-    // revision through successive stage calls.
-    // Read current graph_revision off flow_core.
     let current_rev: Option<String> = tc
         .client()
         .cmd("HGET")
-        .arg(FlowKeyContext::new(&flow_partition(&fid, &cfg()), &fid).core().as_str())
+        .arg(
+            FlowKeyContext::new(&flow_partition(&fid, &cfg()), &fid)
+                .core()
+                .as_str(),
+        )
         .arg("graph_revision")
         .execute()
         .await
         .unwrap();
     let mut rev: u64 = current_rev.and_then(|s| s.parse().ok()).unwrap_or(0);
-    rev = stage_and_apply(&server, &fid, a, d, rev).await;
-    rev = stage_and_apply(&server, &fid, b, d, rev).await;
-    let _ = stage_and_apply(&server, &fid, c, d, rev).await;
-
-    for up in [a, b, c] {
-        fcall_resolve(&tc, &fid, d, up).await;
+    for u in &upstreams {
+        rev = stage_and_apply(server, &fid, u, &downstream, rev).await;
     }
 
-    let snap = worker
-        .describe_flow(&fid)
-        .await
-        .expect("describe_flow")
-        .expect("flow present");
-    let eg = snap
-        .edge_groups
-        .iter()
-        .find(|g| &g.downstream_execution_id == d)
-        .expect("edge group for d present");
-
-    assert_eq!(eg.policy, EdgeDependencyPolicy::AllOf);
-    assert_eq!(eg.total_deps, 3, "n=3");
-    assert_eq!(eg.satisfied_count, 3, "succeeded=3");
-    assert_eq!(eg.group_state, EdgeGroupState::Satisfied);
-
-    let partition = execution_partition(d, &cfg());
-    let ctx = ExecKeyContext::new(&partition, d);
-    let elig: Option<String> = tc
-        .client()
-        .cmd("HGET")
-        .arg(ctx.core().as_str())
-        .arg("eligibility_state")
-        .execute()
-        .await
-        .unwrap();
-    assert_eq!(
-        elig.as_deref(),
-        Some("eligible_now"),
-        "AllOf satisfied → downstream eligible"
-    );
+    (fid, upstreams, downstream)
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn stage_a_backward_compat_shim_allof_without_explicit_policy() {
+async fn stage_c_any_of_cancel_remaining_terminates_siblings() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     seed_partition_config(&tc).await;
     let server = start_server(&tc).await;
     let worker = build_worker().await;
 
-    let (fid, members) = mint_flow_with_members(&tc, 4);
-    let (a, b, c, d) = (&members[0], &members[1], &members[2], &members[3]);
+    let (fid, upstreams, downstream) = setup_fanin(
+        &tc,
+        &server,
+        &worker,
+        3,
+        EdgeDependencyPolicy::any_of(OnSatisfied::cancel_remaining()),
+    )
+    .await;
 
-    create_flow(&server, &fid).await;
-    for m in &members {
-        create_exec(&server, &tc, m).await;
-        add_member(&server, &fid, m).await;
+    fcall_resolve_with(&tc, &fid, &downstream, &upstreams[0], "success").await;
+
+    for (i, sib) in upstreams.iter().enumerate().skip(1) {
+        let sib_cl = sib.clone();
+        let tc_cl = &tc;
+        let terminated = wait_for(|| async {
+            read_exec_field(tc_cl, &sib_cl, "terminal_outcome")
+                .await
+                .as_deref()
+                == Some("cancelled")
+        })
+        .await;
+        assert!(
+            terminated,
+            "sibling #{i} did not reach terminal=cancelled within deadline"
+        );
+        let reason = read_exec_field(&tc, sib, "cancellation_reason").await;
+        assert_eq!(
+            reason.as_deref(),
+            Some("sibling_quorum_satisfied"),
+            "sibling #{i} has wrong cancellation_reason: {reason:?}"
+        );
     }
 
-    // NO set_edge_group_policy call — existing-flow path.
-    let current_rev: Option<String> = tc
-        .client()
-        .cmd("HGET")
-        .arg(FlowKeyContext::new(&flow_partition(&fid, &cfg()), &fid).core().as_str())
-        .arg("graph_revision")
-        .execute()
-        .await
-        .unwrap();
-    let mut rev: u64 = current_rev.and_then(|s| s.parse().ok()).unwrap_or(0);
-    rev = stage_and_apply(&server, &fid, a, d, rev).await;
-    rev = stage_and_apply(&server, &fid, b, d, rev).await;
-    let _ = stage_and_apply(&server, &fid, c, d, rev).await;
-
-    for up in [a, b, c] {
-        fcall_resolve(&tc, &fid, d, up).await;
-    }
-
-    let snap = worker
-        .describe_flow(&fid)
-        .await
-        .expect("describe_flow")
-        .expect("flow present");
-    let eg = snap
-        .edge_groups
-        .iter()
-        .find(|g| &g.downstream_execution_id == d)
-        .expect("edge group for d present (via dual-write or shim)");
-    assert_eq!(eg.policy, EdgeDependencyPolicy::AllOf);
-    assert_eq!(eg.total_deps, 3);
-    assert_eq!(eg.group_state, EdgeGroupState::Satisfied);
-
-    let partition = execution_partition(d, &cfg());
-    let ctx = ExecKeyContext::new(&partition, d);
-    let elig: Option<String> = tc
-        .client()
-        .cmd("HGET")
-        .arg(ctx.core().as_str())
-        .arg("eligibility_state")
-        .execute()
-        .await
-        .unwrap();
     assert_eq!(
-        elig.as_deref(),
+        read_exec_field(&tc, &downstream, "eligibility_state")
+            .await
+            .as_deref(),
         Some("eligible_now"),
-        "backward-compat: AllOf satisfaction still fires without set_edge_group_policy"
+        "downstream eligibility must survive sibling cancels"
     );
 }
 
-// NOTE: The original Stage-A-only `stage_a_rejects_any_of_and_quorum`
-// test lived here to pin the Stage A closed-door stance (AnyOf/Quorum
-// rejected with a typed validation error). RFC-016 Stage B intentionally
-// flips that gate to ACCEPT AnyOf/Quorum — the assertion is obsolete.
-// Stage B coverage for the AnyOf/Quorum paths and the narrower
-// `k == 0` validation lives in `flow_edge_policies_stage_b.rs`.
+#[tokio::test]
+#[serial_test::serial]
+async fn stage_c_quorum_cancel_remaining_terminates_stragglers() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    seed_partition_config(&tc).await;
+    let server = start_server(&tc).await;
+    let worker = build_worker().await;
+
+    let (fid, upstreams, downstream) = setup_fanin(
+        &tc,
+        &server,
+        &worker,
+        5,
+        EdgeDependencyPolicy::quorum(3, OnSatisfied::cancel_remaining()),
+    )
+    .await;
+
+    for i in 0..3 {
+        fcall_resolve_with(&tc, &fid, &downstream, &upstreams[i], "success").await;
+    }
+
+    for i in 3..5 {
+        let sib_cl = upstreams[i].clone();
+        let tc_cl = &tc;
+        let terminated = wait_for(|| async {
+            read_exec_field(tc_cl, &sib_cl, "terminal_outcome")
+                .await
+                .as_deref()
+                == Some("cancelled")
+        })
+        .await;
+        assert!(terminated, "straggler #{i} did not cancel within deadline");
+        let reason =
+            read_exec_field(&tc, &upstreams[i], "cancellation_reason").await;
+        assert_eq!(
+            reason.as_deref(),
+            Some("sibling_quorum_satisfied"),
+            "straggler #{i} wrong reason: {reason:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn stage_c_impossible_quorum_cancels_survivors_with_impossible_reason() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    seed_partition_config(&tc).await;
+    let server = start_server(&tc).await;
+    let worker = build_worker().await;
+
+    let (fid, upstreams, downstream) = setup_fanin(
+        &tc,
+        &server,
+        &worker,
+        5,
+        EdgeDependencyPolicy::quorum(3, OnSatisfied::cancel_remaining()),
+    )
+    .await;
+
+    for i in 0..3 {
+        fcall_resolve_with(&tc, &fid, &downstream, &upstreams[i], "failed").await;
+    }
+
+    for i in 3..5 {
+        let sib_cl = upstreams[i].clone();
+        let tc_cl = &tc;
+        let terminated = wait_for(|| async {
+            read_exec_field(tc_cl, &sib_cl, "terminal_outcome")
+                .await
+                .as_deref()
+                == Some("cancelled")
+        })
+        .await;
+        assert!(
+            terminated,
+            "survivor #{i} did not cancel on impossible quorum"
+        );
+        let reason =
+            read_exec_field(&tc, &upstreams[i], "cancellation_reason").await;
+        assert_eq!(
+            reason.as_deref(),
+            Some("sibling_quorum_impossible"),
+            "survivor #{i} wrong reason: {reason:?}"
+        );
+    }
+
+    assert_eq!(
+        read_exec_field(&tc, &downstream, "terminal_outcome")
+            .await
+            .as_deref(),
+        Some("skipped")
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn stage_c_let_run_never_cancels_siblings() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+    seed_partition_config(&tc).await;
+    let server = start_server(&tc).await;
+    let worker = build_worker().await;
+
+    let (fid, upstreams, downstream) = setup_fanin(
+        &tc,
+        &server,
+        &worker,
+        3,
+        EdgeDependencyPolicy::any_of(OnSatisfied::let_run()),
+    )
+    .await;
+
+    fcall_resolve_with(&tc, &fid, &downstream, &upstreams[0], "success").await;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for i in 1..3 {
+        let term = read_exec_field(&tc, &upstreams[i], "terminal_outcome").await;
+        assert_ne!(
+            term.as_deref(),
+            Some("cancelled"),
+            "LetRun must never touch sibling #{i}, got terminal={term:?}"
+        );
+    }
+}

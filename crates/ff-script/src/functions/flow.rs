@@ -44,6 +44,7 @@ pub struct ResolveDependencyKeys<'a> {
     pub lane_id: &'a ff_core::types::LaneId,
     pub upstream_ctx: &'a ExecKeyContext,
     pub flow_ctx: &'a FlowKeyContext,
+    pub flow_idx: &'a FlowIndexKeys,
     pub downstream_eid: &'a ff_core::types::ExecutionId,
 }
 
@@ -269,16 +270,20 @@ impl FromFcallResult for ApplyDependencyToChildResult {
 }
 
 // ─── ff_resolve_dependency ────────────────────────────────────────────
-// KEYS (12): exec_core, deps_meta, unresolved_set, dep_hash,
+// KEYS (14): exec_core, deps_meta, unresolved_set, dep_hash,
 //            eligible_zset, terminal_zset, blocked_deps_zset,
 //            attempt_hash, stream_meta, downstream_payload,
-//            upstream_result, edgegroup
-// ARGV (3): edge_id, upstream_outcome, now_ms
+//            upstream_result, edgegroup, incoming_set,
+//            pending_cancel_groups_set
+// ARGV (5): edge_id, upstream_outcome, now_ms, flow_id, downstream_eid
 //
 // KEYS[10]/[11] added in Batch C item 3 for server-side
 // data_passing_ref resolution. KEYS[12] added in RFC-016 Stage A for
-// the per-downstream edge-group hash; flow/exec partitions co-locate
-// under `{fp:N}` post-RFC-011 so the FCALL remains single-slot.
+// the per-downstream edge-group hash; KEYS[13]/[14] + ARGV[4]/[5]
+// added in RFC-016 Stage C so the AnyOf/Quorum+CancelRemaining path
+// can enumerate siblings and index the group in the per-partition
+// `pending_cancel_groups` SET. Flow/exec partitions co-locate under
+// `{fp:N}` post-RFC-011 so the FCALL remains single-slot.
 
 ff_function! {
     pub ff_resolve_dependency(args: ResolveDependencyArgs) -> ResolveDependencyResult {
@@ -295,11 +300,15 @@ ff_function! {
             k.ctx.payload(),
             k.upstream_ctx.result(),
             k.flow_ctx.edgegroup(k.downstream_eid),
+            k.flow_ctx.incoming(k.downstream_eid),
+            k.flow_idx.pending_cancel_groups(),
         }
         argv {
             args.edge_id.to_string(),
             args.upstream_outcome.clone(),
             args.now.to_string(),
+            k.flow_ctx.flow_id().to_owned(),
+            k.downstream_eid.to_string(),
         }
     }
 }

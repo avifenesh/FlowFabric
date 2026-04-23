@@ -300,21 +300,33 @@ async fn dispatch_dependency_resolution_inner(
         let upstream_result = upstream_ctx.result();
 
         let edgegroup = flow_ctx.edgegroup(&downstream_eid);
-        let keys: [&str; 12] = [
-            &child_core_key,       // 1
-            &deps_meta,            // 2
-            &unresolved,           // 3
-            &dep_hash,             // 4
-            &eligible,             // 5
-            &terminal,             // 6
-            &blocked_deps,         // 7
-            &attempt_hash,         // 8
-            &stream_meta,          // 9
-            &downstream_payload,   // 10
-            &upstream_result,      // 11
-            &edgegroup,            // 12 (RFC-016 Stage A)
+        let incoming_set = flow_ctx.incoming(&downstream_eid);
+        let pending_cancel_groups = ff_core::keys::FlowIndexKeys::new(&flow_partition)
+            .pending_cancel_groups();
+        let downstream_eid_full = downstream_eid.to_string();
+        let keys: [&str; 14] = [
+            &child_core_key,         // 1
+            &deps_meta,              // 2
+            &unresolved,             // 3
+            &dep_hash,               // 4
+            &eligible,               // 5
+            &terminal,               // 6
+            &blocked_deps,           // 7
+            &attempt_hash,           // 8
+            &stream_meta,            // 9
+            &downstream_payload,     // 10
+            &upstream_result,        // 11
+            &edgegroup,              // 12 (RFC-016 Stage A)
+            &incoming_set,           // 13 (RFC-016 Stage C)
+            &pending_cancel_groups,  // 14 (RFC-016 Stage C)
         ];
-        let argv: [&str; 3] = [edge_id, upstream_outcome, &now_ms];
+        let argv: [&str; 5] = [
+            edge_id,
+            upstream_outcome,
+            &now_ms,
+            flow_id_str,             // 4 (RFC-016 Stage C)
+            &downstream_eid_full,    // 5 (RFC-016 Stage C)
+        ];
 
         match client
             .fcall::<ferriskey::Value>("ff_resolve_dependency", &keys, &argv)

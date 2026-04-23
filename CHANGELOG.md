@@ -44,6 +44,47 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in this release (see Changed below). Lua library version bumped
   20 → 22 (21 → 22 covers the Pattern 3 multi-waitpoint widening).
 
+- **RFC-016 Stage C: sibling-cancel dispatcher + `pending_cancel_groups`
+  index SET.** Builds on Stage B's `cancel_siblings_pending_flag` to
+  land the end-to-end "kill the losers" path. `ff_resolve_dependency`
+  gains two new KEYS (`incoming_set`, `pending_cancel_groups_set`) and
+  two new ARGV (`flow_id`, `downstream_eid`). On the terminal
+  CancelRemaining transition the Lua resolver now ALSO (a) enumerates
+  still-running siblings from the downstream's `incoming_set` + each
+  sibling's `exec_core.lifecycle_phase`, (b) writes the pipe-delimited
+  sibling execution-id list to `cancel_siblings_pending_members` on
+  the edgegroup hash, and (c) SADDs the `<flow_id>|<downstream_eid>`
+  tuple to `ff:idx:{fp:N}:pending_cancel_groups`. New scanner
+  `ff-engine::scanner::edge_cancel_dispatcher` SRANDMEMBERs the
+  pending SET per flow partition, reads each group's members + reason
+  from the edgegroup hash, issues per-sibling `ff_cancel_execution`
+  with `cancellation_reason = sibling_quorum_{satisfied,impossible}`,
+  tracks per-id dispositions (`cancelled` | `already_terminal` |
+  `not_found`), and finally atomically clears the flag + members +
+  SET tuple via a new `ff_drain_sibling_cancel_group` Lua function —
+  one atomic unit so a crash mid-drain leaves either pre- or post-
+  drain state, never a torn in-between. The dispatcher reuses the
+  existing `ff_cancel_execution` FCALL (no new cancel variant); the
+  reason code is threaded through ARGV[2] and lands verbatim on
+  exec_core's `cancellation_reason`. `LetRun` is structurally
+  excluded — the Lua resolver never flags / enumerates / indexes
+  LetRun groups, so the dispatcher can never see them.
+  `EngineConfig::edge_cancel_dispatcher_interval` (default 1s, env
+  override `FF_EDGE_CANCEL_DISPATCHER_INTERVAL_S`) controls the scan
+  cadence. New metrics: `ff_sibling_cancel_dispatched_total{reason}`
+  (2 labels) and `ff_sibling_cancel_disposition_total{disposition}`
+  (fixed cardinality = 3). Integration coverage:
+  `crates/ff-test/tests/flow_edge_policies_stage_c.rs` — 4 scenarios
+  (AnyOf{CancelRemaining} fan-out-3, Quorum(3/5)+CancelRemaining
+  stragglers, impossible-quorum survivors, AnyOf{LetRun}
+  regression). Benchmark harness landed at
+  `benches/harness/benches/quorum_cancel_fanout.rs` per RFC-016 §4.2
+  — runs pre-release, SLO is p99 ≤ 500 ms at `n=100` under
+  `Quorum(1, n) + CancelRemaining` (no enforcement at commit time).
+  **Stage C does NOT ship the crash-mid-cancel reconciler (Stage D),
+  the full cancel-path integration matrix (Stage E), or the benchmark
+  execution / SLO enforcement (release gate).** Lua library bumped
+  22 → 23.
 - **RFC-016 Stage B: AnyOf / Quorum edge-dependency resolver.** Lights
   up the four-counter state machine on top of the Stage A edgegroup
   hash. `EngineBackend::set_edge_group_policy` now ACCEPTS

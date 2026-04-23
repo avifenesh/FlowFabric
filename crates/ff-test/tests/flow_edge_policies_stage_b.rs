@@ -250,6 +250,9 @@ async fn fcall_resolve_with(
     let att = AttemptIndex::new(0);
     let lane = LaneId::new(LANE);
     let edgegroup = fctx.edgegroup(downstream);
+    let incoming_set = fctx.incoming(downstream);
+    let pending_cancel_groups_set = ff_core::keys::FlowIndexKeys::new(&partition)
+        .pending_cancel_groups();
 
     let keys: Vec<String> = vec![
         ctx.core(),
@@ -264,9 +267,17 @@ async fn fcall_resolve_with(
         ctx.payload(),
         upstream_ctx.result(),
         edgegroup,
+        incoming_set,
+        pending_cancel_groups_set,
     ];
     let now = TimestampMs::now().0.to_string();
-    let args: Vec<String> = vec![edge_str, upstream_outcome.into(), now];
+    let args: Vec<String> = vec![
+        edge_str,
+        upstream_outcome.into(),
+        now,
+        fid.to_string(),
+        downstream.to_string(),
+    ];
     let kr: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let ar: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let _: Value = tc
