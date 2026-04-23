@@ -19,3 +19,7 @@ pub use engine_error::EngineError;
 // ff-sdk / ff-server surfaces. Kept alongside `EngineError` so
 // consumers can `use ff_core::{BackendError, BackendErrorKind}`.
 pub use engine_error::{BackendError, BackendErrorKind};
+// DX (HHH v0.3.4 re-smoke): re-export `ScannerFilter` at crate root
+// so consumers can write `ff_core::ScannerFilter` instead of the
+// longer `ff_core::backend::ScannerFilter` path.
+pub use backend::ScannerFilter;
