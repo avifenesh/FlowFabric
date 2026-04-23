@@ -591,6 +591,16 @@ impl FlowFabricWorker {
         Some(&self.backend)
     }
 
+    /// Crate-internal direct borrow of the backend. The public
+    /// [`Self::backend`] still returns `Option` for API stability
+    /// (Stage 1b holdover). Snapshot trait-forwarders in
+    /// [`crate::snapshot`] need an un-wrapped reference.
+    pub(crate) fn backend_ref(
+        &self,
+    ) -> &Arc<dyn ff_core::engine_backend::EngineBackend> {
+        &self.backend
+    }
+
     /// Handle to the completion-event subscription backend, for
     /// consumers that need to observe execution completions (DAG
     /// reconcilers, tenant-isolated subscribers).

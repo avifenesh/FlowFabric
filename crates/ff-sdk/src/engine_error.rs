@@ -82,7 +82,7 @@ pub async fn enrich_dependency_conflict(
     if raw.is_empty() {
         return Err(transport_script(ScriptError::DependencyAlreadyExists));
     }
-    match crate::snapshot::build_edge_snapshot_public(flow_id, edge_id, &raw) {
+    match ff_core::contracts::decode::build_edge_snapshot(flow_id, edge_id, &raw) {
         Ok(existing) => Ok(EngineError::Conflict(ConflictKind::DependencyAlreadyExists {
             existing,
         })),
