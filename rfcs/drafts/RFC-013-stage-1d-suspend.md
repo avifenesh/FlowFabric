@@ -115,6 +115,14 @@ pub struct SuspendArgs {
 
     /// Wall-clock deadline. `None` = suspend indefinitely until a
     /// signal/operator action satisfies the condition.
+    ///
+    /// Validated against **backend wall-clock** (Valkey `TIME`), not
+    /// the caller's `now`. Worker clock skew up to
+    /// `SUSPEND_CLOCK_SKEW_TOLERANCE_MS` (600000 ms = 10 min, per the
+    /// HMAC-grace-window precedent in RFC-004) is accepted; beyond
+    /// that, validation rejects as `timeout_at_in_past`. Callers may
+    /// query backend time via `ff_sdk::diagnostics::server_time()` if
+    /// they need to compute a skew-safe deadline.
     pub timeout_at: Option<TimestampMs>,
 
     /// What happens at `timeout_at` if the condition is unsatisfied.
@@ -163,7 +171,63 @@ Notes:
 - `continuation_metadata_pointer` stays `Option<String>` — same opacity as today. RFC-004 explicitly does not let the engine own continuation bytes.
 - `reason_code` + `requested_by` are typed enums (currently ARGV strings). The enum values are the set defined in RFC-004 §Suspension Reason Categories; `#[non_exhaustive]` so RFC-014/RFC-015 can extend.
 - `WaitpointSpec` (from round-7) is **not** reused as the `suspend` input: it was shaped for `create_waitpoint`'s pending issuance. Keeping them separate is cleaner than overloading one struct with conditional fields.
-- `idempotency_key` is a partition-scoped dedup key. Lua stores a hash `ff:dedup:suspend:{p:N}:<execution_id>:<idempotency_key>` → serialized `SuspendOutcome`, TTL = suspension-timeout ceiling + grace. On hit, the first outcome is returned verbatim (including the original `suspension_id` / `waitpoint_id` / `waitpoint_token`), and no state mutation occurs. This mirrors `UsageDimensions.dedup_key`'s semantics on `report_usage`. Absent a key, §3's non-idempotent contract applies.
+- `idempotency_key` is a partition-scoped dedup key. Lua stores a hash `ff:dedup:suspend:{p:N}:<execution_id>:<idempotency_key>` → serialized `SuspendOutcome`, TTL = `min(timeout_at - now + SUSPEND_DEDUP_GRACE_MS, SUSPEND_DEDUP_MAX_TTL_MS)` where `SUSPEND_DEDUP_GRACE_MS = 60_000` (1 min) and `SUSPEND_DEDUP_MAX_TTL_MS = 604_800_000` (7 days). When `timeout_at` is `None`, TTL caps at `SUSPEND_DEDUP_MAX_TTL_MS`. On hit, the first outcome is returned verbatim (including the original `suspension_id` / `waitpoint_id` / `waitpoint_token`), and no state mutation occurs. This mirrors `UsageDimensions.dedup_key`'s semantics on `report_usage`. Absent a key, §3's non-idempotent contract applies.
+- **Dedup-hit `suspension_id` semantics.** When a dedup entry is hit, the returned `SuspendOutcome::*.suspension_id` is the **first call's** minted id, NOT the retry's. Callers correlating by `suspension_id` (logs, observability) should use the echoed value from `SuspendOutcome`, not the value they passed in — the retry's `suspension_id` is silently discarded. This is the idempotent-replay contract; the request `suspension_id` is effectively a cache key input on dedup-miss and a no-op on dedup-hit.
+
+### §2.2.1 Constructors (required per `non_exhaustive`)
+
+`SuspendArgs`, `WaitpointBinding`, and `ResumePolicy` are all `#[non_exhaustive]`. The following constructors ship with this RFC:
+
+```rust
+impl SuspendArgs {
+    /// Build a minimal `SuspendArgs` for a worker-originated suspension.
+    /// Defaults: `requested_by = Worker`, `timeout_at = None`,
+    /// `timeout_behavior = Fail`, `continuation_metadata_pointer = None`,
+    /// `idempotency_key = None`. Override via `with_*` setters.
+    pub fn new(
+        suspension_id: SuspensionId,
+        waitpoint: WaitpointBinding,
+        resume_condition: ResumeCondition,
+        resume_policy: ResumePolicy,
+        reason_code: SuspensionReasonCode,
+        now: TimestampMs,
+    ) -> Self { /* ... */ }
+
+    pub fn with_timeout(mut self, at: TimestampMs, behavior: TimeoutBehavior) -> Self { /* ... */ }
+    pub fn with_requester(mut self, requester: SuspensionRequester) -> Self { /* ... */ }
+    pub fn with_continuation_metadata_pointer(mut self, p: String) -> Self { /* ... */ }
+    pub fn with_idempotency_key(mut self, key: IdempotencyKey) -> Self { /* ... */ }
+}
+
+impl WaitpointBinding {
+    /// Mint a fresh `WaitpointBinding::Fresh` with worker-side UUID v4
+    /// for `waitpoint_id` and `waitpoint_key = format!("wpk:{id}")`.
+    /// Convenience for the common case.
+    pub fn fresh() -> Self { /* ... */ }
+
+    /// Construct a `UsePending` binding from a `PendingWaitpoint` handle
+    /// returned by `create_waitpoint`.
+    pub fn use_pending(pending: &PendingWaitpoint) -> Self { /* ... */ }
+}
+
+impl ResumePolicy {
+    /// Canonical v1 defaults: `Runnable` target, signals consumed on
+    /// satisfy, buffer discarded on close, no resume delay, waitpoint
+    /// closed on resume. Use this unless you have a specific reason to
+    /// deviate.
+    pub fn normal() -> Self {
+        Self {
+            resume_target: ResumeTarget::Runnable,
+            consume_matched_signals: true,
+            retain_signal_buffer_until_closed: false,
+            resume_delay_ms: None,
+            close_waitpoint_on_resume: true,
+        }
+    }
+}
+```
+
+Memory-rule compliance: these constructors satisfy `non_exhaustive_needs_constructor` — every public `#[non_exhaustive]` type in this RFC is buildable without reaching inside.
 
 ### §2.3 `SuspendOutcome` shape
 
@@ -253,6 +317,8 @@ pub enum ResumeCondition {
 - `minimum_signal_count` (RFC-004 §Resume Condition Fields) is NOT a top-level `SuspendArgs` field; it is implicit per variant — `Composite(AllOf(clauses))` ⇒ `n = |clauses|`; `Composite(AnyOf(clauses))` ⇒ `n = 1`; `Composite(Count{n,…})` (RFC-014) carries an explicit `n`.
 
 **`SignalMatcher` shape:** v1 is `enum SignalMatcher { ByName(String), Wildcard }`. RFC-014 may extend (payload predicates, etc.) — `#[non_exhaustive]`.
+
+**`waitpoint_key` cross-field invariant.** When both `WaitpointBinding::Fresh { waitpoint_key: A }` and `ResumeCondition::Single { waitpoint_key: B, .. }` are present, Rust-side validation enforces `A == B`. Mismatch → `Validation(InvalidInput { detail: "waitpoint_key_mismatch" })`, pre-FCALL. For `WaitpointBinding::UsePending`, the Lua-side lookup supplies the authoritative `waitpoint_key`; if `ResumeCondition::Single.waitpoint_key` is provided and does not match, Lua returns `invalid_waitpoint_for_execution` → `Validation(InvalidWaitpointForExecution)`.
 
 **Why not JSON passthrough:**
 - The round-7 §R7.6.1 open question offered "ARGV-JSON in backend impl" as an alternative. Rejected because: (i) a Postgres backend cannot produce the same JSON shape without re-implementing the Valkey Lua's `initialize_condition` helper; (ii) typed variants let `rustc` enforce exhaustiveness on the SDK forwarder — replacing runtime parse errors with compile errors when RFC-014 lands; (iii) JSON-at-the-seam means every consumer of `dyn EngineBackend` has to agree on a schema that is otherwise undocumented.
@@ -347,6 +413,7 @@ All three are `#[non_exhaustive]`; backend serializes to the corresponding Lua/w
      - If the first call did not commit: same args succeed fresh.
    - **Not idempotent via the `suspension_id`**: Lua does not check for pre-existing `suspension_id` before committing. The second attempt's commit fails on the already-suspended check (see RFC-004 Lua pseudocode `EXISTS KEYS.suspension_current → "already_suspended"`). That returns `EngineError::State(StateKind::AlreadySuspended)`.
    - **Contract**: callers must assume `suspend` is **not** idempotent on retry. On any error after `suspend`, the caller MUST `describe_execution` before retrying, and only retry if lifecycle is still `active`.
+   - **Describe-retry budget.** `describe_execution` is itself retryable under normal transport-retry policy (RFC-010 §Transport). The `suspend` retry remains blocked until one describe succeeds; callers may backoff-retry the describe independently without opening a `suspend` double-commit window. With `idempotency_key` set, this reconciliation is unnecessary — the caller retries `suspend` directly and the backend dedups.
 
 2. **Same handle, same args, exec is in `suspended` already (discovered via describe).**
    - Caller should `claim_resumed_execution` or wait for signal — not re-`suspend`.
@@ -384,8 +451,15 @@ All errors surface as `EngineError`. Variant-by-variant, by scenario:
 | HMAC secrets not initialised for partition | `Transport(boxed ScriptError::hmac_secret_not_initialized)` | Ops issue, not caller issue. |
 | Valkey connection error / transient | `Transport(…)` | Standard. |
 | Strict `suspend` (non-`try`) but buffered signals already satisfy the condition | `State(AlreadySatisfied)` | SDK-side: strict path refuses to return the early-satisfied branch. The typed backend outcome is `SuspendOutcome::AlreadySatisfied`; the strict wrapper maps it to this error. `try_suspend` returns the outcome directly instead. |
+| `ResumeCondition::TimeoutOnly` with `timeout_at.is_none()` | `Validation(InvalidInput { detail: "timeout_only_without_deadline" })` | Rust-side check. Pure-timeout suspend with no deadline would suspend forever with no satisfier. |
+| `WaitpointBinding.waitpoint_key` vs `ResumeCondition::Single.waitpoint_key` mismatch (Fresh binding) | `Validation(InvalidInput { detail: "waitpoint_key_mismatch" })` | Rust-side cross-field check, pre-FCALL. For `UsePending`, Lua-side check → `Validation(InvalidWaitpointForExecution)`. |
+| `WaitpointBinding::UsePending { waitpoint_id }` but that waitpoint was already activated by a prior committed `suspend` | `State(AlreadySuspended)` | Lua check order: exec-level `already_suspended` fires first (the exec is in `suspended` state), so the waitpoint-level check is never reached. |
 
-**New kinds needed:** one. `StateKind::AlreadySatisfied` is added to surface the strict-path refusal of the early-satisfied branch (the underlying backend outcome is always typed `SuspendOutcome`; only the SDK's strict wrapper turns it into an error). Every other scenario maps to an existing variant after Round-7. The `InvalidLeaseForSuspend` variant was added in Round-4 specifically for this path.
+**New kinds needed:** one. `StateKind::AlreadySatisfied` is added to surface the strict-path refusal of the early-satisfied branch (the underlying backend outcome is always typed `SuspendOutcome`; only the SDK's strict wrapper turns it into an error). Every other scenario maps to an existing variant after Round-7. The `InvalidLeaseForSuspend` variant was added in Round-4 specifically for this path (confirmed at `crates/ff-core/src/engine_error.rs:183`).
+
+**Enum-extension safety.** `StateKind`, `ValidationKind`, and `ContentionKind` are all `#[non_exhaustive]` (confirmed at `crates/ff-core/src/engine_error.rs:161,227,315`). Adding `StateKind::AlreadySatisfied` is therefore non-breaking for downstream consumers who match exhaustively with a `_ =>` arm — cairn's `EngineError` match ladders survive the upgrade without a trait break.
+
+**`HandleKind::Suspended` pre-check is not dedup-dodgeable.** The Rust-side handle-kind pre-check (first row: `State(AlreadySuspended)`, no FCALL) fires before any `idempotency_key` dedup lookup can reach Lua. A caller cannot "replay" past a Suspended-kind handle by repeating the same idempotency key; that kind signals a programming bug, not a transport retry. Callers who want idempotent-replay safety must pass a fresh handle for the retry — `idempotency_key` only helps when the retry is an honest transport-error retry with an otherwise-valid handle.
 
 **Classification note:** `LeaseConflict` + `ExecutionNotActive` are retryable; `AlreadySuspended` is cooperative (no-op — the caller's intent is already the state); everything else is either terminal (validation, bug) or transport (standard retry). See `EngineError::classify` for the authoritative mapping — this RFC adds no new classes.
 
@@ -417,10 +491,20 @@ impl ClaimedTask {
     ) -> Result<SuspendedHandle, SdkError> {
         let handle = self.to_handle();
         let args = build_suspend_args(&self, reason_code, resume_condition, timeout, resume_policy);
-        self.stop_renewal();
+        // NOTE: renewal is stopped only AFTER a successful Suspend outcome.
+        // On transport error the lease continues to be renewed so the caller's
+        // describe-and-reconcile per §3.1 is tractable. Suspended outcomes
+        // have lease-state=unowned in Valkey so the renewal loop is a no-op
+        // post-commit; stopping it cleanly avoids a pointless heartbeat.
         match self.backend.suspend(&handle, args).await.map_err(SdkError::from)? {
-            SuspendOutcome::Suspended { handle, .. } => Ok(SuspendedHandle { handle, .. }),
+            SuspendOutcome::Suspended { handle, suspension_id, waitpoint_id, waitpoint_key, waitpoint_token } => {
+                self.stop_renewal();
+                Ok(SuspendedHandle { handle, suspension_id, waitpoint_id, waitpoint_key, waitpoint_token })
+            }
             SuspendOutcome::AlreadySatisfied { .. } => {
+                // Lease is retained Lua-side on AlreadySatisfied; strict form
+                // declines it as an error. Renewal is NOT stopped — the caller
+                // will either re-claim or drop, and the lease naturally rolls.
                 Err(SdkError::Engine(EngineError::State(StateKind::AlreadySatisfied)))
             }
         }
@@ -455,7 +539,22 @@ pub enum TrySuspendOutcome {
     Suspended(SuspendedHandle),
     AlreadySatisfied { task: ClaimedTask, details: SuspendOutcomeDetails },
 }
+
+/// Shared "what happened on the waitpoint" bundle, carried in both the
+/// strict `SuspendedHandle` and the `try_suspend` AlreadySatisfied arm.
+pub struct SuspendOutcomeDetails {
+    pub suspension_id: SuspensionId,
+    pub waitpoint_id: WaitpointId,
+    pub waitpoint_key: String,
+    pub waitpoint_token: WaitpointHmac,
+}
 ```
+
+**Helper: `build_suspend_args`.** SDK-internal; mints UUID v4 for `suspension_id`, takes `waitpoint: WaitpointBinding` from the caller (strict `suspend` defaults to `WaitpointBinding::fresh()`; `try_suspend_on_pending` passes `WaitpointBinding::use_pending(...)`), splits `timeout` into `timeout_at`/`timeout_behavior` (with `TimeoutBehavior::Fail` when `timeout` is `None` and the `timeout_at` is itself `None`), reads `now` from `SystemTime::now().into()`, defaults `requested_by = Worker`, `continuation_metadata_pointer = None`, `idempotency_key = None`. Callers who want idempotent retry use a richer SDK entry point (not in this RFC's surface) that threads `IdempotencyKey` through.
+
+**`PendingWaitpoint` → `WaitpointBinding::UsePending`.** `create_waitpoint` returns a `PendingWaitpoint` struct carrying `waitpoint_id: WaitpointId` plus the minted `WaitpointHmac` token. `WaitpointBinding::use_pending(&pending)` destructures just the `waitpoint_id`; the HMAC token is **resolved Lua-side** from the partition's waitpoint hash at `suspend` time. Round-tripping the token through Rust is redundant and was already rejected by RFC-004 §Waitpoint Security (token lives on the hash, not in worker memory).
+
+**No SDK-level auto-reconcile.** The SDK `suspend` / `try_suspend` wrappers do **not** auto-retry on transport error. Callers own the describe-and-reconcile loop per §3.1; alternately, callers set `idempotency_key` on `SuspendArgs` (via the SDK entry point that threads it) to make the retry safe. This is intentional — auto-reconcile would hide the "is my exec suspended or not?" ambiguity from the consumer, which matters for observability and correctness at scale.
 
 Rationale for the split:
 - `suspend` / `try_suspend` is the idiomatic Rust pattern for "operation may fail in a structured, callable-recoverable way": the strict form returns the happy path directly, the try form returns a Result-of-outcome. `Mutex::lock` panics on poisoning; `Mutex::try_lock` returns `Result`. Same cadence.
@@ -592,7 +691,23 @@ A flatter shape: always return a Handle, with metadata in a side struct, and enc
 
 ### §9.2 Lua changes
 
-**None required.** The wire contract (`ff_suspend_execution` KEYS/ARGV/return) is preserved. The backend serializer materializes the same ARGV strings today's SDK builds by hand. Zero Lua-level risk.
+**Scoped to the `idempotency_key` dedup path.** The non-idempotent path of `ff_suspend_execution` (KEYS 1..17, ARGV 1..17 as shipped) is preserved verbatim — the backend serializer materializes the same strings today's SDK builds by hand. Zero wire risk on that path.
+
+**New dedup-path delta:**
+
+- **+1 KEY (slot 18):** `ff:dedup:suspend:{p:N}:<execution_id>:<idempotency_key>` — a partition-scoped hash keyed on the triple from §2.2. Omitted (empty string passthrough) when the caller does not supply an `idempotency_key`.
+- **+2 ARGV:**
+  - **slot 18:** `idempotency_key` string (empty when `None`).
+  - **slot 19:** `dedup_ttl_ms` u64 — the TTL the backend computes per §2.2 (`min(timeout_at - now + SUSPEND_DEDUP_GRACE_MS, SUSPEND_DEDUP_MAX_TTL_MS)`; `SUSPEND_DEDUP_MAX_TTL_MS` when `timeout_at` is `None`).
+- **Lua changes to `ff_suspend_execution`:**
+  1. Early branch: if ARGV[18] is non-empty, `HGET` the dedup key at KEYS[18] field `outcome`. If present, decode and return verbatim — skip all state mutation.
+  2. Happy path: run existing logic unchanged.
+  3. Post-commit: if ARGV[18] is non-empty, serialize the computed `SuspendOutcome` (using the existing positional-array return format — length-prefixed fields, same layout `parse_suspend_result` reads today) into the dedup hash's `outcome` field, then `PEXPIRE` KEYS[18] by `ARGV[19]`.
+- **Serialized-outcome stability.** The dedup hash stores the Lua-side positional-array return bytes verbatim — the same bytes the script returns on a fresh call. This means dedup format evolves atomically with the `ff_suspend_execution` return contract; a future Lua upgrade that changes the return shape must version-gate dedup reads (recommended: leading version byte). RFC-013 pins `v=1` (no version byte, matches today's shape); future changes are RFC-014+ scope.
+- **`resume_delay_ms` wire path.** Verified against RFC-004: `resume_delay_ms` is carried today in the existing `resume_policy_json` ARGV slot (within the 17-ARGV envelope), not on a separate slot. No new ARGV position needed for this field; the backend serializer writes it into `resume_policy_json` as today.
+- **No change to HMAC / kid-ring / waitpoint-security paths.** Assumption A2 preserved.
+
+Total new Lua LOC: ~30 inside `ff_suspend_execution`. Keys/ARGV slot counts: 17 → 18 / 17 → 19. Backend `slot_count` assertions must update in lockstep with this RFC's landing.
 
 ### §9.3 Test matrix
 
@@ -604,6 +719,13 @@ Required tests (at the landing PR's CI):
    - `SuspendArgs` serde round-trip (JSON) for every `ResumeCondition` variant (RFC-013 surface: `Single`, `OperatorOnly`, `TimeoutOnly`; `Composite` covered at RFC-014 landing).
    - `SuspendOutcome::Suspended`/`AlreadySatisfied` exhaustiveness check in the SDK `try_suspend` wrapper; strict `suspend` wrapper mapping `AlreadySatisfied → State(AlreadySatisfied)` covered by one test.
    - `SuspendArgs::idempotency_key` replay test: two calls with the same key return the same outcome; two calls with different keys act independently (second errors with `State(AlreadySuspended)`).
+   - `SuspendArgs::idempotency_key` TTL-expiry test: call, advance server-time past `dedup_ttl_ms`, third call with the same key acts fresh (errors `State(AlreadySuspended)` because exec is still suspended — but the dedup hash has aged out, so this is a state-check, not a dedup-hit).
+   - `SuspendArgs::idempotency_key` with `timeout_at == None` test: confirms TTL is capped at `SUSPEND_DEDUP_MAX_TTL_MS = 7 days`.
+   - Cross-field validation: `WaitpointBinding::Fresh { waitpoint_key: "wpk:a" }` + `ResumeCondition::Single { waitpoint_key: "wpk:b" }` → `Validation(InvalidInput { detail: "waitpoint_key_mismatch" })`.
+   - `ResumeCondition::TimeoutOnly` + `timeout_at.is_none()` → `Validation(InvalidInput { detail: "timeout_only_without_deadline" })`.
+   - Constructor round-trip: `SuspendArgs::new(...).with_timeout(...).with_idempotency_key(...)` produces the same serialized form as manual struct construction (once the struct construction exists via `ff-core`'s impl).
+   - `WaitpointBinding::fresh()` produces a `waitpoint_key` of form `wpk:<uuid-v4>` matching the UUID in `waitpoint_id`.
+   - `ResumePolicy::normal()` has the v1-documented defaults.
 
 2. **Valkey-backend integration tests**:
    - `suspend` with `WaitpointBinding::Fresh`, `ResumeCondition::Signal`, no timeout → `Suspended`.
@@ -619,6 +741,10 @@ Required tests (at the landing PR's CI):
    - Replay: two `suspend` calls with same args → first succeeds, second returns `State(AlreadySuspended)` (not idempotent).
 
 3. **Cross-backend shape tests**: `SuspendArgs` / `SuspendOutcome` are backend-agnostic. Add a mock `EngineBackend` in test scaffolding that accepts the typed args and produces both outcome variants — assert SDK forwarder dispatches correctly on each.
+
+   - **Backend-internal `ResumeCondition → ARGV-JSON` serializer tests**: for each `ResumeCondition` variant landed by RFC-013 (`Single`, `OperatorOnly`, `TimeoutOnly`), assert the emitted ARGV JSON matches byte-for-byte the string the legacy SDK produced for the equivalent input. This is the canary that keeps the "Lua unchanged on the non-idempotent path" claim honest across future refactors.
+
+   - **Scanner interaction**: existing RFC-004 scanner tests cover all `TimeoutBehavior` variants (`Fail`, `Cancel`, `Expire`, `AutoResumeWithTimeoutSignal`). RFC-013 does not change the scanner; rewire the existing scanner tests onto the typed `SuspendArgs` path to confirm no regression. `TimeoutBehavior::Escalate` stays v2-scoped per RFC-004 Implementation Notes and is not asserted at Stage 1d.
 
 4. **Regression coverage**: the existing `ff-sdk` suspension integration tests rewire onto the new signature. No new fixtures needed.
 
