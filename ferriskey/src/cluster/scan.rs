@@ -951,7 +951,7 @@ mod tests {
         let mut map: SlotsBitsArray = [u64::MAX; BITS_ARRAY_SIZE as usize];
         unmark_slot_as_scanned(&mut map, 5);
         // Slot 5 cleared, everything else set.
-        assert_eq!(map[0], u64::MAX & !(1u64 << 5));
+        assert_eq!(map[0], !(1u64 << 5));
         for word in &map[1..] {
             assert_eq!(*word, u64::MAX);
         }
