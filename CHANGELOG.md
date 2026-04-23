@@ -5,6 +5,35 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`ff-script` gates its `ferriskey` dep behind a new `valkey-client`
+  feature (#171).** Closes the backend-agnosticism leak flagged in the
+  feature-flag-propagation memory: `ff-sdk --no-default-features` used
+  to still pull `ferriskey` through `ff-sdk → ff-script → ferriskey`
+  (the `ff-script` edge was unconditional). `ff-script`'s default
+  feature set is now **empty**; every internal consumer
+  (`ff-sdk[valkey-default]`, `ff-backend-valkey`, `ff-server`,
+  `ff-scheduler`, `ff-test`) explicitly enables
+  `ff-script/valkey-client`. Default workspace builds and
+  `--all-features` are unchanged; `cargo tree -p ff-sdk
+  --no-default-features` now shows a `ferriskey`-free graph.
+
+  **Migration for external consumers that depend on `ff-script`
+  directly:** add `features = ["valkey-client"]` to your `ff-script`
+  Cargo entry if you reference any of:
+  `ScriptError::Valkey`, `ScriptError::valkey_kind`,
+  `ff_script::engine_error_ext::valkey_kind`,
+  `ff_script::loader`, `ff_script::retry`, `ff_script::result`,
+  `ff_script::functions`, `ff_script::stream_tail`,
+  `ff_script::macros`, `FromFcallResult`, `is_retryable_kind`, or
+  `kind_to_stable_str`. Consumers using only the Lua-error enum
+  variants, `ScriptError::class()`, `From<ScriptError> for
+  EngineError`, `engine_error_ext::{class, transport_script,
+  transport_script_ref}`, or the `LIBRARY_SOURCE` / `LIBRARY_VERSION`
+  constants need no change. No public item was removed or renamed —
+  only cfg-gated.
+
 ## [0.5.0] - 2026-04-23
 
 ### Added
