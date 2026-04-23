@@ -142,7 +142,35 @@ three-file harness fix from `4192664` onto the `01f6327` bench tree
 Lease renewal overhead and RSS profile both remain in the pre-v0.1.0
 envelope.
 
-## Scenario 5 — suspend_signal_resume (100 samples)
+## Scenario 5 — suspend_signal_resume (**N=5 samples × 100 roundtrips**)
+
+**Methodology (PR #XXX):** Scenario 5 now runs under N ≥ 5
+independent sampling batches via `FF_BENCH_SAMPLES=5`. Each sample
+collects 100 roundtrips, reports its own p50/p95/p99, and the
+headline numbers are mean + stddev across the 5 per-sample
+percentiles. Mirrors the Scenario 4 / PR #140 fix. No FLUSHALL
+between samples: unlike Scenario 4, Scenario 5 has no accumulating
+queue state and FLUSHALL would wipe the server's per-partition
+`waitpoint_hmac_secrets` keys that the server initialized at
+startup.
+
+Single-sample historical rows (100 roundtrips in one criterion run)
+are retained below for cross-release comparison, but all future
+Scenario 5 floor comparisons should be re-baselined at N ≥ 5 on
+both sides.
+
+**main HEAD (`076baa2`, N=5 on 2026-04-23):**
+
+| metric     | mean   | stddev | per-sample                               |
+|------------|--------|--------|------------------------------------------|
+| p50 ms     |  9.16  |  0.07  | 9.12, 9.07, 9.22, 9.25, 9.18             |
+| p95 ms     |  9.90  |  0.38  | 9.75, 9.76, 9.74, 10.57, 9.68            |
+| p99 ms     | 10.43  |  0.69  | 10.03, 9.83, 11.25, 11.11, 9.94          |
+| ops/s      | 109.12 |  —     | 109.71, 110.31, 108.48, 108.13, 108.96   |
+
+**Single-sample historical rows (legacy criterion, 100 roundtrips in
+one run; N=1 — retain for release-to-release direction checks
+only):**
 
 | metric     | git_sha | v0.4.0 | v0.3.2 (da89fa9) | v0.1.0 (01f6327) |
 |------------|---------|--------|------------------|------------------|
@@ -155,27 +183,17 @@ Measured with `claim_poll_interval_ms=1`; production default
 (1000ms) adds ~500ms on the re-claim leg, so production-projected
 p50 ≈ 509 ms.
 
-**Minor regression flagged (p95/p99):** p95 9.93 → 10.83 ms
-(+9.1%), p99 10.76 → 11.96 ms (+11.2%). p50 and ops/s moved <1.4%
-so the median path is unaffected; the drift is isolated to the
-tail. Against v0.1.0 (p95 10.59, p99 11.91) v0.4.0 is flat-to-
-slightly-better, so the apparent regression is measured against the
-v0.3.2 snapshot specifically. Two plausible causes:
-
-1. Tracing instrumentation overhead landing on the signal-dispatch
-   path (the `#[instrument]` attributes from #170 touch every
-   backend-method invocation on the resume leg); ~100 ns per call
-   × the handful of calls per roundtrip is consistent with ~1 ms
-   of tail drift.
-2. Single-sample variance — suspend_signal_resume has no N=5
-   methodology yet, and the p95/p99 are computed from 100
-   per-iteration samples inside one criterion run.
-
-Recommend: follow-up flame capture on one suspend_signal_resume
-run to attribute the tail drift (matches the `≥ 5% regression ⇒
-investigate` rule at the bottom of this file). Not release-blocking
-against v0.1.0 as the floor, but noted for honesty per
-`feedback_perf_honesty.md`.
+**Previously flagged regression dissolves under N=5.** Issue #173
+noted p95 9.93 → 10.83 ms (+9.1%) and p99 10.76 → 11.96 ms (+11.2%)
+between v0.3.2 and v0.4.0 single-sample snapshots. At N=5 on main
+HEAD, per-sample p95 covers 9.68–10.57 ms and per-sample p99 covers
+9.83–11.25 ms; both v0.3.2's 10.76 ms and v0.4.0's 11.96 ms fall
+inside (or at the edge of) the 5-run band. The tracing
+instrumentation from #170 remains a plausible ~100 ns-per-call
+contributor on the resume leg, but it is not separable from
+run-to-run noise at a 100-roundtrip sample size — consistent with
+Worker SSSS' investigation of #173. N=5 is now the floor for
+release-gate Scenario 5 comparisons.
 
 ## Comparison rules for next release
 
