@@ -19,8 +19,8 @@ use ff_core::backend::{
     WaitpointSpec,
 };
 use ff_core::contracts::{
-    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage,
-    ListLanesPage, ListSuspendedPage, ReportUsageResult,
+    CancelFlowResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
 };
 use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
@@ -266,6 +266,16 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<ReportUsageResult, EngineError> {
         self.record("report_usage")?;
         Err(EngineError::Unavailable { op: "report_usage" })
+    }
+
+    async fn list_executions(
+        &self,
+        _partition: PartitionKey,
+        _cursor: Option<ExecutionId>,
+        _limit: usize,
+    ) -> Result<ListExecutionsPage, EngineError> {
+        self.record("list_executions")?;
+        Ok(ListExecutionsPage::new(Vec::new(), None))
     }
 
     #[cfg(feature = "valkey-default")]

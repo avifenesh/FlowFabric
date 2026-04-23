@@ -7,7 +7,6 @@
 //!
 //! TODO: Untested API endpoints (tested at Server/FCALL layer but not HTTP):
 //! - POST /v1/executions/{id}/revoke-lease
-//! - GET  /v1/executions?partition=N (list_executions)
 //! - POST /v1/budgets/{id}/usage (report_usage)
 //! - POST /v1/budgets/{id}/reset (reset_budget)
 //! - POST /v1/flows/{id}/edges (stage_dependency_edge)
@@ -19,7 +18,6 @@
 //! TODO: Untested Server methods (tested via FCALL but not typed Server API):
 //! - Server::revoke_lease()
 //! - Server::reset_budget()
-//! - Server::list_executions()
 
 use std::sync::Arc;
 

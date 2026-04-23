@@ -55,7 +55,8 @@ use crate::backend::{
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
 use crate::contracts::{
-    EdgeDirection, EdgeSnapshot, ListFlowsPage, ListLanesPage, ListSuspendedPage,
+    EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage,
+    ListSuspendedPage,
 };
 #[cfg(feature = "core")]
 use crate::partition::PartitionKey;
@@ -395,6 +396,39 @@ pub trait EngineBackend: Send + Sync + 'static {
         cursor: Option<ExecutionId>,
         limit: usize,
     ) -> Result<ListSuspendedPage, EngineError>;
+
+    /// Forward-only paginated listing of the executions indexed under
+    /// one partition.
+    ///
+    /// Reads the partition-wide `ff:idx:{p:N}:all_executions` set,
+    /// sorts lexicographically on `ExecutionId`, and returns the page
+    /// of ids strictly greater than `cursor` (or starting from the
+    /// smallest id when `cursor = None`). The returned
+    /// [`ListExecutionsPage::next_cursor`] is the last id on the page
+    /// iff at least one more id exists past it; `None` signals
+    /// end-of-stream.
+    ///
+    /// `limit` is the maximum number of ids returned on this page. A
+    /// `limit` of `0` returns an empty page with `next_cursor = None`.
+    /// Backends MAY cap `limit` internally (Valkey: 1000) and return
+    /// fewer ids than requested; callers continue paginating until
+    /// `next_cursor == None`.
+    ///
+    /// Ordering is stable under concurrent inserts for already-emitted
+    /// ids (an id less-than-or-equal-to the caller's cursor is never
+    /// re-emitted in later pages) but new inserts past the cursor WILL
+    /// appear in subsequent pages — consistent with forward-only
+    /// cursor semantics.
+    ///
+    /// Gated on the `core` feature — partition-scoped listing is part
+    /// of the minimal engine surface every backend must honour.
+    #[cfg(feature = "core")]
+    async fn list_executions(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListExecutionsPage, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait

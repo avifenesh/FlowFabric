@@ -11,8 +11,8 @@ use ff_core::contracts::{
     CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     ApplyDependencyToChildArgs, ApplyDependencyToChildResult,
-    DeliverSignalArgs, DeliverSignalResult, ExecutionInfo, ExecutionSummary,
-    ListExecutionsResult, PendingWaitpointInfo, ReplayExecutionResult,
+    DeliverSignalArgs, DeliverSignalResult, ExecutionInfo,
+    ListExecutionsPage, PendingWaitpointInfo, ReplayExecutionResult,
     ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
     RevokeLeaseResult,
     RotateWaitpointHmacSecretArgs,
@@ -2303,133 +2303,72 @@ impl Server {
         })
     }
 
-    /// List executions from a partition's index ZSET.
+    /// Partition-scoped forward-only cursor listing of executions.
     ///
-    /// No FCALL — direct ZRANGE + pipelined HMGET reads.
-    pub async fn list_executions(
+    /// Parity-wrapper around the Valkey body of
+    /// [`ff_core::engine_backend::EngineBackend::list_executions`].
+    /// Issue #182 replaced the previous offset + lane + state-filter
+    /// shape with this cursor-based API (per owner adjudication:
+    /// cursor-everywhere, HTTP surface unreleased). Reads
+    /// `ff:idx:{p:N}:all_executions`, sorts lexicographically on
+    /// `ExecutionId`, filters `> cursor`, and trims to `limit`.
+    pub async fn list_executions_page(
         &self,
         partition_id: u16,
-        lane: &LaneId,
-        state_filter: &str,
-        offset: u64,
-        limit: u64,
-    ) -> Result<ListExecutionsResult, ServerError> {
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListExecutionsPage, ServerError> {
+        if limit == 0 {
+            return Ok(ListExecutionsPage::new(Vec::new(), None));
+        }
         let partition = ff_core::partition::Partition {
             family: ff_core::partition::PartitionFamily::Execution,
             index: partition_id,
         };
         let idx = IndexKeys::new(&partition);
+        let all_key = idx.all_executions();
 
-        let zset_key = match state_filter {
-            "eligible" => idx.lane_eligible(lane),
-            "delayed" => idx.lane_delayed(lane),
-            "terminal" => idx.lane_terminal(lane),
-            "suspended" => idx.lane_suspended(lane),
-            "active" => idx.lane_active(lane),
-            other => {
-                return Err(ServerError::InvalidInput(format!(
-                    "invalid state_filter: {other}. Use: eligible, delayed, terminal, suspended, active"
-                )));
-            }
-        };
-
-        // ZRANGE key -inf +inf BYSCORE LIMIT offset count
-        let eids: Vec<String> = self
+        let raw_members: Vec<String> = self
             .client
-            .cmd("ZRANGE")
-            .arg(&zset_key)
-            .arg("-inf")
-            .arg("+inf")
-            .arg("BYSCORE")
-            .arg("LIMIT")
-            .arg(offset)
-            .arg(limit)
+            .cmd("SMEMBERS")
+            .arg(&all_key)
             .execute()
             .await
-            .map_err(|e| crate::server::backend_context(e, format!("ZRANGE {zset_key}")))?;
+            .map_err(|e| crate::server::backend_context(e, format!("SMEMBERS {all_key}")))?;
 
-        if eids.is_empty() {
-            return Ok(ListExecutionsResult {
-                executions: vec![],
-                total_returned: 0,
-            });
+        if raw_members.is_empty() {
+            return Ok(ListExecutionsPage::new(Vec::new(), None));
         }
 
-        // Parse execution IDs, warning on corrupt ZSET members
-        let mut parsed = Vec::with_capacity(eids.len());
-        for eid_str in &eids {
-            match ExecutionId::parse(eid_str) {
+        let mut parsed: Vec<ExecutionId> = Vec::with_capacity(raw_members.len());
+        for raw in &raw_members {
+            match ExecutionId::parse(raw) {
                 Ok(id) => parsed.push(id),
                 Err(e) => {
                     tracing::warn!(
-                        raw_id = %eid_str,
+                        raw_id = %raw,
                         error = %e,
-                        zset = %zset_key,
-                        "list_executions: ZSET member failed to parse as ExecutionId (data corruption?)"
+                        set = %all_key,
+                        "list_executions_page: SMEMBERS member failed to parse as ExecutionId \
+                         (data corruption?)"
                     );
                 }
             }
         }
+        parsed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
-        if parsed.is_empty() {
-            return Ok(ListExecutionsResult {
-                executions: vec![],
-                total_returned: 0,
-            });
-        }
+        let filtered: Vec<ExecutionId> = if let Some(c) = cursor.as_ref() {
+            let cs = c.as_str();
+            parsed.into_iter().filter(|e| e.as_str() > cs).collect()
+        } else {
+            parsed
+        };
 
-        // Pipeline all HMGETs into a single round-trip
-        let mut pipe = self.client.pipeline();
-        let mut slots = Vec::with_capacity(parsed.len());
-        for eid in &parsed {
-            let ep = execution_partition(eid, &self.config.partition_config);
-            let ctx = ExecKeyContext::new(&ep, eid);
-            let slot = pipe
-                .cmd::<Vec<Option<String>>>("HMGET")
-                .arg(ctx.core())
-                .arg("namespace")
-                .arg("lane_id")
-                .arg("execution_kind")
-                .arg("public_state")
-                .arg("priority")
-                .arg("created_at")
-                .finish();
-            slots.push(slot);
-        }
-
-        pipe.execute()
-            .await
-            .map_err(|e| crate::server::backend_context(e, "pipeline HMGET"))?;
-
-        let mut summaries = Vec::with_capacity(parsed.len());
-        for (eid, slot) in parsed.into_iter().zip(slots) {
-            let fields: Vec<Option<String>> = slot.value()
-                .map_err(|e| crate::server::backend_context(e, "pipeline slot"))?;
-
-            let field = |i: usize| -> String {
-                fields
-                    .get(i)
-                    .and_then(|v| v.as_ref())
-                    .cloned()
-                    .unwrap_or_default()
-            };
-
-            summaries.push(ExecutionSummary {
-                execution_id: eid,
-                namespace: field(0),
-                lane_id: field(1),
-                execution_kind: field(2),
-                public_state: field(3),
-                priority: field(4).parse().unwrap_or(0),
-                created_at: field(5),
-            });
-        }
-
-        let total = summaries.len();
-        Ok(ListExecutionsResult {
-            executions: summaries,
-            total_returned: total,
-        })
+        let effective_limit = limit.min(1000);
+        let has_more = filtered.len() > effective_limit;
+        let page: Vec<ExecutionId> = filtered.into_iter().take(effective_limit).collect();
+        let next_cursor = if has_more { page.last().cloned() } else { None };
+        Ok(ListExecutionsPage::new(page, next_cursor))
     }
 
     /// Replay a terminal execution.

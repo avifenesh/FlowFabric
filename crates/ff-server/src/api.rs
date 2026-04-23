@@ -601,30 +601,48 @@ fn build_cors_layer(origins: &[String], auth_enabled: bool) -> Result<CorsLayer,
 
 #[derive(Deserialize)]
 struct ListExecutionsParams {
+    /// Partition index (`u16`) to enumerate. Serves as the partition
+    /// key for the forward-only cursor listing.
     partition: u16,
-    #[serde(default = "default_lane")]
-    lane: String,
-    #[serde(default = "default_state_filter")]
-    state: String,
+    /// Exclusive cursor: start listing strictly after this execution
+    /// id. Omit for the first page.
+    #[serde(default)]
+    cursor: Option<String>,
     #[serde(default = "default_limit")]
     limit: u64,
-    #[serde(default)]
-    offset: u64,
 }
 
-fn default_lane() -> String { "default".to_owned() }
-fn default_state_filter() -> String { "eligible".to_owned() }
 fn default_limit() -> u64 { 50 }
 
+/// List executions in one partition with forward-only cursor
+/// pagination.
+///
+/// **Breaking change (unreleased HTTP surface, not on crates.io):** as
+/// of issue #182 this endpoint is a thin forwarder onto
+/// [`ff_core::engine_backend::EngineBackend::list_executions`]. The
+/// previous offset + lane + state filter query parameters were
+/// dropped; the endpoint now returns partition-scoped execution ids
+/// with an opaque `next_cursor`.
+///
+/// Request: `GET /v1/executions?partition=<u16>&cursor=<eid>&limit=<usize>`.
+/// Response: `{ "executions": ["<eid>", ...], "next_cursor": "<eid>" | null }`.
 async fn list_executions(
     State(server): State<Arc<Server>>,
     Query(params): Query<ListExecutionsParams>,
-) -> Result<Json<ListExecutionsResult>, ApiError> {
-    let lane = ff_core::types::LaneId::try_new(params.lane.clone())
-        .map_err(|e| ApiError::from(ServerError::InvalidInput(format!("invalid lane: {e}"))))?;
-    let limit = params.limit.min(1000);
+) -> Result<Json<ListExecutionsPage>, ApiError> {
+    let limit = params.limit.min(1000) as usize;
+    let cursor = match params.cursor {
+        Some(raw) if !raw.is_empty() => Some(
+            ff_core::types::ExecutionId::parse(&raw).map_err(|e| {
+                ApiError::from(ServerError::InvalidInput(format!(
+                    "invalid cursor: {e}"
+                )))
+            })?,
+        ),
+        _ => None,
+    };
     let result = server
-        .list_executions(params.partition, &lane, &params.state, params.offset, limit)
+        .list_executions_page(params.partition, cursor, limit)
         .await?;
     Ok(Json(result))
 }
