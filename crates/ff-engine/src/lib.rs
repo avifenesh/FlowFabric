@@ -117,6 +117,19 @@ pub struct EngineConfig {
     /// the RFC).
     pub edge_cancel_dispatcher_interval: Duration,
 
+    /// RFC-016 Stage D sibling-cancel reconciler interval. Default: 10s.
+    ///
+    /// Safety-net scanner for Invariant Q6: if the engine crashed
+    /// between `ff_resolve_dependency`'s SADD to `pending_cancel_groups`
+    /// and the dispatcher's `ff_drain_sibling_cancel_group`, this
+    /// reconciler detects the orphan tuple and finalises via
+    /// `ff_reconcile_sibling_cancel_group`. It runs at a deliberately
+    /// slower cadence than the dispatcher (10s vs 1s) so the dispatcher
+    /// owns the happy path and the reconciler only cleans up
+    /// crash-recovery residue. The reconciler MUST NOT fight the
+    /// dispatcher — it no-ops whenever siblings are still non-terminal.
+    pub edge_cancel_reconciler_interval: Duration,
+
     /// Per-consumer scanner filter (issue #122).
     ///
     /// Applied by every execution-shaped scanner (lease_expiry,
@@ -161,6 +174,7 @@ impl Default for EngineConfig {
             execution_deadline_interval: Duration::from_secs(5),
             cancel_reconciler_interval: Duration::from_secs(15),
             edge_cancel_dispatcher_interval: Duration::from_secs(1),
+            edge_cancel_reconciler_interval: Duration::from_secs(10),
             scanner_filter: ScannerFilter::default(),
         }
     }
@@ -460,6 +474,26 @@ impl Engine {
             metrics.clone(),
         ));
 
+        // RFC-016 Stage D: sibling-cancel reconciler. Crash-recovery
+        // safety net for Invariant Q6 — finalises tuples in
+        // `pending_cancel_groups` whose dispatcher drain was interrupted
+        // by an engine crash. Runs at a slower cadence than the
+        // dispatcher so it never fights the happy path.
+        let edge_cancel_reconciler = Arc::new(
+            scanner::edge_cancel_reconciler::EdgeCancelReconciler::with_filter_and_metrics(
+                config.edge_cancel_reconciler_interval,
+                scanner_filter.clone(),
+                metrics.clone(),
+            ),
+        );
+        handles.push(supervised_spawn(
+            edge_cancel_reconciler,
+            client.clone(),
+            config.partition_config.num_flow_partitions,
+            shutdown_rx.clone(),
+            metrics.clone(),
+        ));
+
         // Execution deadline scanner (iterates execution partitions)
         let deadline_scanner = Arc::new(ExecutionDeadlineScanner::with_filter(
             config.execution_deadline_interval,
@@ -489,7 +523,7 @@ impl Engine {
             ));
         }
 
-        let scanner_count = if listener_enabled { "16 scanners + completion dispatch" } else { "16 scanners" };
+        let scanner_count = if listener_enabled { "17 scanners + completion dispatch" } else { "17 scanners" };
         tracing::info!(
             num_partitions,
             budget_partitions = config.partition_config.num_budget_partitions,

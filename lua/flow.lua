@@ -1276,6 +1276,105 @@ redis.register_function('ff_drain_sibling_cancel_group', function(keys, args)
 end)
 
 ---------------------------------------------------------------------------
+-- RFC-016 Stage D: ff_reconcile_sibling_cancel_group  (on {fp:N})
+--
+-- Crash-recovery reconciler for Invariant Q6. Stage C's dispatcher
+-- populates `pending_cancel_groups` under ff_resolve_dependency's
+-- atomic satisfied/impossible flip and drains it via
+-- ff_drain_sibling_cancel_group after per-sibling cancels land. An
+-- engine crash between the SADD + the drain leaves stale tuples in
+-- the SET. This function reconciles one tuple atomically:
+--
+--   (1) flag false / absent AND SET still carries the tuple:
+--       stale marker — SREM + return "sremmed_stale".
+--   (2) flag true AND every sibling in `cancel_siblings_pending_members`
+--       is already terminal (dispatcher fired cancels but crashed
+--       before drain): HDEL flag/members + SREM + return
+--       "completed_drain".
+--   (3) flag true AND at least one sibling non-terminal: leave alone
+--       — the dispatcher owns this tuple on its next tick. Return
+--       "no_op".
+--   (4) edgegroup missing (retention / manual delete) with the tuple
+--       still present: SREM + return "sremmed_stale" — nothing to
+--       reconcile; drop the orphan index entry.
+--
+-- Reconciler MUST NOT fight the dispatcher: case (3) leaves state
+-- unchanged.
+--
+-- KEYS (2): pending_cancel_groups_set, edgegroup
+-- ARGV (2): flow_id, downstream_eid
+---------------------------------------------------------------------------
+redis.register_function('ff_reconcile_sibling_cancel_group', function(keys, args)
+  local pending_set = keys[1]
+  local edgegroup = keys[2]
+  local flow_id = args[1] or ""
+  local downstream_eid = args[2] or ""
+
+  if not is_set(flow_id) or not is_set(downstream_eid) then
+    return err("invalid_args", "flow_id and downstream_eid required")
+  end
+
+  local member = flow_id .. "|" .. downstream_eid
+  local in_set = redis.call("SISMEMBER", pending_set, member) == 1
+  if not in_set then
+    -- Raced with the dispatcher or a prior reconcile tick; nothing to do.
+    return ok("no_op", "not_in_set")
+  end
+
+  local group_exists = redis.call("EXISTS", edgegroup) == 1
+  if not group_exists then
+    -- Orphan tuple — group is gone, no sibling state to check.
+    redis.call("SREM", pending_set, member)
+    return ok("sremmed_stale", "missing_edgegroup")
+  end
+
+  local flag = redis.call("HGET", edgegroup, "cancel_siblings_pending_flag")
+  if not is_set(flag) or flag ~= "true" then
+    -- Dispatcher HDEL'd the flag but crashed before SREM.
+    redis.call("SREM", pending_set, member)
+    return ok("sremmed_stale", "flag_cleared")
+  end
+
+  -- Flag true: check members. Empty members_str means the dispatcher
+  -- observed no live siblings at flip-time — still an interrupted
+  -- drain case since the flag is set; clear and SREM.
+  local members_str = redis.call("HGET", edgegroup, "cancel_siblings_pending_members")
+  if not is_set(members_str) then
+    members_str = ""
+  end
+
+  -- Derive exec_tag from edgegroup key (`ff:flow:{fp:N}:<flow_id>:edgegroup:<eid>`).
+  -- All flow members share this slot per RFC-011 §11.
+  local exec_tag = string.match(edgegroup, "(%b{})") or ""
+
+  local all_terminal = true
+  if is_set(members_str) and is_set(exec_tag) then
+    for sib_eid in string.gmatch(members_str, "([^|]+)") do
+      local sib_core_key = "ff:exec:" .. exec_tag .. ":" .. sib_eid .. ":core"
+      local phase = redis.call("HGET", sib_core_key, "lifecycle_phase")
+      if is_set(phase) and phase ~= "terminal" then
+        all_terminal = false
+        break
+      end
+      -- Missing sibling core (retention): treat as terminal for
+      -- reconcile purposes — nothing to cancel, drain is effectively
+      -- complete.
+    end
+  end
+
+  if not all_terminal then
+    -- Dispatcher will handle on its next tick.
+    return ok("no_op", "siblings_running")
+  end
+
+  redis.call("HDEL", edgegroup,
+    "cancel_siblings_pending_flag",
+    "cancel_siblings_pending_members")
+  redis.call("SREM", pending_set, member)
+  return ok("completed_drain", "")
+end)
+
+---------------------------------------------------------------------------
 -- #24  ff_evaluate_flow_eligibility  (on {p:N})
 --
 -- Read-only check of execution + dependency state. Class C.
