@@ -60,6 +60,8 @@ use crate::contracts::{StreamCursor, StreamFrames};
 use crate::engine_error::EngineError;
 #[cfg(feature = "streaming")]
 use crate::types::AttemptIndex;
+#[cfg(feature = "core")]
+use crate::types::EdgeId;
 use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 
 /// The engine write surface — a single trait a backend implementation
@@ -224,6 +226,50 @@ pub trait EngineBackend: Send + Sync + 'static {
         flow_id: &FlowId,
         direction: EdgeDirection,
     ) -> Result<Vec<EdgeSnapshot>, EngineError>;
+
+    /// Snapshot a single dependency edge by its owning flow + edge id.
+    ///
+    /// `Ok(None)` when the edge hash is absent (never staged, or
+    /// staged under a different flow than `flow_id`). Parse failures
+    /// on a present edge hash surface as
+    /// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`]
+    /// — the stored `flow_id` field is cross-checked against the
+    /// caller's expected `flow_id` so a wrong-key read fails loud
+    /// rather than returning an unrelated edge.
+    ///
+    /// Gated on the `core` feature — single-edge reads are part of
+    /// the minimal snapshot surface an alternate backend must honour
+    /// alongside [`Self::describe_execution`] / [`Self::describe_flow`]
+    /// / [`Self::list_edges`].
+    ///
+    /// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`]: crate::engine_error::EngineError::Validation
+    #[cfg(feature = "core")]
+    async fn describe_edge(
+        &self,
+        flow_id: &FlowId,
+        edge_id: &EdgeId,
+    ) -> Result<Option<EdgeSnapshot>, EngineError>;
+
+    /// Resolve an execution's owning flow id, if any.
+    ///
+    /// `Ok(None)` when the execution's core record is absent or has
+    /// no associated flow (standalone execution). A present-but-
+    /// malformed `flow_id` field surfaces as
+    /// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`].
+    ///
+    /// Gated on the `core` feature. Used by ff-sdk's
+    /// `list_outgoing_edges` / `list_incoming_edges` to pivot from a
+    /// consumer-supplied `ExecutionId` to the `FlowId` required by
+    /// [`Self::list_edges`]. A Valkey backend serves this with a
+    /// single `HGET exec_core flow_id`; a Postgres backend serves it
+    /// with the equivalent single-column row lookup.
+    ///
+    /// [`EngineError::Validation { kind: ValidationKind::Corruption, .. }`]: crate::engine_error::EngineError::Validation
+    #[cfg(feature = "core")]
+    async fn resolve_execution_flow_id(
+        &self,
+        eid: &ExecutionId,
+    ) -> Result<Option<FlowId>, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait

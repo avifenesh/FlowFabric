@@ -1,28 +1,29 @@
 //! Typed read-models that decouple consumers from FF's storage engine.
 //!
-//! **RFC-012 Stage 1c T3:** after T3 this module is thin forwarders.
-//! The decoders (`build_execution_snapshot`, `build_flow_snapshot`,
+//! **RFC-012 Stage 1c T3 + issue #160:** this module is a pure thin
+//! forwarder onto the `EngineBackend` trait. The decoders
+//! (`build_execution_snapshot`, `build_flow_snapshot`,
 //! `build_edge_snapshot`) live in `ff_core::contracts::decode` and
 //! the pipeline bodies that invoke them live on
 //! [`ff_backend_valkey::ValkeyBackend`] as `EngineBackend` trait
-//! methods. The three `describe_*` functions here are now 3-line
-//! delegations to `self.backend`; `list_incoming_edges` /
+//! methods. The five `describe_*` / `list_*_edges` functions here are
+//! 3-line delegations to `self.backend`; `list_incoming_edges` /
 //! `list_outgoing_edges` keep their `resolve_flow_id` step (the
-//! trait's `list_edges` requires a `FlowId` argument) and then call
-//! the trait method.
+//! trait's `list_edges` requires a `FlowId` argument) but route it
+//! through [`EngineBackend::resolve_execution_flow_id`] plus a local
+//! RFC-011 co-location cross-check.
 //!
 //! See issue #58 for the strategic context (engine-surface sealing
-//! toward the Postgres backend port).
+//! toward the Postgres backend port); issue #160 closed out the last
+//! raw-client call sites so `FlowFabricWorker::client()` could be
+//! deleted.
 //!
 //! Snapshot types (`ExecutionSnapshot`, `AttemptSummary`, `LeaseSummary`,
 //! `FlowSnapshot`, `EdgeSnapshot`) live in [`ff_core::contracts`] so
 //! non-SDK consumers (tests, REST server, alternate backends) share
 //! them without depending on ff-sdk.
 
-use std::collections::HashMap;
-
 use ff_core::contracts::{EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot};
-use ff_core::keys::ExecKeyContext;
 use ff_core::partition::{execution_partition, flow_partition};
 use ff_core::types::{EdgeId, ExecutionId, FlowId};
 
@@ -67,30 +68,16 @@ impl FlowFabricWorker {
     ///
     /// Returns `Ok(None)` when the edge hash is absent (never staged,
     /// or staged under a different flow).
+    ///
+    /// Post-#160 this is a thin forwarder onto the bundled
+    /// [`EngineBackend::describe_edge`](ff_core::engine_backend::EngineBackend::describe_edge)
+    /// impl.
     pub async fn describe_edge(
         &self,
         flow_id: &FlowId,
         edge_id: &EdgeId,
     ) -> Result<Option<EdgeSnapshot>, SdkError> {
-        let partition = flow_partition(flow_id, self.partition_config());
-        let ctx = ff_core::keys::FlowKeyContext::new(&partition, flow_id);
-        let edge_key = ctx.edge(edge_id);
-
-        let raw: HashMap<String, String> = self
-            .client()
-            .cmd("HGETALL")
-            .arg(&edge_key)
-            .execute()
-            .await
-            .map_err(|e| crate::backend_context(e, "describe_edge: HGETALL edge_hash"))?;
-
-        if raw.is_empty() {
-            return Ok(None);
-        }
-
-        ff_core::contracts::decode::build_edge_snapshot(flow_id, edge_id, &raw)
-            .map(Some)
-            .map_err(SdkError::from)
+        Ok(self.backend_ref().describe_edge(flow_id, edge_id).await?)
     }
 
     /// List all outgoing dependency edges originating from an execution.
@@ -100,7 +87,8 @@ impl FlowFabricWorker {
     ///
     /// # Reads
     ///
-    /// 1. `HGET exec_core flow_id` (via [`Self::resolve_flow_id`]).
+    /// 1. `EngineBackend::resolve_execution_flow_id` (single HGET on
+    ///    `exec_core.flow_id` for the Valkey backend).
     /// 2. `EngineBackend::list_edges` on the resolved flow (SMEMBERS
     ///    + pipelined HGETALL on the flow's partition).
     ///
@@ -145,49 +133,31 @@ impl FlowFabricWorker {
             .await?)
     }
 
-    /// `HGET exec_core.flow_id` and parse to a [`FlowId`]. `None` when
-    /// the exec_core hash is absent OR the flow_id field is empty
-    /// (standalone execution).
-    ///
-    /// Also pins the RFC-011 co-location invariant
-    /// (`execution_partition(eid) == flow_partition(flow_id)`) — a
+    /// Resolve `exec_core.flow_id` via the trait and pin the RFC-011
+    /// co-location invariant
+    /// (`execution_partition(eid) == flow_partition(flow_id)`). A
     /// parsed-but-wrong flow_id would otherwise silently route the
     /// follow-up adjacency reads to the wrong partition and return
     /// bogus empty results. A mismatch surfaces as
     /// `SdkError::Engine(EngineError::Validation { kind: Corruption, .. })`.
+    ///
+    /// Returns `None` when the execution has no owning flow
+    /// (standalone) or when exec_core is absent.
     async fn resolve_flow_id(&self, eid: &ExecutionId) -> Result<Option<FlowId>, SdkError> {
-        let exec_partition = execution_partition(eid, self.partition_config());
-        let ctx = ExecKeyContext::new(&exec_partition, eid);
-        let raw: Option<String> = self
-            .client()
-            .cmd("HGET")
-            .arg(ctx.core())
-            .arg("flow_id")
-            .execute()
-            .await
-            .map_err(|e| crate::backend_context(e, "list_edges: HGET exec_core.flow_id"))?;
-        let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        let Some(flow_id) = self.backend_ref().resolve_execution_flow_id(eid).await? else {
             return Ok(None);
         };
-        let flow_id = FlowId::parse(&raw).map_err(|e| {
-            SdkError::from(ff_core::engine_error::EngineError::Validation {
-                kind: ff_core::engine_error::ValidationKind::Corruption,
-                detail: format!(
-                    "list_edges: exec_core: flow_id: '{raw}' is not a valid UUID \
-                     (key corruption?): {e}"
-                ),
-            })
-        })?;
+        let exec_partition_index = execution_partition(eid, self.partition_config()).index;
         let flow_partition_index = flow_partition(&flow_id, self.partition_config()).index;
-        if exec_partition.index != flow_partition_index {
+        if exec_partition_index != flow_partition_index {
             return Err(SdkError::from(
                 ff_core::engine_error::EngineError::Validation {
                     kind: ff_core::engine_error::ValidationKind::Corruption,
                     detail: format!(
                         "list_edges: exec_core: flow_id: '{flow_id}' partition \
-                         {flow_partition_index} does not match execution partition {} \
-                         (RFC-011 co-location violation; key corruption?)",
-                        exec_partition.index
+                         {flow_partition_index} does not match execution partition \
+                         {exec_partition_index} (RFC-011 co-location violation; \
+                         key corruption?)"
                     ),
                 },
             ));

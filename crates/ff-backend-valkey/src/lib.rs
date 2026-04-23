@@ -538,6 +538,62 @@ async fn list_edges_impl(
     Ok(out)
 }
 
+/// Single `HGETALL edge_hash` + decode via [`build_edge_snapshot`].
+/// `Ok(None)` when the edge hash is absent. Decode failures surface
+/// as `EngineError::Validation { kind: Corruption, .. }`.
+async fn describe_edge_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    flow_id: &FlowId,
+    edge_id: &EdgeId,
+) -> Result<Option<EdgeSnapshot>, EngineError> {
+    let partition = flow_partition(flow_id, partition_config);
+    let fctx = FlowKeyContext::new(&partition, flow_id);
+    let edge_key = fctx.edge(edge_id);
+
+    let raw: HashMap<String, String> = client
+        .cmd("HGETALL")
+        .arg(&edge_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    build_edge_snapshot(flow_id, edge_id, &raw).map(Some)
+}
+
+/// Single `HGET exec_core flow_id` + parse. `Ok(None)` when the
+/// exec_core hash is absent OR the `flow_id` field is empty
+/// (standalone execution). A present-but-malformed value surfaces as
+/// `EngineError::Validation { kind: Corruption, .. }`.
+async fn resolve_execution_flow_id_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    eid: &ExecutionId,
+) -> Result<Option<FlowId>, EngineError> {
+    let partition = execution_partition(eid, partition_config);
+    let ctx = ExecKeyContext::new(&partition, eid);
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("flow_id")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let flow_id = FlowId::parse(&raw).map_err(|e| EngineError::Validation {
+        kind: ff_core::engine_error::ValidationKind::Corruption,
+        detail: format!(
+            "resolve_execution_flow_id: exec_core: flow_id: '{raw}' is not a valid UUID \
+             (key corruption?): {e}"
+        ),
+    })?;
+    Ok(Some(flow_id))
+}
+
 /// Read the deployment's partition config from
 /// `ff:config:partitions`. Keeps `ValkeyBackend` aligned with
 /// ff-server's published `num_flow_partitions` / budget / quota
@@ -1756,6 +1812,21 @@ impl EngineBackend for ValkeyBackend {
         direction: EdgeDirection,
     ) -> Result<Vec<EdgeSnapshot>, EngineError> {
         list_edges_impl(&self.client, &self.partition_config, flow_id, direction).await
+    }
+
+    async fn describe_edge(
+        &self,
+        flow_id: &FlowId,
+        edge_id: &EdgeId,
+    ) -> Result<Option<EdgeSnapshot>, EngineError> {
+        describe_edge_impl(&self.client, &self.partition_config, flow_id, edge_id).await
+    }
+
+    async fn resolve_execution_flow_id(
+        &self,
+        eid: &ExecutionId,
+    ) -> Result<Option<FlowId>, EngineError> {
+        resolve_execution_flow_id_impl(&self.client, &self.partition_config, eid).await
     }
 
     async fn cancel_flow(

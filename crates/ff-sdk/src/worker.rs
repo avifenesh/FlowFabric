@@ -627,25 +627,6 @@ impl FlowFabricWorker {
         self.completion_backend_handle.clone()
     }
 
-    /// Crate-internal borrow of the underlying `ferriskey::Client`.
-    ///
-    /// **RFC-012 Stage 1c tranche-4 (#87):** downgraded from `pub` to
-    /// `pub(crate)`. The public `FlowFabricWorker` surface no longer
-    /// exposes the ferriskey type — consumers that previously reached
-    /// in for `read_stream` / `tail_stream` should now use
-    /// [`ClaimedTask::read_stream`](crate::ClaimedTask::read_stream) /
-    /// [`ClaimedTask::tail_stream`](crate::ClaimedTask::tail_stream)
-    /// (task-holders) or [`read_stream`](crate::read_stream) /
-    /// [`tail_stream`](crate::tail_stream) through a `&dyn
-    /// EngineBackend` (non-task callers).
-    ///
-    /// Retained for in-crate use by
-    /// [`crate::worker::FlowFabricWorker`]'s raw HGET helpers, which
-    /// are not yet migrated to the trait (separate tracking issue).
-    pub(crate) fn client(&self) -> &Client {
-        &self.client
-    }
-
     /// Get the worker config.
     pub fn config(&self) -> &WorkerConfig {
         &self.config
