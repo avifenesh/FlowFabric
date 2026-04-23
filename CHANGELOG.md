@@ -16,6 +16,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (post #170). Importable via Grafana UI or the `/api/dashboards/db`
   endpoint; see `examples/grafana/README.md`. Positioned as the
   0.5.x operator-visibility alternative while `ff-board` builds out.
+- **`ff-observability-http` crate — consumer-side Prometheus `/metrics`
+  HTTP endpoint.** New publishable workspace member that bridges
+  `ff-observability`'s OTEL + Prometheus registry to an `axum::Router`
+  so consumers embedding `ff-sdk` in library mode can expose a scrape
+  endpoint without also pulling `ff-server`. Two entry points:
+  `router(Arc<Metrics>) -> axum::Router` for merging into an existing
+  app, and `serve(addr, Arc<Metrics>)` for a standalone listener. Feature
+  model mirrors `ff-observability`: `enabled` off by default, ON
+  transitively enables `ff-observability/enabled`. Per the Observability
+  RFC adjudication, this ships as a separate crate (not a feature on
+  `ff-sdk`) so axum is only pulled into consumers that opt in.
+  `ff-server` keeps its own built-in `/metrics` route (PR #94) — this
+  crate is for the consumer-in-library-mode use case. Release workflow,
+  `docs/RELEASING.md`, and `release.toml` updated for the new
+  publish-list entry (guarded by the drift check added in PR #132).
 - **Observability wiring on `EngineBackend` trait methods (#154):** every
   non-stub `*_impl` in `ff-backend-valkey` now carries
   `#[tracing::instrument(name = "ff.<method>", skip_all, fields(backend,
