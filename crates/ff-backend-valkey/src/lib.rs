@@ -50,9 +50,13 @@ use ff_script::error::ScriptError;
 use ff_script::functions::flow::{ff_cancel_flow, FlowStructOpKeys};
 use ff_script::result::FcallResult;
 
+pub mod backend_error;
 mod completion;
 mod handle_codec;
 
+pub use backend_error::{
+    backend_error_from_ferriskey, classify_ferriskey_kind, BackendErrorWrapper,
+};
 pub use completion::COMPLETION_CHANNEL;
 
 /// Valkey-FCALL–backed `EngineBackend`.

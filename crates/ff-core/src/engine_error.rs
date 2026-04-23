@@ -330,6 +330,113 @@ pub enum BugKind {
     AttemptNotInCreatedState,
 }
 
+/// Backend-agnostic transport error carried across public
+/// ff-sdk / ff-server error surfaces (#88).
+///
+/// The `Valkey` variant is the only one populated today; additional
+/// variants (e.g. `Postgres`) will be added additively as other
+/// backends land. The enum is `#[non_exhaustive]` so consumers must
+/// include a wildcard arm.
+///
+/// Construction from the Valkey-native `ferriskey::Error` lives in
+/// `ff_backend_valkey::backend_error_from_ferriskey` — keeping that
+/// conversion outside ff-core preserves ff-core's ferriskey-free
+/// public surface.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum BackendError {
+    /// Valkey-backend transport failure. Carries a backend-agnostic
+    /// classification plus the backend-rendered message so downstream
+    /// consumers can inspect without depending on ferriskey.
+    #[error("valkey backend: {kind:?}: {message}")]
+    Valkey {
+        kind: BackendErrorKind,
+        message: String,
+    },
+}
+
+impl BackendError {
+    /// Returns the classified backend kind if this error is a Valkey
+    /// transport fault. Forward-compatible with future backends:
+    /// non-Valkey variants return `None` on a call that names only the
+    /// Valkey kind; code that wants a backend-specific view should
+    /// match directly on [`BackendError`].
+    pub fn kind(&self) -> BackendErrorKind {
+        match self {
+            Self::Valkey { kind, .. } => *kind,
+        }
+    }
+
+    /// Return the backend-rendered message payload.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Valkey { message, .. } => message.as_str(),
+        }
+    }
+}
+
+/// Classified backend transport errors, kept backend-agnostic on
+/// purpose (#88). Each variant maps a family of native backend error
+/// kinds into a stable, consumer-matchable shape.
+///
+/// Consumers requiring the exact native kind for a Valkey backend
+/// must go through `ff_backend_valkey` explicitly; ff-sdk/ff-server's
+/// public surface will only ever hand out [`BackendErrorKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendErrorKind {
+    /// Network / I/O failure: the request may or may not have been
+    /// processed. Typically retryable with backoff.
+    Transport,
+    /// Backend rejected the request on protocol / parse grounds. Not
+    /// retryable without a fix.
+    Protocol,
+    /// Backend timed out responding to the request. Retryable.
+    Timeout,
+    /// Authentication / authorization failure. Not retryable.
+    Auth,
+    /// Cluster topology churn (MOVED, ASK, CLUSTERDOWN, MasterDown,
+    /// CrossSlot, ConnectionNotFoundForRoute, AllConnectionsUnavailable).
+    /// Retryable after topology settles.
+    Cluster,
+    /// Backend is temporarily busy loading state (e.g. Valkey
+    /// `LOADING`). Retryable.
+    BusyLoading,
+    /// Backend indicates the referenced script/function does not
+    /// exist. Typically handled by the caller via re-load.
+    ScriptNotLoaded,
+    /// Any other classified error from the backend. Fallback bucket
+    /// for native kinds outside the curated set above.
+    Other,
+}
+
+impl BackendErrorKind {
+    /// Stable, lowercase-kebab label suitable for log fields / HTTP
+    /// `kind` body slots. Guaranteed not to change across releases
+    /// for the existing variants.
+    pub fn as_stable_str(&self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+            Self::Timeout => "timeout",
+            Self::Auth => "auth",
+            Self::Cluster => "cluster",
+            Self::BusyLoading => "busy_loading",
+            Self::ScriptNotLoaded => "script_not_loaded",
+            Self::Other => "other",
+        }
+    }
+
+    /// Whether a caller should consider this kind retryable with
+    /// backoff. Conservative — auth + protocol + other are terminal.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport | Self::Timeout | Self::Cluster | Self::BusyLoading
+        )
+    }
+}
+
 impl EngineError {
     /// Classify an [`EngineError`] using the underlying
     /// [`ErrorClass`] table.
@@ -428,5 +535,57 @@ mod tests {
             EngineError::Unavailable { op: "foo" }.class(),
             ErrorClass::Terminal
         );
+    }
+
+    #[test]
+    fn backend_error_kind_round_trip() {
+        let be = BackendError::Valkey {
+            kind: BackendErrorKind::Transport,
+            message: "connection reset".into(),
+        };
+        assert_eq!(be.kind(), BackendErrorKind::Transport);
+        assert_eq!(be.message(), "connection reset");
+    }
+
+    #[test]
+    fn backend_kind_stable_strings_fixed() {
+        // Stability fence: these strings are part of the public
+        // contract (log field values, HTTP body `kind` slots). Adding
+        // a variant is additive; changing an existing string is a
+        // break.
+        assert_eq!(BackendErrorKind::Transport.as_stable_str(), "transport");
+        assert_eq!(BackendErrorKind::Protocol.as_stable_str(), "protocol");
+        assert_eq!(BackendErrorKind::Timeout.as_stable_str(), "timeout");
+        assert_eq!(BackendErrorKind::Auth.as_stable_str(), "auth");
+        assert_eq!(BackendErrorKind::Cluster.as_stable_str(), "cluster");
+        assert_eq!(
+            BackendErrorKind::BusyLoading.as_stable_str(),
+            "busy_loading"
+        );
+        assert_eq!(
+            BackendErrorKind::ScriptNotLoaded.as_stable_str(),
+            "script_not_loaded"
+        );
+        assert_eq!(BackendErrorKind::Other.as_stable_str(), "other");
+    }
+
+    #[test]
+    fn backend_kind_retryability() {
+        for k in [
+            BackendErrorKind::Transport,
+            BackendErrorKind::Timeout,
+            BackendErrorKind::Cluster,
+            BackendErrorKind::BusyLoading,
+        ] {
+            assert!(k.is_retryable(), "{k:?} should be retryable");
+        }
+        for k in [
+            BackendErrorKind::Protocol,
+            BackendErrorKind::Auth,
+            BackendErrorKind::ScriptNotLoaded,
+            BackendErrorKind::Other,
+        ] {
+            assert!(!k.is_retryable(), "{k:?} should NOT be retryable");
+        }
     }
 }

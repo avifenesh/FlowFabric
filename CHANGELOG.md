@@ -7,6 +7,47 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking — Seal `ferriskey::Error` leak via `BackendError` wrapper (#88):**
+  Public SDK + server error surfaces no longer name `ferriskey::Error` /
+  `ferriskey::ErrorKind` directly. A new `ff_core::BackendError` +
+  `ff_core::BackendErrorKind` taxonomy (non-exhaustive, backend-agnostic)
+  replaces the raw ferriskey carriers so consumers can classify transport
+  faults without a ferriskey dependency.
+  - `ff-core`: new `BackendError` enum (`Valkey` variant today;
+    additional backends added additively) + `BackendErrorKind`
+    classifier (`Transport`, `Protocol`, `Timeout`, `Auth`,
+    `Cluster`, `BusyLoading`, `ScriptNotLoaded`, `Other`) with
+    `is_retryable()` + stability-fenced `as_stable_str()`.
+  - `ff-backend-valkey`: new `backend_error` module owning the
+    ferriskey → `BackendError` conversion
+    (`backend_error_from_ferriskey`, `classify_ferriskey_kind`,
+    `BackendErrorWrapper`).
+  - `ff-sdk`: `SdkError::Valkey(ferriskey::Error)` →
+    `SdkError::Backend(BackendError)`; `SdkError::ValkeyContext
+    { source: ferriskey::Error, .. }` → `SdkError::BackendContext
+    { source: BackendError, .. }`. `SdkError::valkey_kind()
+    -> Option<ferriskey::ErrorKind>` renamed to
+    `SdkError::backend_kind() -> Option<BackendErrorKind>`. New
+    `From<ferriskey::Error> for SdkError` preserves `?`-propagation
+    at internal call sites.
+  - `ff-server`: `ServerError::Valkey` / `ValkeyContext` similarly
+    reshaped to `Backend(BackendError)` / `BackendContext`.
+    `ServerError::valkey_kind` renamed to `backend_kind`. HTTP
+    `ErrorBody.kind` now sources the wire string from
+    `BackendErrorKind::as_stable_str()` instead of ferriskey's
+    `kind_to_stable_str`; values change (`"io_error"` →
+    `"transport"`, `"cluster_down"` / `"moved"` / `"ask"` /
+    `"try_again"` → `"cluster"`, etc.) — downstream consumers
+    (cairn-fabric) must update any `kind`-string matching.
+  - Behavioral refinement: `BackendErrorKind::is_retryable` treats
+    cluster-churn kinds (`Moved`, `Ask`, `MasterDown`, `CrossSlot`,
+    `ConnectionNotFoundForRoute`, etc.) as retryable where the
+    previous ff-script table treated them as terminal.
+    `FatalReceiveError` + `ProtocolDesync` likewise bucket into
+    retryable `Transport`. This aligns with standard Valkey-cluster
+    client semantics where these are redirects/transients the caller
+    should retry.
+
 - **Breaking — `ff_core::backend::Frame` extended (RFC-012 §R7, PR #147):**
   Added `frame_type: String` + `correlation_id: Option<String>` so
   `ClaimedTask::append_frame` can forward through the `EngineBackend`

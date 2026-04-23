@@ -836,7 +836,7 @@ impl ClaimedTask {
             .client
             .fcall("ff_suspend_execution", &key_refs, &arg_refs)
             .await
-            .map_err(SdkError::Valkey)?;
+            .map_err(SdkError::from)?;
 
         self.stop_renewal();
         parse_suspend_result(&raw, suspension_id, waitpoint_id, waitpoint_key)
@@ -892,7 +892,7 @@ impl ClaimedTask {
 /// server either committed or rejected with a typed response. Only
 /// raw `Transport` errors (connection drops, request timeouts, parse
 /// failures) count as "did not land", which matches the pre-Stage-1b
-/// SDK's `fcall(...).await.map_err(SdkError::Valkey)?` short-circuit
+/// SDK's `fcall(...).await.map_err(SdkError::from)?` short-circuit
 /// — those errors returned before `stop_renewal()` ran, preserving
 /// the `Drop` warning for genuine "lease will leak" cases.
 ///
