@@ -55,6 +55,10 @@ impl Metrics {
 
     pub fn inc_lease_renewal(&self, _outcome: &'static str) {}
 
+    // ── Attempt terminal outcome ──
+
+    pub fn inc_attempt_outcome(&self, _lane: &str, _outcome: super::AttemptOutcome) {}
+
     // ── Worker-at-capacity ──
 
     pub fn inc_worker_at_capacity(&self) {}

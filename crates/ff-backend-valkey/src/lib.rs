@@ -1962,11 +1962,18 @@ impl EngineBackend for ValkeyBackend {
 
     async fn complete(&self, handle: &Handle, payload: Option<Vec<u8>>) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        complete_impl(&self.client, &self.partition_config, &f, payload)
+        let result = complete_impl(&self.client, &self.partition_config, &f, payload)
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "complete: FCALL ff_complete_execution")
-            })
+            });
+        // Fire `ff_attempt_outcome_total` only after the FCALL-side
+        // terminal is confirmed (Ok, including reconciled replays).
+        // Errors pre-terminal do NOT count as an outcome.
+        if let (Ok(()), Some(metrics)) = (&result, &self.metrics) {
+            metrics.inc_attempt_outcome(f.lane_id.as_str(), ff_observability::AttemptOutcome::Ok);
+        }
+        result
     }
 
     async fn fail(
@@ -1976,7 +1983,8 @@ impl EngineBackend for ValkeyBackend {
         classification: FailureClass,
     ) -> Result<FailOutcome, EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        fail_impl(
+        let is_timeout = classification == FailureClass::Timeout;
+        let result = fail_impl(
             &self.client,
             &self.partition_config,
             &f,
@@ -1984,16 +1992,38 @@ impl EngineBackend for ValkeyBackend {
             classification,
         )
         .await
-        .map_err(|e| ff_core::engine_error::backend_context(e, "fail: FCALL ff_fail_execution"))
+        .map_err(|e| ff_core::engine_error::backend_context(e, "fail: FCALL ff_fail_execution"));
+        // Map FailOutcome + classification to the metric label:
+        //   RetryScheduled          → "retry"
+        //   TerminalFailed(Timeout) → "timeout"
+        //   TerminalFailed(other)   → "error"
+        if let (Ok(outcome), Some(metrics)) = (&result, &self.metrics) {
+            let label = match outcome {
+                FailOutcome::RetryScheduled { .. } => ff_observability::AttemptOutcome::Retry,
+                FailOutcome::TerminalFailed if is_timeout => {
+                    ff_observability::AttemptOutcome::Timeout
+                }
+                FailOutcome::TerminalFailed => ff_observability::AttemptOutcome::Error,
+            };
+            metrics.inc_attempt_outcome(f.lane_id.as_str(), label);
+        }
+        result
     }
 
     async fn cancel(&self, handle: &Handle, reason: &str) -> Result<(), EngineError> {
         let f = handle_codec::decode_handle(handle)?;
-        cancel_impl(&self.client, &self.partition_config, &f, reason)
+        let result = cancel_impl(&self.client, &self.partition_config, &f, reason)
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "cancel: FCALL ff_cancel_execution")
-            })
+            });
+        if let (Ok(()), Some(metrics)) = (&result, &self.metrics) {
+            metrics.inc_attempt_outcome(
+                f.lane_id.as_str(),
+                ff_observability::AttemptOutcome::Cancelled,
+            );
+        }
+        result
     }
 
     async fn suspend(
