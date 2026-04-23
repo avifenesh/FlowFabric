@@ -19,7 +19,7 @@ default = ["streaming"]
 streaming = ["ff-core/streaming"]
 
 [dependencies]
-ff-core = { workspace = true }
+ff-core = { version = "0.3.4", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
 ff-script = { workspace = true }
 ferriskey = { workspace = true }
 async-trait = { workspace = true }

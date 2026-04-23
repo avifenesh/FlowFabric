@@ -638,7 +638,7 @@ impl FlowFabricWorker {
     /// EngineBackend` (non-task callers).
     ///
     /// Retained for in-crate use by
-    /// [`crate::snapshot::FlowFabricWorker`]'s raw HGET helpers, which
+    /// [`crate::worker::FlowFabricWorker`]'s raw HGET helpers, which
     /// are not yet migrated to the trait (separate tracking issue).
     pub(crate) fn client(&self) -> &Client {
         &self.client
