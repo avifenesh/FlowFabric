@@ -5479,22 +5479,24 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
     let eid_claimed = task1.execution_id().clone();
     assert_eq!(eid_claimed, eid);
 
-    // 2. Suspend with a signal condition
+    // 2. Suspend with a signal condition (RFC-013 Stage 1d typed args).
+    let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task1.suspend(
-        "waiting_for_signal",
-        &[ff_sdk::task::ConditionMatcher { signal_name: "test_signal".into() }],
-        Some(60_000), // 60s timeout
-        ff_sdk::task::TimeoutBehavior::Fail,
+        ff_sdk::task::SuspensionReasonCode::WaitingForSignal,
+        ff_sdk::task::ResumeCondition::Single {
+            waitpoint_key: wp_key,
+            matcher: ff_sdk::task::SignalMatcher::ByName("test_signal".into()),
+        },
+        Some((
+            ff_core::types::TimestampMs::from_millis(
+                ff_core::types::TimestampMs::now().0 + 60_000,
+            ),
+            ff_sdk::task::TimeoutBehavior::Fail,
+        )),
+        ff_sdk::task::ResumePolicy::normal(),
     ).await.unwrap();
-
-    let (waitpoint_id, _waitpoint_key, waitpoint_token) = match outcome {
-        ff_sdk::task::SuspendOutcome::Suspended {
-            waitpoint_id, waitpoint_key, waitpoint_token, ..
-        } => (waitpoint_id, waitpoint_key, waitpoint_token),
-        ff_sdk::task::SuspendOutcome::AlreadySatisfied { .. } => {
-            panic!("should not be already satisfied");
-        }
-    };
+    let waitpoint_id = outcome.details.waitpoint_id.clone();
+    let waitpoint_token = outcome.details.waitpoint_token.token().clone();
 
     // Verify execution is suspended
     assert_execution_state(&tc, &eid, &ExpectedState {

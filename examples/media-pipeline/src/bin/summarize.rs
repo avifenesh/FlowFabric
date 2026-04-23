@@ -29,8 +29,9 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use ff_sdk::{
-    ClaimedTask, ConditionMatcher, FlowFabricAdminClient, FlowFabricWorker, StreamCursor,
-    SuspendOutcome, TimeoutBehavior, WorkerConfig, STREAM_READ_HARD_CAP,
+    ClaimedTask, FlowFabricAdminClient, FlowFabricWorker, ResumeCondition, ResumePolicy,
+    SignalMatcher, StreamCursor, SuspensionReasonCode, TimeoutBehavior, WorkerConfig,
+    STREAM_READ_HARD_CAP,
 };
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -387,51 +388,29 @@ async fn process(
         return Ok(());
     }
 
+    let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task
         .suspend(
-            "awaiting_summary_review",
-            &[ConditionMatcher {
-                signal_name: SIGNAL_NAME_APPROVAL.into(),
-            }],
-            Some(3_600_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForOperatorReview,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key,
+                matcher: SignalMatcher::ByName(SIGNAL_NAME_APPROVAL.into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 3_600_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
         .await;
-
     match outcome {
-        Ok(SuspendOutcome::Suspended {
-            waitpoint_id,
-            waitpoint_token,
-            ..
-        }) => {
+        Ok(handle) => {
+            let waitpoint_id = &handle.details.waitpoint_id;
+            let waitpoint_token = handle.details.waitpoint_token.token();
             println!("REVIEW_NEEDED eid={eid} wp={waitpoint_id}");
-            // as_str() to bypass WaitpointToken's redacting Display impl —
-            // this stdout line is the intentional wire-boundary disclosure
-            // the review CLI reads. The redacted Display is the default to
-            // keep tracing and error-message paths safe (RFC-004 §Waitpoint
-            // Security); here we explicitly opt in to the raw value.
             println!("WAITPOINT_TOKEN={}", waitpoint_token.as_str());
-        }
-        Ok(SuspendOutcome::AlreadySatisfied { .. }) => {
-            // Unreachable in this example's flow: AlreadySatisfied requires a
-            // pre-existing `create_pending_waitpoint` that buffered a signal
-            // before suspend. We never call create_pending_waitpoint, so the
-            // engine has no buffered signals and this arm cannot fire.
-            //
-            // If a future revision adds a pre-suspend buffer, this branch
-            // self-heals via the F1 persisted-result path: the summary_final
-            // frame was already appended before suspend, so when lease
-            // expiry + scanner re-queue drive a re-claim, the resume branch
-            // in `handle()` finds the frame and completes. No LLM re-run,
-            // no stuck execution. The only cost is one lease-TTL delay.
-            // Tracked as a Batch C ff-sdk follow-up ("suspend should return
-            // the ClaimedTask on AlreadySatisfied so we can complete
-            // immediately").
-            tracing::warn!(
-                execution_id = %eid,
-                "SuspendOutcome::AlreadySatisfied — lease will expire and \
-                 re-claim will pick up the persisted summary_final frame"
-            );
         }
         Err(e) => {
             return Err(e.into());

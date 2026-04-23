@@ -37,7 +37,8 @@ use ff_core::types::*;
 use ff_readiness_tests::server::InProcessServer;
 use ff_readiness_tests::valkey::{TestCluster, TEST_PARTITION_CONFIG};
 use ff_sdk::task::{
-    ClaimedTask, ConditionMatcher, Signal, SignalOutcome, SuspendOutcome, TimeoutBehavior,
+    ClaimedTask, ResumeCondition, ResumePolicy, Signal, SignalMatcher, SignalOutcome,
+    SuspensionReasonCode, TimeoutBehavior,
 };
 
 const LANE: &str = "bug-b-lane";
@@ -126,25 +127,30 @@ async fn bug_b_resume_via_server_claim() {
     assert_eq!(task.execution_id(), &eid, "claim should hand back our exec");
 
     // ── Step 2: suspend ──
+    let wp_key = format!("wpk:{}", ff_core::types::WaitpointId::new());
     let outcome = task
         .suspend(
-            "waiting_for_review",
-            &[ConditionMatcher {
-                signal_name: SIGNAL_NAME.into(),
-            }],
-            Some(60_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForOperatorReview,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key.clone(),
+                matcher: SignalMatcher::ByName(SIGNAL_NAME.into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 60_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
-        .await
-        .expect("suspend");
-    let (wp_id, token) = match outcome {
-        SuspendOutcome::Suspended {
-            waitpoint_id,
-            waitpoint_token,
-            ..
-        } => (waitpoint_id, waitpoint_token),
-        other => panic!("expected Suspended, got {other:?}"),
+        .await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => panic!("suspend: {e}"),
     };
+    // RFC-013 Stage 1d — strict `suspend` returns `SuspendedHandle`.
+    let wp_id = outcome.details.waitpoint_id.clone();
+    let token = outcome.details.waitpoint_token.token().clone();
 
     // ── Step 3: deliver signal — resume condition satisfied ──
     let signal = Signal {

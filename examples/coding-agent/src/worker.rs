@@ -8,8 +8,8 @@ use std::time::Duration;
 use clap::Parser;
 use ff_core::types::BudgetId;
 use ff_sdk::{
-    ConditionMatcher, FlowFabricAdminClient, FlowFabricWorker, SuspendOutcome,
-    TimeoutBehavior, WorkerConfig,
+    FlowFabricAdminClient, FlowFabricWorker, ResumeCondition, ResumePolicy, SignalMatcher,
+    SuspensionReasonCode, TimeoutBehavior, WorkerConfig,
 };
 use tokio::sync::Mutex;
 
@@ -377,30 +377,30 @@ async fn process_task(
 
         tracing::info!(execution_id = %eid, "patch ready — suspending for human review");
 
+        let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
         match task
             .suspend(
-                "awaiting_human_review",
-                &[ConditionMatcher {
-                    signal_name: "review_response".to_string(),
-                }],
-                Some(3_600_000), // 1 hour timeout
-                TimeoutBehavior::Fail,
+                SuspensionReasonCode::WaitingForOperatorReview,
+                ResumeCondition::Single {
+                    waitpoint_key: wp_key,
+                    matcher: SignalMatcher::ByName("review_response".to_string()),
+                },
+                Some((
+                    ff_core::types::TimestampMs::from_millis(
+                        ff_core::types::TimestampMs::now().0 + 3_600_000,
+                    ),
+                    TimeoutBehavior::Fail,
+                )),
+                ResumePolicy::normal(),
             )
             .await
         {
-            Ok(SuspendOutcome::Suspended {
-                waitpoint_id,
-                waitpoint_token,
-                ..
-            }) => {
+            Ok(handle) => {
+                let waitpoint_id = &handle.details.waitpoint_id;
+                let waitpoint_token = handle.details.waitpoint_token.token();
                 println!(
                     "REVIEW NEEDED: execution_id={eid} waitpoint_id={waitpoint_id}"
                 );
-                // Use .as_str() — `WaitpointToken`'s Display impl is
-                // redacted for log safety (RFC-004 §Waitpoint Security),
-                // which would print `<redacted>` here. The approve CLI
-                // needs the raw kid:hex so it can re-submit the HMAC.
-                // Matches the media-pipeline convention.
                 println!("WAITPOINT_TOKEN={}", waitpoint_token.as_str());
                 println!(
                     "  # approve:\n  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --waitpoint-token {} --approve",
@@ -410,9 +410,6 @@ async fn process_task(
                     "  # reject (same signal, approved=false inside payload):\n  cargo run --bin approve -- --execution-id {eid} --waitpoint-id {waitpoint_id} --waitpoint-token {} --reject --feedback \"...\"",
                     waitpoint_token.as_str()
                 );
-            }
-            Ok(SuspendOutcome::AlreadySatisfied { .. }) => {
-                tracing::info!(execution_id = %eid, "review already satisfied");
             }
             Err(e) => {
                 pending.lock().await.remove(&eid);
