@@ -193,7 +193,7 @@ pattern.
 `SdkError::is_retryable()` returns `false` for these — same retry
 posture as the pre-migration `SdkError::Config`.
 
-## 7. Gotchas
+## 7. Gotchas (cross-cutting)
 
 - **`#[non_exhaustive]` forces `..Default::default()`** on
   `BackendTimeouts`, `BackendRetry`, and most other `ff-core::backend`
@@ -219,7 +219,7 @@ posture as the pre-migration `SdkError::Config`.
   `crates/ff-core/src/keys.rs:644`. Use that helper; do not hardcode
   `format!("ff:usagededup:{hash_tag}:{dedup_id}")` parallel to it.
 
-## 7. `Frame` gained `frame_type` + `correlation_id` (#147)
+## 8. `Frame` gained `frame_type` + `correlation_id` (#147)
 
 ```rust
 use ff_core::backend::{Frame, FrameKind};
@@ -264,12 +264,12 @@ consumer shape. Source: PR #147; struct definition
 `crates/ff-core/src/backend.rs:205-220`; constructors
 `:230-260`.
 
-## 8. `EngineBackend` trait deltas (#145, Round-7)
+## 9. `EngineBackend` trait deltas (#145, Round-7)
 
 Three breaking changes land together on the trait surface. Impls
 written against 0.3.x will not compile.
 
-### 8.1 `append_frame` return widened to `AppendFrameOutcome`
+### 9.1 `append_frame` return widened to `AppendFrameOutcome`
 
 ```rust
 // Before (0.3.x):
@@ -296,7 +296,7 @@ Not `#[non_exhaustive]` — construction is backend-internal
 keep compiling but now discard the outcome; touch those sites if you
 want the stream id or frame count for logging.
 
-### 8.2 New `create_waitpoint` trait method
+### 9.2 New `create_waitpoint` trait method
 
 ```rust
 async fn create_waitpoint(
@@ -314,7 +314,7 @@ terminal error on the wire (`PendingWaitpointExpired` in
 
 Source: `crates/ff-core/src/engine_backend.rs:161`.
 
-### 8.3 `report_usage` returns `ReportUsageResult`; `AdmissionDecision` deleted
+### 9.3 `report_usage` returns `ReportUsageResult`; `AdmissionDecision` deleted
 
 ```rust
 // Before (0.3.x):
@@ -349,7 +349,7 @@ pub enum ReportUsageResult {
 
 `SoftBreach` is advisory: increments **are** applied. `HardBreach`
 rejects the report and does **not** apply increments. `AlreadyApplied`
-is the dedup success path (see §10).
+is the dedup success path (see §11).
 
 **Gotcha.** `ReportUsageResult` is `#[non_exhaustive]` — match arms
 must include a wildcard, and exhaustive matches against the 0.3.x
@@ -357,13 +357,13 @@ two-variant enum become non-exhaustive warnings in 0.4.0.
 
 Source: PR #145; `crates/ff-core/src/engine_backend.rs:221-230`.
 
-## 9. `BackendError` seal: `SdkError::Valkey*` → `SdkError::Backend*` (#151, HIGH IMPACT)
+## 10. `BackendError` seal: `SdkError::Valkey*` → `SdkError::Backend*` (#151, HIGH IMPACT)
 
 The public error surface no longer leaks `ferriskey::Error`. Every
 consumer that matched on `SdkError::Valkey` / `ServerError::Valkey*`
 or called `valkey_kind()` MUST update.
 
-### 9.1 Rust error variants
+### 10.1 Rust error variants
 
 ```rust
 // Before (0.3.x):
@@ -398,7 +398,7 @@ match err {
 `ServerError::Backend` / `ServerError::BackendContext` in the same
 shape (source `crates/ff-server/src/server.rs:224,302,318`).
 
-### 9.2 Classifier rename: `valkey_kind()` → `backend_kind()`
+### 10.2 Classifier rename: `valkey_kind()` → `backend_kind()`
 
 ```rust
 // Before: err.valkey_kind() -> Option<ferriskey::ErrorKind>
@@ -409,7 +409,7 @@ shape (source `crates/ff-server/src/server.rs:224,302,318`).
 `::is_retryable()` and `::as_stable_str()` are stable on this type
 (source `crates/ff-core/src/engine_error.rs:413-460`).
 
-### 9.3 HTTP `ErrorBody.kind` wire strings changed
+### 10.3 HTTP `ErrorBody.kind` wire strings changed
 
 This is the **most subtle** breaking change in #151, because it
 silently changes HTTP bodies without any Rust-compile signal.
@@ -452,7 +452,7 @@ ff-sdk consumers out of ferriskey's SemVer — a backend swap doesn't
 cascade a major bump through downstream crates. Source: PR #151;
 `crates/ff-core/src/engine_error.rs:347-460`, `crates/ff-sdk/src/lib.rs:93-119`.
 
-## 10. `UsageDimensions` gained `dedup_key: Option<String>` (Round-7)
+## 11. `UsageDimensions` gained `dedup_key: Option<String>` (Round-7)
 
 ```rust
 use ff_core::backend::UsageDimensions;
@@ -478,16 +478,16 @@ double-counting. `None` / empty string disables dedup and restores
 pre-0.4.0 semantics.
 
 **Gotcha.** This is **not** the legacy `UsageDimensions::custom`
-magic-entry dedup id called out in §6. `dedup_key` is a first-class
+magic-entry dedup id called out in §7. `dedup_key` is a first-class
 field; the `custom`-map variant remains for the
-`usage_dedup_key(hash_tag, dedup_id)` callsite documented in §6.
+`usage_dedup_key(hash_tag, dedup_id)` callsite documented in §7.
 Reports that set *both* produce undefined-at-doc-write-time
 precedence — pick one path per report.
 
 Source: RFC-012 §R7.4 (Round-7 impl); field definition
 `crates/ff-core/src/backend.rs:434-441`.
 
-## 11. `WorkerConfig` hoists backend fields into `BackendConfig` (T1, PR #146)
+## 12. `WorkerConfig` hoists backend fields into `BackendConfig` (T1, PR #146)
 
 > **Status note.** PR #146 is **in-flight at doc-write time
 > (2026-04-22).** The shape below reflects the accepted T1 plan; the
@@ -549,6 +549,73 @@ precondition for the RFC-#58 decoupling work.
 Source: PR #146 (in-flight); current pre-T1 shape
 `crates/ff-sdk/src/config.rs:1-61`.
 
+## 13. Stream access reshape + `client()` sealed (T4, PR #158)
+
+Stage 1c tranche-4 finishes the ferriskey-seal on the worker-facing
+surface. Two shifts land together.
+
+### 13.1 `FlowFabricWorker::client()` → `pub(crate)`
+
+```rust
+// Before (0.3.x): leaked ferriskey::Client.
+let client = worker.client();
+
+// After (0.4.0): accessor is crate-private. Replacements:
+//   - Typed ops: go through SDK methods on `FlowFabricWorker` / `ClaimedTask`.
+//   - Stream reads: `ClaimedTask` methods (§13.2).
+//   - Tests: `TestCluster::backend()` → `Arc<dyn EngineBackend>`.
+```
+
+The #158 grep sweep found zero non-example consumers; ferriskey no
+longer surfaces through any worker-facing accessor.
+
+### 13.2 `read_stream` / `tail_stream` — canonical path is `ClaimedTask`
+
+```rust
+// Before (0.3.x): free fns over `&ferriskey::Client` + `&PartitionConfig`.
+use ff_sdk::task::{read_stream, tail_stream};
+let frames = read_stream(worker.client(), &config, &handle, opts).await?;
+
+// After (0.4.0): method on the task you already hold.
+let frames = task.read_stream(opts).await?;
+let stream = task.tail_stream(opts).await?;
+
+// Free fns still exist with a reshaped signature for non-task callers
+// (tests, consumers holding a bare backend). They now take
+// `&dyn EngineBackend` instead of `&Client` + `&PartitionConfig`:
+use ff_sdk::task::read_stream;
+let frames = read_stream(&*backend, &handle, opts).await?;
+```
+
+Validation (`count_limit` bounds, tail-cursor shape) stays at the SDK
+edge; `SdkError::Config` semantics are preserved across both paths.
+
+Source: PR #158; `ff-core::EngineBackend::{read_stream,tail_stream}`
+(gated on the default-on `streaming` feature),
+`ff-sdk::ClaimedTask::{read_stream,tail_stream}`.
+
+## 14. DX polish: re-exports + `Into<Namespace>` (PR #157)
+
+Four additive re-exports / signature widenings — no break, purely
+cuts `use`-statement ceremony for consumers:
+
+```rust
+// New short paths (canonical paths still work):
+use ff_core::ScannerFilter;          // was ff_core::backend::ScannerFilter
+use ff_core::backend::Namespace;     // was ff_core::types::Namespace
+use ff_backend_valkey::BackendConfig; // was ff_core::backend::BackendConfig
+
+// `ScannerFilter::with_namespace` now takes `impl Into<Namespace>`:
+let filter = ScannerFilter::new().with_namespace("tenant-a"); // &str works
+let filter = ScannerFilter::new().with_namespace(ns);          // Namespace works
+```
+
+`Namespace` is a `string_id!` newtype, so `From<&str>` / `From<String>`
+are infallible — no `TryInto` plumbing required. Existing
+`Namespace::new(s)` call sites still compile via the identity `From<Namespace>`.
+
+Source: PR #157.
+
 ## References
 
 - RFC-012 Stage 1a: type introduction (landed).
@@ -561,4 +628,10 @@ Source: PR #146 (in-flight); current pre-T1 shape
 - PR #147 — `Frame` gains `frame_type` + `correlation_id`.
 - PR #151 — `BackendError` seal; `SdkError::Valkey*` → `SdkError::Backend*`;
   HTTP wire-kind strings change.
+- PR #157 — DX polish: `ff_core::ScannerFilter` / `ff_core::backend::Namespace`
+  / `ff_backend_valkey::BackendConfig` re-exports +
+  `ScannerFilter::with_namespace: impl Into<Namespace>`.
+- PR #158 — Stage 1c T4: `FlowFabricWorker::client()` sealed to
+  `pub(crate)`; `read_stream` / `tail_stream` move onto `ClaimedTask`
+  (free fns reshape to `&dyn EngineBackend`).
 - `docs/rfc011-migration-for-consumers.md` — prior consumer migration.
