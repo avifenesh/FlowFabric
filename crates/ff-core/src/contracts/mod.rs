@@ -2500,6 +2500,41 @@ pub struct ListExecutionsResult {
     pub total_returned: usize,
 }
 
+// ─── list_lanes (issue #184) ───
+
+/// One page of lane ids returned by
+/// [`crate::engine_backend::EngineBackend::list_lanes`].
+///
+/// Lanes are global (not partition-scoped) — the backend enumerates
+/// every registered lane, sorts by [`LaneId`] name, and returns a
+/// `limit`-sized slice starting after `cursor` (exclusive).
+///
+/// `next_cursor` is `Some(last_lane_in_page)` when more pages remain
+/// and `None` when the caller has read the final page. Callers that
+/// want the full list loop until `next_cursor` is `None`, threading
+/// the previous page's `next_cursor` into the next call's `cursor`
+/// argument.
+///
+/// `#[non_exhaustive]` — FF may add fields (e.g. a `total` hint) in
+/// minor releases without a semver break.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListLanesPage {
+    /// The lanes in this page, sorted by [`LaneId`] name.
+    pub lanes: Vec<LaneId>,
+    /// Cursor for the next page (exclusive). `None` ⇒ final page.
+    pub next_cursor: Option<LaneId>,
+}
+
+impl ListLanesPage {
+    /// Construct a [`ListLanesPage`]. Present so downstream crates
+    /// (ff-backend-valkey's `list_lanes` impl) can assemble the
+    /// struct despite the `#[non_exhaustive]` marker.
+    pub fn new(lanes: Vec<LaneId>, next_cursor: Option<LaneId>) -> Self {
+        Self { lanes, next_cursor }
+    }
+}
+
 // ─── rotate_waitpoint_hmac_secret ───
 
 /// Args for `ff_rotate_waitpoint_hmac_secret`. Rotates the HMAC signing

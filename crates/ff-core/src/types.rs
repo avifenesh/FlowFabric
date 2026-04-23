@@ -432,7 +432,12 @@ string_id! {
 // system boundary instead of silently hashing them via the SoloPartitioner.
 
 /// Submission lane (queue-compatible ingress).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+///
+/// `PartialOrd` / `Ord` derive lexicographic order over the inner
+/// string — used by
+/// [`crate::engine_backend::EngineBackend::list_lanes`] to sort the
+/// `ff:idx:lanes` registry into a stable page order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct LaneId(pub String);
 
