@@ -398,6 +398,30 @@ match err {
 `ServerError::Backend` / `ServerError::BackendContext` in the same
 shape (source `crates/ff-server/src/server.rs:224,302,318`).
 
+Note: `BackendError` is an **enum** (not a struct), with a `Valkey`
+variant today. Consumers who prefer pattern-matching over the
+`.kind()` method accessor must name the enum variant explicitly —
+there is no `BackendError { kind, .. }` struct-destructure form:
+
+```rust
+use ff_sdk::{BackendError, BackendErrorKind, SdkError};
+
+match err {
+    SdkError::Backend(BackendError::Valkey { kind, .. }) => match kind {
+        BackendErrorKind::Transport => { /* retry */ }
+        BackendErrorKind::Timeout   => { /* retry */ }
+        // …
+        _ => { /* non_exhaustive wildcard */ }
+    },
+    _ => { /* … */ }
+}
+```
+
+`BackendError` is `#[non_exhaustive]` at the enum level; additional
+backend variants (beyond `Valkey`) may be added additively in future
+releases, so any direct-match site should include a wildcard arm on
+the outer enum as well.
+
 ### 10.2 Classifier rename: `valkey_kind()` → `backend_kind()`
 
 ```rust

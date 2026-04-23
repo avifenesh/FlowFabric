@@ -442,6 +442,48 @@ pub struct UsageDimensions {
     pub dedup_key: Option<String>,
 }
 
+impl UsageDimensions {
+    /// Create an empty usage report (all dimensions zero / `None`).
+    ///
+    /// Provided for external-crate consumers: `UsageDimensions` is
+    /// `#[non_exhaustive]`, so struct-literal and functional-update
+    /// construction are unavailable across crate boundaries. Start
+    /// from `new()` and chain `with_*` setters to build a report.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the input-token count dimension. Consumes and returns
+    /// `self` for chaining.
+    pub fn with_input_tokens(mut self, tokens: u64) -> Self {
+        self.input_tokens = tokens;
+        self
+    }
+
+    /// Set the output-token count dimension. Consumes and returns
+    /// `self` for chaining.
+    pub fn with_output_tokens(mut self, tokens: u64) -> Self {
+        self.output_tokens = tokens;
+        self
+    }
+
+    /// Set the wall-clock duration dimension, in milliseconds.
+    /// Consumes and returns `self` for chaining.
+    pub fn with_wall_ms(mut self, ms: u64) -> Self {
+        self.wall_ms = Some(ms);
+        self
+    }
+
+    /// Set the optional caller-supplied idempotency key. When set,
+    /// the backend rejects a repeat application of the same key with
+    /// `ReportUsageResult::AlreadyApplied` rather than double-counting
+    /// (RFC-012 §R7.4). Consumes and returns `self` for chaining.
+    pub fn with_dedup_key(mut self, key: impl Into<String>) -> Self {
+        self.dedup_key = Some(key.into());
+        self
+    }
+}
+
 // ── §3.3.0 Reclaim / lease types ────────────────────────────────────────
 
 /// Opaque cookie returned by the reclaim scanner; consumed by
@@ -1039,6 +1081,22 @@ mod tests {
         assert_eq!(u.clone(), u);
         assert_eq!(UsageDimensions::default().input_tokens, 0);
         assert_eq!(UsageDimensions::default().dedup_key, None);
+    }
+
+    #[test]
+    fn usage_dimensions_builder_chain() {
+        let u = UsageDimensions::new()
+            .with_input_tokens(10)
+            .with_output_tokens(20)
+            .with_wall_ms(150)
+            .with_dedup_key("k1");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.wall_ms, Some(150));
+        assert_eq!(u.dedup_key.as_deref(), Some("k1"));
+        assert!(u.custom.is_empty());
+        // `new()` is equivalent to `default()`.
+        assert_eq!(UsageDimensions::new(), UsageDimensions::default());
     }
 
     #[test]

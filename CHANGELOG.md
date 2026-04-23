@@ -195,6 +195,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`ff_backend_valkey::build_client`** is now `pub`. `FlowFabricWorker::connect`
   reuses it so the `BackendConfig` → `ferriskey::Client` mapping lives
   in exactly one place.
+- **`UsageDimensions` constructor + builder methods (ff-core):**
+  `UsageDimensions::new()` plus `with_input_tokens`, `with_output_tokens`,
+  `with_wall_ms`, `with_dedup_key` chaining setters. Mirrors the
+  `ScannerFilter::with_*` precedent — `UsageDimensions` is
+  `#[non_exhaustive]` so external crates cannot struct-literal
+  construct; `new()` + `with_*` is now the supported construction
+  path. Purely additive; existing `UsageDimensions::default()` call
+  sites continue to work.
 - **DX polish — re-exports + `ScannerFilter::with_namespace` ergonomics
   (HHH v0.3.4 re-smoke):** four additive papercut fixes for cairn's
   migration path.
