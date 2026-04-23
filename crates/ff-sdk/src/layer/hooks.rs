@@ -19,12 +19,13 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy, FailOutcome,
     FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint, ReclaimToken,
-    ResumeSignal, WaitpointSpec,
+    ResumeSignal,
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
     DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
+    SuspendArgs, SuspendOutcome,
 };
 use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
@@ -187,14 +188,9 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
     async fn suspend(
         &self,
         handle: &Handle,
-        waitpoints: Vec<WaitpointSpec>,
-        timeout: Option<Duration>,
-    ) -> Result<Handle, EngineError> {
-        with_hooks!(
-            self,
-            "suspend",
-            self.inner.suspend(handle, waitpoints, timeout).await
-        )
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        with_hooks!(self, "suspend", self.inner.suspend(handle, args).await)
     }
 
     async fn create_waitpoint(

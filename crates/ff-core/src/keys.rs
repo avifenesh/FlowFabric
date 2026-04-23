@@ -167,6 +167,19 @@ impl ExecKeyContext {
         format!("ff:sigdedup:{}:{}:{}", self.tag, wp_id, idempotency_key)
     }
 
+    /// `ff:dedup:suspend:{p:N}:<eid>:<idem_key>` — Suspend idempotency
+    /// guard (RFC-013 §2.2). Partition-scoped hash that stores a
+    /// serialized [`crate::contracts::SuspendOutcome`] when a caller
+    /// supplies `SuspendArgs::idempotency_key`; a retry within the TTL
+    /// window replays the first outcome verbatim without state
+    /// mutation.
+    pub fn suspend_dedup(&self, idempotency_key: &str) -> String {
+        format!(
+            "ff:dedup:suspend:{}:{}:{}",
+            self.tag, self.eid, idempotency_key
+        )
+    }
+
     // ── Flow Dependency — Execution-Local (RFC-007) ──
 
     /// `ff:exec:{p:N}:<eid>:deps:meta` — Dependency summary.

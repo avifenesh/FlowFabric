@@ -2916,3 +2916,409 @@ pub struct VerifyingKid {
     pub kid: String,
     pub expires_at_ms: i64,
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// RFC-013 Stage 1d: EngineBackend::suspend typed args + outcome
+// ═══════════════════════════════════════════════════════════════════════
+//
+// `SuspendExecutionArgs` / `SuspendExecutionResult` above remain the
+// wire-level Lua-ARGV mirror used by the backend serializer. The types
+// below are the public trait-surface shapes RFC-013 §2.2–§2.6 specifies.
+//
+// Every type in this block is `#[non_exhaustive]` per the RFC §2.2.1
+// memory-rule compliance note; each gets a constructor so external-crate
+// consumers can build them without struct-literal access.
+
+use crate::backend::WaitpointHmac;
+
+/// Partition-scoped idempotency key for retry-safe `EngineBackend::suspend`.
+///
+/// See RFC-013 §2.2 — when set on [`SuspendArgs::idempotency_key`], the
+/// backend dedups the call on `(partition, execution_id, idempotency_key)`
+/// and a second `suspend` with the same triple returns the first call's
+/// [`SuspendOutcome`] verbatim. Absent a key, `suspend` is NOT retry-
+/// idempotent; callers must describe-and-reconcile per §3.1.
+///
+/// Follows the `UsageDimensions::dedup_key` pattern — opaque to the
+/// engine, byte-compared at the partition scope.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IdempotencyKey(String);
+
+impl IdempotencyKey {
+    /// Construct from any stringy input. Empty strings are accepted;
+    /// the backend treats an empty key as "no dedup" at the serialize
+    /// step so `Some(IdempotencyKey::new(""))` is functionally the same
+    /// as `None`.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// Borrow the underlying string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for IdempotencyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// v1 signal-match predicate inside [`ResumeCondition::Single`].
+///
+/// RFC-013 §2.4 — `ByName(String)` matches a single concrete signal
+/// name; `Wildcard` matches any delivered signal. RFC-014 may extend
+/// (payload predicates, pattern matching) — `#[non_exhaustive]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SignalMatcher {
+    /// Match by exact signal name.
+    ByName(String),
+    /// Match any signal delivered to the waitpoint.
+    Wildcard,
+}
+
+/// RFC-013 reserves this enum slot so RFC-014 can define the concrete
+/// composition vocabulary (AllOf / AnyOf / Count over nested
+/// [`ResumeCondition`]s) without breaking RFC-013's trait surface.
+///
+/// RFC-013 ships an empty placeholder: the type is non-constructible
+/// outside this crate today. RFC-014 will add variants additively under
+/// the `#[non_exhaustive]` guard — consumers matching on
+/// [`ResumeCondition::Composite(_)`] today need a `_` catch-all in the
+/// inner arm anyway, so the future additions are source-compatible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum CompositeBody {
+    // RFC-014 populates this enum. The placeholder variant is private
+    // to ff-core so no external caller can construct it.
+    #[doc(hidden)]
+    #[serde(skip)]
+    __Reserved(std::marker::PhantomData<()>),
+}
+
+/// Declarative resume condition for [`SuspendArgs::resume_condition`].
+///
+/// RFC-013 §2.4 — typed replacement for the SDK's former
+/// `ConditionMatcher` / `resume_condition_json` pair.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ResumeCondition {
+    /// Single waitpoint-key match with a predicate. `matcher` is
+    /// evaluated against every signal delivered to `waitpoint_key`.
+    Single {
+        waitpoint_key: String,
+        matcher: SignalMatcher,
+    },
+    /// Operator-only resume — no signal satisfies; only an explicit
+    /// operator resume closes the waitpoint.
+    OperatorOnly,
+    /// Pure-timeout suspension. No signal satisfier; the waitpoint
+    /// resolves only via `timeout_behavior` at `timeout_at`. Requires
+    /// `SuspendArgs::timeout_at` to be `Some(_)` — otherwise the
+    /// Rust-side validator rejects as `timeout_only_without_deadline`.
+    TimeoutOnly,
+    /// Multi-condition composition; RFC-014 defines the body.
+    Composite(CompositeBody),
+}
+
+/// Where a satisfied suspension routes back to.
+///
+/// v1 ships only [`ResumeTarget::Runnable`] — execution returns to
+/// `runnable` and goes through normal scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ResumeTarget {
+    Runnable,
+}
+
+/// Resume-side policy carried alongside [`ResumeCondition`].
+///
+/// RFC-013 §2.5 — what happens when the condition is satisfied. Fields
+/// mirror the `resume_policy_json` the backend serializer writes to Lua
+/// (RFC-004 §Resume policy fields).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ResumePolicy {
+    pub resume_target: ResumeTarget,
+    pub consume_matched_signals: bool,
+    pub retain_signal_buffer_until_closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_delay_ms: Option<u64>,
+    pub close_waitpoint_on_resume: bool,
+}
+
+impl ResumePolicy {
+    /// Canonical v1 defaults (RFC-013 §2.2.1):
+    /// * `resume_target = Runnable`
+    /// * `consume_matched_signals = true`
+    /// * `retain_signal_buffer_until_closed = false`
+    /// * `resume_delay_ms = None`
+    /// * `close_waitpoint_on_resume = true`
+    pub fn normal() -> Self {
+        Self {
+            resume_target: ResumeTarget::Runnable,
+            consume_matched_signals: true,
+            retain_signal_buffer_until_closed: false,
+            resume_delay_ms: None,
+            close_waitpoint_on_resume: true,
+        }
+    }
+}
+
+/// Timeout behavior at the suspension deadline (RFC-004 §Timeout Behavior).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TimeoutBehavior {
+    Fail,
+    Cancel,
+    Expire,
+    AutoResumeWithTimeoutSignal,
+    /// v2 per RFC-004 Implementation Notes; enum slot present for
+    /// additive RFC-014/RFC-015 landing.
+    Escalate,
+}
+
+impl TimeoutBehavior {
+    /// Lua-side string encoding. Matches the wire values Lua's
+    /// `ff_expire_suspension` matches on.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Cancel => "cancel",
+            Self::Expire => "expire",
+            Self::AutoResumeWithTimeoutSignal => "auto_resume_with_timeout_signal",
+            Self::Escalate => "escalate",
+        }
+    }
+}
+
+/// Reason category for a suspension (RFC-004 §Suspension Reason Categories).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SuspensionReasonCode {
+    WaitingForSignal,
+    WaitingForApproval,
+    WaitingForCallback,
+    WaitingForToolResult,
+    WaitingForOperatorReview,
+    PausedByPolicy,
+    PausedByBudget,
+    StepBoundary,
+    ManualPause,
+}
+
+impl SuspensionReasonCode {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::WaitingForSignal => "waiting_for_signal",
+            Self::WaitingForApproval => "waiting_for_approval",
+            Self::WaitingForCallback => "waiting_for_callback",
+            Self::WaitingForToolResult => "waiting_for_tool_result",
+            Self::WaitingForOperatorReview => "waiting_for_operator_review",
+            Self::PausedByPolicy => "paused_by_policy",
+            Self::PausedByBudget => "paused_by_budget",
+            Self::StepBoundary => "step_boundary",
+            Self::ManualPause => "manual_pause",
+        }
+    }
+}
+
+/// Who requested the suspension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SuspensionRequester {
+    Worker,
+    Operator,
+    Policy,
+    SystemTimeoutPolicy,
+}
+
+impl SuspensionRequester {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Operator => "operator",
+            Self::Policy => "policy",
+            Self::SystemTimeoutPolicy => "system_timeout_policy",
+        }
+    }
+}
+
+/// How the waitpoint resource backing a [`SuspendArgs`] is obtained.
+///
+/// RFC-013 §2.2 — `Fresh` mints a new waitpoint as part of `suspend`;
+/// `UsePending` activates a waitpoint previously issued via
+/// `EngineBackend::create_waitpoint`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WaitpointBinding {
+    Fresh {
+        waitpoint_id: WaitpointId,
+        waitpoint_key: String,
+    },
+    UsePending {
+        waitpoint_id: WaitpointId,
+    },
+}
+
+impl WaitpointBinding {
+    /// Mint a fresh binding with a random `waitpoint_id` (UUID v4) and
+    /// `waitpoint_key = "wpk:<uuid>"`.
+    pub fn fresh() -> Self {
+        let wp_id = WaitpointId::new();
+        let key = format!("wpk:{wp_id}");
+        Self::Fresh {
+            waitpoint_id: wp_id,
+            waitpoint_key: key,
+        }
+    }
+
+    /// Construct a `UsePending` binding from a pending waitpoint
+    /// previously issued by `create_waitpoint`. The HMAC token is
+    /// resolved Lua-side from the partition's waitpoint hash at
+    /// `suspend` time (RFC-013 §5.1).
+    pub fn use_pending(pending: &crate::backend::PendingWaitpoint) -> Self {
+        Self::UsePending {
+            waitpoint_id: pending.waitpoint_id.clone(),
+        }
+    }
+}
+
+/// Trait-surface input to [`EngineBackend::suspend`] (RFC-013 §2.2).
+///
+/// Built via [`SuspendArgs::new`] + `with_*` setters; direct struct-
+/// literal construction across crate boundaries is not possible
+/// (`#[non_exhaustive]`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SuspendArgs {
+    pub suspension_id: SuspensionId,
+    pub waitpoint: WaitpointBinding,
+    pub resume_condition: ResumeCondition,
+    pub resume_policy: ResumePolicy,
+    pub reason_code: SuspensionReasonCode,
+    pub requested_by: SuspensionRequester,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_at: Option<TimestampMs>,
+    pub timeout_behavior: TimeoutBehavior,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_metadata_pointer: Option<String>,
+    pub now: TimestampMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl SuspendArgs {
+    /// Build a minimal `SuspendArgs` for a worker-originated suspension.
+    ///
+    /// Defaults: `requested_by = Worker`, `timeout_at = None`,
+    /// `timeout_behavior = Fail`, `continuation_metadata_pointer = None`,
+    /// `idempotency_key = None`. Override via `with_*` setters.
+    pub fn new(
+        suspension_id: SuspensionId,
+        waitpoint: WaitpointBinding,
+        resume_condition: ResumeCondition,
+        resume_policy: ResumePolicy,
+        reason_code: SuspensionReasonCode,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            suspension_id,
+            waitpoint,
+            resume_condition,
+            resume_policy,
+            reason_code,
+            requested_by: SuspensionRequester::Worker,
+            timeout_at: None,
+            timeout_behavior: TimeoutBehavior::Fail,
+            continuation_metadata_pointer: None,
+            now,
+            idempotency_key: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, at: TimestampMs, behavior: TimeoutBehavior) -> Self {
+        self.timeout_at = Some(at);
+        self.timeout_behavior = behavior;
+        self
+    }
+
+    pub fn with_requester(mut self, requester: SuspensionRequester) -> Self {
+        self.requested_by = requester;
+        self
+    }
+
+    pub fn with_continuation_metadata_pointer(mut self, p: String) -> Self {
+        self.continuation_metadata_pointer = Some(p);
+        self
+    }
+
+    pub fn with_idempotency_key(mut self, key: IdempotencyKey) -> Self {
+        self.idempotency_key = Some(key);
+        self
+    }
+}
+
+/// Shared "what happened on the waitpoint" payload carried in both
+/// [`SuspendOutcome`] variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SuspendOutcomeDetails {
+    pub suspension_id: SuspensionId,
+    pub waitpoint_id: WaitpointId,
+    pub waitpoint_key: String,
+    pub waitpoint_token: WaitpointHmac,
+}
+
+impl SuspendOutcomeDetails {
+    pub fn new(
+        suspension_id: SuspensionId,
+        waitpoint_id: WaitpointId,
+        waitpoint_key: String,
+        waitpoint_token: WaitpointHmac,
+    ) -> Self {
+        Self {
+            suspension_id,
+            waitpoint_id,
+            waitpoint_key,
+            waitpoint_token,
+        }
+    }
+}
+
+/// Trait-surface output from [`EngineBackend::suspend`] (RFC-013 §2.3).
+///
+/// Two variants encode the "lease released" vs "lease retained" split.
+/// See §2.3 for the runtime-enforcement semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SuspendOutcome {
+    /// The worker's pre-suspend handle is no longer lease-bearing; a
+    /// fresh `HandleKind::Suspended` handle supersedes it.
+    Suspended {
+        details: SuspendOutcomeDetails,
+        handle: crate::backend::Handle,
+    },
+    /// Buffered signals on a pending waitpoint already satisfied the
+    /// condition at suspension time; the lease is retained and the
+    /// caller's pre-suspend handle remains valid.
+    AlreadySatisfied { details: SuspendOutcomeDetails },
+}
+
+impl SuspendOutcome {
+    /// Borrow the shared details regardless of variant.
+    pub fn details(&self) -> &SuspendOutcomeDetails {
+        match self {
+            Self::Suspended { details, .. } => details,
+            Self::AlreadySatisfied { details } => details,
+        }
+    }
+}
+
+// `EngineBackend::suspend` type re-exports for `ff_core::backend::*`
+// consumers. The `backend` module re-exports these below so external
+// crates can reach them via the idiomatic `ff_core::backend` path that
+// already sources the other trait-surface types (RFC-013 §9.1).

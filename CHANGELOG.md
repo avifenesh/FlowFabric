@@ -167,6 +167,40 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`EngineBackend::suspend` is a typed trait method (RFC-013 Stage 1d,
+  #117).** The round-4 stub at `EngineError::Unavailable { op: "suspend" }`
+  is replaced by a real Valkey impl. The signature moves from
+  `(&Handle, Vec<WaitpointSpec>, Option<Duration>) -> Result<Handle, _>`
+  to `(&Handle, SuspendArgs) -> Result<SuspendOutcome, _>`, closing
+  RFC-012 §R7.6.1. The typed `SuspendArgs` carries a first-class
+  `ResumeCondition` (RFC-014 extends the `Composite` slot without
+  breaking this shape), `ResumePolicy`, `TimeoutBehavior`,
+  `SuspensionReasonCode`, `SuspensionRequester`, and optional
+  `IdempotencyKey` for retry-safe replay. The typed `SuspendOutcome`
+  encodes the `Suspended` / `AlreadySatisfied` split as an enum of
+  structs so the lease-released vs lease-retained branch is pattern-
+  matchable at the call site rather than gated on a nullable handle.
+  New public types in `ff_core::contracts` (re-exported through
+  `ff_core::backend` and `ff_sdk`): `SuspendArgs`, `SuspendOutcome`,
+  `SuspendOutcomeDetails`, `WaitpointBinding`, `ResumeCondition`,
+  `CompositeBody` (empty placeholder RFC-014 populates), `ResumePolicy`,
+  `ResumeTarget`, `TimeoutBehavior`, `SuspensionReasonCode`,
+  `SuspensionRequester`, `SignalMatcher`, `IdempotencyKey`. New
+  `StateKind::AlreadySatisfied` variant surfaces the strict-path
+  refusal of the early-satisfied branch. `ClaimedTask::suspend` is now
+  the strict wrapper returning `SuspendedHandle`; new
+  `ClaimedTask::try_suspend` + `ClaimedTask::try_suspend_on_pending`
+  return `TrySuspendOutcome`, retaining the `ClaimedTask` on
+  `AlreadySatisfied`. The SDK-internal `parse_suspend_result`,
+  `ConditionMatcher`, and SDK-local `TimeoutBehavior` / `SuspendOutcome`
+  types are removed; the wire contract is parsed in the backend and
+  the typed surface re-exported from `ff_core`. Lua
+  `ff_suspend_execution` grows one KEY (dedup hash, slot 18) and two
+  ARGV (`idempotency_key` slot 18, `dedup_ttl_ms` slot 19) for
+  partition-scoped retry dedup; the non-dedup path is byte-for-byte
+  unchanged. Library version bumped 16 → 17, forcing `FUNCTION LOAD
+  REPLACE` on upgrade.
+
 - **`EngineBackend::deliver_signal` + `EngineBackend::claim_resumed_execution`
   — trigger-surface trait methods (#150).** Two new core-feature-gated
   methods on `EngineBackend` that expose signal delivery and resumed-

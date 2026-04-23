@@ -15,7 +15,10 @@
 //!
 //! Run with: cargo test -p ff-test --test resume_signals_integration -- --test-threads=1
 
-use ff_sdk::task::{ConditionMatcher, Signal, SignalOutcome, SuspendOutcome, TimeoutBehavior};
+use ff_sdk::task::{
+    ResumeCondition, ResumePolicy, Signal, SignalMatcher, SignalOutcome, SuspensionReasonCode,
+    TimeoutBehavior,
+};
 use ff_test::fixtures::TestCluster;
 
 const LANE: &str = "resume-sig-lane";
@@ -125,23 +128,26 @@ async fn resume_signals_returns_single_matched_signal_with_payload() {
     let (eid, task) = create_and_claim(&tc, &worker, "single_sig").await;
 
     // Suspend with one matcher.
+    let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task
         .suspend(
-            "waiting_for_approve",
-            &[ConditionMatcher {
-                signal_name: "approve".into(),
-            }],
-            Some(60_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForApproval,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key.clone(),
+                matcher: SignalMatcher::ByName("approve".into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 60_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
         .await
         .unwrap();
-    let (waitpoint_id, _wp_key, token) = match outcome {
-        SuspendOutcome::Suspended { waitpoint_id, waitpoint_key, waitpoint_token, .. } => {
-            (waitpoint_id, waitpoint_key, waitpoint_token)
-        }
-        other => panic!("expected Suspended, got {other:?}"),
-    };
+    let waitpoint_id = outcome.details.waitpoint_id.clone();
+    let token = outcome.details.waitpoint_token.token().clone();
 
     // Deliver signal with a distinctive payload.
     let payload_bytes = b"approved by jane".to_vec();
@@ -184,6 +190,10 @@ async fn resume_signals_returns_single_matched_signal_with_payload() {
     task2.complete(None).await.unwrap();
 }
 
+// RFC-013 deferred multi-signal `all` / `any` composition to RFC-014's
+// `ResumeCondition::Composite(CompositeBody)`. This test is re-enabled
+// when RFC-014 lands.
+#[ignore = "pending RFC-014 Composite body"]
 #[tokio::test]
 #[serial_test::serial]
 async fn resume_signals_all_mode_returns_both_matchers() {
@@ -194,24 +204,29 @@ async fn resume_signals_all_mode_returns_both_matchers() {
 
     let (eid, task) = create_and_claim(&tc, &worker, "all_mode").await;
 
+    // RFC-014 will re-enable multi-matcher suspensions via
+    // `ResumeCondition::Composite`. For now the single-matcher shape
+    // keeps this test compiling under #[ignore].
+    let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task
         .suspend(
-            "waiting_for_both",
-            &[
-                ConditionMatcher { signal_name: "reviewer_a".into() },
-                ConditionMatcher { signal_name: "reviewer_b".into() },
-            ],
-            Some(60_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForApproval,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key,
+                matcher: SignalMatcher::ByName("reviewer_a".into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 60_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
         .await
         .unwrap();
-    let (waitpoint_id, _wp_key, token) = match outcome {
-        SuspendOutcome::Suspended { waitpoint_id, waitpoint_key, waitpoint_token, .. } => {
-            (waitpoint_id, waitpoint_key, waitpoint_token)
-        }
-        other => panic!("expected Suspended, got {other:?}"),
-    };
+    let waitpoint_id = outcome.details.waitpoint_id.clone();
+    let token = outcome.details.waitpoint_token.token().clone();
 
     // Deliver reviewer_a first — suspension must stay open ("all" mode
     // requires both matchers satisfied).
@@ -270,21 +285,26 @@ async fn resume_signals_payload_none_when_signal_payload_omitted() {
 
     let (eid, task) = create_and_claim(&tc, &worker, "no_payload").await;
 
+    let wp_key = format!("wpk:{}", uuid::Uuid::new_v4());
     let outcome = task
         .suspend(
-            "waiting_no_payload",
-            &[ConditionMatcher { signal_name: "ping".into() }],
-            Some(60_000),
-            TimeoutBehavior::Fail,
+            SuspensionReasonCode::WaitingForSignal,
+            ResumeCondition::Single {
+                waitpoint_key: wp_key,
+                matcher: SignalMatcher::ByName("ping".into()),
+            },
+            Some((
+                ff_core::types::TimestampMs::from_millis(
+                    ff_core::types::TimestampMs::now().0 + 60_000,
+                ),
+                TimeoutBehavior::Fail,
+            )),
+            ResumePolicy::normal(),
         )
         .await
         .unwrap();
-    let (waitpoint_id, _wp_key, token) = match outcome {
-        SuspendOutcome::Suspended { waitpoint_id, waitpoint_key, waitpoint_token, .. } => {
-            (waitpoint_id, waitpoint_key, waitpoint_token)
-        }
-        other => panic!("expected Suspended, got {other:?}"),
-    };
+    let waitpoint_id = outcome.details.waitpoint_id.clone();
+    let token = outcome.details.waitpoint_token.token().clone();
 
     let sig = Signal {
         signal_name: "ping".into(),
