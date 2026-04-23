@@ -462,9 +462,10 @@ impl EngineError {
     /// Retryable-on-transient-Valkey-error classification use
     /// `ff_script::engine_error_ext::class` which downcasts to
     /// `ScriptError` and delegates to `ScriptError::class`. ff-sdk's
-    /// public `SdkError::is_retryable` / `valkey_kind` methods wire
+    /// public `SdkError::is_retryable` / `backend_kind` methods wire
     /// the ff-script helper in so consumers retain the Phase-1
-    /// behavior transparently.
+    /// behavior transparently. (`backend_kind` was renamed from
+    /// `valkey_kind` in #88.)
     pub fn class(&self) -> ErrorClass {
         match self {
             Self::NotFound { .. } => ErrorClass::Terminal,
