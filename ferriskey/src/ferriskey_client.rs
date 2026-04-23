@@ -22,7 +22,15 @@ pub type Result<T> = crate::value::Result<T>;
 
 /// High-level Valkey client with convenience methods for common operations.
 #[derive(Clone)]
-pub struct Client(Arc<ClientInner>);
+pub struct Client {
+    inner: Arc<ClientInner>,
+    /// Original connection configuration used to produce `inner`.
+    /// Retained so [`Client::duplicate_connection`] can dial a second
+    /// independent multiplexed socket with identical TLS/auth/cluster
+    /// settings for callers that need to isolate long-blocking reads
+    /// (e.g. `XREAD BLOCK`) from the main multiplex.
+    request: Arc<ConnectionRequest>,
+}
 
 /// Builder for constructing a [`Client`] with custom connection options.
 pub struct ClientBuilder {
@@ -51,8 +59,11 @@ impl Client {
     /// Connect to a standalone Valkey server by URL.
     pub async fn connect(url: &str) -> Result<Client> {
         let request = connection_request_from_url(url, false)?;
-        let inner = ClientInner::new(request, None).await?;
-        Ok(Self(Arc::new(inner)))
+        let inner = ClientInner::new(request.clone(), None).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            request: Arc::new(request),
+        })
     }
 
     /// Connect to a Valkey cluster using one or more seed node URLs.
@@ -85,8 +96,11 @@ impl Client {
             request.addresses.push(node_address_from_addr(info.addr)?);
         }
 
-        let inner = ClientInner::new(request, None).await?;
-        Ok(Self(Arc::new(inner)))
+        let inner = ClientInner::new(request.clone(), None).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            request: Arc::new(request),
+        })
     }
 
     /// Get the value of a key, returning `None` if the key does not exist.
@@ -337,7 +351,31 @@ impl Client {
     /// plain `SCAN`) dispatch without introspecting the builder
     /// that produced this client.
     pub async fn is_cluster(&self) -> bool {
-        self.0.is_cluster().await
+        self.inner.is_cluster().await
+    }
+
+    /// Dial a second, independent multiplexed connection using the
+    /// same configuration (addresses, TLS, auth, cluster mode,
+    /// timeouts, retry strategy, ...) that produced this client.
+    ///
+    /// The returned `Client` does NOT share the internal multiplex
+    /// socket with `self`, so a long-running blocking command on
+    /// either client (e.g. `XREAD BLOCK`) cannot stall in-flight
+    /// commands on the other. Intended for callers that want to
+    /// isolate blocking reads from concurrent writes on the same
+    /// logical handle; drop the duplicate when the blocking
+    /// operation returns and the extra socket is released.
+    ///
+    /// Note: `push_sender`, if configured on the original builder,
+    /// is **not** propagated — the duplicate is a plain command
+    /// client.
+    pub async fn duplicate_connection(&self) -> Result<Client> {
+        let request = (*self.request).clone();
+        let inner = ClientInner::new(request.clone(), None).await?;
+        Ok(Client {
+            inner: Arc::new(inner),
+            request: Arc::new(request),
+        })
     }
 
     /// Cluster-wide `SCAN` driven by ferriskey's internal slot
@@ -362,14 +400,14 @@ impl Client {
         // Clone mirrors the pattern used by `execute`: ClientInner
         // needs `&mut self` for IAM token rotation; the clone is
         // cheap (Arc fields + atomics).
-        let mut inner = (*self.0).clone();
+        let mut inner = (*self.inner).clone();
         inner.cluster_scan_typed(scan_state, args).await
     }
 
     /// Start building an arbitrary command by name.
     pub fn cmd(&self, name: &str) -> CommandBuilder {
         CommandBuilder {
-            client: self.0.clone(),
+            client: self.inner.clone(),
             cmd: cmd(name),
         }
     }
@@ -378,7 +416,7 @@ impl Client {
     pub fn pipeline(&self) -> TypedPipeline {
         TypedPipeline {
             inner: crate::pipeline::Pipeline::new(),
-            client: self.0.clone(),
+            client: self.inner.clone(),
             results: Arc::new(std::sync::OnceLock::new()),
             next_index: 0,
         }
@@ -397,7 +435,7 @@ impl Client {
         // Refactoring send_command to &self would require changing
         // update_connection_password and the ValkeyClientForTests trait across the
         // codebase. The clone is cheap (Arc fields + atomics).
-        let mut inner = (*self.0).clone();
+        let mut inner = (*self.inner).clone();
         let value = inner.send_command(&mut cmd, None).await?;
         from_owned_value(value)
     }
@@ -634,8 +672,12 @@ impl ClientBuilder {
             )));
         }
 
-        let inner = ClientInner::new(self.request, self.push_sender).await?;
-        Ok(Client(Arc::new(inner)))
+        let request = self.request;
+        let inner = ClientInner::new(request.clone(), self.push_sender).await?;
+        Ok(Client {
+            inner: Arc::new(inner),
+            request: Arc::new(request),
+        })
     }
 
     /// Build a client that defers TCP connection until the first
@@ -735,7 +777,7 @@ impl crate::client::ValkeyClientForTests for LazyClient {
         use futures::FutureExt;
         async move {
             let client = self.connect().await?.clone();
-            let mut inner = (*client.0).clone();
+            let mut inner = (*client.inner).clone();
             inner.send_command(cmd, routing).await
         }
         .boxed()
@@ -797,8 +839,11 @@ impl LazyClient {
                 // provides the deferral.
                 let mut config = self.config.clone();
                 config.lazy_connect = false;
-                let inner = ClientInner::new(config, self.push_sender.clone()).await?;
-                Ok::<Client, Error>(Client(Arc::new(inner)))
+                let inner = ClientInner::new(config.clone(), self.push_sender.clone()).await?;
+                Ok::<Client, Error>(Client {
+                    inner: Arc::new(inner),
+                    request: Arc::new(config),
+                })
             })
             .await
     }

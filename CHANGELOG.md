@@ -36,6 +36,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`tail_stream` no longer head-of-line-blocks concurrent writes (#204).**
+  `ValkeyBackend::tail_stream` used to issue `XREAD BLOCK` on the shared
+  ferriskey multiplex, so a concurrent `append_frame`/`XADD` on the same
+  `ClaimedTask` would wait behind the blocking read — or, more commonly,
+  be misreported to the caller as `EngineError::Transport { source:
+  "timed out" }` when ferriskey's client request-timeout fired first.
+  `tail_stream_impl` now obtains a dedicated connection via a new
+  `ferriskey::Client::duplicate_connection()` method, runs the BLOCK on
+  that socket, and drops it on return. Writes on the shared client are
+  unaffected by blocking reads. Regression test:
+  `crates/ff-test/tests/issue_204_tail_stream_no_hol.rs`.
+
 - **`list_lanes` now reflects configured and dynamically-created lanes
   (#203).** `EngineBackend::list_lanes` reads `SMEMBERS ff:idx:lanes`,
   but before this fix no code path wrote to that SET — a

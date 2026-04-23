@@ -3003,10 +3003,13 @@ async fn read_stream_impl(
 /// Valkey XREAD BLOCK-backed stream tailer. See
 /// [`read_stream_impl`] for the migration rationale.
 ///
-/// Callers concerned with head-of-line blocking should build a
-/// dedicated `ValkeyBackend` backed by its own `ferriskey::Client` —
-/// the REST server's `tail_client` split in `ff-server` is the
-/// canonical pattern.
+/// Issues `XREAD BLOCK` on a **dedicated** ferriskey connection
+/// obtained via [`ferriskey::Client::duplicate_connection`] and
+/// drops that connection on return. This keeps the blocking read
+/// off the shared multiplex socket so concurrent non-blocking
+/// operations on the main client (e.g. `XADD` from
+/// `append_frame`) never wait on head-of-line blocking. Fixes
+/// GitHub issue #204.
 #[cfg(feature = "streaming")]
 #[tracing::instrument(
     name = "ff.tail_stream",
@@ -3031,8 +3034,19 @@ async fn tail_stream_impl(
     let stream_key = ctx.stream(attempt_index);
     let stream_meta_key = ctx.stream_meta(attempt_index);
 
+    // Dedicated socket for the blocking read — dropped when this
+    // function returns. Dialling a second connection fails only on
+    // genuine transport problems (refused, TLS handshake, auth);
+    // those are classified the same as any other transport error
+    // via `transport_script`.
+    let tail_client = client
+        .duplicate_connection()
+        .await
+        .map_err(ff_script::error::ScriptError::from)
+        .map_err(transport_script)?;
+
     ff_script::stream_tail::xread_block(
-        client,
+        &tail_client,
         &stream_key,
         &stream_meta_key,
         after.to_wire(),
