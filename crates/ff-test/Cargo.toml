@@ -21,6 +21,10 @@ ff-engine = { workspace = true }
 ff-scheduler = { workspace = true }
 ff-script = { workspace = true }
 ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
+# Promoted from dev-dependencies in #87 closure (Stage 1c tranche-4):
+# `TestCluster::backend()` minting lives in the fixtures library so
+# tests can exercise the trait-forwarded read_stream/tail_stream.
+ff-backend-valkey = { workspace = true }
 ferriskey = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
@@ -30,7 +34,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 ff-server = { workspace = true }
-ff-backend-valkey = { workspace = true }
 serial_test = "3"
 axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

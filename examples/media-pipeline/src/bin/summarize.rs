@@ -29,8 +29,8 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use ff_sdk::{
-    read_stream, ClaimedTask, ConditionMatcher, FlowFabricAdminClient, FlowFabricWorker,
-    StreamCursor, SuspendOutcome, TimeoutBehavior, WorkerConfig, STREAM_READ_HARD_CAP,
+    ClaimedTask, ConditionMatcher, FlowFabricAdminClient, FlowFabricWorker, StreamCursor,
+    SuspendOutcome, TimeoutBehavior, WorkerConfig, STREAM_READ_HARD_CAP,
 };
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -155,8 +155,6 @@ async fn main() -> anyhow::Result<()> {
                             engine.clone(),
                             args.max_new_tokens,
                             args.skip_approval,
-                            worker.client(),
-                            worker.partition_config(),
                         ).await {
                             tracing::error!(execution_id = %eid, error = %e, "task failed");
                         }
@@ -185,10 +183,8 @@ async fn handle(
     engine: Arc<Engine>,
     max_new_tokens: usize,
     skip_approval: bool,
-    client: &ferriskey::Client,
-    partition_config: &ff_core::partition::PartitionConfig,
 ) -> anyhow::Result<()> {
-    let persisted = load_persisted_result(&task, client, partition_config).await?;
+    let persisted = load_persisted_result(&task).await?;
 
     if persisted.is_some() {
         // Summary already generated in a prior attempt. Inspect the resume
@@ -279,20 +275,15 @@ async fn handle(
 /// O(tokens_generated_since_last_summary_final) for typical cases.
 async fn load_persisted_result(
     task: &ClaimedTask,
-    client: &ferriskey::Client,
-    partition_config: &ff_core::partition::PartitionConfig,
 ) -> anyhow::Result<Option<SummarizeResult>> {
-    let frames = read_stream(
-        client,
-        partition_config,
-        task.execution_id(),
-        task.attempt_index(),
-        StreamCursor::Start,
-        StreamCursor::End,
-        STREAM_READ_HARD_CAP,
-    )
-    .await
-    .context("read_stream for resume check")?;
+    let frames = task
+        .read_stream(
+            StreamCursor::Start,
+            StreamCursor::End,
+            STREAM_READ_HARD_CAP,
+        )
+        .await
+        .context("read_stream for resume check")?;
 
     let adapted: Vec<AdaptedFrame<'_>> = frames
         .frames
