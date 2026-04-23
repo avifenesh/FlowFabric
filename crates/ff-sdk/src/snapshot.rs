@@ -25,6 +25,7 @@
 
 use ff_core::contracts::{
     EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListFlowsPage, ListLanesPage,
+    ListSuspendedPage,
 };
 use ff_core::partition::{execution_partition, flow_partition, PartitionKey};
 use ff_core::types::{EdgeId, ExecutionId, FlowId, LaneId};
@@ -175,6 +176,29 @@ impl FlowFabricWorker {
         limit: usize,
     ) -> Result<ListLanesPage, SdkError> {
         Ok(self.backend_ref().list_lanes(cursor, limit).await?)
+    }
+
+    /// List suspended executions in one partition, cursor-paginated,
+    /// with each entry's suspension `reason_code` populated (issue
+    /// #183).
+    ///
+    /// Thin forwarder onto the bundled
+    /// [`EngineBackend::list_suspended`](ff_core::engine_backend::EngineBackend::list_suspended)
+    /// impl. `cursor = None` starts a fresh scan; feed the returned
+    /// [`ListSuspendedPage::next_cursor`] back in to page forward until
+    /// it returns `None`. See
+    /// [`ff_core::contracts::SuspendedExecutionEntry`] for the per-row
+    /// fields (including the free-form `reason` code).
+    pub async fn list_suspended(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListSuspendedPage, SdkError> {
+        Ok(self
+            .backend_ref()
+            .list_suspended(partition, cursor, limit)
+            .await?)
     }
 
     /// Resolve `exec_core.flow_id` via the trait and pin the RFC-011

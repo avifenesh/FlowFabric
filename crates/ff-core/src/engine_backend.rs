@@ -54,7 +54,9 @@ use crate::backend::{
 };
 use crate::contracts::{CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult};
 #[cfg(feature = "core")]
-use crate::contracts::{EdgeDirection, EdgeSnapshot, ListFlowsPage, ListLanesPage};
+use crate::contracts::{
+    EdgeDirection, EdgeSnapshot, ListFlowsPage, ListLanesPage, ListSuspendedPage,
+};
 #[cfg(feature = "core")]
 use crate::partition::PartitionKey;
 #[cfg(feature = "streaming")]
@@ -359,6 +361,40 @@ pub trait EngineBackend: Send + Sync + 'static {
         cursor: Option<LaneId>,
         limit: usize,
     ) -> Result<ListLanesPage, EngineError>;
+
+    /// List suspended executions in one partition, cursor-paginated,
+    /// with each entry's suspension `reason_code` populated (issue
+    /// #183).
+    ///
+    /// Consumer-facing "what's blocked on what?" panels (ff-board's
+    /// suspended-executions view, operator CLIs) need the reason in
+    /// the list response so the UI does not round-trip per row to
+    /// `describe_execution` for a field it knows it needs. `reason`
+    /// on [`SuspendedExecutionEntry`] carries the free-form
+    /// `suspension:current.reason_code` field — see the type rustdoc
+    /// for the String-not-enum rationale.
+    ///
+    /// `cursor` is opaque to callers; pass `None` to start a fresh
+    /// scan and feed the returned [`ListSuspendedPage::next_cursor`]
+    /// back in on subsequent pages until it comes back `None`.
+    /// `limit` bounds the `entries` count; backends MAY return fewer
+    /// when the partition is exhausted.
+    ///
+    /// Ordering is by ascending `suspended_at_ms` (the per-lane
+    /// suspended ZSET score == `timeout_at` or the no-timeout
+    /// sentinel) with execution id as a lex tiebreak, so cursor
+    /// continuation is deterministic across calls.
+    ///
+    /// Gated on the `core` feature — suspended-list enumeration is
+    /// part of the minimal engine surface a Postgres-style backend
+    /// must honour.
+    #[cfg(feature = "core")]
+    async fn list_suspended(
+        &self,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
+    ) -> Result<ListSuspendedPage, EngineError>;
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait
