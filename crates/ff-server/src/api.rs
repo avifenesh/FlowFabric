@@ -300,6 +300,99 @@ impl IntoResponse for ApiError {
                     },
                 )
             }
+            // RFC-017 Stage B: trait-dispatched handlers surface
+            // backend-pool pressure + shutdown races as typed
+            // EngineError variants. Map them to their REST status so
+            // the 429/503 contract preserved from the pre-Stage-B
+            // `ConcurrencyLimitExceeded` arm keeps holding across
+            // migrated handlers (`read_attempt_stream`,
+            // `tail_attempt_stream`, …).
+            ServerError::Engine(boxed) => {
+                use ff_core::engine_error::EngineError as EE;
+                // Peel context wrappers to find the root cause so the
+                // status mapping is stable regardless of nesting.
+                fn root(e: &EE) -> &EE {
+                    match e {
+                        EE::Contextual { source, .. } => root(source),
+                        other => other,
+                    }
+                }
+                match root(boxed) {
+                    EE::ResourceExhausted { pool, max, .. } => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ErrorBody {
+                            error: format!(
+                                "too many concurrent {pool} calls (server max: {max}); retry with backoff"
+                            ),
+                            kind: Some("resource_exhausted".into()),
+                            retryable: Some(true),
+                        },
+                    ),
+                    EE::Unavailable { op } => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorBody {
+                            error: format!("backend op unavailable: {op}"),
+                            kind: Some("unavailable".into()),
+                            retryable: Some(false),
+                        },
+                    ),
+                    EE::NotFound { entity } => (
+                        StatusCode::NOT_FOUND,
+                        ErrorBody::plain(format!("not found: {entity}")),
+                    ),
+                    // `EngineError::Validation` is caller-supplied-input
+                    // rejection (invalid waitpoint HMAC, oversize payload,
+                    // malformed capabilities, …). Before Stage A these
+                    // surfaced as `ServerError::InvalidInput` → 400; once
+                    // `deliver_signal` and friends migrated to trait
+                    // dispatch the same-semantics errors arrived as
+                    // `EngineError::Validation`. Preserve the 400.
+                    EE::Validation { kind, detail } => {
+                        use ff_core::engine_error::ValidationKind as VK;
+                        let code = match kind {
+                            VK::InvalidInput => "invalid_input",
+                            VK::CapabilityMismatch => "capability_mismatch",
+                            VK::InvalidCapabilities => "invalid_capabilities",
+                            VK::InvalidPolicyJson => "invalid_policy_json",
+                            VK::PayloadTooLarge => "payload_too_large",
+                            VK::SignalLimitExceeded => "signal_limit_exceeded",
+                            VK::InvalidWaitpointKey => "invalid_waitpoint_key",
+                            VK::InvalidToken => "invalid_token",
+                            VK::WaitpointNotTokenBound => "waitpoint_not_token_bound",
+                            VK::RetentionLimitExceeded => "retention_limit_exceeded",
+                            VK::InvalidLeaseForSuspend => "invalid_lease_for_suspend",
+                            VK::InvalidDependency => "invalid_dependency",
+                            VK::InvalidWaitpointForExecution => "invalid_waitpoint_for_execution",
+                            VK::InvalidBlockingReason => "invalid_blocking_reason",
+                            VK::InvalidOffset => "invalid_offset",
+                            VK::Unauthorized => "unauthorized",
+                            VK::InvalidBudgetScope => "invalid_budget_scope",
+                            VK::BudgetOverrideNotAllowed => "budget_override_not_allowed",
+                            VK::InvalidQuotaSpec => "invalid_quota_spec",
+                            VK::InvalidKid => "invalid_kid",
+                            VK::InvalidSecretHex => "invalid_secret_hex",
+                            VK::InvalidGraceMs => "invalid_grace_ms",
+                            VK::InvalidTagKey => "invalid_tag_key",
+                            VK::InvalidFrameType => "invalid_frame_type",
+                            _ => "validation_error",
+                        };
+                        let msg = if detail.is_empty() {
+                            code.to_string()
+                        } else {
+                            format!("{code}: {detail}")
+                        };
+                        (StatusCode::BAD_REQUEST, ErrorBody::plain(msg))
+                    }
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorBody {
+                            error: self.0.to_string(),
+                            kind: None,
+                            retryable: Some(self.0.is_retryable()),
+                        },
+                    ),
+                }
+            }
             // Script / Config / PartitionMismatch — developer or deployment
             // errors. No Valkey ErrorKind to surface, but retryable=false is
             // informative: a client-side retry won't change the outcome.

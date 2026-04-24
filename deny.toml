@@ -45,6 +45,9 @@ allow = [
     "CC0-1.0",
     # Permissive; covers webpki-root-certs and its peers.
     "CDLA-Permissive-2.0",
+    # Zlib — OSI-approved permissive license, GPL-compatible.
+    # Pulled transitively via foldhash (hashbrown → sqlx).
+    "Zlib",
 ]
 exceptions = []
 
