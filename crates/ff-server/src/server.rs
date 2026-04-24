@@ -1950,11 +1950,6 @@ fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
     }
 }
 
-/// Parse ff_report_usage_and_check result.
-/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
-///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
-
-
 /// Detect Valkey errors indicating the Lua function library is not loaded.
 ///
 /// After a failover, the new primary may not have the library if replication
@@ -1998,25 +1993,6 @@ async fn fcall_with_reload_on_client(
     }
 }
 
-/// Build the `ff_cancel_execution` KEYS (21) and ARGV (5) by pre-reading
-/// dynamic fields from `exec_core`. Shared by [`Server::cancel_execution`]
-/// and the async cancel_flow member-dispatch path.
-
-/// Backoff schedule for transient Valkey errors during async cancel_flow
-/// dispatch. Length = retry-attempt count (including the initial attempt).
-/// The last entry is not slept on because it's the final attempt.
-/// [`BackendErrorKind::is_retryable`].
-
-/// Cancel a single member execution from a cancel_flow dispatch context.
-/// Parses the flow-member EID string, builds the FCALL via the shared helper,
-/// and executes with the same reload-on-failover semantics as the inline path.
-///
-/// Wrapped in a bounded retry loop (see [`CANCEL_MEMBER_RETRY_DELAYS_MS`]) so
-/// that transient Valkey errors mid-dispatch (failover, `TryAgain`,
-/// `ClusterDown`, `IoError`, `FatalSendError`) do not silently leak
-/// non-cancelled members. `FatalReceiveError` and non-retryable kinds bubble
-/// up immediately — those either indicate the Lua ran server-side anyway or a
-/// permanent mismatch that retries cannot fix.
 /// Acknowledge that a member cancel has committed. Fires
 /// `ff_ack_cancel_member` on `{fp:N}` to SREM the execution from the
 /// flow's `pending_cancels` set and, if empty, ZREM the flow from the
@@ -2044,16 +2020,7 @@ async fn ack_cancel_member(
     }
 }
 
-/// Returns true if a cancel_member failure reflects an already-terminal
-/// (or never-existed) execution, which from the flow-cancel perspective
-/// is ack-worthy success rather than a partial failure. The Lua
-/// `ff_cancel_execution` function emits `execution_not_active` when the
-/// member is already in a terminal phase, and `execution_not_found` when
-/// the key is gone. Both codes arrive here wrapped in
-/// `ServerError::OperationFailed("ff_cancel_execution failed: <code>")`
-/// via `parse_cancel_result`.
-
-/// Engine-error variant of [`is_terminal_ack_error`]: inspects an
+/// Engine-error variant: inspects an
 /// `EngineError` returned from `self.backend.cancel_execution(...)`
 /// and returns `true` when the member is already terminal. Matches the
 /// Lua-code semantics of `execution_not_active` / `execution_not_found`
