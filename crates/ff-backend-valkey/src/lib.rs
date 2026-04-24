@@ -292,6 +292,36 @@ impl ValkeyBackend {
         Self::connect_inner(config, Some(metrics), "connect_with_metrics").await
     }
 
+    /// RFC-017 Stage A: static observability label identifying this
+    /// backend family in logs + metrics (see RFC §5.4 + §9 Stage A).
+    ///
+    /// Kept as an inherent method for Stage A per
+    /// `crates/ff-server/STAGE_A_SCOPE.md` ("Do NOT add new trait
+    /// methods"). RFC-017 §9 Stage A also specifies trait placement
+    /// with a `"unknown"` default — that lift lands in Stage B
+    /// together with `Server::shutdown` integration. The RFC-vs-scope
+    /// divergence is noted in the Stage A PR body.
+    pub fn backend_label(&self) -> &'static str {
+        "valkey"
+    }
+
+    /// RFC-017 Stage A: drain-before-shutdown hook for consumers that
+    /// own an `Arc<ValkeyBackend>`. Stage A is a **no-op** — the
+    /// stream semaphore + `tail_client` still live on `Server`
+    /// (RFC-017 §9 Stage B moves them here), so there is nothing
+    /// backend-scoped to close yet. Signature + call site land now so
+    /// the Stage B migration is additive.
+    ///
+    /// `grace` is accepted and ignored. When the primitives relocate
+    /// in Stage B, this impl closes `stream_semaphore`, awaits
+    /// in-flight permit drops up to `grace`, and maps a timeout to
+    /// `EngineError::Unavailable { op: "shutdown_prepare" }`.
+    ///
+    /// Like [`Self::backend_label`], kept inherent for Stage A.
+    pub async fn shutdown_prepare(&self, _grace: Duration) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     /// Encode the minimum set of attempt-cookie fields into a
     /// Valkey-tagged [`Handle`]. Stage 1b's `ClaimedTask::synth_handle`
     /// calls this on every trait-forwarder entry; Stage 1d will move
@@ -4629,5 +4659,49 @@ mod tests {
             .execute()
             .await
             .expect("PING on explicit-retry client");
+    }
+
+    // ── RFC-017 Stage A: backend_label + shutdown_prepare smoke ──
+    //
+    // Per `crates/ff-server/STAGE_A_SCOPE.md` §"Stage A CI gate":
+    //   assert_eq!(valkey.backend_label(), "valkey");
+    //   assert!(valkey.shutdown_prepare(Duration::from_secs(5)).await.is_ok());
+    // Live-Valkey dependency; `#[ignore]`-gated like the sibling
+    // live tests above. The MockBackend-backed parity tests in
+    // `crates/ff-server/tests/parity_stage_a.rs` cover the non-live
+    // path under the default `cargo test` invocation.
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn backend_label_reports_valkey() {
+        let cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        let client = build_client(&cfg)
+            .await
+            .expect("build_client for backend_label smoke");
+        let backend = ValkeyBackend::from_client_and_partitions(
+            client,
+            PartitionConfig::default(),
+        );
+        assert_eq!(backend.backend_label(), "valkey");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn shutdown_prepare_completes_within_grace() {
+        let cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        let client = build_client(&cfg)
+            .await
+            .expect("build_client for shutdown_prepare smoke");
+        let backend = ValkeyBackend::from_client_and_partitions(
+            client,
+            PartitionConfig::default(),
+        );
+        // Stage A is a no-op; must return Ok promptly well inside
+        // the 5s grace. Stage B tightens this to "within grace when
+        // loaded with 16 in-flight tails".
+        backend
+            .shutdown_prepare(Duration::from_secs(5))
+            .await
+            .expect("shutdown_prepare Ok on Stage A no-op impl");
     }
 }

@@ -87,6 +87,7 @@ async fn start_server(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         waitpoint_hmac_grace_ms: 86_400_000,
         max_concurrent_stream_ops: 64,
+        backend: ff_server::config::BackendKind::default(),
     };
     let server = ff_server::server::Server::start(config)
         .await

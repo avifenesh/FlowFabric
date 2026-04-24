@@ -6273,6 +6273,7 @@ async fn test_server() -> ff_server::server::Server {
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         waitpoint_hmac_grace_ms: 86_400_000,
         max_concurrent_stream_ops: 64,
+        backend: ff_server::config::BackendKind::default(),
     };
     ff_server::server::Server::start(server_config)
         .await
@@ -7324,6 +7325,7 @@ async fn test_system_engine_with_concurrent_scanners() {
                 "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             waitpoint_hmac_grace_ms: 86_400_000,
             max_concurrent_stream_ops: 64,
+        backend: ff_server::config::BackendKind::default(),
         }
     };
     let server = ff_server::server::Server::start(server_config)
