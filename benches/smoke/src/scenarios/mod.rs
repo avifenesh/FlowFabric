@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use ff_backend_postgres::PostgresBackend;
+use ff_backend_postgres::{PgPool, PostgresBackend};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::backend::BackendConfig;
 
@@ -52,7 +52,7 @@ pub const NAMES: &[&str] = &[
 /// path to `create_execution` without modifying the trait.
 pub async fn postgres_connect(
     url: &str,
-) -> Result<(Arc<dyn EngineBackend>, Arc<PostgresBackend>)> {
+) -> Result<(Arc<dyn EngineBackend>, Arc<PostgresBackend>, PgPool)> {
     use ff_core::backend::PostgresConnection;
     use sqlx::postgres::PgPoolOptions;
 
@@ -77,9 +77,9 @@ pub async fn postgres_connect(
         .acquire_timeout(conn.acquire_timeout)
         .connect(&conn.url)
         .await?;
-    let pg = PostgresBackend::from_pool(pool, ff_core::partition::PartitionConfig::default());
+    let pg = PostgresBackend::from_pool(pool.clone(), ff_core::partition::PartitionConfig::default());
 
-    Ok((trait_backend, pg))
+    Ok((trait_backend, pg, pool))
 }
 
 pub async fn run_all_valkey(ctx: Arc<SmokeCtx>) -> Vec<ScenarioReport> {
@@ -115,9 +115,9 @@ pub async fn run_all_valkey(ctx: Arc<SmokeCtx>) -> Vec<ScenarioReport> {
 
 pub async fn run_all_postgres(
     ctx: Arc<SmokeCtx>,
-    handles: Option<(Arc<dyn EngineBackend>, Arc<PostgresBackend>)>,
+    handles: Option<(Arc<dyn EngineBackend>, Arc<PostgresBackend>, PgPool)>,
 ) -> Vec<ScenarioReport> {
-    let Some((trait_backend, pg)) = handles else {
+    let Some((trait_backend, pg, pool)) = handles else {
         let started = Instant::now();
         return NAMES
             .iter()
@@ -133,13 +133,13 @@ pub async fn run_all_postgres(
     };
 
     vec![
-        claim_lifecycle::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
-        flow_anyof::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
+        claim_lifecycle::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone(), pool.clone()).await,
+        flow_anyof::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone(), pool.clone()).await,
         suspend_signal::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
         stream_durable_summary::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
         stream_best_effort::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
         cancel_cascade::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
-        fanout_slo::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone()).await,
+        fanout_slo::run_postgres(ctx.clone(), pg.clone(), trait_backend.clone(), pool.clone()).await,
     ]
 }
 
