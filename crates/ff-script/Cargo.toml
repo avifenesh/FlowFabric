@@ -49,7 +49,7 @@ valkey-client = ["dep:ferriskey"]
 # always-on surface (`contracts`, `keys`, `types`, `error`, `state`,
 # `partition`, `engine_error`); `core` is requested explicitly so the
 # dep stays correct if gates migrate onto those modules.
-ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.6.0", path = "../ff-core", default-features = false, features = ["core"] }
 # Issue #171: optional so `--no-default-features` drops the transport edge.
 ferriskey = { workspace = true, optional = true }
 serde_json = { workspace = true }

@@ -75,7 +75,7 @@ layer-circuit-breaker = ["dep:async-trait"]
 # future tranches will add trait methods + types requiring the Valkey
 # backend). The `valkey-default` feature re-enables them below for the
 # default build.
-ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.6.0", path = "../ff-core", default-features = false, features = ["core"] }
 # Issue #171: ff-script's defaults are empty — the `valkey-client`
 # feature (which owns the `ferriskey` dep edge) is activated below by
 # the `valkey-default` feature, NOT here. This keeps
