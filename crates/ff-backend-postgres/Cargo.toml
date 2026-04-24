@@ -1,0 +1,51 @@
+[package]
+name = "ff-backend-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "FlowFabric EngineBackend impl — Postgres backend (RFC-v0.7, Wave 0 scaffold)"
+
+[features]
+# Mirror ff-core's `core` + `streaming` features so the backend's
+# method-gate `#[cfg]`s line up with the trait surface. `core` is
+# default-on (ff-core's `core` is always-needed for the minimal
+# write surface; ff-backend-valkey takes the same stance via its
+# hard ff-core feature activation). `streaming` tracks ff-core's
+# `streaming` default.
+default = ["core", "streaming"]
+core = ["ff-core/core"]
+streaming = ["ff-core/streaming"]
+# Issue #154 — enable real OTEL metric emission via `ff-observability`.
+# Off by default; mirrors `ff-backend-valkey`.
+observability = ["ff-observability/enabled"]
+
+[dependencies]
+# Wave 0: `core`, `suspension`, `budget` match ff-backend-valkey's
+# ff-core feature set so the Postgres backend honours the same
+# `EngineBackend` method surface.
+ff-core = { version = "0.6.1", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
+# ff-script brings the typed `ScriptError` + result parsers the
+# trait surface already speaks. ff-script's `default = []` means
+# inheriting workspace-as-is already gives us `valkey-client=false`
+# — the Postgres backend does NOT activate ferriskey transitively.
+ff-script = { workspace = true }
+# Always-present observability shim (no-op unless `observability`
+# feature flips the shim to real OTEL). Mirrors ff-backend-valkey.
+ff-observability = { workspace = true }
+
+# Postgres transport. sqlx with tokio-rustls + the macros feature
+# (enables `sqlx::migrate!` compile-time migration loading).
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono"] }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

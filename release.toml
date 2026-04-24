@@ -3,7 +3,7 @@
 # This config drives `cargo release <level>` to perform a consolidated,
 # workspace-wide version bump across the publishable crates:
 #   ferriskey, ff-core, ff-script, ff-observability,
-#   ff-observability-http, ff-backend-valkey,
+#   ff-observability-http, ff-backend-valkey, ff-backend-postgres,
 #   ff-engine, ff-scheduler, ff-sdk, ff-server
 # The former telemetrylib sub-crate was inlined into ferriskey in
 # PR #18; it is no longer a separate publish target. ff-observability
