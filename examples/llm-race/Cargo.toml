@@ -1,0 +1,41 @@
+[workspace]
+
+[package]
+name = "llm-race-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "submit"
+path = "src/bin/submit.rs"
+
+[[bin]]
+name = "provider"
+path = "src/bin/provider.rs"
+
+[[bin]]
+name = "aggregator"
+path = "src/bin/aggregator.rs"
+
+[[bin]]
+name = "approve"
+path = "src/bin/approve.rs"
+
+[dependencies]
+ff-core = { path = "../../crates/ff-core" }
+ff-sdk = { path = "../../crates/ff-sdk" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
