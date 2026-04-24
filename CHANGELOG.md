@@ -5,7 +5,88 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-24
+
+RFC-017 Wave 8 — Postgres backend ships first-class. The `EngineBackend`
+trait expanded by ~17 methods across Waves 0–8, `ServerConfig` flattened
+into a sum-typed `BackendConfig`, and the v0.7 `/v1/pending-waitpoints`
+compatibility shim was retired. See
+[`docs/CONSUMER_MIGRATION_v0.8.md`](docs/CONSUMER_MIGRATION_v0.8.md) for
+the full migration guide and
+[`docs/POSTGRES_PARITY_MATRIX.md`](docs/POSTGRES_PARITY_MATRIX.md) for
+the v0.8.0 Postgres parity audit.
+
+### Breaking
+
+- **RFC-017 `EngineBackend` trait expansion.** ~17 methods added over
+  Waves 4–8 to cover the flow/attempt/budget/admin/completion families
+  on Postgres. Custom `EngineBackend` implementations must add the new
+  methods; `HookedBackend` / `PassthroughBackend` / `ValkeyBackend` /
+  `PostgresBackend` all carry in-tree impls.
+- **`ServerConfig` flat Valkey fields removed.** The deprecated
+  `host` / `port` / `tls` / `cluster` / `skip_library_load` fields on
+  `ServerConfig` are gone. Replaced by nested
+  `ServerConfig::valkey: ValkeyServerConfig` mirroring the existing
+  `ServerConfig::postgres: PostgresServerConfig` shape.
+- **`PendingWaitpointInfo` wire-shape change.** The
+  `/v1/executions/{id}/pending-waitpoints` response no longer carries a
+  raw `waitpoint_token` HMAC. Clients correlate via `(token_kid,
+  token_fingerprint)` alongside the other sanitised fields. The
+  `Deprecation: ff-017` response header was also removed.
+- **`ServerError` variant additions.** Additive variants landed across
+  Stages D1–E3 for Postgres-path error classification; `ServerError` is
+  `#[non_exhaustive]`, so consumers matching it must add a catch-all
+  arm if they haven't already.
+- **`ClaimPolicy::immediate()` removed / `ClaimPolicy::new` signature
+  change** (from the v0.7 cycle, published here). `ClaimPolicy` now
+  carries `worker_id`, `worker_instance_id`, `lease_ttl_ms`.
+  `ReclaimToken::new` gained the matching identity args.
+
 ### Added
+
+- **RFC-017 Stage E4: Postgres backend first-class over HTTP.**
+  `FF_BACKEND=postgres` boots natively — the v0.7-era
+  `FF_BACKEND_ACCEPT_UNREADY=1` / `FF_ENV=development` dev-override is
+  gone and `BACKEND_STAGE_READY` now lists both `valkey` and
+  `postgres`.
+- **`PostgresScheduler` + 6 reconcilers.** Stage E3 landed the
+  Postgres execution-dispatch scheduler plus the sibling-cancel,
+  lease-timeout, completion-listener, cancel-backlog, flow-staging,
+  and edge-group-policy reconcilers on top of the Wave 3 schema.
+- **`Server::start_with_backend`** — test-injection entry point that
+  accepts a constructed `EngineBackend` trait object, used by
+  `crates/ff-test/tests/http_postgres_smoke.rs` for the integration
+  smoke without a full env-var dance.
+- **`http_postgres_smoke` integration test** — end-to-end POST/GET
+  coverage of the HTTP API against a `PostgresBackend`, gated by the
+  `postgres-e2e` feature.
+- **New `docs/CONSUMER_MIGRATION_v0.8.md`** — upgrade guide for
+  `ServerConfig`, `PendingWaitpointInfo`, `FF_BACKEND=postgres`
+  setup, and the `EngineBackend` trait expansion.
+
+### Removed
+
+- `Server::client()` accessor / `Server::client` field.
+- `Server::fcall_with_reload` inherent.
+- `Server::scheduler` field (replaced by trait-routed dispatch).
+- Legacy `waitpoint_token` wire field on
+  `/v1/executions/{id}/pending-waitpoints`; the `Deprecation: ff-017`
+  response header; and the `ValkeyBackend::fetch_waitpoint_token_v07`
+  inherent + trait method. The
+  `ff_pending_waitpoint_legacy_token_served_total` and
+  `ff_backend_unready_boot_total` counters remain declared in
+  `ff-observability` for historical continuity but are no longer
+  emitted by the server.
+- Deprecated `ServerConfig` flat Valkey fields (see Breaking above).
+- `FF_BACKEND_ACCEPT_UNREADY` + `FF_ENV` dev-mode escape hatches on
+  the server boot path.
+
+### v0.7-cycle changes (shipped in 0.8.0)
+
+The following items landed during the v0.7 RFC cycle but did not get a
+point release of their own; they ship here.
+
+#### Added
 
 - **RFC-v0.7 Wave 4c: Postgres flow family (`EngineBackend`).**
   `PostgresBackend` now implements six flow-scoped trait methods over
