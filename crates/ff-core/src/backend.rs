@@ -1744,10 +1744,12 @@ mod tests {
     #[test]
     fn backend_config_valkey_ctor() {
         let c = BackendConfig::valkey("host.local", 6379);
-        // Same-crate match against an otherwise `#[non_exhaustive]`
-        // enum is irrefutable — no wildcard needed and `let-else`
-        // would trip `irrefutable_let_patterns`.
-        let BackendConnection::Valkey(v) = &c.connection;
+        // Wave 0 (#230) added `BackendConnection::Postgres`, so the
+        // match is no longer irrefutable. `let-else` keeps the test
+        // focused on the Valkey arm without a full `match`.
+        let BackendConnection::Valkey(v) = &c.connection else {
+            panic!("expected Valkey connection, got Postgres");
+        };
         assert_eq!(v.host, "host.local");
         assert_eq!(v.port, 6379);
         assert!(!v.tls);
