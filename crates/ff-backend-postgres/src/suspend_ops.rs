@@ -388,8 +388,9 @@ pub(crate) async fn suspend_impl(
             sqlx::query(
                 "INSERT INTO ff_suspension_current \
                    (partition_key, execution_id, suspension_id, suspended_at_ms, \
-                    timeout_at_ms, reason_code, condition, satisfied_set, member_map) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, '[]'::jsonb, '{}'::jsonb) \
+                    timeout_at_ms, reason_code, condition, satisfied_set, member_map, \
+                    timeout_behavior) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, '[]'::jsonb, '{}'::jsonb, $8) \
                  ON CONFLICT (partition_key, execution_id) DO UPDATE SET \
                    suspension_id = EXCLUDED.suspension_id, \
                    suspended_at_ms = EXCLUDED.suspended_at_ms, \
@@ -397,7 +398,8 @@ pub(crate) async fn suspend_impl(
                    reason_code = EXCLUDED.reason_code, \
                    condition = EXCLUDED.condition, \
                    satisfied_set = '[]'::jsonb, \
-                   member_map = '{}'::jsonb",
+                   member_map = '{}'::jsonb, \
+                   timeout_behavior = EXCLUDED.timeout_behavior",
             )
             .bind(part)
             .bind(exec_uuid)
@@ -406,6 +408,7 @@ pub(crate) async fn suspend_impl(
             .bind(args.timeout_at.map(|t| t.0))
             .bind(args.reason_code.as_wire_str())
             .bind(&condition_json)
+            .bind(args.timeout_behavior.as_wire_str())
             .execute(&mut **tx)
             .await
             .map_err(map_sqlx_error)?;
