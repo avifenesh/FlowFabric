@@ -207,6 +207,17 @@ impl From<ServerError> for ApiError {
     }
 }
 
+/// RFC-017 Stage C: handlers that dispatch through the backend trait
+/// surface `EngineError` directly. Wrap into the existing
+/// `ServerError::Engine(Box<EngineError>)` lane so the
+/// `IntoResponse` mapping downstream keeps one code path for
+/// `EngineError`-rooted responses.
+impl From<ff_core::engine_error::EngineError> for ApiError {
+    fn from(e: ff_core::engine_error::EngineError) -> Self {
+        Self(ServerError::Engine(Box::new(e)))
+    }
+}
+
 /// HTTP error body. `kind`/`retryable` are populated for 500s backed by
 /// a backend transport fault (see `ff_core::BackendErrorKind`) so HTTP
 /// clients (e.g. cairn-fabric) can make retry decisions without parsing
@@ -382,6 +393,127 @@ impl IntoResponse for ApiError {
                             format!("{code}: {detail}")
                         };
                         (StatusCode::BAD_REQUEST, ErrorBody::plain(msg))
+                    }
+                    // RFC-017 Stage C: operator-control + budget
+                    // paths surface domain-level conflicts (cycle,
+                    // dep-already-exists, rotation-kid-clash). 409
+                    // Conflict per RFC-010 §10.7.
+                    EE::Conflict(kind) => {
+                        use ff_core::engine_error::ConflictKind as CK;
+                        let code = match kind {
+                            CK::DependencyAlreadyExists { .. } => "dependency_already_exists",
+                            CK::CycleDetected => "cycle_detected",
+                            CK::SelfReferencingEdge => "self_referencing_edge",
+                            CK::ExecutionAlreadyInFlow => "execution_already_in_flow",
+                            CK::WaitpointAlreadyExists => "waitpoint_already_exists",
+                            CK::BudgetAttachConflict => "budget_attach_conflict",
+                            CK::QuotaAttachConflict => "quota_attach_conflict",
+                            CK::RotationConflict(_) => "rotation_conflict",
+                            CK::ActiveAttemptExists => "active_attempt_exists",
+                            _ => "conflict",
+                        };
+                        (
+                            StatusCode::CONFLICT,
+                            ErrorBody {
+                                error: format!("{code}: {kind:?}"),
+                                kind: Some(code.into()),
+                                retryable: Some(false),
+                            },
+                        )
+                    }
+                    // RFC-017 Stage C: retryable contention (lease
+                    // conflict, rate-limit, stale-grant). 409 preserves
+                    // the pre-migration `ServerError::OperationFailed
+                    // → 400` for most of these; we upgrade to 409 so
+                    // clients can distinguish domain-retryable from
+                    // input-validation 400s.
+                    EE::Contention(ck) => {
+                        use ff_core::engine_error::ContentionKind as CK;
+                        let (status, code, retryable) = match ck {
+                            CK::RetryExhausted => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "retry_exhausted",
+                                false,
+                            ),
+                            CK::RateLimitExceeded => (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "rate_limit_exceeded",
+                                true,
+                            ),
+                            CK::ConcurrencyLimitExceeded => (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "concurrency_limit_exceeded",
+                                true,
+                            ),
+                            _ => (StatusCode::CONFLICT, "contention", true),
+                        };
+                        (
+                            status,
+                            ErrorBody {
+                                error: format!("{code}: {ck:?}"),
+                                kind: Some(code.into()),
+                                retryable: Some(retryable),
+                            },
+                        )
+                    }
+                    // RFC-017 Stage C: legal-but-surprising state
+                    // transitions surfaced by the migrated operator-
+                    // control handlers. Most are benign no-ops that
+                    // the client should swallow; a handful are true
+                    // caller errors (ReplayNotAllowed, NotRunnable,
+                    // ExecutionNotTerminal).
+                    EE::State(sk) => {
+                        use ff_core::engine_error::StateKind as SK;
+                        let (status, code) = match sk {
+                            // Replay / non-terminal gating — caller
+                            // input gating error, 409.
+                            SK::ExecutionNotTerminal => {
+                                (StatusCode::CONFLICT, "execution_not_terminal")
+                            }
+                            SK::MaxReplaysExhausted => {
+                                (StatusCode::CONFLICT, "max_replays_exhausted")
+                            }
+                            SK::ReplayNotAllowed => {
+                                (StatusCode::CONFLICT, "replay_not_allowed")
+                            }
+                            SK::NotRunnable => (StatusCode::CONFLICT, "not_runnable"),
+                            SK::Terminal => (StatusCode::CONFLICT, "terminal"),
+                            SK::FlowAlreadyTerminal => {
+                                (StatusCode::CONFLICT, "flow_already_terminal")
+                            }
+                            // Budget / admission — 409 (breach) vs 200
+                            // (soft; kept client-returnable). Stage C
+                            // handlers don't currently emit these as
+                            // Errs (soft-breach arrives as
+                            // `ReportUsageResult::SoftBreach`), so
+                            // these arms are defensive.
+                            SK::BudgetExceeded => (StatusCode::CONFLICT, "budget_exceeded"),
+                            SK::BudgetSoftExceeded => {
+                                (StatusCode::CONFLICT, "budget_soft_exceeded")
+                            }
+                            // Benign no-ops — caller retried something
+                            // that already completed. Pre-migration
+                            // this surfaced as
+                            // `ServerError::OperationFailed` → 400;
+                            // 409 is the correct status for "you tried
+                            // to X but the system is already past X".
+                            SK::AlreadySatisfied
+                            | SK::DuplicateSignal
+                            | SK::OkAlreadyApplied
+                            | SK::AttemptAlreadyTerminal
+                            | SK::StreamAlreadyClosed
+                            | SK::LeaseExpired
+                            | SK::LeaseRevoked => (StatusCode::CONFLICT, "already_satisfied"),
+                            _ => (StatusCode::CONFLICT, "state_conflict"),
+                        };
+                        (
+                            status,
+                            ErrorBody {
+                                error: format!("{code}: {sk:?}"),
+                                kind: Some(code.into()),
+                                retryable: Some(false),
+                            },
+                        )
                     }
                     _ => (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -845,10 +977,15 @@ async fn cancel_execution(
     Path(id): Path<String>,
     AppJson(mut args): AppJson<CancelExecutionArgs>,
 ) -> Result<Json<CancelExecutionResult>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 2): dispatch through the
+    // backend trait. Pre-read + FCALL + parse live inside
+    // `ValkeyBackend::cancel_execution`. The inherent
+    // `Server::cancel_execution` was deleted with this migration;
+    // `cancel_flow_inner`'s internal dispatch keeps its own path.
     let path_eid = parse_execution_id(&id)?;
     check_id_match(&path_eid, &args.execution_id, "execution_id")?;
     args.execution_id = path_eid;
-    Ok(Json(server.cancel_execution(&args).await?))
+    Ok(Json(server.backend().cancel_execution(args).await?))
 }
 
 async fn deliver_signal(
@@ -946,24 +1083,51 @@ async fn change_priority(
     Path(id): Path<String>,
     AppJson(body): AppJson<ChangePriorityBody>,
 ) -> Result<Json<ChangePriorityResult>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 17): dispatch through trait.
     let eid = parse_execution_id(&id)?;
-    Ok(Json(server.change_priority(&eid, body.new_priority).await?))
+    let args = ff_core::contracts::ChangePriorityArgs {
+        execution_id: eid,
+        new_priority: body.new_priority,
+        // Empty lane triggers backend-internal HGET pre-read; wire
+        // format carries no lane field today (the ChangePriorityBody
+        // REST shape only has `new_priority`). Matches legacy
+        // `Server::change_priority` behaviour.
+        lane_id: LaneId::new(""),
+        now: ff_core::types::TimestampMs::now(),
+    };
+    Ok(Json(server.backend().change_priority(args).await?))
 }
 
 async fn replay_execution(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Json<ReplayExecutionResult>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 3 Hard — variadic KEYS
+    // pre-read lives inside `ValkeyBackend::replay_execution`).
     let eid = parse_execution_id(&id)?;
-    Ok(Json(server.replay_execution(&eid).await?))
+    let args = ff_core::contracts::ReplayExecutionArgs {
+        execution_id: eid,
+        now: ff_core::types::TimestampMs::now(),
+    };
+    Ok(Json(server.backend().replay_execution(args).await?))
 }
 
 async fn revoke_lease(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Json<RevokeLeaseResult>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 19).
     let eid = parse_execution_id(&id)?;
-    Ok(Json(server.revoke_lease(&eid).await?))
+    let args = ff_core::contracts::RevokeLeaseArgs {
+        execution_id: eid,
+        expected_lease_id: None,
+        // Empty WIID → backend HGET pre-read. Matches pre-migration
+        // shape where `Server::revoke_lease` read `current_worker_
+        // instance_id` off exec_core itself.
+        worker_instance_id: WorkerInstanceId::new(""),
+        reason: "operator_revoke".to_owned(),
+    };
+    Ok(Json(server.backend().revoke_lease(args).await?))
 }
 
 // ── Scheduler-routed claim (Batch C item 2 PR-B) ──
@@ -1060,18 +1224,35 @@ async fn claim_for_worker(
     let caps: std::collections::BTreeSet<String> =
         body.capabilities.into_iter().collect();
 
-    match server
-        .claim_for_worker(
-            &lane,
-            &worker_id,
-            &worker_instance_id,
-            &caps,
-            body.grant_ttl_ms,
+    // RFC-017 Stage C migration (§4 row 9 / §7): dispatch through
+    // the backend trait — `ValkeyBackend::claim_for_worker` forwards
+    // to its wired `ff_scheduler::Scheduler` handle.
+    let args = ff_core::contracts::ClaimForWorkerArgs::new(
+        lane,
+        worker_id,
+        worker_instance_id,
+        caps,
+        body.grant_ttl_ms,
+    );
+    match server.backend().claim_for_worker(args).await? {
+        ff_core::contracts::ClaimForWorkerOutcome::Granted(grant) => {
+            Ok((StatusCode::OK, Json(ClaimGrantDto::from(grant))).into_response())
+        }
+        ff_core::contracts::ClaimForWorkerOutcome::NoWork => {
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        // `ClaimForWorkerOutcome` is `#[non_exhaustive]` for additive
+        // variants (e.g. `BackPressured { retry_after_ms }`). Until
+        // such a variant lands, surface any new shape as 503 with a
+        // clear message pointing at the client-library version
+        // mismatch.
+        _ => Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody::plain(
+                "claim_for_worker: backend returned a non-exhaustive outcome this server build does not understand".to_owned(),
+            )),
         )
-        .await?
-    {
-        Some(grant) => Ok((StatusCode::OK, Json(ClaimGrantDto::from(grant))).into_response()),
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+            .into_response()),
     }
 }
 
@@ -1315,7 +1496,8 @@ async fn create_budget(
     State(server): State<Arc<Server>>,
     AppJson(args): AppJson<CreateBudgetArgs>,
 ) -> Result<(StatusCode, Json<CreateBudgetResult>), ApiError> {
-    let result = server.create_budget(&args).await?;
+    // RFC-017 Stage C migration (§4 row 7).
+    let result = server.backend().create_budget(args).await?;
     let status = match &result {
         CreateBudgetResult::Created { .. } => StatusCode::CREATED,
         CreateBudgetResult::AlreadySatisfied { .. } => StatusCode::OK,
@@ -1327,8 +1509,9 @@ async fn get_budget_status(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Json<BudgetStatus>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 7 — budget read).
     let bid = parse_budget_id(&id)?;
-    Ok(Json(server.get_budget_status(&bid).await?))
+    Ok(Json(server.backend().get_budget_status(&bid).await?))
 }
 
 #[derive(Deserialize)]
@@ -1344,31 +1527,37 @@ async fn report_usage(
     Path(id): Path<String>,
     AppJson(body): AppJson<ReportUsageBody>,
 ) -> Result<Json<ReportUsageResult>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 7 — admin path via
+    // `report_usage_admin`; no worker handle consumed).
     let bid = parse_budget_id(&id)?;
     let dims: Vec<String> = body.dimensions.keys().cloned().collect();
     let deltas: Vec<u64> = dims.iter().map(|d| body.dimensions[d]).collect();
-    let args = ReportUsageArgs {
-        dimensions: dims,
-        deltas,
-        now: body.now,
-        dedup_key: body.dedup_key,
-    };
-    Ok(Json(server.report_usage(&bid, &args).await?))
+    let mut args = ff_core::contracts::ReportUsageAdminArgs::new(dims, deltas, body.now);
+    if let Some(k) = body.dedup_key {
+        args = args.with_dedup_key(k);
+    }
+    Ok(Json(server.backend().report_usage_admin(&bid, args).await?))
 }
 
 async fn reset_budget(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Json<ResetBudgetResult>, ApiError> {
+    // RFC-017 Stage C migration (§4 row 7).
     let bid = parse_budget_id(&id)?;
-    Ok(Json(server.reset_budget(&bid).await?))
+    let args = ff_core::contracts::ResetBudgetArgs {
+        budget_id: bid,
+        now: ff_core::types::TimestampMs::now(),
+    };
+    Ok(Json(server.backend().reset_budget(args).await?))
 }
 
 async fn create_quota_policy(
     State(server): State<Arc<Server>>,
     AppJson(args): AppJson<CreateQuotaPolicyArgs>,
 ) -> Result<(StatusCode, Json<CreateQuotaPolicyResult>), ApiError> {
-    let result = server.create_quota_policy(&args).await?;
+    // RFC-017 Stage C migration (§4 row 7).
+    let result = server.backend().create_quota_policy(args).await?;
     let status = match &result {
         CreateQuotaPolicyResult::Created { .. } => StatusCode::CREATED,
         CreateQuotaPolicyResult::AlreadySatisfied { .. } => StatusCode::OK,

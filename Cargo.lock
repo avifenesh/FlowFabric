@@ -1017,6 +1017,7 @@ dependencies = [
  "ferriskey",
  "ff-core",
  "ff-observability",
+ "ff-scheduler",
  "ff-script",
  "futures",
  "futures-core",
