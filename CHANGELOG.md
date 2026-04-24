@@ -7,6 +7,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-v0.7 Wave 4c: Postgres flow family (`EngineBackend`).**
+  `PostgresBackend` now implements six flow-scoped trait methods over
+  the Wave 3 schema: `describe_flow`, `list_flows`, `list_edges`,
+  `describe_edge`, `cancel_flow`, and `set_edge_group_policy`.
+  `cancel_flow` runs a SERIALIZABLE cascade with a 3-attempt retry
+  loop (Q11); exhaustion surfaces as
+  `EngineError::Contention(ContentionKind::RetryExhausted)` so
+  consumers fall back to the cancel-backlog reconciler.
+- **`ContentionKind::RetryExhausted`** — additive pre-1.0 variant on
+  the `#[non_exhaustive]` `ContentionKind` enum. Classified as
+  `Retryable` via the existing blanket `Contention(_)` arm.
+
 - **RFC-v0.7 Wave 2: Valkey `EngineBackend::claim` +
   `claim_from_reclaim` implementations.** `ValkeyBackend::claim` now
   performs a fresh-find scan across execution partitions — ZRANGEBYSCORE

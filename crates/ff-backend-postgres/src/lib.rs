@@ -61,6 +61,7 @@ pub mod budget;
 pub mod completion;
 pub mod error;
 pub mod exec_core;
+pub mod flow;
 pub mod handle_codec;
 pub mod listener;
 pub mod migrate;
@@ -298,29 +299,29 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.describe_flow", skip_all)]
     async fn describe_flow(
         &self,
-        _id: &FlowId,
+        id: &FlowId,
     ) -> Result<Option<FlowSnapshot>, EngineError> {
-        unavailable("pg.describe_flow")
+        flow::describe_flow(&self.pool, &self.partition_config, id).await
     }
 
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.list_edges", skip_all)]
     async fn list_edges(
         &self,
-        _flow_id: &FlowId,
-        _direction: EdgeDirection,
+        flow_id: &FlowId,
+        direction: EdgeDirection,
     ) -> Result<Vec<EdgeSnapshot>, EngineError> {
-        unavailable("pg.list_edges")
+        flow::list_edges(&self.pool, &self.partition_config, flow_id, direction).await
     }
 
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.describe_edge", skip_all)]
     async fn describe_edge(
         &self,
-        _flow_id: &FlowId,
-        _edge_id: &EdgeId,
+        flow_id: &FlowId,
+        edge_id: &EdgeId,
     ) -> Result<Option<EdgeSnapshot>, EngineError> {
-        unavailable("pg.describe_edge")
+        flow::describe_edge(&self.pool, &self.partition_config, flow_id, edge_id).await
     }
 
     #[cfg(feature = "core")]
@@ -336,11 +337,11 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.list_flows", skip_all)]
     async fn list_flows(
         &self,
-        _partition: PartitionKey,
-        _cursor: Option<FlowId>,
-        _limit: usize,
+        partition: PartitionKey,
+        cursor: Option<FlowId>,
+        limit: usize,
     ) -> Result<ListFlowsPage, EngineError> {
-        unavailable("pg.list_flows")
+        flow::list_flows(&self.pool, partition, cursor, limit).await
     }
 
     #[cfg(feature = "core")]
@@ -405,22 +406,29 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.cancel_flow", skip_all)]
     async fn cancel_flow(
         &self,
-        _id: &FlowId,
-        _policy: CancelFlowPolicy,
-        _wait: CancelFlowWait,
+        id: &FlowId,
+        policy: CancelFlowPolicy,
+        wait: CancelFlowWait,
     ) -> Result<CancelFlowResult, EngineError> {
-        unavailable("pg.cancel_flow")
+        flow::cancel_flow(&self.pool, &self.partition_config, id, policy, wait).await
     }
 
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.set_edge_group_policy", skip_all)]
     async fn set_edge_group_policy(
         &self,
-        _flow_id: &FlowId,
-        _downstream_execution_id: &ExecutionId,
-        _policy: EdgeDependencyPolicy,
+        flow_id: &FlowId,
+        downstream_execution_id: &ExecutionId,
+        policy: EdgeDependencyPolicy,
     ) -> Result<SetEdgeGroupPolicyResult, EngineError> {
-        unavailable("pg.set_edge_group_policy")
+        flow::set_edge_group_policy(
+            &self.pool,
+            &self.partition_config,
+            flow_id,
+            downstream_execution_id,
+            policy,
+        )
+        .await
     }
 
     // ── Budget ──
