@@ -33,13 +33,15 @@
 //! * `POST /v1/flows/{id}/edges` × 2 → `backend.stage_dependency_edge`
 //! * `POST /v1/flows/{id}/edges/apply` × 2 → `backend.apply_dependency_to_child`
 //!
-//! **Deferred (NOT tested — architectural dependency on later stages):**
-//! * `POST /v1/flows/{id}/cancel` — `Server::cancel_flow_inner` still
-//!   calls the Valkey-only `fcall_with_reload` + `self.client.hmget` /
-//!   `smembers`. Stage **E2** lifts `cancel_flow` onto the trait.
-//! * `GET /v1/executions/{id}` / `.../state` / `.../result` — all use
-//!   `self.client.hgetall` / `hget` / `cmd("GET")`. Stage **E2**
-//!   removes the `Client` field + migrates these reads.
+//! **Deferred (NOT tested — Postgres impls land in Wave 9):**
+//! * `POST /v1/flows/{id}/cancel` — now dispatches through the
+//!   backend trait (`cancel_flow_header` + `ack_cancel_member`), but
+//!   Postgres returns `EngineError::Unavailable` for both methods
+//!   until Wave 9 lands the Postgres-side cancel machinery.
+//! * `GET /v1/executions/{id}` / `.../state` / `.../result` — now
+//!   dispatch through `read_execution_info` / `read_execution_state`
+//!   / `get_execution_result`. Postgres returns `Unavailable` for
+//!   each until the Postgres read-model migration lands.
 //! * `GET /v1/flows/{id}` — route does not exist today; adding it is
 //!   a separate ingress-read task post-E4.
 //! * `claim_for_worker` — scheduler is Valkey-only; Stage **E3** wires

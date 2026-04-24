@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferriskey::{Client, ClientBuilder, Value};
+use ferriskey::ClientBuilder;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use ff_core::engine_backend::EngineBackend;
@@ -19,9 +18,8 @@ use ff_core::contracts::{
     RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
-use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext};
 use ff_core::partition::{execution_partition, flow_partition, PartitionConfig};
-use ff_core::state::{PublicState, StateVector};
+use ff_core::state::PublicState;
 use ff_core::types::*;
 use ff_engine::Engine;
 use ff_script::retry::is_retryable_kind;
@@ -45,7 +43,6 @@ const ALREADY_TERMINAL_MEMBER_CAP: usize = 1000;
 /// Manages the Valkey connection, Lua library loading, background scanners,
 /// and provides a minimal API for Phase 1.
 pub struct Server {
-    client: Client,
     /// Server-wide Semaphore(1) gating admin rotate calls. Legitimate
     /// operators rotate ~monthly and can afford to serialize; concurrent
     /// rotate requests are an attack or misbehaving script. Holding the
@@ -345,9 +342,7 @@ impl Server {
         // `BACKEND_STAGE_READY` to include "postgres"; until then the
         // dev-mode override above is the only way in. On the Postgres
         // path we skip the Valkey-specific engine/scanner + scheduler
-        // construction entirely (E2/E3 wire the Postgres twins); the
-        // Server still holds a `Client` for unmigrated legacy read
-        // paths (retired in Stage E2).
+        // construction entirely (E3 wires the scheduler twin).
         if matches!(config.backend, BackendKind::Postgres) {
             return Self::start_postgres_branch(config, metrics).await;
         }
@@ -570,7 +565,6 @@ impl Server {
         let backend: Arc<dyn EngineBackend> = valkey_backend as Arc<dyn EngineBackend>;
 
         Ok(Self {
-            client,
             // Single-permit semaphore: only one rotate-waitpoint-secret can
             // be mid-flight server-wide. Attackers or misbehaving scripts
             // firing parallel rotations fail fast with 429 instead of
@@ -585,33 +579,26 @@ impl Server {
         })
     }
 
-    /// RFC-017 Wave 8 Stage E1: Postgres boot branch for
+    /// RFC-017 Wave 8 Stage E1/E2: Postgres boot branch for
     /// [`Server::start_with_metrics`]. Called after the §9.0 hard-gate
     /// admitted the boot under the dev-mode override.
     ///
-    /// **Scope (Stage E1):**
+    /// **Scope (Stage E2):**
     /// * Dial Postgres + wrap an `Arc<PostgresBackend>` as the
     ///   `backend` field (all migrated HTTP handlers dispatch through
     ///   the trait — create_execution / create_flow / add member /
-    ///   stage edge / apply dep / describe_flow / etc.).
-    /// * Dial Valkey too — the `Server` still holds a `client: Client`
-    ///   for unmigrated legacy paths (`get_execution_state`,
-    ///   `get_execution`, `cancel_flow_inner`'s idempotent HMGET /
-    ///   SMEMBERS follow-ups, `fetch_waitpoint_token_v07`). Those
-    ///   paths are not reachable in the Postgres HTTP smoke scenario,
-    ///   but the field type is `Client`-not-`Option<Client>` until
-    ///   Stage E2 lands the `cancel_flow` trait migration. **Valkey is
-    ///   dialed but `initialize_deployment` is skipped** — no Lua
-    ///   FUNCTION LOAD, no partition-config write, no HMAC install,
-    ///   no lanes SADD against Valkey on the Postgres path.
+    ///   stage edge / apply dep / describe_flow / cancel_flow / etc.).
+    /// * **No Valkey dial.** The E1 residual ambient-Valkey client is
+    ///   retired in E2 — `Server::client` is gone, `cancel_flow_header`
+    ///   / `ack_cancel_member` / `read_execution_info` /
+    ///   `read_execution_state` / `fetch_waitpoint_token_v07` all flow
+    ///   through the trait. Legacy reads that Postgres does not yet
+    ///   implement surface as `EngineError::Unavailable` (Wave 9).
     /// * Skip engine + scheduler. Stage E3 wires the Postgres-specific
     ///   `claim_for_worker` via the trait; until then the scheduler
-    ///   field stays `None` and `claim_for_worker` fails with a typed
-    ///   error (E3-deferred).
+    ///   field stays `None`.
     /// * Run `apply_migrations` against the Postgres pool so an empty
     ///   database becomes usable without operator out-of-band steps.
-    ///   This matches the Valkey path's `initialize_deployment`
-    ///   ergonomics; Stage E4 may hoist it behind an operator flag.
     async fn start_postgres_branch(
         config: ServerConfig,
         metrics: Arc<ff_observability::Metrics>,
@@ -623,7 +610,7 @@ impl Server {
         }
         tracing::info!(
             pool_size = config.postgres.pool_size,
-            "dialing Postgres backend (RFC-017 Stage E1)"
+            "dialing Postgres backend (RFC-017 Stage E2)"
         );
         let pg_backend_arc = ff_backend_postgres::PostgresBackend::connect_with_metrics(
             config.postgres_config(),
@@ -644,37 +631,15 @@ impl Server {
 
         let backend: Arc<dyn EngineBackend> = pg_backend_arc;
 
-        // Dial a Valkey client for the residual legacy fields. Stage
-        // E2 removes `Server::client: Client` and this dial goes away.
-        tracing::info!(
-            host = %config.host, port = config.port,
-            "dialing ambient Valkey client (Stage E1 residual for \
-             unmigrated legacy fields; retired in Stage E2)"
-        );
-        let mut builder = ClientBuilder::new()
-            .host(&config.host, config.port)
-            .connect_timeout(Duration::from_secs(10))
-            .request_timeout(Duration::from_millis(5000));
-        if config.tls {
-            builder = builder.tls();
-        }
-        if config.cluster {
-            builder = builder.cluster();
-        }
-        let client = builder
-            .build()
-            .await
-            .map_err(|e| crate::server::backend_context(e, "postgres-branch ambient Valkey connect"))?;
-
         tracing::info!(
             flow_partitions = config.partition_config.num_flow_partitions,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-            "FlowFabric server started (Postgres backend, Stage E1). \
-             Engine scanners skipped; scheduler skipped (Stage E3 pending)."
+            "FlowFabric server started (Postgres backend, Stage E2). \
+             Engine scanners skipped; scheduler skipped (Stage E3 pending). \
+             No ambient Valkey client."
         );
 
         Ok(Self {
-            client,
             admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             engine: None,
             config,
@@ -735,14 +700,16 @@ impl Server {
         &self.metrics
     }
 
-    // RFC-017 Stage D2 (§9 Stage D bullet): `Server::client()` accessor
-    // removed; external callers route ping / healthz through the
-    // backend trait (`self.backend.ping()` → `ValkeyBackend::ping`). The
-    // underlying `Client` remains on `Server` only to service the
-    // header-only `ff_cancel_flow` FCALL + its post-header SMEMBERS /
-    // HMGET follow-ups (the backend trait's `cancel_flow` does not yet
-    // surface the caller-supplied `reason`, so the Server-level header
-    // FCALL is preserved pending a trait-signature extension.)
+    // RFC-017 Stage E2 (§9 Stage D bullet completed): `Server::client()`
+    // accessor + underlying `Client` field both removed. External
+    // callers route ping / healthz through the backend trait
+    // (`self.backend.ping()` → `ValkeyBackend::ping`). The
+    // `ff_cancel_flow` header FCALL, its `flow_already_terminal`
+    // HMGET/SMEMBERS fallback, the per-member `ff_ack_cancel_member`
+    // backlog drain, and the `get_execution*` / `fetch_waitpoint_token_v07`
+    // reads are all reachable through the Stage E2 trait additions
+    // (`cancel_flow_header`, `ack_cancel_member`, `read_execution_info`,
+    // `read_execution_state`, `fetch_waitpoint_token_v07`).
 
     /// RFC-017 Stage D1 (§8): fetch the raw `<kid>:<hex>`
     /// `waitpoint_token` so the v0.7.x wire-format shim in
@@ -757,31 +724,13 @@ impl Server {
         execution_id: &ExecutionId,
         waitpoint_id: &WaitpointId,
     ) -> Result<Option<String>, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let token: Option<String> = self
-            .client
-            .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
-            .await
-            .map_err(|e| {
-                crate::server::backend_context(e, "fetch_waitpoint_token_v07: HGET waitpoint_token")
-            })?;
-        Ok(token.filter(|s| !s.is_empty()))
-    }
-
-    /// Execute an FCALL with automatic Lua library reload on "function not loaded".
-    ///
-    /// After a Valkey failover the new primary may not have the Lua library
-    /// loaded (replication lag or cold replica). This wrapper detects that
-    /// condition, reloads the library via `ff_script::loader::ensure_library`,
-    /// and retries the FCALL once.
-    async fn fcall_with_reload(
-        &self,
-        function: &str,
-        keys: &[&str],
-        args: &[&str],
-    ) -> Result<Value, ServerError> {
-        fcall_with_reload_on_client(&self.client, function, keys, args).await
+        // RFC-017 Stage E2: routed through the backend trait. The
+        // Valkey impl carries the HGET verbatim; Postgres returns
+        // Unavailable (it cannot reach this path at boot per §9.0).
+        Ok(self
+            .backend
+            .fetch_waitpoint_token_v07(execution_id, waitpoint_id)
+            .await?)
     }
 
     /// Get the server config.
@@ -823,24 +772,9 @@ impl Server {
         &self,
         execution_id: &ExecutionId,
     ) -> Result<PublicState, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-
-        let state_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "public_state")
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGET public_state"))?;
-
-        match state_str {
-            Some(s) => {
-                let quoted = format!("\"{s}\"");
-                serde_json::from_str(&quoted).map_err(|e| {
-                    ServerError::Script(format!(
-                        "invalid public_state '{s}' for {execution_id}: {e}"
-                    ))
-                })
-            }
+        // RFC-017 Stage E2: routed through the backend trait.
+        match self.backend.read_execution_state(execution_id).await? {
+            Some(s) => Ok(s),
             None => Err(ServerError::NotFound(format!(
                 "execution not found: {execution_id}"
             ))),
@@ -877,26 +811,11 @@ impl Server {
         &self,
         execution_id: &ExecutionId,
     ) -> Result<Option<Vec<u8>>, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-
-        // Binary-safe read. Decoding into `String` would reject any
-        // non-UTF-8 payload (bincode-encoded f32 vectors, compressed
-        // artifacts, arbitrary binary stages) with a ferriskey decode
-        // error that surfaces as HTTP 500. The endpoint response is
-        // already `application/octet-stream`; `Vec<u8>` has a
-        // ferriskey-specialized `FromValue` impl that preserves raw
-        // bytes without UTF-8 validation (see ferriskey/src/value.rs:
-        // `from_byte_vec`). Nil → None via the blanket
-        // `Option<T: FromValue>` wrapper.
-        let payload: Option<Vec<u8>> = self
-            .client
-            .cmd("GET")
-            .arg(ctx.result())
-            .execute()
-            .await
-            .map_err(|e| crate::server::backend_context(e, "GET exec result"))?;
-        Ok(payload)
+        // RFC-017 Stage E2: routed through the backend trait. The
+        // Valkey impl preserves binary-safe semantics via ferriskey's
+        // `Vec<u8>` FromValue; Postgres returns Unavailable until the
+        // result-store migration lands.
+        Ok(self.backend.get_execution_result(execution_id).await?)
     }
 
 
@@ -1052,7 +971,7 @@ impl Server {
     /// the shared background `JoinSet`. Rapid repeated calls against the
     /// same flow will spawn *multiple* overlapping dispatch tasks. This is
     /// not a correctness issue — each member cancel is idempotent and
-    /// terminal flows short-circuit via [`ParsedCancelFlow::AlreadyTerminal`]
+    /// terminal flows short-circuit via [`ff_core::contracts::CancelFlowHeader::AlreadyTerminal`]
     /// — but heavy burst callers should either use `?wait=true` (serialises
     /// the dispatch on the HTTP thread, giving natural backpressure) or
     /// implement client-side deduplication on `flow_id`. The `JoinSet` is
@@ -1097,104 +1016,56 @@ impl Server {
         args: &CancelFlowArgs,
         wait: bool,
     ) -> Result<CancelFlowResult, ServerError> {
-        let partition = flow_partition(&args.flow_id, &self.config.partition_config);
-        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
-        let fidx = FlowIndexKeys::new(&partition);
+        // RFC-017 Stage E2: the header FCALL + AlreadyTerminal fetch
+        // now dispatch through the backend trait. The Server no longer
+        // owns a ferriskey `Client`; `self.backend.cancel_flow_header`
+        // encapsulates the Valkey-specific FCALL + reload-on-failover
+        // + HMGET/SMEMBERS-for-AlreadyTerminal work previously inlined
+        // here.
+        let header = self.backend.cancel_flow_header(args.clone()).await?;
 
-        // Grace window before the reconciler may pick up this flow.
-        // Kept short because the in-process dispatch is fast and bounded;
-        // long enough to cover transport round-trips under load without
-        // the reconciler fighting the live dispatch.
-        const CANCEL_RECONCILER_GRACE_MS: u64 = 30_000;
-
-        // KEYS (5): flow_core, members_set, flow_index, pending_cancels, cancel_backlog
-        let fcall_keys: Vec<String> = vec![
-            fctx.core(),
-            fctx.members(),
-            fidx.flow_index(),
-            fctx.pending_cancels(),
-            fidx.cancel_backlog(),
-        ];
-
-        // ARGV (5): flow_id, reason, cancellation_policy, now_ms, grace_ms
-        let fcall_args: Vec<String> = vec![
-            args.flow_id.to_string(),
-            args.reason.clone(),
-            args.cancellation_policy.clone(),
-            args.now.to_string(),
-            CANCEL_RECONCILER_GRACE_MS.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_cancel_flow", &key_refs, &arg_refs)
-            .await?;
-
-        let (policy, members) = match parse_cancel_flow_raw(&raw)? {
-            ParsedCancelFlow::Cancelled { policy, member_execution_ids } => {
-                (policy, member_execution_ids)
-            }
+        let (policy, members) = match header {
+            ff_core::contracts::CancelFlowHeader::Cancelled {
+                cancellation_policy,
+                member_execution_ids,
+            } => (cancellation_policy, member_execution_ids),
             // Idempotent retry: flow was already cancelled/completed/failed.
-            // Return Cancelled with the *stored* policy and member list so
-            // observability tooling gets the real historical state rather
-            // than echoing the caller's retry intent. One HMGET + SMEMBERS
-            // on the idempotent path — both on {fp:N}, same slot.
-            ParsedCancelFlow::AlreadyTerminal => {
-                let flow_meta: Vec<Option<String>> = self
-                    .client
-                    .cmd("HMGET")
-                    .arg(fctx.core())
-                    .arg("cancellation_policy")
-                    .arg("cancel_reason")
-                    .execute()
-                    .await
-                    .map_err(|e| crate::server::backend_context(e, "HMGET flow_core cancellation_policy,cancel_reason"))?;
-                let stored_policy = flow_meta
-                    .first()
-                    .and_then(|v| v.as_ref())
-                    .filter(|s| !s.is_empty())
-                    .cloned();
-                let stored_reason = flow_meta
-                    .get(1)
-                    .and_then(|v| v.as_ref())
-                    .filter(|s| !s.is_empty())
-                    .cloned();
-                let all_members: Vec<String> = self
-                    .client
-                    .cmd("SMEMBERS")
-                    .arg(fctx.members())
-                    .execute()
-                    .await
-                    .map_err(|e| crate::server::backend_context(e, "SMEMBERS flow members (already terminal)"))?;
-                // Cap the returned list to avoid pathological bandwidth on
-                // idempotent retries for flows with 10k+ members. Clients
-                // already received the authoritative member list on the
-                // first (non-idempotent) call; subsequent retries just need
-                // enough to confirm the operation and trigger per-member
-                // polling if desired.
-                let total_members = all_members.len();
-                let stored_members: Vec<String> = all_members
+            // Return Cancelled with the *stored* policy + (capped) member
+            // list so observability tooling gets the real historical state
+            // rather than echoing the caller's retry intent. The backend
+            // has already done the HMGET + SMEMBERS; the Server just caps
+            // the member list to bound wire bandwidth.
+            ff_core::contracts::CancelFlowHeader::AlreadyTerminal {
+                stored_cancellation_policy,
+                stored_cancel_reason,
+                member_execution_ids,
+            } => {
+                let total_members = member_execution_ids.len();
+                let stored_members: Vec<String> = member_execution_ids
                     .into_iter()
                     .take(ALREADY_TERMINAL_MEMBER_CAP)
                     .collect();
                 tracing::debug!(
                     flow_id = %args.flow_id,
-                    stored_policy = stored_policy.as_deref().unwrap_or(""),
-                    stored_reason = stored_reason.as_deref().unwrap_or(""),
+                    stored_policy = stored_cancellation_policy.as_deref().unwrap_or(""),
+                    stored_reason = stored_cancel_reason.as_deref().unwrap_or(""),
                     total_members,
                     returned_members = stored_members.len(),
                     "cancel_flow: flow already terminal, returning idempotent Cancelled"
                 );
                 return Ok(CancelFlowResult::Cancelled {
-                    // Fall back to caller's policy only if the stored field
-                    // is missing (flows cancelled by older Lua that did not
-                    // persist cancellation_policy).
-                    cancellation_policy: stored_policy
+                    cancellation_policy: stored_cancellation_policy
                         .unwrap_or_else(|| args.cancellation_policy.clone()),
                     member_execution_ids: stored_members,
                 });
+            }
+            // `CancelFlowHeader` is `#[non_exhaustive]`. Any future
+            // variant must be reviewed at this match site before it
+            // reaches the wire; fall closed with a typed server error.
+            other => {
+                return Err(ServerError::OperationFailed(format!(
+                    "cancel_flow_header: unknown CancelFlowHeader variant: {other:?}"
+                )));
             }
         };
         let needs_dispatch = policy == "cancel_all" && !members.is_empty();
@@ -1206,23 +1077,17 @@ impl Server {
             });
         }
 
-        let pending_cancels_key = fctx.pending_cancels();
-        let cancel_backlog_key = fidx.cancel_backlog();
-
         if wait {
             // Synchronous dispatch — cancel every member inline before returning.
             // Collect per-member failures so the caller sees a
             // PartiallyCancelled outcome instead of a false-positive
-            // Cancelled when any member cancel faulted (ghost member,
-            // transport exhaustion, Lua reject). The cancel-backlog
-            // reconciler still retries the unacked members; surfacing
-            // the partial state lets operator tooling alert without
-            // polling per-member state.
-            // RFC-017 Stage D2 (§4 row 5): member-level cancel dispatches
-            // through the backend trait. Each `CancelExecutionArgs` carries
-            // the caller-supplied `reason` verbatim — the same payload the
-            // pre-migration `cancel_member_execution` handed to
-            // `ff_cancel_execution`.
+            // Cancelled when any member cancel faulted. The
+            // cancel-backlog reconciler still retries the unacked
+            // members; surfacing the partial state lets operator
+            // tooling alert without polling per-member state.
+            // RFC-017 Stage E2: ack drain dispatches via the backend
+            // trait's `ack_cancel_member` — the Server no longer owns
+            // a raw ferriskey `Client`.
             let mut failed: Vec<String> = Vec::new();
             for eid_str in &members {
                 let Ok(eid) = ExecutionId::parse(eid_str) else {
@@ -1230,7 +1095,7 @@ impl Server {
                     continue;
                 };
                 let cancel_args = ff_core::contracts::CancelExecutionArgs {
-                    execution_id: eid,
+                    execution_id: eid.clone(),
                     reason: args.reason.clone(),
                     source: ff_core::types::CancelSource::OperatorOverride,
                     lease_id: None,
@@ -1240,23 +1105,21 @@ impl Server {
                 };
                 match self.backend.cancel_execution(cancel_args).await {
                     Ok(_) => {
-                        ack_cancel_member(
-                            &self.client,
-                            &pending_cancels_key,
-                            &cancel_backlog_key,
+                        ack_cancel_member_via_backend(
+                            self.backend.as_ref(),
+                            &args.flow_id,
+                            &eid,
                             eid_str,
-                            &args.flow_id.to_string(),
                         )
                         .await;
                     }
                     Err(e) => {
                         if is_terminal_ack_engine_error(&e) {
-                            ack_cancel_member(
-                                &self.client,
-                                &pending_cancels_key,
-                                &cancel_backlog_key,
+                            ack_cancel_member_via_backend(
+                                self.backend.as_ref(),
+                                &args.flow_id,
+                                &eid,
                                 eid_str,
-                                &args.flow_id.to_string(),
                             )
                             .await;
                             continue;
@@ -1284,31 +1147,21 @@ impl Server {
             });
         }
 
-        // Asynchronous dispatch — spawn into the shared JoinSet so Server::shutdown
-        // can wait for pending cancellations (bounded by a shutdown timeout).
-        // RFC-017 Stage D2 (§4 row 5): dispatches via the backend trait's
-        // `cancel_execution`; `self.client` is still held for the backlog
-        // ack (`SREM pending_cancels + LREM cancel_backlog`) which is not
-        // yet on the trait surface.
+        // Asynchronous dispatch — spawn into the shared JoinSet so
+        // Server::shutdown can wait for pending cancellations (bounded
+        // by a shutdown timeout). RFC-017 Stage E2: both the
+        // per-member cancel and the backlog ack dispatch through the
+        // backend trait (the Server no longer holds a ferriskey handle).
         let backend = self.backend.clone();
-        let client = self.client.clone();
         let reason = args.reason.clone();
         let now = args.now;
         let dispatch_members = members.clone();
         let flow_id = args.flow_id.clone();
-        // Every async cancel_flow contends on this lock, but the critical
-        // section is tiny: try_join_next drain + spawn. Drain is amortized
-        // O(1) — each completed task is reaped exactly once across all
-        // callers, and spawn is synchronous. At realistic cancel rates the
-        // lock hold time is microseconds and does not bottleneck handlers.
+        // Every async cancel_flow contends on this lock, but the
+        // critical section is tiny: try_join_next drain + spawn.
         let mut guard = self.background_tasks.lock().await;
 
         // Reap completed background dispatches before spawning the next.
-        // Without this sweep, JoinSet accumulates Ok(()) results for every
-        // async cancel ever issued — a memory leak in long-running servers
-        // that would otherwise only drain on Server::shutdown. Surface any
-        // panicked/aborted dispatches via tracing so silent failures in
-        // cancel_member_execution are visible in logs.
         while let Some(joined) = guard.try_join_next() {
             if let Err(e) = joined {
                 tracing::warn!(
@@ -1318,17 +1171,8 @@ impl Server {
             }
         }
 
-        let pending_key_owned = pending_cancels_key.clone();
-        let backlog_key_owned = cancel_backlog_key.clone();
-        let flow_id_str = args.flow_id.to_string();
-
         guard.spawn(async move {
             // Bounded parallel dispatch via futures::stream::buffer_unordered.
-            // Sequential cancel of a 1000-member flow at ~2ms/FCALL is ~2s —
-            // too long to finish inside a 15s shutdown abort window for
-            // large flows. Bounding at CONCURRENCY keeps Valkey load
-            // predictable while still cutting wall-clock dispatch time by
-            // ~CONCURRENCY× for large member sets.
             use futures::stream::StreamExt;
             const CONCURRENCY: usize = 16;
 
@@ -1337,12 +1181,8 @@ impl Server {
             futures::stream::iter(dispatch_members)
                 .map(|eid_str| {
                     let backend = backend.clone();
-                    let client = client.clone();
                     let reason = reason.clone();
                     let flow_id = flow_id.clone();
-                    let pending = pending_key_owned.clone();
-                    let backlog = backlog_key_owned.clone();
-                    let flow_id_str = flow_id_str.clone();
                     async move {
                         let Ok(eid) = ExecutionId::parse(&eid_str) else {
                             tracing::warn!(
@@ -1353,7 +1193,7 @@ impl Server {
                             return;
                         };
                         let cancel_args = ff_core::contracts::CancelExecutionArgs {
-                            execution_id: eid,
+                            execution_id: eid.clone(),
                             reason: reason.clone(),
                             source: ff_core::types::CancelSource::OperatorOverride,
                             lease_id: None,
@@ -1363,23 +1203,21 @@ impl Server {
                         };
                         match backend.cancel_execution(cancel_args).await {
                             Ok(_) => {
-                                ack_cancel_member(
-                                    &client,
-                                    &pending,
-                                    &backlog,
+                                ack_cancel_member_via_backend(
+                                    backend.as_ref(),
+                                    &flow_id,
+                                    &eid,
                                     &eid_str,
-                                    &flow_id_str,
                                 )
                                 .await;
                             }
                             Err(e) => {
                                 if is_terminal_ack_engine_error(&e) {
-                                    ack_cancel_member(
-                                        &client,
-                                        &pending,
-                                        &backlog,
+                                    ack_cancel_member_via_backend(
+                                        backend.as_ref(),
+                                        &flow_id,
+                                        &eid,
                                         &eid_str,
-                                        &flow_id_str,
                                     )
                                     .await;
                                 } else {
@@ -1544,98 +1382,19 @@ impl Server {
         }
     }
 
-    /// Get full execution info via HGETALL on exec_core.
+    /// Get full execution info (HGETALL-shape on Valkey; SELECT-shape on
+    /// Postgres once Wave 9 wires it). RFC-017 Stage E2: routed through
+    /// the backend trait's [`ff_core::engine_backend::EngineBackend::read_execution_info`].
     pub async fn get_execution(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<ExecutionInfo, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-
-        let fields: HashMap<String, String> = self
-            .client
-            .hgetall(&ctx.core())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGETALL exec_core"))?;
-
-        if fields.is_empty() {
-            return Err(ServerError::NotFound(format!(
+        match self.backend.read_execution_info(execution_id).await? {
+            Some(info) => Ok(info),
+            None => Err(ServerError::NotFound(format!(
                 "execution not found: {execution_id}"
-            )));
+            ))),
         }
-
-        let parse_enum = |field: &str| -> String {
-            fields.get(field).cloned().unwrap_or_default()
-        };
-        fn deserialize<T: serde::de::DeserializeOwned>(field: &str, raw: &str) -> Result<T, ServerError> {
-            let quoted = format!("\"{raw}\"");
-            serde_json::from_str(&quoted).map_err(|e| {
-                ServerError::Script(format!("invalid {field} '{raw}': {e}"))
-            })
-        }
-
-        let lp_str = parse_enum("lifecycle_phase");
-        let os_str = parse_enum("ownership_state");
-        let es_str = parse_enum("eligibility_state");
-        let br_str = parse_enum("blocking_reason");
-        let to_str = parse_enum("terminal_outcome");
-        let as_str = parse_enum("attempt_state");
-        let ps_str = parse_enum("public_state");
-
-        let state_vector = StateVector {
-            lifecycle_phase: deserialize("lifecycle_phase", &lp_str)?,
-            ownership_state: deserialize("ownership_state", &os_str)?,
-            eligibility_state: deserialize("eligibility_state", &es_str)?,
-            blocking_reason: deserialize("blocking_reason", &br_str)?,
-            terminal_outcome: deserialize("terminal_outcome", &to_str)?,
-            attempt_state: deserialize("attempt_state", &as_str)?,
-            public_state: deserialize("public_state", &ps_str)?,
-        };
-
-        // Reader invariant (RFC-011 §7.3): `flow_id` on exec_core is
-        // stamped atomically with membership in `add_execution_to_flow`'s
-        // single FCALL. Empty iff the exec has no flow affinity (never
-        // called `add_execution_to_flow` — solo execs) — NOT "orphaned
-        // mid-two-phase" (that failure mode is retired). Filter on empty
-        // to surface "no flow affinity" distinctly from "flow X".
-        let flow_id_val = fields.get("flow_id").filter(|s| !s.is_empty()).cloned();
-
-        // started_at / completed_at come from the exec_core hash —
-        // lua/execution.lua writes them alongside the rest of the state
-        // vector. `created_at` is required; the other two are optional
-        // (pre-claim / pre-terminal reads) and elided when empty so the
-        // wire payload for in-flight executions stays the shape existing
-        // callers expect.
-        let started_at_opt = fields
-            .get("started_at")
-            .filter(|s| !s.is_empty())
-            .cloned();
-        let completed_at_opt = fields
-            .get("completed_at")
-            .filter(|s| !s.is_empty())
-            .cloned();
-
-        Ok(ExecutionInfo {
-            execution_id: execution_id.clone(),
-            namespace: parse_enum("namespace"),
-            lane_id: parse_enum("lane_id"),
-            priority: fields
-                .get("priority")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            execution_kind: parse_enum("execution_kind"),
-            state_vector,
-            public_state: deserialize("public_state", &ps_str)?,
-            created_at: parse_enum("created_at"),
-            started_at: started_at_opt,
-            completed_at: completed_at_opt,
-            current_attempt_index: fields
-                .get("current_attempt_index")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            flow_id: flow_id_val,
-            blocking_detail: parse_enum("blocking_detail"),
-        })
     }
 
     /// Partition-scoped forward-only cursor listing of executions.
@@ -1999,56 +1758,6 @@ impl Server {
 
 
 
-/// Outcome of parsing a raw `ff_cancel_flow` FCALL response.
-///
-/// Keeps `AlreadyTerminal` distinct from other script errors so the caller
-/// can treat cancel on an already-cancelled/completed/failed flow as
-/// idempotent success instead of surfacing a 400 to the client.
-enum ParsedCancelFlow {
-    Cancelled {
-        policy: String,
-        member_execution_ids: Vec<String>,
-    },
-    AlreadyTerminal,
-}
-
-/// Parse the raw `ff_cancel_flow` FCALL response.
-///
-/// Returns [`ParsedCancelFlow::Cancelled`] on success, [`ParsedCancelFlow::AlreadyTerminal`]
-/// when the flow was already in a terminal state (idempotent retry), or a
-/// [`ServerError`] for any other failure.
-fn parse_cancel_flow_raw(raw: &Value) -> Result<ParsedCancelFlow, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_cancel_flow: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_cancel_flow: bad status code".into())),
-    };
-    if status != 1 {
-        let error_code = fcall_field_str(arr, 1);
-        if error_code == "flow_already_terminal" {
-            return Ok(ParsedCancelFlow::AlreadyTerminal);
-        }
-        return Err(ServerError::OperationFailed(format!(
-            "ff_cancel_flow failed: {error_code}"
-        )));
-    }
-    // {1, "OK", cancellation_policy, member1, member2, ...}
-    let policy = fcall_field_str(arr, 2);
-    // Iterate to arr.len() rather than breaking on the first empty string —
-    // safer against malformed Lua responses and clearer than a sentinel loop.
-    let mut members = Vec::with_capacity(arr.len().saturating_sub(3));
-    for i in 3..arr.len() {
-        members.push(fcall_field_str(arr, i));
-    }
-    Ok(ParsedCancelFlow::Cancelled { policy, member_execution_ids: members })
-}
-
-
-
-
 
 /// Extract a string from an FCALL result array at the given index.
 /// Convert a `ScriptError` into a `ServerError` preserving `ferriskey::ErrorKind`
@@ -2070,81 +1779,25 @@ fn script_error_to_server(e: ff_script::error::ScriptError) -> ServerError {
     }
 }
 
-fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> String {
-    match arr.get(index) {
-        Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(Value::SimpleString(s))) => s.clone(),
-        Some(Ok(Value::Int(n))) => n.to_string(),
-        _ => String::new(),
-    }
-}
-
-/// Detect Valkey errors indicating the Lua function library is not loaded.
-///
-/// After a failover, the new primary may not have the library if replication
-/// was incomplete. Valkey returns `ERR Function not loaded` for FCALL calls
-/// targeting missing functions.
-fn is_function_not_loaded(e: &ferriskey::Error) -> bool {
-    if matches!(e.kind(), ferriskey::ErrorKind::NoScriptError) {
-        return true;
-    }
-    e.detail()
-        .map(|d| {
-            d.contains("Function not loaded")
-                || d.contains("No matching function")
-                || d.contains("function not found")
-        })
-        .unwrap_or(false)
-        || e.to_string().contains("Function not loaded")
-}
-
-/// Free-function form of [`Server::fcall_with_reload`] — callable from
-/// background tasks that own a cloned `Client` but no `&Server`.
-async fn fcall_with_reload_on_client(
-    client: &Client,
-    function: &str,
-    keys: &[&str],
-    args: &[&str],
-) -> Result<Value, ServerError> {
-    match client.fcall(function, keys, args).await {
-        Ok(v) => Ok(v),
-        Err(e) if is_function_not_loaded(&e) => {
-            tracing::warn!(function, "Lua library not found on server, reloading");
-            ff_script::loader::ensure_library(client)
-                .await
-                .map_err(ServerError::LibraryLoad)?;
-            client
-                .fcall(function, keys, args)
-                .await
-                .map_err(ServerError::from)
-        }
-        Err(e) => Err(ServerError::from(e)),
-    }
-}
-
-/// Acknowledge that a member cancel has committed. Fires
-/// `ff_ack_cancel_member` on `{fp:N}` to SREM the execution from the
-/// flow's `pending_cancels` set and, if empty, ZREM the flow from the
-/// partition-level `cancel_backlog`. Best-effort — failures are logged
-/// but not propagated, since the reconciler will catch anything that
-/// stays behind on its next pass.
-async fn ack_cancel_member(
-    client: &Client,
-    pending_cancels_key: &str,
-    cancel_backlog_key: &str,
+/// Acknowledge that a member cancel has committed. Delegates to
+/// [`EngineBackend::ack_cancel_member`] (Valkey: `ff_ack_cancel_member`
+/// FCALL on `{fp:N}` — SREM the execution from the flow's
+/// `pending_cancels` set and, if empty, ZREM the flow from the
+/// partition-level `cancel_backlog`). Best-effort — failures are
+/// logged but not propagated, since the reconciler drains any
+/// leftovers on its next pass.
+async fn ack_cancel_member_via_backend(
+    backend: &dyn EngineBackend,
+    flow_id: &FlowId,
+    execution_id: &ExecutionId,
     eid_str: &str,
-    flow_id: &str,
 ) {
-    let keys = [pending_cancels_key, cancel_backlog_key];
-    let args_v = [eid_str, flow_id];
-    let fut: Result<Value, _> =
-        client.fcall("ff_ack_cancel_member", &keys, &args_v).await;
-    if let Err(e) = fut {
+    if let Err(e) = backend.ack_cancel_member(flow_id, execution_id).await {
         tracing::warn!(
             flow_id = %flow_id,
             execution_id = %eid_str,
             error = %e,
-            "ff_ack_cancel_member failed; reconciler will drain on next pass"
+            "ack_cancel_member failed; reconciler will drain on next pass"
         );
     }
 }

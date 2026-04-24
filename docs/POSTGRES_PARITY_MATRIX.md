@@ -33,9 +33,16 @@ split into four PRs so each lands in a single session with CI-green:
   / `Server.scheduler` become `Option` (`None` on Postgres). Dev-mode
   override (`FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development`) still
   required; §9.0 hard-gate not yet flipped.
-- **E2** — full `cancel_flow` trait migration (lifts `cancel_flow_inner`
-  into `ValkeyBackend::cancel_flow_with_args`), `Server::client: Client`
-  field removal, `fcall_with_reload` removal.
+- **E2** (shipped, `impl/017-stage-e2`) — `cancel_flow` header + member-
+  ack migrated through the backend trait via new provided-default
+  methods (`cancel_flow_header`, `ack_cancel_member`), Valkey impls
+  porting the Server bodies verbatim (plus `read_execution_info`,
+  `read_execution_state`, `fetch_waitpoint_token_v07`);
+  `Server::client: Client` field + Postgres-branch ambient Valkey
+  dial + `fcall_with_reload` + `fcall_with_reload_on_client` +
+  `parse_cancel_flow_raw` + `is_function_not_loaded` + `fcall_field_str`
+  + standalone `ack_cancel_member` helper removed. Postgres path
+  touches no Valkey at all.
 - **E3** — `Server::claim_for_worker` trait cutover (Postgres-native
   scheduler), `Server::scheduler` field removal.
 - **E4** — v0.8.0 cleanup: deprecated flat Valkey `ServerConfig` fields
@@ -94,6 +101,11 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 | 16 | `list_pending_waitpoints` | `impl` | `stub` | **Landed Stage D1.** Pipelined SSCAN + 2× HMGET + §8 schema rewrite (HMAC redaction + `token_kid`/`token_fingerprint`) + `after`/`limit` pagination. HTTP handler wraps with the v0.7.x `Deprecation: ff-017` header and the raw `waitpoint_token` (fetched via the Valkey-only inherent `Server::fetch_waitpoint_token_v07`) for one-release deprecation warning. Postgres impl lands in Stage D2 (full parity gate). |
 | 17 | `ping` | `impl` | `impl` | Valkey: `PING`. Postgres: `SELECT 1`. |
 | 18 | `claim_for_worker` | `impl` | `stub` | **Landed Stage C.** `ff-backend-valkey` added `ff-scheduler` dep; `ValkeyBackend` holds `Option<Arc<ff_scheduler::Scheduler>>` wired at `ff-server` boot via `ValkeyBackend::with_scheduler` before the `Arc<dyn EngineBackend>` is sealed. Trait impl forwards to `Scheduler::claim_for_worker`; `SchedulerError::Config` maps to `EngineError::Validation`, Valkey transport errors via `transport_fk`. Backends without a wired scheduler (e.g. SDK-side `MockBackend`) surface `EngineError::Unavailable { op: "claim_for_worker (scheduler not wired on this ValkeyBackend)" }`. |
+| 19 | `cancel_flow_header` | `impl` | `stub` | **Landed Stage E2.** Valkey body runs `ff_cancel_flow` FCALL with the caller-supplied reason + cancellation_policy + now + grace window, surfaces `flow_already_terminal` as `CancelFlowHeader::AlreadyTerminal` (with stored policy/reason + full SMEMBERS of members) so the Server can return an idempotent `Cancelled` without re-doing the flip. FCALL-with-reload (post-failover Lua re-install via `ff_script::loader::ensure_library`) inlined on the Valkey impl. Postgres returns `Unavailable` until Wave 9. |
+| 20 | `ack_cancel_member` | `impl` | `stub` | **Landed Stage E2.** Valkey wraps `ff_ack_cancel_member` (SREM from `pending_cancels` + ZREM from `cancel_backlog` if empty). Called by `Server::cancel_flow_inner`'s sync + async dispatchers after each successful per-member cancel. Postgres returns `Unavailable` until Wave 9's cancel-backlog table write lands. |
+| 21 | `read_execution_info` | `impl` | `stub` | **Landed Stage E2.** Valkey body is HGETALL on `exec_core` + field-by-field parse into the legacy `ExecutionInfo` wire shape (`StateVector` with all 7 sub-states), preserving HTTP response bytes. Returns `Ok(None)` when the hash is empty. Postgres returns `Unavailable` until the read-model migration lands. |
+| 22 | `read_execution_state` | `impl` | `stub` | **Landed Stage E2.** Valkey body is HGET `public_state` on `exec_core` + JSON deserialize. Returns `Ok(None)` when the field is absent. Postgres returns `Unavailable`. |
+| 23 | `fetch_waitpoint_token_v07` | `impl` | `stub` | **Landed Stage E2 (relocated from Server).** Valkey body is HGET `waitpoint_token` on the exec's waitpoint hash. Filters empty strings to `None`. Retires at v0.8.0 with the legacy wire field. Postgres returns `Unavailable`. |
 
 **Cross-cutting (unconditional, landed pre-Stage-A):**
 
@@ -184,19 +196,26 @@ sequence anticipated.
   `&["valkey", "postgres"]`; `FF_BACKEND=postgres` boots successfully
   for the first time.
 
-### Remaining gaps for v0.8.0 (E1 honest-scope)
+### Remaining gaps for v0.8.0 (E2 honest-scope)
 
-The Stage E1 smoke deliberately avoided these HTTP routes because the
-server-side dispatch is still Valkey-bound:
+Stage E2 closes the `Server::client` removal and lifts `cancel_flow`
++ `get_execution*` + `fetch_waitpoint_token_v07` onto the backend
+trait (Valkey impls port the Server bodies verbatim; Postgres returns
+`Unavailable` for rows that land in Wave 9). The Stage E1 smoke still
+deliberately avoids the following HTTP routes because Postgres does
+not yet implement the underlying trait method:
 
-- **`POST /v1/flows/{id}/cancel`** — `Server::cancel_flow_inner` still
-  builds FCALL KEYS/ARGV and dispatches through `fcall_with_reload`;
-  the idempotent-retry path does `HMGET` / `SMEMBERS` on `self.client`
-  directly. **Stage E2** lifts `cancel_flow` onto the backend trait,
-  removes `Server::client: Client`, and retires `fcall_with_reload`.
-- **`GET /v1/executions/{id}` / `…/state` / `…/result`** — all three
-  use `self.client.hgetall` / `hget` / `cmd("GET")` on the legacy
-  Valkey client. Migrated as part of **Stage E2**'s field removal.
+- **`POST /v1/flows/{id}/cancel`** — the Server side now dispatches
+  through `backend.cancel_flow_header` + `backend.ack_cancel_member`;
+  both methods have Valkey impls but Postgres returns `Unavailable`
+  until Wave 9 lands the cancel machinery. Smoke remains Valkey-only.
+- **`GET /v1/executions/{id}` / `…/state`** — dispatch through
+  `backend.read_execution_info` / `backend.read_execution_state`;
+  Valkey impls port the HGETALL / HGET + parse logic. Postgres
+  default is `Unavailable` until the PG read-model lands.
+- **`GET /v1/executions/{id}/result`** — trait method `get_execution_result`
+  was already available; Valkey impl unchanged. Postgres returns
+  `Unavailable` until the result-store migration lands.
 - **`GET /v1/flows/{id}`** — this HTTP route does not exist today;
   callers infer flow state from member executions. Introducing it is
   an ingress-read task tracked post-E4.
@@ -215,11 +234,10 @@ server-side dispatch is still Valkey-bound:
   `FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development` through Stages E1-E3.
   Stage E4 flips `BACKEND_STAGE_READY` to include `"postgres"` and
   this requirement goes away.
-- **`Server::client: Client` on Postgres path** — the Stage E1
-  Postgres branch still dials an ambient Valkey client for the
-  residual legacy fields (`get_execution`, `get_execution_state`,
-  `get_execution_result`, `fetch_waitpoint_token_v07`,
-  `cancel_flow_inner`). That dial is not semantically meaningful for
-  Postgres-only deployments; it exists only because the field type is
-  `Client` not `Option<Client>`. **Stage E2** removes the field; the
-  ambient dial goes with it.
+- **`Server::client: Client` on Postgres path** — retired in
+  **Stage E2**. The Postgres branch of `Server::start_with_metrics`
+  no longer dials Valkey at all; the residual legacy-field paths all
+  flow through the `EngineBackend` trait, and Postgres returns
+  `Unavailable` for the methods whose impls land in Wave 9
+  (`cancel_flow_header`, `ack_cancel_member`, `read_execution_info`,
+  `read_execution_state`, `fetch_waitpoint_token_v07`).

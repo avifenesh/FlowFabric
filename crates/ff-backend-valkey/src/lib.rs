@@ -5678,6 +5678,329 @@ impl EngineBackend for ValkeyBackend {
             None => ff_core::contracts::ClaimForWorkerOutcome::no_work(),
         })
     }
+
+    // ── RFC-017 Stage E2 — `Server::client` removal (header + reads) ───
+
+    async fn cancel_flow_header(
+        &self,
+        args: CancelFlowArgs,
+    ) -> Result<ff_core::contracts::CancelFlowHeader, EngineError> {
+        use ff_core::contracts::CancelFlowHeader;
+
+        let partition = flow_partition(&args.flow_id, &self.partition_config);
+        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
+
+        // Grace window matches the Server's pre-E2 constant.
+        const CANCEL_RECONCILER_GRACE_MS: u64 = 30_000;
+
+        let fcall_keys: Vec<String> = vec![
+            fctx.core(),
+            fctx.members(),
+            fidx.flow_index(),
+            fctx.pending_cancels(),
+            fidx.cancel_backlog(),
+        ];
+        let fcall_args: Vec<String> = vec![
+            args.flow_id.to_string(),
+            args.reason.clone(),
+            args.cancellation_policy.clone(),
+            args.now.to_string(),
+            CANCEL_RECONCILER_GRACE_MS.to_string(),
+        ];
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        // FCALL with auto Lua-library reload on failover (previously in
+        // `ff-server::fcall_with_reload_on_client`).
+        let raw: ferriskey::Value = match self
+            .client
+            .fcall("ff_cancel_flow", &key_refs, &arg_refs)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if is_function_not_loaded_fk(&e) => {
+                tracing::warn!(
+                    function = "ff_cancel_flow",
+                    "Lua library not found on server, reloading"
+                );
+                ff_script::loader::ensure_library(&self.client)
+                    .await
+                    .map_err(|le| EngineError::Transport {
+                        backend: "valkey",
+                        source: Box::new(le),
+                    })?;
+                self.client
+                    .fcall("ff_cancel_flow", &key_refs, &arg_refs)
+                    .await
+                    .map_err(|e| ff_core::engine_error::backend_context(
+                        transport_fk(e),
+                        "cancel_flow_header: FCALL ff_cancel_flow (post reload)",
+                    ))?
+            }
+            Err(e) => {
+                return Err(ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "cancel_flow_header: FCALL ff_cancel_flow",
+                ));
+            }
+        };
+
+        // Parse the raw response. Shape:
+        //   {1, "OK", cancellation_policy, member1, member2, ...}  — success
+        //   {0, "flow_already_terminal", ...}                      — idempotent retry
+        let arr = match &raw {
+            ferriskey::Value::Array(arr) => arr,
+            _ => {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: "ff_cancel_flow: expected Array".into(),
+                });
+            }
+        };
+        let status = match arr.first() {
+            Some(Ok(ferriskey::Value::Int(n))) => *n,
+            _ => {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: "ff_cancel_flow: bad status code".into(),
+                });
+            }
+        };
+        fn field_str(arr: &[Result<ferriskey::Value, ferriskey::Error>], index: usize) -> String {
+            match arr.get(index) {
+                Some(Ok(ferriskey::Value::BulkString(b))) => {
+                    String::from_utf8_lossy(b).into_owned()
+                }
+                Some(Ok(ferriskey::Value::SimpleString(s))) => s.clone(),
+                Some(Ok(ferriskey::Value::Int(n))) => n.to_string(),
+                _ => String::new(),
+            }
+        }
+        if status != 1 {
+            let error_code = field_str(arr, 1);
+            if error_code != "flow_already_terminal" {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: format!("ff_cancel_flow failed: {error_code}"),
+                });
+            }
+            // Idempotent retry path: flow was already cancelled/completed/failed.
+            // Fetch stored policy/reason (HMGET on flow_core) + full membership
+            // (SMEMBERS on members_set) so the Server can return an
+            // idempotent `Cancelled` with the historical policy.
+            let flow_meta: Vec<Option<String>> = self
+                .client
+                .cmd("HMGET")
+                .arg(fctx.core())
+                .arg("cancellation_policy")
+                .arg("cancel_reason")
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "cancel_flow_header (AlreadyTerminal): HMGET flow_core cancellation_policy,cancel_reason",
+                ))?;
+            let stored_cancellation_policy = flow_meta
+                .first()
+                .and_then(|v| v.as_ref())
+                .filter(|s| !s.is_empty())
+                .cloned();
+            let stored_cancel_reason = flow_meta
+                .get(1)
+                .and_then(|v| v.as_ref())
+                .filter(|s| !s.is_empty())
+                .cloned();
+            let members: Vec<String> = self
+                .client
+                .cmd("SMEMBERS")
+                .arg(fctx.members())
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "cancel_flow_header (AlreadyTerminal): SMEMBERS flow members",
+                ))?;
+            return Ok(CancelFlowHeader::AlreadyTerminal {
+                stored_cancellation_policy,
+                stored_cancel_reason,
+                member_execution_ids: members,
+            });
+        }
+
+        // Success path: {1, "OK", cancellation_policy, member1, ...}.
+        let policy = field_str(arr, 2);
+        let mut members = Vec::with_capacity(arr.len().saturating_sub(3));
+        for i in 3..arr.len() {
+            members.push(field_str(arr, i));
+        }
+        Ok(CancelFlowHeader::Cancelled {
+            cancellation_policy: policy,
+            member_execution_ids: members,
+        })
+    }
+
+    async fn ack_cancel_member(
+        &self,
+        flow_id: &FlowId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        let partition = flow_partition(flow_id, &self.partition_config);
+        let fctx = FlowKeyContext::new(&partition, flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
+        let pending = fctx.pending_cancels();
+        let backlog = fidx.cancel_backlog();
+        let flow_id_str = flow_id.to_string();
+        let eid_str = execution_id.to_string();
+        let keys = [pending.as_str(), backlog.as_str()];
+        let args_v = [eid_str.as_str(), flow_id_str.as_str()];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_ack_cancel_member", &keys, &args_v)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "ack_cancel_member: FCALL ff_ack_cancel_member",
+            ))?;
+        Ok(())
+    }
+
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ff_core::contracts::ExecutionInfo>, EngineError> {
+        use ff_core::contracts::ExecutionInfo;
+        use ff_core::state::StateVector;
+        use std::collections::HashMap;
+
+        let partition = execution_partition(id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, id);
+        let fields: HashMap<String, String> = self
+            .client
+            .hgetall(&ctx.core())
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "read_execution_info: HGETALL exec_core",
+            ))?;
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let parse_enum = |field: &str| -> String {
+            fields.get(field).cloned().unwrap_or_default()
+        };
+        fn deserialize<T: serde::de::DeserializeOwned>(
+            field: &str,
+            raw: &str,
+        ) -> Result<T, EngineError> {
+            let quoted = format!("\"{raw}\"");
+            serde_json::from_str(&quoted).map_err(|e| EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("invalid {field} '{raw}': {e}"),
+            })
+        }
+        let lp_str = parse_enum("lifecycle_phase");
+        let os_str = parse_enum("ownership_state");
+        let es_str = parse_enum("eligibility_state");
+        let br_str = parse_enum("blocking_reason");
+        let to_str = parse_enum("terminal_outcome");
+        let as_str = parse_enum("attempt_state");
+        let ps_str = parse_enum("public_state");
+        let state_vector = StateVector {
+            lifecycle_phase: deserialize("lifecycle_phase", &lp_str)?,
+            ownership_state: deserialize("ownership_state", &os_str)?,
+            eligibility_state: deserialize("eligibility_state", &es_str)?,
+            blocking_reason: deserialize("blocking_reason", &br_str)?,
+            terminal_outcome: deserialize("terminal_outcome", &to_str)?,
+            attempt_state: deserialize("attempt_state", &as_str)?,
+            public_state: deserialize("public_state", &ps_str)?,
+        };
+        let flow_id_val = fields.get("flow_id").filter(|s| !s.is_empty()).cloned();
+        let started_at_opt = fields.get("started_at").filter(|s| !s.is_empty()).cloned();
+        let completed_at_opt = fields.get("completed_at").filter(|s| !s.is_empty()).cloned();
+        Ok(Some(ExecutionInfo {
+            execution_id: id.clone(),
+            namespace: parse_enum("namespace"),
+            lane_id: parse_enum("lane_id"),
+            priority: fields.get("priority").and_then(|v| v.parse().ok()).unwrap_or(0),
+            execution_kind: parse_enum("execution_kind"),
+            state_vector,
+            public_state: deserialize("public_state", &ps_str)?,
+            created_at: parse_enum("created_at"),
+            started_at: started_at_opt,
+            completed_at: completed_at_opt,
+            current_attempt_index: fields
+                .get("current_attempt_index")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            flow_id: flow_id_val,
+            blocking_detail: parse_enum("blocking_detail"),
+        }))
+    }
+
+    async fn read_execution_state(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ff_core::state::PublicState>, EngineError> {
+        let partition = execution_partition(id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, id);
+        let state_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "public_state")
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "read_execution_state: HGET public_state",
+            ))?;
+        match state_str {
+            Some(s) => {
+                let quoted = format!("\"{s}\"");
+                let parsed: ff_core::state::PublicState = serde_json::from_str(&quoted)
+                    .map_err(|e| EngineError::Validation {
+                        kind: ValidationKind::InvalidInput,
+                        detail: format!("invalid public_state '{s}': {e}"),
+                    })?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn fetch_waitpoint_token_v07(
+        &self,
+        execution_id: &ExecutionId,
+        waitpoint_id: &WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        let partition = execution_partition(execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let token: Option<String> = self
+            .client
+            .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "fetch_waitpoint_token_v07: HGET waitpoint_token",
+            ))?;
+        Ok(token.filter(|s| !s.is_empty()))
+    }
+}
+
+/// Detect Valkey errors indicating the Lua function library is not
+/// loaded (post-failover cold replica, etc.). Relocated from
+/// `ff-server::server::is_function_not_loaded` in Stage E2 alongside
+/// `cancel_flow_header`'s FCALL-with-reload wrapper.
+fn is_function_not_loaded_fk(e: &ferriskey::Error) -> bool {
+    if matches!(e.kind(), ferriskey::ErrorKind::NoScriptError) {
+        return true;
+    }
+    e.detail()
+        .map(|d| {
+            d.contains("Function not loaded")
+                || d.contains("No matching function")
+                || d.contains("function not found")
+        })
+        .unwrap_or(false)
+        || e.to_string().contains("Function not loaded")
 }
 
 // ── Stream read implementations (RFC-012 Stage 1c tranche-4; #87) ──
