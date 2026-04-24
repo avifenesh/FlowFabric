@@ -382,6 +382,31 @@ async fn dispatch_dependency_resolution_inner(
     }
 }
 
+/// Postgres-backend parallel to [`dispatch_dependency_resolution`].
+///
+/// Wave 5a (RFC-v0.7 migration-master Part 3 hotspot #1). Delegates
+/// to [`ff_backend_postgres::dispatch::dispatch_completion`], which
+/// implements the same cascade semantics as the Valkey
+/// `ff_resolve_dependency` FCALL but under the per-hop-transaction
+/// rule adjudicated in K-2 of the RFC round-2 debate: each
+/// downstream `ff_edge_group` advance runs in its own serializable
+/// tx so the cascade never holds a lock across transitive
+/// descendants.
+///
+/// The engine's dispatch loop picks this branch when the deployment
+/// configures the Postgres backend; the Valkey branch above stays
+/// untouched. Keyed on `event_id` (the `ff_completion_event`
+/// bigserial primary key), NOT on `execution_id`, so a replay of the
+/// same completion event short-circuits via the
+/// `dispatched_at_ms IS NULL` claim in the dispatcher.
+#[cfg(feature = "postgres")]
+pub async fn dispatch_via_postgres(
+    pool: &ff_backend_postgres::PgPool,
+    event_id: i64,
+) -> Result<ff_backend_postgres::dispatch::DispatchOutcome, ff_core::engine_error::EngineError> {
+    ff_backend_postgres::dispatch::dispatch_completion(pool, event_id).await
+}
+
 /// Check if an ff_resolve_dependency result indicates the child was
 /// skipped. Result shapes after Batch C item 3:
 ///   `[1, "OK", "already_resolved"]`            — 3 elements total

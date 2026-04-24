@@ -52,13 +52,18 @@ use ff_core::types::AttemptIndex;
 #[cfg(feature = "core")]
 use ff_core::types::EdgeId;
 use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
-use sqlx::PgPool;
+// Wave 5a — re-export `PgPool` so crates that depend on
+// `ff-backend-postgres` (and not `sqlx` directly) can name the pool
+// type in their own APIs (e.g. `ff-engine::dispatch_via_postgres`).
+pub use sqlx::PgPool;
 
 #[cfg(feature = "core")]
 mod admin;
 pub mod attempt;
 pub mod budget;
 pub mod completion;
+#[cfg(feature = "core")]
+pub mod dispatch;
 pub mod error;
 pub mod exec_core;
 pub mod flow;

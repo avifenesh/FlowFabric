@@ -15,6 +15,10 @@ description = "FlowFabric cross-partition dispatch and background scanners"
 # The `ff-observability` dep is always present (no-op shim compiles to
 # zero cost); the feature flips its backend to real OTEL.
 observability = ["ff-observability/enabled"]
+# Wave 5a: enable the Postgres dispatch branch in `partition_router`.
+# Pulls `ff-backend-postgres` as a direct dep. OFF by default; the
+# Valkey-only build stays lean.
+postgres = ["dep:ff-backend-postgres"]
 
 [dependencies]
 ff-core = { workspace = true }
@@ -24,3 +28,6 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Wave 5a: Postgres dispatch delegate. Activated by `postgres`
+# feature only; stays out of the Valkey-only dep graph.
+ff-backend-postgres = { workspace = true, optional = true }
