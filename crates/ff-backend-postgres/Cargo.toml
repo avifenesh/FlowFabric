@@ -51,5 +51,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
+# Wave 4 Agent D (suspend + signal): Rust-side HMAC sign/verify for
+# waitpoint tokens. First server-side HMAC code in the workspace
+# (Valkey backend signs inside Lua). Deliberately scoped to this
+# crate rather than ff-core so parallel Wave-4 agents don't re-lint
+# ff-core's dep graph mid-flight; future refactor can hoist.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
