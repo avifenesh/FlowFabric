@@ -7,6 +7,7 @@ pub mod contracts;
 pub mod engine_backend;
 pub mod engine_error;
 pub mod error;
+pub mod handle_codec;
 pub mod hash;
 pub mod keys;
 pub mod partition;

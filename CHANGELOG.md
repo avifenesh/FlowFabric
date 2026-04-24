@@ -44,6 +44,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   subset semantics, same empty-required-matches-any default). Token
   validation and `CAPS_MAX_{BYTES,TOKENS}` bounds stay at the existing
   ingress sites. Ref: RFC-v0.7 §Q7, PR #230 (Wave 0 scaffold).
+- **RFC-v0.7 Wave 1c: `Handle.opaque` codec moved to
+  `ff_core::handle_codec` with embedded `BackendTag`.** The
+  byte-layout / wire-version logic that previously lived at
+  `ff_backend_valkey::handle_codec` is now a public module in
+  `ff_core` so the future Postgres backend decodes the same shape.
+  New wire format v2 prefixes the buffer with a `0x02` magic byte +
+  one-byte wire version + one-byte `BackendTag` so cross-backend
+  migration tooling can detect which backend minted a given handle
+  without parsing the payload. Pre-Wave-1c (v1) Valkey handles still
+  decode cleanly under `BackendTag::Valkey` via a compat path keyed
+  off the legacy leading byte `0x01` — backward wire compat is
+  non-negotiable per the master spec. New public types:
+  `ff_core::handle_codec::{HandlePayload, DecodedHandle, encode,
+  decode, HandleDecodeError}`; new enum variant
+  `BackendTag::Postgres`; new enum variant
+  `ValidationKind::HandleFromOtherBackend` (returned by backends when
+  a handle tagged for one backend is presented to another). No
+  behaviour change for existing Valkey call sites — `ValkeyBackend`
+  continues to produce and accept handles identically modulo the new
+  leading byte, and the crate-internal `HandleFields` alias still
+  names the same shape.
 
 ### Fixed
 
