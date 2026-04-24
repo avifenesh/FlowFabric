@@ -58,15 +58,13 @@ pub struct Server {
     /// supervisor that Stage E2/E3 will wire).
     engine: Option<Engine>,
     config: ServerConfig,
-    /// Long-lived scheduler instance. Held on the server (not rebuilt per
-    /// claim call) so its rotation cursor can advance across calls — a
-    /// fresh-per-call scheduler would reset the cursor on every tick,
-    /// defeating the fairness property (RFC-009 §scan rotation).
-    ///
-    /// `None` on the Postgres boot path — `Scheduler` wraps a
-    /// `ferriskey::Client` and has no Postgres equivalent yet (Stage
-    /// E3 flips `claim_for_worker` through the backend trait).
-    scheduler: Option<Arc<ff_scheduler::Scheduler>>,
+    // RFC-017 Wave 8 Stage E3 (§9.3 / F8+Q4): `Server::scheduler` field
+    // removed. The Valkey `ff_scheduler::Scheduler` is owned by
+    // `ValkeyBackend` (installed via `with_scheduler` during boot);
+    // the Postgres twin is constructed per-call inside
+    // `PostgresBackend::claim_for_worker`. Server-side dispatch of
+    // `claim_for_worker` now flows through `self.backend` only —
+    // trait cutover per §4 row 9.
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
     /// dispatch). Drained on shutdown with a bounded timeout.
     background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
@@ -555,9 +553,10 @@ impl Server {
         }
         // RFC-017 Stage C: install the scheduler handle so the
         // backend's `claim_for_worker` trait impl dispatches through
-        // it. `Server::scheduler` is retained for Stage-C-scope
-        // metric reads (removed in Stage E per §9.3).
-        if !valkey_backend.with_scheduler(scheduler.clone()) {
+        // it. Stage E3 removed the redundant `Server::scheduler`
+        // field — the backend is the sole owner of the scheduler
+        // after this install.
+        if !valkey_backend.with_scheduler(scheduler) {
             return Err(ServerError::OperationFailed(
                 "ValkeyBackend scheduler wiring failed (unexpected Arc sharing)".into(),
             ));
@@ -572,7 +571,6 @@ impl Server {
             admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             engine: Some(engine),
             config,
-            scheduler: Some(scheduler),
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
             metrics,
             backend,
@@ -610,9 +608,9 @@ impl Server {
         }
         tracing::info!(
             pool_size = config.postgres.pool_size,
-            "dialing Postgres backend (RFC-017 Stage E2)"
+            "dialing Postgres backend (RFC-017 Stage E3)"
         );
-        let pg_backend_arc = ff_backend_postgres::PostgresBackend::connect_with_metrics(
+        let mut pg_backend_arc = ff_backend_postgres::PostgresBackend::connect_with_metrics(
             config.postgres_config(),
             config.partition_config,
             metrics.clone(),
@@ -629,21 +627,43 @@ impl Server {
                 ServerError::OperationFailed(format!("postgres apply_migrations: {e}"))
             })?;
 
+        // RFC-017 Wave 8 Stage E3: spawn the six Postgres reconcilers
+        // (attempt_timeout, lease_expiry, suspension_timeout,
+        // dependency, edge_cancel_dispatcher, edge_cancel_reconciler)
+        // as background tick loops owned by the backend. Drained on
+        // `Server::shutdown` via `backend.shutdown_prepare(grace)`.
+        let scanner_cfg = ff_backend_postgres::PostgresScannerConfig {
+            attempt_timeout_interval: config.engine_config.attempt_timeout_interval,
+            lease_expiry_interval: config.engine_config.lease_expiry_interval,
+            suspension_timeout_interval: config.engine_config.suspension_timeout_interval,
+            dependency_reconciler_interval: config.engine_config.dependency_reconciler_interval,
+            edge_cancel_dispatcher_interval: config.engine_config.edge_cancel_dispatcher_interval,
+            edge_cancel_reconciler_interval: config.engine_config.edge_cancel_reconciler_interval,
+            dependency_stale_threshold_ms:
+                ff_backend_postgres::PostgresScannerConfig::DEFAULT_DEP_STALE_MS,
+            scanner_filter: config.engine_config.scanner_filter.clone(),
+            partition_config: config.partition_config,
+        };
+        if !pg_backend_arc.with_scanners(scanner_cfg) {
+            return Err(ServerError::OperationFailed(
+                "PostgresBackend scanner install failed (unexpected Arc sharing)".into(),
+            ));
+        }
+
         let backend: Arc<dyn EngineBackend> = pg_backend_arc;
 
         tracing::info!(
             flow_partitions = config.partition_config.num_flow_partitions,
             lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-            "FlowFabric server started (Postgres backend, Stage E2). \
-             Engine scanners skipped; scheduler skipped (Stage E3 pending). \
-             No ambient Valkey client."
+            "FlowFabric server started (Postgres backend, Stage E3). \
+             6 Postgres reconcilers active; claim_for_worker routed to \
+             PostgresScheduler. No ambient Valkey client."
         );
 
         Ok(Self {
             admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             engine: None,
             config,
-            scheduler: None,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
             metrics,
             backend,
@@ -1311,19 +1331,23 @@ impl Server {
         Ok(self.backend.change_priority(args).await?)
     }
 
-    /// Scheduler-routed claim entry point (Batch C item 2 PR-B).
+    /// Scheduler-routed claim entry point.
     ///
-    /// Delegates to [`ff_scheduler::Scheduler::claim_for_worker`] which
-    /// runs budget + quota + capability admission before issuing the
-    /// grant. Returns `Ok(None)` when no eligible execution exists on
-    /// the lane at this scan cycle. The worker's subsequent
-    /// `claim_from_grant(lane, grant)` mints the lease.
+    /// RFC-017 Wave 8 Stage E3 (§7): dispatches through the backend
+    /// trait. The Valkey backend forwards to its wired
+    /// [`ff_scheduler::Scheduler`]; the Postgres backend forwards to
+    /// [`ff_backend_postgres::scheduler::PostgresScheduler`]'s
+    /// `FOR UPDATE SKIP LOCKED` admission pipeline. Returns
+    /// `Ok(None)` when no eligible execution exists on the lane at
+    /// this scan cycle — the enum-typed trait outcome
+    /// (`ClaimForWorkerOutcome::NoWork`) is collapsed to `Option::None`
+    /// for the inherent-call contract pre-existing Stage E.
     ///
-    /// Keeping the claim-grant mint inside the server (rather than the
-    /// worker) means capability CSV validation, budget/quota breach
-    /// checks, and lane routing run in one place for every tenant
-    /// worker — the same invariants as the `direct-valkey-claim` path
-    /// enforces inline, but gated at a single server choke point.
+    /// Error mapping: scheduler-class errors arrive as
+    /// [`EngineError`] via the trait boundary and thread through
+    /// `ServerError::Engine`'s HTTP arm
+    /// (budget / capability / unavailable classes land on the
+    /// documented 400/409/503 response codes — see `api::ApiError::into_response`).
     pub async fn claim_for_worker(
         &self,
         lane: &LaneId,
@@ -1332,29 +1356,25 @@ impl Server {
         worker_capabilities: &std::collections::BTreeSet<String>,
         grant_ttl_ms: u64,
     ) -> Result<Option<ff_core::contracts::ClaimGrant>, ServerError> {
-        let scheduler = self.scheduler.as_ref().ok_or_else(|| {
-            ServerError::OperationFailed(
-                "claim_for_worker unavailable on this backend \
-                 (RFC-017 Stage E3 wires the Postgres-native scheduler)"
-                    .into(),
-            )
-        })?;
-        scheduler
-            .claim_for_worker(
-                lane,
-                worker_id,
-                worker_instance_id,
-                worker_capabilities,
-                grant_ttl_ms,
-            )
-            .await
-            .map_err(|e| match e {
-                ff_scheduler::SchedulerError::Valkey(inner) => ServerError::from(inner),
-                ff_scheduler::SchedulerError::ValkeyContext { source, context } => {
-                    crate::server::backend_context(source, context)
-                }
-                ff_scheduler::SchedulerError::Config(msg) => ServerError::InvalidInput(msg),
-            })
+        let args = ff_core::contracts::ClaimForWorkerArgs::new(
+            lane.clone(),
+            worker_id.clone(),
+            worker_instance_id.clone(),
+            worker_capabilities.clone(),
+            grant_ttl_ms,
+        );
+        match self.backend.claim_for_worker(args).await? {
+            ff_core::contracts::ClaimForWorkerOutcome::Granted(g) => Ok(Some(g)),
+            ff_core::contracts::ClaimForWorkerOutcome::NoWork => Ok(None),
+            // `#[non_exhaustive]` — any future additive variant
+            // surfaces as a typed Engine error so callers see a
+            // loud miss instead of a silent `None`.
+            _ => Err(ServerError::Engine(Box::new(
+                ff_core::engine_error::EngineError::Unavailable {
+                    op: "claim_for_worker: unknown ClaimForWorkerOutcome variant",
+                },
+            ))),
+        }
     }
 
     /// Revoke an active lease (operator-initiated). RFC-017 Stage D2:
