@@ -1660,8 +1660,9 @@ pub enum CancelFlowResult {
 }
 
 /// RFC-017 Stage E2: result of the "header" portion of a cancel_flow
-/// operation — the atomic flow-state flip + member enumeration. The
-/// Server composes this with its own wait/async member-dispatch
+/// operation — the atomic flow-state flip + member enumeration.
+///
+/// The Server composes this with its own wait/async member-dispatch
 /// machinery to build the wire-level [`CancelFlowResult`]. Backends
 /// implement [`crate::engine_backend::EngineBackend::cancel_flow_header`]
 /// (default: `Unavailable`) so the Valkey-native `ff_cancel_flow`
@@ -1678,8 +1679,8 @@ pub enum CancelFlowHeader {
         member_execution_ids: Vec<String>,
     },
     /// Flow was already in a terminal state on entry. The backend has
-    /// surfaced the *stored* `cancellation_policy` + `cancel_reason`
-    /// + full membership so the Server can return an idempotent
+    /// surfaced the *stored* `cancellation_policy`, `cancel_reason`,
+    /// and full membership so the Server can return an idempotent
     /// [`CancelFlowResult::Cancelled`] without re-doing the flip.
     AlreadyTerminal {
         /// `None` only for flows cancelled by pre-E2 Lua that never
