@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["harness"]
+members = ["harness", "smoke"]
 exclude = ["comparisons"]
 
 # Isolated from the top-level FlowFabric workspace (which excludes this
