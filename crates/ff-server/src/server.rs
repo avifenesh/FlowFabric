@@ -19,14 +19,8 @@ use ff_core::contracts::{
     RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
-use ff_core::keys::{
-    self, usage_dedup_key, BudgetKeyContext, ExecKeyContext, FlowIndexKeys, FlowKeyContext,
-    IndexKeys, QuotaKeyContext,
-};
-use ff_core::partition::{
-    budget_partition, execution_partition, flow_partition, quota_partition, Partition,
-    PartitionConfig, PartitionFamily,
-};
+use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext};
+use ff_core::partition::{execution_partition, flow_partition, PartitionConfig};
 use ff_core::state::{PublicState, StateVector};
 use ff_core::types::*;
 use ff_engine::Engine;
@@ -45,81 +39,6 @@ const BACKEND_STAGE_READY: &[&str] = &["valkey"];
 /// terminal state (idempotent retry). The first (non-idempotent) cancel call
 /// returns the full list; retries only need a sample.
 const ALREADY_TERMINAL_MEMBER_CAP: usize = 1000;
-
-/// Re-export of the budget dimension cap.
-///
-/// Defined as the single source of truth in `ff_script::functions::budget` so
-/// the typed FCALL wrappers and the REST boundary cannot silently drift
-/// (PR #106 review). The limit exists to cap FCALL ARGV allocation: both
-/// `create_budget` and `report_usage` build argv whose length is linear in
-/// `dimensions.len()`, so an untrusted caller could otherwise request an
-/// unbounded `Vec` allocation (CodeQL `rust/uncontrolled-allocation-size`,
-/// issue #104).
-pub(crate) use ff_script::functions::budget::MAX_BUDGET_DIMENSIONS;
-
-/// Validate `create_budget` dimension inputs before building the FCALL argv.
-///
-/// Rejects:
-///   * more than [`MAX_BUDGET_DIMENSIONS`] dimensions (prevents unbounded
-///     `Vec::with_capacity` allocation on attacker-controlled length);
-///   * parallel-array length mismatches between `dimensions`, `hard_limits`,
-///     and `soft_limits` — these are positional inputs the Lua side indexes
-///     by `i = 1..dim_count`, so a mismatch silently corrupts limits rather
-///     than raising.
-fn validate_create_budget_dimensions(
-    dimensions: &[String],
-    hard_limits: &[u64],
-    soft_limits: &[u64],
-) -> Result<(), ServerError> {
-    let dim_count = dimensions.len();
-    if dim_count > MAX_BUDGET_DIMENSIONS {
-        return Err(ServerError::InvalidInput(format!(
-            "too_many_dimensions: limit={}, got={}",
-            MAX_BUDGET_DIMENSIONS, dim_count
-        )));
-    }
-    if hard_limits.len() != dim_count {
-        return Err(ServerError::InvalidInput(format!(
-            "dimension_limit_array_mismatch: dimensions={} hard_limits={}",
-            dim_count,
-            hard_limits.len()
-        )));
-    }
-    if soft_limits.len() != dim_count {
-        return Err(ServerError::InvalidInput(format!(
-            "dimension_limit_array_mismatch: dimensions={} soft_limits={}",
-            dim_count,
-            soft_limits.len()
-        )));
-    }
-    Ok(())
-}
-
-/// Validate `report_usage` dimension inputs before building the FCALL argv.
-///
-/// Same class of defense as [`validate_create_budget_dimensions`]: caps
-/// argv length and enforces the `dimensions`/`deltas` parallel-array
-/// invariant the Lua side relies on.
-fn validate_report_usage_dimensions(
-    dimensions: &[String],
-    deltas: &[u64],
-) -> Result<(), ServerError> {
-    let dim_count = dimensions.len();
-    if dim_count > MAX_BUDGET_DIMENSIONS {
-        return Err(ServerError::InvalidInput(format!(
-            "too_many_dimensions: limit={}, got={}",
-            MAX_BUDGET_DIMENSIONS, dim_count
-        )));
-    }
-    if deltas.len() != dim_count {
-        return Err(ServerError::InvalidInput(format!(
-            "dimension_delta_array_mismatch: dimensions={} deltas={}",
-            dim_count,
-            deltas.len()
-        )));
-    }
-    Ok(())
-}
 
 /// FlowFabric server — connects everything together.
 ///
@@ -446,63 +365,26 @@ impl Server {
         }
         tracing::info!("Valkey connection established");
 
-        // Step 1b: Verify Valkey version meets the RFC-011 §13 minimum (8.0).
-        // Tolerates a rolling upgrade via a 60s exponential-backoff budget
-        // per RFC-011 §9.17 — transient INFO errors during a node restart
-        // don't trip the check until the whole budget is exhausted.
-        verify_valkey_version(&client).await?;
-
-        // Step 2: Validate or create partition config
-        validate_or_create_partition_config(&client, &config.partition_config).await?;
-
-        // Step 2b: Install waitpoint HMAC secret into every execution partition
-        // (RFC-004 §Waitpoint Security). Fail-fast: if any partition fails,
-        // the server refuses to start — a partial install would silently
-        // reject signal deliveries on half the partitions.
-        initialize_waitpoint_hmac_secret(
-            &client,
-            &config.partition_config,
-            &config.waitpoint_hmac_secret,
-        )
-        .await?;
-
-        // Step 3: Load Lua library (skippable for tests where fixture already loaded)
-        if !config.skip_library_load {
-            tracing::info!("loading flowfabric Lua library");
-            ff_script::loader::ensure_library(&client)
-                .await
-                .map_err(ServerError::LibraryLoad)?;
-        } else {
-            tracing::info!("skipping library load (skip_library_load=true)");
-        }
-
-        // Step 3b: Seed the global lanes registry (`ff:idx:lanes`) with
-        // every lane from ServerConfig.lanes (issue #203).
-        //
-        // `EngineBackend::list_lanes` reads SMEMBERS from this global SET,
-        // so without a boot-time seed a freshly-provisioned deployment
-        // returns an empty lane list until the first execution is created
-        // on each lane. The Lua `ff_create_execution` path also SADDs on
-        // first-sight, which covers dynamic / post-boot lanes; this block
-        // covers the pre-declared set. SADD is idempotent.
-        //
-        // NOTE: `ff:idx:lanes` is intentionally NOT hash-tagged per
-        // partition — it is the single cross-partition global SET in the
-        // system (see `ff_core::keys::lanes_index_key`).
-        if !config.lanes.is_empty() {
-            let lane_strs: Vec<&str> = config.lanes.iter().map(|l| l.as_str()).collect();
-            let _: i64 = client
-                .cmd("SADD")
-                .arg(ff_core::keys::lanes_index_key().as_str())
-                .arg(lane_strs.as_slice())
-                .execute()
-                .await
-                .map_err(|e| crate::server::backend_context(e, "SADD ff:idx:lanes (seed)"))?;
-            tracing::info!(
-                lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-                "seeded lanes index (ff:idx:lanes)"
-            );
-        }
+        // RFC-017 Wave 8 Stage D (§4 row 12): the five Valkey-specific
+        // deployment-initialisation steps (version verify, partition
+        // config, HMAC install, FUNCTION LOAD, lanes seed) now live
+        // behind `ValkeyBackend::initialize_deployment`. Load-bearing
+        // ordering contract preserved in that method's doc-comment.
+        // The call is sequenced after the connection but before the
+        // engine + backend wiring below so the pre-relocation boot
+        // ordering is byte-for-byte identical.
+        let init_backend = ff_backend_valkey::ValkeyBackend::from_client_and_partitions(
+            client.clone(),
+            config.partition_config,
+        );
+        init_backend
+            .initialize_deployment(
+                &config.waitpoint_hmac_secret,
+                &config.lanes,
+                config.skip_library_load,
+            )
+            .await
+            .map_err(|e| ServerError::Engine(Box::new(e)))?;
 
         // Step 4: Start engine with scanners
         // Build a fresh EngineConfig rather than cloning (EngineConfig doesn't derive Clone).
@@ -733,10 +615,14 @@ impl Server {
         &self.metrics
     }
 
-    /// Get a reference to the ferriskey client.
-    pub fn client(&self) -> &Client {
-        &self.client
-    }
+    // RFC-017 Stage D2 (§9 Stage D bullet): `Server::client()` accessor
+    // removed; external callers route ping / healthz through the
+    // backend trait (`self.backend.ping()` → `ValkeyBackend::ping`). The
+    // underlying `Client` remains on `Server` only to service the
+    // header-only `ff_cancel_flow` FCALL + its post-header SMEMBERS /
+    // HMGET follow-ups (the backend trait's `cancel_flow` does not yet
+    // surface the caller-supplied `reason`, so the Server-level header
+    // FCALL is preserved pending a trait-signature extension.)
 
     /// RFC-017 Stage D1 (§8): fetch the raw `<kid>:<hex>`
     /// `waitpoint_token` so the v0.7.x wire-format shim in
@@ -790,119 +676,23 @@ impl Server {
 
     // ── Minimal Phase 1 API ──
 
-    /// Create a new execution.
-    ///
-    /// Uses raw FCALL — will migrate to typed ff-script wrappers in Step 1.2.
+    /// Create a new execution. RFC-017 Stage D2: delegates through the
+    /// backend trait. The KEYS/ARGV build + FCALL dispatch + result parse
+    /// live verbatim in `ValkeyBackend::create_execution`.
     pub async fn create_execution(
         &self,
         args: &CreateExecutionArgs,
     ) -> Result<CreateExecutionResult, ServerError> {
-        let partition = execution_partition(&args.execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        let lane = &args.lane_id;
-        let tag = partition.hash_tag();
-        let idem_key = match &args.idempotency_key {
-            Some(k) if !k.is_empty() => {
-                keys::idempotency_key(&tag, args.namespace.as_str(), k)
-            }
-            _ => ctx.noop(),
-        };
-
-        let delay_str = args
-            .delay_until
-            .map(|d| d.0.to_string())
-            .unwrap_or_default();
-        let is_delayed = !delay_str.is_empty();
-
-        // KEYS (8) must match lua/execution.lua ff_create_execution positional order:
-        //   [1] exec_core, [2] payload, [3] policy, [4] tags,
-        //   [5] scheduling_zset (eligible OR delayed — ONE key),
-        //   [6] idem_key, [7] execution_deadline, [8] all_executions
-        let scheduling_zset = if is_delayed {
-            idx.lane_delayed(lane)
-        } else {
-            idx.lane_eligible(lane)
-        };
-
-        let fcall_keys: Vec<String> = vec![
-            ctx.core(),                  // 1
-            ctx.payload(),               // 2
-            ctx.policy(),                // 3
-            ctx.tags(),                  // 4
-            scheduling_zset,             // 5
-            idem_key,                    // 6
-            idx.execution_deadline(),    // 7
-            idx.all_executions(),        // 8
-        ];
-
-        let tags_json = serde_json::to_string(&args.tags).unwrap_or_else(|_| "{}".to_owned());
-
-        // ARGV (13) must match lua/execution.lua ff_create_execution positional order:
-        //   [1] execution_id, [2] namespace, [3] lane_id, [4] execution_kind,
-        //   [5] priority, [6] creator_identity, [7] policy_json,
-        //   [8] input_payload, [9] delay_until, [10] dedup_ttl_ms,
-        //   [11] tags_json, [12] execution_deadline_at, [13] partition_id
-        let fcall_args: Vec<String> = vec![
-            args.execution_id.to_string(),           // 1
-            args.namespace.to_string(),              // 2
-            args.lane_id.to_string(),                // 3
-            args.execution_kind.clone(),             // 4
-            args.priority.to_string(),               // 5
-            args.creator_identity.clone(),           // 6
-            args.policy.as_ref()
-                .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "{}".to_owned()))
-                .unwrap_or_else(|| "{}".to_owned()), // 7
-            String::from_utf8_lossy(&args.input_payload).into_owned(), // 8
-            delay_str,                               // 9
-            args.idempotency_key.as_ref()
-                .map(|_| "86400000".to_string())
-                .unwrap_or_default(),                // 10 dedup_ttl_ms
-            tags_json,                               // 11
-            args.execution_deadline_at
-                .map(|d| d.to_string())
-                .unwrap_or_default(),                // 12 execution_deadline_at
-            args.partition_id.to_string(),           // 13
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_create_execution", &key_refs, &arg_refs)
-            .await?;
-
-        parse_create_result(&raw, &args.execution_id)
+        Ok(self.backend.create_execution(args.clone()).await?)
     }
 
-    /// Cancel an execution.
+    /// Cancel an execution. RFC-017 Stage D2: delegates through the
+    /// backend trait.
     pub async fn cancel_execution(
         &self,
         args: &CancelExecutionArgs,
     ) -> Result<CancelExecutionResult, ServerError> {
-        let raw = self
-            .fcall_cancel_execution_with_reload(args)
-            .await?;
-        parse_cancel_result(&raw, &args.execution_id)
-    }
-
-    /// Build KEYS/ARGV for `ff_cancel_execution` and invoke via the server's
-    /// reload-capable FCALL. Shared by the inline method and background
-    /// cancel_flow dispatch via [`Self::fcall_cancel_execution_with_reload`].
-    async fn fcall_cancel_execution_with_reload(
-        &self,
-        args: &CancelExecutionArgs,
-    ) -> Result<Value, ServerError> {
-        let (keys, argv) = build_cancel_execution_fcall(
-            &self.client,
-            &self.config.partition_config,
-            args,
-        )
-        .await?;
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        self.fcall_with_reload("ff_cancel_execution", &key_refs, &arg_refs).await
+        Ok(self.backend.cancel_execution(args.clone()).await?)
     }
 
     /// Get the public state of an execution.
@@ -993,278 +783,75 @@ impl Server {
     // ── Budget / Quota API ──
 
     /// Create a new budget policy.
+    /// Create a new budget policy. RFC-017 Stage D2: delegates through
+    /// the backend trait.
     pub async fn create_budget(
         &self,
         args: &CreateBudgetArgs,
     ) -> Result<CreateBudgetResult, ServerError> {
-        // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
-        validate_create_budget_dimensions(
-            &args.dimensions,
-            &args.hard_limits,
-            &args.soft_limits,
-        )?;
-        let partition = budget_partition(&args.budget_id, &self.config.partition_config);
-        let bctx = BudgetKeyContext::new(&partition, &args.budget_id);
-        let resets_key = keys::budget_resets_key(bctx.hash_tag());
-        let policies_index = keys::budget_policies_index(bctx.hash_tag());
-
-        // KEYS (5): budget_def, budget_limits, budget_usage, budget_resets_zset,
-        //           budget_policies_index
-        let fcall_keys: Vec<String> = vec![
-            bctx.definition(),
-            bctx.limits(),
-            bctx.usage(),
-            resets_key,
-            policies_index,
-        ];
-
-        // ARGV (variable): budget_id, scope_type, scope_id, enforcement_mode,
-        //   on_hard_limit, on_soft_limit, reset_interval_ms, now_ms,
-        //   dimension_count, dim_1..dim_N, hard_1..hard_N, soft_1..soft_N
-        let dim_count = args.dimensions.len();
-        let mut fcall_args: Vec<String> = Vec::with_capacity(9 + dim_count * 3);
-        fcall_args.push(args.budget_id.to_string());
-        fcall_args.push(args.scope_type.clone());
-        fcall_args.push(args.scope_id.clone());
-        fcall_args.push(args.enforcement_mode.clone());
-        fcall_args.push(args.on_hard_limit.clone());
-        fcall_args.push(args.on_soft_limit.clone());
-        fcall_args.push(args.reset_interval_ms.to_string());
-        fcall_args.push(args.now.to_string());
-        fcall_args.push(dim_count.to_string());
-        for dim in &args.dimensions {
-            fcall_args.push(dim.clone());
-        }
-        for hard in &args.hard_limits {
-            fcall_args.push(hard.to_string());
-        }
-        for soft in &args.soft_limits {
-            fcall_args.push(soft.to_string());
-        }
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_create_budget", &key_refs, &arg_refs)
-            .await?;
-
-        parse_budget_create_result(&raw, &args.budget_id)
+        Ok(self.backend.create_budget(args.clone()).await?)
     }
 
-    /// Create a new quota/rate-limit policy.
+    /// Create a new quota/rate-limit policy. RFC-017 Stage D2: delegates
+    /// through the backend trait.
     pub async fn create_quota_policy(
         &self,
         args: &CreateQuotaPolicyArgs,
     ) -> Result<CreateQuotaPolicyResult, ServerError> {
-        let partition = quota_partition(&args.quota_policy_id, &self.config.partition_config);
-        let qctx = QuotaKeyContext::new(&partition, &args.quota_policy_id);
-
-        // KEYS (5): quota_def, quota_window_zset, quota_concurrency_counter,
-        //           admitted_set, quota_policies_index
-        let fcall_keys: Vec<String> = vec![
-            qctx.definition(),
-            qctx.window("requests_per_window"),
-            qctx.concurrency(),
-            qctx.admitted_set(),
-            keys::quota_policies_index(qctx.hash_tag()),
-        ];
-
-        // ARGV (5): quota_policy_id, window_seconds, max_requests_per_window,
-        //           max_concurrent, now_ms
-        let fcall_args: Vec<String> = vec![
-            args.quota_policy_id.to_string(),
-            args.window_seconds.to_string(),
-            args.max_requests_per_window.to_string(),
-            args.max_concurrent.to_string(),
-            args.now.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_create_quota_policy", &key_refs, &arg_refs)
-            .await?;
-
-        parse_quota_create_result(&raw, &args.quota_policy_id)
+        Ok(self.backend.create_quota_policy(args.clone()).await?)
     }
 
-    /// Read-only budget status for operator visibility.
+    /// Read-only budget status for operator visibility. RFC-017 Stage
+    /// D2: delegates through the backend trait.
     pub async fn get_budget_status(
         &self,
         budget_id: &BudgetId,
     ) -> Result<BudgetStatus, ServerError> {
-        let partition = budget_partition(budget_id, &self.config.partition_config);
-        let bctx = BudgetKeyContext::new(&partition, budget_id);
-
-        // Read budget definition
-        let def: HashMap<String, String> = self
-            .client
-            .hgetall(&bctx.definition())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGETALL budget_def"))?;
-
-        if def.is_empty() {
-            return Err(ServerError::NotFound(format!(
-                "budget not found: {budget_id}"
-            )));
-        }
-
-        // Read usage
-        let usage_raw: HashMap<String, String> = self
-            .client
-            .hgetall(&bctx.usage())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGETALL budget_usage"))?;
-        let usage: HashMap<String, u64> = usage_raw
-            .into_iter()
-            .filter(|(k, _)| k != "_init")
-            .map(|(k, v)| (k, v.parse().unwrap_or(0)))
-            .collect();
-
-        // Read limits
-        let limits_raw: HashMap<String, String> = self
-            .client
-            .hgetall(&bctx.limits())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGETALL budget_limits"))?;
-        let mut hard_limits = HashMap::new();
-        let mut soft_limits = HashMap::new();
-        for (k, v) in &limits_raw {
-            if let Some(dim) = k.strip_prefix("hard:") {
-                hard_limits.insert(dim.to_string(), v.parse().unwrap_or(0));
-            } else if let Some(dim) = k.strip_prefix("soft:") {
-                soft_limits.insert(dim.to_string(), v.parse().unwrap_or(0));
-            }
-        }
-
-        let non_empty = |s: Option<&String>| -> Option<String> {
-            s.filter(|v| !v.is_empty()).cloned()
-        };
-
-        Ok(BudgetStatus {
-            budget_id: budget_id.to_string(),
-            scope_type: def.get("scope_type").cloned().unwrap_or_default(),
-            scope_id: def.get("scope_id").cloned().unwrap_or_default(),
-            enforcement_mode: def.get("enforcement_mode").cloned().unwrap_or_default(),
-            usage,
-            hard_limits,
-            soft_limits,
-            breach_count: def
-                .get("breach_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            soft_breach_count: def
-                .get("soft_breach_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            last_breach_at: non_empty(def.get("last_breach_at")),
-            last_breach_dim: non_empty(def.get("last_breach_dim")),
-            next_reset_at: non_empty(def.get("next_reset_at")),
-            created_at: non_empty(def.get("created_at")),
-        })
+        Ok(self.backend.get_budget_status(budget_id).await?)
     }
 
-    /// Report usage against a budget and check limits.
+    /// Report usage against a budget and check limits. RFC-017 Stage D2:
+    /// delegates through the backend trait's admin variant
+    /// (`report_usage_admin` — no worker handle required on the admin
+    /// path).
     pub async fn report_usage(
         &self,
         budget_id: &BudgetId,
         args: &ReportUsageArgs,
     ) -> Result<ReportUsageResult, ServerError> {
-        // Cap ARGV before allocation — see MAX_BUDGET_DIMENSIONS (#104).
-        validate_report_usage_dimensions(&args.dimensions, &args.deltas)?;
-        let partition = budget_partition(budget_id, &self.config.partition_config);
-        let bctx = BudgetKeyContext::new(&partition, budget_id);
-
-        // KEYS (3): budget_usage, budget_limits, budget_def
-        let fcall_keys: Vec<String> = vec![bctx.usage(), bctx.limits(), bctx.definition()];
-
-        // ARGV: dim_count, dim_1..dim_N, delta_1..delta_N, now_ms, [dedup_key]
-        let dim_count = args.dimensions.len();
-        let mut fcall_args: Vec<String> = Vec::with_capacity(3 + dim_count * 2);
-        fcall_args.push(dim_count.to_string());
-        for dim in &args.dimensions {
-            fcall_args.push(dim.clone());
+        let mut admin_args = ff_core::contracts::ReportUsageAdminArgs::new(
+            args.dimensions.clone(),
+            args.deltas.clone(),
+            args.now,
+        );
+        if let Some(key) = args.dedup_key.as_ref() {
+            admin_args = admin_args.with_dedup_key(key.clone());
         }
-        for delta in &args.deltas {
-            fcall_args.push(delta.to_string());
-        }
-        fcall_args.push(args.now.to_string());
-        let dedup_key_val = args
-            .dedup_key
-            .as_ref()
-            .filter(|k| !k.is_empty())
-            .map(|k| usage_dedup_key(bctx.hash_tag(), k))
-            .unwrap_or_default();
-        fcall_args.push(dedup_key_val);
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_report_usage_and_check", &key_refs, &arg_refs)
-            .await?;
-
-        parse_report_usage_result(&raw)
+        Ok(self.backend.report_usage_admin(budget_id, admin_args).await?)
     }
 
     /// Reset a budget's usage counters and schedule the next reset.
+    /// RFC-017 Stage D2: delegates through the backend trait.
     pub async fn reset_budget(
         &self,
         budget_id: &BudgetId,
     ) -> Result<ResetBudgetResult, ServerError> {
-        let partition = budget_partition(budget_id, &self.config.partition_config);
-        let bctx = BudgetKeyContext::new(&partition, budget_id);
-        let resets_key = keys::budget_resets_key(bctx.hash_tag());
-
-        // KEYS (3): budget_def, budget_usage, budget_resets_zset
-        let fcall_keys: Vec<String> = vec![bctx.definition(), bctx.usage(), resets_key];
-
-        // ARGV (2): budget_id, now_ms
-        let now = TimestampMs::now();
-        let fcall_args: Vec<String> = vec![budget_id.to_string(), now.to_string()];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_reset_budget", &key_refs, &arg_refs)
-            .await?;
-
-        parse_reset_budget_result(&raw)
+        let args = ff_core::contracts::ResetBudgetArgs {
+            budget_id: budget_id.clone(),
+            now: TimestampMs::now(),
+        };
+        Ok(self.backend.reset_budget(args).await?)
     }
 
     // ── Flow API ──
 
-    /// Create a new flow container.
+    /// Create a new flow container. RFC-017 Stage D2: delegates through
+    /// the backend trait.
     pub async fn create_flow(
         &self,
         args: &CreateFlowArgs,
     ) -> Result<CreateFlowResult, ServerError> {
-        let partition = flow_partition(&args.flow_id, &self.config.partition_config);
-        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
-        let fidx = FlowIndexKeys::new(&partition);
-
-        // KEYS (3): flow_core, members_set, flow_index
-        let fcall_keys: Vec<String> = vec![fctx.core(), fctx.members(), fidx.flow_index()];
-
-        // ARGV (4): flow_id, flow_kind, namespace, now_ms
-        let fcall_args: Vec<String> = vec![
-            args.flow_id.to_string(),
-            args.flow_kind.clone(),
-            args.namespace.to_string(),
-            args.now.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_create_flow", &key_refs, &arg_refs)
-            .await?;
-
-        parse_create_flow_result(&raw, &args.flow_id)
+        Ok(self.backend.create_flow(args.clone()).await?)
     }
 
     /// Add an execution to a flow.
@@ -1308,58 +895,23 @@ impl Server {
         &self,
         args: &AddExecutionToFlowArgs,
     ) -> Result<AddExecutionToFlowResult, ServerError> {
-        let partition = flow_partition(&args.flow_id, &self.config.partition_config);
-        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
-        let fidx = FlowIndexKeys::new(&partition);
-
-        // exec_core co-locates with flow_core under RFC-011 §7.3 —
-        // same `{fp:N}` hash-tag, same slot, part of the same atomic
-        // FCALL below.
-        let exec_partition =
-            execution_partition(&args.execution_id, &self.config.partition_config);
-        let ectx = ExecKeyContext::new(&exec_partition, &args.execution_id);
-
-        // Pre-flight: exec_partition must match flow_partition under
-        // RFC-011 §7.3 co-location contract. If the caller hands us a
-        // `solo`-minted exec whose hash-tag ≠ flow_partition, the FCALL
-        // would fail with raw `CROSSSLOT` on a clustered deploy — a
-        // typed `ServerError::PartitionMismatch` is a clearer signal
-        // that the consumer-contract invariant was violated at mint
-        // time (caller should have used `ExecutionId::for_flow(...)`).
-        // See the Consumer contract section of this method's rustdoc.
-        if exec_partition.index != partition.index {
+        // Preserve the typed `ServerError::PartitionMismatch` pre-flight
+        // check — the backend trait's implementation returns an
+        // `EngineError` on CROSSSLOT, which would surface as
+        // `ServerError::Engine(_)` and hide the consumer-contract
+        // violation. Keep the explicit check at the facade boundary.
+        let flow_part = flow_partition(&args.flow_id, &self.config.partition_config);
+        let exec_part = execution_partition(&args.execution_id, &self.config.partition_config);
+        if exec_part.index != flow_part.index {
             return Err(ServerError::PartitionMismatch(format!(
                 "add_execution_to_flow: execution_id's partition {exec_p} != flow_id's partition {flow_p}. \
                  Post-RFC-011 §7.3 co-location requires mint via `ExecutionId::for_flow(&flow_id, config)` \
                  so the exec's hash-tag matches the flow's `{{fp:N}}`.",
-                exec_p = exec_partition.index,
-                flow_p = partition.index,
+                exec_p = exec_part.index,
+                flow_p = flow_part.index,
             )));
         }
-
-        // KEYS (4): flow_core, members_set, flow_index, exec_core
-        let fcall_keys: Vec<String> = vec![
-            fctx.core(),
-            fctx.members(),
-            fidx.flow_index(),
-            ectx.core(),
-        ];
-
-        // ARGV (3): flow_id, execution_id, now_ms
-        let fcall_args: Vec<String> = vec![
-            args.flow_id.to_string(),
-            args.execution_id.to_string(),
-            args.now.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_add_execution_to_flow", &key_refs, &arg_refs)
-            .await?;
-
-        parse_add_execution_to_flow_result(&raw)
+        Ok(self.backend.add_execution_to_flow(args.clone()).await?)
     }
 
     /// Cancel a flow.
@@ -1546,18 +1098,28 @@ impl Server {
             // reconciler still retries the unacked members; surfacing
             // the partial state lets operator tooling alert without
             // polling per-member state.
+            // RFC-017 Stage D2 (§4 row 5): member-level cancel dispatches
+            // through the backend trait. Each `CancelExecutionArgs` carries
+            // the caller-supplied `reason` verbatim — the same payload the
+            // pre-migration `cancel_member_execution` handed to
+            // `ff_cancel_execution`.
             let mut failed: Vec<String> = Vec::new();
             for eid_str in &members {
-                match cancel_member_execution(
-                    &self.client,
-                    &self.config.partition_config,
-                    eid_str,
-                    &args.reason,
-                    args.now,
-                )
-                .await
-                {
-                    Ok(()) => {
+                let Ok(eid) = ExecutionId::parse(eid_str) else {
+                    failed.push(eid_str.clone());
+                    continue;
+                };
+                let cancel_args = ff_core::contracts::CancelExecutionArgs {
+                    execution_id: eid,
+                    reason: args.reason.clone(),
+                    source: ff_core::types::CancelSource::OperatorOverride,
+                    lease_id: None,
+                    lease_epoch: None,
+                    attempt_id: None,
+                    now: args.now,
+                };
+                match self.backend.cancel_execution(cancel_args).await {
+                    Ok(_) => {
                         ack_cancel_member(
                             &self.client,
                             &pending_cancels_key,
@@ -1568,13 +1130,7 @@ impl Server {
                         .await;
                     }
                     Err(e) => {
-                        // If the member was already terminal (execution_not_active /
-                        // execution_not_found), treat this as ack-worthy success —
-                        // the member is effectively "cancelled" from the flow's
-                        // perspective and shouldn't be surfaced as a partial
-                        // failure. Mirrors cancel_reconciler::cancel_member which
-                        // acks on the same codes to avoid backlog poisoning.
-                        if is_terminal_ack_error(&e) {
+                        if is_terminal_ack_engine_error(&e) {
                             ack_cancel_member(
                                 &self.client,
                                 &pending_cancels_key,
@@ -1610,8 +1166,12 @@ impl Server {
 
         // Asynchronous dispatch — spawn into the shared JoinSet so Server::shutdown
         // can wait for pending cancellations (bounded by a shutdown timeout).
+        // RFC-017 Stage D2 (§4 row 5): dispatches via the backend trait's
+        // `cancel_execution`; `self.client` is still held for the backlog
+        // ack (`SREM pending_cancels + LREM cancel_backlog`) which is not
+        // yet on the trait surface.
+        let backend = self.backend.clone();
         let client = self.client.clone();
-        let partition_config = self.config.partition_config;
         let reason = args.reason.clone();
         let now = args.now;
         let dispatch_members = members.clone();
@@ -1656,6 +1216,7 @@ impl Server {
             let flow_id_for_log = flow_id.clone();
             futures::stream::iter(dispatch_members)
                 .map(|eid_str| {
+                    let backend = backend.clone();
                     let client = client.clone();
                     let reason = reason.clone();
                     let flow_id = flow_id.clone();
@@ -1663,16 +1224,25 @@ impl Server {
                     let backlog = backlog_key_owned.clone();
                     let flow_id_str = flow_id_str.clone();
                     async move {
-                        match cancel_member_execution(
-                            &client,
-                            &partition_config,
-                            &eid_str,
-                            &reason,
+                        let Ok(eid) = ExecutionId::parse(&eid_str) else {
+                            tracing::warn!(
+                                flow_id = %flow_id,
+                                execution_id = %eid_str,
+                                "cancel_flow(async): member id failed to parse; skipping"
+                            );
+                            return;
+                        };
+                        let cancel_args = ff_core::contracts::CancelExecutionArgs {
+                            execution_id: eid,
+                            reason: reason.clone(),
+                            source: ff_core::types::CancelSource::OperatorOverride,
+                            lease_id: None,
+                            lease_epoch: None,
+                            attempt_id: None,
                             now,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
+                        };
+                        match backend.cancel_execution(cancel_args).await {
+                            Ok(_) => {
                                 ack_cancel_member(
                                     &client,
                                     &pending,
@@ -1683,7 +1253,7 @@ impl Server {
                                 .await;
                             }
                             Err(e) => {
-                                if is_terminal_ack_error(&e) {
+                                if is_terminal_ack_engine_error(&e) {
                                     ack_cancel_member(
                                         &client,
                                         &pending,
@@ -1734,103 +1304,16 @@ impl Server {
         &self,
         args: &StageDependencyEdgeArgs,
     ) -> Result<StageDependencyEdgeResult, ServerError> {
-        let partition = flow_partition(&args.flow_id, &self.config.partition_config);
-        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
-
-        // KEYS (6): flow_core, members_set, edge_hash, out_adj_set, in_adj_set, grant_hash
-        let fcall_keys: Vec<String> = vec![
-            fctx.core(),
-            fctx.members(),
-            fctx.edge(&args.edge_id),
-            fctx.outgoing(&args.upstream_execution_id),
-            fctx.incoming(&args.downstream_execution_id),
-            fctx.grant(&args.edge_id.to_string()),
-        ];
-
-        // ARGV (8): flow_id, edge_id, upstream_eid, downstream_eid,
-        //           dependency_kind, data_passing_ref, expected_graph_revision, now_ms
-        let fcall_args: Vec<String> = vec![
-            args.flow_id.to_string(),
-            args.edge_id.to_string(),
-            args.upstream_execution_id.to_string(),
-            args.downstream_execution_id.to_string(),
-            args.dependency_kind.clone(),
-            args.data_passing_ref.clone().unwrap_or_default(),
-            args.expected_graph_revision.to_string(),
-            args.now.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_stage_dependency_edge", &key_refs, &arg_refs)
-            .await?;
-
-        parse_stage_dependency_edge_result(&raw)
+        Ok(self.backend.stage_dependency_edge(args.clone()).await?)
     }
 
-    /// Apply a staged dependency edge to the child execution.
-    ///
-    /// Runs on the child execution partition {p:N}.
-    /// KEYS (8), ARGV (7) — matches lua/flow.lua ff_apply_dependency_to_child.
+    /// Apply a staged dependency edge to the child execution. RFC-017
+    /// Stage D2: delegates through the backend trait.
     pub async fn apply_dependency_to_child(
         &self,
         args: &ApplyDependencyToChildArgs,
     ) -> Result<ApplyDependencyToChildResult, ServerError> {
-        let partition = execution_partition(
-            &args.downstream_execution_id,
-            &self.config.partition_config,
-        );
-        let ctx = ExecKeyContext::new(&partition, &args.downstream_execution_id);
-        let idx = IndexKeys::new(&partition);
-        let flow_partition = ff_core::partition::flow_partition(
-            &args.flow_id,
-            &self.config.partition_config,
-        );
-        let flow_ctx = ff_core::keys::FlowKeyContext::new(&flow_partition, &args.flow_id);
-
-        // Pre-read lane_id for index keys
-        let lane_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
-        let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
-
-        // KEYS (8): exec_core, deps_meta, unresolved_set, dep_hash,
-        //           eligible_zset, blocked_deps_zset, deps_all_edges, edgegroup
-        let fcall_keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.deps_meta(),
-            ctx.deps_unresolved(),
-            ctx.dep_edge(&args.edge_id),
-            idx.lane_eligible(&lane),
-            idx.lane_blocked_dependencies(&lane),
-            ctx.deps_all_edges(),
-            flow_ctx.edgegroup(&args.downstream_execution_id),
-        ];
-
-        // ARGV (7): flow_id, edge_id, upstream_eid, graph_revision,
-        //           dependency_kind, data_passing_ref, now_ms
-        let fcall_args: Vec<String> = vec![
-            args.flow_id.to_string(),
-            args.edge_id.to_string(),
-            args.upstream_execution_id.to_string(),
-            args.graph_revision.to_string(),
-            args.dependency_kind.clone(),
-            args.data_passing_ref.clone().unwrap_or_default(),
-            args.now.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_apply_dependency_to_child", &key_refs, &arg_refs)
-            .await?;
-
-        parse_apply_dependency_result(&raw)
+        Ok(self.backend.apply_dependency_to_child(args.clone()).await?)
     }
 
     // ── Execution operations API ──
@@ -1853,43 +1336,21 @@ impl Server {
         Ok(self.backend.deliver_signal(args.clone()).await?)
     }
 
-    /// Change an execution's priority.
-    ///
-    /// KEYS (2), ARGV (2) — matches lua/scheduling.lua ff_change_priority.
+    /// Change an execution's priority. RFC-017 Stage D2: delegates
+    /// through the backend trait. Empty `lane_id` triggers the backend-
+    /// internal HGET pre-read (matches legacy inherent behaviour).
     pub async fn change_priority(
         &self,
         execution_id: &ExecutionId,
         new_priority: i32,
     ) -> Result<ChangePriorityResult, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // Read lane_id for eligible_zset key
-        let lane_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
-        let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
-
-        // KEYS (2): exec_core, eligible_zset
-        let fcall_keys: Vec<String> = vec![ctx.core(), idx.lane_eligible(&lane)];
-
-        // ARGV (2): execution_id, new_priority
-        let fcall_args: Vec<String> = vec![
-            execution_id.to_string(),
-            new_priority.to_string(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_change_priority", &key_refs, &arg_refs)
-            .await?;
-
-        parse_change_priority_result(&raw, execution_id)
+        let args = ff_core::contracts::ChangePriorityArgs {
+            execution_id: execution_id.clone(),
+            new_priority,
+            lane_id: LaneId::new(""),
+            now: TimestampMs::now(),
+        };
+        Ok(self.backend.change_priority(args).await?)
     }
 
     /// Scheduler-routed claim entry point (Batch C item 2 PR-B).
@@ -1931,54 +1392,29 @@ impl Server {
             })
     }
 
-    /// Revoke an active lease (operator-initiated).
+    /// Revoke an active lease (operator-initiated). RFC-017 Stage D2:
+    /// delegates through the backend trait. The backend's trait impl
+    /// returns `RevokeLeaseResult::AlreadySatisfied` when no active
+    /// lease is present; the Server facade preserves its pre-migration
+    /// `ServerError::NotFound` behaviour by re-mapping that variant.
     pub async fn revoke_lease(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<RevokeLeaseResult, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // Pre-read worker_instance_id for worker_leases key
-        let wiid_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "current_worker_instance_id")
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGET worker_instance_id"))?;
-        let wiid = match wiid_str {
-            Some(ref s) if !s.is_empty() => WorkerInstanceId::new(s),
-            _ => {
-                return Err(ServerError::NotFound(format!(
-                    "no active lease for execution {execution_id} (no current_worker_instance_id)"
-                )));
-            }
+        let args = ff_core::contracts::RevokeLeaseArgs {
+            execution_id: execution_id.clone(),
+            expected_lease_id: None,
+            worker_instance_id: WorkerInstanceId::new(""),
+            reason: "operator_revoke".to_owned(),
         };
-
-        // KEYS (5): exec_core, lease_current, lease_history, lease_expiry_zset, worker_leases
-        let fcall_keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.lease_current(),
-            ctx.lease_history(),
-            idx.lease_expiry(),
-            idx.worker_leases(&wiid),
-        ];
-
-        // ARGV (3): execution_id, expected_lease_id (empty = skip check), revoke_reason
-        let fcall_args: Vec<String> = vec![
-            execution_id.to_string(),
-            String::new(), // no expected_lease_id check
-            "operator_revoke".to_owned(),
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_revoke_lease", &key_refs, &arg_refs)
-            .await?;
-
-        parse_revoke_lease_result(&raw)
+        match self.backend.revoke_lease(args).await? {
+            RevokeLeaseResult::AlreadySatisfied { reason } if reason == "no_active_lease" => {
+                Err(ServerError::NotFound(format!(
+                    "no active lease for execution {execution_id} (no current_worker_instance_id)"
+                )))
+            }
+            other => Ok(other),
+        }
     }
 
     /// Get full execution info via HGETALL on exec_core.
@@ -2110,108 +1546,19 @@ impl Server {
             .await?)
     }
 
-    /// Replay a terminal execution.
-    ///
-    /// Pre-reads exec_core for flow_id and dep edges (variable KEYS).
-    /// KEYS (4+N), ARGV (2+N) — matches lua/flow.lua ff_replay_execution.
+    /// Replay a terminal execution. RFC-017 Stage D2: delegates through
+    /// the backend trait; the variadic-KEYS pre-read (HMGET + SMEMBERS
+    /// for inbound edges on skipped flow members) now lives inside
+    /// `ValkeyBackend::replay_execution`.
     pub async fn replay_execution(
         &self,
         execution_id: &ExecutionId,
     ) -> Result<ReplayExecutionResult, ServerError> {
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // Pre-read lane_id, flow_id, terminal_outcome.
-        //
-        // Reader invariant (RFC-011 §7.3): `flow_id` on exec_core is
-        // stamped atomically with membership by `add_execution_to_flow`'s
-        // single FCALL. Empty iff the exec has no flow affinity
-        // (solo-path create_execution — never added to a flow). The
-        // `is_skipped_flow_member` branch below gates on
-        // `!flow_id_str.is_empty()`, so solo execs correctly fall back
-        // to the non-flow-member replay path. See
-        // `add_execution_to_flow` rustdoc for the atomic-commit
-        // invariant.
-        let dyn_fields: Vec<Option<String>> = self
-            .client
-            .cmd("HMGET")
-            .arg(ctx.core())
-            .arg("lane_id")
-            .arg("flow_id")
-            .arg("terminal_outcome")
-            .execute()
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HMGET replay pre-read"))?;
-        let lane = LaneId::new(
-            dyn_fields
-                .first()
-                .and_then(|v| v.as_ref())
-                .cloned()
-                .unwrap_or_else(|| "default".to_owned()),
-        );
-        let flow_id_str = dyn_fields
-            .get(1)
-            .and_then(|v| v.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let terminal_outcome = dyn_fields
-            .get(2)
-            .and_then(|v| v.as_ref())
-            .cloned()
-            .unwrap_or_default();
-
-        let is_skipped_flow_member = terminal_outcome == "skipped" && !flow_id_str.is_empty();
-
-        // Base KEYS (4): exec_core, terminal_zset, eligible_zset, lease_history
-        let mut fcall_keys: Vec<String> = vec![
-            ctx.core(),
-            idx.lane_terminal(&lane),
-            idx.lane_eligible(&lane),
-            ctx.lease_history(),
-        ];
-
-        // Base ARGV (2): execution_id, now_ms
-        let now = TimestampMs::now();
-        let mut fcall_args: Vec<String> = vec![execution_id.to_string(), now.to_string()];
-
-        if is_skipped_flow_member {
-            // Read ALL inbound edge IDs from the flow partition's adjacency set.
-            // Cannot use deps:unresolved because impossible edges were SREM'd
-            // by ff_resolve_dependency. The flow's in:<eid> set has all edges.
-            let flow_id = FlowId::parse(&flow_id_str)
-                .map_err(|e| ServerError::Script(format!("bad flow_id: {e}")))?;
-            let flow_part =
-                flow_partition(&flow_id, &self.config.partition_config);
-            let flow_ctx = FlowKeyContext::new(&flow_part, &flow_id);
-            let edge_ids: Vec<String> = self
-                .client
-                .cmd("SMEMBERS")
-                .arg(flow_ctx.incoming(execution_id))
-                .execute()
-                .await
-                .map_err(|e| crate::server::backend_context(e, "SMEMBERS replay edges"))?;
-
-            // Extended KEYS: blocked_deps_zset, deps_meta, deps_unresolved, dep_edge_0..N
-            fcall_keys.push(idx.lane_blocked_dependencies(&lane)); // 5
-            fcall_keys.push(ctx.deps_meta()); // 6
-            fcall_keys.push(ctx.deps_unresolved()); // 7
-            for eid_str in &edge_ids {
-                let edge_id = EdgeId::parse(eid_str)
-                    .unwrap_or_else(|_| EdgeId::new());
-                fcall_keys.push(ctx.dep_edge(&edge_id)); // 8..8+N
-                fcall_args.push(eid_str.clone()); // 3..3+N
-            }
-        }
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_replay_execution", &key_refs, &arg_refs)
-            .await?;
-
-        parse_replay_result(&raw)
+        let args = ff_core::contracts::ReplayExecutionArgs {
+            execution_id: execution_id.clone(),
+            now: TimestampMs::now(),
+        };
+        Ok(self.backend.replay_execution(args).await?)
     }
 
     /// Read frames from an attempt's stream (XRANGE wrapper) plus terminal
@@ -2396,485 +1743,6 @@ fn wire_str_to_stream_cursor(s: &str) -> ff_core::contracts::StreamCursor {
     }
 }
 
-// ── Valkey version check (RFC-011 §13) ──
-
-/// Minimum Valkey version the engine requires (see RFC-011 §13). 7.2 is the
-/// release where Valkey Functions and RESP3 stabilized — the primitives the
-/// co-location design and typed FCALL wrappers actually depend on.
-const REQUIRED_VALKEY_MAJOR: u32 = 7;
-const REQUIRED_VALKEY_MINOR: u32 = 2;
-
-/// Upper bound on the rolling-upgrade retry window (RFC-011 §9.17). A Valkey
-/// node cycling through SIGTERM → restart typically completes in well under
-/// 60s; this budget is generous without letting a truly-stuck cluster hang
-/// boot indefinitely.
-const VERSION_CHECK_RETRY_BUDGET: Duration = Duration::from_secs(60);
-
-/// Verify the connected Valkey reports a version ≥ 7.2.
-///
-/// Per RFC-011 §9.17, during a rolling upgrade the node we happen to connect
-/// to may temporarily be pre-upgrade while others are post-upgrade. The check
-/// tolerates this by retrying the whole verification (including low-version
-/// responses) with exponential backoff, capped at a 60s budget.
-///
-/// **Retries on:**
-/// - Low-version responses (below `(REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR)`)
-///   — may resolve as the rolling upgrade progresses onto the connected node.
-/// - Retryable ferriskey transport errors — connection refused,
-///   `BusyLoadingError`, `ClusterDown`, etc., classified via
-///   `ff_script::retry::is_retryable_kind`.
-/// - Missing/unparsable version field — treated as transient (fresh-boot
-///   server may not have the INFO fields populated yet). Reads
-///   `valkey_version` when present (authoritative on Valkey 8.0+), falls
-///   back to `redis_version` for Valkey 7.x.
-///
-/// **Does NOT retry on:**
-/// - Non-retryable transport errors (auth failures, permission denied,
-///   invalid client config) — these are operator misconfiguration, not
-///   transient cluster state; fast-fail preserves a clear signal.
-///
-/// On budget exhaustion, returns the last observed error.
-async fn verify_valkey_version(client: &Client) -> Result<(), ServerError> {
-    let deadline = tokio::time::Instant::now() + VERSION_CHECK_RETRY_BUDGET;
-    let mut backoff = Duration::from_millis(200);
-    loop {
-        let (should_retry, err_for_budget_exhaust, log_detail): (bool, ServerError, String) =
-            match query_valkey_version(client).await {
-                Ok((detected_major, detected_minor))
-                    if (detected_major, detected_minor)
-                        >= (REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR) =>
-                {
-                    tracing::info!(
-                        detected_major,
-                        detected_minor,
-                        required_major = REQUIRED_VALKEY_MAJOR,
-                        required_minor = REQUIRED_VALKEY_MINOR,
-                        "Valkey version accepted"
-                    );
-                    return Ok(());
-                }
-                Ok((detected_major, detected_minor)) => (
-                    // Low version — may be a rolling-upgrade stale node.
-                    // Retry within budget; after exhaustion, the cluster
-                    // is misconfigured and fast-fail is the correct signal.
-                    true,
-                    ServerError::ValkeyVersionTooLow {
-                        detected: format!("{detected_major}.{detected_minor}"),
-                        required: format!("{REQUIRED_VALKEY_MAJOR}.{REQUIRED_VALKEY_MINOR}"),
-                    },
-                    format!(
-                        "detected={detected_major}.{detected_minor} < required={REQUIRED_VALKEY_MAJOR}.{REQUIRED_VALKEY_MINOR}"
-                    ),
-                ),
-                Err(e) => {
-                    // Only retry if the underlying Valkey error is retryable
-                    // by kind. Auth / permission / invalid-config should fast-
-                    // fail so operators see the true root cause immediately,
-                    // not a 60s hang followed by a generic "transient" error.
-                    let retryable = e
-                        .backend_kind()
-                        .map(|k| k.is_retryable())
-                        // Non-backend errors (parse, missing field, operation
-                        // failures) are treated as transient — a fresh-boot
-                        // Valkey may not have redis_version populated yet.
-                        .unwrap_or(true);
-                    let detail = e.to_string();
-                    (retryable, e, detail)
-                }
-            };
-
-        if !should_retry {
-            return Err(err_for_budget_exhaust);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(err_for_budget_exhaust);
-        }
-        tracing::warn!(
-            backoff_ms = backoff.as_millis() as u64,
-            detail = %log_detail,
-            "valkey version check transient failure; retrying"
-        );
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
-    }
-}
-
-/// Run `INFO server` and extract the `(major, minor)` components of the
-/// Valkey version.
-///
-/// Returns `Err` on transport errors, missing field, or unparsable version.
-/// Handles three response shapes:
-///
-/// - **Standalone:** single string body; parse directly.
-/// - **Cluster (RESP3 map):** `INFO` returns a map keyed by node address;
-///   every node runs the same version in a healthy deployment, so we pick
-///   one entry and parse it. Divergent versions during a rolling upgrade
-///   are handled by the outer retry loop.
-/// - **Empty / unexpected:** surfaces as `OperationFailed` with context.
-async fn query_valkey_version(client: &Client) -> Result<(u32, u32), ServerError> {
-    let raw: Value = client
-        .cmd("INFO")
-        .arg("server")
-        .execute()
-        .await
-        .map_err(|e| crate::server::backend_context(e, "INFO server"))?;
-    let bodies = extract_info_bodies(&raw)?;
-    // Cluster: return the minimum (major, minor) across all nodes so a stale
-    // pre-upgrade replica cannot hide behind an already-upgraded primary.
-    // Standalone: exactly one body. The outer retry loop tolerates rolling
-    // upgrades — a briefly-low minimum gets retried; a persistently-low one
-    // exits with the structured floor error.
-    let mut min_version: Option<(u32, u32)> = None;
-    for body in &bodies {
-        let version = parse_valkey_version(body)?;
-        min_version = Some(match min_version {
-            None => version,
-            Some(existing) => existing.min(version),
-        });
-    }
-    min_version.ok_or_else(|| {
-        ServerError::OperationFailed(
-            "valkey version check: cluster INFO returned no node bodies".into(),
-        )
-    })
-}
-
-/// Normalize an `INFO server` response to one string body per node.
-///
-/// Standalone returns a single body. Cluster (RESP3 map keyed by node address)
-/// returns every node's body — the caller must consider all of them to reject
-/// a mixed-version cluster where one stale node is below the floor.
-fn extract_info_bodies(raw: &Value) -> Result<Vec<String>, ServerError> {
-    match raw {
-        Value::BulkString(bytes) => Ok(vec![String::from_utf8_lossy(bytes).into_owned()]),
-        Value::VerbatimString { text, .. } => Ok(vec![text.clone()]),
-        Value::SimpleString(s) => Ok(vec![s.clone()]),
-        Value::Map(entries) => {
-            if entries.is_empty() {
-                return Err(ServerError::OperationFailed(
-                    "valkey version check: cluster INFO returned empty map".into(),
-                ));
-            }
-            let mut out = Vec::with_capacity(entries.len());
-            for (_, body) in entries {
-                out.extend(extract_info_bodies(body)?);
-            }
-            Ok(out)
-        }
-        other => Err(ServerError::OperationFailed(format!(
-            "valkey version check: unexpected INFO shape: {other:?}"
-        ))),
-    }
-}
-
-/// Extract the `(major, minor)` components of the Valkey version from an
-/// `INFO server` response body. Pure parser — pulled out of
-/// [`query_valkey_version`] so it is unit-testable without a live Valkey.
-///
-/// **Prefers `valkey_version:`** (introduced in Valkey 8.0+; this is the real
-/// server version on 8.x/9.x, which pin `redis_version:7.2.4` for
-/// Redis-client compatibility).
-///
-/// **Falls back to `redis_version:` only when the body carries an affirmative
-/// `server_name:valkey` field.** `server_name:` was introduced in Valkey 7.2,
-/// which is our floor — so every floor-compliant Valkey deployment carries
-/// the marker. Redis does not emit `server_name:valkey`, which is how we
-/// reject a Redis backend that would otherwise look identical to Valkey 7.x
-/// at the `redis_version:` level.
-fn parse_valkey_version(info: &str) -> Result<(u32, u32), ServerError> {
-    let extract_major_minor = |line: &str| -> Result<(u32, u32), ServerError> {
-        let trimmed = line.trim();
-        let mut parts = trimmed.split('.');
-        let major_str = parts.next().unwrap_or("").trim();
-        if major_str.is_empty() {
-            return Err(ServerError::OperationFailed(format!(
-                "valkey version check: empty version field in '{trimmed}'"
-            )));
-        }
-        let major = major_str.parse::<u32>().map_err(|_| {
-            ServerError::OperationFailed(format!(
-                "valkey version check: non-numeric major in '{trimmed}'"
-            ))
-        })?;
-        // Minor is required — a bare major ("7") cannot be compared against
-        // the (major, minor) floor reliably. Valkey always reports
-        // major.minor.patch for INFO, so missing minor is a real parse error.
-        let minor_str = parts.next().unwrap_or("").trim();
-        if minor_str.is_empty() {
-            return Err(ServerError::OperationFailed(format!(
-                "valkey version check: missing minor component in '{trimmed}'"
-            )));
-        }
-        let minor = minor_str.parse::<u32>().map_err(|_| {
-            ServerError::OperationFailed(format!(
-                "valkey version check: non-numeric minor in '{trimmed}'"
-            ))
-        })?;
-        Ok((major, minor))
-    };
-    // Prefer valkey_version (authoritative on Valkey 8.0+).
-    if let Some(valkey_line) = info
-        .lines()
-        .find_map(|line| line.strip_prefix("valkey_version:"))
-    {
-        return extract_major_minor(valkey_line);
-    }
-    // No valkey_version — could be Valkey 7.2 (which doesn't emit the field)
-    // or could be Redis. Require an affirmative server_name:valkey marker
-    // before falling back to redis_version. This rejects Redis backends,
-    // which don't emit server_name:valkey.
-    let server_is_valkey = info
-        .lines()
-        .map(str::trim)
-        .any(|line| line.eq_ignore_ascii_case("server_name:valkey"));
-    if !server_is_valkey {
-        return Err(ServerError::OperationFailed(
-            "valkey version check: INFO missing valkey_version and server_name:valkey marker \
-             (unsupported backend — FlowFabric requires Valkey >= 7.2; Redis is not supported)"
-                .into(),
-        ));
-    }
-    // Valkey 7.x fallback. 8.x+ pins redis_version:7.2.4 for Redis-client
-    // compat, so reading it there would under-report — but 8.x+ is handled
-    // by the valkey_version branch above, so we only reach here on 7.x.
-    if let Some(redis_line) = info
-        .lines()
-        .find_map(|line| line.strip_prefix("redis_version:"))
-    {
-        return extract_major_minor(redis_line);
-    }
-    Err(ServerError::OperationFailed(
-        "valkey version check: INFO has server_name:valkey but no redis_version or valkey_version field"
-            .into(),
-    ))
-}
-
-// ── Partition config validation ──
-
-/// Validate or create the `ff:config:partitions` key on first boot.
-///
-/// If the key exists, its values must match the server's config.
-/// If it doesn't exist, create it (first boot).
-async fn validate_or_create_partition_config(
-    client: &Client,
-    config: &PartitionConfig,
-) -> Result<(), ServerError> {
-    let key = keys::global_config_partitions();
-
-    let existing: HashMap<String, String> = client
-        .hgetall(&key)
-        .await
-        .map_err(|e| crate::server::backend_context(e, format!("HGETALL {key}")))?;
-
-    if existing.is_empty() {
-        // First boot — create the config
-        tracing::info!("first boot: creating {key}");
-        client
-            .hset(&key, "num_flow_partitions", &config.num_flow_partitions.to_string())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HSET num_flow_partitions"))?;
-        client
-            .hset(&key, "num_budget_partitions", &config.num_budget_partitions.to_string())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HSET num_budget_partitions"))?;
-        client
-            .hset(&key, "num_quota_partitions", &config.num_quota_partitions.to_string())
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HSET num_quota_partitions"))?;
-        return Ok(());
-    }
-
-    // Validate existing config matches
-    let check = |field: &str, expected: u16| -> Result<(), ServerError> {
-        let stored: u16 = existing
-            .get(field)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if stored != expected {
-            return Err(ServerError::PartitionMismatch(format!(
-                "{field}: stored={stored}, config={expected}. \
-                 Partition counts are fixed at deployment time. \
-                 Either fix your config or migrate the data."
-            )));
-        }
-        Ok(())
-    };
-
-    check("num_flow_partitions", config.num_flow_partitions)?;
-    check("num_budget_partitions", config.num_budget_partitions)?;
-    check("num_quota_partitions", config.num_quota_partitions)?;
-
-    tracing::info!("partition config validated against stored {key}");
-    Ok(())
-}
-
-// ── Waitpoint HMAC secret bootstrap (RFC-004 §Waitpoint Security) ──
-
-/// Stable initial kid written on first boot. Rotation promotes to k2, k3, ...
-/// The kid is stored alongside the secret in every partition's hash so each
-/// FCALL can self-identify which secret produced a given token.
-const WAITPOINT_HMAC_INITIAL_KID: &str = "k1";
-
-/// Per-partition outcome of the HMAC bootstrap step. Collected across the
-/// parallel scan so we can emit aggregated logs once at the end.
-enum PartitionBootOutcome {
-    /// Partition already had a matching (kid, secret) pair.
-    Match,
-    /// Stored secret diverges from env — likely operator rotation; kept.
-    Mismatch,
-    /// Torn write (current_kid present, secret:<kid> missing); repaired.
-    Repaired,
-    /// Fresh partition; atomically installed env secret under kid=k1.
-    Installed,
-}
-
-/// Bounded in-flight concurrency for the startup fan-out. Large enough to
-/// turn a 256-partition install from ~15s sequential into ~1s on cross-AZ
-/// Valkey, small enough to leave a cold cluster breathing room for other
-/// Server::start work (library load, engine scanner spawn).
-const BOOT_INIT_CONCURRENCY: usize = 16;
-
-async fn init_one_partition(
-    client: &Client,
-    partition: Partition,
-    secret_hex: &str,
-) -> Result<PartitionBootOutcome, ServerError> {
-    let key = ff_core::keys::IndexKeys::new(&partition).waitpoint_hmac_secrets();
-
-    // Probe for an existing install. Fast path (fresh partition): HGET
-    // returns nil and we fall through to the atomic install below. Slow
-    // path: secret:<stored_kid> is then HGET'd once we know the kid name.
-    // (A previous version used a 2-field HMGET that included a fake
-    // `secret:probe` placeholder — vestigial from an abandoned
-    // optimization attempt, and confusing to read. Collapsed back to a
-    // single-field HGET.)
-    let stored_kid: Option<String> = client
-        .cmd("HGET")
-        .arg(&key)
-        .arg("current_kid")
-        .execute()
-        .await
-        .map_err(|e| crate::server::backend_context(e, format!("HGET {key} current_kid (init probe)")))?;
-
-    if let Some(stored_kid) = stored_kid {
-        // We didn't know the stored kid up front, so now HGET the real
-        // secret:<stored_kid> field. Two round-trips in the slow path; the
-        // fast path (fresh partition) stays at one.
-        let field = format!("secret:{stored_kid}");
-        let stored_secret: Option<String> = client
-            .hget(&key, &field)
-            .await
-            .map_err(|e| crate::server::backend_context(e, format!("HGET {key} secret:<kid> (init check)")))?;
-        if stored_secret.is_none() {
-            // Torn write from a previous boot: current_kid present but
-            // secret:<kid> missing. Without repair, mint returns
-            // "hmac_secret_not_initialized" on that partition forever.
-            // Repair in place with env secret. Not rotation — rotation
-            // always writes the secret first.
-            client
-                .hset(&key, &field, secret_hex)
-                .await
-                .map_err(|e| crate::server::backend_context(e, format!("HSET {key} secret:<kid> (repair torn write)")))?;
-            return Ok(PartitionBootOutcome::Repaired);
-        }
-        if stored_secret.as_deref() != Some(secret_hex) {
-            return Ok(PartitionBootOutcome::Mismatch);
-        }
-        return Ok(PartitionBootOutcome::Match);
-    }
-
-    // Fresh partition — install current_kid + secret:<kid> atomically in
-    // one HSET. Multi-field HSET is single-command atomic, so a crash
-    // can't leave current_kid without its secret.
-    let secret_field = format!("secret:{WAITPOINT_HMAC_INITIAL_KID}");
-    let _: i64 = client
-        .cmd("HSET")
-        .arg(&key)
-        .arg("current_kid")
-        .arg(WAITPOINT_HMAC_INITIAL_KID)
-        .arg(&secret_field)
-        .arg(secret_hex)
-        .execute()
-        .await
-        .map_err(|e| crate::server::backend_context(e, format!("HSET {key} (init waitpoint HMAC atomic)")))?;
-    Ok(PartitionBootOutcome::Installed)
-}
-
-/// Install the waitpoint HMAC secret on every execution partition.
-///
-/// Parallelized fan-out with bounded in-flight concurrency
-/// (`BOOT_INIT_CONCURRENCY`) so 256-partition boots finish in ~1s instead
-/// of ~15s sequential — the prior sequential loop was tight on K8s
-/// `initialDelaySeconds=30` defaults, especially cross-AZ. Fail-fast:
-/// the first per-partition error aborts boot.
-///
-/// Outcomes aggregate into mismatch/repaired counts (logged once at end)
-/// so operators see a single loud warning per fault class instead of 256
-/// per-partition lines.
-async fn initialize_waitpoint_hmac_secret(
-    client: &Client,
-    partition_config: &PartitionConfig,
-    secret_hex: &str,
-) -> Result<(), ServerError> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-
-    let n = partition_config.num_flow_partitions;
-    tracing::info!(
-        partitions = n,
-        concurrency = BOOT_INIT_CONCURRENCY,
-        "installing waitpoint HMAC secret across {n} execution partitions"
-    );
-
-    let mut mismatch_count: u16 = 0;
-    let mut repaired_count: u16 = 0;
-    let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
-    let mut next_index: u16 = 0;
-
-    loop {
-        while pending.len() < BOOT_INIT_CONCURRENCY && next_index < n {
-            let partition = Partition {
-                family: PartitionFamily::Execution,
-                index: next_index,
-            };
-            let client = client.clone();
-            let secret_hex = secret_hex.to_owned();
-            pending.push(async move {
-                init_one_partition(&client, partition, &secret_hex).await
-            });
-            next_index += 1;
-        }
-        match pending.next().await {
-            Some(res) => match res? {
-                PartitionBootOutcome::Match | PartitionBootOutcome::Installed => {}
-                PartitionBootOutcome::Mismatch => mismatch_count += 1,
-                PartitionBootOutcome::Repaired => repaired_count += 1,
-            },
-            None => break,
-        }
-    }
-
-    if repaired_count > 0 {
-        tracing::warn!(
-            repaired_partitions = repaired_count,
-            total_partitions = n,
-            "repaired {repaired_count} partitions with torn waitpoint HMAC writes \
-             (current_kid present but secret:<kid> missing, likely crash during prior boot)"
-        );
-    }
-
-    if mismatch_count > 0 {
-        tracing::warn!(
-            mismatched_partitions = mismatch_count,
-            total_partitions = n,
-            "stored/env secret mismatch on {mismatch_count} partitions — \
-             env FF_WAITPOINT_HMAC_SECRET ignored in favor of stored values; \
-             run POST /v1/admin/rotate-waitpoint-secret to sync"
-        );
-    }
-
-    tracing::info!(partitions = n, "waitpoint HMAC secret install complete");
-    Ok(())
-}
 
 /// Result of a waitpoint HMAC secret rotation across all execution partitions.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2994,263 +1862,13 @@ impl Server {
 
 // ── FCALL result parsing ──
 
-fn parse_create_result(
-    raw: &Value,
-    execution_id: &ExecutionId,
-) -> Result<CreateExecutionResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_create_execution: expected Array".into())),
-    };
 
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_create_execution: bad status code".into())),
-    };
 
-    if status == 1 {
-        // Check sub-status: OK or DUPLICATE
-        let sub = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
 
-        if sub == "DUPLICATE" {
-            Ok(CreateExecutionResult::Duplicate {
-                execution_id: execution_id.clone(),
-            })
-        } else {
-            Ok(CreateExecutionResult::Created {
-                execution_id: execution_id.clone(),
-                public_state: PublicState::Waiting,
-            })
-        }
-    } else {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::OperationFailed(format!(
-            "ff_create_execution failed: {error_code}"
-        )))
-    }
-}
-
-fn parse_cancel_result(
-    raw: &Value,
-    execution_id: &ExecutionId,
-) -> Result<CancelExecutionResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_cancel_execution: expected Array".into())),
-    };
-
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_cancel_execution: bad status code".into())),
-    };
-
-    if status == 1 {
-        Ok(CancelExecutionResult::Cancelled {
-            execution_id: execution_id.clone(),
-            public_state: PublicState::Cancelled,
-        })
-    } else {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::OperationFailed(format!(
-            "ff_cancel_execution failed: {error_code}"
-        )))
-    }
-}
-
-fn parse_budget_create_result(
-    raw: &Value,
-    budget_id: &BudgetId,
-) -> Result<CreateBudgetResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_create_budget: expected Array".into())),
-    };
-
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_create_budget: bad status code".into())),
-    };
-
-    if status == 1 {
-        let sub = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        if sub == "ALREADY_SATISFIED" {
-            Ok(CreateBudgetResult::AlreadySatisfied {
-                budget_id: budget_id.clone(),
-            })
-        } else {
-            Ok(CreateBudgetResult::Created {
-                budget_id: budget_id.clone(),
-            })
-        }
-    } else {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::OperationFailed(format!(
-            "ff_create_budget failed: {error_code}"
-        )))
-    }
-}
-
-fn parse_quota_create_result(
-    raw: &Value,
-    quota_policy_id: &QuotaPolicyId,
-) -> Result<CreateQuotaPolicyResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_create_quota_policy: expected Array".into())),
-    };
-
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_create_quota_policy: bad status code".into())),
-    };
-
-    if status == 1 {
-        let sub = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        if sub == "ALREADY_SATISFIED" {
-            Ok(CreateQuotaPolicyResult::AlreadySatisfied {
-                quota_policy_id: quota_policy_id.clone(),
-            })
-        } else {
-            Ok(CreateQuotaPolicyResult::Created {
-                quota_policy_id: quota_policy_id.clone(),
-            })
-        }
-    } else {
-        let error_code = arr
-            .get(1)
-            .and_then(|v| match v {
-                Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                Ok(Value::SimpleString(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
-        Err(ServerError::OperationFailed(format!(
-            "ff_create_quota_policy failed: {error_code}"
-        )))
-    }
-}
 
 // ── Flow FCALL result parsing ──
 
-fn parse_create_flow_result(
-    raw: &Value,
-    flow_id: &FlowId,
-) -> Result<CreateFlowResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_create_flow: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_create_flow: bad status code".into())),
-    };
-    if status == 1 {
-        let sub = fcall_field_str(arr, 1);
-        if sub == "ALREADY_SATISFIED" {
-            Ok(CreateFlowResult::AlreadySatisfied {
-                flow_id: flow_id.clone(),
-            })
-        } else {
-            Ok(CreateFlowResult::Created {
-                flow_id: flow_id.clone(),
-            })
-        }
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_create_flow failed: {error_code}"
-        )))
-    }
-}
 
-fn parse_add_execution_to_flow_result(
-    raw: &Value,
-) -> Result<AddExecutionToFlowResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => {
-            return Err(ServerError::Script(
-                "ff_add_execution_to_flow: expected Array".into(),
-            ))
-        }
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => {
-            return Err(ServerError::Script(
-                "ff_add_execution_to_flow: bad status code".into(),
-            ))
-        }
-    };
-    if status == 1 {
-        let sub = fcall_field_str(arr, 1);
-        let eid_str = fcall_field_str(arr, 2);
-        let nc_str = fcall_field_str(arr, 3);
-        let eid = ExecutionId::parse(&eid_str)
-            .map_err(|e| ServerError::Script(format!("bad execution_id: {e}")))?;
-        let nc: u32 = nc_str.parse().unwrap_or(0);
-        if sub == "ALREADY_SATISFIED" {
-            Ok(AddExecutionToFlowResult::AlreadyMember {
-                execution_id: eid,
-                node_count: nc,
-            })
-        } else {
-            Ok(AddExecutionToFlowResult::Added {
-                execution_id: eid,
-                new_node_count: nc,
-            })
-        }
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_add_execution_to_flow failed: {error_code}"
-        )))
-    }
-}
 
 /// Outcome of parsing a raw `ff_cancel_flow` FCALL response.
 ///
@@ -3299,115 +1917,9 @@ fn parse_cancel_flow_raw(raw: &Value) -> Result<ParsedCancelFlow, ServerError> {
     Ok(ParsedCancelFlow::Cancelled { policy, member_execution_ids: members })
 }
 
-fn parse_stage_dependency_edge_result(
-    raw: &Value,
-) -> Result<StageDependencyEdgeResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_stage_dependency_edge: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_stage_dependency_edge: bad status code".into())),
-    };
-    if status == 1 {
-        let edge_id_str = fcall_field_str(arr, 2);
-        let rev_str = fcall_field_str(arr, 3);
-        let edge_id = EdgeId::parse(&edge_id_str)
-            .map_err(|e| ServerError::Script(format!("bad edge_id: {e}")))?;
-        let rev: u64 = rev_str.parse().unwrap_or(0);
-        Ok(StageDependencyEdgeResult::Staged {
-            edge_id,
-            new_graph_revision: rev,
-        })
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_stage_dependency_edge failed: {error_code}"
-        )))
-    }
-}
 
-fn parse_apply_dependency_result(
-    raw: &Value,
-) -> Result<ApplyDependencyToChildResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_apply_dependency_to_child: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_apply_dependency_to_child: bad status code".into())),
-    };
-    if status == 1 {
-        let sub = fcall_field_str(arr, 1);
-        if sub == "ALREADY_APPLIED" || sub == "already_applied" {
-            Ok(ApplyDependencyToChildResult::AlreadyApplied)
-        } else {
-            // OK status — field at index 2 is unsatisfied count
-            let count_str = fcall_field_str(arr, 2);
-            let count: u32 = count_str.parse().unwrap_or(0);
-            Ok(ApplyDependencyToChildResult::Applied {
-                unsatisfied_count: count,
-            })
-        }
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_apply_dependency_to_child failed: {error_code}"
-        )))
-    }
-}
 
-fn parse_change_priority_result(
-    raw: &Value,
-    execution_id: &ExecutionId,
-) -> Result<ChangePriorityResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_change_priority: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_change_priority: bad status code".into())),
-    };
-    if status == 1 {
-        Ok(ChangePriorityResult::Changed {
-            execution_id: execution_id.clone(),
-        })
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_change_priority failed: {error_code}"
-        )))
-    }
-}
 
-fn parse_replay_result(raw: &Value) -> Result<ReplayExecutionResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_replay_execution: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_replay_execution: bad status code".into())),
-    };
-    if status == 1 {
-        // ok("0") for normal replay, ok(N) for skipped flow member
-        let unsatisfied = fcall_field_str(arr, 2);
-        let ps = if unsatisfied == "0" {
-            PublicState::Waiting
-        } else {
-            PublicState::WaitingChildren
-        };
-        Ok(ReplayExecutionResult::Replayed { public_state: ps })
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_replay_execution failed: {error_code}"
-        )))
-    }
-}
 
 /// Extract a string from an FCALL result array at the given index.
 /// Convert a `ScriptError` into a `ServerError` preserving `ferriskey::ErrorKind`
@@ -3435,84 +1947,6 @@ fn fcall_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
         Some(Ok(Value::SimpleString(s))) => s.clone(),
         Some(Ok(Value::Int(n))) => n.to_string(),
         _ => String::new(),
-    }
-}
-
-/// Parse ff_report_usage_and_check result.
-/// Standard format: {1, "OK"}, {1, "SOFT_BREACH", dim, current, limit},
-///                  {1, "HARD_BREACH", dim, current, limit}, {1, "ALREADY_APPLIED"}
-fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_report_usage_and_check: expected Array".into())),
-    };
-    let status_code = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => {
-            return Err(ServerError::Script(
-                "ff_report_usage_and_check: expected Int status code".into(),
-            ))
-        }
-    };
-    if status_code != 1 {
-        let error_code = fcall_field_str(arr, 1);
-        return Err(ServerError::OperationFailed(format!(
-            "ff_report_usage_and_check failed: {error_code}"
-        )));
-    }
-    let sub_status = fcall_field_str(arr, 1);
-    match sub_status.as_str() {
-        "OK" => Ok(ReportUsageResult::Ok),
-        "ALREADY_APPLIED" => Ok(ReportUsageResult::AlreadyApplied),
-        "SOFT_BREACH" => {
-            let dim = fcall_field_str(arr, 2);
-            let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
-            let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
-            Ok(ReportUsageResult::SoftBreach { dimension: dim, current_usage: current, soft_limit: limit })
-        }
-        "HARD_BREACH" => {
-            let dim = fcall_field_str(arr, 2);
-            let current: u64 = fcall_field_str(arr, 3).parse().unwrap_or(0);
-            let limit: u64 = fcall_field_str(arr, 4).parse().unwrap_or(0);
-            Ok(ReportUsageResult::HardBreach {
-                dimension: dim,
-                current_usage: current,
-                hard_limit: limit,
-            })
-        }
-        _ => Err(ServerError::OperationFailed(format!(
-            "ff_report_usage_and_check: unknown sub-status: {sub_status}"
-        ))),
-    }
-}
-
-fn parse_revoke_lease_result(raw: &Value) -> Result<RevokeLeaseResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_revoke_lease: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_revoke_lease: bad status code".into())),
-    };
-    if status == 1 {
-        let sub = fcall_field_str(arr, 1);
-        if sub == "ALREADY_SATISFIED" {
-            let reason = fcall_field_str(arr, 2);
-            Ok(RevokeLeaseResult::AlreadySatisfied { reason })
-        } else {
-            let lid = fcall_field_str(arr, 2);
-            let epoch = fcall_field_str(arr, 3);
-            Ok(RevokeLeaseResult::Revoked {
-                lease_id: lid,
-                lease_epoch: epoch,
-            })
-        }
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_revoke_lease failed: {error_code}"
-        )))
     }
 }
 
@@ -3559,110 +1993,6 @@ async fn fcall_with_reload_on_client(
     }
 }
 
-/// Build the `ff_cancel_execution` KEYS (21) and ARGV (5) by pre-reading
-/// dynamic fields from `exec_core`. Shared by [`Server::cancel_execution`]
-/// and the async cancel_flow member-dispatch path.
-async fn build_cancel_execution_fcall(
-    client: &Client,
-    partition_config: &PartitionConfig,
-    args: &CancelExecutionArgs,
-) -> Result<(Vec<String>, Vec<String>), ServerError> {
-    let partition = execution_partition(&args.execution_id, partition_config);
-    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
-    let idx = IndexKeys::new(&partition);
-
-    let lane_str: Option<String> = client
-        .hget(&ctx.core(), "lane_id")
-        .await
-        .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
-    let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
-
-    let dyn_fields: Vec<Option<String>> = client
-        .cmd("HMGET")
-        .arg(ctx.core())
-        .arg("current_attempt_index")
-        .arg("current_waitpoint_id")
-        .arg("current_worker_instance_id")
-        .execute()
-        .await
-        .map_err(|e| crate::server::backend_context(e, "HMGET cancel pre-read"))?;
-
-    let att_idx_val = dyn_fields.first()
-        .and_then(|v| v.as_ref())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    let att_idx = AttemptIndex::new(att_idx_val);
-    let wp_id_str = dyn_fields.get(1).and_then(|v| v.as_ref()).cloned().unwrap_or_default();
-    let wp_id = if wp_id_str.is_empty() {
-        WaitpointId::new()
-    } else {
-        WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
-    };
-    let wiid_str = dyn_fields.get(2).and_then(|v| v.as_ref()).cloned().unwrap_or_default();
-    let wiid = WorkerInstanceId::new(&wiid_str);
-
-    let keys: Vec<String> = vec![
-        ctx.core(),                              // 1
-        ctx.attempt_hash(att_idx),               // 2
-        ctx.stream_meta(att_idx),                // 3
-        ctx.lease_current(),                     // 4
-        ctx.lease_history(),                     // 5
-        idx.lease_expiry(),                      // 6
-        idx.worker_leases(&wiid),                // 7
-        ctx.suspension_current(),                // 8
-        ctx.waitpoint(&wp_id),                   // 9
-        ctx.waitpoint_condition(&wp_id),         // 10
-        idx.suspension_timeout(),                // 11
-        idx.lane_terminal(&lane),                // 12
-        idx.attempt_timeout(),                   // 13
-        idx.execution_deadline(),                // 14
-        idx.lane_eligible(&lane),                // 15
-        idx.lane_delayed(&lane),                 // 16
-        idx.lane_blocked_dependencies(&lane),    // 17
-        idx.lane_blocked_budget(&lane),          // 18
-        idx.lane_blocked_quota(&lane),           // 19
-        idx.lane_blocked_route(&lane),           // 20
-        idx.lane_blocked_operator(&lane),        // 21
-    ];
-    let argv: Vec<String> = vec![
-        args.execution_id.to_string(),
-        args.reason.clone(),
-        args.source.to_string(),
-        args.lease_id.as_ref().map(|l| l.to_string()).unwrap_or_default(),
-        args.lease_epoch.as_ref().map(|e| e.to_string()).unwrap_or_default(),
-    ];
-    Ok((keys, argv))
-}
-
-/// Backoff schedule for transient Valkey errors during async cancel_flow
-/// dispatch. Length = retry-attempt count (including the initial attempt).
-/// The last entry is not slept on because it's the final attempt.
-const CANCEL_MEMBER_RETRY_DELAYS_MS: [u64; 3] = [100, 500, 2_000];
-
-/// Reach into a `ServerError` for a transport-layer retryability hint.
-/// Matches the variants that can carry a backend transport fault:
-/// direct `Backend`, `BackendContext`, and `LibraryLoad` (which
-/// wraps a ferriskey error internally).
-///
-/// Renamed from `extract_valkey_kind` in #88 — the previous return
-/// type `Option<ferriskey::ErrorKind>` leaked ferriskey into the
-/// server's internal retry logic. Callers now get a backend-agnostic
-/// [`BackendErrorKind`] and dispatch via
-/// [`BackendErrorKind::is_retryable`].
-fn extract_backend_kind(e: &ServerError) -> Option<ff_core::BackendErrorKind> {
-    e.backend_kind()
-}
-
-/// Cancel a single member execution from a cancel_flow dispatch context.
-/// Parses the flow-member EID string, builds the FCALL via the shared helper,
-/// and executes with the same reload-on-failover semantics as the inline path.
-///
-/// Wrapped in a bounded retry loop (see [`CANCEL_MEMBER_RETRY_DELAYS_MS`]) so
-/// that transient Valkey errors mid-dispatch (failover, `TryAgain`,
-/// `ClusterDown`, `IoError`, `FatalSendError`) do not silently leak
-/// non-cancelled members. `FatalReceiveError` and non-retryable kinds bubble
-/// up immediately — those either indicate the Lua ran server-side anyway or a
-/// permanent mismatch that retries cannot fix.
 /// Acknowledge that a member cancel has committed. Fires
 /// `ff_ack_cancel_member` on `{fp:N}` to SREM the execution from the
 /// flow's `pending_cancels` set and, if empty, ZREM the flow from the
@@ -3690,113 +2020,32 @@ async fn ack_cancel_member(
     }
 }
 
-/// Returns true if a cancel_member failure reflects an already-terminal
-/// (or never-existed) execution, which from the flow-cancel perspective
-/// is ack-worthy success rather than a partial failure. The Lua
-/// `ff_cancel_execution` function emits `execution_not_active` when the
-/// member is already in a terminal phase, and `execution_not_found` when
-/// the key is gone. Both codes arrive here wrapped in
-/// `ServerError::OperationFailed("ff_cancel_execution failed: <code>")`
-/// via `parse_cancel_result`.
-fn is_terminal_ack_error(err: &ServerError) -> bool {
+/// Engine-error variant: inspects an
+/// `EngineError` returned from `self.backend.cancel_execution(...)`
+/// and returns `true` when the member is already terminal. Matches the
+/// Lua-code semantics of `execution_not_active` / `execution_not_found`
+/// via the typed `State` / `Validation` classifications the backend
+/// trait impl maps them to.
+fn is_terminal_ack_engine_error(err: &EngineError) -> bool {
     match err {
-        ServerError::OperationFailed(msg) => {
-            msg.contains("execution_not_active") || msg.contains("execution_not_found")
-        }
+        // Already terminal (Lua's `execution_not_active`) or missing
+        // entirely (`execution_not_found`) — both treated as ack-worthy
+        // so the cancel-backlog doesn't poison on a member already in
+        // the intended terminal state.
+        EngineError::State(kind) => matches!(
+            kind,
+            ff_core::engine_error::StateKind::Terminal
+        ),
+        EngineError::NotFound { .. } => true,
+        EngineError::Contextual { source, .. } => is_terminal_ack_engine_error(source),
         _ => false,
     }
 }
 
-async fn cancel_member_execution(
-    client: &Client,
-    partition_config: &PartitionConfig,
-    eid_str: &str,
-    reason: &str,
-    now: TimestampMs,
-) -> Result<(), ServerError> {
-    let execution_id = ExecutionId::parse(eid_str)
-        .map_err(|e| ServerError::InvalidInput(format!("bad execution_id '{eid_str}': {e}")))?;
-    let args = CancelExecutionArgs {
-        execution_id: execution_id.clone(),
-        reason: reason.to_owned(),
-        source: CancelSource::OperatorOverride,
-        lease_id: None,
-        lease_epoch: None,
-        attempt_id: None,
-        now,
-    };
-
-    let attempts = CANCEL_MEMBER_RETRY_DELAYS_MS.len();
-    for (attempt_idx, delay_ms) in CANCEL_MEMBER_RETRY_DELAYS_MS.iter().enumerate() {
-        let is_last = attempt_idx + 1 == attempts;
-        match try_cancel_member_once(client, partition_config, &args).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                // Only retry transport-layer transients; business-logic
-                // errors (Script / OperationFailed / NotFound / InvalidInput)
-                // won't change on retry.
-                let retryable = extract_backend_kind(&e)
-                    .map(|k| k.is_retryable())
-                    .unwrap_or(false);
-                if !retryable || is_last {
-                    return Err(e);
-                }
-                tracing::debug!(
-                    execution_id = %execution_id,
-                    attempt = attempt_idx + 1,
-                    delay_ms = *delay_ms,
-                    error = %e,
-                    "cancel_member_execution: transient error, retrying"
-                );
-                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
-            }
-        }
-    }
-    // Unreachable: the loop above either returns Ok, returns Err on the
-    // last attempt, or returns Err on a non-retryable error. Keep a
-    // defensive fallback for future edits to the retry structure.
-    Err(ServerError::OperationFailed(format!(
-        "cancel_member_execution: retries exhausted for {execution_id}"
-    )))
-}
 
 /// Single cancel attempt — pre-read + FCALL + parse. Factored out so the
 /// retry loop in [`cancel_member_execution`] can invoke it cleanly.
-async fn try_cancel_member_once(
-    client: &Client,
-    partition_config: &PartitionConfig,
-    args: &CancelExecutionArgs,
-) -> Result<(), ServerError> {
-    let (keys, argv) = build_cancel_execution_fcall(client, partition_config, args).await?;
-    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let raw =
-        fcall_with_reload_on_client(client, "ff_cancel_execution", &key_refs, &arg_refs).await?;
-    parse_cancel_result(&raw, &args.execution_id).map(|_| ())
-}
 
-fn parse_reset_budget_result(raw: &Value) -> Result<ResetBudgetResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_reset_budget: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_reset_budget: bad status code".into())),
-    };
-    if status == 1 {
-        let next_str = fcall_field_str(arr, 2);
-        let next_ms: i64 = next_str.parse().unwrap_or(0);
-        Ok(ResetBudgetResult::Reset {
-            next_reset_at: TimestampMs::from_millis(next_ms),
-        })
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_reset_budget failed: {error_code}"
-        )))
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3805,110 +2054,6 @@ mod tests {
 
     fn mk_fk_err(kind: ErrorKind) -> ferriskey::Error {
         ferriskey::Error::from((kind, "synthetic"))
-    }
-
-    // ── Budget dimension-cap validation (issue #104) ──
-
-    #[test]
-    fn create_budget_rejects_over_cap_dimension_count() {
-        let n = MAX_BUDGET_DIMENSIONS + 1;
-        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
-        let hard = vec![1u64; n];
-        let soft = vec![0u64; n];
-        let err = validate_create_budget_dimensions(&dims, &hard, &soft).unwrap_err();
-        match err {
-            ServerError::InvalidInput(msg) => {
-                assert!(msg.contains("too_many_dimensions"), "got: {msg}");
-                assert!(msg.contains(&format!("limit={}", MAX_BUDGET_DIMENSIONS)), "got: {msg}");
-                assert!(msg.contains(&format!("got={n}")), "got: {msg}");
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn create_budget_accepts_exactly_cap_dimensions() {
-        let n = MAX_BUDGET_DIMENSIONS;
-        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
-        let hard = vec![1u64; n];
-        let soft = vec![0u64; n];
-        assert!(validate_create_budget_dimensions(&dims, &hard, &soft).is_ok());
-    }
-
-    #[test]
-    fn create_budget_rejects_hard_limit_length_mismatch() {
-        let dims = vec!["a".to_string(), "b".to_string()];
-        let hard = vec![1u64]; // too short
-        let soft = vec![0u64, 0u64];
-        let err = validate_create_budget_dimensions(&dims, &hard, &soft).unwrap_err();
-        match err {
-            ServerError::InvalidInput(msg) => {
-                assert!(msg.contains("dimension_limit_array_mismatch"), "got: {msg}");
-                assert!(msg.contains("hard_limits=1"), "got: {msg}");
-                assert!(msg.contains("dimensions=2"), "got: {msg}");
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn create_budget_rejects_soft_limit_length_mismatch() {
-        let dims = vec!["a".to_string(), "b".to_string()];
-        let hard = vec![1u64, 2u64];
-        let soft = vec![0u64, 0u64, 0u64]; // too long
-        let err = validate_create_budget_dimensions(&dims, &hard, &soft).unwrap_err();
-        match err {
-            ServerError::InvalidInput(msg) => {
-                assert!(msg.contains("dimension_limit_array_mismatch"), "got: {msg}");
-                assert!(msg.contains("soft_limits=3"), "got: {msg}");
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn report_usage_rejects_over_cap_dimension_count() {
-        let n = MAX_BUDGET_DIMENSIONS + 1;
-        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
-        let deltas = vec![1u64; n];
-        let err = validate_report_usage_dimensions(&dims, &deltas).unwrap_err();
-        match err {
-            ServerError::InvalidInput(msg) => {
-                assert!(msg.contains("too_many_dimensions"), "got: {msg}");
-                assert!(msg.contains(&format!("limit={}", MAX_BUDGET_DIMENSIONS)), "got: {msg}");
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn report_usage_accepts_exactly_cap_dimensions() {
-        let n = MAX_BUDGET_DIMENSIONS;
-        let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
-        let deltas = vec![1u64; n];
-        assert!(validate_report_usage_dimensions(&dims, &deltas).is_ok());
-    }
-
-    #[test]
-    fn report_usage_rejects_delta_length_mismatch() {
-        let dims = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let deltas = vec![1u64, 2u64]; // too short
-        let err = validate_report_usage_dimensions(&dims, &deltas).unwrap_err();
-        match err {
-            ServerError::InvalidInput(msg) => {
-                assert!(msg.contains("dimension_delta_array_mismatch"), "got: {msg}");
-                assert!(msg.contains("dimensions=3"), "got: {msg}");
-                assert!(msg.contains("deltas=2"), "got: {msg}");
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn report_usage_accepts_empty_dimensions() {
-        // Edge case: zero-dimension report_usage is a no-op that should pass
-        // validation (Lua handles dim_count=0 correctly).
-        assert!(validate_report_usage_dimensions(&[], &[]).is_ok());
     }
 
     #[test]
@@ -3986,251 +2131,6 @@ mod tests {
         assert_eq!(err.backend_kind(), None);
     }
 
-    // ── Valkey version check (RFC-011 §13) ──
-
-    #[test]
-    fn parse_valkey_version_prefers_valkey_version_over_redis_version() {
-        // Valkey 8.x+ pins redis_version to 7.2.4 for Redis-client compat
-        // and exposes the real version in valkey_version. Parser must use
-        // valkey_version when both are present.
-        let info = "\
-# Server\r\n\
-redis_version:7.2.4\r\n\
-valkey_version:9.0.3\r\n\
-server_mode:cluster\r\n\
-os:Linux\r\n";
-        assert_eq!(parse_valkey_version(info).unwrap(), (9, 0));
-    }
-
-    #[test]
-    fn parse_valkey_version_real_valkey_8_cluster_body() {
-        // Actual INFO server response observed on valkey/valkey:latest in
-        // cluster mode (CI matrix): redis_version compat-pinned to 7.2.4,
-        // valkey_version authoritative at 9.0.3.
-        let info = "\
-# Server\r\n\
-redis_version:7.2.4\r\n\
-server_name:valkey\r\n\
-valkey_version:9.0.3\r\n\
-valkey_release_stage:ga\r\n\
-redis_git_sha1:00000000\r\n\
-server_mode:cluster\r\n";
-        assert_eq!(parse_valkey_version(info).unwrap(), (9, 0));
-    }
-
-    #[test]
-    fn parse_valkey_version_falls_back_to_redis_version_on_valkey_7() {
-        // Valkey 7.x doesn't emit valkey_version, but does emit
-        // server_name:valkey; parser falls back to redis_version.
-        let info = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nfoo:bar\r\n";
-        assert_eq!(parse_valkey_version(info).unwrap(), (7, 2));
-    }
-
-    #[test]
-    fn parse_valkey_version_rejects_redis_backend() {
-        // Real Redis emits redis_version: but not server_name:valkey and
-        // not valkey_version:. Parser must reject this affirmatively so an
-        // operator pointing ff-server at a Redis instance fails loud instead
-        // of silently running against an unsupported backend.
-        let info = "\
-# Server\r\n\
-redis_version:7.4.0\r\n\
-redis_mode:standalone\r\n\
-os:Linux\r\n";
-        let err = parse_valkey_version(info).unwrap_err();
-        assert!(matches!(err, ServerError::OperationFailed(_)));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Redis is not supported") && msg.contains("server_name:valkey"),
-            "expected Redis-rejection message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_valkey_version_accepts_valkey_7_marker_case_insensitively() {
-        // INFO values are conventionally lowercase but be defensive.
-        let info = "redis_version:7.2.0\r\nSERVER_NAME:Valkey\r\n";
-        assert_eq!(parse_valkey_version(info).unwrap(), (7, 2));
-    }
-
-    #[test]
-    fn parse_valkey_version_errors_when_no_version_field() {
-        let info = "# Server\r\nfoo:bar\r\n";
-        let err = parse_valkey_version(info).unwrap_err();
-        assert!(matches!(err, ServerError::OperationFailed(_)));
-        assert!(
-            err.to_string().contains("missing"),
-            "expected 'missing' in message, got: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_valkey_version_errors_on_non_numeric_major() {
-        let info = "valkey_version:invalid.x.y\n";
-        let err = parse_valkey_version(info).unwrap_err();
-        assert!(matches!(err, ServerError::OperationFailed(_)));
-        assert!(err.to_string().contains("non-numeric major"));
-    }
-
-    #[test]
-    fn parse_valkey_version_errors_on_non_numeric_minor() {
-        let info = "valkey_version:7.x.0\n";
-        let err = parse_valkey_version(info).unwrap_err();
-        assert!(matches!(err, ServerError::OperationFailed(_)));
-        assert!(err.to_string().contains("non-numeric minor"));
-    }
-
-    #[test]
-    fn parse_valkey_version_errors_on_missing_minor() {
-        // Bare major (no dot) — cannot be compared against a (major, minor)
-        // floor. Flag as a real parse error.
-        let info = "valkey_version:7\n";
-        let err = parse_valkey_version(info).unwrap_err();
-        assert!(matches!(err, ServerError::OperationFailed(_)));
-        assert!(err.to_string().contains("missing minor"));
-    }
-
-    #[test]
-    fn extract_info_bodies_unwraps_cluster_map_all_entries() {
-        // Simulates cluster-mode INFO response: map of node_addr → body.
-        // extract_info_bodies must return EVERY node's body so a stale
-        // pre-upgrade replica cannot hide behind an upgraded primary.
-        let body_a = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:9.0.3\r\n";
-        let body_b = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:8.0.0\r\n";
-        let map = Value::Map(vec![
-            (
-                Value::SimpleString("127.0.0.1:7000".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_a.to_string(),
-                },
-            ),
-            (
-                Value::SimpleString("127.0.0.1:7001".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_b.to_string(),
-                },
-            ),
-        ]);
-        let bodies = extract_info_bodies(&map).unwrap();
-        assert_eq!(bodies.len(), 2);
-        assert_eq!(bodies[0], body_a);
-        assert_eq!(bodies[1], body_b);
-    }
-
-    #[test]
-    fn extract_info_bodies_handles_simple_string() {
-        let body_text = "redis_version:7.2.4\r\nvalkey_version:9.0.3\r\n";
-        let v = Value::SimpleString(body_text.to_string());
-        let bodies = extract_info_bodies(&v).unwrap();
-        assert_eq!(bodies, vec![body_text.to_string()]);
-    }
-
-    #[test]
-    fn extract_info_bodies_rejects_empty_cluster_map() {
-        let map = Value::Map(vec![]);
-        let err = extract_info_bodies(&map).unwrap_err();
-        assert!(matches!(err, ServerError::OperationFailed(_)));
-        assert!(err.to_string().contains("empty map"));
-    }
-
-    /// End-to-end composition test for the cluster-min fix (issue #84):
-    /// `extract_info_bodies` → `parse_valkey_version` per node → min-reduce →
-    /// floor comparison. A mixed-version cluster where one node is 7.1.0 must
-    /// fail the gate, even if another node is already on 8.0.0 and that
-    /// node's entry appears first in the map.
-    #[test]
-    fn parse_valkey_version_min_across_cluster_map_picks_lowest() {
-        // node1 appears first and is above the floor. Pre-fix behavior
-        // (first-entry only) would accept. The min across all three nodes is
-        // (7, 1), below the (7, 2) floor, so the gate must reject.
-        let body_node1 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.0.0\r\n";
-        let body_node2 = "# Server\r\nredis_version:7.1.0\r\nserver_name:valkey\r\n";
-        let body_node3 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:7.2.0\r\n";
-        let map = Value::Map(vec![
-            (
-                Value::SimpleString("node1:6379".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_node1.to_string(),
-                },
-            ),
-            (
-                Value::SimpleString("node2:6379".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_node2.to_string(),
-                },
-            ),
-            (
-                Value::SimpleString("node3:6379".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_node3.to_string(),
-                },
-            ),
-        ]);
-
-        let bodies = extract_info_bodies(&map).unwrap();
-        let min = bodies
-            .iter()
-            .map(|b| parse_valkey_version(b).unwrap())
-            .min()
-            .unwrap();
-
-        assert_eq!(min, (7, 1), "min across cluster must be the lowest node");
-        assert!(
-            min < (REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR),
-            "mixed-version cluster with 7.1.0 node must fail the (7,2) gate"
-        );
-    }
-
-    /// Companion to `parse_valkey_version_min_across_cluster_map_picks_lowest`:
-    /// when every node is at or above the floor, the min-reduce + gate
-    /// composition accepts.
-    #[test]
-    fn parse_valkey_version_all_nodes_at_or_above_floor_accepts() {
-        let body_node1 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:8.0.0\r\n";
-        let body_node2 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:7.2.0\r\n";
-        let body_node3 = "# Server\r\nredis_version:7.2.4\r\nserver_name:valkey\r\nvalkey_version:9.0.3\r\n";
-        let map = Value::Map(vec![
-            (
-                Value::SimpleString("node1:6379".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_node1.to_string(),
-                },
-            ),
-            (
-                Value::SimpleString("node2:6379".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_node2.to_string(),
-                },
-            ),
-            (
-                Value::SimpleString("node3:6379".to_string()),
-                Value::VerbatimString {
-                    format: ferriskey::value::VerbatimFormat::Text,
-                    text: body_node3.to_string(),
-                },
-            ),
-        ]);
-
-        let bodies = extract_info_bodies(&map).unwrap();
-        let min = bodies
-            .iter()
-            .map(|b| parse_valkey_version(b).unwrap())
-            .min()
-            .unwrap();
-
-        assert_eq!(min, (7, 2), "min across cluster is the lowest node (7.2)");
-        assert!(
-            min >= (REQUIRED_VALKEY_MAJOR, REQUIRED_VALKEY_MINOR),
-            "all-above-floor cluster must pass the gate"
-        );
-    }
 
     #[test]
     fn valkey_version_too_low_is_not_retryable() {
