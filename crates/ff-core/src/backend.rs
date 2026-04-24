@@ -249,7 +249,79 @@ pub enum StreamMode {
     /// Short-lived frame. XADDed with `mode=best_effort`; per-stream
     /// MAXLEN rolls it off and the stream key gets a TTL refresh only
     /// when the stream has never held a durable frame (RFC-015 §4.1).
-    BestEffortLive { ttl_ms: u32 },
+    ///
+    /// The per-stream MAXLEN is computed dynamically in Lua from an
+    /// EMA of observed append rate (RFC-015 §4.2). See
+    /// [`BestEffortLiveConfig`] for the tunable knobs.
+    BestEffortLive { config: BestEffortLiveConfig },
+}
+
+/// Configuration knobs for [`StreamMode::BestEffortLive`] — RFC-015
+/// §4.2 dynamic MAXLEN sizing.
+///
+/// Defaults derived from the Phase 0 benchmark + RFC §4.1/§4.3 final
+/// design:
+///   - `ttl_ms` — caller-supplied visibility target.
+///   - `maxlen_floor = 64` — RFC §4.1 round-2 default, used for
+///     low-rate streams where the EMA formula would under-size.
+///   - `maxlen_ceiling = 16_384` — cap on per-stream retained entries
+///     (raised from the original §4.2 draft of 2048 after Phase 0
+///     showed 200–4000 Hz LLM-token bursts saturate any lower clamp).
+///   - `ema_alpha = 0.2` — RFC §4.3 gate value. Weights the latest
+///     per-append instantaneous rate at 20 %, decays prior samples
+///     at 80 % each append.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct BestEffortLiveConfig {
+    pub ttl_ms: u32,
+    pub maxlen_floor: u32,
+    pub maxlen_ceiling: u32,
+    pub ema_alpha: f64,
+}
+
+impl BestEffortLiveConfig {
+    /// Construct with the given `ttl_ms` and defaults for the other
+    /// knobs. Matches the shorthand used by
+    /// [`StreamMode::best_effort_live`].
+    pub fn with_ttl(ttl_ms: u32) -> Self {
+        Self {
+            ttl_ms,
+            maxlen_floor: 64,
+            maxlen_ceiling: 16_384,
+            ema_alpha: 0.2,
+        }
+    }
+
+    /// Builder: override [`Self::maxlen_floor`]. Chainable.
+    pub fn with_maxlen_floor(mut self, floor: u32) -> Self {
+        self.maxlen_floor = floor;
+        self
+    }
+
+    /// Builder: override [`Self::maxlen_ceiling`]. Chainable.
+    pub fn with_maxlen_ceiling(mut self, ceiling: u32) -> Self {
+        self.maxlen_ceiling = ceiling;
+        self
+    }
+
+    /// Builder: override [`Self::ema_alpha`]. Chainable. Callers are
+    /// expected to keep α in `(0.0, 1.0]`; the Lua side clamps to that
+    /// range defensively.
+    pub fn with_ema_alpha(mut self, alpha: f64) -> Self {
+        self.ema_alpha = alpha;
+        self
+    }
+}
+
+// Eq/Hash on an f64 field is unsafe (NaN); derive only what's sound.
+impl Eq for BestEffortLiveConfig {}
+impl std::hash::Hash for BestEffortLiveConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ttl_ms.hash(state);
+        self.maxlen_floor.hash(state);
+        self.maxlen_ceiling.hash(state);
+        self.ema_alpha.to_bits().hash(state);
+    }
 }
 
 impl StreamMode {
@@ -268,12 +340,23 @@ impl StreamMode {
         }
     }
 
-    /// [`Self::BestEffortLive`] with the caller-supplied `ttl_ms`.
+    /// [`Self::BestEffortLive`] with the caller-supplied `ttl_ms` and
+    /// default [`BestEffortLiveConfig`] knobs.
     /// RFC-015 §4 guidance: `5_000..=30_000` ms. Below ~1000 ms a live
     /// tailer may not connect in time; above ~60_000 ms the memory
     /// argument against plain [`Self::Durable`] weakens.
     pub fn best_effort_live(ttl_ms: u32) -> Self {
-        StreamMode::BestEffortLive { ttl_ms }
+        StreamMode::BestEffortLive {
+            config: BestEffortLiveConfig::with_ttl(ttl_ms),
+        }
+    }
+
+    /// [`Self::BestEffortLive`] with a fully-specified
+    /// [`BestEffortLiveConfig`]. Use for per-workload tuning of α, the
+    /// MAXLEN clamp, or the TTL — defaults are wired from
+    /// [`BestEffortLiveConfig::with_ttl`].
+    pub fn best_effort_live_with_config(config: BestEffortLiveConfig) -> Self {
+        StreamMode::BestEffortLive { config }
     }
 
     /// Stable wire-level token for this mode, written to the XADD entry
@@ -1517,9 +1600,30 @@ mod tests {
         let b = StreamMode::best_effort_live(15_000);
         assert_eq!(b.wire_str(), "best_effort");
         match b {
-            StreamMode::BestEffortLive { ttl_ms } => assert_eq!(ttl_ms, 15_000),
+            StreamMode::BestEffortLive { config } => {
+                assert_eq!(config.ttl_ms, 15_000);
+                assert_eq!(config.maxlen_floor, 64);
+                assert_eq!(config.maxlen_ceiling, 16_384);
+                assert!((config.ema_alpha - 0.2).abs() < 1e-9);
+            }
             _ => panic!("expected BestEffortLive"),
         }
+
+        let cfg = BestEffortLiveConfig::with_ttl(10_000)
+            .with_maxlen_floor(128)
+            .with_maxlen_ceiling(8_192)
+            .with_ema_alpha(0.3);
+        let b2 = StreamMode::best_effort_live_with_config(cfg);
+        match b2 {
+            StreamMode::BestEffortLive { config } => {
+                assert_eq!(config.ttl_ms, 10_000);
+                assert_eq!(config.maxlen_floor, 128);
+                assert_eq!(config.maxlen_ceiling, 8_192);
+                assert!((config.ema_alpha - 0.3).abs() < 1e-9);
+            }
+            _ => panic!("expected BestEffortLive"),
+        }
+
         assert_eq!(StreamMode::default(), StreamMode::Durable);
     }
 
