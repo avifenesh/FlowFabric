@@ -1,6 +1,0 @@
-748800:C 24 Apr 2026 15:08:10.306 # WARNING: Changing databases number from 16 to 1 since we are in cluster mode
-748800:C 24 Apr 2026 15:08:10.306 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
-748801:C 24 Apr 2026 15:08:10.306 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
-748801:C 24 Apr 2026 15:08:10.306 * Valkey version=7.2.12, bits=64, commit=00000000, modified=0, pid=748801, just started
-748801:C 24 Apr 2026 15:08:10.306 * Configuration loaded
-748801:M 24 Apr 2026 15:08:10.306 # Failed to configure LOCALE for invalid locale name.
