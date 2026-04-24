@@ -13,7 +13,7 @@
 
 `ff-server` is the last Valkey-hardcoded surface in the v0.7 stack. Every `Server::<method>` in `crates/ff-server/src/server.rs` still reaches directly into `ferriskey::Client` via `self.client.fcall_with_reload(...)`, `self.client.cmd(...)`, or `self.tail_client.cmd(...)`, constructing KEYS/ARGV arrays positionally and parsing raw `ferriskey::Value` replies. Wave 4-7 landed a Postgres `EngineBackend`, but no HTTP consumer can reach it because `Server::start(ServerConfig)` hardcodes a ferriskey dial and 23 handler call-sites bypass the trait.
 
-This RFC migrates `Server` onto a single `Arc<dyn EngineBackend>` field, expands the trait to cover every op `ff-server` serves in steady state (adding 12 new methods — ingress + budget/quota admin + operator control — bringing the trait to **44 methods** including two new cross-cutting hooks `shutdown_prepare()` and `backend_label()`), relocates all Valkey-specific primitives (`tail_client`, `stream_semaphore`, `xread_block_lock`) from `Server` into `ValkeyBackend`, and stages the migration in four CI-green stages plus a v0.8 deprecation cleanup.
+This RFC migrates `Server` onto a single `Arc<dyn EngineBackend>` field, expands the trait to cover every op `ff-server` serves in steady state (adding **20** new methods — ingress 5, operator control 4, budget/quota admin 5 (incl. `report_usage_admin`), read+diagnostics 3, scheduling 1, cross-cutting 2 — bringing the trait from **31 → 51 methods**; see §2.3 for the authoritative breakdown), relocates all Valkey-specific primitives (`tail_client`, `stream_semaphore`, `xread_block_lock`) from `Server` into `ValkeyBackend`, and stages the migration in four CI-green stages plus a v0.8 deprecation cleanup. **`FF_BACKEND=postgres` is hard-gated to Stage E (v0.8.0) per §9** — no silent 501s mid-migration.
 
 The ingress + admin promotion is a **breaking trait change** — every external `impl EngineBackend for X` recompiles. The consolidated position: ship it as **v0.8.0**, not as v0.7.x. Rationale in §10.
 
@@ -26,9 +26,9 @@ The ingress + admin promotion is a **breaking trait change** — every external 
 
 **Consolidated positions (resolving A/B divergences; see §3 for the resolution log):**
 
-5. **From A:** add `shutdown_prepare() -> Result<(), EngineError>` to the trait; Valkey closes the stream semaphore, Postgres default no-ops.
+5. **From A (round-1 F12 revised):** add `shutdown_prepare(grace: Duration) -> Result<(), EngineError>` to the trait; **no default impl** — Valkey closes the stream semaphore + drains up to `grace`, Postgres issues `UNLISTEN *` + drains sqlx pool up to `grace`. Per-backend spec in §5.4.
 6. **From B:** add `backend_label() -> &'static str` to the trait for observability dimensioning.
-7. **From B:** `list_pending_waitpoints` must not serialise raw HMAC tokens across the trait boundary — the backend produces signed tokens internally, and the response returns a sanitised `PendingWaitpointInfo` that omits the token secret.
+7. **From B (round-1 F5 revised):** `list_pending_waitpoints` sanitises the HMAC token across the trait boundary — 6 existing fields preserved (`waitpoint_key`, `state`, `required_signal_names`, `activated_at`, `created_at`, `expires_at`), `waitpoint_token` dropped, `(execution_id, token_kid, token_fingerprint)` added. Additive redaction, not wholesale rewrite. Details in §8.
 8. **Manager call:** scheduler cursor state stays scoped to the owning backend crate (`ff_scheduler::Scheduler` under Valkey; `PostgresScheduler` under Postgres) and `Server` borrows it through a trait-method accessor on `EngineBackend::claim_for_worker`, not through a separate `SchedulerBackend` trait. Both schedulers are already backend-scoped in v0.7 (Wave 5b PR #246); this RFC consolidates the server-side dispatch.
 
 ---
@@ -63,7 +63,7 @@ This is **backend drift**. The two concrete backends have different public shape
 In scope:
 
 - `Server` struct + all 24 HTTP handler methods on it.
-- Trait expansion: +12 new methods (ingress + budget/quota admin + operator control + diagnostics) + 2 cross-cutting (`shutdown_prepare`, `backend_label`).
+- Trait expansion: +20 new methods across ingress (5), operator control (4), budget/quota admin (5), read/diagnostics (3), scheduling (1), cross-cutting (2). Authoritative breakdown in §2.3.
 - Admin: `/v1/admin/rotate-waitpoint-secret` migrates to `EngineBackend::rotate_waitpoint_hmac_secret_all` (already on the trait).
 - `ServerConfig` gains `backend: BackendConfig` (sum-typed: Valkey or Postgres).
 
@@ -147,9 +147,19 @@ Boot-time Valkey-only routines (move into `ValkeyBackend::connect`):
 - Author A counted **13 trait-method additions** (ingress 5 + execution-control 8: `cancel_execution`, `get_execution_result`, `create_budget`, `create_quota_policy`, `get_budget_status`, `reset_budget`, `change_priority`, `revoke_lease`, `replay_execution`, `claim_for_worker`) — note A double-counted on one row; true count is 13 new.
 - Author B counted **12** (ingress 5 + operator control 3: `cancel_execution`, `change_priority`, `replay_execution`; budget/quota admin 4: `create_budget`, `reset_budget`, `create_quota_policy`, `get_budget_status`; diagnostics 1: `ping`) and folded `revoke_lease` + `claim_for_worker` + `list_pending_waitpoints` + `get_execution_result` as separate lines, and counted `ping` which A omitted.
 
-**Reconciled count:** **12 new data-plane + admin methods** (ingress 5, operator control 3, budget 3, quota 1 — `report_usage` reuses, `get_budget_status` new) + **`ping`** (diagnostics, +1) + **`claim_for_worker`** (scheduler dispatch, +1) + **`revoke_lease`** (+1) + **`get_execution_result`** (+1) + **`list_pending_waitpoints`** (+1) + **`shutdown_prepare`** (+1) + **`backend_label`** (+1).
+**Reconciled count (authoritative, post-round-1 revision per K F1 + F4).** Direct grep of `origin/main:crates/ff-core/src/engine_backend.rs` inside the `trait EngineBackend` block yields **31 existing methods** (earlier drafts said 30 — off by one against `main`).
 
-**Grand total new trait methods: 12 (ingress + admin + operator control) + `shutdown_prepare` + `backend_label` = 14.** Trait goes from 30 to **44 methods**.
+| Bucket | Methods | Count |
+|---|---|---|
+| Ingress | `create_execution`, `create_flow`, `add_execution_to_flow`, `stage_dependency_edge`, `apply_dependency_to_child` | 5 |
+| Operator control | `cancel_execution`, `change_priority`, `replay_execution`, `revoke_lease` | 4 |
+| Budget + quota admin | `create_budget`, `reset_budget`, `create_quota_policy`, `get_budget_status`, `report_usage_admin` | 5 |
+| Read + diagnostics | `get_execution_result`, `list_pending_waitpoints`, `ping` | 3 |
+| Scheduling | `claim_for_worker` | 1 |
+| Cross-cutting | `shutdown_prepare`, `backend_label` | 2 |
+| **Total new** | | **20** |
+
+**Base 31 + new 20 = 51 methods post-RFC.** Per K's F1 + F4: every new method is counted exactly once; `report_usage_admin` is a first-class new method (not a folded extension of existing `report_usage`). Earlier "44 / +14" and "45 / +15" numbers are retired; **51 / +20** is the single authoritative figure, used everywhere in this revision.
 
 The gap between A's 13 and B's 12 is that B folded `claim_for_worker` under "Scheduler holds its own `Arc<dyn EngineBackend>`, Server forwards" (not a trait add at this stage) while A promoted it to the trait. The consolidation keeps `claim_for_worker` on the trait (§7) — both backends already own a scheduler module; trait-lifting is mechanical and eliminates a branch on `Server`.
 
@@ -206,7 +216,7 @@ Total: 23 runtime call-sites, covering 24 `Server::` methods. `claim_for_worker`
 
 ### 3.1 Trait expansion (consolidated)
 
-**Position: single-trait expansion.** The trait grows from 30 to 44 methods.
+**Position: single-trait expansion.** The trait grows from **31 to 51 methods** (+20; see §2.3 for the authoritative breakdown).
 
 Rationale (consolidated from A §3.1 and B §3.1):
 
@@ -220,7 +230,7 @@ Rationale (consolidated from A §3.1 and B §3.1):
 
 5. **Object-safety hygiene.** The `_assert_dyn_compatible` guard at `engine_backend.rs:664` is one compile-time check. Three traits = three checks, three chances to regress.
 
-6. **RFC-012 R7 precedent.** Round-7 expanded the trait to 30 methods and widened `append_frame` / `report_usage`. 14 more is the same pattern.
+6. **RFC-012 R7 precedent.** Round-7 expanded the trait to 31 methods and widened `append_frame` / `report_usage`. +20 is a larger step but the same pattern — additive, default-impl-protected, semver-gated.
 
 ### 3.2 `Server` struct (consolidated)
 
@@ -250,7 +260,7 @@ Shutdown needs a seam regardless, which is why `shutdown_prepare()` exists on th
 
 | # | Topic | Author A | Author B | Consolidated |
 |---|---|---|---|---|
-| D1 | Total trait size | +13 (ingress 5 + exec-ctl 8) | +12 (ingress 5 + admin 7) | +14 (= +12 data-plane + `shutdown_prepare` + `backend_label`); §2.3 reconciles |
+| D1 | Total trait size | +13 (ingress 5 + exec-ctl 8) | +12 (ingress 5 + admin 7) | **+20** authoritative per §2.3; A + B both undercounted by folding supporting methods into handler rows |
 | D2 | `shutdown_prepare()` | **proposed** | not addressed | **adopt A** — needed for Valkey semaphore drain + Postgres LISTEN detach |
 | D3 | `backend_label()` | not addressed | **proposed** | **adopt B** — one `&'static str` method, metrics-essential |
 | D4 | Scheduler location | field on `ValkeyBackend`, trait-lifted `claim_for_worker` | scheduler holds its own `Arc<dyn EngineBackend>`, Server forwards | **hybrid**: schedulers stay scoped to owning backend crate (Wave 5b pattern); `claim_for_worker` on the trait so `Server` calls one method (§7) |
@@ -278,14 +288,16 @@ Shutdown needs a seam regardless, which is why `shutdown_prepare()` exists on th
 | 5 | Flow ingress | `POST /v1/flows`, `.../executions`, `.../cancel`, `.../edge`, `.../edge/{id}/apply` | **NEW** `create_flow`, `add_execution_to_flow`, `stage_dependency_edge`, `apply_dependency_to_child` + existing `cancel_flow` | M–H | `cancel_flow` trait covers the header only; the 200-line async member-fan-out stays server-local on `Server` (Q-C in §12). |
 | 6 | Execution ingress | `POST /v1/executions` | **NEW** `create_execution` | M | `dedup_ttl_ms = 86400000` literal at `server.rs:734` lifts to `CreateExecutionArgs::idempotency_ttl: Option<Duration>` (default 24h). Zero wire impact. |
 | 7 | Budget + quota admin | `POST /v1/budgets`, `.../budgets/{id}/status`, `.../budgets/{id}/usage`, `.../budgets/{id}/reset`, `.../quota-policies` | **NEW** `create_budget`, `get_budget_status`, `reset_budget`, `create_quota_policy` + existing-but-extended `report_usage` | M–H | See §5 on `report_usage` admin variant. |
-| 8 | Pending-waitpoint listing | `GET .../pending-waitpoints` | **NEW** `list_pending_waitpoints` | M | Returns sanitised `PendingWaitpointInfo` — no raw HMAC token. §8. |
+| 8 | Pending-waitpoint listing | `GET .../pending-waitpoints` | **NEW** `list_pending_waitpoints` | **H** | Round-1 F3: upgraded M→H. Pipelined SSCAN + 2× HMGET + §8 schema rewrite + pagination-cursor new to the trait. Returns sanitised `PendingWaitpointInfo` — no raw HMAC token. §8. |
 | 9 | Claim | `POST /v1/workers/{id}/claim` | **NEW** `claim_for_worker` | M | §7 — `ValkeyBackend` forwards to its `ff_scheduler::Scheduler` field; `PostgresBackend` forwards to `PostgresScheduler`. |
 | 10 | Streams | `GET .../attempts/{n}/stream`, `.../stream/tail` | existing `read_stream` + existing `tail_stream` | T | `tail_client` + semaphore + mutex move into `ValkeyBackend` (§6). 429 semantics preserved via `EngineError::ResourceExhausted { pool, max }` → HTTP 429. |
 | 11 | HMAC rotate | `POST /v1/admin/rotate-waitpoint-secret` | existing `rotate_waitpoint_hmac_secret_all` | T | Fan-out moves inside Valkey impl; admin semaphore + audit emit stay on `Server`. |
-| 12 | Boot verification | (not HTTP-exposed) | N/A — lives inside `ValkeyBackend::connect_with_metrics` | — | `verify_valkey_version`, `ensure_library`, `validate_or_create_partition_config`, `initialize_waitpoint_hmac_secret`, lanes SADD seed. |
-| 13 | Shutdown | (not HTTP-exposed) | **NEW** `shutdown_prepare()` | T | Valkey: closes `stream_semaphore`, drops `tail_client`. Postgres: default no-op (pool drop during Arc release). |
+| 12 | Boot verification | (not HTTP-exposed) | N/A — lives inside `ValkeyBackend::connect_with_metrics` | **H** | Round-1 F3: added explicit score. `verify_valkey_version`, `ensure_library` (FUNCTION LOAD), `validate_or_create_partition_config`, `initialize_waitpoint_hmac_secret`, lanes SADD seed. **Ordering contract (load-bearing):** FUNCTION LOAD precedes lanes SADD seed (SADD scripts reference the library); HMAC init precedes lanes seed (pending-waitpoint reads depend on it). Ordering contract documented on `EngineBackend::connect_with_metrics` trait doc-comment, not just in each impl. |
+| 13 | Shutdown | (not HTTP-exposed) | **NEW** `shutdown_prepare(grace: Duration)` | **H** | Round-1 F12: upgraded T→H. Signature takes a `Duration` grace budget; server wraps with top-level timeout. Valkey: closes `stream_semaphore`, awaits in-flight permits up to `grace`, drops `tail_client`. Postgres: issues `UNLISTEN *` + drains sqlx pool up to `grace`. **No default no-op** — each backend spec'd in §5. Guards against semaphore-close vs in-flight-acquire race (§14.8 mandatory Stage B CI test). |
 
-Totals: **7 trivial, 6 moderate, 3 hard.** The three Hard items (`replay_execution`, `cancel_flow` dispatch, `report_usage` admin-path shape) are the architectural risks and gate Stage C.
+Totals (post-round-1 F3/F12 rescoring): **5 trivial, 4 moderate, 4 hard** — `replay_execution`, `cancel_flow` dispatch, `report_usage` admin-path shape, `list_pending_waitpoints`, boot relocation, and `shutdown_prepare` are the Hard items (6 if boot + shutdown counted separately from handler families). Boot relocation + shutdown are Stage D + Stage B respectively; the others gate Stage C.
+
+Round-1 F3 also clarified `create_execution` idempotency_ttl semantics: the `dedup_ttl_ms = 86400000` literal lifts as `CreateExecutionArgs::idempotency_ttl: Option<Duration>` with a backend-side default of 24h when `None`. **No HTTP-wire change** — the legacy route accepts no idempotency field today, and this revision keeps it that way; the `None` default preserves current behaviour byte-for-byte. A future wire extension is out of scope for RFC-017.
 
 ---
 
@@ -301,34 +313,35 @@ async fn add_execution_to_flow(&self, args: AddExecutionToFlowArgs) -> Result<Ad
 async fn stage_dependency_edge(&self, args: StageDependencyEdgeArgs) -> Result<StageDependencyEdgeResult, EngineError>;
 async fn apply_dependency_to_child(&self, args: ApplyDependencyToChildArgs) -> Result<ApplyDependencyToChildResult, EngineError>;
 
-// ── Operator control (3) ──
+// ── Operator control (4) ──
 async fn cancel_execution(&self, args: CancelExecutionArgs) -> Result<CancelExecutionResult, EngineError>;
 async fn change_priority(&self, args: ChangePriorityArgs) -> Result<ChangePriorityResult, EngineError>;
 async fn replay_execution(&self, args: ReplayArgs) -> Result<ReplayResult, EngineError>;
+async fn revoke_lease(&self, args: RevokeLeaseArgs) -> Result<RevokeLeaseResult, EngineError>;
 
-// ── Budget + quota admin (4) ──
+// ── Budget + quota admin (5) — includes report_usage_admin per round-1 F4 ──
 async fn create_budget(&self, args: CreateBudgetArgs) -> Result<CreateBudgetResult, EngineError>;
 async fn reset_budget(&self, args: ResetBudgetArgs) -> Result<ResetBudgetResult, EngineError>;
 async fn create_quota_policy(&self, args: CreateQuotaPolicyArgs) -> Result<(), EngineError>;
 async fn get_budget_status(&self, id: &BudgetId) -> Result<BudgetStatus, EngineError>;
+async fn report_usage_admin(&self, budget_id: &BudgetId, args: ReportUsageAdminArgs) -> Result<ReportUsageResult, EngineError>;
 
-// ── Read + diagnostics (4) ──
+// ── Read + diagnostics (3) ──
 async fn get_execution_result(&self, id: &ExecutionId) -> Result<Option<Vec<u8>>, EngineError>;
-async fn list_pending_waitpoints(&self, id: &ExecutionId) -> Result<Vec<PendingWaitpointInfo>, EngineError>; // sanitised; see §8
+async fn list_pending_waitpoints(&self, args: ListPendingWaitpointsArgs) -> Result<ListPendingWaitpointsResult, EngineError>; // sanitised; see §8; cursor + limit
 async fn ping(&self) -> Result<(), EngineError>;
-async fn revoke_lease(&self, args: RevokeLeaseArgs) -> Result<RevokeLeaseResult, EngineError>;
 
 // ── Scheduling (1) ──
 async fn claim_for_worker(&self, args: ClaimForWorkerArgs) -> Result<ClaimForWorkerOutcome, EngineError>;
 
 // ── Cross-cutting (2) ──
-async fn shutdown_prepare(&self) -> Result<(), EngineError> { Ok(()) }     // default no-op; ValkeyBackend overrides
-fn backend_label(&self) -> &'static str { "unknown" }                       // default; concrete backends override
+async fn shutdown_prepare(&self, grace: Duration) -> Result<(), EngineError>;  // NO default — each backend spec'd; see §5.4
+fn backend_label(&self) -> &'static str;                                         // NO default — each backend overrides
 ```
 
-**`report_usage` (existing) — admin-path variant.** The existing trait method takes `&Handle` (worker-bound lease cookie). The HTTP admin path `/v1/budgets/{id}/usage` takes `BudgetId` directly (no worker ownership). Consolidated: **add a second method `report_usage_admin(BudgetId, ReportUsageArgs)`** (A Q-A, option i). Matches ingress/admin-vs-worker split already implicit in the trait. This is +1 beyond the 14 above when fully counted; the RFC treats it as part of the `report_usage` family migration in §4 row 7.
+**`report_usage_admin` placement (round-1 F4).** Promoted to a first-class entry in the budget+quota admin group above — not a folded extension of existing `report_usage`. The existing `report_usage(&Handle, ...)` continues to serve the worker-bound lease path; `report_usage_admin(&BudgetId, ReportUsageAdminArgs)` serves `/v1/budgets/{id}/usage` without worker ownership. Feature-flag placement: **`admin`** (see §5.2). Single-binary deployments (worker + operator in one process) compile with both `core` + `admin`; `core`-only deployments lose the admin path cleanly with a compile-level feature gate, not a runtime 501.
 
-**Total trait size after RFC-017:** 30 + 12 data-plane + `shutdown_prepare` + `backend_label` + `report_usage_admin` = **45 methods**. (The summary's "44" counts `report_usage_admin` as an extension of the existing `report_usage` entry; strict call-site count is 45.)
+**Total trait size after RFC-017:** base 31 + 20 new = **51 methods** (per §2.3).
 
 ### 5.1 Method signature conventions
 
@@ -339,6 +352,21 @@ All new methods follow the conventions established by RFC-012 R7:
 - **Error: `EngineError`**, with backend-specific detail in `EngineError::Backend(BackendError { kind, ... })`. No new top-level error variants introduced by this RFC except the default-impl `Unavailable { op: &'static str }`.
 - **No lifetimes on input types.** `&CreateFlowArgs` is acceptable; `&'a CreateFlowArgs<'a>` is not. Keeps the trait mockable in test code without HRTB gymnastics.
 - **`async fn` everywhere.** The trait uses `#[async_trait]` in-tree today; RFC-017 does not switch to native `-> impl Future` (separate decision, not in scope).
+
+### 5.1.1 Struct discipline: `#[non_exhaustive]` + constructors (round-1 F2)
+
+Per project memory `non_exhaustive_needs_constructor` + `feedback_non_exhaustive_needs_constructor`: every public struct used as a trait argument or return value in RFC-017 MUST be `#[non_exhaustive]` AND MUST ship with a `pub fn new(required_fields...) -> Self` constructor in the same PR. The two requirements are paired — one without the other produces either an unbuildable dead API (attribute + no constructor) or a consumer-breakage cliff on every future field addition (constructor + no attribute).
+
+**Structs newly introduced by RFC-017 (all get `#[non_exhaustive]` + `new`):**
+
+- Args: `CreateExecutionArgs`, `CreateFlowArgs`, `AddExecutionToFlowArgs`, `StageDependencyEdgeArgs`, `ApplyDependencyToChildArgs`, `CancelExecutionArgs`, `ChangePriorityArgs`, `ReplayArgs`, `RevokeLeaseArgs`, `CreateBudgetArgs`, `ResetBudgetArgs`, `CreateQuotaPolicyArgs`, `ReportUsageAdminArgs`, `ListPendingWaitpointsArgs`, `ClaimForWorkerArgs`.
+- Results: `CreateExecutionResult`, `CreateFlowResult`, `AddExecutionToFlowResult`, `StageDependencyEdgeResult`, `ApplyDependencyToChildResult`, `CancelExecutionResult`, `ChangePriorityResult`, `ReplayResult`, `RevokeLeaseResult`, `CreateBudgetResult`, `ResetBudgetResult`, `ReportUsageResult`, `ListPendingWaitpointsResult`, `ClaimForWorkerOutcome`, `BudgetStatus`, `PendingWaitpointInfo` (reshape per §8).
+
+**Existing structs upgraded to `#[non_exhaustive]` + `new` at Stage A (v0.8 is a semver break anyway, so the upgrade is free):**
+
+- `CreateExecutionArgs` (currently at `contracts/mod.rs:21`), `CancelExecutionArgs` (:336), `RevokeLeaseArgs` (:364), `CreateBudgetArgs` (:1309), `CreateFlowArgs` (:1511), `AddExecutionToFlowArgs` (:1529), `StageDependencyEdgeArgs` (:1613) — K F2 enumerated these; all confirmed on `origin/main`.
+
+**Explicit non-goal:** RFC-017 does NOT introduce a `*Builder` pattern. The `pub fn new(required_fields...) -> Self` constructor + `pub fn with_<optional>(mut self, v: T) -> Self` fluent setters are the idiomatic pattern in this repo; see ferriskey `ClientBuilder` for precedent. This is explicitly called out so reviewers don't block on missing "builder" types.
 
 ### 5.2 Interaction with feature flags
 
@@ -354,6 +382,22 @@ All new methods follow the conventions established by RFC-012 R7:
 After Stage A, `PostgresBackend` has impls for the 5 ingress methods (promoted from inherent), default-impl `Unavailable` for the 7 other new data-plane methods, and `"postgres"` for `backend_label`. That debt is paid down during Stage D (Postgres HTTP parity hardening). It is tracked explicitly in the `POSTGRES_PARITY_MATRIX.md` alongside the Stage D PR — any method still on `Unavailable` at Stage D ship time is a **hard block**, not a follow-up.
 
 **Default impls.** All newly added data-plane methods get a default impl returning `EngineError::Unavailable { op: "<method_name>" }` — same pattern RFC-012 used for the initial trait landing. Each concrete backend overrides what it actually implements. This keeps Stage A additive: landing the trait expansion does not force Postgres to land all impls in one go.
+
+**`shutdown_prepare` and `backend_label` are explicitly NOT defaulted** (post-round-1 F12 revision): every concrete backend specs its own. Rationale below (§5.4).
+
+### 5.4 `shutdown_prepare` spec (round-1 F12)
+
+**Signature:** `async fn shutdown_prepare(&self, grace: Duration) -> Result<(), EngineError>;` — no default impl.
+
+Per-backend contract:
+
+- **`ValkeyBackend`:** closes `stream_semaphore` (`Semaphore::close()`); awaits in-flight permit drops up to `grace`; drops `tail_client` handle. New `acquire_owned` calls return `EngineError::Unavailable { op: "tail_stream" }` immediately. In-flight calls complete normally. If `grace` elapses before drain, returns `EngineError::Timeout { op: "shutdown_prepare", elapsed: grace }`; caller (server) decides whether to hard-cancel or escalate.
+- **`PostgresBackend`:** issues `UNLISTEN *` on the notification channel; drains the sqlx pool via `Pool::close_with_timeout(grace)`. In-flight queries complete up to `grace`; beyond that, they receive `Err(Canceled)`. No default no-op — the LISTEN session + pool lifecycle demand an explicit detach.
+- **Future backends:** spec their own; the "no default" stance prevents silent wrong behaviour.
+
+**Server integration:** `Server::shutdown()` calls `self.backend.shutdown_prepare(self.config.shutdown_grace).await` BEFORE draining `background_tasks`. Default `shutdown_grace = 30s`; configurable via `ServerConfig::shutdown_grace`. If `shutdown_prepare` returns `Timeout`, `Server` emits a `ff_shutdown_timeout_total` metric increment + `WARN` log + proceeds to background-task cancellation anyway (best-effort on bound).
+
+**Test requirement (promoted to mandatory Stage B CI per round-1 F12):** `tests/shutdown_prepare_under_load.rs` opens 16 concurrent `tail_attempt_stream` sessions, triggers `Server::shutdown()` with `grace = 5s`, asserts (a) all 16 terminate cleanly within 5s; (b) no panics from dropped-permit accounting; (c) new `tail_attempt_stream` requests between `close()` and full drain get `HTTP 503` (mapped from `EngineError::Unavailable`), not `HTTP 500`.
 
 ---
 
@@ -382,7 +426,7 @@ Contract mapping:
 | Primitive | Location after RFC | Surfaced as |
 |---|---|---|
 | `tail_client` | private field of `ValkeyBackend` | Used internally by `tail_stream` + `read_stream` impls. Invisible to `Server`. |
-| `stream_semaphore` | private field of `ValkeyBackend` | Denial surfaces as `EngineError::ResourceExhausted { pool: "stream_ops", max }`; `ServerError::from` maps to HTTP 429. Preserves current 429-on-contention behaviour byte-for-byte. |
+| `stream_semaphore` | private field of `ValkeyBackend` | Denial surfaces as `EngineError::ResourceExhausted { pool: "stream_ops", max, retry_after_ms: Option<u32> }` (post-round-1 F7); `ServerError::from` maps to HTTP 429 with the `Retry-After` header populated from `retry_after_ms` when present. Preserves current 429-on-contention behaviour byte-for-byte and keeps the current retry-hint path that reads `stream_semaphore.available_permits()` — the Valkey impl populates `retry_after_ms` server-side so the mapping layer doesn't need access to the private semaphore. |
 | `xread_block_lock` | private field of `ValkeyBackend` | Internal to the Valkey `tail_stream` impl. No trait surface. |
 | `admin_rotate_semaphore` | **stays on `Server`** | Server-wide fairness gate; not backend-coupled; applies equally to Postgres. |
 
@@ -406,42 +450,76 @@ Both schedulers are already backend-scoped. This RFC consolidates the dispatch:
 1. `ValkeyBackend` takes ownership of `Arc<ff_scheduler::Scheduler>` as a field (constructed in `connect_with_metrics`).
 2. `PostgresBackend` takes ownership of `Arc<PostgresScheduler>` as a field.
 3. `EngineBackend::claim_for_worker(args) -> ClaimForWorkerOutcome` becomes the trait method; each concrete backend forwards to its own scheduler module.
-4. `Server::scheduler: Arc<ff_scheduler::Scheduler>` **stays** as a field during the migration (Stage A/B compatibility), but `Server::claim_for_worker` calls `self.backend.claim_for_worker(...)`. The field is removed in Stage D when `Server` no longer needs it for direct dispatch.
+4. `Server::scheduler: Arc<ff_scheduler::Scheduler>` **stays** as a field **only for claim-path dispatch**, and `Server::claim_for_worker` calls `self.backend.claim_for_worker(...)` (no direct scheduler access from `Server` on the data plane). The field is **removed at Stage D** when the dispatch rewire is complete (round-1 F8 + Q4 resolution; closes Q4). No Postgres-panic surface exists mid-migration because `FF_BACKEND=postgres` is hard-gated to Stage E per §9 (round-1 F9). The two existing debug endpoints (`/debug/scheduler`, `/debug/partition-assignment`) are Valkey-only today and remain Valkey-only — they move into the Valkey-specific `ValkeyBackend::debug_router()` sub-router exposed by the Valkey crate; `Server` mounts it when `backend_label() == "valkey"`. No trait pollution.
 
 Rationale: cursor state is backend-native (Valkey uses co-located lane queues; Postgres uses `FOR UPDATE SKIP LOCKED`). Forcing a common `Scheduler` abstraction above the trait would either leak Valkey-rotation semantics into Postgres or pollute Valkey with SQL-transaction assumptions. Keep it backend-local; expose only the dispatch entrypoint.
 
 ---
 
-## 8. `list_pending_waitpoints` — HMAC redaction
+## 8. `list_pending_waitpoints` — schema rewrite + HMAC redaction
 
-**Adopt B's security posture.** Today `Server::list_pending_waitpoints` materialises `PendingWaitpointInfo { waitpoint_id, hmac_token: String, ... }` and serialises it directly on the wire. The `hmac_token` is a signed resume credential — intended for the waiter who already has the raw secret, but currently returned to any caller with list privilege.
+**Reframed post-round-1 per K F5 + L-3: this is a schema rewrite, not a drop-in redaction. Call it what it is.**
 
-Two concerns:
+Today (`origin/main:crates/ff-core/src/contracts/mod.rs:824-854`), `PendingWaitpointInfo` has 8 fields:
 
-1. **Trait-boundary exposure.** If the backend returns a `hmac_token` as a plain `String` across `Arc<dyn EngineBackend>`, any consumer of the trait (including mocks and test harnesses) sees the raw credential. The boundary should emit a sanitised summary.
+```
+waitpoint_id, waitpoint_key, state: String, waitpoint_token, required_signal_names,
+created_at, activated_at, expires_at
+```
 
-2. **Wire exposure (separate).** The REST response today includes the token. That is a **pre-existing surface** but within scope for this RFC per `feedback_no_preexisting_excuse` — it's our project, and consolidation is the right point to fix it.
+K observed that the earlier §8 draft dropped `waitpoint_key`, `state`, `required_signal_names`, `activated_at` — all operationally load-bearing. `required_signal_names` drives reviewer-UI filtering when multiple concurrent waitpoints exist on one execution; `waitpoint_key` is how reviewers correlate across lanes; `state` + `activated_at` are how reviewers distinguish "still pending" from "just activated, pending resume dispatch". Dropping them is a real UX break. Re-added below.
 
-**Consolidated contract:**
+**Revised contract — additive redaction, not wholesale rewrite:**
 
 ```rust
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWaitpointInfo {
     pub waitpoint_id: WaitpointId,
-    pub execution_id: ExecutionId,
-    pub status: WaitpointStatus,
+    pub waitpoint_key: String,                       // KEPT — reviewer lane correlation
+    pub state: String,                                // KEPT — "pending" / "active" / "closed"
+    pub required_signal_names: Vec<String>,           // KEPT — reviewer UI filter
     pub created_at: TimestampMs,
+    pub activated_at: Option<TimestampMs>,            // KEPT — pending-vs-active distinction
     pub expires_at: Option<TimestampMs>,
-    pub token_kid: String,        // key id — safe to expose
-    pub token_fingerprint: String, // 8-byte hex prefix of HMAC, audit-friendly, not replayable
-    // DROPPED: hmac_token
+    // NEW (additive):
+    pub execution_id: ExecutionId,                    // surfaces the owning execution without a separate lookup
+    pub token_kid: String,                            // HMAC key id — safe to expose
+    pub token_fingerprint: String,                    // 8-byte hex prefix of the HMAC, audit-friendly, not replayable
+    // DROPPED:
+    //   waitpoint_token — this is the only field removed; replaced by (token_kid, token_fingerprint)
+}
+
+impl PendingWaitpointInfo {
+    pub fn new(
+        waitpoint_id: WaitpointId,
+        waitpoint_key: String,
+        state: String,
+        created_at: TimestampMs,
+        expires_at: Option<TimestampMs>,
+        execution_id: ExecutionId,
+        token_kid: String,
+        token_fingerprint: String,
+    ) -> Self { /* required_signal_names = vec![], activated_at = None by default */ }
 }
 ```
 
-- The backend generates + stores the signed token internally; it never crosses the trait.
-- Callers needing the raw token hit a separate path (`/v1/waitpoints/{id}/token` with stricter auth), scoped to RFC-017 follow-up; not landed in this RFC.
-- Wire format: v0.7.x keeps emitting the legacy `hmac_token` field populated with an **empty string + deprecation warning header** (`Deprecation: ff-017`), v0.8.0 removes the field entirely. This preserves the wire shape for one release per §7 of A's back-compat plan.
+Diff vs `origin/main`: **1 field dropped, 3 fields added, 6 fields kept.** Not a rewrite.
 
-This is the **only** wire-format change in this RFC, and it is a **security redaction**, not a feature change. Call it out in release notes.
+**Trait boundary:** the backend never emits the raw `waitpoint_token` across `Arc<dyn EngineBackend>`. Mocks + test harnesses see only `token_kid` + `token_fingerprint`.
+
+**Wire-format v0.7.x → v0.8.0 migration (round-1 L-3 — pick functional-plus-warn, not empty-string):**
+
+- **v0.7.x:** wire response keeps emitting `waitpoint_token` **populated with the real HMAC** (status quo for existing consumers) + emits `Deprecation: ff-017` response header + logs a server-side audit event per serving (`ff_pending_waitpoint_legacy_token_served_total`). Cairn + other consumers get a dashboard signal to migrate before v0.8.0.
+- **v0.8.0:** `waitpoint_token` removed entirely from the wire response; consumers MUST have switched to `(token_kid, token_fingerprint)` + the separate token-fetch path.
+
+This is the **only** wire-format change in this RFC. Schema break at v0.8.0 is real; the one-release functional-plus-warn window (not the earlier draft's empty-string middle-path) gives consumers an observable migration signal without silently breaking their resume flows.
+
+Callers needing the raw token (post-v0.8.0) hit a separate path `/v1/waitpoints/{id}/token` with stricter auth — scoped to an RFC-017 follow-up, not landed here.
+
+**Pagination (round-1 F3 + K §Scenarios 7):** `ListPendingWaitpointsArgs` carries an `after: Option<WaitpointId>` cursor + `limit: Option<u32>` (default 100, max 1000). Valkey impl continues to drive SSCAN cursor-style; Postgres impl uses `WHERE waitpoint_id > $after ORDER BY waitpoint_id LIMIT $limit`. Trait-level pagination is mandatory — a flow with 10k pending waitpoints cannot be served in one round-trip regardless of backend.
+
+Release notes must call out the v0.8.0 wire-break + the v0.7.x audit-log signal explicitly.
 
 ---
 
@@ -449,12 +527,24 @@ This is the **only** wire-format change in this RFC, and it is a **security reda
 
 Four stages + a v0.8 cleanup, each CI-green at the workspace boundary per `feedback_rfc_phases_vs_ci`.
 
+### 9.0 Postgres hard-gate (round-1 F9 + L-1)
+
+**`FF_BACKEND=postgres` refuses to boot during Stages A-D.** `Server::start_with_metrics` validates `backend.backend_label()` against `const BACKEND_STAGE_READY: &[&str] = &["valkey"]` through Stage D; `"postgres"` joins the list only when Stage E (v0.8.0 cleanup) lands. On boot with a gated backend, `Server::start` returns `ServerError::BackendNotReady { backend: "postgres", stage: "D" }` and exits with code 2.
+
+Rationale: silent 501s on 7+ HTTP routes during Stages A-D (default `Unavailable` impls on Postgres for the new data-plane methods) is worse than a hard boot refusal. An operator who tries to stand up a Postgres ff-server mid-migration gets a clear error at startup rather than runtime 501s scattered across 7 routes.
+
+**In-tree artifact:** `docs/POSTGRES_PARITY_MATRIX.md` lands at Stage A merge (NOT alongside Stage D). Per L-1: greppable by cairn-fabric runbooks — one row per trait method × backend × status (`impl` / `unavailable` / `stub`). Updated at every stage merge.
+
+**Stage D gate (mandatory CI, per L-1):** `test_postgres_parity_no_unavailable` iterates every HTTP-exposed trait method and asserts that `PostgresBackend::<method>(...)` on a live Postgres fixture never returns `EngineError::Unavailable`. Failure blocks Stage D merge. Runs in the two-backend CI matrix.
+
+**Stage E boundary:** `BACKEND_STAGE_READY` updated to `&["valkey", "postgres"]`; the `test_postgres_parity_no_unavailable` gate has already passed at Stage D merge; v0.8.0 ships with Postgres as a first-class backend.
+
 ### Stage A — Trait expansion + parity wiring (weeks 0-2)
 
-- Add the 14 new methods to `EngineBackend` with default impls returning `EngineError::Unavailable { op }`.
+- Add the 20 new methods to `EngineBackend` with default impls returning `EngineError::Unavailable { op }`.
 - Add `shutdown_prepare` (default no-op) and `backend_label` (default `"unknown"`).
 - Promote the 5 ingress methods from `PostgresBackend` inherent → `impl EngineBackend for PostgresBackend`. Remove `#[cfg(feature = "core")]` gates.
-- Add `impl EngineBackend for ValkeyBackend` bodies for all 14 new methods. Bodies wrap existing `ff_script::functions::*` helpers — source-of-truth is still the FCALL helpers, **zero behaviour change**.
+- Add `impl EngineBackend for ValkeyBackend` bodies for all 20 new methods. Bodies wrap existing `ff_script::functions::*` helpers — source-of-truth is still the FCALL helpers, **zero behaviour change**.
 - `ValkeyBackend::backend_label()` → `"valkey"`; `PostgresBackend::backend_label()` → `"postgres"`.
 - CI gate: **workspace `cargo test`** + `deploy-approval` example + cairn-fabric consumer CI all green. No `ff-server` handler changes yet.
 
@@ -487,7 +577,7 @@ Four stages + a v0.8 cleanup, each CI-green at the workspace boundary per `feedb
 
 - Migrate handlers 5 (flow ingress), 6 (execution ingress), 8 (pending waitpoints).
 - Move Valkey-specific boot (`ensure_library`, `validate_or_create_partition_config`, `initialize_waitpoint_hmac_secret`, lanes SADD, `verify_valkey_version`) from `Server::start_with_metrics` into `ValkeyBackend::connect_with_metrics`.
-- Wire `BackendConfig::Postgres` into `Server::start_with_metrics`; `ServerConfig::from_env` reads `FF_BACKEND`.
+- Wire `BackendConfig::Postgres` into `Server::start_with_metrics`; `ServerConfig::from_env` reads `FF_BACKEND`. **`FF_BACKEND=postgres` remains hard-gated at startup (§9.0) until Stage E.** `FF_BACKEND=postgres` boots successfully only after `BACKEND_STAGE_READY` is updated in Stage E.
 - Land `Server::start_with_backend(config, backend, metrics)` as the test-injection + future-embedded-user entry point (from B §5).
 - Remove `Server::client()` accessor and `Server::client: Client` field.
 - Remove Stage-B feature flag.
@@ -496,14 +586,16 @@ Four stages + a v0.8 cleanup, each CI-green at the workspace boundary per `feedb
 - Per `feedback_smoke_after_publish`: scratch-project smoke hits all 13 handler families against the published artifact before close.
 - CI gate: two-backend matrix (Valkey + Postgres); full workspace green.
 
-**Deliverable:** `Server` holds only `Arc<dyn EngineBackend>` for data access. `FF_BACKEND=postgres ff-server` serves the full HTTP surface.
+**Deliverable:** `Server` holds only `Arc<dyn EngineBackend>` for data access. `FF_BACKEND=postgres ff-server` still refuses to boot (hard-gate lifted only in Stage E).
 
-### v0.8.0 cleanup (weeks 10+)
+### Stage E — v0.8.0 cleanup + Postgres enablement (weeks 10+)
 
 - Remove deprecated `ServerConfig` flat fields.
-- Remove legacy `hmac_token` field from `/v1/pending-waitpoints` response.
-- Remove `Server::scheduler` field (now unused after full trait-dispatch).
+- Remove legacy `waitpoint_token` wire field from `/v1/pending-waitpoints` response (§8).
+- Remove `Server::scheduler` field (now unused after full trait-dispatch, per F8 + Q4).
+- **Update `BACKEND_STAGE_READY` to `&["valkey", "postgres"]`** — `FF_BACKEND=postgres` boots successfully for the first time.
 - Publish migration matrix to cairn peer team per `feedback_peer_team_boundaries`.
+- CI gate: `test_postgres_parity_no_unavailable` must pass (already green from Stage D); full two-backend workspace + scratch-project smoke.
 
 Stage A is load-bearing; B/C/D are mechanical if A is clean.
 
@@ -516,6 +608,23 @@ Stage A is load-bearing; B/C/D are mechanical if A is clean.
 | C | `report_usage_admin` shape disagreement; `replay_execution` variadic-KEYS misalignment | Owner sign-off on Q1 + Q3 (§12) before Stage C merges; parity tests cover both paths | Revert individual handlers; trait methods stay (unused is harmless) |
 | D | Postgres boot ordering (schema migrations vs HMAC install) diverges from Valkey's (FUNCTION LOAD + lanes SADD) in ways that break HTTP smoke | Two-backend CI matrix; scratch-project smoke before close; boot ordering documented in each backend's `connect_with_metrics` doc-comment | Revert Postgres entry point wiring; fall back to Valkey-only `Server::start_with_metrics` for v0.7.x patch; v0.8.0 re-attempts |
 | v0.8 | External consumer breakage on shim removal | 8-week deprecation window; release notes + migration guide + peer-team comms per `feedback_peer_team_boundaries` | None — by v0.8 the shims are gone by design; consumers who miss the window cut a v0.7.x branch |
+
+### 9.3 Consumer migration cadence (round-1 L-2)
+
+Explicit guidance for cairn-fabric + other external consumers, addressing L's concerns about v0.7.x patch-cadence churn:
+
+| Stage | Wall-clock window | Cairn action | SDK mock-impl update | Dashboard advice |
+|---|---|---|---|---|
+| Baseline | pre-Stage A | stay on v0.7.0-baseline; no action | — | existing dashboards work |
+| A | weeks 0-2 | optional adopt; trait surface grows additively | **update once** — add all 20 new methods with `Unavailable` defaults on the mock | `ff_backend_kind` label not yet present on all instances; DO NOT key selectors on it |
+| B | weeks 2-3 | **no action required** — trait is stable through Stage D | — | — |
+| C | weeks 3-5 | **no action required** | — | — |
+| D | weeks 5-9 | optional adopt; Postgres still gated | — | `ff_backend_kind` now universally present; selectors safe |
+| E / v0.8.0 | week 10+ | mandatory upgrade: remove legacy `ServerConfig` flat-field usage; update `waitpoint_token` consumers to `(token_kid, token_fingerprint)` + separate token-fetch path | — | — |
+
+**Trait stability freeze during Stages B/C (commitment to consumers):** no new trait methods land between Stage A ship and Stage D merge. Cairn mock-impl churn is bounded: **one update at Stage A, one update at v0.8.0** (for signature revisions on Args/Result types if any surfaced during Stages B-D; each such revision is flagged explicitly in the stage PR).
+
+**Dual-version compat test (promoted to mandatory CI, per L-2):** `tests/http_compat_cross_stage.rs` runs a golden-HTTP-diff suite asserting that every non-migrated handler in stage N produces byte-identical HTTP responses to stage N-1 for a fixed scenario matrix. Guards against silent behaviour drift during the migration window.
 
 ### 9.2 Stage-boundary CI contract
 
@@ -536,7 +645,7 @@ Adopted from B §10.4 and A §6.1 (A was loose; B was explicit).
 
 Reasoning:
 
-1. **Trait expansion by +14 methods breaks every external `impl EngineBackend for X`.** Any third-party backend (test mock crates in consumer codebases, hypothetical SQLite/DynamoDB adapters) stops compiling until it adds the new methods. Default impls help — a consumer can rely on them — but the trait surface **has changed**, and that's a minor-version break under Rust's stability contract.
+1. **Trait expansion by +20 methods breaks every external `impl EngineBackend for X`.** Any third-party backend (test mock crates in consumer codebases, hypothetical SQLite/DynamoDB adapters) stops compiling until it adds the new methods. Default impls help — a consumer can rely on them — but the trait surface **has changed**, and that's a minor-version break under Rust's stability contract.
 
 2. **`ServerConfig` shim removal (Stage D + v0.8 cleanup) breaks external construction.** Any consumer who set `ServerConfig { host: ..., port: ..., ... }` directly (not through `Default` + `..`) stops compiling when the flat fields are removed.
 
@@ -568,12 +677,11 @@ pub async fn start_with_metrics(
     config: ServerConfig,
     metrics: Arc<ff_observability::Metrics>,
 ) -> Result<Self, ServerError> {
+    // Post-round-1 F10: partition_config / lanes / waitpoint_hmac_secret move
+    // INTO BackendConfig::Valkey; Server no longer threads them separately.
     let backend: Arc<dyn EngineBackend> = match &config.backend {
         BackendConfig::Valkey(v) => ValkeyBackend::connect_with_metrics(
-            v.to_backend_config(),
-            config.partition_config.clone(),
-            config.lanes.clone(),
-            config.waitpoint_hmac_secret.clone(),
+            v.clone(),
             metrics.clone(),
         ).await?,
         BackendConfig::Postgres(p) => PostgresBackend::connect_with_metrics(
@@ -581,6 +689,13 @@ pub async fn start_with_metrics(
             metrics.clone(),
         ).await?,
     };
+    // Post-round-1 F9: FF_BACKEND=postgres hard-gate until Stage E.
+    if !BACKEND_STAGE_READY.contains(&backend.backend_label()) {
+        return Err(ServerError::BackendNotReady {
+            backend: backend.backend_label(),
+            stage: env!("CARGO_PKG_VERSION"),
+        });
+    }
     Self::start_with_backend(config, backend, metrics).await
 }
 
@@ -595,6 +710,12 @@ pub async fn start_with_backend(
 
 `start_with_backend` is the **new test-injection + embedded-user entry point**. `MockBackend` (§14) plugs in here without touching `ServerConfig` construction.
 
+**`partition_config` + `lanes` + `waitpoint_hmac_secret` ownership (round-1 F10).** These three fields move from `ServerConfig` into `BackendConfig::Valkey(ValkeyConfig { partition_config, lanes, waitpoint_hmac_secret, ... })` at v0.8.0. Rationale: they are Valkey-native constructs (partition hashing model + lanes SADD seed + per-partition HMAC secret), not generic server config. Postgres-backed deploys never set them.
+
+v0.7.x shim: `ServerConfig` retains them as `#[deprecated]` top-level fields that populate `BackendConfig::Valkey(...)` through `From<LegacyServerConfig>`; a runtime **validation** asserts that `ServerConfig.partition_config` (legacy) matches `BackendConfig::Valkey.partition_config` (new) when both are set. Mismatch → `ServerError::ConfigConflict { field: "partition_config" }` at startup (not silent drift).
+
+`start_with_backend` therefore takes its Valkey config *through the backend's own constructor*, not through `ServerConfig`. When a test wires `start_with_backend(config, Arc::new(MockBackend::new()), metrics)`, the mock's own constructor owns its partition_config; `ServerConfig` is consulted only for backend-agnostic fields (`http_addr`, `shutdown_grace`, etc.). No partition-count mismatch window.
+
 `ServerConfig` evolution:
 
 - **v0.7.x (Stages B-D):** `ServerConfig.backend: BackendConfig` lands. Legacy flat fields (`host`, `port`, `tls`, `cluster`, `skip_library_load`) stay `#[deprecated]`. `From<LegacyServerConfig> for ServerConfig` converts. `ServerConfig::from_env` reads `FF_BACKEND` (default `valkey` for parity) and falls back to legacy env vars.
@@ -608,21 +729,20 @@ Metrics + tracing: `/metrics` scrape output preserved. Backend-specific series (
 
 ---
 
-## 12. Open questions (owner-scoped, ≤5)
+## 12. Open questions (owner-scoped)
 
-Resolved during consolidation — **not** deferred: trait count (§2.3), `shutdown_prepare` (D2), `backend_label` (D3), HMAC exposure (§8), semver (§10), config shim cadence (§11), scheduler location (§7), boot trait vs in-backend (D7).
+Resolved during consolidation + round-1 revisions — **not** deferred: trait count (§2.3), `shutdown_prepare` (D2 + §5.4), `backend_label` (D3), HMAC exposure + schema (§8), semver (§10), config shim cadence (§11), scheduler location (§7), boot trait vs in-backend (D7), Postgres hard-gate (§9.0), struct discipline (§5.1.1), Retry-After wiring (§6).
 
-Remaining for owner:
+**Closed in round-1** (previously open, now decided — see `round-1/author-response.md`):
 
-1. **Q1 — `report_usage_admin` shape.** Split the existing trait method into `report_usage(&Handle, ...)` + new `report_usage_admin(BudgetId, ...)`, or promote `Handle` to a sum type (`Worker { handle }` / `Admin { budget }`)? Consolidated lean: **split** (smallest blast radius). Owner confirm.
+- **Q1 (report_usage_admin shape)** — CLOSED in favour of split (smallest blast radius; `Handle` sum-type pollutes every worker call-site with an unwrap). Not owner-scoped per K F11.
+- **Q3 (get_execution_result vs extending ExecutionSnapshot)** — CLOSED in favour of separate method. Binary payloads don't belong on a snapshot struct (§13.3 already takes this position). Not owner-scoped per K F11.
+- **Q4 (Server::scheduler field retirement)** — CLOSED at Stage D per §7 + F8 resolution.
+- **Q5 (third-party trait stability)** — CLOSED. Once v0.8.0 ships, `EngineBackend` is a public API under SemVer; stability is automatic. Sealing is out of scope for RFC-017 (separate RFC-012 R8+ question). Not owner-scoped per K F11.
 
-2. **Q2 — `cancel_flow` dispatch ownership.** Trait header-only (current shape; server owns the 150-line `JoinSet` member fan-out), or trait end-to-end (backend reconciles, trait caller observes)? Ships faster as header-only; end-to-end is more honest and unblocks Postgres reconciliation via `SELECT FOR UPDATE SKIP LOCKED`. Owner call before Stage C merges handler 13.
+**Remaining for owner:**
 
-3. **Q3 — `get_execution_result` vs extending `ExecutionSnapshot`.** Separate trait method returning `Option<Vec<u8>>` (consolidated lean per A §3 — binary payloads don't belong on a snapshot struct), or extend `ExecutionSnapshot` with `Option<ResultBytes>` (B §8 row 3 preference — fewer trait methods)? Lean: separate method. Owner confirm.
-
-4. **Q4 — `Server::scheduler` field retirement timing.** Stage D (aggressive — one release cycle), or v0.8.0 cleanup (conservative — two release cycles, matches other deprecations)? Lean: v0.8.0 cleanup for consistency with flat-field removal. Owner confirm.
-
-5. **Q5 — Third-party backend crates shipping their own `EngineBackend` impl.** Trait is `pub` today; sealed-trait pattern not adopted. Does v0.8's stability commitment extend to the trait itself (i.e. can external crates rely on `EngineBackend` staying stable in patch releases)? Lean: **yes**, per B §12.5 — speculative lock-in otherwise. This decision affects how aggressively we can add further methods post-v0.8.
+1. **Q2 — `cancel_flow` dispatch ownership.** Trait header-only (current shape; server owns the 150-line `JoinSet` member fan-out), or trait end-to-end (backend reconciles, trait caller observes)? Ships faster as header-only; end-to-end is more honest and unblocks Postgres reconciliation via `SELECT FOR UPDATE SKIP LOCKED`. Real scope/contract tradeoff — the only open question after round-1. Owner call before Stage C merges handler 13.
 
 ---
 
@@ -672,7 +792,7 @@ Consolidated from A §9 + B §13.
 
 ### 14.1 Stage A — trait parity
 
-- **Parity matrix test per new trait method** (`crates/ff-backend-valkey/tests/parity_stage_a.rs`). Invoke `Server::<method>` (existing Valkey-direct path) and `self.backend.<new_method>()` against the same Valkey instance; assert identical observable state transitions. Target: 14 new methods × 1 happy-path + 1 error-path = 28 tests minimum.
+- **Parity matrix test per new trait method** (`crates/ff-backend-valkey/tests/parity_stage_a.rs`). Invoke `Server::<method>` (existing Valkey-direct path) and `self.backend.<new_method>()` against the same Valkey instance; assert identical observable state transitions. Target: 20 new methods × 1 happy-path + 1 error-path = 40 tests minimum.
 - **Postgres inherent-to-trait promotion.** Existing `crates/ff-backend-postgres/tests/integration_flow_staging.rs` re-targets to the trait call.
 - **`shutdown_prepare` + `backend_label` smoke.** `assert_eq!(valkey.backend_label(), "valkey"); assert!(valkey.shutdown_prepare().await.is_ok());` Same for Postgres.
 
@@ -711,13 +831,11 @@ Per B §13 — the single biggest ergonomic win from this RFC. `MockBackend` liv
 - `/metrics` scrape before/after each stage — existing series set identical (no incumbent series disappears). Additions: `ff_backend_kind{backend=...}` label on existing counters.
 - `ff_stream_ops_concurrency_rejected` counter relocates from `Server` to `ValkeyBackend`; same name, same label, same scrape.
 
-### 14.8 Fuzzing + property coverage
+### 14.8 Fuzzing + property coverage + shutdown race (mandatory post-round-1 F12)
 
-Not a hard requirement for this RFC, but called out for owner awareness:
-
-- **Round-trip args.** `CreateFlowArgs` / `AddExecutionToFlowArgs` / etc. serde round-trip via `proptest` with `arb` generators — catches trait-boundary serialisation drift when a consumer upgrades one crate but not the other.
-- **Error-variant exhaustiveness.** A unit test iterates `EngineError::<variant>` and asserts `ServerError::from(...)` maps every variant to a distinct HTTP status — catches silent fall-throughs to 500.
-- **`shutdown_prepare` under active traffic.** Integration test opens 16 concurrent `tail_attempt_stream` sessions, calls `Server::shutdown()`, and asserts all 16 terminate within the configured grace period without panics. Specifically guards against the Valkey semaphore close vs in-flight `acquire` race.
+- **Round-trip args.** `CreateFlowArgs` / `AddExecutionToFlowArgs` / etc. serde round-trip via `proptest` with `arb` generators — catches trait-boundary serialisation drift when a consumer upgrades one crate but not the other. Property coverage, non-blocking.
+- **Error-variant exhaustiveness.** A unit test iterates `EngineError::<variant>` and asserts `ServerError::from(...)` maps every variant to a distinct HTTP status — catches silent fall-throughs to 500. Property coverage, non-blocking.
+- **`shutdown_prepare` under active traffic — MANDATORY Stage B CI (promoted from "awareness" per round-1 F12).** `tests/shutdown_prepare_under_load.rs` opens 16 concurrent `tail_attempt_stream` sessions, calls `Server::shutdown()` with `grace = 5s`, and asserts: (a) all 16 terminate cleanly within 5s; (b) no panics from dropped-permit accounting on `stream_semaphore`; (c) new `tail_attempt_stream` requests arriving between `Semaphore::close()` and full drain get `HTTP 503` (mapped from `EngineError::Unavailable`), not `HTTP 500`; (d) the `ff_shutdown_timeout_total` metric stays at 0 for the happy path and increments when `grace` is deliberately set below the drain time. Fails → Stage B merge blocks.
 
 ---
 
@@ -727,7 +845,7 @@ For reference by reviewers comparing this RFC to the A/B divergent drafts:
 
 | Decision | Choice | Source |
 |---|---|---|
-| Trait scope | Single trait, 45 methods (+14 vs v0.7) | A §3.1 + B §3.1 agree |
+| Trait scope | Single trait, **51 methods (+20 vs v0.7)** — post-round-1 reconciliation | A §3.1 + B §3.1 agree on single-trait; count reconciled in round-1 §2.3 |
 | Server field shape | `Arc<dyn EngineBackend>`, no enum, no generic | A §3.2 + B §4 agree |
 | Valkey primitives | Encapsulated in `ValkeyBackend` | A §3.2 + B §9 agree |
 | `shutdown_prepare` | Yes, on the trait | **A** |
@@ -741,11 +859,29 @@ For reference by reviewers comparing this RFC to the A/B divergent drafts:
 | Shim lifetime | 1 minor release (v0.7.x → v0.8.0) | A §6.1 + B §7 agree |
 | Stream-ops capability handle on Server | Rejected (Author A's initial sketch; adopt A's revised position) | **A revised** |
 
-No divergences remain unresolved. The five open questions in §12 are owner-scoped design choices inside the consolidated frame, not unresolved A-vs-B splits.
+**Round-1 revisions applied (2026-04-23):** addressed K's 12 findings + L's 5 deltas; see `rfcs/drafts/RFC-017-challenges/round-1/author-response.md` for the per-finding concede/argue-back record. Material changes: count reconciled to 51 methods (+20), `#[non_exhaustive]` discipline spec added (§5.1.1), `PendingWaitpointInfo` reframed as additive redaction preserving 6 existing fields (§8), `FF_BACKEND=postgres` hard-gated to Stage E (§9.0), `shutdown_prepare` spec'd per-backend with grace budget (§5.4), `Retry-After` added to `ResourceExhausted` (§6), `partition_config` ownership moved into `BackendConfig::Valkey` (§11), open questions reduced from 5 → 1 (Q2 remains), cross-backend semantics appendix added (§16).
+
+No divergences remain unresolved. The one open question in §12 (Q2) is owner-scoped and does not block further rounds.
 
 ---
 
-**End of RFC-017 consolidated master.** ~1000 lines.
+---
+
+## 16. Per-op cross-backend operational semantics (round-1 L-4)
+
+Single paragraph per op. SRE-facing — what does a runbook author need to know about how the same trait method behaves differently on Valkey vs Postgres?
+
+**`rotate_waitpoint_hmac_secret_all`.** Valkey: per-partition FCALL fan-out with `admin_rotate_fanout_concurrency = 16` (server-wide admin semaphore serialises cluster-wide). Runs in **~seconds** for typical deployments; partial-failure is observable (N-1 of N partitions rotated, returned in `RotateResult.partitions_failed`). Postgres: single `UPDATE secrets SET ... WHERE active = true` inside a transaction; runs in **~milliseconds**; partial-failure does not exist (transactional commit or rollback). Audit event schema (unchanged across backends) includes `backend_label()` so post-incident forensics can distinguish the two.
+
+**`cancel_flow` dispatch.** Open question Q2 (§12) — owner call pending. Valkey (header-only lean): server owns the 150-line `JoinSet` member fan-out; backend FCALL cancels the flow header + each member FCALL cancels the execution. Failures partial-observable. Postgres (end-to-end lean): `SELECT FOR UPDATE SKIP LOCKED` inside a transaction cancels header + all members atomically; no partial-failure window. Per-backend semantics section re-visited when Q2 resolves.
+
+**`replay_execution`.** Valkey: `ff_replay_execution` takes variadic KEYS based on inbound-edge count (up to flow's max fan-in); trait method `ReplayArgs` carries `edges: Vec<EdgeRef>` and the Valkey impl expands them into the KEYS array at FCALL-time. Variadic-KEYS contract hidden from `Server`. Postgres: single `INSERT ... SELECT` from `edges_table WHERE target = $execution_id` using SQL UNNEST; no variadic concern. Trait hides both shapes. Failure modes: Valkey can fail mid-fan-out with a partial replay; Postgres is transactional. Runbook must note this.
+
+`backend_label()` is required in **every admin audit emit** (`rotate`, `cancel_flow`, `replay_execution`) and in error reporting to Sentry/equivalent. Guarantees cross-backend forensic correlation.
+
+---
+
+**End of RFC-017 consolidated master (round-1 revised).** ~1150 lines.
 
 Consolidator notes:
 - A and B drafts retained at `rfcs/drafts/RFC-017-ff-server-backend-abstraction-A.md` and `-B.md` as the divergent-author record. PRs #259 and #260 stay open but are superseded by this consolidated draft (manager will not merge them).
