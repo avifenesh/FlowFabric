@@ -198,28 +198,39 @@ Valkey Streams do not support per-entry TTL (an entry only disappears via XDEL o
 `K` (the MAXLEN) is derived:
 
 ```
-K = max(32, min(2048, ceil(recent_rate_hz * ttl_ms / 1000) * 2))
+K = clamp(ceil(recent_rate_hz * ttl_ms / 1000) * 2, 64, 16_384)
 ```
 
-where `recent_rate_hz` is an EMA of append rate stored on the stream metadata Hash (updated inline on each append). The `* 2` factor gives a visibility buffer. Bounds `[32, 2048]` cap worst-case memory and handle cold starts.
+where `recent_rate_hz` is an EMA of append rate stored on the stream metadata Hash (updated inline on each append). The `* 2` factor (safety margin) gives a visibility buffer. Bounds `[64, 16_384]` cap worst-case memory and handle cold starts.
 
 **Cost of EMA tracking.** The EMA update adds 2 HSET + 1 HGET on the metadata Hash per best-effort append. Because the metadata Hash is already touched for lease validation, the amortized cost is a few extra field operations in a Hash already in the working set — small relative to the XADD.
 
-**EMA decay constant α — unset in this RFC, gated on benchmark.** This RFC deliberately does not bake an α value into the spec. See §4.3.
+**EMA decay constant α.** Default **α = 0.2** (locked post-Phase-0, see §4.3). Operators can override per-call via `BestEffortLiveConfig::ema_alpha`.
 
 **Guarantee:** "Visible to a tailer that starts before `append_time + ttl_ms`". After `ttl_ms`, the frame may or may not exist (MAXLEN may have rolled it off; key TTL may have fired).
 
-### §4.3 Tuning-before-ship (EMA α gate)
+### §4.3 EMA α — final values (closed post-Phase-0)
 
-The EMA decay constant α used in §4.2's `recent_rate_hz` update is **not specified in this RFC**. Picking α blindly — e.g., defaulting to α = 0.2 with a ~5-sample span — risks over- or under-sizing `K` for real cairn workloads, which directly drives the memory-vs-visibility tradeoff that motivates `BestEffortLive` in the first place.
+~~The EMA decay constant α used in §4.2's `recent_rate_hz` update is not specified in this RFC.~~ **Resolved 2026-04-23** in the dynamic-MAXLEN implementation PR (feat/rfc015-dynamic-maxlen):
 
-**Pre-release gate for v0.6:**
+| Knob | Value | Exposed as |
+|---|---|---|
+| `ema_alpha` | **0.2** | `BestEffortLiveConfig::ema_alpha` (per-call override) |
+| safety factor | **2.0** | Baked into the K formula; no knob |
+| `maxlen_floor` | **64** | `BestEffortLiveConfig::maxlen_floor` |
+| `maxlen_ceiling` | **16_384** | `BestEffortLiveConfig::maxlen_ceiling` |
 
-- **Benchmark shape.** Sample append-rate on a production cairn workload over a continuous 24 h window (at minimum; longer preferred if cairn diurnal pattern is pronounced). Record the per-stream append-rate distribution and derive p50 and p99 percentile-based window sizes.
-- **α selection criterion.** Choose α such that the EMA-predicted `K` tracks the observed p99 window size within a bounded overshoot (exact bound to be set by the measurement team at gate time, informed by the observed distribution's shape — not guessed here) while not collapsing to the p50 during rate lulls.
-- **Gate.** The v0.6 release cannot ship `BestEffortLive` until the α value is selected from this measurement and recorded in the implementation PR + changelog. If the measurement is unavailable by release time, `BestEffortLive` is held back to a later release; `Durable` + `DurableSummary` may ship independently.
+**Phase 0 outcome.** The EMA-α simulator (`benches/harness/src/bin/ema_alpha_bench.rs`) against a bursty LLM-token trace (29_495 appends / 600 s, 200–4000 Hz in-burst) showed:
 
-This gate closes §11's "EMA α" open question with a decision: deferred-to-measurement, not deferred-indefinitely.
+| Mode | visibility @ ttl=30 s |
+|---|---:|
+| static MAXLEN=64 (shipped baseline) | **0.6 %** |
+| EMA α=0.1 | 98.9 % |
+| EMA α=0.2 (**shipped**) | **98.3 %** |
+| EMA α=0.3 | 97.6 % |
+| EMA α=0.5 | 96.2 % |
+
+α barely moves visibility once the clamp ceiling is high enough. α = 0.2 was chosen as the final value because it sits squarely in the "stable but responsive" band (5-sample span) — the draft RFC's original suspicion. The ceiling raise from 2048 → 16_384 is the load-bearing change; without it all α variants saturated at ~53 % visibility on the target workload.
 
 ### §4.4 Empty-stream tail
 
@@ -357,7 +368,7 @@ pub struct AppendFrameOutcome {
 
 All previously-open questions are resolved in this draft. Retained here with resolution pointers for reviewer traceability.
 
-1. **(Resolved — owner adjudication, 2026-04-23.)** Rate-EMA decay constant α for `BestEffortLive` window sizing (§4.2). Decision: **not specified in this RFC; gated on a pre-v0.6-release benchmark.** See §4.3 for the benchmark shape and gate criteria.
+1. **(Resolved — implementation PR, 2026-04-23.)** Rate-EMA decay constant α for `BestEffortLive` window sizing (§4.2). Decision: **α = 0.2, safety_factor = 2.0, clamp [64, 16_384]** — landed in feat/rfc015-dynamic-maxlen via the offline EMA simulator. Phase 0 raised the clamp ceiling from the draft 2048 to 16_384 (the draft was underspecified for 200–4000 Hz LLM-token bursts; all α variants saturated at 53 % visibility under the lower clamp). See §4.3 for the measurement table.
 2. **(Resolved — owner adjudication, 2026-04-23.)** A `KeepAllDeltas`/`read_summary_history` variant of `DurableSummary` was considered to serve replay/debug. Decision: **dropped from v0.6.** Debug and audit consumers can use raw `Durable` mode for the same need; a second `DurableSummary` variant is not worth the doubled test matrix. See §11 "Alternatives rejected" for the full rationale.
 3. **(Resolved, moved to §6.3.)** Cross-attempt summary merging in `read_execution_stream` is locked to "latest-attempt summary in dedicated field." See §6.3.
 

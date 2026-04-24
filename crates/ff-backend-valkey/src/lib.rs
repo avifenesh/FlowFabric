@@ -1941,27 +1941,70 @@ async fn append_frame_impl(
     // newer variants to the pre-RFC-015 durable wire encoding (safe
     // fallback) so an intermediate-version backend never silently
     // mis-applies a newer mode.
-    let (mode_wire, patch_kind_wire, ttl_ms_wire): (&str, &str, String) = match frame.mode {
-        StreamMode::Durable => ("durable", "", "0".to_owned()),
+    // `mode_wire`, `patch_kind_wire`, `ttl_ms_wire` + the three RFC-015
+    // §4.2 dynamic-MAXLEN knobs (maxlen_floor, maxlen_ceiling, ema_alpha).
+    // The knobs are zero'd for non-BestEffortLive modes — Lua ignores
+    // ARGV 17-19 unless `stream_mode == "best_effort"`.
+    let (mode_wire, patch_kind_wire, ttl_ms_wire, maxlen_floor, maxlen_ceiling, ema_alpha): (
+        &str,
+        &str,
+        String,
+        String,
+        String,
+        String,
+    ) = match frame.mode {
+        StreamMode::Durable => (
+            "durable",
+            "",
+            "0".to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+        ),
         StreamMode::DurableSummary { patch_kind } => {
             let pk = match patch_kind {
                 PatchKind::JsonMergePatch => "json-merge-patch",
                 _ => "json-merge-patch",
             };
-            ("summary", pk, "0".to_owned())
+            (
+                "summary",
+                pk,
+                "0".to_owned(),
+                "0".to_owned(),
+                "0".to_owned(),
+                "0".to_owned(),
+            )
         }
-        StreamMode::BestEffortLive { ttl_ms } => ("best_effort", "", ttl_ms.to_string()),
-        _ => ("durable", "", "0".to_owned()),
+        StreamMode::BestEffortLive { config } => (
+            "best_effort",
+            "",
+            config.ttl_ms.to_string(),
+            config.maxlen_floor.to_string(),
+            config.maxlen_ceiling.to_string(),
+            format!("{:.6}", config.ema_alpha),
+        ),
+        _ => (
+            "durable",
+            "",
+            "0".to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+        ),
     };
 
-    // ARGV (16): execution_id, attempt_index, lease_id, lease_epoch,
+    // ARGV (19): execution_id, attempt_index, lease_id, lease_epoch,
     //            frame_type, ts, payload, encoding, correlation_id,
     //            source, retention_maxlen, attempt_id, max_payload_bytes,
-    //            stream_mode, patch_kind, ttl_ms
-    // Post-RFC-015: ARGV 14-16 added for stream-mode plumbing. Pre-015
-    // callers that still pass 13 ARGV are defaulted to `durable` on
-    // the Lua side (missing = empty = durable), so the extension is
-    // backwards-compatible.
+    //            stream_mode, patch_kind, ttl_ms,
+    //            maxlen_floor, maxlen_ceiling, ema_alpha
+    // RFC-015 wire evolution:
+    //   - Pre-RFC-015: 13 ARGV (durable-only).
+    //   - RFC-015 Phase 1/2: ARGV 14-16 added (mode, patch_kind, ttl_ms).
+    //   - RFC-015 §4.2 dynamic MAXLEN: ARGV 17-19 added
+    //     (maxlen_floor, maxlen_ceiling, ema_alpha). Lua defaults
+    //     missing ARGV to the §4.2 RFC-final values, so older Rust
+    //     callers stay backwards-compatible.
     let args: Vec<String> = vec![
         f.execution_id.to_string(),
         f.attempt_index.to_string(),
@@ -1979,6 +2022,9 @@ async fn append_frame_impl(
         mode_wire.to_owned(),
         patch_kind_wire.to_owned(),
         ttl_ms_wire,
+        maxlen_floor,
+        maxlen_ceiling,
+        ema_alpha,
     ];
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
