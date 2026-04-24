@@ -66,6 +66,8 @@ pub mod handle_codec;
 pub mod listener;
 pub mod migrate;
 pub mod pool;
+pub mod signal;
+pub mod suspend;
 pub mod version;
 
 pub use completion::{PostgresCompletionStream, COMPLETION_CHANNEL};
@@ -452,9 +454,17 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.rotate_waitpoint_hmac_secret_all", skip_all)]
     async fn rotate_waitpoint_hmac_secret_all(
         &self,
-        _args: RotateWaitpointHmacSecretAllArgs,
+        args: RotateWaitpointHmacSecretAllArgs,
     ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
-        unavailable("pg.rotate_waitpoint_hmac_secret_all")
+        // Wave 4 Agent D: Q4 single-global-row write against
+        // `ff_waitpoint_hmac`. `now_ms` is captured here (not
+        // inside the impl) so tests can inject a deterministic
+        // clock via the pool layer in the future.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        signal::rotate_waitpoint_hmac_secret_all_impl(&self.pool, args, now_ms).await
     }
 
     // ── Stream reads (streaming feature) ──
