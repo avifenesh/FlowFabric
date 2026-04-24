@@ -47,3 +47,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures = { workspace = true }
 # Issue #154 — tracing span capture in the observability wiring test.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+# Wave 4g: live Postgres integration tests for the admin/list surface.
+# Gated on `FF_PG_TEST_URL` at runtime (tests are `#[ignore]` by default).
+ff-backend-postgres = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
