@@ -78,6 +78,7 @@ use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_
 use ff_script::result::{FcallResult, FromFcallResult};
 
 pub mod backend_error;
+pub mod boot;
 mod completion;
 mod handle_codec;
 
@@ -348,6 +349,19 @@ impl ValkeyBackend {
     /// Dial + attach `Metrics` in one step. Alternative to
     /// [`ValkeyBackend::connect`] that wires the metrics handle
     /// before the returned `Arc<dyn EngineBackend>` is sealed. (issue #154)
+    ///
+    /// # Boot-step ordering (RFC-017 §4 row 12)
+    ///
+    /// The deployment-init steps relocated from `ff-server` in
+    /// RFC-017 Wave 8 Stage D are run through
+    /// [`Self::initialize_deployment`]. The ordering contract is
+    /// load-bearing: FUNCTION LOAD precedes lanes SADD (SADD scripts
+    /// reference the library) and HMAC init precedes the lanes seed
+    /// (pending-waitpoint reads depend on the secret). Callers that
+    /// bypass `connect_with_metrics` (e.g. `ff-server` which dials
+    /// via [`Self::from_client_partitions_and_connection`]) MUST call
+    /// `initialize_deployment` themselves before handing out the
+    /// `Arc<dyn EngineBackend>`.
     pub async fn connect_with_metrics(
         config: BackendConfig,
         metrics: Arc<ff_observability::Metrics>,
@@ -380,6 +394,44 @@ impl ValkeyBackend {
     #[doc(hidden)]
     pub fn scheduler(&self) -> Option<&Arc<ff_scheduler::Scheduler>> {
         self.scheduler.as_ref()
+    }
+
+    /// RFC-017 Wave 8 Stage D (§4 row 12): run the Valkey-specific
+    /// deployment-initialisation steps on the backend's client. This
+    /// method owns the boot primitives `ff-server` used to run inline
+    /// inside `Server::start_with_metrics`.
+    ///
+    /// **Ordering contract (load-bearing, RFC-017 §4 row 12):**
+    ///
+    /// 1. `verify_valkey_version` (reject pre-7.2)
+    /// 2. `validate_or_create_partition_config`
+    /// 3. `initialize_waitpoint_hmac_secret` **(precedes lanes seed —
+    ///    pending-waitpoint reads depend on the secret being
+    ///    installed)**
+    /// 4. `ensure_library` (FUNCTION LOAD) **(precedes lanes SADD —
+    ///    SADD scripts reference the library)**
+    /// 5. Lanes SADD seed
+    ///
+    /// The order matches the pre-relocation `Server::start_with_metrics`
+    /// body byte-for-byte.
+    ///
+    /// Returns `EngineError::Validation { kind: Corruption, .. }` for
+    /// version-too-low / partition-mismatch / redis-rejected cases;
+    /// `EngineError::Transport` / `Contextual` for Valkey IO faults.
+    pub async fn initialize_deployment(
+        &self,
+        waitpoint_hmac_secret: &str,
+        lanes: &[LaneId],
+        skip_library_load: bool,
+    ) -> Result<(), EngineError> {
+        boot::initialize_deployment_steps(
+            &self.client,
+            &self.partition_config,
+            waitpoint_hmac_secret,
+            lanes,
+            skip_library_load,
+        )
+        .await
     }
 
     /// RFC-017 Stage B: override the default stream-op concurrency
