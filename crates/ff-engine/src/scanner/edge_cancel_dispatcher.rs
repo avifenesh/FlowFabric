@@ -178,6 +178,24 @@ enum GroupOutcome {
     Error,
 }
 
+/// Postgres-backend parallel to the Valkey scan loop.
+///
+/// Wave-6b (RFC-v0.7): delegates to
+/// [`ff_backend_postgres::reconcilers::edge_cancel_dispatcher::dispatcher_tick`],
+/// which mirrors RFC-016 Stage-C semantics against `ff_edge_group` +
+/// `ff_pending_cancel_groups` under a per-group transaction with
+/// `FOR UPDATE SKIP LOCKED` coalescing.
+#[cfg(feature = "postgres")]
+pub async fn dispatch_via_postgres(
+    pool: &ff_backend_postgres::PgPool,
+    filter: &ff_core::backend::ScannerFilter,
+) -> Result<
+    ff_backend_postgres::reconcilers::edge_cancel_dispatcher::DispatchReport,
+    ff_core::engine_error::EngineError,
+> {
+    ff_backend_postgres::reconcilers::edge_cancel_dispatcher::dispatcher_tick(pool, filter).await
+}
+
 impl EdgeCancelDispatcher {
     async fn dispatch_one_group(
         &self,
