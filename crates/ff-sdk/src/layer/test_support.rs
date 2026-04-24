@@ -21,7 +21,8 @@ use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
     DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
-    SuspendArgs, SuspendOutcome, SuspendOutcomeDetails,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
+    SuspendOutcome, SuspendOutcomeDetails,
 };
 use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
@@ -300,6 +301,16 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<ReportUsageResult, EngineError> {
         self.record("report_usage")?;
         Err(EngineError::Unavailable { op: "report_usage" })
+    }
+
+    async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        _args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        self.record("rotate_waitpoint_hmac_secret_all")?;
+        Err(EngineError::Unavailable {
+            op: "rotate_waitpoint_hmac_secret_all",
+        })
     }
 
     async fn list_executions(
