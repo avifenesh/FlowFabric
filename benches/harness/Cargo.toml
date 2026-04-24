@@ -58,7 +58,10 @@ path = "src/bin/cap_routed.rs"
 # RFC-015 §4.2 — EMA α / MAXLEN simulator. Offline replay of a bursty
 # LLM-token trace through the dynamic-MAXLEN formula. Used to
 # re-validate the α = 0.2, floor = 64, ceiling = 16_384 final design
-# after Phase 0 raised the ceiling from 2048. Invoked via:
+# after Phase 0 raised the ceiling from 2048. Does NOT require
+# ff-server — the measurement is over the EMA math + synthetic trace,
+# not live Valkey behavior (RFC §4.2 is not yet implemented server-
+# side; this bench selects the α that SHOULD ship with it). Invoked via:
 #   cargo run -p ff-bench --release --bin ema_alpha_bench
 [[bin]]
 name = "ema_alpha_bench"
@@ -67,6 +70,9 @@ path = "src/bin/ema_alpha_bench.rs"
 [dependencies]
 ff-core = { path = "../../crates/ff-core" }
 ff-sdk = { path = "../../crates/ff-sdk", features = ["direct-valkey-claim"] }
+ff-server = { path = "../../crates/ff-server" }
+ff-engine = { path = "../../crates/ff-engine" }
+ff-test = { path = "../../crates/ff-test" }
 ferriskey = { path = "../../ferriskey" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
