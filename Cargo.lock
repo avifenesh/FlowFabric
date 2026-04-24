@@ -998,6 +998,7 @@ dependencies = [
  "ff-core",
  "ff-observability",
  "ff-script",
+ "futures-core",
  "serde",
  "serde_json",
  "sqlx",
