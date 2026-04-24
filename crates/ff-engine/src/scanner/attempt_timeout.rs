@@ -18,6 +18,22 @@ use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 50;
 
+// ─── Postgres branch (wave 6c) ──────────────────────────────────────────
+//
+// Parallel entry point for deployments running the Postgres backend.
+// Delegates to `ff_backend_postgres::reconcilers::attempt_timeout`. The
+// Valkey scan path above is untouched. The engine's driver picks this
+// branch when the configured backend is Postgres; same shape as
+// `dispatch_via_postgres` (partition_router.rs).
+#[cfg(feature = "postgres")]
+pub async fn scan_tick_pg(
+    pool: &ff_backend_postgres::PgPool,
+    partition_key: i16,
+    filter: &ff_core::backend::ScannerFilter,
+) -> Result<ff_backend_postgres::reconcilers::ScanReport, ff_core::engine_error::EngineError> {
+    ff_backend_postgres::reconcilers::attempt_timeout::scan_tick(pool, partition_key, filter).await
+}
+
 pub struct AttemptTimeoutScanner {
     interval: Duration,
     failures: FailureTracker,

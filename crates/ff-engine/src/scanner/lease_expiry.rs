@@ -18,6 +18,16 @@ use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 /// Batch size per ZRANGEBYSCORE call.
 const BATCH_SIZE: u32 = 50;
 
+// ─── Postgres branch (wave 6c) ──────────────────────────────────────────
+#[cfg(feature = "postgres")]
+pub async fn scan_tick_pg(
+    pool: &ff_backend_postgres::PgPool,
+    partition_key: i16,
+    filter: &ff_core::backend::ScannerFilter,
+) -> Result<ff_backend_postgres::reconcilers::ScanReport, ff_core::engine_error::EngineError> {
+    ff_backend_postgres::reconcilers::lease_expiry::scan_tick(pool, partition_key, filter).await
+}
+
 pub struct LeaseExpiryScanner {
     interval: Duration,
     failures: FailureTracker,
