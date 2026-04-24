@@ -34,6 +34,35 @@ impl BackendKind {
     }
 }
 
+/// RFC-017 Wave 8 Stage E1: Postgres connection parameters carried
+/// on [`ServerConfig`] when `backend == BackendKind::Postgres`.
+///
+/// Unlike the flat Valkey fields (`host` / `port` / `tls` / `cluster`),
+/// the Postgres surface is gathered into its own struct because Stage
+/// E4 will retire the flat Valkey fields in favour of a sum-typed
+/// `BackendConfig` on `ServerConfig`. Keeping the Postgres carrier
+/// pre-sum-typed avoids churn when E4 lands.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PostgresServerConfig {
+    /// Connection URL (libpq / sqlx shape:
+    /// `postgres://user:pass@host:port/db`). Read from `FF_POSTGRES_URL`.
+    pub url: String,
+    /// Max pool connections. Read from `FF_POSTGRES_POOL_SIZE`,
+    /// default `10` (matches sqlx's out-of-box default +
+    /// [`ff_core::backend::PostgresConnection`] default).
+    pub pool_size: u32,
+}
+
+impl Default for PostgresServerConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            pool_size: 10,
+        }
+    }
+}
+
 /// Server configuration, loaded from environment variables.
 pub struct ServerConfig {
     /// Valkey host. Default: `"localhost"`.
@@ -88,6 +117,24 @@ pub struct ServerConfig {
     /// [`BackendKind::Valkey`]. `BackendKind::Postgres` is rejected
     /// at startup through Stage D per RFC-017 §9.0.
     pub backend: BackendKind,
+    /// RFC-017 Wave 8 Stage E1: Postgres connection parameters.
+    /// Meaningful only when `backend == BackendKind::Postgres`; the
+    /// Valkey path ignores these fields.
+    pub postgres: PostgresServerConfig,
+}
+
+impl ServerConfig {
+    /// RFC-017 Wave 8 Stage E1: build the
+    /// [`ff_core::backend::BackendConfig`] the Postgres backend's
+    /// `connect_with_metrics` expects, from the flat `postgres.url`
+    /// + `postgres.pool_size` fields on this struct.
+    pub fn postgres_config(&self) -> ff_core::backend::BackendConfig {
+        let mut cfg = ff_core::backend::BackendConfig::postgres(&self.postgres.url);
+        if let ff_core::backend::BackendConnection::Postgres(ref mut conn) = cfg.connection {
+            conn.max_connections = self.postgres.pool_size;
+        }
+        cfg
+    }
 }
 
 impl ServerConfig {
@@ -141,6 +188,8 @@ impl ServerConfig {
     /// | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Per RFC-017 §9.0, `postgres` is hard-gated at boot through Stage D; dev-override `FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development` bypasses (non-production only). |
     /// | `FF_BACKEND_ACCEPT_UNREADY` | *(unset)* | Dev-only override: `1` or `true` bypasses `BACKEND_STAGE_READY` when `FF_ENV=development`. Production refuses the combination. |
     /// | `FF_ENV` | *(unset)* | Environment marker. Only `development` enables the dev-override path above. Any other value (or unset) keeps the hard-gate active. |
+    /// | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (libpq/sqlx shape, e.g. `postgres://user:pass@host:port/db`). Required when `FF_BACKEND=postgres`; ignored otherwise. |
+    /// | `FF_POSTGRES_POOL_SIZE` | `10` | Max Postgres pool connections; ignored on the Valkey path. |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env_or("FF_HOST", "localhost");
         let port = env_u16("FF_PORT", 6379)?;
@@ -304,6 +353,16 @@ impl ServerConfig {
         // override (`FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development`)
         // is set. Unknown values are rejected eagerly so typos don't
         // silently fall through to the default.
+        // RFC-017 Wave 8 Stage E1: FF_POSTGRES_URL + FF_POSTGRES_POOL_SIZE
+        // populate `postgres` when FF_BACKEND=postgres. Read regardless of
+        // backend selector so operators can preset the values; the Valkey
+        // path ignores them. Empty URL is a hard error only when
+        // FF_BACKEND=postgres (checked during boot).
+        let postgres = PostgresServerConfig {
+            url: std::env::var("FF_POSTGRES_URL").unwrap_or_default(),
+            pool_size: env_u32_positive("FF_POSTGRES_POOL_SIZE", 10)?,
+        };
+
         let backend = match std::env::var("FF_BACKEND") {
             Ok(v) => match v.to_ascii_lowercase().as_str() {
                 "" | "valkey" => BackendKind::Valkey,
@@ -336,6 +395,7 @@ impl ServerConfig {
             waitpoint_hmac_grace_ms,
             max_concurrent_stream_ops,
             backend,
+            postgres,
         })
     }
 }
@@ -370,6 +430,7 @@ impl Default for ServerConfig {
             waitpoint_hmac_grace_ms: 86_400_000,
             max_concurrent_stream_ops: 64,
             backend: BackendKind::default(),
+            postgres: PostgresServerConfig::default(),
         }
     }
 }
