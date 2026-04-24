@@ -200,6 +200,10 @@ pub enum ValidationKind {
     SignalLimitExceeded,
     /// MAC verification failed on waitpoint_key.
     InvalidWaitpointKey,
+    /// HMAC verification failed on a bearer waitpoint_token (signal
+    /// delivery path). Preserved as a distinct variant so the REST
+    /// layer can surface the Lua code `invalid_token` verbatim.
+    InvalidToken,
     /// Pending waitpoint has no HMAC token field.
     WaitpointNotTokenBound,
     /// Frame > 64KB.
