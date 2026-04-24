@@ -6253,11 +6253,14 @@ async fn test_server() -> ff_server::server::Server {
     let cluster = std::env::var("FF_CLUSTER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let server_config = ServerConfig {        valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster },
-
-
-
-
+    let server_config = ServerConfig {
+        valkey: ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls,
+            cluster,
+            skip_library_load: true, // TestCluster::connect() already loaded it
+        },
 
         partition_config: config,
         lanes: vec![LaneId::new(LANE)],
@@ -6267,7 +6270,6 @@ async fn test_server() -> ff_server::server::Server {
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
         },
-        skip_library_load: true, // TestCluster::connect() already loaded it
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:

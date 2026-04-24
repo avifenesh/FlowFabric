@@ -250,8 +250,6 @@ fn test_server_config() -> ff_server::config::ServerConfig {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
-    let tls = ff_test::fixtures::env_flag("FF_TLS");
-    let cluster = ff_test::fixtures::env_flag("FF_CLUSTER");
     ff_server::config::ServerConfig {
         valkey: ff_server::config::ValkeyServerConfig {
             host,
