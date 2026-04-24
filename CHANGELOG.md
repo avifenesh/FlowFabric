@@ -7,6 +7,38 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-v0.7 Wave 2: Valkey `EngineBackend::claim` +
+  `claim_from_reclaim` implementations.** `ValkeyBackend::claim` now
+  performs a fresh-find scan across execution partitions — ZRANGEBYSCORE
+  the lane's eligible set, capability-subset filter via
+  `ff_core::caps::matches`, issue `ff_issue_claim_grant`, and claim via
+  `ff_claim_execution` — and returns a `HandleKind::Fresh` handle.
+  `claim_from_reclaim` unwraps the `ReclaimGrant` carried by
+  `ReclaimToken` and routes through `ff_claim_resumed_execution`,
+  returning a `HandleKind::Resumed` handle with a bumped lease epoch.
+  Both replace the prior `EngineError::Unavailable` stubs.
+
+### Changed
+
+- **Pre-1.0 BREAKING — `ClaimPolicy` extended with worker identity.**
+  `ClaimPolicy` now carries `worker_id: WorkerId`,
+  `worker_instance_id: WorkerInstanceId`, and `lease_ttl_ms: u32` so the
+  backend's `claim(&self, lane, caps, policy)` can invoke
+  `ff_claim_execution` without a side-channel identity lookup (Wave 2
+  design-gap adjudication). The prior `ClaimPolicy::immediate()` and
+  `ClaimPolicy::with_max_wait(..)` constructors are replaced by a single
+  `ClaimPolicy::new(worker_id, worker_instance_id, lease_ttl_ms,
+  max_wait)`. Call-sites migrated: `ff-core::backend` tests,
+  `ff-sdk::layer::tracing_layer` test. Generic forwarders
+  (`ff-sdk::layer::hooks`, `ff-sdk::layer::test_support`,
+  `ff-backend-postgres::claim` stub) pass `ClaimPolicy` through
+  unchanged.
+- **Pre-1.0 BREAKING — `ReclaimToken` extended with worker identity.**
+  Mirrors the `ClaimPolicy` shape so `claim_from_reclaim` (which does
+  not take a `ClaimPolicy`) has the identity it needs to invoke
+  `ff_claim_resumed_execution`. New constructor:
+  `ReclaimToken::new(grant, worker_id, worker_instance_id, lease_ttl_ms)`.
+
 - **RFC-v0.7 Wave 1b: `EngineBackend::rotate_waitpoint_hmac_secret_all`
   (migration-master Q4).** New additive trait method for cluster-wide
   waitpoint HMAC kid rotation. Valkey impl fans out one

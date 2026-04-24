@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::layer::{EngineBackendLayerExt, test_support::PassthroughBackend};
     use ff_core::backend::{CapabilitySet, ClaimPolicy};
-    use ff_core::types::LaneId;
+    use ff_core::types::{LaneId, WorkerId, WorkerInstanceId};
 
     #[tokio::test]
     async fn delegates_and_counts_call() {
@@ -165,7 +165,13 @@ mod tests {
 
         let lane = LaneId::new("main");
         let caps = CapabilitySet::new::<_, String>(Vec::<String>::new());
-        let _ = layered.claim(&lane, &caps, ClaimPolicy::immediate()).await;
+        let policy = ClaimPolicy::new(
+            WorkerId::new("w"),
+            WorkerInstanceId::new("w-1"),
+            30_000,
+            None,
+        );
+        let _ = layered.claim(&lane, &caps, policy).await;
 
         assert_eq!(raw_clone.calls("claim"), 1);
     }
