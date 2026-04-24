@@ -113,6 +113,19 @@ Scenarios covered (see `benches/smoke/README.md` for details):
 - `cancel_cascade` — cancel routing through dispatcher
 - `fanout_slo` — 50-way ingress + claim-pump observation
 
+### v0.7 release-gate status (Wave 7b)
+
+- `suspend_signal` is **Pass on both backends** after Wave 4d landed
+  the Postgres suspend + deliver_signal impls. The scenario now
+  exercises the full RFC-013/014 Single+ByName resume path end-to-end.
+- `flow_anyof` remains **Skip on Postgres** pending Wave 4i
+  (`stage_dependency_edge` + `apply_dependency_to_child` ports to the
+  Pg edge tables — `ff_edge`, `ff_edge_group_counter`). Dispatch
+  cascade (Wave 5a) + Stage C/D reconcilers (Wave 6b) are ready; only
+  the writer side is missing. **This blocker MUST be resolved before
+  tagging v0.7.0** — AnyOf{CancelRemaining} is a headline RFC-016
+  primitive and cannot ship with one backend leg un-exercised.
+
 ## Cutting a release
 
 ```bash

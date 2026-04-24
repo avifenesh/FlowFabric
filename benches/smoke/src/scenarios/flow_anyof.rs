@@ -66,6 +66,11 @@ pub async fn run_postgres(
     ScenarioReport::skip(
         NAME,
         "postgres",
-        "Postgres flow-family waves 4c/5a land the core flow methods but AnyOf{CancelRemaining} dispatch is tracked separately under RFC-016 Stage C/D — re-enable after that lands",
+        "flow_anyof on Postgres requires stage_dependency_edge + apply_dependency_to_child \
+         Postgres impls (tracked as Wave 4i follow-up). Wave 4c landed the 6 flow trait \
+         methods; the staging methods live on ff-server's inherent Valkey surface and \
+         haven't been ported. Prerequisites: INSERT paths into ff_edge + \
+         ff_edge_group_counter. Dispatch cascade (Wave 5a) + Stage C+D reconcilers \
+         (Wave 6b) are ready; only the writer side is missing.",
     )
 }
