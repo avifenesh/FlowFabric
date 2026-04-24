@@ -462,3 +462,59 @@ async fn large_fanout_per_hop_tx_releases_locks() {
         "per-hop-tx invariant broken: peak_holds={peak_holds}"
     );
 }
+
+// ── Test 8: AnyOf + CancelRemaining populates pending_members ────────
+
+/// Regression for the Wave 4i + Wave 6b finding: when the policy flips
+/// `cancel_siblings_pending_flag = true`, `advance_edge_group` MUST
+/// also write the list of sibling upstream execution_ids into
+/// `cancel_siblings_pending_members` — the Wave 6b dispatcher reads
+/// that column to drive the actual per-sibling cancel. Prior to the
+/// fix the flag was set but members stayed `'{}'::text[]`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn advance_edge_group_any_of_populates_cancel_members() {
+    let Some(pool) = setup_or_skip().await else { return };
+    let (flow, downstream, upstreams) = seed_flow(
+        &pool,
+        3,
+        serde_json::json!({"kind": "any_of", "on_satisfied": "cancel_remaining"}),
+        1,
+    )
+    .await;
+
+    // Winner = upstreams[0]; siblings[1..] should still be active
+    // (we only emit the winner's completion event).
+    let ev = emit(&pool, upstreams[0], flow, "success").await;
+    dispatch::dispatch_completion(&pool, ev)
+        .await
+        .expect("dispatch ok");
+
+    // Downstream flips eligible.
+    assert_eq!(exec_eligibility(&pool, downstream).await, "eligible_now");
+    // Pending-cancel bookkeeping row inserted.
+    assert_eq!(pending_cancel_rows(&pool, flow).await, 1);
+
+    // The flag is set + members list contains exactly the 2 non-winner
+    // upstream execution_ids.
+    let row = sqlx::query(
+        "SELECT cancel_siblings_pending_flag, cancel_siblings_pending_members \
+         FROM ff_edge_group \
+         WHERE partition_key = $1 AND flow_id = $2 AND downstream_eid = $3",
+    )
+    .bind(P)
+    .bind(flow)
+    .bind(downstream)
+    .fetch_one(&pool)
+    .await
+    .expect("read edge_group");
+    let flag: bool = row.get("cancel_siblings_pending_flag");
+    let members: Vec<String> = row.get("cancel_siblings_pending_members");
+    assert!(flag, "pending flag not set");
+    assert_eq!(members.len(), 2, "expected 2 siblings; got {members:?}");
+    let mut got: Vec<String> = members;
+    got.sort();
+    let mut want: Vec<String> = upstreams[1..].iter().map(|u| u.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "sibling members mismatch");
+}

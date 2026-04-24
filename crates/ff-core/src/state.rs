@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 // ── Dimension A — Lifecycle Phase ──
@@ -149,6 +151,7 @@ pub enum AttemptState {
 /// Engine-computed user-facing label. Derived from the state vector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PublicState {
     /// Eligible and waiting for a worker to claim.
     Waiting,
@@ -162,6 +165,12 @@ pub enum PublicState {
     Active,
     /// Intentionally paused, waiting for signal/approval/callback.
     Suspended,
+    /// Suspension signal satisfied — awaiting `claim_resumed` to start
+    /// the next attempt. Transient state between `Suspended` and
+    /// `Active`; emitted by the Postgres suspend_signal path (and the
+    /// Valkey equivalent via `ff_deliver_signal` when the waitpoint
+    /// fires). See `ff-backend-postgres::suspend_ops`.
+    Resumable,
     /// Terminal: finished successfully.
     Completed,
     /// Terminal: finished unsuccessfully.
@@ -172,6 +181,34 @@ pub enum PublicState {
     Expired,
     /// Terminal: impossible to run because required dependency failed.
     Skipped,
+}
+
+impl PublicState {
+    /// Snake-case string form. Round-trips with
+    /// `ff_script::functions::suspension::parse_public_state` and the
+    /// raw strings Postgres stores in `ff_exec_core.public_state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Delayed => "delayed",
+            Self::RateLimited => "rate_limited",
+            Self::WaitingChildren => "waiting_children",
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Resumable => "resumable",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl fmt::Display for PublicState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // ── State Vector ──
@@ -464,6 +501,19 @@ mod tests {
         assert!(!AttemptLifecycle::Created.is_terminal());
         assert!(!AttemptLifecycle::Started.is_terminal());
         assert!(!AttemptLifecycle::Suspended.is_terminal());
+    }
+
+    #[test]
+    fn public_state_resumable_roundtrip_display_and_serde() {
+        // Display ↔ snake_case form
+        assert_eq!(PublicState::Resumable.to_string(), "resumable");
+        assert_eq!(PublicState::Resumable.as_str(), "resumable");
+
+        // serde round-trip using the snake_case form
+        let json = serde_json::to_string(&PublicState::Resumable).unwrap();
+        assert_eq!(json, "\"resumable\"");
+        let parsed: PublicState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PublicState::Resumable);
     }
 
     #[test]

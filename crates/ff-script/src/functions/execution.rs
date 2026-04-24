@@ -769,6 +769,7 @@ fn parse_public_state(s: &str) -> Result<PublicState, ScriptError> {
         "waiting_children" => Ok(PublicState::WaitingChildren),
         "active" => Ok(PublicState::Active),
         "suspended" => Ok(PublicState::Suspended),
+        "resumable" => Ok(PublicState::Resumable),
         "completed" => Ok(PublicState::Completed),
         "failed" => Ok(PublicState::Failed),
         "cancelled" => Ok(PublicState::Cancelled),
