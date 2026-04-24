@@ -25,7 +25,8 @@ use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
     DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
-    SuspendArgs, SuspendOutcome,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
+    SuspendOutcome,
 };
 use ff_core::partition::PartitionKey;
 #[cfg(feature = "valkey-default")]
@@ -362,6 +363,17 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "report_usage",
             self.inner.report_usage(handle, budget, dimensions).await
+        )
+    }
+
+    async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        with_hooks!(
+            self,
+            "rotate_waitpoint_hmac_secret_all",
+            self.inner.rotate_waitpoint_hmac_secret_all(args).await
         )
     }
 

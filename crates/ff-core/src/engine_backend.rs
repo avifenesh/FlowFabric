@@ -53,7 +53,8 @@ use crate::backend::{
     ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility,
 };
 use crate::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult, SuspendArgs,
+    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
     SuspendOutcome,
 };
 #[cfg(feature = "core")]
@@ -534,6 +535,39 @@ pub trait EngineBackend: Send + Sync + 'static {
         downstream_execution_id: &ExecutionId,
         policy: crate::contracts::EdgeDependencyPolicy,
     ) -> Result<crate::contracts::SetEdgeGroupPolicyResult, EngineError>;
+
+    // ── HMAC secret rotation (v0.7 migration-master Q4) ──
+
+    /// Rotate the waitpoint HMAC signing kid **cluster-wide**.
+    ///
+    /// **v0.7 migration-master Q4 (adjudicated 2026-04-24).**
+    /// Additive trait surface so Valkey and Postgres backends can
+    /// both expose the "rotate everywhere" semantic under one name.
+    ///
+    /// * Valkey impl fans out an `ff_rotate_waitpoint_hmac_secret`
+    ///   FCALL per execution partition. `entries.len() == num_flow_partitions`
+    ///   and per-partition failures are surfaced as inner `Err`
+    ///   entries — the call as a whole does not fail when one
+    ///   partition's FCALL fails, matching
+    ///   [`ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions`]'s
+    ///   partial-success contract.
+    /// * Postgres impl (Wave 4) writes one row to
+    ///   `ff_waitpoint_hmac(kid, secret, rotated_at)` and returns a
+    ///   single-entry vec with `partition = 0`.
+    ///
+    /// The default impl returns
+    /// [`EngineError::Unavailable`] with
+    /// `op = "rotate_waitpoint_hmac_secret_all"` so backends that
+    /// haven't implemented the method surface the miss loudly rather
+    /// than silently no-op'ing. Both concrete backends override.
+    async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        _args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "rotate_waitpoint_hmac_secret_all",
+        })
+    }
 
     // ── Budget ──
 

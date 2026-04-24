@@ -2895,6 +2895,99 @@ pub enum RotateWaitpointHmacSecretOutcome {
     Noop { kid: String },
 }
 
+// ─── rotate_waitpoint_hmac_secret_all ───
+
+/// Args for [`EngineBackend::rotate_waitpoint_hmac_secret_all`] — the
+/// cluster-wide / backend-native rotation of the waitpoint HMAC
+/// signing kid.
+///
+/// **v0.7 migration-master Q4:** a single additive trait method
+/// replaces the per-partition fan-out that direct-Valkey consumers
+/// hand-rolled via
+/// [`ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions`].
+/// On Valkey it fans out N FCALLs (one per execution partition);
+/// on Postgres (Wave 4) it resolves to a single INSERT against the
+/// global `ff_waitpoint_hmac(kid, secret, rotated_at)` table (no
+/// partition_id column). Consumers prefer this method for clarity —
+/// the pre-existing free-fn + per-partition surface stays available
+/// for backwards compat.
+///
+/// `#[non_exhaustive]` with a [`Self::new`] constructor per the
+/// project memory-rule (unbuildable non_exhaustive types are a dead
+/// API).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RotateWaitpointHmacSecretAllArgs {
+    pub new_kid: String,
+    pub new_secret_hex: String,
+    /// Grace window in ms for tokens signed by the outgoing kid.
+    /// Duration (not a clock value), identical to
+    /// [`RotateWaitpointHmacSecretArgs::grace_ms`].
+    pub grace_ms: u64,
+}
+
+impl RotateWaitpointHmacSecretAllArgs {
+    /// Build the args. Keeping the constructor so consumers don't
+    /// struct-literal past the `#[non_exhaustive]` marker.
+    pub fn new(
+        new_kid: impl Into<String>,
+        new_secret_hex: impl Into<String>,
+        grace_ms: u64,
+    ) -> Self {
+        Self {
+            new_kid: new_kid.into(),
+            new_secret_hex: new_secret_hex.into(),
+            grace_ms,
+        }
+    }
+}
+
+/// Per-partition entry of [`RotateWaitpointHmacSecretAllResult`].
+/// Mirrors [`ff_sdk::admin::PartitionRotationOutcome`] but typed at
+/// the `ff-core` layer so both Valkey and Postgres backends return
+/// the same shape without a Postgres→ferriskey dep.
+///
+/// On backends with no partition concept (Postgres) the entry list
+/// has length 1 with `partition = 0` and the outcome of the global
+/// row write.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RotateWaitpointHmacSecretAllEntry {
+    pub partition: u16,
+    /// The per-partition (or global) rotation outcome. Per-partition
+    /// failures are surfaced as inner `Err` so the fan-out can report
+    /// partial success — matching the existing SDK free-fn contract.
+    pub result: Result<RotateWaitpointHmacSecretOutcome, crate::engine_error::EngineError>,
+}
+
+impl RotateWaitpointHmacSecretAllEntry {
+    pub fn new(
+        partition: u16,
+        result: Result<RotateWaitpointHmacSecretOutcome, crate::engine_error::EngineError>,
+    ) -> Self {
+        Self { partition, result }
+    }
+}
+
+/// Result of [`EngineBackend::rotate_waitpoint_hmac_secret_all`].
+///
+/// The Valkey backend returns one entry per execution partition. The
+/// Postgres backend (Wave 4) will return a single-entry vec with
+/// `partition = 0` since the Postgres schema stores one global row
+/// per kid (Q4 §adjudication). Consumers that want a uniform "did
+/// ALL rotations succeed?" view inspect each entry's `.result`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RotateWaitpointHmacSecretAllResult {
+    pub entries: Vec<RotateWaitpointHmacSecretAllEntry>,
+}
+
+impl RotateWaitpointHmacSecretAllResult {
+    pub fn new(entries: Vec<RotateWaitpointHmacSecretAllEntry>) -> Self {
+        Self { entries }
+    }
+}
+
 // ─── list_waitpoint_hmac_kids ───
 
 #[derive(Clone, Debug, PartialEq, Eq)]

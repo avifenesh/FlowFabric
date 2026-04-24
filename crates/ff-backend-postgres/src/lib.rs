@@ -36,7 +36,8 @@ use ff_core::contracts::{
     ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
 };
 use ff_core::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult, SuspendArgs,
+    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
     SuspendOutcome,
 };
 #[cfg(feature = "streaming")]
@@ -387,6 +388,20 @@ impl EngineBackend for PostgresBackend {
         _dimensions: UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError> {
         unavailable("pg.report_usage")
+    }
+
+    // ── HMAC secret rotation (v0.7 migration-master Q4) ──
+    //
+    // Wave 4 replaces this stub with a single INSERT into
+    // `ff_waitpoint_hmac(kid, secret, rotated_at)`. Wave 0/1 keep
+    // the `Unavailable` shape so a running Postgres backend surfaces
+    // the unimplemented op loudly rather than silently no-op'ing.
+    #[tracing::instrument(name = "pg.rotate_waitpoint_hmac_secret_all", skip_all)]
+    async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        _args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        unavailable("pg.rotate_waitpoint_hmac_secret_all")
     }
 
     // ── Stream reads (streaming feature) ──

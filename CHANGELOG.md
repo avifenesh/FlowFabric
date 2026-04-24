@@ -5,6 +5,29 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **RFC-v0.7 Wave 1b: `EngineBackend::rotate_waitpoint_hmac_secret_all`
+  (migration-master Q4).** New additive trait method for cluster-wide
+  waitpoint HMAC kid rotation. Valkey impl fans out one
+  `ff_rotate_waitpoint_hmac_secret` FCALL per execution partition and
+  returns per-partition outcomes. Postgres impl (Wave 4) will resolve
+  to a single INSERT into the global `ff_waitpoint_hmac(kid, secret,
+  rotated_at)` table; Wave 1b lands the stub returning
+  `EngineError::Unavailable { op: "pg.rotate_waitpoint_hmac_secret_all" }`.
+  SDK exposes `FlowFabricWorker::rotate_waitpoint_hmac_secret_all`;
+  HookedBackend + PassthroughBackend dispatch the new method. The
+  pre-existing per-partition free-fn
+  `ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions` is
+  unchanged for backwards compat.
+- **`ff_core::waitpoint_hmac` re-export module.** Consumer-facing
+  import path for the waitpoint HMAC wire types (`WaitpointHmac`,
+  `VerifyingKid`, `WaitpointHmacKids`) + rotation args/outcomes.
+  Signing and verification remain server-side (Lua on Valkey; Wave 4
+  stored procs on Postgres); the module doc captures the
+  sign/verify-location contract so external crates have one stable
+  path to consume from.
+
 ### Changed
 
 - **RFC-v0.7 Wave 1a: `ff-core::caps` extracted for backend-shared

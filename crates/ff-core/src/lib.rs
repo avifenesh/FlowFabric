@@ -13,6 +13,7 @@ pub mod partition;
 pub mod policy;
 pub mod state;
 pub mod types;
+pub mod waitpoint_hmac;
 
 // Convenience re-export so consumers can write `ff_core::EngineError`.
 pub use engine_error::EngineError;
