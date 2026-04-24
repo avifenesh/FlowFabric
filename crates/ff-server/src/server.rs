@@ -651,6 +651,15 @@ impl Server {
                 "ValkeyBackend stream semaphore sizing failed (unexpected Arc sharing)".into(),
             ));
         }
+        // RFC-017 Stage C: install the scheduler handle so the
+        // backend's `claim_for_worker` trait impl dispatches through
+        // it. `Server::scheduler` is retained for Stage-C-scope
+        // metric reads (removed in Stage E per §9.3).
+        if !valkey_backend.with_scheduler(scheduler.clone()) {
+            return Err(ServerError::OperationFailed(
+                "ValkeyBackend scheduler wiring failed (unexpected Arc sharing)".into(),
+            ));
+        }
         let backend: Arc<dyn EngineBackend> = valkey_backend as Arc<dyn EngineBackend>;
 
         Ok(Self {

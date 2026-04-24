@@ -35,6 +35,10 @@ ff-observability = { workspace = true }
 # retry classification, `ScriptError::Valkey`). Explicit feature activation
 # so the dep stays correct even if ff-script's defaults change.
 ff-script = { workspace = true, features = ["valkey-client"] }
+# RFC-017 Stage C — `claim_for_worker` trait impl forwards to
+# `ff_scheduler::Scheduler`. Wired via `ValkeyBackend::with_scheduler`
+# before the backend is sealed behind `Arc<dyn EngineBackend>`.
+ff-scheduler = { workspace = true }
 ferriskey = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }

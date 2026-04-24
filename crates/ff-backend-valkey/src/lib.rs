@@ -61,16 +61,21 @@ use ff_core::types::{
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
 use ff_script::functions::execution::{
-    ClaimExecutionResultPartial, ExecOpKeys, ff_claim_execution, ff_create_execution,
+    CancelExecutionResultPartial, ClaimExecutionResultPartial, ExecOpKeys, ff_claim_execution,
+    ff_create_execution,
 };
 use ff_script::functions::flow::{
     DepOpKeys, FlowStructOpKeys, ff_add_execution_to_flow, ff_apply_dependency_to_child,
-    ff_cancel_flow, ff_create_flow, ff_stage_dependency_edge,
+    ff_cancel_flow, ff_create_flow, ff_replay_execution, ff_stage_dependency_edge,
+};
+use ff_script::functions::lease::ff_revoke_lease;
+use ff_script::functions::scheduling::{
+    ChangePriorityResultPartial, SchedOpKeys, ff_change_priority,
 };
 use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_report_usage_and_check, ff_reset_budget};
 use ff_script::functions::quota::{QuotaOpKeys, ff_create_quota_policy};
 use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
-use ff_script::result::FcallResult;
+use ff_script::result::{FcallResult, FromFcallResult};
 
 pub mod backend_error;
 mod completion;
@@ -132,6 +137,14 @@ pub struct ValkeyBackend {
     /// admin FCALL. `16` matches the pre-RFC-017 `BOOT_INIT_CONCURRENCY`
     /// on `Server`.
     admin_rotate_fanout_concurrency: u32,
+    /// RFC-017 Stage C — `claim_for_worker` trait impl forwards here.
+    /// `None` ⇒ trait method returns `EngineError::Unavailable { op:
+    /// "claim_for_worker" }`. Wired via [`ValkeyBackend::with_scheduler`]
+    /// at `ff-server` boot before the backend is sealed into
+    /// `Arc<dyn EngineBackend>`; ff-sdk consumers that don't run a
+    /// scheduler leave it `None` (SDK workers don't dispatch the
+    /// scheduler-routed claim path).
+    scheduler: Option<Arc<ff_scheduler::Scheduler>>,
 }
 
 /// Default ceiling for `stream_semaphore` when the caller uses
@@ -251,6 +264,7 @@ impl ValkeyBackend {
             )),
             stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
             admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
+            scheduler: None,
         }))
     }
 
@@ -283,6 +297,7 @@ impl ValkeyBackend {
             )),
             stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
             admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
+            scheduler: None,
         })
     }
 
@@ -306,6 +321,7 @@ impl ValkeyBackend {
             )),
             stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
             admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
+            scheduler: None,
         })
     }
 
@@ -337,6 +353,33 @@ impl ValkeyBackend {
         metrics: Arc<ff_observability::Metrics>,
     ) -> Result<Arc<dyn EngineBackend>, EngineError> {
         Self::connect_inner(config, Some(metrics), "connect_with_metrics").await
+    }
+
+    /// RFC-017 Stage C: install the `ff_scheduler::Scheduler` handle
+    /// that drives [`EngineBackend::claim_for_worker`]. Returns `true`
+    /// when the handle was installed (`Arc::get_mut` saw a unique
+    /// handle); `false` otherwise. When absent, `claim_for_worker`
+    /// returns `EngineError::Unavailable { op: "claim_for_worker" }`.
+    /// Call this before cloning the `Arc` into other positions
+    /// (e.g. before casting to `Arc<dyn EngineBackend>`).
+    pub fn with_scheduler(
+        self: &mut Arc<Self>,
+        scheduler: Arc<ff_scheduler::Scheduler>,
+    ) -> bool {
+        if let Some(inner) = Arc::get_mut(self) {
+            inner.scheduler = Some(scheduler);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// RFC-017 Stage C: test/diagnostic accessor for the wired
+    /// scheduler handle. `None` before [`Self::with_scheduler`] is
+    /// called.
+    #[doc(hidden)]
+    pub fn scheduler(&self) -> Option<&Arc<ff_scheduler::Scheduler>> {
+        self.scheduler.as_ref()
     }
 
     /// RFC-017 Stage B: override the default stream-op concurrency
@@ -4734,6 +4777,482 @@ impl EngineBackend for ValkeyBackend {
                 "get_execution_result: GET result",
             ))?;
         Ok(payload)
+    }
+
+    // ── RFC-017 Stage C — Operator control (4) ────────────────
+
+    async fn cancel_execution(
+        &self,
+        args: ff_core::contracts::CancelExecutionArgs,
+    ) -> Result<ff_core::contracts::CancelExecutionResult, EngineError> {
+        // HMGET pre-read (§4 row 2 semantics preserved): lane_id,
+        // current_attempt_index, current_waitpoint_id,
+        // current_worker_instance_id. Same order as the legacy
+        // `server.rs::build_cancel_execution_fcall` helper so the
+        // variadic KEYS shape fed into `ff_cancel_execution` stays
+        // byte-identical.
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        let dyn_fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(ctx.core())
+            .arg("lane_id")
+            .arg("current_attempt_index")
+            .arg("current_waitpoint_id")
+            .arg("current_worker_instance_id")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "cancel_execution: HMGET exec_core",
+            ))?;
+        let lane = LaneId::new(
+            dyn_fields
+                .first()
+                .and_then(|v| v.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "default".to_owned()),
+        );
+        let att_idx_val = dyn_fields
+            .get(1)
+            .and_then(|v| v.as_ref())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let att_idx = AttemptIndex::new(att_idx_val);
+        let wp_id_str = dyn_fields
+            .get(2)
+            .and_then(|v| v.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let wp_id = if wp_id_str.is_empty() {
+            WaitpointId::new()
+        } else {
+            WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
+        };
+        let wiid_str = dyn_fields
+            .get(3)
+            .and_then(|v| v.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let wiid = WorkerInstanceId::new(&wiid_str);
+
+        // The ff_script `ff_cancel_execution` helper uses a fixed
+        // `ExecOpKeys` struct whose `k.ctx.attempt_hash(AttemptIndex::new(0))`
+        // placeholders don't match the live attempt_index / waitpoint
+        // required by the Lua body for in-flight executions. Build
+        // KEYS/ARGV explicitly using the same layout as the legacy
+        // `build_cancel_execution_fcall` helper on `Server`.
+        let keys: Vec<String> = vec![
+            ctx.core(),
+            ctx.attempt_hash(att_idx),
+            ctx.stream_meta(att_idx),
+            ctx.lease_current(),
+            ctx.lease_history(),
+            idx.lease_expiry(),
+            idx.worker_leases(&wiid),
+            ctx.suspension_current(),
+            ctx.waitpoint(&wp_id),
+            ctx.waitpoint_condition(&wp_id),
+            idx.suspension_timeout(),
+            idx.lane_terminal(&lane),
+            idx.attempt_timeout(),
+            idx.execution_deadline(),
+            idx.lane_eligible(&lane),
+            idx.lane_delayed(&lane),
+            idx.lane_blocked_dependencies(&lane),
+            idx.lane_blocked_budget(&lane),
+            idx.lane_blocked_quota(&lane),
+            idx.lane_blocked_route(&lane),
+            idx.lane_blocked_operator(&lane),
+        ];
+        let argv: Vec<String> = vec![
+            args.execution_id.to_string(),
+            args.reason.clone(),
+            args.source.to_string(),
+            args.lease_id.as_ref().map(|l| l.to_string()).unwrap_or_default(),
+            args.lease_epoch.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+        ];
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+        let raw: ferriskey::Value = self
+            .client
+            .fcall("ff_cancel_execution", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "cancel_execution: FCALL ff_cancel_execution",
+            ))?;
+
+        let partial = CancelExecutionResultPartial::from_fcall_result(&raw)
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "cancel_execution: parse",
+            ))?;
+        Ok(partial.complete(args.execution_id.clone()))
+    }
+
+    async fn change_priority(
+        &self,
+        args: ff_core::contracts::ChangePriorityArgs,
+    ) -> Result<ff_core::contracts::ChangePriorityResult, EngineError> {
+        // HGET lane_id pre-read (§4 row 17). `ChangePriorityArgs`
+        // carries `lane_id` as of RFC-017 Stage A backfill, so the
+        // caller already decided which lane to re-score. Defence-in-
+        // depth: if the caller passes a stub lane, we still accept it
+        // — the Lua `ff_change_priority` validates eligibility against
+        // the exec_core's authoritative lane itself. No extra
+        // round-trip needed.
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // ff_script's `ff_change_priority` uses SchedOpKeys, which
+        // indexes `lane_eligible` on the supplied lane. When the
+        // caller-supplied lane is empty (pre-claim / solo path),
+        // HGET the authoritative value.
+        let lane = if args.lane_id.as_str().is_empty() {
+            let lane_str: Option<String> = self
+                .client
+                .hget(&ctx.core(), "lane_id")
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "change_priority: HGET lane_id",
+                ))?;
+            LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()))
+        } else {
+            args.lane_id.clone()
+        };
+
+        let keys = SchedOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+        };
+        let partial: ChangePriorityResultPartial = ff_change_priority(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "change_priority: FCALL ff_change_priority",
+            ))?;
+        Ok(partial.complete(args.execution_id.clone()))
+    }
+
+    async fn replay_execution(
+        &self,
+        args: ff_core::contracts::ReplayExecutionArgs,
+    ) -> Result<ff_core::contracts::ReplayExecutionResult, EngineError> {
+        // §4 row 3 Hard — variadic KEYS driven by inbound-edge count
+        // of a skipped flow member. Preserve the legacy
+        // `server.rs::replay_execution` body verbatim: HMGET pre-read
+        // (lane_id + flow_id + terminal_outcome) + conditional
+        // SMEMBERS over the flow-partition incoming-edge set when the
+        // member was skipped.
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        let dyn_fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(ctx.core())
+            .arg("lane_id")
+            .arg("flow_id")
+            .arg("terminal_outcome")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "replay_execution: HMGET replay pre-read",
+            ))?;
+        let lane = LaneId::new(
+            dyn_fields
+                .first()
+                .and_then(|v| v.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "default".to_owned()),
+        );
+        let flow_id_str = dyn_fields
+            .get(1)
+            .and_then(|v| v.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let terminal_outcome = dyn_fields
+            .get(2)
+            .and_then(|v| v.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        let is_skipped_flow_member =
+            terminal_outcome == "skipped" && !flow_id_str.is_empty();
+
+        // Base path (non-flow or non-skipped): use the fixed-KEYS
+        // ff_script helper.
+        if !is_skipped_flow_member {
+            let keys = DepOpKeys {
+                ctx: &ctx,
+                idx: &idx,
+                lane_id: &lane,
+                flow_ctx: &FlowKeyContext::new(
+                    &flow_partition(&FlowId::new(), &self.partition_config),
+                    &FlowId::new(),
+                ),
+                downstream_eid: &args.execution_id,
+            };
+            return ff_replay_execution(&self.client, &keys, &args)
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_script(e),
+                    "replay_execution: FCALL ff_replay_execution",
+                ));
+        }
+
+        // Skipped-flow-member variadic-KEYS path — legacy raw FCALL.
+        let flow_id = FlowId::parse(&flow_id_str)
+            .map_err(|e| EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: format!("replay_execution: bad flow_id: {e}"),
+            })?;
+        let flow_part = flow_partition(&flow_id, &self.partition_config);
+        let flow_ctx = FlowKeyContext::new(&flow_part, &flow_id);
+        let edge_ids: Vec<String> = self
+            .client
+            .cmd("SMEMBERS")
+            .arg(flow_ctx.incoming(&args.execution_id))
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "replay_execution: SMEMBERS replay edges",
+            ))?;
+
+        let now = args.now;
+        let mut fcall_keys: Vec<String> = vec![
+            ctx.core(),
+            idx.lane_terminal(&lane),
+            idx.lane_eligible(&lane),
+            ctx.lease_history(),
+            idx.lane_blocked_dependencies(&lane),
+            ctx.deps_meta(),
+            ctx.deps_unresolved(),
+        ];
+        let mut fcall_args: Vec<String> = vec![args.execution_id.to_string(), now.to_string()];
+        for eid_str in &edge_ids {
+            let edge_id = EdgeId::parse(eid_str).unwrap_or_else(|_| EdgeId::new());
+            fcall_keys.push(ctx.dep_edge(&edge_id));
+            fcall_args.push(eid_str.clone());
+        }
+        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
+
+        let raw: ferriskey::Value = self
+            .client
+            .fcall("ff_replay_execution", &key_refs, &arg_refs)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "replay_execution: FCALL ff_replay_execution (variadic)",
+            ))?;
+        ff_core::contracts::ReplayExecutionResult::from_fcall_result(&raw)
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "replay_execution: parse",
+            ))
+    }
+
+    async fn revoke_lease(
+        &self,
+        args: ff_core::contracts::RevokeLeaseArgs,
+    ) -> Result<ff_core::contracts::RevokeLeaseResult, EngineError> {
+        // HGET current_worker_instance_id pre-read (§4 row 19). If
+        // the caller-supplied `worker_instance_id` is empty, read
+        // authoritative. If the execution has no active lease, surface
+        // `EngineError::NotFound`.
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+
+        let effective_wiid = if args.worker_instance_id.as_str().is_empty() {
+            let wiid_str: Option<String> = self
+                .client
+                .hget(&ctx.core(), "current_worker_instance_id")
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "revoke_lease: HGET current_worker_instance_id",
+                ))?;
+            match wiid_str {
+                Some(s) if !s.is_empty() => WorkerInstanceId::new(&s),
+                _ => {
+                    // Legacy `Server::revoke_lease` surfaced this as
+                    // HTTP 404. Preserve the semantics on the trait
+                    // surface by returning the domain-level
+                    // `AlreadySatisfied` variant — `RevokeLeaseResult`
+                    // already carries this as a benign no-op shape, so
+                    // the HTTP handler keeps a 200 Ok + the same JSON
+                    // body it already returned when Lua reported
+                    // "already revoked". Callers that want the
+                    // hard-404 behaviour check `AlreadySatisfied`
+                    // client-side (the reason string carries enough
+                    // detail for operator triage).
+                    return Ok(ff_core::contracts::RevokeLeaseResult::AlreadySatisfied {
+                        reason: "no_active_lease".to_owned(),
+                    });
+                }
+            }
+        } else {
+            args.worker_instance_id.clone()
+        };
+
+        // `ff_revoke_lease` helper needs the full WIID in the key,
+        // which it reads off `args.worker_instance_id`. Rebuild args
+        // with the resolved WIID.
+        let args = ff_core::contracts::RevokeLeaseArgs {
+            execution_id: args.execution_id,
+            expected_lease_id: args.expected_lease_id,
+            worker_instance_id: effective_wiid,
+            reason: args.reason,
+        };
+
+        ff_revoke_lease(&self.client, &ctx, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "revoke_lease: FCALL ff_revoke_lease",
+            ))
+    }
+
+    // ── RFC-017 Stage C — Budget status (read-only) ────────────
+
+    async fn get_budget_status(
+        &self,
+        budget_id: &BudgetId,
+    ) -> Result<ff_core::contracts::BudgetStatus, EngineError> {
+        // §4 row 8 clause — 3× HGETALL direct reads, no FCALL.
+        // Mirrors `ff-server::Server::get_budget_status` verbatim so
+        // the Stage C handler migration is a thin delegate.
+        let partition =
+            ff_core::partition::budget_partition(budget_id, &self.partition_config);
+        let bctx = ff_core::keys::BudgetKeyContext::new(&partition, budget_id);
+
+        let def: HashMap<String, String> = self
+            .client
+            .hgetall(&bctx.definition())
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "get_budget_status: HGETALL budget_def",
+            ))?;
+        if def.is_empty() {
+            // `NotFound.entity` is `&'static str`; include the dynamic
+            // budget id in the contextual wrapper rather than the
+            // entity slot so the HTTP 404 carries the budget id in
+            // its body (matches pre-migration behaviour where
+            // `ServerError::NotFound(format!("budget not found: {id}"))`
+            // stringified through the 404 mapping).
+            return Err(ff_core::engine_error::backend_context(
+                EngineError::NotFound { entity: "budget" },
+                format!("get_budget_status: {budget_id}"),
+            ));
+        }
+
+        let usage_raw: HashMap<String, String> = self
+            .client
+            .hgetall(&bctx.usage())
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "get_budget_status: HGETALL budget_usage",
+            ))?;
+        let usage: HashMap<String, u64> = usage_raw
+            .into_iter()
+            .filter(|(k, _)| k != "_init")
+            .map(|(k, v)| (k, v.parse().unwrap_or(0)))
+            .collect();
+
+        let limits_raw: HashMap<String, String> = self
+            .client
+            .hgetall(&bctx.limits())
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "get_budget_status: HGETALL budget_limits",
+            ))?;
+        let mut hard_limits: HashMap<String, u64> = HashMap::new();
+        let mut soft_limits: HashMap<String, u64> = HashMap::new();
+        for (k, v) in &limits_raw {
+            if let Some(dim) = k.strip_prefix("hard:") {
+                hard_limits.insert(dim.to_string(), v.parse().unwrap_or(0));
+            } else if let Some(dim) = k.strip_prefix("soft:") {
+                soft_limits.insert(dim.to_string(), v.parse().unwrap_or(0));
+            }
+        }
+
+        let non_empty = |s: Option<&String>| -> Option<String> {
+            s.filter(|v| !v.is_empty()).cloned()
+        };
+
+        Ok(ff_core::contracts::BudgetStatus {
+            budget_id: budget_id.to_string(),
+            scope_type: def.get("scope_type").cloned().unwrap_or_default(),
+            scope_id: def.get("scope_id").cloned().unwrap_or_default(),
+            enforcement_mode: def.get("enforcement_mode").cloned().unwrap_or_default(),
+            usage,
+            hard_limits,
+            soft_limits,
+            breach_count: def
+                .get("breach_count")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            soft_breach_count: def
+                .get("soft_breach_count")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            last_breach_at: non_empty(def.get("last_breach_at")),
+            last_breach_dim: non_empty(def.get("last_breach_dim")),
+            next_reset_at: non_empty(def.get("next_reset_at")),
+            created_at: non_empty(def.get("created_at")),
+        })
+    }
+
+    // ── RFC-017 Stage C — Scheduling (claim_for_worker) ────────
+
+    async fn claim_for_worker(
+        &self,
+        args: ff_core::contracts::ClaimForWorkerArgs,
+    ) -> Result<ff_core::contracts::ClaimForWorkerOutcome, EngineError> {
+        let scheduler = self.scheduler.as_ref().ok_or(EngineError::Unavailable {
+            op: "claim_for_worker (scheduler not wired on this ValkeyBackend)",
+        })?;
+        let grant_opt = scheduler
+            .claim_for_worker(
+                &args.lane_id,
+                &args.worker_id,
+                &args.worker_instance_id,
+                &args.worker_capabilities,
+                args.grant_ttl_ms,
+            )
+            .await
+            .map_err(|e| match e {
+                ff_scheduler::SchedulerError::Valkey(inner) => ff_core::engine_error::backend_context(
+                    transport_fk(inner),
+                    "claim_for_worker: scheduler",
+                ),
+                ff_scheduler::SchedulerError::ValkeyContext { source, context } => {
+                    ff_core::engine_error::backend_context(transport_fk(source), context)
+                }
+                ff_scheduler::SchedulerError::Config(msg) => EngineError::Validation {
+                    kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                    detail: msg,
+                },
+            })?;
+        Ok(match grant_opt {
+            Some(g) => ff_core::contracts::ClaimForWorkerOutcome::granted(g),
+            None => ff_core::contracts::ClaimForWorkerOutcome::no_work(),
+        })
     }
 }
 
