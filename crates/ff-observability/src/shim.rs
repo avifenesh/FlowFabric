@@ -80,4 +80,8 @@ impl Metrics {
     // ── RFC-016 Stage D: sibling-cancel reconciler ──
 
     pub fn inc_sibling_cancel_reconcile(&self, _action: &'static str) {}
+
+    // ── RFC-017 Stage B: shutdown_prepare timeout ──
+
+    pub fn inc_shutdown_timeout(&self) {}
 }

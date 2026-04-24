@@ -300,6 +300,56 @@ impl IntoResponse for ApiError {
                     },
                 )
             }
+            // RFC-017 Stage B: trait-dispatched handlers surface
+            // backend-pool pressure + shutdown races as typed
+            // EngineError variants. Map them to their REST status so
+            // the 429/503 contract preserved from the pre-Stage-B
+            // `ConcurrencyLimitExceeded` arm keeps holding across
+            // migrated handlers (`read_attempt_stream`,
+            // `tail_attempt_stream`, …).
+            ServerError::Engine(boxed) => {
+                use ff_core::engine_error::EngineError as EE;
+                // Peel context wrappers to find the root cause so the
+                // status mapping is stable regardless of nesting.
+                fn root(e: &EE) -> &EE {
+                    match e {
+                        EE::Contextual { source, .. } => root(source),
+                        other => other,
+                    }
+                }
+                match root(boxed) {
+                    EE::ResourceExhausted { pool, max, .. } => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ErrorBody {
+                            error: format!(
+                                "too many concurrent {pool} calls (server max: {max}); retry with backoff"
+                            ),
+                            kind: Some("resource_exhausted".into()),
+                            retryable: Some(true),
+                        },
+                    ),
+                    EE::Unavailable { op } => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorBody {
+                            error: format!("backend op unavailable: {op}"),
+                            kind: Some("unavailable".into()),
+                            retryable: Some(false),
+                        },
+                    ),
+                    EE::NotFound { entity } => (
+                        StatusCode::NOT_FOUND,
+                        ErrorBody::plain(format!("not found: {entity}")),
+                    ),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorBody {
+                            error: self.0.to_string(),
+                            kind: None,
+                            retryable: Some(self.0.is_retryable()),
+                        },
+                    ),
+                }
+            }
             // Script / Config / PartitionMismatch — developer or deployment
             // errors. No Valkey ErrorKind to surface, but retryable=false is
             // informative: a client-side retry won't change the outcome.
