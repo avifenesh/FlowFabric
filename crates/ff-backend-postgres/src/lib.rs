@@ -81,6 +81,8 @@ pub mod pool;
 #[cfg(feature = "core")]
 pub mod reconcilers;
 #[cfg(feature = "core")]
+pub mod scanner_supervisor;
+#[cfg(feature = "core")]
 pub mod scheduler;
 pub mod signal;
 #[cfg(feature = "streaming")]
@@ -93,6 +95,8 @@ pub use completion::{PostgresCompletionStream, COMPLETION_CHANNEL};
 pub use error::{map_sqlx_error, PostgresTransportError};
 pub use listener::StreamNotifier;
 pub use migrate::{apply_migrations, MigrationError};
+#[cfg(feature = "core")]
+pub use scanner_supervisor::{PostgresScannerConfig, PostgresScannerHandle};
 pub use version::check_schema_version;
 
 // Re-export the new `PostgresConnection` shape so consumers can name
@@ -122,6 +126,13 @@ pub struct PostgresBackend {
     /// LISTEN wiring (tests that only exercise the write path).
     #[allow(dead_code)]
     stream_notifier: Option<Arc<StreamNotifier>>,
+    /// RFC-017 Wave 8 Stage E3: scanner supervisor handle. Spawned
+    /// during [`Self::connect_with_metrics`] when the caller opts in
+    /// via [`Self::spawn_scanners_during_connect`]; drained on
+    /// [`EngineBackend::shutdown_prepare`]. `None` on `from_pool` /
+    /// test builds that don't want background reconcilers.
+    #[cfg(feature = "core")]
+    scanner_handle: Option<Arc<scanner_supervisor::PostgresScannerHandle>>,
 }
 
 impl PostgresBackend {
@@ -148,6 +159,8 @@ impl PostgresBackend {
             partition_config: PartitionConfig::default(),
             metrics: None,
             stream_notifier,
+            #[cfg(feature = "core")]
+            scanner_handle: None,
         };
         Ok(Arc::new(backend))
     }
@@ -164,6 +177,8 @@ impl PostgresBackend {
             partition_config,
             metrics: None,
             stream_notifier,
+            #[cfg(feature = "core")]
+            scanner_handle: None,
         })
     }
 
@@ -193,7 +208,28 @@ impl PostgresBackend {
             partition_config,
             metrics: Some(metrics),
             stream_notifier,
+            #[cfg(feature = "core")]
+            scanner_handle: None,
         }))
+    }
+
+    /// RFC-017 Wave 8 Stage E3: spawn the six Postgres reconcilers as
+    /// background tick loops. Returns `true` if the scanner handle
+    /// was installed; `false` if the `Arc<Self>` has outstanding
+    /// clones (mirrors the Valkey `with_*` pattern). Callers must
+    /// invoke this before publishing the `Arc<dyn EngineBackend>` so
+    /// the underlying `Arc::get_mut` succeeds.
+    #[cfg(feature = "core")]
+    pub fn with_scanners(
+        self: &mut Arc<Self>,
+        cfg: scanner_supervisor::PostgresScannerConfig,
+    ) -> bool {
+        let Some(inner) = Arc::get_mut(self) else {
+            return false;
+        };
+        let handle = scanner_supervisor::spawn_scanners(inner.pool.clone(), cfg);
+        inner.scanner_handle = Some(Arc::new(handle));
+        true
     }
 
     /// Accessor for the underlying `PgPool`. Stage E1 uses this so
@@ -584,6 +620,35 @@ impl EngineBackend for PostgresBackend {
         "postgres"
     }
 
+    /// RFC-017 Wave 8 Stage E3 (§4 row 9, §7): forward the claim to the
+    /// Postgres-native admission pipeline. Returns `NoWork` when no
+    /// eligible execution is admissible this scan cycle. Budget
+    /// breaches surface as `NoWork` (leaving the row eligible for a
+    /// retry by another worker); validation-class rejections
+    /// (malformed partition, unknown kid) surface as typed
+    /// [`EngineError`] variants mapped to the Server's 400/503 arms.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.claim_for_worker", skip_all)]
+    async fn claim_for_worker(
+        &self,
+        args: ff_core::contracts::ClaimForWorkerArgs,
+    ) -> Result<ff_core::contracts::ClaimForWorkerOutcome, EngineError> {
+        let sched = scheduler::PostgresScheduler::new(self.pool.clone());
+        let grant_opt = sched
+            .claim_for_worker(
+                &args.lane_id,
+                &args.worker_id,
+                &args.worker_instance_id,
+                &args.worker_capabilities,
+                args.grant_ttl_ms,
+            )
+            .await?;
+        Ok(match grant_opt {
+            Some(g) => ff_core::contracts::ClaimForWorkerOutcome::granted(g),
+            None => ff_core::contracts::ClaimForWorkerOutcome::no_work(),
+        })
+    }
+
     async fn ping(&self) -> Result<(), EngineError> {
         // Postgres analogue to Valkey PING — single-round-trip pool
         // liveness. Errors propagate as transport-class EngineError via
@@ -592,6 +657,25 @@ impl EngineBackend for PostgresBackend {
             .fetch_one(&self.pool)
             .await
             .map_err(error::map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// RFC-017 Wave 8 Stage E3: drain the scanner supervisor's
+    /// reconciler tasks up to `grace`, then close the sqlx pool.
+    /// Matches the Valkey backend's shutdown_prepare contract —
+    /// bounded best-effort drain, never returns an error.
+    async fn shutdown_prepare(&self, grace: Duration) -> Result<(), EngineError> {
+        #[cfg(feature = "core")]
+        if let Some(handle) = self.scanner_handle.as_ref() {
+            let timed_out = handle.shutdown(grace).await;
+            if timed_out > 0 {
+                tracing::warn!(
+                    timed_out,
+                    ?grace,
+                    "postgres scanner supervisor exceeded grace on shutdown"
+                );
+            }
+        }
         Ok(())
     }
 
