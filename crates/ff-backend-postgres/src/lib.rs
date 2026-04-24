@@ -31,9 +31,12 @@ use ff_core::backend::{
 };
 #[cfg(feature = "core")]
 use ff_core::contracts::{
-    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CreateExecutionArgs, DeliverSignalArgs,
-    DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage,
-    ListFlowsPage, ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
+    AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
+    ApplyDependencyToChildResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
+    CreateExecutionArgs, CreateFlowArgs, CreateFlowResult, DeliverSignalArgs, DeliverSignalResult,
+    EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage,
+    ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult, StageDependencyEdgeArgs,
+    StageDependencyEdgeResult,
 };
 use ff_core::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
@@ -67,6 +70,8 @@ pub mod dispatch;
 pub mod error;
 pub mod exec_core;
 pub mod flow;
+#[cfg(feature = "core")]
+pub mod flow_staging;
 pub mod handle_codec;
 pub mod listener;
 pub mod migrate;
@@ -180,6 +185,55 @@ impl PostgresBackend {
         args: CreateExecutionArgs,
     ) -> Result<ExecutionId, EngineError> {
         exec_core::create_execution_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    // ── RFC-v0.7 Wave 4i: flow-staging ingress methods ──
+    //
+    // Inherent methods (not on `EngineBackend`) matching the Valkey
+    // side's `ff-server::Server` shape — see `flow_staging` module
+    // docs. Called by ff-server request handlers and the integration
+    // test harness.
+
+    /// Create a flow. Idempotent on `(partition_key, flow_id)`.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.create_flow", skip_all)]
+    pub async fn create_flow(
+        &self,
+        args: &CreateFlowArgs,
+    ) -> Result<CreateFlowResult, EngineError> {
+        flow_staging::create_flow(&self.pool, &self.partition_config, args).await
+    }
+
+    /// Add an execution to a flow. Idempotent on re-add.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.add_execution_to_flow", skip_all)]
+    pub async fn add_execution_to_flow(
+        &self,
+        args: &AddExecutionToFlowArgs,
+    ) -> Result<AddExecutionToFlowResult, EngineError> {
+        flow_staging::add_execution_to_flow(&self.pool, &self.partition_config, args).await
+    }
+
+    /// Stage a dependency edge. CAS on `graph_revision`; stale rev →
+    /// `Contention(StaleGraphRevision)`.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.stage_dependency_edge", skip_all)]
+    pub async fn stage_dependency_edge(
+        &self,
+        args: &StageDependencyEdgeArgs,
+    ) -> Result<StageDependencyEdgeResult, EngineError> {
+        flow_staging::stage_dependency_edge(&self.pool, &self.partition_config, args).await
+    }
+
+    /// Apply a staged dependency to its downstream child — marks the
+    /// edge applied and bumps the downstream's edge-group aggregate.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.apply_dependency_to_child", skip_all)]
+    pub async fn apply_dependency_to_child(
+        &self,
+        args: &ApplyDependencyToChildArgs,
+    ) -> Result<ApplyDependencyToChildResult, EngineError> {
+        flow_staging::apply_dependency_to_child(&self.pool, &self.partition_config, args).await
     }
 }
 
