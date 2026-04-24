@@ -1090,13 +1090,48 @@ impl ValkeyConnection {
     }
 }
 
+/// Postgres-specific connection parameters (RFC-v0.7 Wave 0).
+///
+/// `url` is a standard libpq/sqlx connection string
+/// (`postgres://user:pass@host:port/db`). Pool sizing + acquire
+/// timeout are carried on this struct rather than
+/// [`BackendTimeouts`] / [`BackendRetry`] because they map directly
+/// to `sqlx::postgres::PgPoolOptions` and have no Valkey equivalent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PostgresConnection {
+    /// Postgres connection URL.
+    pub url: String,
+    /// Maximum number of pool connections.
+    pub max_connections: u32,
+    /// Minimum number of idle pool connections.
+    pub min_connections: u32,
+    /// Per-acquire pool timeout.
+    pub acquire_timeout: Duration,
+}
+
+impl PostgresConnection {
+    /// Build a Postgres connection from a URL with defaults for pool
+    /// sizing (matches sqlx's out-of-box defaults: max=10, min=0,
+    /// acquire=30s).
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            max_connections: 10,
+            min_connections: 0,
+            acquire_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Discriminated union over per-backend connection shapes. Stage 1a
-/// ships the Valkey arm; future backends (Postgres) land additively
-/// under the `#[non_exhaustive]` guard.
+/// shipped the Valkey arm; RFC-v0.7 Wave 0 adds the Postgres arm
+/// additively under the `#[non_exhaustive]` guard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackendConnection {
     Valkey(ValkeyConnection),
+    Postgres(PostgresConnection),
 }
 
 /// Configuration passed to `ValkeyBackend::connect` (and, later, to
@@ -1123,6 +1158,16 @@ impl BackendConfig {
     pub fn valkey(host: impl Into<String>, port: u16) -> Self {
         Self {
             connection: BackendConnection::Valkey(ValkeyConnection::new(host, port)),
+            timeouts: BackendTimeouts::default(),
+            retry: BackendRetry::default(),
+        }
+    }
+
+    /// Build a Postgres BackendConfig from a URL. Other fields take
+    /// backend defaults. RFC-v0.7 Wave 0.
+    pub fn postgres(url: impl Into<String>) -> Self {
+        Self {
+            connection: BackendConnection::Postgres(PostgresConnection::new(url)),
             timeouts: BackendTimeouts::default(),
             retry: BackendRetry::default(),
         }
