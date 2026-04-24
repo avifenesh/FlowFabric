@@ -67,6 +67,8 @@ pub mod listener;
 pub mod migrate;
 pub mod pool;
 pub mod signal;
+#[cfg(feature = "streaming")]
+pub mod stream;
 pub mod suspend;
 pub mod version;
 
@@ -98,6 +100,11 @@ pub struct PostgresBackend {
     partition_config: PartitionConfig,
     #[allow(dead_code)]
     metrics: Option<Arc<ff_observability::Metrics>>,
+    /// Wave 4: shared LISTEN notifier. Present on `connect()`-built
+    /// backends; `None` on bare `from_pool` constructions that skip
+    /// LISTEN wiring (tests that only exercise the write path).
+    #[allow(dead_code)]
+    stream_notifier: Option<Arc<StreamNotifier>>,
 }
 
 impl PostgresBackend {
@@ -117,10 +124,12 @@ impl PostgresBackend {
     /// connection arm is not Postgres.
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
         let pool = pool::build_pool(&config).await?;
+        let stream_notifier = Some(StreamNotifier::spawn(pool.clone()));
         let backend = Self {
             pool,
             partition_config: PartitionConfig::default(),
             metrics: None,
+            stream_notifier,
         };
         Ok(Arc::new(backend))
     }
@@ -131,10 +140,12 @@ impl PostgresBackend {
     /// pool and for a future migration CLI that wants to reuse a pool
     /// across migrate-run + smoke-check.
     pub fn from_pool(pool: PgPool, partition_config: PartitionConfig) -> Arc<Self> {
+        let stream_notifier = Some(StreamNotifier::spawn(pool.clone()));
         Arc::new(Self {
             pool,
             partition_config,
             metrics: None,
+            stream_notifier,
         })
     }
 
@@ -202,10 +213,18 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.append_frame", skip_all)]
     async fn append_frame(
         &self,
-        _handle: &Handle,
-        _frame: Frame,
+        handle: &Handle,
+        frame: Frame,
     ) -> Result<AppendFrameOutcome, EngineError> {
-        unavailable("pg.append_frame")
+        #[cfg(feature = "streaming")]
+        {
+            stream::append_frame(&self.pool, &self.partition_config, handle, frame).await
+        }
+        #[cfg(not(feature = "streaming"))]
+        {
+            let _ = (handle, frame);
+            unavailable("pg.append_frame")
+        }
     }
 
     #[tracing::instrument(name = "pg.complete", skip_all)]
@@ -473,36 +492,52 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.read_stream", skip_all)]
     async fn read_stream(
         &self,
-        _execution_id: &ExecutionId,
-        _attempt_index: AttemptIndex,
-        _from: StreamCursor,
-        _to: StreamCursor,
-        _count_limit: u64,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        from: StreamCursor,
+        to: StreamCursor,
+        count_limit: u64,
     ) -> Result<StreamFrames, EngineError> {
-        unavailable("pg.read_stream")
+        stream::read_stream(&self.pool, execution_id, attempt_index, from, to, count_limit).await
     }
 
     #[cfg(feature = "streaming")]
     #[tracing::instrument(name = "pg.tail_stream", skip_all)]
     async fn tail_stream(
         &self,
-        _execution_id: &ExecutionId,
-        _attempt_index: AttemptIndex,
-        _after: StreamCursor,
-        _block_ms: u64,
-        _count_limit: u64,
-        _visibility: TailVisibility,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        after: StreamCursor,
+        block_ms: u64,
+        count_limit: u64,
+        visibility: TailVisibility,
     ) -> Result<StreamFrames, EngineError> {
-        unavailable("pg.tail_stream")
+        let notifier = self
+            .stream_notifier
+            .as_ref()
+            .ok_or(EngineError::Unavailable {
+                op: "pg.tail_stream (notifier not initialised)",
+            })?;
+        stream::tail_stream(
+            &self.pool,
+            notifier,
+            execution_id,
+            attempt_index,
+            after,
+            block_ms,
+            count_limit,
+            visibility,
+        )
+        .await
     }
 
     #[cfg(feature = "streaming")]
     #[tracing::instrument(name = "pg.read_summary", skip_all)]
     async fn read_summary(
         &self,
-        _execution_id: &ExecutionId,
-        _attempt_index: AttemptIndex,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
     ) -> Result<Option<SummaryDocument>, EngineError> {
-        unavailable("pg.read_summary")
+        stream::read_summary(&self.pool, execution_id, attempt_index).await
     }
 }

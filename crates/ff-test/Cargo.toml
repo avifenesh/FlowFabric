@@ -26,13 +26,12 @@ ff-sdk = { workspace = true, features = ["direct-valkey-claim"] }
 # `TestCluster::backend()` minting lives in the fixtures library so
 # tests can exercise the trait-forwarded read_stream/tail_stream.
 ff-backend-valkey = { workspace = true }
-# RFC-v0.7 Wave 4a: integration tests against the Postgres backend
-# live under ff-test/ so a future dual-backend CI matrix can drive
-# both from one crate. The Postgres tests are `#[ignore]`d and only
-# run when `FF_PG_TEST_URL` is set — no live pg needed for default
-# `cargo test -p ff-test`.
+# RFC-v0.7 Wave 4a/4e: integration tests + fixtures that need the
+# Postgres backend live under ff-test/ so a future dual-backend CI
+# matrix can drive both from one crate. The Postgres tests are
+# `#[ignore]`d and only run when `FF_PG_TEST_URL` is set.
 ff-backend-postgres = { workspace = true }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid", "macros", "migrate", "json"] }
 ferriskey = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
@@ -54,8 +53,3 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures = { workspace = true }
 # Issue #154 — tracing span capture in the observability wiring test.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
-# Wave 4c/4f/4g/4h: live Postgres integration tests for flow + budget +
-# admin/list + CompletionBackend surfaces. Gated on `FF_PG_TEST_URL` at
-# runtime (tests are `#[ignore]` by default).
-ff-backend-postgres = { workspace = true }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "uuid", "macros", "migrate", "json"] }
