@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "ff-bench-postgres"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Wave 7c — Postgres perf-parity port of the bench matrix. Mirrors
+# benches/comparisons/apalis/ in package shape: standalone workspace
+# (the repo root excludes benches/), one binary per scenario, JSON
+# reports emitted under benches/results/ keyed by the short git-sha
+# of the commit the bench was built on.
+#
+# Unlike apalis (which drives apalis-redis end-to-end), this package
+# calls FlowFabric's Postgres backend DIRECTLY via
+# `PostgresBackend::from_pool` + the `EngineBackend` trait. That is
+# the narrowest port: no ff-server HTTP, no ff-sdk polling overhead,
+# no Lua. The Valkey-side comparison point for an apples-to-apples
+# read is benches/comparisons/ferriskey-baseline (direct ferriskey +
+# raw Valkey ops) — NOT the ff-sdk scenario 1 in benches/harness/.
+# `COMPARISON.md` spells out the resulting caveat per row.
+
+[[bin]]
+name = "pg-scenario1"
+path = "src/scenario1.rs"
+
+[[bin]]
+name = "pg-scenario2"
+path = "src/scenario2.rs"
+
+[[bin]]
+name = "pg-scenario3"
+path = "src/scenario3.rs"
+
+[[bin]]
+name = "pg-scenario4"
+path = "src/scenario4.rs"
+
+[[bin]]
+name = "pg-scenario5"
+path = "src/scenario5.rs"
+
+[[bin]]
+name = "pg-quorum-cancel-fanout"
+path = "src/quorum_cancel_fanout.rs"
+
+[dependencies]
+ff-bench = { path = "../../harness" }
+ff-core = { path = "../../../crates/ff-core" }
+ff-backend-postgres = { path = "../../../crates/ff-backend-postgres" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "chrono"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
