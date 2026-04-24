@@ -124,9 +124,66 @@ jobs:
       - name: e2e tests (serial)
         run: cargo test -p ff-test -- --test-threads=1
 
+  smoke:
+    # Pre-publish published-artifact smoke (v0.7+). Feedback rule
+    # `feedback_smoke_before_release.md` — v0.6.0 shipped a broken
+    # read_summary because the smoke ran AFTER publish. This job
+    # runs the smoke against workspace-path deps (which match the
+    # final published trait shape bit-for-bit) before the tag-gated
+    # publish step. A failure here MUST block `cargo publish`.
+    #
+    # Required fixtures: Valkey 8.x + Postgres 16 service containers.
+    # No untrusted workflow inputs are consumed in this job; all env
+    # vars below are static literals per the security note at the top
+    # of this file.
+    name: Pre-publish smoke (v0.7+)
+    needs: verify
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ff_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      FF_SMOKE_SERVER: http://localhost:9090
+      FF_SMOKE_VALKEY_HOST: localhost
+      FF_SMOKE_VALKEY_PORT: "6379"
+      FF_SMOKE_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/ff_smoke
+      FF_SMOKE_BACKEND: both
+      FF_SMOKE_STRICT: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+      - name: Install sqlx-cli + postgres client
+        run: |
+          cargo install sqlx-cli --no-default-features --features postgres
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Run smoke gate
+        run: bash scripts/smoke-v0.7.sh
+
   publish:
     name: Publish crates
-    needs: verify
+    needs: [verify, smoke]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     env:

@@ -74,6 +74,58 @@ Before cutting a release, verify:
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.
 
+## Pre-publish smoke (v0.7+)
+
+**Required release gate.** v0.6.0 shipped with a broken `read_summary`
+because the smoke ran *after* `cargo publish`; v0.7 moves the smoke
+in front of the tag so correctness regressions block the release
+instead of triggering a hotfix point release
+(`feedback_smoke_before_release.md`).
+
+Before tagging `v0.7.0` (and every release thereafter):
+
+1. Ensure fixtures are up on `127.0.0.1`:
+   - Valkey 8.x on `:6379`
+   - Postgres 16 on `:5432` with an `ff_smoke` database.
+2. Run:
+   ```bash
+   scripts/smoke-v0.7.sh
+   ```
+   The script handles Valkey/Postgres preflight, applies the Postgres
+   migrations via `sqlx migrate run` (if the CLI is on `PATH`), boots
+   `ff-server` in the background, and runs the scenario binary.
+3. All scenarios must pass on **both** backends. Any `Fail` or
+   cross-backend parity violation aborts the release. `Skip` counts
+   as failure under the default `--strict` mode (pass `FF_SMOKE_STRICT=0`
+   only for debugging — the release gate always runs strict).
+4. After `git tag` + `cargo publish`, run one more smoke against the
+   crates.io artifacts to confirm the publish uploaded cleanly. This
+   post-publish pass is a *publication-sanity check only* — it is
+   not the correctness gate (the pre-publish smoke is).
+
+Scenarios covered (see `benches/smoke/README.md` for details):
+
+- `claim_lifecycle` — create → claim → progress → complete
+- `flow_anyof` — AnyOf{CancelRemaining} DAG reachability
+- `suspend_signal` — suspend + deliver_signal (RFC-013/014)
+- `stream_durable_summary` — **the v0.6.0 regression scenario** (read_summary)
+- `stream_best_effort` — read_stream / tail_stream probe
+- `cancel_cascade` — cancel routing through dispatcher
+- `fanout_slo` — 50-way ingress + claim-pump observation
+
+### v0.7 release-gate status (Wave 7b)
+
+- `suspend_signal` is **Pass on both backends** after Wave 4d landed
+  the Postgres suspend + deliver_signal impls. The scenario now
+  exercises the full RFC-013/014 Single+ByName resume path end-to-end.
+- `flow_anyof` remains **Skip on Postgres** pending Wave 4i
+  (`stage_dependency_edge` + `apply_dependency_to_child` ports to the
+  Pg edge tables — `ff_edge`, `ff_edge_group_counter`). Dispatch
+  cascade (Wave 5a) + Stage C/D reconcilers (Wave 6b) are ready; only
+  the writer side is missing. **This blocker MUST be resolved before
+  tagging v0.7.0** — AnyOf{CancelRemaining} is a headline RFC-016
+  primitive and cannot ship with one backend leg un-exercised.
+
 ## Cutting a release
 
 ```bash

@@ -1,0 +1,42 @@
+[package]
+name = "ff-smoke-v07"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Pre-release v0.7 smoke harness — exercises the published API surfaces against Valkey + Postgres backends."
+
+# Smoke is a single binary; no library surface. Per `feedback_smoke_before_release`
+# the point of this crate is to run as a release gate, not be linked by consumers.
+[[bin]]
+name = "ff-smoke-v07"
+path = "src/main.rs"
+
+[dependencies]
+# Path-deps against the workspace checkout. `feedback_smoke_before_release`
+# calls for workspace-path pre-publish smoke so the final trait shape is
+# exercised bit-for-bit against the HEAD that will be tagged. A separate
+# post-publish smoke (documented in RELEASING.md) re-runs this crate against
+# crates.io artifacts.
+#
+# Why these crates only:
+# * `ff-core`             — EngineBackend trait + `CreateExecutionArgs` + types.
+# * `ff-backend-postgres` — the new v0.7 backend; scenarios call its
+#                            inherent + trait surface directly.
+# * Valkey regression scenarios drive `ff-server` over HTTP (same path a
+#   real consumer takes); no compile-time dep on `ff-backend-valkey` is
+#   necessary for that route.
+ff-core = { path = "../../crates/ff-core" }
+ff-backend-postgres = { path = "../../crates/ff-backend-postgres" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+async-trait = "0.1"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
