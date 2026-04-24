@@ -55,6 +55,7 @@ use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 use sqlx::PgPool;
 
 pub mod error;
+pub mod handle_codec;
 pub mod listener;
 pub mod migrate;
 pub mod pool;

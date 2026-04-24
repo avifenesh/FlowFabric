@@ -318,7 +318,7 @@ impl ValkeyBackend {
         worker_instance_id: WorkerInstanceId,
         kind: HandleKind,
     ) -> Handle {
-        let fields = handle_codec::HandleFields {
+        let fields = handle_codec::HandleFields::new(
             execution_id,
             attempt_index,
             attempt_id,
@@ -327,7 +327,7 @@ impl ValkeyBackend {
             lease_ttl_ms,
             lane_id,
             worker_instance_id,
-        };
+        );
         handle_codec::encode_handle(&fields, kind)
     }
 }

@@ -219,6 +219,16 @@ pub enum ValidationKind {
     /// Classified as `Terminal`: a consumer retrying the read will
     /// see the same bytes. Surface to the operator; do not loop.
     Corruption,
+    /// The [`crate::backend::Handle`] presented to a backend op was
+    /// minted by a different backend (e.g. a Valkey-tagged handle
+    /// passed to the Postgres backend). RFC-v0.7 Wave 1c: cross-backend
+    /// migration tooling emits Handles from one backend that must not
+    /// decode as the other; backends detect the mismatch at op entry
+    /// and return this variant.
+    ///
+    /// `detail` carries `"expected=<tag> actual=<tag>"` for operator
+    /// diagnostics.
+    HandleFromOtherBackend,
 }
 
 /// Contention sub-kinds (retryable per RFC-010 §10.7). Caller should

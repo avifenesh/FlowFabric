@@ -57,6 +57,30 @@ use std::time::Duration;
 pub enum BackendTag {
     /// The Valkey FCALL-backed implementation.
     Valkey,
+    /// The Postgres-backed implementation (RFC-v0.7 Wave 1c).
+    Postgres,
+}
+
+impl BackendTag {
+    /// Stable single-byte wire encoding for the tag. Embedded inside
+    /// [`HandleOpaque`] so cross-backend migration tooling can detect
+    /// which backend minted a given handle without parsing the rest of
+    /// the payload (see [`crate::handle_codec`]).
+    pub const fn wire_byte(self) -> u8 {
+        match self {
+            BackendTag::Valkey => 0x01,
+            BackendTag::Postgres => 0x02,
+        }
+    }
+
+    /// Inverse of [`Self::wire_byte`].
+    pub const fn from_wire_byte(b: u8) -> Option<Self> {
+        match b {
+            0x01 => Some(BackendTag::Valkey),
+            0x02 => Some(BackendTag::Postgres),
+            _ => None,
+        }
+    }
 }
 
 /// Lifecycle kind carried inside a [`Handle`]. Backends validate `kind`
