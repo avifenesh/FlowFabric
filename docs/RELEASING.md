@@ -63,6 +63,12 @@ Before cutting a release, verify:
 - [ ] Valkey minimum is 8.0+. The server refuses to start against
       Valkey < 8.0 (RFC-011 §13). Ensure all production + CI targets
       are on 8.x before cutting.
+- [ ] Postgres `max_locks_per_transaction >= 512` on all target
+      deployments (default `64` is insufficient under concurrent
+      bench/partition load — see
+      [`operator-guide-postgres.md`](operator-guide-postgres.md)).
+      `PostgresBackend::connect` emits a `tracing::warn` at boot when
+      the value is below `256`.
 - [ ] RESP3 is required for the engine's completion listener.
       `FlowFabricWorker::connect` defaults to RESP3; servers fronted
       by protocol-downgrading proxies must be verified against.

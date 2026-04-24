@@ -134,6 +134,7 @@ impl PostgresBackend {
     /// connection arm is not Postgres.
     pub async fn connect(config: BackendConfig) -> Result<Arc<dyn EngineBackend>, EngineError> {
         let pool = pool::build_pool(&config).await?;
+        warn_if_max_locks_low(&pool).await;
         let stream_notifier = Some(StreamNotifier::spawn(pool.clone()));
         let backend = Self {
             pool,
@@ -549,5 +550,89 @@ impl EngineBackend for PostgresBackend {
         attempt_index: AttemptIndex,
     ) -> Result<Option<SummaryDocument>, EngineError> {
         stream::read_summary(&self.pool, execution_id, attempt_index).await
+    }
+}
+
+/// Minimum recommended `max_locks_per_transaction`. Partition-heavy
+/// schemas (256 hash partitions per logical table) can exceed the
+/// Postgres default of `64` per tx under modest concurrent bench
+/// load — the Wave 7c bench hit `out of shared memory` at 16 workers
+/// × 10k tasks with the default and unblocked at `512`. We warn at
+/// boot rather than hard-fail because operators may legitimately
+/// run with a tuned value that still exceeds 64 but sits below our
+/// threshold.
+const MIN_MAX_LOCKS_PER_TRANSACTION: i64 = 256;
+
+/// Probe `max_locks_per_transaction` at connect time + log a warning
+/// when the current value is below the production-safe threshold.
+/// Never fails the connect — probe errors are logged at debug and
+/// swallowed (pg_show may be restricted on exotic deploys).
+async fn warn_if_max_locks_low(pool: &PgPool) {
+    let row: Result<(String,), sqlx::Error> =
+        sqlx::query_as("SHOW max_locks_per_transaction")
+            .fetch_one(pool)
+            .await;
+    match row {
+        Ok((raw,)) => emit_max_locks_decision(&raw),
+        Err(e) => {
+            tracing::debug!("failed to probe max_locks_per_transaction: {e}");
+        }
+    }
+}
+
+/// Pure decision surface for the max-locks probe — extracted for
+/// unit-testability (the live probe is gated by a running Postgres).
+/// Returns the integer value when a warning SHOULD fire, `None`
+/// otherwise (either the raw is valid + at/above threshold, or the
+/// raw is unparseable — the latter is debug-only).
+fn max_locks_warn_value(raw: &str) -> Option<i64> {
+    match raw.parse::<i64>() {
+        Ok(v) if v < MIN_MAX_LOCKS_PER_TRANSACTION => Some(v),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!(raw, "failed to parse max_locks_per_transaction: {e}");
+            None
+        }
+    }
+}
+
+fn emit_max_locks_decision(raw: &str) {
+    if let Some(v) = max_locks_warn_value(raw) {
+        tracing::warn!(
+            current = v,
+            recommended = MIN_MAX_LOCKS_PER_TRANSACTION,
+            "postgres max_locks_per_transaction={v} is below the recommended \
+             minimum ({MIN_MAX_LOCKS_PER_TRANSACTION}); partition-heavy workloads \
+             may hit 'out of shared memory' under concurrent load. \
+             See docs/operator-guide-postgres.md."
+        );
+    }
+}
+
+#[cfg(test)]
+mod max_locks_tests {
+    use super::{max_locks_warn_value, MIN_MAX_LOCKS_PER_TRANSACTION};
+
+    #[test]
+    fn warns_when_below_threshold() {
+        assert_eq!(max_locks_warn_value("64"), Some(64));
+        assert_eq!(
+            max_locks_warn_value(&(MIN_MAX_LOCKS_PER_TRANSACTION - 1).to_string()),
+            Some(MIN_MAX_LOCKS_PER_TRANSACTION - 1)
+        );
+    }
+
+    #[test]
+    fn silent_at_or_above_threshold() {
+        assert_eq!(
+            max_locks_warn_value(&MIN_MAX_LOCKS_PER_TRANSACTION.to_string()),
+            None
+        );
+        assert_eq!(max_locks_warn_value("1024"), None);
+    }
+
+    #[test]
+    fn silent_for_unparseable_raw() {
+        assert_eq!(max_locks_warn_value("not-a-number"), None);
     }
 }
