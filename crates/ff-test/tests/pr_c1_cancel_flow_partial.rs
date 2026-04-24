@@ -80,6 +80,7 @@ async fn start_test_server() -> Server {
         waitpoint_hmac_grace_ms: 86_400_000,
         max_concurrent_stream_ops: 64,
         backend: ff_server::config::BackendKind::default(),
+        postgres: Default::default(),
     };
     Server::start(server_config).await.expect("Server::start")
 }

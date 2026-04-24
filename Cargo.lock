@@ -1148,6 +1148,7 @@ dependencies = [
  "async-trait",
  "axum",
  "ferriskey",
+ "ff-backend-postgres",
  "ff-backend-valkey",
  "ff-core",
  "ff-engine",
