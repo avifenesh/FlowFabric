@@ -167,18 +167,16 @@ impl PostgresBackend {
 
     /// Create one execution row (+ seed the lane registry if new).
     ///
-    /// **RFC-v0.7 Wave 4a.** Inherent method (not on the `EngineBackend`
-    /// trait) — the Valkey side drives creates via a direct
-    /// `ff_create_execution` FCALL from ff-sdk / ff-server, and the
-    /// Postgres side mirrors that pattern: create is an ingress-layer
-    /// operation, not a worker-side op, so it sits outside the worker
-    /// trait surface. ff-server's request handlers + the integration
-    /// test harness call this entry point directly.
-    ///
-    /// Idempotent on primary-key conflict (`(partition_key,
-    /// execution_id)`): a duplicate create returns the caller's
-    /// `execution_id` unchanged, matching
-    /// [`ff_core::contracts::CreateExecutionResult::Duplicate`].
+    /// **RFC-017 Stage A:** this inherent method is retained as a
+    /// thin wrapper around the module-level impl so existing in-tree
+    /// callers (ff-server request handlers, integration tests) keep
+    /// compiling. The trait-lifted entry point is
+    /// [`EngineBackend::create_execution`] below, which calls the
+    /// same impl. Return shape differs — inherent returns
+    /// `ExecutionId`, trait returns
+    /// [`CreateExecutionResult`] per RFC-017 §5 — so we cannot simply
+    /// replace the inherent method. A follow-up PR may deprecate
+    /// this inherent alongside the broader ingress shape alignment.
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.create_execution", skip_all)]
     pub async fn create_execution(
@@ -188,16 +186,15 @@ impl PostgresBackend {
         exec_core::create_execution_impl(&self.pool, &self.partition_config, args).await
     }
 
-    // ── RFC-v0.7 Wave 4i: flow-staging ingress methods ──
-    //
-    // Inherent methods (not on `EngineBackend`) matching the Valkey
-    // side's `ff-server::Server` shape — see `flow_staging` module
-    // docs. Called by ff-server request handlers and the integration
-    // test harness.
+    // ── RFC-017 Stage A: inherent ingress methods retained for
+    // back-compat with in-tree test harnesses + ff-server direct
+    // calls. The trait-lifted peers (`EngineBackend::create_flow`
+    // etc.) delegate to the SAME module-level impls under the hood.
+    // Follow-up PR may sunset these inherents once all in-tree
+    // consumers route through `Arc<dyn EngineBackend>`.
 
-    /// Create a flow. Idempotent on `(partition_key, flow_id)`.
     #[cfg(feature = "core")]
-    #[tracing::instrument(name = "pg.create_flow", skip_all)]
+    #[tracing::instrument(name = "pg.create_flow.inherent", skip_all)]
     pub async fn create_flow(
         &self,
         args: &CreateFlowArgs,
@@ -205,9 +202,8 @@ impl PostgresBackend {
         flow_staging::create_flow(&self.pool, &self.partition_config, args).await
     }
 
-    /// Add an execution to a flow. Idempotent on re-add.
     #[cfg(feature = "core")]
-    #[tracing::instrument(name = "pg.add_execution_to_flow", skip_all)]
+    #[tracing::instrument(name = "pg.add_execution_to_flow.inherent", skip_all)]
     pub async fn add_execution_to_flow(
         &self,
         args: &AddExecutionToFlowArgs,
@@ -215,10 +211,8 @@ impl PostgresBackend {
         flow_staging::add_execution_to_flow(&self.pool, &self.partition_config, args).await
     }
 
-    /// Stage a dependency edge. CAS on `graph_revision`; stale rev →
-    /// `Contention(StaleGraphRevision)`.
     #[cfg(feature = "core")]
-    #[tracing::instrument(name = "pg.stage_dependency_edge", skip_all)]
+    #[tracing::instrument(name = "pg.stage_dependency_edge.inherent", skip_all)]
     pub async fn stage_dependency_edge(
         &self,
         args: &StageDependencyEdgeArgs,
@@ -226,10 +220,8 @@ impl PostgresBackend {
         flow_staging::stage_dependency_edge(&self.pool, &self.partition_config, args).await
     }
 
-    /// Apply a staged dependency to its downstream child — marks the
-    /// edge applied and bumps the downstream's edge-group aggregate.
     #[cfg(feature = "core")]
-    #[tracing::instrument(name = "pg.apply_dependency_to_child", skip_all)]
+    #[tracing::instrument(name = "pg.apply_dependency_to_child.inherent", skip_all)]
     pub async fn apply_dependency_to_child(
         &self,
         args: &ApplyDependencyToChildArgs,
@@ -487,6 +479,59 @@ impl EngineBackend for PostgresBackend {
         args: ClaimResumedExecutionArgs,
     ) -> Result<ClaimResumedExecutionResult, EngineError> {
         suspend_ops::claim_resumed_execution_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    // ── RFC-017 Stage A — ingress (promoted from inherent) ────
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.create_flow", skip_all)]
+    async fn create_flow(
+        &self,
+        args: CreateFlowArgs,
+    ) -> Result<CreateFlowResult, EngineError> {
+        flow_staging::create_flow(&self.pool, &self.partition_config, &args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.add_execution_to_flow", skip_all)]
+    async fn add_execution_to_flow(
+        &self,
+        args: AddExecutionToFlowArgs,
+    ) -> Result<AddExecutionToFlowResult, EngineError> {
+        flow_staging::add_execution_to_flow(&self.pool, &self.partition_config, &args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.stage_dependency_edge", skip_all)]
+    async fn stage_dependency_edge(
+        &self,
+        args: StageDependencyEdgeArgs,
+    ) -> Result<StageDependencyEdgeResult, EngineError> {
+        flow_staging::stage_dependency_edge(&self.pool, &self.partition_config, &args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.apply_dependency_to_child", skip_all)]
+    async fn apply_dependency_to_child(
+        &self,
+        args: ApplyDependencyToChildArgs,
+    ) -> Result<ApplyDependencyToChildResult, EngineError> {
+        flow_staging::apply_dependency_to_child(&self.pool, &self.partition_config, &args).await
+    }
+
+    fn backend_label(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn ping(&self) -> Result<(), EngineError> {
+        // Postgres analogue to Valkey PING — single-round-trip pool
+        // liveness. Errors propagate as transport-class EngineError via
+        // the existing sqlx→EngineError map.
+        let _ = sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(error::map_sqlx_error)?;
+        Ok(())
     }
 
     #[tracing::instrument(name = "pg.cancel_flow", skip_all)]
