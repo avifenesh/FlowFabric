@@ -364,3 +364,32 @@ async fn get_upstream_outcome(
     cache.insert(upstream_id.to_owned(), result.clone());
     result
 }
+
+// ── Postgres branch (Wave 6a, RFC-v0.7) ─────────────────────────────────
+
+/// Postgres parity for [`DependencyReconciler`].
+///
+/// Delegates to [`ff_backend_postgres::reconcilers::dependency::reconcile_tick`]
+/// — the cascade backstop for the per-hop-tx dispatch chain in
+/// Wave 5a. See that module's docs for the transitive-descendant
+/// sweep proof.
+///
+/// The engine's Postgres scanner task drives this on a fixed
+/// interval (mirrors the Valkey `ScannerRunner` contract), passing
+/// its configured `ScannerFilter` and the `stale_threshold_ms`
+/// from `BackendConfig`. A `None` threshold folds to
+/// [`ff_backend_postgres::reconcilers::dependency::DEFAULT_STALE_THRESHOLD_MS`].
+#[cfg(feature = "postgres")]
+pub async fn reconcile_via_postgres(
+    pool: &ff_backend_postgres::PgPool,
+    filter: &ScannerFilter,
+    stale_threshold_ms: Option<i64>,
+) -> Result<
+    ff_backend_postgres::reconcilers::dependency::ReconcileReport,
+    ff_core::engine_error::EngineError,
+> {
+    let threshold = stale_threshold_ms.unwrap_or(
+        ff_backend_postgres::reconcilers::dependency::DEFAULT_STALE_THRESHOLD_MS,
+    );
+    ff_backend_postgres::reconcilers::dependency::reconcile_tick(pool, filter, threshold).await
+}
