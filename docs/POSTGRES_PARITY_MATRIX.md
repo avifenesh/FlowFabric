@@ -45,19 +45,19 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 | 3 | `add_execution_to_flow` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 4 | `stage_dependency_edge` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 5 | `apply_dependency_to_child` | `impl` | `impl` | Promoted from PG inherent to trait. |
-| 6 | `cancel_execution` | `stub` | `stub` | Valkey body requires HMGET pre-read (lane_id + current_attempt_index + current_waitpoint_id + current_worker_instance_id); deferred to Stage C handler migration to keep this PR surgical. |
-| 7 | `change_priority` | `stub` | `stub` | Valkey body requires HGET lane_id pre-read; deferred to Stage C. |
-| 8 | `replay_execution` | `stub` | `stub` | Valkey body requires HMGET + variadic SMEMBERS (§4 row 3 hard-level complexity); deferred to Stage C. |
-| 9 | `revoke_lease` | `stub` | `stub` | Valkey body requires HGET current_worker_instance_id pre-read; deferred to Stage C. |
+| 6 | `cancel_execution` | `impl` | `stub` | **Landed Stage C (PR #impl/017-stage-c).** Valkey body does HMGET pre-read (lane_id + current_attempt_index + current_waitpoint_id + current_worker_instance_id) then raw FCALL with variadic KEYS(21)/ARGV(5) matching `lua/execution.lua::ff_cancel_execution`. |
+| 7 | `change_priority` | `impl` | `stub` | **Landed Stage C.** Valkey body reads authoritative lane via HGET when caller passes empty `lane_id`, then wraps the `ff_change_priority` ff-script helper. |
+| 8 | `replay_execution` | `impl` | `stub` | **Landed Stage C.** Valkey body does HMGET pre-read (lane_id + flow_id + terminal_outcome). Non-flow path wraps `ff_replay_execution`; skipped-flow-member path does SMEMBERS over the flow partition's incoming-edge set and raw FCALL with variadic KEYS/ARGV (§4 row 3 Hard clause). |
+| 9 | `revoke_lease` | `impl` | `stub` | **Landed Stage C.** Valkey body HGETs `current_worker_instance_id` when caller passes empty WIID; surfaces "no active lease" as `RevokeLeaseResult::AlreadySatisfied { reason: "no_active_lease" }` (Lua-canonical semantic — minor delta vs pre-migration HTTP 404, documented in Stage C PR). |
 | 10 | `create_budget` | `impl` | `stub` | Valkey wraps `ff_create_budget`. Postgres default `Unavailable` until Wave 5 budget impls. |
 | 11 | `reset_budget` | `impl` | `stub` | Valkey wraps `ff_reset_budget`. |
 | 12 | `create_quota_policy` | `impl` | `stub` | Valkey wraps `ff_create_quota_policy`. |
-| 13 | `get_budget_status` | `stub` | `stub` | Valkey body is 3× HGETALL + field-level parse (no FCALL); deferred to Stage C to keep the budget-shape refactor in one place. |
+| 13 | `get_budget_status` | `impl` | `stub` | **Landed Stage C.** Valkey body is 3× HGETALL (definition + usage + limits) + field-level parse, no FCALL. Missing budget surfaces as `EngineError::NotFound { entity: "budget" }` with contextual wrapper carrying the budget id. |
 | 14 | `report_usage_admin` | `impl` | `stub` | Valkey wraps `ff_report_usage_and_check` without worker handle. |
 | 15 | `get_execution_result` | `impl` | `stub` | Valkey direct `GET` of `ctx.result()`, binary-safe. |
 | 16 | `list_pending_waitpoints` | `stub` | `stub` | §8 schema rewrite (HMAC redaction + `token_kid`/`token_fingerprint`) is Stage D's explicit scope. Stage A lands the trait signature only. |
 | 17 | `ping` | `impl` | `impl` | Valkey: `PING`. Postgres: `SELECT 1`. |
-| 18 | `claim_for_worker` | `stub` | `stub` | Valkey impl requires `Arc<ff_scheduler::Scheduler>` field on `ValkeyBackend` — adding `ff-scheduler` dep to `ff-backend-valkey` is a dep-graph change kept out of Stage A; scheduler lifts in Stage C / §7. |
+| 18 | `claim_for_worker` | `impl` | `stub` | **Landed Stage C.** `ff-backend-valkey` added `ff-scheduler` dep; `ValkeyBackend` holds `Option<Arc<ff_scheduler::Scheduler>>` wired at `ff-server` boot via `ValkeyBackend::with_scheduler` before the `Arc<dyn EngineBackend>` is sealed. Trait impl forwards to `Scheduler::claim_for_worker`; `SchedulerError::Config` maps to `EngineError::Validation`, Valkey transport errors via `transport_fk`. Backends without a wired scheduler (e.g. SDK-side `MockBackend`) surface `EngineError::Unavailable { op: "claim_for_worker (scheduler not wired on this ValkeyBackend)" }`. |
 
 **Cross-cutting (unconditional, landed pre-Stage-A):**
 
@@ -101,8 +101,18 @@ sequence anticipated.
   inherent).
 - **Stage B (shipped, PR #264):** read + admin + stream handler
   migration on Valkey.
-- **Stage C (next):** operator control + budget-status + claim
-  handler migration. Valkey `stub` rows above move to `impl`.
+- **Stage C (shipped, PR `impl/017-stage-c`):** operator control +
+  budget-status + claim handler migration. The 6 Valkey `stub` rows
+  above (cancel_execution, change_priority, replay_execution,
+  revoke_lease, get_budget_status, claim_for_worker) moved to
+  `impl`. `list_pending_waitpoints` remains `stub` pending Stage D's
+  §8 schema rewrite. Stage C also migrated the 10 HTTP handlers (2
+  operator control, 4 budget admin, 1 quota admin, 1 claim, 1 budget
+  status, 1 admin `report_usage`) from inherent `Server::X(...)` +
+  `fcall_with_reload` to `server.backend().X(...)` trait dispatch
+  via the freshly minted `From<EngineError> for ApiError` bridge.
+  The Engine `IntoResponse` arm gained `Conflict` / `Contention` /
+  `State` kinds mapping to HTTP 409 per RFC-010 §10.7.
 - **Stage D:** ingress + `list_pending_waitpoints` §8 schema rewrite
   + Postgres HTTP cutover. **CI gate:**
   `test_postgres_parity_no_unavailable` asserts no Postgres
