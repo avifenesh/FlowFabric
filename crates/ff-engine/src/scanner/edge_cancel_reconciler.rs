@@ -12,11 +12,11 @@
 //! `pending_cancel_groups` directly (no full scan) and calls
 //! `ff_reconcile_sibling_cancel_group` per tuple. The Lua function
 //! decides atomically:
-//!   - `sremmed_stale`    — flag false / edgegroup missing → SREM only.
-//!   - `completed_drain`  — flag true + all siblings terminal (drain
-//!                          interrupted post-cancels) → HDEL + SREM.
-//!   - `no_op`            — flag true + some sibling still running; the
-//!                          dispatcher will handle on its next tick.
+//!   - `sremmed_stale` — flag false / edgegroup missing → SREM only.
+//!   - `completed_drain` — flag true + all siblings terminal (drain
+//!     interrupted post-cancels) → HDEL + SREM.
+//!   - `no_op` — flag true + some sibling still running; the
+//!     dispatcher will handle on its next tick.
 //!
 //! The reconciler MUST NOT fight the dispatcher — `no_op` leaves state
 //! untouched so the 1s dispatcher cadence retains ownership of the

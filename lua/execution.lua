@@ -276,15 +276,6 @@ redis.register_function('ff_create_execution', function(keys, args)
   -- 9. SADD to all_executions partition index
   redis.call("SADD", K.all_executions_set, A.execution_id)
 
-  -- 9b. First-sight lane registration (issue #203).
-  -- Maintains the global lanes registry `ff:idx:lanes` (read by
-  -- EngineBackend::list_lanes). SADD is idempotent, so repeated
-  -- creates on the same lane are no-ops after the first.
-  -- NOTE: this key is intentionally NOT hash-tagged per partition —
-  -- it is the single cross-partition global SET in the system. See
-  -- ff_core::keys::lanes_index_key.
-  redis.call("SADD", "ff:idx:lanes", A.lane_id)
-
   -- 10. Execution deadline index
   if is_set(A.execution_deadline_at) then
     redis.call("ZADD", K.deadline_zset, tonumber(A.execution_deadline_at), A.execution_id)

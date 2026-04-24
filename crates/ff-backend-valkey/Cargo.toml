@@ -25,7 +25,7 @@ streaming = ["ff-core/streaming"]
 observability = ["ff-observability/enabled"]
 
 [dependencies]
-ff-core = { version = "0.5.0", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
+ff-core = { version = "0.6.0", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
 # Issue #154 — metric emission on `EngineBackend` impls. Always-present
 # so no cfg-gated field on `ValkeyBackend`; the `observability` feature
 # selects shim vs. real OTEL implementation.
