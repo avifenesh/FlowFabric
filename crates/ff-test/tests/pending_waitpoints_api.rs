@@ -11,13 +11,38 @@
 use std::sync::Arc;
 
 use ferriskey::Value;
-use ff_core::contracts::PendingWaitpointInfo;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{execution_partition, PartitionConfig};
 use ff_core::types::*;
 use ff_test::fixtures::TestCluster;
 use reqwest::StatusCode;
+use serde::Deserialize;
 use tokio::task::AbortHandle;
+
+/// RFC-017 Stage D1 (§8) v0.7.x wire DTO — mirrors the
+/// `PendingWaitpointWireV07` serialised by `ff-server::api`. Kept
+/// local to the test so consumer-compatibility assertions are
+/// explicit about what's still on the v0.7 wire.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct PendingWaitpointWireV07 {
+    waitpoint_id: WaitpointId,
+    waitpoint_key: String,
+    state: String,
+    #[serde(default)]
+    required_signal_names: Vec<String>,
+    created_at: TimestampMs,
+    #[serde(default)]
+    activated_at: Option<TimestampMs>,
+    #[serde(default)]
+    expires_at: Option<TimestampMs>,
+    execution_id: ExecutionId,
+    token_kid: String,
+    token_fingerprint: String,
+    /// Legacy v0.7.x — removed at v0.8.0.
+    #[serde(default)]
+    waitpoint_token: Option<String>,
+}
 
 const LANE: &str = "pwp-lane";
 const NS: &str = "pwp-ns";
@@ -352,7 +377,20 @@ async fn test_list_pending_waitpoints_returns_token_after_suspend() {
         .expect("pending-waitpoints request failed");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let list: Vec<PendingWaitpointInfo> =
+    // RFC-017 Stage D1 (§8): the Deprecation: ff-017 header must be
+    // present while the legacy wire field is still served.
+    let deprecation_hdr = resp
+        .headers()
+        .get("Deprecation")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    assert_eq!(
+        deprecation_hdr.as_deref(),
+        Some("ff-017"),
+        "v0.7.x responses must carry Deprecation: ff-017"
+    );
+
+    let list: Vec<PendingWaitpointWireV07> =
         resp.json().await.expect("response body parse failed");
 
     assert_eq!(list.len(), 1, "expected exactly one active waitpoint");
@@ -360,13 +398,22 @@ async fn test_list_pending_waitpoints_returns_token_after_suspend() {
     assert_eq!(entry.waitpoint_id, wp_id);
     assert_eq!(entry.waitpoint_key, wp_key);
     assert_eq!(entry.state, "active");
+    let token = entry.waitpoint_token.as_deref().expect(
+        "v0.7.x wire must still carry the legacy waitpoint_token",
+    );
     assert_eq!(
-        entry.waitpoint_token.as_str(),
-        expected_token,
+        token, expected_token,
         "token must match the one returned to the suspending worker"
     );
     assert!(entry.activated_at.is_some());
-    assert!(!entry.waitpoint_token.as_str().is_empty());
+    assert!(!token.is_empty());
+    // Sanitised fields — present on the trait boundary and the wire.
+    assert!(!entry.token_kid.is_empty(), "token_kid must be populated");
+    assert_eq!(
+        entry.token_fingerprint.len(),
+        16,
+        "token_fingerprint is the first 16 hex chars of the digest"
+    );
     // The fcall_suspend helper above passes
     // required_signal_names=["pwp_signal"]; the endpoint should surface
     // that so a reviewer with multiple waitpoints can pick the right
@@ -396,7 +443,7 @@ async fn test_list_pending_waitpoints_empty_for_unsuspended() {
         .expect("pending-waitpoints request failed");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let list: Vec<PendingWaitpointInfo> =
+    let list: Vec<PendingWaitpointWireV07> =
         resp.json().await.expect("response body parse failed");
     assert!(list.is_empty(), "expected no waitpoints, got {list:?}");
 }

@@ -86,6 +86,15 @@ mod name {
     /// RFC-017 Stage B: count of `shutdown_prepare` calls that
     /// exceeded their `grace` budget on the backend.
     pub const SHUTDOWN_TIMEOUT: &str = "ff_shutdown_timeout";
+    /// RFC-017 Stage D1 (§8): count of pending-waitpoint responses
+    /// that still carried the legacy raw `waitpoint_token` wire field
+    /// under the v0.7.x deprecation window. No labels.
+    pub const PENDING_WAITPOINT_LEGACY_TOKEN: &str =
+        "ff_pending_waitpoint_legacy_token_served";
+    /// RFC-017 §9.0 dev-mode override: count of boots that bypassed
+    /// `BACKEND_STAGE_READY` via `FF_BACKEND_ACCEPT_UNREADY=1 +
+    /// FF_ENV=development`. Labelled by `backend` and `stage`.
+    pub const BACKEND_UNREADY_BOOT: &str = "ff_backend_unready_boot";
 }
 
 struct Inner {
@@ -116,6 +125,8 @@ struct Inner {
     sibling_cancel_disposition: Counter<u64>,
     sibling_cancel_reconcile: Counter<u64>,
     shutdown_timeout: Counter<u64>,
+    pending_waitpoint_legacy_token: Counter<u64>,
+    backend_unready_boot: Counter<u64>,
 }
 
 #[derive(Clone)]
@@ -224,6 +235,23 @@ impl Metrics {
                  per timed-out shutdown.",
             )
             .build();
+        let pending_waitpoint_legacy_token = meter
+            .u64_counter(name::PENDING_WAITPOINT_LEGACY_TOKEN)
+            .with_description(
+                "RFC-017 Stage D1 (§8): count of pending-waitpoint \
+                 entries served with the legacy v0.7.x `waitpoint_token` \
+                 wire field. Emitted once per entry served; zero at \
+                 v0.8.0 (field removed).",
+            )
+            .build();
+        let backend_unready_boot = meter
+            .u64_counter(name::BACKEND_UNREADY_BOOT)
+            .with_description(
+                "RFC-017 §9.0 dev-override: boots that bypassed \
+                 BACKEND_STAGE_READY via FF_BACKEND_ACCEPT_UNREADY=1 + \
+                 FF_ENV=development. Labelled by backend + stage.",
+            )
+            .build();
 
         // Cancel backlog depth — gauge backed by an AtomicU64 so set()
         // from any thread is lock-free. OTEL observable-gauge callback
@@ -258,6 +286,8 @@ impl Metrics {
             sibling_cancel_disposition,
             sibling_cancel_reconcile,
             shutdown_timeout,
+            pending_waitpoint_legacy_token,
+            backend_unready_boot,
         }))
     }
 
@@ -392,6 +422,28 @@ impl Metrics {
     /// backend's `shutdown_prepare` call exceeds its grace budget.
     pub fn inc_shutdown_timeout(&self) {
         self.0.shutdown_timeout.add(1, &[]);
+    }
+
+    /// RFC-017 Stage D1 (§8): increment
+    /// `ff_pending_waitpoint_legacy_token_served_total`. Fired once
+    /// per pending-waitpoint entry served with the legacy raw
+    /// `waitpoint_token` wire field.
+    pub fn inc_pending_waitpoint_legacy_token(&self) {
+        self.0.pending_waitpoint_legacy_token.add(1, &[]);
+    }
+
+    /// RFC-017 §9.0 dev-override: increment
+    /// `ff_backend_unready_boot_total{backend,stage}` when the
+    /// server bypasses `BACKEND_STAGE_READY` via
+    /// `FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development`.
+    pub fn inc_backend_unready_boot(&self, backend: &'static str, stage: &'static str) {
+        self.0.backend_unready_boot.add(
+            1,
+            &[
+                KeyValue::new("backend", backend),
+                KeyValue::new("stage", stage),
+            ],
+        );
     }
 }
 

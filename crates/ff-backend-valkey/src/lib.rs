@@ -414,6 +414,36 @@ impl ValkeyBackend {
         self.stream_semaphore.available_permits()
     }
 
+    /// RFC-017 Stage D1 (§8): Valkey-only inherent fetch of the raw
+    /// `<kid>:<hex>` waitpoint token for the v0.7.x pending-waitpoints
+    /// wire-format shim. **NOT on `EngineBackend`** — the trait
+    /// boundary never exposes the raw HMAC post-§8. The ff-server
+    /// HTTP handler wraps the sanitised trait response and calls
+    /// this inherent to re-inject the legacy field on the wire for
+    /// one-release deprecation warning; the shim + this method go
+    /// away at Stage E / v0.8.0.
+    ///
+    /// Returns `Ok(None)` if the waitpoint hash does not carry a
+    /// `waitpoint_token` field (missing / rotated out). Transport
+    /// errors surface as `EngineError::Transport`.
+    pub async fn fetch_waitpoint_token_v07(
+        &self,
+        execution_id: &ExecutionId,
+        waitpoint_id: &WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        let partition = execution_partition(execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let token: Option<String> = self
+            .client
+            .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "fetch_waitpoint_token_v07: HGET waitpoint_token",
+            ))?;
+        Ok(token.filter(|s| !s.is_empty()))
+    }
+
     /// RFC-017 §14.8 mandatory Stage B CI test hook. Exposes a clone
     /// of the internal semaphore so the shutdown-under-load test can
     /// hold permits directly without dispatching a live FCALL.
@@ -1679,6 +1709,24 @@ fn now_ms_timestamp() -> TimestampMs {
 /// byte-for-byte KEYS/ARGV parity with the SDK's pre-migration code.
 fn transport_fk(e: ferriskey::Error) -> EngineError {
     transport_script(ScriptError::Valkey(e))
+}
+
+/// RFC-017 §8 (Stage D1): parse a stored `waitpoint_token` of the form
+/// `<kid>:<40hex>` into its `(kid, 16-hex-prefix-of-digest)` components.
+///
+/// Robust against malformed input: returns `("", "")` when the stored
+/// value does not match the expected shape. Callers log + skip on
+/// empty tokens upstream, so this helper never panics or surfaces a
+/// typed error — the presence of the raw token is already checked
+/// before this runs.
+fn parse_waitpoint_token_kid_fp(raw: &str) -> (String, String) {
+    match raw.split_once(':') {
+        Some((kid, hex)) if !kid.is_empty() && !hex.is_empty() => {
+            let fp_len = hex.len().min(16);
+            (kid.to_owned(), hex[..fp_len].to_owned())
+        }
+        _ => (String::new(), String::new()),
+    }
 }
 
 /// Parse a raw `{1, "OK", ...}` / `{0, "error", ...}` FCALL result into
@@ -4568,10 +4616,36 @@ impl EngineBackend for ValkeyBackend {
         &self,
         args: ff_core::contracts::AddExecutionToFlowArgs,
     ) -> Result<ff_core::contracts::AddExecutionToFlowResult, EngineError> {
+        // RFC-011 §7.3: exec_core co-locates with its parent flow on
+        // `{fp:N}`. Validate this invariant up-front so a mismatched
+        // `execution_id` (e.g. a `solo`-minted id instead of
+        // `ExecutionId::for_flow`) surfaces as a typed
+        // `EngineError::Validation` rather than a raw Valkey
+        // CROSSSLOT on clustered deployments. Matches the pre-Stage-D1
+        // `Server::add_execution_to_flow` pre-flight check.
         let partition = flow_partition(&args.flow_id, &self.partition_config);
+        let exec_partition =
+            execution_partition(&args.execution_id, &self.partition_config);
+        if exec_partition.index != partition.index {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!(
+                    "add_execution_to_flow: execution_id's partition {} != flow_id's partition {}. \
+                     Post-RFC-011 §7.3 co-location requires mint via \
+                     `ExecutionId::for_flow(&flow_id, config)` so the exec's hash-tag \
+                     matches the flow's `{{fp:N}}`.",
+                    exec_partition.index, partition.index
+                ),
+            });
+        }
         let fctx = FlowKeyContext::new(&partition, &args.flow_id);
         let fidx = FlowIndexKeys::new(&partition);
-        let keys = FlowStructOpKeys { fctx: &fctx, fidx: &fidx };
+        let ectx = ExecKeyContext::new(&exec_partition, &args.execution_id);
+        let keys = ff_script::functions::flow::AddExecutionToFlowKeys {
+            fctx: &fctx,
+            fidx: &fidx,
+            exec_ctx: &ectx,
+        };
         ff_add_execution_to_flow(&self.client, &keys, &args)
             .await
             .map_err(|e| ff_core::engine_error::backend_context(
@@ -4777,6 +4851,304 @@ impl EngineBackend for ValkeyBackend {
                 "get_execution_result: GET result",
             ))?;
         Ok(payload)
+    }
+
+    // ── RFC-017 Stage D1 — list_pending_waitpoints (§8) ─────────
+
+    /// List pending/active waitpoints for an execution. Stage D1
+    /// implementation (RFC-017 §8): SSCAN the waitpoint index,
+    /// pipelined 2× HMGET for each waitpoint + HGET
+    /// `total_matchers`, optional pass-2 HMGET for matcher names,
+    /// parse the stored `<kid>:<hex>` token into
+    /// `(token_kid, token_fingerprint)` and DROP the raw token
+    /// before returning across the trait boundary.
+    ///
+    /// Pagination: the caller's `args.after` is used to skip
+    /// waitpoint ids lexicographically `<= after` after the SSCAN
+    /// dedup. `args.limit` defaults to 100, is capped at 1000. A
+    /// `next_cursor` is returned if more entries were available
+    /// beyond the requested page.
+    async fn list_pending_waitpoints(
+        &self,
+        args: ff_core::contracts::ListPendingWaitpointsArgs,
+    ) -> Result<ff_core::contracts::ListPendingWaitpointsResult, EngineError> {
+        use ff_core::contracts::{ListPendingWaitpointsResult, PendingWaitpointInfo};
+
+        const DEFAULT_LIMIT: u32 = 100;
+        const MAX_LIMIT: u32 = 1000;
+        const WAITPOINTS_SSCAN_COUNT: usize = 100;
+        const WP_FIELDS: [&str; 6] = [
+            "state",
+            "waitpoint_key",
+            "waitpoint_token",
+            "created_at",
+            "activated_at",
+            "expires_at",
+        ];
+
+        let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
+        let execution_id = args.execution_id.clone();
+        let after_str = args.after.as_ref().map(|wp| wp.to_string());
+
+        let partition = execution_partition(&execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &execution_id);
+
+        // Existence check — surface NotFound early so callers don't
+        // get an empty page for a non-existent execution.
+        let core_exists: bool = self
+            .client
+            .cmd("EXISTS")
+            .arg(ctx.core())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "list_pending_waitpoints: EXISTS exec_core",
+            ))?;
+        if !core_exists {
+            return Err(EngineError::NotFound {
+                entity: "execution",
+            });
+        }
+
+        let waitpoints_key = ctx.waitpoints();
+        let mut wp_ids_raw: Vec<String> = Vec::new();
+        let mut cursor: String = "0".to_owned();
+        loop {
+            let reply: (String, Vec<String>) = self
+                .client
+                .cmd("SSCAN")
+                .arg(&waitpoints_key)
+                .arg(&cursor)
+                .arg("COUNT")
+                .arg(WAITPOINTS_SSCAN_COUNT.to_string().as_str())
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "list_pending_waitpoints: SSCAN waitpoints",
+                ))?;
+            cursor = reply.0;
+            wp_ids_raw.extend(reply.1);
+            if cursor == "0" {
+                break;
+            }
+        }
+
+        // SSCAN may dup; dedup + sort for deterministic pagination.
+        wp_ids_raw.sort_unstable();
+        wp_ids_raw.dedup();
+
+        // Apply `after` cursor — skip ids `<= after`.
+        if let Some(after) = &after_str {
+            let start = wp_ids_raw.partition_point(|s| s.as_str() <= after.as_str());
+            wp_ids_raw.drain(..start);
+        }
+
+        if wp_ids_raw.is_empty() {
+            return Ok(ListPendingWaitpointsResult::new(Vec::new()));
+        }
+
+        // Page: request `limit + 1` so we can detect "more to come"
+        // without a second round-trip. We'll cap to wp_ids_raw.len().
+        let page_end = (limit + 1).min(wp_ids_raw.len());
+        let has_more_raw = wp_ids_raw.len() > limit;
+        let page_ids_raw: Vec<String> = wp_ids_raw[..page_end].to_vec();
+
+        // Parse, skip unparseable ids.
+        let mut wp_ids: Vec<WaitpointId> = Vec::with_capacity(page_ids_raw.len());
+        for raw in &page_ids_raw {
+            match WaitpointId::parse(raw) {
+                Ok(id) => wp_ids.push(id),
+                Err(e) => tracing::warn!(
+                    raw_id = %raw,
+                    error = %e,
+                    execution_id = %execution_id,
+                    "list_pending_waitpoints: skipping unparseable waitpoint_id"
+                ),
+            }
+        }
+        if wp_ids.is_empty() {
+            return Ok(ListPendingWaitpointsResult::new(Vec::new()));
+        }
+
+        // Pipeline pass-1: HMGET + HGET total_matchers per waitpoint.
+        let mut pass1 = self.client.pipeline();
+        let mut wp_slots = Vec::with_capacity(wp_ids.len());
+        let mut cond_slots = Vec::with_capacity(wp_ids.len());
+        for wp_id in &wp_ids {
+            let mut cmd = pass1.cmd::<Vec<Option<String>>>("HMGET");
+            cmd = cmd.arg(ctx.waitpoint(wp_id));
+            for f in WP_FIELDS {
+                cmd = cmd.arg(f);
+            }
+            wp_slots.push(cmd.finish());
+
+            cond_slots.push(
+                pass1
+                    .cmd::<Option<String>>("HGET")
+                    .arg(ctx.waitpoint_condition(wp_id))
+                    .arg("total_matchers")
+                    .finish(),
+            );
+        }
+        pass1.execute().await.map_err(|e| {
+            ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "list_pending_waitpoints: pipeline HMGET waitpoints + HGET total_matchers",
+            )
+        })?;
+
+        struct Kept {
+            wp_id: WaitpointId,
+            wp_fields: Vec<Option<String>>,
+            total_matchers: usize,
+        }
+        let mut kept: Vec<Kept> = Vec::with_capacity(wp_ids.len());
+        for ((wp_id, wp_slot), cond_slot) in
+            wp_ids.iter().zip(wp_slots).zip(cond_slots)
+        {
+            let wp_fields: Vec<Option<String>> = wp_slot.value().map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    format!("list_pending_waitpoints: slot HMGET waitpoint {wp_id}"),
+                )
+            })?;
+            if wp_fields.iter().all(Option::is_none) {
+                let _ = cond_slot.value();
+                continue;
+            }
+            let state_ref = wp_fields.first().and_then(|v| v.as_deref()).unwrap_or("");
+            if state_ref != "pending" && state_ref != "active" {
+                let _ = cond_slot.value();
+                continue;
+            }
+            let token_ref = wp_fields.get(2).and_then(|v| v.as_deref()).unwrap_or("");
+            if token_ref.is_empty() {
+                let _ = cond_slot.value();
+                tracing::warn!(
+                    waitpoint_id = %wp_id,
+                    execution_id = %execution_id,
+                    "list_pending_waitpoints: waitpoint hash missing waitpoint_token — skipping"
+                );
+                continue;
+            }
+            let total_matchers = cond_slot
+                .value()
+                .map_err(|e| {
+                    ff_core::engine_error::backend_context(
+                        transport_fk(e),
+                        format!("list_pending_waitpoints: slot HGET total_matchers {wp_id}"),
+                    )
+                })?
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            kept.push(Kept {
+                wp_id: wp_id.clone(),
+                wp_fields,
+                total_matchers,
+            });
+        }
+
+        if kept.is_empty() {
+            return Ok(ListPendingWaitpointsResult::new(Vec::new()));
+        }
+
+        // Pass-2: matcher names for waitpoints with total_matchers > 0.
+        let mut pass2 = self.client.pipeline();
+        let mut matcher_slots: Vec<Option<_>> = Vec::with_capacity(kept.len());
+        let mut pass2_needed = false;
+        for k in &kept {
+            if k.total_matchers == 0 {
+                matcher_slots.push(None);
+                continue;
+            }
+            pass2_needed = true;
+            let mut cmd = pass2.cmd::<Vec<Option<String>>>("HMGET");
+            cmd = cmd.arg(ctx.waitpoint_condition(&k.wp_id));
+            for i in 0..k.total_matchers {
+                cmd = cmd.arg(format!("matcher:{i}:name"));
+            }
+            matcher_slots.push(Some(cmd.finish()));
+        }
+        if pass2_needed {
+            pass2.execute().await.map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "list_pending_waitpoints: pipeline HMGET wp_condition matchers",
+                )
+            })?;
+        }
+
+        let parse_ts = |raw: &str| -> Option<TimestampMs> {
+            if raw.is_empty() {
+                None
+            } else {
+                raw.parse::<i64>().ok().map(TimestampMs)
+            }
+        };
+
+        let mut out: Vec<PendingWaitpointInfo> = Vec::with_capacity(kept.len());
+        let requested_len = kept.len().min(limit);
+        for (k, slot) in kept.into_iter().zip(matcher_slots).take(limit) {
+            let get = |i: usize| -> &str {
+                k.wp_fields.get(i).and_then(|v| v.as_deref()).unwrap_or("")
+            };
+            let required_signal_names: Vec<String> = match slot {
+                None => Vec::new(),
+                Some(s) => {
+                    let vals: Vec<Option<String>> = s.value().map_err(|e| {
+                        ff_core::engine_error::backend_context(
+                            transport_fk(e),
+                            format!(
+                                "list_pending_waitpoints: slot HMGET matchers {}",
+                                k.wp_id
+                            ),
+                        )
+                    })?;
+                    vals.into_iter()
+                        .flatten()
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                }
+            };
+
+            // Parse `<kid>:<40hex>` into (kid, first-16-hex fingerprint).
+            let token_raw = get(2);
+            let (token_kid, token_fingerprint) = parse_waitpoint_token_kid_fp(token_raw);
+
+            let mut info = PendingWaitpointInfo::new(
+                k.wp_id,
+                get(1).to_owned(),
+                get(0).to_owned(),
+                parse_ts(get(3)).unwrap_or(TimestampMs(0)),
+                execution_id.clone(),
+                token_kid,
+                token_fingerprint,
+            );
+            if !required_signal_names.is_empty() {
+                info = info.with_required_signal_names(required_signal_names);
+            }
+            if let Some(ts) = parse_ts(get(4)) {
+                info = info.with_activated_at(ts);
+            }
+            if let Some(ts) = parse_ts(get(5)) {
+                info = info.with_expires_at(ts);
+            }
+            out.push(info);
+        }
+
+        let next_cursor = if has_more_raw {
+            out.last().map(|e| e.waitpoint_id.clone())
+        } else {
+            None
+        };
+        let mut result = ListPendingWaitpointsResult::new(out);
+        if let Some(cursor) = next_cursor {
+            result = result.with_next_cursor(cursor);
+        }
+        let _ = requested_len; // reserved for future diagnostics
+        Ok(result)
     }
 
     // ── RFC-017 Stage C — Operator control (4) ────────────────

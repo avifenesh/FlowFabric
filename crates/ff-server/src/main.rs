@@ -72,8 +72,21 @@ async fn main() {
     let server = match Server::start_with_metrics(config, metrics.clone()).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "failed to start server");
-            std::process::exit(1);
+            // RFC-017 §9.0: hard-gate refusal exits with code 2 so
+            // orchestration tooling can distinguish an operator
+            // misconfiguration (gated backend) from generic boot
+            // failures (code 1). Every other error keeps the legacy
+            // code-1 exit.
+            let exit_code = if matches!(
+                e,
+                ff_server::server::ServerError::BackendNotReady { .. }
+            ) {
+                2
+            } else {
+                1
+            };
+            tracing::error!(error = %e, exit_code, "failed to start server");
+            std::process::exit(exit_code);
         }
     };
 
