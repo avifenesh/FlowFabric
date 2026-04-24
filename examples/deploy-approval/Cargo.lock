@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -402,13 +402,15 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "ferriskey",
  "ff-core",
  "ff-observability",
+ "ff-scheduler",
  "ff-script",
+ "futures",
  "futures-core",
  "serde",
  "serde_json",
@@ -418,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "crc16",
@@ -431,11 +433,23 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.6.1"
+version = "0.8.0"
+
+[[package]]
+name = "ff-scheduler"
+version = "0.8.0"
+dependencies = [
+ "ferriskey",
+ "ff-core",
+ "ff-observability",
+ "ff-script",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "ff-script"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -447,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
