@@ -83,6 +83,9 @@ mod name {
     /// Labelled by `action` ∈ `sremmed_stale` | `completed_drain` |
     /// `no_op`. Cardinality = 3.
     pub const SIBLING_CANCEL_RECONCILE: &str = "ff_sibling_cancel_reconcile";
+    /// RFC-017 Stage B: count of `shutdown_prepare` calls that
+    /// exceeded their `grace` budget on the backend.
+    pub const SHUTDOWN_TIMEOUT: &str = "ff_shutdown_timeout";
 }
 
 struct Inner {
@@ -112,6 +115,7 @@ struct Inner {
     sibling_cancel_dispatched: Counter<u64>,
     sibling_cancel_disposition: Counter<u64>,
     sibling_cancel_reconcile: Counter<u64>,
+    shutdown_timeout: Counter<u64>,
 }
 
 #[derive(Clone)]
@@ -212,6 +216,14 @@ impl Metrics {
                  `no_op`). Invariant Q6 crash-recovery safety net.",
             )
             .build();
+        let shutdown_timeout = meter
+            .u64_counter(name::SHUTDOWN_TIMEOUT)
+            .with_description(
+                "RFC-017 Stage B: count of `backend.shutdown_prepare` \
+                 calls that exceeded their grace budget. Increments once \
+                 per timed-out shutdown.",
+            )
+            .build();
 
         // Cancel backlog depth — gauge backed by an AtomicU64 so set()
         // from any thread is lock-free. OTEL observable-gauge callback
@@ -245,6 +257,7 @@ impl Metrics {
             sibling_cancel_dispatched,
             sibling_cancel_disposition,
             sibling_cancel_reconcile,
+            shutdown_timeout,
         }))
     }
 
@@ -373,6 +386,12 @@ impl Metrics {
         self.0
             .sibling_cancel_reconcile
             .add(1, &[KeyValue::new("action", action)]);
+    }
+
+    /// RFC-017 Stage B: increment `ff_shutdown_timeout_total` when a
+    /// backend's `shutdown_prepare` call exceeds its grace budget.
+    pub fn inc_shutdown_timeout(&self) {
+        self.0.shutdown_timeout.add(1, &[]);
     }
 }
 

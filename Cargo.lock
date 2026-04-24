@@ -1021,6 +1021,7 @@ dependencies = [
  "ff-core",
  "ff-observability",
  "ff-script",
+ "futures",
  "futures-core",
  "serde",
  "serde_json",

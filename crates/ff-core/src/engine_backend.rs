@@ -653,6 +653,32 @@ pub trait EngineBackend: Send + Sync + 'static {
         execution_id: &ExecutionId,
         attempt_index: AttemptIndex,
     ) -> Result<Option<SummaryDocument>, EngineError>;
+
+    // ── Cross-cutting (RFC-017 Stage B trait-lift) ──────────────
+
+    /// Static observability label identifying the backend family in
+    /// logs + metrics (RFC-017 §5.4 + §9 Stage B). Default impl
+    /// returns `"unknown"` so legacy `impl EngineBackend` blocks that
+    /// have not upgraded keep compiling; every in-tree backend
+    /// overrides — `ValkeyBackend` → `"valkey"`, `PostgresBackend` →
+    /// `"postgres"`.
+    fn backend_label(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Drain-before-shutdown hook (RFC-017 §5.4). The server calls
+    /// this before draining its own background tasks so backend-
+    /// scoped primitives (Valkey stream semaphore, Postgres sqlx
+    /// pool, …) can close their gates and await in-flight work up to
+    /// `grace`.
+    ///
+    /// Default impl returns `Ok(())` — a no-op backend has nothing
+    /// backend-scoped to drain. Concrete backends whose data plane
+    /// owns resources (connection pools, semaphores, listeners)
+    /// override with a real body.
+    async fn shutdown_prepare(&self, _grace: Duration) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// Object-safety assertion: `dyn EngineBackend` compiles iff every

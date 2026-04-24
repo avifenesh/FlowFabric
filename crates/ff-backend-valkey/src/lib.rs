@@ -110,7 +110,34 @@ pub struct ValkeyBackend {
     /// The `Metrics` type is a zero-cost shim unless this crate (or
     /// a transitive dep) enables `ff-observability/enabled`.
     metrics: Option<Arc<ff_observability::Metrics>>,
+    /// Stream-op back-pressure gate (RFC-017 §6, Stage B). Relocated
+    /// from `ff-server::Server::stream_semaphore`. Bounds concurrent
+    /// `read_stream` + `tail_stream` calls server-wide; contention
+    /// surfaces as [`EngineError::ResourceExhausted { pool:
+    /// "stream_ops", max, .. }`] at the trait boundary (HTTP 429 at
+    /// the REST boundary after `ServerError::from` maps it). Closed
+    /// during [`ValkeyBackend::shutdown_prepare`] so no new stream
+    /// ops can start while in-flight ones drain.
+    stream_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Max-permit ceiling for `stream_semaphore`, preserved verbatim
+    /// on `EngineError::ResourceExhausted.max` so callers can tune
+    /// backoff or size their concurrency budget.
+    stream_semaphore_max: u32,
+    /// Bounded fan-out concurrency for the rotate-waitpoint-secret
+    /// admin FCALL. `16` matches the pre-RFC-017 `BOOT_INIT_CONCURRENCY`
+    /// on `Server`.
+    admin_rotate_fanout_concurrency: u32,
 }
+
+/// Default ceiling for `stream_semaphore` when the caller uses
+/// [`ValkeyBackend::from_client_and_partitions`] or `connect*`
+/// without explicitly sizing the pool. Mirrors the `ff-server`
+/// default of `FF_MAX_CONCURRENT_STREAM_OPS = 64` (RFC-017 §6).
+pub const DEFAULT_STREAM_SEMAPHORE_PERMITS: u32 = 64;
+
+/// Default admin-rotate fan-out concurrency. Matches the pre-RFC-017
+/// `ff-server::Server::BOOT_INIT_CONCURRENCY = 16`.
+pub const DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY: u32 = 16;
 
 impl ValkeyBackend {
     /// Dial a Valkey node with [`BackendConfig`] and return the
@@ -214,6 +241,11 @@ impl ValkeyBackend {
             partition_config,
             subscriber_connection: Some(v),
             metrics,
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_STREAM_SEMAPHORE_PERMITS as usize,
+            )),
+            stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
+            admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
         }))
     }
 
@@ -241,6 +273,11 @@ impl ValkeyBackend {
             partition_config,
             subscriber_connection: None,
             metrics: None,
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_STREAM_SEMAPHORE_PERMITS as usize,
+            )),
+            stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
+            admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
         })
     }
 
@@ -259,6 +296,11 @@ impl ValkeyBackend {
             partition_config,
             subscriber_connection: Some(connection),
             metrics: None,
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_STREAM_SEMAPHORE_PERMITS as usize,
+            )),
+            stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
+            admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
         })
     }
 
@@ -292,35 +334,49 @@ impl ValkeyBackend {
         Self::connect_inner(config, Some(metrics), "connect_with_metrics").await
     }
 
-    /// RFC-017 Stage A: static observability label identifying this
-    /// backend family in logs + metrics (see RFC §5.4 + §9 Stage A).
-    ///
-    /// Kept as an inherent method for Stage A per
-    /// `crates/ff-server/STAGE_A_SCOPE.md` ("Do NOT add new trait
-    /// methods"). RFC-017 §9 Stage A also specifies trait placement
-    /// with a `"unknown"` default — that lift lands in Stage B
-    /// together with `Server::shutdown` integration. The RFC-vs-scope
-    /// divergence is noted in the Stage A PR body.
-    pub fn backend_label(&self) -> &'static str {
-        "valkey"
+    /// RFC-017 Stage B: override the default stream-op concurrency
+    /// ceiling. Returns `true` when the new ceiling was installed
+    /// (`Arc::get_mut` saw a unique handle); `false` when other
+    /// `Arc` holders prevent mutation. Callers construct the backend
+    /// via `from_*`, then size the pool before cloning into other
+    /// positions.
+    pub fn with_stream_semaphore_permits(self: &mut Arc<Self>, max: u32) -> bool {
+        if let Some(inner) = Arc::get_mut(self) {
+            inner.stream_semaphore = Arc::new(tokio::sync::Semaphore::new(max as usize));
+            inner.stream_semaphore_max = max;
+            true
+        } else {
+            false
+        }
     }
 
-    /// RFC-017 Stage A: drain-before-shutdown hook for consumers that
-    /// own an `Arc<ValkeyBackend>`. Stage A is a **no-op** — the
-    /// stream semaphore + `tail_client` still live on `Server`
-    /// (RFC-017 §9 Stage B moves them here), so there is nothing
-    /// backend-scoped to close yet. Signature + call site land now so
-    /// the Stage B migration is additive.
-    ///
-    /// `grace` is accepted and ignored. When the primitives relocate
-    /// in Stage B, this impl closes `stream_semaphore`, awaits
-    /// in-flight permit drops up to `grace`, and maps a timeout to
-    /// `EngineError::Unavailable { op: "shutdown_prepare" }`.
-    ///
-    /// Like [`Self::backend_label`], kept inherent for Stage A.
-    pub async fn shutdown_prepare(&self, _grace: Duration) -> Result<(), EngineError> {
-        Ok(())
+    /// RFC-017 Stage B: configured ceiling for the stream-op back-
+    /// pressure pool. Exposed so operators + tests can assert the
+    /// 429 `max` surfaced in `EngineError::ResourceExhausted` matches
+    /// what they configured.
+    pub fn stream_semaphore_permits(&self) -> u32 {
+        self.stream_semaphore_max
     }
+
+    /// RFC-017 Stage B: approximate count of currently-available
+    /// permits in the stream-op pool. Used by server-side retry-hint
+    /// heuristics; semaphore semantics mean the value is racy and
+    /// MUST NOT be used for correctness decisions.
+    pub fn stream_semaphore_available(&self) -> usize {
+        self.stream_semaphore.available_permits()
+    }
+
+    /// RFC-017 §14.8 mandatory Stage B CI test hook. Exposes a clone
+    /// of the internal semaphore so the shutdown-under-load test can
+    /// hold permits directly without dispatching a live FCALL.
+    /// Marked `#[doc(hidden)]` so it does not leak into the public
+    /// rustdoc; the method is public only because the integration
+    /// test lives in a sibling crate (`ff-server`).
+    #[doc(hidden)]
+    pub fn stream_semaphore_clone_for_tests(&self) -> Arc<tokio::sync::Semaphore> {
+        self.stream_semaphore.clone()
+    }
+
 
     /// Encode the minimum set of attempt-cookie fields into a
     /// Valkey-tagged [`Handle`]. Stage 1b's `ClaimedTask::synth_handle`
@@ -3757,6 +3813,41 @@ async fn claim_resumed_execution_impl(
     Ok(partial.complete(execution_id))
 }
 
+/// RFC-017 Stage B: acquire a stream-op permit off
+/// `ValkeyBackend::stream_semaphore`. Non-blocking — saturation
+/// surfaces as [`EngineError::ResourceExhausted { pool: "stream_ops",
+/// max, retry_after_ms: Some(..) }`] which the REST boundary maps to
+/// HTTP 429. `Closed` (set during `shutdown_prepare`) surfaces as
+/// [`EngineError::Unavailable { op: "stream_ops" }`] → HTTP 503.
+fn acquire_stream_permit(
+    backend: &ValkeyBackend,
+) -> Result<tokio::sync::OwnedSemaphorePermit, EngineError> {
+    match backend.stream_semaphore.clone().try_acquire_owned() {
+        Ok(p) => Ok(p),
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            // Retry hint: `25ms × (max / available+1)` is a crude
+            // back-off proxy — avoids the "retry immediately"
+            // stampede when a single slow tail holds a permit. A
+            // production-grade heuristic lives at the REST boundary;
+            // this one is adequate and keeps the retry-hint wire
+            // populated.
+            let available = backend.stream_semaphore.available_permits();
+            let hint_ms =
+                25u32.saturating_mul(backend.stream_semaphore_max).saturating_div(
+                    (available as u32).saturating_add(1),
+                );
+            Err(EngineError::ResourceExhausted {
+                pool: "stream_ops",
+                max: backend.stream_semaphore_max,
+                retry_after_ms: Some(hint_ms.max(25)),
+            })
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => Err(EngineError::Unavailable {
+            op: "stream_ops",
+        }),
+    }
+}
+
 #[async_trait]
 impl EngineBackend for ValkeyBackend {
     async fn claim(
@@ -4207,32 +4298,64 @@ impl EngineBackend for ValkeyBackend {
         &self,
         args: RotateWaitpointHmacSecretAllArgs,
     ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        // RFC-017 Stage B: fan-out moves inside the Valkey impl (row
+        // 11 of §4). Bounded-parallel dispatch matches the pre-Stage-B
+        // `ff-server::Server::rotate_waitpoint_secret` body — sequential
+        // rotation at 30ms cross-AZ RTT × 256 partitions was ~7.7s,
+        // uncomfortably close to the 120s HTTP endpoint ceiling.
+        use futures::stream::{FuturesUnordered, StreamExt};
         let per_partition_args = RotateWaitpointHmacSecretArgs {
             new_kid: args.new_kid.clone(),
             new_secret_hex: args.new_secret_hex.clone(),
             grace_ms: args.grace_ms,
         };
         let num = self.partition_config.num_flow_partitions;
+        let concurrency = self.admin_rotate_fanout_concurrency as usize;
+        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut next_index: u16 = 0;
+        // Index-keyed so we can stitch the unordered completions back
+        // into partition-index order before returning — consumers rely
+        // on `entries[i].partition_id == i` (cairn dashboards + tests).
+        let mut by_index: Vec<Option<Result<ff_core::contracts::RotateWaitpointHmacSecretOutcome, EngineError>>> =
+            (0..num).map(|_| None).collect();
+        loop {
+            while pending.len() < concurrency && next_index < num {
+                let partition = Partition {
+                    family: PartitionFamily::Execution,
+                    index: next_index,
+                };
+                let idx = IndexKeys::new(&partition);
+                let args_clone = per_partition_args.clone();
+                let client = &self.client;
+                let i = next_index;
+                pending.push(async move {
+                    let res = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
+                        client,
+                        &idx,
+                        &args_clone,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ff_core::engine_error::backend_context(
+                            transport_script(e),
+                            "rotate_waitpoint_hmac_secret_all: FCALL ff_rotate_waitpoint_hmac_secret",
+                        )
+                    });
+                    (i, res)
+                });
+                next_index += 1;
+            }
+            match pending.next().await {
+                Some((i, res)) => {
+                    by_index[i as usize] = Some(res);
+                }
+                None => break,
+            }
+        }
         let mut entries = Vec::with_capacity(num as usize);
-        for index in 0..num {
-            let partition = Partition {
-                family: PartitionFamily::Execution,
-                index,
-            };
-            let idx = IndexKeys::new(&partition);
-            let result = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
-                &self.client,
-                &idx,
-                &per_partition_args,
-            )
-            .await
-            .map_err(|e| {
-                ff_core::engine_error::backend_context(
-                    transport_script(e),
-                    "rotate_waitpoint_hmac_secret_all: FCALL ff_rotate_waitpoint_hmac_secret",
-                )
-            });
-            entries.push(RotateWaitpointHmacSecretAllEntry::new(index, result));
+        for (i, slot) in by_index.into_iter().enumerate() {
+            let res = slot.expect("every partition rotated exactly once");
+            entries.push(RotateWaitpointHmacSecretAllEntry::new(i as u16, res));
         }
         Ok(RotateWaitpointHmacSecretAllResult::new(entries))
     }
@@ -4246,6 +4369,7 @@ impl EngineBackend for ValkeyBackend {
         to: ff_core::contracts::StreamCursor,
         count_limit: u64,
     ) -> Result<ff_core::contracts::StreamFrames, EngineError> {
+        let _permit = acquire_stream_permit(self)?;
         read_stream_impl(
             &self.client,
             &self.partition_config,
@@ -4269,6 +4393,7 @@ impl EngineBackend for ValkeyBackend {
         count_limit: u64,
         visibility: TailVisibility,
     ) -> Result<ff_core::contracts::StreamFrames, EngineError> {
+        let _permit = acquire_stream_permit(self)?;
         tail_stream_impl(
             &self.client,
             &self.partition_config,
@@ -4281,6 +4406,42 @@ impl EngineBackend for ValkeyBackend {
         )
         .await
         .map_err(|e| ff_core::engine_error::backend_context(e, "tail_stream: XREAD BLOCK"))
+    }
+
+    fn backend_label(&self) -> &'static str {
+        "valkey"
+    }
+
+    /// RFC-017 Stage B: backend-scoped drain hook (§5.4). Closes
+    /// `stream_semaphore` so new `read_stream` / `tail_stream` calls
+    /// fail fast with [`EngineError::Unavailable`]; awaits in-flight
+    /// permits up to `grace`. Exceeding `grace` surfaces as
+    /// [`EngineError::Timeout`] so the server can increment
+    /// `ff_shutdown_timeout_total` and proceed best-effort.
+    async fn shutdown_prepare(&self, grace: Duration) -> Result<(), EngineError> {
+        // Close FIRST so `try_acquire_owned` returns `Closed` for any
+        // new arrivals rather than a stale `NoPermits` decision.
+        self.stream_semaphore.close();
+        let start = std::time::Instant::now();
+        let max_permits = self.stream_semaphore_max as usize;
+        let poll_interval = Duration::from_millis(25);
+        loop {
+            // In-flight count = max - available. On `close()` Tokio's
+            // `Semaphore::available_permits` still returns the live
+            // count excluding held permits; the sum `max - available`
+            // therefore equals the number of in-flight holders.
+            let available = self.stream_semaphore.available_permits();
+            if available >= max_permits {
+                return Ok(());
+            }
+            if start.elapsed() >= grace {
+                return Err(EngineError::Timeout {
+                    op: "shutdown_prepare",
+                    elapsed: start.elapsed(),
+                });
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     #[cfg(feature = "streaming")]
