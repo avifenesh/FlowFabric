@@ -56,6 +56,7 @@ use sqlx::PgPool;
 
 #[cfg(feature = "core")]
 mod admin;
+pub mod budget;
 pub mod error;
 pub mod handle_codec;
 pub mod listener;
@@ -387,10 +388,10 @@ impl EngineBackend for PostgresBackend {
     async fn report_usage(
         &self,
         _handle: &Handle,
-        _budget: &BudgetId,
-        _dimensions: UsageDimensions,
+        budget: &BudgetId,
+        dimensions: UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError> {
-        unavailable("pg.report_usage")
+        budget::report_usage_impl(&self.pool, &self.partition_config, budget, dimensions).await
     }
 
     // ── HMAC secret rotation (v0.7 migration-master Q4) ──
