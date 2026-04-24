@@ -276,6 +276,14 @@ pub enum ContentionKind {
     RateLimitExceeded,
     /// Concurrency cap hit.
     ConcurrencyLimitExceeded,
+    /// Returned after 3 attempts of a SERIALIZABLE transaction in
+    /// Postgres (`cancel_flow`, `deliver_signal`, `suspend`). Caller
+    /// falls back to the appropriate reconciler.
+    ///
+    /// Classified `Retryable` via the blanket `Contention(_)` arm so
+    /// consumer retry-loops don't treat it as terminal; the
+    /// reconciler backstop catches repeat exhaustion.
+    RetryExhausted,
 }
 
 /// Permanent conflict sub-kinds. Caller must reconcile rather than

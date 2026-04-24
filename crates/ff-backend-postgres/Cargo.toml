@@ -40,7 +40,7 @@ ff-observability = { workspace = true }
 
 # Postgres transport. sqlx with tokio-rustls + the macros feature
 # (enables `sqlx::migrate!` compile-time migration loading).
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono", "json"] }
 
 async-trait = { workspace = true }
 tokio = { workspace = true }
