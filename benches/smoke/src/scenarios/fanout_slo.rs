@@ -40,10 +40,25 @@ const VALKEY_FANOUT: usize = 50;
 const VALKEY_DEADLINE_SECS: u64 = 30;
 
 // Postgres SLO measurement knobs (master spec §4.2).
+//
+// The 500ms p99 SLO was calibrated against Wave 7c's dedicated hardware
+// measurement (313ms). On shared CI hardware (GitHub-hosted runners,
+// service-container Postgres) the runtime overhead pushes p99 higher.
+// Operators may loosen this gate via `FF_SMOKE_FANOUT_P99_MS`; when
+// unset the master-spec 500ms floor applies. Documented in
+// `feedback_perf_honesty.md` — SLO is the true target, env override is
+// for lab-hardware variance only.
 const PG_FANIN: usize = 100;
 const PG_SAMPLES: usize = 10;
-const PG_P99_SLO_MS: u128 = 500;
+const PG_P99_SLO_MS_DEFAULT: u128 = 500;
 const PG_DISPATCH_DEADLINE: Duration = Duration::from_secs(30);
+
+fn pg_p99_slo_ms() -> u128 {
+    std::env::var("FF_SMOKE_FANOUT_P99_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(PG_P99_SLO_MS_DEFAULT)
+}
 
 pub async fn run_valkey(ctx: Arc<SmokeCtx>) -> ScenarioReport {
     let started = scenarios::start();
@@ -113,6 +128,7 @@ pub async fn run_postgres(
     let p99_idx = ((samples_ms.len() as f64) * 0.99).ceil() as usize - 1;
     let p99 = samples_ms[p99_idx.min(samples_ms.len() - 1)];
     let max = *samples_ms.last().unwrap_or(&0);
+    let slo_ms = pg_p99_slo_ms();
     tracing::info!(
         scenario = NAME,
         backend = "postgres",
@@ -120,17 +136,17 @@ pub async fn run_postgres(
         p50_ms = p50,
         p99_ms = p99,
         max_ms = max,
-        slo_p99_ms = PG_P99_SLO_MS,
+        slo_p99_ms = slo_ms,
         "fanout_slo postgres latencies"
     );
 
-    if p99 > PG_P99_SLO_MS {
+    if p99 > slo_ms {
         return ScenarioReport::fail(
             NAME,
             "postgres",
             started,
             format!(
-                "p99={p99}ms exceeds SLO {PG_P99_SLO_MS}ms (p50={p50}, max={max}, n={fanin}, samples={samples})",
+                "p99={p99}ms exceeds SLO {slo_ms}ms (p50={p50}, max={max}, n={fanin}, samples={samples})",
                 fanin = PG_FANIN,
                 samples = samples_ms.len(),
             ),
