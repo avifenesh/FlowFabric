@@ -21,7 +21,7 @@
 //! type inventory and §4.1-§4.2 for the `Handle` / `EngineError` shapes.
 
 use crate::contracts::ReclaimGrant;
-use crate::types::{TimestampMs, WaitpointToken};
+use crate::types::{TimestampMs, WaitpointToken, WorkerId, WorkerInstanceId};
 
 // DX (HHH v0.3.4 re-smoke): `Namespace` lives in `ff_core::types` but
 // is used on `BackendConfig` + `ScannerFilter` (both defined in this
@@ -185,27 +185,44 @@ impl CapabilitySet {
     }
 }
 
-/// Policy hints for `claim`. Minimal at Stage 0 per RFC-012 §3.3.0
-/// ("Bikeshed-prone; keep minimal at Stage 0"). Future fields (retry
-/// count, fairness hints) land additively.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+/// Policy hints for `claim`. Carries the worker identity the backend
+/// needs to invoke `ff_claim_execution` (v0.7 Wave 2) plus the
+/// blocking-wait bound.
+///
+/// **Wave 2 extension:** `worker_id` + `worker_instance_id` +
+/// `lease_ttl_ms` are now required so the Valkey backend's `claim`
+/// impl can issue the claim FCALL without a side-channel identity
+/// lookup. The constructor change is a pre-1.0 breaking change,
+/// tracked in the CHANGELOG.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ClaimPolicy {
     /// Maximum blocking wait. `None` means backend-default (today:
     /// non-blocking / immediate return).
     pub max_wait: Option<Duration>,
+    /// Worker identity (stable across process restarts).
+    pub worker_id: WorkerId,
+    /// Worker instance identity (unique per process).
+    pub worker_instance_id: WorkerInstanceId,
+    /// Lease TTL in milliseconds for the claim about to be minted.
+    pub lease_ttl_ms: u32,
 }
 
 impl ClaimPolicy {
-    /// Zero-timeout claim (non-blocking). Matches today's SDK default.
-    pub fn immediate() -> Self {
-        Self { max_wait: None }
-    }
-
-    /// Claim with an explicit blocking bound.
-    pub fn with_max_wait(max_wait: Duration) -> Self {
+    /// Build a claim policy. `max_wait = None` means non-blocking /
+    /// immediate return. `lease_ttl_ms` is the TTL the backend
+    /// installs on the minted lease.
+    pub fn new(
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        lease_ttl_ms: u32,
+        max_wait: Option<Duration>,
+    ) -> Self {
         Self {
-            max_wait: Some(max_wait),
+            max_wait,
+            worker_id,
+            worker_instance_id,
+            lease_ttl_ms,
         }
     }
 }
@@ -817,11 +834,29 @@ impl UsageDimensions {
 #[non_exhaustive]
 pub struct ReclaimToken {
     pub grant: ReclaimGrant,
+    /// Worker identity that will claim the resumed execution.
+    /// Wave 2 additive extension — mirrors the `ClaimPolicy`
+    /// shape since `claim_from_reclaim` does not take a `ClaimPolicy`.
+    pub worker_id: WorkerId,
+    /// Worker instance identity.
+    pub worker_instance_id: WorkerInstanceId,
+    /// Lease TTL (ms) for the resumed attempt's fresh lease.
+    pub lease_ttl_ms: u32,
 }
 
 impl ReclaimToken {
-    pub fn new(grant: ReclaimGrant) -> Self {
-        Self { grant }
+    pub fn new(
+        grant: ReclaimGrant,
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        lease_ttl_ms: u32,
+    ) -> Self {
+        Self {
+            grant,
+            worker_id,
+            worker_instance_id,
+            lease_ttl_ms,
+        }
     }
 }
 
@@ -1406,10 +1441,24 @@ mod tests {
 
     #[test]
     fn claim_policy_derives() {
-        let p = ClaimPolicy::with_max_wait(Duration::from_millis(500));
+        let p = ClaimPolicy::new(
+            WorkerId::new("w"),
+            WorkerInstanceId::new("w-1"),
+            30_000,
+            Some(Duration::from_millis(500)),
+        );
         assert_eq!(p.max_wait, Some(Duration::from_millis(500)));
+        assert_eq!(p.lease_ttl_ms, 30_000);
+        assert_eq!(p.worker_id.as_str(), "w");
+        assert_eq!(p.worker_instance_id.as_str(), "w-1");
         assert_eq!(p.clone(), p);
-        assert_eq!(ClaimPolicy::immediate(), ClaimPolicy::default());
+        let immediate = ClaimPolicy::new(
+            WorkerId::new("w"),
+            WorkerInstanceId::new("w-1"),
+            30_000,
+            None,
+        );
+        assert_eq!(immediate.max_wait, None);
     }
 
     #[test]
@@ -1512,8 +1561,16 @@ mod tests {
             expires_at_ms: 123,
             lane_id: LaneId::new("default"),
         };
-        let t = ReclaimToken::new(grant.clone());
+        let t = ReclaimToken::new(
+            grant.clone(),
+            WorkerId::new("w"),
+            WorkerInstanceId::new("w-1"),
+            30_000,
+        );
         assert_eq!(t.grant, grant);
+        assert_eq!(t.worker_id.as_str(), "w");
+        assert_eq!(t.worker_instance_id.as_str(), "w-1");
+        assert_eq!(t.lease_ttl_ms, 30_000);
         assert_eq!(t.clone(), t);
     }
 

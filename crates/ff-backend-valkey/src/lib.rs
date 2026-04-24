@@ -38,14 +38,14 @@ use ff_core::contracts::decode::{
     build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
 };
 use ff_core::contracts::{
-    AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimResumedExecutionArgs,
-    ClaimResumedExecutionResult, CompositeBody, CountKind, DeliverSignalArgs, DeliverSignalResult,
-    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
-    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
-    ResumeCondition, ResumePolicy, ResumeTarget, RotateWaitpointHmacSecretAllArgs,
-    RotateWaitpointHmacSecretAllEntry, RotateWaitpointHmacSecretAllResult,
-    RotateWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs, SuspendOutcome,
-    SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
+    AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimExecutionArgs,
+    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody,
+    CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
+    ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage,
+    ListLanesPage, ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy,
+    ResumeTarget, RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
+    RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs,
+    SuspendOutcome, SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
 };
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::engine_error::{StateKind, ValidationKind};
@@ -60,7 +60,9 @@ use ff_core::types::{
 };
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
-use ff_script::functions::execution::ExecOpKeys;
+use ff_script::functions::execution::{
+    ClaimExecutionResultPartial, ExecOpKeys, ff_claim_execution,
+};
 use ff_script::functions::flow::{FlowStructOpKeys, ff_cancel_flow};
 use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
 use ff_script::result::FcallResult;
@@ -3392,6 +3394,303 @@ async fn deliver_signal_impl(
         .map_err(EngineError::from)
 }
 
+/// Fresh-find claim implementation (Wave 2, v0.7).
+///
+/// Scans the lane's eligible ZSET across every execution partition,
+/// filters by capability subset-match on each candidate's
+/// `required_capabilities`, and on the first match issues a claim
+/// grant + invokes `ff_claim_execution`. Returns `Ok(None)` when no
+/// partition has an eligible execution the worker can serve.
+///
+/// Returns the encoded Valkey `Handle` on success.
+#[tracing::instrument(
+    name = "ff.claim",
+    skip_all,
+    fields(
+        backend = "valkey",
+        lane = %lane,
+        worker_id = %policy.worker_id,
+        worker_instance_id = %policy.worker_instance_id,
+    )
+)]
+async fn claim_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    lane: &LaneId,
+    capabilities: &CapabilitySet,
+    policy: &ClaimPolicy,
+) -> Result<Option<Handle>, EngineError> {
+    use ff_core::caps::CapabilityRequirement;
+
+    let num_partitions = partition_config.num_flow_partitions;
+    if num_partitions == 0 {
+        return Ok(None);
+    }
+
+    // Build the caps CSV (sorted, deterministic) for the grant FCALL.
+    let mut sorted_caps: Vec<String> = capabilities.tokens.clone();
+    sorted_caps.sort();
+    sorted_caps.dedup();
+    let caps_csv = sorted_caps.join(",");
+
+    for p_idx in 0..num_partitions {
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: p_idx,
+        };
+        let idx = IndexKeys::new(&partition);
+        let eligible_key = idx.lane_eligible(lane);
+
+        // Pick the highest-priority eligible candidate on this partition.
+        let candidates: Vec<String> = client
+            .cmd("ZRANGEBYSCORE")
+            .arg(&eligible_key)
+            .arg("-inf")
+            .arg("+inf")
+            .arg("LIMIT")
+            .arg("0")
+            .arg("1")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+
+        let eid_str = match candidates.first() {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+
+        let execution_id = ExecutionId::parse(&eid_str).map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_claim_execution".into(),
+                execution_id: None,
+                message: format!("bad execution_id in eligible set: {e}"),
+            })
+        })?;
+
+        let ctx = ExecKeyContext::new(&partition, &execution_id);
+
+        // Capability pre-check: if the execution declares required caps
+        // that aren't a subset of the worker's CapabilitySet, skip.
+        let required_csv: Option<String> = client
+            .cmd("HGET")
+            .arg(ctx.core())
+            .arg("required_capabilities")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        if let Some(req) = required_csv.as_deref()
+            && !req.is_empty()
+        {
+            let required = CapabilityRequirement::from_csv(req);
+            if !ff_core::caps::matches(&required, capabilities) {
+                continue;
+            }
+        }
+
+        // Step 1 — issue the claim grant.
+        let grant_keys_owned: [String; 3] =
+            [ctx.core(), ctx.claim_grant(), eligible_key.clone()];
+        let grant_keys_ref: [&str; 3] = [
+            grant_keys_owned[0].as_str(),
+            grant_keys_owned[1].as_str(),
+            grant_keys_owned[2].as_str(),
+        ];
+        let eid_s = execution_id.to_string();
+        let worker_id_s = policy.worker_id.to_string();
+        let worker_instance_s = policy.worker_instance_id.to_string();
+        let lane_s = lane.to_string();
+        let grant_argv: [&str; 9] = [
+            &eid_s,
+            &worker_id_s,
+            &worker_instance_s,
+            &lane_s,
+            "",            // capability_hash
+            "5000",        // grant_ttl_ms (5s)
+            "",            // route_snapshot_json
+            "",            // admission_summary
+            &caps_csv,     // worker_capabilities_csv (sorted)
+        ];
+        let raw: ferriskey::Value = client
+            .fcall("ff_issue_claim_grant", &grant_keys_ref, &grant_argv)
+            .await
+            .map_err(transport_fk)?;
+        // Parse grant result: {1, "OK", ...}
+        let ok = match &raw {
+            ferriskey::Value::Array(arr) => {
+                matches!(arr.first(), Some(Ok(ferriskey::Value::Int(1))))
+            }
+            _ => false,
+        };
+        if !ok {
+            // Non-OK grant (capability mismatch mid-race, already granted, etc.).
+            // Surface as a script error so the caller sees a typed error; callers
+            // that want to continue polling will loop on their own.
+            let code = match &raw {
+                ferriskey::Value::Array(arr) => arr
+                    .get(1)
+                    .and_then(|v| match v {
+                        Ok(ferriskey::Value::BulkString(b)) => {
+                            Some(String::from_utf8_lossy(b).into_owned())
+                        }
+                        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            if let Some(err) = ScriptError::from_code_with_detail(&code, "") {
+                // Retryable errors (capability_mismatch, grant_already_issued,
+                // exec_not_eligible) → skip this partition, keep scanning.
+                use ff_core::error::ErrorClass;
+                let engine_err = EngineError::from(err);
+                if matches!(
+                    ff_script::engine_error_ext::class(&engine_err),
+                    ErrorClass::Retryable | ErrorClass::Informational
+                ) {
+                    continue;
+                }
+                return Err(engine_err);
+            }
+            continue;
+        }
+
+        // Step 2 — claim the execution via ff_claim_execution.
+        let att_idx_str: Option<String> = client
+            .cmd("HGET")
+            .arg(ctx.core())
+            .arg("total_attempt_count")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let next_idx = att_idx_str
+            .as_deref()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let att_idx = AttemptIndex::new(next_idx);
+
+        let lease_id = LeaseId::new();
+        let attempt_id = AttemptId::new();
+
+        let args = ClaimExecutionArgs {
+            execution_id: execution_id.clone(),
+            worker_id: policy.worker_id.clone(),
+            worker_instance_id: policy.worker_instance_id.clone(),
+            lane_id: lane.clone(),
+            lease_id: lease_id.clone(),
+            lease_ttl_ms: u64::from(policy.lease_ttl_ms),
+            attempt_id: attempt_id.clone(),
+            expected_attempt_index: att_idx,
+            attempt_policy_json: "{}".to_owned(),
+            attempt_timeout_ms: None,
+            execution_deadline_at: None,
+            now: TimestampMs::now(),
+        };
+
+        let exec_keys = ExecOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: lane,
+            worker_instance_id: &policy.worker_instance_id,
+        };
+
+        let partial = match ff_claim_execution(client, &exec_keys, &args).await {
+            Ok(p) => p,
+            Err(err) => {
+                use ff_core::error::ErrorClass;
+                let engine_err = EngineError::from(err);
+                if matches!(
+                    ff_script::engine_error_ext::class(&engine_err),
+                    ErrorClass::Retryable | ErrorClass::Informational
+                ) {
+                    continue;
+                }
+                return Err(engine_err);
+            }
+        };
+        let ClaimExecutionResultPartial::Claimed(claimed) = partial;
+
+        let fields = handle_codec::HandleFields::new(
+            execution_id,
+            claimed.attempt_index,
+            claimed.attempt_id,
+            claimed.lease_id,
+            claimed.lease_epoch,
+            u64::from(policy.lease_ttl_ms),
+            lane.clone(),
+            policy.worker_instance_id.clone(),
+        );
+        return Ok(Some(handle_codec::encode_handle(&fields, HandleKind::Fresh)));
+    }
+
+    Ok(None)
+}
+
+/// Resume-claim implementation — consumes a `ReclaimToken` and routes
+/// through `ff_claim_resumed_execution`. Worker identity + lease TTL
+/// ride on the token (Wave 2 additive extension).
+#[tracing::instrument(
+    name = "ff.claim_from_reclaim",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %token.grant.execution_id,
+        worker_instance_id = %token.worker_instance_id,
+    )
+)]
+async fn claim_from_reclaim_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    token: ReclaimToken,
+) -> Result<Option<Handle>, EngineError> {
+    let execution_id = token.grant.execution_id.clone();
+    let lane_id = token.grant.lane_id.clone();
+    let partition = execution_partition(&execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &execution_id);
+
+    // Pre-read current_attempt_index for the existing attempt hash KEY.
+    let att_idx_str: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("current_attempt_index")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let att_idx = AttemptIndex::new(
+        att_idx_str
+            .as_deref()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0),
+    );
+
+    let lease_id = LeaseId::new();
+    let args = ClaimResumedExecutionArgs {
+        execution_id: execution_id.clone(),
+        worker_id: token.worker_id.clone(),
+        worker_instance_id: token.worker_instance_id.clone(),
+        lane_id: lane_id.clone(),
+        lease_id: lease_id.clone(),
+        lease_ttl_ms: u64::from(token.lease_ttl_ms),
+        current_attempt_index: att_idx,
+        remaining_attempt_timeout_ms: None,
+        now: TimestampMs::now(),
+    };
+
+    let ClaimResumedExecutionResult::Claimed(claimed) =
+        claim_resumed_execution_impl(client, partition_config, args).await?;
+
+    let fields = handle_codec::HandleFields::new(
+        execution_id,
+        claimed.attempt_index,
+        claimed.attempt_id,
+        claimed.lease_id,
+        claimed.lease_epoch,
+        u64::from(token.lease_ttl_ms),
+        lane_id,
+        token.worker_instance_id,
+    );
+    Ok(Some(handle_codec::encode_handle(&fields, HandleKind::Resumed)))
+}
+
 /// Thin forwarder to
 /// `ff_script::functions::signal::ff_claim_resumed_execution`. The Lua
 /// returns a partial result (omits `execution_id`, which the caller
@@ -3432,11 +3731,13 @@ async fn claim_resumed_execution_impl(
 impl EngineBackend for ValkeyBackend {
     async fn claim(
         &self,
-        _lane: &LaneId,
-        _capabilities: &CapabilitySet,
-        _policy: ClaimPolicy,
+        lane: &LaneId,
+        capabilities: &CapabilitySet,
+        policy: ClaimPolicy,
     ) -> Result<Option<Handle>, EngineError> {
-        Err(EngineError::Unavailable { op: "claim" })
+        claim_impl(&self.client, &self.partition_config, lane, capabilities, &policy)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(e, "claim: FCALL ff_claim_execution"))
     }
 
     async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
@@ -3620,11 +3921,16 @@ impl EngineBackend for ValkeyBackend {
 
     async fn claim_from_reclaim(
         &self,
-        _token: ReclaimToken,
+        token: ReclaimToken,
     ) -> Result<Option<Handle>, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "claim_from_reclaim",
-        })
+        claim_from_reclaim_impl(&self.client, &self.partition_config, token)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "claim_from_reclaim: FCALL ff_claim_resumed_execution",
+                )
+            })
     }
 
     async fn delay(&self, handle: &Handle, delay_until: TimestampMs) -> Result<(), EngineError> {
