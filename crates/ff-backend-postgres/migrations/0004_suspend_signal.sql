@@ -35,8 +35,8 @@ ALTER TABLE ff_waitpoint_pending
 
 INSERT INTO ff_migration_annotation (version, name, applied_at_ms, backward_compatible)
 VALUES (
-    3,
-    '0003_suspend_signal',
+    4,
+    '0004_suspend_signal',
     (extract(epoch from clock_timestamp())*1000)::bigint,
     true
 );
