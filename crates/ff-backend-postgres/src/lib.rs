@@ -31,9 +31,9 @@ use ff_core::backend::{
 };
 #[cfg(feature = "core")]
 use ff_core::contracts::{
-    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs, DeliverSignalResult,
-    EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage,
-    ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
+    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CreateExecutionArgs, DeliverSignalArgs,
+    DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage,
+    ListFlowsPage, ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
 };
 use ff_core::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
@@ -59,6 +59,7 @@ mod admin;
 pub mod attempt;
 pub mod budget;
 pub mod error;
+pub mod exec_core;
 pub mod handle_codec;
 pub mod listener;
 pub mod migrate;
@@ -131,6 +132,29 @@ impl PostgresBackend {
             metrics: None,
         })
     }
+
+    /// Create one execution row (+ seed the lane registry if new).
+    ///
+    /// **RFC-v0.7 Wave 4a.** Inherent method (not on the `EngineBackend`
+    /// trait) — the Valkey side drives creates via a direct
+    /// `ff_create_execution` FCALL from ff-sdk / ff-server, and the
+    /// Postgres side mirrors that pattern: create is an ingress-layer
+    /// operation, not a worker-side op, so it sits outside the worker
+    /// trait surface. ff-server's request handlers + the integration
+    /// test harness call this entry point directly.
+    ///
+    /// Idempotent on primary-key conflict (`(partition_key,
+    /// execution_id)`): a duplicate create returns the caller's
+    /// `execution_id` unchanged, matching
+    /// [`ff_core::contracts::CreateExecutionResult::Duplicate`].
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.create_execution", skip_all)]
+    pub async fn create_execution(
+        &self,
+        args: CreateExecutionArgs,
+    ) -> Result<ExecutionId, EngineError> {
+        exec_core::create_execution_impl(&self.pool, &self.partition_config, args).await
+    }
 }
 
 /// Short helper: every stub method returns this. Kept as a function
@@ -199,8 +223,15 @@ impl EngineBackend for PostgresBackend {
     }
 
     #[tracing::instrument(name = "pg.cancel", skip_all)]
-    async fn cancel(&self, _handle: &Handle, _reason: &str) -> Result<(), EngineError> {
-        unavailable("pg.cancel")
+    async fn cancel(&self, handle: &Handle, reason: &str) -> Result<(), EngineError> {
+        let payload = handle_codec::decode_handle(handle)?;
+        exec_core::cancel_impl(
+            &self.pool,
+            &self.partition_config,
+            &payload.execution_id,
+            reason,
+        )
+        .await
     }
 
     #[tracing::instrument(name = "pg.suspend", skip_all)]
@@ -257,9 +288,9 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.describe_execution", skip_all)]
     async fn describe_execution(
         &self,
-        _id: &ExecutionId,
+        id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
-        unavailable("pg.describe_execution")
+        exec_core::describe_execution_impl(&self.pool, &self.partition_config, id).await
     }
 
     #[tracing::instrument(name = "pg.describe_flow", skip_all)]
@@ -294,9 +325,9 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.resolve_execution_flow_id", skip_all)]
     async fn resolve_execution_flow_id(
         &self,
-        _eid: &ExecutionId,
+        eid: &ExecutionId,
     ) -> Result<Option<FlowId>, EngineError> {
-        unavailable("pg.resolve_execution_flow_id")
+        exec_core::resolve_execution_flow_id_impl(&self.pool, &self.partition_config, eid).await
     }
 
     #[cfg(feature = "core")]
@@ -335,11 +366,18 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.list_executions", skip_all)]
     async fn list_executions(
         &self,
-        _partition: PartitionKey,
-        _cursor: Option<ExecutionId>,
-        _limit: usize,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
     ) -> Result<ListExecutionsPage, EngineError> {
-        unavailable("pg.list_executions")
+        exec_core::list_executions_impl(
+            &self.pool,
+            &self.partition_config,
+            partition,
+            cursor,
+            limit,
+        )
+        .await
     }
 
     // ── Trigger ops (issue #150) ──
