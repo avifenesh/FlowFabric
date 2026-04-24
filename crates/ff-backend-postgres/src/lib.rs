@@ -77,6 +77,7 @@ pub mod signal;
 #[cfg(feature = "streaming")]
 pub mod stream;
 pub mod suspend;
+pub mod suspend_ops;
 pub mod version;
 
 pub use completion::{PostgresCompletionStream, COMPLETION_CHANNEL};
@@ -268,10 +269,10 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.suspend", skip_all)]
     async fn suspend(
         &self,
-        _handle: &Handle,
-        _args: SuspendArgs,
+        handle: &Handle,
+        args: SuspendArgs,
     ) -> Result<SuspendOutcome, EngineError> {
-        unavailable("pg.suspend")
+        suspend_ops::suspend_impl(&self.pool, &self.partition_config, handle, args).await
     }
 
     #[tracing::instrument(name = "pg.create_waitpoint", skip_all)]
@@ -287,9 +288,9 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.observe_signals", skip_all)]
     async fn observe_signals(
         &self,
-        _handle: &Handle,
+        handle: &Handle,
     ) -> Result<Vec<ResumeSignal>, EngineError> {
-        unavailable("pg.observe_signals")
+        suspend_ops::observe_signals_impl(&self.pool, handle).await
     }
 
     #[tracing::instrument(name = "pg.claim_from_reclaim", skip_all)]
@@ -417,18 +418,18 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.deliver_signal", skip_all)]
     async fn deliver_signal(
         &self,
-        _args: DeliverSignalArgs,
+        args: DeliverSignalArgs,
     ) -> Result<DeliverSignalResult, EngineError> {
-        unavailable("pg.deliver_signal")
+        suspend_ops::deliver_signal_impl(&self.pool, &self.partition_config, args).await
     }
 
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.claim_resumed_execution", skip_all)]
     async fn claim_resumed_execution(
         &self,
-        _args: ClaimResumedExecutionArgs,
+        args: ClaimResumedExecutionArgs,
     ) -> Result<ClaimResumedExecutionResult, EngineError> {
-        unavailable("pg.claim_resumed_execution")
+        suspend_ops::claim_resumed_execution_impl(&self.pool, &self.partition_config, args).await
     }
 
     #[tracing::instrument(name = "pg.cancel_flow", skip_all)]
