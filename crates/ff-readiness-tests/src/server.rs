@@ -75,11 +75,12 @@ impl InProcessServer {
         let tls = crate::valkey::env_flag("FF_TLS");
         let cluster = crate::valkey::env_flag("FF_CLUSTER");
 
-        let config = ServerConfig {
-            host,
-            port,
-            tls,
-            cluster,
+        let config = ServerConfig {            valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster, skip_library_load: true },
+
+
+
+
+
             partition_config: TEST_PARTITION_CONFIG,
             lanes: vec![LaneId::new(lane)],
             listen_addr: "127.0.0.1:0".into(),
@@ -88,7 +89,7 @@ impl InProcessServer {
                 lanes: vec![LaneId::new(lane)],
                 ..Default::default()
             },
-            skip_library_load: true,
+
             cors_origins: vec!["*".to_owned()],
             api_token: None,
             waitpoint_hmac_secret: secret.to_owned(),
@@ -96,7 +97,8 @@ impl InProcessServer {
             max_concurrent_stream_ops: 64,
             backend: ff_server::config::BackendKind::default(),
         postgres: Default::default(),
-        };
+        
+};
 
         let server = Arc::new(Server::start(config).await.expect("Server::start"));
         let app = ff_server::api::router(server.clone(), &["*".to_owned()], None)

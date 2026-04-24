@@ -91,6 +91,7 @@ impl TestApi {
 }
 
 fn test_server_config() -> ff_server::config::ServerConfig {
+
     let config = ff_test::fixtures::TEST_PARTITION_CONFIG;
     let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
     let port: u16 = std::env::var("FF_PORT")
@@ -100,10 +101,13 @@ fn test_server_config() -> ff_server::config::ServerConfig {
     let tls = ff_test::fixtures::env_flag("FF_TLS");
     let cluster = ff_test::fixtures::env_flag("FF_CLUSTER");
     ff_server::config::ServerConfig {
-        host,
-        port,
-        tls,
-        cluster,
+        valkey: ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls: ff_test::fixtures::env_flag("FF_TLS"),
+            cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+            skip_library_load: true,
+        },
         partition_config: config,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "127.0.0.1:0".into(),
@@ -112,7 +116,7 @@ fn test_server_config() -> ff_server::config::ServerConfig {
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
         },
-        skip_library_load: true,
+
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:

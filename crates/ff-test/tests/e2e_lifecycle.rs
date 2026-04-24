@@ -6253,11 +6253,12 @@ async fn test_server() -> ff_server::server::Server {
     let cluster = std::env::var("FF_CLUSTER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let server_config = ServerConfig {
-        host,
-        port,
-        tls,
-        cluster,
+    let server_config = ServerConfig {        valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster },
+
+
+
+
+
         partition_config: config,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "0.0.0.0:0".into(),
@@ -7303,11 +7304,12 @@ async fn test_system_engine_with_concurrent_scanners() {
         let cluster = std::env::var("FF_CLUSTER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        ServerConfig {
-            host,
-            port,
-            tls,
-            cluster,
+        ServerConfig {            valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster, skip_library_load: true },
+
+
+
+
+
             partition_config: config,
             lanes: vec![LaneId::new(LANE)],
             listen_addr: "0.0.0.0:0".into(),
@@ -7319,7 +7321,7 @@ async fn test_system_engine_with_concurrent_scanners() {
                 lease_expiry_interval: std::time::Duration::from_millis(500),
                 ..Default::default()
             },
-            skip_library_load: true,
+
             cors_origins: vec!["*".to_owned()],
             api_token: None,
             waitpoint_hmac_secret:
@@ -7328,7 +7330,8 @@ async fn test_system_engine_with_concurrent_scanners() {
             max_concurrent_stream_ops: 64,
         backend: ff_server::config::BackendKind::default(),
         postgres: Default::default(),
-        }
+        
+}
     };
     let server = ff_server::server::Server::start(server_config)
         .await

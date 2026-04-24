@@ -44,6 +44,7 @@ async fn seed_partition_config(tc: &TestCluster) {
 }
 
 fn server_config_with_lanes(lanes: Vec<LaneId>) -> ff_server::config::ServerConfig {
+
     let config = test_config();
     let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
     let port: u16 = std::env::var("FF_PORT")
@@ -53,10 +54,13 @@ fn server_config_with_lanes(lanes: Vec<LaneId>) -> ff_server::config::ServerConf
     let tls = ff_test::fixtures::env_flag("FF_TLS");
     let cluster = ff_test::fixtures::env_flag("FF_CLUSTER");
     ff_server::config::ServerConfig {
-        host,
-        port,
-        tls,
-        cluster,
+        valkey: ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls: ff_test::fixtures::env_flag("FF_TLS"),
+            cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+            skip_library_load: true,
+        },
         partition_config: config,
         lanes: lanes.clone(),
         listen_addr: "127.0.0.1:0".into(),
@@ -69,7 +73,7 @@ fn server_config_with_lanes(lanes: Vec<LaneId>) -> ff_server::config::ServerConf
         // TestCluster fixture pre-loads the library. The lanes-index seed
         // runs unconditionally regardless of this flag (it does not depend
         // on the Lua library).
-        skip_library_load: true,
+
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:

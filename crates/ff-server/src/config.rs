@@ -58,8 +58,19 @@ impl Default for PostgresServerConfig {
     }
 }
 
-/// Server configuration, loaded from environment variables.
-pub struct ServerConfig {
+/// RFC-017 Wave 8 Stage E4 (v0.8.0): Valkey connection parameters
+/// carried on [`ServerConfig`] when `backend == BackendKind::Valkey`.
+///
+/// Mirrors the pre-existing [`PostgresServerConfig`] shape. Replaces
+/// the flat `host` / `port` / `tls` / `cluster` / `skip_library_load`
+/// fields removed at v0.8.0 in favour of sum-typed nesting.
+///
+/// **Not `#[non_exhaustive]`** so downstream tests and consumers can
+/// construct the struct literal directly. Adding fields here is a
+/// v0.y.0 breaking bump; call sites that want to remain insulated can
+/// use `..ValkeyServerConfig::default()` in their literal.
+#[derive(Debug, Clone)]
+pub struct ValkeyServerConfig {
     /// Valkey host. Default: `"localhost"`.
     pub host: String,
     /// Valkey port. Default: `6379`.
@@ -68,6 +79,28 @@ pub struct ServerConfig {
     pub tls: bool,
     /// Enable Valkey cluster mode.
     pub cluster: bool,
+    /// Skip library loading (for tests where TestCluster already loaded it).
+    pub skip_library_load: bool,
+}
+
+impl Default for ValkeyServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "localhost".into(),
+            port: 6379,
+            tls: false,
+            cluster: false,
+            skip_library_load: false,
+        }
+    }
+}
+
+/// Server configuration, loaded from environment variables.
+///
+/// **RFC-017 Stage E4 (v0.8.0):** the flat Valkey fields (`host`,
+/// `port`, `tls`, `cluster`, `skip_library_load`) were removed. Use
+/// [`ValkeyServerConfig`] on the `valkey` field instead.
+pub struct ServerConfig {
     /// Partition counts (execution/flow/budget/quota).
     pub partition_config: PartitionConfig,
     /// Lanes to manage. Default: `["default"]`.
@@ -76,8 +109,6 @@ pub struct ServerConfig {
     pub listen_addr: String,
     /// Scanner intervals and engine config.
     pub engine_config: EngineConfig,
-    /// Skip library loading (for tests where TestCluster already loaded it).
-    pub skip_library_load: bool,
     /// Allowed CORS origins. `["*"]` means permissive (all origins).
     pub cors_origins: Vec<String>,
     /// Shared-secret API token. If set, all requests except GET /healthz must
@@ -112,6 +143,10 @@ pub struct ServerConfig {
     /// [`BackendKind::Valkey`]. `BackendKind::Postgres` is rejected
     /// at startup through Stage D per RFC-017 §9.0.
     pub backend: BackendKind,
+    /// RFC-017 Stage E4 (v0.8.0): Valkey connection parameters.
+    /// Meaningful only when `backend == BackendKind::Valkey`; the
+    /// Postgres path ignores these fields.
+    pub valkey: ValkeyServerConfig,
     /// RFC-017 Wave 8 Stage E1: Postgres connection parameters.
     /// Meaningful only when `backend == BackendKind::Postgres`; the
     /// Valkey path ignores these fields.
@@ -184,10 +219,13 @@ impl ServerConfig {
     /// | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (libpq/sqlx shape, e.g. `postgres://user:pass@host:port/db`). Required when `FF_BACKEND=postgres`; ignored otherwise. |
     /// | `FF_POSTGRES_POOL_SIZE` | `10` | Max Postgres pool connections; ignored on the Valkey path. |
     pub fn from_env() -> Result<Self, ConfigError> {
-        let host = env_or("FF_HOST", "localhost");
-        let port = env_u16("FF_PORT", 6379)?;
-        let tls = env_bool("FF_TLS");
-        let cluster = env_bool("FF_CLUSTER");
+        let valkey = ValkeyServerConfig {
+            host: env_or("FF_HOST", "localhost"),
+            port: env_u16("FF_PORT", 6379)?,
+            tls: env_bool("FF_TLS"),
+            cluster: env_bool("FF_CLUSTER"),
+            skip_library_load: false,
+        };
         let listen_addr = env_or("FF_LISTEN_ADDR", "0.0.0.0:9090");
         // FF_CORS_ORIGINS contract:
         //   unset      → default "*" (permissive)
@@ -369,21 +407,17 @@ impl ServerConfig {
         };
 
         Ok(Self {
-            host,
-            port,
-            tls,
-            cluster,
             partition_config,
             lanes,
             listen_addr,
             engine_config,
-            skip_library_load: false,
             cors_origins,
             api_token,
             waitpoint_hmac_secret,
             waitpoint_hmac_grace_ms,
             max_concurrent_stream_ops,
             backend,
+            valkey,
             postgres,
         })
     }
@@ -394,10 +428,6 @@ impl Default for ServerConfig {
         let lanes = vec![LaneId::new("default")];
         let partition_config = PartitionConfig::default();
         Self {
-            host: "localhost".into(),
-            port: 6379,
-            tls: false,
-            cluster: false,
             partition_config,
             lanes: lanes.clone(),
             listen_addr: "0.0.0.0:9090".into(),
@@ -406,7 +436,6 @@ impl Default for ServerConfig {
                 lanes,
                 ..Default::default()
             },
-            skip_library_load: false,
             cors_origins: vec!["*".to_owned()],
             api_token: None,
             // Deterministic dev/test secret. Production deployments MUST
@@ -419,6 +448,7 @@ impl Default for ServerConfig {
             waitpoint_hmac_grace_ms: 86_400_000,
             max_concurrent_stream_ops: 64,
             backend: BackendKind::default(),
+            valkey: ValkeyServerConfig::default(),
             postgres: PostgresServerConfig::default(),
         }
     }

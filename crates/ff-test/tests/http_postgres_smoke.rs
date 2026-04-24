@@ -99,11 +99,12 @@ impl PgHttpSmoke {
         cleanup_postgres().await;
 
         let partition_config = PartitionConfig::default();
-        let config = ff_server::config::ServerConfig {
-            host: "localhost".into(),
-            port: 6379,
-            tls: false,
-            cluster: false,
+        let config = ff_server::config::ServerConfig {            valkey: ff_server::config::ValkeyServerConfig { host: "localhost".into(), port: 6379, tls: false, cluster: false, skip_library_load: true },
+
+
+
+
+
             partition_config,
             lanes: vec![LaneId::new(LANE)],
             listen_addr: "127.0.0.1:0".into(),
@@ -112,7 +113,7 @@ impl PgHttpSmoke {
                 lanes: vec![LaneId::new(LANE)],
                 ..Default::default()
             },
-            skip_library_load: true,
+
             cors_origins: vec!["*".to_owned()],
             api_token: None,
             waitpoint_hmac_secret:
@@ -126,7 +127,8 @@ impl PgHttpSmoke {
                 p.pool_size = 10;
                 p
             },
-        };
+        
+};
 
         let server = ff_server::server::Server::start(config)
             .await

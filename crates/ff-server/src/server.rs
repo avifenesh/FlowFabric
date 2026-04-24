@@ -327,18 +327,18 @@ impl Server {
         }
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
-            host = %config.host, port = config.port,
-            tls = config.tls, cluster = config.cluster,
+            host = %config.valkey.host, port = config.valkey.port,
+            tls = config.valkey.tls, cluster = config.valkey.cluster,
             "connecting to Valkey"
         );
         let mut builder = ClientBuilder::new()
-            .host(&config.host, config.port)
+            .host(&config.valkey.host, config.valkey.port)
             .connect_timeout(Duration::from_secs(10))
             .request_timeout(Duration::from_millis(5000));
-        if config.tls {
+        if config.valkey.tls {
             builder = builder.tls();
         }
-        if config.cluster {
+        if config.valkey.cluster {
             builder = builder.cluster();
         }
         let client = builder
@@ -375,7 +375,7 @@ impl Server {
             .initialize_deployment(
                 &config.waitpoint_hmac_secret,
                 &config.lanes,
-                config.skip_library_load,
+                config.valkey.skip_library_load,
             )
             .await
             .map_err(|e| ServerError::Engine(Box::new(e)))?;
@@ -415,11 +415,11 @@ impl Server {
         // the wire subscription now lives in ff-backend-valkey, the
         // engine just consumes the resulting stream.
         let mut valkey_conn = ff_core::backend::ValkeyConnection::new(
-            config.host.clone(),
-            config.port,
+            config.valkey.host.clone(),
+            config.valkey.port,
         );
-        valkey_conn.tls = config.tls;
-        valkey_conn.cluster = config.cluster;
+        valkey_conn.tls = config.valkey.tls;
+        valkey_conn.cluster = config.valkey.cluster;
         let completion_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
             client.clone(),
             config.partition_config,
@@ -515,11 +515,11 @@ impl Server {
             config.partition_config,
             {
                 let mut c = ff_core::backend::ValkeyConnection::new(
-                    config.host.clone(),
-                    config.port,
+                    config.valkey.host.clone(),
+                    config.valkey.port,
                 );
-                c.tls = config.tls;
-                c.cluster = config.cluster;
+                c.tls = config.valkey.tls;
+                c.cluster = config.valkey.cluster;
                 c
             },
         );
