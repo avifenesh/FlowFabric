@@ -7,6 +7,8 @@
 
 Format per finding: **CONCEDE** / **ARGUE-BACK** / **REVISE**. REVISE notes the exact §-anchor that changes in the master RFC.
 
+> **Superseded figure (2026-04-23, post-round-2 housekeeping per L-R2):** the F1 count locked in this document as `base 31 + 14 new = 45` was further reconciled during the revision pass and is **not authoritative**. The RFC body (§Summary, §2.3, §3.1, §5, §15) is authoritative at **base 31 + 20 new = 51**. The +14 figure below pre-dates the explicit surfacing of `report_usage_admin` as a separately-counted method and the promotion of several read/admin rows that the round-1 author response discusses inline. Read F1 and F4 below for the reasoning that drove the reconciliation; treat the RFC body as source of truth for the final count.
+
 ---
 
 ## K's findings
