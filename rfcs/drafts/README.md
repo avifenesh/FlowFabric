@@ -9,6 +9,17 @@ Each cluster of files represents one exploration. Conventions:
 
 ## Index
 
+### RFC-017 ff-server backend abstraction (accepted 2026-04-23)
+
+Tracks the `ff-server` backend-abstraction RFC (A + B divergent drafts → consolidated master → K/L challenger rounds → owner adjudication on Q2).
+
+- `RFC-017-challenges/RFC-017-ff-server-backend-abstraction-A.md` — Author A's divergent draft (PR #259, superseded by consolidated master).
+- `RFC-017-challenges/RFC-017-ff-server-backend-abstraction-B.md` — Author B's divergent draft (PR #260, superseded by consolidated master).
+- `RFC-017-challenges/ACCEPTED.md` — debate-record closure summary (both challengers ACCEPT round 2).
+- `RFC-017-challenges/round-1/author-response.md` — per-finding concede/argue-back record for K's 12 findings + L's 5 deltas.
+
+**Outcome:** consolidated master promoted to `rfcs/RFC-017-ff-server-backend-abstraction.md` as the authoritative final. Owner adjudicated the sole remaining Q2 on 2026-04-23: `cancel_flow` is header-only on the trait; callers poll `describe_flow` for sync-cancel semantics. RFC-017 merged via PR #261; promotion via this PR. Implementation kicks off at Stage A (§9).
+
 ### 2026-04-23 session exploration records (0.4.0 readiness + RFC-009 V2 + Stage-1c followups)
 
 Investigation-only artifacts from the 2026-04-23 session covering 0.4.0 release-readiness, RFC-009 V2 cap-routing dispositioning, Stage-1c planning refinement, observability coverage, and an open-issue obsolescence sweep. Not normative RFCs — preserved as chain-of-reasoning and evidence. Mirrors the 2026-04-22 archive pattern (PR #138).
