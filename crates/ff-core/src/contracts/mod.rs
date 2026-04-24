@@ -1659,6 +1659,40 @@ pub enum CancelFlowResult {
     },
 }
 
+/// RFC-017 Stage E2: result of the "header" portion of a cancel_flow
+/// operation — the atomic flow-state flip + member enumeration. The
+/// Server composes this with its own wait/async member-dispatch
+/// machinery to build the wire-level [`CancelFlowResult`]. Backends
+/// implement [`crate::engine_backend::EngineBackend::cancel_flow_header`]
+/// (default: `Unavailable`) so the Valkey-native `ff_cancel_flow`
+/// FCALL (with its `flow_already_terminal` idempotency branch) can be
+/// driven through the trait without re-shaping the existing public
+/// `cancel_flow(id, policy, wait)` signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CancelFlowHeader {
+    /// Flow-state flipped this call. `member_execution_ids` is the
+    /// full (uncapped) membership at flip time.
+    Cancelled {
+        cancellation_policy: String,
+        member_execution_ids: Vec<String>,
+    },
+    /// Flow was already in a terminal state on entry. The backend has
+    /// surfaced the *stored* `cancellation_policy` + `cancel_reason`
+    /// + full membership so the Server can return an idempotent
+    /// [`CancelFlowResult::Cancelled`] without re-doing the flip.
+    AlreadyTerminal {
+        /// `None` only for flows cancelled by pre-E2 Lua that never
+        /// persisted the policy field.
+        stored_cancellation_policy: Option<String>,
+        /// `None` when the flow was never cancel-reason-stamped.
+        stored_cancel_reason: Option<String>,
+        /// Full membership. Server caps to
+        /// `ALREADY_TERMINAL_MEMBER_CAP` before wiring.
+        member_execution_ids: Vec<String>,
+    },
+}
+
 // ─── stage_dependency_edge ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
