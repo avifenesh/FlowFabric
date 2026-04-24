@@ -33,11 +33,13 @@ use ff_core::backend::{
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
     ApplyDependencyToChildResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
-    CreateExecutionArgs, CreateFlowArgs, CreateFlowResult, DeliverSignalArgs, DeliverSignalResult,
-    EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage,
-    ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult, StageDependencyEdgeArgs,
-    StageDependencyEdgeResult,
+    CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
+    DeliverSignalArgs, DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot,
+    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage,
+    SetEdgeGroupPolicyResult, StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
+#[cfg(feature = "core")]
+use ff_core::state::PublicState;
 use ff_core::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
@@ -519,6 +521,28 @@ impl EngineBackend for PostgresBackend {
     }
 
     // ── RFC-017 Stage A — ingress (promoted from inherent) ────
+
+    /// RFC-017 Wave 8 Stage E1: lift the inherent
+    /// [`PostgresBackend::create_execution`] onto the trait so
+    /// ff-server's migrated HTTP handler can dispatch to Postgres.
+    /// Post-insert the row is idempotent; the Postgres impl does not
+    /// distinguish `Created` from `Duplicate` at the helper level
+    /// (both paths commit and return the execution id), so we always
+    /// surface `Created { public_state: Waiting }` here. A follow-up
+    /// may lift the distinction if a consumer relies on it.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.create_execution.trait", skip_all)]
+    async fn create_execution(
+        &self,
+        args: CreateExecutionArgs,
+    ) -> Result<CreateExecutionResult, EngineError> {
+        let eid = args.execution_id.clone();
+        exec_core::create_execution_impl(&self.pool, &self.partition_config, args).await?;
+        Ok(CreateExecutionResult::Created {
+            execution_id: eid,
+            public_state: PublicState::Waiting,
+        })
+    }
 
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.create_flow", skip_all)]
