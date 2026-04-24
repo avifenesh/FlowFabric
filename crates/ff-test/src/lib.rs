@@ -29,6 +29,7 @@
 //! ```
 
 pub mod assertions;
+pub mod backend_matrix;
 pub mod fixtures;
 pub mod helpers;
 
