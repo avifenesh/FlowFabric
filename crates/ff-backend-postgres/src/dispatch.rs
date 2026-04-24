@@ -257,8 +257,6 @@ async fn advance_edge_group(
     downstream_eid: Uuid,
     outcome: OutcomeKind,
 ) -> Result<(), EngineError> {
-    let _ = upstream_eid; // retained for tracing; no per-hop predicate yet.
-
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
     sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
@@ -367,8 +365,39 @@ async fn advance_edge_group(
             if cancel_siblings && !already_flagged {
                 // Stage-C bookkeeping: add one row to
                 // `ff_pending_cancel_groups` per still-running sibling
-                // group and flip the flag so a replay doesn't
-                // double-enqueue.
+                // group, compute the sibling-members set, and flip the
+                // flag so a replay doesn't double-enqueue. The
+                // reconciler (Wave 6b) consumes `members` to drive
+                // per-sibling cancel; the set excludes the winner.
+                let sibling_rows = sqlx::query(
+                    r#"
+                    SELECT ff_exec_core.execution_id
+                      FROM ff_exec_core
+                      JOIN ff_edge ON ff_edge.upstream_eid = ff_exec_core.execution_id
+                     WHERE ff_exec_core.partition_key = $1
+                       AND ff_edge.partition_key      = $1
+                       AND ff_edge.flow_id            = $2
+                       AND ff_edge.downstream_eid     = $3
+                       AND ff_exec_core.lifecycle_phase NOT IN ('terminal','cancelled')
+                       AND ff_exec_core.public_state  <> 'skipped'
+                       AND ff_exec_core.execution_id <> $4
+                    "#,
+                )
+                .bind(partition_key)
+                .bind(flow_id)
+                .bind(downstream_eid)
+                .bind(upstream_eid)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(map_sqlx_error)?;
+                let members: Vec<String> = sibling_rows
+                    .iter()
+                    .map(|r| {
+                        let u: Uuid = r.get("execution_id");
+                        u.to_string()
+                    })
+                    .collect();
+
                 sqlx::query(
                     r#"
                     INSERT INTO ff_pending_cancel_groups
@@ -388,13 +417,15 @@ async fn advance_edge_group(
                 sqlx::query(
                     r#"
                     UPDATE ff_edge_group
-                       SET cancel_siblings_pending_flag = TRUE
+                       SET cancel_siblings_pending_flag    = TRUE,
+                           cancel_siblings_pending_members = $4
                      WHERE partition_key = $1 AND flow_id = $2 AND downstream_eid = $3
                     "#,
                 )
                 .bind(partition_key)
                 .bind(flow_id)
                 .bind(downstream_eid)
+                .bind(&members)
                 .execute(&mut *tx)
                 .await
                 .map_err(map_sqlx_error)?;
