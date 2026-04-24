@@ -285,7 +285,7 @@ Shutdown needs a seam regardless, which is why `shutdown_prepare()` exists on th
 | 2 | Execution reads | `GET /v1/executions/{id}`, `.../state`, `.../result`, `GET /v1/executions` | existing `describe_execution` + existing `list_executions` + **NEW** `get_execution_result` | M | Shape drift (`ExecutionInfo` vs `ExecutionSnapshot`) adapted server-side (§8.2 of A, retained). `get_execution_result` is a new method because the payload blob is not part of `ExecutionSnapshot`; see Q3 in §12. |
 | 3 | Operator control | `POST .../cancel`, `.../priority`, `.../replay`, `.../revoke-lease` | **NEW** `cancel_execution`, `change_priority`, `replay_execution`, `revoke_lease` | M–H | `replay_execution` is Hard because `ff_replay_execution` takes variadic KEYS based on inbound-edge count; trait signature hides it, Valkey impl does the pre-read internally. |
 | 4 | Signal dispatch | `POST .../signal` | existing `deliver_signal` | T | One-line delegate. |
-| 5 | Flow ingress | `POST /v1/flows`, `.../executions`, `.../cancel`, `.../edge`, `.../edge/{id}/apply` | **NEW** `create_flow`, `add_execution_to_flow`, `stage_dependency_edge`, `apply_dependency_to_child` + existing `cancel_flow` | M–H | `cancel_flow` trait covers the header only; the 200-line async member-fan-out stays server-local on `Server` (Q-C in §12). |
+| 5 | Flow ingress | `POST /v1/flows`, `.../executions`, `.../cancel`, `.../edge`, `.../edge/{id}/apply` | **NEW** `create_flow`, `add_execution_to_flow`, `stage_dependency_edge`, `apply_dependency_to_child` + existing `cancel_flow` | M–H | `cancel_flow` trait covers the header only (Q2 adjudicated 2026-04-23 — see §16); member transitions via dispatcher cascade + reconciler backstop; callers needing sync semantics poll `describe_flow` until `public_flow_state = cancelled`. |
 | 6 | Execution ingress | `POST /v1/executions` | **NEW** `create_execution` | M | `dedup_ttl_ms = 86400000` literal at `server.rs:734` lifts to `CreateExecutionArgs::idempotency_ttl: Option<Duration>` (default 24h). Zero wire impact. |
 | 7 | Budget + quota admin | `POST /v1/budgets`, `.../budgets/{id}/status`, `.../budgets/{id}/usage`, `.../budgets/{id}/reset`, `.../quota-policies` | **NEW** `create_budget`, `get_budget_status`, `reset_budget`, `create_quota_policy` + existing-but-extended `report_usage` | M–H | See §5 on `report_usage` admin variant. |
 | 8 | Pending-waitpoint listing | `GET .../pending-waitpoints` | **NEW** `list_pending_waitpoints` | **H** | Round-1 F3: upgraded M→H. Pipelined SSCAN + 2× HMGET + §8 schema rewrite + pagination-cursor new to the trait. Returns sanitised `PendingWaitpointInfo` — no raw HMAC token. §8. |
@@ -735,7 +735,7 @@ Metrics + tracing: `/metrics` scrape output preserved. Backend-specific series (
 
 ## 12. Open questions (owner-scoped)
 
-Resolved during consolidation + round-1 revisions — **not** deferred: trait count (§2.3), `shutdown_prepare` (D2 + §5.4), `backend_label` (D3), HMAC exposure + schema (§8), semver (§10), config shim cadence (§11), scheduler location (§7), boot trait vs in-backend (D7), Postgres hard-gate (§9.0), struct discipline (§5.1.1), Retry-After wiring (§6).
+**Status as of owner adjudication 2026-04-23: 0 open questions.** All five Qs (Q1–Q5) resolved; Q2 was the sole remaining owner-scoped question after round-1 and is now adjudicated (see below). Resolved during consolidation + round-1 revisions — **not** deferred: trait count (§2.3), `shutdown_prepare` (D2 + §5.4), `backend_label` (D3), HMAC exposure + schema (§8), semver (§10), config shim cadence (§11), scheduler location (§7), boot trait vs in-backend (D7), Postgres hard-gate (§9.0), struct discipline (§5.1.1), Retry-After wiring (§6).
 
 **Closed in round-1** (previously open, now decided — see `round-1/author-response.md`):
 
@@ -744,9 +744,11 @@ Resolved during consolidation + round-1 revisions — **not** deferred: trait co
 - **Q4 (Server::scheduler field retirement)** — CLOSED at Stage D per §7 + F8 resolution.
 - **Q5 (third-party trait stability)** — CLOSED. Once v0.8.0 ships, `EngineBackend` is a public API under SemVer; stability is automatic. Sealing is out of scope for RFC-017 (separate RFC-012 R8+ question). Not owner-scoped per K F11.
 
-**Remaining for owner:**
+**Remaining for owner:** *(none — all Qs adjudicated as of 2026-04-23)*
 
-1. **Q2 — `cancel_flow` dispatch ownership.** Trait header-only (current shape; server owns the 150-line `JoinSet` member fan-out), or trait end-to-end (backend reconciles, trait caller observes)? Ships faster as header-only; end-to-end is more honest and unblocks Postgres reconciliation via `SELECT FOR UPDATE SKIP LOCKED`. Real scope/contract tradeoff — the only open question after round-1. Owner call before Stage C merges handler 13. **Author's advisory lean (per round-2 K-R2-N3, non-binding):** header-only on the trait, with Postgres optionally exposing a stronger transactional cancel as an inherent (non-trait) method per §13.6. Rationale: Valkey cannot provide cross-partition atomicity without a cluster-wide lock, so "end-to-end on the trait" degrades to header-only shape on Valkey anyway; the Postgres-only transactional win is better expressed outside the trait contract. Owner remains free to pick end-to-end if the transactional guarantee is load-bearing. See §16 `cancel_flow` paragraph for both options and their full operational profile.
+**Adjudicated in owner review (2026-04-23):**
+
+1. **Q2 — `cancel_flow` dispatch ownership. ADJUDICATED → header-only on the trait + caller-side async polling.** Owner ruling (2026-04-23): "header-only + async cancel on the caller side. Consumer wanting sync-cancel semantics must explicitly await terminal state via `describe_flow` polling. Honest semantic: `cancel_flow` Ok-return means marked-for-cancel, not members-have-stopped. Side-effects window is real and must be acknowledged, not hidden." Rationale: header-only is consistent with v0.7's per-hop-tx discipline (no long-running transactions holding partition resources), avoids long-tx pathologies under Postgres, and is honest about the in-flight side-effect window rather than pretending cross-backend atomicity that Valkey cannot uniformly provide. §16 `cancel_flow` paragraph is rewritten below as the final single-behavior spec (not two options).
 
 ---
 
@@ -810,7 +812,7 @@ Consolidated from A §9 + B §13.
 ### 14.3 Stage C — operator control + budget
 
 - **Full HTTP matrix against both backends.** Every migrated route × (Valkey, Postgres) × (happy, one error path). ≈24 tests.
-- **`cancel_flow` async dispatch** stays server-local; existing tests pass unchanged.
+- **`cancel_flow` header-only + caller-side polling (per Q2 adjudication).** Stage C adds `tests/cancel_flow_poll_idiom.rs`: call `backend.cancel_flow(...)`; assert Ok returns promptly (sub-100ms under unloaded test harness); poll `backend.describe_flow(...)` and assert `public_flow_state` transitions to `Cancelled` within the dispatcher-tick budget + reconciler backstop window. Run against both Valkey and Postgres. Also asserts: Ok-return does NOT imply members-stopped (a test fixture with a deliberately slow member confirms the side-effects-window caveat is observable, not hidden). Existing server-local `cancel_flow_wait` convenience tests continue to pass (now implemented as poll-loop against the trait).
 - **`report_usage_admin` parity.** Admin-path HTTP call vs worker-path SDK call produce identical budget state.
 
 ### 14.4 Stage D — ingress + boot + cutover
@@ -863,9 +865,11 @@ For reference by reviewers comparing this RFC to the A/B divergent drafts:
 | Shim lifetime | 1 minor release (v0.7.x → v0.8.0) | A §6.1 + B §7 agree |
 | Stream-ops capability handle on Server | Rejected (Author A's initial sketch; adopt A's revised position) | **A revised** |
 
-**Round-1 revisions applied (2026-04-23):** addressed K's 12 findings + L's 5 deltas; see `rfcs/drafts/RFC-017-challenges/round-1/author-response.md` for the per-finding concede/argue-back record. Material changes: count reconciled to 51 methods (+20), `#[non_exhaustive]` discipline spec added (§5.1.1), `PendingWaitpointInfo` reframed as additive redaction preserving 6 existing fields (§8), `FF_BACKEND=postgres` hard-gated to Stage E (§9.0), `shutdown_prepare` spec'd per-backend with grace budget (§5.4), `Retry-After` added to `ResourceExhausted` (§6), `partition_config` ownership moved into `BackendConfig::Valkey` (§11), open questions reduced from 5 → 1 (Q2 remains), cross-backend semantics appendix added (§16).
+**Round-1 revisions applied (2026-04-23):** addressed K's 12 findings + L's 5 deltas; see `rfcs/drafts/RFC-017-challenges/round-1/author-response.md` for the per-finding concede/argue-back record. Material changes: count reconciled to 51 methods (+20), `#[non_exhaustive]` discipline spec added (§5.1.1), `PendingWaitpointInfo` reframed as additive redaction preserving 6 existing fields (§8), `FF_BACKEND=postgres` hard-gated to Stage E (§9.0), `shutdown_prepare` spec'd per-backend with grace budget (§5.4), `Retry-After` added to `ResourceExhausted` (§6), `partition_config` ownership moved into `BackendConfig::Valkey` (§11), open questions reduced from 5 → 1 (Q2 remained as sole owner-scoped); cross-backend semantics appendix added (§16).
 
-No divergences remain unresolved. The one open question in §12 (Q2) is owner-scoped and does not block further rounds.
+**Owner adjudication applied (2026-04-23):** Q2 resolved — header-only `cancel_flow` on the trait with caller-side async `describe_flow` polling for sync-cancel semantics; §16 `cancel_flow` paragraph rewritten as the single-behavior final spec (not two options); caller-expectations semantic ("Ok = marked-for-cancel, not members-have-stopped; side-effects window is real") is load-bearing and documented in §16. **Open questions: 0.**
+
+No divergences remain unresolved. All owner-scoped questions in §12 are adjudicated (Q2 closed 2026-04-23 — header-only cancel_flow + caller-side polling). **RFC-017 is ACCEPTED.**
 
 ---
 
@@ -877,12 +881,27 @@ Single paragraph per op. SRE-facing — what does a runbook author need to know 
 
 **`rotate_waitpoint_hmac_secret_all`.** Valkey: per-partition FCALL fan-out with `admin_rotate_fanout_concurrency = 16` (server-wide admin semaphore serialises cluster-wide). Runs in **~seconds** for typical deployments; partial-failure is observable (N-1 of N partitions rotated, returned in `RotateResult.partitions_failed`). Postgres: single `UPDATE secrets SET ... WHERE active = true` inside a transaction; runs in **~milliseconds**; partial-failure does not exist (transactional commit or rollback). Audit event schema (unchanged across backends) includes `backend_label()` so post-incident forensics can distinguish the two.
 
-**`cancel_flow` dispatch.** Open question Q2 (§12) — owner call pending. Per §13.6, a trait method cannot carry asymmetric per-backend semantics; Q2 is therefore a single binary choice for the trait contract, with two **owner options** pending resolution (not two backend-specific outcomes):
+**`cancel_flow` dispatch (adjudicated 2026-04-23 — header-only + caller-side async polling).** `EngineBackend::cancel_flow` is a **header-only** trait method: the implementation INSERTs cancel markers into the outbox (Valkey: per-partition FCALL writes the cancel marker onto the flow header + each member's outbox entry; Postgres: single transactional `INSERT INTO outbox_events (kind='cancel', target_execution_id, ...)` plus header `UPDATE flows SET public_flow_state='cancelling'`) and returns `Ok(())` once those markers are durably written. **Members transition to cancelled via the dispatcher cascade** (the dispatcher consumes the outbox markers on its next tick per partition) plus the **reconciler backstop** (periodic sweep catches any member whose marker was missed due to partition-level failure and retries the cancel).
 
-- *Option A — header-only on the trait.* `EngineBackend::cancel_flow` promises header-mutation semantics only. Server code owns the 150-line member `JoinSet` fan-out (cross-backend). Valkey executes this natively (per-partition FCALL cancels each execution); Postgres executes the same fan-out in server code against `cancel_execution` trait calls. Failures are partial-observable on both backends.
-- *Option B — end-to-end on the trait.* `EngineBackend::cancel_flow` promises atomic cancel of header + all members. Postgres implements this via `SELECT FOR UPDATE SKIP LOCKED` inside a transaction. Valkey cannot provide cross-partition atomicity without a cluster-wide lock, so its impl degrades to "cancel header, then iterate members" — operationally identical to Option A with one extra round-trip and no transactional guarantee.
+The caller-side idiom for "wait until the flow and all its members are actually terminal" is:
 
-**Author's lean on Q2 (advisory per round-2 K-R2-N3, owner confirm required):** Option A (header-only on the trait). Reasoning: Option B's only differentiating win is Postgres's narrow transactional guarantee, which the wider system cannot uniformly provide (Valkey degrades to the Option-A shape regardless). Postgres is free to expose a stronger transactional cancel as an inherent (non-trait) method that cairn opts into explicitly — this is the pattern §13.6 already endorses for non-trait primitives, and keeps the trait contract single-semantics. Q2 stays open pending owner sign-off; the §16 paragraph will be rewritten to concrete per-backend operational notes (not "leans") once resolved.
+```rust
+// 1. Fire-and-return cancel:
+backend.cancel_flow(&flow_id, reason).await?;   // Ok = marked-for-cancel, NOT members-stopped
+
+// 2. Caller polls describe_flow until public_flow_state == cancelled:
+loop {
+    let snap = backend.describe_flow(&flow_id).await?;
+    if snap.public_flow_state == FlowState::Cancelled { break; }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+```
+
+This is the expected idiom and SHOULD be documented in the ff-sdk + ff-server API docs; `ff-server` exposes `POST /v1/flows/{id}/cancel` (fire-and-return) + clients call `GET /v1/flows/{id}` to poll terminal state. `cancel_flow_wait` (if retained as a `ff-server` convenience handler) implements this loop server-side against its own `backend` reference — it is NOT a distinct trait method.
+
+**Caller expectations (load-bearing semantic — do not paper over).** `cancel_flow` returning `Ok(())` **does not mean members have stopped running**. It means cancel markers are durably recorded in the outbox and members WILL transition to cancelled on the next dispatcher tick (+ reconciler backstop). **In-flight side effects — e.g., outbound HTTP calls to external systems an execution had already started — may complete after the `cancel_flow` Ok-return.** This window is real (bounded by dispatcher-tick-latency + longest in-flight side-effect duration, typically sub-second to seconds, worst-case minutes for long HTTP calls) and must be acknowledged in consumer code, not hidden. Callers needing synchronous "all members observably stopped" semantics must poll `describe_flow` per the idiom above; there is no trait method that promises stronger. This matches v0.7's per-hop-tx discipline (no long-running transactions) and is uniform across Valkey and Postgres backends.
+
+Valkey operational notes: cancel-marker writes are per-partition FCALL — partial failure across partitions is observable (`CancelFlowResult.partitions_failed: Vec<PartitionId>`); reconciler retries on next sweep. Postgres operational notes: single-transaction marker write — partial failure does not exist at the marker layer; dispatcher cascade still takes observable time to materialise member-state transitions. Audit emits `backend_label()` on both paths.
 
 **`shutdown_prepare` (round-2 L-R2-3).** Both backends implement `shutdown_prepare(grace: Duration) -> Result<(), EngineError>` per §5.4, but the operator-visible mechanics diverge and a SIGTERM at `grace=30s` is not the same event on the two backends. Valkey: drains the 16 tail sessions of §14.8 (`tail_client` per-partition) + closes the stream semaphore + cancels outstanding `XREAD BLOCK` leases; observable as a bounded decline in `ff_stream_ops_inflight` over `grace`. Postgres: issues `UNLISTEN *` on each LISTEN connection, waits for in-flight `NOTIFY`-driven waiters to complete (bounded by `grace`), and drains the connection pool; observable as `ff_pg_listen_connections_active` draining to zero. Same trait method, distinct runbook. Audit emits `backend_label()` so dashboards can correlate. Neither backend promises "all work committed at `grace` boundary" — both return on their respective drain-complete signal or on timeout, whichever fires first.
 
