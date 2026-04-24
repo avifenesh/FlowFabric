@@ -3,23 +3,18 @@ use ff_core::types::LaneId;
 use ff_engine::EngineConfig;
 use std::time::Duration;
 
-/// RFC-017 Stage A: backend family selector. Default `Valkey`; the
-/// `Postgres` variant is hard-gated at boot during Stages A-D per
-/// RFC-017 §9.0 (`BACKEND_STAGE_READY`). The gate lifts in Stage E
-/// alongside v0.8.0.
-///
-/// Stage A adds the selector only so `Server::start` can refuse
-/// unready backends cleanly; no `FF_BACKEND` env var is wired yet
-/// (Stage D lands the env plumbing + the `BackendConfig` sum type
-/// per RFC §11).
+/// RFC-017 Stage A: backend family selector. Default `Valkey`. At
+/// Stage E4 (v0.8.0) both `Valkey` and `Postgres` are first-class and
+/// boot without a dev-override; `BACKEND_STAGE_READY` remains in
+/// `ff-server::server` as defence-in-depth for future backend
+/// additions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum BackendKind {
     /// Valkey / FCALL backend (production path through v0.7.x).
     #[default]
     Valkey,
-    /// Postgres backend. **Refuses to boot** until Stage E — see
-    /// [`crate::server::ServerError::BackendNotReady`].
+    /// Postgres backend. First-class since v0.8.0 (RFC-017 Stage E4).
     Postgres,
 }
 
@@ -185,9 +180,7 @@ impl ServerConfig {
     /// | `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval |
     /// | `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval |
     /// | `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel reconciler scanner interval |
-    /// | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Per RFC-017 §9.0, `postgres` is hard-gated at boot through Stage D; dev-override `FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development` bypasses (non-production only). |
-    /// | `FF_BACKEND_ACCEPT_UNREADY` | *(unset)* | Dev-only override: `1` or `true` bypasses `BACKEND_STAGE_READY` when `FF_ENV=development`. Production refuses the combination. |
-    /// | `FF_ENV` | *(unset)* | Environment marker. Only `development` enables the dev-override path above. Any other value (or unset) keeps the hard-gate active. |
+    /// | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Both are first-class at v0.8.0 (RFC-017 Stage E4 flipped `BACKEND_STAGE_READY` to `&["valkey", "postgres"]`). |
     /// | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (libpq/sqlx shape, e.g. `postgres://user:pass@host:port/db`). Required when `FF_BACKEND=postgres`; ignored otherwise. |
     /// | `FF_POSTGRES_POOL_SIZE` | `10` | Max Postgres pool connections; ignored on the Valkey path. |
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -347,17 +340,13 @@ impl ServerConfig {
             scanner_filter: Default::default(),
         };
 
-        // RFC-017 Stage D1 (§9.0): `FF_BACKEND` selects the backend
-        // family at boot. Default `valkey`; `postgres` is hard-gated
-        // through Stage D and refused at startup unless the dev-mode
-        // override (`FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development`)
-        // is set. Unknown values are rejected eagerly so typos don't
-        // silently fall through to the default.
-        // RFC-017 Wave 8 Stage E1: FF_POSTGRES_URL + FF_POSTGRES_POOL_SIZE
-        // populate `postgres` when FF_BACKEND=postgres. Read regardless of
-        // backend selector so operators can preset the values; the Valkey
-        // path ignores them. Empty URL is a hard error only when
-        // FF_BACKEND=postgres (checked during boot).
+        // RFC-017 Stage E4 (v0.8.0): `FF_BACKEND` selects the backend
+        // family at boot. Default `valkey`; both `valkey` and `postgres`
+        // are first-class. Unknown values are rejected eagerly so typos
+        // don't silently fall through to the default. FF_POSTGRES_URL +
+        // FF_POSTGRES_POOL_SIZE populate `postgres` when FF_BACKEND=postgres.
+        // Read regardless of backend selector so operators can preset the
+        // values; the Valkey path ignores them.
         let postgres = PostgresServerConfig {
             url: std::env::var("FF_POSTGRES_URL").unwrap_or_default(),
             pool_size: env_u32_positive("FF_POSTGRES_POOL_SIZE", 10)?,

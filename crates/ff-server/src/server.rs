@@ -30,7 +30,7 @@ use crate::config::{BackendKind, ServerConfig};
 /// joins at Stage E (v0.8.0). Compiled into the binary by design —
 /// see RFC-017 §9.0 "Fleet-wide cutover requirement" for the
 /// rolling-upgrade implication.
-const BACKEND_STAGE_READY: &[&str] = &["valkey"];
+const BACKEND_STAGE_READY: &[&str] = &["valkey", "postgres"];
 
 /// Upper bound on `member_execution_ids` returned in the
 /// [`CancelFlowResult::Cancelled`] response when the flow was already in a
@@ -147,9 +147,8 @@ pub enum ServerError {
     /// `stage` names the current stage ("A"/"B"/"C"/"D") so operator
     /// tooling can correlate the refusal with the migration plan.
     #[error(
-        "backend not ready: {backend} (staged for Stage E; current binary at Stage {stage}). \
-         Set FF_BACKEND=valkey, or set both FF_BACKEND_ACCEPT_UNREADY=1 and FF_ENV=development to \
-         override in dev."
+        "backend not ready: {backend} (not in BACKEND_STAGE_READY; current stage {stage}). \
+         Set FF_BACKEND=valkey or FF_BACKEND=postgres."
     )]
     BackendNotReady {
         backend: &'static str,
@@ -301,39 +300,21 @@ impl Server {
         config: ServerConfig,
         metrics: Arc<ff_observability::Metrics>,
     ) -> Result<Self, ServerError> {
-        // RFC-017 §9.0 hard-gate. Refuse to boot unready backends
-        // unless the dev-mode override combo (FF_BACKEND_ACCEPT_UNREADY=1
-        // AND FF_ENV=development) is set. Production refuses the
-        // override; see the env-var check inline.
+        // RFC-017 §9.0 hard-gate. At v0.8.0 (Stage E4) both `valkey` and
+        // `postgres` are ready; this check remains as defence-in-depth
+        // so future backend additions must explicitly opt into the list.
+        // The `FF_BACKEND_ACCEPT_UNREADY` / `FF_ENV=development` dev-mode
+        // override was retired at Stage E4 because it is no longer
+        // needed — both supported backends now boot without override.
         let label = config.backend.as_str();
         if !BACKEND_STAGE_READY.contains(&label) {
-            let accept_unready = std::env::var("FF_BACKEND_ACCEPT_UNREADY")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let is_dev = std::env::var("FF_ENV")
-                .map(|v| v.eq_ignore_ascii_case("development"))
-                .unwrap_or(false);
-            if accept_unready && is_dev {
-                tracing::warn!(
-                    backend = label,
-                    stage = "E1",
-                    "backend_unready_boot_override: backend={label} stage=E1 \
-                     (FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development)"
-                );
-                let backend_label: &'static str = match config.backend {
+            return Err(ServerError::BackendNotReady {
+                backend: match config.backend {
                     BackendKind::Postgres => "postgres",
                     BackendKind::Valkey => "valkey",
-                };
-                metrics.inc_backend_unready_boot(backend_label, "E1");
-            } else {
-                return Err(ServerError::BackendNotReady {
-                    backend: match config.backend {
-                        BackendKind::Postgres => "postgres",
-                        BackendKind::Valkey => "valkey",
-                    },
-                    stage: "E1",
-                });
-            }
+                },
+                stage: "E4",
+            });
         }
 
         // RFC-017 Wave 8 Stage E1: Postgres dial branch. Stage E4 flips

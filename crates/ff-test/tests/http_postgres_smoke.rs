@@ -94,18 +94,8 @@ struct PgHttpSmoke {
 
 impl PgHttpSmoke {
     async fn setup() -> Self {
-        // CI / dev-override combo required for the §9.0 hard-gate;
-        // Stage E4 flips `BACKEND_STAGE_READY` and this override goes
-        // away.
-        // SAFETY: set_var is unsafe in Rust 2024 because env-vars are
-        // process-global and concurrent reads in other threads are
-        // racy. This test is the sole writer at boot time and the
-        // server reads the values synchronously during `start`.
-        unsafe {
-            std::env::set_var("FF_BACKEND_ACCEPT_UNREADY", "1");
-            std::env::set_var("FF_ENV", "development");
-        }
-
+        // RFC-017 Stage E4 (v0.8.0): `postgres` is in `BACKEND_STAGE_READY`
+        // and boots without the dev-override that Stages D1-E3 required.
         cleanup_postgres().await;
 
         let partition_config = PartitionConfig::default();
