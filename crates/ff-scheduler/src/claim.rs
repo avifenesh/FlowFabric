@@ -18,25 +18,7 @@ use ff_script::retry::is_retryable_kind;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Short stable digest of a worker's capability CSV. Used in per-mismatch
-/// log lines so a worker-caps-CSV up to 4KB does not get echoed on every
-/// capability_mismatch event (would swamp aggregators during an incident).
-/// The full CSV is logged once at WARN when the worker connects; operators
-/// cross-reference this 8-hex prefix to the full set.
-/// Return true iff every non-empty comma-separated token in `required_csv`
-/// is present in `worker_caps`. Mirrors the authoritative Lua subset check
-/// in scheduling.lua (parse_capability_csv + missing_capabilities) — this
-/// is a fast-path Rust short-circuit so we can skip the quota-admission
-/// write for executions we already know the worker can't claim. Empty /
-/// all-separator CSV → subset holds trivially.
-fn caps_subset(required_csv: &str, worker_caps: &BTreeSet<String>) -> bool {
-    required_csv
-        .split(',')
-        .filter(|t| !t.is_empty())
-        .all(|t| worker_caps.contains(t))
-}
-
-/// Short, stable digest of a worker's caps CSV for per-event log lines.
+/// Short stable digest of a worker's caps CSV for per-event log lines.
 /// Thin wrapper around the shared helper so call sites read as
 /// "worker_caps_digest" locally while the algorithm lives in one place.
 fn worker_caps_digest(csv: &str) -> String {
@@ -694,7 +676,7 @@ impl Scheduler {
             };
             if let Some(req) = required_caps_csv.as_deref()
                 && !req.is_empty()
-                && !caps_subset(req, worker_capabilities)
+                && !ff_core::caps::matches_csv(req, worker_capabilities)
             {
                 // Move this execution out of eligible into blocked_route
                 // so we don't hot-loop on it every tick (RFC-009 §564). A

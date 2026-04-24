@@ -5,6 +5,30 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **RFC-v0.7 Wave 1a: `ff-core::caps` extracted for backend-shared
+  capability matching.** The capability subset predicate previously lived
+  as `ff_scheduler::claim::caps_subset` (private) and was implicitly
+  duplicated by the Lua authority in `lua/scheduling.lua`. The Rust
+  predicate now lives in `ff-core::caps` so `ff-backend-valkey` and the
+  future `ff-backend-postgres` share one definition. New public surface:
+  `ff_core::caps::{matches, matches_csv, CapabilityRequirement}`.
+  `ff-scheduler` now calls `ff_core::caps::matches_csv` for the fast-path
+  short-circuit; the Lua `ff_issue_claim_grant` FCALL remains the atomic
+  authority for Valkey. **No behavior change**: `matches_csv` is the
+  line-for-line replacement of the old private helper (same case-sensitive
+  subset semantics, same empty-required-matches-any default). Token
+  validation and `CAPS_MAX_{BYTES,TOKENS}` bounds stay at the existing
+  ingress sites. Ref: RFC-v0.7 §Q7, PR #230 (Wave 0 scaffold).
+
+### Fixed
+
+- **`ff-core` unit tests compile against `BackendConnection` enum added
+  in Wave 0 (#230).** `backend_config_valkey_ctor` used an irrefutable
+  `let` pattern that broke when the `Postgres` variant landed; switched
+  to `let-else` with a descriptive panic. Pure test-only fix.
+
 ## [0.6.1] - 2026-04-24
 
 ### Fixed
