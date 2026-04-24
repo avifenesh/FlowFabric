@@ -58,6 +58,7 @@ use sqlx::PgPool;
 mod admin;
 pub mod attempt;
 pub mod budget;
+pub mod completion;
 pub mod error;
 pub mod exec_core;
 pub mod handle_codec;
@@ -66,6 +67,7 @@ pub mod migrate;
 pub mod pool;
 pub mod version;
 
+pub use completion::{PostgresCompletionStream, COMPLETION_CHANNEL};
 pub use error::{map_sqlx_error, PostgresTransportError};
 pub use listener::StreamNotifier;
 pub use migrate::{apply_migrations, MigrationError};
