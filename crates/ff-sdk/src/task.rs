@@ -49,6 +49,7 @@ pub struct SuspendedHandle {
 ///
 /// Unlike the strict wrapper, `AlreadySatisfied` hands the `ClaimedTask`
 /// back to the caller so work continues on the retained lease.
+#[allow(clippy::large_enum_variant)]
 pub enum TrySuspendOutcome {
     Suspended(SuspendedHandle),
     AlreadySatisfied {
@@ -142,6 +143,7 @@ pub use ff_core::backend::FailOutcome;
 /// double-complete bugs at the type level.
 pub struct ClaimedTask {
     /// Shared Valkey client.
+    #[allow(dead_code)]
     client: Client,
     /// `EngineBackend` the trait-migrated ops forward through.
     ///
@@ -163,6 +165,7 @@ pub struct ClaimedTask {
     /// synthesising one per op via `synth_handle`.
     backend: Arc<dyn EngineBackend>,
     /// Partition config for key construction.
+    #[allow(dead_code)]
     partition_config: PartitionConfig,
     /// Execution identity.
     execution_id: ExecutionId,

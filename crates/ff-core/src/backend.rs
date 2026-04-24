@@ -235,10 +235,11 @@ pub enum PatchKind {
 /// RFC-015 §5). Callers that need strict retention for `Durable` frames
 /// alongside best-effort telemetry must not mix modes on one stream or
 /// should place the durable frames on a sibling stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StreamMode {
     /// Current default — every frame XADDs as a durable entry.
+    #[default]
     Durable,
     /// Server-side rolling-summary collapse. Each frame's payload is a
     /// delta/patch applied atomically to a summary Hash (per
@@ -368,12 +369,6 @@ impl StreamMode {
             StreamMode::DurableSummary { .. } => "summary",
             StreamMode::BestEffortLive { .. } => "best_effort",
         }
-    }
-}
-
-impl Default for StreamMode {
-    fn default() -> Self {
-        StreamMode::Durable
     }
 }
 
