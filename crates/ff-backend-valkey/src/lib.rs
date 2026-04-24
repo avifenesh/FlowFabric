@@ -4059,6 +4059,12 @@ async fn read_summary_impl(
     let ctx = ExecKeyContext::new(&partition, execution_id);
     let summary_key = ctx.stream_summary(attempt_index);
 
+    // HGETALL decodes differently by protocol:
+    //   - RESP2 → `Value::Array` of alternating keys/values.
+    //   - RESP3 → `Value::Map` of `(key, value)` pairs.
+    // ferriskey's default on Valkey 7.2 negotiates RESP3, so we must
+    // accept both shapes (v0.6.0 regression: Array-only match always
+    // returned `Ok(None)` on RESP3).
     let raw: ferriskey::Value = client
         .cmd("HGETALL")
         .arg(&summary_key)
@@ -4066,29 +4072,35 @@ async fn read_summary_impl(
         .await
         .map_err(transport_fk)?;
 
-    // HGETALL returns a flat array of alternating keys/values. Empty ⇒ no
-    // summary (RFC-015 §6.3 returns `Ok(None)`).
-    let entries: Vec<String> = match raw {
-        ferriskey::Value::Array(arr) => arr
-            .into_iter()
-            .filter_map(|v| match v {
-                Ok(ferriskey::Value::BulkString(b)) => {
-                    Some(String::from_utf8_lossy(&b).into_owned())
-                }
-                Ok(ferriskey::Value::SimpleString(s)) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    if entries.is_empty() {
-        return Ok(None);
+    fn value_to_string(v: ferriskey::Value) -> Option<String> {
+        match v {
+            ferriskey::Value::BulkString(b) => {
+                Some(String::from_utf8_lossy(&b).into_owned())
+            }
+            ferriskey::Value::SimpleString(s) => Some(s),
+            _ => None,
+        }
     }
 
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut it = entries.into_iter();
-    while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        map.insert(k, v);
+    match raw {
+        ferriskey::Value::Array(arr) => {
+            let mut it = arr.into_iter().filter_map(|r| r.ok().and_then(value_to_string));
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                map.insert(k, v);
+            }
+        }
+        ferriskey::Value::Map(pairs) => {
+            for (k, v) in pairs {
+                if let (Some(k), Some(v)) = (value_to_string(k), value_to_string(v)) {
+                    map.insert(k, v);
+                }
+            }
+        }
+        _ => {}
+    }
+    if map.is_empty() {
+        return Ok(None);
     }
     let document_json = map
         .remove("document")

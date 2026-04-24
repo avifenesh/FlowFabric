@@ -5,6 +5,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-04-24
+
+### Fixed
+
+- **RFC-015 `read_summary` RESP3 `Value::Map` decode (release-blocker
+  regression from v0.6.0).** `ff-backend-valkey::read_summary_impl`
+  matched only `Value::Array` for the `HGETALL` reply. ferriskey's
+  default client on Valkey 7.2 negotiates RESP3, where `HGETALL`
+  returns `Value::Map`, so every call to `EngineBackend::read_summary`
+  returned `Ok(None)` regardless of whether a summary existed — breaking
+  RFC-015 DurableSummary reads end-to-end. Writes and `summary_version`
+  increments were unaffected. The decoder now accepts both
+  `Value::Array` (RESP2) and `Value::Map` (RESP3) and normalizes into
+  the same `HashMap<String, String>` before parsing into
+  `SummaryDocument`. Caught by the v0.6.0 published-artifact smoke
+  (PR #224). No wire-format, trait, or Lua changes.
+
 ## [0.6.0] - 2026-04-23
 
 ### Changed
