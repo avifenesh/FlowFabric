@@ -384,18 +384,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   unaffected by blocking reads. Regression test:
   `crates/ff-test/tests/issue_204_tail_stream_no_hol.rs`.
 
-- **`list_lanes` now reflects configured and dynamically-created lanes
-  (#203).** `EngineBackend::list_lanes` reads `SMEMBERS ff:idx:lanes`,
-  but before this fix no code path wrote to that SET — a
-  freshly-provisioned deployment returned an empty page even after
-  executions had been submitted. Fix writes the registry from two
-  sides: (1) `Server::start` SADDs every `ServerConfig.lanes` entry at
-  boot (covers the pre-declared set); (2) the Lua
-  `ff_create_execution` function SADDs the lane on every create
-  (covers post-boot / dynamic lanes). SADD is idempotent, so repeated
-  writes are free. Lua library version bumped 15 → 16, forcing
-  `FUNCTION LOAD REPLACE` on upgrade. `ff:idx:lanes` remains a single
-  non-hash-tagged global SET — cross-partition by design.
+- **`list_lanes` populated from `ServerConfig.lanes` at boot (#203).**
+  `EngineBackend::list_lanes` reads `SMEMBERS ff:idx:lanes`. Before
+  this fix no code path wrote to that SET. `Server::start` now SADDs
+  every `ServerConfig.lanes` entry at boot. `ff:idx:lanes` is a
+  non-hash-tagged global SET, so dynamic lane registration via the
+  partition-locked `ff_create_execution` Lua path was attempted in
+  PR #207 but reverted — FCALL can only touch declared KEYS, and a
+  cross-partition SET violates the cluster single-slot invariant.
+  Consumers needing dynamic lanes must extend `ServerConfig.lanes`
+  before boot. A future RFC may introduce per-partition lane
+  registries if cluster-safe dynamic registration becomes a
+  requirement.
 
 - **HTTP-routed claim now re-claims resumed executions (#150, Bug B).**
   `FlowFabricWorker::claim_from_grant` (the entry used by
