@@ -3,6 +3,42 @@ use ff_core::types::LaneId;
 use ff_engine::EngineConfig;
 use std::time::Duration;
 
+/// RFC-017 Stage A: backend family selector. Default `Valkey`; the
+/// `Postgres` variant is hard-gated at boot during Stages A-D per
+/// RFC-017 §9.0 (`BACKEND_STAGE_READY`). The gate lifts in Stage E
+/// alongside v0.8.0.
+///
+/// Stage A adds the selector only so `Server::start` can refuse
+/// unready backends cleanly; no `FF_BACKEND` env var is wired yet
+/// (Stage D lands the env plumbing + the `BackendConfig` sum type
+/// per RFC §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendKind {
+    /// Valkey / FCALL backend (production path through v0.7.x).
+    Valkey,
+    /// Postgres backend. **Refuses to boot** until Stage E — see
+    /// [`crate::server::ServerError::BackendNotReady`].
+    Postgres,
+}
+
+impl BackendKind {
+    /// Stable `&'static str` label matching the backend's
+    /// `backend_label()` for metrics dimensioning.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Valkey => "valkey",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+impl Default for BackendKind {
+    fn default() -> Self {
+        Self::Valkey
+    }
+}
+
 /// Server configuration, loaded from environment variables.
 pub struct ServerConfig {
     /// Valkey host. Default: `"localhost"`.
@@ -53,6 +89,10 @@ pub struct ServerConfig {
     /// `FF_MAX_CONCURRENT_TAIL` (accepted during the R4 rename; both
     /// valid for at least one release).
     pub max_concurrent_stream_ops: u32,
+    /// RFC-017 Stage A: which backend family to boot. Default
+    /// [`BackendKind::Valkey`]. `BackendKind::Postgres` is rejected
+    /// at startup through Stage D per RFC-017 §9.0.
+    pub backend: BackendKind,
 }
 
 impl ServerConfig {
@@ -275,6 +315,7 @@ impl ServerConfig {
             waitpoint_hmac_secret,
             waitpoint_hmac_grace_ms,
             max_concurrent_stream_ops,
+            backend: BackendKind::default(),
         })
     }
 }
@@ -308,6 +349,7 @@ impl Default for ServerConfig {
                     .to_owned(),
             waitpoint_hmac_grace_ms: 86_400_000,
             max_concurrent_stream_ops: 64,
+            backend: BackendKind::default(),
         }
     }
 }

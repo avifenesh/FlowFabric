@@ -76,6 +76,7 @@ fn server_config_with_lanes(lanes: Vec<LaneId>) -> ff_server::config::ServerConf
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         waitpoint_hmac_grace_ms: 86_400_000,
         max_concurrent_stream_ops: 64,
+        backend: ff_server::config::BackendKind::default(),
     }
 }
 
