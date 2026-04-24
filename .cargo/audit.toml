@@ -13,4 +13,13 @@ ignore = [
     # (no custom logger), so the trigger condition does not apply.
     # Remove when opentelemetry-otlp upgrades to tonic ≥0.13.
     "RUSTSEC-2026-0097",
+    # RUSTSEC-2023-0071 — `rsa` 0.9 Marvin-attack timing sidechannel on
+    # RSA private-key operations. Reached transitively through
+    # sqlx-macros-core → sqlx-mysql (sqlx 0.8 compiles all DB drivers
+    # into sqlx-macros unconditionally, even though we only activate
+    # the `postgres` feature on our sqlx dep). FlowFabric never
+    # instantiates a MySQL connection, never performs RSA operations,
+    # and never exposes RSA key material. No exploit path. Remove
+    # when sqlx-macros-core 0.9+ drops unused driver compilation.
+    "RUSTSEC-2023-0071",
 ]
