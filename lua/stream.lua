@@ -84,14 +84,16 @@ end
 -- validation (HMGET, not HGETALL) for minimal overhead. Class B operation.
 --
 -- KEYS (4): exec_core, stream_data, stream_meta, stream_summary
--- ARGV (16): execution_id, attempt_index, lease_id, lease_epoch,
+-- ARGV (19): execution_id, attempt_index, lease_id, lease_epoch,
 --            frame_type, ts, payload, encoding, correlation_id,
 --            source, retention_maxlen, attempt_id, max_payload_bytes,
---            stream_mode, patch_kind, ttl_ms
+--            stream_mode, patch_kind, ttl_ms,
+--            maxlen_floor, maxlen_ceiling, ema_alpha
 --
 -- `stream_mode` (ARGV 14, RFC-015): "" / "durable" → StreamMode::Durable
 -- (default). "summary" → DurableSummary (requires `patch_kind` ARGV 15).
--- "best_effort" → BestEffortLive (uses `ttl_ms` ARGV 16 for PEXPIRE).
+-- "best_effort" → BestEffortLive (uses `ttl_ms` ARGV 16 for PEXPIRE and
+-- ARGV 17-19 for dynamic MAXLEN sizing per RFC-015 §4.2).
 ---------------------------------------------------------------------------
 redis.register_function('ff_append_frame', function(keys, args)
   local K = {
@@ -118,7 +120,20 @@ redis.register_function('ff_append_frame', function(keys, args)
     stream_mode      = args[14] or "",  -- RFC-015
     patch_kind       = args[15] or "",  -- RFC-015
     ttl_ms           = tonumber(args[16] or "0"),
+    -- RFC-015 §4.2 dynamic MAXLEN knobs. Zero / missing → fall back to
+    -- the RFC-final defaults.
+    maxlen_floor     = tonumber(args[17] or "0"),
+    maxlen_ceiling   = tonumber(args[18] or "0"),
+    ema_alpha        = tonumber(args[19] or "0"),
   }
+  if A.maxlen_floor   == nil or A.maxlen_floor   <= 0 then A.maxlen_floor   = 64    end
+  if A.maxlen_ceiling == nil or A.maxlen_ceiling <= 0 then A.maxlen_ceiling = 16384 end
+  if A.ema_alpha      == nil or A.ema_alpha      <= 0 or A.ema_alpha > 1.0 then
+    A.ema_alpha = 0.2
+  end
+  if A.maxlen_ceiling < A.maxlen_floor then
+    A.maxlen_ceiling = A.maxlen_floor
+  end
 
   -- Normalise empty / unknown mode to "durable" for pre-RFC-015 parity.
   if A.stream_mode == "" then A.stream_mode = "durable" end
@@ -296,11 +311,45 @@ redis.register_function('ff_append_frame', function(keys, args)
   if A.stream_mode == "summary" then
     redis.call("XTRIM", K.stream_key, "MAXLEN", "~", 64)
   elseif A.stream_mode == "best_effort" then
-    -- Round-2 default: MAXLEN = 64 (RFC-015 §4.1). EMA-driven sizing
-    -- (§4.2) is benchmark-gated for v0.6 — the conservative static
-    -- default ships until the α value is selected from production
-    -- measurement.
-    redis.call("XTRIM", K.stream_key, "MAXLEN", "~", 64)
+    -- RFC-015 §4.2: dynamic MAXLEN sizing from an EMA of append rate.
+    --
+    --   K = clamp(ceil(ema_rate_hz * ttl_ms / 1000) * 2, floor, ceiling)
+    --
+    -- EMA state persists on the per-attempt stream_meta Hash so the
+    -- estimator survives across Lua invocations. `ema_rate_hz` is Hz;
+    -- `last_append_ts_ms` is the wall-clock of the prior XADD.
+    local meta = redis.call("HMGET", K.stream_meta,
+      "ema_rate_hz", "last_append_ts_ms")
+    local prev_rate_hz = tonumber(meta[1] or "")
+    local prev_ts_ms   = tonumber(meta[2] or "")
+
+    local rate_hz
+    if prev_rate_hz == nil or prev_ts_ms == nil then
+      -- First best-effort append: seed rate so the initial K == floor.
+      -- floor = ceil(seed * ttl_s * 2) → seed = floor / (ttl_s * 2).
+      -- Guard against ttl_ms == 0 to avoid /0.
+      local ttl_s = math.max(A.ttl_ms, 1) / 1000.0
+      rate_hz = A.maxlen_floor / (ttl_s * 2.0)
+    else
+      local dt_ms = now_ms - prev_ts_ms
+      if dt_ms <= 0 then dt_ms = 1 end
+      local inst_hz = 1000.0 / dt_ms
+      rate_hz = A.ema_alpha * inst_hz + (1.0 - A.ema_alpha) * prev_rate_hz
+    end
+
+    local ttl_s_for_k = math.max(A.ttl_ms, 1) / 1000.0
+    local raw_k = math.ceil(rate_hz * ttl_s_for_k * 2.0)
+    if raw_k < A.maxlen_floor   then raw_k = A.maxlen_floor   end
+    if raw_k > A.maxlen_ceiling then raw_k = A.maxlen_ceiling end
+    local target_maxlen = raw_k
+
+    redis.call("XTRIM", K.stream_key, "MAXLEN", "~", target_maxlen)
+
+    redis.call("HSET", K.stream_meta,
+      "ema_rate_hz",         tostring(rate_hz),
+      "last_append_ts_ms",   tostring(now_ms),
+      "maxlen_applied_last", tostring(target_maxlen))
+
     -- PEXPIRE gate: only set a TTL if the stream has NEVER received a
     -- durable frame. Durable content must not be destroyed by a
     -- best-effort TTL refresh.

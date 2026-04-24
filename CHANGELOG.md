@@ -7,6 +7,29 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **RFC-015 §4.2: dynamic MAXLEN sizing for `BestEffortLive`.** The
+  shipped `BestEffortLive` mode trimmed every append at a static
+  `MAXLEN ~ 64` (RFC §4.1 round-2 default). Phase 0 measurement showed
+  this retained ~1.3 s of history on a bursty LLM-token workload — only
+  0.6 % of frames visible inside a 30 s TTL. This change implements the
+  RFC §4.2 EMA path: each best-effort `XADD` now derives `K` from
+  `ceil(ema_rate_hz * ttl_ms / 1000) * 2` clamped to `[floor, ceiling]`
+  with the EMA computed in Lua and persisted on the per-attempt
+  `stream_meta` Hash (`ema_rate_hz`, `last_append_ts_ms`,
+  `maxlen_applied_last`). Defaults: **α = 0.2**, **floor = 64**,
+  **ceiling = 16_384** (raised from the RFC draft's 2048 — all α
+  variants saturated the lower clamp on the target workload). New
+  `BestEffortLiveConfig` on `ff_core::backend` exposes all four knobs
+  with builder-style setters; `StreamMode::best_effort_live(ttl_ms)`
+  still uses defaults for the common case, and new
+  `StreamMode::best_effort_live_with_config(cfg)` is available for
+  tuning. Wire-level: `ff_append_frame` ARGV extended from 16 to 19
+  (backwards-compatible — Lua defaults missing ARGV to the RFC-final
+  values). Closes RFC-015 §4.3. Lua bundle version bumped 24 → 25.
+  Re-validated via `benches/harness/src/bin/ema_alpha_bench.rs`:
+  visibility at α=0.2 under the same Phase 0 workload climbs from
+  0.6 % (static-64) to 98.3 %.
+
 - **RFC-016 Stage E: full integration test matrix + cluster co-location.**
   Test-only PR (no Lua, no impl code, no wire-format changes). Adds
   `crates/ff-test/tests/flow_edge_policies_stage_e.rs` (11 new tests;

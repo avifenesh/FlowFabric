@@ -119,6 +119,9 @@ impl AttemptFixture {
             stream_mode.to_owned(),
             patch_kind.to_owned(),
             ttl_ms.to_string(),
+            "0".to_owned(), // maxlen_floor   → Lua falls back to 64
+            "0".to_owned(), // maxlen_ceiling → Lua falls back to 16_384
+            "0".to_owned(), // ema_alpha      → Lua falls back to 0.2
         ];
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
