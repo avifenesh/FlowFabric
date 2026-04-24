@@ -61,16 +61,18 @@ use crate::contracts::{
 use crate::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
     ApplyDependencyToChildResult, BudgetStatus, CancelExecutionArgs, CancelExecutionResult,
-    ChangePriorityArgs, ChangePriorityResult, ClaimForWorkerArgs, ClaimForWorkerOutcome,
-    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CreateBudgetArgs, CreateBudgetResult,
-    CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
-    CreateQuotaPolicyArgs, CreateQuotaPolicyResult, DeliverSignalArgs, DeliverSignalResult,
-    EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage,
-    ListPendingWaitpointsArgs, ListPendingWaitpointsResult, ListSuspendedPage,
-    ReplayExecutionArgs, ReplayExecutionResult, ReportUsageAdminArgs, ResetBudgetArgs,
-    ResetBudgetResult, RevokeLeaseArgs, RevokeLeaseResult, StageDependencyEdgeArgs,
-    StageDependencyEdgeResult,
+    CancelFlowArgs, ChangePriorityArgs, ChangePriorityResult, ClaimForWorkerArgs,
+    ClaimForWorkerOutcome, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
+    CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
+    CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
+    DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionInfo,
+    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
+    ListPendingWaitpointsResult, ListSuspendedPage, ReplayExecutionArgs, ReplayExecutionResult,
+    ReportUsageAdminArgs, ResetBudgetArgs, ResetBudgetResult, RevokeLeaseArgs, RevokeLeaseResult,
+    StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
+#[cfg(feature = "core")]
+use crate::state::PublicState;
 #[cfg(feature = "core")]
 use crate::partition::PartitionKey;
 #[cfg(feature = "streaming")]
@@ -80,7 +82,7 @@ use crate::engine_error::EngineError;
 use crate::types::AttemptIndex;
 #[cfg(feature = "core")]
 use crate::types::EdgeId;
-use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
+use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs, WaitpointId};
 
 /// The engine write surface — a single trait a backend implementation
 /// honours to serve a `FlowFabricWorker`.
@@ -906,6 +908,104 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// override with a real body.
     async fn shutdown_prepare(&self, _grace: Duration) -> Result<(), EngineError> {
         Ok(())
+    }
+
+    // ── RFC-017 Stage E2 — `Server::client` removal (header + reads) ───
+
+    /// RFC-017 Stage E2: the "header" portion of `cancel_flow` — run the
+    /// atomic flow-state flip (Valkey: `ff_cancel_flow` FCALL; Postgres:
+    /// `cancel_flow_once` tx), decode policy + membership, and surface
+    /// the `flow_already_terminal` idempotency branch as a first-class
+    /// [`CancelFlowHeader::AlreadyTerminal`] so the Server can build
+    /// the wire [`CancelFlowResult`] without reaching for a raw
+    /// `Client`. Separate from the existing
+    /// [`EngineBackend::cancel_flow`] entry point (which takes the
+    /// enum-typed `(policy, wait)` split and returns the wait-collapsed
+    /// `CancelFlowResult`) because the Server owns its own
+    /// wait-dispatch + member-cancel machinery via
+    /// [`EngineBackend::cancel_execution`] + backlog ack.
+    ///
+    /// Default impl returns [`EngineError::Unavailable`] so un-migrated
+    /// backends surface the miss loudly.
+    #[cfg(feature = "core")]
+    async fn cancel_flow_header(
+        &self,
+        _args: CancelFlowArgs,
+    ) -> Result<crate::contracts::CancelFlowHeader, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "cancel_flow_header",
+        })
+    }
+
+    /// RFC-017 Stage E2: best-effort acknowledgement that one member of
+    /// a `cancel_all` flow has completed its per-member cancel. Drains
+    /// the member from the flow's `pending_cancels` set and, if empty,
+    /// removes the flow from the partition-level `cancel_backlog`
+    /// (Valkey: `ff_ack_cancel_member` FCALL; Postgres: table write —
+    /// default `Unavailable` until Wave 9).
+    ///
+    /// Failures are swallowed by the caller — the cancel-backlog
+    /// reconciler is the authoritative drain — but a typed error here
+    /// lets the caller log a backend-scoped context string.
+    #[cfg(feature = "core")]
+    async fn ack_cancel_member(
+        &self,
+        _flow_id: &FlowId,
+        _execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "ack_cancel_member",
+        })
+    }
+
+    /// RFC-017 Stage E2: full-shape execution read used by the
+    /// `GET /v1/executions/{id}` HTTP route. Returns the legacy
+    /// [`ExecutionInfo`] wire shape (not the decoupled
+    /// [`ExecutionSnapshot`]) so the existing HTTP response bytes stay
+    /// identical across the migration.
+    ///
+    /// `Ok(None)` ⇒ no such execution. Default `Unavailable` because
+    /// the Valkey HGETALL-and-parse is backend-specific.
+    #[cfg(feature = "core")]
+    async fn read_execution_info(
+        &self,
+        _id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_execution_info",
+        })
+    }
+
+    /// RFC-017 Stage E2: narrow `public_state` read used by the
+    /// `GET /v1/executions/{id}/state` HTTP route. Returns `Ok(None)`
+    /// when the execution is missing. Default `Unavailable`.
+    #[cfg(feature = "core")]
+    async fn read_execution_state(
+        &self,
+        _id: &ExecutionId,
+    ) -> Result<Option<PublicState>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_execution_state",
+        })
+    }
+
+    /// RFC-017 Stage D1 / E2: fetch the raw `<kid>:<hex>` waitpoint
+    /// token so the v0.7.x wire-format shim in
+    /// `api::list_pending_waitpoints` can re-inject the legacy
+    /// `waitpoint_token` field during the one-release deprecation
+    /// window. Returns `Ok(None)` when the field is absent/empty.
+    /// Valkey-only; Postgres default is `Unavailable`. At v0.8.0 the
+    /// legacy wire field is removed and both this method + caller
+    /// shim go with it.
+    #[cfg(feature = "core")]
+    async fn fetch_waitpoint_token_v07(
+        &self,
+        _execution_id: &ExecutionId,
+        _waitpoint_id: &WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "fetch_waitpoint_token_v07",
+        })
     }
 }
 
