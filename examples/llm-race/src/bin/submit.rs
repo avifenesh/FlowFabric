@@ -218,8 +218,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 7. REST: stage + apply one edge per provider → aggregator ──
     // stage_dependency_edge returns the new graph revision; we pass
     // that to apply_dependency_to_child which hangs the dep off the
-    // downstream child counter.
-    let mut graph_rev = 0u64;
+    // downstream child counter. The initial expected revision must
+    // match the current flow_core state (bumped on every add-member),
+    // so fetch it via the SDK before the first stage.
+    let snap = sdk
+        .describe_flow(&flow_id)
+        .await?
+        .ok_or("describe_flow returned None right after create_flow")?;
+    let mut graph_rev = snap.graph_revision;
     for upstream_eid in &provider_eids {
         let edge_id = EdgeId::new();
         let stage_res = http_post_json(
