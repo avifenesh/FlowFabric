@@ -12,6 +12,7 @@ members = [
     "crates/ff-server",
     "crates/ff-readiness-tests",
     "crates/ff-backend-valkey",
+    "crates/ff-backend-postgres",
     "crates/ff-observability",
     "crates/ff-observability-http",
 ]
@@ -42,6 +43,7 @@ ff-sdk = { version = "0.6.1", path = "crates/ff-sdk" }
 ff-server = { version = "0.6.1", path = "crates/ff-server" }
 ff-test = { path = "crates/ff-test" }
 ff-backend-valkey = { version = "0.6.1", path = "crates/ff-backend-valkey" }
+ff-backend-postgres = { version = "0.6.1", path = "crates/ff-backend-postgres" }
 ff-observability = { version = "0.6.1", path = "crates/ff-observability" }
 ff-observability-http = { version = "0.6.1", path = "crates/ff-observability-http" }
 ferriskey = { version = "0.6.1", path = "ferriskey" }
@@ -62,3 +64,7 @@ futures = "0.3"
 # (issue #90). Pulled in instead of the full `futures` crate to keep
 # ff-core's dep surface narrow — ff-core is the schema crate.
 futures-core = "0.3"
+# RFC-v0.7 Wave 0 — Postgres backend transport. Pinned at workspace
+# root so any future consumer (ff-server, migration CLI) picks up
+# the same version/features.
+sqlx = { version = "0.8", default-features = false }

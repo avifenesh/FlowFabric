@@ -6,7 +6,7 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Ten crates, all pinned to the same version, published in topological order:
+Eleven crates, all pinned to the same version, published in topological order:
 
 1. `ferriskey`       — Valkey client (reparented fork of glide-core;
    the former `telemetrylib` sub-crate was inlined during the Tier 1
@@ -28,15 +28,21 @@ Ten crates, all pinned to the same version, published in topological order:
    set in v0.3.2 after v0.3.1 partial-published (ff-sdk depends on
    it as a workspace dep and its publish step fails without it
    being on crates.io).
-7. `ff-engine`       — cross-partition dispatch + scanners
+7. `ff-backend-postgres` — RFC-v0.7 EngineBackend trait Postgres
+   impl. Wave 0 scaffold ships the crate as an `Unavailable`-stub
+   implementation so `sqlx`/migrations infrastructure is in place
+   before Wave 1+ fills in method bodies. Published alongside the
+   Valkey backend so dual-backend ff-server builds resolve against
+   crates.io.
+8. `ff-engine`       — cross-partition dispatch + scanners
    (includes the `completion_listener` module for push-based DAG
    promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
    §"DAG promotion: push listener + safety-net reconciler")
-8. `ff-scheduler`    — claim-grant scheduler
-9. `ff-sdk`          — worker SDK. `direct-valkey-claim` feature is
-   off by default; production deployments use the scheduler-routed
-   HTTP path via `FlowFabricWorker::claim_via_server`
-10. `ff-server`      — HTTP server library + binary
+9. `ff-scheduler`    — claim-grant scheduler
+10. `ff-sdk`         — worker SDK. `direct-valkey-claim` feature is
+    off by default; production deployments use the scheduler-routed
+    HTTP path via `FlowFabricWorker::claim_via_server`
+11. `ff-server`      — HTTP server library + binary
 
 Excluded from publish:
 

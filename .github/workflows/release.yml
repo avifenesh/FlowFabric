@@ -13,10 +13,11 @@
 #     `publish-new` + `publish-update`.
 #   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
 #
-# Publish set (10 crates, topologically ordered):
+# Publish set (11 crates, topologically ordered):
 #   ferriskey -> ff-core -> ff-script -> ff-observability
 #     -> ff-observability-http
-#     -> ff-backend-valkey -> ff-engine -> ff-scheduler
+#     -> ff-backend-valkey -> ff-backend-postgres
+#     -> ff-engine -> ff-scheduler
 #     -> ff-sdk -> ff-server
 # ff-test is dev-only (publish = false) and not in the set.
 # The former telemetrylib sub-crate was inlined into ferriskey
@@ -224,6 +225,22 @@ jobs:
             exit 1
           }
       - run: sleep 30
+      - name: publish ff-backend-postgres
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${TAG_VERSION#v}"
+          cargo publish -p ff-backend-postgres --no-verify || {
+            echo "::error::cargo publish ff-backend-postgres failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
+            exit 1
+          }
+      - run: sleep 30
       - name: publish ff-engine
         env:
           TAG_VERSION: ${{ github.ref_name }}
@@ -237,6 +254,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
+            echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             exit 1
           }
       - run: sleep 30
@@ -253,6 +271,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
+            echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             exit 1
           }
@@ -270,6 +289,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
+            echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             exit 1
@@ -288,6 +308,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
+            echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-sdk"
