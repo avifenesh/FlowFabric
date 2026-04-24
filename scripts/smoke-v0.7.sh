@@ -113,6 +113,23 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "${BACKEND}" == "valkey" || "${BACKEND}" == "both" ]]; then
+    # Pre-build ff-server with a long-lived cargo invocation so the
+    # subsequent background launch only has to start the binary, not
+    # compile it. v0.8.0 tag run (run 24909817974) failed because the
+    # 30s /healthz window was consumed by a cold --release compile on
+    # an uncached smoke-job runner. Compile here (no time limit),
+    # then launch the pre-built binary below.
+    echo "==> smoke-v0.7: pre-building ff-server (release)"
+    cargo build -p ff-server --release --quiet
+    # Resolve target dir without requiring python: cargo locate-project
+    # gives workspace root; CARGO_TARGET_DIR env overrides if set.
+    CARGO_TARGET_DIR_RESOLVED="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+    FF_SERVER_BIN="${CARGO_TARGET_DIR_RESOLVED}/release/ff-server"
+    if [[ ! -x "${FF_SERVER_BIN}" ]]; then
+        echo "FAIL: ff-server binary not found at ${FF_SERVER_BIN} after build" >&2
+        exit 3
+    fi
+
     echo "==> smoke-v0.7: launching ff-server (backgrounded)"
     FF_HMAC_SECRET_FALLBACK="$(openssl rand -hex 32 2>/dev/null || date +%s%N)"
     FF_WAITPOINT_HMAC_SECRET="${FF_WAITPOINT_HMAC_SECRET:-${FF_HMAC_SECRET_FALLBACK}}" \
@@ -120,7 +137,7 @@ if [[ "${BACKEND}" == "valkey" || "${BACKEND}" == "both" ]]; then
     FF_PORT="${VALKEY_PORT}" \
     FF_LANES="${FF_LANES:-default}" \
     FF_PORT_HTTP="9090" \
-        cargo run -p ff-server --release --quiet \
+        "${FF_SERVER_BIN}" \
         >/tmp/ff-smoke-server.log 2>&1 &
     SERVER_PID=$!
 
