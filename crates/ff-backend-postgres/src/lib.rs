@@ -56,6 +56,7 @@ use sqlx::PgPool;
 
 #[cfg(feature = "core")]
 mod admin;
+pub mod attempt;
 pub mod budget;
 pub mod error;
 pub mod handle_codec;
@@ -147,26 +148,26 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.claim", skip_all)]
     async fn claim(
         &self,
-        _lane: &LaneId,
-        _capabilities: &CapabilitySet,
-        _policy: ClaimPolicy,
+        lane: &LaneId,
+        capabilities: &CapabilitySet,
+        policy: ClaimPolicy,
     ) -> Result<Option<Handle>, EngineError> {
-        unavailable("pg.claim")
+        attempt::claim(&self.pool, lane, capabilities, &policy).await
     }
 
     #[tracing::instrument(name = "pg.renew", skip_all)]
-    async fn renew(&self, _handle: &Handle) -> Result<LeaseRenewal, EngineError> {
-        unavailable("pg.renew")
+    async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+        attempt::renew(&self.pool, handle).await
     }
 
     #[tracing::instrument(name = "pg.progress", skip_all)]
     async fn progress(
         &self,
-        _handle: &Handle,
-        _percent: Option<u8>,
-        _message: Option<String>,
+        handle: &Handle,
+        percent: Option<u8>,
+        message: Option<String>,
     ) -> Result<(), EngineError> {
-        unavailable("pg.progress")
+        attempt::progress(&self.pool, handle, percent, message).await
     }
 
     #[tracing::instrument(name = "pg.append_frame", skip_all)]
@@ -181,20 +182,20 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.complete", skip_all)]
     async fn complete(
         &self,
-        _handle: &Handle,
-        _payload: Option<Vec<u8>>,
+        handle: &Handle,
+        payload: Option<Vec<u8>>,
     ) -> Result<(), EngineError> {
-        unavailable("pg.complete")
+        attempt::complete(&self.pool, handle, payload).await
     }
 
     #[tracing::instrument(name = "pg.fail", skip_all)]
     async fn fail(
         &self,
-        _handle: &Handle,
-        _reason: FailureReason,
-        _classification: FailureClass,
+        handle: &Handle,
+        reason: FailureReason,
+        classification: FailureClass,
     ) -> Result<FailOutcome, EngineError> {
-        unavailable("pg.fail")
+        attempt::fail(&self.pool, handle, reason, classification).await
     }
 
     #[tracing::instrument(name = "pg.cancel", skip_all)]
@@ -232,23 +233,23 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.claim_from_reclaim", skip_all)]
     async fn claim_from_reclaim(
         &self,
-        _token: ReclaimToken,
+        token: ReclaimToken,
     ) -> Result<Option<Handle>, EngineError> {
-        unavailable("pg.claim_from_reclaim")
+        attempt::claim_from_reclaim(&self.pool, token).await
     }
 
     #[tracing::instrument(name = "pg.delay", skip_all)]
     async fn delay(
         &self,
-        _handle: &Handle,
-        _delay_until: TimestampMs,
+        handle: &Handle,
+        delay_until: TimestampMs,
     ) -> Result<(), EngineError> {
-        unavailable("pg.delay")
+        attempt::delay(&self.pool, handle, delay_until).await
     }
 
     #[tracing::instrument(name = "pg.wait_children", skip_all)]
-    async fn wait_children(&self, _handle: &Handle) -> Result<(), EngineError> {
-        unavailable("pg.wait_children")
+    async fn wait_children(&self, handle: &Handle) -> Result<(), EngineError> {
+        attempt::wait_children(&self.pool, handle).await
     }
 
     // ── Read / admin ──
