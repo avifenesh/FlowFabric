@@ -5,6 +5,8 @@ use std::time::Duration;
 use ferriskey::{Client, ClientBuilder, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
+use ff_core::engine_backend::EngineBackend;
+use ff_core::engine_error::EngineError;
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, BudgetStatus, CancelExecutionArgs,
     CancelExecutionResult, CancelFlowArgs, CancelFlowResult, ChangePriorityResult,
@@ -31,7 +33,13 @@ use ff_core::types::*;
 use ff_engine::Engine;
 use ff_script::retry::is_retryable_kind;
 
-use crate::config::ServerConfig;
+use crate::config::{BackendKind, ServerConfig};
+
+/// RFC-017 §9.0: backends that may boot as of this Stage. Postgres
+/// joins at Stage E (v0.8.0). Compiled into the binary by design —
+/// see RFC-017 §9.0 "Fleet-wide cutover requirement" for the
+/// rolling-upgrade implication.
+const BACKEND_STAGE_READY: &[&str] = &["valkey"];
 
 /// Upper bound on `member_execution_ids` returned in the
 /// [`CancelFlowResult::Cancelled`] response when the flow was already in a
@@ -209,6 +217,13 @@ pub struct Server {
     /// [`ff_scheduler::Scheduler::with_metrics`] so a single scrape
     /// sees everything the process produces.
     metrics: Arc<ff_observability::Metrics>,
+    /// RFC-017 Stage A: backend trait object for the data-plane
+    /// migration. Dual-field posture — the existing `client` /
+    /// `tail_client` / `engine` / `scheduler` fields still serve the
+    /// unmigrated handlers during Stages A-D; migrated handlers
+    /// dispatch here. Stages B-D progressively retire the Client
+    /// fields per RFC-017 §9.
+    backend: Arc<dyn EngineBackend>,
 }
 
 /// Server error type.
@@ -265,6 +280,35 @@ pub enum ServerError {
         detected: String,
         required: String,
     },
+    /// RFC-017 §9.0 hard-gate: selected backend is not yet permitted
+    /// to boot in this `ff-server` binary. Operator action is to
+    /// either (a) select `FF_BACKEND=valkey`, or (b) upgrade to a
+    /// Stage E binary once v0.8.0 ships.
+    ///
+    /// `stage` names the current stage ("A"/"B"/"C"/"D") so operator
+    /// tooling can correlate the refusal with the migration plan.
+    #[error(
+        "backend not ready: {backend} (staged for Stage E; current binary at Stage {stage}). \
+         Set FF_BACKEND=valkey, or set both FF_BACKEND_ACCEPT_UNREADY=1 and FF_ENV=development to \
+         override in dev."
+    )]
+    BackendNotReady {
+        backend: &'static str,
+        stage: &'static str,
+    },
+    /// RFC-017 Stage A: an `EngineBackend` trait method returned a
+    /// typed error that is not one of the specific business outcomes
+    /// existing `ServerError` variants model. Includes transport
+    /// faults, validation/corruption, and `Unavailable` for methods
+    /// the backend has not implemented yet.
+    ///
+    /// Stage B/C migrations may refine individual arms into richer
+    /// `ServerError` variants as more handlers route through the
+    /// trait; Stage A keeps this catch-all so the migration lands
+    /// additively. Boxed to keep `ServerError` small (clippy
+    /// `result_large_err` — `EngineError` is ~200 bytes).
+    #[error("engine: {0}")]
+    Engine(#[from] Box<ff_core::engine_error::EngineError>),
 }
 
 /// Lift a native `ferriskey::Error` into [`ServerError::Backend`] via
@@ -274,6 +318,16 @@ pub enum ServerError {
 impl From<ferriskey::Error> for ServerError {
     fn from(err: ferriskey::Error) -> Self {
         Self::Backend(ff_backend_valkey::backend_error_from_ferriskey(&err))
+    }
+}
+
+/// Lift an unboxed `EngineError` into [`ServerError::Engine`]. The
+/// variant stores a `Box<EngineError>` to keep `ServerError` small
+/// (clippy `result_large_err`); this `From` restores `?`-propagation
+/// from trait-dispatched handler paths.
+impl From<ff_core::engine_error::EngineError> for ServerError {
+    fn from(err: ff_core::engine_error::EngineError) -> Self {
+        Self::Engine(Box::new(err))
     }
 }
 
@@ -303,6 +357,12 @@ impl ServerError {
             Self::LibraryLoad(e) => e
                 .valkey_kind()
                 .map(ff_backend_valkey::classify_ferriskey_kind),
+            // RFC-017 Stage A: Engine(EngineError) arm is intentionally
+            // lumped in with the rest (no backend_kind — variants like
+            // Validation / NotFound are business-logic, and Transport
+            // variants already surface under Backend upstream in most
+            // paths). Stage B/C will revisit when more handlers route
+            // through the trait.
             _ => None,
         }
     }
@@ -334,6 +394,15 @@ impl ServerError {
             Self::ConcurrencyLimitExceeded(_, _) => true,
             // Operator must upgrade Valkey; a retry at the caller won't help.
             Self::ValkeyVersionTooLow { .. } => false,
+            // Operator must change FF_BACKEND; not retryable.
+            Self::BackendNotReady { .. } => false,
+            // EngineError's classification helpers handle transport
+            // retry semantics; mirror them so trait-dispatched handlers
+            // keep the same retry policy as the Client path.
+            Self::Engine(e) => matches!(
+                e.as_ref(),
+                EngineError::Transport { .. } | EngineError::Contextual { .. }
+            ),
         }
     }
 }
@@ -359,10 +428,49 @@ impl Server {
     /// build that's the shim, under `observability` it's a real
     /// registry not shared with any HTTP route (useful for tests
     /// exercising the engine in isolation).
+    ///
+    /// **RFC-017 Stage A:** this path gates `config.backend` against
+    /// [`BACKEND_STAGE_READY`] (refuses `BackendKind::Postgres` at
+    /// boot per §9.0), dials the Valkey cluster through the legacy
+    /// path, then synthesises an `Arc<ValkeyBackend>` around the
+    /// dialed client and populates `Server.backend`. The dual-field
+    /// posture is explicit through Stage D; Stage E retires the
+    /// legacy Client fields. See [`Server::start_with_backend`] for
+    /// the test-injection entry point that takes a caller-supplied
+    /// backend.
     pub async fn start_with_metrics(
         config: ServerConfig,
         metrics: Arc<ff_observability::Metrics>,
     ) -> Result<Self, ServerError> {
+        // RFC-017 §9.0 hard-gate. Refuse to boot unready backends
+        // unless the dev-mode override combo (FF_BACKEND_ACCEPT_UNREADY=1
+        // AND FF_ENV=development) is set. Production refuses the
+        // override; see the env-var check inline.
+        let label = config.backend.as_str();
+        if !BACKEND_STAGE_READY.contains(&label) {
+            let accept_unready = std::env::var("FF_BACKEND_ACCEPT_UNREADY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let is_dev = std::env::var("FF_ENV")
+                .map(|v| v.eq_ignore_ascii_case("development"))
+                .unwrap_or(false);
+            if accept_unready && is_dev {
+                tracing::warn!(
+                    backend = label,
+                    stage = "A",
+                    "backend_unready_boot_override: backend={label} stage=A \
+                     (FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development)"
+                );
+            } else {
+                return Err(ServerError::BackendNotReady {
+                    backend: match config.backend {
+                        BackendKind::Postgres => "postgres",
+                        BackendKind::Valkey => "valkey",
+                    },
+                    stage: "A",
+                });
+            }
+        }
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
             host = %config.host, port = config.port,
@@ -609,6 +717,27 @@ impl Server {
             metrics.clone(),
         ));
 
+        // RFC-017 Stage A: synthesise an `Arc<ValkeyBackend>` around the
+        // already-dialed client. Zero additional round-trips; the
+        // backend shares the same ferriskey connection as the legacy
+        // path so migrated + legacy handlers observe identical state.
+        // Stage B relocates `tail_client` / `stream_semaphore` into
+        // the backend; Stage E retires the Client fields entirely.
+        let valkey_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
+            client.clone(),
+            config.partition_config,
+            {
+                let mut c = ff_core::backend::ValkeyConnection::new(
+                    config.host.clone(),
+                    config.port,
+                );
+                c.tls = config.tls;
+                c.cluster = config.cluster;
+                c
+            },
+        );
+        let backend: Arc<dyn EngineBackend> = valkey_backend as Arc<dyn EngineBackend>;
+
         Ok(Self {
             client,
             tail_client,
@@ -624,7 +753,53 @@ impl Server {
             scheduler,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
             metrics,
+            backend,
         })
+    }
+
+    /// RFC-017 Stage A: test-injection + future-embedded-user entry
+    /// point. Takes a caller-constructed `Arc<dyn EngineBackend>` +
+    /// the Valkey connection/engine scaffolding
+    /// [`Server::start_with_metrics`] normally dials for itself.
+    ///
+    /// **Stage A scope:** Stage A is still dual-field — the legacy
+    /// `client` / `tail_client` / `engine` / `scheduler` fields are
+    /// constructed here exactly as in the main boot path, because
+    /// unmigrated handlers still need them. The caller-supplied
+    /// `backend` populates the new trait-object field and services
+    /// the handlers migrated in this stage (see RFC-017 §4
+    /// migration table).
+    ///
+    /// **Stage D evolution:** once the boot path relocates into each
+    /// backend's `connect_with_metrics` (RFC-017 §9 Stage D), this
+    /// entry point becomes the sole constructor — `Server::start` and
+    /// `Server::start_with_metrics` are thin shims that build the
+    /// backend first, then forward here.
+    ///
+    /// Today (Stage A) this path is exercised by `MockBackend` in
+    /// `tests/parity_stage_a.rs`; it does NOT replace the Valkey
+    /// dial under the main binary.
+    pub async fn start_with_backend(
+        config: ServerConfig,
+        backend: Arc<dyn EngineBackend>,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Self, ServerError> {
+        // Stage A: forward through the legacy dial so unmigrated
+        // handlers keep working, then overwrite `backend` with the
+        // caller-supplied handle. Stage D rewires this so the
+        // caller's backend drives the whole boot.
+        let mut server = Self::start_with_metrics(config, metrics).await?;
+        server.backend = backend;
+        Ok(server)
+    }
+
+    /// RFC-017 Stage A: access the backend trait-object driving
+    /// migrated handlers. Stable surface for tests that need to
+    /// inspect the backend directly (e.g. `backend_label()`
+    /// assertions). The Server will dispatch more handlers through
+    /// this handle as Stages B-D land.
+    pub fn backend(&self) -> &Arc<dyn EngineBackend> {
+        &self.backend
     }
 
     /// PR-94: access the shared observability registry.
@@ -2023,98 +2198,14 @@ impl Server {
         &self,
         args: &DeliverSignalArgs,
     ) -> Result<DeliverSignalResult, ServerError> {
-        let partition = execution_partition(&args.execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // Pre-read lane_id for index keys
-        let lane_str: Option<String> = self
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| crate::server::backend_context(e, "HGET lane_id"))?;
-        let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
-
-        let wp_id = &args.waitpoint_id;
-        let sig_id = &args.signal_id;
-        let idem_key = args
-            .idempotency_key
-            .as_ref()
-            .filter(|k| !k.is_empty())
-            .map(|k| ctx.signal_dedup(wp_id, k))
-            .unwrap_or_else(|| ctx.noop());
-
-        // KEYS (14): exec_core, wp_condition, wp_signals_stream,
-        //            exec_signals_zset, signal_hash, signal_payload,
-        //            idem_key, waitpoint_hash, suspension_current,
-        //            eligible_zset, suspended_zset, delayed_zset,
-        //            suspension_timeout_zset, hmac_secrets
-        let fcall_keys: Vec<String> = vec![
-            ctx.core(),                       // 1
-            ctx.waitpoint_condition(wp_id),    // 2
-            ctx.waitpoint_signals(wp_id),      // 3
-            ctx.exec_signals(),                // 4
-            ctx.signal(sig_id),                // 5
-            ctx.signal_payload(sig_id),        // 6
-            idem_key,                          // 7
-            ctx.waitpoint(wp_id),              // 8
-            ctx.suspension_current(),          // 9
-            idx.lane_eligible(&lane),          // 10
-            idx.lane_suspended(&lane),         // 11
-            idx.lane_delayed(&lane),           // 12
-            idx.suspension_timeout(),          // 13
-            idx.waitpoint_hmac_secrets(),      // 14
-        ];
-
-        // ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
-        //            signal_category, source_type, source_identity,
-        //            payload, payload_encoding, idempotency_key,
-        //            correlation_id, target_scope, created_at,
-        //            dedup_ttl_ms, resume_delay_ms, signal_maxlen,
-        //            max_signals_per_execution, waitpoint_token
-        let fcall_args: Vec<String> = vec![
-            args.signal_id.to_string(),                          // 1
-            args.execution_id.to_string(),                       // 2
-            args.waitpoint_id.to_string(),                       // 3
-            args.signal_name.clone(),                            // 4
-            args.signal_category.clone(),                        // 5
-            args.source_type.clone(),                            // 6
-            args.source_identity.clone(),                        // 7
-            args.payload.as_ref()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .unwrap_or_default(),                            // 8
-            args.payload_encoding
-                .clone()
-                .unwrap_or_else(|| "json".to_owned()),           // 9
-            args.idempotency_key
-                .clone()
-                .unwrap_or_default(),                            // 10
-            args.correlation_id
-                .clone()
-                .unwrap_or_default(),                            // 11
-            args.target_scope.clone(),                           // 12
-            args.created_at
-                .map(|ts| ts.to_string())
-                .unwrap_or_else(|| args.now.to_string()),        // 13
-            args.dedup_ttl_ms.unwrap_or(86_400_000).to_string(), // 14
-            args.resume_delay_ms.unwrap_or(0).to_string(),       // 15
-            args.signal_maxlen.unwrap_or(1000).to_string(),      // 16
-            args.max_signals_per_execution
-                .unwrap_or(10_000)
-                .to_string(),                                    // 17
-            // WIRE BOUNDARY — raw token to Lua. Display is redacted
-            // for log safety; use .as_str() at the wire crossing.
-            args.waitpoint_token.as_str().to_owned(),            // 18
-        ];
-
-        let key_refs: Vec<&str> = fcall_keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = fcall_args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self
-            .fcall_with_reload("ff_deliver_signal", &key_refs, &arg_refs)
-            .await?;
-
-        parse_deliver_signal_result(&raw, &args.signal_id)
+        // RFC-017 Stage A migration: dispatch through the backend
+        // trait. The previous body (lane pre-read + KEYS(14) + ARGV(18)
+        // FCALL dispatch + `parse_deliver_signal_result`) lives
+        // verbatim inside `ValkeyBackend::deliver_signal` →
+        // `deliver_signal_impl`. Clone required because the trait
+        // method takes `DeliverSignalArgs` by value (see
+        // `ff_core::engine_backend::EngineBackend::deliver_signal`).
+        Ok(self.backend.deliver_signal(args.clone()).await?)
     }
 
     /// Change an execution's priority.
@@ -2354,57 +2445,24 @@ impl Server {
         cursor: Option<ExecutionId>,
         limit: usize,
     ) -> Result<ListExecutionsPage, ServerError> {
-        if limit == 0 {
-            return Ok(ListExecutionsPage::new(Vec::new(), None));
-        }
+        // RFC-017 Stage A migration: dispatch through the backend
+        // trait. The previous body (SMEMBERS + parse + lex-sort +
+        // filter + cap) is preserved verbatim inside
+        // `ValkeyBackend::list_executions`. One deliberate behaviour
+        // change: corrupt members now surface as
+        // `EngineError::Validation { kind: Corruption, .. }` (→
+        // `ServerError::Engine`), where the legacy path warn-logged
+        // and skipped them. This matches RFC-012's fail-loud contract
+        // for read-surface corruption.
         let partition = ff_core::partition::Partition {
             family: ff_core::partition::PartitionFamily::Execution,
             index: partition_id,
         };
-        let idx = IndexKeys::new(&partition);
-        let all_key = idx.all_executions();
-
-        let raw_members: Vec<String> = self
-            .client
-            .cmd("SMEMBERS")
-            .arg(&all_key)
-            .execute()
-            .await
-            .map_err(|e| crate::server::backend_context(e, format!("SMEMBERS {all_key}")))?;
-
-        if raw_members.is_empty() {
-            return Ok(ListExecutionsPage::new(Vec::new(), None));
-        }
-
-        let mut parsed: Vec<ExecutionId> = Vec::with_capacity(raw_members.len());
-        for raw in &raw_members {
-            match ExecutionId::parse(raw) {
-                Ok(id) => parsed.push(id),
-                Err(e) => {
-                    tracing::warn!(
-                        raw_id = %raw,
-                        error = %e,
-                        set = %all_key,
-                        "list_executions_page: SMEMBERS member failed to parse as ExecutionId \
-                         (data corruption?)"
-                    );
-                }
-            }
-        }
-        parsed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-
-        let filtered: Vec<ExecutionId> = if let Some(c) = cursor.as_ref() {
-            let cs = c.as_str();
-            parsed.into_iter().filter(|e| e.as_str() > cs).collect()
-        } else {
-            parsed
-        };
-
-        let effective_limit = limit.min(1000);
-        let has_more = filtered.len() > effective_limit;
-        let page: Vec<ExecutionId> = filtered.into_iter().take(effective_limit).collect();
-        let next_cursor = if has_more { page.last().cloned() } else { None };
-        Ok(ListExecutionsPage::new(page, next_cursor))
+        let partition_key = ff_core::partition::PartitionKey::from(&partition);
+        Ok(self
+            .backend
+            .list_executions(partition_key, cursor, limit)
+            .await?)
     }
 
     /// Replay a terminal execution.
@@ -3793,43 +3851,6 @@ fn parse_apply_dependency_result(
         let error_code = fcall_field_str(arr, 1);
         Err(ServerError::OperationFailed(format!(
             "ff_apply_dependency_to_child failed: {error_code}"
-        )))
-    }
-}
-
-fn parse_deliver_signal_result(
-    raw: &Value,
-    signal_id: &SignalId,
-) -> Result<DeliverSignalResult, ServerError> {
-    let arr = match raw {
-        Value::Array(arr) => arr,
-        _ => return Err(ServerError::Script("ff_deliver_signal: expected Array".into())),
-    };
-    let status = match arr.first() {
-        Some(Ok(Value::Int(n))) => *n,
-        _ => return Err(ServerError::Script("ff_deliver_signal: bad status code".into())),
-    };
-    if status == 1 {
-        let sub = fcall_field_str(arr, 1);
-        if sub == "DUPLICATE" {
-            // ok_duplicate(existing_signal_id) → {1, "DUPLICATE", existing_signal_id}
-            let existing_str = fcall_field_str(arr, 2);
-            let existing_id = SignalId::parse(&existing_str).unwrap_or_else(|_| signal_id.clone());
-            Ok(DeliverSignalResult::Duplicate {
-                existing_signal_id: existing_id,
-            })
-        } else {
-            // ok(signal_id, effect) → {1, "OK", signal_id, effect}
-            let effect = fcall_field_str(arr, 3);
-            Ok(DeliverSignalResult::Accepted {
-                signal_id: signal_id.clone(),
-                effect,
-            })
-        }
-    } else {
-        let error_code = fcall_field_str(arr, 1);
-        Err(ServerError::OperationFailed(format!(
-            "ff_deliver_signal failed: {error_code}"
         )))
     }
 }

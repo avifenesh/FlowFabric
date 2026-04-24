@@ -58,3 +58,5 @@ futures = { workspace = true }
 # harness that mirrors real browser preflights.
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Used by RFC-017 Stage A `parity_stage_a` MockBackend impl.
+async-trait = { workspace = true }
