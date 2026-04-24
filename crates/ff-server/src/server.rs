@@ -712,28 +712,6 @@ impl Server {
     // (`cancel_flow_header`, `ack_cancel_member`, `read_execution_info`,
     // `read_execution_state`, `fetch_waitpoint_token_v07`).
 
-    /// RFC-017 Stage D1 (§8): fetch the raw `<kid>:<hex>`
-    /// `waitpoint_token` so the v0.7.x wire-format shim in
-    /// `api::list_pending_waitpoints` can re-inject the legacy
-    /// `waitpoint_token` field during the one-release deprecation
-    /// window. **Valkey-only** — the backend hard-gate ensures no
-    /// other backend can reach this path at boot; callers defensive-
-    /// check via `backend_label()` before calling. At v0.8.0 the
-    /// legacy wire field is removed and this method goes with it.
-    pub async fn fetch_waitpoint_token_v07(
-        &self,
-        execution_id: &ExecutionId,
-        waitpoint_id: &WaitpointId,
-    ) -> Result<Option<String>, ServerError> {
-        // RFC-017 Stage E2: routed through the backend trait. The
-        // Valkey impl carries the HGET verbatim; Postgres returns
-        // Unavailable (it cannot reach this path at boot per §9.0).
-        Ok(self
-            .backend
-            .fetch_waitpoint_token_v07(execution_id, waitpoint_id)
-            .await?)
-    }
-
     /// Get the server config.
     pub fn config(&self) -> &ServerConfig {
         &self.config
