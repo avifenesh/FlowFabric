@@ -66,6 +66,8 @@ pub mod handle_codec;
 pub mod listener;
 pub mod migrate;
 pub mod pool;
+#[cfg(feature = "core")]
+pub mod scheduler;
 pub mod signal;
 #[cfg(feature = "streaming")]
 pub mod stream;

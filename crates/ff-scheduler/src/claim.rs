@@ -8,6 +8,16 @@
 //! Candidates that fail budget/quota are blocked via ff_block_execution_for_admission.
 //!
 //! Reference: RFC-009 §12.7, RFC-010 §3.1, RFC-008 §1.7
+//!
+//! # Postgres variant (RFC-v0.7 Wave 5b)
+//!
+//! The admission pipeline is ported to Postgres as
+//! [`ff_backend_postgres::scheduler::PostgresScheduler`]. It lives in
+//! the backend crate — not as a `Scheduler` variant here — to keep
+//! `ff-scheduler` off the sqlx dep graph. `ff-engine` / `ff-server`
+//! branch at construction time on the concrete backend type.
+//! See `crates/ff-backend-postgres/src/scheduler.rs` for the
+//! pipeline + isolation notes.
 
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
