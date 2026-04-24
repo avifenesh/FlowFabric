@@ -904,110 +904,28 @@ async fn get_execution_state(
 }
 
 /// Returns the actionable (`pending`/`active`) waitpoints for an
-/// execution, including the HMAC `waitpoint_token` required to deliver
-/// signals. Human reviewers use this to look up the token originally
-/// returned only to the suspending worker's `SuspendOutcome`.
+/// execution as the sanitised `PendingWaitpointInfo` shape
+/// (6 original fields + `token_kid` + `token_fingerprint` +
+/// `execution_id`). The raw HMAC `waitpoint_token` is NOT returned —
+/// callers correlate waitpoints via `(token_kid, token_fingerprint)`
+/// and obtain the delivery credential through the worker's
+/// `SuspendOutcome` at suspend time.
 ///
-/// SECURITY: `waitpoint_token` is a bearer credential for signal
-/// delivery; leaking it lets a third party forge authority to resume or
-/// influence the execution. Gate the endpoint behind `FF_API_TOKEN` in
-/// any deployment reachable from untrusted networks. The auth middleware
-/// only mounts when `FF_API_TOKEN` is set; this endpoint is
-/// unauthenticated without it, and the server logs a loud warning at
-/// startup so operators notice.
-/// v0.7.x wire DTO for a pending waitpoint entry.
-///
-/// **RFC-017 Stage D1 (§8) — deprecation window.** The trait-boundary
-/// `PendingWaitpointInfo` no longer carries the raw HMAC
-/// `waitpoint_token`; this DTO re-injects the legacy field on the
-/// v0.7.x wire so existing consumers keep functioning for one release.
-/// At v0.8.0 the legacy field is removed outright and the struct
-/// collapses into a direct serialisation of `PendingWaitpointInfo`.
-/// Each response also carries the `Deprecation: ff-017` header and
-/// increments `ff_pending_waitpoint_legacy_token_served_total`.
-#[derive(Serialize)]
-struct PendingWaitpointWireV07 {
-    waitpoint_id: WaitpointId,
-    waitpoint_key: String,
-    state: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    required_signal_names: Vec<String>,
-    created_at: TimestampMs,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    activated_at: Option<TimestampMs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expires_at: Option<TimestampMs>,
-    execution_id: ExecutionId,
-    token_kid: String,
-    token_fingerprint: String,
-    /// RFC-017 §8 legacy v0.7.x field — `null` on non-Valkey backends
-    /// (the v0.7.x token-fetch shim is Valkey-only). Removed at v0.8.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    waitpoint_token: Option<String>,
-}
-
+/// (RFC-017 Stage E4 / v0.8.0 §8: the legacy `waitpoint_token` wire
+/// field was removed; the one-release deprecation window closed with
+/// this release.)
 async fn list_pending_waitpoints(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    // RFC-017 Stage D1 (§4 row 8 / §8): dispatch through the trait +
-    // wrap the sanitised entries for the v0.7.x deprecation window.
+    // RFC-017 Stage E4 (v0.8.0 §8): wire response serializes the
+    // sanitised `PendingWaitpointInfo` directly — no raw HMAC
+    // `waitpoint_token`, no `Deprecation: ff-017` header. Consumers
+    // correlate via `(token_kid, token_fingerprint)`.
     let eid = parse_execution_id(&id)?;
-    let args = ff_core::contracts::ListPendingWaitpointsArgs::new(eid.clone());
+    let args = ff_core::contracts::ListPendingWaitpointsArgs::new(eid);
     let page = server.backend().list_pending_waitpoints(args).await?;
-
-    // Fetch the raw token for each entry via the Valkey-only v0.7.x
-    // shim. The §9.0 hard-gate guarantees only `valkey` backends boot
-    // through Stage D; defensive-in-depth, non-Valkey backends emit
-    // `token = None` + a warn log.
-    let is_valkey = server.backend().backend_label() == "valkey";
-    let metrics = server.metrics();
-    let mut wire: Vec<PendingWaitpointWireV07> = Vec::with_capacity(page.entries.len());
-    for info in page.entries {
-        let legacy_token = if is_valkey {
-            server
-                .fetch_waitpoint_token_v07(&info.execution_id, &info.waitpoint_id)
-                .await
-                .map_err(ApiError::from)?
-        } else {
-            tracing::warn!(
-                execution_id = %info.execution_id,
-                waitpoint_id = %info.waitpoint_id,
-                "pending_waitpoint_legacy_token_unavailable: \
-                 backend does not expose the v0.7.x token-fetch shim"
-            );
-            None
-        };
-        if legacy_token.is_some() {
-            metrics.inc_pending_waitpoint_legacy_token();
-            tracing::info!(
-                target: "audit",
-                execution_id = %info.execution_id,
-                waitpoint_id = %info.waitpoint_id,
-                "pending_waitpoint_legacy_token_served"
-            );
-        }
-        wire.push(PendingWaitpointWireV07 {
-            waitpoint_id: info.waitpoint_id,
-            waitpoint_key: info.waitpoint_key,
-            state: info.state,
-            required_signal_names: info.required_signal_names,
-            created_at: info.created_at,
-            activated_at: info.activated_at,
-            expires_at: info.expires_at,
-            execution_id: info.execution_id,
-            token_kid: info.token_kid,
-            token_fingerprint: info.token_fingerprint,
-            waitpoint_token: legacy_token,
-        });
-    }
-
-    let mut resp = Json(wire).into_response();
-    resp.headers_mut().insert(
-        "Deprecation",
-        axum::http::HeaderValue::from_static("ff-017"),
-    );
-    Ok(resp)
+    Ok(Json(page.entries).into_response())
 }
 
 /// Returns the raw result payload bytes written by the worker's

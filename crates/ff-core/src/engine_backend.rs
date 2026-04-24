@@ -82,7 +82,7 @@ use crate::engine_error::EngineError;
 use crate::types::AttemptIndex;
 #[cfg(feature = "core")]
 use crate::types::EdgeId;
-use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs, WaitpointId};
+use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 
 /// The engine write surface — a single trait a backend implementation
 /// honours to serve a `FlowFabricWorker`.
@@ -989,24 +989,6 @@ pub trait EngineBackend: Send + Sync + 'static {
         })
     }
 
-    /// RFC-017 Stage D1 / E2: fetch the raw `<kid>:<hex>` waitpoint
-    /// token so the v0.7.x wire-format shim in
-    /// `api::list_pending_waitpoints` can re-inject the legacy
-    /// `waitpoint_token` field during the one-release deprecation
-    /// window. Returns `Ok(None)` when the field is absent/empty.
-    /// Valkey-only; Postgres default is `Unavailable`. At v0.8.0 the
-    /// legacy wire field is removed and both this method + caller
-    /// shim go with it.
-    #[cfg(feature = "core")]
-    async fn fetch_waitpoint_token_v07(
-        &self,
-        _execution_id: &ExecutionId,
-        _waitpoint_id: &WaitpointId,
-    ) -> Result<Option<String>, EngineError> {
-        Err(EngineError::Unavailable {
-            op: "fetch_waitpoint_token_v07",
-        })
-    }
 }
 
 /// Object-safety assertion: `dyn EngineBackend` compiles iff every

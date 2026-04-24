@@ -116,10 +116,13 @@ fn test_server_config(api_token: Option<String>) -> ff_server::config::ServerCon
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
     ff_server::config::ServerConfig {
-        host,
-        port,
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        valkey: ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls: ff_test::fixtures::env_flag("FF_TLS"),
+            cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+            skip_library_load: true,
+        },
         partition_config: pc,
         lanes: vec![ff_core::types::LaneId::new("admin-rotate-lane")],
         listen_addr: "127.0.0.1:0".into(),
@@ -128,7 +131,7 @@ fn test_server_config(api_token: Option<String>) -> ff_server::config::ServerCon
             lanes: vec![ff_core::types::LaneId::new("admin-rotate-lane")],
             ..Default::default()
         },
-        skip_library_load: true,
+
         cors_origins: vec!["*".to_owned()],
         api_token,
         // Known-weak all-zeros secret — fine for tests, documented

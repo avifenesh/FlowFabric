@@ -19,13 +19,13 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::task::AbortHandle;
 
-/// RFC-017 Stage D1 (§8) v0.7.x wire DTO — mirrors the
-/// `PendingWaitpointWireV07` serialised by `ff-server::api`. Kept
-/// local to the test so consumer-compatibility assertions are
-/// explicit about what's still on the v0.7 wire.
+/// RFC-017 Stage E4 (v0.8.0 §8) wire DTO — direct serialisation of
+/// `PendingWaitpointInfo`, no raw HMAC. Consumers correlate via
+/// `(token_kid, token_fingerprint)`. Kept local to the test so
+/// consumer-compatibility assertions are explicit about the wire.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct PendingWaitpointWireV07 {
+struct PendingWaitpointWire {
     waitpoint_id: WaitpointId,
     waitpoint_key: String,
     state: String,
@@ -39,9 +39,6 @@ struct PendingWaitpointWireV07 {
     execution_id: ExecutionId,
     token_kid: String,
     token_fingerprint: String,
-    /// Legacy v0.7.x — removed at v0.8.0.
-    #[serde(default)]
-    waitpoint_token: Option<String>,
 }
 
 const LANE: &str = "pwp-lane";
@@ -103,6 +100,7 @@ impl TestApi {
 }
 
 fn test_server_config() -> ff_server::config::ServerConfig {
+
     let pc = ff_test::fixtures::TEST_PARTITION_CONFIG;
     let host = std::env::var("FF_HOST").unwrap_or_else(|_| "localhost".into());
     let port: u16 = std::env::var("FF_PORT")
@@ -110,10 +108,13 @@ fn test_server_config() -> ff_server::config::ServerConfig {
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
     ff_server::config::ServerConfig {
-        host,
-        port,
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+        valkey: ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls: ff_test::fixtures::env_flag("FF_TLS"),
+            cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+            skip_library_load: true,
+        },
         partition_config: pc,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "127.0.0.1:0".into(),
@@ -122,7 +123,7 @@ fn test_server_config() -> ff_server::config::ServerConfig {
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
         },
-        skip_library_load: true,
+
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:
@@ -358,7 +359,9 @@ async fn fcall_suspend(
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-/// Suspend an execution and verify the endpoint returns the minted token.
+/// Suspend an execution and verify the endpoint returns the sanitised
+/// `(token_kid, token_fingerprint)` pair — the raw `waitpoint_token`
+/// and `Deprecation: ff-017` header were both removed at v0.8.0.
 #[tokio::test]
 #[serial_test::serial]
 async fn test_list_pending_waitpoints_returns_token_after_suspend() {
@@ -367,7 +370,7 @@ async fn test_list_pending_waitpoints_returns_token_after_suspend() {
 
     let eid = tc.new_execution_id();
     let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
-    let (wp_id, wp_key, expected_token) =
+    let (wp_id, wp_key, _token) =
         fcall_suspend(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
 
     let resp = api
@@ -378,36 +381,39 @@ async fn test_list_pending_waitpoints_returns_token_after_suspend() {
         .expect("pending-waitpoints request failed");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // RFC-017 Stage D1 (§8): the Deprecation: ff-017 header must be
-    // present while the legacy wire field is still served.
-    let deprecation_hdr = resp
-        .headers()
-        .get("Deprecation")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
-    assert_eq!(
-        deprecation_hdr.as_deref(),
-        Some("ff-017"),
-        "v0.7.x responses must carry Deprecation: ff-017"
+    // RFC-017 Stage E4 (v0.8.0 §8): no more `Deprecation: ff-017`
+    // header — the legacy wire field is gone, so the deprecation
+    // signal is gone too.
+    assert!(
+        resp.headers().get("Deprecation").is_none(),
+        "v0.8.0 responses must not carry Deprecation: ff-017"
     );
 
-    let list: Vec<PendingWaitpointWireV07> =
-        resp.json().await.expect("response body parse failed");
+    // Parse as raw JSON first so we can assert on both the *absence*
+    // of `waitpoint_token` and the *presence* of the sanitised fields.
+    let body: serde_json::Value = resp.json().await.expect("response body parse failed");
+    let arr = body.as_array().expect("response is an array");
+    assert_eq!(arr.len(), 1, "expected exactly one active waitpoint");
+    assert!(
+        arr[0].get("waitpoint_token").is_none(),
+        "v0.8.0 wire must not carry `waitpoint_token`; got {arr:?}"
+    );
+    assert!(
+        arr[0].get("token_kid").and_then(|v| v.as_str()).is_some(),
+        "v0.8.0 wire must carry `token_kid`"
+    );
+    assert!(
+        arr[0].get("token_fingerprint").and_then(|v| v.as_str()).is_some(),
+        "v0.8.0 wire must carry `token_fingerprint`"
+    );
 
-    assert_eq!(list.len(), 1, "expected exactly one active waitpoint");
+    let list: Vec<PendingWaitpointWire> =
+        serde_json::from_value(body).expect("wire DTO parse failed");
     let entry = &list[0];
     assert_eq!(entry.waitpoint_id, wp_id);
     assert_eq!(entry.waitpoint_key, wp_key);
     assert_eq!(entry.state, "active");
-    let token = entry.waitpoint_token.as_deref().expect(
-        "v0.7.x wire must still carry the legacy waitpoint_token",
-    );
-    assert_eq!(
-        token, expected_token,
-        "token must match the one returned to the suspending worker"
-    );
     assert!(entry.activated_at.is_some());
-    assert!(!token.is_empty());
     // Sanitised fields — present on the trait boundary and the wire.
     assert!(!entry.token_kid.is_empty(), "token_kid must be populated");
     assert_eq!(
@@ -444,7 +450,7 @@ async fn test_list_pending_waitpoints_empty_for_unsuspended() {
         .expect("pending-waitpoints request failed");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let list: Vec<PendingWaitpointWireV07> =
+    let list: Vec<PendingWaitpointWire> =
         resp.json().await.expect("response body parse failed");
     assert!(list.is_empty(), "expected no waitpoints, got {list:?}");
 }
