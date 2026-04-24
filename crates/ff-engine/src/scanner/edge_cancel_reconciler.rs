@@ -147,6 +147,23 @@ enum ReconcileOutcome {
     Error,
 }
 
+/// Postgres-backend parallel to the Valkey scan loop.
+///
+/// Wave-6b (RFC-v0.7): delegates to
+/// [`ff_backend_postgres::reconcilers::edge_cancel_reconciler::reconciler_tick`],
+/// which mirrors RFC-016 Stage-D semantics (`sremmed_stale` /
+/// `completed_drain` / `no_op`) against `ff_pending_cancel_groups`.
+#[cfg(feature = "postgres")]
+pub async fn reconcile_via_postgres(
+    pool: &ff_backend_postgres::PgPool,
+    filter: &ff_core::backend::ScannerFilter,
+) -> Result<
+    ff_backend_postgres::reconcilers::edge_cancel_reconciler::ReconcileReport,
+    ff_core::engine_error::EngineError,
+> {
+    ff_backend_postgres::reconcilers::edge_cancel_reconciler::reconciler_tick(pool, filter).await
+}
+
 impl EdgeCancelReconciler {
     async fn reconcile_one_group(
         &self,
