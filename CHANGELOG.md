@@ -5,6 +5,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-04-25
+
+Release-infrastructure fix for v0.8.0 partial-publish.
+
+### Fixed
+
+- **Publish order corrected.** `ff-scheduler` now publishes before
+  `ff-backend-valkey` (RFC-017 Stage C added `ff-backend-valkey →
+  ff-scheduler` dep; publish-list wasn't updated to match). The
+  v0.8.0 tag partial-published ferriskey + ff-core + ff-script +
+  ff-observability + ff-observability-http; those were yanked and
+  re-released at 0.8.1.
+- **Smoke gate env-override.** `FF_SMOKE_FANOUT_P99_MS` allows CI
+  hardware variance without hiding perf regressions locally (master
+  spec 500ms stays strict; CI runners use 1200ms). Release-workflow
+  smoke now passes on GitHub-hosted runners.
+
+No functional changes vs 0.8.0; all RFC-017 delivery notes from 0.8.0
+below still apply.
+
 ## [0.8.0] - 2026-04-24
 
 RFC-017 Wave 8 — Postgres backend ships first-class. The `EngineBackend`

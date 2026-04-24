@@ -23,22 +23,26 @@ Eleven crates, all pinned to the same version, published in topological order:
    embedding `ff-sdk` in library mode without `ff-server`. Added to
    the publish set alongside its introduction; `ff-server` still
    ships its own built-in `/metrics` route (PR #94).
-6. `ff-backend-valkey` — RFC-012 EngineBackend trait Valkey impl,
+6. `ff-scheduler`    — claim-grant scheduler. Must publish BEFORE
+   `ff-backend-valkey` per RFC-017 Stage C (ff-backend-valkey owns
+   `Arc<ff_scheduler::Scheduler>` per §7). Reordered in v0.8.0 after
+   v0.8.0 partial-published (ff-backend-valkey failed version
+   resolution because ff-scheduler ^0.8.0 wasn't yet on crates.io).
+7. `ff-backend-valkey` — RFC-012 EngineBackend trait Valkey impl,
    separated from ff-sdk in RFC-012 Stage 1a. Added to the publish
    set in v0.3.2 after v0.3.1 partial-published (ff-sdk depends on
    it as a workspace dep and its publish step fails without it
    being on crates.io).
-7. `ff-backend-postgres` — RFC-v0.7 EngineBackend trait Postgres
+8. `ff-backend-postgres` — RFC-v0.7 EngineBackend trait Postgres
    impl. Wave 0 scaffold ships the crate as an `Unavailable`-stub
    implementation so `sqlx`/migrations infrastructure is in place
    before Wave 1+ fills in method bodies. Published alongside the
    Valkey backend so dual-backend ff-server builds resolve against
    crates.io.
-8. `ff-engine`       — cross-partition dispatch + scanners
+9. `ff-engine`       — cross-partition dispatch + scanners
    (includes the `completion_listener` module for push-based DAG
    promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
    §"DAG promotion: push listener + safety-net reconciler")
-9. `ff-scheduler`    — claim-grant scheduler
 10. `ff-sdk`         — worker SDK. `direct-valkey-claim` feature is
     off by default; production deployments use the scheduler-routed
     HTTP path via `FlowFabricWorker::claim_via_server`

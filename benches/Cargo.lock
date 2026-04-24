@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -690,17 +690,14 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-postgres"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "ff-core",
  "ff-observability",
- "ff-script",
  "futures-core",
  "hex",
  "hmac",
- "rand 0.8.6",
- "serde",
  "serde_json",
  "sha2",
  "sqlx",
@@ -712,13 +709,15 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "ferriskey",
  "ff-core",
  "ff-observability",
+ "ff-scheduler",
  "ff-script",
+ "futures",
  "futures-core",
  "serde",
  "serde_json",
@@ -751,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "crc16",
@@ -764,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "ff-engine"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",
@@ -780,11 +779,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.6.1"
+version = "0.8.0"
 
 [[package]]
 name = "ff-scheduler"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -796,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -808,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
@@ -824,10 +823,11 @@ dependencies = [
 
 [[package]]
 name = "ff-server"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "axum",
  "ferriskey",
+ "ff-backend-postgres",
  "ff-backend-valkey",
  "ff-core",
  "ff-engine",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "ff-test"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",

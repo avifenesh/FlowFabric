@@ -274,6 +274,21 @@ jobs:
             exit 1
           }
       - run: sleep 30
+      - name: publish ff-scheduler
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${TAG_VERSION#v}"
+          cargo publish -p ff-scheduler --no-verify || {
+            echo "::error::cargo publish ff-scheduler failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            exit 1
+          }
+      - run: sleep 30
       - name: publish ff-backend-valkey
         env:
           TAG_VERSION: ${{ github.ref_name }}
@@ -286,6 +301,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             exit 1
           }
       - run: sleep 30
@@ -301,6 +317,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             exit 1
           }
@@ -317,26 +334,9 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
-            exit 1
-          }
-      - run: sleep 30
-      - name: publish ff-scheduler
-        env:
-          TAG_VERSION: ${{ github.ref_name }}
-        run: |
-          VER="${TAG_VERSION#v}"
-          cargo publish -p ff-scheduler --no-verify || {
-            echo "::error::cargo publish ff-scheduler failed -- yank already-published crate(s) before re-tagging:"
-            echo "::error::  cargo yank --version ${VER} ferriskey"
-            echo "::error::  cargo yank --version ${VER} ff-core"
-            echo "::error::  cargo yank --version ${VER} ff-script"
-            echo "::error::  cargo yank --version ${VER} ff-observability"
-            echo "::error::  cargo yank --version ${VER} ff-observability-http"
-            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
-            echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
-            echo "::error::  cargo yank --version ${VER} ff-engine"
             exit 1
           }
       - run: sleep 30
@@ -352,10 +352,10 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             echo "::error::  cargo yank --version ${VER} ff-engine"
-            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             exit 1
           }
       - run: sleep 30
@@ -371,10 +371,10 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-script"
             echo "::error::  cargo yank --version ${VER} ff-observability"
             echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             echo "::error::  cargo yank --version ${VER} ff-engine"
-            echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-sdk"
             exit 1
           }
