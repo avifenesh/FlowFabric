@@ -110,6 +110,29 @@ pub enum EngineError {
     #[error("unavailable: {op}")]
     Unavailable { op: &'static str },
 
+    /// Backend-owned concurrency pool reached its ceiling (RFC-017 §6).
+    /// `pool` is a stable label (`"stream_ops"`, `"admin_rotate"`, …);
+    /// `max` is the pool ceiling; `retry_after_ms`, when set, is an
+    /// advisory retry hint the backend computed from its own back-
+    /// pressure signal. Maps to HTTP 429 at the `ff-server` boundary.
+    #[error("resource exhausted: pool={pool} max={max}")]
+    ResourceExhausted {
+        pool: &'static str,
+        max: u32,
+        retry_after_ms: Option<u32>,
+    },
+
+    /// An operation ran past its deadline (RFC-017 §5.4
+    /// `shutdown_prepare`). `op` is a stable label, `elapsed` is how
+    /// long the operation ran before the caller aborted. Additive;
+    /// call sites that previously did not emit this variant keep
+    /// emitting whatever they emitted before.
+    #[error("timeout: op={op} elapsed={elapsed:?}")]
+    Timeout {
+        op: &'static str,
+        elapsed: std::time::Duration,
+    },
+
     /// An inner [`EngineError`] wrapped with a call-site label so
     /// operators triaging logs can see which op the error came from
     /// without inferring from surrounding spans. Constructed via
@@ -144,6 +167,8 @@ pub fn backend_context(err: EngineError, context: impl Into<String>) -> EngineEr
     match err {
         EngineError::Transport { .. }
         | EngineError::Unavailable { .. }
+        | EngineError::ResourceExhausted { .. }
+        | EngineError::Timeout { .. }
         | EngineError::Contextual { .. } => EngineError::Contextual {
             source: Box::new(err),
             context: context.into(),
@@ -175,6 +200,10 @@ pub enum ValidationKind {
     SignalLimitExceeded,
     /// MAC verification failed on waitpoint_key.
     InvalidWaitpointKey,
+    /// HMAC verification failed on a bearer waitpoint_token (signal
+    /// delivery path). Preserved as a distinct variant so the REST
+    /// layer can surface the Lua code `invalid_token` verbatim.
+    InvalidToken,
     /// Pending waitpoint has no HMAC token field.
     WaitpointNotTokenBound,
     /// Frame > 64KB.
@@ -570,6 +599,15 @@ impl EngineError {
             // not implemented; the caller must either fall back to a
             // different code path or surface to the user.
             Self::Unavailable { .. } => ErrorClass::Terminal,
+            // Resource exhaustion is retryable — the ceiling is a
+            // transient server-side gate; callers back off and try
+            // again. Mirrors RFC-017 §6 and ServerError::is_retryable
+            // for the pre-migration `ConcurrencyLimitExceeded` arm.
+            Self::ResourceExhausted { .. } => ErrorClass::Retryable,
+            // Timeouts surface as terminal from the caller's POV —
+            // the specific op exceeded its budget; a retry is the
+            // caller's decision, not the error's classification.
+            Self::Timeout { .. } => ErrorClass::Terminal,
             // Descend into the wrapped error — context is diagnostic;
             // classification follows the inner cause.
             Self::Contextual { source, .. } => source.class(),

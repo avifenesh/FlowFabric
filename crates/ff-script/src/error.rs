@@ -151,9 +151,17 @@ pub enum ScriptError {
     #[error("signal_limit_exceeded: max signals per execution reached")]
     SignalLimitExceeded,
 
-    /// MAC failed. Token invalid or expired.
+    /// MAC failed on the waitpoint_key field itself (structural
+    /// mismatch against the stored binding).
     #[error("invalid_waitpoint_key: MAC verification failed")]
     InvalidWaitpointKey,
+
+    /// MAC failed on the HMAC waitpoint_token bearer credential
+    /// (signal-delivery path). Distinct from [`Self::InvalidWaitpointKey`]
+    /// because the operator-surfaced error code is different — callers
+    /// typically render the Lua code verbatim in 4xx response bodies.
+    #[error("invalid_token: waitpoint_token HMAC verification failed")]
+    InvalidToken,
 
     /// Invalid lease for suspend.
     #[error("invalid_lease_for_suspend: lease/attempt binding mismatch")]
@@ -495,6 +503,7 @@ impl ScriptError {
             | Self::PayloadTooLarge
             | Self::SignalLimitExceeded
             | Self::InvalidWaitpointKey
+            | Self::InvalidToken
             | Self::ExecutionNotTerminal
             | Self::MaxReplaysExhausted
             | Self::StreamClosed
@@ -638,6 +647,7 @@ impl ScriptError {
             "payload_too_large" => Self::PayloadTooLarge,
             "signal_limit_exceeded" => Self::SignalLimitExceeded,
             "invalid_waitpoint_key" => Self::InvalidWaitpointKey,
+            "invalid_token" => Self::InvalidToken,
             "invalid_lease_for_suspend" => Self::InvalidLeaseForSuspend,
             "resume_condition_not_met" => Self::ResumeConditionNotMet,
             "waitpoint_not_pending" => Self::WaitpointNotPending,

@@ -17,7 +17,6 @@ use ff_core::contracts::{
     ListExecutionsPage, PendingWaitpointInfo, ReplayExecutionResult,
     ReportUsageArgs, ReportUsageResult, ResetBudgetResult,
     RevokeLeaseResult,
-    RotateWaitpointHmacSecretArgs,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 use ff_core::keys::{
@@ -128,69 +127,6 @@ fn validate_report_usage_dimensions(
 /// and provides a minimal API for Phase 1.
 pub struct Server {
     client: Client,
-    /// Dedicated Valkey connection used EXCLUSIVELY for stream-op calls:
-    /// `xread_block` tails AND `ff_read_attempt_stream` range reads.
-    /// `ferriskey::Client` is a pipelined multiplexed connection; Valkey
-    /// processes commands FIFO on it.
-    ///
-    /// Two head-of-line risks motivate the split from the main client:
-    ///
-    /// * **Blocking**: `XREAD BLOCK 30_000` holds the read side until a
-    ///   new entry arrives or `block_ms` elapses.
-    /// * **Large replies**: `XRANGE … COUNT 10_000` with ~64 KB per
-    ///   frame returns a multi-MB reply serialized on one connection.
-    ///
-    /// Sharing either load with the main client would starve every other
-    /// FCALL (create_execution, claim, rotate_waitpoint_secret,
-    /// budget/quota, admin endpoints) AND every engine scanner.
-    ///
-    /// Kept separate from `client` and from the `Engine` scanner client so
-    /// tail latency cannot couple to foreground API latency or background
-    /// scanner cadence. See RFC-006 Impl Notes for the cascading-failure
-    /// rationale.
-    tail_client: Client,
-    /// Bounds concurrent stream-op calls server-wide — read AND tail
-    /// combined. Each caller acquires one permit for the duration of its
-    /// Valkey round-trip(s); contention surfaces as HTTP 429 at the REST
-    /// boundary, not as a silent queue on the stream connection. Default
-    /// size is `FF_MAX_CONCURRENT_STREAM_OPS` (64; legacy env
-    /// `FF_MAX_CONCURRENT_TAIL` accepted for one release).
-    ///
-    /// Read and tail share the same pool deliberately: they share the
-    /// `tail_client`, so fairness accounting must be unified or a flood
-    /// of one can starve the other. The semaphore is also `close()`d on
-    /// shutdown so no new stream ops can start while existing ones drain
-    /// (see `Server::shutdown`).
-    stream_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Serializes `XREAD BLOCK` calls against `tail_client`.
-    ///
-    /// `ferriskey::Client` is a pipelined multiplexed connection — Valkey
-    /// processes commands FIFO on one socket. `XREAD BLOCK` holds the
-    /// connection's read side for the full `block_ms`, so two parallel
-    /// BLOCKs sent down the same mux serialize: the second waits for the
-    /// first to return before its own BLOCK even begins at the server.
-    /// Meanwhile ferriskey's per-call `request_timeout` (auto-extended to
-    /// `block_ms + 500ms`) starts at future-poll on the CLIENT side, so
-    /// the second call's timeout fires before its turn at the server —
-    /// spurious `timed_out` errors under concurrent tail load.
-    ///
-    /// Explicit serialization around `xread_block` removes the
-    /// silent-failure mode: concurrent tails queue on this Mutex (inside
-    /// an already-acquired semaphore permit), then dispatch one at a
-    /// time with their full `block_ms` budget intact. The semaphore
-    /// ceiling (`max_concurrent_stream_ops`) effectively becomes queue
-    /// depth; throughput on the tail client is 1 BLOCK at a time.
-    ///
-    /// V2 upgrade: a pool of N dedicated `ferriskey::Client` connections
-    /// replacing the single `tail_client` + this Mutex. Deferred; the
-    /// Mutex here is correct v1 behavior.
-    ///
-    /// XRANGE reads (`read_attempt_stream`) are NOT gated by this Mutex —
-    /// XRANGE is non-blocking at the server, so pipelined XRANGEs on one
-    /// mux complete in microseconds each and don't trigger the same
-    /// client-side timeout race. Keeping reads unserialized preserves
-    /// read throughput.
-    xread_block_lock: Arc<tokio::sync::Mutex<()>>,
     /// Server-wide Semaphore(1) gating admin rotate calls. Legitimate
     /// operators rotate ~monthly and can afford to serialize; concurrent
     /// rotate requests are an attack or misbehaving script. Holding the
@@ -621,48 +557,18 @@ impl Server {
             completion_stream,
         );
 
-        // Dedicated tail client. Built AFTER library load + HMAC install
-        // because those steps use the main client; tail client only runs
-        // XREAD/XREAD BLOCK + HMGET on stream_meta, so it never needs the
-        // library loaded — but we build it on the same host/port/TLS
-        // options so network reachability is identical.
-        tracing::info!("opening dedicated tail connection");
-        let mut tail_builder = ClientBuilder::new()
-            .host(&config.host, config.port)
-            .connect_timeout(Duration::from_secs(10))
-            // `request_timeout` is ignored for XREAD BLOCK (ferriskey
-            // auto-extends to `block_ms + 500ms` for blocking commands),
-            // but is used for the companion HMGET — 5s matches main.
-            .request_timeout(Duration::from_millis(5000));
-        if config.tls {
-            tail_builder = tail_builder.tls();
-        }
-        if config.cluster {
-            tail_builder = tail_builder.cluster();
-        }
-        let tail_client = tail_builder
-            .build()
-            .await
-            .map_err(|e| crate::server::backend_context(e, "connect (tail)"))?;
-        let tail_pong: String = tail_client
-            .cmd("PING")
-            .execute()
-            .await
-            .map_err(|e| crate::server::backend_context(e, "PING (tail)"))?;
-        if tail_pong != "PONG" {
-            return Err(ServerError::OperationFailed(format!(
-                "tail client unexpected PING response: {tail_pong}"
-            )));
-        }
-
-        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
-            config.max_concurrent_stream_ops as usize,
-        ));
-        let xread_block_lock = Arc::new(tokio::sync::Mutex::new(()));
+        // RFC-017 Stage B: the dedicated `tail_client`, the
+        // `stream_semaphore`, and the `xread_block_lock` moved into
+        // `ValkeyBackend` (§6). After issue #204's switch to per-call
+        // `duplicate_connection()` inside `tail_stream_impl`, the
+        // dedicated tail mux + serialising mutex are no longer
+        // required — each `XREAD BLOCK` gets its own socket — so
+        // the encapsulated impl only needs the bounded semaphore to
+        // preserve the existing 429-on-contention contract at the
+        // REST boundary.
         tracing::info!(
             max_concurrent_stream_ops = config.max_concurrent_stream_ops,
-            "stream-op client ready (read + tail share the semaphore; \
-             tails additionally serialize via xread_block_lock)"
+            "stream-op semaphore lives inside ValkeyBackend (RFC-017 Stage B)"
         );
 
         // Admin surface warning. /v1/admin/* endpoints (waitpoint HMAC
@@ -723,7 +629,7 @@ impl Server {
         // path so migrated + legacy handlers observe identical state.
         // Stage B relocates `tail_client` / `stream_semaphore` into
         // the backend; Stage E retires the Client fields entirely.
-        let valkey_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
+        let mut valkey_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
             client.clone(),
             config.partition_config,
             {
@@ -736,13 +642,19 @@ impl Server {
                 c
             },
         );
+        // RFC-017 Stage B: size the backend's stream-op semaphore
+        // before handing out the `Arc`. `get_mut` succeeds here
+        // because `valkey_backend` is the sole `Arc` owner at this
+        // point.
+        if !valkey_backend.with_stream_semaphore_permits(config.max_concurrent_stream_ops) {
+            return Err(ServerError::OperationFailed(
+                "ValkeyBackend stream semaphore sizing failed (unexpected Arc sharing)".into(),
+            ));
+        }
         let backend: Arc<dyn EngineBackend> = valkey_backend as Arc<dyn EngineBackend>;
 
         Ok(Self {
             client,
-            tail_client,
-            stream_semaphore,
-            xread_block_lock,
             // Single-permit semaphore: only one rotate-waitpoint-secret can
             // be mid-flight server-wide. Attackers or misbehaving scripts
             // firing parallel rotations fail fast with 429 instead of
@@ -2588,59 +2500,22 @@ impl Server {
         to_id: &str,
         count_limit: u64,
     ) -> Result<ff_core::contracts::StreamFrames, ServerError> {
-        use ff_core::contracts::{ReadFramesArgs, ReadFramesResult};
-
         if count_limit == 0 {
             return Err(ServerError::InvalidInput(
                 "count_limit must be >= 1".to_owned(),
             ));
         }
-
-        // Share the same semaphore as tail. A large XRANGE reply (10_000
-        // frames × ~64KB) is just as capable of head-of-line-blocking the
-        // tail_client mux as a long BLOCK — fairness accounting must be
-        // unified. Non-blocking acquire → 429 on contention.
-        let permit = match self.stream_semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(ServerError::ConcurrencyLimitExceeded(
-                    "stream_ops",
-                    self.config.max_concurrent_stream_ops,
-                ));
-            }
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(ServerError::OperationFailed(
-                    "stream semaphore closed (server shutting down)".into(),
-                ));
-            }
-        };
-
-        let args = ReadFramesArgs {
-            execution_id: execution_id.clone(),
-            attempt_index,
-            from_id: from_id.to_owned(),
-            to_id: to_id.to_owned(),
-            count_limit,
-        };
-
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let keys = ff_script::functions::stream::StreamOpKeys { ctx: &ctx };
-
-        // Route on the dedicated stream client, same as tail. A 10_000-
-        // frame XRANGE reply on the main mux would stall every other
-        // FCALL behind reply serialization.
-        let result = ff_script::functions::stream::ff_read_attempt_stream(
-            &self.tail_client, &keys, &args,
-        )
-        .await
-        .map_err(script_error_to_server);
-
-        drop(permit);
-
-        match result? {
-            ReadFramesResult::Frames(f) => Ok(f),
-        }
+        // RFC-017 Stage B row 10: delegate through the trait. The
+        // backend owns the stream-op semaphore + XRANGE dispatch; the
+        // 429-on-contention semantics round-trip as
+        // `EngineError::ResourceExhausted → ServerError::Engine →
+        // HTTP 429` (see `ServerError::from` below).
+        let from = wire_str_to_stream_cursor(from_id);
+        let to = wire_str_to_stream_cursor(to_id);
+        Ok(self
+            .backend
+            .read_stream(execution_id, attempt_index, from, to, count_limit)
+            .await?)
     }
 
     /// Tail a live attempt's stream (XREAD BLOCK wrapper). Returns frames
@@ -2673,65 +2548,25 @@ impl Server {
                 "count_limit must be >= 1".to_owned(),
             ));
         }
-
-        // Non-blocking permit acquisition on the shared stream_semaphore
-        // (read + tail split the same pool). If the server is already at
-        // the `max_concurrent_stream_ops` ceiling, return `TailUnavailable`
-        // (→ 429) rather than queueing — a queued tail holds the caller's
-        // HTTP request open with no upper bound, which is exactly the
-        // resource-exhaustion pattern this limit exists to prevent.
-        // Clients retry with backoff on 429.
-        //
-        // Worst-case permit hold: if the producer closes the stream via
-        // HSET on stream_meta (not an XADD), the XREAD BLOCK won't wake
-        // until `block_ms` elapses — so a permit can be held for up to
-        // the caller's block_ms even though the terminal signal is
-        // ready. This is a v1-accepted limitation; RFC-006 §Terminal-
-        // signal timing under active tail documents it and sketches the
-        // v2 sentinel-XADD upgrade path.
-        let permit = match self.stream_semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(ServerError::ConcurrencyLimitExceeded(
-                    "stream_ops",
-                    self.config.max_concurrent_stream_ops,
-                ));
-            }
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(ServerError::OperationFailed(
-                    "stream semaphore closed (server shutting down)".into(),
-                ));
-            }
-        };
-
-        let partition = execution_partition(execution_id, &self.config.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let stream_key = ctx.stream(attempt_index);
-        let stream_meta_key = ctx.stream_meta(attempt_index);
-
-        // Acquire the XREAD BLOCK serializer AFTER the stream semaphore.
-        // Nesting order matters: the semaphore is the user-visible
-        // ceiling (surfaces as 429), the Mutex is an internal fairness
-        // gate. Holding the permit while waiting on the Mutex means the
-        // ceiling still bounds queue depth. See the field docstring for
-        // the full rationale (ferriskey pipeline FIFO + client-side
-        // per-call timeout race).
-        let _xread_guard = self.xread_block_lock.lock().await;
-
-        let result = ff_script::stream_tail::xread_block(
-            &self.tail_client,
-            &stream_key,
-            &stream_meta_key,
-            last_id,
-            block_ms,
-            count_limit,
-        )
-        .await
-        .map_err(script_error_to_server);
-
-        drop(_xread_guard);
-        drop(permit);
-        result
+        // RFC-017 Stage B row 10: delegate through the trait. The
+        // backend owns the stream-op semaphore + XREAD BLOCK dispatch
+        // (via `duplicate_connection()` per #204, so neither a shared
+        // tail client nor a serialising mutex is needed). Saturation
+        // round-trips as `EngineError::ResourceExhausted → HTTP 429`;
+        // a post-shutdown arrival round-trips as
+        // `EngineError::Unavailable → HTTP 503`.
+        let after = wire_str_to_stream_cursor(last_id);
+        Ok(self
+            .backend
+            .tail_stream(
+                execution_id,
+                attempt_index,
+                after,
+                block_ms,
+                count_limit,
+                ff_core::backend::TailVisibility::All,
+            )
+            .await?)
     }
 
     /// Graceful shutdown — stops scanners, drains background handler tasks
@@ -2759,19 +2594,40 @@ impl Server {
     pub async fn shutdown(self) {
         tracing::info!("shutting down FlowFabric server");
 
-        // Step 1: Close the stream semaphore FIRST so any in-flight
-        // read/tail calls that are between `try_acquire` and their
-        // Valkey command still hold a valid permit, but no NEW stream
-        // op can start. `Semaphore::close()` is idempotent.
-        self.stream_semaphore.close();
-        tracing::info!(
-            "stream semaphore closed; no new read/tail attempts will be accepted"
-        );
+        // Step 1: RFC-017 Stage B — delegate stream-op pool closure
+        // + drain to the backend's `shutdown_prepare` hook. The
+        // Valkey impl closes its semaphore (no new read/tail starts)
+        // and awaits in-flight permits up to `grace`. A timeout here
+        // is logged + counted on `ff_shutdown_timeout_total`; we
+        // continue with best-effort drain of the server's own
+        // background tasks rather than blocking shutdown behind a
+        // single slow tail.
+        let drain_timeout = Duration::from_secs(15);
+        match self.backend.shutdown_prepare(drain_timeout).await {
+            Ok(()) => tracing::info!(
+                "backend shutdown_prepare complete (stream-op pool drained)"
+            ),
+            Err(ff_core::engine_error::EngineError::Timeout { elapsed, .. }) => {
+                self.metrics.inc_shutdown_timeout();
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "shutdown_prepare exceeded grace; proceeding best-effort"
+                );
+            }
+            Err(e) => {
+                // Non-timeout errors don't block shutdown either, but
+                // they're unexpected — log at warn so operators see
+                // the signal without tripping an alert.
+                tracing::warn!(
+                    err = %e,
+                    "shutdown_prepare returned error; proceeding best-effort"
+                );
+            }
+        }
 
         // Step 2: Drain handler-spawned background tasks with the same
         // ceiling as Engine::shutdown. If dispatch is still running at
         // the deadline, drop the JoinSet to abort remaining tasks.
-        let drain_timeout = Duration::from_secs(15);
         let background = self.background_tasks.clone();
         let drain = async move {
             let mut guard = background.lock().await;
@@ -2790,6 +2646,20 @@ impl Server {
 
         self.engine.shutdown().await;
         tracing::info!("FlowFabric server shutdown complete");
+    }
+}
+
+/// RFC-017 Stage B: lift the wire string (`"-"`, `"+"`, or a concrete
+/// entry id) used by the REST boundary into the typed
+/// [`ff_core::contracts::StreamCursor`] the trait method expects.
+/// Keeps the `read_attempt_stream` / `tail_attempt_stream`
+/// public-function signatures byte-identical while dispatching
+/// through the backend.
+fn wire_str_to_stream_cursor(s: &str) -> ff_core::contracts::StreamCursor {
+    match s {
+        "-" => ff_core::contracts::StreamCursor::Start,
+        "+" => ff_core::contracts::StreamCursor::End,
+        other => ff_core::contracts::StreamCursor::At(other.to_owned()),
     }
 }
 
@@ -3314,13 +3184,9 @@ impl Server {
             ));
         }
 
-        // Single-writer gate. Concurrent rotates against the SAME operator
-        // token are an attack pattern (or a retry-loop bug); legitimate
-        // operators rotate monthly and can afford to serialize. Contention
-        // returns ConcurrencyLimitExceeded("admin_rotate", 1) (→ HTTP 429
-        // with a labelled error body) rather than queueing the HTTP
-        // handler past the 120s endpoint timeout. Permit is held for
-        // the full partition fan-out.
+        // Single-writer gate — admin semaphore + audit log stay on
+        // Server per RFC-017 §4 row 11. The per-partition fan-out
+        // moved inside `ValkeyBackend::rotate_waitpoint_hmac_secret_all`.
         let _permit = match self.admin_rotate_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
@@ -3334,93 +3200,48 @@ impl Server {
         };
 
         let n = self.config.partition_config.num_flow_partitions;
-        // "now" is derived inside the FCALL from `redis.call("TIME")`
-        // (consistency with validate_waitpoint_token and flow scanners);
-        // grace_ms is a duration — safe to carry from config.
         let grace_ms = self.config.waitpoint_hmac_grace_ms;
 
-        // Parallelize the rotation fan-out with the same bounded
-        // concurrency as boot init (BOOT_INIT_CONCURRENCY = 16). A 256-
-        // partition sequential rotation takes ~7.7s at 30ms cross-AZ RTT,
-        // uncomfortably close to the 120s HTTP endpoint timeout under
-        // contention. Atomicity per partition now lives inside the
-        // `ff_rotate_waitpoint_hmac_secret` FCALL (FCALL is atomic per
-        // shard); parallelism across DIFFERENT partitions is safe. The
-        // outer `admin_rotate_semaphore(1)` bounds server-wide concurrent
-        // rotations, so this fan-out only affects a single in-flight
-        // rotate call at a time.
-        use futures::stream::{FuturesUnordered, StreamExt};
+        // RFC-017 Stage B row 11: delegate the per-partition fan-out
+        // to the backend. The trait method returns one entry per
+        // partition with an inner `Result` so partial success is
+        // observable — matching the pre-migration Server body.
+        let args = ff_core::contracts::RotateWaitpointHmacSecretAllArgs::new(
+            new_kid.to_owned(),
+            new_secret_hex.to_owned(),
+            grace_ms,
+        );
+        let result = self
+            .backend
+            .rotate_waitpoint_hmac_secret_all(args)
+            .await?;
 
         let mut rotated = 0u16;
-        let mut failed = Vec::new();
-        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
-        let mut next_index: u16 = 0;
-
-        loop {
-            while pending.len() < BOOT_INIT_CONCURRENCY && next_index < n {
-                let partition = Partition {
-                    family: PartitionFamily::Execution,
-                    index: next_index,
-                };
-                let idx = next_index;
-                // Clone only what the per-partition future needs. The
-                // new_kid / new_secret_hex references outlive the loop
-                // (they come from the enclosing function args), but
-                // FuturesUnordered needs 'static futures. Own the strings.
-                let new_kid_owned = new_kid.to_owned();
-                let new_secret_owned = new_secret_hex.to_owned();
-                let partition_owned = partition;
-                let fut = async move {
-                    let outcome = self
-                        .rotate_single_partition(
-                            &partition_owned,
-                            &new_kid_owned,
-                            &new_secret_owned,
-                            grace_ms,
-                        )
-                        .await;
-                    (idx, partition_owned, outcome)
-                };
-                pending.push(fut);
-                next_index += 1;
-            }
-            match pending.next().await {
-                Some((idx, partition, outcome)) => match outcome {
-                    Ok(()) => {
-                        rotated += 1;
-                        // Per-partition event → DEBUG (not INFO). Rationale:
-                        // one rotate endpoint call produces 256 partition-level
-                        // events, which would blow up paid aggregator budgets
-                        // (Datadog/Splunk) at no operational value. The single
-                        // aggregated audit event below is the compliance
-                        // artifact. Failures stay at ERROR with per-partition
-                        // detail — that's where operators need it.
-                        tracing::debug!(
-                            partition = %partition,
-                            new_kid = %new_kid,
-                            "waitpoint_hmac_rotated"
-                        );
-                    }
-                    Err(e) => {
-                        // Failures stay at ERROR (target=audit) per-partition —
-                        // operators need the partition index + error to debug
-                        // Valkey/config faults. Low cardinality in practice.
-                        tracing::error!(
-                            target: "audit",
-                            partition = %partition,
-                            err = %e,
-                            "waitpoint_hmac_rotation_failed"
-                        );
-                        failed.push(idx);
-                    }
-                },
-                None => break,
+        let mut failed: Vec<u16> = Vec::new();
+        for entry in &result.entries {
+            match &entry.result {
+                Ok(_) => {
+                    rotated += 1;
+                    tracing::debug!(
+                        partition = entry.partition,
+                        new_kid = %new_kid,
+                        "waitpoint_hmac_rotated"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "audit",
+                        partition = entry.partition,
+                        err = %e,
+                        "waitpoint_hmac_rotation_failed"
+                    );
+                    failed.push(entry.partition);
+                }
             }
         }
 
-        // Single aggregated audit event for the whole rotation. This is
-        // the load-bearing compliance artifact — operators alert on
-        // target="audit" at INFO level and this is the stable schema.
+        // Single aggregated audit event (RFC-017 row 11: audit emit
+        // stays on Server).
         tracing::info!(
             target: "audit",
             new_kid = %new_kid,
@@ -3435,56 +3256,6 @@ impl Server {
             failed,
             new_kid: new_kid.to_owned(),
         })
-    }
-
-    /// Rotate on a single partition by dispatching the
-    /// `ff_rotate_waitpoint_hmac_secret` FCALL. FCALL is atomic per shard,
-    /// so no external SETNX lock is needed — the script itself IS the
-    /// atomicity boundary. Single source of truth (Lua); the Rust
-    /// implementation that previously lived here was an exact duplicate
-    /// and has been removed.
-    async fn rotate_single_partition(
-        &self,
-        partition: &Partition,
-        new_kid: &str,
-        new_secret_hex: &str,
-        grace_ms: u64,
-    ) -> Result<(), ServerError> {
-        let idx = IndexKeys::new(partition);
-        let args = RotateWaitpointHmacSecretArgs {
-            new_kid: new_kid.to_owned(),
-            new_secret_hex: new_secret_hex.to_owned(),
-            grace_ms,
-        };
-        let outcome = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
-            &self.client,
-            &idx,
-            &args,
-        )
-        .await
-        .map_err(|e| match e {
-            // Same kid + different secret. Map to the same 409-style
-            // error the old Rust path returned so HTTP callers keep the
-            // current surface.
-            ff_script::ScriptError::RotationConflict(kid) => {
-                ServerError::OperationFailed(format!(
-                    "rotation conflict: kid {kid} already installed with a \
-                     different secret. Either use a fresh kid or restore the \
-                     original secret for this kid before retrying."
-                ))
-            }
-            ff_script::ScriptError::Valkey(v) => crate::server::backend_context(
-                v,
-                format!("FCALL ff_rotate_waitpoint_hmac_secret partition={partition}"),
-            ),
-            other => ServerError::OperationFailed(format!(
-                "rotation failed on partition {partition}: {other}"
-            )),
-        })?;
-        // Either outcome is a successful write from the operator's POV.
-        // Rotated → new install; Noop → idempotent replay.
-        let _ = outcome;
-        Ok(())
     }
 }
 
@@ -3915,6 +3686,7 @@ fn parse_replay_result(raw: &Value) -> Result<ReplayExecutionResult, ServerError
 /// the ErrorKind and made `ServerError::is_retryable()` always return
 /// false. Retry-capable clients (cairn-fabric) would not retry a legit
 /// transient error like `IoError`.
+#[allow(dead_code)] // retained for non-stream FCALL paths that still route via raw ScriptError; stream handlers moved to trait in RFC-017 Stage B
 fn script_error_to_server(e: ff_script::error::ScriptError) -> ServerError {
     match e {
         ff_script::error::ScriptError::Valkey(valkey_err) => {

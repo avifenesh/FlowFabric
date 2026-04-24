@@ -136,6 +136,10 @@ impl From<ScriptError> for EngineError {
                 kind: ValidationKind::InvalidWaitpointKey,
                 detail: String::new(),
             },
+            S::InvalidToken => Self::Validation {
+                kind: ValidationKind::InvalidToken,
+                detail: String::new(),
+            },
             S::WaitpointNotTokenBound => Self::Validation {
                 kind: ValidationKind::WaitpointNotTokenBound,
                 detail: String::new(),

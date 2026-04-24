@@ -12,10 +12,11 @@ use std::time::Duration;
 /// unready backends cleanly; no `FF_BACKEND` env var is wired yet
 /// (Stage D lands the env plumbing + the `BackendConfig` sum type
 /// per RFC §11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum BackendKind {
     /// Valkey / FCALL backend (production path through v0.7.x).
+    #[default]
     Valkey,
     /// Postgres backend. **Refuses to boot** until Stage E — see
     /// [`crate::server::ServerError::BackendNotReady`].
@@ -30,12 +31,6 @@ impl BackendKind {
             Self::Valkey => "valkey",
             Self::Postgres => "postgres",
         }
-    }
-}
-
-impl Default for BackendKind {
-    fn default() -> Self {
-        Self::Valkey
     }
 }
 
