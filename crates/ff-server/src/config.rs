@@ -138,6 +138,9 @@ impl ServerConfig {
     /// | `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval |
     /// | `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval |
     /// | `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel reconciler scanner interval |
+    /// | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Per RFC-017 §9.0, `postgres` is hard-gated at boot through Stage D; dev-override `FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development` bypasses (non-production only). |
+    /// | `FF_BACKEND_ACCEPT_UNREADY` | *(unset)* | Dev-only override: `1` or `true` bypasses `BACKEND_STAGE_READY` when `FF_ENV=development`. Production refuses the combination. |
+    /// | `FF_ENV` | *(unset)* | Environment marker. Only `development` enables the dev-override path above. Any other value (or unset) keeps the hard-gate active. |
     pub fn from_env() -> Result<Self, ConfigError> {
         let host = env_or("FF_HOST", "localhost");
         let port = env_u16("FF_PORT", 6379)?;
@@ -295,6 +298,28 @@ impl ServerConfig {
             scanner_filter: Default::default(),
         };
 
+        // RFC-017 Stage D1 (§9.0): `FF_BACKEND` selects the backend
+        // family at boot. Default `valkey`; `postgres` is hard-gated
+        // through Stage D and refused at startup unless the dev-mode
+        // override (`FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development`)
+        // is set. Unknown values are rejected eagerly so typos don't
+        // silently fall through to the default.
+        let backend = match std::env::var("FF_BACKEND") {
+            Ok(v) => match v.to_ascii_lowercase().as_str() {
+                "" | "valkey" => BackendKind::Valkey,
+                "postgres" => BackendKind::Postgres,
+                other => {
+                    return Err(ConfigError::InvalidValue {
+                        var: "FF_BACKEND".to_owned(),
+                        message: format!(
+                            "unknown backend '{other}': expected 'valkey' or 'postgres'"
+                        ),
+                    });
+                }
+            },
+            Err(_) => BackendKind::default(),
+        };
+
         Ok(Self {
             host,
             port,
@@ -310,7 +335,7 @@ impl ServerConfig {
             waitpoint_hmac_secret,
             waitpoint_hmac_grace_ms,
             max_concurrent_stream_ops,
-            backend: BackendKind::default(),
+            backend,
         })
     }
 }

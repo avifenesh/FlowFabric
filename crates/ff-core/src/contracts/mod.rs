@@ -809,17 +809,17 @@ pub enum BufferSignalResult {
 
 /// One entry in the read-only view of an execution's active waitpoints.
 ///
-/// Returned by `Server::list_pending_waitpoints` (and the
-/// `GET /v1/executions/{id}/pending-waitpoints` REST endpoint). The
-/// `waitpoint_token` is the same HMAC-SHA1 credential a suspending worker
-/// receives in `SuspendOutcome::Suspended` — a reviewer that needs to
-/// deliver a signal against this waitpoint must present it in
-/// `DeliverSignalArgs::waitpoint_token`.
+/// Returned by `EngineBackend::list_pending_waitpoints` (and the
+/// `GET /v1/executions/{id}/pending-waitpoints` REST endpoint).
 ///
-/// Exposing the token here is a deliberate API gap closure: a
-/// human-in-the-loop reviewer has no other path to the token, since only
-/// the suspending worker sees the `SuspendOutcome`. Access is gated by
-/// the same bearer-auth middleware as every other REST endpoint.
+/// **RFC-017 §8 schema rewrite (Stage D1).** This struct no longer
+/// carries the raw HMAC `waitpoint_token` at the trait boundary — the
+/// backend emits only the sanitised `(token_kid, token_fingerprint)`
+/// pair. The HTTP handler (see `ff-server::api::list_pending_waitpoints`)
+/// wraps the trait response and re-injects the real token on the
+/// v0.7.x wire for one-release deprecation warning; the wire field is
+/// removed entirely at v0.8.0.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWaitpointInfo {
     pub waitpoint_id: WaitpointId,
@@ -827,9 +827,6 @@ pub struct PendingWaitpointInfo {
     /// Current waitpoint state: `pending`, `active`, `closed`. Callers
     /// typically filter to `pending` or `active`.
     pub state: String,
-    /// HMAC-SHA1 token minted at create time; required by
-    /// `ff_deliver_signal` and `ff_buffer_signal_for_pending_waitpoint`.
-    pub waitpoint_token: WaitpointToken,
     /// Signal names the resume condition is waiting for. Reviewers that
     /// need to drive a specific waitpoint — particularly when multiple
     /// concurrent waitpoints exist on one execution — filter on this to
@@ -850,6 +847,61 @@ pub struct PendingWaitpointInfo {
     /// Scheduled expiration timestamp. `None` if no timeout configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<TimestampMs>,
+    /// Owning execution — surfaces without a separate lookup.
+    pub execution_id: ExecutionId,
+    /// HMAC key identifier (the `<kid>` prefix of the stored
+    /// `waitpoint_token`). Safe to expose — identifies which signing
+    /// key minted the token without revealing the key material.
+    pub token_kid: String,
+    /// 16-hex-char (8-byte) fingerprint of the HMAC digest. Audit-friendly
+    /// handle that correlates across logs without being replayable.
+    pub token_fingerprint: String,
+}
+
+impl PendingWaitpointInfo {
+    /// Construct a `PendingWaitpointInfo` with the 7 required fields.
+    /// Optional fields (`activated_at`, `expires_at`) default to
+    /// `None`; use [`Self::with_activated_at`] / [`Self::with_expires_at`]
+    /// to populate them. `required_signal_names` defaults to empty
+    /// (wildcard condition); use [`Self::with_required_signal_names`]
+    /// to set it.
+    pub fn new(
+        waitpoint_id: WaitpointId,
+        waitpoint_key: String,
+        state: String,
+        created_at: TimestampMs,
+        execution_id: ExecutionId,
+        token_kid: String,
+        token_fingerprint: String,
+    ) -> Self {
+        Self {
+            waitpoint_id,
+            waitpoint_key,
+            state,
+            required_signal_names: Vec::new(),
+            created_at,
+            activated_at: None,
+            expires_at: None,
+            execution_id,
+            token_kid,
+            token_fingerprint,
+        }
+    }
+
+    pub fn with_activated_at(mut self, activated_at: TimestampMs) -> Self {
+        self.activated_at = Some(activated_at);
+        self
+    }
+
+    pub fn with_expires_at(mut self, expires_at: TimestampMs) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    pub fn with_required_signal_names(mut self, names: Vec<String>) -> Self {
+        self.required_signal_names = names;
+        self
+    }
 }
 
 // ─── expire_suspension ───

@@ -876,7 +876,10 @@ async fn create_execution(
     State(server): State<Arc<Server>>,
     AppJson(args): AppJson<CreateExecutionArgs>,
 ) -> Result<(StatusCode, Json<CreateExecutionResult>), ApiError> {
-    let result = server.create_execution(&args).await?;
+    // RFC-017 Stage D1 (§4 row 6): dispatch through the backend trait.
+    // `ValkeyBackend::create_execution` wraps the same FCALL with the
+    // same 24h idempotency TTL default — zero wire impact.
+    let result = server.backend().create_execution(args).await?;
     let status = match &result {
         CreateExecutionResult::Created { .. } => StatusCode::CREATED,
         CreateExecutionResult::Duplicate { .. } => StatusCode::OK,
@@ -912,12 +915,99 @@ async fn get_execution_state(
 /// only mounts when `FF_API_TOKEN` is set; this endpoint is
 /// unauthenticated without it, and the server logs a loud warning at
 /// startup so operators notice.
+/// v0.7.x wire DTO for a pending waitpoint entry.
+///
+/// **RFC-017 Stage D1 (§8) — deprecation window.** The trait-boundary
+/// `PendingWaitpointInfo` no longer carries the raw HMAC
+/// `waitpoint_token`; this DTO re-injects the legacy field on the
+/// v0.7.x wire so existing consumers keep functioning for one release.
+/// At v0.8.0 the legacy field is removed outright and the struct
+/// collapses into a direct serialisation of `PendingWaitpointInfo`.
+/// Each response also carries the `Deprecation: ff-017` header and
+/// increments `ff_pending_waitpoint_legacy_token_served_total`.
+#[derive(Serialize)]
+struct PendingWaitpointWireV07 {
+    waitpoint_id: WaitpointId,
+    waitpoint_key: String,
+    state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    required_signal_names: Vec<String>,
+    created_at: TimestampMs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activated_at: Option<TimestampMs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<TimestampMs>,
+    execution_id: ExecutionId,
+    token_kid: String,
+    token_fingerprint: String,
+    /// RFC-017 §8 legacy v0.7.x field — `null` on non-Valkey backends
+    /// (the v0.7.x token-fetch shim is Valkey-only). Removed at v0.8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waitpoint_token: Option<String>,
+}
+
 async fn list_pending_waitpoints(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<PendingWaitpointInfo>>, ApiError> {
+) -> Result<Response, ApiError> {
+    // RFC-017 Stage D1 (§4 row 8 / §8): dispatch through the trait +
+    // wrap the sanitised entries for the v0.7.x deprecation window.
     let eid = parse_execution_id(&id)?;
-    Ok(Json(server.list_pending_waitpoints(&eid).await?))
+    let args = ff_core::contracts::ListPendingWaitpointsArgs::new(eid.clone());
+    let page = server.backend().list_pending_waitpoints(args).await?;
+
+    // Fetch the raw token for each entry via the Valkey-only v0.7.x
+    // shim. The §9.0 hard-gate guarantees only `valkey` backends boot
+    // through Stage D; defensive-in-depth, non-Valkey backends emit
+    // `token = None` + a warn log.
+    let is_valkey = server.backend().backend_label() == "valkey";
+    let metrics = server.metrics();
+    let mut wire: Vec<PendingWaitpointWireV07> = Vec::with_capacity(page.entries.len());
+    for info in page.entries {
+        let legacy_token = if is_valkey {
+            server
+                .fetch_waitpoint_token_v07(&info.execution_id, &info.waitpoint_id)
+                .await
+                .map_err(ApiError::from)?
+        } else {
+            tracing::warn!(
+                execution_id = %info.execution_id,
+                waitpoint_id = %info.waitpoint_id,
+                "pending_waitpoint_legacy_token_unavailable: \
+                 backend does not expose the v0.7.x token-fetch shim"
+            );
+            None
+        };
+        if legacy_token.is_some() {
+            metrics.inc_pending_waitpoint_legacy_token();
+            tracing::info!(
+                target: "audit",
+                execution_id = %info.execution_id,
+                waitpoint_id = %info.waitpoint_id,
+                "pending_waitpoint_legacy_token_served"
+            );
+        }
+        wire.push(PendingWaitpointWireV07 {
+            waitpoint_id: info.waitpoint_id,
+            waitpoint_key: info.waitpoint_key,
+            state: info.state,
+            required_signal_names: info.required_signal_names,
+            created_at: info.created_at,
+            activated_at: info.activated_at,
+            expires_at: info.expires_at,
+            execution_id: info.execution_id,
+            token_kid: info.token_kid,
+            token_fingerprint: info.token_fingerprint,
+            waitpoint_token: legacy_token,
+        });
+    }
+
+    let mut resp = Json(wire).into_response();
+    resp.headers_mut().insert(
+        "Deprecation",
+        axum::http::HeaderValue::from_static("ff-017"),
+    );
+    Ok(resp)
 }
 
 /// Returns the raw result payload bytes written by the worker's
@@ -958,8 +1048,9 @@ async fn get_execution_result(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
+    // RFC-017 Stage D1 (§4 row 2): trait-dispatched execution result read.
     let eid = parse_execution_id(&id)?;
-    match server.get_execution_result(&eid).await? {
+    match server.backend().get_execution_result(&eid).await? {
         Some(bytes) => Ok((
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -1413,7 +1504,8 @@ async fn create_flow(
     State(server): State<Arc<Server>>,
     AppJson(args): AppJson<CreateFlowArgs>,
 ) -> Result<(StatusCode, Json<CreateFlowResult>), ApiError> {
-    let result = server.create_flow(&args).await?;
+    // RFC-017 Stage D1 (§4 row 5): trait-dispatched ingress.
+    let result = server.backend().create_flow(args).await?;
     let status = match &result {
         CreateFlowResult::Created { .. } => StatusCode::CREATED,
         CreateFlowResult::AlreadySatisfied { .. } => StatusCode::OK,
@@ -1429,7 +1521,8 @@ async fn add_execution_to_flow(
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    let result = server.add_execution_to_flow(&args).await?;
+    // RFC-017 Stage D1 (§4 row 5): trait-dispatched ingress.
+    let result = server.backend().add_execution_to_flow(args).await?;
     let status = match &result {
         AddExecutionToFlowResult::Added { .. } => StatusCode::CREATED,
         AddExecutionToFlowResult::AlreadyMember { .. } => StatusCode::OK,
@@ -1459,6 +1552,15 @@ async fn cancel_flow(
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
     let wait = params.get("wait").is_some_and(|v| v == "true" || v == "1");
+    // RFC-017 Stage D1 (§4 row 5): header-only dispatch via the trait.
+    // The synchronous `?wait=true` path retains the inherent
+    // `Server::cancel_flow_wait` route because the trait's
+    // `cancel_flow(id, policy, wait)` signature rejects `wait` variants
+    // other than `NoWait` (Valkey impl returns `Unavailable` for timed
+    // waits — `ff_cancel_flow` FCALL is NoWait by construction). The
+    // async member-cancel dispatcher inside `Server::cancel_flow_inner`
+    // continues to service `?wait=false` through the inherent path
+    // until D2 relocates it into `ValkeyBackend::cancel_flow_with_args`.
     let result = if wait {
         server.cancel_flow_wait(&args).await?
     } else {
@@ -1475,7 +1577,8 @@ async fn stage_dependency_edge(
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    let result = server.stage_dependency_edge(&args).await?;
+    // RFC-017 Stage D1 (§4 row 5): trait-dispatched ingress.
+    let result = server.backend().stage_dependency_edge(args).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -1487,7 +1590,8 @@ async fn apply_dependency_to_child(
     let path_fid = parse_flow_id(&id)?;
     check_id_match(&path_fid, &args.flow_id, "flow_id")?;
     args.flow_id = path_fid;
-    Ok(Json(server.apply_dependency_to_child(&args).await?))
+    // RFC-017 Stage D1 (§4 row 5): trait-dispatched ingress.
+    Ok(Json(server.backend().apply_dependency_to_child(args).await?))
 }
 
 // ── Budget / Quota handlers ──

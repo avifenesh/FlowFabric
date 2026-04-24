@@ -23,6 +23,22 @@ some on Stage-E) with `FF_BACKEND=postgres` are unsupported. Operators
 must complete a valkey→valkey Stage D→E rolling upgrade first and flip
 `FF_BACKEND=postgres` as a second rollout.
 
+**Stage D split (owner-adjudicated 2026-04-24).** Stage D scope from
+RFC-017 §9 was split into two PRs to keep reviewer cognitive load
+bounded:
+
+- **D1** (this row of flips) — §8 `PendingWaitpointInfo` schema
+  rewrite, Valkey `list_pending_waitpoints` impl, 8 HTTP handler
+  migrations, `Server::start_with_backend` entry point,
+  `FF_BACKEND` env + §9.0 hard-gate wiring at stage `"D"`,
+  deprecation audit log (`Deprecation: ff-017` header +
+  `ff_pending_waitpoint_legacy_token_served_total`).
+- **D2** (follow-up PR, required before v0.7 tag) — boot relocation
+  into `ValkeyBackend::connect_with_metrics` (§4 row 12),
+  `Server::client: Client` field removal (cascades to remaining
+  handlers still using `fcall_with_reload`), `http_postgres_smoke.rs`
+  integration test, Stage-B feature flag removal.
+
 ---
 
 ## RFC-017 Stage A trait surface (51 methods total)
@@ -55,7 +71,7 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 | 13 | `get_budget_status` | `impl` | `stub` | **Landed Stage C.** Valkey body is 3× HGETALL (definition + usage + limits) + field-level parse, no FCALL. Missing budget surfaces as `EngineError::NotFound { entity: "budget" }` with contextual wrapper carrying the budget id. |
 | 14 | `report_usage_admin` | `impl` | `stub` | Valkey wraps `ff_report_usage_and_check` without worker handle. |
 | 15 | `get_execution_result` | `impl` | `stub` | Valkey direct `GET` of `ctx.result()`, binary-safe. |
-| 16 | `list_pending_waitpoints` | `stub` | `stub` | §8 schema rewrite (HMAC redaction + `token_kid`/`token_fingerprint`) is Stage D's explicit scope. Stage A lands the trait signature only. |
+| 16 | `list_pending_waitpoints` | `impl` | `stub` | **Landed Stage D1.** Pipelined SSCAN + 2× HMGET + §8 schema rewrite (HMAC redaction + `token_kid`/`token_fingerprint`) + `after`/`limit` pagination. HTTP handler wraps with the v0.7.x `Deprecation: ff-017` header and the raw `waitpoint_token` (fetched via the Valkey-only inherent `Server::fetch_waitpoint_token_v07`) for one-release deprecation warning. Postgres impl lands in Stage D2 (full parity gate). |
 | 17 | `ping` | `impl` | `impl` | Valkey: `PING`. Postgres: `SELECT 1`. |
 | 18 | `claim_for_worker` | `impl` | `stub` | **Landed Stage C.** `ff-backend-valkey` added `ff-scheduler` dep; `ValkeyBackend` holds `Option<Arc<ff_scheduler::Scheduler>>` wired at `ff-server` boot via `ValkeyBackend::with_scheduler` before the `Arc<dyn EngineBackend>` is sealed. Trait impl forwards to `Scheduler::claim_for_worker`; `SchedulerError::Config` maps to `EngineError::Validation`, Valkey transport errors via `transport_fk`. Backends without a wired scheduler (e.g. SDK-side `MockBackend`) surface `EngineError::Unavailable { op: "claim_for_worker (scheduler not wired on this ValkeyBackend)" }`. |
 
@@ -113,11 +129,27 @@ sequence anticipated.
   via the freshly minted `From<EngineError> for ApiError` bridge.
   The Engine `IntoResponse` arm gained `Conflict` / `Contention` /
   `State` kinds mapping to HTTP 409 per RFC-010 §10.7.
-- **Stage D:** ingress + `list_pending_waitpoints` §8 schema rewrite
-  + Postgres HTTP cutover. **CI gate:**
+- **Stage D1 (this PR, `impl/017-stage-d1`):** §8 schema rewrite +
+  Valkey `list_pending_waitpoints` impl + 8 HTTP handlers migrated
+  to trait dispatch (`create_execution`, `create_flow`,
+  `add_execution_to_flow`, `stage_dependency_edge`,
+  `apply_dependency_to_child`, `get_execution_result`,
+  `list_pending_waitpoints`, + header-only migration of
+  `cancel_flow` — the async member dispatcher remains on `Server`
+  pending D2). `Server::start_with_backend` entry point added;
+  `FF_BACKEND` env + §9.0 hard-gate wired at stage `"D"` with the
+  dev-mode override and `ff_backend_unready_boot_total{backend,stage}`
+  metric. Deprecation audit log: `Deprecation: ff-017` response
+  header + `ff_pending_waitpoint_legacy_token_served_total` counter
+  + per-entry `pending_waitpoint_legacy_token_served` tracing event.
+- **Stage D2 (follow-up, required before v0.7 tag):** boot
+  relocation into `ValkeyBackend::connect_with_metrics` (§4 row 12),
+  `Server::client: Client` field removal + cascading handler
+  cutover, `http_postgres_smoke.rs` integration test, Stage-B
+  feature flag removal (if present). **CI gate:**
   `test_postgres_parity_no_unavailable` asserts no Postgres
   `Unavailable` on any HTTP-exposed method. Every `stub` in the
-  Postgres column above must be `impl` before Stage D merges.
+  Postgres column above must be `impl` before Stage D2 merges.
 - **Stage E (v0.8.0):** `BACKEND_STAGE_READY` updated to
   `&["valkey", "postgres"]`; `FF_BACKEND=postgres` boots successfully
   for the first time.

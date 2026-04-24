@@ -13,6 +13,18 @@ pub struct FlowStructOpKeys<'a> {
     pub fidx: &'a FlowIndexKeys,
 }
 
+/// Key context for [`ff_add_execution_to_flow`]. Extends
+/// [`FlowStructOpKeys`] with the member execution's `exec_core`
+/// key — Lua expects KEYS(4) with `exec_core` at position 4 to
+/// stamp the flow back-pointer atomically (RFC-011 §7.3). Using
+/// the bare `FlowStructOpKeys` here wires only KEYS(3) and the
+/// function fails at runtime with `redis.call("EXISTS", nil)`.
+pub struct AddExecutionToFlowKeys<'a> {
+    pub fctx: &'a FlowKeyContext,
+    pub fidx: &'a FlowIndexKeys,
+    pub exec_ctx: &'a ExecKeyContext,
+}
+
 /// Key context for child-local dependency operations on {p:N}.
 ///
 /// `flow_ctx` is required for dependency ops (every dependency edge
@@ -96,10 +108,11 @@ impl FromFcallResult for CreateFlowResult {
 
 ff_function! {
     pub ff_add_execution_to_flow(args: AddExecutionToFlowArgs) -> AddExecutionToFlowResult {
-        keys(k: &FlowStructOpKeys<'_>) {
+        keys(k: &AddExecutionToFlowKeys<'_>) {
             k.fctx.core(),
             k.fctx.members(),
             k.fidx.flow_index(),
+            k.exec_ctx.core(),
         }
         argv {
             args.flow_id.to_string(),
