@@ -129,11 +129,17 @@ async fn create_execution_on_lane(tc: &TestCluster, lane: &str) -> ExecutionId {
 }
 
 /// End-to-end coverage: Server::start must seed `ff:idx:lanes` from
-/// ServerConfig.lanes, AND a subsequent execution on a lane NOT in that
-/// list must be added by the Lua first-sight SADD.
+/// ServerConfig.lanes.
+///
+/// Dynamic lane registration via Lua first-sight SADD was initially
+/// implemented (PR #207) but reverted because it violates the cluster
+/// single-slot invariant (`ff:idx:lanes` has no partition hash tag and
+/// FCALL can only touch declared KEYS). Lane registration is therefore
+/// boot-time-only; consumers that need dynamic lanes extend
+/// `ServerConfig.lanes` before boot.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn list_lanes_populated_by_server_boot_and_lua_first_sight() {
+async fn list_lanes_populated_by_server_boot() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     seed_partition_config(&tc).await;
@@ -169,28 +175,4 @@ async fn list_lanes_populated_by_server_boot_and_lua_first_sight() {
     assert!(lane_set.contains("alpha"));
     assert!(lane_set.contains("beta"));
     assert!(lane_set.contains("gamma"));
-
-    // Assert #2 — submitting an execution on a lane NOT in the configured
-    // set adds that lane to the registry via Lua first-sight SADD.
-    let _eid = create_execution_on_lane(&tc, "delta").await;
-
-    let page2 = backend
-        .list_lanes(None, 100)
-        .await
-        .expect("list_lanes after create");
-    assert_eq!(page2.next_cursor, None);
-    assert_eq!(
-        page2.lanes.len(),
-        4,
-        "expected 4 lanes after create, got {:?}",
-        page2.lanes
-    );
-    let lane_set2: HashSet<&str> = page2.lanes.iter().map(|l| l.as_str()).collect();
-    assert!(lane_set2.contains("alpha"));
-    assert!(lane_set2.contains("beta"));
-    assert!(lane_set2.contains("gamma"));
-    assert!(
-        lane_set2.contains("delta"),
-        "Lua first-sight SADD failed to register 'delta'"
-    );
 }

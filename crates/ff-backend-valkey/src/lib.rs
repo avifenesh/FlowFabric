@@ -2986,6 +2986,7 @@ fn resume_policy_to_json(p: &ResumePolicy) -> String {
 }
 
 /// Rust-side pre-FCALL validation (RFC-013 §4 + RFC-014 Pattern 3).
+#[allow(clippy::collapsible_if)]
 fn validate_suspend_args(args: &SuspendArgs) -> Result<(), EngineError> {
     // Non-empty waitpoints vector (RFC-014 §2 Pattern 3 invariant).
     if args.waitpoints.is_empty() {
@@ -3984,6 +3985,7 @@ async fn read_stream_impl(
         attempt_index = %attempt_index,
     )
 )]
+#[allow(clippy::too_many_arguments)]
 async fn tail_stream_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
