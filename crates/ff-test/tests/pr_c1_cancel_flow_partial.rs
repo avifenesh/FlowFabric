@@ -60,10 +60,13 @@ async fn start_test_server() -> Server {
         .unwrap_or(false);
 
     let server_config = ServerConfig {
-        host,
-        port,
-        tls,
-        cluster,
+        valkey: ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls,
+            cluster,
+            skip_library_load: true, // TestCluster::connect() already loaded
+        },
         partition_config: config,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "0.0.0.0:0".into(),
@@ -72,7 +75,6 @@ async fn start_test_server() -> Server {
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
         },
-        skip_library_load: true, // TestCluster::connect() already loaded
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:

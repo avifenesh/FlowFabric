@@ -30,7 +30,7 @@ use crate::config::{BackendKind, ServerConfig};
 /// joins at Stage E (v0.8.0). Compiled into the binary by design —
 /// see RFC-017 §9.0 "Fleet-wide cutover requirement" for the
 /// rolling-upgrade implication.
-const BACKEND_STAGE_READY: &[&str] = &["valkey"];
+const BACKEND_STAGE_READY: &[&str] = &["valkey", "postgres"];
 
 /// Upper bound on `member_execution_ids` returned in the
 /// [`CancelFlowResult::Cancelled`] response when the flow was already in a
@@ -147,9 +147,8 @@ pub enum ServerError {
     /// `stage` names the current stage ("A"/"B"/"C"/"D") so operator
     /// tooling can correlate the refusal with the migration plan.
     #[error(
-        "backend not ready: {backend} (staged for Stage E; current binary at Stage {stage}). \
-         Set FF_BACKEND=valkey, or set both FF_BACKEND_ACCEPT_UNREADY=1 and FF_ENV=development to \
-         override in dev."
+        "backend not ready: {backend} (not in BACKEND_STAGE_READY; current stage {stage}). \
+         Set FF_BACKEND=valkey or FF_BACKEND=postgres."
     )]
     BackendNotReady {
         backend: &'static str,
@@ -301,39 +300,21 @@ impl Server {
         config: ServerConfig,
         metrics: Arc<ff_observability::Metrics>,
     ) -> Result<Self, ServerError> {
-        // RFC-017 §9.0 hard-gate. Refuse to boot unready backends
-        // unless the dev-mode override combo (FF_BACKEND_ACCEPT_UNREADY=1
-        // AND FF_ENV=development) is set. Production refuses the
-        // override; see the env-var check inline.
+        // RFC-017 §9.0 hard-gate. At v0.8.0 (Stage E4) both `valkey` and
+        // `postgres` are ready; this check remains as defence-in-depth
+        // so future backend additions must explicitly opt into the list.
+        // The `FF_BACKEND_ACCEPT_UNREADY` / `FF_ENV=development` dev-mode
+        // override was retired at Stage E4 because it is no longer
+        // needed — both supported backends now boot without override.
         let label = config.backend.as_str();
         if !BACKEND_STAGE_READY.contains(&label) {
-            let accept_unready = std::env::var("FF_BACKEND_ACCEPT_UNREADY")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let is_dev = std::env::var("FF_ENV")
-                .map(|v| v.eq_ignore_ascii_case("development"))
-                .unwrap_or(false);
-            if accept_unready && is_dev {
-                tracing::warn!(
-                    backend = label,
-                    stage = "E1",
-                    "backend_unready_boot_override: backend={label} stage=E1 \
-                     (FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development)"
-                );
-                let backend_label: &'static str = match config.backend {
+            return Err(ServerError::BackendNotReady {
+                backend: match config.backend {
                     BackendKind::Postgres => "postgres",
                     BackendKind::Valkey => "valkey",
-                };
-                metrics.inc_backend_unready_boot(backend_label, "E1");
-            } else {
-                return Err(ServerError::BackendNotReady {
-                    backend: match config.backend {
-                        BackendKind::Postgres => "postgres",
-                        BackendKind::Valkey => "valkey",
-                    },
-                    stage: "E1",
-                });
-            }
+                },
+                stage: "E4",
+            });
         }
 
         // RFC-017 Wave 8 Stage E1: Postgres dial branch. Stage E4 flips
@@ -346,18 +327,18 @@ impl Server {
         }
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
-            host = %config.host, port = config.port,
-            tls = config.tls, cluster = config.cluster,
+            host = %config.valkey.host, port = config.valkey.port,
+            tls = config.valkey.tls, cluster = config.valkey.cluster,
             "connecting to Valkey"
         );
         let mut builder = ClientBuilder::new()
-            .host(&config.host, config.port)
+            .host(&config.valkey.host, config.valkey.port)
             .connect_timeout(Duration::from_secs(10))
             .request_timeout(Duration::from_millis(5000));
-        if config.tls {
+        if config.valkey.tls {
             builder = builder.tls();
         }
-        if config.cluster {
+        if config.valkey.cluster {
             builder = builder.cluster();
         }
         let client = builder
@@ -394,7 +375,7 @@ impl Server {
             .initialize_deployment(
                 &config.waitpoint_hmac_secret,
                 &config.lanes,
-                config.skip_library_load,
+                config.valkey.skip_library_load,
             )
             .await
             .map_err(|e| ServerError::Engine(Box::new(e)))?;
@@ -434,11 +415,11 @@ impl Server {
         // the wire subscription now lives in ff-backend-valkey, the
         // engine just consumes the resulting stream.
         let mut valkey_conn = ff_core::backend::ValkeyConnection::new(
-            config.host.clone(),
-            config.port,
+            config.valkey.host.clone(),
+            config.valkey.port,
         );
-        valkey_conn.tls = config.tls;
-        valkey_conn.cluster = config.cluster;
+        valkey_conn.tls = config.valkey.tls;
+        valkey_conn.cluster = config.valkey.cluster;
         let completion_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
             client.clone(),
             config.partition_config,
@@ -534,11 +515,11 @@ impl Server {
             config.partition_config,
             {
                 let mut c = ff_core::backend::ValkeyConnection::new(
-                    config.host.clone(),
-                    config.port,
+                    config.valkey.host.clone(),
+                    config.valkey.port,
                 );
-                c.tls = config.tls;
-                c.cluster = config.cluster;
+                c.tls = config.valkey.tls;
+                c.cluster = config.valkey.cluster;
                 c
             },
         );
@@ -730,28 +711,6 @@ impl Server {
     // reads are all reachable through the Stage E2 trait additions
     // (`cancel_flow_header`, `ack_cancel_member`, `read_execution_info`,
     // `read_execution_state`, `fetch_waitpoint_token_v07`).
-
-    /// RFC-017 Stage D1 (§8): fetch the raw `<kid>:<hex>`
-    /// `waitpoint_token` so the v0.7.x wire-format shim in
-    /// `api::list_pending_waitpoints` can re-inject the legacy
-    /// `waitpoint_token` field during the one-release deprecation
-    /// window. **Valkey-only** — the backend hard-gate ensures no
-    /// other backend can reach this path at boot; callers defensive-
-    /// check via `backend_label()` before calling. At v0.8.0 the
-    /// legacy wire field is removed and this method goes with it.
-    pub async fn fetch_waitpoint_token_v07(
-        &self,
-        execution_id: &ExecutionId,
-        waitpoint_id: &WaitpointId,
-    ) -> Result<Option<String>, ServerError> {
-        // RFC-017 Stage E2: routed through the backend trait. The
-        // Valkey impl carries the HGET verbatim; Postgres returns
-        // Unavailable (it cannot reach this path at boot per §9.0).
-        Ok(self
-            .backend
-            .fetch_waitpoint_token_v07(execution_id, waitpoint_id)
-            .await?)
-    }
 
     /// Get the server config.
     pub fn config(&self) -> &ServerConfig {

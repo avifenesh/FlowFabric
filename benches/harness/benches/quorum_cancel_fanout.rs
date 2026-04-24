@@ -267,11 +267,12 @@ async fn start_server(tc: &TestCluster) -> std::sync::Arc<ff_server::server::Ser
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
     let pc = *tc.partition_config();
-    let config = ff_server::config::ServerConfig {
-        host,
-        port,
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+    let config = ff_server::config::ServerConfig {        valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: ff_test::fixtures::env_flag("FF_TLS"), cluster: ff_test::fixtures::env_flag("FF_CLUSTER"), skip_library_load: false },
+
+
+
+
+
         partition_config: pc,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "127.0.0.1:0".into(),
@@ -281,14 +282,15 @@ async fn start_server(tc: &TestCluster) -> std::sync::Arc<ff_server::server::Ser
             edge_cancel_dispatcher_interval: Duration::from_millis(250),
             ..Default::default()
         },
-        skip_library_load: false,
+
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         waitpoint_hmac_grace_ms: 86_400_000,
         max_concurrent_stream_ops: 64,
-    };
+    
+};
     let server = ff_server::server::Server::start(config)
         .await
         .expect("Server::start");

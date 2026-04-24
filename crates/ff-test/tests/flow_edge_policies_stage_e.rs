@@ -89,11 +89,12 @@ async fn start_server_with_metrics(
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
     let pc = *tc.partition_config();
-    let config = ff_server::config::ServerConfig {
-        host,
-        port,
-        tls: ff_test::fixtures::env_flag("FF_TLS"),
-        cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
+    let config = ff_server::config::ServerConfig {        valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: ff_test::fixtures::env_flag("FF_TLS"), cluster: ff_test::fixtures::env_flag("FF_CLUSTER"), skip_library_load: false },
+
+
+
+
+
         partition_config: pc,
         lanes: vec![LaneId::new(LANE)],
         listen_addr: "127.0.0.1:0".into(),
@@ -105,7 +106,7 @@ async fn start_server_with_metrics(
             edge_cancel_reconciler_interval: Duration::from_millis(500),
             ..Default::default()
         },
-        skip_library_load: false,
+
         cors_origins: vec!["*".to_owned()],
         api_token: None,
         waitpoint_hmac_secret:
@@ -114,7 +115,8 @@ async fn start_server_with_metrics(
         max_concurrent_stream_ops: 64,
         backend: ff_server::config::BackendKind::default(),
         postgres: Default::default(),
-    };
+    
+};
     let server = ff_server::server::Server::start_with_metrics(config, metrics)
         .await
         .expect("Server::start_with_metrics");

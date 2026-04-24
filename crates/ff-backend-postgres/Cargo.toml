@@ -28,7 +28,7 @@ observability = ["ff-observability/enabled"]
 # Wave 0: `core`, `suspension`, `budget` match ff-backend-valkey's
 # ff-core feature set so the Postgres backend honours the same
 # `EngineBackend` method surface.
-ff-core = { version = "0.6.1", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
+ff-core = { version = "0.8.0", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
 # Always-present observability shim (no-op unless `observability`
 # feature flips the shim to real OTEL). Mirrors ff-backend-valkey.
 ff-observability = { workspace = true }

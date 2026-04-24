@@ -467,35 +467,6 @@ impl ValkeyBackend {
     }
 
     /// RFC-017 Stage D1 (§8): Valkey-only inherent fetch of the raw
-    /// `<kid>:<hex>` waitpoint token for the v0.7.x pending-waitpoints
-    /// wire-format shim. **NOT on `EngineBackend`** — the trait
-    /// boundary never exposes the raw HMAC post-§8. The ff-server
-    /// HTTP handler wraps the sanitised trait response and calls
-    /// this inherent to re-inject the legacy field on the wire for
-    /// one-release deprecation warning; the shim + this method go
-    /// away at Stage E / v0.8.0.
-    ///
-    /// Returns `Ok(None)` if the waitpoint hash does not carry a
-    /// `waitpoint_token` field (missing / rotated out). Transport
-    /// errors surface as `EngineError::Transport`.
-    pub async fn fetch_waitpoint_token_v07(
-        &self,
-        execution_id: &ExecutionId,
-        waitpoint_id: &WaitpointId,
-    ) -> Result<Option<String>, EngineError> {
-        let partition = execution_partition(execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let token: Option<String> = self
-            .client
-            .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
-            .await
-            .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "fetch_waitpoint_token_v07: HGET waitpoint_token",
-            ))?;
-        Ok(token.filter(|s| !s.is_empty()))
-    }
-
     /// RFC-017 §14.8 mandatory Stage B CI test hook. Exposes a clone
     /// of the internal semaphore so the shutdown-under-load test can
     /// hold permits directly without dispatching a live FCALL.
@@ -5966,23 +5937,6 @@ impl EngineBackend for ValkeyBackend {
         }
     }
 
-    async fn fetch_waitpoint_token_v07(
-        &self,
-        execution_id: &ExecutionId,
-        waitpoint_id: &WaitpointId,
-    ) -> Result<Option<String>, EngineError> {
-        let partition = execution_partition(execution_id, &self.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let token: Option<String> = self
-            .client
-            .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
-            .await
-            .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "fetch_waitpoint_token_v07: HGET waitpoint_token",
-            ))?;
-        Ok(token.filter(|s| !s.is_empty()))
-    }
 }
 
 /// Detect Valkey errors indicating the Lua function library is not

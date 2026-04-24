@@ -241,3 +241,56 @@ not yet implement the underlying trait method:
   `Unavailable` for the methods whose impls land in Wave 9
   (`cancel_flow_header`, `ack_cancel_member`, `read_execution_info`,
   `read_execution_state`, `fetch_waitpoint_token_v07`).
+
+---
+
+## Release: v0.8.0 (Stage E4, 2026-04-24)
+
+**Gate status:** `BACKEND_STAGE_READY = &["valkey", "postgres"]`.
+`FF_BACKEND=postgres` boots natively; no `FF_BACKEND_ACCEPT_UNREADY`
+dev-override. The §9.0 hard-gate still exists in `ff-server` as
+defence-in-depth for future backend additions (e.g. SQLite, DynamoDB)
+but no longer trips on Postgres.
+
+### Parity summary at v0.8.0
+
+| Family | Valkey | Postgres | Notes |
+|---|---|---|---|
+| Ingress (create_flow, create_execution, add_execution_to_flow, stage_dependency_edge, apply_dependency_to_child) | `impl` | `impl` | Full HTTP parity. `http_postgres_smoke` exercises all 5 end-to-end. |
+| Flow family (`describe_flow`, `list_flows`, `list_edges`, `describe_edge`, `cancel_flow`, `set_edge_group_policy`) | `impl` | `impl` | RFC-v0.7 Wave 4c. |
+| Flow cancel (`cancel_flow_header`, `ack_cancel_member`) | `impl` | `stub` | Wave 9 follow-up; Postgres `cancel_flow` covers the bulk path, the header/ack split lands with cancel-backlog machinery. |
+| Read model (`read_execution_info`, `read_execution_state`, `get_execution_result`) | `impl` | `stub` | Wave 9 PG read-model migration. |
+| Operator control (`cancel_execution`, `change_priority`, `replay_execution`, `revoke_lease`) | `impl` | `stub` | Wave 9. |
+| Budget / quota (`create_budget`, `reset_budget`, `create_quota_policy`, `get_budget_status`, `report_usage_admin`) | `impl` | `stub` | Wave 9. |
+| Scheduler (`claim_for_worker`) | `impl` | `impl` | Stage E3 `PostgresScheduler` + `claim_for_worker` trait impl + 6 reconcilers. |
+| Waitpoints (`list_pending_waitpoints`) | `impl` | `stub` | Wave 9. |
+| Admin rotation (`rotate_waitpoint_hmac_secret_all`) | `impl` | `stub` | Wave 9 (single-INSERT on the global HMAC table). |
+| Cross-cutting (`backend_label`, `shutdown_prepare`, `ping`) | `impl` | `impl` | — |
+
+### v0.8.0 shipped
+
+- Stage E1 — Postgres HTTP ingress branch + `http_postgres_smoke`.
+- Stage E2 — `Server::client` field retired on Postgres path;
+  `cancel_flow_header` / `ack_cancel_member` / `read_execution_info` /
+  `read_execution_state` / `fetch_waitpoint_token_v07` moved onto the
+  trait (Valkey bodies ported verbatim; Postgres returns `Unavailable`
+  for the Wave-9 rows).
+- Stage E3 — `PostgresScheduler` + `claim_for_worker` trait impl +
+  sibling-cancel, lease-timeout, completion-listener, cancel-backlog,
+  flow-staging, edge-group-policy reconcilers.
+- Stage E4a (this release) — `BACKEND_STAGE_READY` flip,
+  `ServerConfig` flat-field removal, legacy `waitpoint_token` wire
+  field removal, v0.8.0 version bump, CHANGELOG, migration doc.
+
+### Deferred to v0.9 / post-0.8
+
+Every Postgres column row still marked `stub` in the Stage A table
+above lands in Wave 9 (RFC-018, scope TBD). No `stub` row is an
+HTTP-exposed dispatch blocker at v0.8.0 because the corresponding
+HTTP handlers return a structured `503 Unavailable` with an
+`EngineError::Unavailable { op }` body — operators upgrading to
+`FF_BACKEND=postgres` at v0.8.0 get a functional create/read/dispatch
++ scheduler loop and structured-error visibility on the missing
+rows. The consumer migration guide (`docs/CONSUMER_MIGRATION_v0.8.md`)
+lists the current Postgres `Unavailable` surface so consumers know
+what to expect.
