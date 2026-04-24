@@ -121,8 +121,10 @@ if [[ "${BACKEND}" == "valkey" || "${BACKEND}" == "both" ]]; then
     # then launch the pre-built binary below.
     echo "==> smoke-v0.7: pre-building ff-server (release)"
     cargo build -p ff-server --release --quiet
-    FF_SERVER_BIN="$(cargo metadata --format-version 1 --no-deps \
-        | python3 -c 'import sys,json; m=json.load(sys.stdin); print(m["target_directory"])')/release/ff-server"
+    # Resolve target dir without requiring python: cargo locate-project
+    # gives workspace root; CARGO_TARGET_DIR env overrides if set.
+    CARGO_TARGET_DIR_RESOLVED="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+    FF_SERVER_BIN="${CARGO_TARGET_DIR_RESOLVED}/release/ff-server"
     if [[ ! -x "${FF_SERVER_BIN}" ]]; then
         echo "FAIL: ff-server binary not found at ${FF_SERVER_BIN} after build" >&2
         exit 3
