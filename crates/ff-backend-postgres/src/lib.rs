@@ -54,6 +54,8 @@ use ff_core::types::EdgeId;
 use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 use sqlx::PgPool;
 
+#[cfg(feature = "core")]
+mod admin;
 pub mod error;
 pub mod handle_codec;
 pub mod listener;
@@ -310,21 +312,21 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.list_lanes", skip_all)]
     async fn list_lanes(
         &self,
-        _cursor: Option<LaneId>,
-        _limit: usize,
+        cursor: Option<LaneId>,
+        limit: usize,
     ) -> Result<ListLanesPage, EngineError> {
-        unavailable("pg.list_lanes")
+        admin::list_lanes_impl(&self.pool, cursor, limit).await
     }
 
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.list_suspended", skip_all)]
     async fn list_suspended(
         &self,
-        _partition: PartitionKey,
-        _cursor: Option<ExecutionId>,
-        _limit: usize,
+        partition: PartitionKey,
+        cursor: Option<ExecutionId>,
+        limit: usize,
     ) -> Result<ListSuspendedPage, EngineError> {
-        unavailable("pg.list_suspended")
+        admin::list_suspended_impl(&self.pool, partition, cursor, limit).await
     }
 
     #[cfg(feature = "core")]
