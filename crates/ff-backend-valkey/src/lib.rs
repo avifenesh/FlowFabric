@@ -61,9 +61,14 @@ use ff_core::types::{
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
 use ff_script::functions::execution::{
-    ClaimExecutionResultPartial, ExecOpKeys, ff_claim_execution,
+    ClaimExecutionResultPartial, ExecOpKeys, ff_claim_execution, ff_create_execution,
 };
-use ff_script::functions::flow::{FlowStructOpKeys, ff_cancel_flow};
+use ff_script::functions::flow::{
+    DepOpKeys, FlowStructOpKeys, ff_add_execution_to_flow, ff_apply_dependency_to_child,
+    ff_cancel_flow, ff_create_flow, ff_stage_dependency_edge,
+};
+use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_report_usage_and_check, ff_reset_budget};
+use ff_script::functions::quota::{QuotaOpKeys, ff_create_quota_policy};
 use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
 use ff_script::result::FcallResult;
 
@@ -4458,6 +4463,277 @@ impl EngineBackend for ValkeyBackend {
         )
         .await
         .map_err(|e| ff_core::engine_error::backend_context(e, "read_summary: HGETALL summary"))
+    }
+
+    // ─── RFC-017 Stage A overrides (ingress + cheap wrappers) ─────────
+    //
+    // Each method below wraps an existing `ff_script::functions::*`
+    // helper — the FCALL remains the source of truth. Bodies that
+    // need HGET/HMGET pre-reads (cancel_execution, change_priority,
+    // replay_execution, revoke_lease, get_budget_status) inherit the
+    // default `Unavailable` impl; Stage C migration lands those
+    // bodies alongside the matching handler cutover. See
+    // `docs/POSTGRES_PARITY_MATRIX.md` for per-method status.
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn create_execution(
+        &self,
+        args: ff_core::contracts::CreateExecutionArgs,
+    ) -> Result<ff_core::contracts::CreateExecutionResult, EngineError> {
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+        // `worker_instance_id` is an unused field on the struct for
+        // the create path; `ff_create_execution` ignores it. Use a
+        // fresh placeholder rather than threading an Option through
+        // the shared key-context.
+        let placeholder_wiid = WorkerInstanceId::new("");
+        let lane = args.lane_id.clone();
+        let keys = ExecOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+            worker_instance_id: &placeholder_wiid,
+        };
+        ff_create_execution(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "create_execution: FCALL ff_create_execution",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn create_flow(
+        &self,
+        args: ff_core::contracts::CreateFlowArgs,
+    ) -> Result<ff_core::contracts::CreateFlowResult, EngineError> {
+        let partition = flow_partition(&args.flow_id, &self.partition_config);
+        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
+        let keys = FlowStructOpKeys { fctx: &fctx, fidx: &fidx };
+        ff_create_flow(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "create_flow: FCALL ff_create_flow",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn add_execution_to_flow(
+        &self,
+        args: ff_core::contracts::AddExecutionToFlowArgs,
+    ) -> Result<ff_core::contracts::AddExecutionToFlowResult, EngineError> {
+        let partition = flow_partition(&args.flow_id, &self.partition_config);
+        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
+        let keys = FlowStructOpKeys { fctx: &fctx, fidx: &fidx };
+        ff_add_execution_to_flow(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "add_execution_to_flow: FCALL ff_add_execution_to_flow",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn stage_dependency_edge(
+        &self,
+        args: ff_core::contracts::StageDependencyEdgeArgs,
+    ) -> Result<ff_core::contracts::StageDependencyEdgeResult, EngineError> {
+        let partition = flow_partition(&args.flow_id, &self.partition_config);
+        let fctx = FlowKeyContext::new(&partition, &args.flow_id);
+        let fidx = FlowIndexKeys::new(&partition);
+        let keys = FlowStructOpKeys { fctx: &fctx, fidx: &fidx };
+        ff_stage_dependency_edge(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "stage_dependency_edge: FCALL ff_stage_dependency_edge",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn apply_dependency_to_child(
+        &self,
+        args: ff_core::contracts::ApplyDependencyToChildArgs,
+    ) -> Result<ff_core::contracts::ApplyDependencyToChildResult, EngineError> {
+        let partition = execution_partition(&args.downstream_execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.downstream_execution_id);
+        let idx = IndexKeys::new(&partition);
+        let flow_part = flow_partition(&args.flow_id, &self.partition_config);
+        let flow_ctx = FlowKeyContext::new(&flow_part, &args.flow_id);
+        // Pre-read lane_id — same HGET that `ff-server::Server::apply_dependency_to_child`
+        // performs today. Moves verbatim into the backend per RFC-017 §4
+        // row 15.
+        let lane_str: Option<String> = self
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "apply_dependency_to_child: HGET lane_id",
+            ))?;
+        let lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
+        let keys = DepOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+            flow_ctx: &flow_ctx,
+            downstream_eid: &args.downstream_execution_id,
+        };
+        ff_apply_dependency_to_child(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "apply_dependency_to_child: FCALL ff_apply_dependency_to_child",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn create_budget(
+        &self,
+        args: ff_core::contracts::CreateBudgetArgs,
+    ) -> Result<ff_core::contracts::CreateBudgetResult, EngineError> {
+        let partition = ff_core::partition::budget_partition(&args.budget_id, &self.partition_config);
+        let bctx = ff_core::keys::BudgetKeyContext::new(&partition, &args.budget_id);
+        let def = bctx.definition();
+        let limits = bctx.limits();
+        let usage = bctx.usage();
+        let resets = ff_core::keys::budget_resets_key(bctx.hash_tag());
+        let policies_idx = ff_core::keys::budget_policies_index(bctx.hash_tag());
+        let k = BudgetOpKeys {
+            usage_key: &usage,
+            limits_key: &limits,
+            def_key: &def,
+            hash_tag: bctx.hash_tag(),
+        };
+        ff_create_budget(&self.client, &k, &resets, &policies_idx, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "create_budget: FCALL ff_create_budget",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn reset_budget(
+        &self,
+        args: ff_core::contracts::ResetBudgetArgs,
+    ) -> Result<ff_core::contracts::ResetBudgetResult, EngineError> {
+        let partition = ff_core::partition::budget_partition(&args.budget_id, &self.partition_config);
+        let bctx = ff_core::keys::BudgetKeyContext::new(&partition, &args.budget_id);
+        let def = bctx.definition();
+        let limits = bctx.limits();
+        let usage = bctx.usage();
+        let resets = ff_core::keys::budget_resets_key(bctx.hash_tag());
+        let k = BudgetOpKeys {
+            usage_key: &usage,
+            limits_key: &limits,
+            def_key: &def,
+            hash_tag: bctx.hash_tag(),
+        };
+        ff_reset_budget(&self.client, &k, &resets, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "reset_budget: FCALL ff_reset_budget",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn create_quota_policy(
+        &self,
+        args: ff_core::contracts::CreateQuotaPolicyArgs,
+    ) -> Result<ff_core::contracts::CreateQuotaPolicyResult, EngineError> {
+        let partition = ff_core::partition::quota_partition(&args.quota_policy_id, &self.partition_config);
+        let qctx = ff_core::keys::QuotaKeyContext::new(&partition, &args.quota_policy_id);
+        // `execution_id` is unused by `ff_create_quota_policy` (it reads
+        // only `ctx.definition/window/concurrency/admitted_set`). Construct
+        // a placeholder to satisfy the shared `QuotaOpKeys` struct.
+        let placeholder_eid = ExecutionId::solo(&LaneId::new("default"), &self.partition_config);
+        let keys = QuotaOpKeys {
+            ctx: &qctx,
+            dimension: "requests_per_window",
+            execution_id: &placeholder_eid,
+        };
+        ff_create_quota_policy(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "create_quota_policy: FCALL ff_create_quota_policy",
+            ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    async fn report_usage_admin(
+        &self,
+        budget: &BudgetId,
+        args: ff_core::contracts::ReportUsageAdminArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        // Admin path shares the same FCALL as worker-path `report_usage`;
+        // the distinction is that no worker `Handle` is consumed on the
+        // way in (RFC-017 §5 round-1 F4). Translate the admin args to
+        // the worker-facing `ReportUsageArgs` shape that the ff-script
+        // helper expects.
+        let partition = ff_core::partition::budget_partition(budget, &self.partition_config);
+        let bctx = ff_core::keys::BudgetKeyContext::new(&partition, budget);
+        let def = bctx.definition();
+        let limits = bctx.limits();
+        let usage = bctx.usage();
+        let k = BudgetOpKeys {
+            usage_key: &usage,
+            limits_key: &limits,
+            def_key: &def,
+            hash_tag: bctx.hash_tag(),
+        };
+        let worker_args = ff_core::contracts::ReportUsageArgs {
+            dimensions: args.dimensions,
+            deltas: args.deltas,
+            now: args.now,
+            dedup_key: args.dedup_key,
+        };
+        ff_report_usage_and_check(&self.client, &k, &worker_args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "report_usage_admin: FCALL ff_report_usage_and_check",
+            ))
+    }
+
+    async fn ping(&self) -> Result<(), EngineError> {
+        let _: ferriskey::Value = self
+            .client
+            .cmd("PING")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "ping: PING",
+            ))?;
+        Ok(())
+    }
+
+    async fn get_execution_result(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let partition = execution_partition(id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, id);
+        // Binary-safe read. Mirrors `ff-server::Server::get_execution_result`
+        // verbatim so the Stage C handler migration is a one-line delegate.
+        let payload: Option<Vec<u8>> = self
+            .client
+            .cmd("GET")
+            .arg(ctx.result())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "get_execution_result: GET result",
+            ))?;
+        Ok(payload)
     }
 }
 
