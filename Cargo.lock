@@ -1046,6 +1046,7 @@ name = "ff-engine"
 version = "0.6.1"
 dependencies = [
  "ferriskey",
+ "ff-backend-postgres",
  "ff-core",
  "ff-observability",
  "futures",
