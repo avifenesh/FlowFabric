@@ -3729,6 +3729,166 @@ impl SuspendOutcome {
 // crates can reach them via the idiomatic `ff_core::backend` path that
 // already sources the other trait-surface types (RFC-013 §9.1).
 
+// ─── RFC-017 Stage A — trait-expansion Args/Result types ─────────────
+//
+// Per RFC-017 §5.1.1: every struct/enum introduced here is
+// `#[non_exhaustive]` and ships with a `pub fn new(...)` constructor so
+// additive field growth post-v0.8 does not force cross-crate churn.
+
+// ─── claim_for_worker ───
+
+/// Inputs to `EngineBackend::claim_for_worker` (RFC-017 §5, §7). The
+/// Valkey impl forwards to `ff_scheduler::Scheduler::claim_for_worker`;
+/// the Postgres impl forwards to its own scheduler module. The trait
+/// method hides the backend-specific dispatch behind one shape.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ClaimForWorkerArgs {
+    pub lane_id: LaneId,
+    pub worker_id: WorkerId,
+    pub worker_instance_id: WorkerInstanceId,
+    pub worker_capabilities: std::collections::BTreeSet<String>,
+    pub grant_ttl_ms: u64,
+}
+
+impl ClaimForWorkerArgs {
+    /// Required-field constructor. Optional fields today: none — kept
+    /// for forward-compat so a future optional (e.g. `deadline_ms`)
+    /// does not break callers using the builder pattern.
+    pub fn new(
+        lane_id: LaneId,
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        worker_capabilities: std::collections::BTreeSet<String>,
+        grant_ttl_ms: u64,
+    ) -> Self {
+        Self {
+            lane_id,
+            worker_id,
+            worker_instance_id,
+            worker_capabilities,
+            grant_ttl_ms,
+        }
+    }
+}
+
+/// Outcome of `EngineBackend::claim_for_worker`. `None`-like shape
+/// modelled as an enum so additive variants (e.g. `BackPressured {
+/// retry_after_ms }`) do not force a wire break.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimForWorkerOutcome {
+    /// No eligible execution on this lane at this scan cycle.
+    NoWork,
+    /// Grant issued — worker proceeds to `claim_from_grant`.
+    Granted(ClaimGrant),
+}
+
+impl ClaimForWorkerOutcome {
+    /// Build the `NoWork` variant.
+    pub fn no_work() -> Self {
+        Self::NoWork
+    }
+    /// Build the `Granted` variant.
+    pub fn granted(grant: ClaimGrant) -> Self {
+        Self::Granted(grant)
+    }
+}
+
+// ─── list_pending_waitpoints ───
+
+/// Inputs to `EngineBackend::list_pending_waitpoints` (RFC-017 §5, §8).
+/// Pagination is part of the signature so a flow with 10k pending
+/// waitpoints cannot force a single-round-trip read regardless of
+/// backend.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ListPendingWaitpointsArgs {
+    pub execution_id: ExecutionId,
+    /// Exclusive cursor — `None` starts from the beginning.
+    pub after: Option<WaitpointId>,
+    /// Max page size. `None` → backend default (100). Backend-enforced
+    /// cap: 1000.
+    pub limit: Option<u32>,
+}
+
+impl ListPendingWaitpointsArgs {
+    pub fn new(execution_id: ExecutionId) -> Self {
+        Self {
+            execution_id,
+            after: None,
+            limit: None,
+        }
+    }
+    pub fn with_after(mut self, after: WaitpointId) -> Self {
+        self.after = Some(after);
+        self
+    }
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
+/// Page of pending-waitpoint entries. Stage A preserves the existing
+/// `PendingWaitpointInfo` shape; the §8 schema rewrite (HMAC
+/// sanitisation + `(token_kid, token_fingerprint)` additive fields)
+/// ships in Stage D alongside the HTTP wire-format deprecation.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ListPendingWaitpointsResult {
+    pub entries: Vec<PendingWaitpointInfo>,
+    /// Forward-only continuation cursor — `None` signals end-of-stream.
+    pub next_cursor: Option<WaitpointId>,
+}
+
+impl ListPendingWaitpointsResult {
+    pub fn new(entries: Vec<PendingWaitpointInfo>) -> Self {
+        Self {
+            entries,
+            next_cursor: None,
+        }
+    }
+    pub fn with_next_cursor(mut self, cursor: WaitpointId) -> Self {
+        self.next_cursor = Some(cursor);
+        self
+    }
+}
+
+// ─── report_usage_admin ───
+
+/// Inputs to `EngineBackend::report_usage_admin` (RFC-017 §5 budget+
+/// quota admin §5, round-1 F4). Admin-path peer of `report_usage` —
+/// both wrap `ff_report_usage_and_check` on the Valkey side but the
+/// admin call is worker-less, so it cannot reuse the lease-bound
+/// `report_usage(&Handle, ...)` signature. `ReportUsageAdminArgs`
+/// carries the same fields as [`ReportUsageArgs`] without a worker
+/// handle — kept as a distinct type so future admin-only fields (e.g.
+/// `actor_identity`, `audit_reason`) don't pollute the worker path.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ReportUsageAdminArgs {
+    pub dimensions: Vec<String>,
+    pub deltas: Vec<u64>,
+    pub dedup_key: Option<String>,
+    pub now: TimestampMs,
+}
+
+impl ReportUsageAdminArgs {
+    pub fn new(dimensions: Vec<String>, deltas: Vec<u64>, now: TimestampMs) -> Self {
+        Self {
+            dimensions,
+            deltas,
+            dedup_key: None,
+            now,
+        }
+    }
+    pub fn with_dedup_key(mut self, key: String) -> Self {
+        self.dedup_key = Some(key);
+        self
+    }
+}
+
 #[cfg(test)]
 mod rfc_014_validation_tests {
     use super::*;
