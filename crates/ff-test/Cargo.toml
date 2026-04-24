@@ -53,3 +53,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures = { workspace = true }
 # Issue #154 — tracing span capture in the observability wiring test.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+
+[features]
+# RFC-017 Wave 8 Stage E1: gate the `http_postgres_smoke` integration
+# test behind a feature so workspace-default `cargo test` does not
+# attempt to reach a live Postgres. Enable with
+# `cargo test -p ff-test --test http_postgres_smoke --features postgres-e2e`.
+postgres-e2e = []

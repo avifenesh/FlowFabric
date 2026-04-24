@@ -39,6 +39,10 @@ ff-core = { workspace = true }
 ff-script = { workspace = true, features = ["valkey-client"] }
 ff-engine = { workspace = true }
 ff-backend-valkey = { workspace = true }
+# RFC-017 Wave 8 Stage E1: Postgres dial branch on
+# `Server::start_with_metrics`. Default features (`core` + `streaming`)
+# so the Postgres backend's full EngineBackend impl is reachable.
+ff-backend-postgres = { workspace = true }
 ff-scheduler = { workspace = true }
 ff-observability = { workspace = true }
 ferriskey = { workspace = true }
