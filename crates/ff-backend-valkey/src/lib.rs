@@ -42,9 +42,12 @@ use ff_core::contracts::{
     ClaimResumedExecutionResult, CompositeBody, CountKind, DeliverSignalArgs, DeliverSignalResult,
     EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
-    ResumeCondition, ResumePolicy, ResumeTarget, SignalMatcher, SuspendArgs, SuspendOutcome,
+    ResumeCondition, ResumePolicy, ResumeTarget, RotateWaitpointHmacSecretAllArgs,
+    RotateWaitpointHmacSecretAllEntry, RotateWaitpointHmacSecretAllResult,
+    RotateWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs, SuspendOutcome,
     SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
 };
+use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
 use ff_core::engine_backend::EngineBackend;
@@ -3851,6 +3854,51 @@ impl EngineBackend for ValkeyBackend {
                     "report_usage: FCALL ff_report_usage_and_check",
                 )
             })
+    }
+
+    /// Cluster-wide waitpoint HMAC secret rotation (v0.7 Q4).
+    ///
+    /// Concretely fans out one
+    /// `ff_rotate_waitpoint_hmac_secret` FCALL per execution
+    /// partition, mirroring
+    /// [`ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions`]'s
+    /// partial-success contract — a failure on one partition's
+    /// FCALL is recorded as an inner `Err` on that entry and the
+    /// fan-out continues. Sequential (one partition at a time) to
+    /// keep the implementation futures-free; callers that need
+    /// parallelism can wrap at a higher layer.
+    async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        let per_partition_args = RotateWaitpointHmacSecretArgs {
+            new_kid: args.new_kid.clone(),
+            new_secret_hex: args.new_secret_hex.clone(),
+            grace_ms: args.grace_ms,
+        };
+        let num = self.partition_config.num_flow_partitions;
+        let mut entries = Vec::with_capacity(num as usize);
+        for index in 0..num {
+            let partition = Partition {
+                family: PartitionFamily::Execution,
+                index,
+            };
+            let idx = IndexKeys::new(&partition);
+            let result = ff_script::functions::suspension::ff_rotate_waitpoint_hmac_secret(
+                &self.client,
+                &idx,
+                &per_partition_args,
+            )
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    transport_script(e),
+                    "rotate_waitpoint_hmac_secret_all: FCALL ff_rotate_waitpoint_hmac_secret",
+                )
+            });
+            entries.push(RotateWaitpointHmacSecretAllEntry::new(index, result));
+        }
+        Ok(RotateWaitpointHmacSecretAllResult::new(entries))
     }
 
     #[cfg(feature = "streaming")]

@@ -25,7 +25,8 @@
 
 use ff_core::contracts::{
     EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListExecutionsPage,
-    ListFlowsPage, ListLanesPage, ListSuspendedPage,
+    ListFlowsPage, ListLanesPage, ListSuspendedPage, RotateWaitpointHmacSecretAllArgs,
+    RotateWaitpointHmacSecretAllResult,
 };
 use ff_core::partition::{execution_partition, flow_partition, PartitionKey};
 use ff_core::types::{EdgeId, ExecutionId, FlowId, LaneId};
@@ -239,6 +240,28 @@ impl FlowFabricWorker {
         Ok(self
             .backend_ref()
             .list_executions(partition, cursor, limit)
+            .await?)
+    }
+
+    /// Cluster-wide rotation of the waitpoint HMAC signing kid
+    /// (v0.7 Q4).
+    ///
+    /// Thin forwarder onto
+    /// [`EngineBackend::rotate_waitpoint_hmac_secret_all`](ff_core::engine_backend::EngineBackend::rotate_waitpoint_hmac_secret_all).
+    /// On the Valkey backend this fans out one FCALL per execution
+    /// partition; on the Postgres backend (Wave 4) this resolves to a
+    /// single global INSERT. Consumers call this for the clean
+    /// "rotate everywhere" semantic — the older per-partition
+    /// [`crate::admin::rotate_waitpoint_hmac_secret_all_partitions`]
+    /// free function stays available for direct-Valkey callers on
+    /// legacy SDKs.
+    pub async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, SdkError> {
+        Ok(self
+            .backend_ref()
+            .rotate_waitpoint_hmac_secret_all(args)
             .await?)
     }
 
