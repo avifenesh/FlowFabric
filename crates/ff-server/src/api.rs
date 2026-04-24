@@ -1679,12 +1679,14 @@ struct HealthResponse {
 async fn healthz(
     State(server): State<Arc<Server>>,
 ) -> Result<Json<HealthResponse>, ApiError> {
-    let _: String = server
-        .client()
-        .cmd("PING")
-        .execute()
+    // RFC-017 Stage D2 (§4 row 1): dispatch through the backend trait's
+    // `ping` so the healthz probe remains backend-agnostic. Valkey
+    // impl issues `PING`; Postgres impl (Wave 4) runs `SELECT 1`.
+    server
+        .backend()
+        .ping()
         .await
-        .map_err(|e| ApiError(crate::server::backend_context(e, "healthz PING")))?;
+        .map_err(|e| ApiError(ServerError::Engine(Box::new(e))))?;
     Ok(Json(HealthResponse { status: "ok" }))
 }
 
