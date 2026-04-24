@@ -84,4 +84,12 @@ impl Metrics {
     // ── RFC-017 Stage B: shutdown_prepare timeout ──
 
     pub fn inc_shutdown_timeout(&self) {}
+
+    // ── RFC-017 Stage D1 (§8): legacy waitpoint_token audit ──
+
+    pub fn inc_pending_waitpoint_legacy_token(&self) {}
+
+    // ── RFC-017 §9.0 dev-override ──
+
+    pub fn inc_backend_unready_boot(&self, _backend: &'static str, _stage: &'static str) {}
 }
