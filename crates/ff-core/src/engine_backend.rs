@@ -59,9 +59,17 @@ use crate::contracts::{
 };
 #[cfg(feature = "core")]
 use crate::contracts::{
-    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs, DeliverSignalResult,
+    AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
+    ApplyDependencyToChildResult, BudgetStatus, CancelExecutionArgs, CancelExecutionResult,
+    ChangePriorityArgs, ChangePriorityResult, ClaimForWorkerArgs, ClaimForWorkerOutcome,
+    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CreateBudgetArgs, CreateBudgetResult,
+    CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
+    CreateQuotaPolicyArgs, CreateQuotaPolicyResult, DeliverSignalArgs, DeliverSignalResult,
     EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage,
-    ListSuspendedPage,
+    ListPendingWaitpointsArgs, ListPendingWaitpointsResult, ListSuspendedPage,
+    ReplayExecutionArgs, ReplayExecutionResult, ReportUsageAdminArgs, ResetBudgetArgs,
+    ResetBudgetResult, RevokeLeaseArgs, RevokeLeaseResult, StageDependencyEdgeArgs,
+    StageDependencyEdgeResult,
 };
 #[cfg(feature = "core")]
 use crate::partition::PartitionKey;
@@ -653,6 +661,226 @@ pub trait EngineBackend: Send + Sync + 'static {
         execution_id: &ExecutionId,
         attempt_index: AttemptIndex,
     ) -> Result<Option<SummaryDocument>, EngineError>;
+
+    // ── RFC-017 Stage A — Ingress (5) ──────────────────────────
+    //
+    // Every method in this block has a default impl returning
+    // `EngineError::Unavailable { op }` per RFC-017 §5.3. Concrete
+    // backends override each method with a real body. A missing
+    // override surfaces as a loud typed error at the call site rather
+    // than a silent no-op.
+
+    /// Create an execution. Ingress row 6 (RFC-017 §4). Wraps
+    /// `ff_create_execution` on Valkey; `INSERT INTO ff_execution ...`
+    /// on Postgres. The `idempotency_key` + backend-side default
+    /// `dedup_ttl_ms = 86400000` make duplicate submissions idempotent.
+    #[cfg(feature = "core")]
+    async fn create_execution(
+        &self,
+        _args: CreateExecutionArgs,
+    ) -> Result<CreateExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "create_execution",
+        })
+    }
+
+    /// Create a flow header. Ingress row 5.
+    #[cfg(feature = "core")]
+    async fn create_flow(
+        &self,
+        _args: CreateFlowArgs,
+    ) -> Result<CreateFlowResult, EngineError> {
+        Err(EngineError::Unavailable { op: "create_flow" })
+    }
+
+    /// Atomically add an execution to a flow (single-FCALL co-located
+    /// commit on Valkey; single-transaction UPSERT on Postgres).
+    #[cfg(feature = "core")]
+    async fn add_execution_to_flow(
+        &self,
+        _args: AddExecutionToFlowArgs,
+    ) -> Result<AddExecutionToFlowResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "add_execution_to_flow",
+        })
+    }
+
+    /// Stage a dependency edge between flow members. CAS-guarded on
+    /// `graph_revision` — stale rev returns `Contention(StaleGraphRevision)`.
+    #[cfg(feature = "core")]
+    async fn stage_dependency_edge(
+        &self,
+        _args: StageDependencyEdgeArgs,
+    ) -> Result<StageDependencyEdgeResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "stage_dependency_edge",
+        })
+    }
+
+    /// Apply a staged dependency edge to its downstream child.
+    #[cfg(feature = "core")]
+    async fn apply_dependency_to_child(
+        &self,
+        _args: ApplyDependencyToChildArgs,
+    ) -> Result<ApplyDependencyToChildResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "apply_dependency_to_child",
+        })
+    }
+
+    // ── RFC-017 Stage A — Operator control (4) ─────────────────
+
+    /// Operator-initiated execution cancel (row 2).
+    #[cfg(feature = "core")]
+    async fn cancel_execution(
+        &self,
+        _args: CancelExecutionArgs,
+    ) -> Result<CancelExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "cancel_execution",
+        })
+    }
+
+    /// Re-score an execution's eligibility priority (row 17).
+    #[cfg(feature = "core")]
+    async fn change_priority(
+        &self,
+        _args: ChangePriorityArgs,
+    ) -> Result<ChangePriorityResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "change_priority",
+        })
+    }
+
+    /// Replay a terminal execution (row 22). Variadic KEYS handling
+    /// (inbound-edge pre-read) is hidden inside the Valkey impl per
+    /// RFC-017 §4 row 3.
+    #[cfg(feature = "core")]
+    async fn replay_execution(
+        &self,
+        _args: ReplayExecutionArgs,
+    ) -> Result<ReplayExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "replay_execution",
+        })
+    }
+
+    /// Operator-initiated lease revoke (row 19).
+    #[cfg(feature = "core")]
+    async fn revoke_lease(
+        &self,
+        _args: RevokeLeaseArgs,
+    ) -> Result<RevokeLeaseResult, EngineError> {
+        Err(EngineError::Unavailable { op: "revoke_lease" })
+    }
+
+    // ── RFC-017 Stage A — Budget + quota admin (5) ─────────────
+
+    /// Create a budget definition (row 6).
+    #[cfg(feature = "core")]
+    async fn create_budget(
+        &self,
+        _args: CreateBudgetArgs,
+    ) -> Result<CreateBudgetResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "create_budget",
+        })
+    }
+
+    /// Reset a budget's usage counters (row 10).
+    #[cfg(feature = "core")]
+    async fn reset_budget(
+        &self,
+        _args: ResetBudgetArgs,
+    ) -> Result<ResetBudgetResult, EngineError> {
+        Err(EngineError::Unavailable { op: "reset_budget" })
+    }
+
+    /// Create a quota policy (row 7).
+    #[cfg(feature = "core")]
+    async fn create_quota_policy(
+        &self,
+        _args: CreateQuotaPolicyArgs,
+    ) -> Result<CreateQuotaPolicyResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "create_quota_policy",
+        })
+    }
+
+    /// Read-only budget status for operator visibility (row 8).
+    #[cfg(feature = "core")]
+    async fn get_budget_status(
+        &self,
+        _id: &BudgetId,
+    ) -> Result<BudgetStatus, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_budget_status",
+        })
+    }
+
+    /// Admin-path `report_usage` (row 9 + RFC-017 §5 round-1 F4).
+    /// Distinct from the existing [`Self::report_usage`] which takes
+    /// a worker handle — the admin path has no lease context.
+    #[cfg(feature = "core")]
+    async fn report_usage_admin(
+        &self,
+        _budget: &BudgetId,
+        _args: ReportUsageAdminArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "report_usage_admin",
+        })
+    }
+
+    // ── RFC-017 Stage A — Read + diagnostics (3) ───────────────
+
+    /// Fetch the stored result payload for a completed execution
+    /// (row 4). Returns `Ok(None)` when the execution is missing, not
+    /// yet complete, or its payload was trimmed by retention policy.
+    async fn get_execution_result(
+        &self,
+        _id: &ExecutionId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_execution_result",
+        })
+    }
+
+    /// List the pending-or-active waitpoints for an execution, cursor
+    /// paginated (row 5 / §8). Stage A preserves the existing
+    /// `PendingWaitpointInfo` shape; Stage D ships the §8 HMAC
+    /// sanitisation + `(token_kid, token_fingerprint)` schema.
+    #[cfg(feature = "core")]
+    async fn list_pending_waitpoints(
+        &self,
+        _args: ListPendingWaitpointsArgs,
+    ) -> Result<ListPendingWaitpointsResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "list_pending_waitpoints",
+        })
+    }
+
+    /// Backend-level reachability probe (row 1). Valkey: `PING`;
+    /// Postgres: `SELECT 1`.
+    async fn ping(&self) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable { op: "ping" })
+    }
+
+    // ── RFC-017 Stage A — Scheduling (1) ───────────────────────
+
+    /// Scheduler-routed claim entrypoint (row 18, RFC-017 §7). Valkey
+    /// forwards to its `ff_scheduler::Scheduler` cursor; Postgres
+    /// forwards to `PostgresScheduler`'s `FOR UPDATE SKIP LOCKED`
+    /// path.
+    #[cfg(feature = "core")]
+    async fn claim_for_worker(
+        &self,
+        _args: ClaimForWorkerArgs,
+    ) -> Result<ClaimForWorkerOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "claim_for_worker",
+        })
+    }
 
     // ── Cross-cutting (RFC-017 Stage B trait-lift) ──────────────
 
