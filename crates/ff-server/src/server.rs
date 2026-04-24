@@ -54,13 +54,22 @@ pub struct Server {
     /// HTTP 429 instead of silently queueing and blowing past the 120s
     /// HTTP timeout. See `rotate_waitpoint_secret` handler.
     admin_rotate_semaphore: Arc<tokio::sync::Semaphore>,
-    engine: Engine,
+    /// Valkey engine (14 scanners). `None` on the Postgres boot path
+    /// — engine scanners are Valkey-only (RFC-017 Wave 8 Stage E1;
+    /// Postgres reconcilers run out-of-process via
+    /// `ff-backend-postgres::reconcilers` + a separate scanner
+    /// supervisor that Stage E2/E3 will wire).
+    engine: Option<Engine>,
     config: ServerConfig,
     /// Long-lived scheduler instance. Held on the server (not rebuilt per
     /// claim call) so its rotation cursor can advance across calls — a
     /// fresh-per-call scheduler would reset the cursor on every tick,
     /// defeating the fairness property (RFC-009 §scan rotation).
-    scheduler: Arc<ff_scheduler::Scheduler>,
+    ///
+    /// `None` on the Postgres boot path — `Scheduler` wraps a
+    /// `ferriskey::Client` and has no Postgres equivalent yet (Stage
+    /// E3 flips `claim_for_worker` through the backend trait).
+    scheduler: Option<Arc<ff_scheduler::Scheduler>>,
     /// Background tasks spawned by async handlers (e.g. cancel_flow member
     /// dispatch). Drained on shutdown with a bounded timeout.
     background_tasks: Arc<AsyncMutex<JoinSet<()>>>,
@@ -312,24 +321,35 @@ impl Server {
             if accept_unready && is_dev {
                 tracing::warn!(
                     backend = label,
-                    stage = "D",
-                    "backend_unready_boot_override: backend={label} stage=D \
+                    stage = "E1",
+                    "backend_unready_boot_override: backend={label} stage=E1 \
                      (FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development)"
                 );
                 let backend_label: &'static str = match config.backend {
                     BackendKind::Postgres => "postgres",
                     BackendKind::Valkey => "valkey",
                 };
-                metrics.inc_backend_unready_boot(backend_label, "D");
+                metrics.inc_backend_unready_boot(backend_label, "E1");
             } else {
                 return Err(ServerError::BackendNotReady {
                     backend: match config.backend {
                         BackendKind::Postgres => "postgres",
                         BackendKind::Valkey => "valkey",
                     },
-                    stage: "D",
+                    stage: "E1",
                 });
             }
+        }
+
+        // RFC-017 Wave 8 Stage E1: Postgres dial branch. Stage E4 flips
+        // `BACKEND_STAGE_READY` to include "postgres"; until then the
+        // dev-mode override above is the only way in. On the Postgres
+        // path we skip the Valkey-specific engine/scanner + scheduler
+        // construction entirely (E2/E3 wire the Postgres twins); the
+        // Server still holds a `Client` for unmigrated legacy read
+        // paths (retired in Stage E2).
+        if matches!(config.backend, BackendKind::Postgres) {
+            return Self::start_postgres_branch(config, metrics).await;
         }
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
@@ -556,9 +576,109 @@ impl Server {
             // firing parallel rotations fail fast with 429 instead of
             // queueing HTTP handlers.
             admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            engine,
+            engine: Some(engine),
             config,
-            scheduler,
+            scheduler: Some(scheduler),
+            background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
+            metrics,
+            backend,
+        })
+    }
+
+    /// RFC-017 Wave 8 Stage E1: Postgres boot branch for
+    /// [`Server::start_with_metrics`]. Called after the §9.0 hard-gate
+    /// admitted the boot under the dev-mode override.
+    ///
+    /// **Scope (Stage E1):**
+    /// * Dial Postgres + wrap an `Arc<PostgresBackend>` as the
+    ///   `backend` field (all migrated HTTP handlers dispatch through
+    ///   the trait — create_execution / create_flow / add member /
+    ///   stage edge / apply dep / describe_flow / etc.).
+    /// * Dial Valkey too — the `Server` still holds a `client: Client`
+    ///   for unmigrated legacy paths (`get_execution_state`,
+    ///   `get_execution`, `cancel_flow_inner`'s idempotent HMGET /
+    ///   SMEMBERS follow-ups, `fetch_waitpoint_token_v07`). Those
+    ///   paths are not reachable in the Postgres HTTP smoke scenario,
+    ///   but the field type is `Client`-not-`Option<Client>` until
+    ///   Stage E2 lands the `cancel_flow` trait migration. **Valkey is
+    ///   dialed but `initialize_deployment` is skipped** — no Lua
+    ///   FUNCTION LOAD, no partition-config write, no HMAC install,
+    ///   no lanes SADD against Valkey on the Postgres path.
+    /// * Skip engine + scheduler. Stage E3 wires the Postgres-specific
+    ///   `claim_for_worker` via the trait; until then the scheduler
+    ///   field stays `None` and `claim_for_worker` fails with a typed
+    ///   error (E3-deferred).
+    /// * Run `apply_migrations` against the Postgres pool so an empty
+    ///   database becomes usable without operator out-of-band steps.
+    ///   This matches the Valkey path's `initialize_deployment`
+    ///   ergonomics; Stage E4 may hoist it behind an operator flag.
+    async fn start_postgres_branch(
+        config: ServerConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Self, ServerError> {
+        if config.postgres.url.is_empty() {
+            return Err(ServerError::InvalidInput(
+                "FF_BACKEND=postgres requires FF_POSTGRES_URL".into(),
+            ));
+        }
+        tracing::info!(
+            pool_size = config.postgres.pool_size,
+            "dialing Postgres backend (RFC-017 Stage E1)"
+        );
+        let pg_backend_arc = ff_backend_postgres::PostgresBackend::connect_with_metrics(
+            config.postgres_config(),
+            config.partition_config,
+            metrics.clone(),
+        )
+        .await
+        .map_err(|e| ServerError::Engine(Box::new(e)))?;
+
+        // Apply schema migrations idempotently so an empty target
+        // database becomes usable. The underlying pool is shared with
+        // the backend — one pool, one migration run.
+        ff_backend_postgres::apply_migrations(pg_backend_arc.pool())
+            .await
+            .map_err(|e| {
+                ServerError::OperationFailed(format!("postgres apply_migrations: {e}"))
+            })?;
+
+        let backend: Arc<dyn EngineBackend> = pg_backend_arc;
+
+        // Dial a Valkey client for the residual legacy fields. Stage
+        // E2 removes `Server::client: Client` and this dial goes away.
+        tracing::info!(
+            host = %config.host, port = config.port,
+            "dialing ambient Valkey client (Stage E1 residual for \
+             unmigrated legacy fields; retired in Stage E2)"
+        );
+        let mut builder = ClientBuilder::new()
+            .host(&config.host, config.port)
+            .connect_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_millis(5000));
+        if config.tls {
+            builder = builder.tls();
+        }
+        if config.cluster {
+            builder = builder.cluster();
+        }
+        let client = builder
+            .build()
+            .await
+            .map_err(|e| crate::server::backend_context(e, "postgres-branch ambient Valkey connect"))?;
+
+        tracing::info!(
+            flow_partitions = config.partition_config.num_flow_partitions,
+            lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+            "FlowFabric server started (Postgres backend, Stage E1). \
+             Engine scanners skipped; scheduler skipped (Stage E3 pending)."
+        );
+
+        Ok(Self {
+            client,
+            admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            engine: None,
+            config,
+            scheduler: None,
             background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
             metrics,
             backend,
@@ -1374,7 +1494,14 @@ impl Server {
         worker_capabilities: &std::collections::BTreeSet<String>,
         grant_ttl_ms: u64,
     ) -> Result<Option<ff_core::contracts::ClaimGrant>, ServerError> {
-        self.scheduler
+        let scheduler = self.scheduler.as_ref().ok_or_else(|| {
+            ServerError::OperationFailed(
+                "claim_for_worker unavailable on this backend \
+                 (RFC-017 Stage E3 wires the Postgres-native scheduler)"
+                    .into(),
+            )
+        })?;
+        scheduler
             .claim_for_worker(
                 lane,
                 worker_id,
@@ -1724,7 +1851,9 @@ impl Server {
             }
         }
 
-        self.engine.shutdown().await;
+        if let Some(engine) = self.engine {
+            engine.shutdown().await;
+        }
         tracing::info!("FlowFabric server shutdown complete");
     }
 }

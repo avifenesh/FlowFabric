@@ -165,6 +165,43 @@ impl PostgresBackend {
         })
     }
 
+    /// RFC-017 Wave 8 Stage E1: dial Postgres with an explicit
+    /// [`PartitionConfig`] + shared [`ff_observability::Metrics`].
+    /// Mirrors [`ff_backend_valkey::ValkeyBackend::connect_with_metrics`]
+    /// so `ff-server::Server::start_with_metrics` can wire the Postgres
+    /// branch without reaching into the pool builder directly.
+    ///
+    /// Returns a concrete `Arc<Self>` rather than `Arc<dyn EngineBackend>`
+    /// so the caller can cast to the trait object after any additional
+    /// field installs (parallel to the Valkey path which calls
+    /// `with_scheduler` / `with_stream_semaphore_permits` before the
+    /// cast). Stage E1 does NOT run `apply_migrations` — schema
+    /// provisioning is an operator concern (matches the Wave 0 contract
+    /// on [`Self::connect`]).
+    pub async fn connect_with_metrics(
+        config: BackendConfig,
+        partition_config: PartitionConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Arc<Self>, EngineError> {
+        let pool = pool::build_pool(&config).await?;
+        warn_if_max_locks_low(&pool).await;
+        let stream_notifier = Some(StreamNotifier::spawn(pool.clone()));
+        Ok(Arc::new(Self {
+            pool,
+            partition_config,
+            metrics: Some(metrics),
+            stream_notifier,
+        }))
+    }
+
+    /// Accessor for the underlying `PgPool`. Stage E1 uses this so
+    /// `ff-server::Server::start_with_metrics` can run
+    /// [`apply_migrations`] on the same pool before handing the backend
+    /// out as `Arc<dyn EngineBackend>`.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Create one execution row (+ seed the lane registry if new).
     ///
     /// **RFC-017 Stage A:** this inherent method is retained as a
