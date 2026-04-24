@@ -23,6 +23,26 @@ some on Stage-E) with `FF_BACKEND=postgres` are unsupported. Operators
 must complete a valkey→valkey Stage D→E rolling upgrade first and flip
 `FF_BACKEND=postgres` as a second rollout.
 
+**Stage E sub-split (owner-adjudicated 2026-04-24).** Stage E is
+split into four PRs so each lands in a single session with CI-green:
+
+- **E1** (`impl/017-stage-e1`) — Postgres dial branch in
+  `Server::start_with_metrics` + `http_postgres_smoke.rs` test passing
+  end-to-end for the 5 migrated ingress routes. `PostgresBackend::create_execution`
+  trait impl added (inherent was there since Wave 4). `Server.engine`
+  / `Server.scheduler` become `Option` (`None` on Postgres). Dev-mode
+  override (`FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development`) still
+  required; §9.0 hard-gate not yet flipped.
+- **E2** — full `cancel_flow` trait migration (lifts `cancel_flow_inner`
+  into `ValkeyBackend::cancel_flow_with_args`), `Server::client: Client`
+  field removal, `fcall_with_reload` removal.
+- **E3** — `Server::claim_for_worker` trait cutover (Postgres-native
+  scheduler), `Server::scheduler` field removal.
+- **E4** — v0.8.0 cleanup: deprecated flat Valkey `ServerConfig` fields
+  removed, legacy `waitpoint_token` wire field removed,
+  `BACKEND_STAGE_READY` flipped to `&["valkey", "postgres"]`, version
+  bump, cairn matrix published.
+
 **Stage D split (owner-adjudicated 2026-04-24).** Stage D scope from
 RFC-017 §9 was split into two PRs to keep reviewer cognitive load
 bounded:
@@ -56,7 +76,7 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 
 | # | Method | Valkey | Postgres | Notes |
 |---|---|---|---|---|
-| 1 | `create_execution` | `impl` | `stub` | Valkey wraps `ff_create_execution` FCALL. Postgres inherent `create_execution(CreateExecutionArgs) -> ExecutionId` already exists but return shape differs from trait — trait default returns `Unavailable` until Wave 4d reshapes. |
+| 1 | `create_execution` | `impl` | `impl` | **Stage E1 flip.** Valkey wraps `ff_create_execution` FCALL. Postgres trait impl lifts the existing inherent helper and always returns `CreateExecutionResult::Created { public_state: Waiting }` — the helper does not yet distinguish Created vs Duplicate; a follow-up may refine (`http_postgres_smoke` exercises it through HTTP). |
 | 2 | `create_flow` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 3 | `add_execution_to_flow` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 4 | `stage_dependency_edge` | `impl` | `impl` | Promoted from PG inherent to trait. |
@@ -150,6 +170,56 @@ sequence anticipated.
   `test_postgres_parity_no_unavailable` asserts no Postgres
   `Unavailable` on any HTTP-exposed method. Every `stub` in the
   Postgres column above must be `impl` before Stage D2 merges.
+- **Stage E1 (this PR, `impl/017-stage-e1`):** `Server::start_with_metrics`
+  gains a Postgres branch — dials `PostgresBackend::connect_with_metrics`,
+  runs `apply_migrations`, installs the backend as `Arc<dyn EngineBackend>`
+  for all migrated HTTP ingress handlers. `Server::engine` and
+  `Server::scheduler` become `Option<T>` (None on Postgres; Stage E3
+  wires the Postgres-native scheduler). `PostgresBackend::create_execution`
+  lifted onto the trait. New `crates/ff-test/tests/http_postgres_smoke.rs`
+  (gated on `postgres-e2e` feature) passes end-to-end against a live
+  Postgres for 5 migrated HTTP routes: create_flow, create_execution × 3,
+  add_execution_to_flow × 3, stage_dependency_edge × 2, apply_dependency_to_child × 2.
 - **Stage E (v0.8.0):** `BACKEND_STAGE_READY` updated to
   `&["valkey", "postgres"]`; `FF_BACKEND=postgres` boots successfully
   for the first time.
+
+### Remaining gaps for v0.8.0 (E1 honest-scope)
+
+The Stage E1 smoke deliberately avoided these HTTP routes because the
+server-side dispatch is still Valkey-bound:
+
+- **`POST /v1/flows/{id}/cancel`** — `Server::cancel_flow_inner` still
+  builds FCALL KEYS/ARGV and dispatches through `fcall_with_reload`;
+  the idempotent-retry path does `HMGET` / `SMEMBERS` on `self.client`
+  directly. **Stage E2** lifts `cancel_flow` onto the backend trait,
+  removes `Server::client: Client`, and retires `fcall_with_reload`.
+- **`GET /v1/executions/{id}` / `…/state` / `…/result`** — all three
+  use `self.client.hgetall` / `hget` / `cmd("GET")` on the legacy
+  Valkey client. Migrated as part of **Stage E2**'s field removal.
+- **`GET /v1/flows/{id}`** — this HTTP route does not exist today;
+  callers infer flow state from member executions. Introducing it is
+  an ingress-read task tracked post-E4.
+- **`POST /v1/workers/{id}/claim`** — `Server::claim_for_worker` calls
+  `self.scheduler.claim_for_worker` which wraps a `ferriskey::Client`.
+  No Postgres equivalent yet; **Stage E3** wires the Postgres-native
+  scheduler path.
+- **Scheduler + engine scanners on Postgres** — the Postgres boot path
+  skips `Engine::start_with_completions` (scanners hold a
+  `ferriskey::Client`) and skips `Scheduler::with_metrics`. The
+  Postgres reconciler helpers already live under
+  `crates/ff-backend-postgres/src/reconcilers/` and the engine
+  crate's `scan_tick_pg` wrappers exist; a Postgres-side scanner
+  supervisor spawning them on an interval is a Stage E2/E3 task.
+- **Dev-mode override** — `FF_BACKEND=postgres` still requires
+  `FF_BACKEND_ACCEPT_UNREADY=1 + FF_ENV=development` through Stages E1-E3.
+  Stage E4 flips `BACKEND_STAGE_READY` to include `"postgres"` and
+  this requirement goes away.
+- **`Server::client: Client` on Postgres path** — the Stage E1
+  Postgres branch still dials an ambient Valkey client for the
+  residual legacy fields (`get_execution`, `get_execution_state`,
+  `get_execution_result`, `fetch_waitpoint_token_v07`,
+  `cancel_flow_inner`). That dial is not semantically meaningful for
+  Postgres-only deployments; it exists only because the field type is
+  `Client` not `Option<Client>`. **Stage E2** removes the field; the
+  ambient dial goes with it.
