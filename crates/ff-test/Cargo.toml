@@ -17,7 +17,7 @@ release = false
 
 [dependencies]
 ff-core = { workspace = true }
-ff-engine = { workspace = true }
+ff-engine = { workspace = true, features = ["postgres"] }
 ff-scheduler = { workspace = true }
 # Issue #171: test fixtures use FCALL helpers + ferriskey::Value parsers.
 ff-script = { workspace = true, features = ["valkey-client"] }
