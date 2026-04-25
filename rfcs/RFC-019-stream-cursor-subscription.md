@@ -248,11 +248,14 @@ permitted by at-least-once contract).
   `backend.subscribe_lease_history(cursor)` iteration. Direct
   `ferriskey` dep drops. Cursor persisted via cairn's existing
   checkpoint module.
-- **`instance_tag_backfill.rs`:** audited separately — it's one-shot
-  backfill, likely served by `list_executions` with the right filter;
-  may not need a subscription at all. Handled via
-  `subscribe_instance_tags` only if audit shows a subscription is
-  warranted.
+- **`instance_tag_backfill.rs`:** audited 2026-04-24 (#311) — one-shot
+  backfill served by `list_executions` + `ScannerFilter::with_instance_tag(..)`
+  pagination (client-side filter for v0.9; a future `list_executions`
+  filter parameter is the natural efficiency win, not a subscription).
+  `subscribe_instance_tags` deferred: trait method remains, both
+  backends return `Unavailable`, parity matrix row flipped to `n/a`.
+  Resume implementation only on concrete consumer demand for a
+  realtime tag-churn stream — not speculatively.
 - **LOC delta:** ~250 LOC deleted consumer-side; 2 of 5 direct
   `ferriskey` imports removed.
 
@@ -275,10 +278,10 @@ permitted by at-least-once contract).
 
 ### Stage B — Fill the matrix
 
-- Valkey: `subscribe_completion`, `subscribe_signal_delivery`,
-  `subscribe_instance_tags`.
-- Postgres: `subscribe_lease_history`, `subscribe_signal_delivery`,
-  `subscribe_instance_tags`.
+- Valkey: `subscribe_completion`, `subscribe_signal_delivery`.
+  (`subscribe_instance_tags` deferred — see §Cairn Migration Path.)
+- Postgres: `subscribe_lease_history`, `subscribe_signal_delivery`.
+  (`subscribe_instance_tags` deferred — see §Cairn Migration Path.)
 - ff-engine's internal `completion_listener.rs` DAG-promoter migrated
   to consume the trait method (deduplicating the pattern on the way in).
 
