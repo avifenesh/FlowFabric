@@ -300,7 +300,7 @@ but no longer trips on Postgres.
 | Method | Valkey | Postgres | Notes |
 |---|---|---|---|
 | `subscribe_lease_history` | `impl` | `stub` | Valkey: `duplicate_connection()` + `XREAD BLOCK 5000 STREAMS ff:part:{fp:N}:lease_history <cursor>`; cursor is `0x01 ++ ms(BE8) ++ seq(BE8)`. Postgres stub until Stage B (LISTEN/NOTIFY on a `ff_lease_event` outbox) — follow-up issue filed. |
-| `subscribe_completion` | `stub` | `impl` | Postgres wraps `completion::subscribe` (`ff_completion_event` outbox + `LISTEN ff_completion`). Valkey stub until Stage B (fold RESP3 `subscribe_completions` into the trait) — follow-up issue filed. |
+| `subscribe_completion` | `impl` | `impl` | Postgres wraps `completion::subscribe` (`ff_completion_event` outbox + `LISTEN ff_completion`), durable via event-id cursor. Valkey (Stage B, #309) wraps the RESP3 `ff:dag:completions` pubsub subscriber — **partial: non-durable cursor (pubsub-backed, at-most-once over the live subscription window). Postgres impl is durable via outbox + cursor.** Durable Valkey completion subscription is a separate follow-up if demanded. |
 | `subscribe_signal_delivery` | `stub` | `stub` | Stage B on both backends — follow-up issue filed. |
 | `subscribe_instance_tags` | `n/a` | `n/a` | Audited #311 (2026-04-24) + deferred: cairn's one-shot `instance_tag_backfill` pattern is served by `list_executions` + `ScannerFilter::with_instance_tag(..)` pagination; a realtime tag-churn stream is speculative demand we do not have today. Trait method remains and returns `Unavailable` on both backends; reserving the surface for future concrete demand. RFC-019 §instance_tags amended. |
 
