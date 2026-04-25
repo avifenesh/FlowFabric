@@ -39,8 +39,10 @@ pub(crate) struct SlotRefreshState {
     ///
     /// Uses `Instant` (monotonic clock) rather than `SystemTime` because this
     /// value is only compared against itself to measure elapsed time for the
-    /// refresh throttle. `Instant` never jumps backward and is immune to NTP
-    /// steps, VM suspend/restore, and wall-clock drift.
+    /// refresh throttle. `Instant` is guaranteed non-decreasing and is
+    /// appropriate for elapsed-time measurement within this process: unaffected
+    /// by wall-clock / NTP adjustments that could otherwise fool the
+    /// rate-limiter.
     pub(crate) last_run: Arc<RwLock<Option<Instant>>>,
     pub(crate) rate_limiter: SlotsRefreshRateLimit,
 }
