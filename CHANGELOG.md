@@ -25,6 +25,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **BREAKING (direct consumers of v0.9 capability API):**
+  `EngineBackend::capabilities_matrix() -> CapabilityMatrix` renamed
+  to `capabilities() -> Capabilities`; `BTreeMap<Capability,
+  CapabilityStatus>` replaced by flat `Supports` struct with named
+  bool fields (e.g. `caps.supports.cancel_execution`). Matches cairn's
+  original #277 ask. Partial-status nuance (e.g. non-durable cursor on
+  Valkey `subscribe_completion`) moved to rustdoc on the trait method
+  and `docs/POSTGRES_PARITY_MATRIX.md`. Consumers that went through
+  `flowfabric::core::capability::CapabilityMatrix` update their import
+  to `Capabilities` + dot-access fields.
 - `subscribe_instance_tags` deferred per audit (#311): `list_executions`
   + `ScannerFilter` + pagination meets cairn's `instance_tag_backfill`
   use case (one-shot backfill, not realtime tail). Trait method remains

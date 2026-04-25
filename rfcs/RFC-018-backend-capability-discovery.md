@@ -12,6 +12,18 @@ method added, `ValkeyBackend` + `PostgresBackend` populate real
 matrices. Stage B (derived parity matrix) and Stage C (HTTP
 `GET /v1/capabilities` + ff-sdk cache) remain follow-ups; closes
 issue #277 for v0.9.0.
+
+**Shape reshape (v0.10, 2026-04-24):** Stage A shipped a
+`BTreeMap<Capability, CapabilityStatus>` map; cairn's #277 ask was a
+flat named-field struct. v0.10 reshaped the public surface to match:
+`Capability` + `CapabilityStatus` + `CapabilityMatrix` replaced by a
+flat `#[non_exhaustive] pub struct Supports { pub cancel_execution:
+bool, ... }` and a `Capabilities { identity, supports }` container;
+trait method renamed `capabilities_matrix() -> CapabilityMatrix` →
+`capabilities() -> Capabilities`. Partial-status nuance (e.g.
+non-durable cursor on Valkey `subscribe_completion`) moved to rustdoc
+on the trait method + `docs/POSTGRES_PARITY_MATRIX.md`. See §4 shape
+sections for the updated shape; the v0.9 BTreeMap shape is retired.
 **Target release:** v0.9.0 (Stage A); Stage B/C land per §8.
 **Related RFCs:** RFC-012 (EngineBackend trait landing + Round-7 stabilisation), RFC-017 (ff-server backend abstraction + staged Postgres parity)
 **Related issues:** #277 (cairn PG-backend operator-UI blocker — driver for this RFC), #298 (`cancel_flow_wait` Unavailable shape on PG), #282 (backend-parity discovery tracking), #297 (token-budget example surfaced the "what does this backend support" gap)

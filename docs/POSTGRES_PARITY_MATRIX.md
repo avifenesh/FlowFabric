@@ -1,15 +1,19 @@
 # Postgres Parity Matrix — `EngineBackend` trait
 
-**RFC-018 Stage A note (2026-04-24):** this matrix is now callable at
-runtime via
-[`EngineBackend::capabilities_matrix()`](../crates/ff-core/src/engine_backend.rs)
-— concrete `ValkeyBackend` / `PostgresBackend` impls populate a
-`CapabilityMatrix` from their static tables, and consumers (cairn
-operator UI, operator tooling) can read the typed answer at startup
-instead of parsing this file. This document remains the
-human-readable reference during the RFC-017 migration; drift between
-the two is a bug. Stage B (this file generated from the runtime
-matrix + CI drift check) lands as a follow-up PR per RFC-018 §8.
+**RFC-018 Stage A note (2026-04-24, reshaped in v0.10):** this matrix
+is now callable at runtime via
+[`EngineBackend::capabilities()`](../crates/ff-core/src/engine_backend.rs)
+— concrete `ValkeyBackend` / `PostgresBackend` impls populate a flat
+`Capabilities { identity, supports }` value, and consumers (cairn
+operator UI, operator tooling) dot-access the bools
+(`backend.capabilities().supports.<field>`) to read the typed answer
+at startup instead of parsing this file. v0.9 shipped a
+`BTreeMap<Capability, CapabilityStatus>` shape; v0.10 reshaped to the
+flat [`Supports`](../crates/ff-core/src/capability.rs) struct per
+cairn's original #277 ask. This document remains the human-readable
+reference during the RFC-017 migration; drift between the two is a
+bug. Stage B (this file generated from the runtime value + CI drift
+check) lands as a follow-up PR per RFC-018 §8.
 
 **Source of truth** for per-method status across Valkey and Postgres
 backends during the RFC-017 staged migration. Greppable by cairn-fabric
