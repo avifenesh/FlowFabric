@@ -39,6 +39,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::error::map_sqlx_error;
+use crate::lease_event;
 use crate::signal::{hmac_sign, hmac_verify, is_retryable_serialization, SERIALIZABLE_RETRY_BUDGET};
 use crate::suspend::evaluate;
 
@@ -446,6 +447,17 @@ pub(crate) async fn suspend_impl(
             .await
             .map_err(map_sqlx_error)?;
 
+            // RFC-019 Stage B outbox: lease revoked (suspend).
+            lease_event::emit(
+                tx,
+                part,
+                exec_uuid,
+                None,
+                lease_event::EVENT_REVOKED,
+                now,
+            )
+            .await?;
+
             // 8. Assemble outcome.
             let (primary_id, primary_key, primary_token) = signed[0].clone();
             let extras: Vec<AdditionalWaitpointBinding> = signed
@@ -785,6 +797,18 @@ pub(crate) async fn claim_resumed_execution_impl(
     .fetch_one(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
+
+    // RFC-019 Stage B outbox: lease acquired (claim_resumed_execution).
+    let lease_id_str = args.lease_id.to_string();
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        Some(&lease_id_str),
+        lease_event::EVENT_ACQUIRED,
+        now,
+    )
+    .await?;
 
     tx.commit().await.map_err(map_sqlx_error)?;
 

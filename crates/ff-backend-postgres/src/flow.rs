@@ -700,6 +700,21 @@ async fn cancel_flow_once(
         .await
         .map_err(map_sqlx_error)?;
 
+        // RFC-019 Stage B outbox: lease revoked on every cancelled
+        // member. Members that never held a live lease surface a
+        // no-op revoke to consumers — same shape as the Valkey side.
+        sqlx::query(
+            "INSERT INTO ff_lease_event \
+             (execution_id, lease_id, event_type, occurred_at_ms, partition_key) \
+             VALUES ($1, NULL, 'revoked', \
+                     (extract(epoch from clock_timestamp())*1000)::bigint, $2)",
+        )
+        .bind(exec_uuid.to_string())
+        .bind(i32::from(part))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
         member_execution_ids.push(format!("{{fp:{part}}}:{exec_uuid}"));
     }
 
