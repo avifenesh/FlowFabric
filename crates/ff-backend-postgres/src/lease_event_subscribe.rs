@@ -18,11 +18,11 @@
 use std::time::Duration;
 
 use ff_core::engine_error::EngineError;
+use ff_core::stream_events::{LeaseHistoryEvent, LeaseHistorySubscription};
 use ff_core::stream_subscribe::{
-    decode_postgres_event_cursor, encode_postgres_event_cursor, StreamCursor, StreamEvent,
-    StreamFamily, StreamSubscription,
+    decode_postgres_event_cursor, encode_postgres_event_cursor, StreamCursor,
 };
-use ff_core::types::{ExecutionId, TimestampMs};
+use ff_core::types::{ExecutionId, LeaseId, TimestampMs};
 use futures_core::Stream;
 use sqlx::postgres::{PgListener, PgPool};
 use sqlx::Row;
@@ -58,7 +58,7 @@ pub(crate) async fn subscribe(
     pool: &PgPool,
     partition_key: i16,
     cursor: StreamCursor,
-) -> Result<StreamSubscription, EngineError> {
+) -> Result<LeaseHistorySubscription, EngineError> {
     // Decode + validate the caller's cursor before spawning so
     // malformed cursors fail loudly at subscribe time.
     let start = decode_postgres_event_cursor(&cursor).map_err(|msg| {
@@ -83,7 +83,7 @@ pub(crate) async fn subscribe(
         })?,
     };
 
-    let (tx, rx) = mpsc::channel::<Result<StreamEvent, EngineError>>(STREAM_CAPACITY);
+    let (tx, rx) = mpsc::channel::<Result<LeaseHistoryEvent, EngineError>>(STREAM_CAPACITY);
     let pool_clone = pool.clone();
     tokio::spawn(subscriber_loop(
         pool_clone,
@@ -97,11 +97,11 @@ pub(crate) async fn subscribe(
 
 /// `mpsc::Receiver` → `Stream` adapter.
 struct Adapter {
-    rx: mpsc::Receiver<Result<StreamEvent, EngineError>>,
+    rx: mpsc::Receiver<Result<LeaseHistoryEvent, EngineError>>,
 }
 
 impl Stream for Adapter {
-    type Item = Result<StreamEvent, EngineError>;
+    type Item = Result<LeaseHistoryEvent, EngineError>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -114,7 +114,7 @@ impl Stream for Adapter {
 async fn subscriber_loop(
     pool: PgPool,
     partition_key: i16,
-    tx: mpsc::Sender<Result<StreamEvent, EngineError>>,
+    tx: mpsc::Sender<Result<LeaseHistoryEvent, EngineError>>,
     mut last_seen: i64,
 ) {
     loop {
@@ -184,7 +184,7 @@ async fn subscriber_loop(
 }
 
 async fn wait_or_exit(
-    tx: &mpsc::Sender<Result<StreamEvent, EngineError>>,
+    tx: &mpsc::Sender<Result<LeaseHistoryEvent, EngineError>>,
     d: Duration,
 ) -> bool {
     tokio::select! {
@@ -193,12 +193,13 @@ async fn wait_or_exit(
     }
 }
 
-/// Drain rows above `last_seen`; forward each as a `StreamEvent`.
-/// Returns `false` iff the consumer dropped the subscription.
+/// Drain rows above `last_seen`; forward each as a typed
+/// `LeaseHistoryEvent`. Returns `false` iff the consumer dropped
+/// the subscription.
 async fn replay(
     pool: &PgPool,
     partition_key: i16,
-    tx: &mpsc::Sender<Result<StreamEvent, EngineError>>,
+    tx: &mpsc::Sender<Result<LeaseHistoryEvent, EngineError>>,
     last_seen: &mut i64,
 ) -> bool {
     loop {
@@ -255,45 +256,119 @@ async fn replay(
             };
             *last_seen = decoded.event_id;
 
-            // Event payload serialised into `StreamEvent::payload` —
-            // consumer-facing schema built via `serde_json::json!` to
-            // avoid pulling in a `serde` derive dep.
-            let payload = serde_json::json!({
-                "execution_id": decoded.execution_id,
-                "lease_id": decoded.lease_id,
-                "event_type": decoded.event_type,
-                "occurred_at_ms": decoded.occurred_at_ms,
-                "partition_key": decoded.partition_key,
-            });
-            let payload_bytes = match serde_json::to_vec(&payload) {
-                Ok(b) => bytes::Bytes::from(b),
-                Err(e) => {
+            let cursor = encode_postgres_event_cursor(decoded.event_id);
+
+            // Re-attach the `{fp:N}:<uuid>` hash-tag so the inline
+            // `execution_id` matches what Valkey would emit. Rows
+            // without a parseable UUID are defensively skipped —
+            // producers always write a UUID, so a bad row is a
+            // schema corruption surface, not a skip.
+            let execution_id = match Uuid::parse_str(&decoded.execution_id)
+                .ok()
+                .and_then(|uuid| {
+                    ExecutionId::parse(&format!(
+                        "{{fp:{}}}:{}",
+                        decoded.partition_key, uuid
+                    ))
+                    .ok()
+                }) {
+                Some(eid) => eid,
+                None => {
                     tracing::warn!(
-                        error = %e,
-                        "pg.lease_history.replay: payload serialize failed"
+                        execution_id = %decoded.execution_id,
+                        event_id = decoded.event_id,
+                        "pg.lease_history.replay: skipping row with unparseable execution_id"
                     );
                     continue;
                 }
             };
 
-            let cursor = encode_postgres_event_cursor(decoded.event_id);
-            let mut event = StreamEvent::new(
-                StreamFamily::LeaseHistory,
-                cursor,
-                TimestampMs::from_millis(decoded.occurred_at_ms),
-                payload_bytes,
-            );
-            // Re-attach the `{fp:N}:<uuid>` hash-tag so the inline
-            // `execution_id` matches what Valkey would emit. When
-            // parse fails (defensive — producers always write a UUID)
-            // we leave the inline field unset; consumers still see
-            // the raw uuid in the JSON payload.
-            if let Ok(uuid) = Uuid::parse_str(&decoded.execution_id) {
-                let full = format!("{{fp:{}}}:{}", decoded.partition_key, uuid);
-                if let Ok(eid) = ExecutionId::parse(&full) {
-                    event = event.with_execution_id(eid);
+            let lease_id = decoded
+                .lease_id
+                .as_deref()
+                .and_then(|s| LeaseId::parse(s).ok());
+            let at = TimestampMs::from_millis(decoded.occurred_at_ms);
+
+            // PG outbox does not persist the owning worker instance —
+            // the fence triple is rebuilt from attempt rows at lookup
+            // time. Surface `None` for now; consumers who need it go
+            // through `read_execution_state`.
+            let event = match decoded.event_type.as_str() {
+                "acquired" => match lease_id {
+                    Some(lease_id) => LeaseHistoryEvent::Acquired {
+                        cursor,
+                        execution_id,
+                        lease_id,
+                        worker_instance_id: None,
+                        at,
+                    },
+                    None => {
+                        tracing::warn!(
+                            event_id = decoded.event_id,
+                            "pg.lease_history.replay: acquired row missing lease_id"
+                        );
+                        continue;
+                    }
+                },
+                "renewed" => match lease_id {
+                    Some(lease_id) => LeaseHistoryEvent::Renewed {
+                        cursor,
+                        execution_id,
+                        lease_id,
+                        worker_instance_id: None,
+                        at,
+                    },
+                    None => {
+                        tracing::warn!(
+                            event_id = decoded.event_id,
+                            "pg.lease_history.replay: renewed row missing lease_id"
+                        );
+                        continue;
+                    }
+                },
+                "expired" => LeaseHistoryEvent::Expired {
+                    cursor,
+                    execution_id,
+                    lease_id,
+                    prev_owner: None,
+                    at,
+                },
+                "reclaimed" => match lease_id {
+                    Some(new_lease_id) => LeaseHistoryEvent::Reclaimed {
+                        cursor,
+                        execution_id,
+                        new_lease_id,
+                        new_owner: None,
+                        at,
+                    },
+                    None => {
+                        tracing::warn!(
+                            event_id = decoded.event_id,
+                            "pg.lease_history.replay: reclaimed row missing lease_id"
+                        );
+                        continue;
+                    }
+                },
+                "revoked" => LeaseHistoryEvent::Revoked {
+                    cursor,
+                    execution_id,
+                    lease_id,
+                    // PG outbox does not yet persist the revoke source;
+                    // match the Valkey default. Taxonomy typed-up when
+                    // the outbox schema gains a `revoked_by` column.
+                    revoked_by: "operator".to_string(),
+                    at,
+                },
+                other => {
+                    tracing::warn!(
+                        event_id = decoded.event_id,
+                        event_type = %other,
+                        "pg.lease_history.replay: unknown event_type, skipping"
+                    );
+                    continue;
                 }
-            }
+            };
+
             if tx.send(Ok(event)).await.is_err() {
                 return false; // consumer dropped
             }
