@@ -7,6 +7,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`flowfabric` umbrella crate** — re-exports the ff-* family
+  (`ff_core`, `ff_sdk`, and optionally `ff_backend_valkey`,
+  `ff_backend_postgres`, `ff_engine`, `ff_scheduler`, `ff_script`)
+  behind feature flags. Consumers can pin one crate + feature-flag
+  the backend instead of tracking 7–8 separate pins in lockstep.
+  Default `features = ["valkey"]` preserves the v0.7–v0.8 stability
+  posture; `default-features = false, features = ["postgres"]` opts
+  into the Postgres backend. See
+  [`docs/CONSUMER_MIGRATION_v0.8.md`](docs/CONSUMER_MIGRATION_v0.8.md)
+  § "Umbrella crate (flowfabric)" for before/after. Closes #279.
 - `ff-sdk` re-exports `ClaimGrant`, `ReclaimGrant`, `ClaimPolicy`, and
   `ReclaimToken`; consumers typing `claim_from_grant` /
   `claim_from_reclaim_grant` signatures can drop their direct
