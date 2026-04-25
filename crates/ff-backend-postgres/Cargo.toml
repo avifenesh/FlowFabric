@@ -60,3 +60,5 @@ hex = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+futures = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

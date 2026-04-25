@@ -11,6 +11,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Pubsub-backed (at-most-once over live subscription window), cursor
   always empty. Durable Postgres impl was Stage A; durable Valkey
   impl is follow-up (not in Stage B scope).
+- `PostgresBackend::subscribe_lease_history` (RFC-019 Stage B;
+  closes #308). `ff_lease_event` outbox table + `NOTIFY
+  ff_lease_event` trigger; subscription wraps `PgListener` with
+  cursor `0x02 ++ event_id(BE8)`. Valkey already impl'd at Stage A.
 
 ### Changed
 

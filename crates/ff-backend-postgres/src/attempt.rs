@@ -48,6 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::error::map_sqlx_error;
+use crate::lease_event;
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -248,6 +249,17 @@ async fn try_claim_in_partition(
     .await
     .map_err(map_sqlx_error)?;
 
+    // RFC-019 Stage B outbox: lease acquired.
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_ACQUIRED,
+        now,
+    )
+    .await?;
+
     tx.commit().await.map_err(map_sqlx_error)?;
 
     let exec_id = ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}")).map_err(|e| {
@@ -356,6 +368,17 @@ pub(crate) async fn claim_from_reclaim(
     .await
     .map_err(map_sqlx_error)?;
 
+    // RFC-019 Stage B outbox: lease reclaimed.
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_RECLAIMED,
+        now,
+    )
+    .await?;
+
     tx.commit().await.map_err(map_sqlx_error)?;
 
     let new_epoch = current_epoch.saturating_add(1);
@@ -436,6 +459,16 @@ pub(crate) async fn renew(
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
+    // RFC-019 Stage B outbox: lease renewed.
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_RENEWED,
+        now,
+    )
+    .await?;
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(LeaseRenewal::new(
         u64::try_from(new_expires).unwrap_or(0),
@@ -558,6 +591,17 @@ pub(crate) async fn complete(
     .await
     .map_err(map_sqlx_error)?;
 
+    // RFC-019 Stage B outbox: lease revoked (terminal success).
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_REVOKED,
+        now,
+    )
+    .await?;
+
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(())
 }
@@ -618,6 +662,17 @@ pub(crate) async fn fail(
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx_error)?;
+
+        // RFC-019 Stage B outbox: lease revoked (retry scheduled).
+        lease_event::emit(
+            &mut tx,
+            part,
+            exec_uuid,
+            None,
+            lease_event::EVENT_REVOKED,
+            now,
+        )
+        .await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(FailOutcome::RetryScheduled {
@@ -681,6 +736,17 @@ pub(crate) async fn fail(
         .await
         .map_err(map_sqlx_error)?;
 
+        // RFC-019 Stage B outbox: lease revoked (terminal fail).
+        lease_event::emit(
+            &mut tx,
+            part,
+            exec_uuid,
+            None,
+            lease_event::EVENT_REVOKED,
+            now,
+        )
+        .await?;
+
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(FailOutcome::TerminalFailed)
     }
@@ -732,6 +798,17 @@ pub(crate) async fn delay(
     .await
     .map_err(map_sqlx_error)?;
 
+    // RFC-019 Stage B outbox: lease revoked (delay).
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_REVOKED,
+        now_ms(),
+    )
+    .await?;
+
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(())
 }
@@ -779,6 +856,17 @@ pub(crate) async fn wait_children(
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
+
+    // RFC-019 Stage B outbox: lease revoked (wait_children).
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_REVOKED,
+        now_ms(),
+    )
+    .await?;
 
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(())

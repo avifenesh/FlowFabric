@@ -28,6 +28,7 @@ use ff_core::engine_error::EngineError;
 use sqlx::{PgPool, Row};
 
 use crate::error::map_sqlx_error;
+use crate::lease_event;
 use crate::reconcilers::ScanReport;
 use crate::reconcilers::attempt_timeout::skip_by_filter;
 
@@ -171,6 +172,17 @@ async fn release_one(
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
+
+    // RFC-019 Stage B outbox: lease expired (reclaimable).
+    lease_event::emit(
+        &mut tx,
+        partition_key,
+        exec_uuid,
+        None,
+        lease_event::EVENT_EXPIRED,
+        now_ms,
+    )
+    .await?;
 
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(())
