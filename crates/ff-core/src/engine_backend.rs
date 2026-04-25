@@ -1102,24 +1102,21 @@ pub trait EngineBackend: Send + Sync + 'static {
         })
     }
 
-    // ── RFC-019 Stage A — Stream-cursor subscriptions ─────────────
+    // ── RFC-019 Stage A/B/C — Stream-cursor subscriptions ─────────
     //
     // Four owner-adjudicated families (RFC-019 §Open Questions #5):
     // `lease_history`, `completion`, `signal_delivery`,
-    // `instance_tags`. Each returns a `StreamSubscription`
-    // (`Pin<Box<dyn Stream<Item = Result<StreamEvent, EngineError>> +
-    // Send>>`); the consumer drives with `StreamExt::next`.
+    // `instance_tags`. Stage C (this crate) promotes each family to
+    // a typed event enum; consumers `match` on variants instead of
+    // parsing a backend-shaped byte blob.
     //
-    // The cursor is backend-opaque bytes; see
-    // [`crate::stream_subscribe`] for the shared cursor codec + event
-    // payload. All defaults return `EngineError::Unavailable` per
-    // RFC-017 trait-growth conventions. Stage A ships Valkey
-    // `subscribe_lease_history` + Postgres `subscribe_completion`;
-    // the other six (family × backend) combinations stay `Unavailable`
-    // and are tracked in the RFC-019 Stage B follow-up issues.
+    // Each method returns a family-specific subscription alias (see
+    // [`crate::stream_events`]). All defaults return
+    // `EngineError::Unavailable` per RFC-017 trait-growth conventions.
 
-    /// Subscribe to lease lifecycle events (expired / reclaimed /
-    /// revoked) for the partition this backend is configured with.
+    /// Subscribe to lease lifecycle events (acquired / renewed /
+    /// expired / reclaimed / revoked) for the partition this backend
+    /// is configured with.
     ///
     /// Cross-partition fan-out is consumer-side merge: subscribe
     /// per-partition backend instance and interleave on the read
@@ -1130,7 +1127,7 @@ pub trait EngineBackend: Send + Sync + 'static {
     async fn subscribe_lease_history(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
-    ) -> Result<crate::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<crate::stream_events::LeaseHistorySubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_lease_history",
         })
@@ -1138,40 +1135,44 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     /// Subscribe to completion events (terminal state transitions).
     ///
-    /// - **Postgres** (RFC-019 Stage A): wraps the `ff_completion_event`
-    ///   outbox + LISTEN/NOTIFY machinery. Durable via event-id cursor.
-    /// - **Valkey** (RFC-019 Stage B, issue #309): wraps the RESP3
-    ///   `ff:dag:completions` pubsub subscriber. Pubsub is at-most-once
-    ///   over the live subscription window; the cursor is always the
-    ///   empty sentinel. If you need at-least-once replay with durable
+    /// - **Postgres**: wraps the `ff_completion_event` outbox +
+    ///   LISTEN/NOTIFY machinery. Durable via event-id cursor.
+    /// - **Valkey**: wraps the RESP3 `ff:dag:completions` pubsub
+    ///   subscriber. Pubsub is at-most-once over the live
+    ///   subscription window; the cursor is always the empty
+    ///   sentinel. If you need at-least-once replay with durable
     ///   cursor resume, use the Postgres backend (see
     ///   `docs/POSTGRES_PARITY_MATRIX.md` row `subscribe_completion`).
     async fn subscribe_completion(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
-    ) -> Result<crate::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<crate::stream_events::CompletionSubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_completion",
         })
     }
 
-    /// Subscribe to signal-delivery events (waitpoint arming /
-    /// satisfied). Stage B follow-up.
+    /// Subscribe to signal-delivery events (satisfied / buffered /
+    /// deduped).
     async fn subscribe_signal_delivery(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
-    ) -> Result<crate::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<crate::stream_events::SignalDeliverySubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_signal_delivery",
         })
     }
 
     /// Subscribe to instance-tag events (tag attached / cleared).
-    /// Stage B follow-up.
+    ///
+    /// Producer wiring is deferred per #311 audit ("no concrete
+    /// demand"); the trait method exists for API uniformity across
+    /// the four families. Backends currently return
+    /// `EngineError::Unavailable`.
     async fn subscribe_instance_tags(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
-    ) -> Result<crate::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<crate::stream_events::InstanceTagSubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_instance_tags",
         })
