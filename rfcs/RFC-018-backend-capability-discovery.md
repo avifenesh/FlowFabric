@@ -1,9 +1,18 @@
 # RFC-018: `EngineBackend` capability discovery surface
 
-**Status:** Draft
+**Status:** Accepted
 **Author:** FlowFabric Team (manager single-agent draft)
 **Created:** 2026-04-24
-**Target release:** v0.10.0
+**Acceptance:** 2026-04-24 — owner-adjudicated inline on §9 open
+questions (granularity: coarse; version: struct; sync; no event
+stream). Stage A implementation ships in the same PR as this
+promotion — `BackendIdentity` + `Capability` + `CapabilityStatus` +
+`CapabilityMatrix` + `Version` land in `ff-core`, trait default
+method added, `ValkeyBackend` + `PostgresBackend` populate real
+matrices. Stage B (derived parity matrix) and Stage C (HTTP
+`GET /v1/capabilities` + ff-sdk cache) remain follow-ups; closes
+issue #277 for v0.9.0.
+**Target release:** v0.9.0 (Stage A); Stage B/C land per §8.
 **Related RFCs:** RFC-012 (EngineBackend trait landing + Round-7 stabilisation), RFC-017 (ff-server backend abstraction + staged Postgres parity)
 **Related issues:** #277 (cairn PG-backend operator-UI blocker — driver for this RFC), #298 (`cancel_flow_wait` Unavailable shape on PG), #282 (backend-parity discovery tracking), #297 (token-budget example surfaced the "what does this backend support" gap)
 
@@ -341,15 +350,42 @@ Three stages, each CI-gated at the workspace boundary per `feedback_rfc_phases_v
 
 ---
 
-## 9. Open questions (owner-scoped)
+## 9. Open questions — owner adjudication (2026-04-24)
+
+All four open questions closed inline per the draft's own
+recommendations. Rejected options preserved verbatim in §3
+Alternatives (for posterity) and below (with the accepted choice
+marked) so future re-evaluation has the full record.
 
 1. **Capability granularity — ~20 coarse or 50+ fine?** This RFC proposes coarse (one per operator-UI-greyable feature, ~20 entries). Fine would be one per trait method (~50+, tracking RFC-017 §2.3's 51-method post-expansion count). **Recommend coarse** — cairn's UI grey-rendering is on operator-visible features (the "Cancel Flow" button), not per-method (the user does not see `cancel_flow_header` vs `cancel_flow_wait`). Coarse also keeps `Capability` enum growth slow; fine couples it to every trait-surface change. If owner picks fine, Stage A scope doubles.
 
+   **Accepted: coarse.** Stage A ships ~25 variants
+   (`crates/ff-core/src/capability.rs::Capability`). Driver (#277)
+   is UI grey-rendering, which is operator-visible-feature granular,
+   not trait-method granular. `#[non_exhaustive]` keeps the enum
+   growable in follow-up stages.
+
 2. **`Version` semantics — semver string, or `struct { major, minor, patch }`?** This RFC proposes `struct` for compile-time comparison (consumers can write `if backend.identity().version >= Version { major: 0, minor: 10, patch: 0 }` without parsing). Semver string is one-line simpler but forces consumers to pull a semver-parsing dep. **Recommend struct.**
+
+   **Accepted: struct.** Stage A ships
+   `ff_core::capability::Version { major, minor, patch }` with
+   `#[derive(Ord, PartialOrd)]` + const constructor. Consumers do
+   direct comparison without a semver-parsing dep. Pre-release /
+   build-metadata suffixes not in scope for Stage A.
 
 3. **Sync vs async `capabilities_matrix()`?** This RFC proposes sync. Rationale: backend-static info should not require a probe on every query; dynamic probes happen once at `connect_with_metrics` time and cache the result. Sync signature keeps the caller ergonomics clean (no `.await` on a diagnostic call). **Recommend sync.** Open because a hypothetical future backend might want to refresh on every call (e.g. a cluster where capabilities genuinely flip when membership changes); that backend would have to re-poll on connect and accept a possibly-stale answer until next reconnect — acceptable for our current needs.
 
+   **Accepted: sync.** Backends that need a runtime probe
+   (Postgres `LISTEN/NOTIFY` availability, Valkey module presence)
+   do it at `connect*` time and cache. The trait method returns
+   the cached matrix — consumers pay no `.await` on a diagnostic
+   call.
+
 4. **Event-stream of capability changes?** A consumer could subscribe to capability-flip events rather than polling. **Recommend no** — backend capabilities do not change across a deployment's lifecycle (a Postgres instance either has LISTEN/NOTIFY or does not, for its whole boot cycle). Cache at startup. Revisit only if a real consumer use case emerges post-Stage A.
+
+   **Accepted: no.** Cache at startup. Revisit only if a real
+   consumer use case emerges post-Stage A — no stub hook added in
+   this PR so the trait surface stays lean.
 
 ---
 

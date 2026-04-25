@@ -1,5 +1,16 @@
 # Postgres Parity Matrix — `EngineBackend` trait
 
+**RFC-018 Stage A note (2026-04-24):** this matrix is now callable at
+runtime via
+[`EngineBackend::capabilities_matrix()`](../crates/ff-core/src/engine_backend.rs)
+— concrete `ValkeyBackend` / `PostgresBackend` impls populate a
+`CapabilityMatrix` from their static tables, and consumers (cairn
+operator UI, operator tooling) can read the typed answer at startup
+instead of parsing this file. This document remains the
+human-readable reference during the RFC-017 migration; drift between
+the two is a bug. Stage B (this file generated from the runtime
+matrix + CI drift check) lands as a follow-up PR per RFC-018 §8.
+
 **Source of truth** for per-method status across Valkey and Postgres
 backends during the RFC-017 staged migration. Greppable by cairn-fabric
 runbooks + operator tooling. Updated at every stage merge.
