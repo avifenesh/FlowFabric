@@ -41,5 +41,9 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures-core = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
+# RFC-019 Stage A — opaque stream cursor + event payload bytes, plus
+# `tokio_stream::Stream` for the `EngineBackend::subscribe_*` type alias.
+bytes = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]

@@ -133,6 +133,35 @@ pub enum EngineError {
         elapsed: std::time::Duration,
     },
 
+    /// RFC-019 Stage A — a subscription stream returned by
+    /// [`crate::engine_backend::EngineBackend::subscribe_lease_history`]
+    /// (or its siblings) observed a backend disconnect. The cursor is
+    /// the last event position the stream successfully yielded (or
+    /// [`crate::stream_subscribe::StreamCursor::empty`] if none was
+    /// observed). Consumers reconnect by re-calling the same
+    /// `subscribe_*` method with this cursor — that is the
+    /// owner-adjudicated disconnect contract (RFC-019 §Open
+    /// Questions #2).
+    ///
+    /// Terminal from the stream's perspective: the subscription ends
+    /// after yielding this error.
+    #[error("stream disconnected; reconnect with returned cursor")]
+    StreamDisconnected {
+        cursor: crate::stream_subscribe::StreamCursor,
+    },
+
+    /// RFC-019 Stage A — a subscription stream fell behind its bounded
+    /// queue and dropped events rather than blocking the producer.
+    /// Reserved for backends that explicitly surface lag (Stage B
+    /// lands the first call-site via `subscribe_instance_tags`); no
+    /// Stage A backend emits this today but consumers match on it to
+    /// future-proof reconciliation paths.
+    ///
+    /// Non-terminal: the stream continues after this error; callers
+    /// treat it as a "refresh from authoritative state" signal.
+    #[error("stream backpressure; events dropped")]
+    StreamBackpressure,
+
     /// An inner [`EngineError`] wrapped with a call-site label so
     /// operators triaging logs can see which op the error came from
     /// without inferring from surrounding spans. Constructed via
@@ -608,6 +637,14 @@ impl EngineError {
             // the specific op exceeded its budget; a retry is the
             // caller's decision, not the error's classification.
             Self::Timeout { .. } => ErrorClass::Terminal,
+            // RFC-019 Stage A: StreamDisconnected is terminal for the
+            // current stream — consumer reconnects with the cursor,
+            // which is a caller decision, not a retry at this layer.
+            Self::StreamDisconnected { .. } => ErrorClass::Terminal,
+            // StreamBackpressure is informational: events were dropped
+            // but the stream continues. Caller reconciles via
+            // authoritative state.
+            Self::StreamBackpressure => ErrorClass::Informational,
             // Descend into the wrapped error — context is diagnostic;
             // classification follows the inner cause.
             Self::Contextual { source, .. } => source.class(),
