@@ -1021,6 +1021,48 @@ pub enum FailOutcome {
     TerminalFailed,
 }
 
+// ── Issue #281: PrepareOutcome (boot-prep trait-method return) ────────
+
+/// Outcome of an [`EngineBackend::prepare`](crate::engine_backend::EngineBackend::prepare)
+/// call — one-time backend-specific boot preparation.
+///
+/// Issue #281: moves cairn's `ensure_library` retry loop upstream so
+/// consumers can boot any backend uniformly via
+/// `backend.prepare().await?` without knowing whether it is Valkey
+/// (FUNCTION LOAD) or Postgres (migrations are out-of-band per
+/// RFC-v0.7 Wave 0 Q12, so `NoOp`). `#[non_exhaustive]` so future
+/// backends can add variants (e.g. `Skipped { reason }`) additively.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrepareOutcome {
+    /// Backend had nothing to do — either genuinely no-op (Postgres:
+    /// migrations applied out-of-band) or the requested prep work was
+    /// already in place and idempotent (Valkey: library already at
+    /// the expected version; the Valkey impl collapses the
+    /// "already-present" case into `Applied` to keep one success
+    /// variant — consumers that want to distinguish can parse
+    /// `description`).
+    NoOp,
+    /// Backend ran preparation work (e.g. Valkey FUNCTION LOAD
+    /// REPLACE). `description` is a human-readable summary suitable
+    /// for `info!`-level log lines like
+    /// `"FUNCTION LOAD (flowfabric lib v<N>)"`; shape is not
+    /// machine-parseable and MAY change across versions.
+    Applied {
+        /// Human-readable summary of what was prepared.
+        description: String,
+    },
+}
+
+impl PrepareOutcome {
+    /// Shorthand constructor for the `Applied` variant.
+    pub fn applied(description: impl Into<String>) -> Self {
+        Self::Applied {
+            description: description.into(),
+        }
+    }
+}
+
 // ── RFC-012 §R7: AppendFrameOutcome move ────────────────────────────────
 
 /// Outcome of an `append_frame()` call.

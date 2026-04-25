@@ -5042,6 +5042,28 @@ impl EngineBackend for ValkeyBackend {
         Ok(())
     }
 
+    /// Issue #281: trait-surface boot preparation. Delegates to
+    /// [`ff_script::loader::ensure_library`] — same retry semantics
+    /// as [`ValkeyBackend::initialize_deployment`]'s step 4 (3×
+    /// attempts with 1 s backoff on transient transport faults;
+    /// permanent compile errors fail loud without retry). Reported as
+    /// [`PrepareOutcome::Applied`] with `description =
+    /// "FUNCTION LOAD (flowfabric lib v<N>)"` so operators see the
+    /// booted library version in logs.
+    ///
+    /// [`PrepareOutcome::Applied`]: ff_core::backend::PrepareOutcome::Applied
+    async fn prepare(
+        &self,
+    ) -> Result<ff_core::backend::PrepareOutcome, EngineError> {
+        ff_script::loader::ensure_library(&self.client)
+            .await
+            .map_err(boot::load_error_to_engine)?;
+        Ok(ff_core::backend::PrepareOutcome::applied(format!(
+            "FUNCTION LOAD (flowfabric lib v{})",
+            ff_script::LIBRARY_VERSION
+        )))
+    }
+
     async fn get_execution_result(
         &self,
         id: &ExecutionId,

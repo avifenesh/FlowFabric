@@ -391,6 +391,20 @@ fn backend_label_smoke() {
     let _erased: Arc<dyn EngineBackend> = Arc::new(MockBackend::default());
 }
 
+/// Issue #281: a backend that does not override `prepare` — here
+/// `MockBackend` — inherits the trait default and returns
+/// `PrepareOutcome::NoOp`. Ensures out-of-tree backends without
+/// boot-prep work compile-and-no-op for free; the
+/// `ValkeyBackend::prepare` / `PostgresBackend::prepare` overrides
+/// are exercised in their respective crates.
+#[tokio::test]
+async fn prepare_default_impl_returns_noop() {
+    let mock = MockBackend::default();
+    let erased: Arc<dyn EngineBackend> = Arc::new(mock);
+    let outcome = erased.prepare().await.expect("prepare default is Ok");
+    assert_eq!(outcome, ff_core::backend::PrepareOutcome::NoOp);
+}
+
 /// `MockBackend::shutdown_prepare(grace)` drains cleanly within
 /// `grace`. The Stage A Valkey impl is also a no-op (§RFC-017
 /// Stage B moves the stream semaphore + tail client into the
