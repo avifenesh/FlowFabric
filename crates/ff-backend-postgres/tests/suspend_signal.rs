@@ -48,20 +48,26 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Per-test isolation strategy (issue #301). The `ff_waitpoint_hmac`
-/// keystore is a single-row *global* table — rotate / seed semantics
-/// assert on "(prior_kid, active_kid) of the whole table". A shared
+/// keystore is a *global* table (one row per kid, with an `active`
+/// flag picking the current signing kid); rotate / seed semantics
+/// assert on the table-wide `(prior_kid, active_kid)` state. A shared
 /// `public` schema plus per-test `TRUNCATE` races under parallel test
 /// execution (test A's TRUNCATE wipes the kids test B just seeded).
 ///
-/// Fix: only the keystore is a shared singleton; the rest of the
+/// Fix: only the keystore has shared global state; the rest of the
 /// Wave-3 schema (partitioned tables) already isolates via unique
 /// execution UUIDs. So we give every test its own `ff_waitpoint_hmac`
 /// by:
 ///
-/// 1. Ensuring the workspace schema is applied once in `public`
-///    (idempotent `apply_migrations`).
+/// 1. Ensuring the workspace schema is applied to `public`. The call
+///    runs per test but is idempotent via sqlx's migration-tracking
+///    table — only the first invocation does work; subsequent calls
+///    are metadata-lookup no-ops under the advisory lock.
 /// 2. Creating a per-test Postgres schema (`ffpg_test_<uuid>`) holding
-///    only a fresh `ff_waitpoint_hmac` table.
+///    only a shadow `ff_waitpoint_hmac` table, built with
+///    `LIKE public.ff_waitpoint_hmac INCLUDING ALL` so it inherits
+///    future column / index / constraint changes to the canonical
+///    keystore without DDL drift here.
 /// 3. Setting `search_path = <test_schema>, public` on every pool
 ///    connection so the unqualified `ff_waitpoint_hmac` name in
 ///    `signal.rs` resolves to the test-local copy, while every other
@@ -70,15 +76,18 @@ use uuid::Uuid;
 ///
 /// Result: tests parallelize cleanly. No cross-schema FK touches the
 /// keystore (verified against migration DDL — the references are
-/// string kids, not SQL foreign keys). We don't `DROP SCHEMA CASCADE`
-/// on teardown: the test DB is throwaway and the per-test schema
-/// carries only a single 5-column table.
+/// string kids, not SQL foreign keys). Per-test schemas are NOT
+/// dropped on teardown (async Drop in tokio is messy); the test DB
+/// is throwaway and each schema carries only a single 4-column
+/// table. If `FF_PG_TEST_URL` ever points at a long-lived dev DB,
+/// periodic `DROP SCHEMA ffpg_test_* CASCADE` is the maintenance
+/// hook.
 async fn setup_or_skip() -> Option<PgPool> {
     let url = std::env::var("FF_PG_TEST_URL").ok()?;
 
-    // Apply the workspace schema to `public` once (idempotent via
-    // sqlx's migration-tracking table). First invocation seeds
-    // schema; subsequent calls no-op.
+    // Apply the workspace schema to `public`. Idempotent via sqlx's
+    // migration-tracking table; only the first test invocation does
+    // work, later calls are metadata lookups.
     let bootstrap = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)
@@ -95,14 +104,13 @@ async fn setup_or_skip() -> Option<PgPool> {
         .execute(&bootstrap)
         .await
         .expect("create per-test schema");
-    // Shadow copy of `ff_waitpoint_hmac` (matches 0001_initial.sql).
+    // Shadow copy of `ff_waitpoint_hmac` derived from the canonical
+    // migrated table definition via `LIKE ... INCLUDING ALL`. This
+    // picks up any future column / index / constraint changes to the
+    // keystore without a parallel DDL edit here.
     sqlx::query(&format!(
-        "CREATE TABLE {schema}.ff_waitpoint_hmac ( \
-            kid           text      NOT NULL PRIMARY KEY, \
-            secret        bytea     NOT NULL, \
-            rotated_at_ms bigint    NOT NULL, \
-            active        boolean   NOT NULL DEFAULT true \
-         )"
+        "CREATE TABLE {schema}.ff_waitpoint_hmac \
+         (LIKE public.ff_waitpoint_hmac INCLUDING ALL)"
     ))
     .execute(&bootstrap)
     .await
