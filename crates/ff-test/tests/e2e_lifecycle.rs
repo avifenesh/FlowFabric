@@ -1841,11 +1841,12 @@ async fn fcall_deliver_signal(
         ctx.signal_dedup(&wp_id, idempotency_key)
     };
 
-    // KEYS (14): exec_core, wp_condition, wp_signals_stream,
+    // KEYS (15): exec_core, wp_condition, wp_signals_stream,
     //            exec_signals_zset, signal_hash, signal_payload,
     //            idem_key, waitpoint_hash, suspension_current,
     //            eligible_zset, suspended_zset, delayed_zset,
-    //            suspension_timeout_zset, hmac_secrets
+    //            suspension_timeout_zset, hmac_secrets,
+    //            partition_signal_delivery_stream (RFC-019 Stage B / #310)
     let keys: Vec<String> = vec![
         ctx.core(),                              // 1
         ctx.waitpoint_condition(&wp_id),         // 2
@@ -1861,6 +1862,7 @@ async fn fcall_deliver_signal(
         idx.lane_delayed(&lane_id),              // 12
         idx.suspension_timeout(),                // 13
         idx.waitpoint_hmac_secrets(),            // 14
+        idx.partition_signal_delivery(),         // 15
     ];
 
     // ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
@@ -2565,6 +2567,7 @@ async fn test_signal_idempotency() {
         idx.lane_delayed(&lane_id),
         idx.suspension_timeout(),
         idx.waitpoint_hmac_secrets(),
+        idx.partition_signal_delivery(), // 15 (RFC-019 Stage B / #310)
     ];
 
     let args: Vec<String> = vec![
@@ -2606,6 +2609,76 @@ async fn test_signal_idempotency() {
         lifecycle_phase: Some(ff_core::state::LifecyclePhase::Suspended),
         ..Default::default()
     }).await;
+}
+
+/// Regression for #310 (v2 → v3): ff_deliver_signal now requires a
+/// KEYS[15] slot for the partition-level signal-delivery aggregate
+/// stream. A raw FCALL caller that passes only 14 keys makes Lua see
+/// `nil` for `K.partition_signal_delivery_stream`, and the new XADD
+/// fails with "Lua redis lib command arguments must be strings or
+/// integers". The v2 attempt broke the existing raw-FCALL test
+/// helpers for exactly this reason. This test pins the new contract:
+/// (a) FCALL with 15 keys succeeds, and (b) the partition stream
+/// actually receives an entry.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_signal_delivery_xadd_does_not_corrupt_fcall() {
+    let tc = TestCluster::connect().await;
+    tc.cleanup().await;
+
+    let eid = tc.new_execution_id();
+
+    fcall_create_execution(&tc, &eid, NS, LANE, "xadd_regression", 0).await;
+    fcall_issue_claim_grant(&tc, &eid, LANE, WORKER, WORKER_INST).await;
+    let (lease_id, epoch, att_idx, attempt_id) =
+        fcall_claim_execution(&tc, &eid, LANE, WORKER, WORKER_INST, 30_000).await;
+
+    // Two matchers so the single signal below doesn't resume — we're
+    // exercising the "no_op / appended_to_waitpoint" path, which hits
+    // the second new XADD (the one after the composite branch).
+    let resume_cond = build_resume_condition_json(&["sig_a", "sig_b"], "fail");
+    let (_sid, waitpoint_id, _wpk, _sub, wp_token) = fcall_suspend_execution(
+        &tc, &eid, LANE, WORKER_INST,
+        &lease_id, &epoch, &att_idx, &attempt_id,
+        "waiting_for_signal", &resume_cond, None, "fail",
+    ).await;
+
+    // Read partition stream len before.
+    let config = test_config();
+    let partition = execution_partition(&eid, &config);
+    let idx = IndexKeys::new(&partition);
+    let stream_key = idx.partition_signal_delivery();
+    let before: i64 = tc
+        .client()
+        .cmd("XLEN")
+        .arg(&stream_key)
+        .execute()
+        .await
+        .expect("XLEN before");
+
+    // Deliver a signal via the raw-FCALL helper (which passes 15 keys
+    // after the fix). If the helper is wrong (14 keys), the FCALL
+    // returns "Lua redis lib command arguments must be strings or
+    // integers" and the assertion below panics.
+    let (_sig_id, effect) = fcall_deliver_signal(
+        &tc, &eid, LANE, &waitpoint_id, "sig_a", "callback",
+        "dedup-xadd-regression", &wp_token,
+    ).await;
+    assert_eq!(effect, "appended_to_waitpoint");
+
+    // Partition stream should have grown by exactly 1.
+    let after: i64 = tc
+        .client()
+        .cmd("XLEN")
+        .arg(&stream_key)
+        .execute()
+        .await
+        .expect("XLEN after");
+    assert_eq!(
+        after,
+        before + 1,
+        "ff_deliver_signal should XADD exactly one entry to the partition signal-delivery stream",
+    );
 }
 
 /// Cancel a suspended execution → verify terminal/cancelled, suspension closed.
