@@ -23,6 +23,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ff-scheduler` dep pin (closes #283). `Scheduler` itself is
   intentionally not re-exported — implementing a scheduler stays
   behind the explicit `ff-scheduler` dep.
+- `LeaseSummary` gains `lease_id`, `attempt_index`, `last_heartbeat_at`
+  fields + fluent `with_lease_id` / `with_attempt_index` /
+  `with_last_heartbeat_at` setters (closes #278). `#[non_exhaustive]`
+  preserved; construct via `LeaseSummary::new(..).with_*(..)`. Valkey
+  backend surfaces all three via `describe_execution`, letting
+  downstream consumers delete their HGET-based lease-summary
+  wrappers.
 
 ## [0.8.1] - 2026-04-25
 
