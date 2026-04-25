@@ -3,6 +3,16 @@
 All notable changes to FlowFabric are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- `subscribe_instance_tags` deferred per audit (#311): `list_executions`
+  + `ScannerFilter` + pagination meets cairn's `instance_tag_backfill`
+  use case (one-shot backfill, not realtime tail). Trait method remains
+  (returns `Unavailable` on both backends); reserving the surface for
+  future concrete demand. RFC-019 §instance_tags amended.
+
 ## [0.9.0] - 2026-04-25
 
 v0.9 is **fully additive** on top of v0.8: no consumer source changes
