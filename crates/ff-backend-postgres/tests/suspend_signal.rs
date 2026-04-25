@@ -47,23 +47,84 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Per-test isolation strategy (issue #301). The `ff_waitpoint_hmac`
+/// keystore is a single-row *global* table — rotate / seed semantics
+/// assert on "(prior_kid, active_kid) of the whole table". A shared
+/// `public` schema plus per-test `TRUNCATE` races under parallel test
+/// execution (test A's TRUNCATE wipes the kids test B just seeded).
+///
+/// Fix: only the keystore is a shared singleton; the rest of the
+/// Wave-3 schema (partitioned tables) already isolates via unique
+/// execution UUIDs. So we give every test its own `ff_waitpoint_hmac`
+/// by:
+///
+/// 1. Ensuring the workspace schema is applied once in `public`
+///    (idempotent `apply_migrations`).
+/// 2. Creating a per-test Postgres schema (`ffpg_test_<uuid>`) holding
+///    only a fresh `ff_waitpoint_hmac` table.
+/// 3. Setting `search_path = <test_schema>, public` on every pool
+///    connection so the unqualified `ff_waitpoint_hmac` name in
+///    `signal.rs` resolves to the test-local copy, while every other
+///    table (partitioned exec/attempt/waitpoint rows) continues to
+///    resolve into `public`.
+///
+/// Result: tests parallelize cleanly. No cross-schema FK touches the
+/// keystore (verified against migration DDL — the references are
+/// string kids, not SQL foreign keys). We don't `DROP SCHEMA CASCADE`
+/// on teardown: the test DB is throwaway and the per-test schema
+/// carries only a single 5-column table.
 async fn setup_or_skip() -> Option<PgPool> {
     let url = std::env::var("FF_PG_TEST_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
+
+    // Apply the workspace schema to `public` once (idempotent via
+    // sqlx's migration-tracking table). First invocation seeds
+    // schema; subsequent calls no-op.
+    let bootstrap = PgPoolOptions::new()
+        .max_connections(1)
         .connect(&url)
         .await
         .expect("connect to FF_PG_TEST_URL");
-    ff_backend_postgres::apply_migrations(&pool)
+    ff_backend_postgres::apply_migrations(&bootstrap)
         .await
         .expect("apply_migrations clean");
-    // Reset the HMAC keystore between runs. Schema-0001 is shared
-    // across every suspend+signal test and these tests assert on
-    // (prior_kid, active_kid) shape.
-    sqlx::query("TRUNCATE TABLE ff_waitpoint_hmac")
-        .execute(&pool)
+
+    // Unique schema per test invocation. `simple()` avoids hyphens so
+    // the identifier stays unquoted-safe.
+    let schema = format!("ffpg_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&bootstrap)
         .await
-        .expect("truncate ff_waitpoint_hmac");
+        .expect("create per-test schema");
+    // Shadow copy of `ff_waitpoint_hmac` (matches 0001_initial.sql).
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.ff_waitpoint_hmac ( \
+            kid           text      NOT NULL PRIMARY KEY, \
+            secret        bytea     NOT NULL, \
+            rotated_at_ms bigint    NOT NULL, \
+            active        boolean   NOT NULL DEFAULT true \
+         )"
+    ))
+    .execute(&bootstrap)
+    .await
+    .expect("create per-test ff_waitpoint_hmac");
+    bootstrap.close().await;
+
+    let schema_for_hook = schema.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .after_connect(move |conn, _meta| {
+            let schema = schema_for_hook.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {schema}, public"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect to FF_PG_TEST_URL");
+
     Some(pool)
 }
 
@@ -332,9 +393,10 @@ async fn hmac_sign_verify_round_trip_against_rotated_kid() {
 
 /// Minimal per-test fixture: fresh schema + a single pre-populated
 /// execution + attempt so the SERIALIZABLE `suspend` body has a row
-/// to mutate. Uniqueness across concurrent tests comes from the fresh
-/// UUID — we do NOT TRUNCATE partitioned tables here because doing so
-/// under `run_in_transaction` would collide with the trigger fanout.
+/// to mutate. Uniqueness across concurrent tests comes from the
+/// per-test schema set up in [`setup_or_skip`] (issue #301) plus the
+/// fresh execution UUID minted here — partitioned-table rows stay
+/// test-local without a per-test TRUNCATE.
 struct ExecFixture {
     backend: std::sync::Arc<dyn EngineBackend>,
     pool: PgPool,
