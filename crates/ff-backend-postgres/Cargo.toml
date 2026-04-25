@@ -41,10 +41,6 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 futures-core = { workspace = true }
-# RFC-019 Stage A — `subscribe_completion` wraps the existing
-# CompletionBackend stream in a Stream adapter + encodes the outbox
-# event cursor as opaque `bytes::Bytes`.
-bytes = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
