@@ -699,7 +699,11 @@ impl EngineBackend for PostgresBackend {
         policy: CancelFlowPolicy,
         wait: CancelFlowWait,
     ) -> Result<CancelFlowResult, EngineError> {
-        flow::cancel_flow(&self.pool, &self.partition_config, id, policy, wait).await
+        let result = flow::cancel_flow(&self.pool, &self.partition_config, id, policy).await?;
+        if let Some(deadline) = ff_core::engine_backend::cancel_flow_wait_deadline(wait) {
+            ff_core::engine_backend::wait_for_flow_cancellation(self, id, deadline).await?;
+        }
+        Ok(result)
     }
 
     #[cfg(feature = "core")]
