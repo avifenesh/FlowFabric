@@ -55,11 +55,12 @@ pub struct SignalOpKeys<'a> {
 
 // ─── ff_deliver_signal ────────────────────────────────────────────────
 //
-// Lua KEYS (14): exec_core, wp_condition, wp_signals_stream,
+// Lua KEYS (15): exec_core, wp_condition, wp_signals_stream,
 //                exec_signals_zset, signal_hash, signal_payload,
 //                idem_key, waitpoint_hash, suspension_current,
 //                eligible_zset, suspended_zset, delayed_zset,
-//                suspension_timeout_zset, hmac_secrets
+//                suspension_timeout_zset, hmac_secrets,
+//                partition_signal_delivery_stream (RFC-019 Stage B / #310)
 // Lua ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
 //                signal_category, source_type, source_identity,
 //                payload, payload_encoding, idempotency_key,
@@ -86,6 +87,7 @@ ff_function! {
             k.idx.lane_delayed(k.lane_id),                             // 12
             k.idx.suspension_timeout(),                                // 13
             k.idx.waitpoint_hmac_secrets(),                            // 14
+            k.idx.partition_signal_delivery(),                         // 15
         }
         argv {
             args.signal_id.to_string(),                                // 1

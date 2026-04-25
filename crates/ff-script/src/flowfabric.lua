@@ -1292,7 +1292,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '26'
+  return '27'
 end)
 
 
@@ -5199,11 +5199,12 @@ end)
 -- signal, evaluate resume condition, optionally close waitpoint +
 -- suspension + transition suspended -> runnable.
 --
--- KEYS (14): exec_core, wp_condition, wp_signals_stream,
+-- KEYS (15): exec_core, wp_condition, wp_signals_stream,
 --            exec_signals_zset, signal_hash, signal_payload,
 --            idem_key, waitpoint_hash, suspension_current,
 --            eligible_zset, suspended_zset, delayed_zset,
---            suspension_timeout_zset, hmac_secrets
+--            suspension_timeout_zset, hmac_secrets,
+--            partition_signal_delivery_stream (RFC-019 Stage B / #310)
 -- ARGV (18): signal_id, execution_id, waitpoint_id, signal_name,
 --            signal_category, source_type, source_identity,
 --            payload, payload_encoding, idempotency_key,
@@ -5227,6 +5228,7 @@ redis.register_function('ff_deliver_signal', function(keys, args)
     delayed_zset          = keys[12],
     suspension_timeout_zset = keys[13],
     hmac_secrets          = keys[14],
+    partition_signal_delivery_stream = keys[15],
   }
 
   local A = {
@@ -5506,6 +5508,15 @@ redis.register_function('ff_deliver_signal', function(keys, args)
     if redis.call("EXISTS", K.suspension_current) == 1 and not outcome.resume then
       redis.call("HSET", K.suspension_current, "last_signal_at", tostring(now_ms))
     end
+    -- RFC-019 Stage B / #310: partition-level signal-delivery aggregate
+    -- stream. `subscribe_signal_delivery` XREAD BLOCKs this key.
+    redis.call("XADD", K.partition_signal_delivery_stream, "MAXLEN", "~", "1000", "*",
+      "signal_id", A.signal_id,
+      "execution_id", A.execution_id,
+      "waitpoint_id", A.waitpoint_id,
+      "source_identity", A.source_identity,
+      "effect", effect,
+      "delivered_at_ms", tostring(now_ms))
     return ok(A.signal_id, effect)
   end
 
@@ -5638,6 +5649,16 @@ redis.register_function('ff_deliver_signal', function(keys, args)
   if redis.call("EXISTS", K.suspension_current) == 1 then
     redis.call("HSET", K.suspension_current, "last_signal_at", tostring(now_ms))
   end
+
+  -- RFC-019 Stage B / #310: partition-level signal-delivery aggregate
+  -- stream. `subscribe_signal_delivery` XREAD BLOCKs this key.
+  redis.call("XADD", K.partition_signal_delivery_stream, "MAXLEN", "~", "1000", "*",
+    "signal_id", A.signal_id,
+    "execution_id", A.execution_id,
+    "waitpoint_id", A.waitpoint_id,
+    "source_identity", A.source_identity,
+    "effect", effect,
+    "delivered_at_ms", tostring(now_ms))
 
   return ok(A.signal_id, effect)
 end)
