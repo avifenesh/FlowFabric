@@ -6358,6 +6358,94 @@ impl EngineBackend for ValkeyBackend {
     ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
         subscribe_lease_history_impl(&self.client, cursor).await
     }
+
+    // ── RFC-019 Stage B — `subscribe_completion` (issue #309) ─────
+    //
+    // Pubsub-backed wrap over the existing
+    // `CompletionBackend::subscribe_completions` RESP3 subscriber
+    // (`ff:dag:completions` channel, see `completion.rs`). Valkey
+    // completions ride pubsub (at-most-once over the live subscription
+    // window) so the `StreamCursor` surface is a non-durable placeholder
+    // for Stage B: the incoming cursor is ignored and every emitted
+    // event carries `StreamCursor::empty()`. Consumers who need
+    // at-least-once replay with durable cursor resume use the Postgres
+    // backend (see `docs/POSTGRES_PARITY_MATRIX.md` row
+    // `subscribe_completion`). If someone later wants a durable Valkey
+    // completion subscription we move completions from pubsub to an
+    // XADD stream (separate issue — not Stage B scope per #309).
+    //
+    // Payload shape mirrors the Postgres adapter: outcome bytes go in
+    // `StreamEvent.payload`, `execution_id` is inlined, cursor is the
+    // family sentinel (empty for Valkey Stage B).
+    async fn subscribe_completion(
+        &self,
+        _cursor: ff_core::stream_subscribe::StreamCursor,
+    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+        use ff_core::stream_subscribe::{StreamCursor, StreamEvent, StreamFamily};
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        // Delegate to the RESP3 subscriber already exposed via the
+        // `CompletionBackend` trait. This shares the same
+        // reconnect/parse loop (`completion::subscriber_loop`) that
+        // ff-engine's `completion_listener` consumes — no duplicate
+        // pubsub machinery.
+        let inner =
+            ff_core::completion_backend::CompletionBackend::subscribe_completions(self).await?;
+
+        struct Adapter {
+            inner: ff_core::completion_backend::CompletionStream,
+            /// Set once the inner stream ends + we've emitted the
+            /// terminal `StreamDisconnected` error. Ensures we return
+            /// `Ready(None)` on subsequent polls instead of looping on
+            /// the error frame.
+            disconnected_emitted: bool,
+        }
+
+        impl Stream for Adapter {
+            type Item = Result<StreamEvent, EngineError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                if self.disconnected_emitted {
+                    return Poll::Ready(None);
+                }
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => {
+                        // Underlying mpsc closed → subscriber loop
+                        // exited (consumer drop OR unrecoverable
+                        // backend drop). RFC-019 §disconnect contract:
+                        // surface a terminal `StreamDisconnected`
+                        // carrying the cursor to reconnect from. Valkey
+                        // Stage B has no durable cursor so yield the
+                        // empty sentinel and end.
+                        self.disconnected_emitted = true;
+                        Poll::Ready(Some(Err(EngineError::StreamDisconnected {
+                            cursor: StreamCursor::empty(),
+                        })))
+                    }
+                    Poll::Ready(Some(payload)) => {
+                        let event = StreamEvent::new(
+                            StreamFamily::Completion,
+                            StreamCursor::empty(),
+                            payload.produced_at_ms,
+                            bytes::Bytes::from(payload.outcome.into_bytes()),
+                        )
+                        .with_execution_id(payload.execution_id);
+                        Poll::Ready(Some(Ok(event)))
+                    }
+                }
+            }
+        }
+
+        Ok(Box::pin(Adapter {
+            inner,
+            disconnected_emitted: false,
+        }))
+    }
 }
 
 /// Aggregate partition-level lease-history stream key. RFC-019 Stage A

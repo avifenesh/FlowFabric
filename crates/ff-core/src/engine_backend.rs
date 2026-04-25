@@ -1137,8 +1137,15 @@ pub trait EngineBackend: Send + Sync + 'static {
     }
 
     /// Subscribe to completion events (terminal state transitions).
-    /// Postgres: wraps the existing `ff_completion_event` outbox +
-    /// LISTEN/NOTIFY machinery. Valkey: Stage B follow-up.
+    ///
+    /// - **Postgres** (RFC-019 Stage A): wraps the `ff_completion_event`
+    ///   outbox + LISTEN/NOTIFY machinery. Durable via event-id cursor.
+    /// - **Valkey** (RFC-019 Stage B, issue #309): wraps the RESP3
+    ///   `ff:dag:completions` pubsub subscriber. Pubsub is at-most-once
+    ///   over the live subscription window; the cursor is always the
+    ///   empty sentinel. If you need at-least-once replay with durable
+    ///   cursor resume, use the Postgres backend (see
+    ///   `docs/POSTGRES_PARITY_MATRIX.md` row `subscribe_completion`).
     async fn subscribe_completion(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
