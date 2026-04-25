@@ -1985,18 +1985,51 @@ impl AttemptSummary {
 
 /// Currently-held lease summary inside an [`ExecutionSnapshot`].
 ///
-/// `#[non_exhaustive]`.
+/// `#[non_exhaustive]`. New fields may be added in minor releases — use
+/// [`LeaseSummary::new`] plus the fluent `with_*` setters to construct
+/// one, and match with `..` in destructuring.
+///
+/// # Field provenance (FF#278)
+///
+/// * `lease_id` — minted at claim time (`ff_claim_execution` /
+///   `ff_claim_resumed_execution`), cleared atomically with the other
+///   lease fields on revoke/expire/complete. Stable for the lifetime
+///   of a single lease; a fresh one is minted per re-claim. Defaults
+///   to the nil UUID when a backend does not surface per-lease ids
+///   (treat as "field not populated").
+/// * `attempt_index` — the 1-based attempt counter (`current_attempt_index`
+///   on `exec_core`). Set atomically with `current_attempt_id` at claim
+///   time; always populated while a Valkey-backed lease is held.
+/// * `last_heartbeat_at` — the most recent `ff_renew_lease` timestamp
+///   (`lease_last_renewed_at` on `exec_core`). `None` when the field
+///   is empty (e.g. legacy data pre-0.9, or a backend that does not
+///   surface per-renewal heartbeats).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LeaseSummary {
     pub lease_epoch: LeaseEpoch,
     pub worker_instance_id: WorkerInstanceId,
     pub expires_at: TimestampMs,
+    /// Per-lease unique identity. Correlates audit-log entries,
+    /// reclaim events, and recovery traces.
+    pub lease_id: LeaseId,
+    /// 1-based attempt counter; `.0` mirrors `current_attempt_index`
+    /// on `exec_core`.
+    pub attempt_index: AttemptIndex,
+    /// Most recent heartbeat (lease-renewal) timestamp. `None` when the
+    /// backend does not surface per-renewal ticks on this lease.
+    pub last_heartbeat_at: Option<TimestampMs>,
 }
 
 impl LeaseSummary {
-    /// Construct a [`LeaseSummary`]. See [`ExecutionSnapshot::new`]
-    /// for the rationale.
+    /// Construct a [`LeaseSummary`] with the three always-present
+    /// fields. Use the `with_*` setters to populate the FF#278
+    /// additions (`lease_id`, `attempt_index`, `last_heartbeat_at`);
+    /// otherwise they default to the nil / zero / empty forms, which
+    /// callers should treat as "field not surfaced by this backend".
+    ///
+    /// See [`ExecutionSnapshot::new`] for the broader `#[non_exhaustive]`
+    /// construction rationale.
     pub fn new(
         lease_epoch: LeaseEpoch,
         worker_instance_id: WorkerInstanceId,
@@ -2006,7 +2039,31 @@ impl LeaseSummary {
             lease_epoch,
             worker_instance_id,
             expires_at,
+            lease_id: LeaseId::from_uuid(uuid::Uuid::nil()),
+            attempt_index: AttemptIndex::new(0),
+            last_heartbeat_at: None,
         }
+    }
+
+    /// Set the lease's unique identity (FF#278).
+    #[must_use]
+    pub fn with_lease_id(mut self, lease_id: LeaseId) -> Self {
+        self.lease_id = lease_id;
+        self
+    }
+
+    /// Set the 1-based attempt counter (FF#278).
+    #[must_use]
+    pub fn with_attempt_index(mut self, attempt_index: AttemptIndex) -> Self {
+        self.attempt_index = attempt_index;
+        self
+    }
+
+    /// Set the most recent heartbeat timestamp (FF#278).
+    #[must_use]
+    pub fn with_last_heartbeat_at(mut self, ts: TimestampMs) -> Self {
+        self.last_heartbeat_at = Some(ts);
+        self
     }
 }
 
