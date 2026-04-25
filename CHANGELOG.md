@@ -7,6 +7,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`EngineBackend::capabilities_matrix()`** + `BackendIdentity` +
+  `Capability` enum + `CapabilityStatus` enum + `CapabilityMatrix`
+  type. Consumers can query a backend's supported operations at
+  runtime before dispatch; gated UI features + alternative code
+  paths no longer need to trap `EngineError::Unavailable` after
+  the fact. RFC-018 Stage A; Stage B (derived parity matrix) +
+  Stage C (HTTP `GET /v1/capabilities`) land in follow-ups.
+  Closes #277.
 - **`ValkeyBackend::with_embedded_scheduler`** public constructor —
   lets direct `Arc<dyn EngineBackend>` consumers (not going through
   `ff-server`) reach `EngineBackend::claim_for_worker`. Closes #293.

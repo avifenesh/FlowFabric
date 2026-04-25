@@ -932,6 +932,33 @@ pub trait EngineBackend: Send + Sync + 'static {
         "unknown"
     }
 
+    /// RFC-018 Stage A: snapshot of this backend's identity + the
+    /// capability matrix it can actually service. Consumers use this
+    /// at startup to gate UI features / choose between alternative
+    /// code paths before dispatching. See
+    /// `rfcs/RFC-018-backend-capability-discovery.md` for the full
+    /// discovery contract and the four owner-adjudicated open
+    /// questions (granularity: coarse; version: struct; sync; no
+    /// event stream).
+    ///
+    /// Default: returns an empty matrix tagged `family = "unknown"`
+    /// so pre-RFC-018 out-of-tree backends keep compiling and
+    /// consumers treat "no rows" as "dispatch and catch
+    /// [`EngineError::Unavailable`]" (pre-RFC-018 behaviour).
+    /// Concrete in-tree backends (`ValkeyBackend`, `PostgresBackend`)
+    /// override to populate the real matrix.
+    ///
+    /// Sync (no `.await`): backend-static info should not require a
+    /// probe on every query. Dynamic probes happen once at
+    /// `connect*` time and cache the result.
+    fn capabilities_matrix(&self) -> crate::capability::CapabilityMatrix {
+        crate::capability::CapabilityMatrix::new(crate::capability::BackendIdentity::new(
+            "unknown",
+            crate::capability::Version::new(0, 0, 0),
+            "unknown",
+        ))
+    }
+
     /// Issue #281: run one-time backend-specific boot preparation.
     ///
     /// Intended to run ONCE per deployment startup — NOT per request.
@@ -1151,5 +1178,263 @@ pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
         CancelFlowWait::NoWait => None,
         CancelFlowWait::WaitTimeout(d) => Some(d),
         CancelFlowWait::WaitIndefinite => Some(CANCEL_WAIT_INDEFINITE_CEILING),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::{Capability, CapabilityStatus};
+
+    /// A zero-state backend stub used to exercise the default
+    /// `capabilities_matrix()` impl without pulling in a real
+    /// transport. Only the default method is under test here; every
+    /// other method is unreachable on this type.
+    struct DefaultBackend;
+
+    #[async_trait]
+    impl EngineBackend for DefaultBackend {
+        async fn claim(
+            &self,
+            _lane: &LaneId,
+            _capabilities: &CapabilitySet,
+            _policy: ClaimPolicy,
+        ) -> Result<Option<Handle>, EngineError> {
+            unreachable!()
+        }
+        async fn renew(&self, _handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+            unreachable!()
+        }
+        async fn progress(
+            &self,
+            _handle: &Handle,
+            _percent: Option<u8>,
+            _message: Option<String>,
+        ) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        async fn append_frame(
+            &self,
+            _handle: &Handle,
+            _frame: Frame,
+        ) -> Result<AppendFrameOutcome, EngineError> {
+            unreachable!()
+        }
+        async fn complete(
+            &self,
+            _handle: &Handle,
+            _payload: Option<Vec<u8>>,
+        ) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        async fn fail(
+            &self,
+            _handle: &Handle,
+            _reason: FailureReason,
+            _classification: FailureClass,
+        ) -> Result<FailOutcome, EngineError> {
+            unreachable!()
+        }
+        async fn cancel(&self, _handle: &Handle, _reason: &str) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        async fn suspend(
+            &self,
+            _handle: &Handle,
+            _args: SuspendArgs,
+        ) -> Result<SuspendOutcome, EngineError> {
+            unreachable!()
+        }
+        async fn create_waitpoint(
+            &self,
+            _handle: &Handle,
+            _waitpoint_key: &str,
+            _expires_in: Duration,
+        ) -> Result<PendingWaitpoint, EngineError> {
+            unreachable!()
+        }
+        async fn observe_signals(
+            &self,
+            _handle: &Handle,
+        ) -> Result<Vec<ResumeSignal>, EngineError> {
+            unreachable!()
+        }
+        async fn claim_from_reclaim(
+            &self,
+            _token: ReclaimToken,
+        ) -> Result<Option<Handle>, EngineError> {
+            unreachable!()
+        }
+        async fn delay(
+            &self,
+            _handle: &Handle,
+            _delay_until: TimestampMs,
+        ) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        async fn wait_children(&self, _handle: &Handle) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        async fn describe_execution(
+            &self,
+            _id: &ExecutionId,
+        ) -> Result<Option<ExecutionSnapshot>, EngineError> {
+            unreachable!()
+        }
+        async fn describe_flow(
+            &self,
+            _id: &FlowId,
+        ) -> Result<Option<FlowSnapshot>, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn list_edges(
+            &self,
+            _flow_id: &FlowId,
+            _direction: EdgeDirection,
+        ) -> Result<Vec<EdgeSnapshot>, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn describe_edge(
+            &self,
+            _flow_id: &FlowId,
+            _edge_id: &EdgeId,
+        ) -> Result<Option<EdgeSnapshot>, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn resolve_execution_flow_id(
+            &self,
+            _eid: &ExecutionId,
+        ) -> Result<Option<FlowId>, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn list_flows(
+            &self,
+            _partition: PartitionKey,
+            _cursor: Option<FlowId>,
+            _limit: usize,
+        ) -> Result<ListFlowsPage, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn list_lanes(
+            &self,
+            _cursor: Option<LaneId>,
+            _limit: usize,
+        ) -> Result<ListLanesPage, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn list_suspended(
+            &self,
+            _partition: PartitionKey,
+            _cursor: Option<ExecutionId>,
+            _limit: usize,
+        ) -> Result<ListSuspendedPage, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn list_executions(
+            &self,
+            _partition: PartitionKey,
+            _cursor: Option<ExecutionId>,
+            _limit: usize,
+        ) -> Result<ListExecutionsPage, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn deliver_signal(
+            &self,
+            _args: DeliverSignalArgs,
+        ) -> Result<DeliverSignalResult, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn claim_resumed_execution(
+            &self,
+            _args: ClaimResumedExecutionArgs,
+        ) -> Result<ClaimResumedExecutionResult, EngineError> {
+            unreachable!()
+        }
+        async fn cancel_flow(
+            &self,
+            _id: &FlowId,
+            _policy: CancelFlowPolicy,
+            _wait: CancelFlowWait,
+        ) -> Result<CancelFlowResult, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "core")]
+        async fn set_edge_group_policy(
+            &self,
+            _flow_id: &FlowId,
+            _downstream_execution_id: &ExecutionId,
+            _policy: crate::contracts::EdgeDependencyPolicy,
+        ) -> Result<crate::contracts::SetEdgeGroupPolicyResult, EngineError> {
+            unreachable!()
+        }
+        async fn report_usage(
+            &self,
+            _handle: &Handle,
+            _budget: &BudgetId,
+            _dimensions: crate::backend::UsageDimensions,
+        ) -> Result<ReportUsageResult, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "streaming")]
+        async fn read_stream(
+            &self,
+            _execution_id: &ExecutionId,
+            _attempt_index: AttemptIndex,
+            _from: StreamCursor,
+            _to: StreamCursor,
+            _count_limit: u64,
+        ) -> Result<StreamFrames, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "streaming")]
+        async fn tail_stream(
+            &self,
+            _execution_id: &ExecutionId,
+            _attempt_index: AttemptIndex,
+            _after: StreamCursor,
+            _block_ms: u64,
+            _count_limit: u64,
+            _visibility: TailVisibility,
+        ) -> Result<StreamFrames, EngineError> {
+            unreachable!()
+        }
+        #[cfg(feature = "streaming")]
+        async fn read_summary(
+            &self,
+            _execution_id: &ExecutionId,
+            _attempt_index: AttemptIndex,
+        ) -> Result<Option<SummaryDocument>, EngineError> {
+            unreachable!()
+        }
+    }
+
+    /// The default `capabilities_matrix()` impl returns an empty
+    /// matrix tagged `family = "unknown"` so pre-RFC-018 out-of-tree
+    /// backends keep compiling and consumers can distinguish
+    /// "backend predates RFC-018" from "backend reports concrete
+    /// rows." Every concrete in-tree backend overrides.
+    #[test]
+    fn default_capabilities_matrix_is_unknown_family() {
+        let b = DefaultBackend;
+        let m = b.capabilities_matrix();
+        assert_eq!(m.identity.family, "unknown");
+        assert_eq!(
+            m.identity.version,
+            crate::capability::Version::new(0, 0, 0)
+        );
+        assert_eq!(m.identity.rfc017_stage, "unknown");
+        assert!(m.caps.is_empty());
+        // Any capability resolves to Unknown on a default matrix.
+        assert_eq!(m.get(Capability::Ping), CapabilityStatus::Unknown);
+        assert!(!m.supports(Capability::Ping));
     }
 }

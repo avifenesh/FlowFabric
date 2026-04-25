@@ -106,6 +106,121 @@ pub use ff_core::backend::BackendConfig;
 /// from the SDK's public API).
 ///
 /// [`ValkeyConnection::cluster`]: ff_core::backend::ValkeyConnection::cluster
+/// RFC-018 Stage A: static capability table for the Valkey backend.
+/// Reflects the current in-tree `impl EngineBackend for ValkeyBackend`
+/// coverage. `ClaimForWorker` is overridden at runtime in
+/// `capabilities_matrix()` based on scheduler presence — see the
+/// method body for the `Partial` / `Supported` selection.
+static VALKEY_CAPS: &[(
+    ff_core::capability::Capability,
+    ff_core::capability::CapabilityStatus,
+)] = &[
+    (
+        ff_core::capability::Capability::ClaimForWorker,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ClaimFromReclaim,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::SuspendResumeByCount,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CancelExecution,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CancelFlow,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CancelFlowWaitTimeout,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CancelFlowWaitIndefinite,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::StreamRead,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::StreamBestEffortLive,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::StreamDurableSummary,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::DeliverSignal,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ListPendingWaitpoints,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::RotateWaitpointHmac,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::SeedWaitpointHmac,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ReportUsage,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ReportUsageAdminPath,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ResetBudget,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CreateFlow,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CreateExecution,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::StageDependencyEdge,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ApplyDependencyToChild,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::PreparableBoot,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::SubscribeLeaseHistory,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::SubscribeCompletion,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::SubscribeSignalDelivery,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::Ping,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+];
+
 pub struct ValkeyBackend {
     client: ferriskey::Client,
     partition_config: PartitionConfig,
@@ -4755,6 +4870,45 @@ impl EngineBackend for ValkeyBackend {
 
     fn backend_label(&self) -> &'static str {
         "valkey"
+    }
+
+    /// RFC-018 Stage A: populate the capability matrix from the
+    /// static [`VALKEY_CAPS`] table, then adjust for runtime-gated
+    /// rows. Today the only runtime-gated capability is
+    /// `Capability::ClaimForWorker`, which requires the scheduler
+    /// to be wired via
+    /// [`ValkeyBackend::with_scheduler`] or
+    /// [`ValkeyBackend::with_embedded_scheduler`]; a plain
+    /// [`ValkeyBackend::connect`] reports `Partial` with a note
+    /// explaining the gating constraint.
+    fn capabilities_matrix(&self) -> ff_core::capability::CapabilityMatrix {
+        let mut matrix = ff_core::capability::CapabilityMatrix::new(
+            ff_core::capability::BackendIdentity::new(
+                "valkey",
+                ff_core::capability::Version::new(0, 8, 1),
+                "E-shipped",
+            ),
+        );
+        for (cap, status) in VALKEY_CAPS.iter() {
+            matrix.set(*cap, status.clone());
+        }
+        // Runtime gating — scheduler presence determines whether
+        // `claim_for_worker` can actually serve callers.
+        if self.scheduler.is_none() {
+            matrix.set(
+                ff_core::capability::Capability::ClaimForWorker,
+                ff_core::capability::CapabilityStatus::Partial {
+                    note: "requires with_embedded_scheduler or ff-server boot"
+                        .to_string(),
+                },
+            );
+        } else {
+            matrix.set(
+                ff_core::capability::Capability::ClaimForWorker,
+                ff_core::capability::CapabilityStatus::Supported,
+            );
+        }
+        matrix
     }
 
     /// RFC-017 Stage B: backend-scoped drain hook (§5.4). Closes
