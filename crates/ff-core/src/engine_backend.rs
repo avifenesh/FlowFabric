@@ -933,30 +933,33 @@ pub trait EngineBackend: Send + Sync + 'static {
     }
 
     /// RFC-018 Stage A: snapshot of this backend's identity + the
-    /// capability matrix it can actually service. Consumers use this
-    /// at startup to gate UI features / choose between alternative
+    /// flat `Supports` surface it can actually service. Consumers use
+    /// this at startup to gate UI features / choose between alternative
     /// code paths before dispatching. See
     /// `rfcs/RFC-018-backend-capability-discovery.md` for the full
     /// discovery contract and the four owner-adjudicated open
     /// questions (granularity: coarse; version: struct; sync; no
     /// event stream).
     ///
-    /// Default: returns an empty matrix tagged `family = "unknown"`
-    /// so pre-RFC-018 out-of-tree backends keep compiling and
-    /// consumers treat "no rows" as "dispatch and catch
-    /// [`EngineError::Unavailable`]" (pre-RFC-018 behaviour).
+    /// Default: returns a value tagged `family = "unknown"` with every
+    /// `supports.*` bool `false`, so pre-RFC-018 out-of-tree backends
+    /// keep compiling and consumers treat "all false" as "dispatch
+    /// and catch [`EngineError::Unavailable`]" (pre-RFC-018 behaviour).
     /// Concrete in-tree backends (`ValkeyBackend`, `PostgresBackend`)
-    /// override to populate the real matrix.
+    /// override to populate a real value.
     ///
     /// Sync (no `.await`): backend-static info should not require a
     /// probe on every query. Dynamic probes happen once at
     /// `connect*` time and cache the result.
-    fn capabilities_matrix(&self) -> crate::capability::CapabilityMatrix {
-        crate::capability::CapabilityMatrix::new(crate::capability::BackendIdentity::new(
-            "unknown",
-            crate::capability::Version::new(0, 0, 0),
-            "unknown",
-        ))
+    fn capabilities(&self) -> crate::capability::Capabilities {
+        crate::capability::Capabilities::new(
+            crate::capability::BackendIdentity::new(
+                "unknown",
+                crate::capability::Version::new(0, 0, 0),
+                "unknown",
+            ),
+            crate::capability::Supports::none(),
+        )
     }
 
     /// Issue #281: run one-time backend-specific boot preparation.
@@ -1258,10 +1261,9 @@ pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::{Capability, CapabilityStatus};
 
     /// A zero-state backend stub used to exercise the default
-    /// `capabilities_matrix()` impl without pulling in a real
+    /// `capabilities()` impl without pulling in a real
     /// transport. Only the default method is under test here; every
     /// other method is unreachable on this type.
     struct DefaultBackend;
@@ -1491,24 +1493,23 @@ mod tests {
         }
     }
 
-    /// The default `capabilities_matrix()` impl returns an empty
-    /// matrix tagged `family = "unknown"` so pre-RFC-018 out-of-tree
-    /// backends keep compiling and consumers can distinguish
-    /// "backend predates RFC-018" from "backend reports concrete
-    /// rows." Every concrete in-tree backend overrides.
+    /// The default `capabilities()` impl returns a value tagged
+    /// `family = "unknown"` with every `supports.*` bool false, so
+    /// pre-RFC-018 out-of-tree backends keep compiling and consumers
+    /// can distinguish "backend predates RFC-018" from "backend
+    /// reports concrete bools." Every concrete in-tree backend
+    /// overrides.
     #[test]
-    fn default_capabilities_matrix_is_unknown_family() {
+    fn default_capabilities_is_unknown_family_all_false() {
         let b = DefaultBackend;
-        let m = b.capabilities_matrix();
-        assert_eq!(m.identity.family, "unknown");
+        let caps = b.capabilities();
+        assert_eq!(caps.identity.family, "unknown");
         assert_eq!(
-            m.identity.version,
+            caps.identity.version,
             crate::capability::Version::new(0, 0, 0)
         );
-        assert_eq!(m.identity.rfc017_stage, "unknown");
-        assert!(m.caps.is_empty());
-        // Any capability resolves to Unknown on a default matrix.
-        assert_eq!(m.get(Capability::Ping), CapabilityStatus::Unknown);
-        assert!(!m.supports(Capability::Ping));
+        assert_eq!(caps.identity.rfc017_stage, "unknown");
+        // Every field false on the default (matches `Supports::none()`).
+        assert_eq!(caps.supports, crate::capability::Supports::none());
     }
 }

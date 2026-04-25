@@ -5,144 +5,177 @@
 //! backend actually do?" before dispatching — they discovered
 //! capability gaps empirically, by trying a trait method and catching
 //! [`crate::engine_error::EngineError::Unavailable`]. This module
-//! adds a first-class discovery primitive: a [`Capability`] enum,
-//! [`CapabilityStatus`] shape, [`BackendIdentity`] tuple, and a
-//! [`CapabilityMatrix`] container that [`crate::engine_backend::EngineBackend`]
-//! exposes via `capabilities_matrix()`.
+//! adds a first-class discovery primitive: a [`Supports`] flat-bool
+//! struct, a [`BackendIdentity`] tuple, and a [`Capabilities`]
+//! container that [`crate::engine_backend::EngineBackend`] exposes
+//! via `capabilities()`.
 //!
 //! Stage A (this module) is additive: the trait method has a default
-//! impl that returns an empty matrix tagged `family = "unknown"`, so
-//! out-of-tree backends keep compiling. Concrete in-tree backends
-//! (`ValkeyBackend`, `PostgresBackend`) override to report real caps.
+//! impl that returns a `Capabilities` tagged `family = "unknown"` with
+//! every `supports.*` bool `false`, so out-of-tree backends keep
+//! compiling. Concrete in-tree backends (`ValkeyBackend`,
+//! `PostgresBackend`) override to report real caps.
+//!
+//! **Shape history.** v0.9 shipped a `BTreeMap<Capability,
+//! CapabilityStatus>` map; v0.10 reshaped to the flat [`Supports`]
+//! struct below per cairn's original #277 ask (flat named-field
+//! dot-access, no enum + no map lookup). `Partial`-status nuance
+//! (e.g. non-durable cursor on Valkey `subscribe_completion`) now
+//! lives in rustdoc on the trait method and
+//! `docs/POSTGRES_PARITY_MATRIX.md`; the flat bool answers "is this
+//! callable at all."
 //!
 //! Stages B + C (follow-up PRs) derive `docs/POSTGRES_PARITY_MATRIX.md`
-//! from the runtime matrix and expose `GET /v1/capabilities` on
+//! from the runtime value and expose `GET /v1/capabilities` on
 //! `ff-server`.
 //!
 //! See `rfcs/RFC-018-backend-capability-discovery.md` for the full
 //! design, the four owner-adjudicated open questions, and the
 //! Alternatives-considered record.
 
-use std::collections::BTreeMap;
-
-/// Coarse-grained unit of functionality a backend may or may not
-/// provide. Granularity is one entry per operator-UI grey-renderable
-/// feature — not per trait method. See RFC-018 §9 Q1 for the
-/// owner adjudication (`coarse`, recommended by the draft).
+/// Per-capability boolean support surface. Flat named-field shape so
+/// consumers can dot-access (e.g. `caps.supports.cancel_execution`)
+/// instead of map lookup. `#[non_exhaustive]` protects future
+/// additions from source-breaking consumers; construct via
+/// [`Supports::none`] or by returning one from
+/// [`crate::engine_backend::EngineBackend::capabilities`].
 ///
-/// `#[non_exhaustive]`: adding variants in future RFC-018 stages is
-/// a minor bump, not a break. Consumers matching on `Capability`
-/// must carry a wildcard arm.
+/// # Grouping policy
+///
+/// One bool per operator-visible HTTP surface; admin-only surfaces
+/// with many sibling methods roll up to a single bool (e.g.
+/// [`Self::budget_admin`] covers `create_budget` / `report_usage` /
+/// `reset_budget` / `get_budget_status` / `report_usage_admin`;
+/// [`Self::quota_admin`] covers `create_quota_policy`). Cairn's
+/// operator UI grey-renders at the group level; fine-grained
+/// pre-dispatch checks still use
+/// [`crate::engine_error::EngineError::Unavailable`].
+///
+/// # Field order
+///
+/// Per cairn #277 "in the same order as the parity matrix so cairn
+/// can consume by copy-paste." Keep in sync with
+/// `docs/POSTGRES_PARITY_MATRIX.md`.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum Capability {
-    // ── Claim + lifecycle ──
-    /// Scheduler-routed claim entrypoint
-    /// ([`EngineBackend::claim_for_worker`](crate::engine_backend::EngineBackend::claim_for_worker)).
-    ClaimForWorker,
-    /// Consume a reclaim grant to mint a resumed-kind handle.
-    ClaimFromReclaim,
-    /// Suspend + resume by buffered-signal count (RFC-013).
-    SuspendResumeByCount,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Supports {
+    // ── Execution operator control ──
+    /// `cancel_execution`.
+    pub cancel_execution: bool,
+    /// `change_priority`.
+    pub change_priority: bool,
+    /// `replay_execution`.
+    pub replay_execution: bool,
+    /// `revoke_lease`.
+    pub revoke_lease: bool,
 
-    // ── Cancel ──
-    /// Operator-initiated single-execution cancel.
-    CancelExecution,
-    /// Operator-initiated flow cancel (no wait).
-    CancelFlow,
-    /// `cancel_flow` with `CancelFlowWait::WaitTimeout(Duration)`
-    /// (#298 driver).
-    CancelFlowWaitTimeout,
+    // ── Execution reads ──
+    /// `read_execution_state`.
+    pub read_execution_state: bool,
+    /// `read_execution_info`.
+    pub read_execution_info: bool,
+    /// `get_execution_result`.
+    pub get_execution_result: bool,
+
+    // ── Budget + quota (group-level, rolls up siblings) ──
+    /// Covers `create_budget` + `report_usage` + `reset_budget` +
+    /// `get_budget_status` + `report_usage_admin`.
+    pub budget_admin: bool,
+    /// Covers `create_quota_policy`.
+    pub quota_admin: bool,
+
+    // ── Waitpoint admin ──
+    /// `rotate_waitpoint_hmac_secret_all`.
+    pub rotate_waitpoint_hmac_secret_all: bool,
+    /// `seed_waitpoint_hmac_secret` (#280).
+    pub seed_waitpoint_hmac_secret: bool,
+    /// `list_pending_waitpoints`.
+    pub list_pending_waitpoints: bool,
+
+    // ── Flow control ──
+    /// `cancel_flow_header`.
+    pub cancel_flow_header: bool,
+    /// `cancel_flow` with `CancelFlowWait::WaitTimeout(..)`.
+    pub cancel_flow_wait_timeout: bool,
     /// `cancel_flow` with `CancelFlowWait::WaitIndefinite`.
-    CancelFlowWaitIndefinite,
+    pub cancel_flow_wait_indefinite: bool,
+    /// `ack_cancel_member`.
+    pub ack_cancel_member: bool,
 
-    // ── Streams ──
-    /// `read_stream` (XRANGE-style bounded read).
-    StreamRead,
+    // ── Scheduler ──
+    /// `claim_for_worker` (requires a wired scheduler on Valkey;
+    /// Postgres-native on Postgres).
+    pub claim_for_worker: bool,
+
+    // ── Boot ──
+    /// `prepare` does non-trivial work (e.g. Valkey `FUNCTION LOAD`).
+    /// Postgres reports `false` — `prepare` returns `NoOp` there.
+    pub prepare: bool,
+
+    // ── Stream subscriptions (RFC-019) ──
+    /// `subscribe_lease_history`.
+    pub subscribe_lease_history: bool,
+    /// `subscribe_completion`. On Valkey this is pubsub-backed
+    /// (non-durable cursor, at-most-once over the live subscription
+    /// window); Postgres is durable via outbox + cursor. Both report
+    /// `true`; see the trait method rustdoc for the non-durable-cursor
+    /// caveat and `docs/POSTGRES_PARITY_MATRIX.md` for the per-backend
+    /// semantic.
+    pub subscribe_completion: bool,
+    /// `subscribe_signal_delivery`.
+    pub subscribe_signal_delivery: bool,
+    /// `subscribe_instance_tags`. Deferred per #311 (cairn's `instance_tag_backfill`
+    /// pattern is served by `list_executions` + `ScannerFilter::with_instance_tag(..)`);
+    /// reported `false` on both backends today.
+    pub subscribe_instance_tags: bool,
+
+    // ── Streaming (RFC-015) ──
+    /// `read_summary` + durable-summary frames.
+    pub stream_durable_summary: bool,
     /// `tail_stream` (best-effort live tail).
-    StreamBestEffortLive,
-    /// Durable-summary frames + `read_summary`.
-    StreamDurableSummary,
-
-    // ── Signals + waitpoints ──
-    /// Deliver an external signal to a pending waitpoint.
-    DeliverSignal,
-    /// List pending-or-active waitpoints for an execution.
-    ListPendingWaitpoints,
-    /// Cluster-wide HMAC kid rotation.
-    RotateWaitpointHmac,
-    /// Idempotent initial HMAC-secret seed (#280).
-    SeedWaitpointHmac,
-
-    // ── Budget + quota ──
-    /// Worker-handle-path `report_usage`.
-    ReportUsage,
-    /// Admin-path `report_usage` (no worker handle; #297 driver).
-    ReportUsageAdminPath,
-    /// Reset a budget's usage counters.
-    ResetBudget,
-
-    // ── Ingress ──
-    /// Create a flow header.
-    CreateFlow,
-    /// Create an execution.
-    CreateExecution,
-    /// Stage a dependency edge.
-    StageDependencyEdge,
-    /// Apply a staged dependency edge to its downstream child.
-    ApplyDependencyToChild,
-
-    // ── Boot + subscriptions ──
-    /// Backend honours [`EngineBackend::prepare`](crate::engine_backend::EngineBackend::prepare)
-    /// with non-trivial work (e.g. Valkey `FUNCTION LOAD`).
-    PreparableBoot,
-    /// Subscribe to lease-epoch history for a handle.
-    SubscribeLeaseHistory,
-    /// Subscribe to completion notifications.
-    SubscribeCompletion,
-    /// Subscribe to signal-delivery notifications.
-    SubscribeSignalDelivery,
-
-    // ── Diagnostics ──
-    /// Backend-level reachability probe.
-    Ping,
+    pub stream_best_effort_live: bool,
+    // Add new fields here, preserving parity-matrix order.
 }
 
-/// Per-[`Capability`] support status reported by a concrete backend.
-///
-/// Consumers distinguish fully-supported from partially-gated
-/// ("works only with an extra setup step") and unsupported ("the
-/// trait method returns `EngineError::Unavailable` today") via
-/// these variants. `Unknown` is the safe default for pre-RFC-018
-/// backends that never populate a matrix row.
-///
-/// `#[non_exhaustive]`: future stages may add e.g. `SupportedSlow`
-/// or `Deprecated`; consumers must carry a wildcard arm.
-#[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CapabilityStatus {
-    /// Backend fully supports this capability on every call.
-    Supported,
-    /// Backend does not support this capability; calling the
-    /// corresponding trait method returns `EngineError::Unavailable`.
-    Unsupported,
-    /// Backend supports this capability only under specific
-    /// configuration. The `note` explains the gating constraint in
-    /// a human-readable form suitable for UI surfacing.
-    Partial {
-        /// Human-readable hint describing the gating constraint
-        /// (e.g. "requires with_embedded_scheduler").
-        note: String,
-    },
-    /// Backend has not reported a status for this capability.
-    /// Consumers should treat as "dispatch and catch" — equivalent
-    /// to pre-RFC-018 behaviour.
-    Unknown,
+impl Supports {
+    /// Construct a `Supports` with every field `false`. Useful as a
+    /// starting point when assembling a backend-specific capability
+    /// snapshot. Consumers should never see this directly —
+    /// `capabilities()` on a real backend always returns a populated
+    /// instance.
+    pub const fn none() -> Self {
+        Self {
+            cancel_execution: false,
+            change_priority: false,
+            replay_execution: false,
+            revoke_lease: false,
+            read_execution_state: false,
+            read_execution_info: false,
+            get_execution_result: false,
+            budget_admin: false,
+            quota_admin: false,
+            rotate_waitpoint_hmac_secret_all: false,
+            seed_waitpoint_hmac_secret: false,
+            list_pending_waitpoints: false,
+            cancel_flow_header: false,
+            cancel_flow_wait_timeout: false,
+            cancel_flow_wait_indefinite: false,
+            ack_cancel_member: false,
+            claim_for_worker: false,
+            prepare: false,
+            subscribe_lease_history: false,
+            subscribe_completion: false,
+            subscribe_signal_delivery: false,
+            subscribe_instance_tags: false,
+            stream_durable_summary: false,
+            stream_best_effort_live: false,
+        }
+    }
 }
 
 /// Backend crate version. Kept as a struct (not a semver string) per
 /// RFC-018 §9 Q2: consumers can write
-/// `if backend.capabilities_matrix().identity.version >= Version::new(0, 10, 0) { .. }`
+/// `if backend.capabilities().identity.version >= Version::new(0, 10, 0) { .. }`
 /// without pulling a semver-parsing dep.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -156,9 +189,9 @@ pub struct Version {
 }
 
 impl Version {
-    /// Const constructor so concrete backends can declare a
-    /// `const` [`BackendIdentity`] without a function-call overhead
-    /// in `capabilities_matrix()`.
+    /// Const constructor so concrete backends can declare a `const`
+    /// [`BackendIdentity`] without a function-call overhead in
+    /// `capabilities()`.
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
@@ -170,14 +203,14 @@ impl Version {
 
 /// Minimal-identity triple for a backend. Consumers that only need
 /// the family label + version (e.g. for metrics dimensioning) read
-/// this rather than the full [`CapabilityMatrix`].
+/// this rather than the full [`Capabilities`].
 ///
 /// `#[non_exhaustive]`: future stages may add fields (e.g. a
 /// backend-assigned `instance_id` or a `deployment_topology`
-/// hint); construct via the public constructor or struct literal on
-/// `Clone::clone` of an existing value.
+/// hint); construct via [`Self::new`] or by returning one from
+/// [`crate::engine_backend::EngineBackend::capabilities`].
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendIdentity {
     /// Stable backend family name. `"valkey"`, `"postgres"`, or a
     /// concrete string set by an out-of-tree backend. `"unknown"`
@@ -209,61 +242,28 @@ impl BackendIdentity {
 }
 
 /// Full capability snapshot for a backend: its [`BackendIdentity`]
-/// plus a stable-ordered map of [`Capability`] → [`CapabilityStatus`].
+/// plus a flat [`Supports`] surface of per-method bools.
 ///
-/// `BTreeMap` (not `HashMap`) so iteration order is deterministic —
-/// `ff-server`'s JSON response is byte-stable, cairn's operator UI
-/// can render rows in a fixed order, and tests comparing matrices
-/// across runs do not race on hash randomization.
+/// Consumers typically read `caps.supports.<field>` to gate a UI
+/// surface or choose between two code paths before dispatching; the
+/// [`Self::identity`] side exists for metrics dimensioning + UI
+/// labelling.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
-pub struct CapabilityMatrix {
-    /// Backend identity tuple this matrix was assembled for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capabilities {
+    /// Backend identity tuple this snapshot was assembled for.
     pub identity: BackendIdentity,
-    /// Per-capability status. Absent capabilities are treated as
-    /// [`CapabilityStatus::Unknown`] by [`Self::get`].
-    pub caps: BTreeMap<Capability, CapabilityStatus>,
+    /// Per-capability support bools.
+    pub supports: Supports,
 }
 
-impl CapabilityMatrix {
-    /// Build an empty matrix tagged with the given backend identity.
-    /// Backends populate rows via [`Self::set`] before returning the
-    /// matrix from `capabilities_matrix()`.
-    pub fn new(identity: BackendIdentity) -> Self {
-        Self {
-            identity,
-            caps: BTreeMap::new(),
-        }
-    }
-
-    /// Record the status for one capability. Returns `&mut self`
-    /// so backends can chain setup in a builder-style declaration.
-    pub fn set(&mut self, cap: Capability, status: CapabilityStatus) -> &mut Self {
-        self.caps.insert(cap, status);
-        self
-    }
-
-    /// Look up one capability's status. Absent rows return
-    /// [`CapabilityStatus::Unknown`] — callers that need to
-    /// distinguish "absent" from "explicitly marked unknown" must
-    /// consult `self.caps` directly.
-    pub fn get(&self, cap: Capability) -> CapabilityStatus {
-        self.caps
-            .get(&cap)
-            .cloned()
-            .unwrap_or(CapabilityStatus::Unknown)
-    }
-
-    /// Convenience predicate: the capability is
-    /// [`CapabilityStatus::Supported`] or [`CapabilityStatus::Partial`].
-    /// Both map to "you can call the trait method and it will work
-    /// (possibly with a caveat)"; `Unsupported` and `Unknown` both
-    /// map to "don't dispatch, or be ready to catch `Unavailable`."
-    pub fn supports(&self, cap: Capability) -> bool {
-        matches!(
-            self.get(cap),
-            CapabilityStatus::Supported | CapabilityStatus::Partial { .. }
-        )
+impl Capabilities {
+    /// Construct a `Capabilities` value from an identity + a populated
+    /// [`Supports`]. Backends typically build one in `capabilities()`
+    /// without going through a constructor; this exists for
+    /// out-of-tree backends that prefer the explicit call.
+    pub const fn new(identity: BackendIdentity, supports: Supports) -> Self {
+        Self { identity, supports }
     }
 }
 
@@ -291,67 +291,30 @@ mod tests {
     }
 
     #[test]
-    fn matrix_new_is_empty() {
-        let m = CapabilityMatrix::new(BackendIdentity::new(
-            "unknown",
-            Version::new(0, 0, 0),
-            "unknown",
-        ));
-        assert!(m.caps.is_empty());
-        // Unset capability resolves to Unknown.
-        assert_eq!(m.get(Capability::Ping), CapabilityStatus::Unknown);
-        assert!(!m.supports(Capability::Ping));
+    fn supports_none_is_all_false() {
+        let s = Supports::none();
+        // Spot-check a handful across the grouping policy; `Default`
+        // covers the exhaustive guarantee via `assert_eq!` below.
+        assert!(!s.cancel_execution);
+        assert!(!s.budget_admin);
+        assert!(!s.quota_admin);
+        assert!(!s.subscribe_instance_tags);
+        assert!(!s.stream_durable_summary);
+        // `Default::default()` must match `none()` so consumers that
+        // lean on `..Default::default()` get the same zero state.
+        assert_eq!(s, Supports::default());
     }
 
     #[test]
-    fn matrix_set_get_supports() {
-        let mut m = CapabilityMatrix::new(BackendIdentity::new(
-            "valkey",
-            Version::new(0, 9, 0),
-            "E-shipped",
-        ));
-        m.set(Capability::Ping, CapabilityStatus::Supported)
-            .set(Capability::CancelExecution, CapabilityStatus::Unsupported)
-            .set(
-                Capability::ClaimForWorker,
-                CapabilityStatus::Partial {
-                    note: "requires with_embedded_scheduler".to_string(),
-                },
-            );
-
-        assert_eq!(m.get(Capability::Ping), CapabilityStatus::Supported);
-        assert!(m.supports(Capability::Ping));
-
-        assert_eq!(
-            m.get(Capability::CancelExecution),
-            CapabilityStatus::Unsupported
+    fn capabilities_new_wires_identity_and_supports() {
+        let mut s = Supports::none();
+        s.cancel_execution = true;
+        let caps = Capabilities::new(
+            BackendIdentity::new("valkey", Version::new(0, 10, 0), "E-shipped"),
+            s,
         );
-        assert!(!m.supports(Capability::CancelExecution));
-
-        // Partial also reports as supported via the predicate.
-        assert!(m.supports(Capability::ClaimForWorker));
-        match m.get(Capability::ClaimForWorker) {
-            CapabilityStatus::Partial { note } => {
-                assert!(note.contains("with_embedded_scheduler"));
-            }
-            other => panic!("expected Partial, got {other:?}"),
-        }
-
-        // Chain returns &mut self so repeated .set() calls compose.
-        let rows = m.caps.len();
-        assert_eq!(rows, 3);
-    }
-
-    #[test]
-    fn matrix_set_overwrites_existing() {
-        let mut m = CapabilityMatrix::new(BackendIdentity::new(
-            "valkey",
-            Version::new(0, 9, 0),
-            "E-shipped",
-        ));
-        m.set(Capability::Ping, CapabilityStatus::Unsupported);
-        m.set(Capability::Ping, CapabilityStatus::Supported);
-        assert_eq!(m.get(Capability::Ping), CapabilityStatus::Supported);
-        assert_eq!(m.caps.len(), 1);
+        assert_eq!(caps.identity.family, "valkey");
+        assert!(caps.supports.cancel_execution);
+        assert!(!caps.supports.change_priority);
     }
 }
