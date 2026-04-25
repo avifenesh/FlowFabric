@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use ff_backend_valkey::{ValkeyBackend, COMPLETION_CHANNEL};
 use ff_core::backend::BackendConfig;
-use ff_core::stream_subscribe::{StreamCursor, StreamFamily};
+use ff_core::stream_events::CompletionOutcome;
+use ff_core::stream_subscribe::StreamCursor;
 use futures_core::Stream;
 use tokio::time::timeout;
 
@@ -86,27 +87,18 @@ async fn subscribe_completion_yields_publish_frame() {
         .expect("stream ended unexpectedly")
         .expect("backend surfaced error before event");
 
-    assert_eq!(
-        event.family,
-        StreamFamily::Completion,
-        "event family mismatch"
-    );
     assert!(
         event.cursor.as_bytes().is_empty(),
         "Stage B cursor must be the empty sentinel (pubsub-backed, non-durable)"
     );
     assert_eq!(
-        event
-            .execution_id
-            .as_ref()
-            .map(std::string::ToString::to_string)
-            .as_deref(),
-        Some(exec_id),
+        event.execution_id.to_string(),
+        exec_id,
         "execution_id should round-trip"
     );
     assert_eq!(
-        event.payload.as_ref(),
-        b"success",
-        "payload should carry the outcome string"
+        event.outcome,
+        CompletionOutcome::Success,
+        "outcome should typed-decode to Success"
     );
 }

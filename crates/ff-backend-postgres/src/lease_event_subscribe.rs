@@ -292,39 +292,24 @@ async fn replay(
             // PG outbox does not persist the owning worker instance —
             // the fence triple is rebuilt from attempt rows at lookup
             // time. Surface `None` for now; consumers who need it go
-            // through `read_execution_state`.
+            // through `read_execution_state`. `lease_id` is also
+            // typically `None` on PG since `ff_attempt` identity is
+            // `(lease_epoch, attempt_index, execution_id)` rather than
+            // a stable uuid (see `lease_event::emit`).
             let event = match decoded.event_type.as_str() {
-                "acquired" => match lease_id {
-                    Some(lease_id) => LeaseHistoryEvent::Acquired {
-                        cursor,
-                        execution_id,
-                        lease_id,
-                        worker_instance_id: None,
-                        at,
-                    },
-                    None => {
-                        tracing::warn!(
-                            event_id = decoded.event_id,
-                            "pg.lease_history.replay: acquired row missing lease_id"
-                        );
-                        continue;
-                    }
+                "acquired" => LeaseHistoryEvent::Acquired {
+                    cursor,
+                    execution_id,
+                    lease_id,
+                    worker_instance_id: None,
+                    at,
                 },
-                "renewed" => match lease_id {
-                    Some(lease_id) => LeaseHistoryEvent::Renewed {
-                        cursor,
-                        execution_id,
-                        lease_id,
-                        worker_instance_id: None,
-                        at,
-                    },
-                    None => {
-                        tracing::warn!(
-                            event_id = decoded.event_id,
-                            "pg.lease_history.replay: renewed row missing lease_id"
-                        );
-                        continue;
-                    }
+                "renewed" => LeaseHistoryEvent::Renewed {
+                    cursor,
+                    execution_id,
+                    lease_id,
+                    worker_instance_id: None,
+                    at,
                 },
                 "expired" => LeaseHistoryEvent::Expired {
                     cursor,
@@ -333,21 +318,12 @@ async fn replay(
                     prev_owner: None,
                     at,
                 },
-                "reclaimed" => match lease_id {
-                    Some(new_lease_id) => LeaseHistoryEvent::Reclaimed {
-                        cursor,
-                        execution_id,
-                        new_lease_id,
-                        new_owner: None,
-                        at,
-                    },
-                    None => {
-                        tracing::warn!(
-                            event_id = decoded.event_id,
-                            "pg.lease_history.replay: reclaimed row missing lease_id"
-                        );
-                        continue;
-                    }
+                "reclaimed" => LeaseHistoryEvent::Reclaimed {
+                    cursor,
+                    execution_id,
+                    new_lease_id: lease_id,
+                    new_owner: None,
+                    at,
                 },
                 "revoked" => LeaseHistoryEvent::Revoked {
                     cursor,

@@ -62,3 +62,9 @@ bytes = { workspace = true }
 # `ff-server::Server::rotate_waitpoint_secret` per §4 row 11).
 futures = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+# RFC-019 Stage C — integration tests construct synthetic events with
+# real UUIDs so the typed-event decoder asserts on the exact ids we
+# wrote back.
+uuid = { workspace = true }

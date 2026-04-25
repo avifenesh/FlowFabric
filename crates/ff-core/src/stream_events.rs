@@ -60,14 +60,19 @@ pub enum LeaseHistoryEvent {
     Acquired {
         cursor: StreamCursor,
         execution_id: ExecutionId,
-        lease_id: LeaseId,
+        /// Valkey populates this from the Lua producer; Postgres
+        /// outbox may carry `None` today because the attempt row
+        /// identity is `(lease_epoch, attempt_index, execution_id)`
+        /// rather than a stable uuid (see `lease_event::emit`).
+        lease_id: Option<LeaseId>,
         worker_instance_id: Option<WorkerInstanceId>,
         at: TimestampMs,
     },
     Renewed {
         cursor: StreamCursor,
         execution_id: ExecutionId,
-        lease_id: LeaseId,
+        /// Same availability caveat as `Acquired::lease_id`.
+        lease_id: Option<LeaseId>,
         worker_instance_id: Option<WorkerInstanceId>,
         at: TimestampMs,
     },
@@ -81,7 +86,8 @@ pub enum LeaseHistoryEvent {
     Reclaimed {
         cursor: StreamCursor,
         execution_id: ExecutionId,
-        new_lease_id: LeaseId,
+        /// Same availability caveat as `Acquired::lease_id`.
+        new_lease_id: Option<LeaseId>,
         new_owner: Option<WorkerInstanceId>,
         at: TimestampMs,
     },

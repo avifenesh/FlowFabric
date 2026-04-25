@@ -6974,16 +6974,14 @@ fn decode_lease_history_event(
         "acquired" => LeaseHistoryEvent::Acquired {
             cursor,
             execution_id,
-            lease_id: parse_lease("lease_id")
-                .ok_or_else(|| "lease_history: acquired missing lease_id".to_string())?,
+            lease_id: parse_lease("lease_id"),
             worker_instance_id: worker_instance,
             at,
         },
         "renewed" => LeaseHistoryEvent::Renewed {
             cursor,
             execution_id,
-            lease_id: parse_lease("lease_id")
-                .ok_or_else(|| "lease_history: renewed missing lease_id".to_string())?,
+            lease_id: parse_lease("lease_id"),
             worker_instance_id: worker_instance,
             at,
         },
@@ -6997,11 +6995,7 @@ fn decode_lease_history_event(
         "reclaimed" => LeaseHistoryEvent::Reclaimed {
             cursor,
             execution_id,
-            new_lease_id: parse_lease("new_lease_id")
-                .or_else(|| parse_lease("lease_id"))
-                .ok_or_else(|| {
-                    "lease_history: reclaimed missing new_lease_id".to_string()
-                })?,
+            new_lease_id: parse_lease("new_lease_id").or_else(|| parse_lease("lease_id")),
             new_owner: worker_instance,
             at,
         },

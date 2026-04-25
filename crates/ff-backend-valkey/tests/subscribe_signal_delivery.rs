@@ -1,9 +1,9 @@
-//! RFC-019 Stage B integration test — `subscribe_signal_delivery` on
-//! the Valkey backend (#310).
+//! RFC-019 Stage C integration test — typed `subscribe_signal_delivery`
+//! on the Valkey backend (#310).
 //!
 //! Gated `#[ignore]` because it requires a live Valkey at
 //! `localhost:6379`. Mirrors `subscribe_lease_history.rs`: subscribe
-//! + synthetic XADD + observe.
+//! + synthetic XADD + observe a typed `SignalDeliveryEvent`.
 //!
 //! Run with:
 //! ```
@@ -17,9 +17,11 @@ use std::time::Duration;
 use ff_backend_valkey::{partition_signal_delivery_key, ValkeyBackend};
 use ff_core::backend::BackendConfig;
 use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::stream_events::SignalDeliveryEffect;
 use ff_core::stream_subscribe::StreamCursor;
 use futures_core::Stream;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 async fn next_item<S>(stream: &mut S) -> Option<S::Item>
 where
@@ -30,7 +32,7 @@ where
 
 #[tokio::test]
 #[ignore = "requires live Valkey at localhost:6379"]
-async fn subscribe_signal_delivery_yields_xadd_entry() {
+async fn subscribe_signal_delivery_yields_typed_event() {
     let backend = ValkeyBackend::connect(BackendConfig::valkey("localhost", 6379))
         .await
         .expect("connect to localhost valkey");
@@ -40,7 +42,6 @@ async fn subscribe_signal_delivery_yields_xadd_entry() {
         .await
         .expect("subscribe_signal_delivery");
 
-    // Let the XREAD BLOCK loop register before we XADD.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let writer = ferriskey::ClientBuilder::new()
@@ -55,18 +56,25 @@ async fn subscribe_signal_delivery_yields_xadd_entry() {
     };
     let stream_key = partition_signal_delivery_key(&partition);
 
+    let exec_uuid = Uuid::new_v4();
+    let execution_id_str = format!("{{fp:0}}:{exec_uuid}");
+    let signal_uuid = Uuid::new_v4();
+    let waitpoint_uuid = Uuid::new_v4();
+
     let _: ferriskey::Value = writer
         .cmd("XADD")
         .arg(stream_key.as_str())
         .arg("*")
         .arg("signal_id")
-        .arg("sig-rfc019-310")
+        .arg(signal_uuid.to_string().as_str())
         .arg("execution_id")
-        .arg("exec-rfc019-310")
+        .arg(execution_id_str.as_str())
         .arg("waitpoint_id")
-        .arg("wp-rfc019-310")
+        .arg(waitpoint_uuid.to_string().as_str())
+        .arg("source_identity")
+        .arg("test-source")
         .arg("effect")
-        .arg("appended_to_waitpoint")
+        .arg("satisfied")
         .arg("delivered_at_ms")
         .arg("1700000000000")
         .execute()
@@ -80,27 +88,16 @@ async fn subscribe_signal_delivery_yields_xadd_entry() {
         .expect("backend surfaced error before event");
 
     assert_eq!(
-        event.family,
-        ff_core::stream_subscribe::StreamFamily::SignalDelivery,
-        "event family mismatch"
-    );
-    assert!(
-        !event.cursor.as_bytes().is_empty(),
-        "event cursor should be concrete (non-empty)"
-    );
-    assert_eq!(
         event.cursor.as_bytes()[0],
         ff_core::stream_subscribe::VALKEY_CURSOR_PREFIX,
         "cursor prefix must be VALKEY_CURSOR_PREFIX (0x01)"
     );
-    assert!(
-        event
-            .payload
-            .windows(b"sig-rfc019-310".len())
-            .any(|w| w == b"sig-rfc019-310"),
-        "payload should contain the synthetic signal_id; got {:?}",
-        event.payload
-    );
+    assert_eq!(event.signal_id.0, signal_uuid);
+    assert_eq!(event.execution_id.to_string(), execution_id_str);
+    assert_eq!(event.waitpoint_id.as_ref().map(|w| w.0), Some(waitpoint_uuid));
+    assert_eq!(event.source_identity.as_deref(), Some("test-source"));
+    assert_eq!(event.effect, SignalDeliveryEffect::Satisfied);
+    assert_eq!(event.at.0, 1_700_000_000_000);
 
     let _: ferriskey::Value = writer
         .cmd("DEL")
