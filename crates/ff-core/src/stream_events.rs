@@ -34,6 +34,13 @@ use crate::engine_error::EngineError;
 use crate::stream_subscribe::StreamCursor;
 use crate::types::{ExecutionId, LeaseId, SignalId, TimestampMs, WaitpointId, WorkerInstanceId};
 
+// Rustdoc reminder: every `#[non_exhaustive]` struct below MUST pair
+// with a public constructor so external backend crates (ff-backend-
+// valkey, ff-backend-postgres) can still build instances. Adding a
+// new field to a non_exhaustive struct is additive at call sites that
+// use the constructor; callers that build via struct literal would
+// break, which is exactly what `non_exhaustive` is there to prevent.
+
 // ─── LeaseHistory ─────────────────────────────────────────────────
 
 /// Per-event payload of `subscribe_lease_history`.
@@ -177,6 +184,26 @@ pub struct CompletionEvent {
     pub at: TimestampMs,
 }
 
+impl CompletionEvent {
+    /// Construct a `CompletionEvent`. Backend adapters go through
+    /// this constructor instead of struct-literal syntax so future
+    /// additive fields land as builder methods without breaking
+    /// call sites.
+    pub fn new(
+        cursor: StreamCursor,
+        execution_id: ExecutionId,
+        outcome: CompletionOutcome,
+        at: TimestampMs,
+    ) -> Self {
+        Self {
+            cursor,
+            execution_id,
+            outcome,
+            at,
+        }
+    }
+}
+
 /// Stream of typed completion events.
 pub type CompletionSubscription =
     Pin<Box<dyn Stream<Item = Result<CompletionEvent, EngineError>> + Send>>;
@@ -225,6 +252,30 @@ pub struct SignalDeliveryEvent {
     pub source_identity: Option<String>,
     pub effect: SignalDeliveryEffect,
     pub at: TimestampMs,
+}
+
+impl SignalDeliveryEvent {
+    /// Construct a `SignalDeliveryEvent`. Backend adapters use this
+    /// constructor so future additive fields are non-breaking.
+    pub fn new(
+        cursor: StreamCursor,
+        execution_id: ExecutionId,
+        signal_id: SignalId,
+        waitpoint_id: Option<WaitpointId>,
+        source_identity: Option<String>,
+        effect: SignalDeliveryEffect,
+        at: TimestampMs,
+    ) -> Self {
+        Self {
+            cursor,
+            execution_id,
+            signal_id,
+            waitpoint_id,
+            source_identity,
+            effect,
+            at,
+        }
+    }
 }
 
 /// Stream of typed signal-delivery events.
