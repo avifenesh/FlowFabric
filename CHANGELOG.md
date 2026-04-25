@@ -5,6 +5,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `ff-sdk` re-exports `ClaimGrant`, `ReclaimGrant`, `ClaimPolicy`, and
+  `ReclaimToken`; consumers typing `claim_from_grant` /
+  `claim_from_reclaim_grant` signatures can drop their direct
+  `ff-scheduler` dep pin (closes #283). `Scheduler` itself is
+  intentionally not re-exported — implementing a scheduler stays
+  behind the explicit `ff-scheduler` dep.
+
 ## [0.8.1] - 2026-04-25
 
 Release-infrastructure fix for v0.8.0 partial-publish.
