@@ -1084,3 +1084,72 @@ pub trait EngineBackend: Send + Sync + 'static {
 /// EngineBackend>` use.
 #[allow(dead_code)]
 fn _assert_dyn_compatible(_: &dyn EngineBackend) {}
+
+/// Polling interval for [`wait_for_flow_cancellation`]. Tight enough
+/// that a local single-node cancel cascade observes `cancelled` within
+/// one or two polls; slack enough that a `WaitIndefinite` caller does
+/// not hammer `describe_flow` on a live cluster.
+const CANCEL_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Defensive ceiling for [`CancelFlowWait::WaitIndefinite`] — if the
+/// reconciler cascade has not converged in five minutes, something is
+/// wedged and returning `Timeout` is strictly more useful than blocking
+/// forever. RFC-012 §3.1.1 expects real-world cascades to finish within
+/// `reconciler_interval + grace`, which is orders of magnitude below
+/// this.
+const CANCEL_WAIT_INDEFINITE_CEILING: Duration = Duration::from_secs(300);
+
+/// Poll `backend.describe_flow(flow_id)` until `public_flow_state` is
+/// `"cancelled"` or `deadline` elapses.
+///
+/// Shared by every backend's `cancel_flow` trait impl that honours
+/// [`CancelFlowWait::WaitTimeout`] / [`CancelFlowWait::WaitIndefinite`].
+/// The underlying `cancel_flow` FCALL / SQL transaction flips the
+/// flow-level state synchronously; member cancellations dispatch
+/// asynchronously via the reconciler, which also flips
+/// `public_flow_state` to `cancelled` once the cascade completes. This
+/// helper waits for that terminal flip.
+///
+/// Returns:
+/// * `Ok(())` once `public_flow_state = "cancelled"` is observed.
+/// * `Err(EngineError::Timeout { op: "cancel_flow", elapsed })` when
+///   `deadline` elapses first. `elapsed` is the wait budget (the
+///   requested timeout), not wall-clock precision.
+/// * `Err(e)` if `describe_flow` itself errors (propagated).
+pub async fn wait_for_flow_cancellation<B: EngineBackend + ?Sized>(
+    backend: &B,
+    flow_id: &crate::types::FlowId,
+    deadline: Duration,
+) -> Result<(), EngineError> {
+    let start = std::time::Instant::now();
+    loop {
+        match backend.describe_flow(flow_id).await? {
+            Some(snap) if snap.public_flow_state == "cancelled" => return Ok(()),
+            // `None` (flow removed) is also terminal from the caller's
+            // perspective — nothing left to wait on.
+            None => return Ok(()),
+            Some(_) => {}
+        }
+        if start.elapsed() >= deadline {
+            return Err(EngineError::Timeout {
+                op: "cancel_flow",
+                elapsed: deadline,
+            });
+        }
+        tokio::time::sleep(CANCEL_WAIT_POLL_INTERVAL).await;
+    }
+}
+
+/// Convert a [`CancelFlowWait`] into the deadline passed to
+/// [`wait_for_flow_cancellation`]. `NoWait` returns `None` — the caller
+/// must skip the wait entirely.
+pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
+    // `CancelFlowWait` is `#[non_exhaustive]`; this match lives in the
+    // defining crate so the exhaustiveness check keeps the compiler
+    // honest. Future variants must be wired here explicitly.
+    match wait {
+        CancelFlowWait::NoWait => None,
+        CancelFlowWait::WaitTimeout(d) => Some(d),
+        CancelFlowWait::WaitIndefinite => Some(CANCEL_WAIT_INDEFINITE_CEILING),
+    }
+}

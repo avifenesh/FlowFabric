@@ -13,6 +13,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Consumers that talk to a running ff-server via HTTP continue to
   use `FlowFabricWorker::claim_via_server` and don't need the
   embedded scheduler.
+- `EngineBackend::cancel_flow` now supports `WaitTimeout(Duration)`
+  and `WaitIndefinite` on both Valkey and Postgres backends via a
+  shared `describe_flow` poll loop. Callers that previously needed
+  client-side `NoWait` + poll can now pass the wait mode through
+  the trait. Closes #298.
 - **`flowfabric` umbrella crate** — re-exports the ff-* family
   (`ff_core`, `ff_sdk`, and optionally `ff_backend_valkey`,
   `ff_backend_postgres`, `ff_engine`, `ff_scheduler`, `ff_script`)

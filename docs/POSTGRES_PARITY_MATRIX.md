@@ -258,7 +258,7 @@ but no longer trips on Postgres.
 | Family | Valkey | Postgres | Notes |
 |---|---|---|---|
 | Ingress (create_flow, create_execution, add_execution_to_flow, stage_dependency_edge, apply_dependency_to_child) | `impl` | `impl` | Full HTTP parity. `http_postgres_smoke` exercises all 5 end-to-end. |
-| Flow family (`describe_flow`, `list_flows`, `list_edges`, `describe_edge`, `cancel_flow`, `set_edge_group_policy`) | `impl` | `impl` | RFC-v0.7 Wave 4c. |
+| Flow family (`describe_flow`, `list_flows`, `list_edges`, `describe_edge`, `cancel_flow`, `set_edge_group_policy`) | `impl` | `impl` | RFC-v0.7 Wave 4c. `cancel_flow` accepts all three `CancelFlowWait` modes (`NoWait`, `WaitTimeout(Duration)`, `WaitIndefinite`) on both backends via shared `wait_for_flow_cancellation` poll (#298). |
 | Flow cancel (`cancel_flow_header`, `ack_cancel_member`) | `impl` | `stub` | Wave 9 follow-up; Postgres `cancel_flow` covers the bulk path, the header/ack split lands with cancel-backlog machinery. |
 | Read model (`read_execution_info`, `read_execution_state`, `get_execution_result`) | `impl` | `stub` | Wave 9 PG read-model migration. |
 | Operator control (`cancel_execution`, `change_priority`, `replay_execution`, `revoke_lease`) | `impl` | `stub` | Wave 9. |

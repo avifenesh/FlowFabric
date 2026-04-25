@@ -490,3 +490,68 @@ async fn set_edge_group_policy_fresh_write_then_idempotent() {
         .expect("re-set ok");
     assert_eq!(second, SetEdgeGroupPolicyResult::AlreadySet);
 }
+
+/// Issue #298: `cancel_flow(WaitTimeout)` polls `describe_flow` until
+/// `public_flow_state = "cancelled"`. On Postgres the cancel
+/// transaction flips the state row synchronously, so a memberless flow
+/// observes the terminal state on the first poll — well inside the
+/// 500ms deadline.
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn cancel_flow_wait_timeout_returns_cancelled_when_cascade_completes_in_time() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    let flow_id = FlowId::new();
+    seed_flow(&pool, &flow_id, "open").await;
+
+    let backend = backend(pool);
+    let res = backend
+        .cancel_flow(
+            &flow_id,
+            CancelFlowPolicy::CancelAll,
+            CancelFlowWait::WaitTimeout(std::time::Duration::from_millis(500)),
+        )
+        .await
+        .expect("cancel_flow WaitTimeout ok");
+    assert!(
+        matches!(res, CancelFlowResult::Cancelled { .. }),
+        "expected Cancelled, got {res:?}",
+    );
+
+    let snap = backend
+        .describe_flow(&flow_id)
+        .await
+        .expect("describe_flow ok")
+        .expect("flow must exist");
+    assert_eq!(snap.public_flow_state, "cancelled");
+}
+
+/// Issue #298: the shared `wait_for_flow_cancellation` helper must
+/// surface `EngineError::Timeout` when invoked with a deadline that
+/// cannot be met against a still-open flow.
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn cancel_flow_wait_timeout_returns_timeout_when_deadline_exceeded() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    let flow_id = FlowId::new();
+    seed_flow(&pool, &flow_id, "open").await;
+
+    let backend = backend(pool);
+    let err = ff_core::engine_backend::wait_for_flow_cancellation(
+        &*backend,
+        &flow_id,
+        std::time::Duration::from_millis(1),
+    )
+    .await
+    .expect_err("must time out on an open flow");
+    match err {
+        EngineError::Timeout { op, elapsed } => {
+            assert_eq!(op, "cancel_flow");
+            assert_eq!(elapsed, std::time::Duration::from_millis(1));
+        }
+        other => panic!("expected EngineError::Timeout, got {other:?}"),
+    }
+}
