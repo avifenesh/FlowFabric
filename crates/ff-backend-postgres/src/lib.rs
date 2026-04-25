@@ -114,6 +114,133 @@ pub use ff_core::backend::PostgresConnection;
 /// and an optional `ff_observability::Metrics` handle mirroring
 /// [`ff_backend_valkey::ValkeyBackend`]. Future waves add the
 /// [`StreamNotifier`] handle once Wave 4 wires up LISTEN/NOTIFY.
+/// RFC-018 Stage A: static capability table for the Postgres
+/// backend at v0.8.1. Rows still `Unsupported` are Wave-9 follow-up
+/// scope — see `docs/POSTGRES_PARITY_MATRIX.md` for the authoritative
+/// per-row status. `Supported` rows correspond to trait methods
+/// `PostgresBackend` overrides with a real body (ingress,
+/// scheduler, seed, read, cross-cutting); `Unsupported` rows
+/// correspond to trait methods that return
+/// `EngineError::Unavailable` on Postgres today.
+///
+/// Streaming rows are marked `Unsupported` rather than omitted
+/// because the Postgres backend exposes the trait's streaming
+/// methods under the default `streaming` feature but returns
+/// `Unavailable` — that is an operationally distinct state from
+/// "compiled out," and consumers benefit from the typed signal.
+static POSTGRES_CAPS: &[(
+    ff_core::capability::Capability,
+    ff_core::capability::CapabilityStatus,
+)] = &[
+    (
+        ff_core::capability::Capability::ClaimForWorker,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ClaimFromReclaim,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::SuspendResumeByCount,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::CancelExecution,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::CancelFlow,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CancelFlowWaitTimeout,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CancelFlowWaitIndefinite,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::StreamRead,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::StreamBestEffortLive,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::StreamDurableSummary,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::DeliverSignal,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::ListPendingWaitpoints,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::RotateWaitpointHmac,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::SeedWaitpointHmac,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ReportUsage,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::ReportUsageAdminPath,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::ResetBudget,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::CreateFlow,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::CreateExecution,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::StageDependencyEdge,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::ApplyDependencyToChild,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+    (
+        ff_core::capability::Capability::PreparableBoot,
+        // Postgres `prepare()` returns `NoOp` (schema migrations
+        // are applied out-of-band); reported as `Unsupported` so
+        // consumers don't waste a boot-time call expecting work.
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::SubscribeLeaseHistory,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::SubscribeCompletion,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::SubscribeSignalDelivery,
+        ff_core::capability::CapabilityStatus::Unsupported,
+    ),
+    (
+        ff_core::capability::Capability::Ping,
+        ff_core::capability::CapabilityStatus::Supported,
+    ),
+];
+
 pub struct PostgresBackend {
     #[allow(dead_code)] // filled in across waves 2-7
     pool: PgPool,
@@ -618,6 +745,28 @@ impl EngineBackend for PostgresBackend {
 
     fn backend_label(&self) -> &'static str {
         "postgres"
+    }
+
+    /// RFC-018 Stage A: populate the capability matrix from the
+    /// static [`POSTGRES_CAPS`] table. The Postgres backend landed
+    /// through RFC-017 Stage E4 at v0.8.0; rows still marked
+    /// `Unsupported` here correspond to Wave-9 follow-up work
+    /// (`cancel_flow_header`, `ack_cancel_member`, read-model,
+    /// operator control, budget/quota, HMAC rotation,
+    /// `list_pending_waitpoints`). See
+    /// `docs/POSTGRES_PARITY_MATRIX.md` for the per-row breakdown.
+    fn capabilities_matrix(&self) -> ff_core::capability::CapabilityMatrix {
+        let mut matrix = ff_core::capability::CapabilityMatrix::new(
+            ff_core::capability::BackendIdentity::new(
+                "postgres",
+                ff_core::capability::Version::new(0, 8, 1),
+                "E-shipped",
+            ),
+        );
+        for (cap, status) in POSTGRES_CAPS.iter() {
+            matrix.set(*cap, status.clone());
+        }
+        matrix
     }
 
     /// Issue #281: no-op. Schema migrations are applied out-of-band
