@@ -51,8 +51,19 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
         }
     }
 
-    // Load the library with retry for transient errors
-    const MAX_ATTEMPTS: u32 = 3;
+    // Load the library with retry for transient errors.
+    //
+    // Cluster-topology race (issue #275): on a just-formed cluster,
+    // `FUNCTION LOAD` can route to a node that's a replica at dispatch
+    // time (gossip hasn't fully converged). Valkey rejects with
+    // `READONLY: You can't write against a read only replica.`
+    //
+    // Treat READONLY as transient: back off with exponential delay so
+    // slot-map refresh catches the settled topology. 6 attempts with
+    // 1s/2s/4s/4s/4s inter-attempt waits gives ~15s total window,
+    // bounded well under typical `cluster-node-timeout` (5s default).
+    const MAX_ATTEMPTS: u32 = 6;
+    let backoff_ms: [u64; 5] = [1_000, 2_000, 4_000, 4_000, 4_000];
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match client.function_load_replace(LIBRARY_SOURCE).await {
@@ -65,15 +76,17 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
                     tracing::error!(attempt, error = %e, "FUNCTION LOAD failed with permanent error");
                     return Err(LoadError::Valkey(e));
                 }
+                let backoff = backoff_ms.get((attempt as usize).saturating_sub(1)).copied().unwrap_or(4_000);
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_ATTEMPTS,
+                    backoff_ms = backoff,
                     error = %e,
-                    "FUNCTION LOAD failed (transient), retrying in 1s"
+                    "FUNCTION LOAD failed (transient), retrying"
                 );
                 last_err = Some(e);
                 if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                 }
             }
         }
