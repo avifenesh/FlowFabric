@@ -4,7 +4,10 @@
 # workspace-wide version bump across the publishable crates:
 #   ferriskey, ff-core, ff-script, ff-observability,
 #   ff-observability-http, ff-scheduler, ff-backend-valkey,
-#   ff-backend-postgres, ff-engine, ff-sdk, ff-server
+#   ff-backend-postgres, ff-engine, ff-sdk, ff-server, flowfabric
+# (flowfabric is the umbrella re-export crate added in v0.8.2 per
+# issue #279 — it depends on every other publishable crate and
+# publishes LAST in .github/workflows/release.yml.)
 # (ff-scheduler must publish BEFORE ff-backend-valkey per RFC-017
 # Stage C — ff-backend-valkey owns Arc<ff_scheduler::Scheduler>.)
 # The former telemetrylib sub-crate was inlined into ferriskey in

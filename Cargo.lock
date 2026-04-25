@@ -1210,6 +1210,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowfabric"
+version = "0.8.1"
+dependencies = [
+ "ff-backend-postgres",
+ "ff-backend-valkey",
+ "ff-core",
+ "ff-engine",
+ "ff-scheduler",
+ "ff-script",
+ "ff-sdk",
+]
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

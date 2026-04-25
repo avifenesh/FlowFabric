@@ -13,12 +13,14 @@
 #     `publish-new` + `publish-update`.
 #   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
 #
-# Publish set (11 crates, topologically ordered):
+# Publish set (12 crates, topologically ordered):
 #   ferriskey -> ff-core -> ff-script -> ff-observability
 #     -> ff-observability-http
 #     -> ff-backend-valkey -> ff-backend-postgres
 #     -> ff-engine -> ff-scheduler
-#     -> ff-sdk -> ff-server
+#     -> ff-sdk -> ff-server -> flowfabric
+# flowfabric is the umbrella re-export crate (issue #279) and MUST
+# publish last — it depends on every other publishable crate.
 # ff-test is dev-only (publish = false) and not in the set.
 # The former telemetrylib sub-crate was inlined into ferriskey
 # during the Tier 1 envelope collapse (PR #18).
@@ -376,6 +378,23 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-sdk"
+            exit 1
+          }
+      - run: sleep 30
+      # `flowfabric` umbrella (issue #279) depends on every other
+      # publishable ff-* crate + ferriskey, so it MUST publish last.
+      # If this step fails, the consumer-visible umbrella is missing
+      # for the release — yank every previously-published crate and
+      # re-tag as the next patch (crates.io refuses re-publish of a
+      # yanked version).
+      - name: publish flowfabric
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${TAG_VERSION#v}"
+          cargo publish -p flowfabric --no-verify || {
+            echo "::error::cargo publish flowfabric failed — yank every previously-published crate before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey ff-core ff-script ff-observability ff-observability-http ff-scheduler ff-backend-valkey ff-backend-postgres ff-engine ff-sdk ff-server"
             exit 1
           }
 
