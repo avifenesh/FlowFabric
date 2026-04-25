@@ -24,6 +24,54 @@ chronological** — latest at top. Patch releases nest under their minor.
 
 ---
 
+## v0.10 — capability-discovery shape reshape
+
+### v0.10.0 — in prep (tag pending)
+
+Reshape of the RFC-018 Stage A capability-discovery surface to match
+cairn's original #277 ask — flat named-field bool struct instead of
+`BTreeMap<Capability, CapabilityStatus>`. Only consumers that
+directly read `EngineBackend::capabilities_matrix()` (or re-exported
+`CapabilityMatrix` / `Capability` / `CapabilityStatus` via
+`flowfabric::core::capability`) are affected.
+
+#### Breaking
+
+- **`EngineBackend::capabilities_matrix()` → `capabilities()`**
+  `[breaking]`. Return type `CapabilityMatrix` → `Capabilities`.
+  `BTreeMap<Capability, CapabilityStatus>` replaced by flat `Supports`
+  struct with named bool fields.
+
+  ```rust
+  // v0.9.x:
+  use flowfabric::core::capability::{Capability, CapabilityMatrix, CapabilityStatus};
+  let caps: CapabilityMatrix = backend.capabilities_matrix();
+  if matches!(caps.get(Capability::CancelExecution), CapabilityStatus::Supported) {
+      // ...
+  }
+
+  // v0.10+:
+  use flowfabric::core::capability::{Capabilities, Supports};
+  let caps: Capabilities = backend.capabilities();
+  if caps.supports.cancel_execution {
+      // ...
+  }
+  ```
+
+  Partial-status nuance (e.g. non-durable cursor on Valkey
+  `subscribe_completion`) moved to rustdoc on the trait method and
+  `docs/POSTGRES_PARITY_MATRIX.md`; the flat bool answers "is this
+  callable at all," and the per-backend semantic lives in docs.
+
+  Group-level fields (`budget_admin`, `quota_admin`) roll up sibling
+  methods per cairn's grouping preference — one bool for the operator
+  UI grey-render, fine-grained pre-dispatch checks still use
+  `EngineError::Unavailable`. See
+  [`Supports`](../crates/ff-core/src/capability.rs) rustdoc for the
+  per-field mapping.
+
+---
+
 ## v0.9 — umbrella crate + trait-level boot/seed ergonomics
 
 ### v0.9.0 — in prep (tag pending)
