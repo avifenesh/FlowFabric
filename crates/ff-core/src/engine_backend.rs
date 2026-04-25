@@ -903,6 +903,13 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// forwards to its `ff_scheduler::Scheduler` cursor; Postgres
     /// forwards to `PostgresScheduler`'s `FOR UPDATE SKIP LOCKED`
     /// path.
+    ///
+    /// Backends that carry an embedded scheduler (e.g. `ValkeyBackend`
+    /// constructed via `with_embedded_scheduler`, or `PostgresBackend`
+    /// with its `with_scanners` sibling) route the claim through it.
+    /// Backends without a wired scheduler return
+    /// [`EngineError::Unavailable`]. HTTP consumers use
+    /// `FlowFabricWorker::claim_via_server` instead.
     #[cfg(feature = "core")]
     async fn claim_for_worker(
         &self,

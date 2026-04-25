@@ -7,6 +7,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`ValkeyBackend::with_embedded_scheduler`** public constructor —
+  lets direct `Arc<dyn EngineBackend>` consumers (not going through
+  `ff-server`) reach `EngineBackend::claim_for_worker`. Closes #293.
+  Consumers that talk to a running ff-server via HTTP continue to
+  use `FlowFabricWorker::claim_via_server` and don't need the
+  embedded scheduler.
 - **`flowfabric` umbrella crate** — re-exports the ff-* family
   (`ff_core`, `ff_sdk`, and optionally `ff_backend_valkey`,
   `ff_backend_postgres`, `ff_engine`, `ff_scheduler`, `ff_script`)
