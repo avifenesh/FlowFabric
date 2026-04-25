@@ -15,7 +15,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Default `features = ["valkey"]` preserves the v0.7–v0.8 stability
   posture; `default-features = false, features = ["postgres"]` opts
   into the Postgres backend. See
-  [`docs/CONSUMER_MIGRATION_v0.8.md`](docs/CONSUMER_MIGRATION_v0.8.md)
+  [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md)
   § "Umbrella crate (flowfabric)" for before/after. Closes #279.
 - `ff-sdk` re-exports `ClaimGrant`, `ReclaimGrant`, `ClaimPolicy`, and
   `ReclaimToken`; consumers typing `claim_from_grant` /
@@ -41,6 +41,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (FUNCTION LOAD + retry), Postgres returns `NoOp` (migrations run
   out-of-band). Idempotent; safe on every boot. Lets consumers drop
   backend-aware `if let BackendKind::Valkey = ...` boot branches.
+
+### Changed
+
+- `docs/CONSUMER_MIGRATION_v0.8.md` → replaced by rolling
+  `docs/MIGRATIONS.md` covering the last 3 minor versions
+  (v0.7/v0.8/v0.9). Release gate (CLAUDE.md §5 item 5) validates
+  it on every tag.
 
 ### Fixed
 

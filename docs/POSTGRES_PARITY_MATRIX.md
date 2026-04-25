@@ -293,6 +293,7 @@ HTTP handlers return a structured `503 Unavailable` with an
 `EngineError::Unavailable { op }` body — operators upgrading to
 `FF_BACKEND=postgres` at v0.8.0 get a functional create/read/dispatch
 + scheduler loop and structured-error visibility on the missing
-rows. The consumer migration guide (`docs/CONSUMER_MIGRATION_v0.8.md`)
+rows. The consumer migration guide
+([`docs/MIGRATIONS.md`](MIGRATIONS.md) § v0.8 → `FF_BACKEND=postgres`)
 lists the current Postgres `Unavailable` surface so consumers know
 what to expect.
