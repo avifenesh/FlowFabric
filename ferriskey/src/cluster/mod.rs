@@ -2424,9 +2424,12 @@ where
             // Check if the current slot refresh is triggered before the wait duration has passed
             let last_run_rlock = last_run.read().await;
             if let Some(last_run_time) = *last_run_rlock {
-                // `Instant::duration_since` returns `Duration` directly; the
-                // monotonic clock cannot go backward, so no fallback needed.
-                let passed_time = Instant::now().duration_since(last_run_time);
+                // `saturating_duration_since` returns `Duration::ZERO` rather
+                // than panicking if the monotonic clock appears to go backward
+                // (platform-specific anomaly). A zero elapsed time forces a
+                // refresh, which matches the prior `SystemTime`-fallback
+                // behavior.
+                let passed_time = Instant::now().saturating_duration_since(last_run_time);
                 let wait_duration = rate_limiter.wait_duration();
                 if passed_time <= wait_duration {
                     debug!("Skipping slot refresh as the wait duration hasn't yet passed. Passed time = {:?},
