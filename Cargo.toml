@@ -69,6 +69,15 @@ futures = "0.3"
 # (issue #90). Pulled in instead of the full `futures` crate to keep
 # ff-core's dep surface narrow — ff-core is the schema crate.
 futures-core = "0.3"
+# RFC-019 Stage A — opaque `StreamCursor` bytes + subscription payloads.
+# `bytes::Bytes` is the idiomatic zero-copy container for backend-opaque
+# cursor blobs + per-event payloads.
+bytes = "1"
+# RFC-019 Stage A — `tokio_stream::Stream` for the
+# `EngineBackend::subscribe_*` subscription type alias. Already in the
+# workspace graph transitively via sqlx / ferriskey; declared here so
+# ff-core + backends can name it directly.
+tokio-stream = "0.1"
 # RFC-v0.7 Wave 0 — Postgres backend transport. Pinned at workspace
 # root so any future consumer (ff-server, migration CLI) picks up
 # the same version/features.

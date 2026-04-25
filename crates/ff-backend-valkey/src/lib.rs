@@ -6339,6 +6339,336 @@ impl EngineBackend for ValkeyBackend {
         }
     }
 
+    // ── RFC-019 Stage A — `subscribe_lease_history` ───────────────
+    //
+    // Real Valkey impl. Opens a dedicated connection via
+    // `duplicate_connection()`, loops `XREAD BLOCK 5000 STREAMS
+    // <lease_history_stream> <cursor>`, yields each entry as a
+    // `StreamEvent`. On backend disconnect the stream yields
+    // `Err(EngineError::StreamDisconnected { cursor: last_seen })`
+    // and ends; consumers reconnect by re-calling this method.
+    //
+    // Partition scope: one subscription tails the configured
+    // partition's aggregate `lease_history` stream. Cross-partition
+    // consumers instantiate one `ValkeyBackend` per partition and
+    // merge streams consumer-side (RFC-019 §Backend Semantics).
+    async fn subscribe_lease_history(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+        subscribe_lease_history_impl(&self.client, cursor).await
+    }
+}
+
+/// Aggregate partition-level lease-history stream key. RFC-019 Stage A
+/// subscription consumer; Stage B wires the producer side.
+///
+/// Format: `ff:part:{fp:N}:lease_history`. The hash-tag matches the
+/// partition family prefix so a future writer (Lua function emitting
+/// `XADD ff:part:{fp:N}:lease_history ...`) routes to the same slot as
+/// the per-execution state it mirrors.
+pub fn partition_lease_history_key(partition: &Partition) -> String {
+    format!("ff:part:{}:lease_history", partition.hash_tag())
+}
+
+/// Background loop that pumps `XREAD BLOCK` entries into an mpsc for
+/// the `ReceiverStream` returned to the caller.
+async fn subscribe_lease_history_impl(
+    client: &ferriskey::Client,
+    start_cursor: ff_core::stream_subscribe::StreamCursor,
+) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+    use ff_core::stream_subscribe::{
+        decode_valkey_cursor, encode_valkey_cursor, StreamEvent, StreamFamily,
+    };
+    use tokio_stream::wrappers::ReceiverStream;
+
+    // Validate the cursor up front so caller bugs surface loudly at
+    // subscribe-time rather than as a silent first-event error.
+    let start = decode_valkey_cursor(&start_cursor)
+        .map_err(|msg| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: msg.to_string(),
+        })?;
+
+    // Dedicated socket for the blocking XREAD so the multiplexed FCALL
+    // connection never head-of-line-blocks on a long-BLOCK call (same
+    // rationale as `tail_stream_impl`, issue #204).
+    let tail_client = client
+        .duplicate_connection()
+        .await
+        .map_err(ff_script::error::ScriptError::from)
+        .map_err(transport_script)?;
+
+    // Stage A is single-partition per backend instance — the
+    // ValkeyBackend's configured `partition_config` still maps across
+    // the 256-slot execution/flow family, but this subscription tails
+    // partition 0 as the canonical aggregate key. Cross-partition
+    // consumers merge consumer-side.
+    let partition = Partition {
+        family: PartitionFamily::Flow,
+        index: 0,
+    };
+    let stream_key = partition_lease_history_key(&partition);
+
+    // Bounded mpsc — if the consumer stalls, `send` awaits; the XREAD
+    // loop stops pulling new entries until capacity frees up. This is
+    // the owner-adjudicated "pull via Stream" backpressure shape
+    // (RFC-019 §Open Questions #3).
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<StreamEvent, EngineError>,
+    >(64);
+
+    tokio::spawn(async move {
+        let mut last_cursor = start_cursor.clone();
+        // `last_id` is the XREAD exclusive cursor. Empty cursor →
+        // start from `$` (tail-from-now); decoded cursor → resume
+        // strictly after that (ms, seq) pair.
+        let mut last_id = match start {
+            None => "$".to_string(),
+            Some((ms, seq)) => format!("{ms}-{seq}"),
+        };
+
+        loop {
+            let raw = tail_client
+                .cmd("XREAD")
+                .arg("COUNT")
+                .arg(128_u64)
+                .arg("BLOCK")
+                .arg(5_000_u64)
+                .arg("STREAMS")
+                .arg(stream_key.as_str())
+                .arg(last_id.as_str())
+                .execute::<ferriskey::Value>()
+                .await;
+
+            let value = match raw {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "subscribe_lease_history: XREAD BLOCK error, terminating stream"
+                    );
+                    let _ = tx
+                        .send(Err(EngineError::StreamDisconnected {
+                            cursor: last_cursor.clone(),
+                        }))
+                        .await;
+                    return;
+                }
+            };
+
+            let entries = match parse_lease_history_xread(&value, &stream_key) {
+                Ok(e) => e,
+                Err(detail) => {
+                    let _ = tx
+                        .send(Err(EngineError::Validation {
+                            kind: ValidationKind::Corruption,
+                            detail,
+                        }))
+                        .await;
+                    continue;
+                }
+            };
+
+            for (id_ms, id_seq, payload) in entries {
+                let cursor = encode_valkey_cursor(id_ms, id_seq);
+                last_cursor = cursor.clone();
+                last_id = format!("{id_ms}-{id_seq}");
+                let event = StreamEvent::new(
+                    StreamFamily::LeaseHistory,
+                    cursor,
+                    TimestampMs::from_millis(id_ms as i64),
+                    payload,
+                );
+                if tx.send(Ok(event)).await.is_err() {
+                    // Consumer dropped the stream.
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(Box::pin(ReceiverStream::new(rx)))
+}
+
+/// Parse an `XREAD BLOCK STREAMS <key> <id>` reply for a single
+/// stream, returning `(ms, seq, fields_as_bytes)` per entry.
+///
+/// Stage A forwards the raw field map as a flat `FIELD\0VALUE\0...`
+/// byte blob — consumers parse family-specific semantics Stage B will
+/// document. Returns `Ok(vec![])` on `Nil` (BLOCK timeout / no new
+/// entries).
+fn parse_lease_history_xread(
+    raw: &ferriskey::Value,
+    stream_key: &str,
+) -> Result<Vec<(u64, u64, bytes::Bytes)>, String> {
+    use ferriskey::Value;
+    let entries_val = match raw {
+        Value::Nil => return Ok(Vec::new()),
+        // RESP3: Map({stream_key: Map|Array(entries)})
+        Value::Map(m) => {
+            let mut found = None;
+            for (k, v) in m {
+                let key_ok = matches!(k, Value::BulkString(b) if b.as_ref() == stream_key.as_bytes())
+                    || matches!(k, Value::SimpleString(s) if s == stream_key);
+                if key_ok {
+                    found = Some(v.clone());
+                    break;
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => return Ok(Vec::new()),
+            }
+        }
+        // RESP2: Array([[stream_key, [[id, fields], ...]], ...])
+        Value::Array(arr) => {
+            let mut found = None;
+            for entry in arr {
+                let Ok(Value::Array(pair)) = entry.as_ref() else {
+                    continue;
+                };
+                if pair.len() != 2 {
+                    continue;
+                }
+                let matches = match pair[0].as_ref() {
+                    Ok(Value::BulkString(b)) => b.as_ref() == stream_key.as_bytes(),
+                    Ok(Value::SimpleString(s)) => s == stream_key,
+                    _ => false,
+                };
+                if !matches {
+                    continue;
+                }
+                if let Ok(v) = pair[1].as_ref() {
+                    found = Some(v.clone());
+                }
+                break;
+            }
+            match found {
+                Some(v) => v,
+                None => return Ok(Vec::new()),
+            }
+        }
+        _ => return Err("subscribe_lease_history: unexpected XREAD reply shape".into()),
+    };
+
+    let entries = match entries_val {
+        Value::Array(arr) => arr,
+        Value::Map(m) => {
+            // Each entry = (id, fields_value). Normalise to Array.
+            m.into_iter()
+                .map(|(k, v)| Ok::<Value, _>(Value::Array(vec![Ok(k), Ok(v)])))
+                .collect()
+        }
+        _ => return Err("subscribe_lease_history: expected array of entries".into()),
+    };
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry
+            .as_ref()
+            .map_err(|e| format!("subscribe_lease_history: entry error: {e}"))?
+            .clone();
+        let pair = match entry {
+            Value::Array(p) => p,
+            _ => return Err("subscribe_lease_history: entry not an array".into()),
+        };
+        if pair.len() != 2 {
+            return Err("subscribe_lease_history: entry pair != 2".into());
+        }
+        let id_str = match pair[0]
+            .as_ref()
+            .map_err(|e| format!("subscribe_lease_history: id value: {e}"))?
+        {
+            Value::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+            Value::SimpleString(s) => s.clone(),
+            _ => return Err("subscribe_lease_history: id not a string".into()),
+        };
+        let (ms, seq) = parse_stream_id(&id_str)
+            .ok_or_else(|| format!("subscribe_lease_history: bad stream id {id_str:?}"))?;
+
+        // Fields: array of alternating [field, value, field, value, …]
+        // or map; flatten to a NUL-delimited bytes blob for Stage A
+        // opaque payload.
+        let fields_val = pair[1]
+            .as_ref()
+            .map_err(|e| format!("subscribe_lease_history: fields: {e}"))?
+            .clone();
+        let payload = encode_fields_blob(&fields_val);
+        out.push((ms, seq, payload));
+    }
+    Ok(out)
+}
+
+fn parse_stream_id(s: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = s.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// Serialise an XREAD entry's field map to a flat NUL-delimited bytes
+/// blob. Stage A leaves the schema opaque; Stage B will publish a
+/// family-specific Serde shape.
+fn encode_fields_blob(v: &ferriskey::Value) -> bytes::Bytes {
+    use ferriskey::Value;
+    let mut buf: Vec<u8> = Vec::new();
+    fn push_val(buf: &mut Vec<u8>, v: &Value) {
+        match v {
+            Value::BulkString(b) => buf.extend_from_slice(b),
+            Value::SimpleString(s) => buf.extend_from_slice(s.as_bytes()),
+            Value::Int(i) => buf.extend_from_slice(i.to_string().as_bytes()),
+            _ => {}
+        }
+    }
+    match v {
+        Value::Array(arr) => {
+            // ferriskey's XREAD adapter emits `FieldShape::Pairs`:
+            // an outer Array where each element is an inner
+            // Array([field, value]). Fall through to the flat RESP2
+            // shape `[k, v, k, v]` if the first element is not a
+            // pair array.
+            let is_pairs = arr
+                .first()
+                .and_then(|r| r.as_ref().ok())
+                .map(|v| matches!(v, Value::Array(_)))
+                .unwrap_or(false);
+            if is_pairs {
+                for pair in arr {
+                    let Ok(Value::Array(inner)) = pair.as_ref() else {
+                        continue;
+                    };
+                    if inner.len() < 2 {
+                        continue;
+                    }
+                    if let (Ok(k), Ok(vv)) = (inner[0].as_ref(), inner[1].as_ref()) {
+                        push_val(&mut buf, k);
+                        buf.push(0);
+                        push_val(&mut buf, vv);
+                        buf.push(0);
+                    }
+                }
+            } else {
+                let mut it = arr.iter();
+                while let (Some(k), Some(vv)) = (it.next(), it.next()) {
+                    if let (Ok(k), Ok(vv)) = (k.as_ref(), vv.as_ref()) {
+                        push_val(&mut buf, k);
+                        buf.push(0);
+                        push_val(&mut buf, vv);
+                        buf.push(0);
+                    }
+                }
+            }
+        }
+        Value::Map(m) => {
+            for (k, vv) in m {
+                push_val(&mut buf, k);
+                buf.push(0);
+                push_val(&mut buf, vv);
+                buf.push(0);
+            }
+        }
+        _ => {}
+    }
+    bytes::Bytes::from(buf)
 }
 
 /// Detect Valkey errors indicating the Lua function library is not
