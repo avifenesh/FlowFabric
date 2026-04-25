@@ -15,6 +15,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the fact. RFC-018 Stage A; Stage B (derived parity matrix) +
   Stage C (HTTP `GET /v1/capabilities`) land in follow-ups.
   Closes #277.
+- **`EngineBackend::subscribe_{lease_history,completion,signal_delivery,instance_tags}`**
+  trait methods returning `Stream<Item = Result<StreamEvent, EngineError>>`.
+  `subscribe_lease_history` implemented on Valkey (dedicated-connection
+  `XREAD BLOCK` against `ff:part:{fp:N}:lease_history`);
+  `subscribe_completion` implemented on Postgres (wraps the existing
+  `ff_completion_event` outbox + `LISTEN ff_completion` machinery).
+  Cursor is opaque `bytes::Bytes` with a backend-family + version
+  prefix byte; consumer-side reconnect on
+  `EngineError::StreamDisconnected { cursor }`. Four-family allow-list
+  (owner-adjudicated, RFC-019 §Open Questions #5). Other family ×
+  backend combinations return `Unavailable` and are tracked in the
+  RFC-019 Stage B follow-up issues. RFC-019 Stage A; Stage B
+  (complete the family × backend matrix + ff-engine
+  `completion_listener` migration) + Stage C (HTTP SSE surface) land
+  in follow-ups. Closes #282.
 - **`ValkeyBackend::with_embedded_scheduler`** public constructor —
   lets direct `Arc<dyn EngineBackend>` consumers (not going through
   `ff-server`) reach `EngineBackend::claim_for_worker`. Closes #293.

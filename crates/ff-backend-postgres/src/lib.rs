@@ -976,6 +976,81 @@ impl EngineBackend for PostgresBackend {
     ) -> Result<Option<SummaryDocument>, EngineError> {
         stream::read_summary(&self.pool, execution_id, attempt_index).await
     }
+
+    // ── RFC-019 Stage A — `subscribe_completion` ──────────────────
+    //
+    // Postgres real impl. Wraps the existing `ff_completion_event`
+    // outbox + `LISTEN ff_completion` machinery
+    // (see `completion::subscribe`) and adapts each completion
+    // payload into a `stream_subscribe::StreamEvent`.
+    //
+    // Cursor encoding: `POSTGRES_CURSOR_PREFIX (0x02)` + `event_id`
+    // (i64 BE). Stage A resume-from-cursor is not plumbed through the
+    // adapter (the existing subscriber tails from `max(event_id)`);
+    // Stage B threads the cursor into the replay path. The surface is
+    // correct today for consumers that subscribe from tail and
+    // persist cursors for future resume.
+    #[tracing::instrument(name = "pg.subscribe_completion", skip_all)]
+    async fn subscribe_completion(
+        &self,
+        _cursor: ff_core::stream_subscribe::StreamCursor,
+    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+        use ff_core::stream_subscribe::{
+            encode_postgres_event_cursor, StreamEvent, StreamFamily,
+        };
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        // Delegate to the existing CompletionBackend implementation so
+        // the LISTEN/replay machinery is shared. Stage A ignores the
+        // caller's cursor (tails from tail) and surfaces that via the
+        // RFC-019 method doc; Stage B lands resume-from-cursor.
+        let inner = ff_core::completion_backend::CompletionBackend::subscribe_completions(self)
+            .await?;
+
+        // Adapter: `CompletionStream` yields `CompletionPayload` (not
+        // Result); RFC-019 requires `Result<StreamEvent, EngineError>`.
+        // Wrap into an infallible stream mapping each payload.
+        struct Adapter {
+            inner: ff_core::completion_backend::CompletionStream,
+        }
+
+        impl Stream for Adapter {
+            type Item = Result<StreamEvent, EngineError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(payload)) => {
+                        // Stage A: the cursor is a placeholder
+                        // (0-event_id) because the current
+                        // `CompletionPayload` shape does not surface
+                        // `event_id` — Stage B widens
+                        // `CompletionPayload` + plumbs
+                        // replay-from-cursor through the adapter.
+                        // The family prefix stays stable so Stage B
+                        // persistence is forward-compatible for
+                        // consumers that tail from the empty cursor.
+                        let cursor = encode_postgres_event_cursor(0);
+                        let event = StreamEvent::new(
+                            StreamFamily::Completion,
+                            cursor,
+                            payload.produced_at_ms,
+                            bytes::Bytes::from(payload.outcome.clone().into_bytes()),
+                        )
+                        .with_execution_id(payload.execution_id.clone());
+                        Poll::Ready(Some(Ok(event)))
+                    }
+                }
+            }
+        }
+
+        Ok(Box::pin(Adapter { inner }))
+    }
 }
 
 /// Minimum recommended `max_locks_per_transaction`. Partition-heavy

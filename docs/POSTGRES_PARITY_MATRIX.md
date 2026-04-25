@@ -295,6 +295,15 @@ but no longer trips on Postgres.
   `ServerConfig` flat-field removal, legacy `waitpoint_token` wire
   field removal, v0.8.0 version bump, CHANGELOG, migration doc.
 
+### RFC-019 Stage A — Stream-cursor subscriptions (4 methods)
+
+| Method | Valkey | Postgres | Notes |
+|---|---|---|---|
+| `subscribe_lease_history` | `impl` | `stub` | Valkey: `duplicate_connection()` + `XREAD BLOCK 5000 STREAMS ff:part:{fp:N}:lease_history <cursor>`; cursor is `0x01 ++ ms(BE8) ++ seq(BE8)`. Postgres stub until Stage B (LISTEN/NOTIFY on a `ff_lease_event` outbox) — follow-up issue filed. |
+| `subscribe_completion` | `stub` | `impl` | Postgres wraps `completion::subscribe` (`ff_completion_event` outbox + `LISTEN ff_completion`). Valkey stub until Stage B (fold RESP3 `subscribe_completions` into the trait) — follow-up issue filed. |
+| `subscribe_signal_delivery` | `stub` | `stub` | Stage B on both backends — follow-up issue filed. |
+| `subscribe_instance_tags` | `stub` | `stub` | Stage B on both backends — follow-up issue filed. |
+
 ### Deferred to v0.9 / post-0.8
 
 Every Postgres column row still marked `stub` in the Stage A table

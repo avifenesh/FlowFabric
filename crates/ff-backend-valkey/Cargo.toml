@@ -52,6 +52,11 @@ serde_json = { workspace = true }
 # derive.
 tokio = { workspace = true }
 futures-core = { workspace = true }
+# RFC-019 Stage A — `subscribe_lease_history` spawns a bg XREAD loop
+# and forwards parsed `StreamEvent`s over mpsc; `ReceiverStream` is
+# the bounded-mpsc→`Stream` adapter.
+tokio-stream = { workspace = true, features = ["sync"] }
+bytes = { workspace = true }
 # RFC-017 Stage B — bounded-parallel fan-out of the
 # `rotate_waitpoint_hmac_secret_all` FCALL (moved from
 # `ff-server::Server::rotate_waitpoint_secret` per §4 row 11).
