@@ -51,6 +51,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **ferriskey slot-refresh throttle** uses `Instant::now()` instead of
+  `SystemTime::now()` for elapsed-time measurement. `Instant` is
+  monotonic; immune to NTP steps, VM suspend/restore, and variable
+  clock resolution. Closes #290.
 - **Cluster-topology bootstrap race (issue #275).** On a just-formed
   6-node Valkey cluster, `FUNCTION LOAD` could route to a node whose
   topology view still classified it as primary even though it had

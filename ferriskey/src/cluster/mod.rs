@@ -96,7 +96,7 @@ use std::{
         atomic::{self, AtomicUsize, Ordering},
     },
     task::{self, Poll},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 use strum_macros::Display;
 use tokio::{
@@ -2424,16 +2424,9 @@ where
             // Check if the current slot refresh is triggered before the wait duration has passed
             let last_run_rlock = last_run.read().await;
             if let Some(last_run_time) = *last_run_rlock {
-                let passed_time = SystemTime::now()
-                    .duration_since(last_run_time)
-                    .unwrap_or_else(|err| {
-                        warn!(
-                            "Failed to get the duration since the last slot refresh, received error: {:?}",
-                            err
-                        );
-                        // Setting the passed time to 0 will force the current refresh to continue and reset the stored last_run timestamp with the current one
-                        Duration::from_secs(0)
-                    });
+                // `Instant::duration_since` returns `Duration` directly; the
+                // monotonic clock cannot go backward, so no fallback needed.
+                let passed_time = Instant::now().duration_since(last_run_time);
                 let wait_duration = rate_limiter.wait_duration();
                 if passed_time <= wait_duration {
                     debug!("Skipping slot refresh as the wait duration hasn't yet passed. Passed time = {:?},
@@ -2585,7 +2578,7 @@ where
         trigger: SlotRefreshTrigger,
     ) -> Result<()> {
         // Update the slot refresh last run timestamp
-        let now = SystemTime::now();
+        let now = Instant::now();
         let mut last_run_wlock = inner.slot_refresh_state.last_run.write().await;
         *last_run_wlock = Some(now);
         drop(last_run_wlock);
