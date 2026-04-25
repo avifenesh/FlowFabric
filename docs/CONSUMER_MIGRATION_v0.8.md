@@ -1,14 +1,34 @@
-# Consumer Migration Guide — FlowFabric v0.8.0
+# Consumer Migration Guide — FlowFabric v0.8.0 → v0.9.0
 
-RFC-017 Wave 8 ships the Postgres backend as a first-class
+RFC-017 Wave 8 (v0.8.0) ships the Postgres backend as a first-class
 `EngineBackend` over the full HTTP surface and retires the v0.7-era
-compatibility shims. This guide covers the breaking changes a
-library-mode consumer (cairn-fabric or any out-of-tree embedder) must
-adapt to.
+compatibility shims. **v0.9.0 is a fully additive release on top of
+v0.8** — no v0.8 → v0.9 migration work required. This guide covers
+the breaking changes a library-mode consumer (cairn-fabric or any
+out-of-tree embedder) must adapt to when moving from v0.7, plus the
+v0.9 additions that let you delete adapter code.
 
 > Audience: crates that depend on `ff-sdk`, `ff-server`, `ff-core`,
 > or `ff-engine` directly. Pure HTTP API consumers only need the
 > `PendingWaitpointInfo` section.
+
+## v0.9 additions (additive — no migration required)
+
+Each of these lets you delete adapter code. None are required to
+build against v0.9; existing v0.8 consumer code compiles unchanged.
+
+| Addition | Replaces | Issue |
+|---|---|---|
+| `flowfabric` umbrella crate | 7 ff-* `Cargo.toml` pins | #279 |
+| `ff-sdk` re-exports `ClaimGrant` + claim types | Direct `ff-scheduler` pin for type-only import | #283 |
+| `LeaseSummary` adds `lease_id` + `attempt_index` + `last_heartbeat_at` | Consumer HGET wrapper | #278 |
+| `EngineBackend::seed_waitpoint_hmac_secret` | Raw HSET boot path | #280 |
+| `EngineBackend::prepare` | `ff_script::loader::ensure_library` + `BackendKind::Valkey` branch | #281 |
+
+See §8 "Umbrella crate (flowfabric)" for the most load-bearing
+change — replaces 7 pinned dependencies with one.
+
+---
 
 ## 1. `ServerConfig` flat Valkey fields removed
 
