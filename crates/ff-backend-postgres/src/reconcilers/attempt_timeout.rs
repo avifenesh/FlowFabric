@@ -21,6 +21,7 @@ use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
 
 use crate::error::map_sqlx_error;
+use crate::lease_event;
 use crate::reconcilers::ScanReport;
 
 /// Max rows pulled per scan tick.
@@ -232,6 +233,17 @@ async fn expire_one(
         .await
         .map_err(map_sqlx_error)?;
     }
+
+    // RFC-019 Stage B outbox: lease expired (attempt_timeout reconciler).
+    lease_event::emit(
+        &mut tx,
+        partition_key,
+        exec_uuid,
+        None,
+        lease_event::EVENT_EXPIRED,
+        now_ms,
+    )
+    .await?;
 
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(())
