@@ -253,8 +253,14 @@ async fn describe_execution_after_claim_has_attempt_and_lease() {
     let partition = execution_partition(&eid, &config);
     let ctx = ExecKeyContext::new(&partition, &eid);
     let attempt_id = AttemptId::new();
+    let lease_id = LeaseId::new();
     let wid = "desc-exec-inst-claimed";
     let expires_at = TimestampMs::now().0 + 30_000;
+    // FF#278: lease_id + attempt_index are set atomically with
+    // worker_instance_id at claim time; the decoder now requires them
+    // whenever a lease is present. lease_last_renewed_at is optional
+    // (surfaces as last_heartbeat_at: Some when set).
+    let last_renewed_at = TimestampMs::now().0;
     let _: Value = tc
         .client()
         .cmd("HSET")
@@ -265,8 +271,12 @@ async fn describe_execution_after_claim_has_attempt_and_lease() {
         .arg("0")
         .arg("current_worker_instance_id")
         .arg(wid)
+        .arg("current_lease_id")
+        .arg(lease_id.to_string().as_str())
         .arg("lease_expires_at")
         .arg(expires_at.to_string().as_str())
+        .arg("lease_last_renewed_at")
+        .arg(last_renewed_at.to_string().as_str())
         .arg("current_lease_epoch")
         .arg("1")
         .arg("total_attempt_count")
@@ -289,6 +299,10 @@ async fn describe_execution_after_claim_has_attempt_and_lease() {
     assert_eq!(lease.lease_epoch, LeaseEpoch::new(1));
     assert_eq!(lease.worker_instance_id.as_str(), wid);
     assert_eq!(lease.expires_at.0, expires_at);
+    // FF#278: new fields surface on LeaseSummary.
+    assert_eq!(lease.lease_id, lease_id);
+    assert_eq!(lease.attempt_index, AttemptIndex::new(0));
+    assert_eq!(lease.last_heartbeat_at.map(|t| t.0), Some(last_renewed_at));
 
     assert_eq!(snap.total_attempt_count, 1);
 }

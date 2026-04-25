@@ -35,7 +35,7 @@ use crate::contracts::{
 use crate::engine_error::{EngineError, ValidationKind};
 use crate::state::PublicState;
 use crate::types::{
-    AttemptId, AttemptIndex, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, Namespace,
+    AttemptId, AttemptIndex, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId, Namespace,
     TimestampMs, WaitpointId, WorkerInstanceId,
 };
 
@@ -464,11 +464,53 @@ fn build_lease_summary(
             "is missing while current_worker_instance_id is set (key corruption?)",
         )
     })?;
-    Ok(Some(LeaseSummary::new(
+    // FF#278: surface lease_id + attempt_index + last_heartbeat_at.
+    //
+    // lease_id + current_attempt_index are set atomically alongside
+    // current_worker_instance_id at claim time (see
+    // ff_claim_execution / ff_claim_resumed_execution in
+    // flowfabric.lua); a populated worker_instance_id with an empty /
+    // missing lease_id or attempt_index is corruption.
+    let lease_id_str = opt_str(core, "current_lease_id")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            corruption(
+                ctx,
+                Some("current_lease_id"),
+                "is missing while current_worker_instance_id is set (key corruption?)",
+            )
+        })?;
+    let lease_id = LeaseId::parse(lease_id_str).map_err(|e| {
+        corruption(
+            ctx,
+            Some("current_lease_id"),
+            &format!("is not a valid UUID: {e}"),
+        )
+    })?;
+    let attempt_index =
+        parse_u32_strict(core, ctx, "current_attempt_index")?.ok_or_else(|| {
+            corruption(
+                ctx,
+                Some("current_attempt_index"),
+                "is missing while current_worker_instance_id is set (key corruption?)",
+            )
+        })?;
+    // lease_last_renewed_at is set on every claim + renew, but legacy
+    // data (pre-0.9) and unrelated backends may leave it empty. Treat
+    // missing/empty as None rather than surfacing a synthetic value.
+    let last_heartbeat_at = parse_ts(core, ctx, "lease_last_renewed_at")?;
+
+    let mut summary = LeaseSummary::new(
         LeaseEpoch::new(epoch),
         WorkerInstanceId::new(wid_str.to_owned()),
         expires_at,
-    )))
+    )
+    .with_lease_id(lease_id)
+    .with_attempt_index(AttemptIndex::new(attempt_index));
+    if let Some(ts) = last_heartbeat_at {
+        summary = summary.with_last_heartbeat_at(ts);
+    }
+    Ok(Some(summary))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -926,8 +968,12 @@ mod tests {
             .unwrap();
         assert!(snap.current_lease.is_none());
 
+        let lid = LeaseId::new();
         core.insert("lease_expires_at".to_owned(), "9000".to_owned());
         core.insert("current_lease_epoch".to_owned(), "3".to_owned());
+        core.insert("current_lease_id".to_owned(), lid.to_string());
+        core.insert("current_attempt_index".to_owned(), "2".to_owned());
+        core.insert("lease_last_renewed_at".to_owned(), "8500".to_owned());
         let snap = build_execution_snapshot(eid(), &core, HashMap::new())
             .unwrap()
             .unwrap();
@@ -935,6 +981,77 @@ mod tests {
         assert_eq!(lease.lease_epoch, LeaseEpoch::new(3));
         assert_eq!(lease.expires_at.0, 9000);
         assert_eq!(lease.worker_instance_id.as_str(), "w-inst-1");
+        // FF#278 additions.
+        assert_eq!(lease.lease_id, lid);
+        assert_eq!(lease.attempt_index, AttemptIndex::new(2));
+        assert_eq!(lease.last_heartbeat_at.map(|t| t.0), Some(8500));
+    }
+
+    // FF#278: when lease_last_renewed_at is missing (legacy / backend
+    // that does not surface heartbeat ticks), last_heartbeat_at is None.
+    #[test]
+    fn lease_summary_without_heartbeat_returns_none() {
+        let mut core = minimal_core("active");
+        core.insert(
+            "current_worker_instance_id".to_owned(),
+            "w-inst-1".to_owned(),
+        );
+        core.insert("lease_expires_at".to_owned(), "9000".to_owned());
+        core.insert("current_lease_epoch".to_owned(), "3".to_owned());
+        core.insert("current_lease_id".to_owned(), LeaseId::new().to_string());
+        core.insert("current_attempt_index".to_owned(), "1".to_owned());
+        let snap = build_execution_snapshot(eid(), &core, HashMap::new())
+            .unwrap()
+            .unwrap();
+        let lease = snap.current_lease.expect("lease present");
+        assert!(lease.last_heartbeat_at.is_none());
+    }
+
+    // FF#278: populated worker_instance_id with missing lease_id is
+    // corruption — they are written atomically at claim time.
+    #[test]
+    fn lease_without_lease_id_fails_loud() {
+        let mut core = minimal_core("active");
+        core.insert(
+            "current_worker_instance_id".to_owned(),
+            "w-inst-1".to_owned(),
+        );
+        core.insert("lease_expires_at".to_owned(), "9000".to_owned());
+        core.insert("current_lease_epoch".to_owned(), "3".to_owned());
+        core.insert("current_attempt_index".to_owned(), "1".to_owned());
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        expect_corruption_field(err, |d| d.contains("current_lease_id"));
+    }
+
+    #[test]
+    fn lease_with_bad_lease_id_fails_loud() {
+        let mut core = minimal_core("active");
+        core.insert(
+            "current_worker_instance_id".to_owned(),
+            "w-inst-1".to_owned(),
+        );
+        core.insert("lease_expires_at".to_owned(), "9000".to_owned());
+        core.insert("current_lease_epoch".to_owned(), "3".to_owned());
+        core.insert("current_lease_id".to_owned(), "not-a-uuid".to_owned());
+        core.insert("current_attempt_index".to_owned(), "1".to_owned());
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        expect_corruption_field(err, |d| d.contains("current_lease_id"));
+    }
+
+    // FF#278: populated worker_instance_id with missing attempt_index
+    // is corruption — they are written atomically at claim time.
+    #[test]
+    fn lease_without_attempt_index_fails_loud() {
+        let mut core = minimal_core("active");
+        core.insert(
+            "current_worker_instance_id".to_owned(),
+            "w-inst-1".to_owned(),
+        );
+        core.insert("lease_expires_at".to_owned(), "9000".to_owned());
+        core.insert("current_lease_epoch".to_owned(), "3".to_owned());
+        core.insert("current_lease_id".to_owned(), LeaseId::new().to_string());
+        let err = build_execution_snapshot(eid(), &core, HashMap::new()).unwrap_err();
+        expect_corruption_field(err, |d| d.contains("current_attempt_index"));
     }
 
     // ─── FlowSnapshot (describe_flow) ─────────────────────────────────
