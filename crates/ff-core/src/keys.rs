@@ -356,6 +356,14 @@ impl IndexKeys {
     pub fn all_executions(&self) -> String {
         format!("ff:idx:{}:all_executions", self.tag)
     }
+
+    /// `ff:part:{fp:N}:signal_delivery` — partition-level aggregate
+    /// stream that `ff_deliver_signal` XADDs into on every successful
+    /// delivery. `subscribe_signal_delivery` XREAD BLOCKs this key.
+    /// RFC-019 Stage B / #310.
+    pub fn partition_signal_delivery(&self) -> String {
+        format!("ff:part:{}:signal_delivery", self.tag)
+    }
 }
 
 // ─── Flow Partition Keys ({fp:N}) ───
