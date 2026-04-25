@@ -41,7 +41,7 @@
 //!     // In a real deployment `grant` is obtained from the
 //!     // scheduler's `claim_for_worker` RPC/helper; it carries the
 //!     // execution id, capability match, and admission result.
-//!     # let grant: ff_core::contracts::ClaimGrant = unimplemented!();
+//!     # let grant: ff_sdk::ClaimGrant = unimplemented!();
 //!     let task = worker.claim_from_grant(lane, grant).await?;
 //!     println!("claimed: {}", task.execution_id());
 //!     // Process task...
@@ -67,8 +67,13 @@
 //! grant-based path does not. See each method's rustdoc for the
 //! exact migration recipe.
 //!
-//! [`ClaimGrant`]: ff_core::contracts::ClaimGrant
-//! [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+//! `ClaimGrant` / `ReclaimGrant` (and the `ClaimPolicy` /
+//! `ReclaimToken` wire types on the scheduler-owner side) are
+//! re-exported from `ff-sdk` (#283) so consumers do not need a
+//! direct `ff-scheduler` dep just to type these signatures.
+//!
+//! [`ClaimGrant`]: crate::ClaimGrant
+//! [`ReclaimGrant`]: crate::ReclaimGrant
 
 #[cfg(feature = "valkey-default")]
 pub mod admin;
@@ -137,7 +142,7 @@ pub use ff_core::contracts::{
 // `EngineBackend::claim_for_worker`) can name these as
 // `ff_sdk::ClaimGrant` etc. without pinning `ff-scheduler` directly.
 // `Scheduler` itself is intentionally not re-exported: implementing a
-// scheduler is specialised and stays behind the `ff-scheduler` dep.
+// scheduler is specialized and stays behind the `ff-scheduler` dep.
 pub use ff_core::backend::{ClaimPolicy, ReclaimToken};
 pub use ff_core::contracts::{ClaimGrant, ReclaimGrant};
 #[cfg(feature = "valkey-default")]
