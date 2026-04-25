@@ -50,7 +50,7 @@ use async_trait::async_trait;
 use crate::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility,
+    PrepareOutcome, ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility,
 };
 use crate::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
@@ -894,6 +894,56 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// `"postgres"`.
     fn backend_label(&self) -> &'static str {
         "unknown"
+    }
+
+    /// Issue #281: run one-time backend-specific boot preparation.
+    ///
+    /// Intended to run ONCE per deployment startup — NOT per request.
+    /// Idempotent and safe for consumers to call on every application
+    /// boot; backends that have nothing to do return
+    /// [`PrepareOutcome::NoOp`] without side effects.
+    ///
+    /// Per-backend behaviour:
+    ///
+    /// * **Valkey** — issues `FUNCTION LOAD REPLACE` for the
+    ///   `flowfabric` Lua library (with bounded retry on transient
+    ///   transport faults; permanent compile errors surface as
+    ///   [`EngineError::Transport`] without retry). Returns
+    ///   [`PrepareOutcome::Applied`] carrying
+    ///   `"FUNCTION LOAD (flowfabric lib v<N>)"`.
+    /// * **Postgres** — returns [`PrepareOutcome::NoOp`]. Schema
+    ///   migrations are applied out-of-band per
+    ///   `rfcs/drafts/v0.7-migration-master.md §Q12`; the backend
+    ///   runs a schema-version check at connect time and refuses to
+    ///   start on mismatch, so no boot-side prepare work remains.
+    /// * **Default impl** — returns [`PrepareOutcome::NoOp`] so
+    ///   out-of-tree backends without preparation work compile
+    ///   without boilerplate.
+    ///
+    /// # Relationship to the in-tree boot path
+    ///
+    /// `ValkeyBackend::initialize_deployment` (called from
+    /// `Server::start_with_metrics`) already invokes
+    /// [`ensure_library`](ff_script::loader::ensure_library) inline as
+    /// its step 4; that path is unchanged. `prepare()` exists as a
+    /// **trait-surface entry point** so consumers that construct an
+    /// `Arc<dyn EngineBackend>` outside of `Server` (e.g.
+    /// cairn-fabric's boot path at `cairn-fabric/src/boot.rs`) can
+    /// run the same preparation without reaching into
+    /// backend-specific modules. The overlap is intentional: calling
+    /// both `prepare()` and `initialize_deployment` is safe because
+    /// `FUNCTION LOAD REPLACE` is idempotent under the version
+    /// check.
+    ///
+    /// # Layer forwarding
+    ///
+    /// Layer impls (`HookedBackend`, ff-sdk layers) do NOT forward
+    /// `prepare` today — consistent with `backend_label` / `ping` /
+    /// `shutdown_prepare`. Consumers that wrap a backend in layers
+    /// MUST call `prepare()` on the raw backend before wrapping, or
+    /// accept the default [`PrepareOutcome::NoOp`].
+    async fn prepare(&self) -> Result<PrepareOutcome, EngineError> {
+        Ok(PrepareOutcome::NoOp)
     }
 
     /// Drain-before-shutdown hook (RFC-017 §5.4). The server calls

@@ -113,6 +113,7 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 |---|---|---|
 | `backend_label` | `"valkey"` | `"postgres"` |
 | `shutdown_prepare` | `impl` (semaphore drain) | `impl` (ping check; pool drain a follow-up) |
+| `prepare` (issue #281) | `impl` (`FUNCTION LOAD` via `ff_script::loader::ensure_library`; returns `PrepareOutcome::Applied { description: "FUNCTION LOAD (flowfabric lib v<N>)" }`) | `impl` (returns `PrepareOutcome::NoOp` — schema migrations are applied out-of-band per v0.7 Wave 0 Q12; schema-version check runs at connect time) |
 
 ---
 

@@ -620,6 +620,19 @@ impl EngineBackend for PostgresBackend {
         "postgres"
     }
 
+    /// Issue #281: no-op. Schema migrations are applied out-of-band
+    /// per `rfcs/drafts/v0.7-migration-master.md §Q12` (operator runs
+    /// `sqlx migrate run` or the future `ff-migrate` CLI). Boot runs a
+    /// schema-version check at connect time
+    /// ([`crate::version::check_schema_version`]) and refuses to
+    /// start on mismatch, so by the time `prepare()` is callable
+    /// there is nothing further to do.
+    async fn prepare(
+        &self,
+    ) -> Result<ff_core::backend::PrepareOutcome, EngineError> {
+        Ok(ff_core::backend::PrepareOutcome::NoOp)
+    }
+
     /// RFC-017 Wave 8 Stage E3 (§4 row 9, §7): forward the claim to the
     /// Postgres-native admission pipeline. Returns `NoWork` when no
     /// eligible execution is admissible this scan cycle. Budget
