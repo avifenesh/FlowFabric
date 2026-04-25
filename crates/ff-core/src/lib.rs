@@ -1,6 +1,7 @@
 //! Core types, state enums, partition math, key builders, and error codes for FlowFabric.
 
 pub mod backend;
+pub mod capability;
 pub mod caps;
 pub mod completion_backend;
 pub mod contracts;
