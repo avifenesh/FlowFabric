@@ -317,3 +317,56 @@ pub enum InstanceTagEvent {
 /// Stream of typed instance-tag events.
 pub type InstanceTagSubscription =
     Pin<Box<dyn Stream<Item = Result<InstanceTagEvent, EngineError>> + Send>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_outcome_wire_round_trip() {
+        assert_eq!(CompletionOutcome::from_wire("success"), CompletionOutcome::Success);
+        assert_eq!(CompletionOutcome::from_wire("failure"), CompletionOutcome::Failure);
+        assert_eq!(CompletionOutcome::from_wire("cancelled"), CompletionOutcome::Cancelled);
+        match CompletionOutcome::from_wire("timed_out") {
+            CompletionOutcome::Other(s) => assert_eq!(s, "timed_out"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_delivery_effect_wire_round_trip() {
+        assert_eq!(
+            SignalDeliveryEffect::from_wire("satisfied"),
+            SignalDeliveryEffect::Satisfied
+        );
+        assert_eq!(
+            SignalDeliveryEffect::from_wire("buffered"),
+            SignalDeliveryEffect::Buffered
+        );
+        assert_eq!(
+            SignalDeliveryEffect::from_wire("deduped"),
+            SignalDeliveryEffect::Deduped
+        );
+        match SignalDeliveryEffect::from_wire("throttled") {
+            SignalDeliveryEffect::Other(s) => assert_eq!(s, "throttled"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_history_event_accessors() {
+        use crate::types::ExecutionId;
+        let cursor = StreamCursor::new(vec![0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 42]);
+        let exec = ExecutionId::parse("{fp:0}:11111111-1111-4111-8111-111111111111").unwrap();
+        let ev = LeaseHistoryEvent::Expired {
+            cursor: cursor.clone(),
+            execution_id: exec.clone(),
+            lease_id: None,
+            prev_owner: None,
+            at: TimestampMs(1_700_000_000_000),
+        };
+        assert_eq!(ev.cursor(), &cursor);
+        assert_eq!(ev.execution_id(), &exec);
+        assert_eq!(ev.at(), TimestampMs(1_700_000_000_000));
+    }
+}
