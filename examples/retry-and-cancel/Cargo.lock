@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -290,9 +290,10 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "ferriskey",
  "ff-core",
  "ff-observability",
@@ -303,29 +304,33 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
 [[package]]
 name = "ff-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "crc16",
  "futures-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
  "uuid",
 ]
 
 [[package]]
 name = "ff-observability"
-version = "0.8.1"
+version = "0.9.0"
 
 [[package]]
 name = "ff-scheduler"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -337,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -349,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
@@ -1810,6 +1815,18 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
