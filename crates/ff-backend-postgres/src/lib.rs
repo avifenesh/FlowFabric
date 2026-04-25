@@ -87,6 +87,7 @@ pub mod scanner_supervisor;
 #[cfg(feature = "core")]
 pub mod scheduler;
 pub mod signal;
+mod signal_delivery_subscribe;
 mod signal_event;
 #[cfg(feature = "streaming")]
 pub mod stream;
@@ -1074,6 +1075,23 @@ impl EngineBackend for PostgresBackend {
         cursor: ff_core::stream_subscribe::StreamCursor,
     ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
         lease_event_subscribe::subscribe(&self.pool, 0, cursor).await
+    }
+
+    // ── RFC-019 Stage B — `subscribe_signal_delivery` (#310) ─────
+    //
+    // Tails the `ff_signal_event` outbox (written by the producer
+    // INSERT in `suspend_ops::deliver_signal_impl`) via
+    // `LISTEN ff_signal_event` + catch-up SELECT. Cursor encoding
+    // matches `subscribe_lease_history`: `0x02 ++ event_id(BE8)`.
+    //
+    // Partition scope: hardcoded to partition 0 — mirrors the Valkey
+    // Stage B impl which tails partition 0's aggregate stream key.
+    #[tracing::instrument(name = "pg.subscribe_signal_delivery", skip_all)]
+    async fn subscribe_signal_delivery(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+        signal_delivery_subscribe::subscribe(&self.pool, 0, cursor).await
     }
 }
 
