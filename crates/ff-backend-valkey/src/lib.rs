@@ -653,15 +653,12 @@ fn cancel_policy_to_str(p: CancelFlowPolicy) -> &'static str {
     }
 }
 
-/// Stage 1a cancel-flow FCALL wrapper. Only
-/// [`CancelFlowWait::NoWait`] is supported at Stage 1a — the
-/// dispatch+wait loop that [`CancelFlowWait::WaitTimeout`] /
-/// [`CancelFlowWait::WaitIndefinite`] require lands in a
-/// follow-up stage (today's ff-sdk cancel_flow HTTP path does the
-/// wait client-side after the FCALL commits). Rejecting the
-/// wait modes explicitly with [`EngineError::Unavailable`] lets
-/// callers distinguish "backend won't do this yet" from a silent
-/// fallback. See RFC-012 §3.1.1 for the cancel_flow policy matrix.
+/// Cancel-flow FCALL wrapper. Runs the synchronous state-flip +
+/// member-cancel dispatch FCALL; the `wait` parameter is honoured by
+/// the trait-level `cancel_flow` via the shared
+/// [`wait_for_flow_cancellation`](ff_core::engine_backend::wait_for_flow_cancellation)
+/// helper which polls `describe_flow` once the FCALL commits. See
+/// RFC-012 §3.1.1 for the cancel_flow policy / wait matrix.
 #[tracing::instrument(
     name = "ff.cancel_flow",
     skip_all,
@@ -672,30 +669,7 @@ async fn cancel_flow_fcall(
     partition_config: &PartitionConfig,
     flow_id: &FlowId,
     policy: CancelFlowPolicy,
-    wait: CancelFlowWait,
 ) -> Result<CancelFlowResult, EngineError> {
-    match wait {
-        CancelFlowWait::NoWait => {}
-        CancelFlowWait::WaitTimeout(_) => {
-            return Err(EngineError::Unavailable {
-                op: "cancel_flow(wait=WaitTimeout)",
-            });
-        }
-        CancelFlowWait::WaitIndefinite => {
-            return Err(EngineError::Unavailable {
-                op: "cancel_flow(wait=WaitIndefinite)",
-            });
-        }
-        // `CancelFlowWait` is `#[non_exhaustive]`. Future wait
-        // variants must be reviewed here explicitly; fall closed
-        // with Unavailable so callers see a typed error instead of
-        // silent fallback to NoWait.
-        _ => {
-            return Err(EngineError::Unavailable {
-                op: "cancel_flow(wait=unknown)",
-            });
-        }
-    }
     let partition = flow_partition(flow_id, partition_config);
     let fctx = FlowKeyContext::new(&partition, flow_id);
     let fidx = FlowIndexKeys::new(&partition);
@@ -4385,11 +4359,15 @@ impl EngineBackend for ValkeyBackend {
         policy: CancelFlowPolicy,
         wait: CancelFlowWait,
     ) -> Result<CancelFlowResult, EngineError> {
-        cancel_flow_fcall(&self.client, &self.partition_config, id, policy, wait)
+        let result = cancel_flow_fcall(&self.client, &self.partition_config, id, policy)
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "cancel_flow: FCALL ff_cancel_flow")
-            })
+            })?;
+        if let Some(deadline) = ff_core::engine_backend::cancel_flow_wait_deadline(wait) {
+            ff_core::engine_backend::wait_for_flow_cancellation(self, id, deadline).await?;
+        }
+        Ok(result)
     }
 
     async fn set_edge_group_policy(

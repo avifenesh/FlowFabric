@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use ff_core::backend::{CancelFlowPolicy, CancelFlowWait};
+use ff_core::backend::CancelFlowPolicy;
 use ff_core::contracts::{
     CancelFlowResult, EdgeDependencyPolicy, EdgeDirection, EdgeGroupSnapshot, EdgeGroupState,
     EdgeSnapshot, FlowSnapshot, FlowStatus, FlowSummary, ListFlowsPage, OnSatisfied,
@@ -557,7 +557,6 @@ pub async fn cancel_flow(
     partition_config: &ff_core::partition::PartitionConfig,
     id: &FlowId,
     policy: CancelFlowPolicy,
-    _wait: CancelFlowWait,
 ) -> Result<CancelFlowResult, EngineError> {
     let part = flow_partition_byte(id, partition_config);
     let flow_uuid: Uuid = id.0;
