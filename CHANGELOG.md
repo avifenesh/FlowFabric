@@ -7,6 +7,42 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `ff_core::stream_events` module: typed event enums + per-family
+  subscription aliases for the four `EngineBackend::subscribe_*`
+  methods (RFC-019 Stage C; addresses #282 typed surface gap).
+  - `LeaseHistoryEvent` with `Acquired` / `Renewed` / `Expired` /
+    `Reclaimed` / `Revoked` variants.
+  - `CompletionEvent` + `CompletionOutcome::{Success, Failure,
+    Cancelled, Other(String)}`.
+  - `SignalDeliveryEvent` + `SignalDeliveryEffect::{Satisfied,
+    Buffered, Deduped, Other(String)}`.
+  - `InstanceTagEvent` with `Attached` / `Cleared` variants (trait
+    surface only; producer wiring still deferred per #311 audit).
+  Each family ships a subscription alias
+  (`LeaseHistorySubscription`, `CompletionSubscription`,
+  `SignalDeliverySubscription`, `InstanceTagSubscription`). All
+  enums + structs are `#[non_exhaustive]` so future additions are
+  non-breaking; structs pair with `new()` constructors so external
+  crates (ff-backend-valkey, ff-backend-postgres) can still build
+  instances.
+
+### Changed
+
+- **Breaking for direct `EngineBackend` impls**: the four
+  `subscribe_*` trait methods now return family-specific typed
+  subscriptions instead of `StreamSubscription<StreamEvent>` with a
+  byte payload. Trait consumers match on typed variants directly;
+  no more NUL-delimited / JSON payload parsing. The untyped
+  `StreamEvent` + `StreamSubscription` + `StreamFamily` types are
+  removed from `ff_core::stream_subscribe`; cursor codec
+  (`StreamCursor` + `encode_valkey_cursor` / `decode_valkey_cursor`
+  / `encode_postgres_event_cursor` / `decode_postgres_event_cursor`)
+  stays unchanged. See
+  `docs/CONSUMER_MIGRATION_typed-subscribe-events.md` for the
+  consumer migration snippet.
+
+### Added
+
 - `subscribe_signal_delivery` implemented on both backends
   (RFC-019 Stage B; closes #310). Valkey: XREAD BLOCK on partition
   aggregate stream `ff:part:{fp:N}:signal_delivery` (producer XADD
