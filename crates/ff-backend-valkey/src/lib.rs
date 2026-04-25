@@ -44,7 +44,8 @@ use ff_core::contracts::{
     ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage,
     ListLanesPage, ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy,
     ResumeTarget, RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
-    RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs,
+    RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SeedOutcome,
+    SeedWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs,
     SuspendOutcome, SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
 };
 use ff_core::partition::{Partition, PartitionFamily};
@@ -4477,6 +4478,192 @@ impl EngineBackend for ValkeyBackend {
             entries.push(RotateWaitpointHmacSecretAllEntry::new(i as u16, res));
         }
         Ok(RotateWaitpointHmacSecretAllResult::new(entries))
+    }
+
+    /// Seed the initial waitpoint HMAC secret across every execution
+    /// partition (issue #280). Idempotent — intended to be called on
+    /// every boot by cairn-fabric + similar consumers, letting the
+    /// backend decide whether any partition needs an install.
+    ///
+    /// Semantics per partition, using the existing on-disk layout
+    /// (`waitpoint_hmac_secrets:{p:N}` hash with `current_kid` +
+    /// `secret:<kid>` fields):
+    ///
+    /// * `current_kid` absent → HSET both fields, partition reports
+    ///   "installed".
+    /// * `current_kid == args.kid` and stored secret matches →
+    ///   "already-seeded, same secret".
+    /// * `current_kid == args.kid` and stored secret differs →
+    ///   "already-seeded, different secret".
+    /// * `current_kid != args.kid` → `Validation(InvalidInput)`.
+    ///
+    /// The per-partition HSET is NOT atomic across partitions; a
+    /// crash mid-fanout leaves some partitions installed and others
+    /// empty. The next boot-time seed call repairs by installing the
+    /// still-empty partitions. This mirrors the pre-#280
+    /// `initialize_waitpoint_hmac_secret` boot behaviour which cairn
+    /// was calling via raw HSET.
+    ///
+    /// Return shape: `Seeded { kid }` when at least one partition
+    /// installed; otherwise `AlreadySeeded { kid, same_secret }`
+    /// where `same_secret` is true iff every partition had both the
+    /// supplied kid as `current_kid` AND matching secret bytes.
+    async fn seed_waitpoint_hmac_secret(
+        &self,
+        args: SeedWaitpointHmacSecretArgs,
+    ) -> Result<SeedOutcome, EngineError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        if args.secret_hex.len() != 64 || !args.secret_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "secret_hex must be 64 hex characters (256-bit secret)".into(),
+            });
+        }
+        if args.kid.is_empty() {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "kid must be non-empty".into(),
+            });
+        }
+
+        enum PerPart {
+            Installed,
+            Match,
+            SameKidDifferentSecret,
+            DifferentKid(String),
+        }
+
+        let num = self.partition_config.num_flow_partitions;
+        let concurrency = self.admin_rotate_fanout_concurrency as usize;
+        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut next_index: u16 = 0;
+        let mut by_index: Vec<Option<Result<PerPart, EngineError>>> =
+            (0..num).map(|_| None).collect();
+
+        loop {
+            while pending.len() < concurrency && next_index < num {
+                let partition = Partition {
+                    family: PartitionFamily::Execution,
+                    index: next_index,
+                };
+                let key = IndexKeys::new(&partition).waitpoint_hmac_secrets();
+                let client = self.client.clone();
+                let kid = args.kid.clone();
+                let secret_hex = args.secret_hex.clone();
+                let i = next_index;
+                pending.push(async move {
+                    let res: Result<PerPart, EngineError> = async {
+                        let stored_kid: Option<String> = client
+                            .cmd("HGET")
+                            .arg(&key)
+                            .arg("current_kid")
+                            .execute()
+                            .await
+                            .map_err(|e| {
+                                ff_core::engine_error::backend_context(
+                                    transport_fk(e),
+                                    format!("HGET {key} current_kid (seed probe)"),
+                                )
+                            })?;
+                        if let Some(stored_kid) = stored_kid {
+                            if stored_kid != kid {
+                                return Ok(PerPart::DifferentKid(stored_kid));
+                            }
+                            let field = format!("secret:{stored_kid}");
+                            let stored_secret: Option<String> = client
+                                .hget(&key, &field)
+                                .await
+                                .map_err(|e| {
+                                    ff_core::engine_error::backend_context(
+                                        transport_fk(e),
+                                        format!("HGET {key} secret:<kid> (seed probe)"),
+                                    )
+                                })?;
+                            match stored_secret.as_deref() {
+                                Some(s) if s == secret_hex => Ok(PerPart::Match),
+                                Some(_) => Ok(PerPart::SameKidDifferentSecret),
+                                None => {
+                                    client
+                                        .hset(&key, &field, &secret_hex)
+                                        .await
+                                        .map_err(|e| {
+                                            ff_core::engine_error::backend_context(
+                                                transport_fk(e),
+                                                format!(
+                                                    "HSET {key} secret:<kid> (seed repair torn write)"
+                                                ),
+                                            )
+                                        })?;
+                                    Ok(PerPart::Installed)
+                                }
+                            }
+                        } else {
+                            let secret_field = format!("secret:{kid}");
+                            let _: i64 = client
+                                .cmd("HSET")
+                                .arg(&key)
+                                .arg("current_kid")
+                                .arg(&kid)
+                                .arg(&secret_field)
+                                .arg(&secret_hex)
+                                .execute()
+                                .await
+                                .map_err(|e| {
+                                    ff_core::engine_error::backend_context(
+                                        transport_fk(e),
+                                        format!("HSET {key} (seed install)"),
+                                    )
+                                })?;
+                            Ok(PerPart::Installed)
+                        }
+                    }
+                    .await;
+                    (i, res)
+                });
+                next_index += 1;
+            }
+            match pending.next().await {
+                Some((i, res)) => by_index[i as usize] = Some(res),
+                None => break,
+            }
+        }
+
+        let mut installed = 0usize;
+        let mut matched = 0usize;
+        let mut different_secret = 0usize;
+        let mut different_kid: Option<String> = None;
+        for slot in by_index.into_iter() {
+            let res = slot.expect("every partition probed exactly once");
+            match res? {
+                PerPart::Installed => installed += 1,
+                PerPart::Match => matched += 1,
+                PerPart::SameKidDifferentSecret => different_secret += 1,
+                PerPart::DifferentKid(k) => {
+                    different_kid.get_or_insert(k);
+                }
+            }
+        }
+
+        if let Some(stored) = different_kid {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!(
+                    "seed_waitpoint_hmac_secret: stored current_kid {stored:?} differs \
+                     from supplied kid {:?}; use rotate_waitpoint_hmac_secret_all to change kid",
+                    args.kid
+                ),
+            });
+        }
+        if installed > 0 {
+            Ok(SeedOutcome::Seeded { kid: args.kid })
+        } else {
+            let same_secret = different_secret == 0 && matched > 0;
+            Ok(SeedOutcome::AlreadySeeded {
+                kid: args.kid,
+                same_secret,
+            })
+        }
     }
 
     #[cfg(feature = "streaming")]

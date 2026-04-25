@@ -54,8 +54,8 @@ use crate::backend::{
 };
 use crate::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
-    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
-    SuspendOutcome,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
+    SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
 #[cfg(feature = "core")]
 use crate::contracts::{
@@ -576,6 +576,35 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
         Err(EngineError::Unavailable {
             op: "rotate_waitpoint_hmac_secret_all",
+        })
+    }
+
+    /// Seed the initial waitpoint HMAC secret for a fresh deployment
+    /// (issue #280).
+    ///
+    /// **Idempotent.** If a `current_kid` (Valkey per-partition) or
+    /// an active kid row (Postgres) already exists with the given
+    /// `kid`, the method returns
+    /// [`SeedOutcome::AlreadySeeded`] without overwriting, reporting
+    /// whether the stored secret matches the caller-supplied one via
+    /// `same_secret`. Callers (cairn boot, operator tooling) invoke
+    /// this on every boot and let the backend decide whether to
+    /// install — removing the client-side "check then HSET" race that
+    /// cairn's raw-HSET boot path silently tolerated.
+    ///
+    /// For rotation of an already-seeded secret, use
+    /// [`Self::rotate_waitpoint_hmac_secret_all`] instead; seed is
+    /// install-only.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] with
+    /// `op = "seed_waitpoint_hmac_secret"` so backends that haven't
+    /// implemented the method surface the miss loudly.
+    async fn seed_waitpoint_hmac_secret(
+        &self,
+        _args: SeedWaitpointHmacSecretArgs,
+    ) -> Result<SeedOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "seed_waitpoint_hmac_secret",
         })
     }
 
