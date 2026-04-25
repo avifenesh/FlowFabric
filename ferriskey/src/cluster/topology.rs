@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -35,8 +35,13 @@ pub(crate) type TopologyHash = u64;
 pub(crate) struct SlotRefreshState {
     /// Indicates if a slot refresh is currently in progress
     pub(crate) in_progress: AtomicBool,
-    /// The last slot refresh run timestamp
-    pub(crate) last_run: Arc<RwLock<Option<SystemTime>>>,
+    /// The last slot refresh run timestamp.
+    ///
+    /// Uses `Instant` (monotonic clock) rather than `SystemTime` because this
+    /// value is only compared against itself to measure elapsed time for the
+    /// refresh throttle. `Instant` never jumps backward and is immune to NTP
+    /// steps, VM suspend/restore, and wall-clock drift.
+    pub(crate) last_run: Arc<RwLock<Option<Instant>>>,
     pub(crate) rate_limiter: SlotsRefreshRateLimit,
 }
 
