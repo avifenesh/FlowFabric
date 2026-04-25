@@ -70,6 +70,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`ff-backend-postgres` `suspend_signal` keystore race.** Tests
+  used to TRUNCATE the global `ff_waitpoint_hmac` table in per-test
+  setup; under parallel execution test A's TRUNCATE wiped the kids
+  test B had just seeded. Tests now route the keystore through a
+  per-test Postgres schema (`ffpg_test_<uuid>`) via pool
+  `search_path`, so rotate / seed tests don't race. Keystore-only
+  tests parallelize cleanly; matrix-CI Postgres cell keeps
+  `--test-threads=1` for suspend/deliver SERIALIZABLE budget
+  reasons unrelated to the keystore. Closes #301.
 - **ferriskey slot-refresh throttle** uses `Instant::now()` instead of
   `SystemTime::now()` for elapsed-time measurement. `Instant` is
   monotonic; immune to NTP steps, VM suspend/restore, and variable
