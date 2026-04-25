@@ -75,6 +75,8 @@ pub mod flow;
 #[cfg(feature = "core")]
 pub mod flow_staging;
 pub mod handle_codec;
+mod lease_event;
+mod lease_event_subscribe;
 pub mod listener;
 pub mod migrate;
 pub mod pool;
@@ -1050,6 +1052,27 @@ impl EngineBackend for PostgresBackend {
         }
 
         Ok(Box::pin(Adapter { inner }))
+    }
+
+    // ── RFC-019 Stage B — `subscribe_lease_history` ──────────────
+    //
+    // Real Postgres impl. Tails the `ff_lease_event` outbox (written
+    // by producer sites in `attempt.rs`, `flow.rs`, `suspend_ops.rs`,
+    // and the `attempt_timeout` / `lease_expiry` reconcilers) via
+    // `LISTEN ff_lease_event` + catch-up SELECT. Cursor encoding
+    // matches `subscribe_completion`: `0x02 ++ event_id(BE8)`.
+    //
+    // Partition scope: hardcoded to partition 0 — mirrors the Valkey
+    // Stage A impl, which tails partition 0's aggregate stream key.
+    // Cross-partition consumers instantiate one backend per
+    // partition + merge streams consumer-side (RFC-019 §Backend
+    // Semantics).
+    #[tracing::instrument(name = "pg.subscribe_lease_history", skip_all)]
+    async fn subscribe_lease_history(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+        lease_event_subscribe::subscribe(&self.pool, 0, cursor).await
     }
 }
 

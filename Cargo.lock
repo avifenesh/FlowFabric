@@ -998,6 +998,7 @@ dependencies = [
  "bytes",
  "ff-core",
  "ff-observability",
+ "futures",
  "futures-core",
  "hex",
  "hmac",
