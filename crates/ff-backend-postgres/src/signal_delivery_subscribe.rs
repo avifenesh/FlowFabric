@@ -15,11 +15,11 @@
 use std::time::Duration;
 
 use ff_core::engine_error::EngineError;
+use ff_core::stream_events::{SignalDeliveryEffect, SignalDeliveryEvent, SignalDeliverySubscription};
 use ff_core::stream_subscribe::{
-    decode_postgres_event_cursor, encode_postgres_event_cursor, StreamCursor, StreamEvent,
-    StreamFamily, StreamSubscription,
+    decode_postgres_event_cursor, encode_postgres_event_cursor, StreamCursor,
 };
-use ff_core::types::{ExecutionId, TimestampMs};
+use ff_core::types::{ExecutionId, SignalId, TimestampMs, WaitpointId};
 use futures_core::Stream;
 use sqlx::postgres::{PgListener, PgPool};
 use sqlx::Row;
@@ -56,7 +56,7 @@ pub(crate) async fn subscribe(
     pool: &PgPool,
     partition_key: i16,
     cursor: StreamCursor,
-) -> Result<StreamSubscription, EngineError> {
+) -> Result<SignalDeliverySubscription, EngineError> {
     let start = decode_postgres_event_cursor(&cursor).map_err(|msg| {
         EngineError::Validation {
             kind: ff_core::engine_error::ValidationKind::InvalidInput,
@@ -77,7 +77,7 @@ pub(crate) async fn subscribe(
         })?,
     };
 
-    let (tx, rx) = mpsc::channel::<Result<StreamEvent, EngineError>>(STREAM_CAPACITY);
+    let (tx, rx) = mpsc::channel::<Result<SignalDeliveryEvent, EngineError>>(STREAM_CAPACITY);
     let pool_clone = pool.clone();
     tokio::spawn(subscriber_loop(pool_clone, partition_key, tx, last_seen));
 
@@ -85,11 +85,11 @@ pub(crate) async fn subscribe(
 }
 
 struct Adapter {
-    rx: mpsc::Receiver<Result<StreamEvent, EngineError>>,
+    rx: mpsc::Receiver<Result<SignalDeliveryEvent, EngineError>>,
 }
 
 impl Stream for Adapter {
-    type Item = Result<StreamEvent, EngineError>;
+    type Item = Result<SignalDeliveryEvent, EngineError>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -102,7 +102,7 @@ impl Stream for Adapter {
 async fn subscriber_loop(
     pool: PgPool,
     partition_key: i16,
-    tx: mpsc::Sender<Result<StreamEvent, EngineError>>,
+    tx: mpsc::Sender<Result<SignalDeliveryEvent, EngineError>>,
     mut last_seen: i64,
 ) {
     loop {
@@ -168,7 +168,7 @@ async fn subscriber_loop(
 }
 
 async fn wait_or_exit(
-    tx: &mpsc::Sender<Result<StreamEvent, EngineError>>,
+    tx: &mpsc::Sender<Result<SignalDeliveryEvent, EngineError>>,
     d: Duration,
 ) -> bool {
     tokio::select! {
@@ -180,7 +180,7 @@ async fn wait_or_exit(
 async fn replay(
     pool: &PgPool,
     partition_key: i16,
-    tx: &mpsc::Sender<Result<StreamEvent, EngineError>>,
+    tx: &mpsc::Sender<Result<SignalDeliveryEvent, EngineError>>,
     last_seen: &mut i64,
 ) -> bool {
     loop {
@@ -243,38 +243,56 @@ async fn replay(
             };
             *last_seen = decoded.event_id;
 
-            let payload = serde_json::json!({
-                "execution_id": decoded.execution_id,
-                "signal_id": decoded.signal_id,
-                "waitpoint_id": decoded.waitpoint_id,
-                "source_identity": decoded.source_identity,
-                "delivered_at_ms": decoded.delivered_at_ms,
-                "partition_key": decoded.partition_key,
-            });
-            let payload_bytes = match serde_json::to_vec(&payload) {
-                Ok(b) => bytes::Bytes::from(b),
-                Err(e) => {
+            let cursor = encode_postgres_event_cursor(decoded.event_id);
+
+            let execution_id = match Uuid::parse_str(&decoded.execution_id)
+                .ok()
+                .and_then(|uuid| {
+                    ExecutionId::parse(&format!(
+                        "{{fp:{}}}:{}",
+                        decoded.partition_key, uuid
+                    ))
+                    .ok()
+                }) {
+                Some(eid) => eid,
+                None => {
                     tracing::warn!(
-                        error = %e,
-                        "pg.signal_delivery.replay: payload serialize failed"
+                        execution_id = %decoded.execution_id,
+                        event_id = decoded.event_id,
+                        "pg.signal_delivery.replay: skipping row with unparseable execution_id"
                     );
                     continue;
                 }
             };
 
-            let cursor = encode_postgres_event_cursor(decoded.event_id);
-            let mut event = StreamEvent::new(
-                StreamFamily::SignalDelivery,
-                cursor,
-                TimestampMs::from_millis(decoded.delivered_at_ms),
-                payload_bytes,
-            );
-            if let Ok(uuid) = Uuid::parse_str(&decoded.execution_id) {
-                let full = format!("{{fp:{}}}:{}", decoded.partition_key, uuid);
-                if let Ok(eid) = ExecutionId::parse(&full) {
-                    event = event.with_execution_id(eid);
+            let signal_id = match SignalId::parse(&decoded.signal_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        event_id = decoded.event_id,
+                        "pg.signal_delivery.replay: skipping row with bad signal_id"
+                    );
+                    continue;
                 }
-            }
+            };
+            let waitpoint_id = decoded
+                .waitpoint_id
+                .as_deref()
+                .and_then(|s| WaitpointId::parse(s).ok());
+
+            // PG outbox does not yet persist the delivery effect or a
+            // dedup flag; treat every delivered row as `Satisfied`.
+            // When the outbox gains an `effect` column, map here.
+            let event = SignalDeliveryEvent::new(
+                cursor,
+                execution_id,
+                signal_id,
+                waitpoint_id,
+                decoded.source_identity,
+                SignalDeliveryEffect::Satisfied,
+                TimestampMs::from_millis(decoded.delivered_at_ms),
+            );
             if tx.send(Ok(event)).await.is_err() {
                 return false;
             }

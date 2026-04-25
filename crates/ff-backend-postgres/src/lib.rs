@@ -998,30 +998,26 @@ impl EngineBackend for PostgresBackend {
     async fn subscribe_completion(
         &self,
         _cursor: ff_core::stream_subscribe::StreamCursor,
-    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
-        use ff_core::stream_subscribe::{
-            encode_postgres_event_cursor, StreamEvent, StreamFamily,
-        };
+    ) -> Result<ff_core::stream_events::CompletionSubscription, EngineError> {
+        use ff_core::stream_events::{CompletionEvent, CompletionOutcome};
+        use ff_core::stream_subscribe::encode_postgres_event_cursor;
         use futures_core::Stream;
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
         // Delegate to the existing CompletionBackend implementation so
-        // the LISTEN/replay machinery is shared. Stage A ignores the
-        // caller's cursor (tails from tail) and surfaces that via the
-        // RFC-019 method doc; Stage B lands resume-from-cursor.
+        // the LISTEN/replay machinery is shared. The adapter emits
+        // typed `CompletionEvent`s; resume-from-cursor is still
+        // unwired (Stage A surface tails from tail).
         let inner = ff_core::completion_backend::CompletionBackend::subscribe_completions(self)
             .await?;
 
-        // Adapter: `CompletionStream` yields `CompletionPayload` (not
-        // Result); RFC-019 requires `Result<StreamEvent, EngineError>`.
-        // Wrap into an infallible stream mapping each payload.
         struct Adapter {
             inner: ff_core::completion_backend::CompletionStream,
         }
 
         impl Stream for Adapter {
-            type Item = Result<StreamEvent, EngineError>;
+            type Item = Result<CompletionEvent, EngineError>;
             fn poll_next(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -1030,23 +1026,17 @@ impl EngineBackend for PostgresBackend {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Ready(Some(payload)) => {
-                        // Stage A: the cursor is a placeholder
-                        // (0-event_id) because the current
-                        // `CompletionPayload` shape does not surface
-                        // `event_id` — Stage B widens
-                        // `CompletionPayload` + plumbs
-                        // replay-from-cursor through the adapter.
-                        // The family prefix stays stable so Stage B
-                        // persistence is forward-compatible for
-                        // consumers that tail from the empty cursor.
+                        // Placeholder cursor (0-event_id) because
+                        // `CompletionPayload` does not surface
+                        // `event_id` today. Family prefix stays stable
+                        // so persistence is forward-compatible.
                         let cursor = encode_postgres_event_cursor(0);
-                        let event = StreamEvent::new(
-                            StreamFamily::Completion,
+                        let event = CompletionEvent::new(
                             cursor,
+                            payload.execution_id.clone(),
+                            CompletionOutcome::from_wire(&payload.outcome),
                             payload.produced_at_ms,
-                            bytes::Bytes::from(payload.outcome.clone().into_bytes()),
-                        )
-                        .with_execution_id(payload.execution_id.clone());
+                        );
                         Poll::Ready(Some(Ok(event)))
                     }
                 }
@@ -1073,7 +1063,7 @@ impl EngineBackend for PostgresBackend {
     async fn subscribe_lease_history(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
-    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
         lease_event_subscribe::subscribe(&self.pool, 0, cursor).await
     }
 
@@ -1090,7 +1080,7 @@ impl EngineBackend for PostgresBackend {
     async fn subscribe_signal_delivery(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
-    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
         signal_delivery_subscribe::subscribe(&self.pool, 0, cursor).await
     }
 }
