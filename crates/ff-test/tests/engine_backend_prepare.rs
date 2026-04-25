@@ -32,14 +32,32 @@ async fn valkey_prepare_returns_applied() {
     let backend: Arc<dyn EngineBackend> =
         ValkeyBackend::from_client_and_partitions(tc.client().clone(), test_config());
 
-    let outcome = backend.prepare().await.expect("prepare should succeed");
-    match outcome {
-        PrepareOutcome::Applied { description } => {
-            assert!(
-                description.starts_with("FUNCTION LOAD (flowfabric lib v"),
-                "unexpected description: {description:?}"
-            );
+    // Outer retry loop: `ensure_library` already retries transient
+    // transport faults 3× internally, but on slow CI cluster runners
+    // the whole budget can exhaust between when a newly-loaded library
+    // propagates across primaries. Consumers (cairn) call `prepare`
+    // inside their own boot retry loop; this test mirrors that shape.
+    const OUTER_ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for _ in 0..OUTER_ATTEMPTS {
+        match backend.prepare().await {
+            Ok(outcome) => {
+                match outcome {
+                    PrepareOutcome::Applied { description } => {
+                        assert!(
+                            description.starts_with("FUNCTION LOAD (flowfabric lib v"),
+                            "unexpected description: {description:?}"
+                        );
+                    }
+                    other => panic!("Valkey prepare must return Applied, got {other:?}"),
+                }
+                return;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         }
-        other => panic!("Valkey prepare must return Applied, got {other:?}"),
     }
+    panic!("prepare failed after {OUTER_ATTEMPTS} attempts: {last_err:?}");
 }
