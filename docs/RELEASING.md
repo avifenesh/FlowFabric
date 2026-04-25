@@ -6,7 +6,7 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Eleven crates, all pinned to the same version, published in topological order:
+Twelve crates, all pinned to the same version, published in topological order:
 
 1. `ferriskey`       — Valkey client (reparented fork of glide-core;
    the former `telemetrylib` sub-crate was inlined during the Tier 1
@@ -47,6 +47,13 @@ Eleven crates, all pinned to the same version, published in topological order:
     off by default; production deployments use the scheduler-routed
     HTTP path via `FlowFabricWorker::claim_via_server`
 11. `ff-server`      — HTTP server library + binary
+12. `flowfabric`     — umbrella re-export of the ff-* family
+    (issue #279). Depends on every other publishable crate; MUST
+    publish LAST. Lets consumers pin one crate + feature-flag the
+    backend (`flowfabric = { version = "0.8", features = ["valkey"] }`
+    or `features = ["postgres"]`) instead of tracking 7–8 separate
+    pins in lockstep. Default-features=["valkey"] preserves v0.7–
+    v0.8 stability posture.
 
 Excluded from publish:
 

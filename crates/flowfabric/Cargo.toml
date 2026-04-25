@@ -1,0 +1,77 @@
+[package]
+name = "flowfabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "FlowFabric — Valkey/Postgres-native execution engine. Umbrella crate re-exporting the published FlowFabric family."
+
+# Closes #279 — cairn (and future consumers) can pin a single crate
+# instead of the 7–8 ff-* crates and have Cargo resolve a
+# version-coherent set. See `docs/CONSUMER_MIGRATION_v0.8.md` §
+# "Umbrella crate (flowfabric)" for the before/after.
+
+[features]
+# Valkey backend is the default (matches v0.7–v0.8 stability posture).
+# `valkey` activates ff-sdk's `valkey-default` so the worker/task/admin
+# surface and the ferriskey transport re-export stay available. The
+# `postgres` feature does NOT activate valkey-default, matching the
+# `--no-default-features` agnosticism contract proven by RFC-012.
+default = ["valkey"]
+
+valkey = [
+    "dep:ff-backend-valkey",
+    "dep:ff-script",
+    "ff-sdk/valkey-default",
+    "ff-script/valkey-client",
+]
+
+postgres = [
+    "dep:ff-backend-postgres",
+]
+
+# Advanced consumers may want direct scheduler / engine access but most
+# don't. Gate via feature flags so the default umbrella stays minimal.
+engine = ["dep:ff-engine"]
+scheduler-internals = ["dep:ff-scheduler"]
+script-internals = ["dep:ff-script"]
+
+# Re-export of ferriskey's `iam` flag for consumers that pin the
+# umbrella but still need the AWS IAM auth path (parity with
+# `ff-sdk/iam`). Off by default — the ~40-crate AWS dep graph does not
+# land in umbrella builds that don't need it.
+iam = ["ff-sdk/iam"]
+
+[dependencies]
+ff-core = { workspace = true }
+# Direct path-dep (not `workspace = true`) because we need
+# `default-features = false` — Cargo forbids overriding a workspace
+# dep's default-features at the consumer site. Pinning version +
+# path here matches the workspace.dependencies entry; `cargo release`
+# keeps both in lockstep via `shared-version = true`.
+ff-sdk = { version = "0.8.1", path = "../ff-sdk", default-features = false }
+
+ff-backend-valkey = { workspace = true, optional = true }
+ff-backend-postgres = { workspace = true, optional = true }
+ff-engine = { workspace = true, optional = true }
+ff-scheduler = { workspace = true, optional = true }
+# Optional because activating `valkey` also needs `ff-script/valkey-client`
+# (see #171 — the ferriskey transitive edge is ff-script-owned). The
+# `script-internals` feature exposes the crate as `flowfabric::script`.
+ff-script = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+# Build rustdoc with every consumer-visible feature so the re-export
+# shape is discoverable on docs.rs — umbrella is the canonical
+# entry point, its docs page must show the full surface.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.release]
+# Umbrella participates in the workspace-wide `cargo release` bump
+# (shared-version = true in release.toml). Publish is driven by the
+# tag-triggered workflow, not cargo-release itself.

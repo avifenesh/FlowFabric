@@ -210,3 +210,102 @@ the reference for what a "complete" impl looks like.
 7. Re-run your integration smoke. File issues against
    [`rfcs/RFC-017-ff-server-backend-abstraction.md`](../rfcs/RFC-017-ff-server-backend-abstraction.md)
    for any migration-guide gap you hit.
+
+## 8. Umbrella crate (`flowfabric`)
+
+Added in v0.8.2 per issue [#279](https://github.com/avifenesh/FlowFabric/issues/279).
+Consumers who were pinning the 7-crate ff-* family in lockstep can
+switch to a single `flowfabric` pin and let Cargo resolve a coherent
+set.
+
+### Before
+
+```toml
+[dependencies]
+ff-core             = "0.8"
+ff-sdk              = "0.8"
+ff-engine           = "0.8"
+ff-scheduler        = "0.8"
+ff-script           = "0.8"
+ff-backend-valkey   = "0.8"   # or ff-backend-postgres
+ferriskey           = "0.8"   # direct dep for raw client types
+```
+
+```rust
+use ff_core::types::FlowId;
+use ff_core::contracts::ClaimGrant;
+use ff_sdk::{FlowFabricWorker, WorkerConfig};
+use ff_scheduler::Scheduler;
+```
+
+### After (Valkey, default)
+
+```toml
+[dependencies]
+flowfabric = "0.8"    # pulls ff-core + ff-sdk + ff-backend-valkey + ff-script
+```
+
+```rust
+use flowfabric::core::types::FlowId;
+use flowfabric::core::contracts::ClaimGrant;
+use flowfabric::sdk::{FlowFabricWorker, WorkerConfig};
+// or the prelude glob:
+use flowfabric::prelude::*;  // re-exports ff_sdk::* (contracts + backend types)
+```
+
+### After (Postgres backend)
+
+```toml
+[dependencies]
+flowfabric = { version = "0.8", default-features = false, features = ["postgres"] }
+```
+
+Dropping `default-features` turns off the Valkey backend — `ferriskey`
+and `ff-backend-valkey` no longer appear in the transitive graph, and
+`flowfabric::postgres` becomes the only backend re-export.
+
+### Opting into scheduler / engine / script internals
+
+Most consumers never touch these directly. If you do (benchmark
+harness, custom scanner, alternative worker runtime), opt in per-
+crate:
+
+```toml
+flowfabric = {
+    version = "0.8",
+    features = ["valkey", "engine", "scheduler-internals", "script-internals"],
+}
+```
+
+Reach through the qualified paths: `flowfabric::engine::…`,
+`flowfabric::scheduler::…`, `flowfabric::script::…`. These are NOT
+flattened into `prelude` — they're rare enough that explicit paths
+keep import sites self-documenting.
+
+### Feature matrix
+
+| Feature | Default? | Pulls in |
+|---|---|---|
+| `valkey`              | yes | `ff-backend-valkey`, `ff-script/valkey-client`, `ff-sdk/valkey-default` |
+| `postgres`            | no  | `ff-backend-postgres` |
+| `engine`              | no  | `ff-engine` |
+| `scheduler-internals` | no  | `ff-scheduler` |
+| `script-internals`    | no  | `ff-script` (pure Lua-loader, no ferriskey edge) |
+| `iam`                 | no  | propagates `ff-sdk/iam` → `ferriskey/iam` (AWS IAM auth) |
+
+`ff-server` and `ferriskey` are intentionally NOT re-exported by the
+umbrella — `ff-server` is a binary/HTTP-server concern (library-mode
+consumers almost never need it), and direct `ferriskey` consumption
+against FF's public contract is a smell the RFC process prefers to
+resolve by expanding `EngineBackend` rather than re-exposing raw
+client types. Consumers with a demonstrated need can still pin
+`ff-server` or `ferriskey` directly alongside `flowfabric`.
+
+### Version coherence
+
+`flowfabric`'s `Cargo.toml` pins each ff-* sub-crate at the same
+workspace version (via `[workspace.package] version`), so
+`cargo update -p flowfabric` moves them together. This closes the
+class of version-skew bug that hit v0.3.0 and v0.8.0 partial-publishes
+at the consumer side.
+
