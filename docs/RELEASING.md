@@ -120,6 +120,51 @@ Before tagging `v0.7.0` (and every release thereafter):
    post-publish pass is a *publication-sanity check only* — it is
    not the correctness gate (the pre-publish smoke is).
 
+## Published-artifact smoke (v0.9+)
+
+**Additional release gate, compile-time.** `scripts/smoke-v0.7.sh`
+validates correctness against the *in-tree* workspace. It does not
+exercise the crates.io publish path or the external-consumer view
+of the API. Past releases (v0.3.2 non-exhaustive-without-constructor,
+v0.6.0 read_summary) shipped bugs that only appeared when a scratch
+consumer built against the published artifacts
+(`feedback_smoke_after_publish.md`).
+
+For each release cut from v0.9.0 onward, `scripts/published-smoke.sh`
+runs a scratch consumer against the published crates.io artifacts and
+confirms:
+
+- The umbrella `flowfabric` crate + `ff-sdk` + `ff-core` +
+  `ff-backend-valkey` + `ff-backend-postgres` all resolve at the
+  target version from crates.io.
+- The default-feature (Valkey) build compiles.
+- The `--no-default-features --features=postgres` build compiles.
+- Consumer-facing v0.9 symbols are reachable by name:
+  `flowfabric::sdk::ClaimGrant`,
+  `flowfabric::core::backend::PrepareOutcome`,
+  `flowfabric::core::contracts::SeedWaitpointHmacSecretArgs`,
+  `flowfabric::core::contracts::LeaseSummary` fields (`.lease_id`,
+  `.attempt_index`, `.last_heartbeat_at`), and the default feature
+  `valkey` pulling `ff-backend-valkey`.
+
+Usage:
+
+```bash
+scripts/published-smoke.sh 0.9.0
+```
+
+Exit codes: `0` all clean; `1` build or symbol resolution failed;
+`2` script invocation problem.
+
+**Intended release.yml wiring (follow-up PR):** add a new
+`published_smoke` job to `.github/workflows/release.yml` that
+`needs: publish` and runs `scripts/published-smoke.sh ${{ env.TAG_VERSION }}`.
+The GitHub Release job (`release`) then moves to
+`needs: [publish, published_smoke]` so a failed published-artifact
+smoke blocks the release-notes-cut step (the publish itself cannot
+be rolled back beyond `cargo yank`). This enforces CLAUDE.md §5
+item 8 for the external-consumer dimension.
+
 Scenarios covered (see `benches/smoke/README.md` for details):
 
 - `claim_lifecycle` — create → claim → progress → complete
