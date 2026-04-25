@@ -6359,6 +6359,18 @@ impl EngineBackend for ValkeyBackend {
         subscribe_lease_history_impl(&self.client, cursor).await
     }
 
+    // ── RFC-019 Stage B — `subscribe_signal_delivery` (#310) ───────
+    //
+    // Mirror of `subscribe_lease_history` against the partition-level
+    // aggregate `ff:part:{fp:N}:signal_delivery` stream. The producer
+    // XADD lives in `lua/signal.lua::ff_deliver_signal` at new KEYS[15].
+    async fn subscribe_signal_delivery(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+        subscribe_signal_delivery_impl(&self.client, cursor).await
+    }
+
     // ── RFC-019 Stage B — `subscribe_completion` (issue #309) ─────
     //
     // Pubsub-backed wrap over the existing
@@ -6457,6 +6469,116 @@ impl EngineBackend for ValkeyBackend {
 /// the per-execution state it mirrors.
 pub fn partition_lease_history_key(partition: &Partition) -> String {
     format!("ff:part:{}:lease_history", partition.hash_tag())
+}
+
+/// Aggregate partition-level signal-delivery stream key. RFC-019
+/// Stage B (#310). Format: `ff:part:{fp:N}:signal_delivery`. Producer
+/// XADD lives in `lua/signal.lua::ff_deliver_signal` at KEYS[15].
+pub fn partition_signal_delivery_key(partition: &Partition) -> String {
+    format!("ff:part:{}:signal_delivery", partition.hash_tag())
+}
+
+/// Valkey-side `subscribe_signal_delivery` — mirror of
+/// `subscribe_lease_history_impl`, swapped to the signal-delivery
+/// stream key + `StreamFamily::SignalDelivery`.
+async fn subscribe_signal_delivery_impl(
+    client: &ferriskey::Client,
+    start_cursor: ff_core::stream_subscribe::StreamCursor,
+) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+    use ff_core::stream_subscribe::{
+        decode_valkey_cursor, encode_valkey_cursor, StreamEvent, StreamFamily,
+    };
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let start = decode_valkey_cursor(&start_cursor)
+        .map_err(|msg| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: msg.to_string(),
+        })?;
+
+    let tail_client = client
+        .duplicate_connection()
+        .await
+        .map_err(ff_script::error::ScriptError::from)
+        .map_err(transport_script)?;
+
+    let partition = Partition {
+        family: PartitionFamily::Flow,
+        index: 0,
+    };
+    let stream_key = partition_signal_delivery_key(&partition);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<StreamEvent, EngineError>,
+    >(64);
+
+    tokio::spawn(async move {
+        let mut last_cursor = start_cursor.clone();
+        let mut last_id = match start {
+            None => "$".to_string(),
+            Some((ms, seq)) => format!("{ms}-{seq}"),
+        };
+
+        loop {
+            let raw = tail_client
+                .cmd("XREAD")
+                .arg("COUNT")
+                .arg(128_u64)
+                .arg("BLOCK")
+                .arg(5_000_u64)
+                .arg("STREAMS")
+                .arg(stream_key.as_str())
+                .arg(last_id.as_str())
+                .execute::<ferriskey::Value>()
+                .await;
+
+            let value = match raw {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "subscribe_signal_delivery: XREAD BLOCK error, terminating stream"
+                    );
+                    let _ = tx
+                        .send(Err(EngineError::StreamDisconnected {
+                            cursor: last_cursor.clone(),
+                        }))
+                        .await;
+                    return;
+                }
+            };
+
+            let entries = match parse_lease_history_xread(&value, &stream_key) {
+                Ok(e) => e,
+                Err(detail) => {
+                    let _ = tx
+                        .send(Err(EngineError::Validation {
+                            kind: ValidationKind::Corruption,
+                            detail,
+                        }))
+                        .await;
+                    continue;
+                }
+            };
+
+            for (id_ms, id_seq, payload) in entries {
+                let cursor = encode_valkey_cursor(id_ms, id_seq);
+                last_cursor = cursor.clone();
+                last_id = format!("{id_ms}-{id_seq}");
+                let event = StreamEvent::new(
+                    StreamFamily::SignalDelivery,
+                    cursor,
+                    TimestampMs::from_millis(id_ms as i64),
+                    payload,
+                );
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(Box::pin(ReceiverStream::new(rx)))
 }
 
 /// Background loop that pumps `XREAD BLOCK` entries into an mpsc for

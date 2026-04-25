@@ -280,6 +280,7 @@ async fn try_deliver_signal(
         idx.lane_delayed(&lane_id),
         idx.suspension_timeout(),
         idx.waitpoint_hmac_secrets(),
+        idx.partition_signal_delivery(), // 15 (RFC-019 Stage B / #310)
     ];
     let args: Vec<String> = vec![
         signal_id_str.clone(),

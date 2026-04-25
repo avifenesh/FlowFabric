@@ -7,6 +7,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `subscribe_signal_delivery` implemented on both backends
+  (RFC-019 Stage B; closes #310). Valkey: XREAD BLOCK on partition
+  aggregate stream `ff:part:{fp:N}:signal_delivery` (producer XADD
+  added to `ff_deliver_signal` at new KEYS[15] slot). Postgres:
+  `ff_signal_event` outbox + `NOTIFY ff_signal_event` trigger
+  (migration 0007); producer INSERT lives in the `deliver_signal`
+  SERIALIZABLE transaction.
 - `ValkeyBackend::subscribe_completion` (RFC-019 Stage B; closes #309).
   Pubsub-backed (at-most-once over live subscription window), cursor
   always empty. Durable Postgres impl was Stage A; durable Valkey
