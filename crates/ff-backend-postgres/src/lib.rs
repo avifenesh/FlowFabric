@@ -128,10 +128,13 @@ pub use ff_core::backend::PostgresConnection;
 /// scope. See `docs/POSTGRES_PARITY_MATRIX.md` for the authoritative
 /// per-row status.
 ///
-/// `prepare` is `false` on Postgres because `prepare()` returns
-/// `NoOp` (schema migrations are applied out-of-band); the bool says
-/// "backend honours prepare with non-trivial work," and the Postgres
-/// impl has nothing to do.
+/// `prepare` is `true` on Postgres even though `prepare()` returns
+/// `PrepareOutcome::NoOp` (schema migrations are applied out-of-band).
+/// `Supports.prepare` means "can the consumer call `backend.prepare()`
+/// without getting `EngineError::Unavailable`?" — for Postgres the
+/// answer is yes; NoOp is a successful well-defined outcome. Gating
+/// the call off in consumer UIs based on a `false` bool would hide
+/// a callable + correct method.
 ///
 /// `Supports` is `#[non_exhaustive]` so struct-literal construction
 /// from this crate is forbidden; we start from
@@ -160,10 +163,12 @@ fn postgres_supports_base() -> ff_core::capability::Supports {
     s.stream_durable_summary = true;
     s.stream_best_effort_live = true;
 
+    // ── Boot (Postgres returns NoOp but call is callable + correct) ──
+    s.prepare = true;
+
     // Everything else — operator control, execution reads, budget
     // admin, quota admin, list_pending_waitpoints, cancel_flow_header,
-    // ack_cancel_member, prepare — defaults to `false`. Wave 9
-    // follow-up scope.
+    // ack_cancel_member — defaults to `false`. Wave 9 follow-up scope.
 
     s
 }
