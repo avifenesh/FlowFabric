@@ -3,7 +3,15 @@
 All notable changes to FlowFabric are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.9.0] - 2026-04-25
+
+v0.9 is **fully additive** on top of v0.8: no consumer source changes
+are required. The release lets consumers *delete* adapter code — one
+umbrella-crate pin instead of seven ff-* pins, trait-level HMAC-secret
+seeding instead of raw HSET, trait-level boot prep instead of
+`BackendKind::Valkey` branches. Closes every consumer-filed issue
+since v0.8 except the RFC-019 Stage B follow-ups (#308–#311,
+intentional scope).
 
 ### Added
 
@@ -75,6 +83,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (FUNCTION LOAD + retry), Postgres returns `NoOp` (migrations run
   out-of-band). Idempotent; safe on every boot. Lets consumers drop
   backend-aware `if let BackendKind::Valkey = ...` boot branches.
+- **`examples/token-budget`** — v0.9 UC-37 + UC-39 demo exercising
+  flow-level token budget + per-attempt `report_usage`, including
+  hard-breach → `cancel_flow`. ~200 lines; consumer-facing docs for
+  the v0.9 surface (LeaseSummary fields, prepare, seed_waitpoint,
+  umbrella-crate imports).
+- **`scripts/published-smoke.sh`** — published-artifact smoke harness
+  that scratch-compiles a consumer project against the just-published
+  crate versions. Release-gate blocker per CLAUDE.md §5 (caught
+  v0.3.2 → v0.6 external-consumer breakage). Runs against the
+  flowfabric umbrella crate's v0.9 symbol set.
+- **`docs/MIGRATIONS.md`** — rolling 3-minor-window migration page
+  (v0.7 / v0.8 / v0.9). Replaces per-release `CONSUMER_MIGRATION_*.md`
+  files; release gate validates it on every tag.
+- **`CLAUDE.md` §5 Release Gate** — codified the 8-item pre-tag gate
+  (smoke, example builds, live-run, headline example, README sweep,
+  CHANGELOG finalize, POSTGRES_PARITY_MATRIX current, pre-publish
+  smoke in release.yml). Reinforces the lessons from v0.3/v0.6/v0.8
+  partial-publish recoveries.
 
 ### Changed
 
@@ -82,6 +108,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docs/MIGRATIONS.md` covering the last 3 minor versions
   (v0.7/v0.8/v0.9). Release gate (CLAUDE.md §5 item 5) validates
   it on every tag.
+
+### CI
+
+- **Matrix-CI Postgres cell** — ubuntu-latest × postgres 16 × standalone
+  matrix cell added (#299). Gates Postgres backend parity on every PR
+  alongside the existing Valkey standalone + cluster cells. Runs
+  `ff-backend-postgres` suite with `--test-threads=1` for SERIALIZABLE
+  budget reasons.
 
 ### Fixed
 

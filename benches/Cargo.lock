@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -690,9 +690,10 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-postgres"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "ff-core",
  "ff-observability",
  "futures-core",
@@ -709,9 +710,10 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "ferriskey",
  "ff-core",
  "ff-observability",
@@ -722,6 +724,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -750,20 +753,23 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "crc16",
  "futures-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
  "uuid",
 ]
 
 [[package]]
 name = "ff-engine"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",
@@ -779,11 +785,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.8.1"
+version = "0.9.0"
 
 [[package]]
 name = "ff-scheduler"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -795,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -807,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
@@ -823,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "ff-server"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "ferriskey",
@@ -865,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "ff-test"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",
@@ -2932,6 +2938,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
