@@ -132,6 +132,14 @@ pub use ff_core::contracts::{
     SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, SuspensionReasonCode,
     SuspensionRequester, TimeoutBehavior, WaitpointBinding,
 };
+// #283 — Claim-flow wire types. Consumers typing `claim_from_grant` /
+// `claim_from_reclaim_grant` signatures (or wrapping
+// `EngineBackend::claim_for_worker`) can name these as
+// `ff_sdk::ClaimGrant` etc. without pinning `ff-scheduler` directly.
+// `Scheduler` itself is intentionally not re-exported: implementing a
+// scheduler is specialised and stays behind the `ff-scheduler` dep.
+pub use ff_core::backend::{ClaimPolicy, ReclaimToken};
+pub use ff_core::contracts::{ClaimGrant, ReclaimGrant};
 #[cfg(feature = "valkey-default")]
 pub use worker::FlowFabricWorker;
 
