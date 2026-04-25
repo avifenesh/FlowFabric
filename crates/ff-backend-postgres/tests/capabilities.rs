@@ -4,8 +4,9 @@
 //! the v0.9 `Supports` shape: ingress + flow bulk cancel + seed/rotate
 //! HMAC + scheduler + RFC-019 subscriptions + streaming are `true`;
 //! operator control + execution reads + budget / quota admin +
-//! list_pending_waitpoints + cancel_flow_header + ack_cancel_member +
-//! prepare remain `false` pending Wave 9.
+//! list_pending_waitpoints + cancel_flow_header + ack_cancel_member
+//! remain `false` pending Wave 9. `prepare` is `true` (NoOp is a
+//! callable + correct outcome).
 //!
 //! Pool-only (via `from_pool`); no LISTEN/NOTIFY or scanner wiring
 //! required, which keeps this test independent of the per-family
@@ -62,9 +63,12 @@ async fn capabilities_reports_postgres_family_and_v09_supports() {
     assert!(!caps.supports.list_pending_waitpoints);
     assert!(!caps.supports.cancel_flow_header);
     assert!(!caps.supports.ack_cancel_member);
-    // Postgres prepare() is NoOp; `prepare` bool says "non-trivial
-    // work" and stays false.
-    assert!(!caps.supports.prepare);
+    // Postgres prepare() returns NoOp — that's a callable + correct
+    // outcome, not Unavailable. `Supports.prepare` says "can the
+    // consumer call backend.prepare() without getting Unavailable?"
+    // so it's true on Postgres (NoOp is a successful well-defined
+    // outcome).
+    assert!(caps.supports.prepare);
     // Deferred per #311.
     assert!(!caps.supports.subscribe_instance_tags);
 }
