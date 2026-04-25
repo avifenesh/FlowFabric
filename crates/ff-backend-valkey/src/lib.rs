@@ -397,6 +397,67 @@ impl ValkeyBackend {
         self.scheduler.as_ref()
     }
 
+    /// Build a `ValkeyBackend` with an embedded scheduler instance, so
+    /// [`EngineBackend::claim_for_worker`] works from direct-`Arc<dyn
+    /// EngineBackend>` consumers (i.e. outside of `ff-server`'s boot
+    /// path). Consumers that run their own claim loop (no ff-server)
+    /// should use this constructor; consumers that talk to a running
+    /// ff-server via HTTP should continue to use
+    /// `FlowFabricWorker::claim_via_server` and build the backend
+    /// via [`ValkeyBackend::connect`] (no scheduler).
+    ///
+    /// Dials the Valkey client from `config`, loads (or defaults) the
+    /// deployment's `PartitionConfig`, constructs an internal
+    /// [`ff_scheduler::Scheduler`] over that client + partition
+    /// config (sharing `metrics` so claim counters land in the
+    /// caller's OTEL registry), and wires it before sealing the
+    /// returned `Arc<dyn EngineBackend>`. Closes issue #293.
+    pub async fn with_embedded_scheduler(
+        config: BackendConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Arc<dyn EngineBackend>, EngineError> {
+        let BackendConnection::Valkey(v) = config.connection.clone() else {
+            return Err(EngineError::Unavailable {
+                op: "ValkeyBackend::with_embedded_scheduler (non-Valkey BackendConnection)",
+            });
+        };
+        let client = build_client(&config).await?;
+        let partition_config = match load_partition_config(&client).await {
+            Ok(cfg) => cfg,
+            Err(EngineError::Transport { source, .. })
+                if matches!(
+                    source.downcast_ref::<ScriptError>(),
+                    Some(ScriptError::Parse { .. })
+                ) =>
+            {
+                tracing::warn!(
+                    error = %source,
+                    "ff:config:partitions not found, using PartitionConfig::default()"
+                );
+                PartitionConfig::default()
+            }
+            Err(e) => return Err(e),
+        };
+        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
+            client.clone(),
+            partition_config,
+            metrics.clone(),
+        ));
+        let backend = Arc::new(Self {
+            client,
+            partition_config,
+            subscriber_connection: Some(v),
+            metrics: Some(metrics),
+            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_STREAM_SEMAPHORE_PERMITS as usize,
+            )),
+            stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
+            admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
+            scheduler: Some(scheduler),
+        });
+        Ok(backend as Arc<dyn EngineBackend>)
+    }
+
     /// RFC-017 Wave 8 Stage D (§4 row 12): run the Valkey-specific
     /// deployment-initialisation steps on the backend's client. This
     /// method owns the boot primitives `ff-server` used to run inline
@@ -6569,5 +6630,48 @@ mod tests {
             .shutdown_prepare(Duration::from_secs(5))
             .await
             .expect("shutdown_prepare Ok on Stage A no-op impl");
+    }
+
+    // ── Issue #293: `with_embedded_scheduler` reachability ──────
+    //
+    // A `ValkeyBackend` built via `with_embedded_scheduler` routes
+    // `claim_for_worker` through an internally-constructed
+    // `ff_scheduler::Scheduler`, so direct `Arc<dyn EngineBackend>`
+    // consumers (outside `ff-server`'s boot path) reach the trait
+    // method instead of hitting `EngineError::Unavailable`. Live
+    // Valkey at 127.0.0.1:6379 required; `#[ignore]`-gated like the
+    // sibling live tests above.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn claim_for_worker_with_embedded_scheduler() {
+        use ff_core::contracts::{ClaimForWorkerArgs, ClaimForWorkerOutcome};
+        use ff_core::types::{LaneId, WorkerId, WorkerInstanceId};
+
+        let cfg = BackendConfig::valkey("127.0.0.1", 6379);
+        let metrics = Arc::new(ff_observability::Metrics::new());
+        let backend = ValkeyBackend::with_embedded_scheduler(cfg, metrics)
+            .await
+            .expect("with_embedded_scheduler dials + wires scheduler");
+
+        // Empty / absent lane ⇒ scheduler observes no eligible
+        // execution and returns `NoWork`. The load-bearing assertion
+        // is "not `Unavailable`": before #293's fix, the trait impl
+        // returned `Unavailable { op: "claim_for_worker (scheduler
+        // not wired on this ValkeyBackend)" }` for any lane.
+        let args = ClaimForWorkerArgs::new(
+            LaneId::new("ff-issue-293-empty-lane"),
+            WorkerId::new("test-worker"),
+            WorkerInstanceId::new("test-worker-instance"),
+            std::collections::BTreeSet::new(),
+            5_000,
+        );
+        let outcome = backend
+            .claim_for_worker(args)
+            .await
+            .expect("claim_for_worker reaches the embedded scheduler");
+        assert!(
+            matches!(outcome, ClaimForWorkerOutcome::NoWork),
+            "empty lane should yield NoWork, got {outcome:?}"
+        );
     }
 }
