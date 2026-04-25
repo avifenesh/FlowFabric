@@ -5,6 +5,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `ValkeyBackend::subscribe_completion` (RFC-019 Stage B; closes #309).
+  Pubsub-backed (at-most-once over live subscription window), cursor
+  always empty. Durable Postgres impl was Stage A; durable Valkey
+  impl is follow-up (not in Stage B scope).
+
 ### Changed
 
 - `subscribe_instance_tags` deferred per audit (#311): `list_executions`
