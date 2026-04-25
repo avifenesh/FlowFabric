@@ -6355,7 +6355,7 @@ impl EngineBackend for ValkeyBackend {
     async fn subscribe_lease_history(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
-    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
         subscribe_lease_history_impl(&self.client, cursor).await
     }
 
@@ -6367,7 +6367,7 @@ impl EngineBackend for ValkeyBackend {
     async fn subscribe_signal_delivery(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
-    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
+    ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
         subscribe_signal_delivery_impl(&self.client, cursor).await
     }
 
@@ -6392,8 +6392,9 @@ impl EngineBackend for ValkeyBackend {
     async fn subscribe_completion(
         &self,
         _cursor: ff_core::stream_subscribe::StreamCursor,
-    ) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
-        use ff_core::stream_subscribe::{StreamCursor, StreamEvent, StreamFamily};
+    ) -> Result<ff_core::stream_events::CompletionSubscription, EngineError> {
+        use ff_core::stream_events::{CompletionEvent, CompletionOutcome};
+        use ff_core::stream_subscribe::StreamCursor;
         use futures_core::Stream;
         use std::pin::Pin;
         use std::task::{Context, Poll};
@@ -6416,7 +6417,7 @@ impl EngineBackend for ValkeyBackend {
         }
 
         impl Stream for Adapter {
-            type Item = Result<StreamEvent, EngineError>;
+            type Item = Result<CompletionEvent, EngineError>;
             fn poll_next(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -6440,13 +6441,12 @@ impl EngineBackend for ValkeyBackend {
                         })))
                     }
                     Poll::Ready(Some(payload)) => {
-                        let event = StreamEvent::new(
-                            StreamFamily::Completion,
+                        let event = CompletionEvent::new(
                             StreamCursor::empty(),
+                            payload.execution_id,
+                            CompletionOutcome::from_wire(&payload.outcome),
                             payload.produced_at_ms,
-                            bytes::Bytes::from(payload.outcome.into_bytes()),
-                        )
-                        .with_execution_id(payload.execution_id);
+                        );
                         Poll::Ready(Some(Ok(event)))
                     }
                 }
@@ -6480,14 +6480,13 @@ pub fn partition_signal_delivery_key(partition: &Partition) -> String {
 
 /// Valkey-side `subscribe_signal_delivery` — mirror of
 /// `subscribe_lease_history_impl`, swapped to the signal-delivery
-/// stream key + `StreamFamily::SignalDelivery`.
+/// stream key + typed `SignalDeliveryEvent` decoding.
 async fn subscribe_signal_delivery_impl(
     client: &ferriskey::Client,
     start_cursor: ff_core::stream_subscribe::StreamCursor,
-) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
-    use ff_core::stream_subscribe::{
-        decode_valkey_cursor, encode_valkey_cursor, StreamEvent, StreamFamily,
-    };
+) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
+    use ff_core::stream_events::SignalDeliveryEvent;
+    use ff_core::stream_subscribe::{decode_valkey_cursor, encode_valkey_cursor};
     use tokio_stream::wrappers::ReceiverStream;
 
     let start = decode_valkey_cursor(&start_cursor)
@@ -6509,7 +6508,7 @@ async fn subscribe_signal_delivery_impl(
     let stream_key = partition_signal_delivery_key(&partition);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<
-        Result<StreamEvent, EngineError>,
+        Result<SignalDeliveryEvent, EngineError>,
     >(64);
 
     tokio::spawn(async move {
@@ -6565,12 +6564,23 @@ async fn subscribe_signal_delivery_impl(
                 let cursor = encode_valkey_cursor(id_ms, id_seq);
                 last_cursor = cursor.clone();
                 last_id = format!("{id_ms}-{id_seq}");
-                let event = StreamEvent::new(
-                    StreamFamily::SignalDelivery,
+                let fields = decode_nul_field_blob(&payload);
+                let event = match decode_signal_delivery_event(
+                    &fields,
                     cursor,
-                    TimestampMs::from_millis(id_ms as i64),
-                    payload,
-                );
+                    id_ms,
+                ) {
+                    Ok(ev) => ev,
+                    Err(detail) => {
+                        let _ = tx
+                            .send(Err(EngineError::Validation {
+                                kind: ValidationKind::Corruption,
+                                detail,
+                            }))
+                            .await;
+                        continue;
+                    }
+                };
                 if tx.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -6586,10 +6596,9 @@ async fn subscribe_signal_delivery_impl(
 async fn subscribe_lease_history_impl(
     client: &ferriskey::Client,
     start_cursor: ff_core::stream_subscribe::StreamCursor,
-) -> Result<ff_core::stream_subscribe::StreamSubscription, EngineError> {
-    use ff_core::stream_subscribe::{
-        decode_valkey_cursor, encode_valkey_cursor, StreamEvent, StreamFamily,
-    };
+) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
+    use ff_core::stream_events::LeaseHistoryEvent;
+    use ff_core::stream_subscribe::{decode_valkey_cursor, encode_valkey_cursor};
     use tokio_stream::wrappers::ReceiverStream;
 
     // Validate the cursor up front so caller bugs surface loudly at
@@ -6625,7 +6634,7 @@ async fn subscribe_lease_history_impl(
     // the owner-adjudicated "pull via Stream" backpressure shape
     // (RFC-019 §Open Questions #3).
     let (tx, rx) = tokio::sync::mpsc::channel::<
-        Result<StreamEvent, EngineError>,
+        Result<LeaseHistoryEvent, EngineError>,
     >(64);
 
     tokio::spawn(async move {
@@ -6684,12 +6693,23 @@ async fn subscribe_lease_history_impl(
                 let cursor = encode_valkey_cursor(id_ms, id_seq);
                 last_cursor = cursor.clone();
                 last_id = format!("{id_ms}-{id_seq}");
-                let event = StreamEvent::new(
-                    StreamFamily::LeaseHistory,
+                let fields = decode_nul_field_blob(&payload);
+                let event = match decode_lease_history_event(
+                    &fields,
                     cursor,
-                    TimestampMs::from_millis(id_ms as i64),
-                    payload,
-                );
+                    id_ms,
+                ) {
+                    Ok(ev) => ev,
+                    Err(detail) => {
+                        let _ = tx
+                            .send(Err(EngineError::Validation {
+                                kind: ValidationKind::Corruption,
+                                detail,
+                            }))
+                            .await;
+                        continue;
+                    }
+                };
                 if tx.send(Ok(event)).await.is_err() {
                     // Consumer dropped the stream.
                     return;
@@ -6879,6 +6899,180 @@ fn encode_fields_blob(v: &ferriskey::Value) -> bytes::Bytes {
         _ => {}
     }
     bytes::Bytes::from(buf)
+}
+
+/// Parse the NUL-delimited `k\0v\0k\0v\0…` payload blob
+/// `parse_lease_history_xread` produces back into a field map.
+///
+/// Non-UTF-8 keys/values are lossy-decoded — Lua producers only emit
+/// ASCII field names + text values (uuids, ms timestamps, enum strings).
+fn decode_nul_field_blob(
+    blob: &bytes::Bytes,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut it = blob.split(|b| *b == 0u8);
+    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        if k.is_empty() && v.is_empty() {
+            // Trailing NUL pair after the last entry.
+            continue;
+        }
+        let k = String::from_utf8_lossy(k).into_owned();
+        let v = String::from_utf8_lossy(v).into_owned();
+        out.insert(k, v);
+    }
+    out
+}
+
+/// Decode a parsed `lease_history` XREAD entry into a
+/// `LeaseHistoryEvent`. Producer shapes live in `lua/lease.lua`,
+/// `lua/execution.lua`, `lua/helpers.lua` — acquired / renewed /
+/// expired / reclaimed / revoked.
+fn decode_lease_history_event(
+    fields: &std::collections::HashMap<String, String>,
+    cursor: ff_core::stream_subscribe::StreamCursor,
+    id_ms: u64,
+) -> Result<ff_core::stream_events::LeaseHistoryEvent, String> {
+    use ff_core::stream_events::LeaseHistoryEvent;
+    use ff_core::types::{ExecutionId, LeaseId, WorkerInstanceId};
+
+    let event_name = fields
+        .get("event")
+        .ok_or_else(|| "lease_history: missing `event` field".to_string())?
+        .as_str();
+
+    let at = {
+        // Prefer the Lua-stamped `ts`; fall back to the stream id's ms
+        // component. `ts` may carry a floating-point formatting artifact
+        // from `tostring(now_ms)` on some Lua versions, so parse loosely.
+        let ts_ms = fields
+            .get("ts")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(id_ms as i64);
+        TimestampMs::from_millis(ts_ms)
+    };
+
+    let execution_id = fields
+        .get("execution_id")
+        .ok_or_else(|| "lease_history: missing `execution_id`".to_string())
+        .and_then(|s| {
+            ExecutionId::parse(s)
+                .map_err(|e| format!("lease_history: bad execution_id `{s}`: {e}"))
+        })?;
+
+    let parse_lease = |key: &str| -> Option<LeaseId> {
+        fields
+            .get(key)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| LeaseId::parse(s).ok())
+    };
+    let worker_instance = fields
+        .get("worker_instance_id")
+        .filter(|s| !s.is_empty())
+        .map(|s| WorkerInstanceId::new(s.clone()));
+
+    let event = match event_name {
+        "acquired" => LeaseHistoryEvent::Acquired {
+            cursor,
+            execution_id,
+            lease_id: parse_lease("lease_id"),
+            worker_instance_id: worker_instance,
+            at,
+        },
+        "renewed" => LeaseHistoryEvent::Renewed {
+            cursor,
+            execution_id,
+            lease_id: parse_lease("lease_id"),
+            worker_instance_id: worker_instance,
+            at,
+        },
+        "expired" => LeaseHistoryEvent::Expired {
+            cursor,
+            execution_id,
+            lease_id: parse_lease("lease_id"),
+            prev_owner: worker_instance,
+            at,
+        },
+        "reclaimed" => LeaseHistoryEvent::Reclaimed {
+            cursor,
+            execution_id,
+            new_lease_id: parse_lease("new_lease_id").or_else(|| parse_lease("lease_id")),
+            new_owner: worker_instance,
+            at,
+        },
+        "revoked" => LeaseHistoryEvent::Revoked {
+            cursor,
+            execution_id,
+            lease_id: parse_lease("lease_id"),
+            revoked_by: fields
+                .get("reason")
+                .cloned()
+                .unwrap_or_else(|| "operator".to_string()),
+            at,
+        },
+        other => {
+            return Err(format!(
+                "lease_history: unknown event variant `{other}`"
+            ));
+        }
+    };
+    Ok(event)
+}
+
+/// Decode a parsed `signal_delivery` XREAD entry. Producer is
+/// `lua/signal.lua::ff_deliver_signal` (see KEYS[15]).
+fn decode_signal_delivery_event(
+    fields: &std::collections::HashMap<String, String>,
+    cursor: ff_core::stream_subscribe::StreamCursor,
+    id_ms: u64,
+) -> Result<ff_core::stream_events::SignalDeliveryEvent, String> {
+    use ff_core::stream_events::{SignalDeliveryEffect, SignalDeliveryEvent};
+    use ff_core::types::{ExecutionId, SignalId, WaitpointId};
+
+    let execution_id = fields
+        .get("execution_id")
+        .ok_or_else(|| "signal_delivery: missing `execution_id`".to_string())
+        .and_then(|s| {
+            ExecutionId::parse(s)
+                .map_err(|e| format!("signal_delivery: bad execution_id `{s}`: {e}"))
+        })?;
+
+    let signal_id = fields
+        .get("signal_id")
+        .ok_or_else(|| "signal_delivery: missing `signal_id`".to_string())
+        .and_then(|s| {
+            SignalId::parse(s).map_err(|e| format!("signal_delivery: bad signal_id `{s}`: {e}"))
+        })?;
+
+    let waitpoint_id = fields
+        .get("waitpoint_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| WaitpointId::parse(s).ok());
+
+    let source_identity = fields
+        .get("source_identity")
+        .filter(|s| !s.is_empty())
+        .cloned();
+
+    let effect = fields
+        .get("effect")
+        .map(|s| SignalDeliveryEffect::from_wire(s))
+        .unwrap_or(SignalDeliveryEffect::Satisfied);
+
+    let at = fields
+        .get("delivered_at_ms")
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(TimestampMs::from_millis)
+        .unwrap_or_else(|| TimestampMs::from_millis(id_ms as i64));
+
+    Ok(SignalDeliveryEvent::new(
+        cursor,
+        execution_id,
+        signal_id,
+        waitpoint_id,
+        source_identity,
+        effect,
+        at,
+    ))
 }
 
 /// Detect Valkey errors indicating the Lua function library is not

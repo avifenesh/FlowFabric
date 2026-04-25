@@ -1,28 +1,16 @@
-//! RFC-019 Stage A — cross-backend stream-cursor subscription surface.
+//! RFC-019 Stage A/B/C — cross-backend stream-cursor subscription
+//! surface (shared primitives).
 //!
-//! `EngineBackend::subscribe_{lease_history,completion,signal_delivery,
-//! instance_tags}` return a [`StreamSubscription`] — a pinned
-//! `tokio_stream::Stream` of `Result<StreamEvent, EngineError>`. The
-//! cursor is an opaque byte blob the consumer persists across crashes
-//! and hands back on resume; the first byte identifies the backend
-//! family + version so cursors stay stable across backend upgrades.
-//!
-//! This module defines the wire types only — no trait default is here;
-//! defaults live on the `EngineBackend` trait in
-//! [`crate::engine_backend`]. Real impls live in `ff-backend-valkey`
-//! (Valkey `XREAD BLOCK`-backed lease_history) and `ff-backend-postgres`
-//! (`LISTEN/NOTIFY`-backed completion) per RFC-019 §Implementation Plan.
+//! This module defines the [`StreamCursor`] every `subscribe_*`
+//! method accepts, plus the codec helpers backends use to
+//! encode/decode their native stream positions (Valkey `(ms, seq)`,
+//! Postgres `event_id`). Family-specific typed event enums + per-
+//! family subscription aliases live in [`crate::stream_events`].
 //!
 //! Four-family allow-list (RFC-019 §Open Questions #5, owner-
 //! adjudicated 2026-04-24): new families require an RFC amendment.
 
-use std::pin::Pin;
-
 use bytes::Bytes;
-use tokio_stream::Stream;
-
-use crate::engine_error::EngineError;
-use crate::types::{ExecutionId, TimestampMs};
 
 /// Opaque, backend-versioned cursor. Consumers persist the bytes, hand
 /// them back on resume. The first byte MUST encode a backend-family +
@@ -57,93 +45,6 @@ impl StreamCursor {
         Self(Bytes::new())
     }
 }
-
-/// Event families covered by the v0.9 allow-list (RFC-019 §Open
-/// Questions #5). `#[non_exhaustive]` so v0.10+ families land without
-/// breaking consumer match blocks, but the owner-adjudicated stance is
-/// that new families require an RFC amendment — this is not a generic
-/// escape hatch.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamFamily {
-    LeaseHistory,
-    Completion,
-    SignalDelivery,
-    InstanceTags,
-}
-
-/// Per-event payload.
-///
-/// - `family` identifies the event shape.
-/// - `cursor` is the position this event occupies in the stream;
-///   consumers persist it + hand it back on reconnect so replay begins
-///   strictly after this event.
-/// - `execution_id`, `attempt_index`, `timestamp` are inline hot fields
-///   (RFC-019 §Open Questions #4, owner-adjudicated inline) so common
-///   consumers do not need a follow-up `describe_execution` RPC.
-/// - `payload` is the family-specific binary event body. Schema is
-///   the backend's (not stabilised in Stage A — consumers parse via
-///   family-specific helpers Stage B will ship).
-///
-/// `#[non_exhaustive]` so future inline metadata (e.g. `namespace`)
-/// adds without a breaking change.
-#[non_exhaustive]
-#[derive(Clone, Debug)]
-pub struct StreamEvent {
-    pub family: StreamFamily,
-    pub cursor: StreamCursor,
-    pub execution_id: Option<ExecutionId>,
-    pub attempt_index: Option<u32>,
-    pub timestamp: TimestampMs,
-    pub payload: Bytes,
-}
-
-impl StreamEvent {
-    /// Construct a minimal `StreamEvent`. The struct is
-    /// `#[non_exhaustive]` so external crates cannot build via a
-    /// literal — backends go through this constructor + builder.
-    /// Optional inline metadata is added via `with_execution_id` /
-    /// `with_attempt_index` so call-site shape stays stable across
-    /// future field additions.
-    pub fn new(
-        family: StreamFamily,
-        cursor: StreamCursor,
-        timestamp: TimestampMs,
-        payload: Bytes,
-    ) -> Self {
-        Self {
-            family,
-            cursor,
-            execution_id: None,
-            attempt_index: None,
-            timestamp,
-            payload,
-        }
-    }
-
-    #[must_use]
-    pub fn with_execution_id(mut self, id: ExecutionId) -> Self {
-        self.execution_id = Some(id);
-        self
-    }
-
-    #[must_use]
-    pub fn with_attempt_index(mut self, idx: u32) -> Self {
-        self.attempt_index = Some(idx);
-        self
-    }
-}
-
-/// Shape of a subscription stream.
-///
-/// Errors surface as `Err` items (not panics / stream-end); the
-/// terminal `Err(EngineError::StreamDisconnected { cursor })` is the
-/// owner-adjudicated disconnect contract (RFC-019 §Open Questions #2):
-/// the consumer reconnects by re-calling the relevant `subscribe_*`
-/// method with the cursor they observed. Non-terminal errors may be
-/// followed by further events.
-pub type StreamSubscription =
-    Pin<Box<dyn Stream<Item = Result<StreamEvent, EngineError>> + Send>>;
 
 // ─── Valkey cursor codec ───
 //

@@ -14,6 +14,7 @@ pub mod keys;
 pub mod partition;
 pub mod policy;
 pub mod state;
+pub mod stream_events;
 pub mod stream_subscribe;
 pub mod types;
 pub mod waitpoint_hmac;
