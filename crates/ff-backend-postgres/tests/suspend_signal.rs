@@ -47,23 +47,92 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Per-test isolation strategy (issue #301). The `ff_waitpoint_hmac`
+/// keystore is a *global* table (one row per kid, with an `active`
+/// flag picking the current signing kid); rotate / seed semantics
+/// assert on the table-wide `(prior_kid, active_kid)` state. A shared
+/// `public` schema plus per-test `TRUNCATE` races under parallel test
+/// execution (test A's TRUNCATE wipes the kids test B just seeded).
+///
+/// Fix: only the keystore has shared global state; the rest of the
+/// Wave-3 schema (partitioned tables) already isolates via unique
+/// execution UUIDs. So we give every test its own `ff_waitpoint_hmac`
+/// by:
+///
+/// 1. Ensuring the workspace schema is applied to `public`. The call
+///    runs per test but is idempotent via sqlx's migration-tracking
+///    table — only the first invocation does work; subsequent calls
+///    are metadata-lookup no-ops under the advisory lock.
+/// 2. Creating a per-test Postgres schema (`ffpg_test_<uuid>`) holding
+///    only a shadow `ff_waitpoint_hmac` table, built with
+///    `LIKE public.ff_waitpoint_hmac INCLUDING ALL` so it inherits
+///    future column / index / constraint changes to the canonical
+///    keystore without DDL drift here.
+/// 3. Setting `search_path = <test_schema>, public` on every pool
+///    connection so the unqualified `ff_waitpoint_hmac` name in
+///    `signal.rs` resolves to the test-local copy, while every other
+///    table (partitioned exec/attempt/waitpoint rows) continues to
+///    resolve into `public`.
+///
+/// Result: tests parallelize cleanly. No cross-schema FK touches the
+/// keystore (verified against migration DDL — the references are
+/// string kids, not SQL foreign keys). Per-test schemas are NOT
+/// dropped on teardown (async Drop in tokio is messy); the test DB
+/// is throwaway and each schema carries only a single 4-column
+/// table. If `FF_PG_TEST_URL` ever points at a long-lived dev DB,
+/// periodic `DROP SCHEMA ffpg_test_* CASCADE` is the maintenance
+/// hook.
 async fn setup_or_skip() -> Option<PgPool> {
     let url = std::env::var("FF_PG_TEST_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
+
+    // Apply the workspace schema to `public`. Idempotent via sqlx's
+    // migration-tracking table; only the first test invocation does
+    // work, later calls are metadata lookups.
+    let bootstrap = PgPoolOptions::new()
+        .max_connections(1)
         .connect(&url)
         .await
         .expect("connect to FF_PG_TEST_URL");
-    ff_backend_postgres::apply_migrations(&pool)
+    ff_backend_postgres::apply_migrations(&bootstrap)
         .await
         .expect("apply_migrations clean");
-    // Reset the HMAC keystore between runs. Schema-0001 is shared
-    // across every suspend+signal test and these tests assert on
-    // (prior_kid, active_kid) shape.
-    sqlx::query("TRUNCATE TABLE ff_waitpoint_hmac")
-        .execute(&pool)
+
+    // Unique schema per test invocation. `simple()` avoids hyphens so
+    // the identifier stays unquoted-safe.
+    let schema = format!("ffpg_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&bootstrap)
         .await
-        .expect("truncate ff_waitpoint_hmac");
+        .expect("create per-test schema");
+    // Shadow copy of `ff_waitpoint_hmac` derived from the canonical
+    // migrated table definition via `LIKE ... INCLUDING ALL`. This
+    // picks up any future column / index / constraint changes to the
+    // keystore without a parallel DDL edit here.
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.ff_waitpoint_hmac \
+         (LIKE public.ff_waitpoint_hmac INCLUDING ALL)"
+    ))
+    .execute(&bootstrap)
+    .await
+    .expect("create per-test ff_waitpoint_hmac");
+    bootstrap.close().await;
+
+    let schema_for_hook = schema.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .after_connect(move |conn, _meta| {
+            let schema = schema_for_hook.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {schema}, public"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect to FF_PG_TEST_URL");
+
     Some(pool)
 }
 
@@ -332,9 +401,10 @@ async fn hmac_sign_verify_round_trip_against_rotated_kid() {
 
 /// Minimal per-test fixture: fresh schema + a single pre-populated
 /// execution + attempt so the SERIALIZABLE `suspend` body has a row
-/// to mutate. Uniqueness across concurrent tests comes from the fresh
-/// UUID — we do NOT TRUNCATE partitioned tables here because doing so
-/// under `run_in_transaction` would collide with the trigger fanout.
+/// to mutate. Uniqueness across concurrent tests comes from the
+/// per-test schema set up in [`setup_or_skip`] (issue #301) plus the
+/// fresh execution UUID minted here — partitioned-table rows stay
+/// test-local without a per-test TRUNCATE.
 struct ExecFixture {
     backend: std::sync::Arc<dyn EngineBackend>,
     pool: PgPool,
