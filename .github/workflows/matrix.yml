@@ -1,15 +1,16 @@
 name: Matrix CI
 
-# Cross-host + cross-mode + cross-version verification.
+# Cross-host + cross-mode + cross-version + cross-backend verification.
 #
-# Matrix coverage (6 jobs):
+# Matrix coverage (7 jobs):
 #
-#   linux x86_64  × valkey 8   × standalone   -> ubuntu-latest
-#   linux x86_64  × valkey 8   × cluster      -> ubuntu-latest
-#   linux x86_64  × valkey 7.2 × standalone   -> ubuntu-latest    (floor guard)
-#   linux arm64   × valkey 8   × standalone   -> ubuntu-24.04-arm
-#   linux arm64   × valkey 8   × cluster      -> ubuntu-24.04-arm
-#   macos arm64   × valkey 8   × standalone   -> macos-latest
+#   linux x86_64  × valkey 8    × standalone  -> ubuntu-latest
+#   linux x86_64  × valkey 8    × cluster     -> ubuntu-latest
+#   linux x86_64  × valkey 7.2  × standalone  -> ubuntu-latest    (floor guard)
+#   linux arm64   × valkey 8    × standalone  -> ubuntu-24.04-arm
+#   linux arm64   × valkey 8    × cluster     -> ubuntu-24.04-arm
+#   macos arm64   × valkey 8    × standalone  -> macos-latest
+#   linux x86_64  × postgres 16 × standalone  -> ubuntu-latest    (backend parity)
 #
 # **Valkey versions:** RFC-011 §13 sets the floor at Valkey >= 7.2
 # (enforced at ff-server boot via `verify_valkey_version`). 7.2 is where
@@ -28,6 +29,22 @@ name: Matrix CI
 # and x86_64 Rust correctness is already validated through
 # ubuntu-latest. Linux covers the full Valkey version matrix where
 # we actually deploy.
+#
+# **Postgres 16 × standalone** (separate `matrix-postgres` job below):
+# backend-parity gate for the Postgres EngineBackend. Before this
+# cell existed, Postgres validation only ran during the tag-triggered
+# release smoke, so a PR could silently regress Postgres behavior and
+# surface the breakage only during a publish attempt (the partial-
+# publish risk CLAUDE.md §5 warns about). The cell runs the subset of
+# tests that currently passes against Postgres: `-p ff-backend-postgres`
+# (backend unit/integration, `-- --ignored` for live-Postgres tests)
+# and the `http_postgres_smoke` ingress test gated by the
+# `postgres-e2e` feature. The full `ff-test` suite is NOT run under
+# Postgres — docs/POSTGRES_PARITY_MATRIX.md tracks the trait methods
+# that still return `Unavailable` on the Postgres path. Cluster/ARM
+# Postgres variants are intentionally out of scope: Postgres cluster
+# semantics differ from Valkey Cluster, and one solid x86_64 cell
+# gives us the regression signal we need.
 
 on:
   # `paths-ignore` drops doc-only PRs from CI entirely (the matrix
@@ -249,6 +266,119 @@ jobs:
         run: |
           docker compose -f .github/cluster/docker-compose.cluster.yml logs --tail=80 2>&1 || true
 
+  # ── Postgres backend parity cell ─────────────────────────────────
+  #
+  # Separate job (not a row of the Valkey matrix) because the matrix
+  # axes above are Valkey-shaped (host × valkey-version × cluster-mode)
+  # and a Postgres row would leave most of those axes inapplicable.
+  # Running a distinct job keeps the YAML + the failure signal clean.
+  #
+  # Test subset rationale: per docs/POSTGRES_PARITY_MATRIX.md the
+  # Postgres EngineBackend still returns `Unavailable` for a number of
+  # trait methods that the full `ff-test` suite exercises on Valkey.
+  # Running the full suite here would flag known deferrals as failures.
+  # Instead we run:
+  #   * `cargo test -p ff-backend-postgres -- --ignored` — the
+  #     backend's own schema + attempt-family + suspend-signal tests
+  #     (#[ignore]'d by default because they need a live DB; we have
+  #     one in the service container).
+  #   * `cargo test -p ff-test --test http_postgres_smoke
+  #        --features postgres-e2e` — the HTTP-over-Postgres ingress
+  #     smoke (RFC-017 Wave 8 Stage E1).
+  #   * `cargo test -p ff-server --lib` — backend-agnostic ff-server
+  #     unit tests (no live backend needed; picks up skew between the
+  #     Postgres feature-flag assembly and ff-server's internal API).
+  matrix-postgres:
+    name: ubuntu-latest · postgres 16 · standalone
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        # Mirrors release.yml:154-164 verbatim. `postgres:16-alpine`
+        # is the reference image; `pg_isready` healthcheck gates job
+        # startup so tests don't race the DB boot.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ff_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      FF_BACKEND: postgres
+      FF_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/ff_smoke
+      # `ff-backend-postgres` crate tests look for `FF_PG_TEST_URL`
+      # (the older env-var name used in the schema_* / suspend_signal
+      # / pg_engine_backend_attempt test files). Set both so either
+      # naming works without editing the test harness.
+      FF_PG_TEST_URL: postgres://postgres:postgres@localhost:5432/ff_smoke
+      FF_WAITPOINT_HMAC_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+        with:
+          key: ubuntu-latest-postgres-16-standalone
+
+      - name: Install sqlx-cli + postgres client
+        # Mirrors release.yml:185-190. postgresql-client gives us
+        # `pg_isready` + `psql` for diagnostics; sqlx-cli applies the
+        # migrations in the step below (even though the backend
+        # itself calls `apply_migrations` idempotently on boot, running
+        # migrations up-front keeps the "what schema is this test
+        # running against" question answerable from the job log).
+        run: |
+          cargo install sqlx-cli --no-default-features --features postgres
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Apply Postgres migrations
+        working-directory: crates/ff-backend-postgres
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/ff_smoke
+        run: sqlx migrate run
+
+      - name: cargo build (workspace)
+        run: cargo build --workspace
+
+      - name: ff-backend-postgres tests
+        # `-- --ignored` runs the `#[ignore]`'d live-Postgres tests
+        # (schema_0001, schema_0002, pg_engine_backend_attempt,
+        # suspend_signal). Those tests skip gracefully when
+        # FF_PG_TEST_URL is unset; with the service container in
+        # place they execute for real.
+        run: cargo test -p ff-backend-postgres -- --ignored
+
+      - name: HTTP-over-Postgres smoke (ff-test::http_postgres_smoke)
+        # RFC-017 Wave 8 Stage E1. Feature-gated because the test
+        # requires `ff-test/postgres-e2e` to pull in the Postgres
+        # dial branch deps and the test module is `#[cfg]`'d on the
+        # feature.
+        run: cargo test -p ff-test --test http_postgres_smoke --features postgres-e2e
+
+      - name: ff-server unit tests
+        # Backend-agnostic unit tests for ff-server. Runs under the
+        # Postgres job so a feature-flag-propagation bug that only
+        # surfaces in Postgres-configured builds (cf.
+        # feedback_feature_flag_propagation.md) fails CI here rather
+        # than silently in release.
+        run: cargo test -p ff-server --lib
+
+      - name: Dump Postgres logs (diagnostics)
+        if: failure()
+        run: |
+          docker ps -a
+          # The service container name is auto-generated; list and dump.
+          for c in $(docker ps -a --filter "ancestor=postgres:16-alpine" --format '{{.ID}}'); do
+            echo "=== docker logs $c ==="
+            docker logs "$c" 2>&1 | tail -200 || true
+          done
+
   # Always-runs sentinel. Branch protection should list
   # `matrix-tests-complete` as the required status check — NOT the
   # per-matrix-job name — so a doc-only PR (which skips the matrix via
@@ -280,19 +410,24 @@ jobs:
 
   matrix-tests-complete:
     name: matrix-tests-complete
-    needs: [matrix, lua-drift]
+    needs: [matrix, matrix-postgres, lua-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate matrix result
         env:
           MATRIX_RESULT: ${{ needs.matrix.result }}
+          POSTGRES_RESULT: ${{ needs.matrix-postgres.result }}
           DRIFT_RESULT: ${{ needs.lua-drift.result }}
         run: |
           fail=0
           case "$MATRIX_RESULT" in
             success|skipped) echo "matrix: $MATRIX_RESULT — ok" ;;
             *) echo "matrix: $MATRIX_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          case "$POSTGRES_RESULT" in
+            success|skipped) echo "matrix-postgres: $POSTGRES_RESULT — ok" ;;
+            *) echo "matrix-postgres: $POSTGRES_RESULT — blocking merge" >&2; fail=1 ;;
           esac
           case "$DRIFT_RESULT" in
             success|skipped) echo "lua-drift: $DRIFT_RESULT — ok" ;;
