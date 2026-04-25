@@ -252,6 +252,93 @@ pub async fn rotate_waitpoint_hmac_secret_all_impl(
     ]))
 }
 
+/// Implementation of `EngineBackend::seed_waitpoint_hmac_secret` (issue #280).
+///
+/// Semantics against the global `ff_waitpoint_hmac` table:
+///
+/// * No active row exists and no row for the supplied kid → INSERT
+///   the new kid as the active signing kid. Returns
+///   `SeedOutcome::Seeded { kid }`.
+/// * Row for the supplied kid exists (regardless of `active`) →
+///   `SeedOutcome::AlreadySeeded { kid, same_secret }` where
+///   `same_secret` reports whether the stored bytes match.
+/// * Different kid is currently `active=TRUE` → `Validation(InvalidInput)`;
+///   operators must rotate rather than re-seed under a conflicting
+///   kid. Mirrors the Valkey backend's behaviour when the per-partition
+///   `current_kid` differs from the supplied one.
+pub async fn seed_waitpoint_hmac_secret_impl(
+    pool: &PgPool,
+    args: ff_core::contracts::SeedWaitpointHmacSecretArgs,
+    now_ms: i64,
+) -> Result<ff_core::contracts::SeedOutcome, EngineError> {
+    use ff_core::contracts::SeedOutcome;
+
+    if args.secret_hex.len() != 64 || !args.secret_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::InvalidInput,
+            detail: "secret_hex must be 64 hex characters (256-bit secret)".into(),
+        });
+    }
+    if args.kid.is_empty() {
+        return Err(EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::InvalidInput,
+            detail: "kid must be non-empty".into(),
+        });
+    }
+    let secret_bytes = hex::decode(&args.secret_hex).map_err(|_| EngineError::Validation {
+        kind: ff_core::engine_error::ValidationKind::InvalidInput,
+        detail: "secret_hex is not valid hex".into(),
+    })?;
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    let existing: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT secret FROM ff_waitpoint_hmac WHERE kid = $1")
+            .bind(&args.kid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+    if let Some((prior,)) = existing {
+        tx.commit().await.map_err(map_sqlx_error)?;
+        return Ok(SeedOutcome::AlreadySeeded {
+            kid: args.kid,
+            same_secret: prior == secret_bytes,
+        });
+    }
+
+    let active: Option<(String,)> = sqlx::query_as(
+        "SELECT kid FROM ff_waitpoint_hmac WHERE active = TRUE \
+         ORDER BY rotated_at_ms DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+    if let Some((active_kid,)) = active {
+        tx.rollback().await.ok();
+        return Err(EngineError::Validation {
+            kind: ff_core::engine_error::ValidationKind::InvalidInput,
+            detail: format!(
+                "seed_waitpoint_hmac_secret: a different kid {active_kid:?} is already active; \
+                 use rotate_waitpoint_hmac_secret_all to change kid"
+            ),
+        });
+    }
+
+    sqlx::query(
+        "INSERT INTO ff_waitpoint_hmac (kid, secret, rotated_at_ms, active) \
+         VALUES ($1, $2, $3, TRUE)",
+    )
+    .bind(&args.kid)
+    .bind(&secret_bytes)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(SeedOutcome::Seeded { kid: args.kid })
+}
+
 #[cfg(test)]
 mod hmac_tests {
     use super::*;
