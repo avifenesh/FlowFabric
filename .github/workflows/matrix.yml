@@ -361,14 +361,18 @@ jobs:
         # FF_PG_TEST_URL is unset; with the service container in
         # place they execute for real.
         #
-        # `--test-threads=1`: the `suspend_signal` test file TRUNCATEs
-        # `ff_waitpoint_hmac` (a global, non-partitioned keystore
-        # table) in per-test setup. Under parallel test execution
-        # test A's TRUNCATE wipes test B's seeded kid, causing
-        # "kid X missing from keystore" failures. Same serial-
-        # isolation pattern as the Valkey `ff-test` integration run.
-        # Follow-up: isolate the keystore setup (UUID-scoped kids or
-        # per-test schema) so tests can parallelize again.
+        # `--test-threads=1`: the `ff_waitpoint_hmac` keystore race
+        # (issue #301) is fixed — `suspend_signal` tests now route
+        # the keystore through a per-test Postgres schema, so rotate
+        # / seed tests no longer race on a shared TRUNCATE. But the
+        # suspend / deliver_signal SERIALIZABLE retry budget (3
+        # attempts, Q11) is sized for the production claim rate, not
+        # for 16-way parallel integration tests hammering the same
+        # partitioned tables; under that load rw-conflicts
+        # occasionally exhaust the budget. Keystore-only tests
+        # parallelize cleanly; the suspend-family stays serial here
+        # to keep the cell deterministic. Same serial-isolation
+        # pattern as the Valkey `ff-test` integration run.
         run: cargo test -p ff-backend-postgres -- --ignored --test-threads=1
 
       - name: HTTP-over-Postgres smoke (ff-test::http_postgres_smoke)
