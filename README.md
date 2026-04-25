@@ -13,7 +13,7 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
                  │              │              │
           ┌──────┴──────┐ ┌────┴────┐ ┌───────┴───────┐
           │  ff-engine   │ │ ff-sdk  │ │ ff-scheduler  │
-          │  14 scanners │ │ worker  │ │ claim-grant   │
+          │  17 scanners │ │ worker  │ │ claim-grant   │
           └──────┬──────┘ │   API   │ │   cycle       │
                  │        └────┬────┘ └───────┬───────┘
                  │             │              │
@@ -136,10 +136,13 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
   | Variable | Default | Description |
   |----------|---------|-------------|
   | `FF_WAITPOINT_HMAC_SECRET` | *required* | Hex-encoded HMAC signing secret for waitpoint tokens (RFC-004 §Waitpoint Security). Even-length hex; 64 chars (32 bytes) recommended. |
-  | `FF_HOST` | `localhost` | Valkey host |
-  | `FF_PORT` | `6379` | Valkey port |
-  | `FF_TLS` | `false` | Enable TLS (`1` or `true`) |
-  | `FF_CLUSTER` | `false` | Enable cluster mode |
+  | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Both first-class at v0.8.0 (RFC-017 Stage E4). |
+  | `FF_HOST` | `localhost` | Valkey host (ignored when `FF_BACKEND=postgres`) |
+  | `FF_PORT` | `6379` | Valkey port (ignored when `FF_BACKEND=postgres`) |
+  | `FF_TLS` | `false` | Enable Valkey TLS (`1` or `true`) |
+  | `FF_CLUSTER` | `false` | Enable Valkey cluster mode |
+  | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (required when `FF_BACKEND=postgres`). Example: `postgres://user:pass@host:5432/db`. |
+  | `FF_POSTGRES_POOL_SIZE` | `10` | Postgres pool size (ignored on the Valkey path). |
   | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
   | `FF_LANES` | `default` | Comma-separated lane names |
   | `FF_FLOW_PARTITIONS` | `256` | Flow partition count (exec keys co-locate under RFC-011) |
