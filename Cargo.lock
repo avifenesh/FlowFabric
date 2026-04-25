@@ -995,6 +995,7 @@ name = "ff-backend-postgres"
 version = "0.8.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "ff-core",
  "ff-observability",
  "futures-core",
@@ -1014,6 +1015,7 @@ name = "ff-backend-valkey"
 version = "0.8.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "ferriskey",
  "ff-core",
  "ff-observability",
@@ -1024,6 +1026,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -1032,12 +1035,14 @@ name = "ff-core"
 version = "0.8.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "crc16",
  "futures-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "uuid",
 ]
 
@@ -3808,6 +3813,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
