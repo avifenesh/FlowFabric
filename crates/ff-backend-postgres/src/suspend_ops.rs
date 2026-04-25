@@ -41,6 +41,7 @@ use uuid::Uuid;
 use crate::error::map_sqlx_error;
 use crate::lease_event;
 use crate::signal::{hmac_sign, hmac_verify, is_retryable_serialization, SERIALIZABLE_RETRY_BUDGET};
+use crate::signal_event;
 use crate::suspend::evaluate;
 
 // ─── small shared helpers ────────────────────────────────────────────────
@@ -694,6 +695,21 @@ pub(crate) async fn deliver_signal_impl(
             } else {
                 "appended_to_waitpoint"
             };
+
+            // RFC-019 Stage B — `ff_signal_event` outbox. Same tx as
+            // the state writes above so the NOTIFY fires iff the
+            // delivery commits.
+            let wp_id_str = args.waitpoint_id.to_string();
+            signal_event::emit(
+                tx,
+                part,
+                exec_uuid,
+                &args.signal_id.to_string(),
+                Some(wp_id_str.as_str()),
+                Some(args.source_identity.as_str()),
+                args.now.0,
+            )
+            .await?;
 
             Ok(DeliverSignalResult::Accepted {
                 signal_id: args.signal_id.clone(),

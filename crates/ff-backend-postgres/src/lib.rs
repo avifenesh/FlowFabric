@@ -87,6 +87,7 @@ pub mod scanner_supervisor;
 #[cfg(feature = "core")]
 pub mod scheduler;
 pub mod signal;
+mod signal_event;
 #[cfg(feature = "streaming")]
 pub mod stream;
 pub mod suspend;
