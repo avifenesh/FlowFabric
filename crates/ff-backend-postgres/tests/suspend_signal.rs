@@ -24,14 +24,15 @@
 
 use ff_backend_postgres::signal::{
     current_active_kid, fetch_kid, hmac_sign, hmac_verify,
-    rotate_waitpoint_hmac_secret_all_impl, HmacVerifyError,
+    rotate_waitpoint_hmac_secret_all_impl, seed_waitpoint_hmac_secret_impl, HmacVerifyError,
 };
 use ff_backend_postgres::PostgresBackend;
 use ff_core::backend::{BackendTag, Handle, HandleKind};
 use ff_core::contracts::{
     ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody, CountKind,
     DeliverSignalArgs, DeliverSignalResult, IdempotencyKey, ResumeCondition, ResumePolicy,
-    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretOutcome, SignalMatcher,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretOutcome, SeedOutcome,
+    SeedWaitpointHmacSecretArgs, SignalMatcher,
     SuspendArgs, SuspendOutcome, SuspensionReasonCode, WaitpointBinding,
 };
 use ff_core::engine_backend::EngineBackend;
@@ -162,6 +163,123 @@ async fn rotate_all_kid_conflict_rejects() {
         err,
         EngineError::Conflict(ConflictKind::RotationConflict(_))
     ));
+}
+
+// ─── Issue #280: seed_waitpoint_hmac_secret ──────────────────────
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn seed_happy_path_installs_new_kid() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+
+    let secret = "cc".repeat(32);
+    let out = seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-seed", secret.clone()),
+        1_000_000,
+    )
+    .await
+    .expect("seed ok");
+    assert!(matches!(out, SeedOutcome::Seeded { ref kid } if kid == "kid-seed"));
+
+    let (active_kid, _) = current_active_kid(&pool).await.unwrap().expect("active present");
+    assert_eq!(active_kid, "kid-seed");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn seed_replay_same_kid_and_secret_reports_already_seeded_matching() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    let secret = "cc".repeat(32);
+    seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-seed", secret.clone()),
+        1_000_000,
+    )
+    .await
+    .unwrap();
+
+    // Replay: same kid + same secret ⇒ AlreadySeeded { same_secret: true }.
+    let out = seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-seed", secret),
+        2_000_000,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        out,
+        SeedOutcome::AlreadySeeded { ref kid, same_secret: true } if kid == "kid-seed"
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn seed_replay_same_kid_different_secret_reports_mismatch() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-seed", "aa".repeat(32)),
+        1_000_000,
+    )
+    .await
+    .unwrap();
+    let out = seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-seed", "bb".repeat(32)),
+        2_000_000,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        out,
+        SeedOutcome::AlreadySeeded { same_secret: false, .. }
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn seed_different_active_kid_is_validation_error() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-one", "aa".repeat(32)),
+        1_000_000,
+    )
+    .await
+    .unwrap();
+    let err = seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-two", "bb".repeat(32)),
+        2_000_000,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, EngineError::Validation { .. }));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn seed_rejects_invalid_secret_hex_length() {
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    let err = seed_waitpoint_hmac_secret_impl(
+        &pool,
+        SeedWaitpointHmacSecretArgs::new("kid-seed", "shortsecret"),
+        1_000_000,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, EngineError::Validation { .. }));
 }
 
 #[tokio::test]

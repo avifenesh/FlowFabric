@@ -3075,6 +3075,52 @@ impl RotateWaitpointHmacSecretAllResult {
     }
 }
 
+// ─── seed_waitpoint_hmac_secret (issue #280) ───
+
+/// Args for [`EngineBackend::seed_waitpoint_hmac_secret`].
+///
+/// Two required fields and no optional knobs, so there is no fluent
+/// builder — just `new(kid, secret_hex)`. `#[non_exhaustive]` is kept
+/// (with the paired constructor, per the project memory rule) so
+/// future additive knobs don't break callers.
+///
+/// Boot-time provisioning entry point for fresh deployments — see
+/// issue #280 for why cairn needed this in addition to
+/// [`RotateWaitpointHmacSecretAllArgs`]. Unlike rotate, seed is
+/// idempotent: callers invoke it on every boot and the backend
+/// decides whether to install.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct SeedWaitpointHmacSecretArgs {
+    pub kid: String,
+    pub secret_hex: String,
+}
+
+impl SeedWaitpointHmacSecretArgs {
+    pub fn new(kid: impl Into<String>, secret_hex: impl Into<String>) -> Self {
+        Self {
+            kid: kid.into(),
+            secret_hex: secret_hex.into(),
+        }
+    }
+}
+
+/// Result of [`EngineBackend::seed_waitpoint_hmac_secret`].
+///
+/// * `Seeded` — the backend had no `current_kid` (or no row in the
+///   global keystore) and installed `kid` as the active signing kid.
+/// * `AlreadySeeded` — a row for `kid` is already installed.
+///   `same_secret` reports whether the stored secret bytes match the
+///   caller-supplied hex; `false` means the caller should pick a fresh
+///   kid for rotation rather than silently re-installing under the
+///   existing kid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeedOutcome {
+    Seeded { kid: String },
+    AlreadySeeded { kid: String, same_secret: bool },
+}
+
 // ─── list_waitpoint_hmac_kids ───
 
 #[derive(Clone, Debug, PartialEq, Eq)]

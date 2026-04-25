@@ -31,7 +31,7 @@ use ff_core::contracts::{
     EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListExecutionsPage,
     ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs, ListSuspendedPage,
     ReplayExecutionArgs, ReportUsageAdminArgs, ReportUsageResult, ResetBudgetArgs, RevokeLeaseArgs,
-    
+    SeedWaitpointHmacSecretArgs,
     SetEdgeGroupPolicyResult, StageDependencyEdgeArgs, StreamCursor, StreamFrames, SuspendArgs,
     SuspendOutcome,
 };
@@ -540,6 +540,20 @@ async fn default_claim_for_worker_is_unavailable() {
     expect_unavailable(
         backend().claim_for_worker(args).await,
         "claim_for_worker",
+    );
+}
+
+// ─── Admin — seed_waitpoint_hmac_secret (issue #280) ────────────
+
+#[tokio::test]
+async fn default_seed_waitpoint_hmac_secret_is_unavailable() {
+    let args = SeedWaitpointHmacSecretArgs::new(
+        "kid-seed",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    );
+    expect_unavailable(
+        backend().seed_waitpoint_hmac_secret(args).await,
+        "seed_waitpoint_hmac_secret",
     );
 }
 

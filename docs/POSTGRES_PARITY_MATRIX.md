@@ -265,6 +265,7 @@ but no longer trips on Postgres.
 | Scheduler (`claim_for_worker`) | `impl` | `impl` | Stage E3 `PostgresScheduler` + `claim_for_worker` trait impl + 6 reconcilers. |
 | Waitpoints (`list_pending_waitpoints`) | `impl` | `stub` | Wave 9. |
 | Admin rotation (`rotate_waitpoint_hmac_secret_all`) | `impl` | `stub` | Wave 9 (single-INSERT on the global HMAC table). |
+| Admin seed (`seed_waitpoint_hmac_secret`, issue #280) | `impl` | `impl` | Idempotent boot-time seed so cairn can drop its raw HSET boot path. Valkey fans out per-partition HSET against the `waitpoint_hmac_secrets:{p:N}` layout. Postgres INSERTs one row into `ff_waitpoint_hmac` when no kid is active. `AlreadySeeded { same_secret }` lets callers distinguish replay from real conflict. |
 | Cross-cutting (`backend_label`, `shutdown_prepare`, `ping`) | `impl` | `impl` | — |
 
 ### v0.8.0 shipped

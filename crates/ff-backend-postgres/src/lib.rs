@@ -42,8 +42,8 @@ use ff_core::contracts::{
 use ff_core::state::PublicState;
 use ff_core::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
-    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
-    SuspendOutcome,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
+    SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
 #[cfg(feature = "streaming")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
@@ -739,6 +739,21 @@ impl EngineBackend for PostgresBackend {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         signal::rotate_waitpoint_hmac_secret_all_impl(&self.pool, args, now_ms).await
+    }
+
+    #[tracing::instrument(name = "pg.seed_waitpoint_hmac_secret", skip_all)]
+    async fn seed_waitpoint_hmac_secret(
+        &self,
+        args: SeedWaitpointHmacSecretArgs,
+    ) -> Result<SeedOutcome, EngineError> {
+        // Issue #280: install-only boot-time seed against the global
+        // `ff_waitpoint_hmac` table. Idempotent — cairn calls this on
+        // every boot and the backend decides whether to INSERT.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        signal::seed_waitpoint_hmac_secret_impl(&self.pool, args, now_ms).await
     }
 
     // ── Stream reads (streaming feature) ──
