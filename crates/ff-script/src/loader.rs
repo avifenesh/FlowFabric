@@ -59,11 +59,13 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
     // `READONLY: You can't write against a read only replica.`
     //
     // Treat READONLY as transient: back off with exponential delay so
-    // slot-map refresh catches the settled topology. 6 attempts with
-    // 1s/2s/4s/4s/4s inter-attempt waits gives ~15s total window,
-    // bounded well under typical `cluster-node-timeout` (5s default).
-    const MAX_ATTEMPTS: u32 = 6;
-    let backoff_ms: [u64; 5] = [1_000, 2_000, 4_000, 4_000, 4_000];
+    // slot-map refresh catches the settled topology. 8 attempts with
+    // 1s/2s/4s/8s/8s/8s/8s inter-attempt waits gives ~39s total window.
+    // On GHA hosted runners the race window has been observed past 15s
+    // under cgroup CPU throttling; 39s gives generous headroom. Real fix
+    // is ferriskey-side (tracked at issue #290).
+    const MAX_ATTEMPTS: u32 = 8;
+    let backoff_ms: [u64; 7] = [1_000, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000];
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match client.function_load_replace(LIBRARY_SOURCE).await {

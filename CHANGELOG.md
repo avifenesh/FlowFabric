@@ -30,6 +30,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   backend surfaces all three via `describe_execution`, letting
   downstream consumers delete their HGET-based lease-summary
   wrappers.
+- **`EngineBackend::seed_waitpoint_hmac_secret`** — trait-level initial
+  HMAC secret seed (closes #280). Idempotent per-partition; returns
+  `SeedOutcome::{Seeded, AlreadySeeded { same_secret }}`. Valkey impl
+  fans out across partitions with HGET probe + HSET install; Postgres
+  impl single-INSERT against `ff_waitpoint_hmac`. Lets consumers drop
+  raw HSET boot paths that blocked PG adoption.
+- **`EngineBackend::prepare`** — trait-level one-time boot preparation
+  step (closes #281). Valkey delegates to `ff_script::loader::ensure_library`
+  (FUNCTION LOAD + retry), Postgres returns `NoOp` (migrations run
+  out-of-band). Idempotent; safe on every boot. Lets consumers drop
+  backend-aware `if let BackendKind::Valkey = ...` boot branches.
+
+### Fixed
+
+- **Cluster-topology bootstrap race (issue #275).** On a just-formed
+  6-node Valkey cluster, `FUNCTION LOAD` could route to a node whose
+  topology view still classified it as primary even though it had
+  already transitioned to replica in gossip — surfaced as `READONLY`
+  during `Server::start_with_metrics`. Two-part fix:
+  - `.github/cluster/bootstrap.sh` now polls `cluster_state:ok` on all
+    6 nodes and verifies 3 masters + 3 slaves from each node's
+    perspective before declaring the cluster ready (closes #276).
+  - `ff_script::loader::ensure_library` retry window extended from
+    3 × 1s = 4s to 6 attempts × 1s/2s/4s/4s/4s = 15s. READONLY is
+    treated as transient; the extended window covers gossip-convergence
+    + slot-map-refresh even on slow CI hardware (closes #289).
+  Follow-up ferriskey robustness work tracked at #290 (swap
+  `SystemTime::now` → `Instant::now` in slot-refresh throttling).
 
 ## [0.8.1] - 2026-04-25
 
