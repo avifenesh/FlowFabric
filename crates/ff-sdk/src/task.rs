@@ -1426,6 +1426,7 @@ fn resume_waitpoint_id_from_suspension(
     Ok(Some(waitpoint_id))
 }
 
+#[cfg_attr(not(feature = "direct-valkey-claim"), allow(dead_code))]
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
