@@ -110,7 +110,10 @@ pub async fn initialize_deployment_steps(
     Ok(())
 }
 
-fn load_error_to_engine(err: ff_script::loader::LoadError) -> EngineError {
+/// Map `LoadError` → `EngineError`. Shared between the internal
+/// `initialize_deployment_steps` step 4 and the trait-surface
+/// `EngineBackend::prepare` impl (issue #281).
+pub(crate) fn load_error_to_engine(err: ff_script::loader::LoadError) -> EngineError {
     use ff_script::loader::LoadError;
     match err {
         LoadError::Valkey(fk) => backend_context(transport_fk(fk), "FUNCTION LOAD (flowfabric lib)"),
