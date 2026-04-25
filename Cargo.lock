@@ -934,7 +934,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferriskey"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-postgres"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "ff-engine"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry-prometheus",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "ff-observability-http"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "ff-observability",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "ff-readiness-tests"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "ferriskey",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "ff-scheduler"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "ferriskey",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "ff-server"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "ff-test"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "ferriskey",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "flowfabric"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "ff-backend-postgres",
  "ff-backend-valkey",

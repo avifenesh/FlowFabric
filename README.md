@@ -13,7 +13,7 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
                  │              │              │
           ┌──────┴──────┐ ┌────┴────┐ ┌───────┴───────┐
           │  ff-engine   │ │ ff-sdk  │ │ ff-scheduler  │
-          │  17 scanners │ │ worker  │ │ claim-grant   │
+          │  13 scanners │ │ worker  │ │ claim-grant   │
           └──────┬──────┘ │   API   │ │   cycle       │
                  │        └────┬────┘ └───────┬───────┘
                  │             │              │
@@ -41,8 +41,8 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 - **Streaming output** -- append-only frame streams scoped to each attempt
 - **Priority scheduling** -- score-based eligible sets with priority clamping
 - **Capability routing** -- workers advertise capabilities; scheduler subset-matches per-execution requirements
-- **REST API** -- 22 endpoints on axum with JSON error handling, CORS, health check
-- **Backend trait** -- `EngineBackend` is the stable surface for alternate backends (Valkey today, Postgres in scope for later); cursor-paginated `list_executions` / `list_flows` / `list_lanes` / `list_suspended` for operator tooling
+- **REST API** -- 27 endpoints on axum with JSON error handling, CORS, health check
+- **Backend trait** -- `EngineBackend` is the stable surface for alternate backends (Valkey + Postgres both first-class at v0.8.0, RFC-017 Stage E4); `capabilities_matrix()` lets consumers query supported operations at runtime (v0.9, RFC-018); cursor-paginated `list_executions` / `list_flows` / `list_lanes` / `list_suspended` for operator tooling
 - **Client-local tower-style layer surface** -- opt-in `TracingLayer`, `RateLimitLayer`, `MetricsLayer`, `CircuitBreakerLayer` compose around any `EngineBackend`
 - **Observability** -- OTEL via `ff-observability`, Prometheus scrape endpoint via `ff-server` (engine-side) or `ff-observability-http` crate (consumer-side), optional Sentry integration, Grafana dashboard JSON bundled
 - **Cluster-safe** -- all operations use hash-tag partitioning; cluster-aware enumeration via ferriskey's hash-tag-aware `cluster_scan` (single-shard routing when the match pattern embeds a tag)
@@ -119,7 +119,7 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 | `ferriskey` | Valkey client -- in-tree, forked from glide-core (valkey-glide). Hash-tag-aware `cluster_scan` single-shard routing. |
 | `ff-core` | Core types, state enums, partition math, key builders, `EngineBackend` trait, error codes |
 | `ff-script` | Typed FCALL wrappers and Lua library loader |
-| `ff-engine` | Cross-partition dispatch and 14 background scanners |
+| `ff-engine` | Cross-partition dispatch and 13 background scanners |
 | `ff-scheduler` | Claim-grant cycle, fairness, capability matching |
 | `ff-backend-valkey` | `EngineBackend` implementation backed by Valkey FCALL |
 | `ff-sdk` | Worker SDK — public API for worker authors; includes the client-local `EngineBackendLayer` surface |
