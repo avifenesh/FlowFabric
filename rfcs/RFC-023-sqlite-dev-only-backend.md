@@ -694,18 +694,46 @@ trait-implementation. Enumerated:
     e. **Refactor `connect_with`** (`worker.rs:587-596`) so it no
        longer calls `Self::connect(config)`. Instead it directly
        constructs a `FlowFabricWorker` with the supplied `backend`,
-       supplied `completion`, a `PartitionConfig` derived from the
-       backend (new trait accessor) or defaulted when the backend
-       does not expose one, the semaphore built from
+       supplied `completion`, `PartitionConfig::default()` (no
+       backend round-trip to read `ff:config:partitions`; callers
+       who need a non-default `num_flow_partitions` override it
+       post-construction via the existing `config()` borrow shape
+       or pass via the `WorkerConfig` builder, whichever lands
+       first — no new `EngineBackend` trait method is added by
+       this RFC), the semaphore built from
        `config.max_concurrent_tasks`, and — under `valkey-default`
-       only — an absent `client` field (Option or cfg-gated). No
-       PING, no alive-key SET-NX, no Valkey capability
-       advertisement, no `ff:config:partitions` read. Existing
-       `valkey-default` consumers of `connect_with(config, backend,
-       None)` observe the same post-swap state they got before
-       (the `connect` preamble constructed a default `ValkeyBackend`
-       that was then overwritten; removing it simplifies the path
-       and drops one extra Valkey round-trip).
+       only — no `client` field value at all (the field is
+       cfg-gated per step (c) so it is absent from the struct
+       under sqlite-only features, and under `valkey-default` it
+       is populated only by the `connect` path, not by
+       `connect_with`). Lane-empty validation (the one check that
+       `connect` performs before any Valkey work at
+       `worker.rs:164-169`) moves into `connect_with` so every
+       entry point refuses an empty lane list. No PING, no
+       alive-key SET-NX, no Valkey capability advertisement, no
+       `ff:config:partitions` read. Existing `valkey-default`
+       consumers of `connect_with(config, backend, None)` observe
+       the same post-swap state they got before (the `connect`
+       preamble constructed a default `ValkeyBackend` that was
+       then overwritten; removing it simplifies the path and
+       drops one extra Valkey round-trip).
+
+       **`PartitionConfig` shape justification.** Under
+       `valkey-default`, the pre-Rev-5 `connect` path reads
+       `ff:config:partitions` from Valkey and falls back to
+       `PartitionConfig::default()` on missing key or parse
+       failure. Callers using `connect_with` post-Rev-5 skip that
+       read by design (this is the whole point of a
+       backend-agnostic entry); defaulting is the same
+       fallback path the existing code already takes on its
+       no-key branch, so no caller observes a shape they didn't
+       already have to handle. Callers whose deployments require
+       a non-default partition count continue to use `connect`
+       (Valkey) or — on other backends — an ahead-of-time
+       read against the backend's own config surface plus a
+       future `WorkerConfig` field that threads the value in
+       (tracked as a follow-up at v0.12.0 tag time; out of scope
+       for Rev-5).
     f. **Cfg-gate all ferriskey-using methods** behind
        `valkey-default`. Ground-truth inventory at Revision 5:
        `claim_next` and its helpers (`block_route`,
@@ -755,9 +783,12 @@ trait-implementation. Enumerated:
       ungated).
     - `FlowFabricWorker::connect_with(config, backend, completion)`
       — always available; standalone, no `connect` preamble.
-    - `FlowFabricWorker::backend` / `backend_ref` /
-      `completion_backend` / `config` / `partition_config` —
-      always available.
+    - `FlowFabricWorker::backend` / `completion_backend` /
+      `config` / `partition_config` — always available.
+      (`backend_ref` at `worker.rs:613` stays `pub(crate)` — it is
+      a crate-internal unwrapper for `snapshot` trait-forwarders
+      and is not part of the public surface commitment; no change
+      to its visibility in Rev-5.)
     - `FlowFabricWorker::connect` — `valkey-default`-gated;
       ABSENT under sqlite-only features. Documented as the
       Valkey-specific convenience entry that bundles
@@ -927,9 +958,10 @@ is the shape cairn's `cargo test` uses.
 > wiring.)
 >
 > **What the worker can and cannot do under sqlite-only features.**
-> Post-Rev-5 the worker exposes `connect_with`, `backend` /
-> `backend_ref`, `completion_backend`, `config`, and
-> `partition_config` under the sqlite-only feature set. The
+> Post-Rev-5 the worker exposes `connect_with`, `backend`,
+> `completion_backend`, `config`, and `partition_config` under
+> the sqlite-only feature set (`backend_ref` at `worker.rs:613`
+> is `pub(crate)` and remains crate-internal). The
 > claim/signal surface (`claim_next`, `claim_from_grant`,
 > `claim_via_server`, `claim_from_reclaim_grant`, `deliver_signal`)
 > is `valkey-default`-gated and ABSENT under sqlite-only features
