@@ -494,17 +494,36 @@ pub enum BackendError {
         kind: BackendErrorKind,
         message: String,
     },
+
+    /// RFC-023 §4.5: the SQLite dev-only backend refused to construct
+    /// because `FF_DEV_MODE=1` was not set. Exact message text mirrors
+    /// §3.3 HTTP-path text so embedded and server paths give the same
+    /// actionable signal.
+    #[error(
+        "SqliteBackend requires FF_DEV_MODE=1 to activate. SQLite is \
+         dev-only; see https://github.com/avifenesh/FlowFabric/blob/main/docs/dev-harness.md \
+         for details."
+    )]
+    RequiresDevMode,
 }
 
 impl BackendError {
-    /// Returns the classified backend kind if this error is a Valkey
-    /// transport fault. Forward-compatible with future backends:
-    /// non-Valkey variants return `None` on a call that names only the
-    /// Valkey kind; code that wants a backend-specific view should
-    /// match directly on [`BackendError`].
+    /// Returns the classified backend kind.
+    ///
+    /// Every variant maps to a [`BackendErrorKind`] — transport
+    /// variants return their carried `kind`, configuration/guard
+    /// variants return the closest-fitting classification (e.g.
+    /// [`BackendError::RequiresDevMode`] → [`BackendErrorKind::Protocol`]
+    /// because it is a configuration refusal, not a retryable
+    /// transport fault). Consumers needing to distinguish the
+    /// underlying variant should match directly on [`BackendError`];
+    /// `kind()` is the stable, classifier-only view.
     pub fn kind(&self) -> BackendErrorKind {
         match self {
             Self::Valkey { kind, .. } => *kind,
+            // RFC-023: dev-mode guard refusal is a configuration/protocol
+            // fault, not a retryable transport condition.
+            Self::RequiresDevMode => BackendErrorKind::Protocol,
         }
     }
 
@@ -512,6 +531,11 @@ impl BackendError {
     pub fn message(&self) -> &str {
         match self {
             Self::Valkey { message, .. } => message.as_str(),
+            Self::RequiresDevMode => {
+                "SqliteBackend requires FF_DEV_MODE=1 to activate. SQLite is \
+                 dev-only; see https://github.com/avifenesh/FlowFabric/blob/main/docs/dev-harness.md \
+                 for details."
+            }
         }
     }
 }

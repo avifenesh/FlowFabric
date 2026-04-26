@@ -1240,6 +1240,20 @@ consumers (B1).** Runtime behavior for `FF_BACKEND=valkey` and
 shape adjustments on two ff-server types that were not marked
 `#[non_exhaustive]`.
 
+> **V1 verification at Phase 1a base SHA (c035967, Revision 5
+> merge).** `BackendError` and `BackendKind` were already
+> `#[non_exhaustive]` pre-Phase-1a (see
+> `crates/ff-core/src/engine_error.rs:487-488` +
+> `crates/ff-server/src/config.rs:12-13`); Phase 1a only adds
+> variants to those enums, no attribute flip needed. `ServerError`
+> and `ServerConfig` were NOT `#[non_exhaustive]` pre-Phase-1a
+> (`crates/ff-server/src/server.rs:90` +
+> `crates/ff-server/src/config.rs:103`); Phase 1a adds the
+> attribute in the same PR that introduces
+> `ServerError::SqliteRequiresDevMode` + the `sqlite:
+> SqliteServerConfig` field, owning the minor break exactly as
+> §8 prescribes.
+
 **Unchanged:**
 
 - `FF_BACKEND=valkey` (default) and `FF_BACKEND=postgres` runtime

@@ -6326,31 +6326,31 @@ async fn test_server() -> ff_server::server::Server {
     let cluster = std::env::var("FF_CLUSTER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let server_config = ServerConfig {
-        valkey: ff_server::config::ValkeyServerConfig {
+    let server_config = {
+        let mut __cfg = ff_server::config::ServerConfig::default();
+        __cfg.valkey = ff_server::config::ValkeyServerConfig {
             host,
             port,
             tls,
             cluster,
             skip_library_load: true, // TestCluster::connect() already loaded it
-        },
-
-        partition_config: config,
-        lanes: vec![LaneId::new(LANE)],
-        listen_addr: "0.0.0.0:0".into(),
-        engine_config: ff_engine::EngineConfig {
+        };
+        __cfg.partition_config = config;
+        __cfg.lanes = vec![LaneId::new(LANE)];
+        __cfg.listen_addr = "0.0.0.0:0".into();
+        __cfg.engine_config = ff_engine::EngineConfig {
             partition_config: config,
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
-        },
-        cors_origins: vec!["*".to_owned()],
-        api_token: None,
-        waitpoint_hmac_secret:
-            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        waitpoint_hmac_grace_ms: 86_400_000,
-        max_concurrent_stream_ops: 64,
-        backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
+        };
+        __cfg.cors_origins = vec!["*".to_owned()];
+        __cfg.api_token = None;
+        __cfg.waitpoint_hmac_secret = "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        __cfg.waitpoint_hmac_grace_ms = 86_400_000;
+        __cfg.max_concurrent_stream_ops = 64;
+        __cfg.backend = ff_server::config::BackendKind::default();
+        __cfg.postgres = Default::default();
+        __cfg
     };
     ff_server::server::Server::start(server_config)
         .await
@@ -7379,34 +7379,28 @@ async fn test_system_engine_with_concurrent_scanners() {
         let cluster = std::env::var("FF_CLUSTER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        ServerConfig {            valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster, skip_library_load: true },
-
-
-
-
-
-            partition_config: config,
-            lanes: vec![LaneId::new(LANE)],
-            listen_addr: "0.0.0.0:0".into(),
-            engine_config: ff_engine::EngineConfig {
+        {
+        let mut __cfg = ff_server::config::ServerConfig::default();
+        __cfg.valkey = ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster, skip_library_load: true };
+        __cfg.partition_config = config;
+        __cfg.lanes = vec![LaneId::new(LANE)];
+        __cfg.listen_addr = "0.0.0.0:0".into();
+        __cfg.engine_config = ff_engine::EngineConfig {
                 partition_config: config,
                 lanes: vec![LaneId::new(LANE)],
-                // Short intervals for test responsiveness
                 delayed_promoter_interval: std::time::Duration::from_millis(100),
                 lease_expiry_interval: std::time::Duration::from_millis(500),
                 ..Default::default()
-            },
-
-            cors_origins: vec!["*".to_owned()],
-            api_token: None,
-            waitpoint_hmac_secret:
-                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-            waitpoint_hmac_grace_ms: 86_400_000,
-            max_concurrent_stream_ops: 64,
-        backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
-        
-}
+            };
+        __cfg.cors_origins = vec!["*".to_owned()];
+        __cfg.api_token = None;
+        __cfg.waitpoint_hmac_secret = "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        __cfg.waitpoint_hmac_grace_ms = 86_400_000;
+        __cfg.max_concurrent_stream_ops = 64;
+        __cfg.backend = ff_server::config::BackendKind::default();
+        __cfg.postgres = Default::default();
+        __cfg
+    }
     };
     let server = ff_server::server::Server::start(server_config)
         .await

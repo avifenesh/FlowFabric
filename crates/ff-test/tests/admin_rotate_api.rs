@@ -115,35 +115,31 @@ fn test_server_config(api_token: Option<String>) -> ff_server::config::ServerCon
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
-    ff_server::config::ServerConfig {
-        valkey: ff_server::config::ValkeyServerConfig {
+    {
+        let mut __cfg = ff_server::config::ServerConfig::default();
+        __cfg.valkey = ff_server::config::ValkeyServerConfig {
             host,
             port,
             tls: ff_test::fixtures::env_flag("FF_TLS"),
             cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
             skip_library_load: true,
-        },
-        partition_config: pc,
-        lanes: vec![ff_core::types::LaneId::new("admin-rotate-lane")],
-        listen_addr: "127.0.0.1:0".into(),
-        engine_config: ff_engine::EngineConfig {
+        };
+        __cfg.partition_config = pc;
+        __cfg.lanes = vec![ff_core::types::LaneId::new("admin-rotate-lane")];
+        __cfg.listen_addr = "127.0.0.1:0".into();
+        __cfg.engine_config = ff_engine::EngineConfig {
             partition_config: pc,
             lanes: vec![ff_core::types::LaneId::new("admin-rotate-lane")],
             ..Default::default()
-        },
-
-        cors_origins: vec!["*".to_owned()],
-        api_token,
-        // Known-weak all-zeros secret — fine for tests, documented
-        // trivial-to-forge in RFC-004. Server bootstrap refuses to
-        // start without a secret, so we supply one. Every partition
-        // has this as its initial `current_kid = "default"` value.
-        waitpoint_hmac_secret:
-            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        waitpoint_hmac_grace_ms: 86_400_000,
-        max_concurrent_stream_ops: 64,
-        backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
+        };
+        __cfg.cors_origins = vec!["*".to_owned()];
+        __cfg.api_token = api_token;
+        __cfg.waitpoint_hmac_secret = "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        __cfg.waitpoint_hmac_grace_ms = 86_400_000;
+        __cfg.max_concurrent_stream_ops = 64;
+        __cfg.backend = ff_server::config::BackendKind::default();
+        __cfg.postgres = Default::default();
+        __cfg
     }
 }
 

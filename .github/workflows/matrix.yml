@@ -200,11 +200,20 @@ jobs:
       - name: cargo check -p ff-core --no-default-features --features core
         run: cargo check -p ff-core --no-default-features --features core
 
+      # RFC-023 Phase 1a (§9 + §4.4 item 10): mechanical regression
+      # guard for the worker.rs ferriskey-cfg gate. Catches future PRs
+      # that add a ferriskey call outside the `valkey-default` cfg gate
+      # on `FlowFabricWorker` or a sibling module. Adds ~15s on
+      # cold-cache runners.
+      - name: cargo check -p ff-sdk --no-default-features --features sqlite
+        run: cargo check -p ff-sdk --no-default-features --features sqlite
+
       - name: cargo clippy
         run: |
           cargo clippy \
             -p ff-core -p ff-script -p ff-engine -p ff-scheduler \
             -p ff-sdk -p ff-server -p ff-test \
+            -p ff-backend-sqlite \
             --features ff-sdk/direct-valkey-claim \
             -- -D warnings
 

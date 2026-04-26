@@ -53,32 +53,27 @@ async fn start_server(
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
     let pc = *tc.partition_config();
-    let config = ff_server::config::ServerConfig {        valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: ff_test::fixtures::env_flag("FF_TLS"), cluster: ff_test::fixtures::env_flag("FF_CLUSTER"), skip_library_load: false },
-
-
-
-
-
-        partition_config: pc,
-        lanes: vec![LaneId::new(LANE)],
-        listen_addr: "127.0.0.1:0".into(),
-        engine_config: ff_engine::EngineConfig {
+    let config = {
+        let mut __cfg = ff_server::config::ServerConfig::default();
+        __cfg.valkey = ff_server::config::ValkeyServerConfig { host: host, port: port, tls: ff_test::fixtures::env_flag("FF_TLS"), cluster: ff_test::fixtures::env_flag("FF_CLUSTER"), skip_library_load: false };
+        __cfg.partition_config = pc;
+        __cfg.lanes = vec![LaneId::new(LANE)];
+        __cfg.listen_addr = "127.0.0.1:0".into();
+        __cfg.engine_config = ff_engine::EngineConfig {
             partition_config: pc,
             lanes: vec![LaneId::new(LANE)],
             edge_cancel_dispatcher_interval: Duration::from_millis(250),
             ..Default::default()
-        },
-
-        cors_origins: vec!["*".to_owned()],
-        api_token: None,
-        waitpoint_hmac_secret:
-            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        waitpoint_hmac_grace_ms: 86_400_000,
-        max_concurrent_stream_ops: 64,
-        backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
-    
-};
+        };
+        __cfg.cors_origins = vec!["*".to_owned()];
+        __cfg.api_token = None;
+        __cfg.waitpoint_hmac_secret = "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        __cfg.waitpoint_hmac_grace_ms = 86_400_000;
+        __cfg.max_concurrent_stream_ops = 64;
+        __cfg.backend = ff_server::config::BackendKind::default();
+        __cfg.postgres = Default::default();
+        __cfg
+    };
     let server = ff_server::server::Server::start(config)
         .await
         .expect("Server::start");

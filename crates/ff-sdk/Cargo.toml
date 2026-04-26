@@ -32,6 +32,15 @@ default = ["valkey-default"]
 
 direct-valkey-claim = ["valkey-default"]
 
+# RFC-023 Phase 1a (§9 CI cell): compile-only feature proving ff-sdk's
+# `FlowFabricWorker::connect_with` surface works under
+# `default-features = false, features = ["sqlite"]`. Pulls in the
+# SQLite backend crate so downstream consumers can hand its `Arc` to
+# `connect_with`. Does NOT activate the Valkey surface — the
+# `worker::connect` / claim / signal methods are `valkey-default`-gated
+# and remain absent under this feature.
+sqlite = ["dep:ff-backend-sqlite"]
+
 # Re-exports of ferriskey feature flags. Consumers opt in on ff-sdk and
 # the flag propagates to the underlying ferriskey crate. OFF by default
 # — the ~40-crate AWS dep graph does not land in builds that don't need
@@ -90,6 +99,10 @@ ff-script = { workspace = true }
 # build (`--no-default-features`) stays backend-free.
 ff-backend-valkey = { workspace = true, optional = true }
 ferriskey = { workspace = true, optional = true }
+# RFC-023 Phase 1a: optional SQLite backend edge, activated by the
+# `sqlite` feature above. Off by default so Valkey consumers pay no
+# sqlx compile cost.
+ff-backend-sqlite = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

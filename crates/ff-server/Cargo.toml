@@ -43,6 +43,11 @@ ff-backend-valkey = { workspace = true }
 # `Server::start_with_metrics`. Default features (`core` + `streaming`)
 # so the Postgres backend's full EngineBackend impl is reachable.
 ff-backend-postgres = { workspace = true }
+# RFC-023 (v0.12.0): SQLite dev-only backend branch on
+# `Server::start_with_metrics`. Construction is guarded by
+# `FF_DEV_MODE=1` at the type level; the dep is compile-time-present
+# but the backend refuses to run without the env var.
+ff-backend-sqlite = { workspace = true }
 ff-scheduler = { workspace = true }
 ff-observability = { workspace = true }
 ferriskey = { workspace = true }

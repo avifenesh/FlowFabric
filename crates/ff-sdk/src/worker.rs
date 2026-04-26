@@ -1,15 +1,23 @@
+#[cfg(feature = "valkey-default")]
 use std::collections::HashMap;
 #[cfg(feature = "direct-valkey-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+// RFC-023 Phase 1a (§4.4 item 10b): ferriskey imports scoped behind
+// `valkey-default` so the module compiles under
+// `--no-default-features, features = ["sqlite"]`.
+#[cfg(feature = "valkey-default")]
 use ferriskey::{Client, Value};
+#[cfg(feature = "valkey-default")]
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
+#[cfg(feature = "valkey-default")]
 use ff_core::types::*;
 use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
+#[cfg(feature = "valkey-default")]
 use crate::task::ClaimedTask;
 use crate::SdkError;
 
@@ -60,7 +68,20 @@ use crate::SdkError;
 /// }
 /// ```
 pub struct FlowFabricWorker {
-    client: Client,
+    /// RFC-023 Phase 1a (§4.4 item 10c): `ferriskey::Client` is
+    /// `valkey-default`-gated **and** `Option` wrapped. Under
+    /// sqlite-only features the field is absent. Under
+    /// `valkey-default` the field is `Some(client)` when the worker
+    /// was built via [`Self::connect`] (the Valkey-bundled entry
+    /// point that dials), and `None` when it was built via
+    /// [`Self::connect_with`] (the backend-agnostic entry point per
+    /// §4.4 item 10e — no ferriskey round-trip). Claim/signal hot
+    /// paths (all `valkey-default`-gated per §4.4 item 10f) expect
+    /// `Some`; a claim call against a `connect_with`-built worker
+    /// panics with a clear message until the backend-agnostic SDK
+    /// worker-loop RFC lands (tracked in §8).
+    #[cfg(feature = "valkey-default")]
+    client: Option<Client>,
     config: WorkerConfig,
     partition_config: PartitionConfig,
     /// Sorted, deduplicated, comma-separated capabilities — computed once
@@ -88,6 +109,7 @@ pub struct FlowFabricWorker {
     /// [`claim_next`]: FlowFabricWorker::claim_next
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     /// [`claim_from_reclaim_grant`]: FlowFabricWorker::claim_from_reclaim_grant
+    #[cfg_attr(not(feature = "valkey-default"), allow(dead_code))]
     concurrency_semaphore: Arc<Semaphore>,
     /// Rolling offset for chunked partition scans. Each poll advances the
     /// cursor by `PARTITION_SCAN_CHUNK`, so over `ceil(num_partitions /
@@ -141,6 +163,29 @@ pub struct FlowFabricWorker {
 const PARTITION_SCAN_CHUNK: usize = 32;
 
 impl FlowFabricWorker {
+    /// RFC-023 Phase 1a helper: borrow the embedded `ferriskey::Client`,
+    /// panicking with a clear message if the worker was built via
+    /// [`Self::connect_with`] (which does not dial Valkey). Every
+    /// Valkey-specific claim/signal method funnels through this accessor
+    /// so the panic site is uniform and traceable.
+    ///
+    /// A backend-agnostic claim/signal API is deferred per §8 breaking-
+    /// change disclosure; until that lands, valkey-default consumers
+    /// must use [`Self::connect`] if they intend to drive the Valkey
+    /// claim/signal loop.
+    #[cfg(feature = "valkey-default")]
+    #[inline]
+    fn valkey_client(&self) -> &Client {
+        self.client.as_ref().expect(
+            "FlowFabricWorker was built via connect_with (no Valkey dial) \
+             but a Valkey-specific claim/signal method was invoked. \
+             Use FlowFabricWorker::connect to dial Valkey, or drive the \
+             backend directly through the trait surface via .backend().",
+        )
+    }
+}
+
+impl FlowFabricWorker {
     /// Connect to Valkey and prepare the worker.
     ///
     /// Establishes the ferriskey connection. Does NOT load the FlowFabric
@@ -160,6 +205,13 @@ impl FlowFabricWorker {
     /// or embed a UUID/timestamp) rather than hard-coding a stable
     /// value. Production workers that cleanly shut down release the
     /// key; only crashed / kill -9'd processes hit this trap.
+    ///
+    /// **RFC-023 Phase 1a (§4.4 item 10d, v0.12.0):** this Valkey-bundled
+    /// entry point is `#[cfg(feature = "valkey-default")]`-gated.
+    /// Consumers on the sqlite-only feature set must use
+    /// [`FlowFabricWorker::connect_with`] and drive the backend directly
+    /// through the trait surface.
+    #[cfg(feature = "valkey-default")]
     pub async fn connect(config: WorkerConfig) -> Result<Self, SdkError> {
         if config.lanes.is_empty() {
             return Err(SdkError::Config {
@@ -491,7 +543,7 @@ impl FlowFabricWorker {
         > = Some(valkey_backend);
 
         Ok(Self {
-            client,
+            client: Some(client),
             config,
             partition_config,
             #[cfg(feature = "direct-valkey-claim")]
@@ -589,10 +641,100 @@ impl FlowFabricWorker {
         backend: Arc<dyn ff_core::engine_backend::EngineBackend>,
         completion: Option<Arc<dyn ff_core::completion_backend::CompletionBackend>>,
     ) -> Result<Self, SdkError> {
-        let mut worker = Self::connect(config).await?;
-        worker.backend = backend;
-        worker.completion_backend_handle = completion;
-        Ok(worker)
+        // RFC-023 Phase 1a (§4.4 item 10e, v0.12.0): direct
+        // backend-agnostic construction. No `Self::connect` preamble,
+        // no ferriskey round-trips (no PING, no alive-key SET-NX, no
+        // `ff:config:partitions` HGETALL). Callers needing a
+        // non-default `PartitionConfig` under non-Valkey backends use
+        // `connect` (Valkey) or override post-construction through a
+        // future `WorkerConfig` field (tracked as a v0.12.0 follow-up
+        // per §4.4 item 10e).
+        //
+        // Lane-empty validation (the one check `connect` did before
+        // any Valkey work) is hoisted here so every entry point
+        // refuses an empty lane list.
+        if config.lanes.is_empty() {
+            return Err(SdkError::Config {
+                context: "worker_config".into(),
+                field: None,
+                message: "at least one lane is required".into(),
+            });
+        }
+
+        let max_tasks = config.max_concurrent_tasks.max(1);
+        let concurrency_semaphore = Arc::new(Semaphore::new(max_tasks));
+        let partition_config = PartitionConfig::default();
+
+        #[cfg(feature = "direct-valkey-claim")]
+        let scan_cursor_init = scan_cursor_seed(
+            config.worker_instance_id.as_str(),
+            partition_config.num_flow_partitions.max(1) as usize,
+        );
+
+        // Build the capabilities CSV / hash inline for the
+        // direct-valkey-claim path. The validation mirrors `connect`'s
+        // ingress so the two entry points refuse the same malformed
+        // tokens.
+        #[cfg(feature = "direct-valkey-claim")]
+        for cap in &config.capabilities {
+            if cap.is_empty() {
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: "capability token must not be empty".into(),
+                });
+            }
+            if cap.contains(',') {
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: format!(
+                        "capability token may not contain ',' (CSV delimiter): {cap:?}"
+                    ),
+                });
+            }
+            if cap.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(SdkError::Config {
+                    context: "worker_config".into(),
+                    field: Some("capabilities".into()),
+                    message: format!(
+                        "capability token must not contain whitespace or control \
+                         characters: {cap:?}"
+                    ),
+                });
+            }
+        }
+        #[cfg(feature = "direct-valkey-claim")]
+        let worker_capabilities_csv: String = {
+            let set: std::collections::BTreeSet<&str> = config
+                .capabilities
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .collect();
+            set.into_iter().collect::<Vec<_>>().join(",")
+        };
+        #[cfg(feature = "direct-valkey-claim")]
+        let worker_capabilities_hash =
+            ff_core::hash::fnv1a_xor8hex(&worker_capabilities_csv);
+
+        Ok(Self {
+            #[cfg(feature = "valkey-default")]
+            client: None,
+            config,
+            partition_config,
+            #[cfg(feature = "direct-valkey-claim")]
+            worker_capabilities_csv,
+            #[cfg(feature = "direct-valkey-claim")]
+            worker_capabilities_hash,
+            #[cfg(feature = "direct-valkey-claim")]
+            lane_index: AtomicUsize::new(0),
+            concurrency_semaphore,
+            #[cfg(feature = "direct-valkey-claim")]
+            scan_cursor: AtomicUsize::new(scan_cursor_init),
+            backend,
+            completion_backend_handle: completion,
+        })
     }
 
     /// Borrow the `EngineBackend` this worker forwards Stage-1b trait
@@ -610,6 +752,7 @@ impl FlowFabricWorker {
     /// [`Self::backend`] still returns `Option` for API stability
     /// (Stage 1b holdover). Snapshot trait-forwarders in
     /// [`crate::snapshot`] need an un-wrapped reference.
+    #[cfg_attr(not(feature = "valkey-default"), allow(dead_code))]
     pub(crate) fn backend_ref(
         &self,
     ) -> &Arc<dyn ff_core::engine_backend::EngineBackend> {
@@ -729,8 +872,7 @@ impl FlowFabricWorker {
             // ZRANGEBYSCORE to get the highest-priority eligible execution.
             // Score format: -(priority * 1_000_000_000_000) + created_at_ms
             // ZRANGEBYSCORE with "-inf" "+inf" LIMIT 0 1 gives lowest score = highest priority.
-            let result: Value = self
-                .client
+            let result: Value = self.valkey_client()                
                 .cmd("ZRANGEBYSCORE")
                 .arg(&eligible_key)
                 .arg("-inf")
@@ -901,8 +1043,7 @@ impl FlowFabricWorker {
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        let raw: Value = self
-            .client
+        let raw: Value = self.valkey_client()            
             .fcall("ff_issue_claim_grant", &key_refs, &arg_refs)
             .await
             .map_err(SdkError::from)?;
@@ -945,8 +1086,7 @@ impl FlowFabricWorker {
             &now_ms,
         ];
 
-        match self
-            .client
+        match self.valkey_client()            
             .fcall::<Value>("ff_block_execution_for_admission", &keys, &argv)
             .await
         {
@@ -983,6 +1123,7 @@ impl FlowFabricWorker {
     /// callers use `claim_from_grant`.
     ///
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
+    #[cfg(feature = "valkey-default")]
     async fn claim_execution(
         &self,
         execution_id: &ExecutionId,
@@ -997,7 +1138,7 @@ impl FlowFabricWorker {
         // The Lua uses total_attempt_count as the new index and dynamically builds
         // the attempt key from the hash tag, so KEYS[6-8] are placeholders, but
         // we pass the correct index for documentation/debugging.
-        let total_str: Option<String> = self.client
+        let total_str: Option<String> = self.valkey_client()
             .cmd("HGET")
             .arg(ctx.core())
             .arg("total_attempt_count")
@@ -1051,8 +1192,7 @@ impl FlowFabricWorker {
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        let raw: Value = self
-            .client
+        let raw: Value = self.valkey_client()            
             .fcall("ff_claim_execution", &key_refs, &arg_refs)
             .await
             .map_err(SdkError::from)?;
@@ -1135,7 +1275,7 @@ impl FlowFabricWorker {
             .await?;
 
         Ok(ClaimedTask::new(
-            self.client.clone(),
+            self.valkey_client().clone(),
             self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
@@ -1198,6 +1338,7 @@ impl FlowFabricWorker {
     ///
     /// [`ClaimGrant`]: ff_core::contracts::ClaimGrant
     /// [`ff_scheduler::Scheduler::claim_for_worker`]: https://docs.rs/ff-scheduler
+    #[cfg(feature = "valkey-default")]
     pub async fn claim_from_grant(
         &self,
         lane: LaneId,
@@ -1270,6 +1411,7 @@ impl FlowFabricWorker {
     /// (`FlowFabricAdminClient`) reused here so workers don't keep a
     /// second reqwest client around. Build once at worker boot and
     /// hand in by reference on every claim.
+    #[cfg(feature = "valkey-default")]
     pub async fn claim_via_server(
         &self,
         admin: &crate::FlowFabricAdminClient,
@@ -1334,6 +1476,7 @@ impl FlowFabricWorker {
     ///
     /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
+    #[cfg(feature = "valkey-default")]
     pub async fn claim_from_reclaim_grant(
         &self,
         grant: ff_core::contracts::ReclaimGrant,
@@ -1377,6 +1520,7 @@ impl FlowFabricWorker {
     /// [`claim_from_reclaim_grant`].
     ///
     /// [`claim_from_reclaim_grant`]: FlowFabricWorker::claim_from_reclaim_grant
+    #[cfg(feature = "valkey-default")]
     async fn claim_resumed_execution(
         &self,
         execution_id: &ExecutionId,
@@ -1389,7 +1533,7 @@ impl FlowFabricWorker {
         // This is load-bearing: the backend's KEYS[6] must point to the
         // real attempt hash, and the backend takes the index verbatim
         // from `ClaimResumedExecutionArgs::current_attempt_index`.
-        let att_idx_str: Option<String> = self.client
+        let att_idx_str: Option<String> = self.valkey_client()
             .cmd("HGET")
             .arg(ctx.core())
             .arg("current_attempt_index")
@@ -1420,7 +1564,7 @@ impl FlowFabricWorker {
             .await?;
 
         Ok(ClaimedTask::new(
-            self.client.clone(),
+            self.valkey_client().clone(),
             self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
@@ -1441,6 +1585,7 @@ impl FlowFabricWorker {
     /// gated behind `direct-valkey-claim`; now shared by the
     /// feature-gated inline claim path and the public
     /// `claim_from_reclaim_grant` entry point.
+    #[cfg(feature = "valkey-default")]
     async fn read_execution_context(
         &self,
         execution_id: &ExecutionId,
@@ -1449,24 +1594,21 @@ impl FlowFabricWorker {
         let ctx = ExecKeyContext::new(partition, execution_id);
 
         // Read payload
-        let payload: Option<String> = self
-            .client
+        let payload: Option<String> = self.valkey_client()            
             .get(&ctx.payload())
             .await
             .map_err(|e| crate::backend_context(e, "GET payload failed"))?;
         let input_payload = payload.unwrap_or_default().into_bytes();
 
         // Read execution_kind from core
-        let kind: Option<String> = self
-            .client
+        let kind: Option<String> = self.valkey_client()            
             .hget(&ctx.core(), "execution_kind")
             .await
             .map_err(|e| crate::backend_context(e, "HGET execution_kind failed"))?;
         let execution_kind = kind.unwrap_or_default();
 
         // Read tags
-        let tags: HashMap<String, String> = self
-            .client
+        let tags: HashMap<String, String> = self.valkey_client()            
             .hgetall(&ctx.tags())
             .await
             .map_err(|e| crate::backend_context(e, "HGETALL tags"))?;
@@ -1484,6 +1626,7 @@ impl FlowFabricWorker {
     /// Forwards through
     /// [`EngineBackend::deliver_signal`](ff_core::engine_backend::EngineBackend::deliver_signal)
     /// — the trait-level trigger surface landed in issue #150.
+    #[cfg(feature = "valkey-default")]
     pub async fn deliver_signal(
         &self,
         execution_id: &ExecutionId,
@@ -1571,6 +1714,7 @@ fn extract_first_array_string(value: &Value) -> Option<String> {
 
 /// Read partition config from Valkey's `ff:config:partitions` hash.
 /// Returns Err if the key doesn't exist or can't be read.
+#[cfg(feature = "valkey-default")]
 async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkError> {
     let key = ff_core::keys::global_config_partitions();
     let fields: HashMap<String, String> = client
@@ -1619,6 +1763,40 @@ mod completion_accessor_type_tests {
         // worker), so no I/O happens.
         let _f: fn(&FlowFabricWorker) -> Option<Arc<dyn CompletionBackend>> =
             FlowFabricWorker::completion_backend;
+    }
+}
+
+/// RFC-023 Phase 1a §4.4 item 10g compile-only anchor. Parallels
+/// `completion_accessor_type_tests` but fires under the sqlite-only
+/// feature set: proves `FlowFabricWorker::connect_with` is callable
+/// and returns the advertised type under `--no-default-features,
+/// features = ["sqlite"]`. The matching `§9` CI cell (`cargo check
+/// -p ff-sdk --no-default-features --features sqlite`) executes this
+/// compile check mechanically so future PRs that accidentally reach
+/// outside the `valkey-default` gate fail the build.
+#[cfg(all(test, not(feature = "valkey-default")))]
+mod sqlite_only_compile_surface_tests {
+    use super::FlowFabricWorker;
+    use ff_core::completion_backend::CompletionBackend;
+    use ff_core::engine_backend::EngineBackend;
+    use std::sync::Arc;
+
+    #[test]
+    fn addressable_surface_under_sqlite_only() {
+        // Type-level proof that the backend-agnostic accessors are
+        // reachable without the `valkey-default` feature. None of
+        // these are called; the assignment targets pin the signature.
+        let _a: fn(
+            &FlowFabricWorker,
+        ) -> Option<&Arc<dyn EngineBackend>> = FlowFabricWorker::backend;
+        let _b: fn(
+            &FlowFabricWorker,
+        ) -> Option<Arc<dyn CompletionBackend>> =
+            FlowFabricWorker::completion_backend;
+        let _c: fn(&FlowFabricWorker) -> &crate::config::WorkerConfig =
+            FlowFabricWorker::config;
+        let _d: fn(&FlowFabricWorker) -> &ff_core::partition::PartitionConfig =
+            FlowFabricWorker::partition_config;
     }
 }
 

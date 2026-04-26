@@ -13,6 +13,7 @@ members = [
     "crates/ff-readiness-tests",
     "crates/ff-backend-valkey",
     "crates/ff-backend-postgres",
+    "crates/ff-backend-sqlite",
     "crates/ff-observability",
     "crates/ff-observability-http",
     "crates/flowfabric",
@@ -45,6 +46,7 @@ ff-server = { version = "0.11.0", path = "crates/ff-server" }
 ff-test = { path = "crates/ff-test" }
 ff-backend-valkey = { version = "0.11.0", path = "crates/ff-backend-valkey" }
 ff-backend-postgres = { version = "0.11.0", path = "crates/ff-backend-postgres" }
+ff-backend-sqlite = { version = "0.11.0", path = "crates/ff-backend-sqlite" }
 ff-observability = { version = "0.11.0", path = "crates/ff-observability" }
 ff-observability-http = { version = "0.11.0", path = "crates/ff-observability-http" }
 ferriskey = { version = "0.11.0", path = "ferriskey" }
