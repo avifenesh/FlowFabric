@@ -83,7 +83,7 @@ methods are affected.
 
 ## v0.9 — umbrella crate + trait-level boot/seed ergonomics
 
-### v0.9.0 — in prep (tag pending)
+### v0.9.0 — shipped 2026-04-25
 
 v0.9 is **fully additive** on top of v0.8: no consumer source changes
 are required to move from v0.8 → v0.9. The release exists to let
@@ -393,10 +393,10 @@ Rows marked `stub` on the Postgres column return
   `get_execution_result`)
 - budget / quota admin
 - `list_pending_waitpoints`
-- `rotate_waitpoint_hmac_secret_all`
+- `rotate_waitpoint_hmac_secret_all` (resolved at v0.9 — now implemented on Postgres)
 
-These land in Wave 9. If your consumer needs any of them against
-Postgres before Wave 9 ships, stay on the Valkey backend for now.
+The remaining stubs land in Wave 9. If your consumer needs any of them
+against Postgres before Wave 9 ships, stay on the Valkey backend for now.
 
 ### `EngineBackend` trait expansion (custom backend impls)
 
@@ -516,105 +516,11 @@ workspace version (via `[workspace.package] version`), so
 class of version-skew bug that hit v0.3.0 and v0.8.0 partial-publishes
 at the consumer side.
 
----
 
-## v0.7 — content shipped inside v0.8.0
+## Retired (pre-v0.8)
 
-No `v0.7.x` tag was ever published. Changes from the v0.7 RFC cycle
-ship verbatim inside the v0.8.0 release; they're itemised here for
-consumers moving from a pre-v0.8.0 pin (or for readers reconstructing
-when each change landed).
-
-### Added
-
-- **RFC-v0.7 Wave 2: Valkey `EngineBackend::claim` +
-  `claim_from_reclaim` real impls** `[additive]`. `ValkeyBackend::claim`
-  performs a fresh-find scan across execution partitions
-  (ZRANGEBYSCORE on the lane's eligible set, capability-subset filter
-  via `ff_core::caps::matches`, `ff_issue_claim_grant`, and claim via
-  `ff_claim_execution`) and returns `HandleKind::Fresh`.
-  `claim_from_reclaim` unwraps the `ReclaimGrant` carried by
-  `ReclaimToken` and routes through `ff_claim_resumed_execution`,
-  returning `HandleKind::Resumed` with a bumped lease epoch. Replaces
-  prior `EngineError::Unavailable` stubs.
-- **RFC-v0.7 Wave 4c: Postgres flow family** `[additive]`.
-  `PostgresBackend` implements six flow-scoped trait methods over the
-  Wave 3 schema: `describe_flow`, `list_flows`, `list_edges`,
-  `describe_edge`, `cancel_flow`, `set_edge_group_policy`.
-  `cancel_flow` runs a SERIALIZABLE cascade with a 3-attempt retry
-  loop (Q11); exhaustion surfaces as
-  `EngineError::Contention(ContentionKind::RetryExhausted)` so
-  consumers fall back to the cancel-backlog reconciler.
-- **`ContentionKind::RetryExhausted` variant** `[additive]`.
-  `#[non_exhaustive]` enum; classified `Retryable` via the blanket
-  `Contention(_)` arm.
-- **`EngineBackend::rotate_waitpoint_hmac_secret_all`** `[additive]`
-  (RFC-v0.7 Wave 1b, migration-master Q4). Cluster-wide waitpoint
-  HMAC kid rotation. Valkey fan-out one
-  `ff_rotate_waitpoint_hmac_secret` FCALL per execution partition;
-  Postgres Wave 4 resolves to a single INSERT into
-  `ff_waitpoint_hmac(kid, secret, rotated_at)`. Wave 1b ships the
-  Postgres stub. SDK exposes
-  `FlowFabricWorker::rotate_waitpoint_hmac_secret_all`. The
-  pre-existing per-partition free-fn
-  `ff_sdk::admin::rotate_waitpoint_hmac_secret_all_partitions` is
-  unchanged for backwards compat.
-- **`ff_core::waitpoint_hmac` re-export module** `[additive]`.
-  Consumer-facing import path for `WaitpointHmac`, `VerifyingKid`,
-  `WaitpointHmacKids` + rotation args/outcomes. Signing and
-  verification remain server-side (Lua on Valkey; Wave 4 stored procs
-  on Postgres); the module doc captures the sign/verify-location
-  contract.
-
-### Changed
-
-- **Pre-1.0 BREAKING — `ClaimPolicy` extended with worker identity**
-  `[break]`. Now
-  `ClaimPolicy::new(worker_id, worker_instance_id, lease_ttl_ms,
-  max_wait)` — the prior `ClaimPolicy::immediate()` and
-  `ClaimPolicy::with_max_wait(..)` constructors are replaced. The
-  backend's `claim(&self, lane, caps, policy)` can now invoke
-  `ff_claim_execution` without a side-channel identity lookup.
-- **Pre-1.0 BREAKING — `ReclaimToken` extended with worker identity**
-  `[break]`. Mirrors the `ClaimPolicy` shape. New constructor:
-  `ReclaimToken::new(grant, worker_id, worker_instance_id,
-  lease_ttl_ms)`.
-- **RFC-v0.7 Wave 1a: `ff-core::caps` extracted** `[additive]`. The
-  capability subset predicate previously lived as
-  `ff_scheduler::claim::caps_subset` (private) and was implicitly
-  duplicated by `lua/scheduling.lua`. New public surface:
-  `ff_core::caps::{matches, matches_csv, CapabilityRequirement}`.
-  `matches_csv` is a line-for-line replacement of the old private
-  helper (same case-sensitive subset semantics, same
-  empty-required-matches-any default). No behaviour change. Ref
-  RFC-v0.7 §Q7, PR #230.
-- **RFC-v0.7 Wave 1c: `Handle.opaque` codec moved to
-  `ff_core::handle_codec` with embedded `BackendTag`** `[additive]`.
-  Byte-layout / wire-version logic that lived at
-  `ff_backend_valkey::handle_codec` is now a public `ff_core` module
-  so the future Postgres backend decodes the same shape. New wire
-  format v2 prefixes `0x02 magic + 1-byte wire version + 1-byte
-  BackendTag`; pre-Wave-1c (v1) Valkey handles still decode via a
-  compat path keyed off legacy leading byte `0x01`. New public
-  types: `ff_core::handle_codec::{HandlePayload, DecodedHandle,
-  encode, decode, HandleDecodeError}`; new enum variant
-  `BackendTag::Postgres`; new enum variant
-  `ValidationKind::HandleFromOtherBackend` (returned by backends
-  when a handle tagged for one backend is presented to another). No
-  behaviour change for existing Valkey call sites.
-
-### Fixed
-
-- **`ff-core` unit-test compile fix** `[infra]`.
-  `backend_config_valkey_ctor` used an irrefutable `let` pattern that
-  broke when the `Postgres` variant of `BackendConnection` landed;
-  switched to `let-else` with a descriptive panic. Pure test-only.
-
----
-
-## Retired (pre-v0.7)
-
-Archived migration notes at `docs/archive/MIGRATION_v0.6.md` and
-earlier (when/if created — no per-version migration docs existed
-before v0.8; consult `CHANGELOG.md` entries for v0.6/v0.5/v0.4/v0.3
-directly). Current window: v0.7 / v0.8 / v0.9.
+Pre-v0.8 migration content archived at
+https://github.com/avifenesh/flowfabric-archive/blob/main/docs/MIGRATIONS-pre-v0.8.md
+(private). Current rolling window: v0.8 / v0.9 / v0.10. For older
+versions, consult `CHANGELOG.md` entries for v0.6 / v0.5 / v0.4 / v0.3
+directly.

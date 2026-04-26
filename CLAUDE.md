@@ -86,6 +86,17 @@ When operating without real-time owner feedback ("autonomous mode" / "finish wha
 - **Defer with a note** genuine architectural forks that would change scope, consumer contract, or require real tradeoff adjudication. Leave them documented and move on.
 - **Never defer correctness-critical releases.** The release gate (§5 above) is not mechanical — it is the owner's insurance against shipping broken artifacts. Autonomous mode may cut a release; it must not cut one that fails any gate.
 
+## 7. Archived design record
+
+Accepted RFCs and historical design/migration docs live in a separate private repo at `avifenesh/flowfabric-archive`. Before writing a new RFC or re-designing a subsystem, check there for prior thinking. Do not duplicate design work.
+
+Main repo keeps only:
+- User-facing docs (README, CHANGELOG, MIGRATIONS, CONSUMER_MIGRATION_*, POSTGRES_PARITY_MATRIX, DEPLOYMENT, operator guides, RELEASING)
+- Active in-progress RFCs in `rfcs/drafts/` (currently none on main; RFC-020 Wave 9 is tracked on PR #329)
+- Code + tests + examples
+
+Pending work lives in GitHub issues on `avifenesh/flowfabric` — not in planning docs.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
