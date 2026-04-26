@@ -36,9 +36,13 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ff_core::contracts::decode::build_execution_snapshot;
-use ff_core::contracts::{CreateExecutionArgs, ExecutionSnapshot, ListExecutionsPage};
+use ff_core::contracts::{CreateExecutionArgs, ExecutionInfo, ExecutionSnapshot, ListExecutionsPage};
 use ff_core::engine_error::{EngineError, ValidationKind};
 use ff_core::partition::{PartitionConfig, PartitionKey};
+use ff_core::state::{
+    AttemptState, BlockingReason, EligibilityState, LifecyclePhase, OwnershipState, PublicState,
+    StateVector, TerminalOutcome,
+};
 use ff_core::types::{ExecutionId, FlowId};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
@@ -480,5 +484,373 @@ pub(super) async fn resolve_execution_flow_id_impl(
                 "resolve_execution_flow_id: exec_core.flow_id='{s}' is not a valid FlowId: {e}"
             ),
         })
+}
+
+// ─── RFC-020 Wave 9 Spine-B — read model (3 methods) ─────────────
+//
+// All three reads project from the `ff_exec_core` row for the target
+// `(partition_key, execution_id)`; `read_execution_info` additionally
+// LATERAL-joins `ff_attempt` for the current-attempt row (outcome +
+// started_at). READ COMMITTED is sufficient — all three are
+// single-query, read-only, no CAS. Per RFC §4.1 + §7.8,
+// `get_execution_result` is current-attempt semantics (matches Valkey's
+// `GET ctx.result()` primitive; `result` column on `ff_exec_core`).
+//
+// Postgres storage strings for the 6 state-vector dimensions are a
+// superset of the in-core enum literals (`cancelled`, `blocked`,
+// `eligible`, `pending`, `released`, `running`, `pending_claim`, …).
+// These Postgres-specific literals are collapsed to the closest
+// user-facing enum variant by the normalisation helpers below before
+// JSON-deserialising; unknown tokens surface as `Corruption` errors
+// rather than silently defaulting.
+
+// Normalisation maps: `ff_exec_core` literal → closest
+// serde-snake_case enum variant. Each arm is grounded in an actual
+// write site in this crate; unknown tokens fall through so
+// `json_enum!` surfaces `Corruption` loudly.
+
+fn normalise_lifecycle_phase(raw: &str) -> &str {
+    match raw {
+        // Terminal family — `cancelled` is Postgres-specific
+        // (flow.rs:674 writes it directly), `terminal` is canonical.
+        "cancelled" | "terminal" => "terminal",
+        // Pre-runnable + runnable variants collapse to `Runnable`
+        // (the user-facing enum only distinguishes 5 phases). `blocked`
+        // is a legacy literal still referenced in dispatch.rs:352's
+        // CASE clause but no longer written by current paths.
+        "pending" | "runnable" | "eligible" | "blocked" => "runnable",
+        "active" => "active",
+        "suspended" => "suspended",
+        "submitted" => "submitted",
+        other => other,
+    }
+}
+
+fn normalise_ownership_state(raw: &str) -> &str {
+    match raw {
+        // `released` is a Postgres-specific post-suspension marker
+        // (suspend_ops.rs:585); nearest enum variant is `Unowned`.
+        "released" | "unowned" => "unowned",
+        "leased" => "leased",
+        "lease_expired_reclaimable" => "lease_expired_reclaimable",
+        "lease_revoked" => "lease_revoked",
+        other => other,
+    }
+}
+
+fn normalise_eligibility_state(raw: &str) -> &str {
+    match raw {
+        // Terminal-cancelled rows → `NotApplicable` (Valkey parity).
+        "cancelled" => "not_applicable",
+        // Scheduler ClaimGrant transitional state; nearest user-facing
+        // variant is still `EligibleNow` (the exec is about to be
+        // claimed — scheduler has picked it but the worker hasn't
+        // acknowledged yet).
+        "pending_claim" => "eligible_now",
+        other => other,
+    }
+}
+
+fn normalise_attempt_state(raw: &str) -> &str {
+    match raw {
+        // `pending` is the Postgres initial-insert literal
+        // (exec_core.rs:166); `pending_claim` is the scheduler transitional
+        // write. Both collapse to `PendingFirstAttempt`.
+        "pending" | "pending_claim" => "pending_first_attempt",
+        // Bare `running` from the suspension-resume claim path
+        // (suspend_ops.rs:958); canonical form is `running_attempt`.
+        "running" => "running_attempt",
+        // `cancelled` attempt_state (flow.rs cancel path) has no direct
+        // enum variant; nearest is `AttemptTerminal`.
+        "cancelled" => "attempt_terminal",
+        other => other,
+    }
+}
+
+/// Collapse Postgres `public_state` literals to the
+/// `PublicState` snake_case serde form.
+fn normalise_public_state(raw: &str) -> &str {
+    match raw {
+        // Postgres writes the bare `running` literal on the
+        // resume-claim path (suspend_ops.rs:958). Valkey / the
+        // `PublicState` enum spell it `active`.
+        "running" => "active",
+        other => other,
+    }
+}
+
+macro_rules! json_enum {
+    ($ty:ty, $field:expr, $raw:expr) => {{
+        let quoted = format!("\"{}\"", $raw);
+        serde_json::from_str::<$ty>(&quoted).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "exec_core: {}: '{}' is not a known value: {}",
+                $field, $raw, e
+            ),
+        })
+    }};
+}
+
+/// Map an `ff_attempt.outcome` string to a [`TerminalOutcome`]. Only
+/// meaningful when `lifecycle_phase` is terminal/cancelled; otherwise
+/// returns `TerminalOutcome::None`.
+fn derive_terminal_outcome(
+    phase_norm: &str,
+    phase_raw: &str,
+    attempt_outcome: Option<&str>,
+) -> TerminalOutcome {
+    if phase_norm != "terminal" {
+        return TerminalOutcome::None;
+    }
+    if phase_raw == "cancelled" {
+        return TerminalOutcome::Cancelled;
+    }
+    match attempt_outcome {
+        Some("success") => TerminalOutcome::Success,
+        Some("failed") => TerminalOutcome::Failed,
+        Some("cancelled") => TerminalOutcome::Cancelled,
+        Some("expired") => TerminalOutcome::Expired,
+        Some("skipped") => TerminalOutcome::Skipped,
+        _ => TerminalOutcome::None,
+    }
+}
+
+/// RFC-020 §4.1 — `read_execution_state`: single-column point read of
+/// `public_state`. `Ok(None)` when the execution is missing.
+pub(super) async fn read_execution_state_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<Option<PublicState>, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT public_state
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some((raw,)) = row else {
+        return Ok(None);
+    };
+    let parsed: PublicState =
+        json_enum!(PublicState, "public_state", normalise_public_state(&raw))?;
+    Ok(Some(parsed))
+}
+
+/// RFC-020 §4.1 — `read_execution_info`: multi-column projection of
+/// `ff_exec_core` + `LEFT JOIN LATERAL` on `ff_attempt` (current attempt
+/// row) to build [`ExecutionInfo`]. `Ok(None)` when the execution is
+/// missing. Partition-local (both tables co-located on `partition_key`,
+/// RFC-011).
+pub(super) async fn read_execution_info_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<Option<ExecutionInfo>, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    // LATERAL joins: `cur` pins to the current attempt (for
+    // `outcome` — drives `TerminalOutcome`); `first` pins to the
+    // earliest attempt row on the execution (attempt_index ASC — drives
+    // `started_at`, which per `ExecutionInfo` contract is the
+    // first-claim timestamp preserved across retries — Valkey parity).
+    let row = sqlx::query(
+        r#"
+        SELECT ec.flow_id,
+               ec.lane_id,
+               ec.priority,
+               ec.lifecycle_phase,
+               ec.ownership_state,
+               ec.eligibility_state,
+               ec.public_state,
+               ec.attempt_state,
+               ec.blocking_reason,
+               ec.attempt_index,
+               ec.created_at_ms,
+               ec.terminal_at_ms,
+               ec.raw_fields,
+               cur.outcome       AS attempt_outcome,
+               first_att.started_at_ms AS first_started_at_ms
+        FROM ff_exec_core ec
+        LEFT JOIN LATERAL (
+            SELECT outcome
+            FROM ff_attempt
+            WHERE partition_key = ec.partition_key
+              AND execution_id  = ec.execution_id
+              AND attempt_index = ec.attempt_index
+        ) cur ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT started_at_ms
+            FROM ff_attempt
+            WHERE partition_key = ec.partition_key
+              AND execution_id  = ec.execution_id
+              AND started_at_ms IS NOT NULL
+            ORDER BY attempt_index ASC
+            LIMIT 1
+        ) first_att ON TRUE
+        WHERE ec.partition_key = $1 AND ec.execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let flow_id_uuid: Option<Uuid> = row.try_get("flow_id").map_err(map_sqlx_error)?;
+    let lane_id: String = row.try_get("lane_id").map_err(map_sqlx_error)?;
+    let priority: i32 = row.try_get("priority").map_err(map_sqlx_error)?;
+    let lifecycle_phase_raw: String =
+        row.try_get("lifecycle_phase").map_err(map_sqlx_error)?;
+    let ownership_state_raw: String =
+        row.try_get("ownership_state").map_err(map_sqlx_error)?;
+    let eligibility_state_raw: String =
+        row.try_get("eligibility_state").map_err(map_sqlx_error)?;
+    let public_state_raw: String = row.try_get("public_state").map_err(map_sqlx_error)?;
+    let attempt_state_raw: String = row.try_get("attempt_state").map_err(map_sqlx_error)?;
+    let blocking_reason_opt: Option<String> =
+        row.try_get("blocking_reason").map_err(map_sqlx_error)?;
+    let attempt_index: i32 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+    let created_at_ms: i64 = row.try_get("created_at_ms").map_err(map_sqlx_error)?;
+    let terminal_at_ms_opt: Option<i64> =
+        row.try_get("terminal_at_ms").map_err(map_sqlx_error)?;
+    let raw_fields: JsonValue = row.try_get("raw_fields").map_err(map_sqlx_error)?;
+    let attempt_outcome_opt: Option<String> =
+        row.try_get("attempt_outcome").map_err(map_sqlx_error)?;
+    let first_started_at_ms_opt: Option<i64> =
+        row.try_get("first_started_at_ms").map_err(map_sqlx_error)?;
+
+    let lifecycle_phase: LifecyclePhase = json_enum!(
+        LifecyclePhase,
+        "lifecycle_phase",
+        normalise_lifecycle_phase(&lifecycle_phase_raw)
+    )?;
+    let ownership_state: OwnershipState = json_enum!(
+        OwnershipState,
+        "ownership_state",
+        normalise_ownership_state(&ownership_state_raw)
+    )?;
+    let eligibility_state: EligibilityState = json_enum!(
+        EligibilityState,
+        "eligibility_state",
+        normalise_eligibility_state(&eligibility_state_raw)
+    )?;
+    let public_state: PublicState = json_enum!(
+        PublicState,
+        "public_state",
+        normalise_public_state(&public_state_raw)
+    )?;
+    let attempt_state: AttemptState = json_enum!(
+        AttemptState,
+        "attempt_state",
+        normalise_attempt_state(&attempt_state_raw)
+    )?;
+    let blocking_reason: BlockingReason = match blocking_reason_opt
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        None => BlockingReason::None,
+        Some(raw) => json_enum!(BlockingReason, "blocking_reason", raw)?,
+    };
+    let terminal_outcome = derive_terminal_outcome(
+        normalise_lifecycle_phase(&lifecycle_phase_raw),
+        &lifecycle_phase_raw,
+        attempt_outcome_opt.as_deref(),
+    );
+
+    let state_vector = StateVector {
+        lifecycle_phase,
+        ownership_state,
+        eligibility_state,
+        blocking_reason,
+        terminal_outcome,
+        attempt_state,
+        public_state,
+    };
+
+    // Scalar fields from raw_fields JSON (namespace, execution_kind,
+    // blocking_detail). Same shape as `describe_execution_impl` reads.
+    let mut namespace = String::new();
+    let mut execution_kind = String::new();
+    let mut blocking_detail = String::new();
+    if let JsonValue::Object(map) = &raw_fields {
+        if let Some(JsonValue::String(s)) = map.get("namespace") {
+            namespace = s.clone();
+        }
+        if let Some(JsonValue::String(s)) = map.get("execution_kind") {
+            execution_kind = s.clone();
+        }
+        if let Some(JsonValue::String(s)) = map.get("blocking_detail") {
+            blocking_detail = s.clone();
+        }
+    }
+
+    // `ExecutionInfo.flow_id` is the bare UUID wire form of `FlowId`
+    // (per `uuid_id!` macro — no hash-tag prefix). Valkey stores the
+    // bare UUID in `exec_core["flow_id"]` too (Valkey parity).
+    let flow_id = flow_id_uuid.map(|fid| fid.to_string());
+
+    Ok(Some(ExecutionInfo {
+        execution_id: id.clone(),
+        namespace,
+        lane_id,
+        priority,
+        execution_kind,
+        state_vector,
+        public_state,
+        created_at: created_at_ms.to_string(),
+        started_at: first_started_at_ms_opt.map(|v| v.to_string()),
+        completed_at: terminal_at_ms_opt.map(|v| v.to_string()),
+        current_attempt_index: attempt_index.max(0) as u32,
+        flow_id,
+        blocking_detail,
+    }))
+}
+
+/// RFC-020 §4.1 + §7.8 — `get_execution_result`: current-attempt
+/// semantics (matches Valkey's `GET ctx.result()`). Reads the `result`
+/// column from `ff_exec_core`; `Ok(None)` when the execution is missing
+/// or the result is `NULL` (not yet terminal, or cancelled without a
+/// payload).
+pub(super) async fn get_execution_result_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+        r#"
+        SELECT result
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    match row {
+        None => Ok(None),
+        Some((payload,)) => Ok(payload),
+    }
 }
 
