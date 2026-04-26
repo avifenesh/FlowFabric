@@ -23,11 +23,24 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<SqliteBackendInner>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Poison policy: `lookup` and `insert` both recover from a
+/// poisoned lock rather than surfacing the poison. A panic in one
+/// dedup user should NOT silently disable dedup for the rest of
+/// the process — that would let a second backend spin up on the
+/// same path, defeating the §4.2 B6 invariant. Recovery is safe
+/// here because the map's own invariants (key→weak) don't depend
+/// on the panicked code path.
+fn lock_registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Weak<SqliteBackendInner>>> {
+    registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Look up an existing backend by key. Returns `Some(clone)` when a
 /// live entry exists; `None` when absent or the weak handle has
 /// decayed.
 pub(crate) fn lookup(key: &PathBuf) -> Option<Arc<SqliteBackendInner>> {
-    let guard = registry().lock().ok()?;
+    let guard = lock_registry();
     guard.get(key).and_then(Weak::upgrade)
 }
 
@@ -39,10 +52,7 @@ pub(crate) fn insert(
     key: PathBuf,
     inner: Arc<SqliteBackendInner>,
 ) -> Arc<SqliteBackendInner> {
-    let mut guard = match registry().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = lock_registry();
     if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
         return existing;
     }

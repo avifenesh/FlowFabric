@@ -69,6 +69,21 @@ pub(crate) struct SqliteBackendInner {
     /// today the `Weak` entries decay naturally.
     #[allow(dead_code)]
     pub(crate) key: PathBuf,
+    /// Sentinel connection for shared-cache `:memory:` databases.
+    /// SQLite drops a shared-cache in-memory DB the moment the last
+    /// connection referencing it closes; the pool recycles idle
+    /// connections, so without a pinned sentinel the schema + data
+    /// would silently reset between pool checkouts. `None` for
+    /// filesystem-backed databases where the file itself is the
+    /// durable backing store.
+    ///
+    /// Held in a `Mutex` so `Drop` can take ownership — sqlx's
+    /// `SqliteConnection::close` is async + consumes `self`, but we
+    /// don't need graceful close here: process exit drops the
+    /// in-memory DB regardless. Presence alone is what keeps the
+    /// shared cache alive.
+    #[allow(dead_code)]
+    pub(crate) memory_sentinel: Option<std::sync::Mutex<Option<sqlx::SqliteConnection>>>,
 }
 
 /// RFC-023 SQLite dev-only backend.
@@ -94,6 +109,12 @@ impl SqliteBackend {
     /// path, `:memory:`, or a `file:...?mode=memory&cache=shared`
     /// URI.
     ///
+    /// Uses the [`SqliteServerConfig`] defaults (pool size 4, WAL on
+    /// for file paths). For operator-tuned pool/WAL settings, call
+    /// [`SqliteBackend::new_with_config`].
+    ///
+    /// [`SqliteServerConfig`]: ff_server::config::SqliteServerConfig
+    ///
     /// # Errors
     ///
     /// * [`BackendError::RequiresDevMode`] when `FF_DEV_MODE` is
@@ -102,17 +123,22 @@ impl SqliteBackend {
     ///   is backend-agnostic despite the variant name) when the
     ///   pool cannot be constructed.
     pub async fn new(path: &str) -> Result<Arc<Self>, BackendError> {
+        Self::new_with_tuning(path, 4, true).await
+    }
+
+    /// Operator-tuned entry point. `pool_size` sets the pool's max
+    /// connections; `wal_mode` enables `PRAGMA journal_mode=WAL` for
+    /// filesystem-backed databases (ignored for `:memory:` variants
+    /// per RFC-023 §4.6).
+    pub async fn new_with_tuning(
+        path: &str,
+        pool_size: u32,
+        wal_mode: bool,
+    ) -> Result<Arc<Self>, BackendError> {
         // §4.5 production guard — TYPE-level emission point (§3.3 A3).
         if std::env::var("FF_DEV_MODE").as_deref() != Ok("1") {
             return Err(BackendError::RequiresDevMode);
         }
-
-        // §3.3 WARN banner — emits on every successful construction.
-        tracing::warn!(
-            "FlowFabric SQLite backend active (FF_DEV_MODE=1). \
-             This backend is dev-only; single-writer, single-process, \
-             not supported in production. See RFC-023."
-        );
 
         // §4.2 B6: canonicalize the key. `:memory:` and
         // `file::memory:...` pass through verbatim (distinct per-URI
@@ -120,20 +146,37 @@ impl SqliteBackend {
         // `fs::canonicalize` when the file exists; absent files fall
         // back to the raw path so two concurrent constructions before
         // file creation still dedup.
-        let key = if path == ":memory:" || path.starts_with("file::memory:") {
-            PathBuf::from(path)
+        //
+        // F1: bare `:memory:` is rewritten to
+        // `file::memory:?cache=shared&uri=true` so a multi-connection
+        // pool shares ONE in-memory database. Without this rewrite,
+        // each pool connection opens its own private DB and tests see
+        // schema mismatches silently.
+        let is_memory =
+            path == ":memory:" || path.starts_with("file::memory:");
+        let effective_path: std::borrow::Cow<'_, str> = if path == ":memory:" {
+            std::borrow::Cow::Borrowed("file::memory:?cache=shared")
+        } else {
+            std::borrow::Cow::Borrowed(path)
+        };
+
+        let key = if is_memory {
+            PathBuf::from(effective_path.as_ref())
         } else {
             std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
         };
 
         if let Some(existing) = registry::lookup(&key) {
+            // F6: emit WARN only on first-time construction. Registry
+            // hits are dedup clones; operators already saw the banner
+            // when the original handle was built.
             return Ok(Arc::new(Self { inner: existing }));
         }
 
         // Build the pool. sqlx's SqliteConnectOptions parses the full
         // URI form as well as plain paths. `create_if_missing` is
         // what embedded-test consumers expect.
-        let opts: SqliteConnectOptions = path
+        let opts: SqliteConnectOptions = effective_path
             .parse::<SqliteConnectOptions>()
             .map_err(|e| BackendError::Valkey {
                 kind: ff_core::engine_error::BackendErrorKind::Protocol,
@@ -141,14 +184,52 @@ impl SqliteBackend {
             })?
             .create_if_missing(true);
 
+        // F2: apply WAL for filesystem-backed DBs only. SQLite's WAL
+        // is a no-op (and warns) for `:memory:` variants per RFC §4.6.
+        let opts = if wal_mode && !is_memory {
+            opts.journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        } else {
+            opts
+        };
+
+        // F2: pool size from config, default 4. Minimum 1 — sqlx
+        // rejects 0 at pool-build time anyway.
+        let pool_max = pool_size.max(1);
         let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(opts)
+            .max_connections(pool_max)
+            .connect_with(opts.clone())
             .await
             .map_err(|e| BackendError::Valkey {
                 kind: ff_core::engine_error::BackendErrorKind::Transport,
                 message: format!("sqlite pool connect for {path:?}: {e}"),
             })?;
+
+        // F1: for shared-cache `:memory:` DBs, open a standalone
+        // sentinel connection and hold it for the `Arc`'s lifetime.
+        // The shared cache is torn down the moment the last connection
+        // closes; without the sentinel, a pool-idle cycle (all 4
+        // connections temporarily returned) would drop the DB between
+        // test assertions.
+        let memory_sentinel = if is_memory {
+            use sqlx::ConnectOptions;
+            let conn = opts.connect().await.map_err(|e| BackendError::Valkey {
+                kind: ff_core::engine_error::BackendErrorKind::Transport,
+                message: format!(
+                    "sqlite sentinel connect for {path:?}: {e}"
+                ),
+            })?;
+            Some(std::sync::Mutex::new(Some(conn)))
+        } else {
+            None
+        };
+
+        // F6: §3.3 WARN banner — now emitted AFTER registry-miss is
+        // confirmed so dedup clones don't spam the log.
+        tracing::warn!(
+            "FlowFabric SQLite backend active (FF_DEV_MODE=1). \
+             This backend is dev-only; single-writer, single-process, \
+             not supported in production. See RFC-023."
+        );
 
         // Phase 1a: no migrations to apply — the migrations directory
         // is an empty placeholder with a `.sqlite-skip` tombstone.
@@ -159,6 +240,7 @@ impl SqliteBackend {
             pool,
             pubsub: PubSub::new(),
             key: key.clone(),
+            memory_sentinel,
         });
         let inner = registry::insert(key, inner);
         Ok(Arc::new(Self { inner }))
@@ -168,6 +250,15 @@ impl SqliteBackend {
     /// without re-routing through the trait surface.
     #[allow(dead_code)]
     pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.inner.pool
+    }
+
+    /// Test-only pool accessor. Hidden from rustdoc; not a stable
+    /// API. Exists so the in-crate integration tests can verify
+    /// pool-level behaviour (F1 shared-cache sentinel) without
+    /// waiting for Phase 2 data-plane methods to land.
+    #[doc(hidden)]
+    pub fn pool_for_test(&self) -> &SqlitePool {
         &self.inner.pool
     }
 }

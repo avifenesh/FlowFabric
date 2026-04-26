@@ -693,9 +693,14 @@ impl Server {
         tracing::info!(
             path = %config.sqlite.path,
             pool_size = config.sqlite.pool_size,
+            wal_mode = config.sqlite.wal_mode,
             "dialing SQLite backend (RFC-023 dev-only)"
         );
-        let sqlite_arc = ff_backend_sqlite::SqliteBackend::new(&config.sqlite.path)
+        let sqlite_arc = ff_backend_sqlite::SqliteBackend::new_with_tuning(
+            &config.sqlite.path,
+            config.sqlite.pool_size,
+            config.sqlite.wal_mode,
+        )
             .await
             .map_err(|e| match e {
                 ff_core::BackendError::RequiresDevMode => {

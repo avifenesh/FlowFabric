@@ -341,6 +341,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
+            echo "::error::  cargo yank --version ${VER} ff-backend-sqlite"
             exit 1
           }
       - run: sleep 30

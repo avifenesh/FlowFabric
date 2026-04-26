@@ -157,9 +157,16 @@ impl Default for SqliteServerConfig {
 /// [`ValkeyServerConfig`] on the `valkey` field instead.
 ///
 /// **RFC-023 (v0.12.0):** gained `#[non_exhaustive]` + a `sqlite`
-/// field. Consumers constructing via struct literal must migrate to
-/// [`ServerConfig::from_env`], [`ServerConfig::sqlite_dev`], or the
-/// `..Default::default()` spread syntax.
+/// field. External consumers cannot use struct-literal construction
+/// (including `..Default::default()` spread syntax — Rust rejects
+/// the struct-update form on `#[non_exhaustive]` types from other
+/// crates). Build via one of:
+///
+/// * [`ServerConfig::from_env`] — production-ready, validates all
+///   env-driven axes.
+/// * [`ServerConfig::sqlite_dev`] — zero-config dev harness.
+/// * `ServerConfig::default()` followed by field-by-field mutation
+///   — for tests that need to override one or two axes.
 #[non_exhaustive]
 pub struct ServerConfig {
     /// Partition counts (execution/flow/budget/quota).

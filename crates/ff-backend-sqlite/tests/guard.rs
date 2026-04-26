@@ -65,6 +65,43 @@ async fn two_news_same_path_share_handle() {
     assert_eq!(b.backend_label(), "sqlite");
 }
 
+/// F1 regression: a bare `:memory:` path is rewritten to a shared-
+/// cache URI internally and a sentinel connection is held, so data
+/// written through one pool connection survives a pool idle cycle
+/// and is visible to subsequent checkouts.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn memory_shared_cache_survives_pool_cycle() {
+    unsafe {
+        std::env::set_var("FF_DEV_MODE", "1");
+    }
+    let backend = SqliteBackend::new_with_tuning(":memory:", 4, true)
+        .await
+        .expect("construct");
+    let pool = backend.pool_for_test();
+
+    // Write on one connection, drop it, read on a fresh connection.
+    sqlx::query("CREATE TABLE f1 (v INTEGER)")
+        .execute(pool)
+        .await
+        .expect("create");
+    sqlx::query("INSERT INTO f1 VALUES (42)")
+        .execute(pool)
+        .await
+        .expect("insert");
+
+    // Force pool churn: acquire + drop several times.
+    for _ in 0..8 {
+        let _c = pool.acquire().await.expect("acquire");
+    }
+
+    let v: (i64,) = sqlx::query_as("SELECT v FROM f1")
+        .fetch_one(pool)
+        .await
+        .expect("select");
+    assert_eq!(v.0, 42);
+}
+
 #[tokio::test]
 #[serial(ff_dev_mode)]
 async fn distinct_memory_uris_are_distinct() {
