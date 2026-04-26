@@ -922,6 +922,7 @@ impl EngineBackend for PostgresBackend {
     async fn subscribe_completion(
         &self,
         _cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::CompletionSubscription, EngineError> {
         use ff_core::stream_events::{CompletionEvent, CompletionOutcome};
         use ff_core::stream_subscribe::encode_postgres_event_cursor;
@@ -930,11 +931,19 @@ impl EngineBackend for PostgresBackend {
         use std::task::{Context, Poll};
 
         // Delegate to the existing CompletionBackend implementation so
-        // the LISTEN/replay machinery is shared. The adapter emits
-        // typed `CompletionEvent`s; resume-from-cursor is still
-        // unwired (Stage A surface tails from tail).
-        let inner = ff_core::completion_backend::CompletionBackend::subscribe_completions(self)
-            .await?;
+        // the LISTEN/replay machinery is shared. When a non-noop
+        // `ScannerFilter` (#282) is supplied, route through the
+        // `_filtered` variant so the outbox-inline SQL filter applies.
+        // Resume-from-cursor is still unwired (Stage A surface tails
+        // from tail).
+        let inner = if filter.is_noop() {
+            ff_core::completion_backend::CompletionBackend::subscribe_completions(self).await?
+        } else {
+            ff_core::completion_backend::CompletionBackend::subscribe_completions_filtered(
+                self, filter,
+            )
+            .await?
+        };
 
         struct Adapter {
             inner: ff_core::completion_backend::CompletionStream,
@@ -987,8 +996,9 @@ impl EngineBackend for PostgresBackend {
     async fn subscribe_lease_history(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
-        lease_event_subscribe::subscribe(&self.pool, 0, cursor).await
+        lease_event_subscribe::subscribe(&self.pool, 0, cursor, filter.clone()).await
     }
 
     // ── RFC-019 Stage B — `subscribe_signal_delivery` (#310) ─────
@@ -1004,8 +1014,9 @@ impl EngineBackend for PostgresBackend {
     async fn subscribe_signal_delivery(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
-        signal_delivery_subscribe::subscribe(&self.pool, 0, cursor).await
+        signal_delivery_subscribe::subscribe(&self.pool, 0, cursor, filter.clone()).await
     }
 }
 

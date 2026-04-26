@@ -130,7 +130,7 @@ impl FilterGate {
     /// gate's [`ScannerFilter`]. On HGET failure conservatively drops
     /// the event (returns false) so a backend hiccup can't leak a
     /// cross-tenant completion.
-    async fn admits(&self, eid: &ExecutionId) -> bool {
+    pub(crate) async fn admits(&self, eid: &ExecutionId) -> bool {
         let partition = execution_partition(eid, &self.partition_config);
         let tag = partition.hash_tag();
         // Key construction uses the FULL `ExecutionId` string (which
