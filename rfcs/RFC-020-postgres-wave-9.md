@@ -1,8 +1,9 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** DRAFT — Revision 4
+**Status:** ACCEPTED — Revision 4
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
+**Accepted:** 2026-04-26
 **Revision 2:** 2026-04-26 — Round-1 reviewer findings addressed (schema-ground-truth, design-spine reframe, drop G6, full-parity + coherent-wave directive)
 **Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms`; (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
 **Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter); (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
