@@ -209,13 +209,27 @@ async fn read_execution_info_missing_returns_none() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
-async fn read_execution_info_lateral_joins_current_attempt() {
+async fn read_execution_info_lateral_joins_both_attempts() {
+    // Two LATERAL joins in `read_execution_info`:
+    //   * current-attempt (attempt_index = ec.attempt_index) drives
+    //     `outcome` → `TerminalOutcome`;
+    //   * first-attempt (earliest started_at_ms) drives
+    //     `ExecutionInfo.started_at` (first-claim timestamp, preserved
+    //     across retries — Valkey-parity contract).
+    //
+    // Seed two attempts:
+    //   * attempt 0 started at `first_start` (old first-claim);
+    //   * attempt 1 started at `later_start` (current attempt);
+    // then bump `ec.attempt_index = 1`.
+    // The read must surface
+    //   * `started_at = first_start` (NOT later_start)
+    //   * `outcome`-derived state from attempt_index=1 (NULL → None)
     let Some(fx) = seed_backend().await else {
         return;
     };
     let now = TimestampMs::now().0;
-    // Bump attempt_index to 1 — the LATERAL join must pin to this row,
-    // NOT the attempt_index=0 row (which represents a prior attempt).
+    let first_start = now - 10_000;
+    let later_start = now - 100;
     insert_exec_core(
         &fx.pool,
         fx.part,
@@ -237,10 +251,11 @@ async fn read_execution_info_lateral_joins_current_attempt() {
         }),
     )
     .await;
-    // Attempt 0: prior attempt; should be IGNORED by the LATERAL join.
-    insert_attempt(&fx.pool, fx.part, fx.exec_uuid, 0, Some("failed"), Some(1_000)).await;
-    // Attempt 1: current attempt; started_at should surface.
-    insert_attempt(&fx.pool, fx.part, fx.exec_uuid, 1, None, Some(now + 500)).await;
+    // Attempt 0: first-claim row; drives `started_at`.
+    insert_attempt(&fx.pool, fx.part, fx.exec_uuid, 0, Some("failed"), Some(first_start))
+        .await;
+    // Attempt 1: current attempt; drives `outcome` (no terminal outcome yet).
+    insert_attempt(&fx.pool, fx.part, fx.exec_uuid, 1, None, Some(later_start)).await;
 
     let info = fx
         .backend
@@ -255,9 +270,18 @@ async fn read_execution_info_lateral_joins_current_attempt() {
     assert_eq!(info.execution_kind, "task");
     assert_eq!(info.public_state, PublicState::Active);
     assert_eq!(info.state_vector.lifecycle_phase, LifecyclePhase::Active);
+    // Current-attempt (index=1) has no outcome → None (not the
+    // attempt-0 `failed` outcome, which would be a LATERAL mispin).
     assert_eq!(info.state_vector.terminal_outcome, TerminalOutcome::None);
     assert_eq!(info.current_attempt_index, 1);
-    assert_eq!(info.started_at.as_deref(), Some((now + 500).to_string().as_str()));
+    // First-claim `started_at` (attempt_index=0 row); NOT the current
+    // attempt's `later_start`.
+    assert_eq!(
+        info.started_at.as_deref(),
+        Some(first_start.to_string().as_str()),
+        "started_at must be first-claim timestamp (attempt 0), \
+         not current-attempt (attempt 1)"
+    );
     assert!(info.completed_at.is_none());
 }
 
@@ -497,7 +521,10 @@ async fn read_execution_info_pending_claim_eligibility() {
         "unowned",
         "pending_claim",
         "waiting",
-        "pending_claim",
+        // Attempt_state must be a persisted literal; `pending_claim` is
+        // only written on `eligibility_state`. Use the create-time
+        // `pending` (covers the initial-INSERT path).
+        "pending",
         0,
         now,
         None,
@@ -514,5 +541,56 @@ async fn read_execution_info_pending_claim_eligibility() {
     assert_eq!(
         info.state_vector.eligibility_state,
         ff_core::state::EligibilityState::EligibleNow
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn read_execution_info_flow_id_returns_bare_uuid() {
+    // `ExecutionInfo.flow_id` is the bare UUID wire form of `FlowId`
+    // (per `uuid_id!` macro, no hash-tag prefix).
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    // Seed a row and then UPDATE flow_id to a known uuid (the helper
+    // doesn't take flow_id; a direct update keeps the fixture surface
+    // small).
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "default",
+        "submitted",
+        "unowned",
+        "eligible_now",
+        "waiting",
+        "pending",
+        0,
+        now,
+        None,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    let flow_uuid = Uuid::new_v4();
+    sqlx::query("UPDATE ff_exec_core SET flow_id = $1 WHERE partition_key = $2 AND execution_id = $3")
+        .bind(flow_uuid)
+        .bind(fx.part)
+        .bind(fx.exec_uuid)
+        .execute(&fx.pool)
+        .await
+        .expect("update flow_id");
+
+    let info = fx
+        .backend
+        .read_execution_info(&fx.exec_id)
+        .await
+        .expect("call ok")
+        .expect("exec present");
+    assert_eq!(
+        info.flow_id.as_deref(),
+        Some(flow_uuid.to_string().as_str()),
+        "flow_id is bare UUID, not hash-tagged"
     );
 }

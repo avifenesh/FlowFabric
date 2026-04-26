@@ -660,6 +660,11 @@ pub(super) async fn read_execution_info_impl(
     let partition_key: i16 = id.partition() as i16;
     let execution_id = eid_uuid(id);
 
+    // LATERAL joins: `cur` pins to the current attempt (for
+    // `outcome` — drives `TerminalOutcome`); `first` pins to the
+    // earliest attempt row on the execution (attempt_index ASC — drives
+    // `started_at`, which per `ExecutionInfo` contract is the
+    // first-claim timestamp preserved across retries — Valkey parity).
     let row = sqlx::query(
         r#"
         SELECT ec.flow_id,
@@ -675,16 +680,25 @@ pub(super) async fn read_execution_info_impl(
                ec.created_at_ms,
                ec.terminal_at_ms,
                ec.raw_fields,
-               a.outcome    AS attempt_outcome,
-               a.started_at_ms AS attempt_started_at_ms
+               cur.outcome       AS attempt_outcome,
+               first_att.started_at_ms AS first_started_at_ms
         FROM ff_exec_core ec
         LEFT JOIN LATERAL (
-            SELECT outcome, started_at_ms
+            SELECT outcome
             FROM ff_attempt
             WHERE partition_key = ec.partition_key
               AND execution_id  = ec.execution_id
               AND attempt_index = ec.attempt_index
-        ) a ON TRUE
+        ) cur ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT started_at_ms
+            FROM ff_attempt
+            WHERE partition_key = ec.partition_key
+              AND execution_id  = ec.execution_id
+              AND started_at_ms IS NOT NULL
+            ORDER BY attempt_index ASC
+            LIMIT 1
+        ) first_att ON TRUE
         WHERE ec.partition_key = $1 AND ec.execution_id = $2
         "#,
     )
@@ -718,8 +732,8 @@ pub(super) async fn read_execution_info_impl(
     let raw_fields: JsonValue = row.try_get("raw_fields").map_err(map_sqlx_error)?;
     let attempt_outcome_opt: Option<String> =
         row.try_get("attempt_outcome").map_err(map_sqlx_error)?;
-    let attempt_started_at_ms_opt: Option<i64> =
-        row.try_get("attempt_started_at_ms").map_err(map_sqlx_error)?;
+    let first_started_at_ms_opt: Option<i64> =
+        row.try_get("first_started_at_ms").map_err(map_sqlx_error)?;
 
     let lifecycle_phase: LifecyclePhase = json_enum!(
         LifecyclePhase,
@@ -786,8 +800,10 @@ pub(super) async fn read_execution_info_impl(
         }
     }
 
-    let flow_id = flow_id_uuid
-        .map(|fid| format!("{{fp:{part}}}:{fid}", part = id.partition()));
+    // `ExecutionInfo.flow_id` is the bare UUID wire form of `FlowId`
+    // (per `uuid_id!` macro — no hash-tag prefix). Valkey stores the
+    // bare UUID in `exec_core["flow_id"]` too (Valkey parity).
+    let flow_id = flow_id_uuid.map(|fid| fid.to_string());
 
     Ok(Some(ExecutionInfo {
         execution_id: id.clone(),
@@ -798,7 +814,7 @@ pub(super) async fn read_execution_info_impl(
         state_vector,
         public_state,
         created_at: created_at_ms.to_string(),
-        started_at: attempt_started_at_ms_opt.map(|v| v.to_string()),
+        started_at: first_started_at_ms_opt.map(|v| v.to_string()),
         completed_at: terminal_at_ms_opt.map(|v| v.to_string()),
         current_attempt_index: attempt_index.max(0) as u32,
         flow_id,
