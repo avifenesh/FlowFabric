@@ -35,7 +35,7 @@ use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::EngineError;
 #[cfg(feature = "valkey-default")]
 use ff_core::types::AttemptIndex;
-use ff_core::types::{BudgetId, EdgeId, ExecutionId, FlowId, LaneId, TimestampMs};
+use ff_core::types::{BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
 
 /// Outcome of a delegated call, as a borrowed view for hook
 /// consumption. Kept allocation-free: error category is a
@@ -192,6 +192,19 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
         args: SuspendArgs,
     ) -> Result<SuspendOutcome, EngineError> {
         with_hooks!(self, "suspend", self.inner.suspend(handle, args).await)
+    }
+
+    async fn suspend_by_triple(
+        &self,
+        exec_id: ExecutionId,
+        triple: LeaseFence,
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        with_hooks!(
+            self,
+            "suspend_by_triple",
+            self.inner.suspend_by_triple(exec_id, triple, args).await
+        )
     }
 
     async fn create_waitpoint(

@@ -308,6 +308,12 @@ but no longer trips on Postgres.
 | `subscribe_signal_delivery` | `impl` | `impl` | Valkey: `duplicate_connection()` + `XREAD BLOCK 5000 STREAMS ff:part:{fp:N}:signal_delivery <cursor>`; cursor is `0x01 ++ ms(BE8) ++ seq(BE8)`. Producer XADD lives in `ff_deliver_signal` at KEYS[15]. Postgres: `ff_signal_event` outbox + `LISTEN ff_signal_event`; cursor is `0x02 ++ event_id(BE8)`. Producer INSERT lives in `suspend_ops::deliver_signal_impl`'s SERIALIZABLE tx. **#282 ScannerFilter surface**: trait method takes `filter: &ScannerFilter`; Valkey gates via the shared #122 `FilterGate`; Postgres filters in-memory against denormalised `namespace`/`instance_tag` columns on `ff_signal_event` (migration 0009). (Stage B, #310 / #282) |
 | `subscribe_instance_tags` | `n/a` | `n/a` | Audited #311 (2026-04-24) + deferred: cairn's one-shot `instance_tag_backfill` pattern is served by `list_executions` + `ScannerFilter::with_instance_tag(..)` pagination; a realtime tag-churn stream is speculative demand we do not have today. Trait method remains and returns `Unavailable` on both backends; reserving the surface for future concrete demand. RFC-019 §instance_tags amended. |
 
+### Post-v0.9 additive methods
+
+| Method | Valkey | Postgres | Notes |
+|---|---|---|---|
+| `suspend_by_triple` | `impl` | `impl` | Cairn #322 service-layer entry point for suspend-by-triple (pause-by-operator, enter-waiting-approval, cancel-with-timeout-record). Valkey: HGETALL `exec_core` pre-read for `lane_id` / `current_attempt_index` / `current_worker_instance_id`, then the existing `ff_suspend_execution` FCALL with fence fields sourced from the triple — identical Lua dedup / §3 replay contract as `suspend`. Postgres: single `SELECT attempt_index FROM ff_exec_core` pre-read (Postgres attempts are keyed by `attempt_index`, not the triple's `attempt_id` — the `attempt_id` field is advisory on this backend), then the shared `suspend_core` SERIALIZABLE body. Default trait impl returns `EngineError::Unavailable { op: "suspend_by_triple" }` so downstream impls remain non-breaking. |
+
 ### Deferred to v0.9 / post-0.8
 
 Every Postgres column row still marked `stub` in the Stage A table

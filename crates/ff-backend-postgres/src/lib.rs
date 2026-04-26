@@ -56,7 +56,7 @@ use ff_core::partition::PartitionConfig;
 use ff_core::types::AttemptIndex;
 #[cfg(feature = "core")]
 use ff_core::types::EdgeId;
-use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
+use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
 // Wave 5a — re-export `PgPool` so crates that depend on
 // `ff-backend-postgres` (and not `sqlx` directly) can name the pool
 // type in their own APIs (e.g. `ff-engine::dispatch_via_postgres`).
@@ -456,6 +456,23 @@ impl EngineBackend for PostgresBackend {
         args: SuspendArgs,
     ) -> Result<SuspendOutcome, EngineError> {
         suspend_ops::suspend_impl(&self.pool, &self.partition_config, handle, args).await
+    }
+
+    #[tracing::instrument(name = "pg.suspend_by_triple", skip_all)]
+    async fn suspend_by_triple(
+        &self,
+        exec_id: ExecutionId,
+        triple: LeaseFence,
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        suspend_ops::suspend_by_triple_impl(
+            &self.pool,
+            &self.partition_config,
+            exec_id,
+            triple,
+            args,
+        )
+        .await
     }
 
     #[tracing::instrument(name = "pg.create_waitpoint", skip_all)]
