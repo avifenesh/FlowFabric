@@ -504,10 +504,21 @@ pub(super) async fn resolve_execution_flow_id_impl(
 // JSON-deserialising; unknown tokens surface as `Corruption` errors
 // rather than silently defaulting.
 
+// Normalisation maps: `ff_exec_core` literal → closest
+// serde-snake_case enum variant. Each arm is grounded in an actual
+// write site in this crate; unknown tokens fall through so
+// `json_enum!` surfaces `Corruption` loudly.
+
 fn normalise_lifecycle_phase(raw: &str) -> &str {
     match raw {
+        // Terminal family — `cancelled` is Postgres-specific
+        // (flow.rs:674 writes it directly), `terminal` is canonical.
         "cancelled" | "terminal" => "terminal",
-        "pending" | "runnable" | "eligible" | "blocked" | "leased" => "runnable",
+        // Pre-runnable + runnable variants collapse to `Runnable`
+        // (the user-facing enum only distinguishes 5 phases). `blocked`
+        // is a legacy literal still referenced in dispatch.rs:352's
+        // CASE clause but no longer written by current paths.
+        "pending" | "runnable" | "eligible" | "blocked" => "runnable",
         "active" => "active",
         "suspended" => "suspended",
         "submitted" => "submitted",
@@ -517,6 +528,8 @@ fn normalise_lifecycle_phase(raw: &str) -> &str {
 
 fn normalise_ownership_state(raw: &str) -> &str {
     match raw {
+        // `released` is a Postgres-specific post-suspension marker
+        // (suspend_ops.rs:585); nearest enum variant is `Unowned`.
         "released" | "unowned" => "unowned",
         "leased" => "leased",
         "lease_expired_reclaimable" => "lease_expired_reclaimable",
@@ -527,15 +540,41 @@ fn normalise_ownership_state(raw: &str) -> &str {
 
 fn normalise_eligibility_state(raw: &str) -> &str {
     match raw {
+        // Terminal-cancelled rows → `NotApplicable` (Valkey parity).
         "cancelled" => "not_applicable",
+        // Scheduler ClaimGrant transitional state; nearest user-facing
+        // variant is still `EligibleNow` (the exec is about to be
+        // claimed — scheduler has picked it but the worker hasn't
+        // acknowledged yet).
+        "pending_claim" => "eligible_now",
         other => other,
     }
 }
 
 fn normalise_attempt_state(raw: &str) -> &str {
     match raw {
-        "pending_claim" => "pending_first_attempt",
+        // `pending` is the Postgres initial-insert literal
+        // (exec_core.rs:166); `pending_claim` is the scheduler transitional
+        // write. Both collapse to `PendingFirstAttempt`.
+        "pending" | "pending_claim" => "pending_first_attempt",
+        // Bare `running` from the suspension-resume claim path
+        // (suspend_ops.rs:958); canonical form is `running_attempt`.
         "running" => "running_attempt",
+        // `cancelled` attempt_state (flow.rs cancel path) has no direct
+        // enum variant; nearest is `AttemptTerminal`.
+        "cancelled" => "attempt_terminal",
+        other => other,
+    }
+}
+
+/// Collapse Postgres `public_state` literals to the
+/// `PublicState` snake_case serde form.
+fn normalise_public_state(raw: &str) -> &str {
+    match raw {
+        // Postgres writes the bare `running` literal on the
+        // resume-claim path (suspend_ops.rs:958). Valkey / the
+        // `PublicState` enum spell it `active`.
+        "running" => "active",
         other => other,
     }
 }
@@ -603,7 +642,8 @@ pub(super) async fn read_execution_state_impl(
     let Some((raw,)) = row else {
         return Ok(None);
     };
-    let parsed: PublicState = json_enum!(PublicState, "public_state", &raw)?;
+    let parsed: PublicState =
+        json_enum!(PublicState, "public_state", normalise_public_state(&raw))?;
     Ok(Some(parsed))
 }
 
@@ -696,7 +736,11 @@ pub(super) async fn read_execution_info_impl(
         "eligibility_state",
         normalise_eligibility_state(&eligibility_state_raw)
     )?;
-    let public_state: PublicState = json_enum!(PublicState, "public_state", &public_state_raw)?;
+    let public_state: PublicState = json_enum!(
+        PublicState,
+        "public_state",
+        normalise_public_state(&public_state_raw)
+    )?;
     let attempt_state: AttemptState = json_enum!(
         AttemptState,
         "attempt_state",

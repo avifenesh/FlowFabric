@@ -176,7 +176,7 @@ async fn read_execution_state_returns_public_state() {
         "active",
         "leased",
         "not_applicable",
-        "active",
+        "running", // Postgres writes `running`; read layer normalises → Active
         "running_attempt",
         0,
         now,
@@ -224,7 +224,7 @@ async fn read_execution_info_lateral_joins_current_attempt() {
         "active",
         "leased",
         "not_applicable",
-        "active",
+        "running", // Postgres writes `running`; read layer normalises → Active
         "running_attempt",
         1,
         now,
@@ -343,7 +343,7 @@ async fn get_execution_result_active_returns_none() {
         "active",
         "leased",
         "not_applicable",
-        "active",
+        "running",
         "running_attempt",
         0,
         now,
@@ -393,4 +393,126 @@ async fn get_execution_result_terminal_returns_payload() {
         .await
         .expect("call ok");
     assert_eq!(got.as_deref(), Some(payload.as_slice()));
+}
+
+// ── Normalization coverage for write-site literals ───────────────
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn read_execution_info_fresh_create_literals() {
+    // Mirrors exactly the literals `create_execution_impl` writes on
+    // INSERT: submitted/unowned/eligible_now/waiting/pending. Exercises
+    // `attempt_state = 'pending'` → `PendingFirstAttempt` normalisation.
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "default",
+        "submitted",
+        "unowned",
+        "eligible_now",
+        "waiting",
+        "pending", // Postgres create-time literal
+        0,
+        now,
+        None,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+
+    let info = fx
+        .backend
+        .read_execution_info(&fx.exec_id)
+        .await
+        .expect("call ok")
+        .expect("exec present");
+    assert_eq!(info.public_state, PublicState::Waiting);
+    // `pending` normalises to `PendingFirstAttempt`.
+    assert_eq!(
+        info.state_vector.attempt_state,
+        ff_core::state::AttemptState::PendingFirstAttempt
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn read_execution_info_cancelled_row() {
+    // Postgres cancel path writes lifecycle_phase='cancelled',
+    // eligibility_state='cancelled', public_state='cancelled',
+    // attempt_state='cancelled' (flow.rs:674 + attempt.rs cancel).
+    // Exercises every normalisation branch on the terminal-cancel row.
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "default",
+        "cancelled",
+        "unowned",
+        "cancelled",
+        "cancelled",
+        "cancelled",
+        0,
+        now,
+        Some(now + 1),
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+
+    let info = fx
+        .backend
+        .read_execution_info(&fx.exec_id)
+        .await
+        .expect("call ok")
+        .expect("exec present");
+    assert_eq!(info.public_state, PublicState::Cancelled);
+    assert_eq!(info.state_vector.lifecycle_phase, LifecyclePhase::Terminal);
+    assert_eq!(info.state_vector.terminal_outcome, TerminalOutcome::Cancelled);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn read_execution_info_pending_claim_eligibility() {
+    // Scheduler ClaimGrant transitional literal `pending_claim` on
+    // `eligibility_state`; must normalise to `EligibleNow`.
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "default",
+        "runnable",
+        "unowned",
+        "pending_claim",
+        "waiting",
+        "pending_claim",
+        0,
+        now,
+        None,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    let info = fx
+        .backend
+        .read_execution_info(&fx.exec_id)
+        .await
+        .expect("call ok")
+        .expect("exec present");
+    assert_eq!(
+        info.state_vector.eligibility_state,
+        ff_core::state::EligibilityState::EligibleNow
+    );
 }
