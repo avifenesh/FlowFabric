@@ -34,6 +34,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - CI cell (`cargo check -p ff-sdk --no-default-features --features
   sqlite`) — mechanical regression guard for the RFC-023 Phase 1a
   worker.rs cfg-gate discipline.
+- **`ff-backend-sqlite` — Phase 1b: 14 hand-ported SQLite-dialect
+  migrations (0001-0014) covering exec / attempt / flow / budget /
+  quota / outbox schemas.** `SqliteBackend::new` now calls
+  `sqlx::migrate!` against the pool on construction. Flat tables (no
+  HASH-partitioning DDL), `jsonb → TEXT`, `bytea → BLOB`,
+  `uuid → BLOB`, `BIGSERIAL → INTEGER PRIMARY KEY AUTOINCREMENT`,
+  `pg_notify` triggers dropped (broadcast moves to Rust per RFC-023
+  §4.2), `CREATE INDEX CONCURRENTLY` / `USING GIN` / `INCLUDE(...)`
+  collapse to plain `CREATE INDEX`. Trait impls remain `Unavailable`
+  until Phase 2+.
+- `ff_execution_capabilities` junction table on SQLite (replaces the
+  PG `text[]` + GIN shape per RFC-023 §4.1 A4). `WITHOUT ROWID` +
+  reverse index for capability-first routing lookups.
+- `scripts/lint-migrations.sh` — parity-drift lint comparing the PG
+  and SQLite migration directories. Wired into `.github/workflows/
+  matrix.yml` as a quality-gate job (`migration-parity`).
 
 ### Changed
 

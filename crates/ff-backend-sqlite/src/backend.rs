@@ -231,10 +231,17 @@ impl SqliteBackend {
              not supported in production. See RFC-023."
         );
 
-        // Phase 1a: no migrations to apply — the migrations directory
-        // is an empty placeholder with a `.sqlite-skip` tombstone.
-        // Phase 1b lands `sqlx::migrate!("./migrations").run(&pool)`
-        // alongside the first real migration file.
+        // RFC-023 Phase 1b: apply the 14 hand-ported SQLite-dialect
+        // migrations against the freshly-constructed pool. `sqlx::migrate!`
+        // embeds the files at compile time and records applied versions
+        // in `_sqlx_migrations` so reruns are idempotent.
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|e| BackendError::Valkey {
+                kind: ff_core::engine_error::BackendErrorKind::Protocol,
+                message: format!("sqlite migrate for {path:?}: {e}"),
+            })?;
 
         let inner = Arc::new(SqliteBackendInner {
             pool,
