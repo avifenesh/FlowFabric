@@ -896,26 +896,26 @@ fn member_wire_id(partition_key: i16, exec_uuid: Uuid) -> String {
 
 async fn cancel_flow_header_once(
     pool: &PgPool,
+    partition_config: &ff_core::partition::PartitionConfig,
     args: &CancelFlowArgs,
 ) -> Result<CancelFlowHeader, EngineError> {
     let flow_uuid: Uuid = args.flow_id.0;
     // Flow + members share `partition_key` via the flow's partition
-    // hash (RFC-011 co-location). We compute it the same way the
-    // existing `flow::cancel_flow` path does — but here we don't have
-    // a `PartitionConfig`; use a default shape since partition_key is
-    // just `crc16(flow_id) % 256` and the member rows were written
-    // under the same hash.
+    // hash (RFC-011 co-location). Use the backend's configured
+    // `partition_config` so non-default `num_flow_partitions`
+    // deployments route correctly.
     let partition_key: i16 =
-        ff_core::partition::flow_partition(&args.flow_id, &ff_core::partition::PartitionConfig::default())
-            .index as i16;
+        ff_core::partition::flow_partition(&args.flow_id, partition_config).index as i16;
     let now: i64 = args.now.0;
 
     let mut tx = begin_serializable(pool).await?;
 
-    // Pre-read the flow row under lock. If an existing
-    // `ff_cancel_backlog` row already exists for this flow (idempotent
-    // replay / concurrent second call), surface AlreadyTerminal with
-    // the stored policy + the full (already-enumerated) membership.
+    // Pre-read the flow row under lock. Idempotent-replay trigger is
+    // `public_flow_state` — flows already in a terminal state surface
+    // `AlreadyTerminal` with stored policy/reason from `raw_fields` +
+    // either the prior backlog-member enumeration (if we landed the
+    // first flip) or live `ff_exec_core` membership (pre-E2-shape
+    // flow cancelled by the legacy `flow::cancel_flow` path).
     let flow_row = sqlx::query(
         r#"
         SELECT public_flow_state, raw_fields
@@ -1063,31 +1063,37 @@ async fn cancel_flow_header_once(
     .await
     .map_err(map_sqlx_error)?;
 
-    let mut member_execution_ids: Vec<String> = Vec::with_capacity(member_rows.len());
-    for row in &member_rows {
-        let exec_uuid: Uuid = row.get("execution_id");
-        let wire = member_wire_id(partition_key, exec_uuid);
+    let member_uuids: Vec<Uuid> = member_rows.iter().map(|r| r.get("execution_id")).collect();
+    let member_execution_ids: Vec<String> = member_uuids
+        .iter()
+        .map(|u| member_wire_id(partition_key, *u))
+        .collect();
 
-        // Insert backlog member row.
+    if !member_uuids.is_empty() {
+        // Bulk INSERT backlog members via UNNEST — one round-trip
+        // regardless of membership cardinality (vs. N round-trips in
+        // the prior per-member loop).
         sqlx::query(
             r#"
             INSERT INTO ff_cancel_backlog_member
-                (partition_key, flow_id, execution_id, ack_state)
-            VALUES ($1, $2, $3, 'pending')
+                (partition_key, flow_id, execution_id)
+            SELECT $1, $2, eid
+              FROM UNNEST($3::text[]) AS eid
             ON CONFLICT (partition_key, flow_id, execution_id) DO NOTHING
             "#,
         )
         .bind(partition_key)
         .bind(flow_uuid)
-        .bind(&wire)
+        .bind(&member_execution_ids)
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx_error)?;
 
-        // Flip the member's `ff_exec_core` lifecycle (same shape as
-        // `flow::cancel_flow_once`). The Server's own wait/async
-        // machinery drives the per-member cancel events downstream;
-        // the backlog row lives until `ack_cancel_member` drains it.
+        // Bulk UPDATE each member's `ff_exec_core` lifecycle (same
+        // shape as `flow::cancel_flow_once`). The Server's own
+        // wait/async machinery drives per-member cancel events
+        // downstream; the backlog rows live until `ack_cancel_member`
+        // drains them.
         sqlx::query(
             r#"
             UPDATE ff_exec_core
@@ -1097,18 +1103,16 @@ async fn cancel_flow_header_once(
                    terminal_at_ms      = COALESCE(terminal_at_ms, $3),
                    cancellation_reason = COALESCE(cancellation_reason, $4),
                    cancelled_by        = COALESCE(cancelled_by, 'cancel_flow_header')
-             WHERE partition_key = $1 AND execution_id = $2
+             WHERE partition_key = $1 AND execution_id = ANY($2::uuid[])
             "#,
         )
         .bind(partition_key)
-        .bind(exec_uuid)
+        .bind(&member_uuids)
         .bind(now)
         .bind(&args.reason)
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx_error)?;
-
-        member_execution_ids.push(wire);
     }
 
     // Outbox emit (§4.2.7 — flow-level `flow_cancel_requested`).
@@ -1137,22 +1141,23 @@ async fn cancel_flow_header_once(
 
 pub(super) async fn cancel_flow_header_impl(
     pool: &PgPool,
+    partition_config: &ff_core::partition::PartitionConfig,
     args: CancelFlowArgs,
 ) -> Result<CancelFlowHeader, EngineError> {
-    retry_serializable(|| cancel_flow_header_once(pool, &args)).await
+    retry_serializable(|| cancel_flow_header_once(pool, partition_config, &args)).await
 }
 
 // ─── ack_cancel_member (§4.2.3) ────────────────────────────────────
 
 async fn ack_cancel_member_once(
     pool: &PgPool,
+    partition_config: &ff_core::partition::PartitionConfig,
     flow_id: &FlowId,
     execution_id: &ExecutionId,
 ) -> Result<(), EngineError> {
     let flow_uuid: Uuid = flow_id.0;
     let partition_key: i16 =
-        ff_core::partition::flow_partition(flow_id, &ff_core::partition::PartitionConfig::default())
-            .index as i16;
+        ff_core::partition::flow_partition(flow_id, partition_config).index as i16;
     let member_wire = execution_id.as_str();
 
     let mut tx = begin_serializable(pool).await?;
@@ -1213,8 +1218,12 @@ async fn ack_cancel_member_once(
 
 pub(super) async fn ack_cancel_member_impl(
     pool: &PgPool,
+    partition_config: &ff_core::partition::PartitionConfig,
     flow_id: FlowId,
     execution_id: ExecutionId,
 ) -> Result<(), EngineError> {
-    retry_serializable(|| ack_cancel_member_once(pool, &flow_id, &execution_id)).await
+    retry_serializable(|| {
+        ack_cancel_member_once(pool, partition_config, &flow_id, &execution_id)
+    })
+    .await
 }

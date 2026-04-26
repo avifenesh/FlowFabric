@@ -643,7 +643,7 @@ async fn cancel_flow_header_creates_backlog_rows() {
     // Member rows: 2 pending.
     let member_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM ff_cancel_backlog_member \
-         WHERE partition_key = $1 AND flow_id = $2 AND ack_state = 'pending'",
+         WHERE partition_key = $1 AND flow_id = $2",
     )
     .bind(part)
     .bind(flow_uuid)

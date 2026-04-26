@@ -11,9 +11,13 @@
 --   * `ff_cancel_backlog`         — one row per flow; carries flow-level
 --     cancellation policy + reason + requested-at + optional grace
 --     window + status.
---   * `ff_cancel_backlog_member`  — one row per pending member; ack'd
---     rows are DELETEd in the same tx as the parent-row
---     conditional-DELETE CTE.
+--   * `ff_cancel_backlog_member`  — one row per pending member. The
+--     `ack_cancel_member` path hard-DELETEs the row on ack; the
+--     parent backlog row is then conditionally DELETE'd in a second
+--     statement when the last member drains. (Postgres data-modifying
+--     CTEs share a snapshot across statements, which would leave the
+--     parent behind on the last-member drain, so the implementation
+--     uses two sequential DELETEs inside the same SERIALIZABLE tx.)
 --
 -- Both tables are HASH-partitioned 256 ways on `partition_key`
 -- matching the 0001/0002/0012 convention (flow + member executions
@@ -45,15 +49,14 @@ CREATE TABLE ff_cancel_backlog (
     PRIMARY KEY (partition_key, flow_id)
 ) PARTITION BY HASH (partition_key);
 
--- Junction-table row per pending member. `ack_state` flips to 'acked'
--- (or the row is DELETEd outright by the CTE); `acked_at_ms`
--- timestamps the drain for the reconciler's time-based cleanup.
+-- Junction-table row per pending member. `ack_cancel_member`
+-- hard-DELETEs the row on ack; presence = "still pending", absence
+-- = "acked" (there is no per-row ack-state flag because the ack path
+-- doesn't flip state, it removes the row).
 CREATE TABLE ff_cancel_backlog_member (
     partition_key   smallint NOT NULL,
     flow_id         uuid     NOT NULL,
     execution_id    text     NOT NULL,
-    ack_state       text     NOT NULL DEFAULT 'pending',
-    acked_at_ms     bigint,
     PRIMARY KEY (partition_key, flow_id, execution_id)
 ) PARTITION BY HASH (partition_key);
 
@@ -73,19 +76,6 @@ COMMIT;
 -- ============================================================
 -- Section 3 — Secondary indexes (non-PK)
 -- ============================================================
--- Pending-ack scan: the cancel-backlog reconciler polls this to
--- redrive stuck members. `WHERE ack_state = 'pending'` is the hot
--- predicate; include `flow_id` on the leading key so the scan groups
--- per-flow without a heap hit.
-CREATE INDEX ff_cancel_backlog_member_pending_idx
-    ON ff_cancel_backlog_member (partition_key, flow_id)
-    WHERE ack_state = 'pending';
-
--- Time-based cleanup: prune drained members beyond the grace window.
-CREATE INDEX ff_cancel_backlog_member_acked_at_idx
-    ON ff_cancel_backlog_member (partition_key, acked_at_ms)
-    WHERE acked_at_ms IS NOT NULL;
-
 -- Grace-window scan (`grace_until_ms` ≤ now) for reconciler wake-up.
 CREATE INDEX ff_cancel_backlog_grace_idx
     ON ff_cancel_backlog (partition_key, grace_until_ms)

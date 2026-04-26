@@ -766,7 +766,7 @@ impl EngineBackend for PostgresBackend {
         &self,
         args: CancelFlowArgs,
     ) -> Result<CancelFlowHeader, EngineError> {
-        operator::cancel_flow_header_impl(&self.pool, args).await
+        operator::cancel_flow_header_impl(&self.pool, &self.partition_config, args).await
     }
 
     #[cfg(feature = "core")]
@@ -776,7 +776,13 @@ impl EngineBackend for PostgresBackend {
         flow_id: &FlowId,
         execution_id: &ExecutionId,
     ) -> Result<(), EngineError> {
-        operator::ack_cancel_member_impl(&self.pool, flow_id.clone(), execution_id.clone()).await
+        operator::ack_cancel_member_impl(
+            &self.pool,
+            &self.partition_config,
+            flow_id.clone(),
+            execution_id.clone(),
+        )
+        .await
     }
 
     // ── RFC-017 Stage A — ingress (promoted from inherent) ────
