@@ -1,12 +1,30 @@
 # RFC-023: SQLite — dev-only backend (testing harness, Temporal-pattern)
 
 **Status:** DRAFT
-**Revision:** 2
+**Revision:** 3
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Target release:** v0.12.0 (next content delivery after v0.11.0 Postgres Wave 9)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions), RFC-020 (Postgres Wave 9 — shipped v0.11.0), RFC-022 (parked: full-parity SQLite — superseded in scope by this RFC)
 **Tracking issue:** #338
+
+### Revision 3 summary (2026-04-26)
+
+Round-2 yielded A+C ACCEPT, B REQUEST-REVISION with 3 surgical
+items. No scope changes; doc-only alignment to ground-truth code:
+
+- **B-R3-1 (§4.7.1).** Replaced fictional `ff_sdk::worker::Worker`
+  import with the real `ff_sdk::FlowFabricWorker` re-export at
+  `crates/ff-sdk/src/lib.rs:149`, and updated the example's
+  `connect_with` call-site + the "directly wraps" prose line.
+- **B-R3-2 (§4.5).** Clarified that `BackendError::RequiresDevMode`
+  is a NEW variant on the existing `#[non_exhaustive]`
+  `BackendError` enum at `crates/ff-core/src/engine_error.rs:488`
+  — NOT a new `BackendErrorKind` variant (that enum is scoped to
+  Valkey transport classification per its rustdoc).
+- **B-R3-3 (§9).** Added `CHANGELOG.md` `[Unreleased]` gate bullet
+  for the four new public APIs plus the new
+  `BackendError::RequiresDevMode` variant, per CLAUDE.md §5.
 
 ### Revision 2 summary (2026-04-26)
 
@@ -509,8 +527,12 @@ Present → emits the warn banner on the tracing root before
 **Embedded path — `SqliteBackend::new`** (library entrypoint in
 `crates/ff-backend-sqlite/src/lib.rs`): performs the SAME
 `FF_DEV_MODE=1` check at the top of the function. Absent →
-returns `BackendError::RequiresDevMode` (parallel shape to
-`ServerError::SqliteRequiresDevMode`). Present → emits the warn
+returns a new `BackendError::RequiresDevMode` variant (parallel
+shape to `ServerError::SqliteRequiresDevMode`; adds a new variant
+on the existing `#[non_exhaustive]` `BackendError` enum at
+`crates/ff-core/src/engine_error.rs:488`. Does NOT extend
+`BackendErrorKind`, which is scoped to Valkey transport
+classification per its existing rustdoc). Present → emits the warn
 banner on construction. Reason: cairn and FF-internal embedded
 tests (§4.7 primary example) instantiate SQLite without ever
 touching ff-server; the guard cannot live only at the ff-server
@@ -548,14 +570,14 @@ ff-server boundary exercised.
 #### 4.7.1 Embedded path — primary, cairn-canonical
 
 No HTTP listener, no bind port, no `reqwest` dependency — the
-`Worker` directly wraps the SQLite backend trait object. This
+`FlowFabricWorker` directly wraps the SQLite backend trait object. This
 is the shape cairn's `cargo test` uses.
 
 ```rust
 // cairn-fabric/tests/integration_sqlite.rs
 use std::sync::Arc;
 use ff_backend_sqlite::SqliteBackend;
-use ff_sdk::worker::{Worker, WorkerConfig};
+use ff_sdk::{FlowFabricWorker, WorkerConfig};
 
 #[tokio::test]
 async fn end_to_end_op_roundtrip_on_sqlite() {
@@ -573,13 +595,13 @@ async fn end_to_end_op_roundtrip_on_sqlite() {
         SqliteBackend::new(&db_uri).await.expect("sqlite init"),
     );
 
-    // `Worker::connect_with` accepts any `Arc<dyn EngineBackend>`
+    // `FlowFabricWorker::connect_with` accepts any `Arc<dyn EngineBackend>`
     // (crates/ff-sdk/src/worker.rs:587). No ff-server needed.
     let config = WorkerConfig::builder()
         .lanes(vec!["default".into()])
         .build()
         .expect("worker config");
-    let worker = Worker::connect_with(config, backend, None)
+    let worker = FlowFabricWorker::connect_with(config, backend, None)
         .await
         .expect("worker connect");
 
@@ -890,6 +912,12 @@ whole or does not ship.
 - [ ] **Parity-drift migration lint** (§4.1) green: every PG
       migration has a SQLite sibling or a `.sqlite-skip` entry
       with tracking issue.
+- [ ] **CHANGELOG entries.** `CHANGELOG.md` `[Unreleased]` entries
+      under `### Added` for the four new public APIs
+      (`BackendKind::Sqlite`, `SqliteServerConfig`,
+      `ServerConfig::sqlite_dev()`, `SqliteBackend::new`), plus the
+      new `BackendError::RequiresDevMode` variant per §4.5.
+      Consistent with CLAUDE.md §5 release-gate discipline.
 
 Per [feedback_release_publish_list_drift](../../memory/feedback_release_publish_list_drift.md),
 release-config files (release.yml, release.toml, RELEASING.md)
