@@ -53,6 +53,12 @@ use ff_core::contracts::ExecutionInfo;
 use ff_core::contracts::{
     CancelExecutionArgs, CancelExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
 };
+// RFC-020 Wave 9 Spine-A pt.2 — operator-control + flow-cancel mutating surfaces.
+#[cfg(feature = "core")]
+use ff_core::contracts::{
+    CancelFlowArgs, CancelFlowHeader, ChangePriorityArgs, ChangePriorityResult,
+    ReplayExecutionArgs, ReplayExecutionResult,
+};
 // RFC-020 Wave 9 Standalone-1 — budget/quota admin surfaces.
 #[cfg(feature = "core")]
 use ff_core::contracts::{
@@ -95,6 +101,8 @@ pub mod listener;
 pub mod migrate;
 #[cfg(feature = "core")]
 pub mod operator;
+#[cfg(feature = "core")]
+mod operator_event;
 pub mod pool;
 #[cfg(feature = "core")]
 pub mod reconcilers;
@@ -723,6 +731,58 @@ impl EngineBackend for PostgresBackend {
         args: RevokeLeaseArgs,
     ) -> Result<RevokeLeaseResult, EngineError> {
         operator::revoke_lease_impl(&self.pool, args).await
+    }
+
+    // ── RFC-020 Wave 9 Spine-A pt.2 — operator control + flow cancel (§4.2.3 + §4.2.4 + §4.2.5) ─
+    //
+    // Four methods landing behind `Supports.change_priority` +
+    // `Supports.replay_execution` + `Supports.cancel_flow_header` +
+    // `Supports.ack_cancel_member` (all stay `false` until the Wave 9
+    // release PR flips them atomically, RFC §6.3). SERIALIZABLE + CAS +
+    // `ff_operator_event` outbox emit on the same tx (§4.2.6 + §4.2.7).
+    // `ack_cancel_member` is silent on the outbox (Valkey-parity).
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.change_priority", skip_all)]
+    async fn change_priority(
+        &self,
+        args: ChangePriorityArgs,
+    ) -> Result<ChangePriorityResult, EngineError> {
+        operator::change_priority_impl(&self.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.replay_execution", skip_all)]
+    async fn replay_execution(
+        &self,
+        args: ReplayExecutionArgs,
+    ) -> Result<ReplayExecutionResult, EngineError> {
+        operator::replay_execution_impl(&self.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.cancel_flow_header", skip_all)]
+    async fn cancel_flow_header(
+        &self,
+        args: CancelFlowArgs,
+    ) -> Result<CancelFlowHeader, EngineError> {
+        operator::cancel_flow_header_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.ack_cancel_member", skip_all)]
+    async fn ack_cancel_member(
+        &self,
+        flow_id: &FlowId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        operator::ack_cancel_member_impl(
+            &self.pool,
+            &self.partition_config,
+            flow_id.clone(),
+            execution_id.clone(),
+        )
+        .await
     }
 
     // ── RFC-017 Stage A — ingress (promoted from inherent) ────
