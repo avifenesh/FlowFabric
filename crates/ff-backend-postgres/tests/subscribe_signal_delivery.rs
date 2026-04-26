@@ -6,6 +6,7 @@
 //! dragging the full HMAC + suspension state machine into scope.
 
 use ff_backend_postgres::{apply_migrations, PostgresBackend};
+use ff_core::backend::ScannerFilter;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::partition::PartitionConfig;
 use ff_core::stream_events::SignalDeliveryEffect;
@@ -38,7 +39,7 @@ async fn subscribe_signal_delivery_yields_typed_event() {
     let backend = PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
 
     let mut stream = backend
-        .subscribe_signal_delivery(StreamCursor::empty())
+        .subscribe_signal_delivery(StreamCursor::empty(), &ScannerFilter::default())
         .await
         .expect("subscribe");
 
@@ -123,7 +124,7 @@ async fn subscribe_signal_delivery_cursor_resume() {
 
     let start_cursor = ff_core::stream_subscribe::encode_postgres_event_cursor(tail);
     let mut stream = backend
-        .subscribe_signal_delivery(start_cursor)
+        .subscribe_signal_delivery(start_cursor, &ScannerFilter::default())
         .await
         .expect("subscribe resume");
 
@@ -138,7 +139,7 @@ async fn subscribe_signal_delivery_cursor_resume() {
     drop(stream);
 
     let mut stream2 = backend
-        .subscribe_signal_delivery(resume_cursor.clone())
+        .subscribe_signal_delivery(resume_cursor.clone(), &ScannerFilter::default())
         .await
         .expect("subscribe resume after drop");
     let second = tokio::time::timeout(Duration::from_secs(5), stream2.next())

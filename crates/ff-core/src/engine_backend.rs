@@ -1127,9 +1127,18 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// `Err(EngineError::StreamDisconnected { cursor })` on backend
     /// disconnect; resume by calling this method again with the
     /// returned cursor.
+    ///
+    /// `filter` (#282): when `filter.instance_tag` is `Some((k, v))`,
+    /// only events whose execution carries tag `k = v` are yielded
+    /// (matching the [`crate::backend::ScannerFilter`] surface from
+    /// #122). Pass `&ScannerFilter::default()` for unfiltered
+    /// behaviour. Filtering happens inside the backend stream; the
+    /// [`crate::stream_events::LeaseHistorySubscription`] return type
+    /// is unchanged.
     async fn subscribe_lease_history(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
+        _filter: &crate::backend::ScannerFilter,
     ) -> Result<crate::stream_events::LeaseHistorySubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_lease_history",
@@ -1146,9 +1155,15 @@ pub trait EngineBackend: Send + Sync + 'static {
     ///   sentinel. If you need at-least-once replay with durable
     ///   cursor resume, use the Postgres backend (see
     ///   `docs/POSTGRES_PARITY_MATRIX.md` row `subscribe_completion`).
+    ///
+    /// `filter` (#282): see [`Self::subscribe_lease_history`]. Valkey
+    /// reuses the `subscribe_completions_filtered` per-event HGET
+    /// gate; Postgres filters inline against the outbox's denormalised
+    /// `instance_tag` column.
     async fn subscribe_completion(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
+        _filter: &crate::backend::ScannerFilter,
     ) -> Result<crate::stream_events::CompletionSubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_completion",
@@ -1157,9 +1172,12 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     /// Subscribe to signal-delivery events (satisfied / buffered /
     /// deduped).
+    ///
+    /// `filter` (#282): see [`Self::subscribe_lease_history`].
     async fn subscribe_signal_delivery(
         &self,
         _cursor: crate::stream_subscribe::StreamCursor,
+        _filter: &crate::backend::ScannerFilter,
     ) -> Result<crate::stream_events::SignalDeliverySubscription, EngineError> {
         Err(EngineError::Unavailable {
             op: "subscribe_signal_delivery",

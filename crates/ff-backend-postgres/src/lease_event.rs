@@ -39,16 +39,39 @@ pub(crate) async fn emit<'c>(
     event_type: &'static str,
     occurred_at_ms: i64,
 ) -> Result<(), EngineError> {
+    // #282 — populate `namespace` + `instance_tag` via co-transactional
+    // SELECT on `ff_exec_core` so `subscribe_lease_history` with a
+    // non-noop [`ff_core::backend::ScannerFilter`] can filter inline.
+    // Rows for executions that never wrote a tag hash get NULL →
+    // filtered subscribers silently drop them (unfiltered subscribers
+    // ignore both columns, preserving pre-#282 behaviour).
+    //
+    // The `instance_tag` column stores the VALUE of the execution's
+    // `cairn.instance_id` tag (mirrors the dependency-reconciler
+    // convention, `reconcilers::dependency::reconcile_tick`); the
+    // consumer compares `filter.instance_tag.1` against it.
     sqlx::query(
         "INSERT INTO ff_lease_event \
-         (execution_id, lease_id, event_type, occurred_at_ms, partition_key) \
-         VALUES ($1, $2, $3, $4, $5)",
+         (execution_id, lease_id, event_type, occurred_at_ms, partition_key, \
+          namespace, instance_tag) \
+         SELECT $1, $2, $3, $4, $5, \
+                raw_fields->>'namespace', \
+                raw_fields->'tags'->>'cairn.instance_id' \
+         FROM ff_exec_core \
+         WHERE partition_key = $5 AND execution_id = $6::uuid \
+         UNION ALL \
+         SELECT $1, $2, $3, $4, $5, NULL, NULL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM ff_exec_core \
+             WHERE partition_key = $5 AND execution_id = $6::uuid \
+         )",
     )
     .bind(execution_uuid.to_string())
     .bind(lease_id)
     .bind(event_type)
     .bind(occurred_at_ms)
     .bind(i32::from(partition_key))
+    .bind(execution_uuid)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_error)?;
