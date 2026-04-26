@@ -6272,8 +6272,14 @@ impl EngineBackend for ValkeyBackend {
     async fn subscribe_lease_history(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
-        subscribe_lease_history_impl(&self.client, cursor).await
+        subscribe_lease_history_impl(
+            &self.client,
+            cursor,
+            build_filter_gate(self, filter),
+        )
+        .await
     }
 
     // ── RFC-019 Stage B — `subscribe_signal_delivery` (#310) ───────
@@ -6284,8 +6290,14 @@ impl EngineBackend for ValkeyBackend {
     async fn subscribe_signal_delivery(
         &self,
         cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
-        subscribe_signal_delivery_impl(&self.client, cursor).await
+        subscribe_signal_delivery_impl(
+            &self.client,
+            cursor,
+            build_filter_gate(self, filter),
+        )
+        .await
     }
 
     // ── RFC-019 Stage B — `subscribe_completion` (issue #309) ─────
@@ -6309,6 +6321,7 @@ impl EngineBackend for ValkeyBackend {
     async fn subscribe_completion(
         &self,
         _cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::CompletionSubscription, EngineError> {
         use ff_core::stream_events::{CompletionEvent, CompletionOutcome};
         use ff_core::stream_subscribe::StreamCursor;
@@ -6317,12 +6330,20 @@ impl EngineBackend for ValkeyBackend {
         use std::task::{Context, Poll};
 
         // Delegate to the RESP3 subscriber already exposed via the
-        // `CompletionBackend` trait. This shares the same
-        // reconnect/parse loop (`completion::subscriber_loop`) that
-        // ff-engine's `completion_listener` consumes — no duplicate
-        // pubsub machinery.
-        let inner =
-            ff_core::completion_backend::CompletionBackend::subscribe_completions(self).await?;
+        // `CompletionBackend` trait. When a non-noop filter is
+        // supplied, forward it so the per-push HGET gate installed by
+        // `subscribe_completions_filtered` runs inline. This shares
+        // the same reconnect/parse loop (`completion::subscriber_loop`)
+        // that ff-engine's `completion_listener` consumes — no
+        // duplicate pubsub machinery.
+        let inner = if filter.is_noop() {
+            ff_core::completion_backend::CompletionBackend::subscribe_completions(self).await?
+        } else {
+            ff_core::completion_backend::CompletionBackend::subscribe_completions_filtered(
+                self, filter,
+            )
+            .await?
+        };
 
         struct Adapter {
             inner: ff_core::completion_backend::CompletionStream,
@@ -6395,12 +6416,32 @@ pub fn partition_signal_delivery_key(partition: &Partition) -> String {
     format!("ff:part:{}:signal_delivery", partition.hash_tag())
 }
 
+/// Build the per-subscriber `FilterGate` for `subscribe_lease_history` /
+/// `subscribe_signal_delivery`. Returns `None` when the filter is a
+/// no-op (short-circuit the per-event HGET path entirely). Shares the
+/// exact shape used by `subscribe_completions_filtered` (#122) —
+/// consumers sharing a Valkey keyspace see only their own events.
+fn build_filter_gate(
+    backend: &ValkeyBackend,
+    filter: &ff_core::backend::ScannerFilter,
+) -> Option<crate::completion::FilterGate> {
+    if filter.is_noop() {
+        return None;
+    }
+    Some(crate::completion::FilterGate {
+        client: backend.client.clone(),
+        partition_config: backend.partition_config,
+        filter: filter.clone(),
+    })
+}
+
 /// Valkey-side `subscribe_signal_delivery` — mirror of
 /// `subscribe_lease_history_impl`, swapped to the signal-delivery
 /// stream key + typed `SignalDeliveryEvent` decoding.
 async fn subscribe_signal_delivery_impl(
     client: &ferriskey::Client,
     start_cursor: ff_core::stream_subscribe::StreamCursor,
+    filter_gate: Option<crate::completion::FilterGate>,
 ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
     use ff_core::stream_events::SignalDeliveryEvent;
     use ff_core::stream_subscribe::{decode_valkey_cursor, encode_valkey_cursor};
@@ -6498,6 +6539,16 @@ async fn subscribe_signal_delivery_impl(
                         continue;
                     }
                 };
+                // #282: apply per-subscriber `ScannerFilter` via the
+                // shared FilterGate — matches
+                // `subscribe_completions_filtered`. On non-admit the
+                // event is dropped silently; other consumers sharing
+                // the keyspace receive their own gated copy.
+                if let Some(ref g) = filter_gate
+                    && !g.admits(&event.execution_id).await
+                {
+                    continue;
+                }
                 if tx.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -6513,6 +6564,7 @@ async fn subscribe_signal_delivery_impl(
 async fn subscribe_lease_history_impl(
     client: &ferriskey::Client,
     start_cursor: ff_core::stream_subscribe::StreamCursor,
+    filter_gate: Option<crate::completion::FilterGate>,
 ) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
     use ff_core::stream_events::LeaseHistoryEvent;
     use ff_core::stream_subscribe::{decode_valkey_cursor, encode_valkey_cursor};
@@ -6627,6 +6679,13 @@ async fn subscribe_lease_history_impl(
                         continue;
                     }
                 };
+                // #282: per-subscriber filter gate; see sibling
+                // comment in subscribe_signal_delivery_impl.
+                if let Some(ref g) = filter_gate
+                    && !g.admits(event.execution_id()).await
+                {
+                    continue;
+                }
                 if tx.send(Ok(event)).await.is_err() {
                     // Consumer dropped the stream.
                     return;

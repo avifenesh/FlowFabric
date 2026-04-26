@@ -26,10 +26,23 @@ pub(crate) async fn emit<'c>(
     source_identity: Option<&str>,
     delivered_at_ms: i64,
 ) -> Result<(), EngineError> {
+    // #282 — populate `namespace` + `instance_tag` via co-transactional
+    // SELECT on `ff_exec_core`. See `lease_event::emit` for rationale.
     sqlx::query(
         "INSERT INTO ff_signal_event \
-         (execution_id, signal_id, waitpoint_id, source_identity, delivered_at_ms, partition_key) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (execution_id, signal_id, waitpoint_id, source_identity, \
+          delivered_at_ms, partition_key, namespace, instance_tag) \
+         SELECT $1, $2, $3, $4, $5, $6, \
+                raw_fields->>'namespace', \
+                raw_fields->'tags'->>'cairn.instance_id' \
+         FROM ff_exec_core \
+         WHERE partition_key = $6 AND execution_id = $7::uuid \
+         UNION ALL \
+         SELECT $1, $2, $3, $4, $5, $6, NULL, NULL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM ff_exec_core \
+             WHERE partition_key = $6 AND execution_id = $7::uuid \
+         )",
     )
     .bind(execution_uuid.to_string())
     .bind(signal_id)
@@ -37,6 +50,7 @@ pub(crate) async fn emit<'c>(
     .bind(source_identity)
     .bind(delivered_at_ms)
     .bind(i32::from(partition_key))
+    .bind(execution_uuid)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_error)?;

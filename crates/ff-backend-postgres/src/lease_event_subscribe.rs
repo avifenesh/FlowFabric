@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::engine_error::EngineError;
 use ff_core::stream_events::{LeaseHistoryEvent, LeaseHistorySubscription};
 use ff_core::stream_subscribe::{
@@ -42,6 +43,32 @@ const REPLAY_BATCH: i64 = 256;
 /// Reconnect backoff when the LISTEN connection drops.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(200);
 
+/// #282 — in-memory `ScannerFilter` check over an outbox row's
+/// denormalised `namespace` + `instance_tag` columns. Namespace
+/// compares exact; `instance_tag` compares the caller-supplied VALUE
+/// (the key half of the tuple is denormalisation-choice at write time,
+/// not a query-time input — matches the Valkey/dependency-reconciler
+/// convention). NULL columns never match a non-None filter dimension.
+pub(crate) fn passes_filter(
+    filter: &ScannerFilter,
+    row_namespace: Option<&str>,
+    row_instance_tag: Option<&str>,
+) -> bool {
+    if let Some(ref want_ns) = filter.namespace {
+        match row_namespace {
+            Some(have) if have == want_ns.as_str() => {}
+            _ => return false,
+        }
+    }
+    if let Some((_, ref want_value)) = filter.instance_tag {
+        match row_instance_tag {
+            Some(have) if have == want_value.as_str() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 struct LeaseEventRow {
     event_id: i64,
     execution_id: String,
@@ -58,6 +85,7 @@ pub(crate) async fn subscribe(
     pool: &PgPool,
     partition_key: i16,
     cursor: StreamCursor,
+    filter: ScannerFilter,
 ) -> Result<LeaseHistorySubscription, EngineError> {
     // Decode + validate the caller's cursor before spawning so
     // malformed cursors fail loudly at subscribe time.
@@ -90,6 +118,7 @@ pub(crate) async fn subscribe(
         partition_key,
         tx,
         last_seen,
+        filter,
     ));
 
     Ok(Box::pin(Adapter { rx }))
@@ -116,6 +145,7 @@ async fn subscriber_loop(
     partition_key: i16,
     tx: mpsc::Sender<Result<LeaseHistoryEvent, EngineError>>,
     mut last_seen: i64,
+    filter: ScannerFilter,
 ) {
     loop {
         let mut listener = match PgListener::connect_with(&pool).await {
@@ -143,7 +173,7 @@ async fn subscriber_loop(
         }
 
         // Catch-up replay.
-        if !replay(&pool, partition_key, &tx, &mut last_seen).await {
+        if !replay(&pool, partition_key, &tx, &mut last_seen, &filter).await {
             return;
         }
 
@@ -153,7 +183,7 @@ async fn subscriber_loop(
                 res = listener.recv() => {
                     match res {
                         Ok(_notif) => {
-                            if !replay(&pool, partition_key, &tx, &mut last_seen).await {
+                            if !replay(&pool, partition_key, &tx, &mut last_seen, &filter).await {
                                 return;
                             }
                         }
@@ -201,10 +231,19 @@ async fn replay(
     partition_key: i16,
     tx: &mpsc::Sender<Result<LeaseHistoryEvent, EngineError>>,
     last_seen: &mut i64,
+    filter: &ScannerFilter,
 ) -> bool {
+    // #282 — read the denormalised filter columns on every row so the
+    // in-memory `ScannerFilter::matches`-shaped check can admit / drop
+    // without a per-event RTT. SELECT is unfiltered (matches the
+    // `completion::replay` pattern + keeps `last_seen` advancing past
+    // dropped rows) — the bandwidth cost of two extra TEXT columns is
+    // dwarfed by the round-trip savings of not re-querying skipped
+    // rows on every LISTEN wake.
     loop {
         let rows = match sqlx::query(
-            "SELECT event_id, execution_id, lease_id, event_type, occurred_at_ms, partition_key \
+            "SELECT event_id, execution_id, lease_id, event_type, occurred_at_ms, \
+                    partition_key, namespace, instance_tag \
              FROM ff_lease_event \
              WHERE partition_key = $1 AND event_id > $2 \
              ORDER BY event_id ASC \
@@ -245,6 +284,14 @@ async fn replay(
             let Ok(partition_key) = row.try_get::<i32, _>("partition_key") else {
                 continue;
             };
+            // #282 — denormalised filter columns (added in migration
+            // 0008). NULL-safe via `Option<String>`; unfiltered
+            // subscribers bypass the compare entirely.
+            let namespace: Option<String> =
+                row.try_get::<Option<String>, _>("namespace").unwrap_or(None);
+            let instance_tag: Option<String> = row
+                .try_get::<Option<String>, _>("instance_tag")
+                .unwrap_or(None);
 
             let decoded = LeaseEventRow {
                 event_id,
@@ -255,6 +302,16 @@ async fn replay(
                 partition_key,
             };
             *last_seen = decoded.event_id;
+
+            // #282 — apply `ScannerFilter` inline. Match semantics
+            // mirror the Valkey `FilterGate`: namespace equality +
+            // instance-tag-value equality. A NULL-column row on a
+            // non-noop filter is silently dropped (matches the
+            // "filtered subscribers silently drop NULL-column rows"
+            // invariant documented in migration 0008).
+            if !passes_filter(filter, namespace.as_deref(), instance_tag.as_deref()) {
+                continue;
+            }
 
             let cursor = encode_postgres_event_cursor(decoded.event_id);
 

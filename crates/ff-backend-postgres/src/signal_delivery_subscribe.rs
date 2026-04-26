@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use ff_core::backend::ScannerFilter;
 use ff_core::engine_error::EngineError;
 use ff_core::stream_events::{SignalDeliveryEffect, SignalDeliveryEvent, SignalDeliverySubscription};
 use ff_core::stream_subscribe::{
@@ -56,6 +57,7 @@ pub(crate) async fn subscribe(
     pool: &PgPool,
     partition_key: i16,
     cursor: StreamCursor,
+    filter: ScannerFilter,
 ) -> Result<SignalDeliverySubscription, EngineError> {
     let start = decode_postgres_event_cursor(&cursor).map_err(|msg| {
         EngineError::Validation {
@@ -79,7 +81,7 @@ pub(crate) async fn subscribe(
 
     let (tx, rx) = mpsc::channel::<Result<SignalDeliveryEvent, EngineError>>(STREAM_CAPACITY);
     let pool_clone = pool.clone();
-    tokio::spawn(subscriber_loop(pool_clone, partition_key, tx, last_seen));
+    tokio::spawn(subscriber_loop(pool_clone, partition_key, tx, last_seen, filter));
 
     Ok(Box::pin(Adapter { rx }))
 }
@@ -104,6 +106,7 @@ async fn subscriber_loop(
     partition_key: i16,
     tx: mpsc::Sender<Result<SignalDeliveryEvent, EngineError>>,
     mut last_seen: i64,
+    filter: ScannerFilter,
 ) {
     loop {
         let mut listener = match PgListener::connect_with(&pool).await {
@@ -130,7 +133,7 @@ async fn subscriber_loop(
             continue;
         }
 
-        if !replay(&pool, partition_key, &tx, &mut last_seen).await {
+        if !replay(&pool, partition_key, &tx, &mut last_seen, &filter).await {
             return;
         }
 
@@ -140,7 +143,7 @@ async fn subscriber_loop(
                 res = listener.recv() => {
                     match res {
                         Ok(_notif) => {
-                            if !replay(&pool, partition_key, &tx, &mut last_seen).await {
+                            if !replay(&pool, partition_key, &tx, &mut last_seen, &filter).await {
                                 return;
                             }
                         }
@@ -182,11 +185,15 @@ async fn replay(
     partition_key: i16,
     tx: &mpsc::Sender<Result<SignalDeliveryEvent, EngineError>>,
     last_seen: &mut i64,
+    filter: &ScannerFilter,
 ) -> bool {
     loop {
+        // #282 — unfiltered SELECT; `ScannerFilter` gates in-memory via
+        // the denormalised columns (see sibling comment in
+        // `lease_event_subscribe::replay`).
         let rows = match sqlx::query(
             "SELECT event_id, execution_id, signal_id, waitpoint_id, source_identity, \
-                    delivered_at_ms, partition_key \
+                    delivered_at_ms, partition_key, namespace, instance_tag \
              FROM ff_signal_event \
              WHERE partition_key = $1 AND event_id > $2 \
              ORDER BY event_id ASC \
@@ -231,6 +238,12 @@ async fn replay(
             let Ok(partition_key) = row.try_get::<i32, _>("partition_key") else {
                 continue;
             };
+            // #282 — denormalised filter columns (migration 0009).
+            let namespace: Option<String> =
+                row.try_get::<Option<String>, _>("namespace").unwrap_or(None);
+            let instance_tag: Option<String> = row
+                .try_get::<Option<String>, _>("instance_tag")
+                .unwrap_or(None);
 
             let decoded = SignalEventRow {
                 event_id,
@@ -242,6 +255,16 @@ async fn replay(
                 partition_key,
             };
             *last_seen = decoded.event_id;
+
+            // #282 — apply filter after `last_seen` is advanced so
+            // dropped rows don't re-appear on the next replay pass.
+            if !crate::lease_event_subscribe::passes_filter(
+                filter,
+                namespace.as_deref(),
+                instance_tag.as_deref(),
+            ) {
+                continue;
+            }
 
             let cursor = encode_postgres_event_cursor(decoded.event_id);
 
