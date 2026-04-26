@@ -103,6 +103,13 @@ pub use admin::{
     rotate_waitpoint_hmac_secret_all_partitions, FlowFabricAdminClient, PartitionRotationOutcome,
     RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
 };
+// RFC-023 Phase 1a: re-export `SqliteBackend` so consumers using
+// `ff-sdk = { default-features = false, features = ["sqlite"] }` can
+// name it as `ff_sdk::SqliteBackend` without pinning the
+// `ff-backend-sqlite` crate directly. Also keeps the dep graph
+// `ff-backend-sqlite` edge reachable from ff-sdk's public API.
+#[cfg(feature = "sqlite")]
+pub use ff_backend_sqlite::SqliteBackend;
 pub use config::WorkerConfig;
 pub use engine_error::{
     BugKind, ConflictKind, ContentionKind, EngineError, StateKind, ValidationKind,
