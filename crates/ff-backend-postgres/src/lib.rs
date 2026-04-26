@@ -35,8 +35,9 @@ use ff_core::contracts::{
     ApplyDependencyToChildResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
     CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
     DeliverSignalArgs, DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot,
-    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage,
-    SetEdgeGroupPolicyResult, StageDependencyEdgeArgs, StageDependencyEdgeResult,
+    ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
+    ListPendingWaitpointsResult, ListSuspendedPage, SetEdgeGroupPolicyResult,
+    StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 #[cfg(feature = "core")]
 use ff_core::state::PublicState;
@@ -630,6 +631,23 @@ impl EngineBackend for PostgresBackend {
         args: ClaimResumedExecutionArgs,
     ) -> Result<ClaimResumedExecutionResult, EngineError> {
         suspend_ops::claim_resumed_execution_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    // ── RFC-020 Wave 9 Standalone-2 — list_pending_waitpoints (§4.5) ─
+    //
+    // Read-only projection of `ff_waitpoint_pending` serving the 10-
+    // field `PendingWaitpointInfo` contract. Producer-side writes of
+    // the 3 new 0011 columns (`state`, `required_signal_names`,
+    // `activated_at_ms`) land alongside this method in the same PR —
+    // see `suspend_ops::suspend_core` INSERT site. Capability flip
+    // deferred to Wave 9 release PR per RFC §6.3.
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.list_pending_waitpoints", skip_all)]
+    async fn list_pending_waitpoints(
+        &self,
+        args: ListPendingWaitpointsArgs,
+    ) -> Result<ListPendingWaitpointsResult, EngineError> {
+        suspend_ops::list_pending_waitpoints_impl(&self.pool, args).await
     }
 
     // ── RFC-017 Stage A — ingress (promoted from inherent) ────

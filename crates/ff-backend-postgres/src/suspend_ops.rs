@@ -24,8 +24,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ff_core::backend::{BackendTag, Handle, HandleKind, HandleOpaque, ResumeSignal, WaitpointHmac};
 use ff_core::contracts::{
     AdditionalWaitpointBinding, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
-    ClaimedResumedExecution, DeliverSignalArgs, DeliverSignalResult, ResumeCondition, SuspendArgs,
-    SuspendOutcome, SuspendOutcomeDetails, WaitpointBinding,
+    ClaimedResumedExecution, CompositeBody, DeliverSignalArgs, DeliverSignalResult,
+    ListPendingWaitpointsArgs, ListPendingWaitpointsResult, PendingWaitpointInfo, ResumeCondition,
+    SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, WaitpointBinding,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::{encode as encode_opaque, HandlePayload};
@@ -105,6 +106,90 @@ fn susp_uuid(s: &SuspensionId) -> Result<Uuid, EngineError> {
         kind: ValidationKind::InvalidInput,
         detail: format!("suspension_id not a UUID: {e}"),
     })
+}
+
+/// RFC-020 §3.1.1 — derive `required_signal_names` for a single
+/// `waitpoint_key` from the suspend call's `ResumeCondition`. Walks
+/// the condition tree and collects every `SignalMatcher::ByName` that
+/// targets this specific waitpoint. `Wildcard` matchers contribute
+/// nothing (an empty result vec is the wire-level wildcard marker per
+/// `PendingWaitpointInfo::required_signal_names` docs).
+///
+/// `OperatorOnly` / `TimeoutOnly` are rendered with the same sentinel
+/// names that the Valkey wire format emits (`__operator_only__` /
+/// `__timeout_only__`, see `ff-backend-valkey/src/lib.rs:3205-3222`)
+/// so an operator-only or timeout-only waitpoint is distinguishable
+/// from a true wildcard at the `PendingWaitpointInfo` surface. The
+/// `__`-prefix sentinel values are never real signal names.
+///
+/// `Count { matcher: None }` returns empty (any signal on the listed
+/// waitpoints counts). Duplicates are de-duplicated preserving
+/// first-seen order.
+fn derive_required_signal_names(cond: &ResumeCondition, wp_key: &str) -> Vec<String> {
+    const OPERATOR_ONLY_SENTINEL: &str = "__operator_only__";
+    const TIMEOUT_ONLY_SENTINEL: &str = "__timeout_only__";
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if !name.is_empty() && !out.iter().any(|e| e == name) {
+            out.push(name.to_owned());
+        }
+    };
+    fn walk(cond: &ResumeCondition, target: &str, push: &mut dyn FnMut(&str)) {
+        match cond {
+            ResumeCondition::Single {
+                waitpoint_key,
+                matcher,
+            } => {
+                if waitpoint_key == target
+                    && let SignalMatcher::ByName(name) = matcher
+                {
+                    push(name.as_str());
+                }
+            }
+            ResumeCondition::OperatorOnly => push(OPERATOR_ONLY_SENTINEL),
+            ResumeCondition::TimeoutOnly => push(TIMEOUT_ONLY_SENTINEL),
+            ResumeCondition::Composite(body) => walk_body(body, target, push),
+            _ => {}
+        }
+    }
+    fn walk_body(body: &CompositeBody, target: &str, push: &mut dyn FnMut(&str)) {
+        match body {
+            CompositeBody::AllOf { members } => {
+                for m in members {
+                    walk(m, target, push);
+                }
+            }
+            CompositeBody::Count {
+                matcher, waitpoints, ..
+            } => {
+                if waitpoints.iter().any(|w| w == target)
+                    && let Some(SignalMatcher::ByName(name)) = matcher
+                {
+                    push(name.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(cond, wp_key, &mut push);
+    out
+}
+
+/// RFC-017 §8 / RFC-020 §4.5 — parse the stored `<kid>:<hex>` waitpoint
+/// token into a `(token_kid, token_fingerprint)` pair. `token_fingerprint`
+/// is the first 16 hex chars (8 bytes) of the HMAC digest — the §8 audit-
+/// friendly handle. Malformed input collapses to `("", "")` so callers
+/// can skip / log without surfacing a typed error. Mirrors
+/// `ff-backend-valkey::parse_waitpoint_token_kid_fp`.
+fn parse_waitpoint_token_kid_fp(raw: &str) -> (String, String) {
+    match raw.split_once(':') {
+        Some((kid, hex)) if !kid.is_empty() && !hex.is_empty() => {
+            let fp_len = hex.len().min(16);
+            (kid.to_owned(), hex[..fp_len].to_owned())
+        }
+        _ => (String::new(), String::new()),
+    }
 }
 
 // ─── SERIALIZABLE retry loop ─────────────────────────────────────────────
@@ -416,14 +501,31 @@ async fn suspend_core(
                 };
                 let msg = format!("{}:{}", payload.execution_id, wp_id);
                 let token = hmac_sign(&secret, &kid, msg.as_bytes());
+                // RFC-020 §3.1.1 — populate 0011 columns on insert.
+                // `suspend_core` atomically lands the suspension (exec_core
+                // flips to `suspended` in the same txn as this INSERT), so
+                // from any observer's perspective the waitpoint is already
+                // activated at the moment it becomes visible — there is no
+                // separate pending→active transition on Postgres. Write
+                // `state = 'active'` + `activated_at_ms = now` directly.
+                // `required_signal_names` is derived per-waitpoint from the
+                // resume condition; an empty vec denotes the wildcard case
+                // per the `PendingWaitpointInfo::required_signal_names`
+                // contract.
+                let required_names =
+                    derive_required_signal_names(&args.resume_condition, &wp_key);
                 sqlx::query(
                     "INSERT INTO ff_waitpoint_pending \
                        (partition_key, waitpoint_id, execution_id, token_kid, token, \
-                        created_at_ms, expires_at_ms, waitpoint_key) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                        created_at_ms, expires_at_ms, waitpoint_key, \
+                        state, required_signal_names, activated_at_ms) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $6) \
                      ON CONFLICT (partition_key, waitpoint_id) DO UPDATE SET \
                        token_kid = EXCLUDED.token_kid, token = EXCLUDED.token, \
-                       waitpoint_key = EXCLUDED.waitpoint_key",
+                       waitpoint_key = EXCLUDED.waitpoint_key, \
+                       state = EXCLUDED.state, \
+                       required_signal_names = EXCLUDED.required_signal_names, \
+                       activated_at_ms = EXCLUDED.activated_at_ms",
                 )
                 .bind(part)
                 .bind(wp_uuid(&wp_id)?)
@@ -433,6 +535,7 @@ async fn suspend_core(
                 .bind(now)
                 .bind(args.timeout_at.map(|t| t.0))
                 .bind(&wp_key)
+                .bind(&required_names)
                 .execute(&mut **tx)
                 .await
                 .map_err(map_sqlx_error)?;
@@ -939,4 +1042,131 @@ pub(crate) async fn observe_signals_impl(
         }
     }
     Ok(out)
+}
+
+// ─── list_pending_waitpoints ─────────────────────────────────────────────
+
+/// RFC-020 §4.5 — read-only projection of pending-or-active waitpoints
+/// for a given execution. SQL parity with Valkey's SSCAN + 2× HMGET
+/// shape: single-table scan of `ff_waitpoint_pending` with cursor
+/// `(waitpoint_id > $after ORDER BY waitpoint_id LIMIT $limit+1)`,
+/// surfaces the `PendingWaitpointInfo` 10-field contract.
+/// `token_fingerprint` is computed from the stored `<kid>:<hex>` token
+/// — the raw token never crosses the trait boundary per RFC-017 Stage
+/// D1 / §8.
+///
+/// Pre-read existence check on `ff_exec_core` mirrors Valkey's
+/// `EXISTS exec_core` so a non-existent execution surfaces `NotFound`
+/// rather than an empty page.
+///
+/// Rows with `state NOT IN ('pending', 'active')` (e.g. `'closed'`)
+/// are filtered server-side to match Valkey's client-side keep-filter.
+pub(crate) async fn list_pending_waitpoints_impl(
+    pool: &PgPool,
+    args: ListPendingWaitpointsArgs,
+) -> Result<ListPendingWaitpointsResult, EngineError> {
+    const DEFAULT_LIMIT: u32 = 100;
+    const MAX_LIMIT: u32 = 1000;
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as i64;
+    let after_uuid = match args.after.as_ref() {
+        Some(wp) => Some(wp_uuid(wp)?),
+        None => None,
+    };
+
+    // Existence probe — a non-existent execution is `NotFound`, not an
+    // empty page. Matches Valkey's `EXISTS exec_core` pre-check.
+    let exists: Option<(i16,)> = sqlx::query_as(
+        "SELECT 1::smallint FROM ff_exec_core \
+          WHERE partition_key = $1 AND execution_id = $2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    if exists.is_none() {
+        return Err(EngineError::NotFound { entity: "execution" });
+    }
+
+    // Page: request `limit + 1` so we can detect "more to come" without
+    // a second round-trip. Row tuple order matches the SELECT below:
+    // (waitpoint_id, waitpoint_key, state, required_signal_names,
+    //  created_at_ms, activated_at_ms, expires_at_ms, token_kid, token).
+    // Raw token is fingerprinted client-side — never returned across
+    // the trait boundary per RFC-017 Stage D1 / §8.
+    type Row = (
+        Uuid,
+        String,
+        String,
+        Vec<String>,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT waitpoint_id, waitpoint_key, state, required_signal_names, \
+                created_at_ms, activated_at_ms, expires_at_ms, token_kid, token \
+           FROM ff_waitpoint_pending \
+          WHERE partition_key = $1 \
+            AND execution_id = $2 \
+            AND state IN ('pending', 'active') \
+            AND ($3::uuid IS NULL OR waitpoint_id > $3) \
+          ORDER BY waitpoint_id \
+          LIMIT $4",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(after_uuid)
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let has_more = rows.len() as i64 > limit;
+    let take_n = if has_more { limit as usize } else { rows.len() };
+
+    let mut entries: Vec<PendingWaitpointInfo> = Vec::with_capacity(take_n);
+    for (wp_uid, wp_key, state, req_names, created_ms, activated_ms, expires_ms, _kid, token)
+        in rows.into_iter().take(take_n)
+    {
+        let wp_id = WaitpointId::from_uuid(wp_uid);
+        // Parse stored `<kid>:<hex>` into audit-safe pair. The `token_kid`
+        // column is redundant with the parsed kid — we prefer the parsed
+        // one so the surface stays byte-identical to Valkey's.
+        let (token_kid, token_fingerprint) = parse_waitpoint_token_kid_fp(&token);
+        let mut info = PendingWaitpointInfo::new(
+            wp_id,
+            wp_key,
+            state,
+            TimestampMs(created_ms),
+            args.execution_id.clone(),
+            token_kid,
+            token_fingerprint,
+        );
+        if !req_names.is_empty() {
+            info = info.with_required_signal_names(req_names);
+        }
+        if let Some(ms) = activated_ms {
+            info = info.with_activated_at(TimestampMs(ms));
+        }
+        if let Some(ms) = expires_ms {
+            info = info.with_expires_at(TimestampMs(ms));
+        }
+        entries.push(info);
+    }
+
+    let next_cursor = if has_more {
+        entries.last().map(|e| e.waitpoint_id.clone())
+    } else {
+        None
+    };
+    let mut result = ListPendingWaitpointsResult::new(entries);
+    if let Some(cursor) = next_cursor {
+        result = result.with_next_cursor(cursor);
+    }
+    Ok(result)
 }
