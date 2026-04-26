@@ -46,6 +46,8 @@ use ff_core::contracts::{
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
+#[cfg(feature = "core")]
+use ff_core::contracts::ExecutionInfo;
 #[cfg(feature = "streaming")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
 use ff_core::engine_backend::EngineBackend;
@@ -631,6 +633,41 @@ impl EngineBackend for PostgresBackend {
         args: ClaimResumedExecutionArgs,
     ) -> Result<ClaimResumedExecutionResult, EngineError> {
         suspend_ops::claim_resumed_execution_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    // ── RFC-020 Wave 9 Spine-B — read model (3 methods, §4.1) ────────
+    //
+    // Partition-local single-row reads against `ff_exec_core` (+ LATERAL
+    // join on `ff_attempt` for `read_execution_info`). READ COMMITTED
+    // (no CAS; all three are read-only). `get_execution_result` returns
+    // current-attempt semantics per §7.8 (matches Valkey's
+    // `GET ctx.result()` primitive). Capability flips land at the Wave 9
+    // release PR per RFC §6.3.
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.read_execution_state", skip_all)]
+    async fn read_execution_state(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<PublicState>, EngineError> {
+        exec_core::read_execution_state_impl(&self.pool, &self.partition_config, id).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.read_execution_info", skip_all)]
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, EngineError> {
+        exec_core::read_execution_info_impl(&self.pool, &self.partition_config, id).await
+    }
+
+    #[tracing::instrument(name = "pg.get_execution_result", skip_all)]
+    async fn get_execution_result(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        exec_core::get_execution_result_impl(&self.pool, &self.partition_config, id).await
     }
 
     // ── RFC-020 Wave 9 Standalone-2 — list_pending_waitpoints (§4.5) ─
