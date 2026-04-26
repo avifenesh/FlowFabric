@@ -438,9 +438,22 @@ jobs:
             exit 1
           fi
 
+  # RFC-023 §4.1 + issue #365 — parity-drift lint for the PG ↔ SQLite
+  # migration pair. Blocks PRs that add a PG migration without a
+  # matching SQLite port (or an `.sqlite-skip` entry with an issue
+  # reference) and vice versa. Runs as a plain shell step — no cargo
+  # build needed.
+  migration-parity:
+    name: sqlite/postgres migration parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: scripts/lint-migrations.sh
+        run: bash scripts/lint-migrations.sh
+
   matrix-tests-complete:
     name: matrix-tests-complete
-    needs: [matrix, matrix-postgres, lua-drift]
+    needs: [matrix, matrix-postgres, lua-drift, migration-parity]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -449,6 +462,7 @@ jobs:
           MATRIX_RESULT: ${{ needs.matrix.result }}
           POSTGRES_RESULT: ${{ needs.matrix-postgres.result }}
           DRIFT_RESULT: ${{ needs.lua-drift.result }}
+          MIGRATION_PARITY_RESULT: ${{ needs.migration-parity.result }}
         run: |
           fail=0
           case "$MATRIX_RESULT" in
@@ -462,5 +476,9 @@ jobs:
           case "$DRIFT_RESULT" in
             success|skipped) echo "lua-drift: $DRIFT_RESULT — ok" ;;
             *) echo "lua-drift: $DRIFT_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          case "$MIGRATION_PARITY_RESULT" in
+            success|skipped) echo "migration-parity: $MIGRATION_PARITY_RESULT — ok" ;;
+            *) echo "migration-parity: $MIGRATION_PARITY_RESULT — blocking merge" >&2; fail=1 ;;
           esac
           exit $fail
