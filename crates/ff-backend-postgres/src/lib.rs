@@ -46,6 +46,12 @@ use ff_core::contracts::{
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
+// RFC-020 Wave 9 Standalone-1 — budget/quota admin surfaces.
+#[cfg(feature = "core")]
+use ff_core::contracts::{
+    BudgetStatus, CreateBudgetArgs, CreateBudgetResult, CreateQuotaPolicyArgs,
+    CreateQuotaPolicyResult, ReportUsageAdminArgs, ResetBudgetArgs, ResetBudgetResult,
+};
 #[cfg(feature = "streaming")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
 use ff_core::engine_backend::EngineBackend;
@@ -846,6 +852,59 @@ impl EngineBackend for PostgresBackend {
         dimensions: UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError> {
         budget::report_usage_impl(&self.pool, &self.partition_config, budget, dimensions).await
+    }
+
+    // ── RFC-020 Wave 9 Standalone-1 — budget/quota admin (§4.4) ─────
+    //
+    // Five methods landing behind capability flags that stay `false`
+    // until the Wave 9 release PR flips them atomically (RFC §6.3).
+    // Schema + trait impls land now; capability-surface flip is one
+    // PR later.
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.create_budget", skip_all)]
+    async fn create_budget(
+        &self,
+        args: CreateBudgetArgs,
+    ) -> Result<CreateBudgetResult, EngineError> {
+        budget::create_budget_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.reset_budget", skip_all)]
+    async fn reset_budget(
+        &self,
+        args: ResetBudgetArgs,
+    ) -> Result<ResetBudgetResult, EngineError> {
+        budget::reset_budget_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.create_quota_policy", skip_all)]
+    async fn create_quota_policy(
+        &self,
+        args: CreateQuotaPolicyArgs,
+    ) -> Result<CreateQuotaPolicyResult, EngineError> {
+        budget::create_quota_policy_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.get_budget_status", skip_all)]
+    async fn get_budget_status(
+        &self,
+        id: &BudgetId,
+    ) -> Result<BudgetStatus, EngineError> {
+        budget::get_budget_status_impl(&self.pool, &self.partition_config, id).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.report_usage_admin", skip_all)]
+    async fn report_usage_admin(
+        &self,
+        budget_id: &BudgetId,
+        args: ReportUsageAdminArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        budget::report_usage_admin_impl(&self.pool, &self.partition_config, budget_id, args).await
     }
 
     // ── HMAC secret rotation (v0.7 migration-master Q4) ──
