@@ -1,12 +1,13 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** ACCEPTED — Revision 4
+**Status:** ACCEPTED — Revision 5
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
 **Revision 2:** 2026-04-26 — Round-1 reviewer findings addressed (schema-ground-truth, design-spine reframe, drop G6, full-parity + coherent-wave directive)
-**Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms`; (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
-**Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter); (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
+**Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms` (**Revision 5 correction: `waitpoint_key` already shipped via migration 0004; 0011 adds 3 columns, not 4**); (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
+**Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter) — **superseded by Revision 5 (moot: column already exists from 0004)**; (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
+**Revision 5:** 2026-04-26 — Ground-truth correction: `waitpoint_key` column already exists on `ff_waitpoint_pending` since migration 0004 (Wave 4d), populated as `TEXT NOT NULL DEFAULT ''` and actively used by `suspend_ops.rs`. Revision 4's §4.5 treated it as a new 0011 column; NEW-5 degraded-counter design was predicated on pre-0011 NULL rows that can never exist. This revision reframes migration 0011 as 3 additive columns (`state`, `required_signal_names`, `activated_at_ms`), drops the `waitpoint_key` addition, drops NEW-5 degraded-counter, simplifies §4.5 query to read `waitpoint_key` directly. No scope or method-count change.
 **Target release:** v0.11 (single coordinated ship; whole wave or withdraw)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction + staged Postgres parity), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions)
 **Related artifacts:**
@@ -47,9 +48,11 @@ Revision 3 adds two additive migrations to the wave:
   `flow_cancel_requested`). Preserves the RFC-019 `ff_signal_event`
   subscriber contract (§4.2.7, §4.3). Option X per Round-2 §central
   decision.
-- **0011 `ff_waitpoint_pending` additive columns** — `waitpoint_key`,
-  `state`, `required_signal_names`, `activated_at_ms`. Required to
-  serve the real `PendingWaitpointInfo` contract (§4.5).
+- **0011 `ff_waitpoint_pending` additive columns** — `state`,
+  `required_signal_names`, `activated_at_ms`. Required to serve the
+  real `PendingWaitpointInfo` contract (§4.5). (`waitpoint_key`
+  already exists from migration 0004 and is actively written by
+  `suspend_ops.rs` — not added here. Corrected in Revision 5.)
 
 Both migrations are prerequisites for the claimed method-impls (not
 new features) and ship in the Wave-9 release-PR sequence (§6.2).
@@ -166,9 +169,15 @@ every flag below is asserted `false` at
 ### 3.1.1 Producer-side write-path change (not a 14th method)
 
 Standalone-2 (`list_pending_waitpoints`) also modifies the producer-
-side `suspend_*` write path to populate the 4 new 0011 columns
-(`waitpoint_key`, `state`, `required_signal_names`, `activated_at_ms`)
-on initial insert + activation transitions. This is in-scope
+side `suspend_*` write path to populate the 3 new 0011 columns
+(`state`, `required_signal_names`, `activated_at_ms`) on initial
+insert + activation transitions. (`waitpoint_key` is already written
+on insert by `suspend_ops.rs` since migration 0004 and needs no new
+wiring here.) On initial insert the producer writes
+`required_signal_names` from the condition spec; `state` defaults
+to `'pending'` and `activated_at_ms` is NULL until the
+pending→active activation transition, which writes
+`state = 'active'` + `activated_at_ms = now()`. This is in-scope
 change surface outside the 13 listed methods but is **not** a new
 method impl — it is the minimum necessary write-side wiring to let
 Standalone-2's read-path serve the real `PendingWaitpointInfo`
@@ -657,13 +666,14 @@ Phantom fields `flow_id` and `attempt_index` are NOT in the
 contract and are dropped from the projection.
 
 **Data-availability gap + migration 0011.** Of the 10 contract
-fields, four have no source column in the existing schema:
-`waitpoint_key`, `state`, `required_signal_names`, `activated_at`.
-None of those is derivable cleanly:
+fields, three have no source column in the existing schema:
+`state`, `required_signal_names`, `activated_at`. (A fourth field,
+`waitpoint_key`, was mis-scoped as missing in Revision 3/4; it
+already exists on `ff_waitpoint_pending` as `TEXT NOT NULL DEFAULT ''`
+since migration 0004 and is populated by `suspend_ops.rs` on insert.
+Corrected in Revision 5.) None of the three missing fields is
+derivable cleanly:
 
-- `waitpoint_key` — the user-level key string (distinct from the
-  UUID `waitpoint_id`); needed by cairn to correlate against the
-  worker-side `suspend` call. Not present in any existing table.
 - `state` — `'pending' | 'active' | 'closed'`. Revision 2
   claimed "presence in the table implies pending"; this collapses
   `pending` and `active` (activation is a separate state in the
@@ -675,11 +685,11 @@ None of those is derivable cleanly:
 - `activated_at` — the timestamp when the waitpoint transitioned
   `pending → active`. No historical source.
 
-Revision 3 adds migration 0011 with additive columns:
+Revision 3 adds migration 0011 with additive columns (Revision 5:
+3 columns, not 4):
 
 ```sql
 ALTER TABLE ff_waitpoint_pending
-    ADD COLUMN waitpoint_key         TEXT,
     ADD COLUMN state                 TEXT NOT NULL DEFAULT 'pending',
     ADD COLUMN required_signal_names TEXT[] NOT NULL DEFAULT '{}',
     ADD COLUMN activated_at_ms       BIGINT;
@@ -688,40 +698,23 @@ ALTER TABLE ff_waitpoint_pending
 All columns are nullable-or-defaulted → additive and
 `backward_compatible = true`. Existing rows inserted pre-0011 get
 `state = 'pending'`, empty `required_signal_names`, NULL
-`waitpoint_key` / `activated_at_ms`. New inserts (post-0011) must
-populate `waitpoint_key` + `required_signal_names` from the
-producer-side `suspend_*` path; activation transitions populate
-`state = 'active', activated_at_ms = now`. The producer + activation
-wiring changes land in the same PR as migration 0011 (§6.2 step 4)
-— without them the table has usable defaults but degraded fidelity
-on already-inserted rows.
+`activated_at_ms`. New inserts (post-0011) populate
+`required_signal_names` from the producer-side `suspend_*` path;
+activation transitions populate `state = 'active', activated_at_ms = now`.
+The producer + activation wiring changes land in the same PR as
+migration 0011 (§6.2 step 4) — without them the table has usable
+defaults but degraded fidelity on already-inserted rows.
 
 **Field mapping (post-0011):**
 
-- `waitpoint_id`, `execution_id`, `created_at` (from
-  `created_at_ms`), `expires_at` (from `expires_at_ms`),
-  `token_kid` — direct columns.
+- `waitpoint_id`, `waitpoint_key`, `execution_id`, `created_at`
+  (from `created_at_ms`), `expires_at` (from `expires_at_ms`),
+  `token_kid` — direct columns (`waitpoint_key` from migration
+  0004).
 - `token_fingerprint` — computed from `token` at projection
   (redaction per Stage D1 contract; never returned raw).
-- `waitpoint_key`, `state`, `required_signal_names`, `activated_at`
-  (from `activated_at_ms`) — direct columns post-0011.
-
-**Pre-0011 row projection (NEW-5).** `PendingWaitpointInfo.waitpoint_key`
-is `String` (non-Option). Rows inserted before migration 0011 have
-`waitpoint_key IS NULL` and cannot be backfilled without access to
-the original producer-side `suspend_*` call site. Projection
-behavior: `COALESCE(wp.waitpoint_key, '') AS waitpoint_key`,
-surfacing an empty string for pre-0011 rows (legible to cairn as
-"unknown" without contract-violating a `null`). Each projected
-empty-key row increments a new operator-observable counter
-`ff_waitpoint_pending_degraded_total{reason="missing_waitpoint_key"}`
-so operators can observe the degraded-legibility tail and age it
-out as pre-0011 waitpoints resolve. The counter plumbs through the
-existing metrics surface (OTEL via ferriskey per 2026-04-22 owner
-lock) — no new telemetry-infra surface. Filtering pre-0011 rows
-from the listing was considered and rejected: hiding operator-
-visible in-flight suspensions is worse than returning them with a
-sentinel + counter.
+- `state`, `required_signal_names`, `activated_at` (from
+  `activated_at_ms`) — direct columns post-0011.
 
 No JOIN to `ff_exec_core` / `ff_attempt` required — the phantom
 `flow_id`/`attempt_index` fields are not in the contract.
@@ -1080,7 +1073,7 @@ read APIs, not just Wave 9.
 **Rejected.** The schema decisions in Revision 3 remain contained:
 join-on-read against existing columns (no new projection tables);
 one new backlog pair; one new operator-event outbox channel
-(migration 0010); four additive columns on an existing table
+(migration 0010); three additive columns on an existing table
 (migration 0011). None of these is a forward-facing primitive that
 warrants a separate RFC audience — they are all mechanical
 prerequisites for the method impls this RFC proposes. If a future
