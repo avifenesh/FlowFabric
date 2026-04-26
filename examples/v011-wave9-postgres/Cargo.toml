@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "v011-wave9-postgres-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "v011-wave9-postgres"
+path = "src/main.rs"
+
+[dependencies]
+# v0.11 Wave 9 landed on the Postgres backend. This example calls the
+# trait methods directly against a live Postgres, so we pull the
+# umbrella with the `postgres` feature and a couple of supporting
+# crates.
+flowfabric = { path = "../../crates/flowfabric", default-features = false, features = ["postgres"] }
+ff-backend-postgres = { path = "../../crates/ff-backend-postgres" }
+ff-core = { path = "../../crates/ff-core" }
+
+anyhow = "1"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

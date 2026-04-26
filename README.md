@@ -83,8 +83,9 @@ FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 
 ### 3. Try an example
 
-Five end-to-end examples live under [`examples/`](examples/):
+Six end-to-end examples live under [`examples/`](examples/):
 
+- **[`v011-wave9-postgres`](examples/v011-wave9-postgres/)** -- v0.11 headline demo for the RFC-020 Wave 9 Postgres release. Multi-tenant operator dashboard exercising all six Wave-9 method groups on Postgres: budget/quota admin, `change_priority`, `cancel_execution` + `ack_cancel_member`, `replay_execution`, `list_pending_waitpoints`, `cancel_flow_header`, and `read_execution_info`. Requires `FF_PG_TEST_URL`.
 - **[`v010-read-side-ergonomics`](examples/v010-read-side-ergonomics/)** -- v0.10 headline demo for consumer read-side APIs: flat `Capabilities::supports.<flag>` discovery (#277), typed `LeaseHistoryEvent` from `subscribe_lease_history` (#282), and tag-restricted subscriptions via `ScannerFilter::with_instance_tag(..)`. Multi-tenant lease-audit console pattern. No external dependencies beyond a running `ff-server`.
 - **[`llm-race`](examples/llm-race/)** -- race N free OpenRouter LLM providers against the same prompt; automatically cancel losers when one wins; stream the winner via `DurableSummary` with JSON Merge Patch. Exercises v0.6 `AnyOf{CancelRemaining}` + `Count{DistinctSources}` + typed `SuspendArgs`. Verified live 2026-04-24. Best starting point for learning v0.6 primitives. Requires `OPENROUTER_API_KEY` (free tier).
 - **[`coding-agent`](examples/coding-agent/)** -- LLM-powered code-patch worker with streaming output and human-in-the-loop suspend/signal review. Requires `OPENROUTER_API_KEY`.
