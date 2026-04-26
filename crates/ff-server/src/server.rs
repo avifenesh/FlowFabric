@@ -30,7 +30,7 @@ use crate::config::{BackendKind, ServerConfig};
 /// joins at Stage E (v0.8.0). Compiled into the binary by design —
 /// see RFC-017 §9.0 "Fleet-wide cutover requirement" for the
 /// rolling-upgrade implication.
-const BACKEND_STAGE_READY: &[&str] = &["valkey", "postgres"];
+const BACKEND_STAGE_READY: &[&str] = &["valkey", "postgres", "sqlite"];
 
 /// Upper bound on `member_execution_ids` returned in the
 /// [`CancelFlowResult::Cancelled`] response when the flow was already in a
@@ -86,7 +86,12 @@ pub struct Server {
 }
 
 /// Server error type.
+///
+/// **RFC-023 (v0.12.0):** `#[non_exhaustive]` was added; consumers
+/// writing exhaustive matches must include a wildcard arm. See
+/// `CHANGELOG.md` / `docs/CONSUMER_MIGRATION_0.12.md`.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ServerError {
     /// Backend transport error. Previously wrapped `ferriskey::Error`
     /// directly (#88); now carries a backend-agnostic
@@ -167,6 +172,15 @@ pub enum ServerError {
     /// `result_large_err` — `EngineError` is ~200 bytes).
     #[error("engine: {0}")]
     Engine(#[from] Box<ff_core::engine_error::EngineError>),
+
+    /// RFC-023 §4.5 (v0.12.0): the SQLite backend refused to construct
+    /// because `FF_DEV_MODE=1` was not set. Wraps the underlying
+    /// [`BackendError::RequiresDevMode`] so callers can recover the
+    /// full classification without a string match.
+    ///
+    /// [`BackendError::RequiresDevMode`]: ff_core::BackendError::RequiresDevMode
+    #[error("sqlite requires FF_DEV_MODE=1: {0}")]
+    SqliteRequiresDevMode(#[source] ff_core::BackendError),
 }
 
 /// Lift a native `ferriskey::Error` into [`ServerError::Backend`] via
@@ -254,6 +268,8 @@ impl ServerError {
             Self::ValkeyVersionTooLow { .. } => false,
             // Operator must change FF_BACKEND; not retryable.
             Self::BackendNotReady { .. } => false,
+            // RFC-023: operator must set FF_DEV_MODE=1; not retryable.
+            Self::SqliteRequiresDevMode(_) => false,
             // EngineError's classification helpers handle transport
             // retry semantics; mirror them so trait-dispatched handlers
             // keep the same retry policy as the Client path.
@@ -312,6 +328,7 @@ impl Server {
                 backend: match config.backend {
                     BackendKind::Postgres => "postgres",
                     BackendKind::Valkey => "valkey",
+                    BackendKind::Sqlite => "sqlite",
                 },
                 stage: "E4",
             });
@@ -324,6 +341,12 @@ impl Server {
         // construction entirely (E3 wires the scheduler twin).
         if matches!(config.backend, BackendKind::Postgres) {
             return Self::start_postgres_branch(config, metrics).await;
+        }
+        // RFC-023 §4.4 item 6 (v0.12.0): SQLite dev-only branch. The
+        // `FF_DEV_MODE=1` guard lives on `SqliteBackend::new`, not
+        // here — see §3.3 A3 single-emission contract.
+        if matches!(config.backend, BackendKind::Sqlite) {
+            return Self::start_sqlite_branch(config, metrics).await;
         }
         // Step 1: Connect to Valkey via ClientBuilder
         tracing::info!(
@@ -640,6 +663,53 @@ impl Server {
             "FlowFabric server started (Postgres backend, Stage E3). \
              6 Postgres reconcilers active; claim_for_worker routed to \
              PostgresScheduler. No ambient Valkey client."
+        );
+
+        Ok(Self {
+            admin_rotate_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            engine: None,
+            config,
+            background_tasks: Arc::new(AsyncMutex::new(JoinSet::new())),
+            metrics,
+            backend,
+        })
+    }
+
+    /// RFC-023 §4.4 item 6 + §4.5 (v0.12.0): SQLite dev-only boot
+    /// branch. The `FF_DEV_MODE=1` guard + WARN banner live on the
+    /// `SqliteBackend::new` TYPE per the §3.3 A3 single-emission
+    /// contract; this branch constructs the backend, maps
+    /// [`BackendError::RequiresDevMode`] into
+    /// [`ServerError::SqliteRequiresDevMode`], and otherwise wires
+    /// the trait object into the `Server` exactly like the Postgres
+    /// branch. Engine + scanner + scheduler construction is skipped
+    /// (SQLite is Phase 1a stubs; trait impl lands in Phase 2+).
+    ///
+    /// [`BackendError::RequiresDevMode`]: ff_core::BackendError::RequiresDevMode
+    async fn start_sqlite_branch(
+        config: ServerConfig,
+        metrics: Arc<ff_observability::Metrics>,
+    ) -> Result<Self, ServerError> {
+        tracing::info!(
+            path = %config.sqlite.path,
+            pool_size = config.sqlite.pool_size,
+            "dialing SQLite backend (RFC-023 dev-only)"
+        );
+        let sqlite_arc = ff_backend_sqlite::SqliteBackend::new(&config.sqlite.path)
+            .await
+            .map_err(|e| match e {
+                ff_core::BackendError::RequiresDevMode => {
+                    ServerError::SqliteRequiresDevMode(e)
+                }
+                other => ServerError::Backend(other),
+            })?;
+        let backend: Arc<dyn EngineBackend> = sqlite_arc;
+
+        tracing::info!(
+            flow_partitions = config.partition_config.num_flow_partitions,
+            lanes = ?config.lanes.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+            "FlowFabric server started (SQLite dev-only backend, RFC-023 Phase 1a). \
+             Trait impls beyond capabilities()/prepare() return Unavailable until Phase 2+."
         );
 
         Ok(Self {

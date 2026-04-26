@@ -75,30 +75,33 @@ impl InProcessServer {
         let tls = crate::valkey::env_flag("FF_TLS");
         let cluster = crate::valkey::env_flag("FF_CLUSTER");
 
-        let config = ServerConfig {            valkey: ff_server::config::ValkeyServerConfig { host: host, port: port, tls: tls, cluster: cluster, skip_library_load: true },
-
-
-
-
-
+        // RFC-023 (v0.12.0): `ServerConfig` is now
+        // `#[non_exhaustive]`. Mutate in-place from `Default::default`
+        // rather than via struct literal (which is no longer permitted
+        // for non-exhaustive structs from outside the defining crate).
+        let mut config = ServerConfig::default();
+        config.valkey = ff_server::config::ValkeyServerConfig {
+            host,
+            port,
+            tls,
+            cluster,
+            skip_library_load: true,
+        };
+        config.partition_config = TEST_PARTITION_CONFIG;
+        config.lanes = vec![LaneId::new(lane)];
+        config.listen_addr = "127.0.0.1:0".into();
+        config.engine_config = ff_engine::EngineConfig {
             partition_config: TEST_PARTITION_CONFIG,
             lanes: vec![LaneId::new(lane)],
-            listen_addr: "127.0.0.1:0".into(),
-            engine_config: ff_engine::EngineConfig {
-                partition_config: TEST_PARTITION_CONFIG,
-                lanes: vec![LaneId::new(lane)],
-                ..Default::default()
-            },
-
-            cors_origins: vec!["*".to_owned()],
-            api_token: None,
-            waitpoint_hmac_secret: secret.to_owned(),
-            waitpoint_hmac_grace_ms: 86_400_000,
-            max_concurrent_stream_ops: 64,
-            backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
-        
-};
+            ..Default::default()
+        };
+        config.cors_origins = vec!["*".to_owned()];
+        config.api_token = None;
+        config.waitpoint_hmac_secret = secret.to_owned();
+        config.waitpoint_hmac_grace_ms = 86_400_000;
+        config.max_concurrent_stream_ops = 64;
+        config.backend = ff_server::config::BackendKind::default();
+        config.postgres = Default::default();
 
         let server = Arc::new(Server::start(config).await.expect("Server::start"));
         let app = ff_server::api::router(server.clone(), &["*".to_owned()], None)

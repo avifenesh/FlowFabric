@@ -5,6 +5,62 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`crates/ff-backend-sqlite` — SQLite dev-only backend (RFC-023 Phase 1a).**
+  Activation requires `FF_DEV_MODE=1`. Construction is guarded at the
+  `SqliteBackend::new` TYPE level (§4.5 / §3.3 A3) so every entry
+  point — embedded, `ff_server::start_sqlite_branch`, and
+  `ff_sdk::FlowFabricWorker::connect_with` — pays the guard.
+  Phase 1a ships the scaffolding only: process-local per-path
+  registry (§4.2 B6), `sqlx::SqlitePool`, WARN banner on
+  construction, and an `EngineBackend` impl whose data-plane
+  methods return `EngineError::Unavailable`. Phase 1b lands the
+  hand-ported SQLite-dialect migrations; Phase 2+ replaces the stubs.
+- `BackendKind::Sqlite` variant on `ff_server::config::BackendKind`.
+- `SqliteServerConfig` (public, `#[non_exhaustive]`) with `new(path)`
+  + `with_pool_size(n)` + `with_wal(bool)` builders.
+- `ServerConfig::sqlite_dev()` — zero-config test/dev constructor
+  (in-memory SQLite, auth disabled, `127.0.0.1:0` bind).
+- `SqliteBackend::new(path)` embedded constructor returning
+  `Result<Arc<Self>, BackendError>`.
+- `BackendError::RequiresDevMode` variant (RFC-023 §4.5). Render
+  text matches the server-path §3.3 text (docs URL included).
+- `ServerError::SqliteRequiresDevMode(BackendError)` variant
+  wrapping the embedded-path refusal.
+- `FF_BACKEND=sqlite`, `FF_SQLITE_PATH`, `FF_SQLITE_POOL_SIZE`, and
+  `FF_DEV_MODE` env vars on `ServerConfig::from_env`. README +
+  rustdoc env tables updated.
+- CI cell (`cargo check -p ff-sdk --no-default-features --features
+  sqlite`) — mechanical regression guard for the RFC-023 Phase 1a
+  worker.rs cfg-gate discipline.
+
+### Changed
+
+- **`ServerError` is now `#[non_exhaustive]`** (RFC-023 §8 minor
+  break). Consumers with exhaustive matches must add a wildcard
+  arm.
+- **`ServerConfig` is now `#[non_exhaustive]`** (RFC-023 §8 minor
+  break) + gained a `sqlite: SqliteServerConfig` field. Struct-
+  literal consumers migrate to `ServerConfig::from_env()`,
+  `ServerConfig::sqlite_dev()`, or mutation from
+  `ServerConfig::default()`.
+- **`ff_sdk::FlowFabricWorker` surface under `--no-default-features,
+  features = ["sqlite"]`** (RFC-023 §4.4 item 10). The
+  `ff_sdk::worker` module is no longer gated on `valkey-default`;
+  `FlowFabricWorker::connect_with(config, backend, completion)` is
+  always reachable and no longer dials Valkey internally (no PING,
+  no alive-key SET-NX, no `ff:config:partitions` HGETALL).
+  Valkey-specific methods — `connect`, `claim_next`,
+  `claim_execution`, `claim_from_grant`, `claim_via_server`,
+  `claim_from_reclaim_grant`, `claim_resumed_execution`,
+  `read_execution_context`, `deliver_signal` — are now
+  `#[cfg(feature = "valkey-default")]` and ABSENT under
+  sqlite-only features. A backend-agnostic SDK claim/signal loop
+  is deferred to a future RFC. The embedded `ferriskey::Client`
+  field is `Option<Client>`; populated by `connect`, left `None`
+  by `connect_with`.
+
 ## [0.11.0] - 2026-04-26
 
 ### Added

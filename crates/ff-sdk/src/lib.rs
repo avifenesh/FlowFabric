@@ -90,7 +90,11 @@ pub mod layer;
 pub mod snapshot;
 #[cfg(feature = "valkey-default")]
 pub mod task;
-#[cfg(feature = "valkey-default")]
+// RFC-023 Phase 1a (§4.4 item 10): `worker` is always compiled.
+// The ferriskey-dependent methods inside it are `valkey-default`-
+// gated at the item level; the module itself no longer is, so
+// `FlowFabricWorker::connect_with` + the trait-forwarder accessors
+// are reachable under `default-features = false, features = ["sqlite"]`.
 pub mod worker;
 
 // Re-exports for convenience
@@ -145,7 +149,11 @@ pub use ff_core::contracts::{
 // scheduler is specialized and stays behind the `ff-scheduler` dep.
 pub use ff_core::backend::{ClaimPolicy, ReclaimToken};
 pub use ff_core::contracts::{ClaimGrant, ReclaimGrant};
-#[cfg(feature = "valkey-default")]
+// RFC-023 Phase 1a (§4.4 item 10): re-export always reachable. The
+// Valkey-specific methods (`connect`, `claim_*`, `deliver_signal`)
+// are item-level cfg-gated; under sqlite-only features the type
+// exposes `connect_with`, `backend`, `completion_backend`, `config`,
+// and `partition_config`.
 pub use worker::FlowFabricWorker;
 
 /// SDK error type.

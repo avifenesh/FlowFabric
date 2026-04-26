@@ -39,15 +39,21 @@ Twelve crates, all pinned to the same version, published in topological order:
    before Wave 1+ fills in method bodies. Published alongside the
    Valkey backend so dual-backend ff-server builds resolve against
    crates.io.
-9. `ff-engine`       — cross-partition dispatch + scanners
-   (includes the `completion_listener` module for push-based DAG
-   promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
-   §"DAG promotion: push listener + safety-net reconciler")
-10. `ff-sdk`         — worker SDK. `direct-valkey-claim` feature is
+9. `ff-backend-sqlite` — RFC-023 SQLite dev-only EngineBackend.
+   Phase 1a scaffold (v0.12.0) ships the crate as an
+   `Unavailable`-stub with the `FF_DEV_MODE=1` guard + registry dedup
+   in place; Phase 1b+ fills in the hand-ported SQLite migrations
+   and trait bodies. Published so consumers opting into the dev
+   harness can `cargo add ff-backend-sqlite` from crates.io.
+10. `ff-engine`       — cross-partition dispatch + scanners
+    (includes the `completion_listener` module for push-based DAG
+    promotion; see [`rfc011-operator-runbook.md`](rfc011-operator-runbook.md)
+    §"DAG promotion: push listener + safety-net reconciler")
+11. `ff-sdk`         — worker SDK. `direct-valkey-claim` feature is
     off by default; production deployments use the scheduler-routed
     HTTP path via `FlowFabricWorker::claim_via_server`
-11. `ff-server`      — HTTP server library + binary
-12. `flowfabric`     — umbrella re-export of the ff-* family
+12. `ff-server`      — HTTP server library + binary
+13. `flowfabric`     — umbrella re-export of the ff-* family
     (issue #279). Depends on every other publishable crate; MUST
     publish LAST. Lets consumers pin one crate + feature-flag the
     backend (`flowfabric = { version = "0.8", features = ["valkey"] }`

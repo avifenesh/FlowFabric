@@ -494,6 +494,17 @@ pub enum BackendError {
         kind: BackendErrorKind,
         message: String,
     },
+
+    /// RFC-023 §4.5: the SQLite dev-only backend refused to construct
+    /// because `FF_DEV_MODE=1` was not set. Exact message text mirrors
+    /// §3.3 HTTP-path text so embedded and server paths give the same
+    /// actionable signal.
+    #[error(
+        "SqliteBackend requires FF_DEV_MODE=1 to activate. SQLite is \
+         dev-only; see https://github.com/avifenesh/FlowFabric/blob/main/docs/dev-harness.md \
+         for details."
+    )]
+    RequiresDevMode,
 }
 
 impl BackendError {
@@ -505,6 +516,9 @@ impl BackendError {
     pub fn kind(&self) -> BackendErrorKind {
         match self {
             Self::Valkey { kind, .. } => *kind,
+            // RFC-023: dev-mode guard refusal is a configuration/protocol
+            // fault, not a retryable transport condition.
+            Self::RequiresDevMode => BackendErrorKind::Protocol,
         }
     }
 
@@ -512,6 +526,11 @@ impl BackendError {
     pub fn message(&self) -> &str {
         match self {
             Self::Valkey { message, .. } => message.as_str(),
+            Self::RequiresDevMode => {
+                "SqliteBackend requires FF_DEV_MODE=1 to activate. SQLite is \
+                 dev-only; see https://github.com/avifenesh/FlowFabric/blob/main/docs/dev-harness.md \
+                 for details."
+            }
         }
     }
 }

@@ -1,0 +1,44 @@
+[package]
+name = "ff-backend-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "FlowFabric EngineBackend impl — SQLite dev-only backend (RFC-023, Phase 1a scaffold)"
+
+[features]
+# Mirror ff-core / ff-backend-postgres feature topology so method-gate
+# `#[cfg]`s line up with the trait surface.
+default = ["core", "streaming"]
+core = ["ff-core/core"]
+streaming = ["ff-core/streaming"]
+
+[dependencies]
+# Phase 1a: ff-core features match ff-backend-postgres so the SQLite
+# impl honours the same `EngineBackend` method surface. Trait impl
+# bodies arrive in Phase 2+; Phase 1a returns `EngineError::Unavailable`
+# from every method except `capabilities()` + `prepare()`.
+ff-core = { version = "0.11.0", path = "../ff-core", default-features = false, features = ["core", "suspension", "budget"] }
+
+# SQLite transport. Bundled SQLite is deliberately selected to decouple
+# the backend from the operating distro's libsqlite3 version — RFC-023
+# §7.1 owner recommendation. JSON1 + RETURNING (>= 3.35) rely on this.
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio", "macros", "migrate", "json", "chrono", "uuid"] }
+
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Env-var isolation across the two test files (`guard.rs` +
+# `capabilities.rs`): SQLite tests read `FF_DEV_MODE` from the process
+# environment, and `cargo test` runs per-binary tests in parallel by
+# default. `serial_test` enforces per-`#[serial]` ordering.
+serial_test = "3"

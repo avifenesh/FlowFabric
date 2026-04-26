@@ -13,12 +13,14 @@
 #     `publish-new` + `publish-update`.
 #   - GITHUB_TOKEN is auto-provided by GHA; `gh release create` uses it.
 #
-# Publish set (12 crates, topologically ordered):
+# Publish set (13 crates, topologically ordered):
 #   ferriskey -> ff-core -> ff-script -> ff-observability
 #     -> ff-observability-http
-#     -> ff-backend-valkey -> ff-backend-postgres
+#     -> ff-backend-valkey -> ff-backend-postgres -> ff-backend-sqlite
 #     -> ff-engine -> ff-scheduler
 #     -> ff-sdk -> ff-server -> flowfabric
+# ff-backend-sqlite added at v0.12.0 (RFC-023 Phase 1a). Dev-only —
+# construction guarded by FF_DEV_MODE=1.
 # flowfabric is the umbrella re-export crate (issue #279) and MUST
 # publish last — it depends on every other publishable crate.
 # ff-test is dev-only (publish = false) and not in the set.
@@ -324,6 +326,24 @@ jobs:
             exit 1
           }
       - run: sleep 30
+      - name: publish ff-backend-sqlite
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          VER="${TAG_VERSION#v}"
+          cargo publish -p ff-backend-sqlite --no-verify || {
+            echo "::error::cargo publish ff-backend-sqlite failed -- yank already-published crate(s) before re-tagging:"
+            echo "::error::  cargo yank --version ${VER} ferriskey"
+            echo "::error::  cargo yank --version ${VER} ff-core"
+            echo "::error::  cargo yank --version ${VER} ff-script"
+            echo "::error::  cargo yank --version ${VER} ff-observability"
+            echo "::error::  cargo yank --version ${VER} ff-observability-http"
+            echo "::error::  cargo yank --version ${VER} ff-scheduler"
+            echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
+            echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
+            exit 1
+          }
+      - run: sleep 30
       - name: publish ff-engine
         env:
           TAG_VERSION: ${{ github.ref_name }}
@@ -339,6 +359,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
+            echo "::error::  cargo yank --version ${VER} ff-backend-sqlite"
             exit 1
           }
       - run: sleep 30
@@ -357,6 +378,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
+            echo "::error::  cargo yank --version ${VER} ff-backend-sqlite"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             exit 1
           }
@@ -376,6 +398,7 @@ jobs:
             echo "::error::  cargo yank --version ${VER} ff-scheduler"
             echo "::error::  cargo yank --version ${VER} ff-backend-valkey"
             echo "::error::  cargo yank --version ${VER} ff-backend-postgres"
+            echo "::error::  cargo yank --version ${VER} ff-backend-sqlite"
             echo "::error::  cargo yank --version ${VER} ff-engine"
             echo "::error::  cargo yank --version ${VER} ff-sdk"
             exit 1
@@ -394,7 +417,7 @@ jobs:
           VER="${TAG_VERSION#v}"
           cargo publish -p flowfabric --no-verify || {
             echo "::error::cargo publish flowfabric failed — yank every previously-published crate before re-tagging:"
-            echo "::error::  cargo yank --version ${VER} ferriskey ff-core ff-script ff-observability ff-observability-http ff-scheduler ff-backend-valkey ff-backend-postgres ff-engine ff-sdk ff-server"
+            echo "::error::  cargo yank --version ${VER} ferriskey ff-core ff-script ff-observability ff-observability-http ff-scheduler ff-backend-valkey ff-backend-postgres ff-backend-sqlite ff-engine ff-sdk ff-server"
             exit 1
           }
 

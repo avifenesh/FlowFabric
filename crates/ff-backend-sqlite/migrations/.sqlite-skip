@@ -1,0 +1,9 @@
+# RFC-023 §4.1 parity-drift lint sidecar. Phase 1a lands no migrations
+# (the first real entries arrive in Phase 1b, which ports the 14 PG
+# migrations). The `.sqlite-skip` format is documented in RFC-023
+# §4.1: one relative path per line pointing at the PG migration
+# intentionally skipped, `#` comments, inline `# issue:NNN` suffix for
+# tracking.
+#
+# Phase 1a intentionally has NO entries — the lint (also Phase 1b)
+# will first run against a populated migrations directory.
