@@ -1,9 +1,10 @@
 # RFC-023: SQLite — dev-only backend (testing harness, Temporal-pattern)
 
-**Status:** DRAFT
+**Status:** ACCEPTED
 **Revision:** 3
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
+**Accepted:** 2026-04-26
 **Target release:** v0.12.0 (next content delivery after v0.11.0 Postgres Wave 9)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions), RFC-020 (Postgres Wave 9 — shipped v0.11.0), RFC-022 (parked: full-parity SQLite — superseded in scope by this RFC)
 **Tracking issue:** #338
