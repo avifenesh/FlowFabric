@@ -9,18 +9,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Postgres Wave 9 — 12 trait methods flipped from `Unavailable` to
-  real impl (RFC-020 Rev 7).** `cancel_execution`, `change_priority`,
+- **Postgres Wave 9 — 15 trait methods flipped from `Unavailable` to
+  real impl, 12 capability flags flipped `false → true` (RFC-020
+  Rev 7).** Methods: `cancel_execution`, `change_priority`,
   `replay_execution`, `revoke_lease`, `read_execution_state`,
   `read_execution_info`, `get_execution_result`, `create_budget`,
   `reset_budget`, `create_quota_policy`, `get_budget_status`,
   `report_usage_admin`, `list_pending_waitpoints`,
   `cancel_flow_header`, `ack_cancel_member` all land concretely on
-  `PostgresBackend`. `PostgresBackend::capabilities().supports`
-  reports `true` for all 12 Wave-9 flags (plus the pre-existing
-  grouping flags `budget_admin` / `quota_admin`).
-  `subscribe_instance_tags` remains `false` per #311 (speculative
-  demand; served by `list_executions` +
+  `PostgresBackend`. Capability flags (per
+  `PostgresBackend::capabilities().supports`): the 7 operator-control
+  + read-model method-level flags (`cancel_execution`,
+  `change_priority`, `replay_execution`, `revoke_lease`,
+  `read_execution_state`, `read_execution_info`,
+  `get_execution_result`), the 2 grouping flags (`budget_admin`
+  covering the 4 budget methods, `quota_admin` covering
+  `create_quota_policy`), `list_pending_waitpoints`,
+  `cancel_flow_header`, `ack_cancel_member` — **12 flags total** —
+  all flip to `true`. `subscribe_instance_tags` remains `false` per
+  #311 (speculative demand; served by `list_executions` +
   `ScannerFilter::with_instance_tag`). Design record:
   `rfcs/RFC-020-postgres-wave-9.md`.
 - **Migration 0010 — `ff_operator_event` outbox.** New LISTEN/NOTIFY

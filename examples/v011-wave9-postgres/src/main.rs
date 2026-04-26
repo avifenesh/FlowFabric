@@ -237,7 +237,16 @@ fn budget_args(id: &BudgetId, tenant: &str, hard_tokens: u64, soft_tokens: u64, 
 }
 
 fn exec_uuid_of(id: &ExecutionId) -> Uuid {
-    Uuid::parse_str(id.as_str().split_once("}:").unwrap().1).unwrap()
+    // ExecutionId carries the `{fp:N}:<uuid>` shape (types.rs:97).
+    // Surface parse errors loudly so a future hash-tag shape change
+    // fails fast rather than corrupting demo state silently.
+    let s = id.as_str();
+    let (_, tail) = s.split_once("}:").unwrap_or_else(|| {
+        panic!("ExecutionId missing `{{fp:N}}:` hash-tag prefix: {s:?}")
+    });
+    Uuid::parse_str(tail).unwrap_or_else(|e| {
+        panic!("ExecutionId tail is not a valid UUID: {tail:?} ({e})")
+    })
 }
 
 async fn seed_runnable_exec(
@@ -283,7 +292,7 @@ async fn seed_failed_exec(pool: &PgPool, config: &PartitionConfig, lane: &LaneId
             lifecycle_phase, ownership_state, eligibility_state, \
             public_state, attempt_state, priority, created_at_ms, raw_fields) \
          VALUES ($1, $2, $3, 0, 'terminal', 'unowned', 'not_applicable', \
-                 'failed', 'terminated', 100, $4, '{}'::jsonb)",
+                 'failed', 'attempt_terminal', 100, $4, '{}'::jsonb)",
     )
     .bind(part)
     .bind(uuid)

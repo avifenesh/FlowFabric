@@ -875,7 +875,7 @@ impl EngineBackend for PostgresBackend {
         ff_core::capability::Capabilities::new(
             ff_core::capability::BackendIdentity::new(
                 "postgres",
-                ff_core::capability::Version::new(0, 10, 0),
+                ff_core::capability::Version::new(0, 11, 0),
                 "E-shipped",
             ),
             postgres_supports_base(),
