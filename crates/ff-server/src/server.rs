@@ -620,6 +620,7 @@ impl Server {
             dependency_reconciler_interval: config.engine_config.dependency_reconciler_interval,
             edge_cancel_dispatcher_interval: config.engine_config.edge_cancel_dispatcher_interval,
             edge_cancel_reconciler_interval: config.engine_config.edge_cancel_reconciler_interval,
+            budget_reset_interval: config.engine_config.budget_reset_interval,
             dependency_stale_threshold_ms:
                 ff_backend_postgres::PostgresScannerConfig::DEFAULT_DEP_STALE_MS,
             scanner_filter: config.engine_config.scanner_filter.clone(),
