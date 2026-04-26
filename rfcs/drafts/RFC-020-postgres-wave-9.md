@@ -1,10 +1,11 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** DRAFT — Revision 3
+**Status:** DRAFT — Revision 4
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Revision 2:** 2026-04-26 — Round-1 reviewer findings addressed (schema-ground-truth, design-spine reframe, drop G6, full-parity + coherent-wave directive)
 **Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms`; (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
+**Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter); (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
 **Target release:** v0.11 (single coordinated ship; whole wave or withdraw)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction + staged Postgres parity), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions)
 **Related artifacts:**
@@ -161,6 +162,18 @@ every flag below is asserted `false` at
 |---|---|
 | `list_pending_waitpoints` | `SSCAN` + 2× `HMGET` (schema per Stage D1, HMAC-redacted) |
 
+### 3.1.1 Producer-side write-path change (not a 14th method)
+
+Standalone-2 (`list_pending_waitpoints`) also modifies the producer-
+side `suspend_*` write path to populate the 4 new 0011 columns
+(`waitpoint_key`, `state`, `required_signal_names`, `activated_at_ms`)
+on initial insert + activation transitions. This is in-scope
+change surface outside the 13 listed methods but is **not** a new
+method impl — it is the minimum necessary write-side wiring to let
+Standalone-2's read-path serve the real `PendingWaitpointInfo`
+contract (§4.5). Wired in Spine-A pt.2's step-4 PR alongside
+migration 0011 (§6.2 step 4).
+
 ### 3.2 Dropped from scope: `subscribe_instance_tags`
 
 Removed from Wave 9 entirely. It is `Unavailable` on **both** backends
@@ -263,9 +276,10 @@ All six mutating methods follow a single SQL template:
   Column binding: `lane_id` / `attempt_index` / `lifecycle_phase`
   live on `ff_exec_core`; `worker_instance_id` / `outcome` /
   `lease_epoch` live on `ff_attempt` (matches A5).
-- Mutate: set `lifecycle_phase = 'Cancelled'`, `cancellation_reason
+- Mutate: set `lifecycle_phase = 'cancelled'`, `cancellation_reason
   = $reason`, `cancelled_by = $source`, `terminal_at_ms = now()`.
-  CAS on `attempt_index`.
+  CAS on `attempt_index`. (Lowercase `cancelled` matches the real
+  enum; see `crates/ff-backend-postgres/src/flow.rs:674`.)
 - Outbox: `INSERT INTO ff_lease_event (execution_id, lease_id,
   event_type, occurred_at_ms, partition_key) VALUES (..., 'revoked',
   ...)` when `worker_instance_id IS NOT NULL` (lease was active);
@@ -315,15 +329,31 @@ surfaces a `40001 serialization_failure` at COMMIT. The retry loop
 state visible: the losing tx's member-DELETE becomes a no-op (row
 already gone), the parent-DELETE predicate re-evaluates against
 post-winner state, and the method returns idempotent success. The
-retry budget matches the existing Stage-E3 reconciler retries; no
-new retry surface is introduced.
+retry budget is **3 attempts**, matching the existing
+`CANCEL_FLOW_MAX_ATTEMPTS` constant
+(`crates/ff-backend-postgres/src/flow.rs:52`); exhaustion surfaces
+`ContentionKind::RetryExhausted` to the caller, who falls back on
+the reconciler. No new retry-budget surface is introduced.
 
 #### 4.2.4 `change_priority`
 
+- Pre-read: `SELECT lifecycle_phase FROM ff_exec_core WHERE
+  (partition_key, execution_id) = (...) FOR UPDATE`. Acquires the
+  row lock against the reconciler per the §4.2 step-3 template.
+- Validate: `lifecycle_phase NOT IN ('terminal','cancelled')`
+  (non-terminal gate; terminal execs cannot have priority changed).
+  Lowercase values match the real `lifecycle_phase` enum
+  (`pending | blocked | eligible | active | leased | suspended |
+  runnable | terminal | cancelled`); see dispatch.rs:356 for the
+  same idiom.
 - Mutate: `UPDATE ff_exec_core SET priority = $new WHERE
-  (partition_key, execution_id) = (...) AND lifecycle_phase IN
-  ('Pending', 'Scheduled', 'Running') FOR UPDATE`. CAS on
-  `lifecycle_phase` (not a priority change for terminal execs).
+  (partition_key, execution_id) = (...) AND lifecycle_phase NOT IN
+  ('terminal','cancelled')`. Row-count = 0 (concurrent terminal
+  transition after pre-read) → return `AlreadyTerminal`.
+  (Revision 4: Revision 3's draft had a stray `FOR UPDATE` on the
+  `UPDATE`, which is invalid SQL — `FOR UPDATE` is SELECT-only.
+  The row-lock comes from the pre-read SELECT above per the §4.2
+  template.)
 - Outbox: `ff_operator_event` row (migration 0010, §4.3) with
   `event_type = 'priority_changed'`.
 
@@ -375,18 +405,29 @@ Postgres parity:
      Column binding (A5): `lifecycle_phase` / `flow_id` /
      `attempt_index` live on `ff_exec_core`; `outcome` lives on
      `ff_attempt`. The join pins to the current-attempt row only.
-  2. Require `lifecycle_phase` terminal (else `NotReplayable`).
-  3. `UPDATE ff_exec_core SET lifecycle_phase = 'Pending',
+  2. Require `lifecycle_phase = 'terminal'` (else `NotReplayable`).
+  3. `UPDATE ff_exec_core SET lifecycle_phase = 'runnable',
      terminal_at_ms = NULL, result = NULL, attempt_index =
      attempt_index + 1, cancellation_reason = NULL, cancelled_by =
-     NULL`.
+     NULL`. The post-replay phase is `'runnable'` (not `'pending'`)
+     to match Valkey's `ff_replay_execution` body, which writes
+     `"lifecycle_phase", "runnable"` on the base normal-replay path
+     (`crates/ff-script/src/flowfabric.lua:8625`) and on the
+     skipped-flow-member path (same file, line 8591). `'pending'`
+     in the real enum denotes a freshly-created execution pre-
+     dependency-resolution — a different state than post-replay
+     reset. (Skipped-flow-member variant may additionally transition
+     through blocked/eligibility sub-states via the upstream-edge
+     reset; those are scheduler secondary-state columns
+     orthogonal to `lifecycle_phase`.)
   4. `INSERT INTO ff_attempt (partition_key, execution_id,
      attempt_index, ...)` for the new attempt row (initialised
      empty, like a fresh create). The prior terminal `ff_attempt`
      row stays — it is history, not state. Reconciler-scope audit
      is in §4.2.6 (A4): existing scanners key off
      `ff_exec_core.attempt_index = ff_attempt.attempt_index`, so
-     historical rows are not picked up.
+     historical rows are not picked up. (Post-replay
+  `lifecycle_phase = 'runnable'` on the current attempt, as above.)
   5. Outbox: `ff_operator_event` row (`event_type = 'replayed'`).
 - **Skipped-flow-member path.** Additional CTE over `ff_edge` (where
   `downstream_eid = $id`) to find incoming edges. Valkey's
@@ -420,9 +461,11 @@ Specifically:
   already-cleared worker.
 - `cancel_execution` vs `replay_execution` → both take UPDATE
   locks on `ff_exec_core`; serial. Whichever commits first wins.
-  The loser's pre-state validation (requires terminal for replay,
-  non-terminal for cancel) fails → method returns its method-
-  specific `NotReplayable` / `AlreadyTerminal`. No corruption.
+  The loser's pre-state validation (replay requires
+  `lifecycle_phase = 'terminal'`; cancel requires
+  `lifecycle_phase NOT IN ('terminal','cancelled')`) fails →
+  method returns its method-specific `NotReplayable` /
+  `AlreadyTerminal`. No corruption.
 
 Net: the lock protocol + CAS fencing make reconciler-interaction
 symmetric to Valkey's Lua-atomic behavior. No new reconciler
@@ -442,12 +485,14 @@ this as a potential scanner hazard. Audited partners:
   attempt_index)` triple — no cross-attempt contamination.
 - `reconcilers/attempt_timeout.rs:50-77` scans `ff_attempt` JOINed
   against `ff_exec_core` on `lifecycle_phase = 'active'`. A
-  historical attempt whose `ff_exec_core` is now `'Pending'` (post-
-  replay) is not `'active'` and is filtered out. `expire_one`
+  historical attempt whose `ff_exec_core` is now `'runnable'`
+  (post-replay) is not `'active'` and is filtered out. `expire_one`
   (line 131-153) explicitly re-reads `ff_exec_core.attempt_index`
   as `cur_attempt` and binds the UPDATE `WHERE attempt_index = $4`
   to the scanner's picked index — if that doesn't match the current
-  attempt, the row update is a no-op on historical data.
+  attempt, the row update is a no-op on historical data. (Note:
+  `lifecycle_phase = 'active'` — lowercase — matches the real enum
+  in `reconcilers/attempt_timeout.rs:58`.)
 - `reconcilers/edge_cancel_reconciler.rs` / `dependency.rs` /
   `edge_cancel_dispatcher.rs` operate on `ff_exec_core` +
   `ff_edge*` — no direct `ff_attempt` scan surface.
@@ -660,6 +705,23 @@ on already-inserted rows.
 - `waitpoint_key`, `state`, `required_signal_names`, `activated_at`
   (from `activated_at_ms`) — direct columns post-0011.
 
+**Pre-0011 row projection (NEW-5).** `PendingWaitpointInfo.waitpoint_key`
+is `String` (non-Option). Rows inserted before migration 0011 have
+`waitpoint_key IS NULL` and cannot be backfilled without access to
+the original producer-side `suspend_*` call site. Projection
+behavior: `COALESCE(wp.waitpoint_key, '') AS waitpoint_key`,
+surfacing an empty string for pre-0011 rows (legible to cairn as
+"unknown" without contract-violating a `null`). Each projected
+empty-key row increments a new operator-observable counter
+`ff_waitpoint_pending_degraded_total{reason="missing_waitpoint_key"}`
+so operators can observe the degraded-legibility tail and age it
+out as pre-0011 waitpoints resolve. The counter plumbs through the
+existing metrics surface (OTEL via ferriskey per 2026-04-22 owner
+lock) — no new telemetry-infra surface. Filtering pre-0011 rows
+from the listing was considered and rejected: hiding operator-
+visible in-flight suspensions is worse than returning them with a
+sentinel + counter.
+
 No JOIN to `ff_exec_core` / `ff_attempt` required — the phantom
 `flow_id`/`attempt_index` fields are not in the contract.
 
@@ -796,6 +858,18 @@ lands its own migration file (numbered sequentially after `0009_*`):
 - **backward_compatible = true** in every `ff_migration_annotation`
   row. Operators can roll backward to any pre-Wave-9 ff-server
   binary; extra tables sit idle.
+- **Rollback is forward-only-stateful (B-2).** Post-0011 binary
+  populates `state = 'active'` + `activated_at_ms` on the
+  pending→active waitpoint activation transition. A rolled-back
+  pre-0011 binary does not know about these columns and will not
+  mutate `state` back to `'pending'` on the reverse transition;
+  already-activated rows persist their post-0011 `state` value
+  until post-0011 code processes them again. Full rollback-safety
+  (i.e. a rolled-back binary silently ignoring Wave-9-written
+  columns and staying semantically consistent) is out-of-scope;
+  `backward_compatible = true` here means the schema is additive
+  and old binaries boot, not that Wave-9-written state is
+  round-trippable through a rollback.
 
 ### 6.3 Release + capability-flip protocol
 
@@ -1012,6 +1086,14 @@ prerequisites for the method impls this RFC proposes. If a future
 Wave-10 introduces projection tables or cross-cutting schema
 shapes, it is welcome to split at that time. RFC-020 stays
 single-doc.
+
+### 8.6a Repurpose `ff_signal_event` for operator-control events
+
+Rejected in Rev-3 (§4.2.4 / §4.2.7): schema mismatch (no
+`event_type` column, `signal_id NOT NULL`) + subscriber-contract
+fork against the existing "signal-delivery" channel semantic. See
+§4.2.4 channel-choice rationale; migration 0010 introduces the
+dedicated `ff_operator_event` channel instead.
 
 ### 8.7 Split Wave 9 across v0.11 + v0.12
 
