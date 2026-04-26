@@ -42,7 +42,7 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
 - **Priority scheduling** -- score-based eligible sets with priority clamping
 - **Capability routing** -- workers advertise capabilities; scheduler subset-matches per-execution requirements
 - **REST API** -- 27 endpoints on axum with JSON error handling, CORS, health check
-- **Backend trait** -- `EngineBackend` is the stable surface for alternate backends (Valkey + Postgres both first-class at v0.8.0, RFC-017 Stage E4); `capabilities_matrix()` lets consumers query supported operations at runtime (v0.9, RFC-018); cursor-paginated `list_executions` / `list_flows` / `list_lanes` / `list_suspended` for operator tooling
+- **Backend trait** -- `EngineBackend` is the stable surface for alternate backends (Valkey + Postgres both first-class at v0.8.0, RFC-017 Stage E4); `capabilities()` returns a flat `Capabilities { identity, supports }` — dot-access `caps.supports.<method>` bools (v0.10, #277); typed `subscribe_lease_history` / `subscribe_completion` / `subscribe_signal_delivery` with a required `&ScannerFilter` parameter for per-tenant tag isolation (pass `&ScannerFilter::default()` for the unfiltered stream) (v0.10, #282); cursor-paginated `list_executions` / `list_flows` / `list_lanes` / `list_suspended` for operator tooling
 - **Client-local tower-style layer surface** -- opt-in `TracingLayer`, `RateLimitLayer`, `MetricsLayer`, `CircuitBreakerLayer` compose around any `EngineBackend`
 - **Observability** -- OTEL via `ff-observability`, Prometheus scrape endpoint via `ff-server` (engine-side) or `ff-observability-http` crate (consumer-side), optional Sentry integration, Grafana dashboard JSON bundled
 - **Cluster-safe** -- all operations use hash-tag partitioning; cluster-aware enumeration via ferriskey's hash-tag-aware `cluster_scan` (single-shard routing when the match pattern embeds a tag)
@@ -83,8 +83,9 @@ FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 
 ### 3. Try an example
 
-Four end-to-end examples live under [`examples/`](examples/):
+Five end-to-end examples live under [`examples/`](examples/):
 
+- **[`v010-read-side-ergonomics`](examples/v010-read-side-ergonomics/)** -- v0.10 headline demo for consumer read-side APIs: flat `Capabilities::supports.<flag>` discovery (#277), typed `LeaseHistoryEvent` from `subscribe_lease_history` (#282), and tag-restricted subscriptions via `ScannerFilter::with_instance_tag(..)`. Multi-tenant lease-audit console pattern. No external dependencies beyond a running `ff-server`.
 - **[`llm-race`](examples/llm-race/)** -- race N free OpenRouter LLM providers against the same prompt; automatically cancel losers when one wins; stream the winner via `DurableSummary` with JSON Merge Patch. Exercises v0.6 `AnyOf{CancelRemaining}` + `Count{DistinctSources}` + typed `SuspendArgs`. Verified live 2026-04-24. Best starting point for learning v0.6 primitives. Requires `OPENROUTER_API_KEY` (free tier).
 - **[`coding-agent`](examples/coding-agent/)** -- LLM-powered code-patch worker with streaming output and human-in-the-loop suspend/signal review. Requires `OPENROUTER_API_KEY`.
 - **[`media-pipeline`](examples/media-pipeline/)** -- three-stage audio pipeline (transcribe → summarize → embed) exercising capability routing, stream tail with terminal markers, and HMAC-signed waitpoint signals. Requires `OPENROUTER_API_KEY` + local whisper.cpp.
