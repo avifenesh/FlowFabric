@@ -1,13 +1,47 @@
 # RFC-023: SQLite — dev-only backend (testing harness, Temporal-pattern)
 
 **Status:** ACCEPTED
-**Revision:** 4
+**Revision:** 5
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
 **Target release:** v0.12.0 (next content delivery after v0.11.0 Postgres Wave 9)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions), RFC-020 (Postgres Wave 9 — shipped v0.11.0), RFC-022 (parked: full-parity SQLite — superseded in scope by this RFC)
 **Tracking issue:** #338
+
+### Revision 5 summary (2026-04-26)
+
+Phase 1a impl agent surfaced that Revision 4's §4.4 item 10 ("one
+`#[cfg(feature = "valkey-default")]` line removed, zero behavior
+change") was wrong against ground truth. The real code surface:
+
+- `crates/ff-sdk/src/lib.rs:93-94` gates the `worker` MODULE itself
+  (`#[cfg(feature = "valkey-default")] pub mod worker;`), not only
+  the re-export — so removing the re-export gate alone is a no-op
+  under sqlite-only features (the module is absent).
+- `crates/ff-sdk/src/worker.rs:6` carries an unconditional
+  `use ferriskey::{Client, Value};` at module scope; `Client` is
+  embedded in the `FlowFabricWorker` struct at `worker.rs:63`; the
+  type cannot be constructed without dialing Valkey.
+- `FlowFabricWorker::connect_with` at `worker.rs:587-596` literally
+  calls `Self::connect(config).await?` first and then swaps the
+  backend — the opposite of a backend-agnostic entry point.
+- `claim_from_grant` / `claim_via_server` / `claim_from_reclaim_grant`
+  / `claim_resumed_execution` / `claim_execution` /
+  `read_execution_context` / `deliver_signal` all use
+  `self.client` (ferriskey) directly and are NOT gated today
+  (only `claim_next` + its helpers are `direct-valkey-claim`-gated).
+
+Owner decision 2026-04-26: do the worker.rs surgery in Phase 1a
+(Option C), not a cfg-line-removal narrow fix. §4.4 item 10 is
+rewritten to honestly enumerate the scope; §4.7.1's stray-env
+footnote is replaced with a post-surgery compile-surface note;
+§8 absorbs the additional minor-breaking-change surface (claim
+methods become `valkey-default`-gated at the API boundary); §9
+adds a `cargo check -p ff-sdk --no-default-features --features sqlite`
+CI cell as the mechanical regression guard; §10 adds the
+cfg-regression maintenance-tax line. No open questions added;
+no reframing of §§1–3, §4.1–§4.3, §4.5–§4.7.2, §5, §6, §7.
 
 ### Revision 4 summary (2026-04-26)
 
@@ -611,23 +645,175 @@ trait-implementation. Enumerated:
    struct-literal construction, so struct-literal consumers
    already have to migrate; adding `#[non_exhaustive]` in the same
    PR locks in the proper long-term shape.
-10. **`FlowFabricWorker` re-export moves out of `valkey-default`
-    cfg gate** (A1). Today at `crates/ff-sdk/src/lib.rs:149` the
-    re-export reads `#[cfg(feature = "valkey-default")] pub use
-    worker::FlowFabricWorker;`. Under cairn's canonical dependency
-    posture (`ff-sdk = { ..., default-features = false, features =
-    ["sqlite"] }`) the re-export vanishes and the §4.7.1 embedded
-    example stops compiling. Fix is disposition (a) from Round-3:
-    drop the cfg gate entirely — `FlowFabricWorker` is
-    backend-agnostic per RFC-012 #164 (it already accepts
-    `Arc<dyn EngineBackend>` via `connect_with`). The `worker`
-    module itself carries no valkey-only dep in its public path;
-    the gate existed only to avoid a downstream
-    `FlowFabricWorker::connect` env-URL construction requirement,
-    which the `connect_with` embedded path sidesteps. Net diff: one
-    `#[cfg(feature = "valkey-default")]` line removed, no new
-    public surface, zero behavior change for
-    `valkey-default`-enabled consumers.
+10. **`ff_sdk::FlowFabricWorker` backend-agnostic refactor** (A1,
+    Rev-5 rewrite). Revision 4 framed this as a single cfg-line
+    removal. Phase 1a ground-truth verification showed that framing
+    is wrong: the `worker` MODULE itself is cfg-gated at
+    `crates/ff-sdk/src/lib.rs:93-94`
+    (`#[cfg(feature = "valkey-default")] pub mod worker;`); the
+    module unconditionally imports `ferriskey::{Client, Value}` at
+    `worker.rs:6`; `FlowFabricWorker` embeds a `ferriskey::Client`
+    in its struct at `worker.rs:63`; and
+    `FlowFabricWorker::connect_with` at `worker.rs:587-596`
+    internally calls `Self::connect(config).await?` first (which
+    dials Valkey, writes the `ff:worker:{id}:alive` SET-NX
+    sentinel, reads `ff:config:partitions`, and wraps a
+    `ValkeyBackend`) before swapping in the caller-supplied
+    backend. Under cairn's canonical `ff-sdk = { default-features =
+    false, features = ["sqlite"] }` posture the module is ABSENT,
+    `FlowFabricWorker` does not exist as a symbol, and even if the
+    re-export were ungated the type could not compile
+    (ferriskey-unresolved) and `connect_with` would still dial
+    ferriskey during its preamble. The Revision 4 one-line fix does
+    not reach the real blocker.
+
+    **Rev-5 scope (Phase 1a).** Surgical refactor of `worker.rs`
+    so `FlowFabricWorker::connect_with` is a genuine backend-agnostic
+    entry under any feature set:
+
+    a. **Ungate `pub mod worker;`** at `lib.rs:93-94` — always
+       compiled. Same treatment for the `pub use
+       worker::FlowFabricWorker;` re-export at `lib.rs:149`.
+    b. **Scope ferriskey imports to a cfg-gated inner
+       region.** The module-scope `use ferriskey::{Client, Value};`
+       at `worker.rs:6` moves behind `#[cfg(feature =
+       "valkey-default")]`. Methods that need the concrete
+       `ferriskey::Client` stay inside that cfg region.
+    c. **Make the `FlowFabricWorker::client` field cfg-gated.**
+       The embedded `ferriskey::Client` at `worker.rs:63` becomes
+       `#[cfg(feature = "valkey-default")] client: Client,`.
+       Under sqlite-only features the struct carries no ferriskey
+       state; all backend ops must route through the
+       `backend: Arc<dyn EngineBackend>` field.
+    d. **Cfg-gate `FlowFabricWorker::connect`** at
+       `worker.rs:163-509` behind `#[cfg(feature = "valkey-default")]`.
+       Under sqlite-only features `connect()` does not exist as a
+       symbol. The rustdoc explicitly calls the method the
+       Valkey-only entry point; consumers on non-Valkey backends
+       use `connect_with` exclusively.
+    e. **Refactor `connect_with`** (`worker.rs:587-596`) so it no
+       longer calls `Self::connect(config)`. Instead it directly
+       constructs a `FlowFabricWorker` with the supplied `backend`,
+       supplied `completion`, `PartitionConfig::default()` (no
+       backend round-trip to read `ff:config:partitions`; callers
+       who need a non-default `num_flow_partitions` override it
+       post-construction via the existing `config()` borrow shape
+       or pass via the `WorkerConfig` builder, whichever lands
+       first — no new `EngineBackend` trait method is added by
+       this RFC), the semaphore built from
+       `config.max_concurrent_tasks`, and — under `valkey-default`
+       only — no `client` field value at all (the field is
+       cfg-gated per step (c) so it is absent from the struct
+       under sqlite-only features, and under `valkey-default` it
+       is populated only by the `connect` path, not by
+       `connect_with`). Lane-empty validation (the one check that
+       `connect` performs before any Valkey work at
+       `worker.rs:164-169`) moves into `connect_with` so every
+       entry point refuses an empty lane list. No PING, no
+       alive-key SET-NX, no Valkey capability advertisement, no
+       `ff:config:partitions` read. Existing `valkey-default`
+       consumers of `connect_with(config, backend, None)` observe
+       the same post-swap state they got before (the `connect`
+       preamble constructed a default `ValkeyBackend` that was
+       then overwritten; removing it simplifies the path and
+       drops one extra Valkey round-trip).
+
+       **`PartitionConfig` shape justification.** Under
+       `valkey-default`, the pre-Rev-5 `connect` path reads
+       `ff:config:partitions` from Valkey and falls back to
+       `PartitionConfig::default()` on missing key or parse
+       failure. Callers using `connect_with` post-Rev-5 skip that
+       read by design (this is the whole point of a
+       backend-agnostic entry); defaulting is the same
+       fallback path the existing code already takes on its
+       no-key branch, so no caller observes a shape they didn't
+       already have to handle. Callers whose deployments require
+       a non-default partition count continue to use `connect`
+       (Valkey) or — on other backends — an ahead-of-time
+       read against the backend's own config surface plus a
+       future `WorkerConfig` field that threads the value in
+       (tracked as a follow-up at v0.12.0 tag time; out of scope
+       for Rev-5).
+    f. **Cfg-gate all ferriskey-using methods** behind
+       `valkey-default`. Ground-truth inventory at Revision 5:
+       `claim_next` and its helpers (`block_route`,
+       `issue_claim_grant`, `next_lane`, `extract_first_array_string`,
+       `is_retryable_claim_error`, `scan_cursor_seed`) are already
+       behind `direct-valkey-claim` (which implies
+       `valkey-default`) — no change. Additions needed:
+       `claim_execution` (`worker.rs:986`), `claim_from_grant`
+       (`worker.rs:1201`), `claim_via_server` (`worker.rs:1273`),
+       `claim_from_reclaim_grant` (`worker.rs:1337`),
+       `claim_resumed_execution` (`worker.rs:1380`),
+       `read_execution_context` (`worker.rs:1444`), `deliver_signal`
+       (`worker.rs:1487`), and the free function
+       `read_partition_config` (`worker.rs:1574`) all gain
+       `#[cfg(feature = "valkey-default")]`. Under sqlite-only
+       features `FlowFabricWorker` exposes only `connect_with`,
+       `backend`, `backend_ref`, `completion_backend`, `config`,
+       and `partition_config`; the claim/signal surface is absent
+       (a backend-agnostic claim/signal API is deferred to a
+       follow-up RFC tracked in the breaking-change disclosure
+       below). The `ClaimedTask` surface at `crates/ff-sdk/src/task.rs`
+       already gated behind `valkey-default` at `lib.rs:92` stays
+       gated — this refactor does not try to make `ClaimedTask`
+       backend-agnostic (Stage 1d scope).
+    g. **Update `completion_accessor_type_tests`** at
+       `worker.rs:1604-1623` — the test is already
+       `cfg`-independent but references `FlowFabricWorker`
+       from an ungated test module, so it compiles under the
+       new layout unchanged. Add a parallel
+       `#[cfg(not(feature = "valkey-default"))]` compile-only test
+       that asserts `FlowFabricWorker::connect_with` is callable
+       with the sqlite-only feature set; this is the mechanical
+       anchor for the §9 CI cell.
+
+    **Behavioral impact.** Under `valkey-default` (the default for
+    every shipped consumer today) there is zero runtime behavior
+    change — the only difference is that `connect_with` no longer
+    fires the `connect` preamble's throwaway Valkey round-trips,
+    which is a small net improvement not a contract change. Under
+    `--no-default-features, features = ["sqlite"]` the `worker`
+    module compiles, `FlowFabricWorker::connect_with(config,
+    backend, None)` works, and the cairn-canonical §4.7.1 example
+    runs without any Valkey reachability.
+
+    **Public API shape after Rev-5 Phase 1a:**
+    - `FlowFabricWorker` — always addressable (module + re-export
+      ungated).
+    - `FlowFabricWorker::connect_with(config, backend, completion)`
+      — always available; standalone, no `connect` preamble.
+    - `FlowFabricWorker::backend` / `completion_backend` /
+      `config` / `partition_config` — always available.
+      (`backend_ref` at `worker.rs:613` stays `pub(crate)` — it is
+      a crate-internal unwrapper for `snapshot` trait-forwarders
+      and is not part of the public surface commitment; no change
+      to its visibility in Rev-5.)
+    - `FlowFabricWorker::connect` — `valkey-default`-gated;
+      ABSENT under sqlite-only features. Documented as the
+      Valkey-specific convenience entry that bundles
+      `ValkeyBackend` construction.
+    - Claim + signal methods (`claim_next`, `claim_from_grant`,
+      `claim_via_server`, `claim_from_reclaim_grant`,
+      `deliver_signal`) — `valkey-default`-gated. Under
+      sqlite-only features the returned worker can hold a backend
+      and hand out `backend()` references but cannot drive the
+      claim/signal loop (§4.7.1 primary cairn path drives the
+      backend directly via `EngineBackend` trait methods; a
+      backend-agnostic SDK worker-loop is deferred to a future
+      RFC tracked in the §8 breaking-change disclosure).
+
+    **Net diff estimate.** ~50–100 lines changed in `worker.rs`
+    (cfg attributes on module-scope imports, struct field,
+    `connect`, 7 additional methods + 1 free function;
+    `connect_with` body rewritten to ~20 lines of direct
+    construction replacing the 10-line `Self::connect` preamble).
+    1 line removed at `lib.rs:93` (module gate); 1 line
+    removed at `lib.rs:149` (re-export gate). No new public
+    types, no trait-signature changes. Tests: one new
+    `#[cfg(not(feature = "valkey-default"))]` compile-only
+    assertion in `worker.rs` matching the existing pattern at
+    `worker.rs:1604-1623`.
 
 **Embedded, no-HTTP consumers** continue to use the existing
 `Server::start_with_backend` (`server.rs:677`) by constructing
@@ -645,8 +831,14 @@ EngineBackend>` shape and is the cairn-canonical embedded path.
 - `ServerError::SqliteRequiresDevMode` (variant)
 - `ServerError` and `ServerConfig` gain `#[non_exhaustive]` (B1)
 - `ff_sdk::FlowFabricWorker` becomes addressable under
-  `default-features = false, features = ["sqlite"]` (re-export
-  cfg-gate removed, A1)
+  `default-features = false, features = ["sqlite"]` via the
+  Rev-5 Phase 1a `worker.rs` surgery (A1): module + re-export
+  cfg-gates removed, `connect_with` refactored to a standalone
+  backend-agnostic constructor, ferriskey-using methods
+  (`connect`, `claim_next`, `claim_from_grant`,
+  `claim_via_server`, `claim_from_reclaim_grant`,
+  `deliver_signal`, and internal helpers) cfg-gated behind
+  `valkey-default` (§4.4 item 10)
 - `FF_BACKEND=sqlite`, `FF_SQLITE_PATH`, `FF_SQLITE_POOL_SIZE`,
   `FF_DEV_MODE`
 
@@ -736,37 +928,50 @@ No HTTP listener, no bind port, no `reqwest` dependency — the
 `FlowFabricWorker` directly wraps the SQLite backend trait object. This
 is the shape cairn's `cargo test` uses.
 
-> **Compile-surface note (A1).** Under cairn's canonical
-> `ff-sdk = { ..., default-features = false, features = ["sqlite"] }`
-> posture, `ff_sdk::FlowFabricWorker` must remain re-exported
-> without the `valkey-default` cfg gate. §4.4 item 10 commits the
-> re-export to be backend-agnostic. The example below assumes that
-> change is landed; without it the `use ff_sdk::FlowFabricWorker`
-> line fails to resolve under the sqlite-only posture.
+> **Compile-surface note (A1, Rev-5).** §4.4 item 10 commits both
+> the `pub mod worker;` module gate at
+> `crates/ff-sdk/src/lib.rs:93` and the
+> `pub use worker::FlowFabricWorker;` re-export gate at
+> `crates/ff-sdk/src/lib.rs:149` to be ungated, plus the
+> `worker.rs` surgery that cfg-gates `FlowFabricWorker::connect`
+> and the Valkey-specific claim/signal methods behind
+> `valkey-default`. The example below assumes that Phase 1a change
+> is landed; without it the `use ff_sdk::FlowFabricWorker` line
+> fails to resolve under the sqlite-only posture (module absent).
 >
-> **Stray-env hazard (B3).** `FlowFabricWorker::connect_with` at
-> `crates/ff-sdk/src/worker.rs:587-590` internally calls
-> `FlowFabricWorker::connect(config)` first and then swaps the
-> backend. That inner `connect` consults `FF_HOST` / `FF_PORT` /
-> `FF_CONNECTION_URL` to build a Valkey client. Under the embedded
-> SQLite harness these MUST NOT be set — if they are, `connect`
-> attempts (and may succeed at) a real Valkey connection before
-> the backend swap, producing the opposite of the "no Docker"
-> promise. Canonical mitigation: unset them in
-> `.cargo/config.toml [env]` explicitly, e.g.
+> **Post-surgery `connect_with` behavior (Rev-5).**
+> `FlowFabricWorker::connect_with(config, backend, None)` directly
+> constructs the worker with the supplied `backend` — no
+> `Self::connect(config)` preamble runs, no ferriskey client is
+> dialed, no PING is issued, no `ff:worker:{id}:alive` SET-NX
+> sentinel is written, no `ff:config:partitions` HGETALL is
+> performed. Consumer code under
+> `ff-sdk = { default-features = false, features = ["sqlite"] }`
+> can safely call `connect_with` from any context without
+> unsetting `FF_HOST` / `FF_PORT` / `FF_CONNECTION_URL`
+> environment variables — the code path that read them is
+> compiled out. The Revision 4 `.cargo/config.toml [env]`
+> stray-env mitigation is obsolete once Phase 1a ships and is NOT
+> required for cairn's canonical posture. (`FF_DEV_MODE=1` is
+> still required — §4.5 enforcement lives on the
+> `SqliteBackend::new` type and applies regardless of worker
+> wiring.)
 >
-> ```toml
-> [env]
-> FF_DEV_MODE = "1"
-> FF_HOST = { value = "", force = true }
-> FF_PORT = { value = "", force = true }
-> FF_CONNECTION_URL = { value = "", force = true }
-> ```
->
-> This is documented in `docs/dev-harness.md` per §9. A follow-up
-> that refactors `connect_with` to skip the `connect` preamble
-> entirely when a backend is supplied is out of scope for this RFC
-> and tracked separately.
+> **What the worker can and cannot do under sqlite-only features.**
+> Post-Rev-5 the worker exposes `connect_with`, `backend`,
+> `completion_backend`, `config`, and `partition_config` under
+> the sqlite-only feature set (`backend_ref` at `worker.rs:613`
+> is `pub(crate)` and remains crate-internal). The
+> claim/signal surface (`claim_next`, `claim_from_grant`,
+> `claim_via_server`, `claim_from_reclaim_grant`, `deliver_signal`)
+> is `valkey-default`-gated and ABSENT under sqlite-only features
+> — a backend-agnostic SDK claim/signal loop is deferred to a
+> future RFC (§8 breaking-change disclosure). Cairn's canonical
+> tests drive the backend directly via `EngineBackend` /
+> `CompletionBackend` trait methods on the returned `backend()` /
+> `completion_backend()` handles, which is the intended Phase 1a
+> shape and matches how `ff-server`'s own Postgres branch
+> exercises the trait surface today.
 
 ```rust
 // cairn-fabric/tests/integration_sqlite.rs
@@ -1064,10 +1269,32 @@ same PR):**
    callers are unaffected; the field populates with defaults under
    non-sqlite `FF_BACKEND` values.
 
-Both breaks are noted in `CHANGELOG.md [Unreleased] ### Changed`
-per the §9 release-gate discipline and called out in
-`docs/CONSUMER_MIGRATION_0.12.md`. The alternative dispositions
-considered:
+3. **`ff_sdk::worker` module cfg-gating shift (Rev-5, A1).** The
+   `ff_sdk::worker` module moves from `valkey-default`-gated
+   (`crates/ff-sdk/src/lib.rs:93`) to always-compiled.
+   `FlowFabricWorker::connect` becomes
+   `#[cfg(feature = "valkey-default")]` and is ABSENT under
+   `--no-default-features`; likewise `claim_next`,
+   `claim_from_grant`, `claim_via_server`,
+   `claim_from_reclaim_grant`, and `deliver_signal`. Consumers who
+   built with `--no-default-features` AND directly called these
+   methods (no such consumer exists on crates.io today per a
+   2026-04-26 scan; this is a forward-looking commitment) must
+   either enable the `valkey-default` feature to restore the
+   Valkey-bundled convenience path or switch to the backend-agnostic
+   `connect_with(config, backend, completion)` entry plus direct
+   `EngineBackend` trait calls through `backend()` for the
+   claim/signal surface. A backend-agnostic SDK worker-loop is
+   deferred to a future RFC (tracked as a §9 follow-up issue at
+   v0.12.0 tag time); until that RFC lands, consumers using the
+   SDK on non-Valkey backends drive the claim/signal ops through
+   the trait surface directly. This is a pre-1.0 minor break,
+   consistent with the existing RFC-023 §8 posture.
+
+Both ff-server breaks plus the ff-sdk shift are noted in
+`CHANGELOG.md [Unreleased] ### Changed` per the §9 release-gate
+discipline and called out in `docs/CONSUMER_MIGRATION_0.12.md`.
+The alternative dispositions considered:
 
 - **Option (b) — route SQLite refusal through existing
   `ServerError::InvalidInput` / `OperationFailed`.** Avoids the
@@ -1162,6 +1389,16 @@ whole or does not ship.
 - [ ] **Parity-drift migration lint** (§4.1) green: every PG
       migration has a SQLite sibling or a `.sqlite-skip` entry
       with tracking issue.
+- [ ] **ff-sdk no-default-features compile gate (Rev-5, §4.4 item
+      10).** A CI cell runs
+      `cargo check -p ff-sdk --no-default-features --features sqlite`
+      and passes. Catches regressions where a future PR adds a
+      ferriskey call outside the `valkey-default` cfg gate on
+      `FlowFabricWorker` or a sibling module. Lives alongside the
+      existing `cargo check -p ff-core --no-default-features
+      --features core` cell in `.github/workflows/matrix.yml`
+      (currently at line 200-201 of that file); adds ~15 seconds
+      wall-clock on cold-cache runners.
 - [ ] **CHANGELOG entries.** `CHANGELOG.md` `[Unreleased]` entries
       under `### Added` for the four new public APIs
       (`BackendKind::Sqlite`, `SqliteServerConfig`,
@@ -1215,6 +1452,17 @@ Honest enumeration:
   storms under parallel test load, WAL files surviving a
   crash and confusing re-open). Triage time comes out of
   maintainer bandwidth, not automation.
+- **`ff_sdk::worker` cfg-regression review (Rev-5).** Every
+  future PR that adds a Valkey-specific worker method, adds a
+  ferriskey API call, or introduces a new ferriskey-dependent
+  helper on the `FlowFabricWorker` surface must be reviewed for
+  `#[cfg(feature = "valkey-default")]` gate correctness. The §9
+  `cargo check -p ff-sdk --no-default-features --features sqlite`
+  CI cell catches regressions mechanically (adds ~15 seconds to
+  the matrix on cold cache) but the human review tax is that
+  every reviewer on an ff-sdk worker change checks the gate
+  discipline, the same way every PG PR already checks the
+  third-backend-impl discipline.
 
 **Tax sizing.** Maintenance tax is estimated at **~80% of the
 full-parity RFC-022 shape's cost.** The 20% saved is
