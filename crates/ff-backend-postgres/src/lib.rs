@@ -190,9 +190,24 @@ fn postgres_supports_base() -> ff_core::capability::Supports {
     // ── Boot (Postgres returns NoOp but call is callable + correct) ──
     s.prepare = true;
 
-    // Everything else — operator control, execution reads, budget
-    // admin, quota admin, list_pending_waitpoints, cancel_flow_header,
-    // ack_cancel_member — defaults to `false`. Wave 9 follow-up scope.
+    // ── Wave 9 (v0.11) — operator control + read model + budget/quota
+    //    admin + list_pending_waitpoints + cancel_flow_header +
+    //    ack_cancel_member all ship concretely on Postgres via
+    //    RFC-020 Rev 7. subscribe_instance_tags remains `false` per
+    //    #311 (speculative demand, served by list_executions +
+    //    ScannerFilter::with_instance_tag today).
+    s.cancel_execution = true;
+    s.change_priority = true;
+    s.replay_execution = true;
+    s.revoke_lease = true;
+    s.read_execution_state = true;
+    s.read_execution_info = true;
+    s.get_execution_result = true;
+    s.budget_admin = true;
+    s.quota_admin = true;
+    s.list_pending_waitpoints = true;
+    s.cancel_flow_header = true;
+    s.ack_cancel_member = true;
 
     s
 }
@@ -860,7 +875,7 @@ impl EngineBackend for PostgresBackend {
         ff_core::capability::Capabilities::new(
             ff_core::capability::BackendIdentity::new(
                 "postgres",
-                ff_core::capability::Version::new(0, 10, 0),
+                ff_core::capability::Version::new(0, 11, 0),
                 "E-shipped",
             ),
             postgres_supports_base(),

@@ -103,23 +103,23 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 | 3 | `add_execution_to_flow` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 4 | `stage_dependency_edge` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 5 | `apply_dependency_to_child` | `impl` | `impl` | Promoted from PG inherent to trait. |
-| 6 | `cancel_execution` | `impl` | `stub` | **Landed Stage C (PR #impl/017-stage-c).** Valkey body does HMGET pre-read (lane_id + current_attempt_index + current_waitpoint_id + current_worker_instance_id) then raw FCALL with variadic KEYS(21)/ARGV(5) matching `lua/execution.lua::ff_cancel_execution`. |
-| 7 | `change_priority` | `impl` | `stub` | **Landed Stage C.** Valkey body reads authoritative lane via HGET when caller passes empty `lane_id`, then wraps the `ff_change_priority` ff-script helper. |
-| 8 | `replay_execution` | `impl` | `stub` | **Landed Stage C.** Valkey body does HMGET pre-read (lane_id + flow_id + terminal_outcome). Non-flow path wraps `ff_replay_execution`; skipped-flow-member path does SMEMBERS over the flow partition's incoming-edge set and raw FCALL with variadic KEYS/ARGV (§4 row 3 Hard clause). |
-| 9 | `revoke_lease` | `impl` | `stub` | **Landed Stage C.** Valkey body HGETs `current_worker_instance_id` when caller passes empty WIID; surfaces "no active lease" as `RevokeLeaseResult::AlreadySatisfied { reason: "no_active_lease" }` (Lua-canonical semantic — minor delta vs pre-migration HTTP 404, documented in Stage C PR). |
-| 10 | `create_budget` | `impl` | `stub` | Valkey wraps `ff_create_budget`. Postgres default `Unavailable` until Wave 5 budget impls. |
-| 11 | `reset_budget` | `impl` | `stub` | Valkey wraps `ff_reset_budget`. |
-| 12 | `create_quota_policy` | `impl` | `stub` | Valkey wraps `ff_create_quota_policy`. |
-| 13 | `get_budget_status` | `impl` | `stub` | **Landed Stage C.** Valkey body is 3× HGETALL (definition + usage + limits) + field-level parse, no FCALL. Missing budget surfaces as `EngineError::NotFound { entity: "budget" }` with contextual wrapper carrying the budget id. |
-| 14 | `report_usage_admin` | `impl` | `stub` | Valkey wraps `ff_report_usage_and_check` without worker handle. |
-| 15 | `get_execution_result` | `impl` | `stub` | Valkey direct `GET` of `ctx.result()`, binary-safe. |
-| 16 | `list_pending_waitpoints` | `impl` | `stub` | **Landed Stage D1.** Pipelined SSCAN + 2× HMGET + §8 schema rewrite (HMAC redaction + `token_kid`/`token_fingerprint`) + `after`/`limit` pagination. HTTP handler wraps with the v0.7.x `Deprecation: ff-017` header and the raw `waitpoint_token` (fetched via the Valkey-only inherent `Server::fetch_waitpoint_token_v07`) for one-release deprecation warning. Postgres impl lands in Stage D2 (full parity gate). |
+| 6 | `cancel_execution` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020).** Postgres wraps the §4.2 SERIALIZABLE-fn template + `ff_lease_event` emit. Valkey body does HMGET pre-read (lane_id + current_attempt_index + current_waitpoint_id + current_worker_instance_id) then raw FCALL with variadic KEYS(21)/ARGV(5) matching `lua/execution.lua::ff_cancel_execution`. |
+| 7 | `change_priority` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.2.4).** Postgres UPDATE on `ff_exec_core` + `ff_operator_event` outbox emit (migration 0010); row-count=0 maps to `EngineError::ExecutionNotEligible` per Rev 7 Fork 3. Valkey reads authoritative lane via HGET when caller passes empty `lane_id`, then wraps `ff_change_priority`. |
+| 8 | `replay_execution` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.2.5 Rev 7).** Postgres in-place UPDATE on existing `ff_attempt` (no `attempt_index` bump, matches Valkey) + `ff_edge_group` counter reset for skipped-flow-member path (Rev 7 Fork 1 Option A) + `ff_operator_event` emit. |
+| 9 | `revoke_lease` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020).** Postgres SERIALIZABLE-fn path + `ff_lease_event` emit; surfaces "no active lease" as `RevokeLeaseResult::AlreadySatisfied { reason: "no_active_lease" }` matching Valkey. |
+| 10 | `create_budget` | `impl` | `impl` | **Wave 9 v0.11 (RFC-020 §4.4, Rev 6).** Postgres INSERT on `ff_budget_policy` (migration 0013 adds scheduling + breach + definitional columns). Valkey wraps `ff_create_budget`. |
+| 11 | `reset_budget` | `impl` | `impl` | **Wave 9 v0.11.** Postgres UPDATE clears breach counters + bumps `next_reset_at_ms`. Valkey wraps `ff_reset_budget`. |
+| 12 | `create_quota_policy` | `impl` | `impl` | **Wave 9 v0.11 (RFC-020 §4.4, Rev 6).** Postgres INSERT on `ff_quota_policy` family (migration 0012: `ff_quota_policy` + `ff_quota_window` + `ff_quota_admitted`, 256-way HASH-partitioned on `partition_key`). Valkey wraps `ff_create_quota_policy`. |
+| 13 | `get_budget_status` | `impl` | `impl` | **Wave 9 v0.11.** Postgres 2-table read on `ff_budget_policy` + `ff_budget_usage` with `hard_limits` / `soft_limits` parsed from `policy_json`. Valkey is 3× HGETALL. |
+| 14 | `report_usage_admin` | `impl` | `impl` | **Wave 9 v0.11.** Postgres READ-COMMITTED INSERT-or-UPDATE on `ff_budget_usage` + incremental breach-counter bookkeeping on `ff_budget_policy` matching Valkey's pattern. |
+| 15 | `get_execution_result` | `impl` | `impl` | **Wave 9 v0.11 (RFC-020 §4.1).** Postgres `SELECT result FROM ff_exec_core` (current-attempt semantics match Valkey's `GET ctx.result()`). |
+| 16 | `list_pending_waitpoints` | `impl` | `impl` | **Landed Stage D1 (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.5).** Postgres `SELECT` against `ff_waitpoint_pending` with migration 0011 additive columns (`state`, `required_signal_names`, `activated_at_ms`); producer-side `suspend_ops` writes these on insert + activation. `waitpoint_key` was already shipped via migration 0004 (Rev 5 ground-truth correction). Valkey path: pipelined SSCAN + 2× HMGET. Both backends share the §8 D1 schema (HMAC redaction + `token_kid`/`token_fingerprint`) + `after`/`limit` pagination. |
 | 17 | `ping` | `impl` | `impl` | Valkey: `PING`. Postgres: `SELECT 1`. |
-| 18 | `claim_for_worker` | `impl` | `stub` | **Landed Stage C.** `ff-backend-valkey` added `ff-scheduler` dep; `ValkeyBackend` holds `Option<Arc<ff_scheduler::Scheduler>>` wired at `ff-server` boot via `ValkeyBackend::with_scheduler` before the `Arc<dyn EngineBackend>` is sealed. Trait impl forwards to `Scheduler::claim_for_worker`; `SchedulerError::Config` maps to `EngineError::Validation`, Valkey transport errors via `transport_fk`. Backends without a wired scheduler (e.g. SDK-side `MockBackend`) surface `EngineError::Unavailable { op: "claim_for_worker (scheduler not wired on this ValkeyBackend)" }`. |
-| 19 | `cancel_flow_header` | `impl` | `stub` | **Landed Stage E2.** Valkey body runs `ff_cancel_flow` FCALL with the caller-supplied reason + cancellation_policy + now + grace window, surfaces `flow_already_terminal` as `CancelFlowHeader::AlreadyTerminal` (with stored policy/reason + full SMEMBERS of members) so the Server can return an idempotent `Cancelled` without re-doing the flip. FCALL-with-reload (post-failover Lua re-install via `ff_script::loader::ensure_library`) inlined on the Valkey impl. Postgres returns `Unavailable` until Wave 9. |
-| 20 | `ack_cancel_member` | `impl` | `stub` | **Landed Stage E2.** Valkey wraps `ff_ack_cancel_member` (SREM from `pending_cancels` + ZREM from `cancel_backlog` if empty). Called by `Server::cancel_flow_inner`'s sync + async dispatchers after each successful per-member cancel. Postgres returns `Unavailable` until Wave 9's cancel-backlog table write lands. |
-| 21 | `read_execution_info` | `impl` | `stub` | **Landed Stage E2.** Valkey body is HGETALL on `exec_core` + field-by-field parse into the legacy `ExecutionInfo` wire shape (`StateVector` with all 7 sub-states), preserving HTTP response bytes. Returns `Ok(None)` when the hash is empty. Postgres returns `Unavailable` until the read-model migration lands. |
-| 22 | `read_execution_state` | `impl` | `stub` | **Landed Stage E2.** Valkey body is HGET `public_state` on `exec_core` + JSON deserialize. Returns `Ok(None)` when the field is absent. Postgres returns `Unavailable`. |
+| 18 | `claim_for_worker` | `impl` | `impl` | **Landed Stage C (Valkey) + Stage E3 (Postgres).** Valkey: `ff-backend-valkey` added `ff-scheduler` dep; `ValkeyBackend` holds `Option<Arc<ff_scheduler::Scheduler>>` wired at `ff-server` boot. Postgres: `PostgresScheduler` + 6 reconcilers shipped at Stage E3 (v0.8.0). Both backends report `Supports.claim_for_worker = true` when a scheduler is wired. |
+| 19 | `cancel_flow_header` | `impl` | `impl` | **Landed Stage E2 (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.3).** Postgres UPDATE on `ff_flow` + insert into `ff_cancel_backlog` (migration 0014) driving the per-member cancel sweep; `AlreadyTerminal` returned idempotently with stored policy/reason on row-count=0. Valkey wraps `ff_cancel_flow` FCALL. |
+| 20 | `ack_cancel_member` | `impl` | `impl` | **Landed Stage E2 (Valkey) + Wave 9 v0.11 (Postgres).** Postgres DELETE on `ff_cancel_backlog` member entry; drives the cancel-backlog reconciler. Valkey wraps `ff_ack_cancel_member` (SREM + conditional ZREM). |
+| 21 | `read_execution_info` | `impl` | `impl` | **Landed Stage E2 (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.1).** Postgres multi-column projection on `ff_exec_core` + `LEFT JOIN LATERAL` on `ff_attempt` → `ExecutionInfo` / StateVector parse; partition-local. Returns `Ok(None)` when the row is absent. Valkey: HGETALL on `exec_core`. |
+| 22 | `read_execution_state` | `impl` | `impl` | **Landed Stage E2 (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.1).** Postgres `SELECT public_state FROM ff_exec_core` (partition-local single-column point read) + JSON deserialize. Valkey: HGET `public_state` on `exec_core`. |
 | 23 | `fetch_waitpoint_token_v07` | `impl` | `stub` | **Landed Stage E2 (relocated from Server).** Valkey body is HGET `waitpoint_token` on the exec's waitpoint hash. Filters empty strings to `None`. Retires at v0.8.0 with the legacy wire field. Postgres returns `Unavailable`. |
 
 **Cross-cutting (unconditional, landed pre-Stage-A):**
@@ -314,24 +314,67 @@ but no longer trips on Postgres.
 |---|---|---|---|
 | `suspend_by_triple` | `impl` | `impl` | Cairn #322 service-layer entry point for suspend-by-triple (pause-by-operator, enter-waiting-approval, cancel-with-timeout-record). Valkey: HGETALL `exec_core` pre-read for `lane_id` / `current_attempt_index` / `current_worker_instance_id`, then the existing `ff_suspend_execution` FCALL with fence fields sourced from the triple — identical Lua dedup / §3 replay contract as `suspend`. Postgres: single `SELECT attempt_index FROM ff_exec_core` pre-read (Postgres attempts are keyed by `attempt_index`, not the triple's `attempt_id` — the `attempt_id` field is advisory on this backend), then the shared `suspend_core` SERIALIZABLE body. Default trait impl returns `EngineError::Unavailable { op: "suspend_by_triple" }` so downstream impls remain non-breaking. |
 
-### Deferred to v0.9 / post-0.8
+### Deferred to v0.9 / post-0.8 (historical — closed at v0.11.0)
 
-Every Postgres column row still marked `stub` in the Stage A table
-above lands in Wave 9 (RFC-018, scope TBD). No `stub` row is an
-HTTP-exposed dispatch blocker at v0.8.0 because the corresponding
-HTTP handlers return a structured `503 Unavailable` with an
-`EngineError::Unavailable { op }` body — operators upgrading to
-`FF_BACKEND=postgres` at v0.8.0 get a functional create/read/dispatch
-+ scheduler loop and structured-error visibility on the missing
-rows. The consumer migration guide
-([`docs/MIGRATIONS.md`](MIGRATIONS.md) § v0.8 → `FF_BACKEND=postgres`)
-lists the current Postgres `Unavailable` surface so consumers know
-what to expect.
+At v0.8.0 every Wave-9 Postgres cell was `stub`. No `stub` row was
+HTTP-exposed as a dispatch blocker because handlers returned a
+structured `503 Unavailable` with an `EngineError::Unavailable { op }`
+body. **All Wave-9 rows flipped to `impl` at v0.11.0**; see next
+section.
 
-### Wave 9 planned
+## Release: v0.11.0 (Wave 9, 2026-04-26)
 
-Design for the Wave 9 Postgres deferrals is committed in
-[`rfcs/RFC-020-postgres-wave-9.md`](../rfcs/RFC-020-postgres-wave-9.md)
-(ACCEPTED 2026-04-26, Revision 4, target v0.11). Parity rows above
-will flip as the RFC lands in implementation PRs — no rows are
-pre-flipped here.
+`PostgresBackend::capabilities()` reports `true` for the 12 Wave-9
+flags (`cancel_execution`, `change_priority`, `replay_execution`,
+`revoke_lease`, `read_execution_state`, `read_execution_info`,
+`get_execution_result`, `budget_admin`, `quota_admin`,
+`list_pending_waitpoints`, `cancel_flow_header`, `ack_cancel_member`).
+Every Stage-A table row above is now `impl | impl` except
+`subscribe_instance_tags` (`n/a` on both per #311) and the retired
+`fetch_waitpoint_token_v07` (removed at v0.8.0).
+
+### Parity summary at v0.11.0
+
+| Family | Valkey | Postgres | Notes |
+|---|---|---|---|
+| Ingress (5 methods) | `impl` | `impl` | — |
+| Flow family (6 methods) | `impl` | `impl` | — |
+| Flow cancel (`cancel_flow_header`, `ack_cancel_member`) | `impl` | `impl` | **Wave 9.** Postgres cancel-backlog via migration 0014. |
+| Read model (`read_execution_info`, `read_execution_state`, `get_execution_result`) | `impl` | `impl` | **Wave 9.** Postgres join-on-read against `ff_exec_core` + `ff_attempt`. |
+| Operator control (`cancel_execution`, `change_priority`, `replay_execution`, `revoke_lease`) | `impl` | `impl` | **Wave 9.** Postgres SERIALIZABLE-fn template + `ff_operator_event` / `ff_lease_event` outbox emit. |
+| Budget / quota (`create_budget`, `reset_budget`, `create_quota_policy`, `get_budget_status`, `report_usage_admin`) | `impl` | `impl` | **Wave 9.** Postgres migrations 0012 + 0013 + Postgres-native `BudgetResetReconciler`. |
+| Scheduler (`claim_for_worker`) | `impl` | `impl` | — |
+| Waitpoints (`list_pending_waitpoints`) | `impl` | `impl` | **Wave 9.** Postgres `ff_waitpoint_pending` with migration 0011 columns. |
+| Admin rotation + seed | `impl` | `impl` | — |
+| Cross-cutting | `impl` | `impl` | — |
+| `subscribe_instance_tags` | `n/a` | `n/a` | Deferred per #311 (speculative demand). |
+
+### Wave 9 — shipped v0.11.0 (2026-04-26)
+
+Full design record: [`rfcs/RFC-020-postgres-wave-9.md`](../rfcs/RFC-020-postgres-wave-9.md)
+(ACCEPTED 2026-04-26, Revision 7). All 13 Wave-9 method rows flipped
+`stub → impl` on the Postgres column at v0.11.0; the
+`subscribe_instance_tags` row remains `n/a` on both backends per #311
+(speculative demand, served by `list_executions` +
+`ScannerFilter::with_instance_tag` today).
+
+Migrations shipped as part of Wave 9 (all additive, forward-only):
+
+- **0010** `ff_operator_event` outbox — new LISTEN/NOTIFY channel for
+  operator-control events (`priority_changed` / `replayed` /
+  `flow_cancel_requested`), preserving the RFC-019 `ff_signal_event`
+  subscriber contract.
+- **0011** `ff_waitpoint_pending` additive columns (`state`,
+  `required_signal_names`, `activated_at_ms`) — required to serve the
+  real `PendingWaitpointInfo` contract.
+- **0012** `ff_quota_policy` family (`ff_quota_policy` +
+  `ff_quota_window` + `ff_quota_admitted`, 256-way HASH-partitioned on
+  `partition_key`).
+- **0013** `ff_budget_policy` additive columns — `next_reset_at_ms`
+  + 4 breach-tracking + 3 definitional columns; enables a Postgres-
+  native `BudgetResetReconciler`.
+- **0014** `ff_cancel_backlog` table — per-member cancel tracking
+  driving `cancel_flow_header` + `ack_cancel_member` + the
+  cancel-backlog reconciler.
+
+Consumer migration notes at [`CONSUMER_MIGRATION_0.11.md`](CONSUMER_MIGRATION_0.11.md).
