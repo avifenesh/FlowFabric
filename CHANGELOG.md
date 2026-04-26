@@ -53,6 +53,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   non-breaking; structs pair with `new()` constructors so external
   crates (ff-backend-valkey, ff-backend-postgres) can still build
   instances.
+- `subscribe_signal_delivery` implemented on both backends
+  (RFC-019 Stage B; closes #310). Valkey: XREAD BLOCK on partition
+  aggregate stream `ff:part:{fp:N}:signal_delivery` (producer XADD
+  added to `ff_deliver_signal` at new KEYS[15] slot). Postgres:
+  `ff_signal_event` outbox + `NOTIFY ff_signal_event` trigger
+  (migration 0007); producer INSERT lives in the `deliver_signal`
+  SERIALIZABLE transaction.
+- `ValkeyBackend::subscribe_completion` (RFC-019 Stage B; closes #309).
+  Pubsub-backed (at-most-once over live subscription window), cursor
+  always empty. Durable Postgres impl was Stage A; durable Valkey
+  impl is follow-up (not in Stage B scope).
+- `PostgresBackend::subscribe_lease_history` (RFC-019 Stage B;
+  closes #308). `ff_lease_event` outbox table + `NOTIFY
+  ff_lease_event` trigger; subscription wraps `PgListener` with
+  cursor `0x02 ++ event_id(BE8)`. Valkey already impl'd at Stage A.
 
 ### Changed
 
@@ -82,27 +97,6 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ff_lease_event` (migration 0008) and `ff_signal_event` (migration
   0009). Return types are unchanged — filtering happens inside the
   backend stream before yielding, not via an envelope wrapper.
-
-### Added
-
-- `subscribe_signal_delivery` implemented on both backends
-  (RFC-019 Stage B; closes #310). Valkey: XREAD BLOCK on partition
-  aggregate stream `ff:part:{fp:N}:signal_delivery` (producer XADD
-  added to `ff_deliver_signal` at new KEYS[15] slot). Postgres:
-  `ff_signal_event` outbox + `NOTIFY ff_signal_event` trigger
-  (migration 0007); producer INSERT lives in the `deliver_signal`
-  SERIALIZABLE transaction.
-- `ValkeyBackend::subscribe_completion` (RFC-019 Stage B; closes #309).
-  Pubsub-backed (at-most-once over live subscription window), cursor
-  always empty. Durable Postgres impl was Stage A; durable Valkey
-  impl is follow-up (not in Stage B scope).
-- `PostgresBackend::subscribe_lease_history` (RFC-019 Stage B;
-  closes #308). `ff_lease_event` outbox table + `NOTIFY
-  ff_lease_event` trigger; subscription wraps `PgListener` with
-  cursor `0x02 ++ event_id(BE8)`. Valkey already impl'd at Stage A.
-
-### Changed
-
 - **BREAKING (direct consumers of v0.9 capability API):**
   `EngineBackend::capabilities_matrix() -> CapabilityMatrix` renamed
   to `capabilities() -> Capabilities`; `BTreeMap<Capability,

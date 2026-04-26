@@ -1,7 +1,8 @@
 # v010-read-side-ergonomics
 
-Headline consumer demo for the v0.10.0 read-side API surface. Exercises
-every feature named in the v0.10 changelog under a single process:
+Headline consumer demo for the v0.10.0 read-side API surface.
+Exercises the three read-side changes called out in the v0.10
+changelog under a single process:
 
 | Feature | Issue / PR | Shown in this example |
 |---------|------------|-----------------------|
@@ -24,8 +25,9 @@ The example submits one execution per tenant (tagged with
 worker, and at shutdown diffs the two streams:
 
 * Global subscriber must observe both executions.
-* Tenant-scoped subscriber must observe acme only. The example panics
-  if the tenant-scoped panel leaks a contoso event.
+* Tenant-scoped subscriber must observe acme only. The example exits
+  non-zero (`Err` out of `main`) if the tenant-scoped panel leaks a
+  contoso event.
 
 ## Prereqs
 
@@ -56,7 +58,7 @@ INFO claimed task ...
 INFO completed successfully ...
 INFO subscriber yielded typed event label=all variant=Acquired ...
 INFO subscriber yielded typed event label=acme-only variant=Acquired ...
-INFO terminal execution_id=... state=succeeded
+INFO terminal execution_id=... state=completed
 INFO subscriber drain complete all=... acme=...
 INFO demo complete — capabilities() read, typed LeaseHistoryEvent match, ScannerFilter isolation verified
 ```
