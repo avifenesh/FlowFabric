@@ -1,12 +1,16 @@
 # RFC-011 operator runbook
 
-Operational guidance for FlowFabric deployments running post-[RFC-011](../rfcs/RFC-011-exec-flow-colocation.md)
-(phases 1-5). Covers environment variables, rolling upgrade, collision
+Operational guidance for FlowFabric deployments running post-RFC-011
+(phases 1-5; RFC-011 itself is preserved in the [private archive
+repo](https://github.com/avifenesh/flowfabric-archive/blob/main/rfcs/RFC-011-exec-flow-colocation.md)).
+Covers environment variables, rolling upgrade, collision
 observability, and migration artifacts.
 
-Paired with the [consumer migration guide](rfc011-migration-for-consumers.md)
-(which tells SDK consumers what to change in their code). This doc is for the
-operator responsible for the Valkey backend + FlowFabric server deployment.
+Paired with the [consumer migration guide](https://github.com/avifenesh/flowfabric-archive/blob/main/docs/rfc011-migration-for-consumers.md)
+(which tells SDK consumers what to change in their code; archived
+— consumers completed this migration in the v0.4.0 era). This doc is
+for the operator responsible for the Valkey backend + FlowFabric
+server deployment.
 
 ## Environment variables
 
@@ -284,13 +288,13 @@ context, it's stale; replace with an RFC-011 §7.3 pointer.
 |---|---|---|
 | Server exits with `valkey version too low: detected <M.m>, required >= 7.2` | Valkey below 7.2 backend | Upgrade Valkey to 7.2+; see [rolling upgrade](#rolling-upgrade-procedure-below-floor--72) |
 | Boot hangs for ~60s then exits with `valkey ({context}): ...` | Valkey unreachable during rolling upgrade OR truly down | If the cluster is mid-restart, wait and retry; otherwise check network/DNS |
-| `ServerError::PartitionMismatch` on `add_execution_to_flow` | Consumer minted exec with wrong flow/lane routing | Consumer bug — see [migration guide Step 1](rfc011-migration-for-consumers.md#step-1--executionid-construction) |
+| `ServerError::PartitionMismatch` on `add_execution_to_flow` | Consumer minted exec with wrong flow/lane routing | Consumer bug — see [migration guide Step 1 (archived)](https://github.com/avifenesh/flowfabric-archive/blob/main/docs/rfc011-migration-for-consumers.md#step-1--executionid-construction) |
 | `partition_config mismatch: num_flow_partitions expected N, got M` on boot | `FF_FLOW_PARTITIONS` changed after first boot | Cannot hot-change partition count — re-seed or accept existing config |
 
 ## Reference
 
-- [RFC-011 exec/flow hash-slot co-location](../rfcs/RFC-011-exec-flow-colocation.md) — primary design (revisions 3 + 4)
-- [Consumer migration guide](rfc011-migration-for-consumers.md) — what SDK consumers change
+- [RFC-011 exec/flow hash-slot co-location (archived)](https://github.com/avifenesh/flowfabric-archive/blob/main/rfcs/RFC-011-exec-flow-colocation.md) — primary design (revisions 3 + 4)
+- [Consumer migration guide (archived)](https://github.com/avifenesh/flowfabric-archive/blob/main/docs/rfc011-migration-for-consumers.md) — what SDK consumers change (migration completed v0.4.0 era)
 - [Releasing FlowFabric](RELEASING.md) — release cadence + publish workflow
 
 Merged RFC-011 implementation PRs: #19, #20, #23, #25, #26, #27, #28, #29, #30.

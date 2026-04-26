@@ -45,14 +45,22 @@ while let Some(item) = sub.next().await {
 
 ## After (v0.10)
 
+The `subscribe_lease_history` / `subscribe_completion` /
+`subscribe_signal_delivery` methods also gained a `filter` parameter
+(issue #282) — pass `&ScannerFilter::default()` for the unfiltered
+behaviour shown below. `subscribe_instance_tags` does **not** take a
+filter and still returns `EngineError::Unavailable` on both backends
+(#311 producer wiring deferred).
+
 ```rust
+use ff_core::backend::ScannerFilter;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::stream_events::LeaseHistoryEvent;
 use ff_core::stream_subscribe::StreamCursor;
 use futures::StreamExt;
 
 let mut sub = backend
-    .subscribe_lease_history(StreamCursor::empty())
+    .subscribe_lease_history(StreamCursor::empty(), &ScannerFilter::default())
     .await?;
 while let Some(item) = sub.next().await {
     match item? {

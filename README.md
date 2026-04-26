@@ -13,7 +13,7 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
                  │              │              │
           ┌──────┴──────┐ ┌────┴────┐ ┌───────┴───────┐
           │  ff-engine   │ │ ff-sdk  │ │ ff-scheduler  │
-          │  13 scanners │ │ worker  │ │ claim-grant   │
+          │  17 scanners │ │ worker  │ │ claim-grant   │
           └──────┬──────┘ │   API   │ │   cycle       │
                  │        └────┬────┘ └───────┬───────┘
                  │             │              │
@@ -120,9 +120,11 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 | `ferriskey` | Valkey client -- in-tree, forked from glide-core (valkey-glide). Hash-tag-aware `cluster_scan` single-shard routing. |
 | `ff-core` | Core types, state enums, partition math, key builders, `EngineBackend` trait, error codes |
 | `ff-script` | Typed FCALL wrappers and Lua library loader |
-| `ff-engine` | Cross-partition dispatch and 13 background scanners |
+| `ff-engine` | Cross-partition dispatch and 17 background scanners |
 | `ff-scheduler` | Claim-grant cycle, fairness, capability matching |
 | `ff-backend-valkey` | `EngineBackend` implementation backed by Valkey FCALL |
+| `ff-backend-postgres` | `EngineBackend` implementation backed by Postgres (RFC-017 Stage E) |
+| `flowfabric` | Umbrella re-export crate; feature-flagged backend selection (`valkey` default, `postgres` opt-in) |
 | `ff-sdk` | Worker SDK — public API for worker authors; includes the client-local `EngineBackendLayer` surface |
 | `ff-server` | HTTP API server, Valkey connection, boot sequence, engine `/metrics` endpoint |
 | `ff-observability` | OTEL + Prometheus instrumentation, optional Sentry integration |
