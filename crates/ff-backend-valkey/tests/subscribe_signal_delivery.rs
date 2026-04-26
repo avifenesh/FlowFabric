@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use ff_backend_valkey::{partition_signal_delivery_key, ValkeyBackend};
-use ff_core::backend::BackendConfig;
+use ff_core::backend::{BackendConfig, ScannerFilter};
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::stream_events::SignalDeliveryEffect;
 use ff_core::stream_subscribe::StreamCursor;
@@ -38,7 +38,7 @@ async fn subscribe_signal_delivery_yields_typed_event() {
         .expect("connect to localhost valkey");
 
     let mut sub = backend
-        .subscribe_signal_delivery(StreamCursor::empty())
+        .subscribe_signal_delivery(StreamCursor::empty(), &ScannerFilter::default())
         .await
         .expect("subscribe_signal_delivery");
 

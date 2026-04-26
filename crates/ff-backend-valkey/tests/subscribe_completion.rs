@@ -23,7 +23,7 @@
 use std::time::Duration;
 
 use ff_backend_valkey::{ValkeyBackend, COMPLETION_CHANNEL};
-use ff_core::backend::BackendConfig;
+use ff_core::backend::{BackendConfig, ScannerFilter};
 use ff_core::stream_events::CompletionOutcome;
 use ff_core::stream_subscribe::StreamCursor;
 use futures_core::Stream;
@@ -45,7 +45,7 @@ async fn subscribe_completion_yields_publish_frame() {
         .expect("connect to localhost valkey");
 
     let mut sub = backend
-        .subscribe_completion(StreamCursor::empty())
+        .subscribe_completion(StreamCursor::empty(), &ScannerFilter::default())
         .await
         .expect("subscribe_completion");
 

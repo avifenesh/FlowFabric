@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use ff_backend_valkey::{partition_lease_history_key, ValkeyBackend};
-use ff_core::backend::BackendConfig;
+use ff_core::backend::{BackendConfig, ScannerFilter};
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::stream_events::LeaseHistoryEvent;
 use ff_core::stream_subscribe::StreamCursor;
@@ -46,7 +46,7 @@ async fn subscribe_lease_history_yields_typed_reclaimed_event() {
         .expect("connect to localhost valkey");
 
     let mut sub = backend
-        .subscribe_lease_history(StreamCursor::empty())
+        .subscribe_lease_history(StreamCursor::empty(), &ScannerFilter::default())
         .await
         .expect("subscribe_lease_history");
 

@@ -40,6 +40,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stays unchanged. See
   `docs/CONSUMER_MIGRATION_typed-subscribe-events.md` for the
   consumer migration snippet.
+- **Breaking for direct `EngineBackend` impls**:
+  `subscribe_lease_history`, `subscribe_completion`, and
+  `subscribe_signal_delivery` gain a required `filter:
+  &ScannerFilter` parameter (#282 / RFC-019 surface). Pass
+  `&ScannerFilter::default()` to preserve unfiltered behaviour; pass
+  `ScannerFilter::new().with_instance_tag(k, v)` to isolate a
+  subscriber to a single cairn-style instance when multiple
+  FlowFabric consumers share a backend. Valkey reuses the #122
+  `FilterGate` (per-event HGET on
+  `ff:exec:{p}:<eid>:tags`); Postgres filters inline against new
+  denormalised `namespace` + `instance_tag` columns on
+  `ff_lease_event` (migration 0008) and `ff_signal_event` (migration
+  0009). Return types are unchanged — filtering happens inside the
+  backend stream before yielding, not via an envelope wrapper.
 
 ### Added
 
