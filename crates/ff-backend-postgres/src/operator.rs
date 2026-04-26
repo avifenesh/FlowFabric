@@ -24,16 +24,19 @@
 use std::time::Duration;
 
 use ff_core::contracts::{
-    CancelExecutionArgs, CancelExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
+    CancelExecutionArgs, CancelExecutionResult, CancelFlowArgs, CancelFlowHeader,
+    ChangePriorityArgs, ChangePriorityResult, ReplayExecutionArgs, ReplayExecutionResult,
+    RevokeLeaseArgs, RevokeLeaseResult,
 };
-use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
+use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::state::PublicState;
-use ff_core::types::CancelSource;
+use ff_core::types::{CancelSource, ExecutionId, FlowId};
+use serde_json::json;
 use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::error::map_sqlx_error;
-use crate::lease_event;
+use crate::{lease_event, operator_event};
 
 /// Max attempts on `40001` / `40P01`. Matches
 /// [`crate::flow::CANCEL_FLOW_MAX_ATTEMPTS`] (RFC §4.2).
@@ -520,4 +523,698 @@ pub(super) async fn revoke_lease_impl(
     }
     let _ = last;
     Err(EngineError::Contention(ContentionKind::RetryExhausted))
+}
+
+// ─── change_priority (§4.2.4, Rev 7 Fork 3) ────────────────────────
+
+/// Shared retry wrapper — SERIALIZABLE + 3-attempt retry on 40001 /
+/// 40P01 (§4.2 template).
+async fn retry_serializable<F, Fut, T>(mut f: F) -> Result<T, EngineError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, EngineError>>,
+{
+    let mut last: Option<EngineError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                if is_serialization_conflict(&err) {
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        let ms = 5u64 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                    }
+                    last = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    let _ = last;
+    Err(EngineError::Contention(ContentionKind::RetryExhausted))
+}
+
+async fn change_priority_once(
+    pool: &PgPool,
+    args: &ChangePriorityArgs,
+) -> Result<ChangePriorityResult, EngineError> {
+    let partition_key: i16 = args.execution_id.partition() as i16;
+    let exec_uuid = eid_uuid(&args.execution_id);
+    let now: i64 = args.now.0;
+
+    let mut tx = begin_serializable(pool).await?;
+
+    // Pre-read under NO KEY UPDATE lock. Gate fields mirror the Valkey
+    // Lua check (`flowfabric.lua:3683-3688`): lifecycle_phase = 'runnable'
+    // AND eligibility_state = 'eligible_now' — any other state surfaces
+    // `execution_not_eligible` (Rev 7 Fork 3, Option C).
+    let row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, eligibility_state, priority
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR NO KEY UPDATE
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Err(EngineError::NotFound {
+            entity: "execution",
+        });
+    };
+
+    let lifecycle_phase: String = row.try_get("lifecycle_phase").map_err(map_sqlx_error)?;
+    let eligibility_state: String = row.try_get("eligibility_state").map_err(map_sqlx_error)?;
+    let old_priority: i32 = row.try_get("priority").map_err(map_sqlx_error)?;
+
+    // Valkey-canonical gate (`flowfabric.lua:3683-3688`). Both fails-
+    // closed with `execution_not_eligible`.
+    if lifecycle_phase != "runnable" || eligibility_state != "eligible_now" {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Err(EngineError::Contention(
+            ContentionKind::ExecutionNotEligible,
+        ));
+    }
+
+    // Clamp new_priority to [0, 9000] matching Valkey's
+    // `ff_change_priority` (flowfabric.lua:3695-3696 — "same as
+    // ff_create_execution").
+    let new_priority = args.new_priority.clamp(0, 9000);
+
+    // Mutate. Repeat the gate in the WHERE clause as belt-and-
+    // suspenders; row-count = 0 on concurrent transition between
+    // the pre-read and UPDATE surfaces the same `execution_not_eligible`
+    // error.
+    let affected = sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET priority   = $3,
+               raw_fields = jsonb_set(raw_fields,
+                                      '{last_mutation_at}',
+                                      to_jsonb($4::text))
+         WHERE partition_key = $1 AND execution_id = $2
+           AND lifecycle_phase   = 'runnable'
+           AND eligibility_state = 'eligible_now'
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(new_priority)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?
+    .rows_affected();
+
+    if affected == 0 {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Err(EngineError::Contention(
+            ContentionKind::ExecutionNotEligible,
+        ));
+    }
+
+    // Outbox emit (§4.2.7 — ff_operator_event event_type='priority_changed').
+    operator_event::emit(
+        &mut tx,
+        partition_key,
+        exec_uuid,
+        operator_event::EVENT_PRIORITY_CHANGED,
+        json!({
+            "old_priority": old_priority,
+            "new_priority": new_priority,
+        }),
+        now,
+    )
+    .await?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    Ok(ChangePriorityResult::Changed {
+        execution_id: args.execution_id.clone(),
+    })
+}
+
+pub(super) async fn change_priority_impl(
+    pool: &PgPool,
+    args: ChangePriorityArgs,
+) -> Result<ChangePriorityResult, EngineError> {
+    retry_serializable(|| change_priority_once(pool, &args)).await
+}
+
+// ─── replay_execution (§4.2.5, Rev 7 Forks 1 + 2) ──────────────────
+
+async fn replay_execution_once(
+    pool: &PgPool,
+    args: &ReplayExecutionArgs,
+) -> Result<ReplayExecutionResult, EngineError> {
+    let partition_key: i16 = args.execution_id.partition() as i16;
+    let exec_uuid = eid_uuid(&args.execution_id);
+    let now: i64 = args.now.0;
+
+    let mut tx = begin_serializable(pool).await?;
+
+    // Pre-read under lock. Read the current attempt's `outcome` so we
+    // can derive `terminal_outcome` per `exec_core::derive_terminal_outcome`.
+    let ec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, flow_id, attempt_index, priority, raw_fields
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR NO KEY UPDATE
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(ec_row) = ec_row else {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Err(EngineError::NotFound {
+            entity: "execution",
+        });
+    };
+
+    let lifecycle_phase: String = ec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    let flow_id: Option<Uuid> = ec_row.try_get("flow_id").map_err(map_sqlx_error)?;
+    let attempt_index: i32 = ec_row.try_get("attempt_index").map_err(map_sqlx_error)?;
+
+    // Valkey-canonical gate: `lifecycle_phase = 'terminal'`
+    // (`flowfabric.lua:8535-8537` → `err("execution_not_terminal")`).
+    if lifecycle_phase != "terminal" {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Err(EngineError::State(StateKind::ExecutionNotTerminal));
+    }
+
+    // Read the current attempt's outcome for the skipped-flow-member
+    // branch check.
+    let att_row = sqlx::query(
+        r#"
+        SELECT outcome
+          FROM ff_attempt
+         WHERE partition_key = $1 AND execution_id = $2 AND attempt_index = $3
+         FOR UPDATE
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let attempt_outcome: Option<String> = match att_row.as_ref() {
+        Some(r) => r.try_get("outcome").map_err(map_sqlx_error)?,
+        None => None,
+    };
+
+    // Branch selector matches Valkey (`flowfabric.lua:8555`).
+    // Postgres `terminal_outcome` is derived, not stored; mirror
+    // `exec_core::derive_terminal_outcome` at the SQL level.
+    let is_skipped_flow_member =
+        attempt_outcome.as_deref() == Some("skipped") && flow_id.is_some();
+
+    // Skipped-flow-member branch (Rev 7 Fork 1 Option A).
+    // Reset downstream edge-group counters: skip/fail/running → 0,
+    // success preserved. Valkey ground-truth:
+    // `flowfabric.lua:8580` comment "satisfied edges remain satisfied".
+    let groups_reset: i64 = if is_skipped_flow_member {
+        let count = sqlx::query(
+            r#"
+            UPDATE ff_edge_group
+               SET skip_count    = 0,
+                   fail_count    = 0,
+                   running_count = 0
+             WHERE (partition_key, flow_id, downstream_eid) IN (
+               SELECT DISTINCT e.partition_key, e.flow_id, e.downstream_eid
+                 FROM ff_edge e
+                WHERE e.partition_key   = $1
+                  AND e.downstream_eid = $2
+             )
+            "#,
+        )
+        .bind(partition_key)
+        .bind(exec_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?
+        .rows_affected();
+        count as i64
+    } else {
+        0
+    };
+
+    // Both branches: in-place mutate `ff_exec_core` to
+    // `lifecycle_phase='runnable'` — matches Valkey's base+skip
+    // both writing `runnable` (flowfabric.lua:8591 + 8625).
+    // `attempt_index` NOT bumped (Rev 7 Fork 2 Option A).
+    //
+    // Secondary state differs per branch per §4.2.5:
+    //  - normal:  eligibility_state='eligible_now', public_state='waiting'
+    //  - skipped: eligibility_state='blocked_by_dependencies',
+    //             public_state='waiting_children'
+    //
+    // raw_fields.replay_count bumped (+1). Valkey bumps
+    // exec_core.replay_count; Postgres stores it in raw_fields.
+    let (eligibility_state, public_state) = if is_skipped_flow_member {
+        ("blocked_by_dependencies", "waiting_children")
+    } else {
+        ("eligible_now", "waiting")
+    };
+
+    sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET lifecycle_phase      = 'runnable',
+               ownership_state      = 'unowned',
+               eligibility_state    = $3,
+               public_state         = $4,
+               attempt_state        = 'pending_replay_attempt',
+               terminal_at_ms       = NULL,
+               result               = NULL,
+               cancellation_reason  = NULL,
+               cancelled_by         = NULL,
+               raw_fields           = jsonb_set(
+                 jsonb_set(raw_fields, '{last_mutation_at}', to_jsonb($5::text)),
+                 '{replay_count}',
+                 to_jsonb(COALESCE((raw_fields->>'replay_count')::int, 0) + 1)
+               )
+         WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(eligibility_state)
+    .bind(public_state)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // In-place mutate the current `ff_attempt` row (Rev 7 Fork 2
+    // Option A). Reset outcome + lease state; bump lease_epoch to
+    // fence any in-flight RMW. No new attempt row inserted; no
+    // historical row retained. Only columns that exist on the real
+    // schema are touched (`ff_attempt` has no `lease_id` / `result` /
+    // `error_code` columns — see migrations/0001_initial.sql:160-176).
+    if att_row.is_some() {
+        sqlx::query(
+            r#"
+            UPDATE ff_attempt
+               SET outcome              = NULL,
+                   terminal_at_ms       = NULL,
+                   worker_id            = NULL,
+                   worker_instance_id   = NULL,
+                   lease_expires_at_ms  = NULL,
+                   lease_epoch          = lease_epoch + 1
+             WHERE partition_key = $1 AND execution_id = $2 AND attempt_index = $3
+            "#,
+        )
+        .bind(partition_key)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    }
+
+    // Outbox emit (§4.2.7 — ff_operator_event event_type='replayed').
+    let details = if is_skipped_flow_member {
+        json!({
+            "branch": "skipped_flow_member",
+            "groups_reset": groups_reset,
+        })
+    } else {
+        json!({
+            "branch": "normal",
+        })
+    };
+    operator_event::emit(
+        &mut tx,
+        partition_key,
+        exec_uuid,
+        operator_event::EVENT_REPLAYED,
+        details,
+        now,
+    )
+    .await?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    let ps = if is_skipped_flow_member {
+        PublicState::WaitingChildren
+    } else {
+        PublicState::Waiting
+    };
+    Ok(ReplayExecutionResult::Replayed { public_state: ps })
+}
+
+pub(super) async fn replay_execution_impl(
+    pool: &PgPool,
+    args: ReplayExecutionArgs,
+) -> Result<ReplayExecutionResult, EngineError> {
+    retry_serializable(|| replay_execution_once(pool, &args)).await
+}
+
+// ─── cancel_flow_header (§4.2.3) ───────────────────────────────────
+
+/// Format a member execution UUID as the wire-form `ExecutionId`
+/// string (`{fp:N}:<uuid>`) expected by downstream consumers.
+fn member_wire_id(partition_key: i16, exec_uuid: Uuid) -> String {
+    format!("{{fp:{partition_key}}}:{exec_uuid}")
+}
+
+async fn cancel_flow_header_once(
+    pool: &PgPool,
+    args: &CancelFlowArgs,
+) -> Result<CancelFlowHeader, EngineError> {
+    let flow_uuid: Uuid = args.flow_id.0;
+    // Flow + members share `partition_key` via the flow's partition
+    // hash (RFC-011 co-location). We compute it the same way the
+    // existing `flow::cancel_flow` path does — but here we don't have
+    // a `PartitionConfig`; use a default shape since partition_key is
+    // just `crc16(flow_id) % 256` and the member rows were written
+    // under the same hash.
+    let partition_key: i16 =
+        ff_core::partition::flow_partition(&args.flow_id, &ff_core::partition::PartitionConfig::default())
+            .index as i16;
+    let now: i64 = args.now.0;
+
+    let mut tx = begin_serializable(pool).await?;
+
+    // Pre-read the flow row under lock. If an existing
+    // `ff_cancel_backlog` row already exists for this flow (idempotent
+    // replay / concurrent second call), surface AlreadyTerminal with
+    // the stored policy + the full (already-enumerated) membership.
+    let flow_row = sqlx::query(
+        r#"
+        SELECT public_flow_state, raw_fields
+          FROM ff_flow_core
+         WHERE partition_key = $1 AND flow_id = $2
+         FOR NO KEY UPDATE
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(flow_row) = flow_row else {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Err(EngineError::NotFound { entity: "flow" });
+    };
+
+    let public_flow_state: String = flow_row
+        .try_get("public_flow_state")
+        .map_err(map_sqlx_error)?;
+    let raw_fields: serde_json::Value = flow_row.try_get("raw_fields").map_err(map_sqlx_error)?;
+
+    // Idempotent-replay path — flow already in a terminal state. Read
+    // stored policy / reason (from raw_fields — `flow::cancel_flow`
+    // writes `cancellation_policy` there) + the backlog-member rows
+    // (our prior enumeration).
+    if matches!(public_flow_state.as_str(), "cancelled" | "completed" | "failed") {
+        let stored_cancellation_policy = raw_fields
+            .get("cancellation_policy")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let stored_cancel_reason = raw_fields
+            .get("cancel_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+
+        // Return the enumerated members from the backlog if we have
+        // one; otherwise fall back to live `ff_exec_core` membership
+        // (matches Valkey's SMEMBERS pattern on flow_members_set).
+        let member_rows = sqlx::query(
+            r#"
+            SELECT execution_id
+              FROM ff_cancel_backlog_member
+             WHERE partition_key = $1 AND flow_id = $2
+            "#,
+        )
+        .bind(partition_key)
+        .bind(flow_uuid)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let members: Vec<String> = if member_rows.is_empty() {
+            // Pre-E2-shape flow: enumerate live members from exec_core.
+            let live = sqlx::query(
+                r#"
+                SELECT execution_id
+                  FROM ff_exec_core
+                 WHERE partition_key = $1 AND flow_id = $2
+                "#,
+            )
+            .bind(partition_key)
+            .bind(flow_uuid)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+            live.iter()
+                .map(|r| {
+                    let u: Uuid = r.get("execution_id");
+                    member_wire_id(partition_key, u)
+                })
+                .collect()
+        } else {
+            member_rows
+                .iter()
+                .map(|r| r.get::<String, _>("execution_id"))
+                .collect()
+        };
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        return Ok(CancelFlowHeader::AlreadyTerminal {
+            stored_cancellation_policy,
+            stored_cancel_reason,
+            member_execution_ids: members,
+        });
+    }
+
+    // Fresh cancel — flip flow_core + insert backlog header + enumerate
+    // + bulk-insert backlog members + flip exec_core lifecycle_phase
+    // per member (matches `flow::cancel_flow_once` pattern).
+
+    sqlx::query(
+        r#"
+        UPDATE ff_flow_core
+           SET public_flow_state = 'cancelled',
+               terminal_at_ms    = COALESCE(terminal_at_ms, $3),
+               raw_fields        = raw_fields
+                                    || jsonb_build_object(
+                                         'cancellation_policy', $4::text,
+                                         'cancel_reason',       $5::text)
+         WHERE partition_key = $1 AND flow_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .bind(now)
+    .bind(&args.cancellation_policy)
+    .bind(&args.reason)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO ff_cancel_backlog
+            (partition_key, flow_id, requested_at_ms, requester, reason,
+             cancellation_policy, status)
+        VALUES ($1, $2, $3, '', $4, $5, 'pending')
+        ON CONFLICT (partition_key, flow_id) DO NOTHING
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .bind(now)
+    .bind(&args.reason)
+    .bind(&args.cancellation_policy)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // Enumerate in-flight members.
+    let member_rows = sqlx::query(
+        r#"
+        SELECT execution_id
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND flow_id = $2
+           AND lifecycle_phase NOT IN ('terminal','cancelled')
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let mut member_execution_ids: Vec<String> = Vec::with_capacity(member_rows.len());
+    for row in &member_rows {
+        let exec_uuid: Uuid = row.get("execution_id");
+        let wire = member_wire_id(partition_key, exec_uuid);
+
+        // Insert backlog member row.
+        sqlx::query(
+            r#"
+            INSERT INTO ff_cancel_backlog_member
+                (partition_key, flow_id, execution_id, ack_state)
+            VALUES ($1, $2, $3, 'pending')
+            ON CONFLICT (partition_key, flow_id, execution_id) DO NOTHING
+            "#,
+        )
+        .bind(partition_key)
+        .bind(flow_uuid)
+        .bind(&wire)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Flip the member's `ff_exec_core` lifecycle (same shape as
+        // `flow::cancel_flow_once`). The Server's own wait/async
+        // machinery drives the per-member cancel events downstream;
+        // the backlog row lives until `ack_cancel_member` drains it.
+        sqlx::query(
+            r#"
+            UPDATE ff_exec_core
+               SET lifecycle_phase     = 'cancelled',
+                   eligibility_state   = 'cancelled',
+                   public_state        = 'cancelled',
+                   terminal_at_ms      = COALESCE(terminal_at_ms, $3),
+                   cancellation_reason = COALESCE(cancellation_reason, $4),
+                   cancelled_by        = COALESCE(cancelled_by, 'cancel_flow_header')
+             WHERE partition_key = $1 AND execution_id = $2
+            "#,
+        )
+        .bind(partition_key)
+        .bind(exec_uuid)
+        .bind(now)
+        .bind(&args.reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        member_execution_ids.push(wire);
+    }
+
+    // Outbox emit (§4.2.7 — flow-level `flow_cancel_requested`).
+    operator_event::emit(
+        &mut tx,
+        partition_key,
+        flow_uuid,
+        operator_event::EVENT_FLOW_CANCEL_REQUESTED,
+        json!({
+            "flow_id": flow_uuid.to_string(),
+            "cancellation_policy": &args.cancellation_policy,
+            "reason": &args.reason,
+            "member_count": member_execution_ids.len(),
+        }),
+        now,
+    )
+    .await?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    Ok(CancelFlowHeader::Cancelled {
+        cancellation_policy: args.cancellation_policy.clone(),
+        member_execution_ids,
+    })
+}
+
+pub(super) async fn cancel_flow_header_impl(
+    pool: &PgPool,
+    args: CancelFlowArgs,
+) -> Result<CancelFlowHeader, EngineError> {
+    retry_serializable(|| cancel_flow_header_once(pool, &args)).await
+}
+
+// ─── ack_cancel_member (§4.2.3) ────────────────────────────────────
+
+async fn ack_cancel_member_once(
+    pool: &PgPool,
+    flow_id: &FlowId,
+    execution_id: &ExecutionId,
+) -> Result<(), EngineError> {
+    let flow_uuid: Uuid = flow_id.0;
+    let partition_key: i16 =
+        ff_core::partition::flow_partition(flow_id, &ff_core::partition::PartitionConfig::default())
+            .index as i16;
+    let member_wire = execution_id.as_str();
+
+    let mut tx = begin_serializable(pool).await?;
+
+    // §4.2.3 — member-drain + conditional parent-DELETE. Under
+    // SERIALIZABLE, concurrent ack × ack race: both TXs read identical
+    // snapshots of `ff_cancel_backlog_member`; the losing TX gets
+    // 40001 at COMMIT and is retried by `retry_serializable` — the
+    // retry observes the winner's state and the member-DELETE becomes
+    // a no-op (0 rows), the parent-DELETE predicate re-evaluates
+    // against post-winner state.
+    //
+    // Implementation note: Postgres data-modifying CTEs share a
+    // snapshot across all statements in the WITH clause — a CTE-form
+    // `WITH deleted_member AS (DELETE ...) DELETE FROM parent WHERE
+    // NOT EXISTS (...)` leaves the parent behind on the last-member
+    // drain because the outer DELETE's `NOT EXISTS` still sees the
+    // about-to-be-deleted row in the snapshot. Two statements in the
+    // same tx observe the prior statement's writes — SERIALIZABLE
+    // isolation still holds against concurrent acks.
+    //
+    // NO outbox emit (§4.2.7 — Valkey-parity quiet).
+    sqlx::query(
+        r#"
+        DELETE FROM ff_cancel_backlog_member
+         WHERE partition_key = $1
+           AND flow_id       = $2
+           AND execution_id  = $3
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .bind(member_wire)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM ff_cancel_backlog
+         WHERE partition_key = $1
+           AND flow_id       = $2
+           AND NOT EXISTS (
+             SELECT 1 FROM ff_cancel_backlog_member
+              WHERE partition_key = $1 AND flow_id = $2
+           )
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(())
+}
+
+pub(super) async fn ack_cancel_member_impl(
+    pool: &PgPool,
+    flow_id: FlowId,
+    execution_id: ExecutionId,
+) -> Result<(), EngineError> {
+    retry_serializable(|| ack_cancel_member_once(pool, &flow_id, &execution_id)).await
 }
