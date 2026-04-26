@@ -34,7 +34,7 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # Env-var isolation across the two test files (`guard.rs` +
 # `capabilities.rs`): SQLite tests read `FF_DEV_MODE` from the process
 # environment, and `cargo test` runs per-binary tests in parallel by

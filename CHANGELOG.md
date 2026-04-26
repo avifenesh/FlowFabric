@@ -50,6 +50,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `scripts/lint-migrations.sh` — parity-drift lint comparing the PG
   and SQLite migration directories. Wired into `.github/workflows/
   matrix.yml` as a quality-gate job (`migration-parity`).
+- **`ff-backend-sqlite` — Phase 2a.1: dialect-fork foundations +
+  retry helper + classifier (RFC-023 §4.3).** `src/queries/`
+  scaffolding (`attempt`, `exec_core`, `lease`, `dispatch`
+  submodules) establishes the dialect-forked query module layout;
+  method bodies land in Phase 2a.2 / 2a.3. `src/retry.rs` adds
+  `retry_serializable` helper + `IsRetryableBusy` trait, mirroring
+  the PG reference (`5ms * 2^attempt` backoff, `MAX_ATTEMPTS = 3`).
+  `is_retryable_sqlite_busy` + `MAX_ATTEMPTS` promoted to the public
+  surface so Wave-9 ops can pull the full retry vocabulary from a
+  single path. Classifier + retry-loop unit tests (11 total) cover
+  busy / locked / corrupt / full / misuse / non-DB errors plus first-
+  try success, mid-retry recovery, exhaustion, and backoff shape.
 
 ### Changed
 
