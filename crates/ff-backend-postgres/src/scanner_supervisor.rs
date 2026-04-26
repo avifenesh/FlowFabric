@@ -39,6 +39,11 @@ pub struct PostgresScannerConfig {
     pub dependency_reconciler_interval: Duration,
     pub edge_cancel_dispatcher_interval: Duration,
     pub edge_cancel_reconciler_interval: Duration,
+    /// RFC-020 Wave 9 Standalone-1: cadence for the `budget_reset`
+    /// reconciler. Matches the Valkey side's
+    /// `ff-server::config::budget_reset_interval` knob so the same
+    /// env value drives both backends.
+    pub budget_reset_interval: Duration,
     /// Stale-threshold for the dependency reconciler (ms). Matches
     /// the Valkey scanner's `stale_threshold_ms` knob.
     pub dependency_stale_threshold_ms: i64,
@@ -105,9 +110,13 @@ pub fn spawn_scanners(pool: PgPool, cfg: PostgresScannerConfig) -> PostgresScann
     let (tx, rx) = watch::channel(false);
     let js = Arc::new(Mutex::new(JoinSet::new()));
 
-    // Capture partition count up-front so each task doesn't need the
-    // full PartitionConfig reference.
+    // Capture partition counts up-front so each task doesn't need the
+    // full PartitionConfig reference. `budget_reset` iterates over the
+    // budget partition space (`num_budget_partitions`), distinct from
+    // the execution/flow partition space the other partition-scoped
+    // reconcilers walk.
     let num_partitions: i16 = cfg.partition_config.num_flow_partitions as i16;
+    let num_budget_partitions: i16 = cfg.partition_config.num_budget_partitions as i16;
     let filter = cfg.scanner_filter.clone();
 
     // ── Partition-scoped reconcilers ──
@@ -155,6 +164,31 @@ pub fn spawn_scanners(pool: PgPool, cfg: PostgresScannerConfig) -> PostgresScann
                 .await
                 .map(|_| ())
         }),
+    );
+
+    // ── `budget_reset` (RFC-020 Wave 9 Standalone-1) ──
+    //
+    // Walks the budget partition space, not the flow/exec space, so
+    // it uses `num_budget_partitions`. Filter is ignored — budget IDs
+    // are not namespace/instance-tagged (mirrors the Valkey
+    // `BudgetResetScanner` which accepts the filter "for uniform API"
+    // and does not apply it, issue #122).
+    spawn_partition_scan(
+        &js,
+        &tx,
+        rx.clone(),
+        pool.clone(),
+        cfg.budget_reset_interval,
+        num_budget_partitions,
+        filter.clone(),
+        "pg.budget_reset",
+        |pool, part, _filter| {
+            Box::pin(async move {
+                reconcilers::budget_reset::scan_tick(&pool, part)
+                    .await
+                    .map(|_| ())
+            })
+        },
     );
 
     // ── Global (non-partition-scoped) reconcilers ──
@@ -209,9 +243,10 @@ pub fn spawn_scanners(pool: PgPool, cfg: PostgresScannerConfig) -> PostgresScann
     );
 
     tracing::info!(
-        scanners = 6,
+        scanners = 7,
         num_partitions,
-        "postgres scanner supervisor spawned (RFC-017 Stage E3)"
+        num_budget_partitions,
+        "postgres scanner supervisor spawned (RFC-017 Stage E3 + RFC-020 Wave 9 budget_reset)"
     );
 
     PostgresScannerHandle {

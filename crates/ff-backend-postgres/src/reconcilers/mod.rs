@@ -9,6 +9,7 @@
 //! per-hop-tx dispatch cascade from Wave 5a.
 
 pub mod attempt_timeout;
+pub mod budget_reset;
 pub mod dependency;
 pub mod edge_cancel_dispatcher;
 pub mod edge_cancel_reconciler;
