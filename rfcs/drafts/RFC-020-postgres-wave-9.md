@@ -1,9 +1,10 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** DRAFT — Revision 2
+**Status:** DRAFT — Revision 3
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Revision 2:** 2026-04-26 — Round-1 reviewer findings addressed (schema-ground-truth, design-spine reframe, drop G6, full-parity + coherent-wave directive)
+**Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms`; (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
 **Target release:** v0.11 (single coordinated ship; whole wave or withdraw)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction + staged Postgres parity), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions)
 **Related artifacts:**
@@ -36,6 +37,20 @@ across operator-control-shaped methods**, plus two standalone groups
 dropped — see §3 and §8.4). The wave ships coherent in **one
 release** (v0.11); sequencing below is **impl-effort order**, not a
 staged consumer rollout.
+
+Revision 3 adds two additive migrations to the wave:
+
+- **0010 `ff_operator_event` outbox** — new channel for operator-
+  control events (`priority_changed` / `replayed` /
+  `flow_cancel_requested`). Preserves the RFC-019 `ff_signal_event`
+  subscriber contract (§4.2.7, §4.3). Option X per Round-2 §central
+  decision.
+- **0011 `ff_waitpoint_pending` additive columns** — `waitpoint_key`,
+  `state`, `required_signal_names`, `activated_at_ms`. Required to
+  serve the real `PendingWaitpointInfo` contract (§4.5).
+
+Both migrations are prerequisites for the claimed method-impls (not
+new features) and ship in the Wave-9 release-PR sequence (§6.2).
 
 ---
 
@@ -79,7 +94,9 @@ is rejected (see §8.4). Consequences:
   pin window across five releases; a coherent v0.11 closes it in
   one.
 - Matrix + capability-test updates are a single atomic capability-
-  surface flip at release time (§6.3), not a drip-feed of flips.
+  surface flip at the release PR (§6.3), not a drip-feed of flips.
+  (Revision 3 pins this; Revision 2's fallback "or per-step if
+  cleanly isolated" is removed — §6.3 is now unambiguous.)
 
 ---
 
@@ -116,7 +133,7 @@ every flag below is asserted `false` at
 | `cancel_flow_header` | `ff_cancel_flow` FCALL + `AlreadyTerminal` idempotent replay | Needs cancel-backlog table (§4.3) |
 | `ack_cancel_member`  | `ff_ack_cancel_member` = `SREM pending_cancels` + conditional `ZREM cancel_backlog` | Same backlog table |
 | `cancel_execution`   | `HMGET` pre-read + `ff_cancel_execution` FCALL | emits `ff_lease_event` |
-| `change_priority`    | `ff_change_priority` ff-script helper | emits `ff_signal_event` (see §4.2.4) |
+| `change_priority`    | `ff_change_priority` ff-script helper | emits `ff_operator_event` (new channel, §4.2.4) |
 | `replay_execution`   | `ff_replay_execution` + skipped-flow-member variant | see §4.2.5 — semantics called out |
 | `revoke_lease`       | `ff_revoke_lease` + `AlreadySatisfied { reason }` | emits `ff_lease_event` |
 
@@ -239,9 +256,13 @@ All six mutating methods follow a single SQL template:
 
 #### 4.2.1 `cancel_execution`
 
-- Pre-read: `SELECT lane_id, attempt_index, lifecycle_phase,
-  worker_instance_id FROM ff_exec_core LEFT JOIN ff_attempt ... FOR
-  UPDATE`.
+- Pre-read: `SELECT ec.lane_id, ec.attempt_index, ec.lifecycle_phase,
+  a.worker_instance_id FROM ff_exec_core ec LEFT JOIN ff_attempt a
+  ON (a.partition_key, a.execution_id, a.attempt_index) =
+  (ec.partition_key, ec.execution_id, ec.attempt_index) FOR UPDATE`.
+  Column binding: `lane_id` / `attempt_index` / `lifecycle_phase`
+  live on `ff_exec_core`; `worker_instance_id` / `outcome` /
+  `lease_epoch` live on `ff_attempt` (matches A5).
 - Mutate: set `lifecycle_phase = 'Cancelled'`, `cancellation_reason
   = $reason`, `cancelled_by = $source`, `terminal_at_ms = now()`.
   CAS on `attempt_index`.
@@ -277,9 +298,25 @@ All six mutating methods follow a single SQL template:
   WHERE (partition_key, flow_id, member_execution_id) = (...)`
   (junction-table shape — §7.5 resolved) + conditional DELETE of
   the parent backlog row when no members remain (CTE).
-- Outbox: `ff_signal_event` row on header (flow-level), none on
-  ack-member (too chatty; Valkey XADDs only the header event
-  too — see `valkey/lib.rs:ff_cancel_flow`).
+- Outbox: `ff_operator_event` row on header (flow-level,
+  `event_type='flow_cancel_requested'`), none on ack-member
+  (too chatty; Valkey XADDs only the header event too — see
+  `valkey/lib.rs:ff_cancel_flow`).
+
+**Intra-ack race (C2).** Two concurrent `ack_cancel_member` calls on
+the same `(partition_key, flow_id)` both execute the conditional
+parent-DELETE CTE (`WITH deleted_member AS (DELETE ...) DELETE FROM
+ff_cancel_backlog WHERE flow_id = $flow AND NOT EXISTS (SELECT 1
+FROM ff_cancel_backlog_member WHERE ...)`). Under SERIALIZABLE, the
+two transactions observe identical snapshots of the predicate-read
+on `ff_cancel_backlog_member`; one commits first, the second
+surfaces a `40001 serialization_failure` at COMMIT. The retry loop
+(step 7 of the §4.2 template) re-runs the tx with the committed
+state visible: the losing tx's member-DELETE becomes a no-op (row
+already gone), the parent-DELETE predicate re-evaluates against
+post-winner state, and the method returns idempotent success. The
+retry budget matches the existing Stage-E3 reconciler retries; no
+new retry surface is introduced.
 
 #### 4.2.4 `change_priority`
 
@@ -287,15 +324,36 @@ All six mutating methods follow a single SQL template:
   (partition_key, execution_id) = (...) AND lifecycle_phase IN
   ('Pending', 'Scheduled', 'Running') FOR UPDATE`. CAS on
   `lifecycle_phase` (not a priority change for terminal execs).
-- Outbox: `ff_signal_event` row (new `event_type = 'priority_changed'`
-  value; channel already exists from `0007_signal_event_outbox.sql`).
-  Rationale: `change_priority` is not lease-affecting
-  (`ff_lease_event` is wrong channel), but RFC-019 subscribers on
-  `ff_signal_event` want to observe operator-driven priority
-  mutations to re-drive scheduler projections. The existing
-  `ff_signal_event` channel is the closest fit; alternative is a
-  new `ff_operator_event` channel, which §7.3 considers and rejects
-  for Wave 9 scope-creep reasons.
+- Outbox: `ff_operator_event` row (migration 0010, §4.3) with
+  `event_type = 'priority_changed'`.
+
+**Channel-choice rationale (revised in Revision 3).** Revision 2
+routed operator-control events onto `ff_signal_event` on the grounds
+that the channel "already exists." Round-2 review (Reviewer A, A1 +
+A2) exposed two load-bearing problems with that shape:
+
+1. **Schema mismatch.** `ff_signal_event` has no `event_type`
+   column; its columns are `(event_id, execution_id, signal_id,
+   waitpoint_id, source_identity, delivered_at_ms, partition_key)`
+   plus `(namespace, instance_tag)` from 0009. Emitting a
+   `priority_changed` row onto it requires either a schema-breaking
+   migration on `signal_id NOT NULL` or a `DEFAULT 'synthetic'`
+   kludge — both worse than a dedicated table.
+2. **Subscriber-contract fork.** `0007_signal_event_outbox.sql`
+   header comment binds the channel to "signal-delivery" semantics.
+   RFC-019 subscribers treat the stream as signal-delivery outbox;
+   injecting operator-control events silently changes the
+   subscriber contract (passive subscribers drink operator events
+   as if they were signal deliveries).
+
+Revision 3 picks Option X: a new `ff_operator_event` outbox table +
+`LISTEN/NOTIFY` channel (DDL in §4.3, migration 0010). Clean
+channel separation preserves RFC-019 signal-delivery semantics;
+subscribers opt in to operator events explicitly.
+
+Revision 2's "no new outbox tables required" claim is withdrawn.
+The Round-2 rejection-rationale paragraph below is kept as the
+historical record but tagged overridden.
 
 #### 4.2.5 `replay_execution` — semantic resolution
 
@@ -309,8 +367,14 @@ rather than failed). See `valkey/lib.rs:5736-5850`.
 Postgres parity:
 
 - **Base path.** SERIALIZABLE tx:
-  1. `SELECT lifecycle_phase, flow_id, attempt_index,
-     outcome FROM ff_exec_core LEFT JOIN ff_attempt` FOR UPDATE.
+  1. `SELECT ec.lifecycle_phase, ec.flow_id, ec.attempt_index,
+     a.outcome FROM ff_exec_core ec LEFT JOIN ff_attempt a
+     ON (a.partition_key, a.execution_id, a.attempt_index) =
+     (ec.partition_key, ec.execution_id, ec.attempt_index)
+     FOR UPDATE`.
+     Column binding (A5): `lifecycle_phase` / `flow_id` /
+     `attempt_index` live on `ff_exec_core`; `outcome` lives on
+     `ff_attempt`. The join pins to the current-attempt row only.
   2. Require `lifecycle_phase` terminal (else `NotReplayable`).
   3. `UPDATE ff_exec_core SET lifecycle_phase = 'Pending',
      terminal_at_ms = NULL, result = NULL, attempt_index =
@@ -319,8 +383,11 @@ Postgres parity:
   4. `INSERT INTO ff_attempt (partition_key, execution_id,
      attempt_index, ...)` for the new attempt row (initialised
      empty, like a fresh create). The prior terminal `ff_attempt`
-     row stays — it's history, not state.
-  5. Outbox: `ff_signal_event` row (`event_type = 'replayed'`).
+     row stays — it is history, not state. Reconciler-scope audit
+     is in §4.2.6 (A4): existing scanners key off
+     `ff_exec_core.attempt_index = ff_attempt.attempt_index`, so
+     historical rows are not picked up.
+  5. Outbox: `ff_operator_event` row (`event_type = 'replayed'`).
 - **Skipped-flow-member path.** Additional CTE over `ff_edge` (where
   `downstream_eid = $id`) to find incoming edges. Valkey's
   `SMEMBERS` maps to `SELECT DISTINCT upstream_eid FROM ff_edge
@@ -361,23 +428,120 @@ Net: the lock protocol + CAS fencing make reconciler-interaction
 symmetric to Valkey's Lua-atomic behavior. No new reconciler
 modifications required.
 
-#### 4.2.7 Outbox emission matrix (§7.3 resolved: yes-emit)
+**Per-attempt scope audit (A4).** `replay_execution` increments
+`ff_exec_core.attempt_index` and leaves historical `ff_attempt` rows
+in place (§4.2.5 step 4). This adds N-row history semantics to
+`ff_attempt` — a new invariant for the backend. Reviewer A flagged
+this as a potential scanner hazard. Audited partners:
+
+- `reconcilers/lease_expiry.rs:60-83` scans `ff_attempt` rows with
+  non-NULL `lease_expires_at_ms`. Historical rows have
+  `lease_expires_at_ms = NULL` after their terminal transition
+  (lease is released at terminal), so they are not selected.
+  `release_one` keys by explicit `(partition_key, execution_id,
+  attempt_index)` triple — no cross-attempt contamination.
+- `reconcilers/attempt_timeout.rs:50-77` scans `ff_attempt` JOINed
+  against `ff_exec_core` on `lifecycle_phase = 'active'`. A
+  historical attempt whose `ff_exec_core` is now `'Pending'` (post-
+  replay) is not `'active'` and is filtered out. `expire_one`
+  (line 131-153) explicitly re-reads `ff_exec_core.attempt_index`
+  as `cur_attempt` and binds the UPDATE `WHERE attempt_index = $4`
+  to the scanner's picked index — if that doesn't match the current
+  attempt, the row update is a no-op on historical data.
+- `reconcilers/edge_cancel_reconciler.rs` / `dependency.rs` /
+  `edge_cancel_dispatcher.rs` operate on `ff_exec_core` +
+  `ff_edge*` — no direct `ff_attempt` scan surface.
+- `reconcilers/suspension_timeout.rs` operates on
+  `ff_suspension_current`; orthogonal.
+
+Conclusion: the existing scanner surface already scopes by
+`ff_exec_core.attempt_index` (directly or transitively via
+`lifecycle_phase`), so adding historical `ff_attempt` rows is
+invariant-safe. No new scanner modifications required.
+
+#### 4.2.7 Outbox emission matrix (§7.3 resolved: yes-emit, Option X in Revision 3)
 
 | Method | Outbox | `event_type` |
 |---|---|---|
 | `cancel_execution` | `ff_lease_event` (if lease active) | `revoked` |
 | `revoke_lease` | `ff_lease_event` | `revoked` |
-| `change_priority` | `ff_signal_event` | `priority_changed` |
-| `replay_execution` | `ff_signal_event` | `replayed` |
-| `cancel_flow_header` | `ff_signal_event` | `flow_cancel_requested` |
+| `change_priority` | `ff_operator_event` (new, migration 0010) | `priority_changed` |
+| `replay_execution` | `ff_operator_event` | `replayed` |
+| `cancel_flow_header` | `ff_operator_event` | `flow_cancel_requested` |
 | `ack_cancel_member` | (none — too chatty; matches Valkey) | — |
 
 All emissions happen in the same SERIALIZABLE tx as the mutation,
-flushed to subscribers via the existing `pg_notify` triggers
-(`0006_lease_event_outbox.sql` / `0007_signal_event_outbox.sql`).
-No new outbox tables required.
+flushed to subscribers via the existing `pg_notify` trigger on
+`ff_lease_event` (`0006_lease_event_outbox.sql`) plus the new
+`ff_operator_event` trigger (migration 0010, §4.3).
 
-### 4.3 Cancel-backlog tables (partitioned) — Spine-A support
+**Subscriber-contract analysis (A2).** `ff_signal_event` (RFC-019
+Stage B, `0007_signal_event_outbox.sql`) is bound by header comment
+to "signal-delivery" semantics: producers INSERT one row per
+successful `deliver_signal` call. Its schema (`event_id,
+execution_id, signal_id NOT NULL, waitpoint_id, source_identity,
+delivered_at_ms, partition_key`) + instance-tag columns added by
+0009 reflects that shape. Operator-control events do not have a
+`signal_id`; repurposing the channel would either force
+`signal_id = synthetic` rows (breaking existing subscribers that
+treat `signal_id` as lookup-ready) or require a schema-breaking
+migration to `signal_id NULL`. Revision 3 avoids both by introducing
+the dedicated `ff_operator_event` channel (§4.3). Existing RFC-019
+subscribers on `ff_signal_event` see no contract change.
+
+The "no new outbox tables required" claim from Revision 2 is
+withdrawn. Migration 0010 is an additive prerequisite, not a new
+feature (§6.2).
+
+### 4.3 New tables — Spine-A support
+
+Revision 3 introduces two additive tables. Migrations ship in the
+Spine-A implementation PRs (§6.2).
+
+#### 4.3.1 `ff_operator_event` outbox (migration 0010)
+
+New outbox table mirroring `ff_signal_event`
+(`0007_signal_event_outbox.sql`) + `ff_lease_event`
+(`0006_lease_event_outbox.sql`) shape, dedicated to operator-control
+events. DDL shape:
+
+```sql
+CREATE TABLE ff_operator_event (
+    event_id        BIGSERIAL PRIMARY KEY,
+    execution_id    TEXT NOT NULL,
+    event_type      TEXT NOT NULL,  -- 'priority_changed' | 'replayed' | 'flow_cancel_requested'
+    details         jsonb,          -- method-specific payload (new_priority, flow_id, etc.)
+    occurred_at_ms  BIGINT NOT NULL,
+    partition_key   INT NOT NULL,
+    namespace       TEXT,           -- RFC-019 subscriber-filter (parity with 0009)
+    instance_tag    TEXT            -- RFC-019 subscriber-filter
+);
+
+CREATE INDEX ff_operator_event_partition_key_idx
+    ON ff_operator_event (partition_key, event_id);
+
+CREATE FUNCTION ff_notify_operator_event() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_notify('ff_operator_event', NEW.event_id::text);
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER ff_operator_event_notify_trg
+    AFTER INSERT ON ff_operator_event
+    FOR EACH ROW EXECUTE FUNCTION ff_notify_operator_event();
+```
+
+`namespace` / `instance_tag` ship in the initial DDL (rather than
+bolted on in a later 0009-shaped migration) because Wave 9's
+consumer surface already expects RFC-019 subscriber filters to work.
+
+Catch-up shape + subscription integration mirrors `ff_signal_event`;
+RFC-019's subscription infrastructure gains a third channel with no
+structural changes.
+
+#### 4.3.2 Cancel-backlog tables (partitioned)
 
 Corrects Round-1 finding #6 (top-level `ff_cancel_backlog` violates
 the 256-way HASH-partition convention).
@@ -428,22 +592,76 @@ partitioned 256 ways with PK `(partition_key, waitpoint_id)` and
 has **no `status` column** — presence in the table implies pending
 (signal-delivery moves rows out).
 
-Columns actually present:
+Columns actually present today:
 `partition_key, waitpoint_id, execution_id, token_kid, token,
 created_at_ms, expires_at_ms, condition`.
 
-`PendingWaitpointInfo` (trait return) requires `token_kid,
-token_fingerprint, flow_id, execution_id, attempt_index`. Of those:
+**Contract ground truth (A3).** The trait return type is
+`PendingWaitpointInfo` (`crates/ff-core/src/contracts/mod.rs:822-859`),
+not the invented 5-field struct in Revision 2. The real contract has
+10 fields:
 
-- `token_kid` — direct from `ff_waitpoint_pending`.
+```
+waitpoint_id, waitpoint_key, state, required_signal_names,
+created_at, activated_at (Option), expires_at (Option),
+execution_id, token_kid, token_fingerprint
+```
+
+Phantom fields `flow_id` and `attempt_index` are NOT in the
+contract and are dropped from the projection.
+
+**Data-availability gap + migration 0011.** Of the 10 contract
+fields, four have no source column in the existing schema:
+`waitpoint_key`, `state`, `required_signal_names`, `activated_at`.
+None of those is derivable cleanly:
+
+- `waitpoint_key` — the user-level key string (distinct from the
+  UUID `waitpoint_id`); needed by cairn to correlate against the
+  worker-side `suspend` call. Not present in any existing table.
+- `state` — `'pending' | 'active' | 'closed'`. Revision 2
+  claimed "presence in the table implies pending"; this collapses
+  `pending` and `active` (activation is a separate state in the
+  contract). Cannot be derived without a column.
+- `required_signal_names` — derivable in principle from
+  `condition jsonb`, but the jsonb shape is opaque producer-side;
+  extracting names requires the backend to understand every
+  condition variant. Fragile.
+- `activated_at` — the timestamp when the waitpoint transitioned
+  `pending → active`. No historical source.
+
+Revision 3 adds migration 0011 with additive columns:
+
+```sql
+ALTER TABLE ff_waitpoint_pending
+    ADD COLUMN waitpoint_key         TEXT,
+    ADD COLUMN state                 TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN required_signal_names TEXT[] NOT NULL DEFAULT '{}',
+    ADD COLUMN activated_at_ms       BIGINT;
+```
+
+All columns are nullable-or-defaulted → additive and
+`backward_compatible = true`. Existing rows inserted pre-0011 get
+`state = 'pending'`, empty `required_signal_names`, NULL
+`waitpoint_key` / `activated_at_ms`. New inserts (post-0011) must
+populate `waitpoint_key` + `required_signal_names` from the
+producer-side `suspend_*` path; activation transitions populate
+`state = 'active', activated_at_ms = now`. The producer + activation
+wiring changes land in the same PR as migration 0011 (§6.2 step 4)
+— without them the table has usable defaults but degraded fidelity
+on already-inserted rows.
+
+**Field mapping (post-0011):**
+
+- `waitpoint_id`, `execution_id`, `created_at` (from
+  `created_at_ms`), `expires_at` (from `expires_at_ms`),
+  `token_kid` — direct columns.
 - `token_fingerprint` — computed from `token` at projection
   (redaction per Stage D1 contract; never returned raw).
-- `execution_id` — direct.
-- `flow_id` — requires JOIN to `ff_exec_core` on `(partition_key,
-  execution_id)` (partition-local; co-located).
-- `attempt_index` — requires JOIN to `ff_attempt` on
-  `(partition_key, execution_id, attempt_index = current)`. Current
-  attempt = `ff_exec_core.attempt_index`. Partition-local.
+- `waitpoint_key`, `state`, `required_signal_names`, `activated_at`
+  (from `activated_at_ms`) — direct columns post-0011.
+
+No JOIN to `ff_exec_core` / `ff_attempt` required — the phantom
+`flow_id`/`attempt_index` fields are not in the contract.
 
 **Partition-enumeration.** The method does not take a partition key
 as input; cursor `id > $after ORDER BY id LIMIT` is a cross-
@@ -462,7 +680,7 @@ partition scan. Shape:
   a hot path; sequential iteration is simpler and matches Valkey's
   single-shard SSCAN shape.
 
-Query sketch:
+Query sketch (post-0011):
 
 ```sql
 SELECT wp.partition_key,
@@ -470,20 +688,19 @@ SELECT wp.partition_key,
        wp.execution_id,
        wp.token_kid,
        wp.token,           -- fingerprinted in projection, never returned raw
+       wp.waitpoint_key,
+       wp.state,
+       wp.required_signal_names,
        wp.created_at_ms,
-       ec.flow_id,
-       ec.attempt_index
+       wp.activated_at_ms,
+       wp.expires_at_ms
 FROM ff_waitpoint_pending wp
-JOIN ff_exec_core ec
-  ON ec.partition_key = wp.partition_key
- AND ec.execution_id  = wp.execution_id
 WHERE (wp.partition_key, wp.waitpoint_id) > ($after_pk, $after_wp)
 ORDER BY wp.partition_key, wp.waitpoint_id
 LIMIT $limit;
 ```
 
-`attempt_index` comes from `ff_exec_core.attempt_index` (current
-attempt) — consistent with Valkey's single-attempt projection.
+Single-table scan; no JOIN.
 
 ---
 
@@ -533,16 +750,22 @@ drove:
    spine's `SELECT ... FOR UPDATE` templates.
 2. **Standalone-1 — Budget / quota admin (5 methods).** No
    cross-coupling; unblocks `examples/token-budget` on Postgres.
-3. **Spine-A pt.1 — `cancel_execution` + `revoke_lease` + `change_priority`
-   (3 methods).** Existing tables only (`ff_exec_core`, `ff_attempt`,
-   `ff_lease_event`, `ff_signal_event`); proves the SERIALIZABLE-fn
-   + outbox template.
-4. **Standalone-2 — `list_pending_waitpoints` (1 method).** Small,
-   existing table, partition-cursor shakedown.
+3. **Spine-A pt.1 — `cancel_execution` + `revoke_lease` +
+   `change_priority` (3 methods).** Tables:
+   `ff_exec_core` / `ff_attempt` / `ff_lease_event` (existing);
+   `ff_operator_event` (**new, migration 0010**). Proves the
+   SERIALIZABLE-fn + outbox template and lands the operator-event
+   channel that spine-A pt.2 also uses.
+4. **Standalone-2 — `list_pending_waitpoints` (1 method).**
+   Lands **migration 0011** (additive columns on
+   `ff_waitpoint_pending`) + producer-side writes that populate the
+   new columns on `suspend_*` / activation transitions.
+   Partition-cursor shakedown.
 5. **Spine-A pt.2 — `cancel_flow_header` + `ack_cancel_member` +
    `replay_execution` (3 methods).** Introduces
-   `ff_cancel_backlog` + `ff_cancel_backlog_member`; needs the
-   spine template from step 3 in-tree.
+   `ff_cancel_backlog` + `ff_cancel_backlog_member` (migration
+   numbered after 0011); emits on the `ff_operator_event` channel
+   landed in step 3.
 
 Each step is its own PR; the release is cut **only after all five
 steps merge**. A step that cannot land cleanly withdraws the wave
@@ -559,8 +782,14 @@ lands its own migration file (numbered sequentially after `0009_*`):
   NOT EXISTS` + `INSERT INTO ff_migration_annotation ... ON
   CONFLICT DO NOTHING`. Re-running `migrate()` is a no-op.
 - **Additive.** No column drops, no type changes on existing
-  columns; Wave 9 only adds `ff_cancel_backlog` +
-  `ff_cancel_backlog_member`. No destructive DDL.
+  columns. Wave 9 adds:
+  - `ff_cancel_backlog` + `ff_cancel_backlog_member` (spine-A pt.2
+    step, numbered after 0011 in impl-order).
+  - `ff_operator_event` outbox table + trigger (migration 0010,
+    lands with spine-A pt.1).
+  - Additive columns on `ff_waitpoint_pending` (migration 0011,
+    lands with standalone-2 step).
+  No destructive DDL.
 - **No stop-the-world.** `CREATE INDEX CONCURRENTLY` for any
   indexes added post-0001. Table creation + annotation inserts
   are cheap + locking-bounded.
@@ -570,22 +799,42 @@ lands its own migration file (numbered sequentially after `0009_*`):
 
 ### 6.3 Release + capability-flip protocol
 
-- All 13 method impls + migrations merge to main behind their
-  `Supports` flags still `false` (the trait impl is correct; the
-  capability flag lies to consumers). **OR**, if the PR cleanly
-  isolates flipping the flag, steps 1–5 each ship with their
-  flag(s) flipped on-merge (both patterns acceptable per CI-gate
-  discipline).
-- **Final release PR** (no new method impls): flips any still-
-  `false` `Supports` flags in §3.1 to `true`, updates
-  `crates/ff-backend-postgres/tests/capabilities.rs:53-73` to
-  assert `true` for the 13 flags, updates
-  `docs/POSTGRES_PARITY_MATRIX.md` to drop the `stub` column for
-  every method, appends v0.11 `CHANGELOG.md` section.
-  **Also** flips the stale `rotate_waitpoint_hmac_secret_all`
-  matrix row to `impl` as a housekeeping sweep (§3.3).
-- Release gate per CLAUDE.md §5: smoke before tag, examples
-  build, parity matrix current.
+**Capability-flip timing — atomic at the release PR (B3/C3d).**
+Revision 2 offered either per-step-flip or release-PR-flip as
+"both acceptable." Revision 3 collapses to a single rule, matching
+§2.2's "single atomic capability-surface flip at release time":
+
+- Steps 1–5 land method impls + migrations behind `Supports` flags
+  that stay `false`. The trait impl is correct on-disk; the flag
+  continues to report `false` so capability-discovery consumers
+  see no churn during the wave's landing window.
+- The **final release PR** (no new method impls) performs a single
+  atomic flip:
+  - Flips all 13 `Supports` flags in §3.1 from `false` → `true`.
+  - Updates `crates/ff-backend-postgres/tests/capabilities.rs:53-73`
+    to assert `true` for the 13 flags.
+  - Updates `docs/POSTGRES_PARITY_MATRIX.md` to drop the `stub`
+    column for every Wave-9 method.
+  - **Line item (B4):** flips the stale
+    `rotate_waitpoint_hmac_secret_all` matrix row to `impl`
+    (housekeeping, §3.3 — already shipped in-tree but docs lag).
+  - **Line item (B1):** commits `docs/CONSUMER_MIGRATION_0.11.md`
+    (matches v0.8 / v0.10 precedent); documents capability-flag
+    flips, new outbox channel (`ff_operator_event`), new waitpoint
+    columns.
+  - Appends v0.11 `CHANGELOG.md` section.
+
+**Release gate additions (B2).** In addition to the CLAUDE.md §5
+gate (smoke before tag, examples build, parity matrix current,
+README sweep, etc.), Wave 9 adds:
+
+- **`examples/token-budget/` runs green on `FF_BACKEND=postgres`.**
+  This example exercises Standalone-1 (create_budget / reset_budget
+  / create_quota_policy / get_budget_status / report_usage_admin)
+  end-to-end. It must PASS on the Postgres backend before tag; a
+  failure withdraws the release (whole-wave-or-withdraw).
+- Smoke runs against the published artifact per
+  [feedback_smoke_before_release].
 
 ---
 
@@ -608,11 +857,16 @@ transition is not justified. See §4.1.
 choice is already made in-tree; admin methods commit to match that
 shape. Not an open fork.
 
-### 7.3 Operator-control outbox emission — **RESOLVED in §4.2.7**
+### 7.3 Operator-control outbox emission — **RESOLVED in §4.2.7 (Option X in Revision 3)**
 
 Yes-emit for every mutating Spine-A method, routed to
-`ff_lease_event` for lease-affecting ops and `ff_signal_event` for
-others. Matrix in §4.2.7.
+`ff_lease_event` for lease-affecting ops and the **new
+`ff_operator_event` channel** (migration 0010, §4.3.1) for
+priority/replay/flow-cancel events. Matrix in §4.2.7.
+
+Revision 2 routed these onto `ff_signal_event`; Round-2 found that
+was a schema-impossible + subscriber-contract-breaking choice
+(A1/A2). Revision 3 introduces the dedicated channel.
 
 ### 7.4 Reconciler interaction + cancel/replay race — **RESOLVED in §4.2.6**
 
@@ -625,26 +879,49 @@ Junction table (`ff_cancel_backlog_member`) over array-column
 (`BYTEA[]`), both 256-way partitioned. Junction composes better
 with partitioned `FOR UPDATE` row-level locking.
 
-### 7.6 Capability-flip timing — **RESOLVED in §6.3**
+### 7.6 Capability-flip timing — **RESOLVED in §6.3 (atomic-at-release-PR in Revision 3)**
 
-Owner directive is coherent wave in one release. Flags flip in the
-final release PR (or per-step PR if cleanly isolated); matrix flip
-is atomic at release time.
+Owner directive is coherent wave in one release. Revision 3 pins
+the flip to the release PR only (single atomic flip); per-step-flip
+variant is withdrawn to align with §2.2.
 
 ### 7.7 — (withdrawn; `rotate_waitpoint_hmac_secret_all` housekeeping folded into §6.3)
 
 ### 7.8 `get_execution_result` attempt indexing — **RESOLVED in §4.1**
 
-Matches Valkey's `GET ctx.result()` which is current-attempt.
-`ff_exec_core.result` is the binding column; no `attempt_index`
-input. Per-attempt-history is out of scope for Wave 9.
+Matches Valkey's `GET ctx.result()`
+(`crates/ff-backend-valkey/src/lib.rs:5254-5273`) which reads the
+current attempt's result. `ff_exec_core.result` is the binding
+column; no `attempt_index` input. Per-attempt-history is out of
+scope for Wave 9.
 
-### 7.9 Remaining owner-call items (push if needed)
+**C3c forward-commitment note.** Picking current-attempt semantics
+for `get_execution_result` means a per-attempt-history API cannot
+be added by extending this method's signature later (trait methods
+are non-breaking-only in consumer contract); a future
+"per-attempt-history" surface would need a new method
+(`get_execution_result_history` or similar). This is acceptable:
+Valkey's primitive is also current-attempt, and per-attempt history
+is not in any known consumer ask. If the need arises, it's a
+new-method addition — not an API break.
 
-None. All §7 items resolved in Revision 2. If the owner disagrees
-with any resolution (read-model join-on-read; junction-table
-backlog; yes-emit outbox; get_execution_result=current-attempt),
-§7 reopens the specific item in Round-3.
+### 7.9 `ack_cancel_member` silent-on-both parity — **RESOLVED (C3b)**
+
+Neither backend emits an outbox row on `ack_cancel_member` (Valkey
+does not XADD per-member; §4.2.7 matches). This is the intended
+forward shape: per-member outbox traffic would be proportional to
+flow size, and the header-level `flow_cancel_requested` event
+already drives all observer re-projection needs. No owner-call
+fork.
+
+### 7.10 Remaining owner-call items (push if needed)
+
+None. All Round-2 findings resolved in Revision 3 via agent
+autonomy (Option X outbox channel, additive waitpoint migration,
+atomic-at-release-PR flip, C3a–d). If the owner disagrees with any
+resolution (Option X vs Y; additive-migration vs join-derive for
+waitpoint; `get_execution_result` semantics; ack silence), §7
+reopens the specific item in Round-4.
 
 ---
 
@@ -725,12 +1002,16 @@ shape into a prerequisite "RFC-020a schema-shape" doc, with RFC-020
 depending on it. Argument: schema decisions govern all future PG
 read APIs, not just Wave 9.
 
-**Rejected.** The schema decisions in Revision 2 are contained:
+**Rejected.** The schema decisions in Revision 3 remain contained:
 join-on-read against existing columns (no new projection tables);
-one new backlog pair. Neither is a forward-facing primitive that
-warrants a separate RFC audience. If a future Wave-10 introduces
-projection tables or cross-cutting schema shapes, it is welcome to
-split at that time. RFC-020 stays single-doc.
+one new backlog pair; one new operator-event outbox channel
+(migration 0010); four additive columns on an existing table
+(migration 0011). None of these is a forward-facing primitive that
+warrants a separate RFC audience — they are all mechanical
+prerequisites for the method impls this RFC proposes. If a future
+Wave-10 introduces projection tables or cross-cutting schema
+shapes, it is welcome to split at that time. RFC-020 stays
+single-doc.
 
 ### 8.7 Split Wave 9 across v0.11 + v0.12
 
@@ -742,6 +1023,33 @@ reviewer-C's "ship-G4+G5-only" variant.
 promise; splitting means cairn pins across two minors on an
 incomplete capability set. Whole-wave-or-withdraw: the split-RFC
 shape is explicitly the failure mode the directive is avoiding.
+
+**Per-release-risk engagement (C1).** Reviewer C's argument on the
+merits: splitting Wave 9 halves the DDL + method surface changing
+per release, shrinking the blast radius of any regression
+discovered post-tag. If Spine-B + Standalone-1 land in v0.11 and a
+bug surfaces, v0.11.1 is a narrow hotfix over 8 methods, not 13;
+the v0.12 spine-A ship can absorb the fix and continue. This is
+the standard "smaller deployable unit" argument and it is not
+frivolous.
+
+The counter-argument, specific to Wave 9's shape: the design
+**spine** (§4.2) is one template applied 6 times; the risk delta
+between shipping 3 spine methods in v0.11 + 3 in v0.12 and
+shipping all 6 in v0.11 is smaller than method count suggests,
+because the spine template is the unit of review and the unit of
+bug — a spine regression is 6-method-wide regardless of the ship
+cadence. Meanwhile, the cost of splitting is structural: cairn
+pins across two minors rather than one, the capability-discovery
+surface flips twice (operator-UI greys-out state changes twice),
+the CHANGELOG + CONSUMER_MIGRATION doc is duplicated, and the
+"Postgres != parity" state persists for an extra release cycle
+against the full-parity directive. On net, the coherence-per-
+release cost of splitting exceeds the per-release-risk benefit
+given the spine's template-shaped risk surface. Single-release is
+the better trade for this specific wave; per-release-risk would
+dominate if the 13 methods were 13 independent templates, but they
+are not.
 
 ---
 
@@ -757,12 +1065,24 @@ shape is explicitly the failure mode the directive is avoiding.
   `ff_flow_core`, `ff_edge`); all references in §4 are traceable
 - `crates/ff-backend-postgres/migrations/0006_lease_event_outbox.sql`
 - `crates/ff-backend-postgres/migrations/0007_signal_event_outbox.sql`
+  — schema source for A1 (no `event_type` column; `signal_id NOT
+  NULL`) driving the Option X decision
+- `crates/ff-backend-postgres/migrations/0008_lease_event_instance_tag.sql`
+  / `0009_signal_event_instance_tag.sql` — RFC-019 instance-tag
+  columns; `ff_operator_event` (§4.3.1) ships with parity columns
+  in its initial DDL
+- `crates/ff-core/src/contracts/mod.rs:822-859` —
+  `PendingWaitpointInfo` contract ground truth (A3)
 - `crates/ff-backend-postgres/src/lib.rs` — current `Unavailable`
   sites (grep `EngineError::Unavailable`)
 - `crates/ff-backend-postgres/src/budget.rs:154` — shipped
   `report_usage_impl` (the §4.4 / §7.2 binding shape)
 - `crates/ff-backend-postgres/src/reconcilers/lease_expiry.rs` —
   the §4.2.6 race partner
+- `crates/ff-backend-postgres/src/reconcilers/attempt_timeout.rs`
+  — per-attempt scope audit (A4, §4.2.6)
+- `crates/ff-backend-valkey/src/lib.rs:5254-5273` —
+  `get_execution_result` current-attempt semantics (§4.1, §7.8)
 - `crates/ff-backend-valkey/src/lib.rs:5570-5900` — Valkey
   reference impls for Spine-A semantic parity
 - `rfcs/RFC-012-engine-backend-trait.md` §Round-7 — higher-op
