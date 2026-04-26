@@ -56,8 +56,8 @@ use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
 use ff_core::types::{
-    AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
-    SignalId, TimestampMs, WaitpointId, WorkerInstanceId,
+    AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseFence,
+    LeaseId, SignalId, TimestampMs, WaitpointId, WorkerInstanceId,
 };
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
@@ -4202,6 +4202,83 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "suspend: FCALL ff_suspend_execution")
+            })
+    }
+
+    async fn suspend_by_triple(
+        &self,
+        exec_id: ExecutionId,
+        triple: LeaseFence,
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        // RFC-013 §4 — validate args before any pre-read so malformed
+        // SuspendArgs surface as `Validation(InvalidInput)` regardless
+        // of execution state. Mirrors `suspend`.
+        validate_suspend_args(&args)?;
+
+        // Pre-read the exec_core fields that `suspend_impl` would
+        // otherwise pull from the Handle payload: lane_id, current
+        // attempt_index, current worker_instance_id. Lease fence fields
+        // (lease_id, lease_epoch, attempt_id) come from `triple`
+        // directly — the Lua side fences against these on `lease_current`.
+        let partition = execution_partition(&exec_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &exec_id);
+        let core_key = ctx.core();
+        let core: HashMap<String, String> = self
+            .client
+            .cmd("HGETALL")
+            .arg(&core_key)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        if core.is_empty() {
+            return Err(EngineError::NotFound { entity: "execution" });
+        }
+        let lane_str = core.get("lane_id").cloned().unwrap_or_default();
+        if lane_str.is_empty() {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: "suspend_by_triple: exec_core missing lane_id".into(),
+            });
+        }
+        let att_idx_str = core
+            .get("current_attempt_index")
+            .cloned()
+            .unwrap_or_default();
+        let att_idx: u32 = att_idx_str.parse().map_err(|_| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "suspend_by_triple: exec_core.current_attempt_index not a u32: {att_idx_str:?}"
+            ),
+        })?;
+        let wiid_str = core
+            .get("current_worker_instance_id")
+            .cloned()
+            .unwrap_or_default();
+        // An empty `current_worker_instance_id` means the lease was
+        // already released — the fence check on `lease_current` will
+        // fail with `stale_lease`; pass a placeholder so we still reach
+        // the FCALL and surface the canonical error.
+        let worker_instance_id = WorkerInstanceId::new(wiid_str);
+
+        let fields = handle_codec::HandleFields::new(
+            exec_id,
+            AttemptIndex::new(att_idx),
+            triple.attempt_id,
+            triple.lease_id,
+            triple.lease_epoch,
+            // lease_ttl_ms is unused on the suspend FCALL path; pass 0.
+            0,
+            LaneId::new(lane_str),
+            worker_instance_id,
+        );
+        suspend_impl(&self.client, &self.partition_config, &fields, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "suspend_by_triple: FCALL ff_suspend_execution",
+                )
             })
     }
 

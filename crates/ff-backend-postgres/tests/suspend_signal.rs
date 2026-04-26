@@ -40,8 +40,8 @@ use ff_core::engine_error::{ConflictKind, ContentionKind, EngineError};
 use ff_core::handle_codec::{encode as encode_opaque, HandlePayload};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::{
-    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseEpoch, LeaseId, SignalId, SuspensionId,
-    TimestampMs, WaitpointId, WaitpointToken, WorkerId, WorkerInstanceId,
+    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseEpoch, LeaseFence, LeaseId, SignalId,
+    SuspensionId, TimestampMs, WaitpointId, WaitpointToken, WorkerId, WorkerInstanceId,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -1010,4 +1010,64 @@ async fn deliver_signal_retry_exhaustion_returns_retry_exhausted() {
     // Q11 contract regardless of scheduling.
     assert_eq!(ff_backend_postgres::signal::SERIALIZABLE_RETRY_BUDGET, 3);
     let _ = wp_uuid; // silence dead-binding lint
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Cairn #322 — suspend_by_triple service-layer entry point.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn suspend_by_triple_fresh_returns_suspended() {
+    let Some(fx) = setup_exec_or_skip().await else {
+        return;
+    };
+
+    let triple = LeaseFence {
+        lease_id: LeaseId::new(),
+        lease_epoch: fx.lease_epoch,
+        attempt_id: AttemptId::new(),
+    };
+
+    let (args, _wp_id) = make_suspend_args("wpk:triple");
+    let suspension_id = args.suspension_id.clone();
+    let outcome = fx
+        .backend
+        .suspend_by_triple(fx.exec_id.clone(), triple, args)
+        .await
+        .expect("suspend_by_triple ok");
+
+    match outcome {
+        SuspendOutcome::Suspended { details, handle } => {
+            assert_eq!(details.suspension_id, suspension_id);
+            assert_eq!(details.waitpoint_key, "wpk:triple");
+            assert_eq!(handle.kind, HandleKind::Suspended);
+            assert_eq!(handle.backend, BackendTag::Postgres);
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+
+    // Lease epoch bumped on suspend — a replay with the stale triple
+    // surfaces as LeaseConflict.
+    let stale = LeaseFence {
+        lease_id: LeaseId::new(),
+        lease_epoch: fx.lease_epoch,
+        attempt_id: AttemptId::new(),
+    };
+    let (args2, _) = make_suspend_args("wpk:triple-replay");
+    let err = fx
+        .backend
+        .suspend_by_triple(fx.exec_id.clone(), stale, args2)
+        .await
+        .expect_err("stale epoch must reject");
+    assert!(
+        matches!(err, EngineError::Contention(ContentionKind::LeaseConflict))
+            || matches!(err, EngineError::Contention(ContentionKind::RetryExhausted)),
+        "expected LeaseConflict or RetryExhausted, got {err:?}"
+    );
+    let _ = fx.exec_uuid; // silence dead-binding lint
+    let _ = fx.part;
+    let _ = fx.attempt_index;
+    let _ = fx.lane;
+    let _ = fx.pool;
 }

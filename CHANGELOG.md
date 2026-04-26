@@ -7,6 +7,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `EngineBackend::suspend_by_triple(exec_id, LeaseFence, SuspendArgs)`
+  — service-layer entry point for suspending an execution when the
+  caller holds a lease fence triple but no worker `Handle` (cairn #322;
+  unblocks cairn's pause-by-operator, enter-waiting-approval, and
+  cancel-with-timeout-record call sites that today fall back to raw
+  FCALL glue). Additive with a default impl returning
+  `EngineError::Unavailable { op: "suspend_by_triple" }`; Valkey and
+  Postgres backends override. Semantics mirror `suspend` (same
+  `SuspendArgs` validation, same `SuspendOutcome` lifecycle, same
+  RFC-013 §3 replay / dedup contract) — the only difference is the
+  fencing source. On Valkey the triple's `(lease_id, lease_epoch,
+  attempt_id)` drives the Lua fence against `lease_current`;
+  `attempt_index` + `lane_id` + `worker_instance_id` are recovered
+  from `exec_core`. On Postgres the fence is `lease_epoch` against
+  `ff_attempt`; `attempt_index` is read from `ff_exec_core` (Postgres
+  attempts are keyed by `(execution_id, attempt_index)` — the triple's
+  `attempt_id` is advisory on this backend).
 - `ff_core::handle_codec::v1_handle_for_tests` — test-only fixture
   that synthesises a pre-Wave-1c (v1) handle byte buffer for the
   given `HandlePayload`. Gated behind the new `test-fixtures` feature
@@ -16,7 +33,6 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Motivated by downstream cross-version compat testing (cairn #323)
   where event logs persisted under FF 0.3 must still decode under
   FF 0.9+.
-
 - `ff_core::stream_events` module: typed event enums + per-family
   subscription aliases for the four `EngineBackend::subscribe_*`
   methods (RFC-019 Stage C; addresses #282 typed surface gap).
