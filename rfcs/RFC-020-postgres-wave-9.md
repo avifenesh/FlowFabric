@@ -1,6 +1,6 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** ACCEPTED — Revision 5
+**Status:** ACCEPTED — Revision 6
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
@@ -8,6 +8,7 @@
 **Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms` (**Revision 5 correction: `waitpoint_key` already shipped via migration 0004; 0011 adds 3 columns, not 4**); (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
 **Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter) — **superseded by Revision 5 (moot: column already exists from 0004)**; (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
 **Revision 5:** 2026-04-26 — Ground-truth correction: `waitpoint_key` column already exists on `ff_waitpoint_pending` since migration 0004 (Wave 4d), populated as `TEXT NOT NULL DEFAULT ''` and actively used by `suspend_ops.rs`. Revision 4's §4.5 treated it as a new 0011 column; NEW-5 degraded-counter design was predicated on pre-0011 NULL rows that can never exist. This revision reframes migration 0011 as 3 additive columns (`state`, `required_signal_names`, `activated_at_ms`), drops the `waitpoint_key` addition, drops NEW-5 degraded-counter, simplifies §4.5 query to read `waitpoint_key` directly. No scope or method-count change.
+**Revision 6:** 2026-04-26 — Standalone-1 (Budget/quota admin) §4.4 rework. Standalone-1 impl attempt surfaced four structural gaps that Revision 5's §4.4 glossed over ("sits on top of existing `0002_budget.sql` tables" was false for quota; `BudgetStatus`'s 9 runtime fields have no column source on `ff_budget_policy`; budget reset scheduling has no Postgres analogue for Valkey's `budget_resets_zset` + `BudgetResetScanner`; and the "3× HGETALL → 3 SELECTs" query sketch was written against a schema that does not exist). Revision 6 resolves: (Gap 1) new **migration 0012 `ff_quota_policy` family** — 4 tables (`ff_quota_policy`, `ff_quota_window`, `ff_quota_concurrency`, `ff_quota_admitted`) mirroring the 5-key Valkey layout, 256-way HASH-partitioned on `partition_key`; (Gap 2) new **migration 0013** adds `next_reset_at_ms BIGINT` + 4 breach-tracking columns + 3 definitional columns to `ff_budget_policy` (Option A: single-table; breach updates remain READ COMMITTED to match the existing `report_usage_impl` isolation per Q11 — SERIALIZABLE retry budget does not apply on this hot path), and adds a new Postgres-native `BudgetResetReconciler` in `crates/ff-backend-postgres/src/reconcilers/budget_reset.rs` that selects due resets by `next_reset_at_ms <= now` (Option B for scheduling — column-on-policy over separate schedule table); (Gap 3) the 9 `BudgetStatus` fields (`breach_count`, `soft_breach_count`, `last_breach_at_ms`, `last_breach_dim`, `next_reset_at_ms`, `scope_type`, `scope_id`, `enforcement_mode`, `created_at_ms`) are columns on `ff_budget_policy` via migration 0013; `report_usage_impl` is amended to maintain `breach_count` / `soft_breach_count` / `last_breach_at_ms` / `last_breach_dim` incrementally matching Valkey's `flowfabric.lua:6576-6580,6614` pattern (this lifts Revision 5's §7.2 "don't touch shipped `report_usage_impl`" pin for this specific extension — see §7.2); (Gap 4) §4.4 query sketches rewritten against the real 2-table shape (`ff_budget_policy` including counters + `ff_budget_usage`), with `hard_limits` / `soft_limits` parsed from `policy_json`. Scope grows by two additive migrations (0012, 0013) and one new scanner (`budget_reset` Postgres reconciler); method count unchanged at 13. No spine-A, spine-B, standalone-2, release-gate, or non-budget §6.1 change.
 **Target release:** v0.11 (single coordinated ship; whole wave or withdraw)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction + staged Postgres parity), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions)
 **Related artifacts:**
@@ -618,26 +619,431 @@ Two tables, both partitioned 256 ways on `partition_key`:
 
 Migration DDL lands in the Spine-A implementation PR (§6.2).
 
-### 4.4 Standalone-1 — Budget / quota admin
+### 4.4 Standalone-1 — Budget / quota admin (Revision 6 rework)
 
-Sits on top of the existing `budget.rs` module and its existing
-tables (`ff_budget` / `ff_quota_policy` / budget-usage tables from
-`0002_budget.sql`). Key observation (§7.2 resolved):
-`report_usage_impl` at `crates/ff-backend-postgres/src/budget.rs:154`
-already ships; its granularity choice is **already made** (see §7.2).
-Wave 9 commits admin methods to match that shape.
+**Revision 6 reframe.** Revision 5 asserted Standalone-1 "sits on
+top of existing `0002_budget.sql` tables" and treated the 5 admin
+methods as thin INSERT/SELECT wrappers. Ground truth after the
+Standalone-1 impl attempt:
 
-- `create_budget` / `reset_budget` / `create_quota_policy` = single
-  `INSERT ... ON CONFLICT DO UPDATE` — definitional writes against
-  the existing schema.
-- `get_budget_status` = 3 SELECTs (definition + usage + limits) +
-  `NotFound { entity: "budget" }` on empty definition-row set.
-  Mirrors Valkey's 3× HGETALL pattern.
-- `report_usage_admin` = worker-handle-less variant of
-  `report_usage`. Factor out the shared
-  `report_usage_and_check_core` helper and call with a sentinel
-  `worker_instance = None`. The existing `report_usage_impl`
-  granularity (already shipping) is the binding contract.
+- `0002_budget.sql` ships **only** `ff_budget_policy` +
+  `ff_budget_usage` + `ff_budget_usage_dedup`. **There is no
+  `ff_quota_policy`, no `ff_quota_window`, no concurrency counter,
+  no admitted-set.** `create_quota_policy` has no schema to write
+  against.
+- `ff_budget_policy` has columns `(partition_key, budget_id,
+  policy_json, created_at_ms, updated_at_ms)` — only 5 columns.
+  `BudgetStatus` (`contracts/mod.rs:1413-1430`) requires 9 fields
+  not present: `breach_count`, `soft_breach_count`,
+  `last_breach_at`, `last_breach_dim`, `next_reset_at`,
+  `scope_type`, `scope_id`, `enforcement_mode`, `created_at`.
+  (`scope_type` / `scope_id` / `enforcement_mode` / `created_at`
+  could be derived by parsing `policy_json`, but that's fragile +
+  couples read-path to policy-blob shape.)
+- Valkey has `budget_resets_zset` scored on `next_reset_at_ms` +
+  a dedicated scanner (`crates/ff-engine/src/scanner/budget_reset.rs`)
+  that ZRANGEBYSCOREs due budgets and FCALLs `ff_reset_budget` per
+  partition. Postgres has **no equivalent** — `reset_budget` works
+  as a manual admin FCALL but periodic resets don't fire.
+
+Revision 6 adds two additive migrations (§4.4.5) and extends
+`report_usage_impl` to maintain breach counters (§4.4.6). The
+spine/standalone decomposition is unchanged.
+
+#### 4.4.1 `create_quota_policy` — schema prerequisite (migration 0012)
+
+Valkey's `ff_create_quota_policy` (see `flowfabric.lua:6839-6878`)
+writes 5 keys per policy on `{q:K}`:
+
+| Valkey key | Shape | Postgres target |
+|---|---|---|
+| `ff:quota:{q:K}:<qid>` | Hash: `quota_policy_id`, `requests_per_window_seconds`, `max_requests_per_window`, `active_concurrency_cap`, `created_at` | Row in `ff_quota_policy` |
+| `ff:quota:{q:K}:<qid>:window:<dim>` | ZSET (sliding-window request timestamps) | Row per (policy, dimension, admission-ts) in `ff_quota_window` |
+| `ff:quota:{q:K}:<qid>:concurrency` | Counter (INCR/DECR; int-as-string) | Column `active_concurrency` on `ff_quota_policy` — single-counter per policy mirrors Valkey's single-key shape |
+| `ff:quota:{q:K}:<qid>:admitted_set` | SET of admitted `execution_id`s | Row per (policy, execution_id) in `ff_quota_admitted` |
+| `ff:idx:{q:K}:quota_policies` | SET of policy IDs on this partition (reconciler discovery replacing SCAN) | Implicit — `SELECT quota_policy_id FROM ff_quota_policy WHERE partition_key = $pk` replaces the SCAN-avoidance SET; no dedicated table (§7.12 rationale) |
+
+Concurrency counter on the policy row: §4.4.4 audits contention (one
+admit/release vs. one config read) and concludes a column on the
+policy row is fine given admission granularity. If contention
+surfaces post-ship we split to a separate `ff_quota_concurrency`
+table; see §7.12.
+
+**DDL shape** (migration `0012_quota_policy.sql`, spec follows
+`0002_budget.sql` conventions — `-- no-transaction`, HASH 256 on
+`partition_key`, explicit COMMIT between partition-child DO blocks,
+`backward_compatible=true`):
+
+```sql
+-- Policy definition (one row per policy).
+CREATE TABLE ff_quota_policy (
+    partition_key                 smallint NOT NULL,
+    quota_policy_id               text     NOT NULL,
+    requests_per_window_seconds   bigint   NOT NULL,
+    max_requests_per_window       bigint   NOT NULL,
+    active_concurrency_cap        bigint   NOT NULL,
+    active_concurrency            bigint   NOT NULL DEFAULT 0,
+    created_at_ms                 bigint   NOT NULL,
+    updated_at_ms                 bigint   NOT NULL,
+    PRIMARY KEY (partition_key, quota_policy_id)
+) PARTITION BY HASH (partition_key);
+
+-- Sliding-window admission record. One row per admitted request per
+-- (policy, dimension). ZREMRANGEBYSCORE maps to DELETE WHERE
+-- admitted_at_ms < now - window_ms.
+CREATE TABLE ff_quota_window (
+    partition_key     smallint NOT NULL,
+    quota_policy_id   text     NOT NULL,
+    dimension         text     NOT NULL DEFAULT '',
+    admitted_at_ms    bigint   NOT NULL,
+    execution_id      text     NOT NULL,
+    PRIMARY KEY (partition_key, quota_policy_id, dimension, admitted_at_ms, execution_id)
+) PARTITION BY HASH (partition_key);
+
+CREATE INDEX ff_quota_window_sweep_idx
+    ON ff_quota_window (partition_key, quota_policy_id, dimension, admitted_at_ms);
+
+-- Idempotent admitted-set: presence = admitted-within-current-window.
+-- Mirrors Valkey's SADD admitted_set. `expires_at_ms` bounds the row
+-- for the admitted-guard TTL semantic (Valkey's
+-- `admitted_guard_key` SET NX PX window_ms) — sweeper trims expired
+-- rows.
+CREATE TABLE ff_quota_admitted (
+    partition_key     smallint NOT NULL,
+    quota_policy_id   text     NOT NULL,
+    execution_id      text     NOT NULL,
+    admitted_at_ms    bigint   NOT NULL,
+    expires_at_ms     bigint   NOT NULL,
+    PRIMARY KEY (partition_key, quota_policy_id, execution_id)
+) PARTITION BY HASH (partition_key);
+
+CREATE INDEX ff_quota_admitted_expires_idx
+    ON ff_quota_admitted (partition_key, expires_at_ms);
+
+-- 3 parents × 256 children = 768 partition children, created in
+-- three `DO` blocks with explicit COMMIT boundaries per the 0002
+-- pattern.
+```
+
+`ff_quota_concurrency` (enumerated in Revision 6 pre-draft as a
+fourth table) is **not** a separate table — the concurrency counter
+is a column on `ff_quota_policy.active_concurrency` per the table
+above. "4 Postgres tables mirroring 5 Valkey keys" with the 5th
+being implicit (SELECT over `ff_quota_policy` for the partition)
+and one Valkey key collapsed onto a column (`concurrency`).
+
+**`create_quota_policy` query shape:**
+
+```sql
+INSERT INTO ff_quota_policy
+    (partition_key, quota_policy_id, requests_per_window_seconds,
+     max_requests_per_window, active_concurrency_cap,
+     active_concurrency, created_at_ms, updated_at_ms)
+VALUES ($1, $2, $3, $4, $5, 0, $6, $6)
+ON CONFLICT (partition_key, quota_policy_id) DO NOTHING
+RETURNING created_at_ms;
+```
+
+Row-count = 0 → return `CreateQuotaPolicyResult::AlreadySatisfied`
+(matches Valkey's `ok_already_satisfied`); row-count = 1 →
+`Created`.
+
+#### 4.4.2 `create_budget` — definitional write against existing `ff_budget_policy`
+
+Migration 0013 (§4.4.5) extends `ff_budget_policy` with the
+breach / scheduling / definitional columns. `create_budget`'s
+INSERT populates them:
+
+```sql
+INSERT INTO ff_budget_policy
+    (partition_key, budget_id, policy_json, scope_type, scope_id,
+     enforcement_mode, breach_count, soft_breach_count,
+     last_breach_at_ms, last_breach_dim, next_reset_at_ms,
+     created_at_ms, updated_at_ms)
+VALUES ($1, $2, $3, $4, $5, $6, 0, 0, NULL, NULL,
+        CASE WHEN $7::bigint > 0 THEN $8::bigint + $7::bigint ELSE NULL END,
+        $8, $8)
+ON CONFLICT (partition_key, budget_id) DO NOTHING
+RETURNING created_at_ms;
+```
+
+`$7` is `reset_interval_ms`; when > 0, `next_reset_at_ms` is seeded
+to `now + interval` so the `budget_reset` reconciler picks it up.
+Matches Valkey's `ff_create_budget` `ZADD resets_zset` scheduling
+(flowfabric.lua:6522-6526).
+
+Row-count = 0 → `CreateBudgetResult::AlreadySatisfied`; row-count = 1
+→ `Created`.
+
+#### 4.4.3 `reset_budget` — manual admin FCALL + scheduler-compatible
+
+SERIALIZABLE tx (matches Valkey's Lua atomicity — the zero-all
+pattern must not see mid-flight increments from concurrent
+`report_usage_admin`):
+
+```sql
+-- Zero all usage rows for this budget.
+UPDATE ff_budget_usage
+SET current_value = 0, last_reset_at_ms = $3, updated_at_ms = $3
+WHERE partition_key = $1 AND budget_id = $2;
+
+-- Reset metadata + reschedule.
+UPDATE ff_budget_policy
+SET last_breach_at_ms = NULL,
+    last_breach_dim   = NULL,
+    updated_at_ms     = $3,
+    next_reset_at_ms  = CASE
+        WHEN (policy_json->>'reset_interval_ms')::bigint > 0
+        THEN $3 + (policy_json->>'reset_interval_ms')::bigint
+        ELSE NULL
+    END
+WHERE partition_key = $1 AND budget_id = $2
+RETURNING next_reset_at_ms;
+```
+
+Returns `ResetBudgetResult::Reset { next_reset_at_ms }`. If the
+row doesn't exist → `EngineError::NotFound { entity: "budget" }`
+(matches Valkey's no-op when the Hash is missing).
+
+**Reset scanner (Gap 2, Option B).** Valkey's scheduler-side
+`BudgetResetScanner` lives in `crates/ff-engine/src/scanner/budget_reset.rs`
+and is Valkey-native (ZRANGEBYSCORE + FCALL). Postgres adds a new
+Postgres-native reconciler in
+`crates/ff-backend-postgres/src/reconcilers/budget_reset.rs`
+(named `budget_reset` matching the Valkey scanner-name so
+observability metrics align across backends; wired into
+`reconcilers/mod.rs::register_all`). Cadence matches the existing
+`BudgetResetScanner::new(interval)` passed from
+`ff-server::config::budget_reset_interval` (server.rs:395) — the
+ff-server config knob drives both backends. Scan shape:
+
+```sql
+-- Per partition: pick due resets, bounded batch.
+SELECT budget_id
+FROM ff_budget_policy
+WHERE partition_key = $1
+  AND next_reset_at_ms IS NOT NULL
+  AND next_reset_at_ms <= $2
+ORDER BY next_reset_at_ms
+LIMIT $3;
+```
+
+Batch size matches existing scanners (20; see
+`crates/ff-backend-postgres/src/reconcilers/lease_expiry.rs` +
+`crates/ff-engine/src/scanner/budget_reset.rs:18`). For each
+returned `budget_id` the reconciler invokes the same
+`reset_budget_impl` codepath the admin FCALL uses — one
+SERIALIZABLE tx per budget (same retry budget as §4.2.3). Races
+between a manual `reset_budget` + the scanner's reset resolve
+identically to Valkey: both observe the same
+`next_reset_at_ms`-recompute + RETURNING, so the second commit is
+idempotent (re-zero-all is a no-op; next_reset_at_ms overwritten
+with the later `now + interval`, scanner picks it up next tick).
+
+#### 4.4.4 `create_quota_policy` / admission interaction (reference, not in-scope for 13-method Wave 9)
+
+`ff_check_admission_and_record` (the hot-path admission FCALL,
+Valkey `flowfabric.lua:6892-6974`) is **not** a Wave-9 method; it
+lives on the hot path and ships pre-Wave-9 on Valkey. Migration
+0012's schema is scoped to what `create_quota_policy` needs to
+persist + what future admission impls need to reference; admission
+itself is a separate backlog item, and the hot-path tx shape
+(SELECT FOR UPDATE on `ff_quota_policy` + INSERT on
+`ff_quota_window` + INSERT on `ff_quota_admitted` + concurrency
+INCR as a column UPDATE) is sketched here for schema-shape
+review only. Wave 9 ships the schema + `create_quota_policy` only;
+the admission impl is a follow-up on another wave.
+
+**Concurrency-column contention check (§7.12).** `active_concurrency`
+is a single column on `ff_quota_policy`; each admission/release
+UPDATEs `SET active_concurrency = active_concurrency + 1` (or -1)
+under `FOR UPDATE` row lock. If admission RPS per policy exceeds
+tens-of-thousands/sec this becomes a contention hotspot; at that
+point splitting to a separate `ff_quota_concurrency` table with
+sharded-counter shape is the migration. Wave 9 accepts the
+single-column shape because (a) admission is not Wave-9 scope
+(definition-write only), (b) Valkey's single-counter shape is the
+same semantics, and (c) the split migration is additive. Tracked
+as §7.12 open question.
+
+#### 4.4.5 Migrations 0012 + 0013 (additive)
+
+- **0012 `0012_quota_policy.sql`** — Gap 1. DDL in §4.4.1. Creates
+  `ff_quota_policy` + `ff_quota_window` + `ff_quota_admitted` (3
+  tables, 256-way HASH-partitioned) + indexes.
+  `backward_compatible=true`. Lands in the Standalone-1
+  implementation PR per §6.2.
+- **0013 `0013_budget_policy_extensions.sql`** — Gaps 2+3.
+  Additive ALTER on `ff_budget_policy`:
+
+```sql
+ALTER TABLE ff_budget_policy
+    ADD COLUMN scope_type          text   NOT NULL DEFAULT '',
+    ADD COLUMN scope_id            text   NOT NULL DEFAULT '',
+    ADD COLUMN enforcement_mode    text   NOT NULL DEFAULT '',
+    ADD COLUMN breach_count        bigint NOT NULL DEFAULT 0,
+    ADD COLUMN soft_breach_count   bigint NOT NULL DEFAULT 0,
+    ADD COLUMN last_breach_at_ms   bigint,
+    ADD COLUMN last_breach_dim     text,
+    ADD COLUMN next_reset_at_ms    bigint;
+
+CREATE INDEX ff_budget_policy_reset_due_idx
+    ON ff_budget_policy (partition_key, next_reset_at_ms)
+    WHERE next_reset_at_ms IS NOT NULL;
+```
+
+`backward_compatible=true` — all adds are nullable-or-defaulted.
+Existing rows get `scope_type=''`, `breach_count=0`,
+`next_reset_at_ms=NULL`. Wave 9's Standalone-1 impl populates the
+columns on `create_budget` writes post-0013; pre-0013-inserted rows
+return `scope_type=''` etc. in `get_budget_status` — degraded but
+non-breaking (matches the usual "new column on old rows" posture).
+The partial index `ff_budget_policy_reset_due_idx` backs the reset
+scanner query (§4.4.3) — partial because most budgets have
+`next_reset_at_ms=NULL` (no scheduled reset).
+
+`ALTER TABLE ... ADD COLUMN` with a defaulted NOT NULL column
+performs a table-rewrite on Postgres < 11; Postgres 12+ (the
+project's supported-version floor per `crates/ff-backend-postgres/README.md`)
+stores the default in catalog metadata and the ALTER is
+O(1)-metadata-only. Partition-child rewrite is not needed. The
+partial index is created with `CREATE INDEX CONCURRENTLY` per
+§6.2's no-stop-the-world rule.
+
+Migration numbering follows Wave 9's impl-effort order: 0010
+(operator_event) + 0011 (waitpoint-extensions) ship in spine-A pt.1
+and standalone-2 respectively; 0012 + 0013 ship in Standalone-1's
+PR. 0012 precedes 0013 because the quota schema is fresh (no prior
+rows) while 0013 ALTERs a populated table; ordering them
+0012-then-0013 mirrors "new table first, existing-table extension
+second" as a readability convention, not a hard dependency.
+
+#### 4.4.6 `report_usage_admin` + breach-counter maintenance (Gap 3)
+
+Revision 5's §7.2 pinned `report_usage_impl` as "already shipping,
+don't touch" to avoid hot-path scope creep. Revision 6 lifts the
+pin **for the breach-counter update specifically** and keeps it in
+place for every other aspect (READ COMMITTED isolation, FOR
+UPDATE per-dim row locking, dedup handling, policy parsing). The
+amendment is the narrowest possible extension:
+
+- On **hard breach** (current code at `budget.rs:287-302`): before
+  committing the `HardBreach` outcome, run
+  ```sql
+  UPDATE ff_budget_policy
+  SET breach_count = breach_count + 1,
+      last_breach_at_ms = $ts,
+      last_breach_dim   = $dim,
+      updated_at_ms     = $ts
+  WHERE partition_key = $pk AND budget_id = $bid;
+  ```
+  Matches Valkey's `HINCRBY breach_count 1` + `HSET
+  last_breach_at / last_breach_dim` at `flowfabric.lua:6576-6580`.
+- On **soft breach** (current code at `budget.rs:326-336`): after
+  the per-dim increments commit, increment `soft_breach_count`:
+  ```sql
+  UPDATE ff_budget_policy
+  SET soft_breach_count = soft_breach_count + 1,
+      updated_at_ms     = $ts
+  WHERE partition_key = $pk AND budget_id = $bid;
+  ```
+  Matches Valkey's `HINCRBY soft_breach_count 1` at
+  `flowfabric.lua:6614`.
+
+**Isolation discipline.** The existing `report_usage_impl` sets
+`READ COMMITTED` at `budget.rs:168-171` per 0002's Q11 note
+("budget ops run at READ COMMITTED + row-level `FOR UPDATE`, not
+SERIALIZABLE"). Breach-counter increments stay on the same tx +
+same isolation — they are additive UPDATEs against a row that's
+already referenced (the policy row was loaded `FOR SHARE` at
+`budget.rs:226-234`). The SERIALIZABLE retry budget from §4.2.3
+does **not** apply here: §4.2.3 retries are for cancel_flow ack
+races with backlog predicate reads, which are structurally absent
+from `report_usage_impl`. Contention is bounded by row-level lock
+on `ff_budget_policy`, which is already held `FOR SHARE` on the
+policy-load — the breach UPDATE upgrades the lock (Postgres row
+locks upgrade implicitly from SHARE to EXCLUSIVE on first
+mutation) and commits on tx commit. Two concurrent
+`report_usage_impl` calls that both hit hard-breach serialize on
+the UPDATE; `breach_count` stays monotonic (no lost updates — RC
++ row lock is sufficient for counter-increment semantics).
+
+**Hot-path latency impact (potential concern, flagged for
+measurement).** Every `report_usage_impl` call that results in a
+breach now runs one extra UPDATE. Non-breach calls are unaffected.
+Breach UPDATEs are partition-local (same partition as the policy
+row) + hit the primary-key partition child directly; cost is one
+row UPDATE under a lock already held. Expected impact: <50μs
+median overhead per breach; negligible on non-breach paths. If
+benchmarks surface a regression post-impl, the alternatives are
+(a) move breach counters to a separate `ff_budget_counters` table
+(Gap 3 Option B, rejected for Wave 9) to avoid policy-row
+contention, or (b) batch breach-counter updates via a dedicated
+scanner. Both are follow-up moves, not Wave-9 blockers.
+
+**`report_usage_admin` entry point.** Factor the shared body into
+`report_usage_and_check_core(tx, pool, partition_config, budget,
+dimensions, worker_instance: Option<&WorkerInstanceId>)`;
+`report_usage_impl` calls with `worker_instance = Some(&w)`,
+`report_usage_admin` calls with `worker_instance = None`. The
+worker-instance argument is not used by the breach-counter
+UPDATEs themselves (they are budget-scoped, not worker-scoped);
+the split is only to avoid leaking a phantom `WorkerInstanceId`
+field on the admin surface.
+
+#### 4.4.7 `get_budget_status` — 2-SELECT shape (Gap 4)
+
+Revision 5's "3 SELECTs (definition + usage + limits)" assumed
+limits lived in a separate Hash (mirroring Valkey's
+`budget_limits` key). In Postgres `hard_limits` + `soft_limits`
+are persisted inside `ff_budget_policy.policy_json` by
+`create_budget`'s writer (`budget.rs:382-396` already writes
+`policy_json` via `ON CONFLICT DO UPDATE`). Revision 6 collapses
+to 2 SELECTs:
+
+```sql
+-- SELECT 1: policy row (definitional + counters + scheduler).
+SELECT scope_type, scope_id, enforcement_mode,
+       breach_count, soft_breach_count,
+       last_breach_at_ms, last_breach_dim,
+       next_reset_at_ms, created_at_ms,
+       policy_json
+FROM ff_budget_policy
+WHERE partition_key = $1 AND budget_id = $2;
+
+-- SELECT 2: usage rows (one per dimension).
+SELECT dimensions_key, current_value
+FROM ff_budget_usage
+WHERE partition_key = $1 AND budget_id = $2;
+```
+
+Empty SELECT 1 → `EngineError::NotFound { entity: "budget" }` with
+a `backend_context` wrapper carrying the budget_id (matches
+Valkey's behavior at `lib.rs:5940-5951`). `hard_limits` +
+`soft_limits` are parsed from `policy_json` via the existing
+`limits_from_policy` helper (`budget.rs:243-244`). `usage` is the
+`dimensions_key → current_value` map from SELECT 2. The 9
+`BudgetStatus` `*_at_ms` integer columns are formatted to `Option<String>`
+via the same non-empty wrapper Valkey uses (`lib.rs:5985-5987`) so
+the contract shape matches byte-for-byte across backends.
+
+No JOIN — the two SELECTs are executed sequentially on the same
+connection (not in a transaction; budget status is a snapshot read
+and the two queries racing a concurrent `reset_budget` is
+acceptable — same eventual-consistency semantic as Valkey's 3×
+HGETALL). A single-query `LEFT JOIN` form was considered and
+rejected: per-dimension fan-out complicates deserialization + the
+two-query form stays partition-local on both reads.
+
+#### 4.4.8 Summary of Standalone-1 query shapes (post-Revision-6)
+
+| Method | Query shape | Table(s) touched |
+|---|---|---|
+| `create_budget` | 1 INSERT ON CONFLICT | `ff_budget_policy` |
+| `reset_budget` | 2 UPDATEs + RETURNING (SERIALIZABLE tx) | `ff_budget_usage`, `ff_budget_policy` |
+| `create_quota_policy` | 1 INSERT ON CONFLICT | `ff_quota_policy` |
+| `get_budget_status` | 2 SELECTs | `ff_budget_policy`, `ff_budget_usage` |
+| `report_usage_admin` | shared `report_usage_and_check_core` (RC tx) | `ff_budget_policy`, `ff_budget_usage`, `ff_budget_usage_dedup` |
 
 ### 4.5 Standalone-2 — `list_pending_waitpoints`
 
@@ -805,7 +1211,18 @@ drove:
    response structs, and landing read shapes first de-risks the
    spine's `SELECT ... FOR UPDATE` templates.
 2. **Standalone-1 — Budget / quota admin (5 methods).** No
-   cross-coupling; unblocks `examples/token-budget` on Postgres.
+   cross-coupling with spine-A/B. Lands **migrations 0012 + 0013**
+   (§4.4.5): 0012 adds the `ff_quota_policy` family (3 tables);
+   0013 extends `ff_budget_policy` with 8 additive columns +
+   partial index on `next_reset_at_ms`. Lands the new
+   `BudgetResetReconciler` at
+   `crates/ff-backend-postgres/src/reconcilers/budget_reset.rs`
+   (§4.4.3) + wires it into `reconcilers/mod.rs::register_all`
+   so `examples/token-budget` sees periodic resets on Postgres
+   matching Valkey. Extends `report_usage_impl` with breach-counter
+   UPDATEs (§4.4.6) — Revision 5's §7.2 pin lifted narrowly for
+   this extension only. Unblocks `examples/token-budget` on
+   Postgres (§6.3 release-gate).
 3. **Spine-A pt.1 — `cancel_execution` + `revoke_lease` +
    `change_priority` (3 methods).** Tables:
    `ff_exec_core` / `ff_attempt` / `ff_lease_event` (existing);
@@ -820,8 +1237,8 @@ drove:
 5. **Spine-A pt.2 — `cancel_flow_header` + `ack_cancel_member` +
    `replay_execution` (3 methods).** Introduces
    `ff_cancel_backlog` + `ff_cancel_backlog_member` (migration
-   numbered after 0011); emits on the `ff_operator_event` channel
-   landed in step 3.
+   0014, after Standalone-1's 0012+0013); emits on the
+   `ff_operator_event` channel landed in step 3.
 
 Each step is its own PR; the release is cut **only after all five
 steps merge**. A step that cannot land cleanly withdraws the wave
@@ -839,12 +1256,16 @@ lands its own migration file (numbered sequentially after `0009_*`):
   CONFLICT DO NOTHING`. Re-running `migrate()` is a no-op.
 - **Additive.** No column drops, no type changes on existing
   columns. Wave 9 adds:
-  - `ff_cancel_backlog` + `ff_cancel_backlog_member` (spine-A pt.2
-    step, numbered after 0011 in impl-order).
   - `ff_operator_event` outbox table + trigger (migration 0010,
     lands with spine-A pt.1).
   - Additive columns on `ff_waitpoint_pending` (migration 0011,
     lands with standalone-2 step).
+  - `ff_quota_policy` + `ff_quota_window` + `ff_quota_admitted`
+    (migration 0012, lands with Standalone-1 step).
+  - Additive columns + partial index on `ff_budget_policy`
+    (migration 0013, lands with Standalone-1 step).
+  - `ff_cancel_backlog` + `ff_cancel_backlog_member` (spine-A pt.2
+    step, numbered 0014 after 0013 in impl-order).
   No destructive DDL.
 - **No stop-the-world.** `CREATE INDEX CONCURRENTLY` for any
   indexes added post-0001. Table creation + annotation inserts
@@ -899,8 +1320,14 @@ README sweep, etc.), Wave 9 adds:
 - **`examples/token-budget/` runs green on `FF_BACKEND=postgres`.**
   This example exercises Standalone-1 (create_budget / reset_budget
   / create_quota_policy / get_budget_status / report_usage_admin)
-  end-to-end. It must PASS on the Postgres backend before tag; a
-  failure withdraws the release (whole-wave-or-withdraw).
+  end-to-end — including `status.breach_count` / `soft_breach_count`
+  post-mortem reads at `examples/token-budget/src/main.rs:200-201`,
+  which require the migration 0013 columns + the §4.4.6
+  `report_usage_impl` breach-counter extension. Revision 6 keeps
+  §6.3's existing gate unchanged; the Standalone-1 PR (§6.1 step 2)
+  is the milestone at which this gate starts passing. It must PASS
+  on the Postgres backend before tag; a failure withdraws the
+  release (whole-wave-or-withdraw).
 - Smoke runs against the published artifact per
   [feedback_smoke_before_release].
 
@@ -918,12 +1345,21 @@ projection. Cairn's call pattern is one-exec-at-a-time on operator
 click; projection-table write amplification across every state
 transition is not justified. See §4.1.
 
-### 7.2 Budget counter granularity — **RESOLVED in §4.4**
+### 7.2 Budget counter granularity — **RESOLVED in §4.4 (Revision 6 refinement)**
 
 `report_usage_impl` already ships
-(`crates/ff-backend-postgres/src/budget.rs:154`). The granularity
-choice is already made in-tree; admin methods commit to match that
-shape. Not an open fork.
+(`crates/ff-backend-postgres/src/budget.rs:154`). The per-dimension
+granularity choice is already made in-tree; admin methods commit to
+match that shape. Revision 6 narrowly extends `report_usage_impl`
+(§4.4.6) to maintain `breach_count` / `soft_breach_count` /
+`last_breach_at_ms` / `last_breach_dim` on `ff_budget_policy`
+(migration 0013) — this is the Gap-3 resolution. The pin from
+Revisions 2-5 ("don't touch the shipped hot-path code") is lifted
+for this specific additive UPDATE and kept in place for all other
+aspects of `report_usage_impl` (isolation level, FOR UPDATE
+per-dim row locking, dedup shape). See §4.4.6 for isolation +
+contention analysis; potential-hot-path-impact flagged but
+expected to be <50μs per breach on partition-local UPDATEs.
 
 ### 7.3 Operator-control outbox emission — **RESOLVED in §4.2.7 (Option X in Revision 3)**
 
@@ -982,14 +1418,50 @@ flow size, and the header-level `flow_cancel_requested` event
 already drives all observer re-projection needs. No owner-call
 fork.
 
-### 7.10 Remaining owner-call items (push if needed)
+### 7.11 Budget-policy row contention on breach-UPDATE (Revision 6, flagged)
 
-None. All Round-2 findings resolved in Revision 3 via agent
-autonomy (Option X outbox channel, additive waitpoint migration,
-atomic-at-release-PR flip, C3a–d). If the owner disagrees with any
-resolution (Option X vs Y; additive-migration vs join-derive for
-waitpoint; `get_execution_result` semantics; ack silence), §7
-reopens the specific item in Round-4.
+Revision 6 §4.4.6 extends `report_usage_impl` to UPDATE
+`ff_budget_policy.breach_count` on every hard-breach call. Under
+concurrent hard-breach load (same budget_id, many simultaneous
+`report_usage` callers), these UPDATEs serialize on the policy
+row's EXCLUSIVE lock. Expected scenarios see <10 concurrent
+breaches/budget/sec (breaches are exceptional — typical load
+returns OK/SoftBreach), so this is not expected to be a hotspot.
+If post-impl benchmarks surface >500μs p99 on hard-breach paths,
+the fallback is to migrate breach counters to a separate
+`ff_budget_counters` table (Gap 3 Option B). This is an
+additive migration — the policy-row counters become derived
+history, and the hot-path writes move to the separate table with
+a sharded-counter shape. Tracked as a Wave-10 follow-up; not a
+Wave-9 blocker. Flagged per Revision 6's Gap-3 analysis.
+
+### 7.12 Quota-policy concurrency-column contention (Revision 6, flagged)
+
+Migration 0012 lands `active_concurrency` as a column on
+`ff_quota_policy`. Admission + release UPDATEs `SET
+active_concurrency = active_concurrency +/- 1` under a `FOR UPDATE`
+row lock, serializing all admission RPS against the single row.
+Wave 9 ships the quota *schema* + `create_quota_policy` only —
+admission (`ff_check_admission_and_record` parity) is not
+Wave-9 scope. At typical admission RPS (hundreds/sec/policy)
+the single-row lock is fine; at RPS >10k/policy/sec the row
+becomes a hotspot. Mitigation: split to a separate
+`ff_quota_concurrency` table with sharded-counter shape when the
+hot-path admission impl lands. Flagged here so the admission
+RFC (future, not Wave 9) addresses it before shipping hot-path
+code against a contention-prone shape.
+
+### 7.13 Remaining owner-call items (push if needed)
+
+None. Revision 3 resolved Round-2 findings (Option X outbox,
+additive waitpoint migration, atomic-at-release-PR flip, C3a–d).
+Revision 6 adds two flagged-but-not-blocking open questions (§7.11
++ §7.12) around post-impl contention measurement — both have
+additive follow-up migrations as the mitigation path, neither is
+a Wave-9 blocker. If the owner disagrees with any resolution
+(Option X vs Y; additive-migration vs join-derive for waitpoint;
+`get_execution_result` semantics; ack silence; §7.11 / §7.12
+hotspot tolerance), §7 reopens the specific item.
 
 ---
 
@@ -1070,15 +1542,19 @@ shape into a prerequisite "RFC-020a schema-shape" doc, with RFC-020
 depending on it. Argument: schema decisions govern all future PG
 read APIs, not just Wave 9.
 
-**Rejected.** The schema decisions in Revision 3 remain contained:
+**Rejected.** The schema decisions in Revision 6 remain contained:
 join-on-read against existing columns (no new projection tables);
 one new backlog pair; one new operator-event outbox channel
 (migration 0010); three additive columns on an existing table
-(migration 0011). None of these is a forward-facing primitive that
-warrants a separate RFC audience — they are all mechanical
-prerequisites for the method impls this RFC proposes. If a future
-Wave-10 introduces projection tables or cross-cutting schema
-shapes, it is welcome to split at that time. RFC-020 stays
+(migration 0011); the `ff_quota_policy` family (migration 0012)
+mirroring Valkey's already-shipped quota key layout one-to-one;
+and additive columns on `ff_budget_policy` (migration 0013) that
+close `BudgetStatus` data-availability gaps. None of these is a
+forward-facing primitive that warrants a separate RFC audience —
+they are all mechanical prerequisites for the method impls this
+RFC proposes, each traceable to a specific Valkey-canonical shape.
+If a future Wave-10 introduces projection tables or cross-cutting
+schema shapes, it is welcome to split at that time. RFC-020 stays
 single-doc.
 
 ### 8.6a Repurpose `ff_signal_event` for operator-control events
@@ -1152,7 +1628,30 @@ are not.
 - `crates/ff-backend-postgres/src/lib.rs` — current `Unavailable`
   sites (grep `EngineError::Unavailable`)
 - `crates/ff-backend-postgres/src/budget.rs:154` — shipped
-  `report_usage_impl` (the §4.4 / §7.2 binding shape)
+  `report_usage_impl` (the §4.4 / §7.2 binding shape; Revision 6
+  §4.4.6 amends with breach-counter UPDATEs)
+- `crates/ff-backend-postgres/migrations/0002_budget.sql` — real
+  budget schema (Revision 6 Gap-3 base: `ff_budget_policy` +
+  `ff_budget_usage` + `ff_budget_usage_dedup`; 0013 extends
+  `ff_budget_policy` with 8 columns)
+- `crates/ff-core/src/contracts/mod.rs:1388-1407` —
+  `CreateQuotaPolicyArgs` / `CreateQuotaPolicyResult` (Revision 6
+  Gap-1 contract)
+- `crates/ff-core/src/contracts/mod.rs:1413-1430` — `BudgetStatus`
+  contract ground-truth (Revision 6 Gap-3 driver: 9 fields without
+  column sources pre-0013)
+- `crates/ff-core/src/keys.rs:573-615` — `QuotaKeyContext` Valkey
+  key layout (Revision 6 Gap-1 shape reference for 0012)
+- `crates/ff-script/src/flowfabric.lua:6451-6676` — Valkey
+  `ff_create_budget` / `ff_report_usage_and_check` / `ff_reset_budget`
+  (Revision 6 §4.4.6 breach-counter pattern source)
+- `crates/ff-script/src/flowfabric.lua:6839-6878` — Valkey
+  `ff_create_quota_policy` (Revision 6 Gap-1 reference)
+- `crates/ff-backend-valkey/src/lib.rs:5109-5204` + `5921-6010`
+  — Valkey Rust impls of Standalone-1's 5 admin methods
+- `crates/ff-engine/src/scanner/budget_reset.rs` — Valkey budget-
+  reset scanner shape (Revision 6 §4.4.3 basis for the Postgres-
+  native `reconcilers/budget_reset.rs`)
 - `crates/ff-backend-postgres/src/reconcilers/lease_expiry.rs` —
   the §4.2.6 race partner
 - `crates/ff-backend-postgres/src/reconcilers/attempt_timeout.rs`
