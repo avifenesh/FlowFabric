@@ -139,15 +139,30 @@ mod tests {
 
     #[test]
     fn classifier_matches_busy() {
+        // Primary codes.
         assert!(db_err("5").is_retryable_busy(), "SQLITE_BUSY (5)");
         assert!(db_err("6").is_retryable_busy(), "SQLITE_LOCKED (6)");
-        assert!(
-            db_err("517").is_retryable_busy(),
-            "SQLITE_BUSY_SNAPSHOT (517)"
-        );
+        // BUSY extended codes: low 8 bits == 5.
         assert!(
             db_err("261").is_retryable_busy(),
-            "SQLITE_LOCKED_SHAREDCACHE (261)"
+            "SQLITE_BUSY_RECOVERY (261 = 5 | 1<<8)"
+        );
+        assert!(
+            db_err("517").is_retryable_busy(),
+            "SQLITE_BUSY_SNAPSHOT (517 = 5 | 2<<8)"
+        );
+        assert!(
+            db_err("773").is_retryable_busy(),
+            "SQLITE_BUSY_TIMEOUT (773 = 5 | 3<<8)"
+        );
+        // LOCKED extended codes: low 8 bits == 6.
+        assert!(
+            db_err("262").is_retryable_busy(),
+            "SQLITE_LOCKED_SHAREDCACHE (262 = 6 | 1<<8)"
+        );
+        assert!(
+            db_err("518").is_retryable_busy(),
+            "SQLITE_LOCKED_VTAB (518 = 6 | 2<<8)"
         );
     }
 
@@ -172,6 +187,16 @@ mod tests {
     #[test]
     fn classifier_rejects_non_db_error() {
         assert!(!sqlx::Error::RowNotFound.is_retryable_busy());
+    }
+
+    #[test]
+    fn classifier_rejects_extended_non_busy_family() {
+        // SQLITE_IOERR = 10; SQLITE_IOERR_READ = 10 | 1<<8 = 266.
+        // High byte collides nothing with BUSY/LOCKED — low 8 bits
+        // must be 5 or 6 for a match. Guard against future mask bugs.
+        assert!(!db_err("266").is_retryable_busy());
+        // SQLITE_CONSTRAINT = 19; SQLITE_CONSTRAINT_UNIQUE = 19 | 8<<8 = 2067.
+        assert!(!db_err("2067").is_retryable_busy());
     }
 
     // ── retry_serializable tests ─────────────────────────────────

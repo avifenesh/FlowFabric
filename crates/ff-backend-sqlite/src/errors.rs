@@ -23,11 +23,17 @@ pub use crate::retry::MAX_ATTEMPTS;
 /// [`crate::retry::retry_serializable`].
 pub fn is_retryable_sqlite_busy(err: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db_err) = err {
-        // sqlx's SQLite driver surfaces extended result codes via the
-        // `code()` accessor. The three SQLITE_BUSY / SQLITE_LOCKED
-        // families are decimal 5 and 6 in the base result codes.
-        if let Some(code) = db_err.code() {
-            return matches!(code.as_ref(), "5" | "6" | "517" | "261");
+        // sqlx's SQLite driver surfaces the *extended* result code via
+        // `DatabaseError::code()` (see `sqlx_sqlite::SqliteError` —
+        // uses `sqlite3_extended_errcode`). We must match the primary
+        // codes (5, 6) AND every extended code whose low 8 bits are
+        // 5 or 6 so BUSY_RECOVERY / BUSY_SNAPSHOT / BUSY_TIMEOUT /
+        // LOCKED_SHAREDCACHE / LOCKED_VTAB all classify as retryable.
+        if let Some(code) = db_err.code()
+            && let Ok(n) = code.parse::<i32>()
+        {
+            let primary = n & 0xff;
+            return primary == 5 || primary == 6;
         }
     }
     false
