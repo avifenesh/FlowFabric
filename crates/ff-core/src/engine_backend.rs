@@ -82,7 +82,7 @@ use crate::engine_error::EngineError;
 use crate::types::AttemptIndex;
 #[cfg(feature = "core")]
 use crate::types::EdgeId;
-use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
+use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
 
 /// The engine write surface — a single trait a backend implementation
 /// honours to serve a `FlowFabricWorker`.
@@ -188,6 +188,36 @@ pub trait EngineBackend: Send + Sync + 'static {
         handle: &Handle,
         args: SuspendArgs,
     ) -> Result<SuspendOutcome, EngineError>;
+
+    /// Suspend by execution id + lease fence triple, for service-layer
+    /// callers that hold a run record / lease-claim descriptor but no
+    /// worker [`Handle`] (cairn issue #322).
+    ///
+    /// Semantics mirror [`Self::suspend`] exactly — the same
+    /// [`SuspendArgs`] validation, the same [`SuspendOutcome`]
+    /// lifecycle, the same RFC-013 §3 dedup / replay contract. The
+    /// only difference is the fencing source: instead of the
+    /// `(lease_id, lease_epoch, attempt_id)` fields embedded in a
+    /// `Handle`, the backend fences against the triple passed directly.
+    /// Attempt-index, lane, and worker-instance metadata that
+    /// [`Self::suspend`] reads from the handle payload are recovered
+    /// from the backend's authoritative execution record (Valkey:
+    /// `exec_core` HGETs; Postgres: `ff_attempt` row lookup).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so
+    /// existing backend impls remain non-breaking. Production backends
+    /// (Valkey, Postgres) override.
+    async fn suspend_by_triple(
+        &self,
+        exec_id: ExecutionId,
+        triple: LeaseFence,
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        let _ = (exec_id, triple, args);
+        Err(EngineError::Unavailable {
+            op: "suspend_by_triple",
+        })
+    }
 
     /// Issue a pending waitpoint for future signal delivery.
     ///

@@ -31,8 +31,8 @@ use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::{encode as encode_opaque, HandlePayload};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::{
-    AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, SignalId, SuspensionId, TimestampMs,
-    WaitpointId,
+    AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, LeaseFence, SignalId, SuspensionId,
+    TimestampMs, WaitpointId,
 };
 use serde_json::{json, Value as JsonValue};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -265,6 +265,66 @@ pub(crate) async fn suspend_impl(
     args: SuspendArgs,
 ) -> Result<SuspendOutcome, EngineError> {
     let payload = decode_handle(handle)?;
+    suspend_core(pool, payload, args).await
+}
+
+/// Cairn #322 — service-layer entry point: suspend when the caller
+/// holds a lease fence triple but no `Handle`. Resolves `attempt_index`
+/// from `ff_attempt` by `(exec_id, attempt_id)` then delegates to the
+/// same transactional body used by [`suspend_impl`].
+pub(crate) async fn suspend_by_triple_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    exec_id: ExecutionId,
+    triple: LeaseFence,
+    args: SuspendArgs,
+) -> Result<SuspendOutcome, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&exec_id)?;
+    // Postgres-side attempts are keyed by `(execution_id, attempt_index)`;
+    // there is no `attempt_id` column on `ff_attempt`. The triple's
+    // `attempt_id` is therefore advisory on this backend — the
+    // authoritative "which attempt" pointer lives on `ff_exec_core`.
+    // Read it outside the serializable body; `suspend_core` re-fences
+    // against `lease_epoch` (`FOR UPDATE`) inside the txn so a racing
+    // attempt-bump or lease-bump surfaces as `Contention(LeaseConflict)`.
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT attempt_index FROM ff_exec_core \
+         WHERE partition_key = $1 AND execution_id = $2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    let attempt_index_i = match row {
+        Some((i,)) => i,
+        None => return Err(EngineError::NotFound { entity: "execution" }),
+    };
+    let attempt_index =
+        AttemptIndex::new(u32::try_from(attempt_index_i.max(0)).unwrap_or(0));
+
+    // Synthesize a HandlePayload — `suspend_core` only reads
+    // `execution_id`, `attempt_index`, and `lease_epoch`; the rest of
+    // the payload fields are carried through to the replayed-outcome
+    // handle encoding (kind = Suspended).
+    let payload = HandlePayload::new(
+        exec_id,
+        attempt_index,
+        triple.attempt_id,
+        triple.lease_id,
+        triple.lease_epoch,
+        0,
+        ff_core::types::LaneId::new(""),
+        ff_core::types::WorkerInstanceId::new(""),
+    );
+    suspend_core(pool, payload, args).await
+}
+
+async fn suspend_core(
+    pool: &PgPool,
+    payload: HandlePayload,
+    args: SuspendArgs,
+) -> Result<SuspendOutcome, EngineError> {
     let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
     let attempt_index_i = i32::try_from(payload.attempt_index.0).unwrap_or(0);
     let expected_epoch = payload.lease_epoch.0;
