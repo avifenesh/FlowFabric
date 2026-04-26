@@ -191,7 +191,7 @@ pub(crate) async fn report_usage_admin_impl(
         });
     }
     let mut custom: BTreeMap<String, u64> = BTreeMap::new();
-    for (d, v) in args.dimensions.into_iter().zip(args.deltas.into_iter()) {
+    for (d, v) in args.dimensions.into_iter().zip(args.deltas) {
         custom.insert(d, v);
     }
     // `UsageDimensions` is `#[non_exhaustive]`; build via `new()` +
