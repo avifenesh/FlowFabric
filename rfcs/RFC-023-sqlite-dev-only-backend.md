@@ -1,13 +1,57 @@
 # RFC-023: SQLite — dev-only backend (testing harness, Temporal-pattern)
 
 **Status:** ACCEPTED
-**Revision:** 3
+**Revision:** 4
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
 **Target release:** v0.12.0 (next content delivery after v0.11.0 Postgres Wave 9)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions), RFC-020 (Postgres Wave 9 — shipped v0.11.0), RFC-022 (parked: full-parity SQLite — superseded in scope by this RFC)
 **Tracking issue:** #338
+
+### Revision 4 summary (2026-04-26)
+
+Post-acceptance Round-3 extra-sanity review yielded 6 structural
+findings across Reviewers A (technical) and B (consumer); Reviewer
+C was ACCEPT-as-is. No scope changes; each edit traces to a numbered
+finding:
+
+- **A1 (§4.4, §4.7.1).** Committed disposition (a) — the
+  `FlowFabricWorker` re-export at `crates/ff-sdk/src/lib.rs:149` must
+  move out of the `valkey-default` cfg gate to remain addressable
+  under cairn's `default-features = false, features = ["sqlite"]`
+  dependency posture. Added as a §4.4 item and footnoted in §4.7.1.
+- **A2 (§4.2).** `subscribe_completion` parity with PG v0.11 requires
+  porting outbox migrations `0006_lease_event_outbox.sql`,
+  `0007_signal_event_outbox.sql`, `0010_operator_event_outbox.sql`
+  to SQLite (INSERT paths intact). Broadcast channel is WAKEUP only;
+  cursor-resume replay goes through the outbox per RFC-019 contract.
+- **A3 (§3.3, §4.5).** Resolved dual-emission ambiguity: banner
+  emits ONLY from `SqliteBackend::new` (the TYPE-level guard per
+  §4.5); the server branch detects construction failure and maps
+  the error but does not emit its own banner.
+- **B1 (§8, §4.4).** Committed disposition (a): `ServerError` at
+  `crates/ff-server/src/server.rs:90` and `ServerConfig` at
+  `crates/ff-server/src/config.rs:103` are NOT `#[non_exhaustive]`
+  today; both gain the attribute in the same v0.12.0 PR that adds
+  the new variant/field. §8 rewritten honestly — this is a minor
+  breaking change for exhaustive-match and struct-literal consumers.
+- **B2 (§4.5).** Committed exact embedded-path error text to parity
+  with the §3.3 server-path text; both carry the docs URL.
+- **B3 (§9, §4.7.1).** `docs/dev-harness.md` content-spec tightened
+  to name `.cargo/config.toml [env]` as canonical; added §4.7.1
+  footnote warning that stray `FF_HOST` / `FF_PORT` /
+  `FF_CONNECTION_URL` env must be unset because
+  `FlowFabricWorker::connect_with` at `crates/ff-sdk/src/worker.rs:587-590`
+  internally dispatches through `connect` before backend swap.
+
+Plus two non-blocking C-trivia inclusions:
+
+- **C-trivia-1 (§4.4 item 4).** `sqlite_dev()` disables ALL auth
+  axes — worker token, admin token, waitpoint HMAC — stated
+  explicitly.
+- **C-trivia-2 (§4.1).** `.sqlite-skip` sidecar format: one path
+  per line, `#` comments, optional `# issue:NNN` suffix.
 
 ### Revision 3 summary (2026-04-26)
 
@@ -232,6 +276,18 @@ with the same message text. The embedded path is not a production
 bypass; every path that produces a `SqliteBackend` handle pays the
 guard.
 
+**Single emission point — banner lives on the TYPE (A3).** Both
+the HTTP branch (`start_sqlite_branch`) and the embedded path
+ultimately construct `SqliteBackend::new`. The banner + `FF_DEV_MODE`
+check fire inside `SqliteBackend::new` so every path that yields a
+`SqliteBackend` handle gets exactly one banner emission. The HTTP
+branch does NOT re-emit the banner; it wraps `SqliteBackend::new`
+construction failure into `ServerError::SqliteRequiresDevMode`
+(mapping only) and otherwise lets the type-level emission stand.
+This prevents duplicate banners under HTTP boot (previously Round-2
+text read ambiguously as if both layers emit). See §4.5 for the
+enforcement split.
+
 **Relationship to existing dev axes (B4).** FF already has two
 dev-leaning env knobs: `FF_ENV=development` and
 `FF_BACKEND_ACCEPT_UNREADY=1` (see
@@ -324,6 +380,22 @@ skip-list entry MUST cite a tracking issue. Lint wired into
 `cargo check`. This promotes the Round-1 §7.3 open question to a
 decided in-scope deliverable; no more owner fork there.
 
+**`.sqlite-skip` file format (C-trivia-2).** One relative path per
+line (pointing at the PG migration that is intentionally skipped);
+`#`-prefixed lines are comments; an inline `# issue:NNN` suffix on
+a path line is the canonical shape for citing the tracking issue.
+Blank lines are ignored. Example:
+
+```
+# PG-only partitioning admin migration; no SQLite analogue.
+0012_partition_admin_ops.sql  # issue:501
+
+# Full-text search GIN migration - deferred; SQLite FTS5 port TBD.
+0013_pg_fts_indexes.sql  # issue:502
+```
+
+The lint parses this format directly; no TOML/YAML frame.
+
 **Runtime SQL (the ~10 inline `jsonb_build_object` / `jsonb_set`
 sites in the PG backend):** options: (a) fork the Rust
 query-module per backend (duplicate strings); (b) per-query
@@ -359,6 +431,37 @@ Ordering: PG guarantees `pg_notify` fires at COMMIT in commit
 order. Broadcast emit fires after `tx.commit()` returns,
 per-writer, and there is exactly one writer (§4.6). Commit-order
 fan-out preserved by construction.
+
+**Cursor-resume semantic — outbox-inside-tx + broadcast-as-wakeup
+(A2).** PG v0.11 achieves late-subscriber cursor-resume (RFC-019)
+via outbox tables (`0006_lease_event_outbox.sql`,
+`0007_signal_event_outbox.sql`, `0010_operator_event_outbox.sql`)
+written INSIDE the operating transaction, plus `pg_notify` as the
+wakeup. A consumer that connects after an event committed can still
+replay via `SELECT ... FROM outbox WHERE id > :cursor` before
+attaching `LISTEN`. The broadcast channel alone cannot provide this
+— `tokio::sync::broadcast` has no history beyond its ring buffer,
+so a late subscriber would miss committed events.
+
+**SQLite port MUST preserve the same shape:**
+
+- Outbox migrations `0006`, `0007`, `0010` port to SQLite with their
+  INSERT paths intact (1:1 numbered per §4.1 parity-drift lint).
+  Rows carry the same monotonic cursor column PG uses.
+- Write paths (complete/fail/signal/operator-op) INSERT into the
+  outbox inside the transaction and then emit on the broadcast
+  channel AFTER `tx.commit()` returns. The broadcast emit is the
+  WAKEUP only.
+- `subscribe_completion` / `subscribe_lease_history` /
+  `subscribe_signal_delivery` subscribers cursor-resume from the
+  outbox table (SELECT rows after the caller's cursor), then attach
+  the broadcast receiver for forward events. Hand-off point is the
+  outbox tail at the moment of broadcast subscribe — mirrors the PG
+  `LISTEN`-then-`SELECT` handshake.
+
+This satisfies the RFC-019 cursor-resume contract consumers already
+depend on without requiring cross-process fan-out (which remains a
+permanent non-goal, §5).
 
 **Cross-process subscribe fan-out — intentionally unsupported
 (A2).** Cross-process subscribe fan-out is a PG-only property via
@@ -464,10 +567,15 @@ trait-implementation. Enumerated:
    `FF_SQLITE_POOL_SIZE` (default 4) populates `sqlite.pool_size`.
 4. **`ServerConfig::sqlite_dev()`** constructor added — a
    builder shortcut that returns a pre-wired `ServerConfig` with
-   `backend = Sqlite`, `sqlite.path = ":memory:"`, all auth
-   disabled, listen_addr bound to `127.0.0.1:0` (OS-picked port),
-   suitable for `Worker::connect_with` embedded tests per §4.7.
-   Narrow to dev; no prod path constructs this.
+   `backend = Sqlite`, `sqlite.path = ":memory:"`, ALL auth axes
+   disabled (`api_token = None`, admin-token disabled,
+   `waitpoint_hmac_secret` set to a dev-only placeholder that
+   refuses to accept tokens from outside the same process — cairn
+   tests don't round-trip waitpoint tokens through a network
+   surface so this is safe), listen_addr bound to `127.0.0.1:0`
+   (OS-picked port), suitable for `Worker::connect_with` embedded
+   tests per §4.7. Narrow to dev; no prod path constructs this.
+   (C-trivia-1.)
 5. **`BACKEND_STAGE_READY`** (`server.rs:33`) extended to
    `&["valkey", "postgres", "sqlite"]`.
 6. **`start_sqlite_branch`** added to `server.rs`, parallel to
@@ -490,6 +598,36 @@ trait-implementation. Enumerated:
    backend wired.
 7. **`ServerError::SqliteRequiresDevMode`** added to
    `server.rs` error enum (alongside `BackendNotReady`).
+8. **`ServerError` gains `#[non_exhaustive]`** at
+   `crates/ff-server/src/server.rs:90` (B1). Ground-truth
+   verification at Revision 4: the enum is NOT `#[non_exhaustive]`
+   today, so adding `SqliteRequiresDevMode` is a minor breaking
+   change for exhaustive-match consumers. The attribute is added
+   in the same v0.12.0 PR to absorb this break and all future
+   variant additions. §8 rewritten to own this honestly.
+9. **`ServerConfig` gains `#[non_exhaustive]`** at
+   `crates/ff-server/src/config.rs:103` (B1). Same rationale:
+   adding the `sqlite: SqliteServerConfig` field (item 2) breaks
+   struct-literal construction, so struct-literal consumers
+   already have to migrate; adding `#[non_exhaustive]` in the same
+   PR locks in the proper long-term shape.
+10. **`FlowFabricWorker` re-export moves out of `valkey-default`
+    cfg gate** (A1). Today at `crates/ff-sdk/src/lib.rs:149` the
+    re-export reads `#[cfg(feature = "valkey-default")] pub use
+    worker::FlowFabricWorker;`. Under cairn's canonical dependency
+    posture (`ff-sdk = { ..., default-features = false, features =
+    ["sqlite"] }`) the re-export vanishes and the §4.7.1 embedded
+    example stops compiling. Fix is disposition (a) from Round-3:
+    drop the cfg gate entirely — `FlowFabricWorker` is
+    backend-agnostic per RFC-012 #164 (it already accepts
+    `Arc<dyn EngineBackend>` via `connect_with`). The `worker`
+    module itself carries no valkey-only dep in its public path;
+    the gate existed only to avoid a downstream
+    `FlowFabricWorker::connect` env-URL construction requirement,
+    which the `connect_with` embedded path sidesteps. Net diff: one
+    `#[cfg(feature = "valkey-default")]` line removed, no new
+    public surface, zero behavior change for
+    `valkey-default`-enabled consumers.
 
 **Embedded, no-HTTP consumers** continue to use the existing
 `Server::start_with_backend` (`server.rs:677`) by constructing
@@ -504,6 +642,11 @@ EngineBackend>` shape and is the cairn-canonical embedded path.
 - `BackendKind::Sqlite`
 - `ServerConfig::sqlite: SqliteServerConfig`
 - `ServerConfig::sqlite_dev() -> Self`
+- `ServerError::SqliteRequiresDevMode` (variant)
+- `ServerError` and `ServerConfig` gain `#[non_exhaustive]` (B1)
+- `ff_sdk::FlowFabricWorker` becomes addressable under
+  `default-features = false, features = ["sqlite"]` (re-export
+  cfg-gate removed, A1)
 - `FF_BACKEND=sqlite`, `FF_SQLITE_PATH`, `FF_SQLITE_POOL_SIZE`,
   `FF_DEV_MODE`
 
@@ -515,36 +658,55 @@ items above; the library-level boot path itself is unchanged.
 
 ### 4.5 Production-guard mechanism
 
-Per §3.3. Two symmetric enforcement points:
-
-**HTTP path — `Server::start_sqlite_branch`** (new, §4.4 item 6
-in `crates/ff-server/src/server.rs`): checks
-`std::env::var("FF_DEV_MODE").as_deref() == Ok("1")` before any
-backend construction. Absent → returns
-`ServerError::SqliteRequiresDevMode` with the §3.3 error text.
-Present → emits the warn banner on the tracing root before
-`SqliteBackend::new` runs.
+Per §3.3. Emission lives on the TYPE (§3.3 A3); the HTTP branch
+maps errors and does not double-emit.
 
 **Embedded path — `SqliteBackend::new`** (library entrypoint in
-`crates/ff-backend-sqlite/src/lib.rs`): performs the SAME
-`FF_DEV_MODE=1` check at the top of the function. Absent →
-returns a new `BackendError::RequiresDevMode` variant (parallel
-shape to `ServerError::SqliteRequiresDevMode`; adds a new variant
-on the existing `#[non_exhaustive]` `BackendError` enum at
-`crates/ff-core/src/engine_error.rs:488`. Does NOT extend
-`BackendErrorKind`, which is scoped to Valkey transport
-classification per its existing rustdoc). Present → emits the warn
-banner on construction. Reason: cairn and FF-internal embedded
+`crates/ff-backend-sqlite/src/lib.rs`, the SINGLE enforcement +
+emission point): checks
+`std::env::var("FF_DEV_MODE").as_deref() == Ok("1")` at the top of
+the function. Absent → returns a new `BackendError::RequiresDevMode`
+variant (parallel shape to `ServerError::SqliteRequiresDevMode`;
+adds a new variant on the existing `#[non_exhaustive]`
+`BackendError` enum at `crates/ff-core/src/engine_error.rs:488`.
+Does NOT extend `BackendErrorKind`, which is scoped to Valkey
+transport classification per its existing rustdoc). Present →
+emits the warn banner on construction.
+
+**Committed embedded-path error text (B2).** The
+`BackendError::RequiresDevMode` message renders as:
+
+```
+SqliteBackend requires FF_DEV_MODE=1 to activate. SQLite is
+dev-only; see https://github.com/avifenesh/FlowFabric/blob/main/docs/dev-harness.md
+for details.
+```
+
+This parallels the §3.3 HTTP-path text (both include the
+dev-harness.md URL) and gives embedded consumers the same
+actionable signal. Kept in sync with §3.3 by the smoke-script
+assertion in `scripts/smoke-sqlite.sh` (§9).
+
+**HTTP path — `Server::start_sqlite_branch`** (new, §4.4 item 6
+in `crates/ff-server/src/server.rs`): delegates to
+`SqliteBackend::new`. When that returns
+`BackendError::RequiresDevMode`, the branch maps the error into
+`ServerError::SqliteRequiresDevMode` (with the §3.3 text) and
+returns it to the caller. The branch does NOT re-check
+`FF_DEV_MODE` itself and does NOT re-emit the banner — the type
+already did both. This keeps the guard single-sourced and prevents
+two-banner output under HTTP boot.
+
+**Rationale for TYPE placement.** cairn and FF-internal embedded
 tests (§4.7 primary example) instantiate SQLite without ever
 touching ff-server; the guard cannot live only at the ff-server
 layer or it is trivially bypassed by
 `Worker::connect_with(…, Arc::new(SqliteBackend::new(path)))`.
 The guard is on the TYPE, not the server.
 
-Banner emits on every process start so log aggregators can alert
-if a SQLite backend ever reaches an environment it shouldn't.
-Same banner text from `start_sqlite_branch` and
-`SqliteBackend::new` to keep operator-facing signal identical.
+Banner emits on every `SqliteBackend::new` success so log
+aggregators can alert if a SQLite backend ever reaches an
+environment it shouldn't.
 
 ### 4.6 Test infrastructure
 
@@ -573,6 +735,38 @@ ff-server boundary exercised.
 No HTTP listener, no bind port, no `reqwest` dependency — the
 `FlowFabricWorker` directly wraps the SQLite backend trait object. This
 is the shape cairn's `cargo test` uses.
+
+> **Compile-surface note (A1).** Under cairn's canonical
+> `ff-sdk = { ..., default-features = false, features = ["sqlite"] }`
+> posture, `ff_sdk::FlowFabricWorker` must remain re-exported
+> without the `valkey-default` cfg gate. §4.4 item 10 commits the
+> re-export to be backend-agnostic. The example below assumes that
+> change is landed; without it the `use ff_sdk::FlowFabricWorker`
+> line fails to resolve under the sqlite-only posture.
+>
+> **Stray-env hazard (B3).** `FlowFabricWorker::connect_with` at
+> `crates/ff-sdk/src/worker.rs:587-590` internally calls
+> `FlowFabricWorker::connect(config)` first and then swaps the
+> backend. That inner `connect` consults `FF_HOST` / `FF_PORT` /
+> `FF_CONNECTION_URL` to build a Valkey client. Under the embedded
+> SQLite harness these MUST NOT be set — if they are, `connect`
+> attempts (and may succeed at) a real Valkey connection before
+> the backend swap, producing the opposite of the "no Docker"
+> promise. Canonical mitigation: unset them in
+> `.cargo/config.toml [env]` explicitly, e.g.
+>
+> ```toml
+> [env]
+> FF_DEV_MODE = "1"
+> FF_HOST = { value = "", force = true }
+> FF_PORT = { value = "", force = true }
+> FF_CONNECTION_URL = { value = "", force = true }
+> ```
+>
+> This is documented in `docs/dev-harness.md` per §9. A follow-up
+> that refactors `connect_with` to skip the `connect` preamble
+> entirely when a backend is supplied is out of scope for this RFC
+> and tracked separately.
 
 ```rust
 // cairn-fabric/tests/integration_sqlite.rs
@@ -835,13 +1029,56 @@ decided in-scope deliverable.)*
 
 ## 8. Migration impact (consumer-facing)
 
-**Purely additive.** Existing consumers unaffected:
+**Mostly additive, with two minor breaking changes for exhaustive
+consumers (B1).** Runtime behavior for `FF_BACKEND=valkey` and
+`FF_BACKEND=postgres` is unchanged; the breaks are compile-time
+shape adjustments on two ff-server types that were not marked
+`#[non_exhaustive]`.
 
-- `FF_BACKEND=valkey` (default) and `FF_BACKEND=postgres` behave
-  identically to v0.11.
+**Unchanged:**
+
+- `FF_BACKEND=valkey` (default) and `FF_BACKEND=postgres` runtime
+  behavior identical to v0.11.
 - No schema change in Postgres or Valkey backends.
 - No trait change in `ff-core::engine_backend`.
 - No capability-matrix change for the two existing backends.
+
+**Breaking at v0.12.0 (committed disposition: Reviewer B option
+(a) — own the break and mark both types `#[non_exhaustive]` in the
+same PR):**
+
+1. **`ServerError` gains `SqliteRequiresDevMode` variant + becomes
+   `#[non_exhaustive]`.** Ground-truth at Revision 4:
+   `crates/ff-server/src/server.rs:90` enum has NO
+   `#[non_exhaustive]` today. Consumers writing exhaustive `match`
+   arms on `ServerError` will fail to compile and must add a
+   wildcard arm or the new variant. Pre-1.0 project posture makes
+   this the right moment to seal the enum against future additions.
+2. **`ServerConfig` gains `sqlite: SqliteServerConfig` field +
+   becomes `#[non_exhaustive]`.** Ground-truth at Revision 4:
+   `crates/ff-server/src/config.rs:103` struct has NO
+   `#[non_exhaustive]` today. Consumers constructing
+   `ServerConfig { ... }` via struct literal must migrate to the
+   `from_env` path, the `sqlite_dev()` constructor (§4.4 item 4),
+   or `..Default::default()` syntax. Existing `ServerConfig::from_env`
+   callers are unaffected; the field populates with defaults under
+   non-sqlite `FF_BACKEND` values.
+
+Both breaks are noted in `CHANGELOG.md [Unreleased] ### Changed`
+per the §9 release-gate discipline and called out in
+`docs/CONSUMER_MIGRATION_0.12.md`. The alternative dispositions
+considered:
+
+- **Option (b) — route SQLite refusal through existing
+  `ServerError::InvalidInput` / `OperationFailed`.** Avoids the
+  `ServerError` variant add, but still requires the `ServerConfig`
+  field add (hence still breaking struct-literal consumers).
+  Delivers a less-classifiable error shape for a short-term
+  `#[non_exhaustive]` deferral. Rejected.
+- **Option (c) — accept both as minor breaking, do NOT add
+  `#[non_exhaustive]` now.** Saves one line-change today; pays
+  the same consumer break every time a future RFC adds another
+  variant/field. Rejected as non-ideal long-term posture.
 
 Consumer opt-in path (cairn example):
 
@@ -849,8 +1086,12 @@ Consumer opt-in path (cairn example):
    feature, per §7.2).
 2. Set `FF_BACKEND=sqlite` + `FF_DEV_MODE=1` +
    `FF_SQLITE_PATH=:memory:` in the test harness env.
-3. Replace `docker compose up postgres` preamble with nothing.
-4. `cargo test` — passes.
+3. If constructing `ServerConfig` via struct literal, switch to
+   `ServerConfig::from_env()` or `ServerConfig::sqlite_dev()` or
+   use `..Default::default()` spread.
+4. If exhaustively matching `ServerError`, add wildcard arm.
+5. Replace `docker compose up postgres` preamble with nothing.
+6. `cargo test` — passes.
 
 No code change in consumer test bodies beyond the `ServerConfig`
 wiring (which most consumers already parameterize over
@@ -882,6 +1123,14 @@ whole or does not ship.
 - [ ] Docs: new `docs/dev-harness.md` that enumerates
       dev→prod gotchas (SQLite absent in prod, `FF_DEV_MODE=1`
       required, single-writer envelope, migration port parity).
+      **Content spec (B3):** canonical `FF_DEV_MODE=1` setup is
+      the `.cargo/config.toml [env]` block (reliable across
+      parallel `cargo test` invocations, survives workspace
+      members); `std::env::set_var` in test bodies is shown only
+      as a fallback with an explicit parallel-test-safety caveat
+      (the env is process-global and racy across threads). The
+      doc also lists stray-env cleanup (`FF_HOST` / `FF_PORT` /
+      `FF_CONNECTION_URL`) per the §4.7.1 footnote.
 - [ ] `examples/ff-dev/` example compiles + runs + documents
       "try it in 60 seconds."
 - [ ] RELEASING.md updated if §7.2 lands as Option A (new
