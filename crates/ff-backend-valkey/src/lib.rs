@@ -4898,7 +4898,7 @@ impl EngineBackend for ValkeyBackend {
         ff_core::capability::Capabilities::new(
             ff_core::capability::BackendIdentity::new(
                 "valkey",
-                ff_core::capability::Version::new(0, 9, 0),
+                ff_core::capability::Version::new(0, 10, 0),
                 "E-shipped",
             ),
             supports,

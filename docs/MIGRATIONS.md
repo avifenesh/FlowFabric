@@ -24,16 +24,25 @@ chronological** — latest at top. Patch releases nest under their minor.
 
 ---
 
-## v0.10 — capability-discovery shape reshape
+## v0.10 — read-side ergonomics (capabilities + typed subscribe + filter)
 
-### v0.10.0 — in prep (tag pending)
+### v0.10.0 — 2026-04-26
 
-Reshape of the RFC-018 Stage A capability-discovery surface to match
-cairn's original #277 ask — flat named-field bool struct instead of
-`BTreeMap<Capability, CapabilityStatus>`. Only consumers that
-directly read `EngineBackend::capabilities_matrix()` (or re-exported
-`CapabilityMatrix` / `Capability` / `CapabilityStatus` via
-`flowfabric::core::capability`) are affected.
+Consumer-facing read-side surface lands in one minor: flat capability
+struct (#277), typed stream-event enums (#282 Stage C), and a required
+`ScannerFilter` parameter on three `subscribe_*` trait methods
+(#282). Two additive: `EngineBackend::suspend_by_triple` (#322) and
+`ff_core::handle_codec::v1_handle_for_tests` (#323, behind
+`test-fixtures` feature).
+
+See `docs/CONSUMER_MIGRATION_0.10.md` for the full before/after
+snippets + upgrade checklist; this page gives the rolling-window
+summary.
+
+Only consumers that directly read `EngineBackend::capabilities_matrix()`
+(or re-exported `CapabilityMatrix` / `Capability` / `CapabilityStatus`
+via `flowfabric::core::capability`) or call the `subscribe_*` trait
+methods are affected.
 
 #### Breaking
 
