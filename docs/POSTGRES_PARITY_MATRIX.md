@@ -327,3 +327,11 @@ rows. The consumer migration guide
 ([`docs/MIGRATIONS.md`](MIGRATIONS.md) § v0.8 → `FF_BACKEND=postgres`)
 lists the current Postgres `Unavailable` surface so consumers know
 what to expect.
+
+### Wave 9 planned
+
+Design for the Wave 9 Postgres deferrals is committed in
+[`rfcs/RFC-020-postgres-wave-9.md`](../rfcs/RFC-020-postgres-wave-9.md)
+(ACCEPTED 2026-04-26, Revision 4, target v0.11). Parity rows above
+will flip as the RFC lands in implementation PRs — no rows are
+pre-flipped here.
