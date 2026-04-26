@@ -66,4 +66,20 @@ if [ ${#orphan_sqlite[@]} -gt 0 ]; then
   exit 1
 fi
 
+# Third pass: every .sqlite-skip entry must name a real PG migration,
+# otherwise stale/typo'd entries silently hide intended parity work.
+stale_skips=()
+for skip in $SKIP_SET; do
+  if ! printf '%s\n' $pg_files | grep -qx "$skip"; then
+    stale_skips+=("$skip")
+  fi
+done
+
+if [ ${#stale_skips[@]} -gt 0 ]; then
+  echo "ERROR: .sqlite-skip entries do not match any PG migration filename:" >&2
+  printf '  %s\n' "${stale_skips[@]}" >&2
+  echo "  (remove stale entries or fix the filename to match $PG_DIR)" >&2
+  exit 1
+fi
+
 echo "OK: migration parity verified ($(echo "$pg_files" | wc -w | tr -d ' ') pairs)"

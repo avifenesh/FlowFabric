@@ -13,6 +13,11 @@ use serial_test::serial;
 /// DB under FF_DEV_MODE=1. The helper embeds a UUID in the URI so
 /// parallel tests never collide on the registry key.
 async fn fresh_backend() -> std::sync::Arc<SqliteBackend> {
+    // SAFETY: test-only env mutation; every caller is tagged
+    // `#[serial(ff_dev_mode)]` which serialises all FF_DEV_MODE
+    // readers + writers across this crate's test binaries, so no
+    // concurrent reader observes the write (the UB vector `set_var`
+    // is marked unsafe for in Rust 1.87+).
     unsafe {
         std::env::set_var("FF_DEV_MODE", "1");
     }
@@ -45,8 +50,8 @@ async fn migrations_apply_and_schema_is_present() {
 
     // Spot-check a handful of table names drawn from every
     // contributing migration. `sqlite_master` is the canonical SQLite
-    // catalog; `type='table'` filters out indexes + the sqlx metadata
-    // table.
+    // catalog; `type='table'` filters out indexes and views.
+    // `_sqlx_migrations` IS a table and is expected — asserted below.
     let mut rows =
         sqlx::query_as::<_, (String,)>("SELECT name FROM sqlite_master WHERE type='table'")
             .fetch_all(pool)

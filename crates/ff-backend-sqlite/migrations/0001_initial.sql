@@ -274,8 +274,9 @@ CREATE TABLE ff_stream_frame (
     PRIMARY KEY (partition_key, execution_id, attempt_index, ts_ms, seq)
 );
 
-CREATE INDEX ff_stream_frame_ts_seq_idx
-    ON ff_stream_frame (partition_key, execution_id, attempt_index, ts_ms, seq);
+-- No explicit ts/seq index: SQLite auto-indexes the PRIMARY KEY
+-- above, which already matches the (partition_key, execution_id,
+-- attempt_index, ts_ms, seq) scan shape used by stream catch-up.
 
 CREATE TABLE ff_stream_summary (
     partition_key       INTEGER NOT NULL,
@@ -324,8 +325,9 @@ CREATE TABLE ff_completion_event (
 CREATE UNIQUE INDEX ff_completion_event_partition_event_idx
     ON ff_completion_event (partition_key, event_id);
 
-CREATE INDEX ff_completion_event_event_id_idx
-    ON ff_completion_event (event_id);
+-- No explicit index on `event_id` alone: it is `INTEGER PRIMARY KEY
+-- AUTOINCREMENT`, i.e. an alias for SQLite's rowid, which is already
+-- the implicit primary index. A secondary index would be pure overhead.
 
 -- ============================================================
 -- Section 7 — Migration annotation + partition-config seed
@@ -339,6 +341,17 @@ VALUES (
     0
 );
 
+-- Seed the partition-config row.
+--
+-- NOTE: diverges from the PG seed (256/256/256). Per RFC-023 §4.1, the
+-- SQLite backend runs with scanner-supervisor fan-out N=1 — the notion
+-- of hashed partition routing does not apply to a single-writer
+-- embedded SQLite DB — so `num_*_partitions = 1` is the correct
+-- metadata-of-record here. Phase 2+ code must NOT read these values
+-- expecting PG parity; they describe the SQLite deployment shape.
+--
+-- `ff_version = '0.12.0'` matches the version in which this schema
+-- lands (RFC-023 Phase 1b).
 INSERT INTO ff_partition_config (
     singleton_lock,
     num_flow_partitions,
