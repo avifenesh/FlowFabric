@@ -250,31 +250,31 @@ fn test_server_config() -> ff_server::config::ServerConfig {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6379);
-    ff_server::config::ServerConfig {
-        valkey: ff_server::config::ValkeyServerConfig {
+    {
+        let mut __cfg = ff_server::config::ServerConfig::default();
+        __cfg.valkey = ff_server::config::ValkeyServerConfig {
             host,
             port,
             tls: ff_test::fixtures::env_flag("FF_TLS"),
             cluster: ff_test::fixtures::env_flag("FF_CLUSTER"),
             skip_library_load: true,
-        },
-        partition_config: config,
-        lanes: vec![LaneId::new(LANE)],
-        listen_addr: "127.0.0.1:0".into(),
-        engine_config: ff_engine::EngineConfig {
+        };
+        __cfg.partition_config = config;
+        __cfg.lanes = vec![LaneId::new(LANE)];
+        __cfg.listen_addr = "127.0.0.1:0".into();
+        __cfg.engine_config = ff_engine::EngineConfig {
             partition_config: config,
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
-        },
-
-        cors_origins: vec!["*".to_owned()],
-        api_token: None,
-        waitpoint_hmac_secret:
-            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        waitpoint_hmac_grace_ms: 86_400_000,
-        max_concurrent_stream_ops: 64,
-        backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
+        };
+        __cfg.cors_origins = vec!["*".to_owned()];
+        __cfg.api_token = None;
+        __cfg.waitpoint_hmac_secret = "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        __cfg.waitpoint_hmac_grace_ms = 86_400_000;
+        __cfg.max_concurrent_stream_ops = 64;
+        __cfg.backend = ff_server::config::BackendKind::default();
+        __cfg.postgres = Default::default();
+        __cfg
     }
 }
 

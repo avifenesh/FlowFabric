@@ -16,6 +16,11 @@ pub enum BackendKind {
     Valkey,
     /// Postgres backend. First-class since v0.8.0 (RFC-017 Stage E4).
     Postgres,
+    /// SQLite dev-only backend (RFC-023 v0.12.0). Activation requires
+    /// `FF_DEV_MODE=1`; the backend refuses to construct otherwise
+    /// regardless of entry point (embedded `SqliteBackend::new` or
+    /// HTTP `start_sqlite_branch`).
+    Sqlite,
 }
 
 impl BackendKind {
@@ -25,6 +30,7 @@ impl BackendKind {
         match self {
             Self::Valkey => "valkey",
             Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
         }
     }
 }
@@ -95,11 +101,73 @@ impl Default for ValkeyServerConfig {
     }
 }
 
+/// RFC-023 (v0.12.0): SQLite dev-only connection parameters carried
+/// on [`ServerConfig`] when `backend == BackendKind::Sqlite`.
+///
+/// `#[non_exhaustive]` — consumers build via [`Self::new`] + the
+/// builder methods; adding future fields is additive.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SqliteServerConfig {
+    /// File path or in-memory URI — `:memory:`, `file::memory:...`,
+    /// or an ordinary filesystem path. Read from `FF_SQLITE_PATH`.
+    pub path: String,
+    /// Connection-pool size. Default `4` (1 writer + 3 readers under
+    /// WAL). Read from `FF_SQLITE_POOL_SIZE`.
+    pub pool_size: u32,
+    /// Enable WAL journaling. Default `true`. Ignored for
+    /// `:memory:` databases where WAL is a no-op.
+    pub wal_mode: bool,
+}
+
+impl SqliteServerConfig {
+    /// Construct a new config with the given path and defaults
+    /// (`pool_size = 4`, `wal_mode = true`).
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            pool_size: 4,
+            wal_mode: true,
+        }
+    }
+
+    /// Builder: override pool size (writer + readers combined).
+    pub fn with_pool_size(mut self, n: u32) -> Self {
+        self.pool_size = n;
+        self
+    }
+
+    /// Builder: toggle WAL journaling.
+    pub fn with_wal(mut self, on: bool) -> Self {
+        self.wal_mode = on;
+        self
+    }
+}
+
+impl Default for SqliteServerConfig {
+    fn default() -> Self {
+        Self::new(":memory:")
+    }
+}
+
 /// Server configuration, loaded from environment variables.
 ///
 /// **RFC-017 Stage E4 (v0.8.0):** the flat Valkey fields (`host`,
 /// `port`, `tls`, `cluster`, `skip_library_load`) were removed. Use
 /// [`ValkeyServerConfig`] on the `valkey` field instead.
+///
+/// **RFC-023 (v0.12.0):** gained `#[non_exhaustive]` + a `sqlite`
+/// field. External consumers cannot use struct-literal construction
+/// (including `..Default::default()` spread syntax — Rust rejects
+/// the struct-update form on `#[non_exhaustive]` types from other
+/// crates). Build via one of:
+///
+/// * [`ServerConfig::from_env`] — production-ready, validates all
+///   env-driven axes.
+/// * [`ServerConfig::sqlite_dev`] — zero-config dev harness.
+/// * `ServerConfig::default()` followed by field-by-field mutation
+///   — for tests that need to override one or two axes.
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Partition counts (execution/flow/budget/quota).
     pub partition_config: PartitionConfig,
@@ -151,6 +219,10 @@ pub struct ServerConfig {
     /// Meaningful only when `backend == BackendKind::Postgres`; the
     /// Valkey path ignores these fields.
     pub postgres: PostgresServerConfig,
+    /// RFC-023 (v0.12.0): SQLite dev-only connection parameters.
+    /// Meaningful only when `backend == BackendKind::Sqlite`; the
+    /// Valkey/Postgres paths ignore these fields.
+    pub sqlite: SqliteServerConfig,
 }
 
 impl ServerConfig {
@@ -215,9 +287,12 @@ impl ServerConfig {
     /// | `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval |
     /// | `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval |
     /// | `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel reconciler scanner interval |
-    /// | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Both are first-class at v0.8.0 (RFC-017 Stage E4 flipped `BACKEND_STAGE_READY` to `&["valkey", "postgres"]`). |
+    /// | `FF_BACKEND` | `valkey` | Backend family — `valkey`, `postgres`, or `sqlite` (RFC-023 dev-only). |
     /// | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (libpq/sqlx shape, e.g. `postgres://user:pass@host:port/db`). Required when `FF_BACKEND=postgres`; ignored otherwise. |
     /// | `FF_POSTGRES_POOL_SIZE` | `10` | Max Postgres pool connections; ignored on the Valkey path. |
+    /// | `FF_SQLITE_PATH` | `:memory:` | SQLite database path or URI. Used when `FF_BACKEND=sqlite`. |
+    /// | `FF_SQLITE_POOL_SIZE` | `4` | Max SQLite pool connections (1 writer + (pool_size - 1) readers). |
+    /// | `FF_DEV_MODE` | *(unset)* | Must be `1` to activate `FF_BACKEND=sqlite`. Orthogonal to `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1`. |
     pub fn from_env() -> Result<Self, ConfigError> {
         let valkey = ValkeyServerConfig {
             host: env_or("FF_HOST", "localhost"),
@@ -390,15 +465,24 @@ impl ServerConfig {
             pool_size: env_u32_positive("FF_POSTGRES_POOL_SIZE", 10)?,
         };
 
+        // RFC-023 (v0.12.0): read SQLite fields unconditionally so
+        // operators can preset values; non-sqlite backends ignore.
+        let sqlite = SqliteServerConfig {
+            path: env_or("FF_SQLITE_PATH", ":memory:"),
+            pool_size: env_u32_positive("FF_SQLITE_POOL_SIZE", 4)?,
+            wal_mode: true,
+        };
+
         let backend = match std::env::var("FF_BACKEND") {
             Ok(v) => match v.to_ascii_lowercase().as_str() {
                 "" | "valkey" => BackendKind::Valkey,
                 "postgres" => BackendKind::Postgres,
+                "sqlite" => BackendKind::Sqlite,
                 other => {
                     return Err(ConfigError::InvalidValue {
                         var: "FF_BACKEND".to_owned(),
                         message: format!(
-                            "unknown backend '{other}': expected 'valkey' or 'postgres'"
+                            "unknown backend '{other}': expected 'valkey', 'postgres', or 'sqlite'"
                         ),
                     });
                 }
@@ -419,7 +503,29 @@ impl ServerConfig {
             backend,
             valkey,
             postgres,
+            sqlite,
         })
+    }
+
+    /// RFC-023 §4.4 item 4 (v0.12.0): zero-config SQLite dev harness
+    /// builder. Returns a `ServerConfig` pre-wired with
+    /// `backend = Sqlite`, `sqlite.path = ":memory:"`,
+    /// `listen_addr = "127.0.0.1:0"` (OS-picked port), and ALL auth
+    /// axes disabled: `api_token = None`, admin auth off,
+    /// `waitpoint_hmac_secret` set to a deterministic dev placeholder.
+    ///
+    /// **Dev/test only.** The returned config is unsafe for
+    /// production — every auth path is open and the SQLite backend
+    /// itself demands `FF_DEV_MODE=1` at construction time per
+    /// §4.5.
+    pub fn sqlite_dev() -> Self {
+        Self {
+            sqlite: SqliteServerConfig::new(":memory:"),
+            backend: BackendKind::Sqlite,
+            listen_addr: "127.0.0.1:0".into(),
+            api_token: None,
+            ..Default::default()
+        }
     }
 }
 
@@ -450,6 +556,7 @@ impl Default for ServerConfig {
             backend: BackendKind::default(),
             valkey: ValkeyServerConfig::default(),
             postgres: PostgresServerConfig::default(),
+            sqlite: SqliteServerConfig::default(),
         }
     }
 }

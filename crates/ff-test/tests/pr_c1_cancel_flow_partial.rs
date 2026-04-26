@@ -59,30 +59,31 @@ async fn start_test_server() -> Server {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let server_config = ServerConfig {
-        valkey: ff_server::config::ValkeyServerConfig {
+    let server_config = {
+        let mut __cfg = ff_server::config::ServerConfig::default();
+        __cfg.valkey = ff_server::config::ValkeyServerConfig {
             host,
             port,
             tls,
             cluster,
             skip_library_load: true, // TestCluster::connect() already loaded
-        },
-        partition_config: config,
-        lanes: vec![LaneId::new(LANE)],
-        listen_addr: "0.0.0.0:0".into(),
-        engine_config: ff_engine::EngineConfig {
+        };
+        __cfg.partition_config = config;
+        __cfg.lanes = vec![LaneId::new(LANE)];
+        __cfg.listen_addr = "0.0.0.0:0".into();
+        __cfg.engine_config = ff_engine::EngineConfig {
             partition_config: config,
             lanes: vec![LaneId::new(LANE)],
             ..Default::default()
-        },
-        cors_origins: vec!["*".to_owned()],
-        api_token: None,
-        waitpoint_hmac_secret:
-            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        waitpoint_hmac_grace_ms: 86_400_000,
-        max_concurrent_stream_ops: 64,
-        backend: ff_server::config::BackendKind::default(),
-        postgres: Default::default(),
+        };
+        __cfg.cors_origins = vec!["*".to_owned()];
+        __cfg.api_token = None;
+        __cfg.waitpoint_hmac_secret = "0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        __cfg.waitpoint_hmac_grace_ms = 86_400_000;
+        __cfg.max_concurrent_stream_ops = 64;
+        __cfg.backend = ff_server::config::BackendKind::default();
+        __cfg.postgres = Default::default();
+        __cfg
     };
     Server::start(server_config).await.expect("Server::start")
 }
