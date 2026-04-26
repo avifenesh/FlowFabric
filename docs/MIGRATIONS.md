@@ -246,9 +246,10 @@ Postgres flow family, `ClaimPolicy` / `ReclaimToken` reshape).
 6. If migrating to Postgres, set `FF_BACKEND=postgres` +
    `FF_POSTGRES_URL` + `FF_WAITPOINT_HMAC_SECRET`
    ([§ FF_BACKEND=postgres setup](#ff_backendpostgres-setup)).
-7. Re-run your integration smoke. File issues against
-   [`rfcs/RFC-017-ff-server-backend-abstraction.md`](../rfcs/RFC-017-ff-server-backend-abstraction.md)
-   for any migration-guide gap you hit.
+7. Re-run your integration smoke. File issues against this repo for any
+   migration-guide gap you hit; RFC-017 design record lives in the
+   [archive repo](https://github.com/avifenesh/flowfabric-archive/blob/main/rfcs/RFC-017-ff-server-backend-abstraction.md)
+   (private).
 
 ---
 
