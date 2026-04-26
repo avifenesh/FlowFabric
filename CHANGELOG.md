@@ -5,6 +5,85 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-26
+
+### Added
+
+- **Postgres Wave 9 — 15 trait methods flipped from `Unavailable` to
+  real impl, 12 capability flags flipped `false → true` (RFC-020
+  Rev 7).** Methods: `cancel_execution`, `change_priority`,
+  `replay_execution`, `revoke_lease`, `read_execution_state`,
+  `read_execution_info`, `get_execution_result`, `create_budget`,
+  `reset_budget`, `create_quota_policy`, `get_budget_status`,
+  `report_usage_admin`, `list_pending_waitpoints`,
+  `cancel_flow_header`, `ack_cancel_member` all land concretely on
+  `PostgresBackend`. Capability flags (per
+  `PostgresBackend::capabilities().supports`): the 7 operator-control
+  + read-model method-level flags (`cancel_execution`,
+  `change_priority`, `replay_execution`, `revoke_lease`,
+  `read_execution_state`, `read_execution_info`,
+  `get_execution_result`), the 2 grouping flags (`budget_admin`
+  covering the 4 budget methods, `quota_admin` covering
+  `create_quota_policy`), `list_pending_waitpoints`,
+  `cancel_flow_header`, `ack_cancel_member` — **12 flags total** —
+  all flip to `true`. `subscribe_instance_tags` remains `false` per
+  #311 (speculative demand; served by `list_executions` +
+  `ScannerFilter::with_instance_tag`). Design record:
+  `rfcs/RFC-020-postgres-wave-9.md`.
+- **Migration 0010 — `ff_operator_event` outbox.** New LISTEN/NOTIFY
+  channel for operator-control events (`priority_changed` /
+  `replayed` / `flow_cancel_requested`) emitted by the Postgres impls
+  of `change_priority` / `replay_execution` / `cancel_flow_header`.
+  Preserves the RFC-019 `ff_signal_event` subscriber contract
+  (separate channel, no repurpose).
+- **Migration 0011 — `ff_waitpoint_pending` additive columns.**
+  Adds `state`, `required_signal_names`, `activated_at_ms` to serve
+  the real `PendingWaitpointInfo` contract from Postgres.
+  Producer-side `suspend_ops` writes the new columns on initial
+  insert + the pending→active activation transition.
+- **Migration 0012 — `ff_quota_policy` family.** 3 tables
+  (`ff_quota_policy`, `ff_quota_window`, `ff_quota_admitted`), 256-way
+  HASH-partitioned on `partition_key`. Concurrency represented as a
+  column on `ff_quota_policy` (Valkey-counter-key → Postgres column
+  collapse).
+- **Migration 0013 — `ff_budget_policy` additive columns.**
+  `next_reset_at_ms BIGINT` + 4 breach-tracking columns + 3
+  definitional columns, backing both `get_budget_status` and the new
+  `BudgetResetReconciler`. `report_usage_impl` extended to maintain
+  `breach_count` / `soft_breach_count` / `last_breach_at_ms` /
+  `last_breach_dim` incrementally, matching Valkey's existing
+  pattern.
+- **Migration 0014 — `ff_cancel_backlog` table.** Per-member cancel
+  backlog driving `cancel_flow_header` + `ack_cancel_member` on
+  Postgres and the cancel-backlog reconciler sweep.
+- **`BudgetResetReconciler` (Postgres-native).** New scanner under
+  `crates/ff-backend-postgres/src/reconcilers/budget_reset.rs`;
+  selects due resets by `next_reset_at_ms <= now`. Column-on-policy
+  scheduling rather than a separate schedule table.
+
+### Changed
+
+- **POSTGRES_PARITY_MATRIX.md.** 13 Wave-9 rows flipped `stub → impl`
+  on the Postgres column. v0.11.0 parity summary section added. Every
+  Stage-A row is now `impl | impl` except `fetch_waitpoint_token_v07`
+  (retired at v0.8.0) and `subscribe_instance_tags` (`n/a` on both).
+
+### Fixed
+
+- `rotate_waitpoint_hmac_secret_all` matrix-row label updated to
+  reflect its long-standing `impl | impl` status (housekeeping per
+  RFC-020 §3.3; no behaviour change).
+
+### Notes
+
+- No Rust API surface change. No wire-format change. Valkey backend
+  behaviour unchanged (RFC-020 §5.2 "no Valkey behavior change"
+  mandate).
+- **Required before upgrade on Postgres deployments:** apply
+  migrations 0010–0014 before serving v0.11.0 traffic. Auto-run by
+  `ff-server` at boot; operators applying out-of-band must run them
+  in order. See `docs/CONSUMER_MIGRATION_0.11.md`.
+
 ## [0.10.0] - 2026-04-26
 
 ### Added

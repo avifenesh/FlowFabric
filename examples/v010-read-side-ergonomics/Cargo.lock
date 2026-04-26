@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -326,11 +326,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "ff-scheduler"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",

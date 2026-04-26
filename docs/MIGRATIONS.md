@@ -24,6 +24,59 @@ chronological** — latest at top. Patch releases nest under their minor.
 
 ---
 
+## v0.11 — Postgres Wave 9 (12 capability flips + 5 migrations)
+
+### v0.11.0 — 2026-04-26
+
+Full parity on the Postgres backend for the remaining Wave-9 surface
+(RFC-020 Rev 7). 12 `PostgresBackend::capabilities().supports` flags
+flip `false → true`:
+
+- Operator control: `cancel_execution`, `change_priority`,
+  `replay_execution`, `revoke_lease`
+- Read model: `read_execution_info`, `read_execution_state`,
+  `get_execution_result`
+- Budget / quota admin: `budget_admin`, `quota_admin`
+- Waitpoints: `list_pending_waitpoints`
+- Flow cancel split: `cancel_flow_header`, `ack_cancel_member`
+
+No Rust API change. No wire-format change. Valkey backend behaviour
+unchanged per RFC-020 §5.2.
+
+See `docs/CONSUMER_MIGRATION_0.11.md` for the full consumer
+checklist + migration-ordering notes; this page gives the
+rolling-window summary.
+
+#### Infra
+
+- **Postgres migrations 0010–0014** `[infra]`. All additive, forward-
+  only. Must be applied in order **before** serving v0.11.0 traffic
+  on a Postgres deployment. `ff-server` auto-runs them at boot via
+  `apply_migrations`; operators managing schema out-of-band must
+  apply them manually (e.g. `sqlx migrate run`).
+  - `0010_operator_event_outbox.sql` — `ff_operator_event` + trigger
+    + `NOTIFY ff_operator_event` channel.
+  - `0011_waitpoint_pending_extensions.sql` — adds `state`,
+    `required_signal_names`, `activated_at_ms` columns on
+    `ff_waitpoint_pending`.
+  - `0012_quota_policy.sql` — `ff_quota_policy` + `ff_quota_window`
+    + `ff_quota_admitted` tables (256-way HASH-partitioned).
+  - `0013_budget_policy_extensions.sql` — scheduling + breach +
+    definitional columns on `ff_budget_policy`.
+  - `0014_cancel_backlog.sql` — `ff_cancel_backlog` table driving
+    `cancel_flow_header` + `ack_cancel_member`.
+
+#### Additive
+
+- **12 Postgres `Unavailable` methods now serve real responses**
+  `[additive]`. Consumers grey-rendering operator UI actions based
+  on `capabilities().supports.<field>` will see the flags flip to
+  `true` after upgrading + running migrations. No consumer code
+  change required; audit UI code for stale "Postgres does not
+  support X" copy.
+
+---
+
 ## v0.10 — read-side ergonomics (capabilities + typed subscribe + filter)
 
 ### v0.10.0 — 2026-04-26
@@ -518,10 +571,13 @@ class of version-skew bug that hit v0.3.0 and v0.8.0 partial-publishes
 at the consumer side.
 
 
-## Retired (pre-v0.8)
+## Retired (pre-v0.9)
 
-Pre-v0.8 migration content archived at
+Current rolling window: v0.9 / v0.10 / v0.11. The v0.8 section above
+falls outside the window at v0.11.0 but is kept inline during the
+roll transition so cross-links (e.g. the umbrella-crate appendix
+referenced from the v0.9 entry) stay resolvable. Fully-retired
+content is archived at
 https://github.com/avifenesh/flowfabric-archive/blob/main/docs/MIGRATIONS-pre-v0.8.md
-(private). Current rolling window: v0.8 / v0.9 / v0.10. For older
-versions, consult `CHANGELOG.md` entries for v0.6 / v0.5 / v0.4 / v0.3
-directly.
+(private). For older versions, consult `CHANGELOG.md` entries for
+v0.6 / v0.5 / v0.4 / v0.3 directly.
