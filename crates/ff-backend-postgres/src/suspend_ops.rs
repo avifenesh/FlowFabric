@@ -113,22 +113,29 @@ fn susp_uuid(s: &SuspensionId) -> Result<Uuid, EngineError> {
 /// the condition tree and collects every `SignalMatcher::ByName` that
 /// targets this specific waitpoint. `Wildcard` matchers contribute
 /// nothing (an empty result vec is the wire-level wildcard marker per
-/// `PendingWaitpointInfo::required_signal_names` docs). `OperatorOnly`
-/// / `TimeoutOnly` / `Count { matcher: None }` likewise return empty.
-/// Duplicates are de-duplicated preserving first-seen order.
+/// `PendingWaitpointInfo::required_signal_names` docs).
+///
+/// `OperatorOnly` / `TimeoutOnly` are rendered with the same sentinel
+/// names that the Valkey wire format emits (`__operator_only__` /
+/// `__timeout_only__`, see `ff-backend-valkey/src/lib.rs:3205-3222`)
+/// so an operator-only or timeout-only waitpoint is distinguishable
+/// from a true wildcard at the `PendingWaitpointInfo` surface. The
+/// `__`-prefix sentinel values are never real signal names.
+///
+/// `Count { matcher: None }` returns empty (any signal on the listed
+/// waitpoints counts). Duplicates are de-duplicated preserving
+/// first-seen order.
 fn derive_required_signal_names(cond: &ResumeCondition, wp_key: &str) -> Vec<String> {
+    const OPERATOR_ONLY_SENTINEL: &str = "__operator_only__";
+    const TIMEOUT_ONLY_SENTINEL: &str = "__timeout_only__";
+
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: &str| {
         if !name.is_empty() && !out.iter().any(|e| e == name) {
             out.push(name.to_owned());
         }
     };
-    fn walk(
-        cond: &ResumeCondition,
-        target: &str,
-        inherited_matcher: Option<&SignalMatcher>,
-        push: &mut dyn FnMut(&str),
-    ) {
+    fn walk(cond: &ResumeCondition, target: &str, push: &mut dyn FnMut(&str)) {
         match cond {
             ResumeCondition::Single {
                 waitpoint_key,
@@ -139,8 +146,9 @@ fn derive_required_signal_names(cond: &ResumeCondition, wp_key: &str) -> Vec<Str
                 {
                     push(name.as_str());
                 }
-                let _ = inherited_matcher;
             }
+            ResumeCondition::OperatorOnly => push(OPERATOR_ONLY_SENTINEL),
+            ResumeCondition::TimeoutOnly => push(TIMEOUT_ONLY_SENTINEL),
             ResumeCondition::Composite(body) => walk_body(body, target, push),
             _ => {}
         }
@@ -149,7 +157,7 @@ fn derive_required_signal_names(cond: &ResumeCondition, wp_key: &str) -> Vec<Str
         match body {
             CompositeBody::AllOf { members } => {
                 for m in members {
-                    walk(m, target, None, push);
+                    walk(m, target, push);
                 }
             }
             CompositeBody::Count {
@@ -164,7 +172,7 @@ fn derive_required_signal_names(cond: &ResumeCondition, wp_key: &str) -> Vec<Str
             _ => {}
         }
     }
-    walk(cond, wp_key, None, &mut push);
+    walk(cond, wp_key, &mut push);
     out
 }
 
@@ -1125,10 +1133,7 @@ pub(crate) async fn list_pending_waitpoints_impl(
     for (wp_uid, wp_key, state, req_names, created_ms, activated_ms, expires_ms, _kid, token)
         in rows.into_iter().take(take_n)
     {
-        let wp_id = WaitpointId::parse(&wp_uid.to_string()).map_err(|e| EngineError::Validation {
-            kind: ValidationKind::Corruption,
-            detail: format!("stored waitpoint_id not parseable: {e}"),
-        })?;
+        let wp_id = WaitpointId::from_uuid(wp_uid);
         // Parse stored `<kid>:<hex>` into audit-safe pair. The `token_kid`
         // column is redundant with the parsed kid — we prefer the parsed
         // one so the surface stays byte-identical to Valkey's.

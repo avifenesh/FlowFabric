@@ -11,14 +11,15 @@
 //! * [`producer_writes_active_state_and_activated_at`] — insert
 //!   populates `state = 'active'` + `activated_at_ms = now` (no
 //!   separate `pending→active` transition exists on Postgres; the
-//!   suspension lands atomically).
-//! * [`producer_writes_required_signal_names_byname`] — `Single`
-//!   with `SignalMatcher::ByName` produces a `[name]` vec.
+//!   suspension lands atomically). Also asserts `ByName` matcher →
+//!   `[name]` in `required_signal_names`.
 //! * [`producer_writes_required_signal_names_wildcard`] — `Single`
 //!   with `SignalMatcher::Wildcard` produces an empty vec (wildcard
 //!   wire marker).
 //! * [`producer_writes_required_signal_names_allof`] — `AllOf` tree
 //!   distributes per-waitpoint names correctly.
+//! * [`producer_writes_required_signal_names_operator_only`] —
+//!   `OperatorOnly` → `[__operator_only__]` sentinel (Valkey parity).
 //! * [`list_returns_not_found_for_missing_execution`] — matches
 //!   Valkey's `EXISTS exec_core` pre-check.
 //! * [`list_returns_single_waitpoint`] — happy-path end-to-end:
@@ -98,7 +99,6 @@ struct ExecFixture {
     pool: PgPool,
     exec_id: ExecutionId,
     part: i16,
-    exec_uuid: Uuid,
     handle: Handle,
 }
 
@@ -172,7 +172,6 @@ async fn setup_exec_or_skip() -> Option<ExecFixture> {
         pool,
         exec_id,
         part,
-        exec_uuid,
         handle,
     })
 }
@@ -321,6 +320,43 @@ async fn producer_writes_required_signal_names_allof() {
     .await
     .unwrap();
     assert_eq!(b.0, vec!["sig-b".to_owned()]);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn producer_writes_required_signal_names_operator_only() {
+    let Some(fx) = setup_exec_or_skip().await else {
+        return;
+    };
+
+    let wp_id = WaitpointId::new();
+    let args = SuspendArgs::new(
+        SuspensionId::new(),
+        WaitpointBinding::Fresh {
+            waitpoint_id: wp_id.clone(),
+            waitpoint_key: "wpk:op".into(),
+        },
+        ResumeCondition::OperatorOnly,
+        ResumePolicy::normal(),
+        SuspensionReasonCode::WaitingForSignal,
+        TimestampMs::now(),
+    );
+    fx.backend.suspend(&fx.handle, args).await.expect("suspend");
+
+    let row: (Vec<String>,) = sqlx::query_as(
+        "SELECT required_signal_names FROM ff_waitpoint_pending \
+          WHERE partition_key = $1 AND waitpoint_id = $2",
+    )
+    .bind(fx.part)
+    .bind(Uuid::parse_str(&wp_id.to_string()).unwrap())
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.0,
+        vec!["__operator_only__".to_owned()],
+        "OperatorOnly → sentinel name (Valkey parity)"
+    );
 }
 
 // ─── list_pending_waitpoints method tests ────────────────────────────────
@@ -491,6 +527,4 @@ async fn list_paginates_with_cursor() {
     let mut expected = vec![wp1, wp2, wp3];
     expected.sort_by_key(|w| w.to_string());
     assert_eq!(all, expected);
-
-    let _ = fx.exec_uuid; // suppress unused-field warning
 }
