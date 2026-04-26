@@ -7,6 +7,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `ff_core::handle_codec::v1_handle_for_tests` — test-only fixture
+  that synthesises a pre-Wave-1c (v1) handle byte buffer for the
+  given `HandlePayload`. Gated behind the new `test-fixtures` feature
+  on `ff-core` (default OFF) so it never leaks into production
+  builds. Round-trips through `handle_codec::decode` via the v1
+  compat path, yielding `BackendTag::Valkey` + the original payload.
+  Motivated by downstream cross-version compat testing (cairn #323)
+  where event logs persisted under FF 0.3 must still decode under
+  FF 0.9+.
+
 - `ff_core::stream_events` module: typed event enums + per-family
   subscription aliases for the four `EngineBackend::subscribe_*`
   methods (RFC-019 Stage C; addresses #282 typed surface gap).

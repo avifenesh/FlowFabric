@@ -31,6 +31,12 @@ core = []
 streaming = []
 suspension = []
 budget = []
+# Exposes `handle_codec::v1_handle_for_tests` — a pre-Wave-1c (v1)
+# byte producer used by cross-version compat tests in downstream
+# consumers (e.g. cairn #323) to verify that HandleCodec::decode
+# still handles event-log handles persisted under FF 0.3. Default
+# OFF so the fixture never leaks into production builds.
+test-fixtures = []
 
 [dependencies]
 uuid = { workspace = true }

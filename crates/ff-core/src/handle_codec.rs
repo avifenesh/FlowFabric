@@ -236,6 +236,30 @@ pub fn decode(opaque: &HandleOpaque) -> Result<DecodedHandle, HandleDecodeError>
     Ok(DecodedHandle { tag, payload })
 }
 
+/// Produce a pre-Wave-1c (v1) byte buffer for the given payload.
+///
+/// **Test-only**: gated behind the `test-fixtures` feature so it
+/// cannot leak into production builds. The returned bytes are the
+/// exact on-wire shape that the pre-Wave-1c Valkey-only encoder
+/// produced — a single `V1_VERSION_TAG` (`0x01`) leading byte followed
+/// by the field block (see module docs §Fields). The buffer decodes
+/// via [`decode`] through the v1 compat path, yielding
+/// `tag = BackendTag::Valkey`.
+///
+/// Used by downstream consumers (e.g. cairn event-log migration tests,
+/// issue #323) to verify that persistent handles written under FF 0.3
+/// still decode cleanly under FF 0.9+.
+///
+/// There is intentionally no `decode` counterpart — v1 parsing goes
+/// through [`decode`]; this function only synthesises input.
+#[cfg(feature = "test-fixtures")]
+pub fn v1_handle_for_tests(payload: &HandlePayload) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    buf.push(V1_VERSION_TAG);
+    write_fields(&mut buf, payload);
+    buf
+}
+
 // ── Field serialization ─────────────────────────────────────────────────
 
 fn write_fields(buf: &mut Vec<u8>, f: &HandlePayload) {
@@ -450,6 +474,31 @@ mod tests {
         let opaque = HandleOpaque::new(Box::new([0xAB]));
         let err = decode(&opaque).unwrap_err();
         assert!(matches!(err, HandleDecodeError::BadV1Version { got: 0xAB }));
+    }
+
+    /// Issue #323: consumers building cross-version compat tests use
+    /// `v1_handle_for_tests` to synthesise a v1 byte buffer, then
+    /// round-trip it through `HandleCodec::decode` to verify the v1
+    /// compat path still accepts 0.3-era persisted handles. The
+    /// fixture must produce bytes byte-identical to what the hand-
+    /// rolled v1 buffer in `old_v1_format_decodes_as_valkey` produces.
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn v1_handle_for_tests_round_trip() {
+        let p = sample_payload();
+        let v1_bytes = super::v1_handle_for_tests(&p);
+        // Leading byte is v1 version tag (no v2 magic).
+        assert_eq!(v1_bytes[0], V1_VERSION_TAG);
+        // Byte-for-byte identical to the reference v1 synthesiser.
+        let mut expected: Vec<u8> = Vec::new();
+        expected.push(V1_VERSION_TAG);
+        write_fields(&mut expected, &p);
+        assert_eq!(v1_bytes, expected);
+        // Decodes via the v2 compat path → Valkey + original payload.
+        let opaque = HandleOpaque::new(v1_bytes.into_boxed_slice());
+        let decoded = decode(&opaque).expect("v1 fixture decodes");
+        assert_eq!(decoded.tag, BackendTag::Valkey);
+        assert_eq!(decoded.payload, p);
     }
 
     #[test]
