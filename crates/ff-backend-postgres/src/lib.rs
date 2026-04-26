@@ -48,6 +48,11 @@ use ff_core::contracts::{
 };
 #[cfg(feature = "core")]
 use ff_core::contracts::ExecutionInfo;
+// RFC-020 Wave 9 Spine-A pt.1 — operator-control mutating surfaces.
+#[cfg(feature = "core")]
+use ff_core::contracts::{
+    CancelExecutionArgs, CancelExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
+};
 // RFC-020 Wave 9 Standalone-1 — budget/quota admin surfaces.
 #[cfg(feature = "core")]
 use ff_core::contracts::{
@@ -88,6 +93,8 @@ mod lease_event;
 mod lease_event_subscribe;
 pub mod listener;
 pub mod migrate;
+#[cfg(feature = "core")]
+pub mod operator;
 pub mod pool;
 #[cfg(feature = "core")]
 pub mod reconcilers;
@@ -691,6 +698,31 @@ impl EngineBackend for PostgresBackend {
         args: ListPendingWaitpointsArgs,
     ) -> Result<ListPendingWaitpointsResult, EngineError> {
         suspend_ops::list_pending_waitpoints_impl(&self.pool, args).await
+    }
+
+    // ── RFC-020 Wave 9 Spine-A pt.1 — operator-control mutations (§4.2) ─
+    //
+    // Two methods landing behind `Supports.cancel_execution` +
+    // `Supports.revoke_lease` (both stay `false` until the Wave 9
+    // release PR flips them atomically, RFC §6.3). SERIALIZABLE + CAS +
+    // `ff_lease_event` outbox emit on the same tx (§4.2.6 + §4.2.7).
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.cancel_execution", skip_all)]
+    async fn cancel_execution(
+        &self,
+        args: CancelExecutionArgs,
+    ) -> Result<CancelExecutionResult, EngineError> {
+        operator::cancel_execution_impl(&self.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.revoke_lease", skip_all)]
+    async fn revoke_lease(
+        &self,
+        args: RevokeLeaseArgs,
+    ) -> Result<RevokeLeaseResult, EngineError> {
+        operator::revoke_lease_impl(&self.pool, args).await
     }
 
     // ── RFC-017 Stage A — ingress (promoted from inherent) ────
