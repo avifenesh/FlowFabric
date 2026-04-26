@@ -5,6 +5,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-04-26
+
 ### Added
 
 - `EngineBackend::suspend_by_triple(exec_id, LeaseFence, SuspendArgs)`

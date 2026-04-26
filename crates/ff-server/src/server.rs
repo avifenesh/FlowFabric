@@ -1804,10 +1804,6 @@ fn is_terminal_ack_engine_error(err: &EngineError) -> bool {
 }
 
 
-/// Single cancel attempt — pre-read + FCALL + parse. Factored out so the
-/// retry loop in [`cancel_member_execution`] can invoke it cleanly.
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
