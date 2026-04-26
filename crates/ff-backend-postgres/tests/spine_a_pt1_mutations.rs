@@ -21,8 +21,9 @@
 //!   lease_event row.
 //! * `revoke_lease_no_active_lease_returns_already_satisfied` —
 //!   unowned attempt → `AlreadySatisfied { reason: "no_active_lease" }`.
-//! * `revoke_lease_epoch_mismatch_returns_already_satisfied` —
-//!   concurrent epoch bump → `AlreadySatisfied { reason: "epoch_moved" }`.
+//! * `revoke_lease_double_call_is_idempotent` — second call after the
+//!   lease is cleared returns `AlreadySatisfied { reason: "no_active_lease" }`
+//!   (exercises the already-revoked idempotent path).
 //! * `concurrent_cancel_execution_one_wins_one_idempotent` — two
 //!   parallel cancels resolve (both see the exec cancelled; neither
 //!   surfaces a transport error to the caller).
@@ -373,6 +374,59 @@ async fn cancel_execution_terminal_other_outcome_is_conflict() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn cancel_execution_lease_holder_without_epoch_is_validation_error() {
+    // Per `CancelExecutionArgs` docstring, `lease_epoch` is required
+    // when source is not operator_override AND the execution is
+    // active. Missing value → Validation (not silent bypass).
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "active",
+        "leased",
+        "running",
+        "running_attempt",
+        0,
+        now,
+    )
+    .await;
+    insert_attempt_with_lease(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        0,
+        Some("wiid-q"),
+        2,
+        Some(now + 60_000),
+        Some(now),
+    )
+    .await;
+
+    let err = fx
+        .backend
+        .cancel_execution(CancelExecutionArgs {
+            execution_id: fx.exec_id.clone(),
+            reason: "r".into(),
+            source: CancelSource::LeaseHolder,
+            lease_id: None,
+            lease_epoch: None,
+            attempt_id: None,
+            now: TimestampMs::now(),
+        })
+        .await
+        .expect_err("missing lease_epoch on non-override must reject");
+    assert!(
+        matches!(err, EngineError::Validation { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
 async fn cancel_execution_missing_is_not_found() {
     let Some(fx) = seed_backend().await else {
         return;
@@ -466,6 +520,135 @@ async fn revoke_lease_happy_path_emits_event() {
 
     let n = count_lease_events(&fx.pool, fx.part, fx.exec_uuid, "revoked").await;
     assert_eq!(n, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn revoke_lease_flips_exec_core_to_reclaimable_runnable() {
+    // Per `lease_expiry::release_one` parity: on successful revoke
+    // the exec_core row must transition to
+    // `lifecycle_phase=runnable, ownership_state=unowned,
+    //  eligibility_state=eligible_now, attempt_state=attempt_interrupted`
+    // so the normal claim path picks it back up.
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "active",
+        "leased",
+        "running",
+        "running_attempt",
+        0,
+        now,
+    )
+    .await;
+    insert_attempt_with_lease(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        0,
+        Some("wiid-flip"),
+        0,
+        Some(now + 30_000),
+        Some(now),
+    )
+    .await;
+
+    fx.backend
+        .revoke_lease(RevokeLeaseArgs {
+            execution_id: fx.exec_id.clone(),
+            expected_lease_id: None,
+            worker_instance_id: WorkerInstanceId::new("wiid-flip"),
+            reason: "op".into(),
+        })
+        .await
+        .expect("ok");
+
+    let (phase, ownership, elig, att_state): (String, String, String, String) = sqlx::query_as(
+        "SELECT lifecycle_phase, ownership_state, eligibility_state, attempt_state \
+         FROM ff_exec_core WHERE partition_key = $1 AND execution_id = $2",
+    )
+    .bind(fx.part)
+    .bind(fx.exec_uuid)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("read");
+    assert_eq!(phase, "runnable");
+    assert_eq!(ownership, "unowned");
+    assert_eq!(elig, "eligible_now");
+    assert_eq!(att_state, "attempt_interrupted");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn revoke_lease_wrong_worker_instance_id_is_already_satisfied() {
+    // Targeted revoke: if the attempt is held by a different worker
+    // than the caller identifies, `AlreadySatisfied { reason:
+    // "different_worker_instance_id" }` — no mutation, no outbox.
+    let Some(fx) = seed_backend().await else {
+        return;
+    };
+    let now = TimestampMs::now().0;
+    insert_exec_core(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        "active",
+        "leased",
+        "running",
+        "running_attempt",
+        0,
+        now,
+    )
+    .await;
+    insert_attempt_with_lease(
+        &fx.pool,
+        fx.part,
+        fx.exec_uuid,
+        0,
+        Some("wiid-real"),
+        0,
+        Some(now + 30_000),
+        Some(now),
+    )
+    .await;
+
+    let r = fx
+        .backend
+        .revoke_lease(RevokeLeaseArgs {
+            execution_id: fx.exec_id.clone(),
+            expected_lease_id: None,
+            worker_instance_id: WorkerInstanceId::new("wiid-other"),
+            reason: "op".into(),
+        })
+        .await
+        .expect("ok");
+    assert!(
+        matches!(
+            r,
+            RevokeLeaseResult::AlreadySatisfied { ref reason } if reason == "different_worker_instance_id"
+        ),
+        "got {r:?}"
+    );
+    let n = count_lease_events(&fx.pool, fx.part, fx.exec_uuid, "revoked").await;
+    assert_eq!(n, 0);
+
+    // Attempt row must be untouched.
+    let wiid: Option<String> = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT worker_instance_id FROM ff_attempt \
+         WHERE partition_key = $1 AND execution_id = $2 AND attempt_index = 0",
+    )
+    .bind(fx.part)
+    .bind(fx.exec_uuid)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("read")
+    .0;
+    assert_eq!(wiid.as_deref(), Some("wiid-real"));
 }
 
 #[tokio::test]

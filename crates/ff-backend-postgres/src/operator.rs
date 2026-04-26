@@ -86,16 +86,21 @@ fn synthetic_lease_id(exec_uuid: Uuid, attempt_index: i32, lease_epoch: i64) -> 
 
 /// Transactional body for [`cancel_execution_impl`].
 ///
-/// Returns `Ok(Some(result))` on success, `Ok(None)` never (the
-/// function always yields a concrete outcome), `Err(e)` for
-/// serialization retries + hard failures.
+/// Returns `Ok(result)` on success (one tx); `Err(e)` for
+/// serialization retries (40001/40P01 → re-enters the outer loop) and
+/// hard failures (NotFound, StaleLease, Validation on terminal
+/// conflict).
 async fn cancel_execution_once(
     pool: &PgPool,
     args: &CancelExecutionArgs,
 ) -> Result<CancelExecutionResult, EngineError> {
     let partition_key: i16 = args.execution_id.partition() as i16;
     let exec_uuid = eid_uuid(&args.execution_id);
-    let now = now_ms();
+    // Honour caller-supplied `args.now` for `terminal_at_ms` +
+    // `raw_fields.last_mutation_at` + outbox `occurred_at_ms` so
+    // retries + cross-backend comparisons don't drift on the DB host
+    // clock.
+    let now: i64 = args.now.0;
 
     let mut tx = begin_serializable(pool).await?;
 
@@ -163,19 +168,29 @@ async fn cancel_execution_once(
     }
 
     // Lease fence validation (Valkey parity — only enforced when
-    // source != operator_override). The Valkey side keys fence on
-    // `current_lease_id` + `current_lease_epoch`; Postgres has no
-    // stable `lease_id` column, so we fence on `lease_epoch` only
-    // when the caller supplied one. `LeaseId` fencing is a no-op on
-    // Postgres (documented in `operator.rs` + matches the
-    // `lease_event::emit` docs for `lease_id = None`).
+    // `source != CancelSource::OperatorOverride`). Per
+    // `CancelExecutionArgs` docstring, `lease_epoch` is REQUIRED
+    // when source is not operator_override AND the execution is
+    // active; missing input on that path surfaces a `Validation`
+    // error rather than silently bypassing. The Valkey side keys
+    // fence on `current_lease_id` + `current_lease_epoch`; Postgres
+    // has no stable `lease_id` column, so we fence on `lease_epoch`.
+    // `lease_id` in args is ignored on Postgres (documented parity
+    // gap — matches the `lease_event::emit` docs for `lease_id = None`).
     let lease_active = worker_instance_id
         .as_deref()
         .is_some_and(|s| !s.is_empty());
-    if !matches!(args.source, CancelSource::OperatorOverride)
-        && lease_active
-        && let Some(expected_epoch) = args.lease_epoch.as_ref()
-    {
+    if !matches!(args.source, CancelSource::OperatorOverride) && lease_active {
+        let Some(expected_epoch) = args.lease_epoch.as_ref() else {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!(
+                    "cancel_execution: execution_id={}: lease_epoch required when source != operator_override and execution is active",
+                    args.execution_id
+                ),
+            });
+        };
         let expected: i64 = i64::try_from(expected_epoch.0).unwrap_or(i64::MAX);
         if lease_epoch.unwrap_or(0) != expected {
             tx.rollback().await.map_err(map_sqlx_error)?;
@@ -228,8 +243,8 @@ async fn cancel_execution_once(
                SET worker_instance_id   = NULL,
                    lease_expires_at_ms  = NULL,
                    lease_epoch          = lease_epoch + 1,
-                   terminal_at_ms       = COALESCE(terminal_at_ms, $4),
-                   outcome              = COALESCE(outcome, 'cancelled')
+                   terminal_at_ms       = $4,
+                   outcome              = 'cancelled'
              WHERE partition_key = $1 AND execution_id = $2 AND attempt_index = $3
             "#,
         )
@@ -367,7 +382,42 @@ async fn revoke_lease_once(
         });
     }
 
+    // Targeted-revoke fence: the caller identifies a specific owner
+    // via `args.worker_instance_id`. If the locked attempt is held
+    // by a different worker, surface `AlreadySatisfied` (idempotent
+    // parity — the targeted lease is already gone, from this
+    // caller's perspective). An empty caller-supplied wiid is a
+    // wildcard (matches Valkey's `revoke_lease: HGET
+    // current_worker_instance_id` fallback at `lib.rs:5869-5899`).
+    let caller_wiid = args.worker_instance_id.as_str();
+    if !caller_wiid.is_empty()
+        && worker_instance_id.as_deref() != Some(caller_wiid)
+    {
+        tx.rollback().await.map_err(map_sqlx_error)?;
+        return Ok(RevokeLeaseResult::AlreadySatisfied {
+            reason: "different_worker_instance_id".to_owned(),
+        });
+    }
+
     let prior_epoch = lease_epoch.unwrap_or(0);
+
+    // Optional `expected_lease_id` fence. Valkey uses a stable
+    // lease_id; Postgres synthesises one from
+    // `(execution_id, attempt_index, lease_epoch)`. Empty string is
+    // the documented "skip check" path on the args docstring.
+    if let Some(expected) = args
+        .expected_lease_id
+        .as_ref()
+        .filter(|s| !s.is_empty())
+    {
+        let current_id = synthetic_lease_id(exec_uuid, attempt_index, prior_epoch);
+        if expected != &current_id {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            return Ok(RevokeLeaseResult::AlreadySatisfied {
+                reason: "lease_id_mismatch".to_owned(),
+            });
+        }
+    }
 
     // CAS on `lease_epoch`. Row-count = 0 → another writer bumped
     // the epoch (reconciler or concurrent revoke) → `AlreadySatisfied`
@@ -399,6 +449,32 @@ async fn revoke_lease_once(
             reason: "epoch_moved".to_owned(),
         });
     }
+
+    // Flip `ff_exec_core` back to reclaimable-runnable so the normal
+    // claim path picks it up — mirrors
+    // `reconcilers::lease_expiry::release_one` (lease_expiry.rs:156-173).
+    // Gated on `lifecycle_phase = 'active'` to avoid touching a row
+    // that's been concurrently terminated (cancelled / completed).
+    sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET lifecycle_phase   = 'runnable',
+               ownership_state   = 'unowned',
+               eligibility_state = 'eligible_now',
+               attempt_state     = 'attempt_interrupted',
+               raw_fields        = jsonb_set(raw_fields,
+                                             '{last_mutation_at}',
+                                             to_jsonb($3::text))
+         WHERE partition_key = $1 AND execution_id = $2
+           AND lifecycle_phase = 'active'
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
 
     // Step 5 — outbox emit (§4.2.7 — `ff_lease_event event_type=revoked`).
     lease_event::emit(
