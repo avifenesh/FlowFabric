@@ -1,6 +1,6 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** ACCEPTED — Revision 6
+**Status:** ACCEPTED — Revision 7
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
@@ -8,6 +8,8 @@
 **Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms` (**Revision 5 correction: `waitpoint_key` already shipped via migration 0004; 0011 adds 3 columns, not 4**); (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
 **Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter) — **superseded by Revision 5 (moot: column already exists from 0004)**; (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
 **Revision 5:** 2026-04-26 — Ground-truth correction: `waitpoint_key` column already exists on `ff_waitpoint_pending` since migration 0004 (Wave 4d), populated as `TEXT NOT NULL DEFAULT ''` and actively used by `suspend_ops.rs`. Revision 4's §4.5 treated it as a new 0011 column; NEW-5 degraded-counter design was predicated on pre-0011 NULL rows that can never exist. This revision reframes migration 0011 as 3 additive columns (`state`, `required_signal_names`, `activated_at_ms`), drops the `waitpoint_key` addition, drops NEW-5 degraded-counter, simplifies §4.5 query to read `waitpoint_key` directly. No scope or method-count change.
+**Revision 7:** 2026-04-26 — Spine-A pt.2 impl-attempt surfaced three semantic forks in §4.2.5 + §4.2.4 that Revision 6 wrote against absent Postgres structures. Resolved in Revision 7 against the §5.2 "no Valkey behavior change" mandate: (Fork 1, §4.2.5 skipped-flow-member path) Valkey's per-dep-edge state reset + deps_meta counter recompute (`flowfabric.lua:8557-8615`) has no column on `ff_edge_group` (`ff_dep_edge` + `ff_deps_meta` are Valkey-only). **Resolved Option A** — reset downstream's `ff_edge_group` counters to neutral state (`running_count = 0`, `skip_count = 0`, `fail_count = 0`; `success_count` preserved) via UPDATE driven by `SELECT DISTINCT downstream_eid FROM ff_edge WHERE downstream_eid = $id` — structurally closest to Valkey's dep-state reset; feasibility confirmed against `ff_edge_group` schema (`0001_initial.sql:217-230`, no CHECK constraints on counter columns). (Fork 2, §4.2.5 normal-replay path) Revisions 4-6 bumped `attempt_index + 1` + INSERT new `ff_attempt`; Valkey (`flowfabric.lua:8625-8650`) mutates in-place without bumping. **Resolved Option A** — in-place UPDATE on the existing `ff_attempt` row, no `attempt_index` bump, matching Valkey exactly. §4.2.6 per-attempt-scope audit (A4) narrowed accordingly — no historical-rows invariant any more. (Fork 3, §4.2.4 `change_priority` return shape) Revision 6 §4.2.4 specified `AlreadyTerminal` on row-count=0 but `ChangePriorityResult` contract (`crates/ff-core/src/contracts/mod.rs:445-448`) has only a `Changed` variant. **Resolved Option C → mirror Valkey** — Valkey's `ff_change_priority` (`flowfabric.lua:3683-3688`) returns `err("execution_not_eligible")` on any non-runnable / non-eligible state, which is an `EngineError` in the Rust layer, not an outcome-enum variant. Postgres matches: row-count=0 maps to `EngineError::ExecutionNotEligible` (or equivalent mapping of Valkey's `execution_not_eligible` error), not a new `AlreadyTerminal` variant. No contract amendment needed; `ChangePriorityResult::Changed` remains the sole variant. No scope, method count, migration, or non-§4.2.4/§4.2.5/§4.2.6 content change.
+
 **Revision 6:** 2026-04-26 — Standalone-1 (Budget/quota admin) §4.4 rework. Standalone-1 impl attempt surfaced four structural gaps that Revision 5's §4.4 glossed over ("sits on top of existing `0002_budget.sql` tables" was false for quota; `BudgetStatus`'s 9 runtime fields have no column source on `ff_budget_policy`; budget reset scheduling has no Postgres analogue for Valkey's `budget_resets_zset` + `BudgetResetScanner`; and the "3× HGETALL → 3 SELECTs" query sketch was written against a schema that does not exist). Revision 6 resolves: (Gap 1) new **migration 0012 `ff_quota_policy` family** — 3 tables (`ff_quota_policy`, `ff_quota_window`, `ff_quota_admitted`) with concurrency represented as a column on `ff_quota_policy` (single Valkey counter-key = single Postgres column; `quota_policies_index` collapses to a partition-scoped SELECT, no dedicated table), 256-way HASH-partitioned on `partition_key`; (Gap 2) new **migration 0013** adds `next_reset_at_ms BIGINT` + 4 breach-tracking columns + 3 definitional columns to `ff_budget_policy` (Option A: single-table; breach updates remain READ COMMITTED to match the existing `report_usage_impl` isolation per Q11 — SERIALIZABLE retry budget does not apply on this hot path), and adds a new Postgres-native `BudgetResetReconciler` in `crates/ff-backend-postgres/src/reconcilers/budget_reset.rs` that selects due resets by `next_reset_at_ms <= now` (Option B for scheduling — column-on-policy over separate schedule table); (Gap 3) the 9 `BudgetStatus` fields (`breach_count`, `soft_breach_count`, `last_breach_at_ms`, `last_breach_dim`, `next_reset_at_ms`, `scope_type`, `scope_id`, `enforcement_mode`, `created_at_ms`) are columns on `ff_budget_policy` via migration 0013; `report_usage_impl` is amended to maintain `breach_count` / `soft_breach_count` / `last_breach_at_ms` / `last_breach_dim` incrementally matching Valkey's `flowfabric.lua:6576-6580,6614` pattern (this lifts Revision 5's §7.2 "don't touch shipped `report_usage_impl`" pin for this specific extension — see §7.2); (Gap 4) §4.4 query sketches rewritten against the real 2-table shape (`ff_budget_policy` including counters + `ff_budget_usage`), with `hard_limits` / `soft_limits` parsed from `policy_json`. Scope grows by two additive migrations (0012, 0013) and one new scanner (`budget_reset` Postgres reconciler); method count unchanged at 13. No spine-A, spine-B, standalone-2, release-gate, or non-budget §6.1 change.
 **Target release:** v0.11 (single coordinated ship; whole wave or withdraw)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction + staged Postgres parity), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions)
@@ -360,11 +362,27 @@ the reconciler. No new retry-budget surface is introduced.
 - Mutate: `UPDATE ff_exec_core SET priority = $new WHERE
   (partition_key, execution_id) = (...) AND lifecycle_phase NOT IN
   ('terminal','cancelled')`. Row-count = 0 (concurrent terminal
-  transition after pre-read) → return `AlreadyTerminal`.
+  transition after pre-read, or pre-read already saw terminal) →
+  return the Valkey-mirroring error `EngineError` mapping of
+  `execution_not_eligible`, **not** a new `ChangePriorityResult`
+  enum variant. Valkey's `ff_change_priority`
+  (`crates/ff-script/src/flowfabric.lua:3683-3688`) fails-closed with
+  `err("execution_not_eligible")` whenever `lifecycle_phase ~=
+  "runnable"` or `eligibility_state ~= "eligible_now"`; this is the
+  existing `ff-script` error mapping (`crates/ff-script/src/error.rs:218`,
+  `error.rs:663`) surfaced to callers as an `EngineError` — not an
+  outcome-enum variant. Postgres must mirror that shape per §5.2
+  (no Valkey behavior change). `ChangePriorityResult` stays
+  single-variant (`Changed { execution_id }`); no contract amendment.
   (Revision 4: Revision 3's draft had a stray `FOR UPDATE` on the
   `UPDATE`, which is invalid SQL — `FOR UPDATE` is SELECT-only.
   The row-lock comes from the pre-read SELECT above per the §4.2
   template.)
+  (Revision 7: Revision 6's "row-count = 0 → return `AlreadyTerminal`"
+  was written against a contract variant that does not exist
+  (`crates/ff-core/src/contracts/mod.rs:445-448` has only `Changed`).
+  Fork 3 resolved Option C → mirror Valkey's
+  `execution_not_eligible` error instead of minting a new variant.)
 - Outbox: `ff_operator_event` row (migration 0010, §4.3) with
   `event_type = 'priority_changed'`.
 
@@ -407,51 +425,157 @@ rather than failed). See `valkey/lib.rs:5736-5850`.
 
 Postgres parity:
 
-- **Base path.** SERIALIZABLE tx:
+- **Base path (normal replay).** SERIALIZABLE tx:
   1. `SELECT ec.lifecycle_phase, ec.flow_id, ec.attempt_index,
-     a.outcome FROM ff_exec_core ec LEFT JOIN ff_attempt a
-     ON (a.partition_key, a.execution_id, a.attempt_index) =
-     (ec.partition_key, ec.execution_id, ec.attempt_index)
+     ec.terminal_outcome, a.outcome FROM ff_exec_core ec LEFT JOIN
+     ff_attempt a ON (a.partition_key, a.execution_id, a.attempt_index)
+     = (ec.partition_key, ec.execution_id, ec.attempt_index)
      FOR UPDATE`.
      Column binding (A5): `lifecycle_phase` / `flow_id` /
-     `attempt_index` live on `ff_exec_core`; `outcome` lives on
-     `ff_attempt`. The join pins to the current-attempt row only.
+     `attempt_index` / `terminal_outcome` live on `ff_exec_core`;
+     `outcome` lives on `ff_attempt`. The join pins to the
+     current-attempt row only.
   2. Require `lifecycle_phase = 'terminal'` (else `NotReplayable`).
   3. `UPDATE ff_exec_core SET lifecycle_phase = 'runnable',
-     terminal_at_ms = NULL, result = NULL, attempt_index =
-     attempt_index + 1, cancellation_reason = NULL, cancelled_by =
-     NULL`. The post-replay phase is `'runnable'` (not `'pending'`)
-     to match Valkey's `ff_replay_execution` body, which writes
-     `"lifecycle_phase", "runnable"` on the base normal-replay path
-     (`crates/ff-script/src/flowfabric.lua:8625`) and on the
-     skipped-flow-member path (same file, line 8591). `'pending'`
-     in the real enum denotes a freshly-created execution pre-
-     dependency-resolution — a different state than post-replay
-     reset. (Skipped-flow-member variant may additionally transition
-     through blocked/eligibility sub-states via the upstream-edge
-     reset; those are scheduler secondary-state columns
-     orthogonal to `lifecycle_phase`.)
-  4. `INSERT INTO ff_attempt (partition_key, execution_id,
-     attempt_index, ...)` for the new attempt row (initialised
-     empty, like a fresh create). The prior terminal `ff_attempt`
-     row stays — it is history, not state. Reconciler-scope audit
-     is in §4.2.6 (A4): existing scanners key off
-     `ff_exec_core.attempt_index = ff_attempt.attempt_index`, so
-     historical rows are not picked up. (Post-replay
-  `lifecycle_phase = 'runnable'` on the current attempt, as above.)
-  5. Outbox: `ff_operator_event` row (`event_type = 'replayed'`).
-- **Skipped-flow-member path.** Additional CTE over `ff_edge` (where
-  `downstream_eid = $id`) to find incoming edges. Valkey's
-  `SMEMBERS` maps to `SELECT DISTINCT upstream_eid FROM ff_edge
-  WHERE (partition_key, flow_id, downstream_eid) = (...)`. The
-  outbound shape — reset upstream-edge states so the skipped member
-  becomes eligible again — matches the Valkey body.
+     terminal_at_ms = NULL, result = NULL, cancellation_reason =
+     NULL, cancelled_by = NULL, terminal_outcome = NULL`.
+     **`attempt_index` is NOT incremented** (Revision 7 Fork 2,
+     Option A). The post-replay phase is `'runnable'` (not
+     `'pending'`) to match Valkey's `ff_replay_execution` body,
+     which writes `"lifecycle_phase", "runnable"` on the base
+     normal-replay path (`crates/ff-script/src/flowfabric.lua:8625`)
+     and on the skipped-flow-member path (same file, line 8591).
+     `'pending'` in the real enum denotes a freshly-created
+     execution pre-dependency-resolution — a different state than
+     post-replay reset. (Skipped-flow-member variant may
+     additionally transition through blocked/eligibility sub-states
+     via the edge-group reset; those are scheduler secondary-state
+     columns orthogonal to `lifecycle_phase`.)
+  4. `UPDATE ff_attempt SET outcome = NULL, completed_at_ms = NULL,
+     worker_id = NULL, lease_id = NULL, lease_epoch = 0,
+     lease_expires_at_ms = NULL, result = NULL, error_code = NULL,
+     error_message = NULL WHERE (partition_key, execution_id,
+     attempt_index) = (ec.partition_key, ec.execution_id,
+     ec.attempt_index)`. **In-place mutation** of the existing
+     current-attempt row — **no INSERT of a new `ff_attempt` row,
+     no historical row retained** (Revision 7 Fork 2, Option A).
+     This matches Valkey's `ff_replay_execution` which mutates
+     `exec_core` in place and does not bump
+     `current_attempt_index`. The prior terminal attempt's state
+     is overwritten, not archived — same observable behavior as
+     Valkey. Consumers observing
+     `get_execution_info().current_attempt_index` see the same
+     index across backends before and after replay.
+  5. Outbox: `ff_operator_event` row (`event_type = 'replayed'`,
+     `details` JSON carries `{"variant": "normal"}`).
+
+- **Skipped-flow-member path.** Triggered when the terminal
+  `ff_exec_core` row has `terminal_outcome = 'skipped'` AND
+  `flow_id IS NOT NULL`. In addition to the base-path mutations
+  (steps 3 + 4 above, minus step 2's `'terminal'` gate — the gate
+  holds here too because Valkey also requires terminal state before
+  replay), reset downstream edge-group counters so the replayed
+  exec can re-enter the dependency-gated flow.
+
+  **Valkey ground truth** (`flowfabric.lua:8557-8615`): iterate
+  each incoming `dep_edge`, flip `impossible → unsatisfied` edges,
+  SADD to `deps_unresolved`, HSET `deps_meta.unsatisfied_required_count
+  = <new-count>`, HSET `deps_meta.impossible_required_count = 0`,
+  flip `exec_core` → `lifecycle_phase='runnable'` +
+  `eligibility_state='blocked_by_dependencies'`.
+
+  **Postgres translation (Revision 7 Fork 1, Option A).** Postgres
+  has no `ff_dep_edge` or `ff_deps_meta` table; dependency gating
+  is represented by `ff_edge_group` counters
+  (`0001_initial.sql:217-230`, columns `success_count`,
+  `fail_count`, `skip_count`, `running_count`, invariant
+  `total = success + fail + skip + running` maintained by
+  `crates/ff-backend-postgres/src/dispatch.rs:300-339` +
+  `edge_cancel_dispatcher.rs:234`). Reset the downstream's edge
+  groups to a neutral state so upstream re-execution transitions
+  drive the counters back up via the normal dispatch-path code
+  (dispatch.rs:304 decrements `running` then increments the
+  terminal bucket — the normal lifecycle handles the rebuild).
+
+  Concrete SQL (inside the same SERIALIZABLE tx as base-path
+  steps 3 + 4):
+  ```sql
+  -- Fork 1 Option A: reset downstream edge-group counters.
+  -- skip_count / fail_count / running_count zeroed; success_count
+  -- preserved (upstreams that already succeeded stay accounted;
+  -- they do not re-run on replay of the downstream, so their
+  -- contribution is stable).
+  UPDATE ff_edge_group
+     SET skip_count    = 0,
+         fail_count    = 0,
+         running_count = 0
+   WHERE (partition_key, flow_id, downstream_eid) IN (
+     SELECT DISTINCT e.partition_key, e.flow_id, e.downstream_eid
+       FROM ff_edge e
+      WHERE e.partition_key = $partition
+        AND e.downstream_eid = $execution_id
+   );
+  ```
+  (The SELECT is degenerate — `ff_edge_group` is keyed on
+  `(partition_key, flow_id, downstream_eid)` and the replayed
+  execution IS the downstream, so there is exactly one matching
+  edge-group row per `(flow_id, downstream_eid)` pair. The
+  `SELECT DISTINCT` form is kept for symmetry with
+  `dispatch.rs:320` and tolerates multi-group edges if
+  downstream fan-in later grows.)
+
+  Additionally, override step 3's `lifecycle_phase = 'runnable'`
+  secondary state: mirror Valkey's
+  `eligibility_state = 'blocked_by_dependencies'` semantic by
+  leaving the downstream out of any eligible-promotion path —
+  with `skip_count = 0` and zero upstream terminal signals, the
+  existing scanner promotion gate (`dispatch.rs` evaluate →
+  `Decision::Satisfied` only when all groups hit k_target) will
+  not promote this exec until upstream re-executions drive the
+  counters back up. No separate `eligibility_state` column write
+  is needed — the gate is counter-driven.
+
+  **Why Option A over alternatives.** Option B (delete + recreate
+  `ff_edge_group` rows) loses `policy` + `k_target` + `policy_version`
+  and forces a re-read of the graph's edge policy, adding a JOIN to
+  `ff_edge` per replay; Option C (mark exec runnable but leave
+  counters untouched) leaves `skip_count > 0` which the
+  dispatch-path evaluate() treats as a terminal signal, so the
+  replayed exec stays eligible-but-never-promoted — behaviorally
+  broken; Option D (return `EngineError::Unavailable` for
+  skipped-flow-member replay) is honest but violates the §5.2
+  full-parity mandate and leaves cairn's replay UI partially
+  broken on Postgres. Option A's `success_count` preservation is
+  justified by Valkey's mirror semantic: Valkey leaves
+  `state='satisfied'` edges untouched during the skip-replay
+  reset (`flowfabric.lua:8580` comment "satisfied edges remain
+  satisfied (upstream already succeeded)").
+
+  **Double-bump analysis.** Concern: upstream re-execution's
+  terminal transition hits `dispatch.rs:304` which
+  `running -= 1` — decrementing a counter we just set to 0 →
+  clamped to 0 via `running.max(0)` (dispatch.rs:336). Then
+  the outcome bucket (`success_count` / `fail_count` /
+  `skip_count`) increments normally. No double-bump: the
+  counter lifecycle is symmetric — we reset to a state as-if no
+  upstream had yet terminalized, and normal lifecycle drives
+  counters up from there.
+
+  Outbox: `ff_operator_event` row (`event_type = 'replayed'`,
+  `details` JSON carries `{"variant": "skipped_flow_member",
+  "groups_reset": N}` where N is the row-count returned by the
+  UPDATE above).
 
 This is **not** equivalent to "delete the result row" or "insert a
 new `ff_attempt` and forget the old one." The ephemeral
 scheduler-state reset in Valkey is structural state-machine replay;
 Postgres implements it as the same state-machine transition,
-persisted rather than ephemeral.
+persisted rather than ephemeral. Revision 7 further tightens: the
+in-place UPDATE on `ff_attempt` (base path) and the counter reset
+on `ff_edge_group` (skipped-flow-member path) both preserve the
+current `attempt_index`, matching Valkey's behavior exactly —
+replayed execs keep the same `current_attempt_index` across
+backends.
 
 #### 4.2.6 Reconciler interaction (§7.4 resolved)
 
@@ -482,11 +606,18 @@ Net: the lock protocol + CAS fencing make reconciler-interaction
 symmetric to Valkey's Lua-atomic behavior. No new reconciler
 modifications required.
 
-**Per-attempt scope audit (A4).** `replay_execution` increments
-`ff_exec_core.attempt_index` and leaves historical `ff_attempt` rows
-in place (§4.2.5 step 4). This adds N-row history semantics to
-`ff_attempt` — a new invariant for the backend. Reviewer A flagged
-this as a potential scanner hazard. Audited partners:
+**Per-attempt scope audit (A4).** Revision 7 note: the historical-
+rows hazard flagged here is **no longer applicable** under
+Revision 7's Fork-2 Option-A resolution in §4.2.5 — `replay_execution`
+now mutates the current `ff_attempt` row in place and does **not**
+bump `attempt_index`, so there is no N-row history accumulation on
+`ff_attempt`. The audit below is preserved verbatim as the historical
+reasoning record (it cleared the now-retracted N-row-history shape
+against the same scanners) and demonstrates that the scanners are
+also robust under the in-place-mutate shape: every scanner keys
+against `ff_exec_core.attempt_index` / `lifecycle_phase`, so
+whether `ff_attempt` carries one row or many, the scoping is
+correct. Revision 7 content:
 
 - `reconcilers/lease_expiry.rs:60-83` scans `ff_attempt` rows with
   non-NULL `lease_expires_at_ms`. Historical rows have
@@ -522,7 +653,7 @@ invariant-safe. No new scanner modifications required.
 | `cancel_execution` | `ff_lease_event` (if lease active) | `revoked` |
 | `revoke_lease` | `ff_lease_event` | `revoked` |
 | `change_priority` | `ff_operator_event` (new, migration 0010) | `priority_changed` |
-| `replay_execution` | `ff_operator_event` | `replayed` |
+| `replay_execution` | `ff_operator_event` | `replayed` (details: `{variant: "normal" \| "skipped_flow_member", groups_reset?: N}` — Revision 7 §4.2.5) |
 | `cancel_flow_header` | `ff_operator_event` | `flow_cancel_requested` |
 | `ack_cancel_member` | (none — too chatty; matches Valkey) | — |
 
@@ -1507,10 +1638,80 @@ additive waitpoint migration, atomic-at-release-PR flip, C3a–d).
 Revision 6 adds two flagged-but-not-blocking open questions (§7.11
 + §7.12) around post-impl contention measurement — both have
 additive follow-up migrations as the mitigation path, neither is
-a Wave-9 blocker. If the owner disagrees with any resolution
-(Option X vs Y; additive-migration vs join-derive for waitpoint;
-`get_execution_result` semantics; ack silence; §7.11 / §7.12
-hotspot tolerance), §7 reopens the specific item.
+a Wave-9 blocker. Revision 7 resolves three impl-surfaced forks
+(§7.14/§7.15/§7.16 below) — none are owner-call items, all three
+resolved under §5.2 mandate without scope change. If the owner
+disagrees with any resolution (Option X vs Y; additive-migration
+vs join-derive for waitpoint; `get_execution_result` semantics;
+ack silence; §7.11 / §7.12 hotspot tolerance; §7.14 / §7.15 /
+§7.16 translations), §7 reopens the specific item.
+
+### 7.14 `replay_execution` skipped-flow-member path on Postgres — **RESOLVED in §4.2.5 (Revision 7, Fork 1 Option A)**
+
+Valkey's skipped-flow-member replay (`flowfabric.lua:8557-8615`)
+resets per-`dep_edge` state + recomputes `deps_meta` counters.
+Postgres has no `ff_dep_edge` / `ff_deps_meta` — dep gating lives
+on `ff_edge_group` counters. Spine-A pt.2 impl attempt surfaced
+that Revision 6's "reset upstream-edge states matching Valkey"
+had no column to write against.
+
+Outcome: Option A — reset downstream's `ff_edge_group` counters
+to neutral (`running_count = 0`, `skip_count = 0`, `fail_count = 0`;
+`success_count` preserved, mirroring Valkey's "satisfied edges
+remain satisfied" at `flowfabric.lua:8580`). Concrete SQL in
+§4.2.5. Feasibility confirmed against `0001_initial.sql:217-230`
+(no CHECK constraints on counter columns). Double-bump concern
+self-resolves via `running.max(0)` clamp in
+`dispatch.rs:336`.
+
+Rejected alternatives documented in §8.8: Option B (delete +
+recreate `ff_edge_group`), Option C (mark runnable without
+counter reset), Option D (declare not-supported / return
+`EngineError::Unavailable`).
+
+### 7.15 `attempt_index` semantics on normal-replay — **RESOLVED in §4.2.5 (Revision 7, Fork 2 Option A)**
+
+Revisions 4-6 §4.2.5 specified `attempt_index + 1` + INSERT new
+`ff_attempt` row on normal replay. Valkey (`flowfabric.lua:8625-8650`)
+mutates in place without bumping `attempt_index` (no
+`current_attempt_index + 1`, no new hash). Spine-A pt.2 impl
+noted the divergence would leak through `get_execution_info().
+current_attempt_index` across backends.
+
+Outcome: Option A — in-place UPDATE on the existing `ff_attempt`
+row, no `attempt_index` bump, matching Valkey exactly. §5.2
+locks "no Valkey behavior change"; the historical-audit
+nice-to-have that Revision 4's INSERT shape introduced was not
+Valkey-canonical and is dropped. §4.2.6 A4 scanner-hazard
+audit updated accordingly.
+
+Rejected alternatives documented in §8.9: Option B (keep RFC
+divergence, document as cross-backend observable difference),
+Option C (amend `ff_attempt` schema with
+`replayed_from_attempt_index` audit column to preserve in-place
+semantic with history).
+
+### 7.16 `change_priority` return shape on already-terminal — **RESOLVED in §4.2.4 (Revision 7, Fork 3 Option C)**
+
+Revision 6 §4.2.4 specified row-count=0 → return `AlreadyTerminal`.
+`ChangePriorityResult` contract (`crates/ff-core/src/contracts/mod.rs:445-448`)
+has only a `Changed` variant — the specified variant did not exist.
+
+Outcome: Option C → mirror Valkey. Valkey's `ff_change_priority`
+(`flowfabric.lua:3683-3688`) returns
+`err("execution_not_eligible")` on any non-runnable / non-
+eligible_now state; this surfaces as an `EngineError` in the
+Rust layer (`crates/ff-script/src/error.rs:218,663`), **not** as
+an outcome-enum variant. Postgres matches: row-count=0 maps to
+the same `EngineError` mapping. `ChangePriorityResult` stays
+single-variant; no contract amendment needed for Wave 9.
+
+Rejected alternatives documented in §8.10: Option A (amend
+`ChangePriorityResult` to add `AlreadyTerminal` variant — a
+pre-1.0 breaking contract change, not Valkey-canonical), Option
+B (return `EngineError::Validation` instead of mirror of
+`execution_not_eligible` — would introduce a different error
+shape than Valkey emits).
 
 ---
 
@@ -1652,6 +1853,84 @@ the better trade for this specific wave; per-release-risk would
 dominate if the 13 methods were 13 independent templates, but they
 are not.
 
+### 8.8 `replay_execution` skipped-flow-member — Options B / C / D (rejected per Revision 7 Fork 1)
+
+Fork 1 considered four translations of Valkey's
+`ff_dep_edge` + `ff_deps_meta` reset onto Postgres's
+`ff_edge_group` counter shape; Revision 7 picks Option A
+(§4.2.5 + §7.14). The three rejected options:
+
+- **Option B — delete + recreate `ff_edge_group` rows.** Clean-
+  slate reset: `DELETE FROM ff_edge_group WHERE downstream_eid =
+  $id` then re-`INSERT` from an edge-policy join. Rejected
+  because it loses `policy` / `k_target` / `policy_version` on
+  every replay, forcing a JOIN to `ff_edge` + re-derivation of
+  the policy payload — adds a read hop to the replay hot path
+  for no observable gain over Option A's in-place counter reset.
+- **Option C — mark `exec_core.lifecycle_phase = 'runnable'` but
+  leave `ff_edge_group` counters untouched.** Rejected as
+  behaviorally broken: `skip_count > 0` continues to satisfy the
+  dispatch-path evaluator's terminal-signal test, so the
+  replayed exec stays in `'runnable'` + dependency-gated forever
+  — eligible-but-never-promoted. Replay UI shows "replayed" but
+  the exec never re-runs; a silent failure mode.
+- **Option D — return `EngineError::Unavailable` for
+  skipped-flow-member replay on Postgres.** Honest-divergence
+  path: normal replay works fully, skipped-flow-member replay
+  documented as Postgres-only-not-supported. Rejected because
+  §5.2 locks full parity — cairn's replay UI would partially
+  grey-out on Postgres even though Option A is feasible against
+  the shipped `ff_edge_group` schema. Option D remains the
+  fallback if Option A's counter reset surfaces a hidden
+  constraint violation during Spine-A pt.2 impl; if that
+  happens, reopen §7.14.
+
+### 8.9 `replay_execution` normal path — Options B / C (rejected per Revision 7 Fork 2)
+
+Fork 2 considered three translations of Valkey's in-place
+replay; Revision 7 picks Option A (§4.2.5 + §7.15). The two
+rejected options:
+
+- **Option B — keep Revision 4-6's `attempt_index + 1` +
+  INSERT-new-row divergence; document explicitly as a
+  cross-backend observable difference.** Rejected: §5.2 locks
+  "no Valkey behavior change"; consumers observing
+  `get_execution_info().current_attempt_index` would see
+  different index values across backends on the same logical
+  event, which is a parity break. The historical-audit
+  nice-to-have that motivated Revision 4's bump was not
+  Valkey-canonical in the first place.
+- **Option C — amend `ff_attempt` schema with
+  `replayed_from_attempt_index` audit column; keep in-place
+  UPDATE semantic while preserving history via the audit
+  column.** Rejected: additive schema change for a non-
+  Valkey-canonical feature. If a per-attempt-history surface is
+  needed later, it is a separate RFC (matching the §7.8 C3c
+  forward-commitment shape for `get_execution_result`) — not
+  something to bolt into Wave 9 Spine-A.
+
+### 8.10 `change_priority` already-terminal return shape — Options A / B (rejected per Revision 7 Fork 3)
+
+Fork 3 considered three shapes for row-count=0 on the UPDATE;
+Revision 7 picks Option C → mirror Valkey (§4.2.4 + §7.16). The
+two rejected options:
+
+- **Option A — amend `ChangePriorityResult` contract with an
+  `AlreadyTerminal` variant.** Would require a breaking contract
+  change (pre-1.0, so nominally in-window, but Wave 9's §5.2
+  locks "no Valkey behavior change" — and Valkey does not return
+  an outcome-enum variant here, it returns an error). Adding a
+  variant Valkey does not emit is inventing a new parity shape
+  just for Postgres, which inverts the spine's binding semantic.
+- **Option B — return `EngineError::Validation { kind:
+  InvalidInput, message: "execution already terminal" }`.**
+  Rejected: Valkey returns a specific
+  `execution_not_eligible` error (not a generic validation
+  error); consumers pattern-matching that specific error code
+  would miss on Postgres if the mapping differs. Option C
+  mirrors the Valkey code exactly — no consumer contract
+  divergence.
+
 ---
 
 ## 9. References + consumer-ask posture
@@ -1705,6 +1984,30 @@ are not.
   the §4.2.6 race partner
 - `crates/ff-backend-postgres/src/reconcilers/attempt_timeout.rs`
   — per-attempt scope audit (A4, §4.2.6)
+- `crates/ff-backend-postgres/src/dispatch.rs:300-339` — Revision 7
+  Fork 1 reference: `ff_edge_group` counter-update template
+  (`running -= 1`, outcome-bucket increment, invariant
+  `total = success + fail + skip + running`) that the
+  §4.2.5 skipped-flow-member reset mirrors in reverse
+- `crates/ff-backend-postgres/src/edge_cancel_dispatcher.rs:234` —
+  Revision 7 Fork 1 reference: second site maintaining
+  `ff_edge_group` counters on terminal transitions; invariant
+  audit confirmed reset-to-neutral-then-rebuild is symmetric to
+  the existing write path
+- `crates/ff-script/src/flowfabric.lua:3683-3688` — Revision 7
+  Fork 3 reference: Valkey `ff_change_priority` returns
+  `err("execution_not_eligible")` on non-runnable / non-eligible
+  state (the mirror-target for §4.2.4's row-count=0 mapping)
+- `crates/ff-script/src/error.rs:218,663` — Revision 7 Fork 3
+  reference: Rust error mapping for `execution_not_eligible`
+  surfaced via `EngineError`
+- `crates/ff-core/src/contracts/mod.rs:445-448` — Revision 7
+  Fork 3 reference: `ChangePriorityResult` contract; stays
+  single-variant under Revision 7 resolution
+- `crates/ff-script/src/flowfabric.lua:8557-8650` — Revision 7
+  Fork 1 + Fork 2 reference: Valkey `ff_replay_execution`
+  canonical semantics, both skipped-flow-member path
+  (8557-8615) and normal-replay path (8619-8650)
 - `crates/ff-backend-valkey/src/lib.rs:5254-5273` —
   `get_execution_result` current-attempt semantics (§4.1, §7.8)
 - `crates/ff-backend-valkey/src/lib.rs:5570-5900` — Valkey
