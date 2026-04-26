@@ -111,10 +111,11 @@ invariants.
 
 ## 2. ff-server
 
-Stateless HTTP API in front of Valkey. Runs the 15 background scanners
+Stateless HTTP API in front of Valkey. Runs the 17 background scanners
 in `ff-engine` (attempt-timeout, budget-reset, budget-reconciler,
 cancel-reconciler, delayed-promoter, dependency-reconciler,
-execution-deadline, flow-projector, index-reconciler, lease-expiry,
+edge-cancel-dispatcher, edge-cancel-reconciler, execution-deadline,
+flow-projector, index-reconciler, lease-expiry,
 pending-waitpoint-expiry, quota-reconciler, retention-trimmer,
 suspension-timeout, unblock) plus an optional completion listener —
 they drive timeouts, promotions, reconciliation, and retention.

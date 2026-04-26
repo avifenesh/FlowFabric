@@ -280,7 +280,7 @@ but no longer trips on Postgres.
 | Budget / quota (`create_budget`, `reset_budget`, `create_quota_policy`, `get_budget_status`, `report_usage_admin`) | `impl` | `stub` | Wave 9. |
 | Scheduler (`claim_for_worker`) | `impl` | `impl` | Stage E3 `PostgresScheduler` + `claim_for_worker` trait impl + 6 reconcilers. |
 | Waitpoints (`list_pending_waitpoints`) | `impl` | `stub` | Wave 9. |
-| Admin rotation (`rotate_waitpoint_hmac_secret_all`) | `impl` | `stub` | Wave 9 (single-INSERT on the global HMAC table). |
+| Admin rotation (`rotate_waitpoint_hmac_secret_all`) | `impl` | `impl` | Shipped pre-v0.10; Postgres path is a single INSERT against `ff_waitpoint_hmac(kid, secret, rotated_at)` (ground truth: `crates/ff-backend-postgres/tests/capabilities.rs:44`). |
 | Admin seed (`seed_waitpoint_hmac_secret`, issue #280) | `impl` | `impl` | Idempotent boot-time seed so cairn can drop its raw HSET boot path. Valkey fans out per-partition HSET against the `waitpoint_hmac_secrets:{p:N}` layout. Postgres INSERTs one row into `ff_waitpoint_hmac` when no kid is active. `AlreadySeeded { same_secret }` lets callers distinguish replay from real conflict. |
 | Cross-cutting (`backend_label`, `shutdown_prepare`, `ping`) | `impl` | `impl` | — |
 
