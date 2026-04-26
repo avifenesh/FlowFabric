@@ -1,11 +1,62 @@
 # RFC-023: SQLite — dev-only backend (testing harness, Temporal-pattern)
 
 **Status:** DRAFT
+**Revision:** 2
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Target release:** v0.12.0 (next content delivery after v0.11.0 Postgres Wave 9)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions), RFC-020 (Postgres Wave 9 — shipped v0.11.0), RFC-022 (parked: full-parity SQLite — superseded in scope by this RFC)
 **Tracking issue:** #338
+
+### Revision 2 summary (2026-04-26)
+
+Round-1 produced 17 concrete findings across three reviewers
+(A: technical, B: consumer, C: framing). None reframe scope; all
+tighten existing sections. Resolved in this revision:
+
+- **A1** §4.4 / §4.5 rewritten to be honest about the code surface —
+  `start_sqlite_branch`, `BACKEND_STAGE_READY` inclusion, new
+  `SqliteServerConfig` sub-config, new `BackendKind::Sqlite` variant.
+  The "no new API" claim retracted.
+- **A2** §4.2 notes cross-process subscribe fan-out is a PG-only
+  property; multi-ff-server-one-file is intentionally unsupported.
+- **A3** §4.3 adds `is_retryable_sqlite_busy` classifier paralleling
+  PG's `is_retryable_serialization`; Wave-9 SERIALIZABLE ops wrap
+  the classifier.
+- **A4** §4.1 pins `required_capabilities` as a normalized junction
+  table `ff_execution_capabilities`, not a JSON text-array scan.
+  Scanner-supervisor N=1 note added.
+- **B1** §4.7 example rewritten against real ff-sdk APIs
+  (`FlowFabricAdminClient::new`, `Worker::connect_with`); imports
+  complete; `test_config()` replaced with `ServerConfig::sqlite_dev()`
+  constructor now committed as a §4.4 scope item.
+- **B2** §4.7 split into embedded (cairn-canonical) and HTTP
+  examples.
+- **B3** `SqliteBackend::new()` embedded-path production-guard parity
+  wired in §3.3 and §4.5.
+- **B4** `FF_DEV_MODE=1` explicitly orthogonal to existing
+  `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1` axes;
+  documented in §3.3.
+- **B5** §9 adds doc-update gates (`CONSUMER_MIGRATION_0.12.md`,
+  `DEPLOYMENT.md`, `MIGRATIONS.md`, README env var table, parity
+  matrix SQLite column).
+- **B6** §4.2 adds the per-process-per-path `SqliteBackend`
+  uniqueness invariant with `OnceCell` registry.
+- **B7** §4.3 adds the full-Wave-9 coverage justification.
+- **C1** §7.3 (parity-drift lint + `.sqlite-skip` sidecar) promoted
+  from open question to §4.1 / §9 decision.
+- **C2** §1 positioning statement added: SQLite = testing harness;
+  Valkey = engine; Postgres = enterprise persistence.
+- **C3** §10 adds three missing tax lines (smoke upkeep, docs drift,
+  debugging load) + ~80% sizing sentence.
+- **C4** §5 non-goal #8 — no Wave-N+ SQLite-only perf/scale work.
+- **C5** §9 adds RFC-018 capability-matrix snapshot gate.
+- **C6** §10 CI estimate revised from "~2 min" to "3–5 min on
+  cold-cache runners."
+
+§7 retained only the two genuine owner forks (SQLite version floor,
+publishable-crate posture). §7.3 (parity-drift) moved to decided
+scope.
 
 > **Draft status:** this RFC is NOT accepted. Open questions in §7 list
 > genuine forks the owner must adjudicate before acceptance. Where
@@ -22,6 +73,17 @@
 ---
 
 ## 1. Summary
+
+### 1.0 Positioning statement (public-facing)
+
+**SQLite is a testing harness; Valkey is the engine; PostgreSQL is
+the enterprise persistence layer.** This RFC adds a third backend
+scoped explicitly to the testing-harness role. Public docs (README,
+comparison pages, consumer migration guides) communicate this
+positioning to prevent dilution of FlowFabric's Valkey-native
+thesis. Every dev-only marker in this RFC traces back to that
+positioning — the scope qualifier is the product promise, not
+paperwork.
 
 Add a third `EngineBackend` implementation — **SQLite** — scoped
 **permanently** as a dev-only / testing backend. Concrete shape:
@@ -138,9 +200,39 @@ cohort the guard exists to catch).
   it shouldn't.
 
 This matches the `BACKEND_STAGE_READY` precedent in
-`crates/ff-server/src/server.rs` (§server.rs:33) — we already
-refuse unready backends at `Server::start_with_metrics`; SQLite
-takes a parallel gate.
+`crates/ff-server/src/server.rs:33` — we already refuse unready
+backends at `Server::start_with_metrics`; SQLite joins the list
+(`BACKEND_STAGE_READY = &["valkey", "postgres", "sqlite"]`) and
+takes a parallel explicit-opt-in gate on top.
+
+**Embedded-path symmetry (B3).** The guard is NOT ff-server-only.
+`SqliteBackend::new(path)` — the library entry point used by
+no-HTTP embedded consumers per §4.4 — MUST also refuse construction
+when `FF_DEV_MODE` is unset, returning a matching `BackendError`
+with the same message text. The embedded path is not a production
+bypass; every path that produces a `SqliteBackend` handle pays the
+guard.
+
+**Relationship to existing dev axes (B4).** FF already has two
+dev-leaning env knobs: `FF_ENV=development` and
+`FF_BACKEND_ACCEPT_UNREADY=1` (see
+`docs/POSTGRES_PARITY_MATRIX.md:249-250`, retired at Stage E4 for
+PG but retained as the generic mechanism). `FF_DEV_MODE=1` is
+**orthogonal**, not an alias:
+
+- `FF_DEV_MODE=1` is the SQLite-specific production-guard gate.
+  It does nothing for `FF_BACKEND=valkey|postgres`.
+- `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1` remain the
+  generic "unready backend stage" override for future backend
+  additions before they join `BACKEND_STAGE_READY`.
+- SQLite joins `BACKEND_STAGE_READY` at introduction (no stage-E
+  ramp), so the generic override is not needed for SQLite; the
+  SQLite-specific `FF_DEV_MODE=1` gate does the production
+  protection.
+
+Documented in the §9 doc-drop: README env-var table entry calls
+out the orthogonal relationship; `docs/dev-harness.md` explains
+the separation for operators.
 
 Hardware checks and docs-only are addressed in §6 as rejected
 alternatives to the guard design.
@@ -174,11 +266,44 @@ PG migrations `0001` … `0014` cannot be shared. Dialect gap:
 
 **Migrations:** hand-ported SQLite-dialect files in
 `crates/ff-backend-sqlite/migrations/0001_*.sql` … `0014_*.sql`,
-1:1 numbered with PG for parity-drift detection (count
-mismatch = lint-fail; §7.3). Partitioning is **dropped** —
-one non-partitioned table per entity. Correct under the
-single-writer / dev-throughput envelope; not correct for PG,
-which is why PG partitions.
+1:1 numbered with PG for parity-drift detection. Partitioning is
+**dropped** — one non-partitioned table per entity. Correct under
+the single-writer / dev-throughput envelope; not correct for PG,
+which is why PG partitions. As a corollary, the scanner supervisor
+collapses to `N=1` on SQLite — no partition fan-out — since the
+flat tables have no partition key to dispatch over.
+
+**Capability-array port (A4).** The PG schema represents
+`required_capabilities` as `text[]` with a GIN index for
+capability-routing lookups (per RFC-018 / Stage 1 RFC-018). This
+does NOT port as a JSON text column + table scan; that would
+collapse routing performance on any non-trivial test. The SQLite
+port uses a normalized junction table:
+
+```sql
+CREATE TABLE ff_execution_capabilities (
+    execution_id BLOB NOT NULL,
+    capability   TEXT NOT NULL,
+    PRIMARY KEY (execution_id, capability)
+) WITHOUT ROWID;
+CREATE INDEX idx_cap_reverse
+    ON ff_execution_capabilities (capability, execution_id);
+```
+
+Routing lookups hit the reverse index; insert/update on the parent
+execution row drives a delete-then-insert against the junction in
+the same transaction. This is the standard SQLite shape for
+what PG does with `text[] + GIN`.
+
+**Parity-drift lint — decided in-scope (C1).** CI lints that
+`crates/ff-backend-sqlite/migrations/NNNN_*.sql` exists for every
+`crates/ff-backend-postgres/migrations/NNNN_*.sql`. A
+`.sqlite-skip` sidecar allow-list covers genuinely PG-only
+migrations (a partitioning-only admin op, for example); each
+skip-list entry MUST cite a tracking issue. Lint wired into
+`scripts/lint-migrations.sh` and runs in the same CI job as
+`cargo check`. This promotes the Round-1 §7.3 open question to a
+decided in-scope deliverable; no more owner fork there.
 
 **Runtime SQL (the ~10 inline `jsonb_build_object` / `jsonb_set`
 sites in the PG backend):** options: (a) fork the Rust
@@ -216,6 +341,34 @@ order. Broadcast emit fires after `tx.commit()` returns,
 per-writer, and there is exactly one writer (§4.6). Commit-order
 fan-out preserved by construction.
 
+**Cross-process subscribe fan-out — intentionally unsupported
+(A2).** Cross-process subscribe fan-out is a PG-only property via
+`PgListener`. Under SQLite's single-process envelope, a second
+ff-server process pointing at the same file will NOT receive
+subscribe events originated elsewhere. This is intentional
+(§5 non-goal #5) and accepted under the dev envelope. Consumers
+needing cross-process semantics pick Valkey or PG; that is the
+product purpose of three backends.
+
+**One `SqliteBackend` per file-path per process — invariant
+(B6).** Multiple `SqliteBackend::new(path)` handles to the same
+file within a process would get separate broadcast channels and
+lose cross-handle notifications (handle A writes; handle B's
+subscriber never sees it). To prevent this silently:
+
+- Canonicalize the path on construction (`fs::canonicalize`;
+  `:memory:` passes through).
+- Keep a process-local `OnceCell<Mutex<HashMap<PathBuf,
+  Weak<SqliteBackendInner>>>>` registry.
+- Second `new(path)` for a live entry returns the existing handle
+  (clone of `Arc<SqliteBackendInner>`); entry gone (Weak
+  upgraded to `None`) falls through to fresh construction.
+- For `:memory:` each call is a separate database by construction
+  — the registry entry key includes the per-call UUID from the
+  `file:ff-test-<uuid>?mode=memory&cache=shared` URI (§4.6), so
+  genuinely-distinct in-memory DBs stay distinct while
+  same-URI reuse shares.
+
 ### 4.3 Parity commitment
 
 **SQLite parity = PG v0.11 parity.** Every RFC-018 `Supports`
@@ -235,41 +388,140 @@ a parity gap.
 "subset of tests" carve-out. Per-test skips only via RFC-018
 capability flags, never via backend-identity checks.
 
-### 4.4 Embedded entry-point — DECISION: Option Y (no new API)
+**Full-Wave-9 surface justification (B7).** SQLite ports the full
+Wave-9 surface (operator ops, budget admin, cancel_flow_header,
+ack_cancel_member, change_priority, replay_execution, etc.) even
+though cairn's `cargo test` primary use case doesn't exercise
+every op. Reason: capability-flag parity per RFC-018 must not
+lie. If `Supports::CancelFlowHeader` reads `true` on SQLite, the
+op must actually work, not panic or return `Unavailable`. The
+alternative — per-backend capability carve-outs — fragments the
+`Supports` matrix into a "mostly-parity" tier that consumers
+cannot reason about cleanly, and opens the door to per-release
+drift in what "dev-only" covers. Over-provisioning test coverage
+is cheaper than lying about capabilities.
 
-Do consumers want `ff-server` as a library with no HTTP
-listener?
+**Retry classifier for SQLite transient errors (A3).** PG has
+`is_retryable_serialization` that maps `SerializationFailure` /
+`DeadlockDetected` to retry. SQLite's analogue is transient busy
+contention on the single-writer lock:
 
-- **Option X:** add `Server::start_embedded(backend: Arc<dyn
-  EngineBackend>) -> ServerHandle` — no HTTP bind.
-- **Option Y:** no new API. `Server::start_with_backend(...)`
-  already exists at `crates/ff-server/src/server.rs:677` and
-  accepts any `Arc<dyn EngineBackend>`. No-HTTP consumers
-  construct `SqliteBackend::new(path).await?` directly and
-  route through `ff-engine`, bypassing ff-server entirely.
+- `SQLITE_BUSY`
+- `SQLITE_BUSY_TIMEOUT` (subclass)
+- `SQLITE_LOCKED`
 
-**Decision:** **Option Y**. `start_with_backend` already covers
-library-level use; `start_embedded` duplicates it with marginally
-different defaults. `SqliteBackend::new(path)` + `ff-engine`
-suffices for no-HTTP embedded. Documenting this as the embedded
-story is cheaper than a third `start_*` method.
+Add `is_retryable_sqlite_busy(&sqlx::Error) -> bool` in
+`ff-backend-sqlite/src/errors.rs` paralleling PG's classifier.
+Wave-9 SERIALIZABLE ops that wrap the classifier: `cancel_flow`,
+`cancel_flow_header`, `ack_cancel_member`, `change_priority`,
+`replay_execution`, `complete_attempt`, `fail_attempt`,
+`deliver_signal`, plus the scanner-supervisor's budget-reconcile
+path. Non-retryable kinds (`SQLITE_CORRUPT`, `SQLITE_FULL`, etc.)
+surface as hard errors per PG's existing shape — this is the
+mechanical mirror of the PG classifier, not a new policy.
 
-**Consequence:** `SqliteBackend::new(path: &str) -> Result<Self,
-BackendError>` is a **public API** stability commitment. The
-embedded path skips `ServerConfig` entirely, so TLS / auth / HTTP
-bind concerns stay contained in ff-server.
+### 4.4 Server integration — concrete code surface (A1)
+
+Round-1 Reviewer A correctly flagged that the Round-1 draft
+claimed "no new API" while the `start_with_metrics` code at
+`crates/ff-server/src/server.rs:299-318` today hard-refuses any
+backend not in `BACKEND_STAGE_READY` and then hard-matches
+`BackendKind::{Valkey, Postgres}` only. Landing SQLite requires
+**concrete, named changes** to server.rs and config.rs, not just
+trait-implementation. Enumerated:
+
+1. **`BackendKind::Sqlite`** added to
+   `crates/ff-server/src/config.rs:13` (the `#[non_exhaustive]`
+   enum). `BackendKind::as_str` returns `"sqlite"`.
+2. **`SqliteServerConfig`** added to
+   `crates/ff-server/src/config.rs` alongside
+   `PostgresServerConfig` / `ValkeyServerConfig`. Fields:
+   `path: String` (file path or `:memory:` URI),
+   `pool_size: u32` (default 4). `ServerConfig::sqlite:
+   SqliteServerConfig` field added.
+3. **`ServerConfig::from_env`** (`config.rs:393-407`) extended:
+   `FF_BACKEND` accepts `"sqlite"` (alongside `"valkey"` /
+   `"postgres"`); `FF_SQLITE_PATH` populates `sqlite.path`;
+   `FF_SQLITE_POOL_SIZE` (default 4) populates `sqlite.pool_size`.
+4. **`ServerConfig::sqlite_dev()`** constructor added — a
+   builder shortcut that returns a pre-wired `ServerConfig` with
+   `backend = Sqlite`, `sqlite.path = ":memory:"`, all auth
+   disabled, listen_addr bound to `127.0.0.1:0` (OS-picked port),
+   suitable for `Worker::connect_with` embedded tests per §4.7.
+   Narrow to dev; no prod path constructs this.
+5. **`BACKEND_STAGE_READY`** (`server.rs:33`) extended to
+   `&["valkey", "postgres", "sqlite"]`.
+6. **`start_sqlite_branch`** added to `server.rs`, parallel to
+   the existing `start_postgres_branch` dispatch at
+   `server.rs:325-327`. The dispatch chain becomes:
+   ```rust
+   if matches!(config.backend, BackendKind::Postgres) {
+       return Self::start_postgres_branch(config, metrics).await;
+   }
+   if matches!(config.backend, BackendKind::Sqlite) {
+       return Self::start_sqlite_branch(config, metrics).await;
+   }
+   // ...Valkey default path unchanged...
+   ```
+   `start_sqlite_branch` performs the §3.3 `FF_DEV_MODE=1`
+   production-guard check, emits the warn banner, constructs
+   `SqliteBackend::new(&config.sqlite.path)`, skips the
+   Valkey-specific scanner / scheduler construction (matching
+   the PG branch), and returns a `Server` with the SQLite
+   backend wired.
+7. **`ServerError::SqliteRequiresDevMode`** added to
+   `server.rs` error enum (alongside `BackendNotReady`).
+
+**Embedded, no-HTTP consumers** continue to use the existing
+`Server::start_with_backend` (`server.rs:677`) by constructing
+`SqliteBackend::new(path).await?` and wrapping in `Arc<dyn
+EngineBackend>`. That API signature is unchanged. `Worker::connect_with`
+(`ff-sdk/src/worker.rs:587`) accepts the same `Arc<dyn
+EngineBackend>` shape and is the cairn-canonical embedded path.
+
+**Public API stability commitments taking effect at v0.12.0:**
+
+- `SqliteBackend::new(path: &str) -> Result<Self, BackendError>`
+- `BackendKind::Sqlite`
+- `ServerConfig::sqlite: SqliteServerConfig`
+- `ServerConfig::sqlite_dev() -> Self`
+- `FF_BACKEND=sqlite`, `FF_SQLITE_PATH`, `FF_SQLITE_POOL_SIZE`,
+  `FF_DEV_MODE`
+
+Option X (a hypothetical `Server::start_embedded` with no HTTP
+bind) is not needed — `start_with_backend` already covers
+library-level use; the earlier "Option Y" framing was correct in
+outcome but wrong to claim "no new API." The new API is the four
+items above; the library-level boot path itself is unchanged.
 
 ### 4.5 Production-guard mechanism
 
-Per §3.3. Implementation locus: `Server::start_with_metrics`
-(`crates/ff-server/src/server.rs`), parallel to the existing
-`BACKEND_STAGE_READY` gate at line 33. On
-`BackendKind::Sqlite`: check `FF_DEV_MODE=1`, return
-`ServerError::SqliteRequiresDevMode` if absent; otherwise emit
-the §3.3 warn banner on startup. `SqliteBackend::new(path)`
-called directly (embedded path, §4.4 Y) also emits the banner
-on construction so the dev-only signal survives the no-ff-server
-case.
+Per §3.3. Two symmetric enforcement points:
+
+**HTTP path — `Server::start_sqlite_branch`** (new, §4.4 item 6
+in `crates/ff-server/src/server.rs`): checks
+`std::env::var("FF_DEV_MODE").as_deref() == Ok("1")` before any
+backend construction. Absent → returns
+`ServerError::SqliteRequiresDevMode` with the §3.3 error text.
+Present → emits the warn banner on the tracing root before
+`SqliteBackend::new` runs.
+
+**Embedded path — `SqliteBackend::new`** (library entrypoint in
+`crates/ff-backend-sqlite/src/lib.rs`): performs the SAME
+`FF_DEV_MODE=1` check at the top of the function. Absent →
+returns `BackendError::RequiresDevMode` (parallel shape to
+`ServerError::SqliteRequiresDevMode`). Present → emits the warn
+banner on construction. Reason: cairn and FF-internal embedded
+tests (§4.7 primary example) instantiate SQLite without ever
+touching ff-server; the guard cannot live only at the ff-server
+layer or it is trivially bypassed by
+`Worker::connect_with(…, Arc::new(SqliteBackend::new(path)))`.
+The guard is on the TYPE, not the server.
+
+Banner emits on every process start so log aggregators can alert
+if a SQLite backend ever reaches an environment it shouldn't.
+Same banner text from `start_sqlite_branch` and
+`SqliteBackend::new` to keep operator-facing signal identical.
 
 ### 4.6 Test infrastructure
 
@@ -289,32 +541,97 @@ case.
 
 ### 4.7 `cargo test` story for cairn-fabric
 
-Example of a cairn migration from Docker-PG to SQLite-dev:
+Two supported shapes. Cairn-canonical = **embedded (no HTTP)**.
+The HTTP shape is for consumer harnesses that want the full
+ff-server boundary exercised.
+
+#### 4.7.1 Embedded path — primary, cairn-canonical
+
+No HTTP listener, no bind port, no `reqwest` dependency — the
+`Worker` directly wraps the SQLite backend trait object. This
+is the shape cairn's `cargo test` uses.
 
 ```rust
 // cairn-fabric/tests/integration_sqlite.rs
-use ff_backend_sqlite::SqliteBackend;
-use ff_server::Server;
 use std::sync::Arc;
+use ff_backend_sqlite::SqliteBackend;
+use ff_sdk::worker::{Worker, WorkerConfig};
 
 #[tokio::test]
 async fn end_to_end_op_roundtrip_on_sqlite() {
+    // FF_DEV_MODE=1 must be set by the harness (e.g. in the
+    // `[env]` block of .cargo/config.toml, or the shell running
+    // `cargo test`). `SqliteBackend::new` refuses without it per
+    // §4.5.
+    std::env::set_var("FF_DEV_MODE", "1");
+
     let db_uri = format!(
         "file:cairn-test-{}?mode=memory&cache=shared",
         uuid::Uuid::new_v4(),
     );
-    let backend = SqliteBackend::new(&db_uri).await.unwrap();
-    let server = Server::start_with_backend(
-        test_config(),
-        Arc::new(backend),
-    ).await.unwrap();
-    let client = Client::connect(server.http_addr()).await.unwrap();
-    // ... cairn's existing test logic, unchanged ...
+    let backend = Arc::new(
+        SqliteBackend::new(&db_uri).await.expect("sqlite init"),
+    );
+
+    // `Worker::connect_with` accepts any `Arc<dyn EngineBackend>`
+    // (crates/ff-sdk/src/worker.rs:587). No ff-server needed.
+    let config = WorkerConfig::builder()
+        .lanes(vec!["default".into()])
+        .build()
+        .expect("worker config");
+    let worker = Worker::connect_with(config, backend, None)
+        .await
+        .expect("worker connect");
+
+    // ... cairn's existing test logic against `worker`, unchanged ...
 }
 ```
 
-Before: `docker compose up postgres` + `FF_POSTGRES_URL` +
-per-test schema isolation. After: 20 lines and `cargo test`.
+#### 4.7.2 HTTP path — secondary, operator / consumer smoke
+
+For consumer harnesses that want to drive the full REST surface
+(the `published-smoke.sh` shape, and the consumer-migration doc
+example):
+
+```rust
+// examples/ff-dev or consumer smoke test
+use ff_backend_sqlite::SqliteBackend;
+use ff_sdk::admin::FlowFabricAdminClient;
+use ff_server::config::ServerConfig;
+use ff_server::server::Server;
+use std::sync::Arc;
+
+#[tokio::test]
+async fn http_roundtrip_on_sqlite() {
+    std::env::set_var("FF_DEV_MODE", "1");
+
+    // `ServerConfig::sqlite_dev()` is the §4.4 item 4 builder —
+    // pre-wires backend=Sqlite, sqlite.path=":memory:",
+    // listen_addr=127.0.0.1:0, auth disabled.
+    let config = ServerConfig::sqlite_dev();
+
+    let backend = Arc::new(
+        SqliteBackend::new(&config.sqlite.path).await.unwrap(),
+    );
+    let metrics = Arc::new(ff_observability::Metrics::new());
+    let server = Server::start_with_backend(config, backend, metrics)
+        .await
+        .expect("server start");
+
+    // `FlowFabricAdminClient::new` is the real ff-sdk API
+    // (crates/ff-sdk/src/admin.rs:50). No `Client::connect` —
+    // that doesn't exist.
+    let admin = FlowFabricAdminClient::new(
+        format!("http://{}", server.listen_addr()),
+    ).expect("admin client");
+
+    // ... smoke logic against `admin` ...
+}
+```
+
+Before (both shapes, pre-RFC-023): `docker compose up postgres`
++ `FF_POSTGRES_URL` + per-test schema isolation. After: 20–35
+lines and `cargo test`.
 
 ---
 
@@ -346,6 +663,13 @@ roadmap item.
    permanently. If a consumer articulates a genuine production
    single-node use case in the future, that is a new RFC with
    a new scope thesis — not a v2 of this one.
+8. **NOT Wave-N+ SQLite-only performance or scale work.** Any
+   future Wave that improves SQLite performance in isolation of
+   its PG equivalent is permanently out of scope. SQLite tracks
+   PG v0.11+ parity; it does not receive dedicated perf or scale
+   RFCs. If SQLite acquires a performance gap against PG, the
+   resolution is either (a) accept the gap (dev envelope) or (b)
+   port the PG fix; never (c) a SQLite-specific perf RFC.
 
 ---
 
@@ -438,6 +762,9 @@ exists and covers the embedded case.
 
 ## 7. Open questions (genuine forks for owner adjudication)
 
+Two remain after Round-2. The Round-1 §7.3 (parity-drift lint)
+is promoted to §4.1 as in-scope.
+
 ### 7.1 SQLite version floor
 
 SQLite `RETURNING` landed in 3.35 (2021); JSON1 is default-built
@@ -478,16 +805,8 @@ a release-list line item ([feedback_release_publish_list_drift](../../memory/fee
 owner should weigh the release-discipline cost against the
 discoverability gain.
 
-### 7.3 Scope of migrations 1:1 parity-drift linting
-
-Should CI lint that
-`crates/ff-backend-sqlite/migrations/NNNN_*.sql` exists for
-every `crates/ff-backend-postgres/migrations/NNNN_*.sql`? Drafter
-recommends **yes** — a simple shell-based lint in `scripts/`
-prevents a PG RFC from landing a migration and forgetting the
-SQLite port. Open because "forgetting the port" might be
-intentional (a PG-only admin operation) — need a small
-allow-list mechanism (`.sqlite-skip` sidecar) for those.
+*(Round-1 §7.3 parity-drift lint was promoted to §4.1 as a
+decided in-scope deliverable.)*
 
 ---
 
@@ -546,6 +865,31 @@ whole or does not ship.
       publishable crate).
 - [ ] `release.yml` + `release.toml` updated if new publishable
       crate.
+- [ ] **New `docs/CONSUMER_MIGRATION_0.12.md`** following the
+      v0.10 / v0.11 pattern — "how cairn migrates a test file
+      from Docker-PG to SQLite-dev in ~20 lines." (B5)
+- [ ] **`docs/DEPLOYMENT.md` updated** with an explicit
+      "SQLite is NOT a deployment target" section citing
+      `FF_DEV_MODE=1` rationale and the §1.0 positioning
+      statement. (B5)
+- [ ] **`docs/MIGRATIONS.md` updated** with env var row for
+      `FF_BACKEND=sqlite`, `FF_SQLITE_PATH`, `FF_SQLITE_POOL_SIZE`,
+      `FF_DEV_MODE`. (B5)
+- [ ] **Root `README.md` env var table** (`README.md:140-148`)
+      extended with the four new env vars (`FF_BACKEND=sqlite`
+      accepted value, `FF_SQLITE_PATH`, `FF_SQLITE_POOL_SIZE`,
+      `FF_DEV_MODE`). (B5)
+- [ ] **Parity matrix**: `docs/POSTGRES_PARITY_MATRIX.md` gains a
+      SQLite column (filename kept as-is to avoid URL churn in
+      external links; renaming to `BACKEND_PARITY_MATRIX.md`
+      flagged in §7 if owner wants the rename). (B5)
+- [ ] **RFC-018 capability-matrix snapshot test on SQLite**
+      passes — every `Supports` flag matches PG v0.11's, no gaps.
+      This is the mechanical enforcer of §4.3's parity
+      commitment. (C5)
+- [ ] **Parity-drift migration lint** (§4.1) green: every PG
+      migration has a SQLite sibling or a `.sqlite-skip` entry
+      with tracking issue.
 
 Per [feedback_release_publish_list_drift](../../memory/feedback_release_publish_list_drift.md),
 release-config files (release.yml, release.toml, RELEASING.md)
@@ -557,20 +901,49 @@ are updated in the same PR that introduces the crate.
 
 Honest enumeration:
 
-- **Schema-changing RFCs port 1 more migration per PR.** §7.3
+- **Schema-changing RFCs port 1 more migration per PR.** §4.1
   parity lint enforces.
 - **Trait-surface RFCs add a third backend impl per PR.** Same
   discipline as ff-backend-valkey; SQLite is row 3.
 - **CI matrix.** One new cell `cargo test --workspace --features
-  sqlite`; ~2 min additional wall clock (SQLite fast; compile
-  dominates).
-- **Parity-drift detection.** §7.3 lint + existing
-  `tests/capabilities.rs` pattern (RFC-018).
+  sqlite`. Estimate **3–5 minutes** on cold-cache CI runners —
+  the bundled sqlx compile dominates the wall clock, not the
+  tests themselves. Warm-cache runs are sub-minute. (C6)
+- **Parity-drift detection.** §4.1 migration lint + RFC-018
+  capability-matrix snapshot test (§9). Two mechanical
+  enforcers; both in CI before merge.
 - **Bundled SQLite binary size.** sqlx bundled build adds
   ~500 KB; feature-gated, non-opt-in consumers don't pay.
 - **Postgres-RFC cognitive load.** Third-backend consideration
   on every PG PR; valkey already precedents this, RFC-017
   through RFC-020 landed without blockage.
+- **Smoke-script upkeep.** (C3) `scripts/smoke-sqlite.sh` +
+  the SQLite scenario in `scripts/published-smoke.sh` are
+  ongoing release-gate weight. Every env-var rename, every
+  `ServerConfig::sqlite_dev` shape change, and every
+  `SqliteBackend::new` signature change drives a smoke-script
+  edit. Budget this as ~1 smoke-script touch per 2 releases
+  steady state.
+- **Docs-drift risk.** (C3) `docs/dev-harness.md` + README
+  "60 seconds" section + §4.7 examples + `CONSUMER_MIGRATION_*`
+  + `DEPLOYMENT.md` + `MIGRATIONS.md` — six docs paths all
+  carrying SQLite references. Any env-var or config shape
+  change drives a sync-or-drift audit across them. RFC-023
+  lands the baseline; future RFCs that touch backend config
+  must sweep all six.
+- **Debugging load.** (C3) Contributors hit SQLite-only
+  dialect-gap, WAL-mode, and single-writer serialization
+  quirks that don't exist on PG or Valkey (e.g. `SQLITE_BUSY`
+  storms under parallel test load, WAL files surviving a
+  crash and confusing re-open). Triage time comes out of
+  maintainer bandwidth, not automation.
+
+**Tax sizing.** Maintenance tax is estimated at **~80% of the
+full-parity RFC-022 shape's cost.** The 20% saved is
+production-operations surface that dev-only deliberately skips:
+no prod SQLite bug reports, no perf tuning under real load, no
+HA debugging, no cluster/replication operator guides. Owner has
+accepted the 80% figure per the "SQLite for testing" directive.
 
 **Owner has accepted this tax** per the "SQLite for testing"
 directive. This section is the honest ledger, not a plea for
