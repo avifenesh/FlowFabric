@@ -98,3 +98,58 @@ pub(crate) const UPDATE_EXEC_CORE_FAIL_TERMINAL_SQL: &str = r#"
            raw_fields = json_set(raw_fields, '$.last_failure_message', ?2)
      WHERE partition_key = ?3 AND execution_id = ?4
 "#;
+
+// ── Phase 2b.1 producer-side: create_execution inserts ──────────────────
+
+/// Idempotent insert of one `ff_exec_core` row. `ON CONFLICT DO NOTHING`
+/// mirrors the PG path (`ff-backend-postgres/src/exec_core.rs:157-188`)
+/// and the Valkey `ff_create_execution` FCALL's `Duplicate` outcome —
+/// caller detects duplicate via post-insert changes() == 0.
+///
+/// Binds (in order):
+///   1. partition_key (i64)
+///   2. execution_id (Uuid)
+///   3. lane_id (TEXT)
+///   4. priority (i64)
+///   5. created_at_ms (i64)
+///   6. deadline_at_ms (Option<i64>)
+///   7. payload (Option<Vec<u8>>)
+///   8. policy (Option<TEXT JSON>)
+///   9. raw_fields (TEXT JSON)
+pub(crate) const INSERT_EXEC_CORE_SQL: &str = r#"
+    INSERT INTO ff_exec_core (
+        partition_key, execution_id, flow_id, lane_id,
+        attempt_index,
+        lifecycle_phase, ownership_state, eligibility_state,
+        public_state, attempt_state,
+        priority, created_at_ms, deadline_at_ms,
+        payload, policy, raw_fields
+    ) VALUES (
+        ?1, ?2, NULL, ?3,
+        0,
+        'submitted', 'unowned', 'eligible_now',
+        'waiting', 'pending',
+        ?4, ?5, ?6,
+        ?7, ?8, ?9
+    )
+    ON CONFLICT (partition_key, execution_id) DO NOTHING
+"#;
+
+/// Idempotent insert into the normalized capability junction
+/// (RFC-023 §4.1 A4 — replaces PG's `text[]` + GIN). One row per
+/// `(execution_id, capability)` pair; junction rows persist as long
+/// as their parent `ff_exec_core` row does.
+pub(crate) const INSERT_EXEC_CAPABILITY_SQL: &str = r#"
+    INSERT INTO ff_execution_capabilities (execution_id, capability)
+    VALUES (?1, ?2)
+    ON CONFLICT (execution_id, capability) DO NOTHING
+"#;
+
+/// Idempotent seed of the lane registry (Q6 — dynamic lanes seed
+/// here on first use). Mirror of PG at
+/// `ff-backend-postgres/src/exec_core.rs:191-203`.
+pub(crate) const INSERT_LANE_REGISTRY_SQL: &str = r#"
+    INSERT INTO ff_lane_registry (lane_id, registered_at_ms, registered_by)
+    VALUES (?1, ?2, 'create_execution')
+    ON CONFLICT (lane_id) DO NOTHING
+"#;

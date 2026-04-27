@@ -43,7 +43,8 @@ use ff_core::types::{AttemptId, AttemptIndex, LeaseEpoch, LeaseId};
 use crate::errors::map_sqlx_error;
 use crate::handle_codec::{decode_handle, encode_handle};
 use crate::queries::{
-    attempt as q_attempt, exec_core as q_exec, lease as q_lease, stream as q_stream,
+    attempt as q_attempt, dispatch as q_dispatch, exec_core as q_exec, flow as q_flow,
+    flow_staging as q_flow_staging, lease as q_lease, stream as q_stream,
 };
 use crate::retry::retry_serializable;
 #[cfg(feature = "core")]
@@ -52,14 +53,78 @@ use ff_core::partition::PartitionKey;
 use ff_core::types::EdgeId;
 use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
 
-use crate::pubsub::PubSub;
+use crate::pubsub::{OutboxEvent, PubSub};
 use crate::registry;
+#[cfg(feature = "core")]
+use ff_core::contracts::{
+    AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
+    ApplyDependencyToChildResult, CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs,
+    CreateFlowResult, StageDependencyEdgeArgs, StageDependencyEdgeResult,
+};
+#[cfg(feature = "core")]
+use ff_core::state::PublicState;
+use tokio::sync::broadcast;
 
 /// Phase-1a-wide `Unavailable` helper. Each stubbed method names
 /// itself here so call-site errors carry a stable identifier.
 #[inline]
 fn unavailable<T>(op: &'static str) -> Result<T, EngineError> {
     Err(EngineError::Unavailable { op })
+}
+
+// ── Phase 2b.1: post-commit broadcast emit support ─────────────────────
+
+/// Enum selector for the 5 broadcast channels. Inner transaction bodies
+/// accumulate `(OutboxChannel, OutboxEvent)` pairs in a `Vec` and the
+/// outer wrapper dispatches them AFTER `tx.commit()` succeeds. This
+/// preserves the RFC-023 §4.2 ordering invariant: broadcast wakeup
+/// fires only for events that genuinely committed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OutboxChannel {
+    LeaseHistory,
+    Completion,
+    #[allow(dead_code)] // wired in Phase 2b.2 deliver_signal
+    SignalDelivery,
+    StreamFrame,
+    #[allow(dead_code)] // wired in Phase 2b.2 operator ops
+    OperatorEvent,
+}
+
+/// A pending post-commit broadcast emit. See [`OutboxChannel`].
+pub(crate) type PendingEmit = (OutboxChannel, OutboxEvent);
+
+/// Dispatch every pending emit via the appropriate broadcast channel.
+/// Called AFTER `tx.commit()` returns OK so consumers only observe
+/// wakeups for genuinely-committed events.
+fn dispatch_pending_emits(pubsub: &PubSub, emits: &[PendingEmit]) {
+    for (channel, ev) in emits {
+        let sender: &broadcast::Sender<OutboxEvent> = match channel {
+            OutboxChannel::LeaseHistory => &pubsub.lease_history,
+            OutboxChannel::Completion => &pubsub.completion,
+            OutboxChannel::SignalDelivery => &pubsub.signal_delivery,
+            OutboxChannel::StreamFrame => &pubsub.stream_frame,
+            OutboxChannel::OperatorEvent => &pubsub.operator_event,
+        };
+        PubSub::emit(sender, ev.clone());
+    }
+}
+
+/// Read `last_insert_rowid()` inside the open txn and turn it into
+/// an [`OutboxEvent`]. SQLite's AUTOINCREMENT outbox tables use the
+/// rowid alias as the `event_id`, so this read is correct for every
+/// outbox table defined under `migrations/000{1,6,7,10}_*.sql`.
+async fn last_outbox_event(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    partition_key: i64,
+) -> Result<OutboxEvent, EngineError> {
+    let event_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(OutboxEvent {
+        event_id,
+        partition_key,
+    })
 }
 
 // ── Phase 2a.2 helpers: hot-path shared logic ──────────────────────────
@@ -187,6 +252,7 @@ async fn fence_check(
 
 async fn claim_impl(
     pool: &SqlitePool,
+    pubsub: &PubSub,
     lane: &ff_core::types::LaneId,
     capabilities: &CapabilitySet,
     policy: &ClaimPolicy,
@@ -199,8 +265,9 @@ async fn claim_impl(
     let mut conn = begin_immediate(pool).await?;
     let result = claim_inner(&mut conn, part, lane, capabilities, policy).await;
     match result {
-        Ok(Some(handle)) => {
+        Ok(Some((handle, emits))) => {
             commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
             Ok(Some(handle))
         }
         Ok(None) => {
@@ -223,7 +290,7 @@ async fn claim_inner(
     lane: &ff_core::types::LaneId,
     capabilities: &CapabilitySet,
     policy: &ClaimPolicy,
-) -> Result<Option<Handle>, EngineError> {
+) -> Result<Option<(Handle, Vec<PendingEmit>)>, EngineError> {
     // Scan up to CAP_SCAN_BATCH eligible rows in priority order and
     // walk until we find the first capability-satisfying one. Under
     // §4.1 A3 SQLite runs on a single partition, so a high-priority
@@ -307,9 +374,11 @@ async fn claim_inner(
     // RFC-019 Stage B outbox parity (PG reference at
     // `ff-backend-postgres/src/lease_event.rs`): record a lease
     // lifecycle event so a later `subscribe_lease_history` reader
-    // observes the acquisition. The PG `pg_notify` trigger is dropped
-    // per §4.2; in-Rust broadcast wiring lands in a later phase.
-    insert_lease_event(conn, part, exec_uuid, "acquired", now).await?;
+    // observes the acquisition. Post-commit broadcast emit wired in
+    // Phase 2b.1 per RFC-023 §4.2.
+    let mut emits: Vec<PendingEmit> = Vec::new();
+    let ev = insert_lease_event(conn, part, exec_uuid, "acquired", now).await?;
+    emits.push((OutboxChannel::LeaseHistory, ev));
 
     let attempt_index = AttemptIndex::new(u32::try_from(attempt_index_i.max(0)).unwrap_or(0));
     let exec_id = ff_core::types::ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}"))
@@ -327,11 +396,12 @@ async fn claim_inner(
         lane.clone(),
         policy.worker_instance_id.clone(),
     );
-    Ok(Some(encode_handle(&payload, HandleKind::Fresh)))
+    Ok(Some((encode_handle(&payload, HandleKind::Fresh), emits)))
 }
 
 async fn complete_impl(
     pool: &SqlitePool,
+    pubsub: &PubSub,
     handle: &Handle,
     payload_bytes: Option<Vec<u8>>,
 ) -> Result<(), EngineError> {
@@ -351,7 +421,11 @@ async fn complete_impl(
     )
     .await;
     match result {
-        Ok(()) => commit_or_rollback(&mut conn).await,
+        Ok(emits) => {
+            commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
+            Ok(())
+        }
         Err(e) => {
             rollback_quiet(&mut conn).await;
             Err(e)
@@ -366,7 +440,7 @@ async fn complete_inner(
     attempt_index: i64,
     expected_epoch: u64,
     payload_bytes: Option<Vec<u8>>,
-) -> Result<(), EngineError> {
+) -> Result<Vec<PendingEmit>, EngineError> {
     fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
     let now = now_ms();
 
@@ -388,17 +462,13 @@ async fn complete_inner(
         .await
         .map_err(map_sqlx_error)?;
 
-    sqlx::query(q_attempt::INSERT_COMPLETION_EVENT_SQL)
-        .bind("success")
-        .bind(now)
-        .bind(part)
-        .bind(exec_uuid)
-        .execute(&mut **conn)
-        .await
-        .map_err(map_sqlx_error)?;
+    let mut emits: Vec<PendingEmit> = Vec::new();
+    let completion_ev = insert_completion_event_ev(conn, part, exec_uuid, "success", now).await?;
+    emits.push((OutboxChannel::Completion, completion_ev));
 
-    insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
-    Ok(())
+    let lease_ev = insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+    emits.push((OutboxChannel::LeaseHistory, lease_ev));
+    Ok(emits)
 }
 
 /// Classify whether a `fail()` call reschedules a retry or transitions
@@ -425,6 +495,7 @@ fn classify_retryable(classification: FailureClass) -> bool {
 
 async fn fail_impl(
     pool: &SqlitePool,
+    pubsub: &PubSub,
     handle: &Handle,
     reason: FailureReason,
     classification: FailureClass,
@@ -448,8 +519,9 @@ async fn fail_impl(
     )
     .await;
     match result {
-        Ok(outcome) => {
+        Ok((outcome, emits)) => {
             commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
             Ok(outcome)
         }
         Err(e) => {
@@ -469,9 +541,10 @@ async fn fail_inner(
     retryable: bool,
     reason: &FailureReason,
     classification: FailureClass,
-) -> Result<FailOutcome, EngineError> {
+) -> Result<(FailOutcome, Vec<PendingEmit>), EngineError> {
     fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
     let now = now_ms();
+    let mut emits: Vec<PendingEmit> = Vec::new();
 
     if retryable {
         sqlx::query(q_attempt::UPDATE_ATTEMPT_FAIL_RETRY_SQL)
@@ -491,7 +564,8 @@ async fn fail_inner(
             .await
             .map_err(map_sqlx_error)?;
 
-        insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+        let lease_ev = insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+        emits.push((OutboxChannel::LeaseHistory, lease_ev));
         // Log the transient failure so operators tracing a retry loop
         // can correlate cause without re-reading the attempt row
         // themselves (Gemini review #1).
@@ -502,9 +576,12 @@ async fn fail_inner(
             attempt_index = attempt_index,
             "sqlite.fail: scheduling retry"
         );
-        Ok(FailOutcome::RetryScheduled {
-            delay_until: ff_core::types::TimestampMs::from_millis(now),
-        })
+        Ok((
+            FailOutcome::RetryScheduled {
+                delay_until: ff_core::types::TimestampMs::from_millis(now),
+            },
+            emits,
+        ))
     } else {
         sqlx::query(q_attempt::UPDATE_ATTEMPT_FAIL_TERMINAL_SQL)
             .bind(now)
@@ -524,53 +601,69 @@ async fn fail_inner(
             .await
             .map_err(map_sqlx_error)?;
 
-        sqlx::query(q_attempt::INSERT_COMPLETION_EVENT_SQL)
-            .bind("failed")
-            .bind(now)
-            .bind(part)
-            .bind(exec_uuid)
-            .execute(&mut **conn)
-            .await
-            .map_err(map_sqlx_error)?;
+        let completion_ev = insert_completion_event_ev(conn, part, exec_uuid, "failed", now).await?;
+        emits.push((OutboxChannel::Completion, completion_ev));
 
-        insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
-        Ok(FailOutcome::TerminalFailed)
+        let lease_ev = insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+        emits.push((OutboxChannel::LeaseHistory, lease_ev));
+        Ok((FailOutcome::TerminalFailed, emits))
     }
 }
 
-/// Emit one RFC-019 Stage B lease-lifecycle outbox row.
+/// Emit one RFC-019 Stage B lease-lifecycle outbox row + return the
+/// generated outbox `event_id` wrapped in an [`OutboxEvent`] for the
+/// caller to queue as a post-commit broadcast.
 ///
 /// Mirrors `ff-backend-postgres/src/lease_event.rs`. The PG
-/// `pg_notify` trigger is dropped per RFC-023 §4.2 (broadcast moves
-/// into a Rust post-commit channel in a later phase); durable replay
-/// via `event_id > cursor` continues to ride against this table.
+/// `pg_notify` trigger is dropped per RFC-023 §4.2 — broadcast moves
+/// into the Rust post-commit dispatch landed in Phase 2b.1; durable
+/// replay via `event_id > cursor` continues to ride against this
+/// table.
 async fn insert_lease_event(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
     part: i64,
     exec_uuid: Uuid,
     event_type: &str,
     now: i64,
-) -> Result<(), EngineError> {
-    sqlx::query(
-        r#"
-        INSERT INTO ff_lease_event (
-            execution_id, lease_id, event_type, occurred_at_ms, partition_key
-        ) VALUES (?1, NULL, ?2, ?3, ?4)
-        "#,
-    )
-    .bind(exec_uuid.to_string())
-    .bind(event_type)
-    .bind(now)
-    .bind(part)
-    .execute(&mut **conn)
-    .await
-    .map_err(map_sqlx_error)?;
-    Ok(())
+) -> Result<OutboxEvent, EngineError> {
+    sqlx::query(q_dispatch::INSERT_LEASE_EVENT_SQL)
+        .bind(exec_uuid.to_string())
+        .bind(event_type)
+        .bind(now)
+        .bind(part)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    last_outbox_event(conn, part).await
+}
+
+/// Insert one completion outbox row (success / failed / cancelled /
+/// retry) and return the `event_id` wrapped in an [`OutboxEvent`].
+async fn insert_completion_event_ev(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    outcome: &str,
+    now: i64,
+) -> Result<OutboxEvent, EngineError> {
+    sqlx::query(q_attempt::INSERT_COMPLETION_EVENT_SQL)
+        .bind(outcome)
+        .bind(now)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    last_outbox_event(conn, part).await
 }
 
 // ── Phase 2a.3 hot-path bodies ────────────────────────────────────────
 
-async fn renew_impl(pool: &SqlitePool, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+async fn renew_impl(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    handle: &Handle,
+) -> Result<LeaseRenewal, EngineError> {
     let payload = decode_handle(handle)?;
     let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
     let attempt_index = i64::from(payload.attempt_index.0);
@@ -588,8 +681,9 @@ async fn renew_impl(pool: &SqlitePool, handle: &Handle) -> Result<LeaseRenewal, 
     )
     .await;
     match result {
-        Ok(renewal) => {
+        Ok((renewal, emits)) => {
             commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
             Ok(renewal)
         }
         Err(e) => {
@@ -606,7 +700,7 @@ async fn renew_inner(
     attempt_index: i64,
     expected_epoch: u64,
     lease_ttl_ms: i64,
-) -> Result<LeaseRenewal, EngineError> {
+) -> Result<(LeaseRenewal, Vec<PendingEmit>), EngineError> {
     fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
     let now = now_ms();
     let new_expires = now.saturating_add(lease_ttl_ms);
@@ -621,11 +715,12 @@ async fn renew_inner(
         .map_err(map_sqlx_error)?;
 
     // RFC-019 Stage B outbox parity: lease renewed event.
-    insert_lease_event(conn, part, exec_uuid, "renewed", now).await?;
+    let ev = insert_lease_event(conn, part, exec_uuid, "renewed", now).await?;
+    let emits = vec![(OutboxChannel::LeaseHistory, ev)];
 
-    Ok(LeaseRenewal::new(
-        u64::try_from(new_expires).unwrap_or(0),
-        expected_epoch,
+    Ok((
+        LeaseRenewal::new(u64::try_from(new_expires).unwrap_or(0), expected_epoch),
+        emits,
     ))
 }
 
@@ -754,6 +849,7 @@ fn build_fields_json(frame: &Frame) -> String {
 
 async fn append_frame_impl(
     pool: &SqlitePool,
+    pubsub: &PubSub,
     handle: &Handle,
     frame: Frame,
 ) -> Result<AppendFrameOutcome, EngineError> {
@@ -773,8 +869,9 @@ async fn append_frame_impl(
     )
     .await;
     match result {
-        Ok(outcome) => {
+        Ok((outcome, emits)) => {
             commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
             Ok(outcome)
         }
         Err(e) => {
@@ -791,7 +888,7 @@ async fn append_frame_inner(
     attempt_index: i64,
     expected_epoch: u64,
     frame: Frame,
-) -> Result<AppendFrameOutcome, EngineError> {
+) -> Result<(AppendFrameOutcome, Vec<PendingEmit>), EngineError> {
     fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
 
     let ts_ms = now_ms();
@@ -824,6 +921,14 @@ async fn append_frame_inner(
         .execute(&mut **conn)
         .await
         .map_err(map_sqlx_error)?;
+
+    // Post-commit broadcast on the stream_frame channel. `ff_stream_frame`
+    // uses a composite primary key, not AUTOINCREMENT — `last_insert_rowid()`
+    // still returns the rowid of the just-inserted row (SQLite assigns
+    // one for every non-WITHOUT-ROWID table), so the outbox-event id is
+    // unique per append within the table's rowid sequence.
+    let stream_ev = last_outbox_event(conn, part).await?;
+    let emits: Vec<PendingEmit> = vec![(OutboxChannel::StreamFrame, stream_ev)];
 
     let mut summary_version: Option<u64> = None;
 
@@ -956,13 +1061,14 @@ async fn append_frame_inner(
     if let Some(v) = summary_version {
         out = out.with_summary_version(v);
     }
-    Ok(out)
+    Ok((out, emits))
 }
 
 // ── claim_from_reclaim ────────────────────────────────────────────────
 
 async fn claim_from_reclaim_impl(
     pool: &SqlitePool,
+    pubsub: &PubSub,
     token: &ReclaimToken,
 ) -> Result<Option<Handle>, EngineError> {
     let eid = &token.grant.execution_id;
@@ -971,8 +1077,9 @@ async fn claim_from_reclaim_impl(
     let mut conn = begin_immediate(pool).await?;
     let result = claim_from_reclaim_inner(&mut conn, part, exec_uuid, token).await;
     match result {
-        Ok(Some(handle)) => {
+        Ok(Some((handle, emits))) => {
             commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
             Ok(Some(handle))
         }
         Ok(None) => {
@@ -991,7 +1098,7 @@ async fn claim_from_reclaim_inner(
     part: i64,
     exec_uuid: Uuid,
     token: &ReclaimToken,
-) -> Result<Option<Handle>, EngineError> {
+) -> Result<Option<(Handle, Vec<PendingEmit>)>, EngineError> {
     // Latest attempt under the partition/exec. Mirror of PG at
     // `ff-backend-postgres/src/attempt.rs:294-308`.
     let row = sqlx::query(q_lease::SELECT_LATEST_ATTEMPT_FOR_RECLAIM_SQL)
@@ -1038,7 +1145,8 @@ async fn claim_from_reclaim_inner(
         .await
         .map_err(map_sqlx_error)?;
 
-    insert_lease_event(conn, part, exec_uuid, "reclaimed", now).await?;
+    let ev = insert_lease_event(conn, part, exec_uuid, "reclaimed", now).await?;
+    let emits = vec![(OutboxChannel::LeaseHistory, ev)];
 
     let new_epoch = current_epoch.saturating_add(1);
     let payload = HandlePayload::new(
@@ -1051,7 +1159,724 @@ async fn claim_from_reclaim_inner(
         token.grant.lane_id.clone(),
         token.worker_instance_id.clone(),
     );
-    Ok(Some(encode_handle(&payload, HandleKind::Resumed)))
+    Ok(Some((encode_handle(&payload, HandleKind::Resumed), emits)))
+}
+
+// ── Phase 2b.1 producer-side bodies (Group A) ─────────────────────────
+
+/// Serialize an optional [`ff_core::policy::ExecutionPolicy`] into the
+/// TEXT JSON shape stored in `ff_exec_core.policy`. Mirrors PG at
+/// `ff-backend-postgres/src/exec_core.rs:144-150` (the PG side stores
+/// jsonb; SQLite stores the same JSON in a TEXT column).
+#[cfg(feature = "core")]
+fn encode_policy_json(
+    policy: Option<&ff_core::policy::ExecutionPolicy>,
+) -> Result<Option<String>, EngineError> {
+    match policy {
+        Some(p) => serde_json::to_string(p)
+            .map(Some)
+            .map_err(|e| EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("create_execution: policy: serialize failed: {e}"),
+            }),
+        None => Ok(None),
+    }
+}
+
+/// Build `raw_fields` for a fresh `ff_exec_core` row. Mirror of PG's
+/// `create_execution_impl` JSON shape so downstream read paths decode
+/// identically. TEXT JSON in SQLite vs jsonb in PG is otherwise opaque.
+#[cfg(feature = "core")]
+fn build_create_execution_raw_fields(args: &CreateExecutionArgs) -> String {
+    use serde_json::{Map, Value};
+    let mut raw: Map<String, Value> = Map::new();
+    raw.insert(
+        "namespace".into(),
+        Value::String(args.namespace.as_str().to_owned()),
+    );
+    raw.insert(
+        "execution_kind".into(),
+        Value::String(args.execution_kind.clone()),
+    );
+    raw.insert(
+        "creator_identity".into(),
+        Value::String(args.creator_identity.clone()),
+    );
+    if let Some(k) = &args.idempotency_key {
+        raw.insert("idempotency_key".into(), Value::String(k.clone()));
+    }
+    if let Some(enc) = &args.payload_encoding {
+        raw.insert("payload_encoding".into(), Value::String(enc.clone()));
+    }
+    raw.insert(
+        "last_mutation_at".into(),
+        Value::String(args.now.0.to_string()),
+    );
+    raw.insert(
+        "total_attempt_count".into(),
+        Value::String("0".to_owned()),
+    );
+    let tags_json: Map<String, Value> = args
+        .tags
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    raw.insert("tags".into(), Value::Object(tags_json));
+    Value::Object(raw).to_string()
+}
+
+#[cfg(feature = "core")]
+async fn create_execution_impl(
+    pool: &SqlitePool,
+    args: &CreateExecutionArgs,
+) -> Result<CreateExecutionResult, EngineError> {
+    let part: i64 = i64::from(args.execution_id.partition());
+    let exec_uuid = {
+        let s = args.execution_id.as_str();
+        let tail = s
+            .split_once("}:")
+            .map(|(_, t)| t)
+            .ok_or_else(|| EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("execution_id missing `}}:` separator: {s}"),
+            })?;
+        Uuid::parse_str(tail).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("execution_id UUID invalid: {e}"),
+        })?
+    };
+    let lane_id = args.lane_id.as_str().to_owned();
+    let priority: i64 = i64::from(args.priority);
+    let created_at_ms: i64 = args.now.0;
+    let deadline_at_ms: Option<i64> = args.execution_deadline_at.map(|t| t.0);
+    let raw_fields = build_create_execution_raw_fields(args);
+    let policy_json = encode_policy_json(args.policy.as_ref())?;
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let insert_result = sqlx::query(q_exec::INSERT_EXEC_CORE_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(&lane_id)
+        .bind(priority)
+        .bind(created_at_ms)
+        .bind(deadline_at_ms)
+        .bind(args.input_payload.as_slice())
+        .bind(policy_json.as_deref())
+        .bind(&raw_fields)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error);
+
+    let result = async {
+        let res = insert_result?;
+        let inserted = res.rows_affected() > 0;
+
+        if inserted {
+            // Populate the capability junction — RFC-023 §4.1 A4.
+            // Required caps live on `ExecutionPolicy.scheduling.required_capabilities`
+            // per the PG reference; if absent, no junction rows are
+            // written (matches PG's empty `text[]` default).
+            let required: Vec<String> = args
+                .policy
+                .as_ref()
+                .and_then(|p| p.routing_requirements.as_ref())
+                .map(|r| r.required_capabilities.iter().cloned().collect())
+                .unwrap_or_default();
+            for cap in &required {
+                sqlx::query(q_exec::INSERT_EXEC_CAPABILITY_SQL)
+                    .bind(exec_uuid)
+                    .bind(cap)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(map_sqlx_error)?;
+            }
+        }
+
+        // Lane-registry seed is idempotent and runs on every call so
+        // a dynamic lane seen for the first time on a duplicate
+        // create_execution still registers.
+        sqlx::query(q_exec::INSERT_LANE_REGISTRY_SQL)
+            .bind(&lane_id)
+            .bind(created_at_ms)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok::<bool, EngineError>(inserted)
+    }
+    .await;
+
+    match result {
+        Ok(inserted) => {
+            commit_or_rollback(&mut conn).await?;
+            if inserted {
+                Ok(CreateExecutionResult::Created {
+                    execution_id: args.execution_id.clone(),
+                    public_state: PublicState::Waiting,
+                })
+            } else {
+                Ok(CreateExecutionResult::Duplicate {
+                    execution_id: args.execution_id.clone(),
+                })
+            }
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(feature = "core")]
+async fn create_flow_impl(
+    pool: &SqlitePool,
+    args: &CreateFlowArgs,
+) -> Result<CreateFlowResult, EngineError> {
+    // Flow partition under single-writer SQLite is always 0 (§4.1 A3).
+    let part: i64 = 0;
+    let flow_uuid: Uuid = args.flow_id.0;
+    let now_ms = args.now.0;
+
+    let raw_fields = serde_json::json!({
+        "flow_kind": args.flow_kind,
+        "namespace": args.namespace.as_str(),
+        "node_count": 0,
+        "edge_count": 0,
+        "last_mutation_at_ms": now_ms,
+    })
+    .to_string();
+
+    let mut conn = begin_immediate(pool).await?;
+    let ins = sqlx::query(q_flow::INSERT_FLOW_CORE_SQL)
+        .bind(part)
+        .bind(flow_uuid)
+        .bind(now_ms)
+        .bind(&raw_fields)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error);
+    match ins {
+        Ok(r) => {
+            commit_or_rollback(&mut conn).await?;
+            if r.rows_affected() > 0 {
+                Ok(CreateFlowResult::Created {
+                    flow_id: args.flow_id.clone(),
+                })
+            } else {
+                Ok(CreateFlowResult::AlreadySatisfied {
+                    flow_id: args.flow_id.clone(),
+                })
+            }
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(feature = "core")]
+async fn add_execution_to_flow_impl(
+    pool: &SqlitePool,
+    args: &AddExecutionToFlowArgs,
+) -> Result<AddExecutionToFlowResult, EngineError> {
+    let part: i64 = 0;
+    let flow_uuid: Uuid = args.flow_id.0;
+    let (exec_part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    // Under single-writer SQLite every entity lives on partition 0
+    // (§4.1 A3). The exec id MUST carry `{fp:0}` because any other
+    // partition is unreachable.
+    if exec_part != part {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "execution partition mismatch: expected 0, got {exec_part}"
+            ),
+        });
+    }
+    let now_ms = args.now.0;
+
+    let mut conn = begin_immediate(pool).await?;
+    let work = async {
+        // 1. Load flow_core.
+        let flow_row = sqlx::query(q_flow_staging::SELECT_FLOW_CORE_FOR_STAGE_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        let Some(flow_row) = flow_row else {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "flow_not_found".into(),
+            });
+        };
+        let public_flow_state: String = flow_row.try_get("public_flow_state").map_err(map_sqlx_error)?;
+        if matches!(
+            public_flow_state.as_str(),
+            "cancelled" | "completed" | "failed" | "terminal"
+        ) {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "flow_already_terminal".into(),
+            });
+        }
+        let raw_fields_text: String = flow_row.try_get("raw_fields").map_err(map_sqlx_error)?;
+
+        // 2. Load exec_core back-pointer.
+        let exec_row = sqlx::query(q_flow_staging::SELECT_EXEC_FLOW_ID_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        let Some(exec_row) = exec_row else {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "execution_not_found".into(),
+            });
+        };
+        let existing_flow_id: Option<Uuid> = exec_row.try_get("flow_id").map_err(map_sqlx_error)?;
+
+        // 3. Idempotent: already on this flow.
+        if existing_flow_id == Some(flow_uuid) {
+            // Read node_count from cached raw_fields (avoid a second SELECT).
+            let raw_val: serde_json::Value = serde_json::from_str(&raw_fields_text).unwrap_or_else(
+                |_| serde_json::Value::Object(serde_json::Map::new()),
+            );
+            let nc = raw_val
+                .get("node_count")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0);
+            return Ok(AddExecutionToFlowResult::AlreadyMember {
+                execution_id: args.execution_id.clone(),
+                node_count: nc,
+            });
+        }
+
+        // 4. Cross-flow refusal.
+        if let Some(other) = existing_flow_id
+            && other != flow_uuid
+        {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("already_member_of_different_flow:{other}"),
+            });
+        }
+
+        // 5. Stamp exec.flow_id + bump flow counters.
+        sqlx::query(q_flow_staging::UPDATE_EXEC_SET_FLOW_ID_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(flow_uuid)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        sqlx::query(q_flow_staging::BUMP_FLOW_NODE_COUNT_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(now_ms)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        let new_nc: i64 = sqlx::query_scalar(q_flow_staging::SELECT_FLOW_NODE_COUNT_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(AddExecutionToFlowResult::Added {
+            execution_id: args.execution_id.clone(),
+            new_node_count: u32::try_from(new_nc.max(0)).unwrap_or(0),
+        })
+    }
+    .await;
+
+    match work {
+        Ok(res) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(res)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(feature = "core")]
+async fn stage_dependency_edge_impl(
+    pool: &SqlitePool,
+    args: &StageDependencyEdgeArgs,
+) -> Result<StageDependencyEdgeResult, EngineError> {
+    if args.upstream_execution_id == args.downstream_execution_id {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "self_referencing_edge".into(),
+        });
+    }
+
+    let part: i64 = 0;
+    let flow_uuid: Uuid = args.flow_id.0;
+    let edge_uuid: Uuid = args.edge_id.0;
+    let (up_part, upstream_uuid) = split_exec_id(&args.upstream_execution_id)?;
+    let (down_part, downstream_uuid) = split_exec_id(&args.downstream_execution_id)?;
+    if up_part != part || down_part != part {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "execution partition mismatch under single-writer SQLite".into(),
+        });
+    }
+    let now_ms = args.now.0;
+    let expected_rev = i64::try_from(args.expected_graph_revision).unwrap_or(i64::MAX);
+
+    let mut conn = begin_immediate(pool).await?;
+    let work = async {
+        // 1. CAS bump flow_core. `changes()` after execute tells us
+        //    whether the WHERE matched.
+        let cas = sqlx::query(q_flow_staging::CAS_BUMP_FLOW_REV_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(expected_rev)
+            .bind(now_ms)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        if cas.rows_affected() == 0 {
+            // Distinguish flow-missing vs terminal vs stale-rev.
+            let probe = sqlx::query(q_flow_staging::SELECT_FLOW_REV_AND_STATE_SQL)
+                .bind(part)
+                .bind(flow_uuid)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+            return match probe {
+                None => Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: "flow_not_found".into(),
+                }),
+                Some(r) => {
+                    let state: String = r.try_get("public_flow_state").map_err(map_sqlx_error)?;
+                    if matches!(state.as_str(), "cancelled" | "completed" | "failed" | "terminal") {
+                        Err(EngineError::Validation {
+                            kind: ValidationKind::InvalidInput,
+                            detail: "flow_already_terminal".into(),
+                        })
+                    } else {
+                        Err(EngineError::Contention(ContentionKind::StaleGraphRevision))
+                    }
+                }
+            };
+        }
+
+        // 2. Membership check.
+        let member_rows = sqlx::query_scalar::<_, Uuid>(q_flow_staging::SELECT_FLOW_MEMBERSHIP_PAIR_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(upstream_uuid)
+            .bind(downstream_uuid)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        if !member_rows.contains(&upstream_uuid) || !member_rows.contains(&downstream_uuid) {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "execution_not_in_flow".into(),
+            });
+        }
+
+        // 3. Insert edge.
+        let policy_json = serde_json::json!({
+            "dependency_kind": args.dependency_kind,
+            "satisfaction_condition": "all_required",
+            "data_passing_ref": args.data_passing_ref.clone().unwrap_or_default(),
+            "edge_state": "pending",
+            "created_at_ms": now_ms,
+            "created_by": "engine",
+            "staged_at_ms": now_ms,
+            "applied_at_ms": serde_json::Value::Null,
+        })
+        .to_string();
+        let ins = sqlx::query(q_flow_staging::INSERT_EDGE_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(edge_uuid)
+            .bind(upstream_uuid)
+            .bind(downstream_uuid)
+            .bind(&policy_json)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        if ins.rows_affected() == 0 {
+            // Edge already exists — parity with the PG `Conflict(
+            // DependencyAlreadyExists { existing })` path would require
+            // rehydrating the existing `EdgeSnapshot`, but SQLite
+            // currently has no `describe_edge` reader wired (Phase
+            // 2b.2). Surface the conflict as a Validation error
+            // naming the edge_id so callers see a stable signal;
+            // when `describe_edge` lands this can tighten to
+            // `Conflict(DependencyAlreadyExists {..})`.
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("dependency_already_exists:edge_id={edge_uuid}"),
+            });
+        }
+
+        // 4. Read post-bump revision.
+        let new_rev: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT graph_revision FROM ff_flow_core \
+             WHERE partition_key = ?1 AND flow_id = ?2",
+        )
+        .bind(part)
+        .bind(flow_uuid)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(StageDependencyEdgeResult::Staged {
+            edge_id: args.edge_id.clone(),
+            new_graph_revision: u64::try_from(new_rev).unwrap_or(0),
+        })
+    }
+    .await;
+
+    match work {
+        Ok(res) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(res)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(feature = "core")]
+async fn apply_dependency_to_child_impl(
+    pool: &SqlitePool,
+    args: &ApplyDependencyToChildArgs,
+) -> Result<ApplyDependencyToChildResult, EngineError> {
+    let part: i64 = 0;
+    let flow_uuid: Uuid = args.flow_id.0;
+    let edge_uuid: Uuid = args.edge_id.0;
+    let (down_part, downstream_uuid) = split_exec_id(&args.downstream_execution_id)?;
+    if down_part != part {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "execution partition mismatch under single-writer SQLite".into(),
+        });
+    }
+    let now_ms = args.now.0;
+
+    let mut conn = begin_immediate(pool).await?;
+    let work = async {
+        // 1. Load the edge row.
+        let row = sqlx::query(q_flow_staging::SELECT_EDGE_POLICY_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(edge_uuid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        let Some(row) = row else {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "edge_not_found".into(),
+            });
+        };
+        let policy_text: String = row.try_get("policy").map_err(map_sqlx_error)?;
+        let mut policy: serde_json::Value = serde_json::from_str(&policy_text).map_err(|e| {
+            EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!("ff_edge.policy: {e}"),
+            }
+        })?;
+
+        // 2. Idempotency.
+        let already_applied = policy
+            .get("applied_at_ms")
+            .and_then(|v| v.as_i64())
+            .is_some();
+        if already_applied {
+            return Ok(ApplyDependencyToChildResult::AlreadyApplied);
+        }
+
+        // 3. Mutate policy JSON.
+        if let Some(obj) = policy.as_object_mut() {
+            obj.insert("applied_at_ms".into(), serde_json::json!(now_ms));
+            obj.insert("edge_state".into(), serde_json::json!("applied"));
+        }
+        let new_policy_text = policy.to_string();
+        sqlx::query(q_flow_staging::UPDATE_EDGE_POLICY_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(edge_uuid)
+            .bind(&new_policy_text)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        // 4. Upsert edge_group.
+        let default_group_policy = serde_json::json!({ "kind": "all_of" }).to_string();
+        sqlx::query(q_flow_staging::UPSERT_EDGE_GROUP_APPLY_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(downstream_uuid)
+            .bind(&default_group_policy)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        // 5. Read post-upsert running_count.
+        let unsatisfied: i64 =
+            sqlx::query_scalar(q_flow_staging::SELECT_EDGE_GROUP_RUNNING_COUNT_SQL)
+                .bind(part)
+                .bind(flow_uuid)
+                .bind(downstream_uuid)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+        Ok(ApplyDependencyToChildResult::Applied {
+            unsatisfied_count: u32::try_from(unsatisfied.max(0)).unwrap_or(0),
+        })
+    }
+    .await;
+
+    match work {
+        Ok(res) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(res)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+fn cancel_policy_to_str(p: CancelFlowPolicy) -> &'static str {
+    match p {
+        CancelFlowPolicy::FlowOnly => "cancel_flow_only",
+        CancelFlowPolicy::CancelAll => "cancel_all",
+        CancelFlowPolicy::CancelPending => "cancel_pending",
+        // Forward-compat for additive `CancelFlowPolicy` variants —
+        // encode as `cancel_all` (safest conservative default), matching
+        // the PG reference at `ff-backend-postgres/src/flow.rs:525-534`.
+        _ => "cancel_all",
+    }
+}
+
+async fn cancel_flow_impl(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    id: &FlowId,
+    policy: CancelFlowPolicy,
+) -> Result<CancelFlowResult, EngineError> {
+    let part: i64 = 0;
+    let flow_uuid: Uuid = id.0;
+    let policy_str = cancel_policy_to_str(policy);
+    let now_ms = now_ms();
+
+    let mut conn = begin_immediate(pool).await?;
+    let work: Result<(CancelFlowResult, Vec<PendingEmit>), EngineError> = async {
+        // Step 1 — flip flow_core.
+        let flip = sqlx::query(q_flow::UPDATE_FLOW_CORE_CANCEL_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(now_ms)
+            .bind(policy_str)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        if flip.rows_affected() == 0 {
+            // Flow not found — return idempotent empty-member success
+            // matching PG at `ff-backend-postgres/src/flow.rs:635-641`.
+            return Ok((
+                CancelFlowResult::Cancelled {
+                    cancellation_policy: policy_str.to_owned(),
+                    member_execution_ids: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        }
+
+        // Step 2 — enumerate + cancel members.
+        let member_rows: Vec<Uuid> = if matches!(policy, CancelFlowPolicy::FlowOnly) {
+            Vec::new()
+        } else {
+            let sql = match policy {
+                CancelFlowPolicy::CancelPending => q_flow::SELECT_FLOW_MEMBERS_CANCEL_PENDING_SQL,
+                _ => q_flow::SELECT_FLOW_MEMBERS_CANCEL_ALL_SQL,
+            };
+            sqlx::query_scalar::<_, Uuid>(sql)
+                .bind(part)
+                .bind(flow_uuid)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?
+        };
+
+        let mut member_execution_ids: Vec<String> = Vec::with_capacity(member_rows.len());
+        let mut emits: Vec<PendingEmit> = Vec::new();
+        for exec_uuid in &member_rows {
+            sqlx::query(q_flow::UPDATE_EXEC_CORE_CANCEL_MEMBER_SQL)
+                .bind(part)
+                .bind(exec_uuid)
+                .bind(now_ms)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+            // Completion outbox + lease-revoked outbox — mirror of PG
+            // at `ff-backend-postgres/src/flow.rs:688-716`.
+            let completion_ev =
+                insert_completion_event_ev(&mut conn, part, *exec_uuid, "cancelled", now_ms)
+                    .await?;
+            emits.push((OutboxChannel::Completion, completion_ev));
+            let lease_ev =
+                insert_lease_event(&mut conn, part, *exec_uuid, "revoked", now_ms).await?;
+            emits.push((OutboxChannel::LeaseHistory, lease_ev));
+
+            member_execution_ids.push(format!("{{fp:{part}}}:{exec_uuid}"));
+        }
+
+        // Step 3 — CancelPending bookkeeping.
+        if matches!(policy, CancelFlowPolicy::CancelPending) {
+            sqlx::query(q_flow::INSERT_PENDING_CANCEL_GROUPS_SQL)
+                .bind(part)
+                .bind(flow_uuid)
+                .bind(now_ms)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+
+        Ok((
+            CancelFlowResult::Cancelled {
+                cancellation_policy: policy_str.to_owned(),
+                member_execution_ids,
+            },
+            emits,
+        ))
+    }
+    .await;
+
+    match work {
+        Ok((res, emits)) => {
+            commit_or_rollback(&mut conn).await?;
+            dispatch_pending_emits(pubsub, &emits);
+            Ok(res)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
 }
 
 /// Internal shared state. `Arc<SqliteBackendInner>` is what the
@@ -1063,8 +1888,7 @@ pub(crate) struct SqliteBackendInner {
     /// re-plumbing construction.
     #[allow(dead_code)]
     pub(crate) pool: SqlitePool,
-    /// Per-backend wakeup channels (Phase 3 wiring).
-    #[allow(dead_code)]
+    /// Per-backend post-commit wakeup channels (Phase 2b.1 wiring).
     pub(crate) pubsub: PubSub,
     /// Registry key (canonical path or verbatim `:memory:` URI).
     /// Held for Drop-time cleanup if we need it in a future phase;
@@ -1280,12 +2104,14 @@ impl EngineBackend for SqliteBackend {
         policy: ClaimPolicy,
     ) -> Result<Option<Handle>, EngineError> {
         let pool = &self.inner.pool;
-        retry_serializable(|| claim_impl(pool, lane, capabilities, &policy)).await
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| claim_impl(pool, pubsub, lane, capabilities, &policy)).await
     }
 
     async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
         let pool = &self.inner.pool;
-        retry_serializable(|| renew_impl(pool, handle)).await
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| renew_impl(pool, pubsub, handle)).await
     }
 
     async fn progress(
@@ -1304,12 +2130,14 @@ impl EngineBackend for SqliteBackend {
         frame: Frame,
     ) -> Result<AppendFrameOutcome, EngineError> {
         let pool = &self.inner.pool;
-        retry_serializable(|| append_frame_impl(pool, handle, frame.clone())).await
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| append_frame_impl(pool, pubsub, handle, frame.clone())).await
     }
 
     async fn complete(&self, handle: &Handle, payload: Option<Vec<u8>>) -> Result<(), EngineError> {
         let pool = &self.inner.pool;
-        retry_serializable(|| complete_impl(pool, handle, payload.clone())).await
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| complete_impl(pool, pubsub, handle, payload.clone())).await
     }
 
     async fn fail(
@@ -1319,7 +2147,8 @@ impl EngineBackend for SqliteBackend {
         classification: FailureClass,
     ) -> Result<FailOutcome, EngineError> {
         let pool = &self.inner.pool;
-        retry_serializable(|| fail_impl(pool, handle, reason.clone(), classification)).await
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| fail_impl(pool, pubsub, handle, reason.clone(), classification)).await
     }
 
     async fn cancel(&self, _handle: &Handle, _reason: &str) -> Result<(), EngineError> {
@@ -1349,7 +2178,8 @@ impl EngineBackend for SqliteBackend {
 
     async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError> {
         let pool = &self.inner.pool;
-        retry_serializable(|| claim_from_reclaim_impl(pool, &token)).await
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| claim_from_reclaim_impl(pool, pubsub, &token)).await
     }
 
     async fn delay(&self, _handle: &Handle, _delay_until: TimestampMs) -> Result<(), EngineError> {
@@ -1456,11 +2286,18 @@ impl EngineBackend for SqliteBackend {
 
     async fn cancel_flow(
         &self,
-        _id: &FlowId,
-        _policy: CancelFlowPolicy,
+        id: &FlowId,
+        policy: CancelFlowPolicy,
         _wait: CancelFlowWait,
     ) -> Result<CancelFlowResult, EngineError> {
-        unavailable("sqlite.cancel_flow")
+        // RFC-023 Phase 2b.1 Group A — classic cancel_flow only. The
+        // `wait` axis is a Valkey/PG async-dispatch concern (member
+        // cancel fan-out); under single-writer SQLite every member
+        // flip happens in the same transaction as the header flip, so
+        // the result is always synchronous `Cancelled {..}`.
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| cancel_flow_impl(pool, pubsub, id, policy)).await
     }
 
     #[cfg(feature = "core")]
@@ -1514,6 +2351,58 @@ impl EngineBackend for SqliteBackend {
         _attempt_index: AttemptIndex,
     ) -> Result<Option<ff_core::backend::SummaryDocument>, EngineError> {
         unavailable("sqlite.read_summary")
+    }
+
+    // ── RFC-017 Stage A — Ingress (create + flow staging) ──
+    //
+    // Phase 2b.1 Group A lands 5 of the 9 ingress methods. The
+    // remaining 4 (cancel_execution / change_priority /
+    // replay_execution / plus the operator-event reads) land in
+    // Phase 2b.2 alongside the Group B/C/D.2 scope.
+
+    #[cfg(feature = "core")]
+    async fn create_execution(
+        &self,
+        args: CreateExecutionArgs,
+    ) -> Result<CreateExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| create_execution_impl(pool, &args)).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn create_flow(
+        &self,
+        args: CreateFlowArgs,
+    ) -> Result<CreateFlowResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| create_flow_impl(pool, &args)).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn add_execution_to_flow(
+        &self,
+        args: AddExecutionToFlowArgs,
+    ) -> Result<AddExecutionToFlowResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| add_execution_to_flow_impl(pool, &args)).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn stage_dependency_edge(
+        &self,
+        args: StageDependencyEdgeArgs,
+    ) -> Result<StageDependencyEdgeResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| stage_dependency_edge_impl(pool, &args)).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn apply_dependency_to_child(
+        &self,
+        args: ApplyDependencyToChildArgs,
+    ) -> Result<ApplyDependencyToChildResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| apply_dependency_to_child_impl(pool, &args)).await
     }
 
     // ── RFC-018 capability discovery ──
