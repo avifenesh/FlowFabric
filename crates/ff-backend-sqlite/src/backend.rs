@@ -671,10 +671,11 @@ async fn progress_inner(
 ) -> Result<(), EngineError> {
     fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
 
-    // `coalesce(?, json_extract(raw_fields, '$.progress_pct'))` keeps
-    // any prior value when the caller passed None — mirrors the PG
-    // path's jsonb-partial-merge semantics. Binds: pct → i64 or NULL,
-    // msg → TEXT or NULL.
+    // `UPDATE_EXEC_CORE_PROGRESS_SQL` is self-correct for any NULL/
+    // non-NULL combination of the two binds (PR #376 Copilot review) —
+    // its nested `CASE WHEN ? IS NULL` shape treats each field as
+    // independent and leaves the corresponding JSON path absent when
+    // the caller passed None. No Rust-side short-circuit needed.
     sqlx::query(q_exec::UPDATE_EXEC_CORE_PROGRESS_SQL)
         .bind(percent.map(i64::from))
         .bind(message)
@@ -844,8 +845,17 @@ async fn append_frame_inner(
 
         let (mut doc, prev_version): (serde_json::Value, i64) = match existing {
             Some((text, v)) => {
-                let parsed = serde_json::from_str(&text)
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                // Strict-parse posture (PR #376 gemini review): a stored
+                // `document_json` that no longer round-trips indicates
+                // DB corruption. Surface loudly via `Corruption` rather
+                // than silently overwriting with an empty object.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| EngineError::Validation {
+                        kind: ValidationKind::Corruption,
+                        detail: format!(
+                            "corrupt summary document in ff_stream_summary: {e}"
+                        ),
+                    })?;
                 (parsed, v)
             }
             None => (serde_json::Value::Object(serde_json::Map::new()), 0),

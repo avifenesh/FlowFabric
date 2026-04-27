@@ -48,27 +48,40 @@ pub(crate) const UPDATE_EXEC_CORE_FAIL_RETRY_SQL: &str = r#"
 "#;
 
 /// Merge `progress_pct` + `progress_message` into `ff_exec_core.raw_fields`
-/// (TEXT-encoded JSON). NULL binds leave the corresponding field untouched
-/// via `coalesce` — SQLite's `json_set` overwrites with NULL when passed
-/// a NULL argument, which would drop a previously-recorded value on a
-/// partial `progress` call. Mirror of PG at
-/// `ff-backend-postgres/src/attempt.rs:498-518`; PG uses `raw_fields ||`
-/// on a jsonb object, we re-express the same observable write shape via
-/// two nested `json_set` calls over a TEXT document.
+/// (TEXT-encoded JSON). NULL binds must leave the corresponding field
+/// untouched, INCLUDING when the JSON path is currently absent — a naive
+/// `json_set(x, '$.k', coalesce(NULL, json_extract(absent))) =
+/// json_set(x, '$.k', NULL)` materializes an explicit JSON `null`,
+/// which diverges from the PG `raw_fields ||` no-op semantics for an
+/// empty patch (PR #376 Copilot review).
+///
+/// The `CASE WHEN ? IS NULL THEN <inner> ELSE json_set(<inner>, '$.k', ?)`
+/// shape skips the `json_set` call entirely when the bind is NULL,
+/// preserving absent fields AND preserving prior non-NULL values.
+/// Mirror of PG at `ff-backend-postgres/src/attempt.rs:498-518`; PG
+/// uses `raw_fields ||` on a jsonb object, we re-express the same
+/// observable write shape via conditional `json_set` calls over a
+/// TEXT document.
 ///
 /// Binds: `?1 = pct (nullable INT)`, `?2 = message (nullable TEXT)`,
 /// `?3 = partition_key`, `?4 = execution_id`.
 pub(crate) const UPDATE_EXEC_CORE_PROGRESS_SQL: &str = r#"
     UPDATE ff_exec_core
-       SET raw_fields = json_set(
-               json_set(
-                   raw_fields,
-                   '$.progress_pct',
-                   coalesce(?1, json_extract(raw_fields, '$.progress_pct'))
-               ),
-               '$.progress_message',
-               coalesce(?2, json_extract(raw_fields, '$.progress_message'))
-           )
+       SET raw_fields = CASE
+               WHEN ?2 IS NULL THEN
+                   CASE
+                       WHEN ?1 IS NULL THEN raw_fields
+                       ELSE json_set(raw_fields, '$.progress_pct', ?1)
+                   END
+               ELSE json_set(
+                   CASE
+                       WHEN ?1 IS NULL THEN raw_fields
+                       ELSE json_set(raw_fields, '$.progress_pct', ?1)
+                   END,
+                   '$.progress_message',
+                   ?2
+               )
+           END
      WHERE partition_key = ?3 AND execution_id = ?4
 "#;
 

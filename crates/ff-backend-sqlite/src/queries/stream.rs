@@ -11,8 +11,8 @@
 //!
 //! * `ff_stream_summary.document_json` is TEXT (not `jsonb`) in the
 //!   SQLite port; JSON Merge Patch is applied in Rust via
-//!   `apply_json_merge_patch_text` and written back whole. Same
-//!   observable behaviour as the PG `jsonb` path.
+//!   `crate::backend::apply_json_merge_patch` and written back whole.
+//!   Same observable behaviour as the PG `jsonb` path.
 //! * BestEffortLive trim uses a subquery-IN delete with the same
 //!   shape as PG — SQLite supports correlated subqueries in `DELETE`.
 //! * `pg_advisory_xact_lock` is replaced by the enclosing

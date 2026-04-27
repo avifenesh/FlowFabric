@@ -920,3 +920,73 @@ async fn claim_from_reclaim_live_lease_returns_none() {
         .expect("claim_from_reclaim");
     assert!(res.is_none(), "live lease must block reclaim");
 }
+
+/// PR #376 Copilot review — with the prior field absent + a NULL bind,
+/// SQLite's `json_set(x, '$.k', coalesce(NULL, NULL))` could
+/// materialize an explicit JSON `null`, diverging from the PG
+/// `raw_fields ||` no-op semantics. Assert that a partial `progress`
+/// on a fresh row leaves the un-set field ABSENT, not JSON null.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_partial_update_leaves_absent_field_absent() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    // Set only pct; message has never been written.
+    backend
+        .progress(&h, Some(25), None)
+        .await
+        .expect("progress pct-only");
+
+    // `json_type('$.progress_message')` on an absent key returns NULL.
+    // If the write path materialized `"progress_message": null`,
+    // `json_type` would return `'null'` (the string literal).
+    let pool = backend.pool_for_test();
+    let msg_type: Option<String> = sqlx::query_scalar(
+        "SELECT json_type(raw_fields, '$.progress_message') \
+         FROM ff_exec_core WHERE partition_key = 0 AND execution_id = ?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read json_type");
+    assert_eq!(
+        msg_type, None,
+        "absent field must remain absent, got json_type = {msg_type:?}"
+    );
+}
+
+/// PR #376 Copilot review — `progress(None, None)` must be a no-op.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_both_none_is_no_op() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    backend.progress(&h, None, None).await.expect("progress noop");
+
+    let pool = backend.pool_for_test();
+    let pct_type: Option<String> = sqlx::query_scalar(
+        "SELECT json_type(raw_fields, '$.progress_pct') \
+         FROM ff_exec_core WHERE partition_key = 0 AND execution_id = ?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read json_type");
+    assert_eq!(pct_type, None);
+}
