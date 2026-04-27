@@ -13,10 +13,11 @@ use std::time::Duration;
 use ff_backend_sqlite::SqliteBackend;
 use ff_core::backend::{CapabilitySet, ClaimPolicy};
 use ff_core::contracts::{
-    CancelExecutionArgs, CancelExecutionResult, ChangePriorityArgs, ChangePriorityResult,
-    CreateExecutionArgs, CreateExecutionResult, ReplayExecutionArgs, ReplayExecutionResult,
-    RevokeLeaseArgs, RevokeLeaseResult,
+    CancelExecutionArgs, CancelExecutionResult, CancelFlowArgs, CancelFlowHeader,
+    ChangePriorityArgs, ChangePriorityResult, CreateExecutionArgs, CreateExecutionResult,
+    ReplayExecutionArgs, ReplayExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
 };
+use ff_core::types::FlowId;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind};
 use ff_core::state::PublicState;
@@ -598,4 +599,257 @@ async fn concurrent_cancel_serialization() {
     // Small delay to let any broadcast emits settle before the backend
     // drops (avoids a noisy test-teardown race on the wakeup channel).
     tokio::time::sleep(Duration::from_millis(20)).await;
+}
+
+// ── cancel_flow_header + ack_cancel_member (Phase 3.3) ─────────────
+
+/// Seed a flow with N in-flight members on partition 0. Bypasses the
+/// `create_flow` ingress since Phase 3.3 only ships cancel-path
+/// glue — matching the PG reference test style at
+/// `spine_a_pt2_mutations.rs`.
+async fn seed_flow_with_members(
+    b: &Arc<SqliteBackend>,
+    flow_id: &FlowId,
+    n: usize,
+) -> Vec<Uuid> {
+    let flow_uuid = flow_id.0;
+    sqlx::query(
+        "INSERT INTO ff_flow_core \
+           (partition_key, flow_id, graph_revision, public_flow_state, created_at_ms, raw_fields) \
+         VALUES (0, ?1, 0, 'open', ?2, '{}')",
+    )
+    .bind(flow_uuid)
+    .bind(now_ms())
+    .execute(b.pool_for_test())
+    .await
+    .unwrap();
+
+    let mut members = Vec::with_capacity(n);
+    for _ in 0..n {
+        let m = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ff_exec_core \
+               (partition_key, execution_id, flow_id, lane_id, attempt_index, \
+                lifecycle_phase, ownership_state, eligibility_state, \
+                public_state, attempt_state, priority, created_at_ms, raw_fields) \
+             VALUES (0, ?1, ?2, 'default', 0, \
+                     'active', 'leased', 'eligible_now', 'running', 'running_attempt', \
+                     0, ?3, '{}')",
+        )
+        .bind(m)
+        .bind(flow_uuid)
+        .bind(now_ms())
+        .execute(b.pool_for_test())
+        .await
+        .unwrap();
+        members.push(m);
+    }
+    members
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn cancel_flow_header_happy_path_creates_backlog_and_flips_members() {
+    let b = fresh_backend().await;
+    let flow_id = FlowId::new();
+    let members = seed_flow_with_members(&b, &flow_id, 3).await;
+
+    let r = b
+        .cancel_flow_header(CancelFlowArgs {
+            flow_id: flow_id.clone(),
+            reason: "op-shutdown".into(),
+            cancellation_policy: "cancel_all".into(),
+            now: TimestampMs::from_millis(now_ms()),
+        })
+        .await
+        .expect("cancel_flow_header ok");
+    match r {
+        CancelFlowHeader::Cancelled {
+            cancellation_policy,
+            member_execution_ids,
+        } => {
+            assert_eq!(cancellation_policy, "cancel_all");
+            assert_eq!(member_execution_ids.len(), 3);
+        }
+        other => panic!("expected Cancelled, got {other:?}"),
+    }
+
+    // ff_cancel_backlog has one row.
+    let header_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_cancel_backlog WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(header_count, 1);
+
+    // ff_cancel_backlog_member has 3 rows.
+    let member_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_cancel_backlog_member WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(member_rows, 3);
+
+    // Members flipped to cancelled on ff_exec_core.
+    let cancelled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_exec_core \
+         WHERE flow_id=?1 AND lifecycle_phase='cancelled'",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(cancelled, 3);
+
+    // flow_core flipped.
+    let fstate: String = sqlx::query_scalar(
+        "SELECT public_flow_state FROM ff_flow_core WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(fstate, "cancelled");
+
+    // Operator event emitted.
+    let op_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_operator_event \
+         WHERE event_type='flow_cancel_requested' AND execution_id=?1",
+    )
+    .bind(flow_id.0.to_string())
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(op_events, 1);
+
+    let _ = members;
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn cancel_flow_header_already_terminal_is_idempotent() {
+    let b = fresh_backend().await;
+    let flow_id = FlowId::new();
+    // Seed a pre-cancelled flow directly.
+    sqlx::query(
+        "INSERT INTO ff_flow_core \
+           (partition_key, flow_id, graph_revision, public_flow_state, created_at_ms, raw_fields) \
+         VALUES (0, ?1, 0, 'cancelled', ?2, \
+           '{\"cancellation_policy\":\"flow_only\",\"cancel_reason\":\"prior\"}')",
+    )
+    .bind(flow_id.0)
+    .bind(now_ms())
+    .execute(b.pool_for_test())
+    .await
+    .unwrap();
+
+    let r = b
+        .cancel_flow_header(CancelFlowArgs {
+            flow_id: flow_id.clone(),
+            reason: "retry".into(),
+            cancellation_policy: "cancel_all".into(),
+            now: TimestampMs::from_millis(now_ms()),
+        })
+        .await
+        .expect("idempotent ok");
+    match r {
+        CancelFlowHeader::AlreadyTerminal {
+            stored_cancellation_policy,
+            stored_cancel_reason,
+            member_execution_ids,
+        } => {
+            assert_eq!(stored_cancellation_policy.as_deref(), Some("flow_only"));
+            assert_eq!(stored_cancel_reason.as_deref(), Some("prior"));
+            assert!(member_execution_ids.is_empty());
+        }
+        other => panic!("expected AlreadyTerminal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn ack_cancel_member_drains_and_deletes_parent_when_last() {
+    let b = fresh_backend().await;
+    let flow_id = FlowId::new();
+    let _members = seed_flow_with_members(&b, &flow_id, 2).await;
+
+    let r = b
+        .cancel_flow_header(CancelFlowArgs {
+            flow_id: flow_id.clone(),
+            reason: "test".into(),
+            cancellation_policy: "cancel_all".into(),
+            now: TimestampMs::from_millis(now_ms()),
+        })
+        .await
+        .expect("cancel ok");
+    let member_ids = match r {
+        CancelFlowHeader::Cancelled {
+            member_execution_ids,
+            ..
+        } => member_execution_ids,
+        other => panic!("expected Cancelled, got {other:?}"),
+    };
+    assert_eq!(member_ids.len(), 2);
+
+    // Ack first member.
+    let eid_a = ExecutionId::parse(&member_ids[0]).expect("parse");
+    b.ack_cancel_member(&flow_id, &eid_a)
+        .await
+        .expect("ack 1");
+
+    // Parent still present (one member remains).
+    let header_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_cancel_backlog WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(header_count, 1);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_cancel_backlog_member WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(remaining, 1);
+
+    // Ack second member — final ack should drop both child + parent.
+    let eid_b = ExecutionId::parse(&member_ids[1]).expect("parse");
+    b.ack_cancel_member(&flow_id, &eid_b)
+        .await
+        .expect("ack 2");
+    let header_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_cancel_backlog WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(header_after, 0, "parent backlog row dropped on final ack");
+    let members_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_cancel_backlog_member WHERE flow_id=?1",
+    )
+    .bind(flow_id.0)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(members_after, 0);
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn ack_cancel_member_idempotent_on_missing() {
+    let b = fresh_backend().await;
+    let flow_id = FlowId::new();
+    let missing_eid = new_exec_id();
+    // No backlog row exists — ack is a no-op.
+    b.ack_cancel_member(&flow_id, &missing_eid)
+        .await
+        .expect("idempotent no-op");
 }
