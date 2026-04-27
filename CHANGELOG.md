@@ -32,12 +32,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `ff-backend-sqlite::errors::map_sqlx_error` + `IsRetryableBusy for
   EngineError` — lets `retry_serializable` classify translated
   transport errors without a custom error type.
-- `crates/ff-backend-sqlite/tests/hot_path.rs` — 8 tests covering
-  claim happy path, claim no-work, capability-subset mismatch,
-  complete happy path, complete fence-mismatch →
-  `Contention(LeaseConflict)`, cross-backend (Valkey-tagged) handle
-  rejection via `ValidationKind::HandleFromOtherBackend`,
-  transient-fail retry scheduling, and permanent-fail terminal.
+- `ff-backend-sqlite`: claim path now walks a bounded batch (16) of
+  eligible rows and matches capabilities in-Rust until it finds the
+  first serveable one — fixes a starvation window where a
+  high-priority row with unserveable caps would block the entire
+  lane for a given worker (PR-375 review).
+- `ff-backend-sqlite`: lease-lifecycle outbox parity with PG — claim
+  / complete / fail emit `ff_lease_event` rows (`acquired` /
+  `revoked`) under the same txn so a later
+  `subscribe_lease_history` reader sees the cascade (PR-375 review).
+- `ff-backend-sqlite`: `FailureClass` wildcard defaults to retry
+  (least-destructive) per the project's `#[non_exhaustive]` rule —
+  an unknown future variant MUST NOT silently burn the attempt on
+  backend upgrades.
+- `crates/ff-backend-sqlite/tests/hot_path.rs` — 10 tests covering
+  claim happy path, claim no-work, capability-subset mismatch
+  skip-return-None, capability-subset-walk-past-priority, claim +
+  complete lease-event emission, complete happy path, complete
+  fence-mismatch → `Contention(LeaseConflict)`, cross-backend
+  (Valkey-tagged) handle rejection via
+  `ValidationKind::HandleFromOtherBackend`, transient-fail retry
+  scheduling, and permanent-fail terminal.
 - **`crates/ff-backend-sqlite` — SQLite dev-only backend (RFC-023 Phase 1a).**
   Activation requires `FF_DEV_MODE=1`. Construction is guarded at the
   `SqliteBackend::new` TYPE level (§4.5 / §3.3 A3) so every entry

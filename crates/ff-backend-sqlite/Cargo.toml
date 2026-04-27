@@ -41,7 +41,3 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 # environment, and `cargo test` runs per-binary tests in parallel by
 # default. `serial_test` enforces per-`#[serial]` ordering.
 serial_test = "3"
-# Phase 2a.2 hot-path tests seed `ff_exec_core` / `ff_attempt` rows via
-# raw SQL (the `create_execution` trait surface lands in Phase 2b) and
-# need direct `uuid` to bind 16-byte BLOBs.
-uuid = { workspace = true }

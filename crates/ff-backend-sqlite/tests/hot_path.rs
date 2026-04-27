@@ -359,6 +359,91 @@ async fn fail_transient_schedules_retry_and_reruns_runnable() {
     );
 }
 
+/// Capability subset check walks past higher-priority rows that the
+/// worker cannot serve rather than returning `None` immediately. This
+/// is the fix for PR-375 review finding on single-partition starvation.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn claim_walks_past_capability_mismatch_to_match_lower_priority() {
+    let backend = fresh_backend().await;
+    let pool = backend.pool_for_test();
+
+    // Seed two rows on the same lane:
+    // * high-priority requires capB (worker lacks it)
+    // * low-priority requires capA (worker has it)
+    let hi = Uuid::new_v4();
+    let lo = Uuid::new_v4();
+    for (uuid, priority, cap) in [(hi, 10, "capB"), (lo, 0, "capA")] {
+        sqlx::query(
+            r#"
+            INSERT INTO ff_exec_core (
+                partition_key, execution_id, lane_id, attempt_index,
+                lifecycle_phase, ownership_state, eligibility_state,
+                public_state, attempt_state, priority, created_at_ms
+            ) VALUES (0, ?1, 'default', 0,
+                      'runnable', 'unowned', 'eligible_now',
+                      'pending', 'initial', ?2, 1)
+            "#,
+        )
+        .bind(uuid)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("seed exec_core");
+        sqlx::query(
+            "INSERT INTO ff_execution_capabilities (execution_id, capability) VALUES (?1, ?2)",
+        )
+        .bind(uuid)
+        .bind(cap)
+        .execute(pool)
+        .await
+        .expect("seed caps");
+    }
+
+    let caps = CapabilitySet::new(["capA"]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("claims the matching lower-priority row");
+
+    // The low-priority row got claimed; the high-priority row is still
+    // runnable.
+    assert_eq!(h.backend, BackendTag::Sqlite);
+    assert_eq!(read_exec_phase(&backend, lo).await, "active");
+    assert_eq!(read_exec_phase(&backend, hi).await, "runnable");
+}
+
+/// claim + complete each emit a row into `ff_lease_event` (acquired /
+/// revoked) so `subscribe_lease_history` readers observe a coherent
+/// lifecycle. Mirrors the PG path via `lease_event::emit`.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn claim_and_complete_emit_lease_events() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+    backend.complete(&h, None).await.expect("complete");
+
+    let pool = backend.pool_for_test();
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_type, execution_id FROM ff_lease_event \
+          WHERE execution_id = ?1 ORDER BY event_id ASC",
+    )
+    .bind(exec_uuid.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read lease events");
+    let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(types, vec!["acquired", "revoked"]);
+}
+
 #[tokio::test]
 #[serial(ff_dev_mode)]
 async fn fail_permanent_writes_terminal_failed() {

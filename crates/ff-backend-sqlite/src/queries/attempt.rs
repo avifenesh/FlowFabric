@@ -26,11 +26,16 @@
 //! [`ff_core::engine_error::ContentionKind::LeaseConflict`] without
 //! retrying (it is a semantic conflict, not transient busy).
 
-/// Scan one eligible row in the partition/lane. Caller iterates the
-/// `(partition_key, priority, created_at_ms)` order; `LIMIT 1`
-/// yields the highest-priority-oldest runnable row. No `FOR UPDATE
-/// SKIP LOCKED` — the enclosing `BEGIN IMMEDIATE` already serializes
-/// writers per §4.1 A3.
+/// Scan up to `?3` eligible rows in the partition/lane ordered by
+/// `(priority DESC, created_at_ms ASC)`. No `FOR UPDATE SKIP LOCKED`
+/// — the enclosing `BEGIN IMMEDIATE` already serializes writers per
+/// §4.1 A3.
+///
+/// The batch shape (vs. `LIMIT 1`) lets `claim_impl` walk past rows
+/// whose required capabilities the current worker lacks without
+/// starving lower-priority-but-eligible members of the same lane —
+/// caught in PR-375 review. Bounded budget keeps the lock window
+/// predictable even when the top-priority row has an exotic cap set.
 pub(crate) const SELECT_ELIGIBLE_EXEC_SQL: &str = r#"
     SELECT execution_id, attempt_index
       FROM ff_exec_core
@@ -39,7 +44,7 @@ pub(crate) const SELECT_ELIGIBLE_EXEC_SQL: &str = r#"
        AND lifecycle_phase = 'runnable'
        AND eligibility_state = 'eligible_now'
      ORDER BY priority DESC, created_at_ms ASC
-     LIMIT 1
+     LIMIT ?3
 "#;
 
 /// Fetch the capability tokens bound to an execution via the junction
