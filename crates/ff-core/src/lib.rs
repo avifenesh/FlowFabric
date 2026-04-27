@@ -5,6 +5,7 @@ pub mod capability;
 pub mod caps;
 pub mod completion_backend;
 pub mod contracts;
+pub mod crypto;
 pub mod engine_backend;
 pub mod engine_error;
 pub mod error;
