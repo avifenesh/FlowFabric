@@ -7,6 +7,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 2a.2 hot-path trait impls (RFC-023).**
+  Replaces the `Unavailable` stubs for `claim`, `complete`, and `fail`
+  with real bodies paralleling `ff-backend-postgres::attempt`. Handle
+  minting + decode flows through the Phase 2a.1.5 `handle_codec`
+  (`BackendTag::Sqlite`, wire byte `0x03`); fence CAS is enforced under
+  `BEGIN IMMEDIATE` txns (§4.1 A3); capability subset-match reads the
+  `ff_execution_capabilities` junction (§4.1 A4) and compares in Rust
+  via `ff-core::caps`. Transient `SQLITE_BUSY` is wrapped by the
+  Phase-2a.1 `retry_serializable` helper (`MAX_ATTEMPTS = 3`,
+  5ms/10ms backoff). Phase 2a.3 (lease-lifecycle: renew, delay,
+  cancel, wait_children, append_frame) follows; no `Supports`-flag
+  flips land in this PR (§4.4 Rev-6 clarification: `claim` /
+  `complete` / `fail` are trait-mandatory hot-path ops without a
+  `Supports` bool).
+- `crates/ff-backend-sqlite/src/queries/attempt.rs` +
+  `.../queries/exec_core.rs` populated with hot-path SQL consts
+  (`SELECT_ELIGIBLE_EXEC_SQL`, `UPSERT_ATTEMPT_ON_CLAIM_SQL`,
+  `SELECT_ATTEMPT_EPOCH_SQL`, `UPDATE_ATTEMPT_COMPLETE_SQL`,
+  `UPDATE_ATTEMPT_FAIL_RETRY_SQL`, `UPDATE_ATTEMPT_FAIL_TERMINAL_SQL`,
+  `INSERT_COMPLETION_EVENT_SQL`, `UPDATE_EXEC_CORE_CLAIM_SQL`,
+  `UPDATE_EXEC_CORE_COMPLETE_SQL`, `UPDATE_EXEC_CORE_FAIL_RETRY_SQL`,
+  `UPDATE_EXEC_CORE_FAIL_TERMINAL_SQL`).
+- `ff-backend-sqlite::errors::map_sqlx_error` + `IsRetryableBusy for
+  EngineError` — lets `retry_serializable` classify translated
+  transport errors without a custom error type.
+- `crates/ff-backend-sqlite/tests/hot_path.rs` — 8 tests covering
+  claim happy path, claim no-work, capability-subset mismatch,
+  complete happy path, complete fence-mismatch →
+  `Contention(LeaseConflict)`, cross-backend (Valkey-tagged) handle
+  rejection via `ValidationKind::HandleFromOtherBackend`,
+  transient-fail retry scheduling, and permanent-fail terminal.
 - **`crates/ff-backend-sqlite` — SQLite dev-only backend (RFC-023 Phase 1a).**
   Activation requires `FF_DEV_MODE=1`. Construction is guarded at the
   `SqliteBackend::new` TYPE level (§4.5 / §3.3 A3) so every entry
