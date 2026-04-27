@@ -82,8 +82,15 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
                     tracing::error!(attempt, error = %e, "FUNCTION LOAD failed with permanent error");
                     return Err(LoadError::Valkey(e));
                 }
-                last_err = Some(e);
                 if attempt < MAX_ATTEMPTS {
+                    // Log the transient error's Display before moving
+                    // `e` into `last_err` so the structured field is
+                    // a real error reference, not a post-hoc
+                    // `Option<String>` round-trip.
+                    let backoff = backoff_ms
+                        .get((attempt as usize).saturating_sub(1))
+                        .copied()
+                        .unwrap_or(4_000);
                     // Before sleeping, force a slot-map refresh so the
                     // next attempt routes against fresh topology. No-op
                     // in standalone mode. A refresh failure is logged
@@ -97,18 +104,17 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
                             "force_cluster_slot_refresh failed between FUNCTION LOAD retries"
                         );
                     }
-                    let backoff = backoff_ms
-                        .get((attempt as usize).saturating_sub(1))
-                        .copied()
-                        .unwrap_or(4_000);
                     tracing::warn!(
                         attempt,
                         max_attempts = MAX_ATTEMPTS,
                         backoff_ms = backoff,
-                        error = ?last_err.as_ref().map(|e| e.to_string()),
+                        error = %e,
                         "FUNCTION LOAD failed (transient), refreshed slot map, retrying"
                     );
+                    last_err = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                } else {
+                    last_err = Some(e);
                 }
             }
         }

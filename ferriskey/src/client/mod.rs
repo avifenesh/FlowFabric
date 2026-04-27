@@ -894,11 +894,21 @@ impl Client {
     /// error from a write that was routed to a former-primary that
     /// has been demoted to a replica) before retrying the command.
     pub async fn force_cluster_slot_refresh(&self) -> Result<()> {
-        let guard = self.internal_client.read().await;
-        match &*guard {
-            ClientWrapper::Standalone(_) => Ok(()),
-            ClientWrapper::Cluster { client } => client.force_slot_refresh().await,
-        }
+        // Clone the `ClusterConnection` under the lock so we don't
+        // hold the `internal_client` read guard across the network
+        // refresh: a writer (e.g. `update_connection_password`) that
+        // queues during the refresh would otherwise starve every
+        // subsequent reader until topology resolution completes.
+        // `ClusterConnection` is `Clone` and the clone is cheap (mpsc
+        // sender + `Arc<InnerCore>`).
+        let cluster = {
+            let guard = self.internal_client.read().await;
+            match &*guard {
+                ClientWrapper::Standalone(_) => return Ok(()),
+                ClientWrapper::Cluster { client } => client.clone(),
+            }
+        };
+        cluster.force_slot_refresh().await
     }
 
     /// Typed-tuple variant of [`Self::cluster_scan`] for Rust
