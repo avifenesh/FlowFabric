@@ -70,3 +70,32 @@ pub const SELECT_WAITPOINT_FOR_DELIVER_SQL: &str =
 pub const DELETE_WAITPOINTS_BY_EXEC_SQL: &str =
     "DELETE FROM ff_waitpoint_pending \
       WHERE partition_key = ?1 AND execution_id = ?2";
+
+// ── list_pending_waitpoints (RFC-020 §4.5, Phase 3.3) ──────────────
+
+/// Existence probe — matches PG reference's `EXISTS exec_core`
+/// pre-check so a non-existent execution surfaces `NotFound` rather
+/// than an empty page. Binds: ?1 partition_key, ?2 execution_id BLOB.
+pub const SELECT_EXEC_EXISTS_SQL: &str =
+    "SELECT 1 FROM ff_exec_core WHERE partition_key = ?1 AND execution_id = ?2";
+
+/// Cursor-paginated scan of `ff_waitpoint_pending` for one execution.
+/// Filters to `state IN ('pending','active')` (matches Valkey's
+/// client-side keep filter). Fetches `limit + 1` to detect "more to
+/// come" without a second round-trip.
+///
+/// Binds:
+///   1. partition_key (i64)
+///   2. execution_id BLOB
+///   3. after_waitpoint_id BLOB — NULL → no cursor
+///   4. limit_plus_one (i64)
+pub const SELECT_PENDING_WAITPOINTS_PAGE_SQL: &str =
+    "SELECT waitpoint_id, waitpoint_key, state, required_signal_names, \
+            created_at_ms, activated_at_ms, expires_at_ms, token_kid, token \
+       FROM ff_waitpoint_pending \
+      WHERE partition_key = ?1 \
+        AND execution_id  = ?2 \
+        AND state IN ('pending', 'active') \
+        AND (?3 IS NULL OR waitpoint_id > ?3) \
+      ORDER BY waitpoint_id \
+      LIMIT ?4";

@@ -61,10 +61,12 @@ use crate::registry;
 #[cfg(feature = "core")]
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
-    ApplyDependencyToChildResult, CancelExecutionArgs, CancelExecutionResult,
-    ChangePriorityArgs, ChangePriorityResult, CreateExecutionArgs, CreateExecutionResult,
-    CreateFlowArgs, CreateFlowResult, ReplayExecutionArgs, ReplayExecutionResult,
-    RevokeLeaseArgs, RevokeLeaseResult, StageDependencyEdgeArgs, StageDependencyEdgeResult,
+    ApplyDependencyToChildResult, CancelExecutionArgs, CancelExecutionResult, CancelFlowArgs,
+    CancelFlowHeader, ChangePriorityArgs, ChangePriorityResult, CreateExecutionArgs,
+    CreateExecutionResult, CreateFlowArgs, CreateFlowResult, ExecutionInfo,
+    ListPendingWaitpointsArgs, ListPendingWaitpointsResult, ReplayExecutionArgs,
+    ReplayExecutionResult, RevokeLeaseArgs, RevokeLeaseResult, StageDependencyEdgeArgs,
+    StageDependencyEdgeResult,
 };
 #[cfg(feature = "core")]
 use ff_core::state::PublicState;
@@ -2780,6 +2782,78 @@ impl EngineBackend for SqliteBackend {
         args: ReplayExecutionArgs,
     ) -> Result<ReplayExecutionResult, EngineError> {
         crate::operator::replay_execution_impl(&self.inner.pool, &self.inner.pubsub, args).await
+    }
+
+    // ── RFC-020 Wave 9 — Read model (Phase 3.3) ──────────────────────
+    //
+    // Three read-only methods paralleling PG §4.1. Normalisation
+    // helpers collapse storage-tier lifecycle/state literals to the
+    // `serde_snake_case` wire form; unknown tokens surface
+    // `Corruption`. `get_execution_result` has current-attempt
+    // semantics per RFC-020 Rev 7 Fork 3.
+
+    #[cfg(feature = "core")]
+    async fn read_execution_state(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<PublicState>, EngineError> {
+        crate::reads::read_execution_state_impl(&self.inner.pool, id).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, EngineError> {
+        crate::reads::read_execution_info_impl(&self.inner.pool, id).await
+    }
+
+    async fn get_execution_result(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        crate::reads::get_execution_result_impl(&self.inner.pool, id).await
+    }
+
+    // ── RFC-020 Wave 9 — Cancel-flow split (Phase 3.3) ───────────────
+    //
+    // `cancel_flow_header` is the atomic flow-state flip + member
+    // enumeration; `ack_cancel_member` is the drain of one member +
+    // parent-delete when empty. The Server composes these with its
+    // wait/async machinery to build the wire-level
+    // [`CancelFlowResult`]. `ack_cancel_member` is silent on the
+    // outbox (RFC-020 §4.2.7 Valkey-parity).
+
+    #[cfg(feature = "core")]
+    async fn cancel_flow_header(
+        &self,
+        args: CancelFlowArgs,
+    ) -> Result<CancelFlowHeader, EngineError> {
+        crate::operator::cancel_flow_header_impl(&self.inner.pool, &self.inner.pubsub, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn ack_cancel_member(
+        &self,
+        flow_id: &FlowId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        crate::operator::ack_cancel_member_impl(
+            &self.inner.pool,
+            flow_id.clone(),
+            execution_id.clone(),
+        )
+        .await
+    }
+
+    // ── RFC-020 Wave 9 — list_pending_waitpoints (Phase 3.3) ─────────
+
+    #[cfg(feature = "core")]
+    async fn list_pending_waitpoints(
+        &self,
+        args: ListPendingWaitpointsArgs,
+    ) -> Result<ListPendingWaitpointsResult, EngineError> {
+        crate::suspend_ops::list_pending_waitpoints_impl(&self.inner.pool, args).await
     }
 
     // ── RFC-019 Stage B/C — subscribe_* (Phase 3.1) ──────────────────

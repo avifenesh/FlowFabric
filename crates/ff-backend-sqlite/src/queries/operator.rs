@@ -221,6 +221,124 @@ pub(crate) const UPDATE_ATTEMPT_REPLAY_RESET_SQL: &str = r#"
      WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3
 "#;
 
+// ── cancel_flow_header (§4.2.3, Phase 3.3) ─────────────────────────
+
+/// Pre-read flow core row under the write lock (`BEGIN IMMEDIATE`).
+/// Binds: ?1 partition_key, ?2 flow_id BLOB.
+pub(crate) const SELECT_FLOW_CORE_FOR_CANCEL_SQL: &str = r#"
+    SELECT public_flow_state, raw_fields
+      FROM ff_flow_core
+     WHERE partition_key = ?1 AND flow_id = ?2
+"#;
+
+/// Flip `ff_flow_core` to cancelled + merge `cancellation_policy` +
+/// `cancel_reason` into `raw_fields`. SQLite has no `jsonb ||` merge;
+/// we nest two `json_set` calls. Binds: ?1 part, ?2 flow_id, ?3 now,
+/// ?4 cancellation_policy, ?5 reason.
+pub(crate) const UPDATE_FLOW_CORE_CANCEL_WITH_REASON_SQL: &str = r#"
+    UPDATE ff_flow_core
+       SET public_flow_state = 'cancelled',
+           terminal_at_ms    = COALESCE(terminal_at_ms, ?3),
+           raw_fields        = json_set(
+                                 json_set(raw_fields,
+                                          '$.cancellation_policy', ?4),
+                                 '$.cancel_reason', ?5)
+     WHERE partition_key = ?1 AND flow_id = ?2
+"#;
+
+/// Idempotent insert of the backlog header. Binds: ?1 part, ?2
+/// flow_id, ?3 requested_at_ms, ?4 reason, ?5 cancellation_policy.
+pub(crate) const INSERT_CANCEL_BACKLOG_SQL: &str = r#"
+    INSERT INTO ff_cancel_backlog
+        (partition_key, flow_id, requested_at_ms, requester, reason,
+         cancellation_policy, status)
+    VALUES (?1, ?2, ?3, '', ?4, ?5, 'pending')
+    ON CONFLICT (partition_key, flow_id) DO NOTHING
+"#;
+
+/// Enumerate in-flight member executions for a flow. Binds: ?1 part,
+/// ?2 flow_id BLOB.
+pub(crate) const SELECT_FLOW_INFLIGHT_MEMBERS_SQL: &str = r#"
+    SELECT execution_id
+      FROM ff_exec_core
+     WHERE partition_key = ?1 AND flow_id = ?2
+       AND lifecycle_phase NOT IN ('terminal','cancelled')
+"#;
+
+/// Enumerate all members (used for idempotent-replay when a backlog
+/// row doesn't exist yet). Binds: ?1 part, ?2 flow_id.
+pub(crate) const SELECT_FLOW_ALL_MEMBERS_SQL: &str = r#"
+    SELECT execution_id
+      FROM ff_exec_core
+     WHERE partition_key = ?1 AND flow_id = ?2
+"#;
+
+/// Enumerate already-enumerated backlog members (idempotent-replay
+/// path). Binds: ?1 part, ?2 flow_id.
+pub(crate) const SELECT_CANCEL_BACKLOG_MEMBERS_SQL: &str = r#"
+    SELECT execution_id
+      FROM ff_cancel_backlog_member
+     WHERE partition_key = ?1 AND flow_id = ?2
+"#;
+
+/// Insert one backlog member row. Binds: ?1 part, ?2 flow_id, ?3
+/// execution_id wire-string. SQLite has no bulk UNNEST — the caller
+/// loops; under single-writer with BEGIN IMMEDIATE each statement is
+/// cheap and the membership cardinality is bounded.
+pub(crate) const INSERT_CANCEL_BACKLOG_MEMBER_SQL: &str = r#"
+    INSERT INTO ff_cancel_backlog_member
+        (partition_key, flow_id, execution_id)
+    VALUES (?1, ?2, ?3)
+    ON CONFLICT (partition_key, flow_id, execution_id) DO NOTHING
+"#;
+
+/// Flip one member exec_core row to cancelled for the `cancel_flow_header`
+/// fan-out. Binds: ?1 part, ?2 execution_id BLOB, ?3 now, ?4 reason.
+///
+/// Also clears `ownership_state` + `attempt_state` to their terminal
+/// forms so the `StateVector` assembled by `read_execution_info` is
+/// internally consistent (cursor bugbot: a live-running member would
+/// otherwise retain `ownership_state='leased'` + `attempt_state=
+/// 'running_attempt'` alongside `lifecycle_phase='cancelled'`).
+pub(crate) const UPDATE_EXEC_CORE_CANCEL_FROM_HEADER_SQL: &str = r#"
+    UPDATE ff_exec_core
+       SET lifecycle_phase     = 'cancelled',
+           ownership_state     = 'unowned',
+           eligibility_state   = 'cancelled',
+           public_state        = 'cancelled',
+           attempt_state       = 'cancelled',
+           terminal_at_ms      = COALESCE(terminal_at_ms, ?3),
+           cancellation_reason = COALESCE(cancellation_reason, ?4),
+           cancelled_by        = COALESCE(cancelled_by, 'cancel_flow_header')
+     WHERE partition_key = ?1 AND execution_id = ?2
+"#;
+
+// ── ack_cancel_member (§4.2.3, Phase 3.3) ──────────────────────────
+
+/// Delete one backlog member row. Binds: ?1 part, ?2 flow_id, ?3
+/// execution_id wire-string.
+pub(crate) const DELETE_CANCEL_BACKLOG_MEMBER_SQL: &str = r#"
+    DELETE FROM ff_cancel_backlog_member
+     WHERE partition_key = ?1
+       AND flow_id       = ?2
+       AND execution_id  = ?3
+"#;
+
+/// Delete backlog header IFF no members remain. Binds: ?1 part, ?2
+/// flow_id. Note: the NOT EXISTS subquery re-checks member_map
+/// post-member-delete in the same statement window, so a last-member
+/// ack drops both in a single logical step. Concurrent acks race at
+/// commit time and the loser retries through `retry_serializable`.
+pub(crate) const DELETE_CANCEL_BACKLOG_IF_EMPTY_SQL: &str = r#"
+    DELETE FROM ff_cancel_backlog
+     WHERE partition_key = ?1
+       AND flow_id       = ?2
+       AND NOT EXISTS (
+         SELECT 1 FROM ff_cancel_backlog_member
+          WHERE partition_key = ?1 AND flow_id = ?2
+       )
+"#;
+
 // ── operator_event outbox (co-transactional) ───────────────────────
 
 /// Insert one operator-event outbox row, back-filling `namespace` +
@@ -249,5 +367,36 @@ pub(crate) const INSERT_OPERATOR_EVENT_SQL: &str = r#"
      WHERE NOT EXISTS (
          SELECT 1 FROM ff_exec_core
           WHERE partition_key = ?5 AND execution_id = ?6
+     )
+"#;
+
+/// Insert one operator-event outbox row, back-filling `namespace`
+/// from the co-transactional `ff_flow_core.raw_fields` row. Used by
+/// `flow_cancel_requested` where the `execution_id` column on the
+/// outbox carries the FLOW id (Phase 3.3 parity with PG reference
+/// `ff-backend-postgres/src/operator.rs:1118-1132`). `instance_tag`
+/// is left NULL — flows don't carry `cairn.instance_id` tags today.
+///
+/// Binds:
+///   1. flow_id TEXT (stringified UUID) — written on outbox row.
+///   2. event_type TEXT ('flow_cancel_requested').
+///   3. details TEXT (nullable JSON).
+///   4. occurred_at_ms (i64).
+///   5. partition_key (i64).
+///   6. flow_id BLOB — for the co-transactional flow_core lookup.
+pub(crate) const INSERT_OPERATOR_EVENT_FLOW_SQL: &str = r#"
+    INSERT INTO ff_operator_event
+        (execution_id, event_type, details, occurred_at_ms, partition_key,
+         namespace, instance_tag)
+    SELECT ?1, ?2, ?3, ?4, ?5,
+           json_extract(raw_fields, '$.namespace'),
+           NULL
+      FROM ff_flow_core
+     WHERE partition_key = ?5 AND flow_id = ?6
+    UNION ALL
+    SELECT ?1, ?2, ?3, ?4, ?5, NULL, NULL
+     WHERE NOT EXISTS (
+         SELECT 1 FROM ff_flow_core
+          WHERE partition_key = ?5 AND flow_id = ?6
      )
 "#;

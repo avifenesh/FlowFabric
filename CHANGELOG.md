@@ -7,6 +7,65 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 3.3 Wave 9 read model +
+  cancel-flow split + waitpoint read (RFC-023 Phase 3.3 / RFC-020 §4.1
+  + §4.2.3 + §4.5).** Replaces 6 `Unavailable` trait defaults with
+  real SQLite bodies ported from the Postgres reference
+  (`ff-backend-postgres/src/exec_core.rs` + `operator.rs` +
+  `suspend_ops.rs`). Read model: `read_execution_state` (single-column
+  projection of `public_state`), `read_execution_info` (multi-column
+  projection + correlated attempt subqueries → `ExecutionInfo`), and
+  `get_execution_result` (current-attempt semantics per Rev 7 Fork 3).
+  Cancel-flow split: `cancel_flow_header` (atomic flip of flow_core +
+  backlog header + member rows + per-member exec_core flip + outbox
+  `flow_cancel_requested`; idempotent replay returns
+  `AlreadyTerminal { stored_* }`), and `ack_cancel_member` (member
+  drain + conditional parent delete; NO outbox emit per §4.2.7
+  Valkey-parity). Waitpoint read: `list_pending_waitpoints`
+  (cursor-paginated scan of `ff_waitpoint_pending` with `state IN
+  ('pending','active')` filter, `NotFound` on missing execution,
+  `(token_kid, token_fingerprint)` parsed from the stored token).
+  Storage-tier literal normalisation reuses the PG helper shapes:
+  `cancelled`/`terminal` → Terminal; `running` → Active; `pending`/
+  `pending_claim` → PendingFirstAttempt; unknown tokens surface as
+  `EngineError::Validation(Corruption)` via `json_enum!`.
+- `crates/ff-backend-sqlite/src/reads.rs` — new module hosting the 3
+  read bodies + 5 `normalise_*` helpers + `derive_terminal_outcome`.
+- `crates/ff-backend-sqlite/src/queries/reads.rs` — SQL for the 3 read
+  paths. SQLite `LEFT JOIN LATERAL` lowered to correlated subqueries
+  in the SELECT list.
+- `crates/ff-backend-sqlite/src/operator.rs` — extended with
+  `cancel_flow_header_impl` + `ack_cancel_member_impl` + helper
+  `insert_operator_event_flow` (back-fills namespace from
+  `ff_flow_core.raw_fields`).
+- `crates/ff-backend-sqlite/src/queries/operator.rs` — extended with
+  cancel-flow-header SQL set (`SELECT_FLOW_CORE_FOR_CANCEL_SQL`,
+  `UPDATE_FLOW_CORE_CANCEL_WITH_REASON_SQL`, `INSERT_CANCEL_BACKLOG_SQL`,
+  `SELECT_FLOW_INFLIGHT_MEMBERS_SQL`, `INSERT_CANCEL_BACKLOG_MEMBER_SQL`,
+  `UPDATE_EXEC_CORE_CANCEL_FROM_HEADER_SQL`,
+  `DELETE_CANCEL_BACKLOG_MEMBER_SQL`,
+  `DELETE_CANCEL_BACKLOG_IF_EMPTY_SQL`) plus
+  `INSERT_OPERATOR_EVENT_FLOW_SQL` for flow-keyed operator events.
+- `crates/ff-backend-sqlite/src/queries/waitpoint.rs` — extended with
+  `SELECT_EXEC_EXISTS_SQL` + `SELECT_PENDING_WAITPOINTS_PAGE_SQL` for
+  the paginated pending-waitpoint scan.
+- `crates/ff-backend-sqlite/src/suspend_ops.rs` — extended with
+  `list_pending_waitpoints_impl` + `parse_waitpoint_token_kid_fp`
+  (mirrors the PG reference shape).
+- `crates/ff-backend-sqlite/tests/wave9_reads.rs` — 9 integration
+  tests covering the read model (missing → None, post-create,
+  post-claim, normalisation, terminal-outcome derivation, active/
+  terminal result semantics).
+- `crates/ff-backend-sqlite/tests/wave9_waitpoints.rs` — 5 integration
+  tests covering `list_pending_waitpoints` (empty, happy path with all
+  10 `PendingWaitpointInfo` fields populated, cursor pagination across
+  3 pages, `NotFound` on missing execution, `state='closed'` filter).
+- `crates/ff-backend-sqlite/tests/wave9_operator.rs` — extended with
+  4 integration tests for `cancel_flow_header` (happy path with
+  backlog + member + operator_event + exec_core verification,
+  idempotent `AlreadyTerminal` replay) and `ack_cancel_member`
+  (member-drain + final-ack parent-delete, idempotent no-op on missing).
+
 - **`crates/ff-backend-sqlite` — Phase 3.2 Wave 9 operator control
   (RFC-023 Phase 3.2 / RFC-020 §4.2.1-5).** Replaces the 4 `Unavailable`
   trait defaults for `cancel_execution`, `revoke_lease`,
