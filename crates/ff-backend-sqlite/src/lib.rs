@@ -26,10 +26,13 @@
 #![allow(clippy::result_large_err)]
 
 mod backend;
+mod completion_subscribe;
 mod config;
 mod errors;
 mod handle_codec;
+mod lease_event_subscribe;
 mod outbox_cursor;
+mod signal_delivery_subscribe;
 #[doc(hidden)]
 pub mod pubsub;
 pub mod queries;
