@@ -47,6 +47,44 @@ pub(crate) const UPDATE_EXEC_CORE_FAIL_RETRY_SQL: &str = r#"
      WHERE partition_key = ?2 AND execution_id = ?3
 "#;
 
+/// Merge `progress_pct` + `progress_message` into `ff_exec_core.raw_fields`
+/// (TEXT-encoded JSON). NULL binds must leave the corresponding field
+/// untouched, INCLUDING when the JSON path is currently absent — a naive
+/// `json_set(x, '$.k', coalesce(NULL, json_extract(absent))) =
+/// json_set(x, '$.k', NULL)` materializes an explicit JSON `null`,
+/// which diverges from the PG `raw_fields ||` no-op semantics for an
+/// empty patch (PR #376 Copilot review).
+///
+/// The `CASE WHEN ? IS NULL THEN <inner> ELSE json_set(<inner>, '$.k', ?)`
+/// shape skips the `json_set` call entirely when the bind is NULL,
+/// preserving absent fields AND preserving prior non-NULL values.
+/// Mirror of PG at `ff-backend-postgres/src/attempt.rs:498-518`; PG
+/// uses `raw_fields ||` on a jsonb object, we re-express the same
+/// observable write shape via conditional `json_set` calls over a
+/// TEXT document.
+///
+/// Binds: `?1 = pct (nullable INT)`, `?2 = message (nullable TEXT)`,
+/// `?3 = partition_key`, `?4 = execution_id`.
+pub(crate) const UPDATE_EXEC_CORE_PROGRESS_SQL: &str = r#"
+    UPDATE ff_exec_core
+       SET raw_fields = CASE
+               WHEN ?2 IS NULL THEN
+                   CASE
+                       WHEN ?1 IS NULL THEN raw_fields
+                       ELSE json_set(raw_fields, '$.progress_pct', ?1)
+                   END
+               ELSE json_set(
+                   CASE
+                       WHEN ?1 IS NULL THEN raw_fields
+                       ELSE json_set(raw_fields, '$.progress_pct', ?1)
+                   END,
+                   '$.progress_message',
+                   ?2
+               )
+           END
+     WHERE partition_key = ?3 AND execution_id = ?4
+"#;
+
 /// Flip exec_core to terminal failed — retry budget exhausted or
 /// classification was permanent. Mirror of PG at
 /// `ff-backend-postgres/src/attempt.rs:700-718`.

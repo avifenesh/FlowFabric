@@ -7,6 +7,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 2a.3 lease-lifecycle + progress +
+  append_frame (RFC-023).** Replaces the `Unavailable` stubs for `renew`,
+  `progress`, `append_frame`, and `claim_from_reclaim` with real bodies
+  paralleling `ff-backend-postgres::attempt` + `ff-backend-postgres::stream`.
+  Fence CAS via `SELECT_ATTEMPT_EPOCH_SQL` under `BEGIN IMMEDIATE`
+  (§4.1 A3) gates every write; `LeaseConflict` on mismatch, no retry.
+  Lease-event outbox emits `renewed` / `reclaimed` rows to
+  `ff_lease_event` for RFC-019 subscribe parity. `append_frame` covers
+  the full RFC-015 write surface — `Durable`, `DurableSummary` with
+  in-Rust JSON Merge Patch (RFC 7396 incl. `__ff_null__` sentinel), and
+  `BestEffortLive` with EMA-driven MAXLEN trim. Read surface
+  (`read_stream` / `tail_stream` / `read_summary`) remains deferred
+  (Phase 2b). `progress` merges `progress_pct` + `progress_message`
+  into `ff_exec_core.raw_fields` via `json_set(coalesce(...))` so
+  partial updates preserve prior values.
+- `crates/ff-backend-sqlite/src/queries/lease.rs` populated with
+  `UPDATE_ATTEMPT_RENEW_SQL`, `SELECT_LATEST_ATTEMPT_FOR_RECLAIM_SQL`,
+  `UPDATE_ATTEMPT_RECLAIM_SQL`, `UPDATE_EXEC_CORE_RECLAIM_SQL`.
+- `crates/ff-backend-sqlite/src/queries/stream.rs` (new) populated with
+  the RFC-015 write-path SQL: `SELECT_MAX_SEQ_SQL`,
+  `INSERT_STREAM_FRAME_SQL`, `SELECT_STREAM_SUMMARY_SQL`,
+  `INSERT_STREAM_SUMMARY_SQL`, `UPDATE_STREAM_SUMMARY_SQL`,
+  `SELECT_STREAM_META_SQL`, `UPSERT_STREAM_META_SQL`,
+  `TRIM_STREAM_FRAMES_SQL`, `COUNT_STREAM_FRAMES_SQL`.
+- `crates/ff-backend-sqlite/src/queries/exec_core.rs`:
+  `UPDATE_EXEC_CORE_PROGRESS_SQL` added for the `progress` path.
+- `crates/ff-backend-sqlite/Cargo.toml`: direct `serde_json` dep added
+  (summary DurableSummary path merges in Rust before write-back).
 - **`crates/ff-backend-sqlite` — Phase 2a.2 hot-path trait impls (RFC-023).**
   Replaces the `Unavailable` stubs for `claim`, `complete`, and `fail`
   with real bodies paralleling `ff-backend-postgres::attempt`. Handle
