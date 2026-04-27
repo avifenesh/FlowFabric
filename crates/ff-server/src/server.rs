@@ -708,6 +708,14 @@ impl Server {
                 }
                 other => ServerError::Backend(other),
             })?;
+
+        // RFC-023 Phase 3.5: install the N=1 scanner supervisor
+        // (`budget_reset` today). Drained via `shutdown_prepare`.
+        let scanner_cfg = ff_backend_sqlite::SqliteScannerConfig {
+            budget_reset_interval: config.engine_config.budget_reset_interval,
+        };
+        sqlite_arc.with_scanners(scanner_cfg);
+
         let backend: Arc<dyn EngineBackend> = sqlite_arc;
 
         tracing::info!(

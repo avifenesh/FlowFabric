@@ -2180,6 +2180,12 @@ pub(crate) struct SqliteBackendInner {
     /// shared cache alive.
     #[allow(dead_code)]
     pub(crate) memory_sentinel: Option<std::sync::Mutex<Option<sqlx::SqliteConnection>>>,
+    /// RFC-023 Phase 3.5: scanner supervisor handle. Installed at
+    /// most once per backend instance (registry-shared inner) via
+    /// [`SqliteBackend::with_scanners`]; drained on
+    /// `EngineBackend::shutdown_prepare`. `OnceLock` so dedup clones
+    /// that race on `with_scanners` produce at most one supervisor.
+    pub(crate) scanner_handle: std::sync::OnceLock<crate::scanner_supervisor::SqliteScannerHandle>,
 }
 
 /// RFC-023 SQLite dev-only backend.
@@ -2341,6 +2347,7 @@ impl SqliteBackend {
             pubsub: PubSub::new(),
             key: key.clone(),
             memory_sentinel,
+            scanner_handle: std::sync::OnceLock::new(),
         });
         let inner = registry::insert(key, inner);
         Ok(Arc::new(Self { inner }))
@@ -2351,6 +2358,38 @@ impl SqliteBackend {
     #[allow(dead_code)]
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.inner.pool
+    }
+
+    /// RFC-023 Phase 3.5: spawn the N=1 scanner supervisor
+    /// (currently `budget_reset` only) as a background tick loop.
+    /// Idempotent: the first caller wins; subsequent calls on the
+    /// same registry-shared backend no-op. Drained on
+    /// [`EngineBackend::shutdown_prepare`].
+    ///
+    /// Returns `true` if this call installed the supervisor,
+    /// `false` if a supervisor was already present.
+    pub fn with_scanners(&self, cfg: crate::scanner_supervisor::SqliteScannerConfig) -> bool {
+        // Build outside the `OnceLock::set` call so we only spawn
+        // tasks if we actually win the race to install.
+        let mut result = false;
+        let _ = self.inner.scanner_handle.get_or_init(|| {
+            result = true;
+            crate::scanner_supervisor::spawn_scanners(self.inner.pool.clone(), cfg)
+        });
+        result
+    }
+
+    /// Test-only hook to drive the `budget_reset` reconciler
+    /// synchronously against a fixed `now`. Hidden from rustdoc;
+    /// exists so Phase 3.5 integration tests can verify reconciler
+    /// semantics without waiting on wall-clock cadence ticks.
+    #[doc(hidden)]
+    pub async fn budget_reset_scan_tick_for_test(
+        &self,
+        now_ms: i64,
+    ) -> Result<(u32, u32), EngineError> {
+        let report = crate::reconcilers::budget_reset::scan_tick(&self.inner.pool, now_ms).await?;
+        Ok((report.processed, report.errors))
     }
 
     /// Test-only pool accessor. Hidden from rustdoc; not a stable
@@ -2389,6 +2428,26 @@ impl SqliteBackend {
 
 #[async_trait]
 impl EngineBackend for SqliteBackend {
+    // ── Lifecycle ──
+
+    /// RFC-023 Phase 3.5: drain the scanner supervisor (if
+    /// installed) up to `grace`. Matches the PG backend's
+    /// `shutdown_prepare` contract — bounded best-effort drain,
+    /// never returns an error.
+    async fn shutdown_prepare(&self, grace: Duration) -> Result<(), EngineError> {
+        if let Some(handle) = self.inner.scanner_handle.get() {
+            let timed_out = handle.shutdown(grace).await;
+            if timed_out > 0 {
+                tracing::warn!(
+                    timed_out,
+                    ?grace,
+                    "sqlite scanner supervisor exceeded grace on shutdown"
+                );
+            }
+        }
+        Ok(())
+    }
+
     // ── Claim + lifecycle ──
 
     async fn claim(

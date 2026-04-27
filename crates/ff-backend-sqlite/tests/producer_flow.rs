@@ -67,8 +67,10 @@ fn new_exec_id() -> ExecutionId {
 fn create_execution_args(exec_id: &ExecutionId, caps: &[&str]) -> CreateExecutionArgs {
     let mut policy = ff_core::policy::ExecutionPolicy::default();
     if !caps.is_empty() {
-        let mut rr = ff_core::policy::RoutingRequirements::default();
-        rr.required_capabilities = caps.iter().map(|s| (*s).to_owned()).collect();
+        let rr = ff_core::policy::RoutingRequirements {
+            required_capabilities: caps.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        };
         policy.routing_requirements = Some(rr);
     }
     CreateExecutionArgs {

@@ -35,6 +35,8 @@ mod lease_event_subscribe;
 mod operator;
 mod outbox_cursor;
 mod reads;
+mod reconcilers;
+mod scanner_supervisor;
 mod signal_delivery_subscribe;
 #[doc(hidden)]
 pub mod pubsub;
@@ -47,3 +49,4 @@ mod tx_util;
 pub use backend::SqliteBackend;
 pub use errors::{MAX_ATTEMPTS, is_retryable_sqlite_busy};
 pub use retry::{IsRetryableBusy, retry_serializable};
+pub use scanner_supervisor::{SqliteScannerConfig, SqliteScannerHandle};
