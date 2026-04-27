@@ -47,6 +47,31 @@ pub(crate) const UPDATE_EXEC_CORE_FAIL_RETRY_SQL: &str = r#"
      WHERE partition_key = ?2 AND execution_id = ?3
 "#;
 
+/// Merge `progress_pct` + `progress_message` into `ff_exec_core.raw_fields`
+/// (TEXT-encoded JSON). NULL binds leave the corresponding field untouched
+/// via `coalesce` — SQLite's `json_set` overwrites with NULL when passed
+/// a NULL argument, which would drop a previously-recorded value on a
+/// partial `progress` call. Mirror of PG at
+/// `ff-backend-postgres/src/attempt.rs:498-518`; PG uses `raw_fields ||`
+/// on a jsonb object, we re-express the same observable write shape via
+/// two nested `json_set` calls over a TEXT document.
+///
+/// Binds: `?1 = pct (nullable INT)`, `?2 = message (nullable TEXT)`,
+/// `?3 = partition_key`, `?4 = execution_id`.
+pub(crate) const UPDATE_EXEC_CORE_PROGRESS_SQL: &str = r#"
+    UPDATE ff_exec_core
+       SET raw_fields = json_set(
+               json_set(
+                   raw_fields,
+                   '$.progress_pct',
+                   coalesce(?1, json_extract(raw_fields, '$.progress_pct'))
+               ),
+               '$.progress_message',
+               coalesce(?2, json_extract(raw_fields, '$.progress_message'))
+           )
+     WHERE partition_key = ?3 AND execution_id = ?4
+"#;
+
 /// Flip exec_core to terminal failed — retry budget exhausted or
 /// classification was permanent. Mirror of PG at
 /// `ff-backend-postgres/src/attempt.rs:700-718`.

@@ -14,34 +14,37 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use ff_core::backend::PrepareOutcome;
 use ff_core::backend::{
-    AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
-    FailOutcome, FailureClass, FailureReason, Frame, Handle, HandleKind, LeaseRenewal,
-    PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
+    AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy, FailOutcome,
+    FailureClass, FailureReason, Frame, FrameKind, Handle, HandleKind, LeaseRenewal, PatchKind,
+    PendingWaitpoint, ReclaimToken, ResumeSignal, SUMMARY_NULL_SENTINEL, StreamMode,
+    UsageDimensions,
 };
-use ff_core::caps::{matches as caps_matches, CapabilityRequirement};
-use ff_core::handle_codec::HandlePayload;
-use ff_core::types::{AttemptId, AttemptIndex, LeaseEpoch, LeaseId};
 use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
-#[cfg(feature = "core")]
-use ff_core::contracts::{
-    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
-    DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage,
-    ListFlowsPage, ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
-};
+use ff_core::caps::{CapabilityRequirement, matches as caps_matches};
 use ff_core::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult, SuspendArgs,
     SuspendOutcome,
 };
+#[cfg(feature = "core")]
+use ff_core::contracts::{
+    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs, DeliverSignalResult,
+    EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ListExecutionsPage, ListFlowsPage,
+    ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
+};
 #[cfg(feature = "streaming")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
-use ff_core::backend::PrepareOutcome;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{BackendError, ContentionKind, EngineError, ValidationKind};
+use ff_core::handle_codec::HandlePayload;
+use ff_core::types::{AttemptId, AttemptIndex, LeaseEpoch, LeaseId};
 
 use crate::errors::map_sqlx_error;
 use crate::handle_codec::{decode_handle, encode_handle};
-use crate::queries::{attempt as q_attempt, exec_core as q_exec};
+use crate::queries::{
+    attempt as q_attempt, exec_core as q_exec, lease as q_lease, stream as q_stream,
+};
 use crate::retry::retry_serializable;
 #[cfg(feature = "core")]
 use ff_core::partition::PartitionKey;
@@ -77,24 +80,22 @@ fn now_ms() -> i64 {
 /// Decompose an [`ff_core::types::ExecutionId`] formatted `{fp:N}:<uuid>`
 /// into `(partition_index, uuid_bytes)` — SQLite stores the UUID as a
 /// 16-byte `BLOB` (§4.1) so we bind via `uuid::Uuid`.
-fn split_exec_id(
-    eid: &ff_core::types::ExecutionId,
-) -> Result<(i64, Uuid), EngineError> {
+fn split_exec_id(eid: &ff_core::types::ExecutionId) -> Result<(i64, Uuid), EngineError> {
     let s = eid.as_str();
-    let rest = s.strip_prefix("{fp:").ok_or_else(|| EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: format!("execution_id missing `{{fp:` prefix: {s}"),
-    })?;
+    let rest = s
+        .strip_prefix("{fp:")
+        .ok_or_else(|| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("execution_id missing `{{fp:` prefix: {s}"),
+        })?;
     let close = rest.find("}:").ok_or_else(|| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
         detail: format!("execution_id missing `}}:`: {s}"),
     })?;
-    let part: i64 = rest[..close]
-        .parse()
-        .map_err(|_| EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: format!("execution_id partition index not u16: {s}"),
-        })?;
+    let part: i64 = rest[..close].parse().map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id partition index not u16: {s}"),
+    })?;
     let uuid = Uuid::parse_str(&rest[close + 2..]).map_err(|_| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
         detail: format!("execution_id UUID invalid: {s}"),
@@ -567,6 +568,481 @@ async fn insert_lease_event(
     Ok(())
 }
 
+// ── Phase 2a.3 hot-path bodies ────────────────────────────────────────
+
+async fn renew_impl(pool: &SqlitePool, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+    let payload = decode_handle(handle)?;
+    let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
+    let attempt_index = i64::from(payload.attempt_index.0);
+    let expected_epoch = payload.lease_epoch.0;
+    let lease_ttl_ms = i64::try_from(payload.lease_ttl_ms).unwrap_or(0);
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = renew_inner(
+        &mut conn,
+        part,
+        exec_uuid,
+        attempt_index,
+        expected_epoch,
+        lease_ttl_ms,
+    )
+    .await;
+    match result {
+        Ok(renewal) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(renewal)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn renew_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+    expected_epoch: u64,
+    lease_ttl_ms: i64,
+) -> Result<LeaseRenewal, EngineError> {
+    fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
+    let now = now_ms();
+    let new_expires = now.saturating_add(lease_ttl_ms);
+
+    sqlx::query(q_lease::UPDATE_ATTEMPT_RENEW_SQL)
+        .bind(new_expires)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    // RFC-019 Stage B outbox parity: lease renewed event.
+    insert_lease_event(conn, part, exec_uuid, "renewed", now).await?;
+
+    Ok(LeaseRenewal::new(
+        u64::try_from(new_expires).unwrap_or(0),
+        expected_epoch,
+    ))
+}
+
+async fn progress_impl(
+    pool: &SqlitePool,
+    handle: &Handle,
+    percent: Option<u8>,
+    message: Option<String>,
+) -> Result<(), EngineError> {
+    let payload = decode_handle(handle)?;
+    let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
+    let attempt_index = i64::from(payload.attempt_index.0);
+    let expected_epoch = payload.lease_epoch.0;
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = progress_inner(
+        &mut conn,
+        part,
+        exec_uuid,
+        attempt_index,
+        expected_epoch,
+        percent,
+        message,
+    )
+    .await;
+    match result {
+        Ok(()) => commit_or_rollback(&mut conn).await,
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn progress_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+    expected_epoch: u64,
+    percent: Option<u8>,
+    message: Option<String>,
+) -> Result<(), EngineError> {
+    fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
+
+    // `coalesce(?, json_extract(raw_fields, '$.progress_pct'))` keeps
+    // any prior value when the caller passed None — mirrors the PG
+    // path's jsonb-partial-merge semantics. Binds: pct → i64 or NULL,
+    // msg → TEXT or NULL.
+    sqlx::query(q_exec::UPDATE_EXEC_CORE_PROGRESS_SQL)
+        .bind(percent.map(i64::from))
+        .bind(message)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
+// ── append_frame (RFC-015 write surface) ──────────────────────────────
+
+/// Apply one RFC 7396 JSON Merge Patch in-place. Mirrors the PG helper
+/// at `ff-backend-postgres/src/stream.rs::apply_json_merge_patch`;
+/// both implementations must honour the [`SUMMARY_NULL_SENTINEL`]
+/// rewrite (leaf `"__ff_null__"` → JSON `null`) so the round-trip
+/// invariant holds across backends.
+fn apply_json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    use serde_json::Value;
+    if let Value::Object(patch_map) = patch {
+        if !target.is_object() {
+            *target = Value::Object(serde_json::Map::new());
+        }
+        let target_map = target.as_object_mut().expect("just ensured object");
+        for (k, v) in patch_map {
+            match v {
+                Value::Null => {
+                    target_map.remove(k);
+                }
+                Value::String(s) if s == SUMMARY_NULL_SENTINEL => {
+                    target_map.insert(k.clone(), Value::Null);
+                }
+                Value::Object(_) => {
+                    let entry = target_map.entry(k.clone()).or_insert(Value::Null);
+                    apply_json_merge_patch(entry, v);
+                }
+                other => {
+                    target_map.insert(k.clone(), other.clone());
+                }
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
+/// Build the `fields` JSON TEXT blob for a frame — mirrors the PG
+/// helper at `ff-backend-postgres/src/stream.rs::build_fields_json`
+/// so downstream readers observe the same shape on both backends.
+fn build_fields_json(frame: &Frame) -> String {
+    use serde_json::{Map, Value};
+    let payload_str = String::from_utf8_lossy(&frame.bytes).into_owned();
+    let mut map = Map::new();
+    let frame_type = if frame.frame_type.is_empty() {
+        match frame.kind {
+            FrameKind::Stdout => "stdout",
+            FrameKind::Stderr => "stderr",
+            FrameKind::Event => "event",
+            FrameKind::Blob => "blob",
+            _ => "event",
+        }
+        .to_owned()
+    } else {
+        frame.frame_type.clone()
+    };
+    map.insert("frame_type".into(), Value::String(frame_type));
+    map.insert("payload".into(), Value::String(payload_str));
+    map.insert("encoding".into(), Value::String("utf8".into()));
+    map.insert("source".into(), Value::String("worker".into()));
+    if let Some(corr) = &frame.correlation_id {
+        map.insert("correlation_id".into(), Value::String(corr.clone()));
+    }
+    Value::Object(map).to_string()
+}
+
+async fn append_frame_impl(
+    pool: &SqlitePool,
+    handle: &Handle,
+    frame: Frame,
+) -> Result<AppendFrameOutcome, EngineError> {
+    let payload = decode_handle(handle)?;
+    let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
+    let attempt_index = i64::from(payload.attempt_index.0);
+    let expected_epoch = payload.lease_epoch.0;
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = append_frame_inner(
+        &mut conn,
+        part,
+        exec_uuid,
+        attempt_index,
+        expected_epoch,
+        frame,
+    )
+    .await;
+    match result {
+        Ok(outcome) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn append_frame_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+    expected_epoch: u64,
+    frame: Frame,
+) -> Result<AppendFrameOutcome, EngineError> {
+    fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
+
+    let ts_ms = now_ms();
+    let mode_wire = frame.mode.wire_str();
+    let fields_text = build_fields_json(&frame);
+
+    // Mint `seq` as MAX(seq) + 1 under the txn lock. `BEGIN IMMEDIATE`
+    // serializes writers so there is no need for an additional advisory
+    // lock (the PG path uses `pg_advisory_xact_lock` because READ
+    // COMMITTED isolates less strictly).
+    let max_seq: Option<i64> = sqlx::query_scalar(q_stream::SELECT_MAX_SEQ_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .bind(ts_ms)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    let next_seq: i64 = max_seq.map(|s| s + 1).unwrap_or(0);
+
+    sqlx::query(q_stream::INSERT_STREAM_FRAME_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .bind(ts_ms)
+        .bind(next_seq)
+        .bind(&fields_text)
+        .bind(mode_wire)
+        .bind(ts_ms)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    let mut summary_version: Option<u64> = None;
+
+    // DurableSummary: JSON Merge Patch applied in Rust, TEXT in/out.
+    if let StreamMode::DurableSummary { patch_kind } = &frame.mode {
+        let patch: serde_json::Value =
+            serde_json::from_slice(&frame.bytes).map_err(|e| EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("summary patch not valid JSON: {e}"),
+            })?;
+
+        let existing: Option<(String, i64)> = sqlx::query_as(q_stream::SELECT_STREAM_SUMMARY_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let (mut doc, prev_version): (serde_json::Value, i64) = match existing {
+            Some((text, v)) => {
+                let parsed = serde_json::from_str(&text)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                (parsed, v)
+            }
+            None => (serde_json::Value::Object(serde_json::Map::new()), 0),
+        };
+
+        match patch_kind {
+            PatchKind::JsonMergePatch => apply_json_merge_patch(&mut doc, &patch),
+            _ => apply_json_merge_patch(&mut doc, &patch),
+        }
+
+        let new_version = prev_version + 1;
+        let patch_kind_wire = "json-merge-patch";
+        let doc_text = doc.to_string();
+        if prev_version == 0 {
+            sqlx::query(q_stream::INSERT_STREAM_SUMMARY_SQL)
+                .bind(part)
+                .bind(exec_uuid)
+                .bind(attempt_index)
+                .bind(&doc_text)
+                .bind(new_version)
+                .bind(patch_kind_wire)
+                .bind(ts_ms)
+                .bind(ts_ms)
+                .execute(&mut **conn)
+                .await
+                .map_err(map_sqlx_error)?;
+        } else {
+            sqlx::query(q_stream::UPDATE_STREAM_SUMMARY_SQL)
+                .bind(part)
+                .bind(exec_uuid)
+                .bind(attempt_index)
+                .bind(&doc_text)
+                .bind(new_version)
+                .bind(patch_kind_wire)
+                .bind(ts_ms)
+                .execute(&mut **conn)
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        summary_version = Some(u64::try_from(new_version).unwrap_or(0));
+    }
+
+    // BestEffortLive: EMA + trim. Computation ports from the PG helper
+    // at `ff-backend-postgres/src/stream.rs:272-339`.
+    if let StreamMode::BestEffortLive { config } = &frame.mode {
+        let meta: Option<(f64, i64)> = sqlx::query_as(q_stream::SELECT_STREAM_META_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let (ema_prev, last_ts) = meta.unwrap_or((0.0, 0));
+        let inst_rate: f64 = if last_ts > 0 && ts_ms > last_ts {
+            1000.0 / ((ts_ms - last_ts) as f64)
+        } else {
+            0.0
+        };
+        let alpha = config.ema_alpha;
+        let ema_new = alpha * inst_rate + (1.0 - alpha) * ema_prev;
+        let k_raw = (ema_new * (f64::from(config.ttl_ms)) / 1000.0).ceil() as i64 * 2;
+        let k = k_raw
+            .max(i64::from(config.maxlen_floor))
+            .min(i64::from(config.maxlen_ceiling));
+
+        sqlx::query(q_stream::UPSERT_STREAM_META_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .bind(ema_new)
+            .bind(ts_ms)
+            .bind(k)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(q_stream::TRIM_STREAM_FRAMES_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .bind(k)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+    }
+
+    let frame_count: i64 = sqlx::query_scalar(q_stream::COUNT_STREAM_FRAMES_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    let stream_id = format!("{ts_ms}-{next_seq}");
+    let mut out = AppendFrameOutcome::new(stream_id, u64::try_from(frame_count).unwrap_or(0));
+    if let Some(v) = summary_version {
+        out = out.with_summary_version(v);
+    }
+    Ok(out)
+}
+
+// ── claim_from_reclaim ────────────────────────────────────────────────
+
+async fn claim_from_reclaim_impl(
+    pool: &SqlitePool,
+    token: &ReclaimToken,
+) -> Result<Option<Handle>, EngineError> {
+    let eid = &token.grant.execution_id;
+    let (part, exec_uuid) = split_exec_id(eid)?;
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = claim_from_reclaim_inner(&mut conn, part, exec_uuid, token).await;
+    match result {
+        Ok(Some(handle)) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(Some(handle))
+        }
+        Ok(None) => {
+            rollback_quiet(&mut conn).await;
+            Ok(None)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn claim_from_reclaim_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    token: &ReclaimToken,
+) -> Result<Option<Handle>, EngineError> {
+    // Latest attempt under the partition/exec. Mirror of PG at
+    // `ff-backend-postgres/src/attempt.rs:294-308`.
+    let row = sqlx::query(q_lease::SELECT_LATEST_ATTEMPT_FOR_RECLAIM_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    let Some(row) = row else {
+        return Err(EngineError::NotFound { entity: "attempt" });
+    };
+    let attempt_index_i: i64 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+    let current_epoch: i64 = row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+    let expires_at: Option<i64> = row
+        .try_get::<Option<i64>, _>("lease_expires_at_ms")
+        .map_err(map_sqlx_error)?;
+
+    let now = now_ms();
+    // Live-lease → grant no longer honour-able.
+    let live = matches!(expires_at, Some(exp) if exp > now);
+    if live {
+        return Ok(None);
+    }
+
+    let lease_ttl_ms = i64::from(token.lease_ttl_ms);
+    let new_expires = now.saturating_add(lease_ttl_ms);
+
+    sqlx::query(q_lease::UPDATE_ATTEMPT_RECLAIM_SQL)
+        .bind(token.worker_id.as_str())
+        .bind(token.worker_instance_id.as_str())
+        .bind(new_expires)
+        .bind(now)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index_i)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    sqlx::query(q_lease::UPDATE_EXEC_CORE_RECLAIM_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    insert_lease_event(conn, part, exec_uuid, "reclaimed", now).await?;
+
+    let new_epoch = current_epoch.saturating_add(1);
+    let payload = HandlePayload::new(
+        token.grant.execution_id.clone(),
+        AttemptIndex::new(u32::try_from(attempt_index_i.max(0)).unwrap_or(0)),
+        AttemptId::new(),
+        LeaseId::new(),
+        LeaseEpoch(u64::try_from(new_epoch).unwrap_or(0)),
+        u64::from(token.lease_ttl_ms),
+        token.grant.lane_id.clone(),
+        token.worker_instance_id.clone(),
+    );
+    Ok(Some(encode_handle(&payload, HandleKind::Resumed)))
+}
 
 /// Internal shared state. `Arc<SqliteBackendInner>` is what the
 /// registry stores weak references to and what `SqliteBackend`
@@ -668,8 +1144,7 @@ impl SqliteBackend {
         // pool shares ONE in-memory database. Without this rewrite,
         // each pool connection opens its own private DB and tests see
         // schema mismatches silently.
-        let is_memory =
-            path == ":memory:" || path.starts_with("file::memory:");
+        let is_memory = path == ":memory:" || path.starts_with("file::memory:");
         let effective_path: std::borrow::Cow<'_, str> = if path == ":memory:" {
             std::borrow::Cow::Borrowed("file::memory:?cache=shared")
         } else {
@@ -730,9 +1205,7 @@ impl SqliteBackend {
             use sqlx::ConnectOptions;
             let conn = opts.connect().await.map_err(|e| BackendError::Valkey {
                 kind: ff_core::engine_error::BackendErrorKind::Transport,
-                message: format!(
-                    "sqlite sentinel connect for {path:?}: {e}"
-                ),
+                message: format!("sqlite sentinel connect for {path:?}: {e}"),
             })?;
             Some(std::sync::Mutex::new(Some(conn)))
         } else {
@@ -800,32 +1273,31 @@ impl EngineBackend for SqliteBackend {
         retry_serializable(|| claim_impl(pool, lane, capabilities, &policy)).await
     }
 
-    async fn renew(&self, _handle: &Handle) -> Result<LeaseRenewal, EngineError> {
-        unavailable("sqlite.renew")
+    async fn renew(&self, handle: &Handle) -> Result<LeaseRenewal, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| renew_impl(pool, handle)).await
     }
 
     async fn progress(
         &self,
-        _handle: &Handle,
-        _percent: Option<u8>,
-        _message: Option<String>,
+        handle: &Handle,
+        percent: Option<u8>,
+        message: Option<String>,
     ) -> Result<(), EngineError> {
-        unavailable("sqlite.progress")
+        let pool = &self.inner.pool;
+        retry_serializable(|| progress_impl(pool, handle, percent, message.clone())).await
     }
 
     async fn append_frame(
         &self,
-        _handle: &Handle,
-        _frame: Frame,
+        handle: &Handle,
+        frame: Frame,
     ) -> Result<AppendFrameOutcome, EngineError> {
-        unavailable("sqlite.append_frame")
+        let pool = &self.inner.pool;
+        retry_serializable(|| append_frame_impl(pool, handle, frame.clone())).await
     }
 
-    async fn complete(
-        &self,
-        handle: &Handle,
-        payload: Option<Vec<u8>>,
-    ) -> Result<(), EngineError> {
+    async fn complete(&self, handle: &Handle, payload: Option<Vec<u8>>) -> Result<(), EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| complete_impl(pool, handle, payload.clone())).await
     }
@@ -865,18 +1337,12 @@ impl EngineBackend for SqliteBackend {
         unavailable("sqlite.observe_signals")
     }
 
-    async fn claim_from_reclaim(
-        &self,
-        _token: ReclaimToken,
-    ) -> Result<Option<Handle>, EngineError> {
-        unavailable("sqlite.claim_from_reclaim")
+    async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| claim_from_reclaim_impl(pool, &token)).await
     }
 
-    async fn delay(
-        &self,
-        _handle: &Handle,
-        _delay_until: TimestampMs,
-    ) -> Result<(), EngineError> {
+    async fn delay(&self, _handle: &Handle, _delay_until: TimestampMs) -> Result<(), EngineError> {
         unavailable("sqlite.delay")
     }
 
@@ -893,10 +1359,7 @@ impl EngineBackend for SqliteBackend {
         unavailable("sqlite.describe_execution")
     }
 
-    async fn describe_flow(
-        &self,
-        _id: &FlowId,
-    ) -> Result<Option<FlowSnapshot>, EngineError> {
+    async fn describe_flow(&self, _id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {
         unavailable("sqlite.describe_flow")
     }
 

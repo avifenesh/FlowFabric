@@ -13,3 +13,4 @@ pub mod attempt;
 pub mod dispatch;
 pub mod exec_core;
 pub mod lease;
+pub mod stream;

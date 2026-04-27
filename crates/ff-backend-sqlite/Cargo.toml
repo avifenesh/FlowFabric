@@ -33,6 +33,10 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Phase 2a.3: `append_frame` DurableSummary path reads + merges the
+# stored `document_json` in Rust (RFC 7396) before writing it back, so
+# the crate needs direct serde_json access.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
