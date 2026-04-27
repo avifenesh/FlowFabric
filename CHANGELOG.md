@@ -7,6 +7,60 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 2b.2.1 suspend/signal/waitpoint
+  producer (RFC-023 Group B, minus `list_pending_waitpoints` deferred
+  to Phase 3).** Replaces 6 Group B `Unavailable` stubs with real
+  bodies + adds 2 overrides for the default-`Unavailable` HMAC secret
+  methods: `suspend`, `suspend_by_triple`, `create_waitpoint`,
+  `observe_signals`, `deliver_signal`, `claim_resumed_execution`,
+  `seed_waitpoint_hmac_secret`, `rotate_waitpoint_hmac_secret_all`.
+  Every body mirrors `ff-backend-postgres/src/suspend_ops.rs` +
+  `ff-backend-postgres/src/signal.rs` statement-by-statement; SQLite
+  dialect changes are `jsonb → TEXT` JSON codec (serde_json at the
+  Rust boundary), `text[] → TEXT` holding a JSON array literal for
+  `required_signal_names`, and `BEGIN IMMEDIATE` single-writer
+  serialization replacing PG SERIALIZABLE + `FOR UPDATE`. The
+  composite-condition evaluator is a pure-Rust copy of the PG reference
+  (`ff-backend-postgres/src/suspend.rs::evaluate`) kept local to the
+  SQLite module tree to avoid a cross-backend crate dependency. Signal
+  delivery emits a post-commit wakeup on the `signal_delivery`
+  broadcast channel; a signal that satisfies the resume condition also
+  writes a completion outbox row and wakes `completion`, and
+  `claim_resumed_execution` writes an `acquired` lease-event row + wakes
+  `lease_history`. Dedup cache (`ff_suspend_dedup`) honours the
+  RFC-013 §3 replay ladder so an idempotent retry returns the same
+  `suspension_id` + token bytes as the original call.
+- `crates/ff-backend-sqlite/src/queries/{suspend,signal,waitpoint}.rs`
+  — SQLite SQL constants mirroring the PG bodies; no bodies live in
+  these modules, only the statement strings used by `suspend_ops.rs`.
+- `crates/ff-backend-sqlite/src/suspend_ops.rs` — the Group B bodies,
+  paralleling `ff-backend-postgres/src/suspend_ops.rs`.
+- `crates/ff-backend-sqlite/tests/producer_suspend.rs` — 8-test
+  integration harness covering happy-path suspend, idempotent replay,
+  fence-mismatch contention, HMAC-seeded create_waitpoint token
+  format, deliver_signal happy-path + append-without-satisfaction, the
+  satisfy→claim_resumed round-trip, seed idempotency, and rotate
+  replay semantics.
+- **`crates/ff-core::crypto::hmac` — extracted HMAC-SHA256 sign/verify
+  primitives.** The Postgres backend's in-crate `hmac_sign` /
+  `hmac_verify` / `HmacVerifyError` move to `ff_core::crypto::hmac`
+  with zero behaviour change so both Postgres + SQLite consume a
+  single Rust implementation (Valkey continues to sign inside Lua).
+  The PG `signal.rs` re-exports from ff-core for backward
+  compatibility of internal call sites.
+
+### Changed
+
+- **`crates/ff-backend-postgres` — HMAC primitives hoisted to
+  `ff-core`.** `ff-backend-postgres/src/signal.rs::{hmac_sign,
+  hmac_verify, HmacVerifyError}` are now re-exports from
+  `ff_core::crypto::hmac`. No consumer-visible change: the wire shape
+  (`<kid>:<hex>`) and the `HmacVerifyError` variants are byte- and
+  variant-identical. The `hmac` + `sha2` direct dependencies are
+  dropped from `ff-backend-postgres`' `Cargo.toml` (now transitive
+  through `ff-core`); `hex` stays — `suspend_ops.rs` still uses it for
+  opaque-handle + payload hex codec.
+
 - **`crates/ff-backend-sqlite` — Phase 2b.1 producer exec/flow + pubsub
   foundation (RFC-023 Group A + D.1).** Replaces 6 `Unavailable` stubs
   with real bodies: `create_execution` (seeds `ff_exec_core` + the

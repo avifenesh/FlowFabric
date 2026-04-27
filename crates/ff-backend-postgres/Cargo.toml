@@ -45,13 +45,9 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
-# Wave 4 Agent D (suspend + signal): Rust-side HMAC sign/verify for
-# waitpoint tokens. First server-side HMAC code in the workspace
-# (Valkey backend signs inside Lua). Deliberately scoped to this
-# crate rather than ff-core so parallel Wave-4 agents don't re-lint
-# ff-core's dep graph mid-flight; future refactor can hoist.
-hmac = "0.12"
-sha2 = "0.10"
+# RFC-023 Phase 2b.2.1: HMAC primitives moved to `ff_core::crypto::hmac`
+# and consumed as a re-export in `signal.rs`. `hex` stays — still used
+# by `suspend_ops.rs` for opaque-handle / payload hex codec.
 hex = "0.4"
 
 [dev-dependencies]

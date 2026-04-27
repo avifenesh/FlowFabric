@@ -51,5 +51,11 @@ tokio = { workspace = true, features = ["time"] }
 # `tokio_stream::Stream` for the `EngineBackend::subscribe_*` type alias.
 bytes = { workspace = true }
 tokio-stream = { workspace = true }
+# RFC-023 Phase 2b.2.1 — HMAC primitives extracted from
+# ff-backend-postgres so both Postgres and SQLite backends consume one
+# Rust implementation. The Valkey backend still signs inside Lua.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]

@@ -24,17 +24,18 @@
 //!   row write + active-flag flip. Wired into `EngineBackend` in
 //!   [`crate::lib.rs`].
 //!
-//! HMAC sign/verify primitives live here (not in `ff-core`) so the
-//! Cargo.toml delta stays scoped to this crate while parallel Wave-4
-//! agents are churning ff-core. A follow-up can hoist the primitive
-//! into `ff_core::waitpoint_hmac` once both backends converge.
+//! HMAC sign/verify primitives hoisted to `ff_core::crypto::hmac` in
+//! RFC-023 Phase 2b.2.1 so the Postgres + SQLite backends share one
+//! Rust implementation. The Valkey backend still signs inside Lua, so
+//! no third consumer is pending. This module re-exports for backward
+//! compatibility of internal call sites.
 
 use ff_core::engine_error::EngineError;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use sqlx::PgPool;
 
 use crate::error::map_sqlx_error;
+
+pub use ff_core::crypto::hmac::{hmac_sign, hmac_verify, HmacVerifyError};
 
 /// Q11 retry budget for SERIALIZABLE transactions. On retry exhaustion
 /// the suspend / deliver_signal call sites are expected to return
@@ -53,60 +54,6 @@ pub fn is_retryable_serialization(err: &sqlx::Error) -> bool {
     } else {
         false
     }
-}
-
-/// HMAC-SHA256 signature over `kid || ":" || message`. Returns a
-/// `kid:hex` token. Matches the conceptual shape of the Valkey Lua
-/// signer (`kid:40hex`); SHA256 rather than SHA1 so we use the
-/// stdlib-friendly primitive. The two backends never cross-verify
-/// tokens.
-pub fn hmac_sign(secret: &[u8], kid: &str, message: &[u8]) -> String {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts any key length");
-    mac.update(kid.as_bytes());
-    mac.update(b":");
-    mac.update(message);
-    let out = mac.finalize().into_bytes();
-    format!("{kid}:{}", hex::encode(out))
-}
-
-/// Verify a `kid:hex` token. Returns `Ok(())` iff the digest matches
-/// `secret` over `message`. Constant-time via
-/// [`hmac::Mac::verify_slice`].
-pub fn hmac_verify(
-    secret: &[u8],
-    kid: &str,
-    message: &[u8],
-    token: &str,
-) -> Result<(), HmacVerifyError> {
-    let (tok_kid, tok_hex) =
-        token.split_once(':').ok_or(HmacVerifyError::Malformed)?;
-    if tok_kid != kid {
-        return Err(HmacVerifyError::WrongKid {
-            expected: kid.to_owned(),
-            actual: tok_kid.to_owned(),
-        });
-    }
-    let expected = hex::decode(tok_hex).map_err(|_| HmacVerifyError::Malformed)?;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-        .map_err(|_| HmacVerifyError::Malformed)?;
-    mac.update(kid.as_bytes());
-    mac.update(b":");
-    mac.update(message);
-    mac.verify_slice(&expected)
-        .map_err(|_| HmacVerifyError::SignatureMismatch)
-}
-
-/// Errors from [`hmac_verify`]. Callers map these onto
-/// `EngineError::Validation(InvalidToken)` at the trait boundary.
-#[derive(Debug, thiserror::Error)]
-pub enum HmacVerifyError {
-    #[error("token malformed; expected kid:hex shape")]
-    Malformed,
-    #[error("token kid mismatch; expected {expected}, got {actual}")]
-    WrongKid { expected: String, actual: String },
-    #[error("HMAC signature mismatch")]
-    SignatureMismatch,
 }
 
 /// Resolve the currently-active HMAC secret (kid + bytes) from
@@ -339,43 +286,5 @@ pub async fn seed_waitpoint_hmac_secret_impl(
     Ok(SeedOutcome::Seeded { kid: args.kid })
 }
 
-#[cfg(test)]
-mod hmac_tests {
-    use super::*;
-
-    #[test]
-    fn sign_then_verify_round_trip() {
-        let secret = b"super-secret-key";
-        let tok = hmac_sign(secret, "kid1", b"exec-id:wp-id");
-        assert!(tok.starts_with("kid1:"));
-        hmac_verify(secret, "kid1", b"exec-id:wp-id", &tok).expect("verify ok");
-    }
-
-    #[test]
-    fn verify_rejects_tampered_message() {
-        let secret = b"s";
-        let tok = hmac_sign(secret, "k", b"msg");
-        let err = hmac_verify(secret, "k", b"tampered", &tok).unwrap_err();
-        assert!(matches!(err, HmacVerifyError::SignatureMismatch));
-    }
-
-    #[test]
-    fn verify_rejects_wrong_kid() {
-        let secret = b"s";
-        let tok = hmac_sign(secret, "k1", b"msg");
-        let err = hmac_verify(secret, "k2", b"msg", &tok).unwrap_err();
-        assert!(matches!(err, HmacVerifyError::WrongKid { .. }));
-    }
-
-    #[test]
-    fn verify_rejects_malformed() {
-        assert!(matches!(
-            hmac_verify(b"s", "k", b"msg", "no-colon-token"),
-            Err(HmacVerifyError::Malformed)
-        ));
-        assert!(matches!(
-            hmac_verify(b"s", "k", b"msg", "k:not-hex-zzzz"),
-            Err(HmacVerifyError::Malformed)
-        ));
-    }
-}
+// HMAC round-trip + tamper tests live in `ff_core::crypto::hmac`
+// alongside the extracted primitive.
