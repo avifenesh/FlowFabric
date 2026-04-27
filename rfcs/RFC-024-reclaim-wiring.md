@@ -1,9 +1,10 @@
 # RFC-024: Wire `ff_reclaim_execution` + `ff_issue_reclaim_grant` to the consumer surface
 
-**Status:** DRAFT
+**Status:** ACCEPTED
 **Revision:** 2
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
+**Accepted:** 2026-04-28
 **Target release:** v0.12.0 (joint wave with RFC-023 SQLite; all three backends folded)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (lease events), RFC-020 (Postgres Wave 9), RFC-023 (SQLite dev-only backend)
 **Tracking issue:** #371
