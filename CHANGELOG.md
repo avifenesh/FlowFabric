@@ -277,6 +277,32 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **ferriskey: expose `Client::force_cluster_slot_refresh` (closes
+  #369).** New `pub async fn force_cluster_slot_refresh(&self) ->
+  Result<()>` on `ferriskey::Client` (and on the internal
+  `ClientInner` + `cluster::ClusterConnection::force_slot_refresh`)
+  wraps the existing internal
+  `refresh_slots_and_subscriptions_with_retries` with
+  `RefreshPolicy::NotThrottable` +
+  `SlotRefreshTrigger::RuntimeRefresh`. Standalone mode is a no-op
+  returning `Ok(())` without a network round-trip. Intended for
+  consumers that have observed a stale-topology symptom (e.g.
+  `READONLY` on a write after failover) and want the next retry to
+  use a fresh slot map.
+- **`ff-script::loader` — force a cluster slot-map refresh between
+  `FUNCTION LOAD` retries.** The old retry loop slept blindly (1s /
+  2s / 4s / 8s … = ~39s total) without nudging ferriskey's slot
+  cache, so every attempt re-used the same stale routing and the
+  `READONLY` surface re-occurred until the background refresher
+  happened to fire. Each retry now calls
+  `client.force_cluster_slot_refresh().await` before the sleep,
+  making attempts productive. First attempt still skips the refresh
+  so the happy-path cluster has no extra RTT.
+- **`ff-script::loader` — shorten retry window from ~39s to ~15s
+  (6 attempts with 500ms/1s/2s/4s/7s backoff).** Retries are
+  productive now (each actually refreshes topology), so the blind
+  defense-in-depth padding is no longer needed.
+
 - **`crates/ff-backend-sqlite` — outbox producer tag back-fill
   (Phase 3.1-flagged regression, fixed in Phase 3.2).** Prior to
   Phase 3.2 the SQLite `ff_lease_event` + `ff_completion_event`
