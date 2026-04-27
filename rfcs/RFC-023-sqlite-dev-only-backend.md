@@ -1,13 +1,86 @@
 # RFC-023: SQLite — dev-only backend (testing harness, Temporal-pattern)
 
 **Status:** ACCEPTED
-**Revision:** 5
+**Revision:** 6
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
 **Target release:** v0.12.0 (next content delivery after v0.11.0 Postgres Wave 9)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (stream-cursor subscriptions), RFC-020 (Postgres Wave 9 — shipped v0.11.0), RFC-022 (parked: full-parity SQLite — superseded in scope by this RFC)
 **Tracking issue:** #338
+
+### Revision 6 summary (2026-04-26)
+
+Phase 2a.2 agent, tasked with the SqliteBackend attempt-ops bodies
+(claim/complete/fail), surfaced that Revision 5 is silent on
+handle-tag extension despite every claim/complete/fail/suspend op
+returning a `Handle` whose `backend` field is a `BackendTag`. Ground
+truth at `d351625`: `ff-core::backend::BackendTag` is a
+`#[non_exhaustive] enum { Valkey, Postgres }` with wire-byte codec
+at `crates/ff-core/src/handle_codec.rs` (Valkey=`0x01`,
+Postgres=`0x02`). Without a `BackendTag::Sqlite` variant + assigned
+wire byte, `SqliteBackend` cannot mint a single handle, which blocks
+Phase 2a.2 mechanically.
+
+Revision 6 amendments are all structural / scope-alignment, no
+reframing of §§1–3 or §§5–7:
+
+- **§4.3 pointer update.** Notes that `is_retryable_sqlite_busy` +
+  `retry_serializable` + `MAX_ATTEMPTS = 3` shipped in Phase 2a.1
+  (PR #370, merge SHA `d351625`, file
+  `crates/ff-backend-sqlite/src/retry.rs`). `MAX_ATTEMPTS` matches
+  the PG `CANCEL_FLOW_MAX_ATTEMPTS` cap by construction — same
+  policy, different classifier kinds.
+- **§4.4 item 11 — `BackendTag::Sqlite` + wire byte `0x03` +
+  cross-crate match-site posture.** New item enumerating the
+  `ff-core` additions (variant + `wire_byte` arm + `from_wire_byte`
+  arm) and the cross-crate match-site audit: with
+  `#[non_exhaustive]` already on `BackendTag`, every consumer match
+  site already carries a wildcard arm, so the addition is
+  compile-safe; semantic correctness (each rejection site names the
+  expected backend) is reviewed site-by-site and confirmed
+  additively correct. Rejection text matches the existing
+  "expected={:?} actual={:?}" shape at
+  `ff-backend-postgres/src/handle_codec.rs:30-50`.
+- **§4.4 Supports-flag clarification.** The prior Phase 2a.2
+  briefing mislabeled `complete` / `fail` as `Supports`-gated;
+  ground-truth at `d351625`: only `claim_for_worker` has a
+  `Supports` bool. `complete` / `fail` are trait-mandatory
+  hot-path ops with no flag. SQLite wires them as always-on
+  ambient capability; no `Supports` bool flips for these two.
+- **§4.5 — `SqliteBackend` handle decode path.** New subsection
+  documenting that `SqliteBackend`'s decode validates wire byte
+  `0x03`, rejects `0x01` / `0x02` with the same
+  `EngineError::Validation { kind: HandleFromOtherBackend, .. }`
+  shape used by PG + Valkey, and reuses `ff-core::handle_codec`
+  infrastructure — no new codec, just the new tag variant.
+- **§4.8 — Phase 2a sub-ordering (new subsection).** Makes the
+  2a.1 → 2a.1.5 → 2a.2 → 2a.3 dependency chain explicit, matching
+  the Phase 1a / 1b split precedent. Without 2a.1.5 landed, 2a.2
+  cannot mint handles; 2a.3 depends on 2a.2's lease lifecycle
+  wiring.
+- **§8 — additive-extension audit line.** Adds
+  `BackendTag::Sqlite` variant extension as an additive change on
+  the existing `#[non_exhaustive]` enum — no consumer break.
+
+No new open questions. No scope expansion beyond the structural
+documentation listed above. Phase 2a.2 retry follows 2a.1.5 merge.
+
+**Ground-truth surprise worth noting.** The brief asked to extend
+`v1_handle_for_tests` (behind `test-fixtures`) with a Sqlite-tag
+variant. Ground truth at `crates/ff-core/src/handle_codec.rs:245-261`:
+that fixture synthesises the **v1 wire format** (pre-wire-byte,
+magic-byte `V1_VERSION_TAG` only) and the rustdoc explicitly
+documents that v1 buffers decode as `BackendTag::Valkey` via the
+compat path. v1 is a FF-0.3-era Valkey-only format that predates
+the tag byte; it cannot carry a Sqlite-tag variant. A Sqlite-tag
+fixture would be a new v2-format test helper, not an amendment to
+`v1_handle_for_tests`. Revision 6 does NOT add such a fixture — the
+existing `encode(BackendTag::Sqlite, payload)` call chain through
+the v2 codec covers all Sqlite handle test needs and needs no new
+helper. Flagged here for Phase 2a.1.5 implementer; if they discover
+a genuine v2-fixture need during coding, that is a separate follow-up
+note, not Rev-6 scope.
 
 ### Revision 5 summary (2026-04-26)
 
@@ -576,6 +649,16 @@ path. Non-retryable kinds (`SQLITE_CORRUPT`, `SQLITE_FULL`, etc.)
 surface as hard errors per PG's existing shape — this is the
 mechanical mirror of the PG classifier, not a new policy.
 
+**Shipped at Phase 2a.1 (Rev-6 pointer).** `is_retryable_sqlite_busy`
++ the `retry_serializable` wrapper landed in PR #370, merge SHA
+`d351625`, at `crates/ff-backend-sqlite/src/retry.rs`. Retry-cap
+`MAX_ATTEMPTS = 3` matches PG's `CANCEL_FLOW_MAX_ATTEMPTS` by
+construction (same policy across SERIALIZABLE-retry ops, different
+classifier predicates feeding it). Phase 2a.2 bodies call
+`retry_serializable(|| op(tx))` directly — no per-op retry
+bookkeeping is open-coded. This line is a reference pointer to the
+shipped implementation; no new spec added.
+
 ### 4.4 Server integration — concrete code surface (A1)
 
 Round-1 Reviewer A correctly flagged that the Round-1 draft
@@ -815,6 +898,118 @@ trait-implementation. Enumerated:
     assertion in `worker.rs` matching the existing pattern at
     `worker.rs:1604-1623`.
 
+11. **`BackendTag::Sqlite` + wire byte `0x03` + cross-crate
+    match-site audit (Rev-6).** Every claim / complete / fail /
+    suspend / resume op that `SqliteBackend` implements must mint
+    a `Handle`, and `Handle::backend` carries a `BackendTag`
+    (`crates/ff-core/src/backend.rs:57-84` + `:137`). Rev-5 is
+    silent on this; Phase 2a.2 surfaced it before coding.
+
+    **`ff-core::backend::BackendTag` extension.** Additive on the
+    existing `#[non_exhaustive]` enum at
+    `crates/ff-core/src/backend.rs:55-62`:
+
+    ```rust
+    #[non_exhaustive]
+    pub enum BackendTag {
+        Valkey,
+        Postgres,
+        Sqlite, // new, Rev-6
+    }
+    ```
+
+    **Wire-byte assignment.** `BackendTag::Sqlite` gets wire byte
+    `0x03`, matching the numeric progression (`Valkey=0x01`,
+    `Postgres=0x02`, `Sqlite=0x03`). Updates land in
+    `crates/ff-core/src/backend.rs` at `wire_byte` (line 69-74)
+    and `from_wire_byte` (line 77-83):
+
+    ```rust
+    pub const fn wire_byte(self) -> u8 {
+        match self {
+            BackendTag::Valkey => 0x01,
+            BackendTag::Postgres => 0x02,
+            BackendTag::Sqlite => 0x03, // new
+        }
+    }
+
+    pub const fn from_wire_byte(b: u8) -> Option<Self> {
+        match b {
+            0x01 => Some(BackendTag::Valkey),
+            0x02 => Some(BackendTag::Postgres),
+            0x03 => Some(BackendTag::Sqlite), // new
+            _ => None,
+        }
+    }
+    ```
+
+    **Cross-crate match-site posture.** `BackendTag` is already
+    `#[non_exhaustive]`, so every consumer `match` site in the
+    repo already carries either a wildcard arm or uses inequality
+    checks (`!= BackendTag::Postgres`). Compile-safe by
+    construction; the review is semantic (does each site correctly
+    classify `BackendTag::Sqlite` as "not my backend" where
+    appropriate?). Audit at `d351625`:
+
+    - `crates/ff-backend-valkey/src/handle_codec.rs:44-68` —
+      `!= BackendTag::Valkey` inequality. `Sqlite` takes the "other
+      backend" branch, returns
+      `EngineError::Validation { kind: HandleFromOtherBackend, .. }`
+      with `expected=Valkey actual=Sqlite` in the detail text.
+      **Correct additively.**
+    - `crates/ff-backend-postgres/src/handle_codec.rs:30-50` —
+      same inequality shape; `Sqlite` takes the "other backend"
+      branch with `expected=Postgres actual=Sqlite`.
+      **Correct additively.**
+    - `crates/ff-backend-postgres/src/attempt.rs:91-101` — two
+      inequality checks (`handle.backend != BackendTag::Postgres`
+      at line 91, `decoded.tag != BackendTag::Postgres` at line
+      101). Sqlite handles routed here hit the rejection path.
+      **Correct additively.**
+    - `crates/ff-backend-postgres/src/suspend_ops.rs:81-88` —
+      identical inequality pair. **Correct additively.**
+    - `ff-core` internal matches — only the `wire_byte` /
+      `from_wire_byte` pair in `backend.rs` (exhaustive; updated
+      by this item) plus the test-module encodes in `backend.rs`
+      and `handle_codec.rs` (no runtime branching on the variant
+      set). The `V1_VERSION_TAG => BackendTag::Valkey` compat arm
+      at `handle_codec.rs:231` stays Valkey (v1 is FF-0.3-era
+      Valkey-only format; see Rev-6 ground-truth-surprise note).
+
+    No site needs a code change beyond the `ff-core/backend.rs`
+    variant + arm additions. Phase 2a.1.5 lands `ff-core` changes
+    only. Every other crate inherits correctness mechanically via
+    `#[non_exhaustive]` + inequality-style checks.
+
+    **New SqliteBackend match site.** Phase 2a.2 introduces
+    `crates/ff-backend-sqlite/src/handle_codec.rs` with the mirror
+    shape (inequality check against `BackendTag::Sqlite`, same
+    rejection text). Documented under §4.5 below, not duplicated
+    here.
+
+    **Net diff estimate (Phase 2a.1.5).** ~8 lines in
+    `crates/ff-core/src/backend.rs` (one variant + two match
+    arms); ~2 lines in `crates/ff-core/src/handle_codec.rs` docs
+    updating the wire-byte comment at line 29 to mention `0x03 =
+    Sqlite`; one new test in `backend.rs` round-tripping the
+    Sqlite wire byte alongside the existing Valkey / Postgres
+    tests at lines 1437 and 1465. Zero changes to
+    `ff-backend-valkey`, `ff-backend-postgres`, or any match-site
+    consumer.
+
+**Supports-flag clarification (Rev-6).** The Phase 2a.2 brief
+framed this step as "flip `Supports::claim_for_worker` +
+`Supports::complete` + `Supports::fail` to `true`." Ground truth at
+`d351625`: `Supports` is a bool-per-field struct in
+`crates/ff-core/src/supports.rs` with a flag for
+`claim_for_worker` (scheduler-routed claim) but NO flags for
+`complete` / `fail` — those are trait-mandatory hot-path ops, not
+capability-gated. SqliteBackend wires `complete` + `fail` as
+always-on ambient capability (same posture as PG + Valkey);
+`Supports::claim_for_worker` flips to `true` when a scheduler is
+wired (not before). No action on `complete` / `fail` at Phase 2a.2
+beyond implementing the trait methods.
+
 **Embedded, no-HTTP consumers** continue to use the existing
 `Server::start_with_backend` (`server.rs:677`) by constructing
 `SqliteBackend::new(path).await?` and wrapping in `Arc<dyn
@@ -899,6 +1094,61 @@ The guard is on the TYPE, not the server.
 Banner emits on every `SqliteBackend::new` success so log
 aggregators can alert if a SQLite backend ever reaches an
 environment it shouldn't.
+
+**`SqliteBackend` handle codec (Rev-6).** The SQLite crate gets its
+own `handle_codec.rs` mirroring the Postgres + Valkey shape (see
+§4.4 item 11 for the cross-crate audit). Concretely, at
+`crates/ff-backend-sqlite/src/handle_codec.rs`:
+
+```rust
+use ff_core::backend::{BackendTag, Handle, HandleKind, HandleOpaque};
+use ff_core::handle_codec::{decode as core_decode, encode as core_encode};
+use ff_core::engine_error::{EngineError, ValidationKind};
+use ff_core::payload::HandlePayload;
+
+pub(crate) fn encode_handle(payload: &HandlePayload, kind: HandleKind) -> Handle {
+    let opaque: HandleOpaque = core_encode(BackendTag::Sqlite, payload);
+    Handle::new(BackendTag::Sqlite, kind, opaque)
+}
+
+pub(crate) fn decode_handle(handle: &Handle) -> Result<HandlePayload, EngineError> {
+    if handle.backend != BackendTag::Sqlite {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::HandleFromOtherBackend,
+            detail: format!(
+                "expected={:?} actual={:?}",
+                BackendTag::Sqlite,
+                handle.backend
+            ),
+        });
+    }
+    let decoded = core_decode(&handle.opaque)?;
+    if decoded.tag != BackendTag::Sqlite {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::HandleFromOtherBackend,
+            detail: format!(
+                "expected={:?} actual={:?} (embedded tag)",
+                BackendTag::Sqlite,
+                decoded.tag
+            ),
+        });
+    }
+    Ok(decoded.payload)
+}
+```
+
+No new codec infrastructure — the SQLite crate reuses
+`ff-core::handle_codec::{encode, decode}` exactly as PG and Valkey
+do. Wire byte `0x03` (§4.4 item 11) is what distinguishes minted
+handles; decode rejects `0x01` (Valkey-minted) and `0x02`
+(Postgres-minted) with the same
+`EngineError::Validation { kind: HandleFromOtherBackend, .. }`
+shape the other two backends use. Cross-backend test coverage (a
+handle minted by Valkey/Postgres rejected by SqliteBackend decode
+with the correct error text) lands in Phase 2a.1.5 alongside the
+new crate file, mirroring
+`ff-backend-postgres/src/handle_codec.rs:91-92` and
+`ff-backend-valkey/src/handle_codec.rs:114-115`.
 
 ### 4.6 Test infrastructure
 
@@ -1054,6 +1304,47 @@ async fn http_roundtrip_on_sqlite() {
 Before (both shapes, pre-RFC-023): `docker compose up postgres`
 + `FF_POSTGRES_URL` + per-test schema isolation. After: 20–35
 lines and `cargo test`.
+
+### 4.8 Phase sub-ordering (Rev-6)
+
+This RFC ships across multiple phases matching the Phase 1a / 1b
+split precedent — not one megacommit. Phase 2a is itself
+sub-ordered:
+
+- **Phase 2a.1 — SHIPPED at `d351625` (PR #370).** SQLite-dialect
+  query-module scaffolding (`ff-backend-sqlite/src/queries/`) +
+  `retry_serializable` wrapper + `is_retryable_sqlite_busy`
+  classifier + `MAX_ATTEMPTS = 3` retry cap (§4.3). No trait-op
+  bodies yet; the scaffolding compiles and all retry-logic tests
+  pass standalone.
+- **Phase 2a.1.5 — required before Phase 2a.2.** Landing
+  `BackendTag::Sqlite` variant + wire byte `0x03` + the new
+  `crates/ff-backend-sqlite/src/handle_codec.rs` file per §4.4
+  item 11 and §4.5's "SqliteBackend handle codec" subsection.
+  Cross-crate match-site audit per §4.4 item 11 (confirmed
+  compile-safe + semantically correct additively). Rev-6 is the
+  spec for this phase.
+- **Phase 2a.2 — depends on 2a.1.5.** Attempt-ops bodies:
+  `SqliteBackend::claim_for_worker`, `SqliteBackend::complete`,
+  `SqliteBackend::fail`. Wraps every SERIALIZABLE call through
+  `retry_serializable`. Every op that returns a `Handle` mints
+  via `handle_codec::encode_handle`; every op that consumes a
+  `Handle` validates via `handle_codec::decode_handle`. Without
+  Phase 2a.1.5 landed, 2a.2 cannot mint a single handle.
+- **Phase 2a.3 — depends on 2a.2.** Lease lifecycle:
+  `SqliteBackend::renew`, `SqliteBackend::cancel`,
+  `SqliteBackend::suspend`, `SqliteBackend::claim_from_reclaim`.
+  Extends the attempt-ops surface with the full lease state
+  machine; reuses the 2a.1.5 handle codec directly.
+- **Phase 2b and later** — Wave-9 operator ops, budget admin,
+  RFC-019 subscribe surface — as defined in §4.3 parity
+  commitment.
+
+Sub-ordering is explicit here because the Phase 2a.2 briefing
+attempted to jump from 2a.1 straight to attempt-ops bodies and
+surfaced the 2a.1.5 gap at coding time (Rev-6 exists because of
+that surface). Future phases that touch handle-minting flows get
+the same audit discipline at RFC-spec time, not at coding time.
 
 ---
 
@@ -1304,6 +1595,22 @@ same PR):**
    SDK on non-Valkey backends drive the claim/signal ops through
    the trait surface directly. This is a pre-1.0 minor break,
    consistent with the existing RFC-023 §8 posture.
+
+**Additive, non-breaking (Rev-6):**
+
+4. **`BackendTag::Sqlite` variant addition** (§4.4 item 11).
+   `ff-core::backend::BackendTag` is already `#[non_exhaustive]`
+   at `crates/ff-core/src/backend.rs:55-62`, and every consumer
+   match site in the repo uses either a wildcard arm or
+   inequality checks (`!= BackendTag::Postgres` / `!=
+   BackendTag::Valkey`). Adding the `Sqlite` variant is
+   compile-safe across the workspace and consumer crates; no
+   consumer migration is required. Wire byte `0x03` is a new
+   additive byte in the `HandleCodec` version-2 encoding,
+   orthogonal to existing `0x01` / `0x02` handles (Valkey + PG
+   handles continue to decode correctly after the addition).
+   `CHANGELOG.md [Unreleased] ### Added` gets a line for the
+   variant per the §9 release-gate.
 
 Both ff-server breaks plus the ff-sdk shift are noted in
 `CHANGELOG.md [Unreleased] ### Changed` per the §9 release-gate
