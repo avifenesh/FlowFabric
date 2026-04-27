@@ -91,9 +91,16 @@ fn outcome_to_json(r: &ReportUsageResult) -> JsonValue {
             "current_usage": current_usage,
             "hard_limit": hard_limit,
         }),
-        // `#[non_exhaustive]`; future variants reach the backend via
-        // ff-core before landing an impl here, so emit a placeholder
-        // the replay path will reject rather than silently mis-decoding.
+        // `#[non_exhaustive]`; future `ReportUsageResult` variants
+        // reach the backend via ff-core before landing an impl here.
+        // Matches the PG reference fallback (`ff-backend-postgres/src/
+        // budget.rs:102`): a future variant round-trips as `Ok` on
+        // dedup replay rather than surfacing as `Corruption`. This
+        // is permissive-by-design for forward compatibility — the
+        // tradeoff is that a consumer running newer `ff-core` against
+        // an older backend binary sees `Ok` instead of the intended
+        // outcome on replay. Non-replay paths use the direct result,
+        // so the window is bounded to dedup-replay only.
         _ => json!({"kind": "Ok"}),
     }
 }
@@ -213,6 +220,13 @@ pub(crate) async fn report_usage_admin_impl(
     let mut ud = UsageDimensions::new();
     ud.custom = custom;
     ud.dedup_key = args.dedup_key;
+    // `args.now` is dropped here — matches PG reference
+    // (`ff-backend-postgres/src/budget.rs::report_usage_admin_impl`),
+    // which also delegates to the core and re-derives `now_ms()`.
+    // Server-clock authority is the cross-backend invariant:
+    // admins cannot back-date usage writes. Reviewer flag carried
+    // forward as a cross-backend design question; not a SQLite-only
+    // bug to fix here.
     retry_serializable(|| report_usage_and_check_core(pool, budget, ud.clone())).await
 }
 

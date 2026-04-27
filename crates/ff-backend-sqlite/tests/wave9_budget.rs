@@ -91,7 +91,7 @@ fn admin_args(dim: &str, delta: u64) -> ReportUsageAdminArgs {
 // ── create_budget ──────────────────────────────────────────────────
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn create_budget_happy_path() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -104,7 +104,7 @@ async fn create_budget_happy_path() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn create_budget_seeds_next_reset_with_interval() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -131,7 +131,7 @@ async fn create_budget_seeds_next_reset_with_interval() {
 // ── reset_budget ───────────────────────────────────────────────────
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn reset_budget_clears_counters_advances_next_reset() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -168,7 +168,7 @@ async fn reset_budget_clears_counters_advances_next_reset() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn reset_budget_not_found_returns_notfound() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -188,7 +188,7 @@ async fn reset_budget_not_found_returns_notfound() {
 // ── create_quota_policy ────────────────────────────────────────────
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn create_quota_policy_writes_policy_row_idempotent() {
     let b = fresh_backend().await;
     let qid = QuotaPolicyId::new();
@@ -208,7 +208,7 @@ async fn create_quota_policy_writes_policy_row_idempotent() {
 // ── get_budget_status ──────────────────────────────────────────────
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn get_budget_status_returns_limits_and_counters() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -235,7 +235,7 @@ async fn get_budget_status_returns_limits_and_counters() {
 // ── report_usage_admin ─────────────────────────────────────────────
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn report_usage_admin_ok_increments_usage() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -250,7 +250,7 @@ async fn report_usage_admin_ok_increments_usage() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn report_usage_admin_soft_breach_increments_soft_count() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -269,7 +269,7 @@ async fn report_usage_admin_soft_breach_increments_soft_count() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn report_usage_admin_hard_breach_rejects_and_increments_hard_count() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -304,7 +304,7 @@ async fn report_usage_admin_hard_breach_rejects_and_increments_hard_count() {
 /// run that Phase 3.5 (scanner supervisor + scheduler wiring) will
 /// unblock.
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn token_budget_scenario_trips_hard_breach_via_counter() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
@@ -366,7 +366,7 @@ async fn token_budget_scenario_trips_hard_breach_via_counter() {
 }
 
 #[tokio::test]
-#[serial]
+#[serial(ff_dev_mode)]
 async fn report_usage_admin_dedup_replay_returns_cached_outcome() {
     let b = fresh_backend().await;
     let bid = BudgetId::new();
