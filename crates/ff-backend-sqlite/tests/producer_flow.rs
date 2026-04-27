@@ -421,18 +421,23 @@ async fn stage_dependency_edge_rejects_stale_revision() {
 
 // ── Pubsub foundation smoke (Group D.1) ────────────────────────────────
 
-/// End-to-end smoke: `complete()` writes ff_completion_event + emits
-/// a wakeup on the completion broadcast channel. We don't yet have a
-/// subscribe_completion trait surface (Phase 2b.2); this test asserts
-/// the outbox row lands with the correct event_id via direct SQL —
-/// the broadcast emit itself is exercised indirectly by the channel's
-/// receiver-count being non-zero post-commit (manufactured here by
-/// subscribing to the channel via a test-only pool accessor).
+/// End-to-end smoke covering BOTH halves of Group D.1:
+///   1. Durable replay path — `ff_completion_event` row with
+///      `outcome='success'` lands.
+///   2. Broadcast wakeup path — a subscriber on the completion
+///      channel (obtained via the test-only
+///      `subscribe_completion_for_test` accessor) receives an
+///      `OutboxEvent` with `event_id` matching the outbox row.
 #[tokio::test]
 #[serial(ff_dev_mode)]
-async fn complete_writes_completion_outbox_row() {
+async fn complete_writes_outbox_row_and_wakes_broadcast_subscriber() {
     let backend = fresh_backend().await;
     let pool = backend.pool_for_test();
+
+    // Subscribe BEFORE the write so the broadcast receiver is
+    // attached at post-commit emit time. broadcast channels only
+    // deliver to subscribers attached at send time.
+    let mut rx = backend.subscribe_completion_for_test();
 
     // Seed one runnable exec via the producer surface now that it exists.
     let eid = new_exec_id();
@@ -469,13 +474,25 @@ async fn complete_writes_completion_outbox_row() {
 
     backend.complete(&h, None).await.expect("complete");
 
-    // Durable replay: ff_completion_event has one row with outcome=success.
-    let outcome: String = sqlx::query_scalar(
-        "SELECT outcome FROM ff_completion_event WHERE execution_id = ?1",
+    // Durable-replay assertion: ff_completion_event has one row with
+    // outcome=success and its event_id matches what the broadcast
+    // emitted.
+    let (outcome, db_event_id): (String, i64) = sqlx::query_as(
+        "SELECT outcome, event_id FROM ff_completion_event WHERE execution_id = ?1",
     )
     .bind(exec_uuid)
     .fetch_one(pool)
     .await
     .expect("read completion event");
     assert_eq!(outcome, "success");
+
+    // Broadcast-wakeup assertion: the receiver gets an OutboxEvent
+    // whose event_id matches the persisted row. Use a short timeout
+    // so a missed wakeup fails loudly instead of hanging the test.
+    let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+        .await
+        .expect("broadcast wakeup within 500ms")
+        .expect("broadcast channel healthy");
+    assert_eq!(ev.event_id, db_event_id);
+    assert_eq!(ev.partition_key, 0);
 }

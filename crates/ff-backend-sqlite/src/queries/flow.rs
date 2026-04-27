@@ -26,6 +26,23 @@ pub(crate) const INSERT_FLOW_CORE_SQL: &str = r#"
     ON CONFLICT (partition_key, flow_id) DO NOTHING
 "#;
 
+// Lifecycle-phase literal sets used by cancel_flow member selection.
+// Kept as SQL-inline literals (rather than Rust constants bound at
+// query time) because SQLite does not support IN-list parameter
+// arrays; each literal is a deployment-wide invariant string that
+// `ff_exec_core.lifecycle_phase` can take, never user input.
+// Centralizing them in this module so any future lifecycle-phase
+// vocabulary change touches exactly one file.
+//
+// `TERMINAL_PHASES` — an exec row in any of these is already finished,
+// so cancel_flow skips it. Mirrors PG's `NOT IN (...)` filter at
+// `ff-backend-postgres/src/flow.rs:648-649` plus the RFC-023 SQLite
+// 'terminal' literal (see `queries/exec_core.rs::UPDATE_EXEC_CORE_COMPLETE_SQL`
+// which writes 'terminal' rather than PG's multiple terminal literals).
+//
+// `PRE_RUNNABLE_PHASES` — the `CancelPending` policy only flips rows
+// whose execution hasn't started yet.
+
 // ── cancel_flow ─────────────────────────────────────────────────────────
 
 /// Atomic flip of flow_core to cancelled, recording the requested

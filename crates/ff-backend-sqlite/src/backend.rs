@@ -1274,9 +1274,12 @@ async fn create_execution_impl(
 
         if inserted {
             // Populate the capability junction — RFC-023 §4.1 A4.
-            // Required caps live on `ExecutionPolicy.scheduling.required_capabilities`
-            // per the PG reference; if absent, no junction rows are
-            // written (matches PG's empty `text[]` default).
+            // Required caps live on
+            // `ExecutionPolicy.routing_requirements.required_capabilities`;
+            // if absent, no junction rows are written (matches PG's
+            // empty `text[]` default — see PG reference at
+            // `ff-backend-postgres/src/exec_core.rs:157-188` which also
+            // stores an empty `text[]` array when the policy is None).
             let required: Vec<String> = args
                 .policy
                 .as_ref()
@@ -1763,10 +1766,17 @@ fn cancel_policy_to_str(p: CancelFlowPolicy) -> &'static str {
         CancelFlowPolicy::FlowOnly => "cancel_flow_only",
         CancelFlowPolicy::CancelAll => "cancel_all",
         CancelFlowPolicy::CancelPending => "cancel_pending",
-        // Forward-compat for additive `CancelFlowPolicy` variants —
-        // encode as `cancel_all` (safest conservative default), matching
-        // the PG reference at `ff-backend-postgres/src/flow.rs:525-534`.
-        _ => "cancel_all",
+        // Forward-compat for additive `CancelFlowPolicy` variants.
+        // Per the project's non-exhaustive-enum rule (confirmed by
+        // cursor-bugbot learned-rule #dc768b31; cf. Valkey backend fix
+        // PR #114), destructive-action wildcards MUST default to the
+        // LEAST-destructive variant — widening cancel scope
+        // irreversibly destroys work, while narrowing is safely
+        // retryable by the caller. The PG reference at
+        // `ff-backend-postgres/src/flow.rs:525-534` takes the wider
+        // default; SQLite intentionally diverges here to match
+        // Valkey's correctness posture.
+        _ => "cancel_flow_only",
     }
 }
 
@@ -2090,6 +2100,19 @@ impl SqliteBackend {
     #[doc(hidden)]
     pub fn pool_for_test(&self) -> &SqlitePool {
         &self.inner.pool
+    }
+
+    /// Test-only subscribe helper — returns a `Receiver` for the
+    /// completion-outbox broadcast channel so integration tests can
+    /// assert that a `complete()` / `fail()` / `cancel_flow()` call
+    /// wakes subscribers post-commit. The production `subscribe_*`
+    /// surface lands in Phase 2b.2; this accessor is narrow + hidden
+    /// so it doesn't leak into the public API.
+    #[doc(hidden)]
+    pub fn subscribe_completion_for_test(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::pubsub::OutboxEvent> {
+        self.inner.pubsub.completion.subscribe()
     }
 }
 

@@ -19,10 +19,11 @@
 //!
 //! Each [`OutboxEvent`] carries the partition key it landed on; a
 //! partition-scoped subscriber filters on its own `OutboxEvent::partition_key`.
-//! The post-commit emit never drops the event (broadcast `send`
-//! returns `Ok` when there are zero receivers and `Err(SendError)`
-//! only when the receiver count is zero — the producer side is
-//! infallible from our POV).
+//! The post-commit emit is wakeup-only and does not determine
+//! durability. If broadcast `send` finds no attached receivers it
+//! returns `Err(SendError(_))`; we intentionally ignore that case
+//! because durable replay comes from the outbox table, so a missed
+//! wakeup is NOT a lost event from the producer's POV.
 
 use tokio::sync::broadcast;
 
@@ -41,19 +42,18 @@ const DEFAULT_CAPACITY: usize = 256;
 /// subscriber from the outbox table using `event_id` as a cursor,
 /// matching the RFC-019 catch-up shape.
 #[derive(Clone, Debug)]
-pub(crate) struct OutboxEvent {
+#[doc(hidden)] // test-only surface exposed via `subscribe_*_for_test`
+pub struct OutboxEvent {
     /// Auto-incrementing outbox row id (monotonic per table). Read by
     /// Phase 2b.2 `subscribe_*` consumers as the catch-up cursor; the
     /// producer side fills it from `last_insert_rowid()`.
-    #[allow(dead_code)] // Phase 2b.2 subscribers read this
-    pub(crate) event_id: i64,
+    pub event_id: i64,
     /// Partition the write targeted. SQLite currently runs with
     /// `num_flow_partitions = 1` (§4.1 A3) so this is always `0`
     /// today, but the field exists for topology symmetry with PG
     /// and for future partition fan-out if the invariant ever
     /// relaxes.
-    #[allow(dead_code)] // Phase 2b.2 partition-scoped subscribers filter on this
-    pub(crate) partition_key: i64,
+    pub partition_key: i64,
 }
 
 /// Per-backend in-process wakeup channels. One broadcast channel per
