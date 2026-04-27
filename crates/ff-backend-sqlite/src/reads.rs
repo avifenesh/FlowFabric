@@ -266,18 +266,33 @@ pub(crate) async fn read_execution_info_impl(
         .and_then(|bytes| Uuid::from_slice(bytes).ok())
         .map(|u| u.to_string());
 
+    // Checked integer conversions — surface storage-tier corruption
+    // loudly instead of silently truncating (copilot review).
+    let priority_i32: i32 = i32::try_from(priority).map_err(|e| EngineError::Validation {
+        kind: ValidationKind::Corruption,
+        detail: format!("exec_core: priority out of i32 range: {priority}: {e}"),
+    })?;
+    let attempt_index_u32: u32 = u32::try_from(attempt_index.max(0)).map_err(|e| {
+        EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "exec_core: attempt_index out of u32 range: {attempt_index}: {e}"
+            ),
+        }
+    })?;
+
     Ok(Some(ExecutionInfo {
         execution_id: id.clone(),
         namespace,
         lane_id,
-        priority: priority as i32,
+        priority: priority_i32,
         execution_kind,
         state_vector,
         public_state,
         created_at: created_at_ms.to_string(),
         started_at: first_started_at_ms_opt.map(|v| v.to_string()),
         completed_at: terminal_at_ms_opt.map(|v| v.to_string()),
-        current_attempt_index: attempt_index.max(0) as u32,
+        current_attempt_index: attempt_index_u32,
         flow_id,
         blocking_detail,
     }))

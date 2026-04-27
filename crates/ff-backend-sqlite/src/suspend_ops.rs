@@ -1303,10 +1303,15 @@ pub(crate) async fn list_pending_waitpoints_impl(
         let (token_kid, token_fingerprint) = parse_waitpoint_token_kid_fp(&token);
 
         // Decode JSON array literal into Vec<String>. Malformed JSON
-        // collapses to empty (wildcard) per the
-        // `PendingWaitpointInfo::required_signal_names` contract.
+        // surfaces `Corruption` loudly rather than silently collapsing
+        // to empty (gemini review — data-integrity guard).
         let req_names: Vec<String> =
-            serde_json::from_str(&req_names_json).unwrap_or_default();
+            serde_json::from_str(&req_names_json).map_err(|e| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!(
+                    "waitpoint_pending: required_signal_names not valid JSON: {e}"
+                ),
+            })?;
 
         let mut info = PendingWaitpointInfo::new(
             wp_id,

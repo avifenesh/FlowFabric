@@ -672,6 +672,8 @@ fn member_wire_id(partition_key: i64, exec_uuid: Uuid) -> String {
 
 /// Insert one operator-event row keyed on a flow_id (not
 /// execution_id). Used by `flow_cancel_requested` per RFC-020 §4.2.3.
+/// Reuses `last_outbox_event` for consistency with the other outbox
+/// insertion helpers in this module (gemini review).
 async fn insert_operator_event_flow(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
     part: i64,
@@ -679,7 +681,7 @@ async fn insert_operator_event_flow(
     event_type: &str,
     details: Option<String>,
     now: i64,
-) -> Result<OutboxEvent, OutboxInsertErr> {
+) -> Result<OutboxEvent, EngineError> {
     sqlx::query(q_op::INSERT_OPERATOR_EVENT_FLOW_SQL)
         .bind(flow_uuid.to_string())
         .bind(event_type)
@@ -689,22 +691,8 @@ async fn insert_operator_event_flow(
         .bind(flow_uuid)
         .execute(&mut **conn)
         .await
-        .map_err(|e| OutboxInsertErr(map_sqlx_error(e)))?;
-    let event_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
-        .fetch_one(&mut **conn)
-        .await
-        .map_err(|e| OutboxInsertErr(map_sqlx_error(e)))?;
-    Ok(OutboxEvent {
-        event_id,
-        partition_key: part,
-    })
-}
-
-struct OutboxInsertErr(EngineError);
-impl From<OutboxInsertErr> for EngineError {
-    fn from(e: OutboxInsertErr) -> Self {
-        e.0
-    }
+        .map_err(map_sqlx_error)?;
+    last_outbox_event(conn, part).await
 }
 
 async fn cancel_flow_header_once(
@@ -738,8 +726,12 @@ async fn cancel_flow_header_once(
         // Idempotent-replay path — already terminal. Return stored
         // policy / reason + enumerated members. Mirrors PG.
         if matches!(public_flow_state.as_str(), "cancelled" | "completed" | "failed") {
-            let raw: serde_json::Value =
-                serde_json::from_str(&raw_fields_str).unwrap_or(serde_json::Value::Null);
+            let raw: serde_json::Value = serde_json::from_str(&raw_fields_str).map_err(|e| {
+                EngineError::Validation {
+                    kind: ValidationKind::Corruption,
+                    detail: format!("flow_core: raw_fields not valid JSON: {e}"),
+                }
+            })?;
             let stored_cancellation_policy = raw
                 .get("cancellation_policy")
                 .and_then(|v| v.as_str())

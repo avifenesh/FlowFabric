@@ -294,11 +294,19 @@ pub(crate) const INSERT_CANCEL_BACKLOG_MEMBER_SQL: &str = r#"
 
 /// Flip one member exec_core row to cancelled for the `cancel_flow_header`
 /// fan-out. Binds: ?1 part, ?2 execution_id BLOB, ?3 now, ?4 reason.
+///
+/// Also clears `ownership_state` + `attempt_state` to their terminal
+/// forms so the `StateVector` assembled by `read_execution_info` is
+/// internally consistent (cursor bugbot: a live-running member would
+/// otherwise retain `ownership_state='leased'` + `attempt_state=
+/// 'running_attempt'` alongside `lifecycle_phase='cancelled'`).
 pub(crate) const UPDATE_EXEC_CORE_CANCEL_FROM_HEADER_SQL: &str = r#"
     UPDATE ff_exec_core
        SET lifecycle_phase     = 'cancelled',
+           ownership_state     = 'unowned',
            eligibility_state   = 'cancelled',
            public_state        = 'cancelled',
+           attempt_state       = 'cancelled',
            terminal_at_ms      = COALESCE(terminal_at_ms, ?3),
            cancellation_reason = COALESCE(cancellation_reason, ?4),
            cancelled_by        = COALESCE(cancelled_by, 'cancel_flow_header')
