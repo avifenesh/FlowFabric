@@ -887,6 +887,20 @@ impl Client {
         matches!(&*guard, ClientWrapper::Cluster { .. })
     }
 
+    /// Force an immediate refresh of the cluster slot map.
+    ///
+    /// No-op in standalone mode; callers typically dispatch this
+    /// after observing a stale-topology symptom (e.g. a `READONLY`
+    /// error from a write that was routed to a former-primary that
+    /// has been demoted to a replica) before retrying the command.
+    pub async fn force_cluster_slot_refresh(&self) -> Result<()> {
+        let guard = self.internal_client.read().await;
+        match &*guard {
+            ClientWrapper::Standalone(_) => Ok(()),
+            ClientWrapper::Cluster { client } => client.force_slot_refresh().await,
+        }
+    }
+
     /// Typed-tuple variant of [`Self::cluster_scan`] for Rust
     /// callers that want direct access to the next scan state and
     /// key list without the language-binding cursor-id container

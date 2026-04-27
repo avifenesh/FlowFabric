@@ -53,19 +53,23 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
 
     // Load the library with retry for transient errors.
     //
-    // Cluster-topology race (issue #275): on a just-formed cluster,
-    // `FUNCTION LOAD` can route to a node that's a replica at dispatch
-    // time (gossip hasn't fully converged). Valkey rejects with
-    // `READONLY: You can't write against a read only replica.`
+    // Cluster-topology race (issues #275 / #369): on a just-formed
+    // cluster, `FUNCTION LOAD` can route to a node that's a replica
+    // at dispatch time (gossip hasn't fully converged, or ferriskey's
+    // cached slot map pre-dates the primary/replica swap). Valkey
+    // rejects with `READONLY: You can't write against a read only
+    // replica.`
     //
-    // Treat READONLY as transient: back off with exponential delay so
-    // slot-map refresh catches the settled topology. 8 attempts with
-    // 1s/2s/4s/8s/8s/8s/8s inter-attempt waits gives ~39s total window.
-    // On GHA hosted runners the race window has been observed past 15s
-    // under cgroup CPU throttling; 39s gives generous headroom. Real fix
-    // is ferriskey-side (tracked at issue #290).
-    const MAX_ATTEMPTS: u32 = 8;
-    let backoff_ms: [u64; 7] = [1_000, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000];
+    // Mitigation: before each retry, force an unthrottled cluster
+    // slot-map refresh via ferriskey, then back off briefly. Each
+    // retry is productive (fresh topology), so the total window is
+    // ~14.5s (500ms + 1s + 2s + 4s + 7s between 6 attempts) instead
+    // of the earlier ~39s blind-sleep window.
+    //
+    // A deeper fix — ferriskey auto-refreshing on `READONLY` inside
+    // its cluster dispatch — is tracked as a follow-up to #290.
+    const MAX_ATTEMPTS: u32 = 6;
+    let backoff_ms: [u64; 5] = [500, 1_000, 2_000, 4_000, 7_000];
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match client.function_load_replace(LIBRARY_SOURCE).await {
@@ -78,16 +82,32 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
                     tracing::error!(attempt, error = %e, "FUNCTION LOAD failed with permanent error");
                     return Err(LoadError::Valkey(e));
                 }
-                let backoff = backoff_ms.get((attempt as usize).saturating_sub(1)).copied().unwrap_or(4_000);
-                tracing::warn!(
-                    attempt,
-                    max_attempts = MAX_ATTEMPTS,
-                    backoff_ms = backoff,
-                    error = %e,
-                    "FUNCTION LOAD failed (transient), retrying"
-                );
                 last_err = Some(e);
                 if attempt < MAX_ATTEMPTS {
+                    // Before sleeping, force a slot-map refresh so the
+                    // next attempt routes against fresh topology. No-op
+                    // in standalone mode. A refresh failure is logged
+                    // but does not abort the retry loop — the sleep +
+                    // next attempt may still succeed (e.g. after a
+                    // background topology tick).
+                    if let Err(refresh_err) = client.force_cluster_slot_refresh().await {
+                        tracing::debug!(
+                            attempt,
+                            error = %refresh_err,
+                            "force_cluster_slot_refresh failed between FUNCTION LOAD retries"
+                        );
+                    }
+                    let backoff = backoff_ms
+                        .get((attempt as usize).saturating_sub(1))
+                        .copied()
+                        .unwrap_or(4_000);
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        backoff_ms = backoff,
+                        error = ?last_err.as_ref().map(|e| e.to_string()),
+                        "FUNCTION LOAD failed (transient), refreshed slot map, retrying"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                 }
             }

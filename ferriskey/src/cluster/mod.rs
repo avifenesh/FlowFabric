@@ -295,6 +295,26 @@ where
         self.route_cluster_scan(cluster_scan_args).await
     }
 
+    /// Force an immediate, unthrottled refresh of the cluster slot map.
+    ///
+    /// Intended for callers that have just observed a stale-topology
+    /// symptom (e.g. a write command routed to a replica returning
+    /// `READONLY You can't write against a read only replica`) and want
+    /// to drive a fresh CLUSTER SLOTS query before retrying. Uses the
+    /// `NotThrottable` policy so the refresh runs even if one was
+    /// recently attempted.
+    ///
+    /// Serialized behind the same topology-refresh lock as the
+    /// background refresher; concurrent callers coalesce.
+    pub async fn force_slot_refresh(&self) -> Result<()> {
+        ClusterConnInner::<C>::refresh_slots_and_subscriptions_with_retries(
+            self.inner.clone(),
+            &RefreshPolicy::NotThrottable,
+            SlotRefreshTrigger::RuntimeRefresh,
+        )
+        .await
+    }
+
     /// Route cluster scan to be handled by internal cluster_scan command
     async fn route_cluster_scan(
         &mut self,
