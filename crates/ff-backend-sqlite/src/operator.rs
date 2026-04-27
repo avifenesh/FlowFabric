@@ -36,12 +36,13 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use ff_core::contracts::{
-    CancelExecutionArgs, CancelExecutionResult, ChangePriorityArgs, ChangePriorityResult,
-    ReplayExecutionArgs, ReplayExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
+    CancelExecutionArgs, CancelExecutionResult, CancelFlowArgs, CancelFlowHeader,
+    ChangePriorityArgs, ChangePriorityResult, ReplayExecutionArgs, ReplayExecutionResult,
+    RevokeLeaseArgs, RevokeLeaseResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::state::PublicState;
-use ff_core::types::CancelSource;
+use ff_core::types::{CancelSource, ExecutionId, FlowId};
 
 use crate::errors::map_sqlx_error;
 use crate::pubsub::{OutboxEvent, PubSub};
@@ -658,4 +659,283 @@ pub(crate) async fn replay_execution_impl(
     args: ReplayExecutionArgs,
 ) -> Result<ReplayExecutionResult, EngineError> {
     retry_serializable(|| replay_execution_once(pool, pubsub, &args)).await
+}
+
+// ─── cancel_flow_header (§4.2.3, Phase 3.3) ─────────────────────────
+
+/// Format a member execution UUID as the wire-form `ExecutionId`
+/// string (`{fp:N}:<uuid>`). SQLite uses `part=0` for all flows
+/// (single-writer, no partitioning).
+fn member_wire_id(partition_key: i64, exec_uuid: Uuid) -> String {
+    format!("{{fp:{partition_key}}}:{exec_uuid}")
+}
+
+/// Insert one operator-event row keyed on a flow_id (not
+/// execution_id). Used by `flow_cancel_requested` per RFC-020 §4.2.3.
+/// Reuses `last_outbox_event` for consistency with the other outbox
+/// insertion helpers in this module (gemini review).
+async fn insert_operator_event_flow(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    flow_uuid: Uuid,
+    event_type: &str,
+    details: Option<String>,
+    now: i64,
+) -> Result<OutboxEvent, EngineError> {
+    sqlx::query(q_op::INSERT_OPERATOR_EVENT_FLOW_SQL)
+        .bind(flow_uuid.to_string())
+        .bind(event_type)
+        .bind(details)
+        .bind(now)
+        .bind(part)
+        .bind(flow_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    last_outbox_event(conn, part).await
+}
+
+async fn cancel_flow_header_once(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    args: &CancelFlowArgs,
+) -> Result<CancelFlowHeader, EngineError> {
+    let part: i64 = 0; // SQLite single-partition (mirrors cancel_flow_impl).
+    let flow_uuid: Uuid = args.flow_id.0;
+    let now = args.now.0;
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result = async {
+        let flow_row = sqlx::query(q_op::SELECT_FLOW_CORE_FOR_CANCEL_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let Some(flow_row) = flow_row else {
+            return Err(EngineError::NotFound { entity: "flow" });
+        };
+
+        let public_flow_state: String = flow_row
+            .try_get("public_flow_state")
+            .map_err(map_sqlx_error)?;
+        let raw_fields_str: String = flow_row.try_get("raw_fields").map_err(map_sqlx_error)?;
+
+        // Idempotent-replay path — already terminal. Return stored
+        // policy / reason + enumerated members. Mirrors PG.
+        if matches!(public_flow_state.as_str(), "cancelled" | "completed" | "failed") {
+            let raw: serde_json::Value = serde_json::from_str(&raw_fields_str).map_err(|e| {
+                EngineError::Validation {
+                    kind: ValidationKind::Corruption,
+                    detail: format!("flow_core: raw_fields not valid JSON: {e}"),
+                }
+            })?;
+            let stored_cancellation_policy = raw
+                .get("cancellation_policy")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let stored_cancel_reason = raw
+                .get("cancel_reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+
+            let backlog_members: Vec<String> =
+                sqlx::query_scalar::<_, String>(q_op::SELECT_CANCEL_BACKLOG_MEMBERS_SQL)
+                    .bind(part)
+                    .bind(flow_uuid)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(map_sqlx_error)?;
+
+            let members: Vec<String> = if backlog_members.is_empty() {
+                // Pre-E2-shape flow: enumerate live exec_core rows.
+                let live = sqlx::query_scalar::<_, Uuid>(q_op::SELECT_FLOW_ALL_MEMBERS_SQL)
+                    .bind(part)
+                    .bind(flow_uuid)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                live.into_iter().map(|u| member_wire_id(part, u)).collect()
+            } else {
+                backlog_members
+            };
+
+            return Ok((
+                CancelFlowHeader::AlreadyTerminal {
+                    stored_cancellation_policy,
+                    stored_cancel_reason,
+                    member_execution_ids: members,
+                },
+                None,
+            ));
+        }
+
+        // Fresh cancel path.
+        sqlx::query(q_op::UPDATE_FLOW_CORE_CANCEL_WITH_REASON_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(now)
+            .bind(&args.cancellation_policy)
+            .bind(&args.reason)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(q_op::INSERT_CANCEL_BACKLOG_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(now)
+            .bind(&args.reason)
+            .bind(&args.cancellation_policy)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let member_uuids: Vec<Uuid> =
+            sqlx::query_scalar::<_, Uuid>(q_op::SELECT_FLOW_INFLIGHT_MEMBERS_SQL)
+                .bind(part)
+                .bind(flow_uuid)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+        let member_execution_ids: Vec<String> = member_uuids
+            .iter()
+            .map(|u| member_wire_id(part, *u))
+            .collect();
+
+        // SQLite has no bulk UNNEST — loop. Under single-writer
+        // BEGIN IMMEDIATE each statement is cheap and membership is
+        // bounded; matches `cancel_flow_impl` shape at backend.rs:2090.
+        for (wire_id, exec_uuid) in member_execution_ids.iter().zip(member_uuids.iter()) {
+            sqlx::query(q_op::INSERT_CANCEL_BACKLOG_MEMBER_SQL)
+                .bind(part)
+                .bind(flow_uuid)
+                .bind(wire_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+            sqlx::query(q_op::UPDATE_EXEC_CORE_CANCEL_FROM_HEADER_SQL)
+                .bind(part)
+                .bind(exec_uuid)
+                .bind(now)
+                .bind(&args.reason)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+
+        // Outbox emit — flow-level `flow_cancel_requested`.
+        let details = json!({
+            "flow_id": flow_uuid.to_string(),
+            "cancellation_policy": &args.cancellation_policy,
+            "reason": &args.reason,
+            "member_count": member_execution_ids.len(),
+        });
+        let ev = insert_operator_event_flow(
+            &mut conn,
+            part,
+            flow_uuid,
+            "flow_cancel_requested",
+            Some(details.to_string()),
+            now,
+        )
+        .await?;
+
+        Ok((
+            CancelFlowHeader::Cancelled {
+                cancellation_policy: args.cancellation_policy.clone(),
+                member_execution_ids,
+            },
+            Some(ev),
+        ))
+    }
+    .await;
+
+    match result {
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+        Ok((ret, ev)) => {
+            commit_or_rollback(&mut conn).await?;
+            if let Some(ev) = ev {
+                dispatch_operator(pubsub, ev);
+            }
+            Ok(ret)
+        }
+    }
+}
+
+pub(crate) async fn cancel_flow_header_impl(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    args: CancelFlowArgs,
+) -> Result<CancelFlowHeader, EngineError> {
+    retry_serializable(|| cancel_flow_header_once(pool, pubsub, &args)).await
+}
+
+// ─── ack_cancel_member (§4.2.3, Phase 3.3) ──────────────────────────
+
+async fn ack_cancel_member_once(
+    pool: &SqlitePool,
+    flow_id: &FlowId,
+    execution_id: &ExecutionId,
+) -> Result<(), EngineError> {
+    let part: i64 = 0;
+    let flow_uuid: Uuid = flow_id.0;
+    let member_wire = execution_id.as_str();
+
+    let mut conn = begin_immediate(pool).await?;
+
+    // Intra-ack drain: delete the member row, then delete the parent
+    // iff empty. Under SQLite single-writer (BEGIN IMMEDIATE) the two
+    // statements share a serialised window, so the final-ack path
+    // observes post-delete state; concurrent acks from other processes
+    // race at BEGIN IMMEDIATE and are re-sequenced by
+    // `retry_serializable` — matches PG SERIALIZABLE CTE shape.
+    //
+    // NO outbox emit — RFC-020 §4.2.7 matrix marks this path silent
+    // for Valkey parity.
+    let result = async {
+        sqlx::query(q_op::DELETE_CANCEL_BACKLOG_MEMBER_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .bind(member_wire)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(q_op::DELETE_CANCEL_BACKLOG_IF_EMPTY_SQL)
+            .bind(part)
+            .bind(flow_uuid)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok::<(), EngineError>(())
+    }
+    .await;
+
+    match result {
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+        Ok(()) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn ack_cancel_member_impl(
+    pool: &SqlitePool,
+    flow_id: FlowId,
+    execution_id: ExecutionId,
+) -> Result<(), EngineError> {
+    retry_serializable(|| ack_cancel_member_once(pool, &flow_id, &execution_id)).await
 }

@@ -24,7 +24,8 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     AdditionalWaitpointBinding, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
-    ClaimedResumedExecution, DeliverSignalArgs, DeliverSignalResult, ResumeCondition,
+    ClaimedResumedExecution, DeliverSignalArgs, DeliverSignalResult,
+    ListPendingWaitpointsArgs, ListPendingWaitpointsResult, PendingWaitpointInfo, ResumeCondition,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
     RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretOutcome, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails,
@@ -1216,4 +1217,131 @@ pub(crate) async fn rotate_waitpoint_hmac_secret_all_impl(
     Ok(RotateWaitpointHmacSecretAllResult::new(vec![
         RotateWaitpointHmacSecretAllEntry::new(0, outcome_res),
     ]))
+}
+
+// ── list_pending_waitpoints (RFC-020 §4.5, Phase 3.3) ──────────────────
+
+/// RFC-017 §8 / RFC-020 §4.5 — parse the stored `<kid>:<hex>` waitpoint
+/// token into a `(token_kid, token_fingerprint)` pair. The fingerprint
+/// is the first 16 hex chars (8 bytes) of the HMAC digest — the §8
+/// audit-safe handle. Malformed input collapses to `("", "")` so
+/// callers skip / log without surfacing a typed error. Mirrors the PG
+/// reference at `ff-backend-postgres/src/suspend_ops.rs`.
+fn parse_waitpoint_token_kid_fp(raw: &str) -> (String, String) {
+    match raw.split_once(':') {
+        Some((kid, hex)) if !kid.is_empty() && !hex.is_empty() => {
+            let fp_len = hex.len().min(16);
+            (kid.to_owned(), hex[..fp_len].to_owned())
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// RFC-020 §4.5 — read-only projection of pending-or-active waitpoints
+/// for one execution. Cursor-paginated SELECT against
+/// `ff_waitpoint_pending`. Pre-check `ff_exec_core` existence so a
+/// non-existent execution surfaces `NotFound` rather than an empty
+/// page (mirrors PG + Valkey). `token_fingerprint` is parsed from the
+/// stored `<kid>:<hex>` token — the raw token never crosses the trait
+/// boundary per RFC-017 Stage D1 / §8.
+pub(crate) async fn list_pending_waitpoints_impl(
+    pool: &SqlitePool,
+    args: ListPendingWaitpointsArgs,
+) -> Result<ListPendingWaitpointsResult, EngineError> {
+    const DEFAULT_LIMIT: u32 = 100;
+    const MAX_LIMIT: u32 = 1000;
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as i64;
+    let after_uuid = match args.after.as_ref() {
+        Some(wp) => Some(wp_uuid(wp)?),
+        None => None,
+    };
+
+    // Existence probe.
+    let exists: Option<(i64,)> = sqlx::query_as(q_wp::SELECT_EXEC_EXISTS_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+    if exists.is_none() {
+        return Err(EngineError::NotFound { entity: "execution" });
+    }
+
+    // Page: request `limit + 1` for "has more" detection.
+    // `required_signal_names` is stored as a TEXT JSON array literal
+    // (SQLite has no native text[] — see migration 0011 default).
+    type Row = (
+        Uuid,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        String,
+        String,
+    );
+    let rows: Vec<Row> = sqlx::query_as(q_wp::SELECT_PENDING_WAITPOINTS_PAGE_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(after_uuid)
+        .bind(limit + 1)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    let has_more = rows.len() as i64 > limit;
+    let take_n = if has_more { limit as usize } else { rows.len() };
+
+    let mut entries: Vec<PendingWaitpointInfo> = Vec::with_capacity(take_n);
+    for (wp_uid, wp_key, state, req_names_json, created_ms, activated_ms, expires_ms, _kid, token)
+        in rows.into_iter().take(take_n)
+    {
+        let wp_id = WaitpointId::from_uuid(wp_uid);
+        let (token_kid, token_fingerprint) = parse_waitpoint_token_kid_fp(&token);
+
+        // Decode JSON array literal into Vec<String>. Malformed JSON
+        // surfaces `Corruption` loudly rather than silently collapsing
+        // to empty (gemini review — data-integrity guard).
+        let req_names: Vec<String> =
+            serde_json::from_str(&req_names_json).map_err(|e| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!(
+                    "waitpoint_pending: required_signal_names not valid JSON: {e}"
+                ),
+            })?;
+
+        let mut info = PendingWaitpointInfo::new(
+            wp_id,
+            wp_key,
+            state,
+            TimestampMs(created_ms),
+            args.execution_id.clone(),
+            token_kid,
+            token_fingerprint,
+        );
+        if !req_names.is_empty() {
+            info = info.with_required_signal_names(req_names);
+        }
+        if let Some(ms) = activated_ms {
+            info = info.with_activated_at(TimestampMs(ms));
+        }
+        if let Some(ms) = expires_ms {
+            info = info.with_expires_at(TimestampMs(ms));
+        }
+        entries.push(info);
+    }
+
+    let next_cursor = if has_more {
+        entries.last().map(|e| e.waitpoint_id.clone())
+    } else {
+        None
+    };
+    let mut result = ListPendingWaitpointsResult::new(entries);
+    if let Some(cursor) = next_cursor {
+        result = result.with_next_cursor(cursor);
+    }
+    Ok(result)
 }
