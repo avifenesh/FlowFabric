@@ -59,6 +59,8 @@ pub enum BackendTag {
     Valkey,
     /// The Postgres-backed implementation (RFC-v0.7 Wave 1c).
     Postgres,
+    /// The SQLite-backed implementation — dev-only (RFC-023).
+    Sqlite,
 }
 
 impl BackendTag {
@@ -66,10 +68,16 @@ impl BackendTag {
     /// [`HandleOpaque`] so cross-backend migration tooling can detect
     /// which backend minted a given handle without parsing the rest of
     /// the payload (see [`crate::handle_codec`]).
+    ///
+    /// Wire byte allocations:
+    /// * `0x01` — [`BackendTag::Valkey`]
+    /// * `0x02` — [`BackendTag::Postgres`] (RFC-v0.7 Wave 1c)
+    /// * `0x03` — [`BackendTag::Sqlite`] (RFC-023 Phase 2a.1.5)
     pub const fn wire_byte(self) -> u8 {
         match self {
             BackendTag::Valkey => 0x01,
             BackendTag::Postgres => 0x02,
+            BackendTag::Sqlite => 0x03,
         }
     }
 
@@ -78,6 +86,7 @@ impl BackendTag {
         match b {
             0x01 => Some(BackendTag::Valkey),
             0x02 => Some(BackendTag::Postgres),
+            0x03 => Some(BackendTag::Sqlite),
             _ => None,
         }
     }

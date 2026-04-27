@@ -28,6 +28,7 @@
 mod backend;
 mod config;
 mod errors;
+mod handle_codec;
 mod pubsub;
 pub mod queries;
 mod registry;

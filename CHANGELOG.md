@@ -62,6 +62,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   single path. Classifier + retry-loop unit tests (11 total) cover
   busy / locked / corrupt / full / misuse / non-DB errors plus first-
   try success, mid-retry recovery, exhaustion, and backoff shape.
+- **`ff-core` — `BackendTag::Sqlite` variant (wire byte `0x03`)
+  (RFC-023 Phase 2a.1.5 / §4.4 item 11).** Additive, non-breaking —
+  the enum is already `#[non_exhaustive]`. `wire_byte` /
+  `from_wire_byte` gain the `0x03 ↔ Sqlite` mapping; `handle_codec`
+  v2 encode/decode round-trips SQLite-tagged handles through the
+  existing core codec with no new infrastructure.
+- **`ff-backend-sqlite` — new `handle_codec` module (RFC-023 §4.5 /
+  Phase 2a.1.5 scaffold).** Mirrors the `ff-backend-postgres` and
+  `ff-backend-valkey` wrappers: `encode_handle` mints
+  SQLite-tagged `Handle`s via `ff_core::handle_codec::encode`,
+  `decode_handle` validates the outer `BackendTag` + embedded tag
+  and rejects Valkey/Postgres-minted handles with
+  `ValidationKind::HandleFromOtherBackend`. Bodies are
+  `#[allow(dead_code)]` through Phase 2a.1.5 — Phase 2a.2 wires
+  them into the claim/complete/fail path.
 
 ### Changed
 
