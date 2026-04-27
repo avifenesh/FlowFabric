@@ -26,7 +26,8 @@
 //! v2 layout (Wave 1c+):
 //!   [0]       u8    magic (0x02) — new-format marker
 //!   [1]       u8    wire version (today: 0x01)
-//!   [2]       u8    BackendTag wire byte (0x01 = Valkey, 0x02 = Postgres)
+//!   [2]       u8    BackendTag wire byte (0x01 = Valkey, 0x02 = Postgres,
+//!                                         0x03 = Sqlite — RFC-023)
 //!   [3..]             fields (see §Fields)
 //!
 //! v1 layout (pre-Wave-1c, Valkey-only — read-only compat):
@@ -424,6 +425,28 @@ mod tests {
         let decoded = decode(&opaque).expect("round-trip");
         assert_eq!(decoded.tag, BackendTag::Postgres);
         assert_eq!(decoded.payload, p);
+    }
+
+    /// RFC-023 Phase 2a.1.5 — `BackendTag::Sqlite` minted handles
+    /// round-trip through the core codec with wire byte `0x03`.
+    #[test]
+    fn round_trip_sqlite_v2() {
+        let p = sample_payload();
+        let opaque = encode(BackendTag::Sqlite, &p);
+        assert_eq!(opaque.as_bytes()[2], BackendTag::Sqlite.wire_byte());
+        let decoded = decode(&opaque).expect("round-trip");
+        assert_eq!(decoded.tag, BackendTag::Sqlite);
+        assert_eq!(decoded.payload, p);
+    }
+
+    #[test]
+    fn wire_byte_sqlite() {
+        assert_eq!(BackendTag::Sqlite.wire_byte(), 0x03);
+    }
+
+    #[test]
+    fn from_wire_byte_sqlite() {
+        assert_eq!(BackendTag::from_wire_byte(0x03), Some(BackendTag::Sqlite));
     }
 
     /// Regression guard: an opaque buffer produced by the pre-Wave-1c
